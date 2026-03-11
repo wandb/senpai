@@ -1,0 +1,17 @@
+[project]
+name = "senpai"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "torch_geometric",
+    "rich",
+    "python-dotenv",
+    "simple-parsing",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ipython",
+    "jupyter",
+]
