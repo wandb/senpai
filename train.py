@@ -213,7 +213,7 @@ for epoch in range(cfg.n_epochs):
         "lr": scheduler.get_last_lr()[0],
         "epoch_time_s": dt,
     }
-    wandb.log(metrics, step=epoch + 1)
+    wandb.log(metrics, commit=False)
 
     if torch.cuda.is_available():
         peak_mem_gb = torch.cuda.max_memory_allocated() / 1e9
