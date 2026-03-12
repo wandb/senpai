@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 CoreWeave, Inc.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-PackageName: senpai
+
 """Train Transolver on full-field airfoil flow prediction with separate surface/volume losses."""
 
 import time

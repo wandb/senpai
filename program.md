@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 CoreWeave, Inc.
+SPDX-License-Identifier: Apache-2.0
+SPDX-PackageName: senpai
+-->
+
 # autoresearch
 
 This is an experiment to have the LLM do its own research on NN-CFD surrogates.

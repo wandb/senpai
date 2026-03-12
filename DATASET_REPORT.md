@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 CoreWeave, Inc.
+SPDX-License-Identifier: Apache-2.0
+SPDX-PackageName: senpai
+-->
+
 # TandemFoilSet Dataset Report
 
 **Source:** <https://researchdata.ntu.edu.sg/dataset.xhtml?persistentId=doi:10.21979/N9/KTXSCU>

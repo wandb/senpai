@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 CoreWeave, Inc.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-PackageName: senpai
+
 """Transolver model with physics attention for irregular meshes."""
 
 from collections.abc import Mapping
