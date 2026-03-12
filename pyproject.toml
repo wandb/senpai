@@ -5,9 +5,14 @@ requires-python = ">=3.10"
 dependencies = [
     "torch",
     "torch_geometric",
+    "einops",
+    "timm",
     "rich",
     "python-dotenv",
     "simple-parsing",
+    "wandb",
+    "tqdm",
+    "matplotlib",
 ]
 
 [project.optional-dependencies]

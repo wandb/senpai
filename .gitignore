@@ -27,3 +27,9 @@ Thumbs.db
 *.pkl
 *.pt
 *.ckpt
+
+# Wandb
+wandb/
+
+# Plots
+plots/

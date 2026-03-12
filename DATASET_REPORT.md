@@ -210,15 +210,45 @@ The `boundary` field (uint8) encodes 8 distinct boundary types:
 
 ---
 
-## 6. Zone IDs
+## 6. Zone IDs and Overset (Chimera) Mesh Structure
 
 | Value | Description |
 |-------|-------------|
-| 0 | Far-field / freestream region |
-| 1 | Foil 1 refinement zone |
-| 2 | Foil 2 refinement zone (tandem only) |
+| 0 | Background mesh (coarse, covers full domain) |
+| 1 | Foil 1 refinement patch (dense, around first airfoil) |
+| 2 | Foil 2 refinement patch (dense, around second airfoil — tandem only) |
 
 Single-element files: `{0, 1}`. Tandem files: `{0, 1, 2}`.
+
+### 6.1 Overset Mesh Layout
+
+All datasets use an **overset (chimera) mesh** where the refinement zones spatially overlap with the background mesh. The CFD solver computes on each zone independently and interpolates at overlap boundaries.
+
+```
+┌─────────────────────────────────────────────────┐
+│  Zone 0 — coarse background (full domain)       │
+│                                                   │
+│       ┌──────────────┐   ┌──────────────┐        │
+│       │  Zone 1       │   │  Zone 2       │       │
+│       │  (dense,      │   │  (dense,      │       │
+│       │  foil 1)      │   │  foil 2)      │       │
+│       └──────────────┘   └──────────────┘        │
+│                                                   │
+└─────────────────────────────────────────────────┘
+```
+
+**This means points from different zones overlap in space.** Zone 0 has coarse background points underneath the dense zone 1/2 patches. The overlap counts per dataset:
+
+| Subset | Zones | Zone 0 | Zone 1 | Zone 2 | Zone 0 pts in Zone 1 bbox | Zone 0 pts in Zone 2 bbox |
+|--------|-------|--------|--------|--------|--------------------------|--------------------------|
+| RaceCar single | 0, 1 | 20,780 | 59,692 | — | 6,057 | — |
+| RaceCar tandem (mgn) | 0, 1, 2 | 31,327 | 61,432 | 21,292 | 7,280 | 4,084 |
+| Cruise randomFields | 0, 1, 2 | 101,017 | 61,104 | 61,104 | 8,458 | 8,462 |
+| Cruise Re500 | 0, 1, 2 | 318,854 | 15,300 | 15,300 | 4,996 | 4,990 |
+
+> **Implication for training:** The overlapping points mean two nodes at nearly the same spatial location can have different field values (one from the background solve, one from the refinement solve). This is normal for overset CFD — the refinement zone values are authoritative near the airfoil. For NN surrogates, the model must learn to predict consistent values for both overlapping nodes.
+>
+> **Implication for visualization:** Naively triangulating all points together creates artifacts at zone boundaries due to the density jump and spatial overlap. For clean plots, either (a) remove zone 0 points inside zone 1/2 bounding boxes, or (b) triangulate each zone separately.
 
 ---
 
