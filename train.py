@@ -3,6 +3,7 @@
 import time
 import torch
 import wandb
+import yaml
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from tqdm import tqdm
@@ -11,18 +12,14 @@ import simple_parsing as sp
 
 from prepare import FullFieldDataset, pad_collate, DATA_ROOT
 from transolver import Transolver
-from utils import visualize
+from utils import visualize, dataset_stats
 
+
+MAX_TIMEOUT = 5.0 # minutes
+MAX_EPOCHS = 20
 
 @dataclass
 class Config:
-    n_hidden: int = 128
-    n_layers: int = 5
-    n_head: int = 4
-    slice_num: int = 64
-    mlp_ratio: int = 2
-    n_epochs: int = 10
-    max_minutes: float = 5.0
     lr: float = 5e-4
     weight_decay: float = 1e-4
     batch_size: int = 4
@@ -31,24 +28,10 @@ class Config:
     debug: bool = False
 
 
-def compute_stats(dataset, max_samples=200):
-    """Compute per-channel mean/std from a subset of the training data."""
-    all_x, all_y = [], []
-    for i in range(min(max_samples, len(dataset))):
-        x, y, _ = dataset[i]
-        all_x.append(x)
-        all_y.append(y)
-    all_x = torch.cat(all_x)
-    all_y = torch.cat(all_y)
-    return {
-        "x_mean": all_x.mean(0), "x_std": all_x.std(0).clamp(min=1e-6),
-        "y_mean": all_y.mean(0), "y_std": all_y.std(0).clamp(min=1e-6),
-    }
-
 cfg = sp.parse(Config)
 
 if cfg.debug:
-    cfg.n_epochs = 3
+    MAX_EPOCHS = 3
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}" + (" [DEBUG MODE]" if cfg.debug else ""))
@@ -63,55 +46,58 @@ if cfg.debug:
 
 print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
 
-print("Computing normalization stats...")
-stats = compute_stats(train_ds)
-for k, v in stats.items():
-    stats[k] = v.to(device)
+stats = {k: v.to(device) for k, v in dataset_stats[cfg.dataset].items()}
 
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
 train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, **loader_kwargs)
 val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
 
-model = Transolver(
+model_config = dict(
     space_dim=2,
     fun_dim=16,
     out_dim=3,
-    n_hidden=cfg.n_hidden,
-    n_layers=cfg.n_layers,
-    n_head=cfg.n_head,
-    slice_num=cfg.slice_num,
-    mlp_ratio=cfg.mlp_ratio,
+    n_hidden=128,
+    n_layers=5,
+    n_head=4,
+    slice_num=64,
+    mlp_ratio=2,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
+)
+
+
+model = Transolver(
+    **model_config
 ).to(device)
 
 n_params = sum(p.numel() for p in model.parameters())
-scaled_lr = cfg.lr * (cfg.batch_size ** 0.5)  # sqrt scaling rule (base LR at BS=1)
-optimizer = torch.optim.AdamW(model.parameters(), lr=scaled_lr, weight_decay=cfg.weight_decay)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.n_epochs)
-print(f"Parameters: {n_params:,}, LR: {scaled_lr:.1e} (base {cfg.lr:.1e} x BS {cfg.batch_size})")
+optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
+
 
 # --- wandb ---
 run = wandb.init(
     project="senpai",
-    config={**asdict(cfg), "scaled_lr": scaled_lr, "n_params": n_params, "train_samples": len(train_ds), "val_samples": len(val_ds)},
+    config={**asdict(cfg), "model_config": model_config, "n_params": n_params, "train_samples": len(train_ds), "val_samples": len(val_ds)},
     mode="offline" if cfg.debug else "online",
 )
 
-model_dir = Path("models")
-model_dir.mkdir(exist_ok=True)
-model_path = model_dir / f"model-{run.id}.pt"
+model_dir = Path(f"models/model-{run.id}")
+model_dir.mkdir(parents=True)
+model_path = model_dir / f"checkpoint.pt"
+with open(model_dir / "config.yaml", "w") as f:
+    yaml.dump(model_config, f)
 
 best_val = float("inf")
 best_metrics = {}
 train_start = time.time()
 
-for epoch in range(cfg.n_epochs):
+for epoch in range(MAX_EPOCHS):
     # Check wall-clock timeout
     elapsed_min = (time.time() - train_start) / 60.0
-    if elapsed_min >= cfg.max_minutes:
-        print(f"Wall-clock limit reached ({elapsed_min:.1f} min >= {cfg.max_minutes} min). Stopping.")
+    if elapsed_min >= MAX_TIMEOUT:
+        print(f"Wall-clock limit reached ({elapsed_min:.1f} min >= {MAX_TIMEOUT} min). Stopping.")
         break
 
     t0 = time.time()
@@ -122,7 +108,7 @@ for epoch in range(cfg.n_epochs):
     epoch_surf = 0.0
     n_batches = 0
 
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg.n_epochs} [train]", leave=False)
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     for x, y, is_surface, mask in pbar:
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
@@ -165,7 +151,7 @@ for epoch in range(cfg.n_epochs):
     n_val = 0
 
     with torch.no_grad():
-        for x, y, is_surface, mask in tqdm(val_loader, desc=f"Epoch {epoch+1}/{cfg.n_epochs} [val]", leave=False):
+        for x, y, is_surface, mask in tqdm(val_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [val]", leave=False):
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             is_surface = is_surface.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
