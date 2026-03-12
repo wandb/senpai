@@ -263,7 +263,8 @@ if best_metrics:
     # Generate visualizations with best model
     print("\nGenerating flow field plots...")
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-    images = visualize(model, val_ds, stats, device, n_samples=2 if cfg.debug else 4)
+    plot_dir = Path("plots") / run.id
+    images = visualize(model, val_ds, stats, device, n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
     if images:
         wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images]})
 

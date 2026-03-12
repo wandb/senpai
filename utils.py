@@ -12,24 +12,39 @@ FIELD_NAMES = ["Ux", "Uy", "p"]
 OUT_DIR = Path("plots")
 
 
-def _make_triangulation(px, py, surf_pos):
-    """Create Delaunay triangulation and mask triangles inside airfoil bodies."""
+def _make_triangulation(px, py, surf_pos, edge_mult=4.0):
+    """Create Delaunay triangulation and mask triangles inside airfoil bodies
+    and spurious long-edge triangles at mesh boundaries."""
     from scipy.spatial import ConvexHull
-    from matplotlib.path import Path
+    from matplotlib.path import Path as MplPath
     triang = tri.Triangulation(px, py)
     triangles = triang.triangles
     p = np.column_stack([px, py])
     centroids = p[triangles].mean(axis=1)
-    # Use convex hull of surface points to mask triangles inside the airfoil
+
+    # Mask triangles inside airfoil (convex hull of surface points)
     hull = ConvexHull(surf_pos)
-    hull_path = Path(surf_pos[hull.vertices])
-    triang.set_mask(hull_path.contains_points(centroids))
+    hull_path = MplPath(surf_pos[hull.vertices])
+    inside_mask = hull_path.contains_points(centroids)
+
+    # Mask triangles with edges much longer than the local median
+    # This removes artifacts at the boundary between coarse and dense meshes
+    v0, v1, v2 = p[triangles[:, 0]], p[triangles[:, 1]], p[triangles[:, 2]]
+    e0 = np.linalg.norm(v1 - v0, axis=1)
+    e1 = np.linalg.norm(v2 - v1, axis=1)
+    e2 = np.linalg.norm(v0 - v2, axis=1)
+    max_edge = np.maximum(e0, np.maximum(e1, e2))
+    median_edge = np.median(max_edge)
+    long_mask = max_edge > edge_mult * median_edge
+
+    triang.set_mask(inside_mask | long_mask)
     return triang
 
 
-def plot_samples(dataset, indices=None, n_samples=4, prefix="data_sample"):
+def plot_samples(dataset, indices=None, n_samples=4, prefix="data_sample", out_dir=None):
     """Plot ground truth flow fields for raw dataset samples."""
-    OUT_DIR.mkdir(exist_ok=True)
+    out_dir = Path(out_dir) if out_dir else OUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
     saved = []
     if indices is None:
         indices = list(range(min(n_samples, len(dataset))))
@@ -68,7 +83,7 @@ def plot_samples(dataset, indices=None, n_samples=4, prefix="data_sample"):
             ax.plot(surf_pos[:, 0], surf_pos[:, 1], "k.", markersize=0.3)
 
         plt.tight_layout()
-        path = OUT_DIR / f"{prefix}_{idx}.png"
+        path = out_dir / f"{prefix}_{idx}.png"
         fig.savefig(path, dpi=150)
         plt.close(fig)
         saved.append(path)
@@ -77,9 +92,10 @@ def plot_samples(dataset, indices=None, n_samples=4, prefix="data_sample"):
     return saved
 
 
-def visualize(model, val_ds, stats, device, n_samples=4):
+def visualize(model, val_ds, stats, device, n_samples=4, out_dir=None):
     """Generate flow field comparison plots for validation samples."""
-    OUT_DIR.mkdir(exist_ok=True)
+    out_dir = Path(out_dir) if out_dir else OUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
     model.eval()
     saved = []
 
@@ -144,7 +160,7 @@ def visualize(model, val_ds, stats, device, n_samples=4):
                 ax.plot(surf_pos[:, 0], surf_pos[:, 1], "k.", markersize=0.3)
 
         plt.tight_layout()
-        path = OUT_DIR / f"val_sample_{sample_idx}.png"
+        path = out_dir / f"val_sample_{sample_idx}.png"
         fig.savefig(path, dpi=150)
         plt.close(fig)
         saved.append(path)
