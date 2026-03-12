@@ -25,7 +25,7 @@ class Config:
     max_minutes: float = 5.0
     lr: float = 5e-4
     weight_decay: float = 1e-4
-    batch_size: int = 16
+    batch_size: int = 4
     surf_weight: float = 10.0
     dataset: str = "raceCar_single_randomFields"
     debug: bool = False
