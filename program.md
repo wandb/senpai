@@ -32,7 +32,7 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The training script stops after **10 epochs or 5 minutes** (whichever comes first; configurable via `--n_epochs` and `--max_minutes`). You launch it as: `python train.py > run.log 2>&1`
+Each experiment runs on a single GPU. The training script stops after **10 epochs or 5 minutes** (whichever comes first).
 
 **What you CAN do:**
 - Modify `train.py` — hyperparameters, optimizer, loss formulation, batch size, learning rate schedule, loss weighting, normalization strategy, etc.
@@ -46,7 +46,7 @@ Each experiment runs on a single GPU. The training script stops after **10 epoch
 **The goal is simple: get the lowest validation losses.** We track two primary metrics:
 - **Surface MAE** — mean absolute error on airfoil surface nodes (Ux, Uy, p). This is the most important metric for engineering applications.
 - **Volume MAE** — mean absolute error on volume (field) nodes.
-- **val/total_loss** — the combined validation loss (vol_loss + surf_weight * surf_loss).
+- **val/loss** — the combined validation loss (vol_loss + surf_weight * surf_loss).
 
 Lower is better for all metrics. Surface accuracy matters most — these are the quantities engineers care about (forces, pressure distributions on the airfoil).
 
@@ -133,7 +133,7 @@ The idea is that you are a completely autonomous researcher trying things out. I
 - Optimizer: AdamW vs Adam, weight decay, gradient clipping
 - Multi-scale or hierarchical approaches
 
-**Timeout**: Default is 10 epochs / 5 minutes. You can increase for promising ideas (e.g. `--n_epochs 50 --max_minutes 40`). The script auto-stops at the wall-clock limit.
+**Timeout**: Default is 10 epochs / 5 minutes. Don't change this, it's your budget. You have 8 GPUs, so you can run this workflow up to 8 time sin parallel.
 
 **Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 
