@@ -8,6 +8,8 @@ SPDX-PackageName: senpai
 
 Autonomous neural network research on CFD surrogates, powered by Claude Code agents coordinated through GitHub PRs.
 
+![val/loss over time](scatter_plot.png)
+
 ## The idea
 
 We want to run autonomous ML research at scale: many hypotheses explored in parallel by AI agents, with all coordination happening through GitHub. No custom dashboards, no message queues — just PRs, labels, and code review.
