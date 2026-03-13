@@ -26,6 +26,8 @@ See `advisor.md`, `student.md`, and `program.md` for the full protocols.
 
 ## Architecture
 
+![k9s deployments](k9s.png)
+
 ```mermaid
 graph TD
     subgraph K8s["Kubernetes Cluster"]
