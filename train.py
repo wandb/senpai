@@ -31,6 +31,7 @@ class Config:
     dataset: str = "raceCar_single_randomFields"
     wandb_group: str | None = None  # group related runs (e.g. iterations on the same idea)
     wandb_name: str | None = None  # name for this specific run
+    agent: str | None = None  # agent name tag for W&B filtering
     debug: bool = False
 
 
@@ -87,6 +88,7 @@ run = wandb.init(
     project="senpai",
     group=cfg.wandb_group,
     name=cfg.wandb_name,
+    tags=[cfg.agent] if cfg.agent else [],
     config={**asdict(cfg), "model_config": model_config, "n_params": n_params, "train_samples": len(train_ds), "val_samples": len(val_ds)},
     mode="offline" if cfg.debug else "online",
 )
