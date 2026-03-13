@@ -21,6 +21,7 @@ venv/
 
 # Claude Code
 .claude/
+!.claude/skills/
 
 # OS
 .DS_Store
@@ -40,3 +41,11 @@ plots/
 
 # models
 models/
+
+# K8s secrets (keep the .template, ignore actual secrets)
+k8s/secrets.yaml
+
+# Experiment logs
+run*.log
+results.tsv
+experiment_log/

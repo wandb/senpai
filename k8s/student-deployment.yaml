@@ -1,0 +1,96 @@
+# SPDX-FileCopyrightText: 2026 CoreWeave, Inc.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-PackageName: senpai
+#
+# A student is a long-running worker that polls for PR assignments.
+# Replace {{STUDENT_NAME}} and {{RESEARCH_TAG}} before applying, or use launch.py.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: senpai-{{STUDENT_NAME}}
+  labels:
+    app: senpai
+    role: student
+    research-tag: {{RESEARCH_TAG}}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: senpai
+      student: {{STUDENT_NAME}}
+  template:
+    metadata:
+      labels:
+        app: senpai
+        role: student
+        student: {{STUDENT_NAME}}
+        research-tag: {{RESEARCH_TAG}}
+    spec:
+      containers:
+      - name: student
+        image: ghcr.io/tcapelle/dev_box:latest
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -e
+          git config --global url."https://${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+          git clone --branch "$SENPAI_REPO_BRANCH" "$SENPAI_REPO_URL" /workspace/senpai
+          cd /workspace/senpai
+          bash k8s/entrypoint-student.sh
+        env:
+        - name: SENPAI_REPO_URL
+          value: "https://github.com/wandb/senpai.git"
+        - name: SENPAI_REPO_BRANCH
+          value: "main"
+        - name: SENPAI_STUDENT_NAME
+          value: {{STUDENT_NAME}}
+        - name: SENPAI_RESEARCH_TAG
+          value: {{RESEARCH_TAG}}
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: senpai-secrets
+              key: wandb-api-key
+        - name: ANTHROPIC_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: senpai-secrets
+              key: anthropic-api-key
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: senpai-secrets
+              key: github-token
+        - name: WANDB_ENTITY
+          value: "{{WANDB_ENTITY}}"
+        - name: WANDB_PROJECT
+          value: "senpai"
+        resources:
+          requests:
+            cpu: "120"
+            memory: "960Gi"
+            nvidia.com/gpu: "8"
+          limits:
+            cpu: "120"
+            memory: "960Gi"
+            nvidia.com/gpu: "8"
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+        - name: dataset
+          mountPath: /mnt/new-pvc
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 32Gi
+      - name: dataset
+        persistentVolumeClaim:
+          claimName: new-pvc
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"

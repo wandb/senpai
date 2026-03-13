@@ -4,6 +4,7 @@
 
 """Train Transolver on full-field airfoil flow prediction with separate surface/volume losses."""
 
+import os
 import time
 import torch
 import wandb
@@ -21,7 +22,6 @@ from utils import visualize, dataset_stats
 
 MAX_TIMEOUT = 5.0 # minutes
 MAX_EPOCHS = 20
-
 @dataclass
 class Config:
     lr: float = 5e-4
@@ -31,6 +31,7 @@ class Config:
     dataset: str = "raceCar_single_randomFields"
     wandb_group: str | None = None  # group related runs (e.g. iterations on the same idea)
     wandb_name: str | None = None  # name for this specific run
+    agent: str | None = None  # agent name (e.g. pepe) for filtering in W&B
     debug: bool = False
 
 
@@ -84,9 +85,10 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOC
 
 # --- wandb ---
 run = wandb.init(
-    project="senpai",
+    project=os.environ.get("WANDB_PROJECT", "senpai"),
     group=cfg.wandb_group,
     name=cfg.wandb_name,
+    tags=[cfg.agent] if cfg.agent else [],
     config={**asdict(cfg), "model_config": model_config, "n_params": n_params, "train_samples": len(train_ds), "val_samples": len(val_ds)},
     mode="offline" if cfg.debug else "online",
 )
@@ -237,6 +239,7 @@ for epoch in range(MAX_EPOCHS):
         f"mae_vol=[Ux:{mae_vol[0]:.2f} Uy:{mae_vol[1]:.2f} p:{mae_vol[2]:.1f}]  "
         f"mae_surf=[Ux:{mae_surf[0]:.2f} Uy:{mae_surf[1]:.2f} p:{mae_surf[2]:.1f}]{tag}"
     )
+
 
 # --- Final summary ---
 total_time = (time.time() - train_start) / 60.0
