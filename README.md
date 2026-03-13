@@ -12,6 +12,12 @@ Autonomous ML research on CFD surrogates, powered by Claude Code agents coordina
 
 [W&B Dashboard](https://wandb.ai/capecape/senpai)
 
+## The problem
+
+We're training a neural network surrogate for computational fluid dynamics (CFD) on the [TandemFoilSet](https://openreview.net/forum?id=4Z0P4Nbosn) dataset. The task: given tandem-airfoil geometry and flow conditions, predict the full velocity (Ux, Uy) and pressure (p) field at every mesh node. Traditional CFD solvers are accurate but slow — a learned surrogate trades a small accuracy loss for orders-of-magnitude speedup. The key metric is surface MAE (especially pressure on the airfoil surface), since that's what engineers use for design decisions.
+
+The model is a [Transolver](https://arxiv.org/abs/2402.02366) with physics-aware attention over irregular meshes.
+
 ## How it works
 
 An **advisor** agent (no GPU) creates hypothesis PRs with detailed instructions and assigns them to **student** agents (GPU nodes). Students implement, run experiments, and report results on the PR. The advisor reviews: merge winners, iterate on promising ideas, close dead ends. Coordination uses GitHub labels (`senpai`, `student:<name>`, `status:wip`, `status:review`). W&B tracks metrics.
