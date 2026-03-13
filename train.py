@@ -4,6 +4,7 @@
 
 """Train Transolver on full-field airfoil flow prediction with separate surface/volume losses."""
 
+import math
 import time
 import torch
 import wandb
@@ -19,6 +20,16 @@ from transolver import Transolver
 from utils import visualize, dataset_stats
 
 
+FOURIER_FREQS = 6  # 2 + 4*6 = 26 dims
+
+
+def fourier_encode(xy, num_freqs=FOURIER_FREQS):
+    """Sinusoidal positional encoding. xy: [B, N, 2] → [B, N, 2 + 4*num_freqs]"""
+    freqs = torch.arange(1, num_freqs + 1, device=xy.device, dtype=xy.dtype)
+    angles = 2 * math.pi * xy.unsqueeze(-1) * freqs  # [B, N, 2, k]
+    return torch.cat([xy, angles.sin().flatten(-2), angles.cos().flatten(-2)], dim=-1)
+
+
 MAX_TIMEOUT = 5.0 # minutes
 MAX_EPOCHS = 20
 
@@ -28,9 +39,12 @@ class Config:
     weight_decay: float = 1e-4
     batch_size: int = 4
     surf_weight: float = 10.0
+    loss_type: str = "mse"  # "mse", "l1", or "huber"
+    huber_delta: float = 0.1
     dataset: str = "raceCar_single_randomFields"
     wandb_group: str | None = None  # group related runs (e.g. iterations on the same idea)
     wandb_name: str | None = None  # name for this specific run
+    agent: str | None = None  # agent name for filtering in W&B
     debug: bool = False
 
 
@@ -60,12 +74,12 @@ train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, **l
 val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
 
 model_config = dict(
-    space_dim=2,
+    space_dim=2 + 4 * FOURIER_FREQS,  # 26 with 6 Fourier frequencies
     fun_dim=16,
     out_dim=3,
     n_hidden=128,
-    n_layers=5,
-    n_head=4,
+    n_layers=1,
+    n_head=8,
     slice_num=64,
     mlp_ratio=2,
     output_fields=["Ux", "Uy", "p"],
@@ -87,6 +101,7 @@ run = wandb.init(
     project="senpai",
     group=cfg.wandb_group,
     name=cfg.wandb_name,
+    tags=[cfg.agent] if cfg.agent else [],
     config={**asdict(cfg), "model_config": model_config, "n_params": n_params, "train_samples": len(train_ds), "val_samples": len(val_ds)},
     mode="offline" if cfg.debug else "online",
 )
@@ -123,15 +138,21 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         x = (x - stats["x_mean"]) / stats["x_std"]
+        x = torch.cat([fourier_encode(x[..., :2]), x[..., 2:]], dim=-1)
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
         pred = model({"x": x})["preds"]
-        sq_err = (pred - y_norm) ** 2
+        if cfg.loss_type == "l1":
+            err = torch.abs(pred - y_norm)
+        elif cfg.loss_type == "huber":
+            err = torch.nn.functional.huber_loss(pred, y_norm, reduction="none", delta=cfg.huber_delta)
+        else:
+            err = (pred - y_norm) ** 2
 
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
-        vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-        surf_loss = (sq_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        vol_loss = (err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
+        surf_loss = (err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + cfg.surf_weight * surf_loss
         wandb.log({"train/loss": loss.item()})
 
@@ -165,15 +186,21 @@ for epoch in range(MAX_EPOCHS):
             mask = mask.to(device, non_blocking=True)
 
             x = (x - stats["x_mean"]) / stats["x_std"]
+            x = torch.cat([fourier_encode(x[..., :2]), x[..., 2:]], dim=-1)
             y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
             pred = model({"x": x})["preds"]
-            sq_err = (pred - y_norm) ** 2
+            if cfg.loss_type == "l1":
+                val_err = torch.abs(pred - y_norm)
+            elif cfg.loss_type == "huber":
+                val_err = torch.nn.functional.huber_loss(pred, y_norm, reduction="none", delta=cfg.huber_delta)
+            else:
+                val_err = (pred - y_norm) ** 2
 
             vol_mask = mask & ~is_surface
             surf_mask = mask & is_surface
-            val_vol += (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
-            val_surf += (sq_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+            val_vol += (val_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
+            val_surf += (val_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
             n_val += 1
 
             pred_orig = pred * stats["y_std"] + stats["y_mean"]
