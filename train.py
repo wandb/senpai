@@ -21,7 +21,7 @@ from utils import visualize, dataset_stats
 
 
 MAX_TIMEOUT = 5.0 # minutes
-MAX_EPOCHS = 50
+MAX_EPOCHS = 100
 @dataclass
 class Config:
     lr: float = 5e-4
@@ -65,7 +65,7 @@ model_config = dict(
     fun_dim=16,
     out_dim=3,
     n_hidden=128,
-    n_layers=5,
+    n_layers=1,
     n_head=4,
     slice_num=64,
     mlp_ratio=2,
@@ -80,7 +80,16 @@ model = Transolver(
 
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
+scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    optimizer,
+    max_lr=cfg.lr,
+    epochs=MAX_EPOCHS,
+    steps_per_epoch=len(train_loader),
+    pct_start=0.05,        # 5% warmup (~5 epochs)
+    anneal_strategy='cos',
+    div_factor=25,          # initial_lr = max_lr/25
+    final_div_factor=1e4,   # final_lr = initial_lr/1e4
+)
 
 
 # --- wandb ---
@@ -140,13 +149,13 @@ for epoch in range(MAX_EPOCHS):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        scheduler.step()
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
         n_batches += 1
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
-    scheduler.step()
     epoch_vol /= n_batches
     epoch_surf /= n_batches
 
