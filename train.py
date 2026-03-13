@@ -28,7 +28,9 @@ class Config:
     weight_decay: float = 1e-4
     batch_size: int = 4
     surf_weight: float = 10.0
+    huber_delta: float = 0.01
     dataset: str = "raceCar_single_randomFields"
+    agent: str = ""
     wandb_group: str | None = None  # group related runs (e.g. iterations on the same idea)
     wandb_name: str | None = None  # name for this specific run
     debug: bool = False
@@ -79,7 +81,15 @@ model = Transolver(
 
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
+scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    optimizer,
+    max_lr=0.02,
+    epochs=MAX_EPOCHS,
+    steps_per_epoch=len(train_loader),
+    pct_start=0.3,
+    anneal_strategy='cos',
+    final_div_factor=1e4,
+)
 
 
 # --- wandb ---
@@ -87,6 +97,7 @@ run = wandb.init(
     project="senpai",
     group=cfg.wandb_group,
     name=cfg.wandb_name,
+    tags=[cfg.agent] if cfg.agent else None,
     config={**asdict(cfg), "model_config": model_config, "n_params": n_params, "train_samples": len(train_ds), "val_samples": len(val_ds)},
     mode="offline" if cfg.debug else "online",
 )
@@ -126,25 +137,24 @@ for epoch in range(MAX_EPOCHS):
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
         pred = model({"x": x})["preds"]
-        sq_err = (pred - y_norm) ** 2
+        huber_err = torch.nn.functional.huber_loss(pred, y_norm, delta=cfg.huber_delta, reduction='none')
 
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
-        vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-        surf_loss = (sq_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        vol_loss = (huber_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
+        surf_loss = (huber_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + cfg.surf_weight * surf_loss
-        wandb.log({"train/loss": loss.item()})
+        wandb.log({"train/loss": loss.item(), "lr": scheduler.get_last_lr()[0]})
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        scheduler.step()
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
         n_batches += 1
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
-
-    scheduler.step()
     epoch_vol /= n_batches
     epoch_surf /= n_batches
 
@@ -168,12 +178,12 @@ for epoch in range(MAX_EPOCHS):
             y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
             pred = model({"x": x})["preds"]
-            sq_err = (pred - y_norm) ** 2
+            huber_err = torch.nn.functional.huber_loss(pred, y_norm, delta=cfg.huber_delta, reduction='none')
 
             vol_mask = mask & ~is_surface
             surf_mask = mask & is_surface
-            val_vol += (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
-            val_surf += (sq_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+            val_vol += (huber_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
+            val_surf += (huber_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
             n_val += 1
 
             pred_orig = pred * stats["y_std"] + stats["y_mean"]
@@ -204,7 +214,7 @@ for epoch in range(MAX_EPOCHS):
         "val/mae_surf_Ux": mae_surf[0].item(),
         "val/mae_surf_Uy": mae_surf[1].item(),
         "val/mae_surf_p": mae_surf[2].item(),
-        "lr": scheduler.get_last_lr()[0],
+        "lr_epoch": scheduler.get_last_lr()[0],
         "epoch_time_s": dt,
     }
     wandb.log(metrics, commit=False)
