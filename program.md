@@ -35,6 +35,8 @@ Lower is better. Surface accuracy (especially pressure) matters most.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it.
 
+**Timeout**: Each training run is capped at 10 epochs / 5 minutes by default. Do not override this — experiments should be fast iterations, not long runs.
+
 ## Roles
 
 Research is coordinated through GitHub PRs with an advisor/student model. See `advisor.md` and `student.md` for role-specific workflows.

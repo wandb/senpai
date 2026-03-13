@@ -48,6 +48,7 @@ Read `program.md` for the full research context, constraints, metrics, and file 
    ```bash
    python train.py --agent <your-name> --wandb_name "<your-name>/<description>" [--wandb_group "<idea>"]
    ```
+   - **Timeout**: Each run is capped at 10 epochs / 5 minutes by default. Do not change this unless the PR instructions explicitly say to.
    - Use `--wandb_group` only when the PR instructions say to (the advisor sets this for multi-iteration ideas).
    - If the run crashes, check the log. Fix typos/import errors and re-run. If the idea is fundamentally broken, report that in the results.
    - Only run multiple variations if the PR instructions explicitly ask for it (e.g. "try surface weight 5, 10, 20"). Otherwise, run the single experiment described.
