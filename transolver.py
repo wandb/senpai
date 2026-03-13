@@ -167,6 +167,7 @@ class Transolver(nn.Module):
         unified_pos=False,
         output_fields: list[str] | None = None,
         output_dims: list[int] | None = None,
+        input_dim: int | None = None,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -180,6 +181,13 @@ class Transolver(nn.Module):
             raise ValueError("out_dim must equal sum(output_dims)")
         self.output_fields = output_fields
         self.output_dims = output_dims
+
+        # Optional input projection: maps dataset's fixed input_dim → space_dim + fun_dim
+        effective_input = fun_dim + space_dim
+        if input_dim is not None and input_dim != effective_input:
+            self.input_proj = nn.Linear(input_dim, effective_input)
+        else:
+            self.input_proj = None
 
         if self.unified_pos:
             self.preprocess = MLP(
@@ -265,6 +273,9 @@ class Transolver(nn.Module):
                 raise ValueError("Missing required input tensor: pos")
             new_pos = self.get_grid(pos)
             x = torch.cat((x, new_pos), dim=-1)
+
+        if self.input_proj is not None:
+            x = self.input_proj(x)
 
         fx = self.preprocess(x)
         fx = fx + self.placeholder[None, None, :]
