@@ -66,8 +66,13 @@ Read `program.md` for the full research context, constraints, metrics, and file 
    git add -A && git commit -m "<concise description of changes>"
    git push origin <branch>
    gh pr ready <number>
-   gh pr edit <number> --remove-label "status:wip" --add-label "status:review"
    ```
+   Then swap the status label (keep all other labels intact):
+   ```bash
+   gh api repos/{owner}/{repo}/issues/<number>/labels/status:wip --method DELETE
+   gh api repos/{owner}/{repo}/issues/<number>/labels -f "labels[]=status:review" --method POST
+   ```
+   **IMPORTANT:** Never use `gh pr edit --remove-label --add-label` — it strips other labels. Always use the API calls above to swap status labels individually.
 
 7. **Go back to step 1** and poll for the next assignment.
 
