@@ -70,10 +70,10 @@ while true; do
     echo "=== Advisor Loop iteration $ITERATION ($(date)) ==="
 
     if [ "$ITERATION" -eq 1 ]; then
-        claude -p "$PROMPT" --dangerously-skip-permissions || true
+        claude -p "$PROMPT" --model "claude-opus-4-6[1m]" --dangerously-skip-permissions || true
     else
-        claude -c -p "$PROMPT" --dangerously-skip-permissions || \
-        claude -p "$PROMPT" --dangerously-skip-permissions || true
+        claude -c -p "$PROMPT" --model "claude-opus-4-6[1m]" --dangerously-skip-permissions || \
+        claude -p "$PROMPT" --model "claude-opus-4-6[1m]" --dangerously-skip-permissions || true
     fi
 
     echo "=== Advisor exited at $(date), next check in 5 minutes ==="
