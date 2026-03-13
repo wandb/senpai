@@ -46,10 +46,10 @@ apt-get update && apt-get install -y gh
 # gh uses GITHUB_TOKEN env var automatically, no explicit login needed
 echo "=== gh auth ready (using GITHUB_TOKEN env var) ==="
 
-# --- Launch Claude Code ---
+# --- Launch Claude Code in Ralph Loop ---
 export IS_SANDBOX=1
 
-exec claude -p "$(cat <<EOF
+PROMPT="$(cat <<EOF
 You are the senpai advisor.
 
 Read advisor.md for your full workflow, and program.md for the research context and constraints.
@@ -62,4 +62,20 @@ You can also monitor student pods: kubectl get deployments -l app=senpai
 
 Start by surveying the current state: check W&B metrics, list existing PRs, and identify what needs attention.
 EOF
-)" --dangerously-skip-permissions
+)"
+
+ITERATION=0
+while true; do
+    ITERATION=$((ITERATION + 1))
+    echo "=== Advisor Loop iteration $ITERATION ($(date)) ==="
+
+    if [ "$ITERATION" -eq 1 ]; then
+        claude -p "$PROMPT" --dangerously-skip-permissions || true
+    else
+        claude -c -p "$PROMPT" --dangerously-skip-permissions || \
+        claude -p "$PROMPT" --dangerously-skip-permissions || true
+    fi
+
+    echo "=== Advisor exited at $(date), next check in 5 minutes ==="
+    sleep 300
+done

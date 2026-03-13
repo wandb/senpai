@@ -14,7 +14,7 @@ from pathlib import Path
 import simple_parsing as sp
 
 STUDENT_TEMPLATE = Path(__file__).parent / "student-deployment.yaml"
-ADVISOR_TEMPLATE = Path(__file__).parent / "advisor-pod.yaml"
+ADVISOR_TEMPLATE = Path(__file__).parent / "advisor-deployment.yaml"
 
 STUDENT_NAMES = [
     "frieren", "fern", "tanjiro", "nezuko", "alphonse", "edward",
@@ -132,11 +132,11 @@ def main():
             print("Launched advisor pod")
         print(f"\nMonitor:")
         print(f"  kubectl get deployments -l research-tag={args.tag}")
-        print(f"  kubectl get pod senpai-advisor")
+        print(f"  kubectl get deployment senpai-advisor")
         print(f"  kubectl logs -f deployment/senpai-{student_list[0]}")
         print(f"\nStop:")
         print(f"  kubectl delete deployments -l research-tag={args.tag}")
-        print(f"  kubectl delete pod senpai-advisor")
+        print(f"  kubectl delete deployment senpai-advisor")
 
 
 if __name__ == "__main__":
