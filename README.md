@@ -4,6 +4,114 @@ SPDX-License-Identifier: Apache-2.0
 SPDX-PackageName: senpai
 -->
 
+# senpai
+
+Autonomous neural network research on CFD surrogates, powered by Claude Code agents running on Kubernetes.
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        Kubernetes Cluster                    │
+│                                                              │
+│  ┌──────────────────┐                                        │
+│  │   Orchestrator    │  No GPU, lightweight                  │
+│  │   (Claude Code)   │  Reads journals, queries W&B          │
+│  │                   │  Launches/stops agent pods             │
+│  └────────┬──────────┘                                       │
+│           │ kubectl                                          │
+│           │                                                  │
+│  ┌────────▼──────────────────────────────────────────────┐   │
+│  │              Agent Pods (one per GPU node)              │  │
+│  │                                                        │  │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐               │  │
+│  │  │  pepe   │  │  agata  │  │ claudio │  ...           │  │
+│  │  │ 8x GPU  │  │ 8x GPU  │  │ 8x GPU  │               │  │
+│  │  │         │  │         │  │         │               │  │
+│  │  │ Claude  │  │ Claude  │  │ Claude  │               │  │
+│  │  │ Code    │  │ Code    │  │ Code    │               │  │
+│  │  └────┬────┘  └────┬────┘  └────┬────┘               │  │
+│  └───────┼────────────┼────────────┼─────────────────────┘  │
+│          │            │            │                         │
+│  ┌───────▼────────────▼────────────▼─────────────────────┐  │
+│  │                  Shared PVC                            │  │
+│  │                                                        │  │
+│  │  /mnt/new-pvc/                                         │  │
+│  │    datasets/tandemfoil/    ← training data             │  │
+│  │    senpai/journals/        ← research journals (*.md)  │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                    ┌─────────▼─────────┐
+                    │    Weights &       │
+                    │    Biases          │
+                    │                   │
+                    │  Metrics, runs,   │
+                    │  tags, groups     │
+                    └───────────────────┘
+```
+
+### Components
+
+**Agent pods** — Each agent is a full GPU node (8x GPU) running Claude Code autonomously. It reads `program.md`, modifies the model/training code, runs experiments, and iterates. Agents use git worktrees to run multiple experiments in parallel across their 8 GPUs.
+
+**Orchestrator** — A lightweight pod (no GPU) that manages the fleet. It reads agent journals, queries W&B for metrics, and can launch/stop agents via kubectl.
+
+**Shared PVC** — Persistent volume mounted on all pods. Holds the training dataset and agent research journals.
+
+**W&B** — All training runs log to a shared W&B project. Agents use `--agent <name>` (stored in config and tags) for filtering. `--wandb_group` groups iterations on the same idea.
+
+**Research journals** — Each agent maintains a markdown journal at `/mnt/new-pvc/senpai/journals/<agent>.md` with hypotheses, results, and plans. Agents read each other's journals to avoid duplicating work.
+
+## Quick start
+
+### 1. Create the K8s secret
+
+```bash
+kubectl create secret generic senpai-secrets \
+  --from-literal=wandb-api-key=$WANDB_API_KEY \
+  --from-literal=anthropic-api-key=$ANTHROPIC_API_KEY \
+  --from-literal=github-token=$GITHUB_TOKEN
+```
+
+### 2. Launch research agents
+
+```bash
+# Launch 3 agents by name
+python k8s/launch.py --tag mar13 --names "pepe,agata,claudio" \
+  --wandb_entity capecape --repo_branch k8s-service
+
+# Launch 4 agents (picks from the name pool)
+python k8s/launch.py --tag mar13 --n_agents 4 --wandb_entity capecape
+```
+
+### 3. Deploy the orchestrator (optional)
+
+```bash
+kubectl apply -f k8s/orchestrator-rbac.yaml
+kubectl apply -f k8s/orchestrator-pod.yaml
+```
+
+### 4. Monitor
+
+```bash
+# Check running agents
+kubectl get jobs -l app=senpai
+
+# Watch an agent's logs
+kubectl logs -f job/senpai-pepe
+
+# Check what an agent is doing
+kubectl exec -it <pod-name> -- ps aux | grep python
+
+# Read research journals
+kubectl exec <pod-name> -- cat /mnt/new-pvc/senpai/journals/pepe.md
+
+# Stop all agents
+kubectl delete jobs -l research-tag=mar13
+```
+
 ## Dev Environment: Devpod
 
 The devpod has global python installed, so you can directly run scripts with `python my_script.py`, no need to use `uv` or `venv`.
