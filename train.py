@@ -6,6 +6,7 @@
 
 import time
 import torch
+import torch.nn.functional as F
 import wandb
 import yaml
 from dataclasses import dataclass, asdict
@@ -64,7 +65,7 @@ model_config = dict(
     fun_dim=16,
     out_dim=3,
     n_hidden=128,
-    n_layers=5,
+    n_layers=1,
     n_head=4,
     slice_num=64,
     mlp_ratio=2,
@@ -79,7 +80,7 @@ model = Transolver(
 
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10, eta_min=1e-5)
 
 
 # --- wandb ---
@@ -126,12 +127,12 @@ for epoch in range(MAX_EPOCHS):
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
         pred = model({"x": x})["preds"]
-        sq_err = (pred - y_norm) ** 2
+        huber_err = F.huber_loss(pred, y_norm, reduction="none", delta=0.01)
 
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
-        vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-        surf_loss = (sq_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        vol_loss = (huber_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
+        surf_loss = (huber_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + cfg.surf_weight * surf_loss
         wandb.log({"train/loss": loss.item()})
 
@@ -168,12 +169,12 @@ for epoch in range(MAX_EPOCHS):
             y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
             pred = model({"x": x})["preds"]
-            sq_err = (pred - y_norm) ** 2
+            huber_err = F.huber_loss(pred, y_norm, reduction="none", delta=0.01)
 
             vol_mask = mask & ~is_surface
             surf_mask = mask & is_surface
-            val_vol += (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
-            val_surf += (sq_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+            val_vol += (huber_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
+            val_surf += (huber_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
             n_val += 1
 
             pred_orig = pred * stats["y_std"] + stats["y_mean"]
