@@ -4,9 +4,11 @@
 
 """Train Transolver on full-field airfoil flow prediction with separate surface/volume losses."""
 
+import math
 import os
 import time
 import torch
+import torch.nn.functional as F
 import wandb
 import yaml
 from dataclasses import dataclass, asdict
@@ -21,18 +23,45 @@ from utils import visualize, dataset_stats
 
 
 MAX_TIMEOUT = 5.0 # minutes
-MAX_EPOCHS = 50
+MAX_EPOCHS = 100
 @dataclass
 class Config:
     lr: float = 5e-4
     weight_decay: float = 1e-4
     batch_size: int = 4
     surf_weight: float = 10.0
+    huber_delta: float = 0.01
     dataset: str = "raceCar_single_randomFields"
     wandb_group: str | None = None  # group related runs (e.g. iterations on the same idea)
     wandb_name: str | None = None  # name for this specific run
     agent: str | None = None  # agent name (e.g. pepe) for filtering in W&B
     debug: bool = False
+
+
+def fourier_encode(coords, num_freqs=6):
+    """Fourier positional encoding for spatial coordinates.
+
+    For k=0..num_freqs-1, computes sin(2^k * pi * coord) and cos(2^k * pi * coord)
+    for each coordinate. Returns 4*num_freqs features (12 per coord × 2 coords = 24).
+    """
+    freqs = (2 ** torch.arange(num_freqs, device=coords.device, dtype=coords.dtype)) * math.pi
+    x_freqs = coords.unsqueeze(-1) * freqs  # (..., 2, num_freqs)
+    sin_feats = torch.sin(x_freqs)
+    cos_feats = torch.cos(x_freqs)
+    feats = torch.cat([sin_feats, cos_feats], dim=-1)  # (..., 2, 2*num_freqs)
+    return feats.reshape(*coords.shape[:-1], -1)  # (..., 4*num_freqs = 24)
+
+
+class FourierWrapper(torch.nn.Module):
+    """Wraps model to apply Fourier encoding inside forward, for use with visualize()."""
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, data, **kwargs):
+        x = data["x"]
+        x = torch.cat([fourier_encode(x[..., :2]), x[..., 2:]], dim=-1)
+        return self.model({"x": x}, **kwargs)
 
 
 cfg = sp.parse(Config)
@@ -61,11 +90,11 @@ train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, **l
 val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
 
 model_config = dict(
-    space_dim=2,
+    space_dim=24,  # 6-freq Fourier encoding: 12 features per coord × 2 coords
     fun_dim=16,
     out_dim=3,
     n_hidden=128,
-    n_layers=5,
+    n_layers=1,
     n_head=4,
     slice_num=64,
     mlp_ratio=2,
@@ -125,15 +154,16 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         x = (x - stats["x_mean"]) / stats["x_std"]
+        x = torch.cat([fourier_encode(x[..., :2]), x[..., 2:]], dim=-1)
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
         pred = model({"x": x})["preds"]
-        sq_err = (pred - y_norm) ** 2
+        huber_err = F.huber_loss(pred, y_norm, reduction="none", delta=cfg.huber_delta)
 
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
-        vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-        surf_loss = (sq_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        vol_loss = (huber_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
+        surf_loss = (huber_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + cfg.surf_weight * surf_loss
         wandb.log({"train/loss": loss.item()})
 
@@ -167,15 +197,16 @@ for epoch in range(MAX_EPOCHS):
             mask = mask.to(device, non_blocking=True)
 
             x = (x - stats["x_mean"]) / stats["x_std"]
+            x = torch.cat([fourier_encode(x[..., :2]), x[..., 2:]], dim=-1)
             y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
             pred = model({"x": x})["preds"]
-            sq_err = (pred - y_norm) ** 2
+            huber_err = F.huber_loss(pred, y_norm, reduction="none", delta=cfg.huber_delta)
 
             vol_mask = mask & ~is_surface
             surf_mask = mask & is_surface
-            val_vol += (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
-            val_surf += (sq_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+            val_vol += (huber_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
+            val_surf += (huber_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
             n_val += 1
 
             pred_orig = pred * stats["y_std"] + stats["y_mean"]
@@ -261,7 +292,7 @@ if best_metrics:
     print("\nGenerating flow field plots...")
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     plot_dir = Path("plots") / run.id
-    images = visualize(model, val_ds, stats, device, n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
+    images = visualize(FourierWrapper(model), val_ds, stats, device, n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
     if images:
         wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images]})
 
