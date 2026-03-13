@@ -153,7 +153,7 @@ When an experiment doesn't improve, just delete the worktree and branch.
 
 LOOP FOREVER:
 
-1. **Survey the state**: Check which GPUs are free, review `results.tsv` for the current best, look at what's running
+1. **Survey the state**: Check which GPUs are free, review `results.tsv` for the current best. Query W&B to see what other agents have tried (use the wandb skill's `wandb_helpers.runs_to_dataframe()` to check recent runs in the "senpai" project). Avoid duplicating experiments that are already running or completed.
 2. **Plan**: Decide how to allocate free GPUs. Consider:
    - Is there an active idea that needs more iterations? Give it another GPU run.
    - Are there new ideas worth exploring? Spin up new worktrees.

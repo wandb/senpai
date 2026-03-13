@@ -40,3 +40,10 @@ plots/
 
 # models
 models/
+
+# K8s secrets (keep the .template, ignore actual secrets)
+k8s/secrets.yaml
+
+# Experiment logs
+run*.log
+results.tsv
