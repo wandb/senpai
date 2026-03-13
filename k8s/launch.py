@@ -20,6 +20,7 @@ TEMPLATE = Path(__file__).parent / "agent-job.yaml"
 class Args:
     """Launch autonomous research agents on Kubernetes."""
     tag: str  # research tag (e.g. mar13)
+    name: str = ""  # researcher name (e.g. pepe); defaults to tag
     n_agents: int = 4  # number of agents to launch
     repo_url: str = "https://github.com/wandb/senpai.git"  # git repo URL
     repo_branch: str = "main"  # git branch to clone
@@ -58,8 +59,9 @@ def main():
     args = sp.parse(Args)
     template = TEMPLATE.read_text()
 
+    base_name = args.name or args.tag
     for i in range(args.n_agents):
-        agent_name = f"{args.tag}-{i}"
+        agent_name = f"{base_name}-{i}"
         manifest = render_job(template, agent_name, args.tag, args)
 
         if args.dry_run:
@@ -82,7 +84,7 @@ def main():
     if not args.dry_run:
         print(f"\nLaunched {args.n_agents} agents with tag '{args.tag}'")
         print(f"Monitor: kubectl get jobs -l research-tag={args.tag}")
-        print(f"Logs:    kubectl logs -f job/senpai-{args.tag}-0")
+        print(f"Logs:    kubectl logs -f job/senpai-{base_name}-0")
         print(f"Stop:    kubectl delete jobs -l research-tag={args.tag}")
 
 
