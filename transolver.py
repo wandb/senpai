@@ -210,6 +210,7 @@ class Transolver(nn.Module):
                 for idx in range(n_layers)
             ]
         )
+        self.input_bypass = nn.Linear(fun_dim + space_dim, out_dim)
         self.initialize_weights()
         self.placeholder = nn.Parameter((1 / n_hidden) * torch.rand(n_hidden, dtype=torch.float))
 
@@ -260,6 +261,8 @@ class Transolver(nn.Module):
         if condition is not None:
             raise ValueError("Transolver does not support conditioning inputs")
 
+        x_raw = x  # save raw input for bypass
+
         if self.unified_pos:
             if pos is None:
                 raise ValueError("Missing required input tensor: pos")
@@ -271,5 +274,9 @@ class Transolver(nn.Module):
 
         for block in self.blocks:
             fx = block(fx)
+
+        # Add input bypass: attention output + linear(raw input)
+        fx = fx + self.input_bypass(x_raw)
+
         self._validate_output_dims(fx)
         return {"preds": fx}
