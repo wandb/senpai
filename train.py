@@ -28,6 +28,9 @@ class Config:
     weight_decay: float = 1e-4
     batch_size: int = 4
     surf_weight: float = 10.0
+    p_weight: float = 1.0       # per-channel pressure multiplier in surface Huber loss
+    huber_delta: float = 1.0    # Huber loss delta (transition from quadratic to linear)
+    agent: str = ""              # agent name tag for W&B
     dataset: str = "raceCar_single_randomFields"
     wandb_group: str | None = None  # group related runs (e.g. iterations on the same idea)
     wandb_name: str | None = None  # name for this specific run
@@ -87,6 +90,7 @@ run = wandb.init(
     project="senpai",
     group=cfg.wandb_group,
     name=cfg.wandb_name,
+    tags=[cfg.agent] if cfg.agent else None,
     config={**asdict(cfg), "model_config": model_config, "n_params": n_params, "train_samples": len(train_ds), "val_samples": len(val_ds)},
     mode="offline" if cfg.debug else "online",
 )
@@ -126,12 +130,13 @@ for epoch in range(MAX_EPOCHS):
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
         pred = model({"x": x})["preds"]
-        sq_err = (pred - y_norm) ** 2
+        huber_err = torch.nn.functional.huber_loss(pred, y_norm, delta=cfg.huber_delta, reduction='none')
 
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
-        vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-        surf_loss = (sq_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        vol_loss = (huber_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
+        channel_weights = torch.tensor([1.0, 1.0, cfg.p_weight], device=huber_err.device)
+        surf_loss = (huber_err * surf_mask.unsqueeze(-1) * channel_weights).sum() / (surf_mask.sum().clamp(min=1) * 3)
         loss = vol_loss + cfg.surf_weight * surf_loss
         wandb.log({"train/loss": loss.item()})
 
@@ -168,12 +173,13 @@ for epoch in range(MAX_EPOCHS):
             y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
             pred = model({"x": x})["preds"]
-            sq_err = (pred - y_norm) ** 2
+            huber_err = torch.nn.functional.huber_loss(pred, y_norm, delta=cfg.huber_delta, reduction='none')
 
             vol_mask = mask & ~is_surface
             surf_mask = mask & is_surface
-            val_vol += (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
-            val_surf += (sq_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+            val_vol += (huber_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
+            channel_weights = torch.tensor([1.0, 1.0, cfg.p_weight], device=huber_err.device)
+            val_surf += (huber_err * surf_mask.unsqueeze(-1) * channel_weights).sum().item() / (surf_mask.sum().clamp(min=1).item() * 3)
             n_val += 1
 
             pred_orig = pred * stats["y_std"] + stats["y_mean"]
