@@ -211,4 +211,34 @@ Check if a GPU is free: `nvidia-smi --query-gpu=utilization.gpu --format=csv,noh
 
 **Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run in the same worktree. If the idea itself is fundamentally broken, log "crash" in the tsv, delete the worktree, and move on.
 
+## Research journal
+
+You maintain a research journal at `/mnt/new-pvc/senpai/journals/<your-agent-id>.md`. This is your lab notebook — it captures the thinking that W&B metrics can't.
+
+**Update it after every experiment** with:
+- What you tried and why (the hypothesis)
+- Whether it worked (keep/discard/crash) and key takeaways
+- What you plan to try next
+
+**Before starting a new experiment**, read the other agents' journals at `/mnt/new-pvc/senpai/journals/` to see what they've tried, what's working, and what dead ends to avoid. Don't duplicate their work.
+
+Example journal entry:
+
+```markdown
+## Experiment 3: channel-weighted loss (2026-03-13)
+
+**Hypothesis**: pressure has much larger magnitude than velocity — weighting the loss
+per-channel (Ux, Uy, p separately) might help the model balance learning across fields.
+
+**Changes**: Added per-channel weights [1.0, 1.0, 0.01] to scale the MSE loss.
+
+**Result**: DISCARD — val_loss 18.5 (baseline 15.2). The pressure weight was too low,
+model basically ignored pressure. Need a smarter way to balance — maybe normalize
+per-channel first, then weight.
+
+**Next**: Try normalizing the loss per-channel by the target variance before weighting.
+```
+
+Keep it concise but useful. The journal is how you build on your own past work and share knowledge with other agents.
+
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read the dataset report for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
