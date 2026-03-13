@@ -21,6 +21,7 @@ venv/
 
 # Claude Code
 .claude/
+!.claude/skills/
 
 # OS
 .DS_Store

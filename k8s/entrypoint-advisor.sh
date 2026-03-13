@@ -45,11 +45,6 @@ echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githu
 apt-get update && apt-get install -y gh
 echo "$GITHUB_TOKEN" | gh auth login --with-token
 
-# --- Install W&B skill for Claude Code ---
-git clone --depth 1 https://github.com/wandb/skills.git /tmp/wandb-skills
-cd /tmp/wandb-skills && bash install.sh --global --yes
-cd "$WORKDIR"
-
 # --- Launch Claude Code ---
 export IS_SANDBOX=1
 
