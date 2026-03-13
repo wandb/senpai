@@ -18,6 +18,7 @@ TEMPLATE = Path(__file__).parent / "agent-job.yaml"
 AGENT_NAMES = [
     "pepe", "agata", "frida", "taro", "lina", "ravi", "nora", "kiko",
     "suki", "dante", "mila", "oscar", "yuki", "zara", "felix", "ines",
+    "claudio", "belen", "mateo", "sofia",
 ]
 
 
@@ -25,7 +26,8 @@ AGENT_NAMES = [
 class Args:
     """Launch autonomous research agents on Kubernetes."""
     tag: str  # research tag (e.g. mar13)
-    n_agents: int = 4  # number of agents to launch
+    names: str = ""  # comma-separated agent names to launch (e.g. "agata,claudio")
+    n_agents: int = 4  # number of agents to launch (ignored if --names is provided)
     repo_url: str = "https://github.com/wandb/senpai.git"  # git repo URL
     repo_branch: str = "main"  # git branch to clone
     image: str = "ghcr.io/tcapelle/senpai-agent:latest"  # container image
@@ -63,11 +65,14 @@ def main():
     args = sp.parse(Args)
     template = TEMPLATE.read_text()
 
-    if args.n_agents > len(AGENT_NAMES):
-        print(f"ERROR: max {len(AGENT_NAMES)} agents (got {args.n_agents})", file=sys.stderr)
-        sys.exit(1)
-    for i in range(args.n_agents):
-        agent_name = AGENT_NAMES[i]
+    if args.names:
+        agent_list = [n.strip() for n in args.names.split(",")]
+    else:
+        if args.n_agents > len(AGENT_NAMES):
+            print(f"ERROR: max {len(AGENT_NAMES)} agents (got {args.n_agents})", file=sys.stderr)
+            sys.exit(1)
+        agent_list = AGENT_NAMES[:args.n_agents]
+    for agent_name in agent_list:
         manifest = render_job(template, agent_name, args.tag, args)
 
         if args.dry_run:
@@ -88,9 +93,9 @@ def main():
                 print(f"  {result.stdout.strip()}")
 
     if not args.dry_run:
-        print(f"\nLaunched {args.n_agents} agents with tag '{args.tag}'")
+        print(f"\nLaunched {len(agent_list)} agents: {', '.join(agent_list)}")
         print(f"Monitor: kubectl get jobs -l research-tag={args.tag}")
-        print(f"Logs:    kubectl logs -f job/senpai-{AGENT_NAMES[0]}")
+        print(f"Logs:    kubectl logs -f job/senpai-{agent_list[0]}")
         print(f"Stop:    kubectl delete jobs -l research-tag={args.tag}")
 
 
