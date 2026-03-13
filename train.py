@@ -83,7 +83,7 @@ n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 scheduler = torch.optim.lr_scheduler.OneCycleLR(
     optimizer,
-    max_lr=0.02,
+    max_lr=0.015,
     epochs=MAX_EPOCHS,
     steps_per_epoch=len(train_loader),
     pct_start=0.3,
