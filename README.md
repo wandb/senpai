@@ -18,51 +18,33 @@ See `advisor.md`, `student.md`, and `program.md` for the full protocols.
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                        Kubernetes Cluster                         │
-│                                                                   │
-│  ┌───────────────────┐                                            │
-│  │     Advisor Pod    │  No GPU, lightweight                      │
-│  │   (Claude Code)    │  Creates hypothesis PRs                   │
-│  │                    │  Reviews results, merges/closes            │
-│  └────────┬───────────┘                                           │
-│           │ GitHub PRs (draft → review → merge/close)             │
-│           │                                                       │
-│  ┌────────▼───────────────────────────────────────────────────┐   │
-│  │           Student Deployments (one per GPU node)            │   │
-│  │                                                             │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐                 │   │
-│  │  │ frieren  │  │   fern   │  │ tanjiro  │  ...             │   │
-│  │  │ 8x GPU   │  │ 8x GPU   │  │ 8x GPU   │                │   │
-│  │  └──────────┘  └──────────┘  └──────────┘                 │   │
-│  └────────────────────────────────────────────────────────────┘   │
-│                                                                   │
-└──────────────────────────────────────────────────────────────────┘
-         │                              │
-┌────────▼─────────┐          ┌─────────▼─────────┐
-│     GitHub        │          │   Weights &        │
-│  PRs = hypotheses │          │   Biases            │
-│  Labels = routing │          │  Metrics, runs     │
-└───────────────────┘          └────────────────────┘
+```mermaid
+graph TD
+    subgraph K8s["Kubernetes Cluster"]
+        A["Advisor Pod<br/>(Claude Code, no GPU)<br/>Creates hypothesis PRs<br/>Reviews results, merges/closes"]
+        subgraph Students["Student Deployments (one per GPU node)"]
+            S1["frieren<br/>8x GPU"]
+            S2["fern<br/>8x GPU"]
+            S3["tanjiro<br/>8x GPU"]
+            S4["..."]
+        end
+        A -->|"GitHub PRs<br/>(draft → review → merge/close)"| Students
+    end
+    K8s --> GH["GitHub<br/>PRs = hypotheses<br/>Labels = routing"]
+    K8s --> WB["Weights & Biases<br/>Metrics, runs, groups"]
 ```
 
 ### PR lifecycle
 
-```
-Advisor creates draft PR ──→ student:frieren + status:wip
-        │
-        ▼
-Student picks up PR, implements, runs experiments
-        │
-        ▼
-Student pushes results ──→ status:review
-        │
-        ▼
-Advisor reviews:
-  ├── Merge (squash) ──→ improvement lands on main
-  ├── Request changes ──→ status:wip (student iterates)
-  └── Close ──→ dead end, branch deleted
+```mermaid
+graph TD
+    A["Advisor creates draft PR"] -->|"student:name + status:wip"| B["Student picks up PR"]
+    B --> C["Implements hypothesis, runs experiments"]
+    C -->|"status:review"| D["Advisor reviews"]
+    D -->|Merge| E["Improvement lands on main"]
+    D -->|Request changes| F["status:wip — student iterates"]
+    D -->|Close| G["Dead end, branch deleted"]
+    F --> B
 ```
 
 ## Key files
