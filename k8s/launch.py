@@ -16,9 +16,10 @@ import simple_parsing as sp
 TEMPLATE = Path(__file__).parent / "agent-job.yaml"
 
 AGENT_NAMES = [
-    "pepe", "agata", "frida", "taro", "lina", "ravi", "nora", "kiko",
-    "suki", "dante", "mila", "oscar", "yuki", "zara", "felix", "ines",
-    "claudio", "belen", "mateo", "sofia",
+    "frieren", "fern", "tanjiro", "nezuko", "alphonse", "edward",
+    "thorfinn", "askeladd", "violet", "gilbert", "senku", "kohaku",
+    "emma", "norman", "chihiro", "haku", "shoya", "shouko",
+    "mitsuha", "taki", "shinji", "rei", "kaneda", "tetsuo",
 ]
 
 
