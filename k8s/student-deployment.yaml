@@ -29,7 +29,7 @@ spec:
     spec:
       containers:
       - name: student
-        image: ghcr.io/tcapelle/senpai-agent:latest
+        image: ghcr.io/tcapelle/dev_box:latest
         command: ["/bin/bash", "-c"]
         args:
         - |

@@ -32,7 +32,7 @@ class Args:
     n_students: int = 4  # number of students to launch (ignored if --names is provided)
     repo_url: str = "https://github.com/wandb/senpai.git"  # git repo URL
     repo_branch: str = "main"  # git branch to clone
-    image: str = "ghcr.io/tcapelle/senpai-agent:latest"  # container image for students
+    image: str = "ghcr.io/tcapelle/dev_box:latest"  # container image for students
     wandb_entity: str = ""  # W&B entity (team or username)
     advisor: bool = False  # also deploy the advisor pod
     students_only: bool = False  # only deploy students, skip advisor
@@ -54,7 +54,7 @@ def render_student(template: str, student_name: str, tag: str, args: Args) -> st
         f'value: "{args.repo_branch}"',
     )
     out = out.replace(
-        "image: ghcr.io/tcapelle/senpai-agent:latest",
+        "image: ghcr.io/tcapelle/dev_box:latest",
         f"image: {args.image}",
     )
     return out
