@@ -7,6 +7,7 @@
 import os
 import time
 import torch
+import torch.nn.functional as F
 import wandb
 import yaml
 from dataclasses import dataclass, asdict
@@ -21,13 +22,14 @@ from utils import visualize, dataset_stats
 
 
 MAX_TIMEOUT = 5.0 # minutes
-MAX_EPOCHS = 50
+MAX_EPOCHS = 200
 @dataclass
 class Config:
-    lr: float = 5e-4
+    lr: float = 0.006
     weight_decay: float = 1e-4
     batch_size: int = 4
-    surf_weight: float = 10.0
+    surf_weight: float = 25.0
+    huber_delta: float = 0.01
     dataset: str = "raceCar_single_randomFields"
     wandb_group: str | None = None  # group related runs (e.g. iterations on the same idea)
     wandb_name: str | None = None  # name for this specific run
@@ -65,7 +67,7 @@ model_config = dict(
     fun_dim=16,
     out_dim=3,
     n_hidden=128,
-    n_layers=5,
+    n_layers=1,
     n_head=4,
     slice_num=64,
     mlp_ratio=2,
@@ -79,6 +81,7 @@ model = Transolver(
 ).to(device)
 
 n_params = sum(p.numel() for p in model.parameters())
+model = torch.compile(model)
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
 
@@ -127,14 +130,14 @@ for epoch in range(MAX_EPOCHS):
         x = (x - stats["x_mean"]) / stats["x_std"]
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
-        pred = model({"x": x})["preds"]
-        sq_err = (pred - y_norm) ** 2
-
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
-        vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-        surf_loss = (sq_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
-        loss = vol_loss + cfg.surf_weight * surf_loss
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            pred = model({"x": x})["preds"]
+            huber_err = F.huber_loss(pred, y_norm, delta=cfg.huber_delta, reduction='none')
+            vol_loss = (huber_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
+            surf_loss = (huber_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            loss = vol_loss + cfg.surf_weight * surf_loss
         wandb.log({"train/loss": loss.item()})
 
         optimizer.zero_grad()
@@ -169,16 +172,16 @@ for epoch in range(MAX_EPOCHS):
             x = (x - stats["x_mean"]) / stats["x_std"]
             y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
-            pred = model({"x": x})["preds"]
-            sq_err = (pred - y_norm) ** 2
-
             vol_mask = mask & ~is_surface
             surf_mask = mask & is_surface
-            val_vol += (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
-            val_surf += (sq_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                pred = model({"x": x})["preds"]
+                huber_err = F.huber_loss(pred, y_norm, delta=cfg.huber_delta, reduction='none')
+                val_vol += (huber_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
+                val_surf += (huber_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
             n_val += 1
 
-            pred_orig = pred * stats["y_std"] + stats["y_mean"]
+            pred_orig = pred.float() * stats["y_std"] + stats["y_mean"]
             err = (pred_orig - y).abs()
             mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
             mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
