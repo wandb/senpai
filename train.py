@@ -19,9 +19,6 @@ from transolver import Transolver
 from utils import visualize, dataset_stats
 
 
-MAX_TIMEOUT = 5.0 # minutes
-MAX_EPOCHS = 20
-
 @dataclass
 class Config:
     lr: float = 5e-4
@@ -29,6 +26,12 @@ class Config:
     batch_size: int = 4
     surf_weight: float = 10.0
     dataset: str = "raceCar_single_randomFields"
+    epochs: int = 10
+    n_layers: int = 5
+    n_hidden: int = 128
+    mlp_ratio: int = 2
+    slice_num: int = 64
+    agent: str | None = None
     wandb_group: str | None = None  # group related runs (e.g. iterations on the same idea)
     wandb_name: str | None = None  # name for this specific run
     debug: bool = False
@@ -36,8 +39,8 @@ class Config:
 
 cfg = sp.parse(Config)
 
-if cfg.debug:
-    MAX_EPOCHS = 3
+MAX_EPOCHS = 3 if cfg.debug else cfg.epochs
+MAX_TIMEOUT = 5.0 if cfg.debug else cfg.epochs * 2.0  # minutes, scaled with epoch count
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}" + (" [DEBUG MODE]" if cfg.debug else ""))
@@ -63,11 +66,11 @@ model_config = dict(
     space_dim=2,
     fun_dim=16,
     out_dim=3,
-    n_hidden=128,
-    n_layers=5,
+    n_hidden=cfg.n_hidden,
+    n_layers=cfg.n_layers,
     n_head=4,
-    slice_num=64,
-    mlp_ratio=2,
+    slice_num=cfg.slice_num,
+    mlp_ratio=cfg.mlp_ratio,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
 )
@@ -87,6 +90,7 @@ run = wandb.init(
     project="senpai",
     group=cfg.wandb_group,
     name=cfg.wandb_name,
+    tags=[cfg.agent] if cfg.agent else [],
     config={**asdict(cfg), "model_config": model_config, "n_params": n_params, "train_samples": len(train_ds), "val_samples": len(val_ds)},
     mode="offline" if cfg.debug else "online",
 )
