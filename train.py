@@ -19,8 +19,8 @@ from transolver import Transolver
 from utils import visualize, dataset_stats
 
 
-MAX_TIMEOUT = 25.0 # minutes
-MAX_EPOCHS = 60
+MAX_TIMEOUT = 35.0 # minutes
+MAX_EPOCHS = 80
 
 @dataclass
 class Config:
