@@ -7,6 +7,7 @@
 import os
 import time
 import torch
+import torch.nn.functional as F
 import wandb
 import yaml
 from dataclasses import dataclass, asdict
@@ -21,13 +22,15 @@ from utils import visualize, dataset_stats
 
 
 MAX_TIMEOUT = 5.0 # minutes
-MAX_EPOCHS = 50
+MAX_EPOCHS = 130
 @dataclass
 class Config:
-    lr: float = 5e-4
+    lr: float = 0.006
     weight_decay: float = 1e-4
     batch_size: int = 4
-    surf_weight: float = 10.0
+    surf_weight: float = 25.0
+    huber_delta: float = 0.01
+    val_every: int = 5  # validate every N epochs
     dataset: str = "raceCar_single_randomFields"
     wandb_group: str | None = None  # group related runs (e.g. iterations on the same idea)
     wandb_name: str | None = None  # name for this specific run
@@ -65,7 +68,7 @@ model_config = dict(
     fun_dim=16,
     out_dim=3,
     n_hidden=128,
-    n_layers=5,
+    n_layers=1,
     n_head=4,
     slice_num=64,
     mlp_ratio=2,
@@ -128,12 +131,12 @@ for epoch in range(MAX_EPOCHS):
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
         pred = model({"x": x})["preds"]
-        sq_err = (pred - y_norm) ** 2
+        err = F.huber_loss(pred, y_norm, delta=cfg.huber_delta, reduction="none")
 
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
-        vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-        surf_loss = (sq_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        vol_loss = (err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
+        surf_loss = (err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + cfg.surf_weight * surf_loss
         wandb.log({"train/loss": loss.item()})
 
@@ -150,7 +153,21 @@ for epoch in range(MAX_EPOCHS):
     epoch_vol /= n_batches
     epoch_surf /= n_batches
 
-    # --- Validate ---
+    # --- Validate (every val_every epochs or on the last epoch) ---
+    run_val = (epoch % cfg.val_every == 0) or (epoch == MAX_EPOCHS - 1)
+
+    if not run_val:
+        dt = time.time() - t0
+        metrics = {
+            "train/vol_loss": epoch_vol,
+            "train/surf_loss": epoch_surf,
+            "lr": scheduler.get_last_lr()[0],
+            "epoch_time_s": dt,
+        }
+        wandb.log(metrics)
+        print(f"Epoch {epoch+1:3d} ({dt:.0f}s) train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}] [val skipped]")
+        continue
+
     model.eval()
     val_vol = 0.0
     val_surf = 0.0
@@ -170,18 +187,18 @@ for epoch in range(MAX_EPOCHS):
             y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
             pred = model({"x": x})["preds"]
-            sq_err = (pred - y_norm) ** 2
+            err = F.huber_loss(pred, y_norm, delta=cfg.huber_delta, reduction="none")
 
             vol_mask = mask & ~is_surface
             surf_mask = mask & is_surface
-            val_vol += (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
-            val_surf += (sq_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+            val_vol += (err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
+            val_surf += (err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
             n_val += 1
 
             pred_orig = pred * stats["y_std"] + stats["y_mean"]
-            err = (pred_orig - y).abs()
-            mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
-            mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
+            abs_err = (pred_orig - y).abs()
+            mae_surf += (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
+            mae_vol += (abs_err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
             n_surf += surf_mask.sum().item()
             n_vol += vol_mask.sum().item()
 
