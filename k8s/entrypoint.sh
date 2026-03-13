@@ -40,11 +40,11 @@ git clone --depth 1 https://github.com/wandb/skills.git /tmp/wandb-skills
 cd /tmp/wandb-skills && bash install.sh --global --yes
 cd "$WORKDIR"
 
-# --- Launch Claude Code ---
+# --- Launch Claude Code in Ralph Loop ---
 # IS_SANDBOX=1 allows --dangerously-skip-permissions to work.
 export IS_SANDBOX=1
 
-exec claude -p "$(cat <<EOF
+PROMPT="$(cat <<EOF
 You are an autonomous research agent (ID: $AGENT_ID).
 
 Read program.md for the full protocol. Follow the setup and experiment loop.
@@ -56,13 +56,35 @@ Key context for this run:
 - You are one of several parallel agents. Always pass these flags to train.py:
   --agent $AGENT_ID --wandb_name "$AGENT_ID/<experiment-description>"
   Use --wandb_group only to group iterations on the same idea (e.g. --wandb_group "multi-scale-attn").
-  For example: --agent pepe --wandb_name "pepe/baseline"
-  Or: --agent pepe --wandb_group "local-attention" --wandb_name "pepe/local-attention-v2"
+  For example: --agent $AGENT_ID --wandb_name "$AGENT_ID/baseline"
+  Or: --agent $AGENT_ID --wandb_group "local-attention" --wandb_name "$AGENT_ID/local-attention-v2"
 - W&B project "senpai" is shared across all agents. Check existing runs there to avoid duplicating work.
 - The dataset is at /mnt/new-pvc/datasets/tandemfoil/
 - Keep a research journal at /mnt/new-pvc/senpai/journals/$AGENT_ID.md — update it after each experiment with: what you tried, your hypothesis, whether it worked, and what you'll try next. This is how you communicate with the orchestrator and other agents.
 - Before starting a new experiment, read other agents' journals at /mnt/new-pvc/senpai/journals/ to see what's been tried and what's working. Avoid duplicating their work.
 
-Begin now.
+Continue the experiment loop. Check your journal and results.tsv to see where you left off.
 EOF
-)" --dangerously-skip-permissions
+)"
+
+# Ralph loop: same prompt fed repeatedly. Claude sees its own previous
+# work in files, git, journal. If it exits (context limit, error, etc.),
+# we restart with --continue so it picks up the conversation, then fall
+# back to a fresh prompt if --continue fails.
+ITERATION=0
+while true; do
+    ITERATION=$((ITERATION + 1))
+    echo "=== Ralph Loop iteration $ITERATION ($(date)) ==="
+
+    if [ "$ITERATION" -eq 1 ]; then
+        # First run: fresh prompt
+        echo "$PROMPT" | claude -p --dangerously-skip-permissions || true
+    else
+        # Subsequent runs: try to continue the conversation, fall back to fresh
+        echo "$PROMPT" | claude -p --continue --dangerously-skip-permissions || \
+        echo "$PROMPT" | claude -p --dangerously-skip-permissions || true
+    fi
+
+    echo "=== Claude exited at $(date), restarting in 5s ==="
+    sleep 5
+done
