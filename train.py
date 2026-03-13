@@ -28,7 +28,12 @@ class Config:
     weight_decay: float = 1e-4
     batch_size: int = 4
     surf_weight: float = 10.0
+    n_layers: int = 5
+    n_head: int = 4
+    n_hidden: int = 128
+    huber_delta: float = 0.0  # 0 = MSE; >0 = Huber with this delta
     dataset: str = "raceCar_single_randomFields"
+    agent: str = "unknown"
     wandb_group: str | None = None  # group related runs (e.g. iterations on the same idea)
     wandb_name: str | None = None  # name for this specific run
     debug: bool = False
@@ -63,9 +68,9 @@ model_config = dict(
     space_dim=2,
     fun_dim=16,
     out_dim=3,
-    n_hidden=128,
-    n_layers=5,
-    n_head=4,
+    n_hidden=cfg.n_hidden,
+    n_layers=cfg.n_layers,
+    n_head=cfg.n_head,
     slice_num=64,
     mlp_ratio=2,
     output_fields=["Ux", "Uy", "p"],
@@ -126,12 +131,19 @@ for epoch in range(MAX_EPOCHS):
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
         pred = model({"x": x})["preds"]
-        sq_err = (pred - y_norm) ** 2
+        err = pred - y_norm
+        if cfg.huber_delta > 0:
+            abs_err = err.abs()
+            elem_loss = torch.where(abs_err <= cfg.huber_delta,
+                                    0.5 * err ** 2,
+                                    cfg.huber_delta * (abs_err - 0.5 * cfg.huber_delta))
+        else:
+            elem_loss = err ** 2
 
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
-        vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-        surf_loss = (sq_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        vol_loss = (elem_loss * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
+        surf_loss = (elem_loss * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + cfg.surf_weight * surf_loss
         wandb.log({"train/loss": loss.item()})
 
@@ -168,12 +180,19 @@ for epoch in range(MAX_EPOCHS):
             y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
             pred = model({"x": x})["preds"]
-            sq_err = (pred - y_norm) ** 2
+            err = pred - y_norm
+            if cfg.huber_delta > 0:
+                abs_err = err.abs()
+                elem_loss = torch.where(abs_err <= cfg.huber_delta,
+                                        0.5 * err ** 2,
+                                        cfg.huber_delta * (abs_err - 0.5 * cfg.huber_delta))
+            else:
+                elem_loss = err ** 2
 
             vol_mask = mask & ~is_surface
             surf_mask = mask & is_surface
-            val_vol += (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
-            val_surf += (sq_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+            val_vol += (elem_loss * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
+            val_surf += (elem_loss * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
             n_val += 1
 
             pred_orig = pred * stats["y_std"] + stats["y_mean"]
