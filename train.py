@@ -15,6 +15,8 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader, random_split, Subset
 import simple_parsing as sp
 
+from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
+
 from prepare import FullFieldDataset, pad_collate, DATA_ROOT
 from transolver import Transolver
 from utils import visualize, dataset_stats
@@ -81,6 +83,9 @@ model = Transolver(
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
+swa_model = AveragedModel(model)
+swa_start = 48
+swa_scheduler = SWALR(optimizer, swa_lr=0.001)
 
 
 # --- wandb ---
@@ -150,12 +155,17 @@ for epoch in range(MAX_EPOCHS):
         n_batches += 1
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
-    scheduler.step()
+    if epoch >= swa_start:
+        swa_model.update_parameters(model)
+        swa_scheduler.step()
+    else:
+        scheduler.step()
     epoch_vol /= n_batches
     epoch_surf /= n_batches
 
     # --- Validate ---
-    model.eval()
+    eval_model = swa_model if epoch >= swa_start else model
+    eval_model.eval()
     val_vol = 0.0
     val_surf = 0.0
     mae_surf = torch.zeros(3, device=device)
@@ -174,7 +184,7 @@ for epoch in range(MAX_EPOCHS):
             y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                pred = model({"x": x})["preds"]
+                pred = eval_model({"x": x})["preds"]
                 diff = pred - y_norm
                 sq_err = diff ** 2
                 abs_err = diff.abs()
@@ -213,7 +223,7 @@ for epoch in range(MAX_EPOCHS):
         "val/mae_surf_Ux": mae_surf[0].item(),
         "val/mae_surf_Uy": mae_surf[1].item(),
         "val/mae_surf_p": mae_surf[2].item(),
-        "lr": scheduler.get_last_lr()[0],
+        "lr": optimizer.param_groups[0]['lr'],
         "epoch_time_s": dt,
     }
     wandb.log(metrics, commit=False)
@@ -236,7 +246,8 @@ for epoch in range(MAX_EPOCHS):
             "epoch": epoch + 1,
             "val_loss_loss": val_loss,
         }
-        torch.save(model.state_dict(), model_path)
+        state = swa_model.module.state_dict() if epoch >= swa_start else model.state_dict()
+        torch.save(state, model_path)
         tag = f" * -> {model_path}"
 
     print(
@@ -247,6 +258,8 @@ for epoch in range(MAX_EPOCHS):
         f"mae_surf=[Ux:{mae_surf[0]:.2f} Uy:{mae_surf[1]:.2f} p:{mae_surf[2]:.1f}]{tag}"
     )
 
+
+update_bn(train_loader, swa_model, device=device)
 
 # --- Final summary ---
 total_time = (time.time() - train_start) / 60.0
