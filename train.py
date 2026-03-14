@@ -99,6 +99,17 @@ model_path = model_dir / f"checkpoint.pt"
 with open(model_dir / "config.yaml", "w") as f:
     yaml.dump(model_config, f)
 
+def surface_loss_curriculum(pred, target, surf_mask, channel_w, epoch, max_epochs):
+    """Smoothly interpolate surface loss from MSE to L1."""
+    alpha = min(epoch / (max_epochs * 0.6), 1.0)  # 0 at epoch 0, 1.0 at 60% of training
+    diff = pred - target
+    sq_err = diff ** 2
+    abs_err = diff.abs()
+    elem_loss = (1.0 - alpha) * sq_err + alpha * abs_err
+    masked = elem_loss * surf_mask.unsqueeze(-1) * channel_w
+    return masked.sum() / surf_mask.sum().clamp(min=1)
+
+
 best_val = float("inf")
 best_metrics = {}
 train_start = time.time()
@@ -134,7 +145,7 @@ for epoch in range(MAX_EPOCHS):
         surf_mask = mask & is_surface
         vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
         channel_w = torch.tensor([1.0, 1.0, 1.5], device=device)
-        surf_loss = (sq_err * surf_mask.unsqueeze(-1) * channel_w).sum() / surf_mask.sum().clamp(min=1)
+        surf_loss = surface_loss_curriculum(pred, y_norm, surf_mask, channel_w, epoch, MAX_EPOCHS)
         loss = vol_loss + cfg.surf_weight * surf_loss
         wandb.log({"train/loss": loss.item()})
 
