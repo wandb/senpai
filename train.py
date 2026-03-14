@@ -21,13 +21,13 @@ from utils import visualize, dataset_stats
 
 
 MAX_TIMEOUT = 5.0 # minutes
-MAX_EPOCHS = 50
+MAX_EPOCHS = 150
 @dataclass
 class Config:
-    lr: float = 5e-4
+    lr: float = 0.006
     weight_decay: float = 1e-4
     batch_size: int = 4
-    surf_weight: float = 10.0
+    surf_weight: float = 25.0
     dataset: str = "raceCar_single_randomFields"
     wandb_group: str | None = None  # group related runs (e.g. iterations on the same idea)
     wandb_name: str | None = None  # name for this specific run
@@ -65,7 +65,7 @@ model_config = dict(
     fun_dim=16,
     out_dim=3,
     n_hidden=128,
-    n_layers=5,
+    n_layers=1,
     n_head=4,
     slice_num=64,
     mlp_ratio=2,
@@ -150,95 +150,103 @@ for epoch in range(MAX_EPOCHS):
     epoch_vol /= n_batches
     epoch_surf /= n_batches
 
-    # --- Validate ---
-    model.eval()
-    val_vol = 0.0
-    val_surf = 0.0
-    mae_surf = torch.zeros(3, device=device)
-    mae_vol = torch.zeros(3, device=device)
-    n_surf = 0
-    n_vol = 0
-    n_val = 0
-
-    with torch.no_grad():
-        for x, y, is_surface, mask in tqdm(val_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [val]", leave=False):
-            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            is_surface = is_surface.to(device, non_blocking=True)
-            mask = mask.to(device, non_blocking=True)
-
-            x = (x - stats["x_mean"]) / stats["x_std"]
-            y_norm = (y - stats["y_mean"]) / stats["y_std"]
-
-            pred = model({"x": x})["preds"]
-            sq_err = (pred - y_norm) ** 2
-
-            vol_mask = mask & ~is_surface
-            surf_mask = mask & is_surface
-            val_vol += (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
-            val_surf += (sq_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
-            n_val += 1
-
-            pred_orig = pred * stats["y_std"] + stats["y_mean"]
-            err = (pred_orig - y).abs()
-            mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
-            mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
-            n_surf += surf_mask.sum().item()
-            n_vol += vol_mask.sum().item()
-
-    val_vol /= n_val
-    val_surf /= n_val
-    val_loss = val_vol + cfg.surf_weight * val_surf
-    mae_surf /= max(n_surf, 1)
-    mae_vol /= max(n_vol, 1)
-
     dt = time.time() - t0
-
-    # --- Log to wandb ---
-    metrics = {
-        "train/vol_loss": epoch_vol,
-        "train/surf_loss": epoch_surf,
-        "val/vol_loss": val_vol,
-        "val/surf_loss": val_surf,
-        "val/loss": val_loss,
-        "val/mae_vol_Ux": mae_vol[0].item(),
-        "val/mae_vol_Uy": mae_vol[1].item(),
-        "val/mae_vol_p": mae_vol[2].item(),
-        "val/mae_surf_Ux": mae_surf[0].item(),
-        "val/mae_surf_Uy": mae_surf[1].item(),
-        "val/mae_surf_p": mae_surf[2].item(),
-        "lr": scheduler.get_last_lr()[0],
-        "epoch_time_s": dt,
-    }
-    wandb.log(metrics, commit=False)
 
     if torch.cuda.is_available():
         peak_mem_gb = torch.cuda.max_memory_allocated() / 1e9
     else:
         peak_mem_gb = 0.0
 
-    tag = ""
-    if val_loss < best_val:
-        best_val = val_loss
-        best_metrics = {
-            "mae_vol_Ux": mae_vol[0].item(),
-            "mae_vol_Uy": mae_vol[1].item(),
-            "mae_vol_p": mae_vol[2].item(),
-            "mae_surf_Ux": mae_surf[0].item(),
-            "mae_surf_Uy": mae_surf[1].item(),
-            "mae_surf_p": mae_surf[2].item(),
-            "epoch": epoch + 1,
-            "val_loss_loss": val_loss,
-        }
-        torch.save(model.state_dict(), model_path)
-        tag = f" * -> {model_path}"
+    do_val = (epoch % 5 == 0) or (epoch >= MAX_EPOCHS - 1) or ((time.time() - train_start) / 60.0 >= MAX_TIMEOUT - 0.5)
+    if do_val:
+        # --- Validate ---
+        model.eval()
+        val_vol = 0.0
+        val_surf = 0.0
+        mae_surf = torch.zeros(3, device=device)
+        mae_vol = torch.zeros(3, device=device)
+        n_surf = 0
+        n_vol = 0
+        n_val = 0
 
-    print(
-        f"Epoch {epoch+1:3d} ({dt:.0f}s) [{peak_mem_gb:.1f}GB]  "
-        f"train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  "
-        f"val[vol={val_vol:.4f} surf={val_surf:.4f}]  "
-        f"mae_vol=[Ux:{mae_vol[0]:.2f} Uy:{mae_vol[1]:.2f} p:{mae_vol[2]:.1f}]  "
-        f"mae_surf=[Ux:{mae_surf[0]:.2f} Uy:{mae_surf[1]:.2f} p:{mae_surf[2]:.1f}]{tag}"
-    )
+        with torch.no_grad():
+            for x, y, is_surface, mask in tqdm(val_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [val]", leave=False):
+                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                is_surface = is_surface.to(device, non_blocking=True)
+                mask = mask.to(device, non_blocking=True)
+
+                x = (x - stats["x_mean"]) / stats["x_std"]
+                y_norm = (y - stats["y_mean"]) / stats["y_std"]
+
+                pred = model({"x": x})["preds"]
+                sq_err = (pred - y_norm) ** 2
+
+                vol_mask = mask & ~is_surface
+                surf_mask = mask & is_surface
+                val_vol += (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
+                val_surf += (sq_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+                n_val += 1
+
+                pred_orig = pred * stats["y_std"] + stats["y_mean"]
+                err = (pred_orig - y).abs()
+                mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                n_surf += surf_mask.sum().item()
+                n_vol += vol_mask.sum().item()
+
+        val_vol /= n_val
+        val_surf /= n_val
+        val_loss = val_vol + cfg.surf_weight * val_surf
+        mae_surf /= max(n_surf, 1)
+        mae_vol /= max(n_vol, 1)
+
+        # --- Log to wandb ---
+        metrics = {
+            "train/vol_loss": epoch_vol,
+            "train/surf_loss": epoch_surf,
+            "val/vol_loss": val_vol,
+            "val/surf_loss": val_surf,
+            "val/loss": val_loss,
+            "val/mae_vol_Ux": mae_vol[0].item(),
+            "val/mae_vol_Uy": mae_vol[1].item(),
+            "val/mae_vol_p": mae_vol[2].item(),
+            "val/mae_surf_Ux": mae_surf[0].item(),
+            "val/mae_surf_Uy": mae_surf[1].item(),
+            "val/mae_surf_p": mae_surf[2].item(),
+            "lr": scheduler.get_last_lr()[0],
+            "epoch_time_s": dt,
+        }
+        wandb.log(metrics, commit=False)
+
+        tag = ""
+        if val_loss < best_val:
+            best_val = val_loss
+            best_metrics = {
+                "mae_vol_Ux": mae_vol[0].item(),
+                "mae_vol_Uy": mae_vol[1].item(),
+                "mae_vol_p": mae_vol[2].item(),
+                "mae_surf_Ux": mae_surf[0].item(),
+                "mae_surf_Uy": mae_surf[1].item(),
+                "mae_surf_p": mae_surf[2].item(),
+                "epoch": epoch + 1,
+                "val_loss_loss": val_loss,
+            }
+            torch.save(model.state_dict(), model_path)
+            tag = f" * -> {model_path}"
+
+        print(
+            f"Epoch {epoch+1:3d} ({dt:.0f}s) [{peak_mem_gb:.1f}GB]  "
+            f"train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  "
+            f"val[vol={val_vol:.4f} surf={val_surf:.4f}]  "
+            f"mae_vol=[Ux:{mae_vol[0]:.2f} Uy:{mae_vol[1]:.2f} p:{mae_vol[2]:.1f}]  "
+            f"mae_surf=[Ux:{mae_surf[0]:.2f} Uy:{mae_surf[1]:.2f} p:{mae_surf[2]:.1f}]{tag}"
+        )
+    else:
+        wandb.log({"train/vol_loss": epoch_vol, "train/surf_loss": epoch_surf, "lr": scheduler.get_last_lr()[0], "epoch_time_s": dt})
+        print(
+            f"Epoch {epoch+1:3d} ({dt:.0f}s) [{peak_mem_gb:.1f}GB]  "
+            f"train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]"
+        )
 
 
 # --- Final summary ---
