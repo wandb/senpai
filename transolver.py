@@ -142,7 +142,7 @@ class TransolverBlock(nn.Module):
             self.ln_3 = nn.LayerNorm(hidden_dim)
             self.mlp2 = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.GELU(),
+                nn.SiLU(),
                 nn.Linear(hidden_dim // 2, out_dim),
             )
 
