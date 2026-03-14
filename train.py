@@ -27,7 +27,7 @@ class Config:
     lr: float = 0.006
     weight_decay: float = 0.0
     batch_size: int = 4
-    surf_weight: float = 10.0
+    surf_weight: float = 12.0
     dataset: str = "raceCar_single_randomFields"
     wandb_group: str | None = None  # group related runs (e.g. iterations on the same idea)
     wandb_name: str | None = None  # name for this specific run
@@ -81,9 +81,9 @@ model = Transolver(
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-warmup = LinearLR(optimizer, start_factor=1e-5/0.006, total_iters=3)
-cosine = CosineAnnealingLR(optimizer, T_max=67)  # 70-3=67 remaining epochs
-scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[3])
+warmup = LinearLR(optimizer, start_factor=1e-5/0.006, total_iters=5)
+cosine = CosineAnnealingLR(optimizer, T_max=65, eta_min=1e-4)  # 70-5=65 remaining epochs
+scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[5])
 
 
 # --- wandb ---
