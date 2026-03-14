@@ -142,6 +142,7 @@ class TransolverBlock(nn.Module):
             self.ln_3 = nn.LayerNorm(hidden_dim)
             self.mlp2 = nn.Linear(hidden_dim, out_dim)       # volume head
             self.surf_mlp = nn.Linear(hidden_dim, out_dim)    # surface head
+            self.pressure_head = nn.Linear(hidden_dim, 1)     # dedicated pressure head
 
     def forward(self, fx, is_surface=None):
         fx = self.attn(self.ln_1(fx)) + fx
@@ -149,8 +150,11 @@ class TransolverBlock(nn.Module):
         if self.last_layer:
             h = self.ln_3(fx)
             if is_surface is not None:
-                vol_pred = self.mlp2(h)
-                surf_pred = self.surf_mlp(h)
+                vol_pred = self.mlp2(h)           # (B, N, 3)
+                surf_pred = self.surf_mlp(h)      # (B, N, 3)
+                # Override pressure channel with dedicated head
+                p_pred = self.pressure_head(h)    # (B, N, 1)
+                surf_pred = torch.cat([surf_pred[:, :, :2], p_pred], dim=-1)
                 mask = is_surface.unsqueeze(-1).expand_as(vol_pred)
                 return torch.where(mask, surf_pred, vol_pred)
             return self.mlp2(h)
