@@ -62,7 +62,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.scale = dim_head**-0.5
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
-        self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
+        tau_init = torch.tensor([[[[0.3]], [[0.8]]]])  # head 0: sharp, head 1: soft
+        self.temperature = nn.Parameter(tau_init)
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
