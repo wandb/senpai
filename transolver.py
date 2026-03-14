@@ -140,13 +140,21 @@ class TransolverBlock(nn.Module):
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
-            self.mlp2 = nn.Linear(hidden_dim, out_dim)
+            self.mlp2_vel = nn.Linear(hidden_dim, out_dim - 1)  # Ux, Uy
+            self.mlp2_p = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.GELU(),
+                nn.Linear(hidden_dim // 2, 1),
+            )
 
     def forward(self, fx):
         fx = self.attn(self.ln_1(fx)) + fx
         fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            h = self.ln_3(fx)
+            vel = self.mlp2_vel(h)   # (B, N, 2) for Ux, Uy
+            p = self.mlp2_p(h)       # (B, N, 1) for pressure
+            return torch.cat([vel, p], dim=-1)  # (B, N, 3)
         return fx
 
 
