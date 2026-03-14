@@ -128,12 +128,14 @@ for epoch in range(MAX_EPOCHS):
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
         pred = model({"x": x})["preds"]
-        sq_err = (pred - y_norm) ** 2
+        diff = pred - y_norm
+        sq_err = diff ** 2
+        abs_err = diff.abs()
 
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
         vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-        surf_loss = (sq_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + cfg.surf_weight * surf_loss
         wandb.log({"train/loss": loss.item()})
 
@@ -171,12 +173,14 @@ for epoch in range(MAX_EPOCHS):
             y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
             pred = model({"x": x})["preds"]
-            sq_err = (pred - y_norm) ** 2
+            diff = pred - y_norm
+            sq_err = diff ** 2
+            abs_err = diff.abs()
 
             vol_mask = mask & ~is_surface
             surf_mask = mask & is_surface
             val_vol += (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
-            val_surf += (sq_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+            val_surf += (abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
             n_val += 1
 
             pred_orig = pred * stats["y_std"] + stats["y_mean"]
