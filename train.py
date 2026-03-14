@@ -80,6 +80,10 @@ model = Transolver(
 
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+from torch.optim.swa_utils import AveragedModel, update_bn
+swa_model = AveragedModel(model)
+SWA_START = 53  # start averaging from epoch 53 (last ~15 epochs)
+swa_n_updates = 0
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 warmup = LinearLR(optimizer, start_factor=1e-5/0.006, total_iters=5)
 cosine = CosineAnnealingLR(optimizer, T_max=65, eta_min=1e-4)
@@ -154,6 +158,9 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
+    if epoch >= SWA_START:
+        swa_model.update_parameters(model)
+        swa_n_updates += 1
     epoch_vol /= n_batches
     epoch_surf /= n_batches
 
@@ -248,6 +255,72 @@ for epoch in range(MAX_EPOCHS):
         f"mae_surf=[Ux:{mae_surf[0]:.2f} Uy:{mae_surf[1]:.2f} p:{mae_surf[2]:.1f}]{tag}"
     )
 
+
+# --- SWA evaluation ---
+if swa_n_updates > 0:
+    print(f"\nEvaluating SWA model ({swa_n_updates} snapshots averaged)...")
+    update_bn(train_loader, swa_model, device=device)
+    swa_model.eval()
+    swa_vol = 0.0
+    swa_surf = 0.0
+    swa_mae_surf = torch.zeros(3, device=device)
+    swa_mae_vol = torch.zeros(3, device=device)
+    swa_n_surf = 0
+    swa_n_vol = 0
+    swa_n_val = 0
+
+    with torch.no_grad():
+        for x, y, is_surface, mask in tqdm(val_loader, desc="SWA [val]", leave=False):
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            is_surface = is_surface.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
+
+            x = (x - stats["x_mean"]) / stats["x_std"]
+            y_norm = (y - stats["y_mean"]) / stats["y_std"]
+
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                pred = swa_model({"x": x})["preds"]
+            sq_err = (pred - y_norm) ** 2
+
+            vol_mask = mask & ~is_surface
+            surf_mask = mask & is_surface
+            swa_vol += (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
+            swa_surf += (sq_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+            swa_n_val += 1
+
+            pred_orig = pred * stats["y_std"] + stats["y_mean"]
+            err = (pred_orig - y).abs()
+            swa_mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
+            swa_mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
+            swa_n_surf += surf_mask.sum().item()
+            swa_n_vol += vol_mask.sum().item()
+
+    swa_vol /= swa_n_val
+    swa_surf /= swa_n_val
+    swa_loss = swa_vol + cfg.surf_weight * swa_surf
+    swa_mae_surf /= max(swa_n_surf, 1)
+    swa_mae_vol /= max(swa_n_vol, 1)
+
+    wandb.log({
+        "swa/vol_loss": swa_vol,
+        "swa/surf_loss": swa_surf,
+        "swa/loss": swa_loss,
+        "swa/mae_vol_Ux": swa_mae_vol[0].item(),
+        "swa/mae_vol_Uy": swa_mae_vol[1].item(),
+        "swa/mae_vol_p": swa_mae_vol[2].item(),
+        "swa/mae_surf_Ux": swa_mae_surf[0].item(),
+        "swa/mae_surf_Uy": swa_mae_surf[1].item(),
+        "swa/mae_surf_p": swa_mae_surf[2].item(),
+        "swa/n_updates": swa_n_updates,
+    })
+    wandb.summary.update({
+        "swa_mae_surf_Ux": swa_mae_surf[0].item(),
+        "swa_mae_surf_Uy": swa_mae_surf[1].item(),
+        "swa_mae_surf_p": swa_mae_surf[2].item(),
+        "swa_loss": swa_loss,
+        "swa_n_updates": swa_n_updates,
+    })
+    print(f"SWA ({swa_n_updates} snapshots): val_loss={swa_loss:.4f}  mae_surf=[Ux:{swa_mae_surf[0]:.2f} Uy:{swa_mae_surf[1]:.2f} p:{swa_mae_surf[2]:.1f}]")
 
 # --- Final summary ---
 total_time = (time.time() - train_start) / 60.0
