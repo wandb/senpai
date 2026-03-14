@@ -124,6 +124,15 @@ for epoch in range(MAX_EPOCHS):
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
 
+        if model.training:
+            # Random y-flip augmentation per sample in batch
+            flip_mask = torch.rand(x.shape[0], device=device) < 0.5  # (B,)
+            flip = flip_mask.unsqueeze(-1)  # (B, 1)
+            x[flip_mask, :, 1] = -x[flip_mask, :, 1]   # z-coordinate
+            x[flip_mask, :, 3] = -x[flip_mask, :, 3]   # saf_y
+            x[flip_mask, :, 14] = -x[flip_mask, :, 14] # AoA
+            y[flip_mask, :, 1] = -y[flip_mask, :, 1]   # Uy
+
         x = (x - stats["x_mean"]) / stats["x_std"]
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
