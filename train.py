@@ -102,7 +102,6 @@ model_path = model_dir / f"checkpoint.pt"
 with open(model_dir / "config.yaml", "w") as f:
     yaml.dump(model_config, f)
 
-best_val = float("inf")
 best_metrics = {}
 train_start = time.time()
 
@@ -225,8 +224,8 @@ for epoch in range(MAX_EPOCHS):
         peak_mem_gb = 0.0
 
     tag = ""
-    if val_loss < best_val:
-        best_val = val_loss
+    surf_p_mae = mae_surf[2].item()
+    if not best_metrics or surf_p_mae < best_metrics.get("mae_surf_p", float("inf")):
         best_metrics = {
             "mae_vol_Ux": mae_vol[0].item(),
             "mae_vol_Uy": mae_vol[1].item(),
