@@ -4,6 +4,7 @@
 
 """Train Transolver on full-field airfoil flow prediction with separate surface/volume losses."""
 
+import copy
 import os
 import time
 import torch
@@ -78,6 +79,9 @@ model = Transolver(
     **model_config
 ).to(device)
 
+ema_model = copy.deepcopy(model)
+ema_decay = 0.999
+
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
@@ -142,6 +146,10 @@ for epoch in range(MAX_EPOCHS):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
+        with torch.no_grad():
+            for p_ema, p in zip(ema_model.parameters(), model.parameters()):
+                p_ema.data.mul_(ema_decay).add_(p.data, alpha=1 - ema_decay)
+
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
         n_batches += 1
@@ -152,7 +160,7 @@ for epoch in range(MAX_EPOCHS):
     epoch_surf /= n_batches
 
     # --- Validate ---
-    model.eval()
+    ema_model.eval()
     val_vol = 0.0
     val_surf = 0.0
     mae_surf = torch.zeros(3, device=device)
@@ -170,7 +178,7 @@ for epoch in range(MAX_EPOCHS):
             x = (x - stats["x_mean"]) / stats["x_std"]
             y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
-            pred = model({"x": x})["preds"]
+            pred = ema_model({"x": x})["preds"]
             sq_err = (pred - y_norm) ** 2
 
             vol_mask = mask & ~is_surface
@@ -230,7 +238,7 @@ for epoch in range(MAX_EPOCHS):
             "epoch": epoch + 1,
             "val_loss_loss": val_loss,
         }
-        torch.save(model.state_dict(), model_path)
+        torch.save(ema_model.state_dict(), model_path)
         tag = f" * -> {model_path}"
 
     print(
