@@ -146,8 +146,9 @@ for epoch in range(MAX_EPOCHS):
         vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
         channel_w = torch.tensor([1.0, 1.0, 1.5], device=device)
         surf_loss = surface_loss_curriculum(pred, y_norm, surf_mask, channel_w, epoch, MAX_EPOCHS)
-        loss = vol_loss + cfg.surf_weight * surf_loss
-        wandb.log({"train/loss": loss.item()})
+        dynamic_sw = 5.0 if epoch < 4 else 15.0
+        loss = vol_loss + dynamic_sw * surf_loss
+        wandb.log({"train/loss": loss.item(), "train/dynamic_sw": dynamic_sw})
 
         optimizer.zero_grad()
         loss.backward()
