@@ -4,6 +4,7 @@
 
 """Train Transolver on full-field airfoil flow prediction with separate surface/volume losses."""
 
+import math
 import os
 import time
 import torch
@@ -24,7 +25,7 @@ MAX_TIMEOUT = 5.0 # minutes
 MAX_EPOCHS = 50
 @dataclass
 class Config:
-    lr: float = 0.015
+    lr: float = 0.020
     weight_decay: float = 0.0
     batch_size: int = 4
     surf_weight: float = 12.0
@@ -80,7 +81,12 @@ model = Transolver(
 
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
+warmup_epochs = 3
+def lr_lambda(epoch):
+    if epoch < warmup_epochs:
+        return (epoch + 1) / warmup_epochs
+    return 0.5 * (1 + math.cos(math.pi * (epoch - warmup_epochs) / (MAX_EPOCHS - warmup_epochs)))
+scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 # --- wandb ---
