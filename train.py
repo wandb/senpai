@@ -82,7 +82,7 @@ n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 warmup = LinearLR(optimizer, start_factor=1e-5/0.006, total_iters=3)
-cosine = CosineAnnealingLR(optimizer, T_max=67)  # 70-3=67 remaining epochs
+cosine = CosineAnnealingLR(optimizer, T_max=67, eta_min=1e-4)
 scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[3])
 
 
