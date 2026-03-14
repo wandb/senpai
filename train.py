@@ -21,11 +21,11 @@ from utils import visualize, dataset_stats
 
 
 MAX_TIMEOUT = 5.0 # minutes
-MAX_EPOCHS = 50
+MAX_EPOCHS = 70
 @dataclass
 class Config:
-    lr: float = 5e-4
-    weight_decay: float = 1e-4
+    lr: float = 0.006
+    weight_decay: float = 0.0
     batch_size: int = 4
     surf_weight: float = 10.0
     dataset: str = "raceCar_single_randomFields"
@@ -102,6 +102,7 @@ with open(model_dir / "config.yaml", "w") as f:
 best_val = float("inf")
 best_metrics = {}
 train_start = time.time()
+dynamic_sw = cfg.surf_weight  # start at 10.0
 
 for epoch in range(MAX_EPOCHS):
     # Check wall-clock timeout
@@ -127,18 +128,36 @@ for epoch in range(MAX_EPOCHS):
         x = (x - stats["x_mean"]) / stats["x_std"]
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
-        pred = model({"x": x})["preds"]
-        sq_err = (pred - y_norm) ** 2
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            pred = model({"x": x})["preds"]
+            diff = pred - y_norm
+            sq_err = diff ** 2
+            abs_err = diff.abs()
+            vol_mask = mask & ~is_surface
+            surf_mask = mask & is_surface
+            vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
+            surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            loss = vol_loss + dynamic_sw * surf_loss
 
-        vol_mask = mask & ~is_surface
-        surf_mask = mask & is_surface
-        vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-        surf_loss = (sq_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
-        loss = vol_loss + cfg.surf_weight * surf_loss
+        if n_batches == 0:  # first batch of each epoch
+            optimizer.zero_grad()
+            vol_loss.backward(retain_graph=True)
+            vol_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+            optimizer.zero_grad()
+            (dynamic_sw * surf_loss).backward(retain_graph=True)
+            surf_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+            optimizer.zero_grad()
+            if surf_grad_norm > 0:
+                ratio = (vol_grad_norm / surf_grad_norm).item()
+                dynamic_sw = max(2.0, min(20.0, dynamic_sw * 0.9 + ratio * 0.1))
+            wandb.log({"dynamic_sw": dynamic_sw})
+            loss = vol_loss + dynamic_sw * surf_loss
+
         wandb.log({"train/loss": loss.item()})
 
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         epoch_vol += vol_loss.item()
@@ -169,7 +188,8 @@ for epoch in range(MAX_EPOCHS):
             x = (x - stats["x_mean"]) / stats["x_std"]
             y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
-            pred = model({"x": x})["preds"]
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                pred = model({"x": x})["preds"]
             sq_err = (pred - y_norm) ** 2
 
             vol_mask = mask & ~is_surface
