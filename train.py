@@ -24,10 +24,10 @@ MAX_TIMEOUT = 5.0 # minutes
 MAX_EPOCHS = 50
 @dataclass
 class Config:
-    lr: float = 5e-4
+    lr: float = 0.012
     weight_decay: float = 1e-4
     batch_size: int = 4
-    surf_weight: float = 10.0
+    surf_weight: float = 25.0
     dataset: str = "raceCar_single_randomFields"
     wandb_group: str | None = None  # group related runs (e.g. iterations on the same idea)
     wandb_name: str | None = None  # name for this specific run
@@ -65,7 +65,7 @@ model_config = dict(
     fun_dim=16,
     out_dim=3,
     n_hidden=128,
-    n_layers=5,
+    n_layers=1,
     n_head=4,
     slice_num=64,
     mlp_ratio=2,
