@@ -7,6 +7,7 @@
 import os
 import time
 import torch
+import torch.nn.functional as F
 import wandb
 import yaml
 from dataclasses import dataclass, asdict
@@ -65,7 +66,7 @@ model_config = dict(
     fun_dim=16,
     out_dim=3,
     n_hidden=128,
-    n_layers=5,
+    n_layers=1,
     n_head=4,
     slice_num=64,
     mlp_ratio=2,
@@ -128,7 +129,7 @@ for epoch in range(MAX_EPOCHS):
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
         pred = model({"x": x})["preds"]
-        sq_err = (pred - y_norm) ** 2
+        sq_err = F.huber_loss(pred, y_norm, reduction='none', delta=0.01)
 
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
@@ -170,7 +171,7 @@ for epoch in range(MAX_EPOCHS):
             y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
             pred = model({"x": x})["preds"]
-            sq_err = (pred - y_norm) ** 2
+            sq_err = F.huber_loss(pred, y_norm, reduction='none', delta=0.01)
 
             vol_mask = mask & ~is_surface
             surf_mask = mask & is_surface
