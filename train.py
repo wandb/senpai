@@ -27,7 +27,7 @@ class Config:
     lr: float = 0.015
     weight_decay: float = 0.0
     batch_size: int = 4
-    surf_weight: float = 12.0
+    surf_weight: float = 16.0
     dataset: str = "raceCar_single_randomFields"
     wandb_group: str | None = None  # group related runs (e.g. iterations on the same idea)
     wandb_name: str | None = None  # name for this specific run
@@ -42,6 +42,7 @@ if cfg.debug:
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}" + (" [DEBUG MODE]" if cfg.debug else ""))
+surf_channel_weights = torch.tensor([1.0, 1.0, 3.0], device=device)
 
 # Eager cache — all 899 samples preprocessed into RAM (~13GB)
 ds = FullFieldDataset([DATA_ROOT / f"{cfg.dataset}.pickle"], cache_size=0)
@@ -136,7 +137,7 @@ for epoch in range(MAX_EPOCHS):
             vol_mask = mask & ~is_surface
             surf_mask = mask & is_surface
             vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-            surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            surf_loss = (abs_err * surf_mask.unsqueeze(-1) * surf_channel_weights).sum() / surf_mask.sum().clamp(min=1)
             loss = vol_loss + cfg.surf_weight * surf_loss
         wandb.log({"train/loss": loss.item()})
 
@@ -182,7 +183,7 @@ for epoch in range(MAX_EPOCHS):
             vol_mask = mask & ~is_surface
             surf_mask = mask & is_surface
             val_vol += (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
-            val_surf += (abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+            val_surf += (abs_err * surf_mask.unsqueeze(-1) * surf_channel_weights).sum().item() / surf_mask.sum().clamp(min=1).item()
             n_val += 1
 
             pred_orig = pred * stats["y_std"] + stats["y_mean"]
