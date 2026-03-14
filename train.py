@@ -144,7 +144,9 @@ for epoch in range(MAX_EPOCHS):
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
         vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-        channel_w = torch.tensor([1.0, 1.0, 1.5], device=device)
+        alpha = min(epoch / 4.0, 1.0)  # same schedule as loss curriculum
+        p_weight = 1.0 + alpha * 1.0   # 1.0 during MSE, ramps to 2.0 during L1
+        channel_w = torch.tensor([1.0, 1.0, p_weight], device=device)
         surf_loss = surface_loss_curriculum(pred, y_norm, surf_mask, channel_w, epoch, MAX_EPOCHS)
         loss = vol_loss + cfg.surf_weight * surf_loss
         wandb.log({"train/loss": loss.item()})
