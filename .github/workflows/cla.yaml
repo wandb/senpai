@@ -26,4 +26,4 @@ jobs:
           path-to-document: "https://github.com/wandb/senpai/blob/main/cla.md"
           # branch should not be protected
           branch: "cla"
-          allowlist: actions-user, dependabot[bot], wandbmachine, jlzhao27, zaysola
+          allowlist: actions-user, dependabot[bot], wandbmachine, jlzhao27, zaysola, tcapelle, morganmcg1
