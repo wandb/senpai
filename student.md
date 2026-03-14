@@ -37,6 +37,7 @@ Read `program.md` for the full research context, constraints, metrics, and file 
      git fetch origin
      git checkout <branch>
      ```
+   - Note: PRs target the `advisor` branch, not `main`.
 
 3. **Implement the hypothesis**
    - Follow the instructions in the PR body.

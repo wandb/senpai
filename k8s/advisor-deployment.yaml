@@ -65,7 +65,7 @@ spec:
         - name: WANDB_ENTITY
           value: "capecape"
         - name: WANDB_PROJECT
-          value: "senpai"
+          value: "senpai_biz"
         resources:
           requests:
             cpu: "4"

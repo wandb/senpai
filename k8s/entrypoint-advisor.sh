@@ -30,6 +30,16 @@ uv pip install --system -e .
 git config user.name "senpai-advisor"
 git config user.email "senpai-advisor@senpai"
 
+# --- Create or checkout advisor branch ---
+git fetch origin
+if git rev-parse --verify origin/advisor >/dev/null 2>&1; then
+    git checkout advisor
+    git pull origin advisor
+else
+    git checkout -b advisor
+    git push -u origin advisor
+fi
+
 # --- Install Claude Code ---
 curl -fsSL https://claude.ai/install.sh | bash
 export PATH="$HOME/.claude/bin:$PATH"
@@ -56,7 +66,9 @@ Read advisor.md for your full workflow, and program.md for the research context 
 
 Your students are: $STUDENT_NAMES
 Research tag: $RESEARCH_TAG
-W&B project: capecape/senpai
+W&B project: capecape/senpai_biz
+
+IMPORTANT: You work on the 'advisor' branch, NOT main. All PRs target 'advisor' as base. When creating branches, checkout from 'advisor'. When merging, squash-merge into 'advisor'.
 
 You can also monitor student pods: kubectl get deployments -l app=senpai
 

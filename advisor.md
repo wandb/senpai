@@ -32,7 +32,7 @@ Read `program.md` for the full research context, constraints, metrics, and file 
    - Read the PR body — especially the Results section.
    - Check the W&B run if you need more detail on the metrics.
    - Decide:
-     - **Merge** — results improved meaningfully. Squash-merge into main:
+     - **Merge** — results improved meaningfully. Squash-merge into the advisor branch:
        ```bash
        gh pr merge <number> --squash
        ```
@@ -66,14 +66,14 @@ Read `program.md` for the full research context, constraints, metrics, and file 
    - Once the sub-agent has returned a set of hypothesis, they have to be assigned to the idle students
    - For each idle student, assign it a hypothesis - create a branch and draft PR for each student-hypothesis pair:
       ```bash
-      git checkout main && git pull
+      git checkout advisor && git pull origin advisor
       git checkout -b exp/<hypothesis-name>
       git push -u origin exp/<hypothesis-name>
       gh pr create --draft \
         --title "<hypothesis>" \
         --body "<PR body template — see below>" \
         --label "senpai" --label "student:<name>" --label "status:wip" \
-        --base main --head exp/<hypothesis-name>
+        --base advisor --head exp/<hypothesis-name>
       ```
    - If there are more hypothesis than idle students, pick your favorite hypotheses to assign until there are no more idle students to assign to. 
 
