@@ -75,8 +75,9 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout),
         )
+        self.pos_proj = nn.Linear(2, dim_head, bias=False)  # project 2D coords to attention dim
 
-    def forward(self, x):
+    def forward(self, x, pos=None):
         # x: (B, N, C)
         bsz, num_points, _ = x.shape
 
@@ -92,6 +93,13 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             .permute(0, 2, 1, 3)
             .contiguous()
         )  # B H N C
+
+        # Inject spatial awareness into slice assignment
+        if pos is not None:
+            pos_emb = self.pos_proj(pos)  # (B, N, dim_head)
+            pos_emb = pos_emb.unsqueeze(1).expand(-1, self.heads, -1, -1)  # (B, H, N, C)
+            x_mid = x_mid + 0.1 * pos_emb  # small scale to modulate, not dominate
+
         slice_weights = self.softmax(self.in_project_slice(x_mid) / self.temperature)  # B H N G
         slice_norm = slice_weights.sum(2)  # B H G
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
@@ -143,8 +151,8 @@ class TransolverBlock(nn.Module):
             self.mlp2 = nn.Linear(hidden_dim, out_dim)       # volume head
             self.surf_mlp = nn.Linear(hidden_dim, out_dim)    # surface head
 
-    def forward(self, fx, is_surface=None):
-        fx = self.attn(self.ln_1(fx)) + fx
+    def forward(self, fx, is_surface=None, pos=None):
+        fx = self.attn(self.ln_1(fx), pos=pos) + fx
         fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
             h = self.ln_3(fx)
@@ -278,10 +286,12 @@ class Transolver(nn.Module):
         fx = self.preprocess(x)
         fx = fx + self.placeholder[None, None, :]
 
+        pos_raw = x[:, :, :2]  # first 2 channels are normalized positions
+
         for block in self.blocks:
             if block.last_layer and is_surface is not None:
-                fx = block(fx, is_surface=is_surface)
+                fx = block(fx, is_surface=is_surface, pos=pos_raw)
             else:
-                fx = block(fx)
+                fx = block(fx, pos=pos_raw)
         self._validate_output_dims(fx)
         return {"preds": fx}
