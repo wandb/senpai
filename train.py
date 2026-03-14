@@ -173,11 +173,18 @@ for epoch in range(MAX_EPOCHS):
             is_surface = is_surface.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
 
-            x = (x - stats["x_mean"]) / stats["x_std"]
+            x_normed = (x - stats["x_mean"]) / stats["x_std"]
             y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                pred = model({"x": x})["preds"]
+            TTA_K = 4
+            TTA_SIGMA = 0.01
+            preds = []
+            for _ in range(TTA_K):
+                x_tta = x_normed + torch.randn_like(x_normed) * TTA_SIGMA
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    p = model({"x": x_tta})["preds"]
+                preds.append(p)
+            pred = torch.stack(preds).mean(0)
             sq_err = (pred - y_norm) ** 2
 
             vol_mask = mask & ~is_surface
