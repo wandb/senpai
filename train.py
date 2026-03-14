@@ -26,7 +26,7 @@ MAX_EPOCHS = 70
 @dataclass
 class Config:
     lr: float = 0.008
-    weight_decay: float = 0.0
+    weight_decay: float = 1e-5
     batch_size: int = 4
     surf_weight: float = 15.0
     dataset: str = "raceCar_single_randomFields"
