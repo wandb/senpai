@@ -24,7 +24,7 @@ MAX_TIMEOUT = 5.0 # minutes
 MAX_EPOCHS = 70
 @dataclass
 class Config:
-    lr: float = 0.006
+    lr: float = 0.008
     weight_decay: float = 0.0
     batch_size: int = 4
     surf_weight: float = 10.0
@@ -81,7 +81,7 @@ model = Transolver(
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-warmup = LinearLR(optimizer, start_factor=1e-5/0.006, total_iters=3)
+warmup = LinearLR(optimizer, start_factor=1e-5/0.008, total_iters=3)
 cosine = CosineAnnealingLR(optimizer, T_max=67)  # 70-3=67 remaining epochs
 scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[3])
 
