@@ -220,6 +220,12 @@ class Transolver(nn.Module):
         self.initialize_weights()
         self.placeholder = nn.Parameter((1 / n_hidden) * torch.rand(n_hidden, dtype=torch.float))
 
+        # Fourier feature injection at intermediate layers
+        n_freq = 4
+        self.freq_scales = nn.Parameter(torch.linspace(0.0, 2.0, n_freq))  # learnable log-frequencies
+        self.freq_proj = nn.Linear(n_freq * 2 * 2, n_hidden, bias=False)  # 16 -> n_hidden
+        nn.init.zeros_(self.freq_proj.weight)  # zero-init: starts as no-op
+
     def initialize_weights(self):
         self.apply(self._init_weights)
 
@@ -275,10 +281,20 @@ class Transolver(nn.Module):
 
         is_surface = data.get("is_surface", None)
 
+        pos_raw = x[:, :, :2]  # first 2 channels are normalized positions
+
+        # Build Fourier features
+        freq = pos_raw.unsqueeze(-1) * self.freq_scales.exp()  # (B, N, 2, 4)
+        ff = torch.cat([freq.sin(), freq.cos()], dim=-1)  # (B, N, 2, 8)
+        ff = ff.reshape(pos_raw.shape[0], pos_raw.shape[1], -1)  # (B, N, 16)
+        ff_proj = self.freq_proj(ff)  # (B, N, n_hidden)
+
         fx = self.preprocess(x)
         fx = fx + self.placeholder[None, None, :]
 
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
+            if i > 0:  # inject from second block onward
+                fx = fx + ff_proj
             if block.last_layer and is_surface is not None:
                 fx = block(fx, is_surface=is_surface)
             else:
