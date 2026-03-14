@@ -60,6 +60,23 @@ loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
 train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, **loader_kwargs)
 val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
 
+# Compute surface-specific stats
+surf_y_sum = torch.zeros(3, device=device)
+surf_y_sq_sum = torch.zeros(3, device=device)
+surf_count = 0
+for x, y, is_surface, mask in train_loader:
+    y = y.to(device)
+    is_surface = is_surface.to(device)
+    mask = mask.to(device)
+    surf_mask = mask & is_surface
+    surf_y = y[surf_mask.unsqueeze(-1).expand_as(y)].view(-1, 3)
+    surf_y_sum += surf_y.sum(0)
+    surf_y_sq_sum += (surf_y ** 2).sum(0)
+    surf_count += surf_mask.sum().item()
+surf_y_mean = surf_y_sum / surf_count
+surf_y_std = ((surf_y_sq_sum / surf_count) - surf_y_mean ** 2).sqrt()
+print(f"Surface y stats: mean={surf_y_mean.tolist()}, std={surf_y_std.tolist()}")
+
 model_config = dict(
     space_dim=2,
     fun_dim=16,
@@ -128,7 +145,9 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         x = (x - stats["x_mean"]) / stats["x_std"]
-        y_norm = (y - stats["y_mean"]) / stats["y_std"]
+        y_norm_vol = (y - stats["y_mean"]) / stats["y_std"]
+        y_norm_surf = (y - surf_y_mean) / surf_y_std
+        y_norm = torch.where(is_surface.unsqueeze(-1), y_norm_surf, y_norm_vol)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pred = model({"x": x})["preds"]
