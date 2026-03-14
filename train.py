@@ -143,7 +143,8 @@ for epoch in range(MAX_EPOCHS):
 
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
-        vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
+        vol_err = (pred - y_norm).abs()
+        vol_loss = (vol_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
         channel_w = torch.tensor([1.0, 1.0, 1.5], device=device)
         surf_loss = surface_loss_curriculum(pred, y_norm, surf_mask, channel_w, epoch, MAX_EPOCHS)
         loss = vol_loss + cfg.surf_weight * surf_loss
