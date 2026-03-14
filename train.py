@@ -127,6 +127,16 @@ for epoch in range(MAX_EPOCHS):
         x = (x - stats["x_mean"]) / stats["x_std"]
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
+        # Per-sample normalize spatial coords (first 2 features) after global norm
+        # Use mask to only compute stats over valid nodes
+        spatial = x[:, :, :2]  # (B, N, 2)
+        mask_expanded = mask.unsqueeze(-1).float()  # (B, N, 1)
+        n_valid = mask_expanded.sum(dim=1, keepdim=True).clamp(min=1)  # (B, 1, 1)
+        spatial_mean = (spatial * mask_expanded).sum(dim=1, keepdim=True) / n_valid  # (B, 1, 2)
+        spatial_centered = spatial - spatial_mean
+        spatial_std = ((spatial_centered ** 2 * mask_expanded).sum(dim=1, keepdim=True) / n_valid).sqrt().clamp(min=1e-6)
+        x[:, :, :2] = spatial_centered / spatial_std
+
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             pred = model({"x": x})["preds"]
             diff = pred - y_norm
@@ -172,6 +182,15 @@ for epoch in range(MAX_EPOCHS):
 
             x = (x - stats["x_mean"]) / stats["x_std"]
             y_norm = (y - stats["y_mean"]) / stats["y_std"]
+
+            # Per-sample normalize spatial coords (first 2 features) after global norm
+            spatial = x[:, :, :2]  # (B, N, 2)
+            mask_expanded = mask.unsqueeze(-1).float()  # (B, N, 1)
+            n_valid = mask_expanded.sum(dim=1, keepdim=True).clamp(min=1)  # (B, 1, 1)
+            spatial_mean = (spatial * mask_expanded).sum(dim=1, keepdim=True) / n_valid  # (B, 1, 2)
+            spatial_centered = spatial - spatial_mean
+            spatial_std = ((spatial_centered ** 2 * mask_expanded).sum(dim=1, keepdim=True) / n_valid).sqrt().clamp(min=1e-6)
+            x[:, :, :2] = spatial_centered / spatial_std
 
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 pred = model({"x": x})["preds"]
