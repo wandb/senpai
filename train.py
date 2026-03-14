@@ -81,9 +81,9 @@ model = Transolver(
 
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-warmup = LinearLR(optimizer, start_factor=1e-5/0.008, total_iters=5)
-cosine = CosineAnnealingLR(optimizer, T_max=65, eta_min=1e-4)
-scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[5])
+warmup = LinearLR(optimizer, start_factor=1e-5/0.008, total_iters=3)
+cosine = CosineAnnealingLR(optimizer, T_max=67, eta_min=1e-4)
+scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[3])
 
 
 # --- wandb ---
