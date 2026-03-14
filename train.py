@@ -7,6 +7,7 @@
 import os
 import time
 import torch
+import torch.nn.functional as F
 import wandb
 import yaml
 from dataclasses import dataclass, asdict
@@ -139,7 +140,8 @@ for epoch in range(MAX_EPOCHS):
             surf_mask = mask & is_surface
             vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
             channel_w = torch.tensor([1.0, 1.0, 1.5], device=pred.device)
-            surf_loss = (abs_err * surf_mask.unsqueeze(-1) * channel_w).sum() / surf_mask.sum().clamp(min=1)
+            huber_err = F.huber_loss(pred, y_norm, reduction='none', delta=0.5)
+            surf_loss = (huber_err * surf_mask.unsqueeze(-1) * channel_w).sum() / surf_mask.sum().clamp(min=1)
             loss = vol_loss + cfg.surf_weight * surf_loss
         wandb.log({"train/loss": loss.item()})
 
