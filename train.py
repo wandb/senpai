@@ -22,9 +22,10 @@ from utils import visualize, dataset_stats
 
 MAX_TIMEOUT = 5.0 # minutes
 MAX_EPOCHS = 50
+ACCUM_STEPS = 4
 @dataclass
 class Config:
-    lr: float = 0.015
+    lr: float = 0.025
     weight_decay: float = 1e-4
     batch_size: int = 4
     surf_weight: float = 8.0
@@ -118,6 +119,7 @@ for epoch in range(MAX_EPOCHS):
     epoch_surf = 0.0
     n_batches = 0
 
+    optimizer.zero_grad()
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     for x, y, is_surface, mask in pbar:
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
@@ -137,10 +139,13 @@ for epoch in range(MAX_EPOCHS):
         loss = vol_loss + cfg.surf_weight * surf_loss
         wandb.log({"train/loss": loss.item()})
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        scaled_loss = loss / ACCUM_STEPS
+        scaled_loss.backward()
+
+        if (n_batches + 1) % ACCUM_STEPS == 0 or (n_batches + 1) == len(train_loader):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
