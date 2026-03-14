@@ -140,13 +140,20 @@ class TransolverBlock(nn.Module):
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
-            self.mlp2 = nn.Linear(hidden_dim, out_dim)
+            self.mlp2 = nn.Linear(hidden_dim, out_dim)       # volume head
+            self.surf_mlp = nn.Linear(hidden_dim, out_dim)    # surface head
 
-    def forward(self, fx):
+    def forward(self, fx, is_surface=None):
         fx = self.attn(self.ln_1(fx)) + fx
         fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            h = self.ln_3(fx)
+            if is_surface is not None:
+                vol_pred = self.mlp2(h)
+                surf_pred = self.surf_mlp(h)
+                mask = is_surface.unsqueeze(-1).expand_as(vol_pred)
+                return torch.where(mask, surf_pred, vol_pred)
+            return self.mlp2(h)
         return fx
 
 
@@ -266,10 +273,15 @@ class Transolver(nn.Module):
             new_pos = self.get_grid(pos)
             x = torch.cat((x, new_pos), dim=-1)
 
+        is_surface = data.get("is_surface", None)
+
         fx = self.preprocess(x)
         fx = fx + self.placeholder[None, None, :]
 
         for block in self.blocks:
-            fx = block(fx)
+            if block.last_layer and is_surface is not None:
+                fx = block(fx, is_surface=is_surface)
+            else:
+                fx = block(fx)
         self._validate_output_dims(fx)
         return {"preds": fx}

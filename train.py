@@ -138,7 +138,7 @@ for epoch in range(MAX_EPOCHS):
         x = (x - stats["x_mean"]) / stats["x_std"]
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
-        pred = model({"x": x})["preds"]
+        pred = model({"x": x, "is_surface": is_surface})["preds"]
         sq_err = (pred - y_norm) ** 2
 
         vol_mask = mask & ~is_surface
@@ -181,7 +181,7 @@ for epoch in range(MAX_EPOCHS):
             x = (x - stats["x_mean"]) / stats["x_std"]
             y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
-            pred = model({"x": x})["preds"]
+            pred = model({"x": x, "is_surface": is_surface})["preds"]
             sq_err = (pred - y_norm) ** 2
 
             vol_mask = mask & ~is_surface
