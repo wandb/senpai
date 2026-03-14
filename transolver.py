@@ -217,6 +217,10 @@ class Transolver(nn.Module):
         )
         self.initialize_weights()
         self.placeholder = nn.Parameter((1 / n_hidden) * torch.rand(n_hidden, dtype=torch.float))
+        for block in self.blocks:
+            nn.init.orthogonal_(block.attn.to_q.weight)
+            nn.init.orthogonal_(block.attn.to_k.weight)
+            nn.init.orthogonal_(block.attn.to_v.weight)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
