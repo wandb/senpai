@@ -28,25 +28,45 @@ Read `program.md` for the full research context, constraints, metrics, and file 
    - Identify: which students are idle (no `status:wip` PR), which PRs are awaiting review (`status:review`).
 
 2. **Review completed PRs** (`status:review`)
-   For each PR that is ready for review:
-   - Read the PR body — especially the Results section.
-   - Check the W&B run if you need more detail on the metrics.
-   - Decide:
-     - **Merge** — results improved meaningfully. Squash-merge into the advisor branch:
-       ```bash
-       gh pr merge <number> --squash
-       ```
-     - **Request changes** — promising direction but needs iteration. Leave review comments explaining what to try next, then send back:
-       ```bash
-       gh pr ready <number> --undo
-       gh api repos/{owner}/{repo}/issues/<number>/labels/status:review --method DELETE
-       gh api repos/{owner}/{repo}/issues/<number>/labels -f "labels[]=status:wip" --method POST
-       ```
-       **IMPORTANT:** Never use `gh pr edit --remove-label --add-label` — it strips other labels. Always use the API calls above to swap status labels individually.
-     - **Close** — dead end, or adds complexity without benefit:
-       ```bash
-       gh pr close <number> --delete-branch
-       ```
+
+   Review **each PR individually** — never batch-close an entire round. Follow this sequence:
+
+   **a. Rank all review-ready PRs by `best_mae_surf_p`** (lower is better). Check the W&B run for each PR — the student's reported metrics in the PR body may be stale or incomplete.
+
+   **b. Merge winners sequentially, best first.** A PR is a winner if its `best_mae_surf_p` is lower than the current baseline. Merge aggressively — even small improvements compound over rounds.
+
+   For each winner, starting with the best:
+   - Squash-merge into the advisor branch:
+     ```bash
+     gh pr merge <number> --squash
+     ```
+   - **Update your baseline** immediately to the newly merged metrics. All subsequent reviews in this round compare against this updated baseline.
+   - Pull the updated advisor branch before attempting the next merge:
+     ```bash
+     git checkout <advisor-branch> && git pull origin <advisor-branch>
+     ```
+   - If the next winner has **merge conflicts** (because it branched before the previous merge), send it back to the student for rebase:
+     ```bash
+     # Comment explaining what happened
+     gh pr comment <number> --body "Rebasing needed: <advisor-branch> was updated after merging PR #<merged>. Please rebase onto <advisor-branch>, re-run the experiment to verify the improvement still holds, and resubmit."
+     gh pr ready <number> --undo
+     gh api repos/{owner}/{repo}/issues/<number>/labels/status:review --method DELETE
+     gh api repos/{owner}/{repo}/issues/<number>/labels -f "labels[]=status:wip" --method POST
+     ```
+
+   **c. Request changes** on promising PRs that didn't beat baseline but show an interesting direction. Leave specific feedback on what variation to try next, then send back:
+   ```bash
+   gh pr ready <number> --undo
+   gh api repos/{owner}/{repo}/issues/<number>/labels/status:review --method DELETE
+   gh api repos/{owner}/{repo}/issues/<number>/labels -f "labels[]=status:wip" --method POST
+   ```
+
+   **d. Close** only clear dead ends — results significantly worse than baseline, or the approach is fundamentally broken:
+   ```bash
+   gh pr close <number> --delete-branch
+   ```
+
+   **IMPORTANT:** Never use `gh pr edit --remove-label --add-label` — it strips other labels. Always use the API calls above to swap status labels individually.
 
 3. **Create new hypotheses** for idle students
    Assign to a new hypothesis to test to each student without a `status:wip` PR. Use a sub-agent, powered by the Opus model, to review all previous experiments and generate fresh new hypothesis to test. Give the sub-agent the following instructions plus any additional context you think might be relevant:
@@ -112,10 +132,10 @@ Be specific in your Instructions to the Student. "Try a higher learning rate" is
 
 ## Decision criteria
 
-- **Merge** if surface MAE improved meaningfully — especially pressure, which is the hardest channel.
-- **Request changes** if the direction is promising but the student should try a variation (different weight, different schedule, etc.).
-- **Close** if the idea clearly doesn't work, or if the improvement is tiny but adds significant complexity (simplicity criterion from `program.md`).
-- When in doubt between merge and close, consider: does this change make the codebase better or worse to build on?
+- **Merge** if `best_mae_surf_p` is lower than the current baseline — even by a small amount. Small improvements compound across rounds. The only reason to reject an improvement is if it adds disproportionate complexity for a tiny gain.
+- **Request changes** if the direction is promising but didn't beat baseline — the student should try a variation (different weight, different schedule, etc.).
+- **Close** only if results are clearly worse (>5% regression) or the approach is fundamentally broken (diverged, crashed, etc.).
+- When in doubt between merge and close, **merge**. We want to compound improvements.
 
 ## Prioritization
 
@@ -131,19 +151,6 @@ Not all ideas are equal. Prioritize:
 - **Always include baseline metrics.** Students need a target to compare against.
 - **Use `--wandb_group`** in instructions when you expect a hypothesis to need multiple iterations (e.g. "Try surface weight 5, 10, 20").
 - **Read student suggestions.** The "Suggested follow-ups" section in results often contains good next ideas — the student saw the data.
-- **Kill dead ends quickly.** Don't waste student GPU time on diminishing returns. Close and move on.
-- **Update the baseline** after each merge. The next PR should reference the new best metrics.
+- **Compound improvements.** Merge every PR that beats baseline, even by a small margin. Architecture changes and hyperparameter changes are often orthogonal and stack. Two 1% improvements merged sequentially are better than one 2% improvement.
+- **Update the baseline after every merge.** The next review and the next round of PRs must reference the new best metrics.
 - **Timeout**: Each training run is capped at 5 minutes. Do not override this — experiments should be fast iterations, not long runs.
-
-## Ideas to explore
-
-Non-exhaustive starting points for hypotheses. Use your judgment on ordering based on current results:
-- Loss formulation: surface weight, per-channel weighting, L1 vs MSE, gradient-based losses
-- Learning rate schedule: warmup, cosine annealing, OneCycleLR
-- Model architecture: number of layers, hidden dim, number of heads, slice count, MLP ratio
-- Attention mechanism: different slice projections, local attention, multi-scale
-- Input features: encoding improvements, positional encoding enhancements
-- Normalization: per-sample vs global, different normalization strategies
-- Data augmentation: if applicable to CFD meshes
-- Optimizer: AdamW vs Adam, weight decay, gradient clipping
-- Multi-scale or hierarchical approaches
