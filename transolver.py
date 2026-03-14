@@ -213,6 +213,14 @@ class Transolver(nn.Module):
         self.initialize_weights()
         self.placeholder = nn.Parameter((1 / n_hidden) * torch.rand(n_hidden, dtype=torch.float))
 
+        # Stochastic depth: linear drop rate schedule
+        max_drop_rate = 0.15
+        for idx, block in enumerate(self.blocks):
+            if 0 < idx < n_layers - 1:  # never drop first or last block
+                block.drop_rate = max_drop_rate * idx / max(n_layers - 2, 1)
+            else:
+                block.drop_rate = 0.0
+
     def initialize_weights(self):
         self.apply(self._init_weights)
 
@@ -270,6 +278,9 @@ class Transolver(nn.Module):
         fx = fx + self.placeholder[None, None, :]
 
         for block in self.blocks:
+            if self.training and hasattr(block, 'drop_rate') and block.drop_rate > 0.0:
+                if torch.rand(1, device=fx.device).item() < block.drop_rate:
+                    continue  # skip block; fx passes through unchanged (identity residual)
             fx = block(fx)
         self._validate_output_dims(fx)
         return {"preds": fx}
