@@ -130,12 +130,18 @@ for epoch in range(MAX_EPOCHS):
         pred = model({"x": x})["preds"]
         diff = pred - y_norm
         sq_err = diff ** 2
-        abs_err = diff.abs()
+        abs_diff = diff.abs()
 
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
         vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-        surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+
+        # Huber loss for surface: smooth near zero, L1 for large errors
+        huber_delta = 1.0
+        huber_err = torch.where(abs_diff <= huber_delta,
+                                0.5 * sq_err / huber_delta,
+                                abs_diff - 0.5 * huber_delta)
+        surf_loss = (huber_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + cfg.surf_weight * surf_loss
         wandb.log({"train/loss": loss.item()})
 
@@ -175,12 +181,16 @@ for epoch in range(MAX_EPOCHS):
             pred = model({"x": x})["preds"]
             diff = pred - y_norm
             sq_err = diff ** 2
-            abs_err = diff.abs()
+            abs_diff = diff.abs()
 
             vol_mask = mask & ~is_surface
             surf_mask = mask & is_surface
             val_vol += (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
-            val_surf += (abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+            huber_delta = 1.0
+            huber_err = torch.where(abs_diff <= huber_delta,
+                                    0.5 * sq_err / huber_delta,
+                                    abs_diff - 0.5 * huber_delta)
+            val_surf += (huber_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
             n_val += 1
 
             pred_orig = pred * stats["y_std"] + stats["y_mean"]
