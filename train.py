@@ -101,7 +101,7 @@ with open(model_dir / "config.yaml", "w") as f:
 
 def surface_loss_curriculum(pred, target, surf_mask, channel_w, epoch, max_epochs):
     """Smoothly interpolate surface loss from MSE to L1."""
-    alpha = min(epoch / 6.0, 1.0)  # 0 at epoch 0, 1.0 at epoch 6 (matching ~10 epoch budget)
+    alpha = min(epoch / 4.0, 1.0)  # 0 at epoch 0, 1.0 at epoch 4
     diff = pred - target
     sq_err = diff ** 2
     abs_err = diff.abs()
