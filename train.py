@@ -21,7 +21,7 @@ from utils import visualize, dataset_stats
 
 
 MAX_TIMEOUT = 5.0 # minutes
-MAX_EPOCHS = 70
+MAX_EPOCHS = 62
 @dataclass
 class Config:
     lr: float = 0.006
@@ -64,8 +64,8 @@ model_config = dict(
     space_dim=2,
     fun_dim=16,
     out_dim=3,
-    n_hidden=128,
-    n_layers=1,
+    n_hidden=112,
+    n_layers=2,
     n_head=2,
     slice_num=32,
     mlp_ratio=2,
@@ -77,12 +77,13 @@ model_config = dict(
 model = Transolver(
     **model_config
 ).to(device)
+model = torch.compile(model, mode="reduce-overhead")
 
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 warmup = LinearLR(optimizer, start_factor=1e-5/0.006, total_iters=5)
-cosine = CosineAnnealingLR(optimizer, T_max=65, eta_min=1e-4)
+cosine = CosineAnnealingLR(optimizer, T_max=56, eta_min=1e-4)  # 62-5-1=56 remaining epochs
 scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[5])
 
 
