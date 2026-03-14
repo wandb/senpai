@@ -140,6 +140,14 @@ for epoch in range(MAX_EPOCHS):
 
         optimizer.zero_grad()
         loss.backward()
+
+        # Gradient centralization: subtract column-wise mean from weight gradients
+        for p in model.parameters():
+            if p.grad is not None and p.grad.dim() > 1:
+                p.grad.data.sub_(
+                    p.grad.data.mean(dim=tuple(range(1, p.grad.dim())), keepdim=True)
+                )
+
         optimizer.step()
 
         epoch_vol += vol_loss.item()
