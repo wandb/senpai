@@ -130,16 +130,42 @@ for epoch in range(MAX_EPOCHS):
         x = (x - stats["x_mean"]) / stats["x_std"]
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
+        vol_mask = mask & ~is_surface
+        surf_mask = mask & is_surface
+        # Gradient-weighted node weights: boost high-gradient surface regions
+        node_weight = torch.ones(x.shape[0], x.shape[1], device=device)
+        with torch.no_grad():
+            for b in range(x.shape[0]):
+                s_idx = surf_mask[b].nonzero(as_tuple=True)[0]
+                n_surf = s_idx.shape[0]
+                if n_surf < 3:
+                    continue
+                pos = x[b, s_idx, :2]  # normalized coords
+                p = y[b, s_idx, 2]     # raw pressure
+                centroid = pos.mean(0)
+                theta = torch.atan2(pos[:, 1] - centroid[1], pos[:, 0] - centroid[0])
+                order = theta.argsort()
+                p_sorted = p[order]
+                pos_sorted = pos[order]
+                dp = torch.cat([(p_sorted[1:] - p_sorted[:-1]).abs(),
+                                (p_sorted[0:1] - p_sorted[-1:]).abs()])
+                ds = torch.cat([(pos_sorted[1:] - pos_sorted[:-1]).norm(dim=1),
+                                (pos_sorted[0:1] - pos_sorted[-1:]).norm(dim=1)]) + 1e-8
+                grad_mag = dp / ds
+                mean_grad = grad_mag.mean().clamp(min=1e-10)
+                grad_norm = grad_mag / mean_grad
+                w = 1.0 + 0.5 * (grad_norm - 1.0)
+                inv_order = torch.empty_like(order)
+                inv_order[order] = torch.arange(n_surf, device=device)
+                node_weight[b, s_idx] = w[inv_order]
+        channel_w = torch.tensor([1.0, 1.0, 1.5], device=device)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pred = model({"x": x})["preds"]
             diff = pred - y_norm
             sq_err = diff ** 2
             abs_err = diff.abs()
-            vol_mask = mask & ~is_surface
-            surf_mask = mask & is_surface
             vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-            channel_w = torch.tensor([1.0, 1.0, 1.5], device=pred.device)
-            surf_loss = (abs_err * surf_mask.unsqueeze(-1) * channel_w).sum() / surf_mask.sum().clamp(min=1)
+            surf_loss = (abs_err * surf_mask.unsqueeze(-1) * channel_w * node_weight.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
             loss = vol_loss + cfg.surf_weight * surf_loss
         wandb.log({"train/loss": loss.item()})
 
