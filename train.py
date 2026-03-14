@@ -138,6 +138,15 @@ for epoch in range(MAX_EPOCHS):
         x = (x - stats["x_mean"]) / stats["x_std"]
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
+        # Input-space Mixup: interpolate pairs within the batch
+        if x.size(0) > 1:
+            lam = torch.distributions.Beta(0.4, 0.4).sample().item()
+            idx = torch.randperm(x.size(0), device=device)
+            x = lam * x + (1 - lam) * x[idx]
+            y_norm = lam * y_norm + (1 - lam) * y_norm[idx]
+            # Keep original surface mask (conservative); intersect validity masks
+            mask = mask & mask[idx]
+
         pred = model({"x": x, "is_surface": is_surface})["preds"]
         sq_err = (pred - y_norm) ** 2
 
