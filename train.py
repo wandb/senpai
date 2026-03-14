@@ -21,7 +21,7 @@ from utils import visualize, dataset_stats
 
 
 MAX_TIMEOUT = 5.0 # minutes
-MAX_EPOCHS = 80
+MAX_EPOCHS = 120
 @dataclass
 class Config:
     lr: float = 0.015
