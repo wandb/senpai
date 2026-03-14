@@ -78,8 +78,16 @@ model = Transolver(
     **model_config
 ).to(device)
 
+node_weight_net = torch.nn.Sequential(
+    torch.nn.Linear(18, 1),
+    torch.nn.Sigmoid()
+).to(device)
+
 n_params = sum(p.numel() for p in model.parameters())
-optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+optimizer = torch.optim.AdamW(
+    list(model.parameters()) + list(node_weight_net.parameters()),
+    lr=cfg.lr, weight_decay=cfg.weight_decay
+)
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 warmup = LinearLR(optimizer, start_factor=1e-5/0.006, total_iters=5)
 cosine = CosineAnnealingLR(optimizer, T_max=65, eta_min=1e-4)
@@ -138,14 +146,16 @@ for epoch in range(MAX_EPOCHS):
             vol_mask = mask & ~is_surface
             surf_mask = mask & is_surface
             vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
+            raw_w = node_weight_net(x)  # (B, N, 1) — uses normalized input
+            node_w = 0.5 + raw_w  # range [0.5, 1.5]
             channel_w = torch.tensor([1.0, 1.0, 1.5], device=pred.device)
-            surf_loss = (abs_err * surf_mask.unsqueeze(-1) * channel_w).sum() / surf_mask.sum().clamp(min=1)
+            surf_loss = (abs_err * surf_mask.unsqueeze(-1) * channel_w * node_w).sum() / surf_mask.sum().clamp(min=1)
             loss = vol_loss + cfg.surf_weight * surf_loss
         wandb.log({"train/loss": loss.item()})
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(node_weight_net.parameters()), max_norm=1.0)
         optimizer.step()
 
         epoch_vol += vol_loss.item()
