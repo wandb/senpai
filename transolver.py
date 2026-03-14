@@ -140,7 +140,11 @@ class TransolverBlock(nn.Module):
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
-            self.mlp2 = nn.Linear(hidden_dim, out_dim)
+            self.mlp2 = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.GELU(),
+                nn.Linear(hidden_dim // 2, out_dim),
+            )
 
     def forward(self, fx):
         fx = self.attn(self.ln_1(fx)) + fx
@@ -212,6 +216,7 @@ class Transolver(nn.Module):
         )
         self.initialize_weights()
         self.placeholder = nn.Parameter((1 / n_hidden) * torch.rand(n_hidden, dtype=torch.float))
+        self.skip_proj = nn.Linear(n_hidden, n_hidden)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -268,8 +273,11 @@ class Transolver(nn.Module):
 
         fx = self.preprocess(x)
         fx = fx + self.placeholder[None, None, :]
+        fx_skip = self.skip_proj(fx)  # save projected input features
 
-        for block in self.blocks:
+        for block in self.blocks[:-1]:
             fx = block(fx)
+        fx = fx + fx_skip  # add skip before last block
+        fx = self.blocks[-1](fx)
         self._validate_output_dims(fx)
         return {"preds": fx}
