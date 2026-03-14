@@ -26,7 +26,7 @@ MAX_EPOCHS = 50
 class Config:
     lr: float = 2e-3
     weight_decay: float = 1e-4
-    batch_size: int = 4
+    batch_size: int = 8
     surf_weight: float = 10.0
     dataset: str = "raceCar_single_randomFields"
     wandb_group: str | None = None  # group related runs (e.g. iterations on the same idea)
@@ -80,7 +80,7 @@ model = Transolver(
 
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=15)
 
 
 # --- wandb ---
@@ -101,7 +101,7 @@ with open(model_dir / "config.yaml", "w") as f:
 
 def surface_loss_curriculum(pred, target, surf_mask, channel_w, epoch, max_epochs):
     """Smoothly interpolate surface loss from MSE to L1."""
-    alpha = min(epoch / 4.0, 1.0)  # 0 at epoch 0, 1.0 at epoch 4
+    alpha = min(epoch / 6.0, 1.0)  # 0 at epoch 0, 1.0 at epoch 6 (~40% of 15 epochs)
     diff = pred - target
     sq_err = diff ** 2
     abs_err = diff.abs()
