@@ -64,8 +64,8 @@ model_config = dict(
     space_dim=2,
     fun_dim=16,
     out_dim=3,
-    n_hidden=128,
-    n_layers=1,
+    n_hidden=96,
+    n_layers=2,
     n_head=2,
     slice_num=32,
     mlp_ratio=2,
@@ -81,7 +81,7 @@ model = Transolver(
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-warmup = LinearLR(optimizer, start_factor=1e-5/0.006, total_iters=3)
+warmup = LinearLR(optimizer, start_factor=1e-5/cfg.lr, total_iters=3)
 cosine = CosineAnnealingLR(optimizer, T_max=67)  # 70-3=67 remaining epochs
 scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[3])
 
