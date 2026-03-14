@@ -138,7 +138,7 @@ for epoch in range(MAX_EPOCHS):
             vol_mask = mask & ~is_surface
             surf_mask = mask & is_surface
             vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-            channel_w = torch.tensor([1.0, 1.0, 1.5], device=pred.device)
+            channel_w = torch.tensor([0.5, 0.5, 1.5], device=pred.device)
             surf_loss = (abs_err * surf_mask.unsqueeze(-1) * channel_w).sum() / surf_mask.sum().clamp(min=1)
             loss = vol_loss + cfg.surf_weight * surf_loss
         wandb.log({"train/loss": loss.item()})
