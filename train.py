@@ -24,7 +24,7 @@ MAX_TIMEOUT = 5.0 # minutes
 MAX_EPOCHS = 50
 @dataclass
 class Config:
-    lr: float = 5e-4
+    lr: float = 2e-3
     weight_decay: float = 1e-4
     batch_size: int = 4
     surf_weight: float = 10.0
@@ -80,7 +80,7 @@ model = Transolver(
 
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
 
 
 # --- wandb ---
