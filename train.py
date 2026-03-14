@@ -4,6 +4,7 @@
 
 """Train Transolver on full-field airfoil flow prediction with separate surface/volume losses."""
 
+import copy
 import os
 import time
 import torch
@@ -80,7 +81,7 @@ model = Transolver(
 
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=17, T_mult=1)
 
 
 # --- wandb ---
@@ -102,6 +103,8 @@ with open(model_dir / "config.yaml", "w") as f:
 best_val = float("inf")
 best_metrics = {}
 train_start = time.time()
+snapshots = []
+snapshot_epochs = [16, 33, 50, 67]  # 0-indexed end of each 17-epoch cycle
 
 for epoch in range(MAX_EPOCHS):
     # Check wall-clock timeout
@@ -246,6 +249,90 @@ for epoch in range(MAX_EPOCHS):
         f"mae_vol=[Ux:{mae_vol[0]:.2f} Uy:{mae_vol[1]:.2f} p:{mae_vol[2]:.1f}]  "
         f"mae_surf=[Ux:{mae_surf[0]:.2f} Uy:{mae_surf[1]:.2f} p:{mae_surf[2]:.1f}]{tag}"
     )
+
+    if epoch in snapshot_epochs:
+        snapshots.append(copy.deepcopy(model.state_dict()))
+        print(f"  [Snapshot saved at epoch {epoch+1}, total snapshots: {len(snapshots)}]")
+
+
+# --- Snapshot averaging ---
+if len(snapshots) >= 2:
+    print(f"\nAveraging {len(snapshots)} snapshots...")
+    avg_state = {}
+    for key in snapshots[0]:
+        avg_state[key] = torch.stack([s[key].float() for s in snapshots]).mean(dim=0)
+    model.load_state_dict(avg_state)
+
+    # Run validation with averaged model
+    model.eval()
+    val_vol_ens = 0.0
+    val_surf_ens = 0.0
+    mae_surf_ens = torch.zeros(3, device=device)
+    mae_vol_ens = torch.zeros(3, device=device)
+    n_surf_ens = 0
+    n_vol_ens = 0
+    n_val_ens = 0
+
+    with torch.no_grad():
+        for x, y, is_surface, mask in tqdm(val_loader, desc="Ensemble [val]", leave=False):
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            is_surface = is_surface.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
+
+            x = (x - stats["x_mean"]) / stats["x_std"]
+            y_norm = (y - stats["y_mean"]) / stats["y_std"]
+
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                pred = model({"x": x})["preds"]
+                diff = pred - y_norm
+                sq_err = diff ** 2
+                abs_err = diff.abs()
+
+            vol_mask = mask & ~is_surface
+            surf_mask = mask & is_surface
+            val_vol_ens += (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
+            val_surf_ens += (abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+            n_val_ens += 1
+
+            pred_orig = pred * stats["y_std"] + stats["y_mean"]
+            err = (pred_orig - y).abs()
+            mae_surf_ens += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
+            mae_vol_ens += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
+            n_surf_ens += surf_mask.sum().item()
+            n_vol_ens += vol_mask.sum().item()
+
+    val_vol_ens /= n_val_ens
+    val_surf_ens /= n_val_ens
+    val_loss_ens = val_vol_ens + cfg.surf_weight * val_surf_ens
+    mae_surf_ens /= max(n_surf_ens, 1)
+    mae_vol_ens /= max(n_vol_ens, 1)
+
+    ens_metrics = {
+        "mae_vol_Ux": mae_vol_ens[0].item(),
+        "mae_vol_Uy": mae_vol_ens[1].item(),
+        "mae_vol_p": mae_vol_ens[2].item(),
+        "mae_surf_Ux": mae_surf_ens[0].item(),
+        "mae_surf_Uy": mae_surf_ens[1].item(),
+        "mae_surf_p": mae_surf_ens[2].item(),
+        "val_loss": val_loss_ens,
+    }
+    wandb.summary.update({"ensemble_" + k: v for k, v in ens_metrics.items()})
+    print(f"Ensemble val_loss: {val_loss_ens:.4f}")
+    print(f"  Volume  MAE:  Ux={mae_vol_ens[0]:.2f}  Uy={mae_vol_ens[1]:.2f}  p={mae_vol_ens[2]:.1f}")
+    print(f"  Surface MAE:  Ux={mae_surf_ens[0]:.2f}  Uy={mae_surf_ens[1]:.2f}  p={mae_surf_ens[2]:.1f}")
+
+    # Use ensemble as the final model for visualization
+    best_metrics = {
+        "mae_vol_Ux": mae_vol_ens[0].item(),
+        "mae_vol_Uy": mae_vol_ens[1].item(),
+        "mae_vol_p": mae_vol_ens[2].item(),
+        "mae_surf_Ux": mae_surf_ens[0].item(),
+        "mae_surf_Uy": mae_surf_ens[1].item(),
+        "mae_surf_p": mae_surf_ens[2].item(),
+        "epoch": "ensemble",
+        "val_loss_loss": val_loss_ens,
+    }
+    torch.save(avg_state, model_path)
 
 
 # --- Final summary ---
