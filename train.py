@@ -24,9 +24,9 @@ MAX_TIMEOUT = 5.0 # minutes
 MAX_EPOCHS = 50
 @dataclass
 class Config:
-    lr: float = 0.015
+    lr: float = 0.020
     weight_decay: float = 1e-4
-    batch_size: int = 4
+    batch_size: int = 8
     surf_weight: float = 8.0
     dataset: str = "raceCar_single_randomFields"
     wandb_group: str | None = None  # group related runs (e.g. iterations on the same idea)
