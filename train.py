@@ -102,6 +102,20 @@ model_path = model_dir / f"checkpoint.pt"
 with open(model_dir / "config.yaml", "w") as f:
     yaml.dump(model_config, f)
 
+class EMA:
+    def __init__(self, model, decay=0.998):
+        self.decay = decay
+        self.shadow = {k: v.clone() for k, v in model.state_dict().items()}
+    def update(self, model):
+        for k, v in model.state_dict().items():
+            self.shadow[k].mul_(self.decay).add_(v, alpha=1-self.decay)
+    def apply(self, model):
+        self.backup = {k: v.clone() for k, v in model.state_dict().items()}
+        model.load_state_dict(self.shadow)
+    def restore(self, model):
+        model.load_state_dict(self.backup)
+ema = EMA(model, decay=0.998)
+
 best_val = float("inf")
 best_metrics = {}
 train_start = time.time()
@@ -147,6 +161,7 @@ for epoch in range(MAX_EPOCHS):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        ema.update(model)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -157,7 +172,8 @@ for epoch in range(MAX_EPOCHS):
     epoch_vol /= n_batches
     epoch_surf /= n_batches
 
-    # --- Validate ---
+    # --- Validate (with EMA weights) ---
+    ema.apply(model)
     model.eval()
     val_vol = 0.0
     val_surf = 0.0
@@ -247,6 +263,7 @@ for epoch in range(MAX_EPOCHS):
         f"mae_vol=[Ux:{mae_vol[0]:.2f} Uy:{mae_vol[1]:.2f} p:{mae_vol[2]:.1f}]  "
         f"mae_surf=[Ux:{mae_surf[0]:.2f} Uy:{mae_surf[1]:.2f} p:{mae_surf[2]:.1f}]{tag}"
     )
+    ema.restore(model)
 
 
 # --- Final summary ---
