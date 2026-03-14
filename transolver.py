@@ -64,6 +64,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.dropout = nn.Dropout(dropout)
         tau_init = torch.tensor([[[[0.3]], [[0.8]]]])  # head 0: sharp, head 1: soft
         self.temperature = nn.Parameter(tau_init)
+        self.head_gate = nn.Parameter(torch.ones(1, heads, 1, 1))
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
@@ -111,6 +112,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         )  # B H G D
 
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
+        out_x = out_x * self.head_gate
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
         return self.to_out(out_x)
 
