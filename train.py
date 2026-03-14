@@ -21,13 +21,14 @@ from utils import visualize, dataset_stats
 
 
 MAX_TIMEOUT = 5.0 # minutes
-MAX_EPOCHS = 50
+MAX_EPOCHS = 100
 @dataclass
 class Config:
     lr: float = 5e-4
     weight_decay: float = 1e-4
     batch_size: int = 4
     surf_weight: float = 10.0
+    channel_weights: str = "1.0,1.0,3.0"  # Ux, Uy, p weights
     dataset: str = "raceCar_single_randomFields"
     wandb_group: str | None = None  # group related runs (e.g. iterations on the same idea)
     wandb_name: str | None = None  # name for this specific run
@@ -41,6 +42,9 @@ if cfg.debug:
     MAX_EPOCHS = 3
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+channel_w = torch.tensor([float(w) for w in cfg.channel_weights.split(",")], device=device)
+channel_w = channel_w / channel_w.sum() * 3.0  # normalize so mean weight = 1.0
 print(f"Device: {device}" + (" [DEBUG MODE]" if cfg.debug else ""))
 
 # Eager cache — all 899 samples preprocessed into RAM (~13GB)
@@ -65,7 +69,7 @@ model_config = dict(
     fun_dim=16,
     out_dim=3,
     n_hidden=128,
-    n_layers=5,
+    n_layers=1,
     n_head=4,
     slice_num=64,
     mlp_ratio=2,
@@ -128,7 +132,7 @@ for epoch in range(MAX_EPOCHS):
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
         pred = model({"x": x})["preds"]
-        sq_err = (pred - y_norm) ** 2
+        sq_err = (pred - y_norm) ** 2 * channel_w[None, None, :]  # (B, N, 3) * (1, 1, 3)
 
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
@@ -170,7 +174,7 @@ for epoch in range(MAX_EPOCHS):
             y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
             pred = model({"x": x})["preds"]
-            sq_err = (pred - y_norm) ** 2
+            sq_err = (pred - y_norm) ** 2 * channel_w[None, None, :]  # (B, N, 3) * (1, 1, 3)
 
             vol_mask = mask & ~is_surface
             surf_mask = mask & is_surface
