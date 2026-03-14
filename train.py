@@ -21,13 +21,13 @@ from utils import visualize, dataset_stats
 
 
 MAX_TIMEOUT = 5.0 # minutes
-MAX_EPOCHS = 50
+MAX_EPOCHS = 100
 @dataclass
 class Config:
-    lr: float = 5e-4
+    lr: float = 0.006
     weight_decay: float = 1e-4
     batch_size: int = 4
-    surf_weight: float = 10.0
+    surf_weight: float = 25.0
     dataset: str = "raceCar_single_randomFields"
     wandb_group: str | None = None  # group related runs (e.g. iterations on the same idea)
     wandb_name: str | None = None  # name for this specific run
@@ -65,7 +65,7 @@ model_config = dict(
     fun_dim=16,
     out_dim=3,
     n_hidden=128,
-    n_layers=5,
+    n_layers=1,
     n_head=4,
     slice_num=64,
     mlp_ratio=2,
@@ -79,8 +79,40 @@ model = Transolver(
 ).to(device)
 
 n_params = sum(p.numel() for p in model.parameters())
-optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
+
+
+class Lookahead:
+    def __init__(self, optimizer, k=5, alpha=0.5):
+        self.optimizer = optimizer
+        self.k = k
+        self.alpha = alpha
+        self.step_count = 0
+        self.slow_params = [
+            [p.clone().detach() for p in group['params']]
+            for group in optimizer.param_groups
+        ]
+
+    def step(self):
+        self.optimizer.step()
+        self.step_count += 1
+        if self.step_count % self.k == 0:
+            for group_idx, group in enumerate(self.optimizer.param_groups):
+                for p_idx, p in enumerate(group['params']):
+                    slow = self.slow_params[group_idx][p_idx]
+                    slow.add_(self.alpha * (p.data - slow))
+                    p.data.copy_(slow)
+
+    def zero_grad(self):
+        self.optimizer.zero_grad()
+
+    @property
+    def param_groups(self):
+        return self.optimizer.param_groups
+
+
+base_optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+optimizer = Lookahead(base_optimizer, k=5, alpha=0.5)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=MAX_EPOCHS)
 
 
 # --- wandb ---
