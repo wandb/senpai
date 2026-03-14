@@ -9,6 +9,7 @@ import time
 import torch
 import wandb
 import yaml
+from torch.amp import autocast, GradScaler
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from tqdm import tqdm
@@ -21,7 +22,7 @@ from utils import visualize, dataset_stats
 
 
 MAX_TIMEOUT = 5.0 # minutes
-MAX_EPOCHS = 50
+MAX_EPOCHS = 100
 @dataclass
 class Config:
     lr: float = 0.015
@@ -81,6 +82,7 @@ model = Transolver(
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
+scaler = GradScaler()
 
 
 # --- wandb ---
@@ -127,20 +129,24 @@ for epoch in range(MAX_EPOCHS):
         x = (x - stats["x_mean"]) / stats["x_std"]
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
-        pred = model({"x": x})["preds"]
-        sq_err = (pred - y_norm) ** 2
+        with autocast(device_type='cuda', dtype=torch.float16):
+            pred = model({"x": x})["preds"]
+            sq_err = (pred - y_norm) ** 2
 
-        vol_mask = mask & ~is_surface
-        surf_mask = mask & is_surface
-        vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-        surf_loss = (sq_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
-        loss = vol_loss + cfg.surf_weight * surf_loss
+            vol_mask = mask & ~is_surface
+            surf_mask = mask & is_surface
+            vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
+            surf_loss = (sq_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            loss = vol_loss + cfg.surf_weight * surf_loss
+
         wandb.log({"train/loss": loss.item()})
 
         optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -170,8 +176,9 @@ for epoch in range(MAX_EPOCHS):
             x = (x - stats["x_mean"]) / stats["x_std"]
             y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
-            pred = model({"x": x})["preds"]
-            sq_err = (pred - y_norm) ** 2
+            with autocast(device_type='cuda', dtype=torch.float16):
+                pred = model({"x": x})["preds"]
+                sq_err = (pred - y_norm) ** 2
 
             vol_mask = mask & ~is_surface
             surf_mask = mask & is_surface
