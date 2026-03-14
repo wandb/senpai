@@ -27,7 +27,7 @@ class Config:
     lr: float = 0.006
     weight_decay: float = 0.0
     batch_size: int = 4
-    surf_weight: float = 10.0
+    surf_weight: float = 12.0
     dataset: str = "raceCar_single_randomFields"
     wandb_group: str | None = None  # group related runs (e.g. iterations on the same idea)
     wandb_name: str | None = None  # name for this specific run
