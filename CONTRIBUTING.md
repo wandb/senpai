@@ -1,8 +1,12 @@
 # Contributing to wandb senpai
 
-## Contributions 
+## Contributions
 
-Contributions to the main autoresearch loop are welcome! We would ask that you share wandb links or other evidence in your PR that the changes have improved the loop if possible :) 
+Contributions to the main autoresearch loop are welcome! We would ask that you share wandb links or other evidence in your PR that the changes have improved the loop if possible :)
+
+## CLA
+
+Before your contribution can be merged, you must sign our [Contributor License Agreement](cla.md) by commenting `I have read the CLA Document and I hereby sign the CLA` on your pull request.
 
 ## License headers
 <!--- REUSE-IgnoreStart -->
