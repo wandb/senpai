@@ -26,7 +26,7 @@ MAX_EPOCHS = 70
 @dataclass
 class Config:
     lr: float = 0.008
-    weight_decay: float = 1e-5
+    weight_decay: float = 0.0
     batch_size: int = 4
     surf_weight: float = 15.0
     dataset: str = "raceCar_single_randomFields"
@@ -140,9 +140,6 @@ for epoch in range(MAX_EPOCHS):
 
         x = (x - stats["x_mean"]) / stats["x_std"]
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
-
-        # Target noise regularization (only during training)
-        y_norm = y_norm + 0.01 * torch.randn_like(y_norm)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pred = model({"x": x})["preds"]
