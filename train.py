@@ -129,6 +129,8 @@ for epoch in range(MAX_EPOCHS):
 
         pred = model({"x": x})["preds"]
         sq_err = (pred - y_norm) ** 2
+        channel_w = torch.tensor([1.0, 1.0, 3.0], device=device)  # [Ux, Uy, p]
+        sq_err = sq_err * channel_w[None, None, :]
 
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
@@ -171,6 +173,8 @@ for epoch in range(MAX_EPOCHS):
 
             pred = model({"x": x})["preds"]
             sq_err = (pred - y_norm) ** 2
+            channel_w = torch.tensor([1.0, 1.0, 3.0], device=device)  # [Ux, Uy, p]
+            sq_err = sq_err * channel_w[None, None, :]
 
             vol_mask = mask & ~is_surface
             surf_mask = mask & is_surface
