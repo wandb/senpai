@@ -1,6 +1,8 @@
 # Contributing to wandb senpai
 
-(wandb team to populate)
+## Contributions 
+
+Contributions to the main autoresearch loop are welcome! We would ask that you share wandb links or other evidence in your PR that the changes have improved the loop if possible :) 
 
 ## License headers
 <!--- REUSE-IgnoreStart -->
