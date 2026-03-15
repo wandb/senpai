@@ -27,7 +27,7 @@ MAX_EPOCHS = 70
 class Config:
     lr: float = 0.008
     weight_decay: float = 1e-5
-    batch_size: int = 4
+    batch_size: int = 2
     surf_weight: float = 15.0
     dataset: str = "raceCar_single_randomFields"
     wandb_group: str | None = None  # group related runs (e.g. iterations on the same idea)
