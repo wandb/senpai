@@ -63,9 +63,9 @@ spec:
               name: senpai-secrets
               key: github-token
         - name: WANDB_ENTITY
-          value: "capecape"
+          value: "wandb-applied-ai-team"
         - name: WANDB_PROJECT
-          value: "senpai"
+          value: "senpai-v1"
         resources:
           requests:
             cpu: "4"

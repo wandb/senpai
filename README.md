@@ -141,11 +141,11 @@ Create these labels on the repo: `senpai`, `status:wip`, `status:review`, and on
 ```bash
 # Launch advisor + 3 students
 python k8s/launch.py --tag mar13 --names "frieren,fern,tanjiro" \
-  --wandb_entity capecape --repo_branch main
+  --wandb_entity wandb-applied-ai-team --repo_branch main
 
 # Students only (no advisor)
 python k8s/launch.py --tag mar13 --n_students 4 --students_only \
-  --wandb_entity capecape
+  --wandb_entity wandb-applied-ai-team
 
 # Dry run to preview manifests
 python k8s/launch.py --tag mar13 --names "frieren" --dry_run

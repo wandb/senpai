@@ -65,7 +65,7 @@ spec:
         - name: WANDB_ENTITY
           value: "{{WANDB_ENTITY}}"
         - name: WANDB_PROJECT
-          value: "senpai"
+          value: "senpai-v1"
         resources:
           requests:
             cpu: "120"

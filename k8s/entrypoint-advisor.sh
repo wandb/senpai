@@ -56,7 +56,7 @@ Read advisor.md for your full workflow, and program.md for the research context 
 
 Your students are: $STUDENT_NAMES
 Research tag: $RESEARCH_TAG
-W&B project: capecape/senpai
+W&B project: wandb-applied-ai-team/senpai
 
 You can also monitor student pods: kubectl get deployments -l app=senpai
 
