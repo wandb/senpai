@@ -15,7 +15,7 @@ from pathlib import Path
 from tqdm import tqdm
 from torch.utils.data import DataLoader, random_split, Subset
 import simple_parsing as sp
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR, CosineAnnealingWarmRestarts
 
 from prepare import FullFieldDataset, pad_collate, DATA_ROOT
 from transolver import Transolver
@@ -102,9 +102,12 @@ model = Transolver(
 
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+restart_scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=12, T_mult=1, eta_min=1e-4)
 warmup = LinearLR(optimizer, start_factor=1e-5/0.008, total_iters=5)
-cosine = CosineAnnealingLR(optimizer, T_max=65, eta_min=1e-4)
-scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[5])
+scheduler = SequentialLR(optimizer, schedulers=[warmup, restart_scheduler], milestones=[5])
+
+snapshots = []
+SNAPSHOT_CYCLE = 12
 
 
 # --- wandb ---
@@ -215,6 +218,10 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
+    effective_epoch = epoch - 5  # account for warmup
+    if effective_epoch > 0 and effective_epoch % SNAPSHOT_CYCLE == 0:
+        snapshots.append({k: v.cpu().clone() for k, v in model.state_dict().items()})
+        print(f"  Snapshot saved ({len(snapshots)} total)")
     epoch_vol /= n_batches
     epoch_surf /= n_batches
 
@@ -335,6 +342,61 @@ else:
 if best_metrics:
     wandb.summary.update({"best_" + k: v for k, v in best_metrics.items()})
 
+# --- Ensemble validation ---
+if snapshots:
+    print(f"\nRunning ensemble validation with {len(snapshots)} snapshots...")
+    ensemble_mae_surf = torch.zeros(3, device=device)
+    ensemble_mae_vol = torch.zeros(3, device=device)
+    ensemble_n_surf = 0
+    ensemble_n_vol = 0
+
+    with torch.no_grad():
+        for x, y, is_surface, mask in val_loader:
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            is_surface = is_surface.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
+
+            log_re_val = x[:, 0, 13]
+            umag_val = torch.exp(log_re_val) * 1.461e-5
+            q_val = 0.5 * 1.225 * umag_val ** 2
+            phys_scale_val = torch.stack([umag_val, umag_val, q_val], dim=-1)
+
+            x = (x - stats["x_mean"]) / stats["x_std"]
+
+            # Average predictions across all snapshots
+            preds_sum = torch.zeros(x.shape[0], x.shape[1], 3, device=device)
+            for snap in snapshots:
+                model.load_state_dict({k: v.to(device) for k, v in snap.items()})
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    pred = model({"x": x})["preds"]
+                preds_sum += pred.float()
+            pred_avg = preds_sum / len(snapshots)
+
+            pred_scaled = pred_avg * phys_y_stats["y_std"] + phys_y_stats["y_mean"]
+            pred_orig = pred_scaled * phys_scale_val[:, None, :]
+            err = (pred_orig - y).abs()
+            vol_mask = mask & ~is_surface
+            surf_mask = mask & is_surface
+            ensemble_mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
+            ensemble_mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
+            ensemble_n_surf += surf_mask.sum().item()
+            ensemble_n_vol += vol_mask.sum().item()
+
+    ensemble_mae_surf /= max(ensemble_n_surf, 1)
+    ensemble_mae_vol /= max(ensemble_n_vol, 1)
+    print(f"  Ensemble Surface MAE:  Ux={ensemble_mae_surf[0]:.2f}  Uy={ensemble_mae_surf[1]:.2f}  p={ensemble_mae_surf[2]:.1f}")
+    print(f"  Ensemble Volume  MAE:  Ux={ensemble_mae_vol[0]:.2f}  Uy={ensemble_mae_vol[1]:.2f}  p={ensemble_mae_vol[2]:.1f}")
+    wandb.summary.update({
+        "ensemble_mae_surf_Ux": ensemble_mae_surf[0].item(),
+        "ensemble_mae_surf_Uy": ensemble_mae_surf[1].item(),
+        "ensemble_mae_surf_p": ensemble_mae_surf[2].item(),
+        "ensemble_mae_vol_Ux": ensemble_mae_vol[0].item(),
+        "ensemble_mae_vol_Uy": ensemble_mae_vol[1].item(),
+        "ensemble_mae_vol_p": ensemble_mae_vol[2].item(),
+        "n_snapshots": len(snapshots),
+    })
+
+if best_metrics:
     # Generate visualizations with best model
     print("\nGenerating flow field plots...")
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
