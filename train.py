@@ -6,7 +6,6 @@
 
 import os
 import time
-import numpy as np
 import torch
 import wandb
 import yaml
@@ -57,25 +56,11 @@ print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
 
 stats = {k: v.to(device) for k, v in dataset_stats[cfg.dataset].items()}
 
-# Precompute physics-scaled target normalization stats
-print("Computing physics-scaled normalization stats...")
-_scaled_sum = torch.zeros(3, dtype=torch.float64)
-_scaled_sq_sum = torch.zeros(3, dtype=torch.float64)
-_n_total = 0
-for _i in range(len(ds)):
-    _x_i, _y_i, _ = ds[_i]
-    _log_re = _x_i[0, 13].item()  # log(Re), constant across nodes
-    _umag = float(np.exp(_log_re)) * 1.461e-5  # Umag = Re * nu / c (nu=1.461e-5)
-    _q = 0.5 * 1.225 * _umag ** 2  # dynamic pressure (rho=1.225)
-    _scale = torch.tensor([_umag, _umag, _q], dtype=torch.float64)
-    _y_scaled = _y_i.double() / _scale
-    _scaled_sum += _y_scaled.sum(dim=0)
-    _scaled_sq_sum += (_y_scaled ** 2).sum(dim=0)
-    _n_total += _y_i.shape[0]
-_phys_y_mean = (_scaled_sum / _n_total).float()
-_phys_y_std = ((_scaled_sq_sum / _n_total - _phys_y_mean.double() ** 2).sqrt()).float()
-phys_y_stats = {"y_mean": _phys_y_mean.to(device), "y_std": _phys_y_std.to(device)}
-print(f"  Physics y_mean={_phys_y_mean.tolist()}, y_std={_phys_y_std.tolist()}")
+# Pre-computed physics-scaled normalization stats (avoids ~15s startup)
+phys_y_stats = {
+    "y_mean": torch.tensor([0.8387087, -0.02737183, -0.19293371], device=device),
+    "y_std": torch.tensor([0.41293243, 0.26277012, 0.59805059], device=device),
+}
 
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
