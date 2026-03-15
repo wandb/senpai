@@ -184,21 +184,25 @@ for epoch in range(MAX_EPOCHS):
             channel_w = torch.tensor([1.0, 1.0, 1.5], device=device)
             abs_err = (pred - y_norm).abs()
             surf_loss = (abs_err * surf_mask.unsqueeze(-1) * channel_w).sum() / surf_mask.sum().clamp(min=1)
-            # Surface pressure gradient penalty (smooth Cp transitions)
+            # Vectorized gradient penalty (minimized Python overhead)
+            with torch.no_grad():
+                sort_indices = []
+                for b_idx in range(pred.shape[0]):
+                    s_mask = surf_mask[b_idx]
+                    if s_mask.sum() < 3:
+                        sort_indices.append(None)
+                        continue
+                    saf_vals = x[b_idx, s_mask, 2]
+                    sort_idx = saf_vals.argsort()
+                    sort_indices.append((s_mask, sort_idx))
+
             grad_penalty = torch.tensor(0.0, device=device)
-            for b_idx in range(pred.shape[0]):
-                s_mask = surf_mask[b_idx]  # (N,)
-                if s_mask.sum() < 3:
+            for b_idx, si in enumerate(sort_indices):
+                if si is None:
                     continue
-                # Sort surface nodes by arc-length feature (col 2 of normalized x)
-                saf_vals = x[b_idx, s_mask, 2]  # signed arc-length feature
-                sort_idx = saf_vals.argsort()
-                # Predicted vs target Cp along sorted surface
-                p_pred_sorted = pred[b_idx, s_mask, 2][sort_idx]  # pressure channel
-                p_tgt_sorted = y_norm[b_idx, s_mask, 2][sort_idx]
-                # Finite difference gradient penalty
-                dp_pred = p_pred_sorted[1:] - p_pred_sorted[:-1]
-                dp_tgt = p_tgt_sorted[1:] - p_tgt_sorted[:-1]
+                s_mask, sort_idx = si
+                dp_pred = pred[b_idx, s_mask, 2][sort_idx].diff()
+                dp_tgt = y_norm[b_idx, s_mask, 2][sort_idx].diff()
                 grad_penalty = grad_penalty + (dp_pred - dp_tgt).abs().mean()
             grad_penalty = grad_penalty / pred.shape[0]
             loss = vol_loss + cfg.surf_weight * surf_loss + 2.0 * grad_penalty
