@@ -6,6 +6,7 @@
 
 import os
 import time
+import numpy as np
 import torch
 import wandb
 import yaml
@@ -55,6 +56,26 @@ if cfg.debug:
 print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
 
 stats = {k: v.to(device) for k, v in dataset_stats[cfg.dataset].items()}
+
+# Precompute physics-scaled target normalization stats
+print("Computing physics-scaled normalization stats...")
+_scaled_sum = torch.zeros(3, dtype=torch.float64)
+_scaled_sq_sum = torch.zeros(3, dtype=torch.float64)
+_n_total = 0
+for _i in range(len(ds)):
+    _x_i, _y_i, _ = ds[_i]
+    _log_re = _x_i[0, 13].item()  # log(Re), constant across nodes
+    _umag = float(np.exp(_log_re)) * 1.461e-5  # Umag = Re * nu / c (nu=1.461e-5)
+    _q = 0.5 * 1.225 * _umag ** 2  # dynamic pressure (rho=1.225)
+    _scale = torch.tensor([_umag, _umag, _q], dtype=torch.float64)
+    _y_scaled = _y_i.double() / _scale
+    _scaled_sum += _y_scaled.sum(dim=0)
+    _scaled_sq_sum += (_y_scaled ** 2).sum(dim=0)
+    _n_total += _y_i.shape[0]
+_phys_y_mean = (_scaled_sum / _n_total).float()
+_phys_y_std = ((_scaled_sq_sum / _n_total - _phys_y_mean.double() ** 2).sqrt()).float()
+phys_y_stats = {"y_mean": _phys_y_mean.to(device), "y_std": _phys_y_std.to(device)}
+print(f"  Physics y_mean={_phys_y_mean.tolist()}, y_std={_phys_y_std.tolist()}")
 
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
@@ -138,8 +159,17 @@ for epoch in range(MAX_EPOCHS):
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
 
+        # Extract per-sample Umag from log_Re (feature 13) BEFORE x normalization
+        log_re = x[:, 0, 13]  # (B,) -- constant across nodes
+        umag = torch.exp(log_re) * 1.461e-5
+        q = 0.5 * 1.225 * umag ** 2
+        phys_scale = torch.stack([umag, umag, q], dim=-1)  # (B, 3)
+
         x = (x - stats["x_mean"]) / stats["x_std"]
-        y_norm = (y - stats["y_mean"]) / stats["y_std"]
+
+        # Physics-based target normalization
+        y_scaled = y / phys_scale[:, None, :]
+        y_norm = (y_scaled - phys_y_stats["y_mean"]) / phys_y_stats["y_std"]
 
         # Target noise regularization (only during training)
         y_norm = y_norm + 0.01 * torch.randn_like(y_norm)
@@ -187,8 +217,14 @@ for epoch in range(MAX_EPOCHS):
             is_surface = is_surface.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
 
+            log_re_val = x[:, 0, 13]
+            umag_val = torch.exp(log_re_val) * 1.461e-5
+            q_val = 0.5 * 1.225 * umag_val ** 2
+            phys_scale_val = torch.stack([umag_val, umag_val, q_val], dim=-1)
+
             x = (x - stats["x_mean"]) / stats["x_std"]
-            y_norm = (y - stats["y_mean"]) / stats["y_std"]
+            y_scaled = y / phys_scale_val[:, None, :]
+            y_norm = (y_scaled - phys_y_stats["y_mean"]) / phys_y_stats["y_std"]
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 pred = model({"x": x})["preds"]
@@ -201,7 +237,9 @@ for epoch in range(MAX_EPOCHS):
             val_surf += (sq_err * surf_mask.unsqueeze(-1) * channel_w).sum().item() / surf_mask.sum().clamp(min=1).item()
             n_val += 1
 
-            pred_orig = pred.float() * stats["y_std"] + stats["y_mean"]
+            # Reverse physics scaling for original-scale MAE
+            pred_scaled = pred.float() * phys_y_stats["y_std"] + phys_y_stats["y_mean"]
+            pred_orig = pred_scaled * phys_scale_val[:, None, :]
             err = (pred_orig - y).abs()
             mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
             mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
