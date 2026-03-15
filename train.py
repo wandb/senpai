@@ -184,24 +184,7 @@ for epoch in range(MAX_EPOCHS):
             channel_w = torch.tensor([1.0, 1.0, 1.5], device=device)
             abs_err = (pred - y_norm).abs()
             surf_loss = (abs_err * surf_mask.unsqueeze(-1) * channel_w).sum() / surf_mask.sum().clamp(min=1)
-            # Surface pressure gradient penalty (smooth Cp transitions)
-            grad_penalty = torch.tensor(0.0, device=device)
-            for b_idx in range(pred.shape[0]):
-                s_mask = surf_mask[b_idx]  # (N,)
-                if s_mask.sum() < 3:
-                    continue
-                # Sort surface nodes by arc-length feature (col 2 of normalized x)
-                saf_vals = x[b_idx, s_mask, 2]  # signed arc-length feature
-                sort_idx = saf_vals.argsort()
-                # Predicted vs target Cp along sorted surface
-                p_pred_sorted = pred[b_idx, s_mask, 2][sort_idx]  # pressure channel
-                p_tgt_sorted = y_norm[b_idx, s_mask, 2][sort_idx]
-                # Finite difference gradient penalty
-                dp_pred = p_pred_sorted[1:] - p_pred_sorted[:-1]
-                dp_tgt = p_tgt_sorted[1:] - p_tgt_sorted[:-1]
-                grad_penalty = grad_penalty + (dp_pred - dp_tgt).abs().mean()
-            grad_penalty = grad_penalty / pred.shape[0]
-            loss = vol_loss + cfg.surf_weight * surf_loss + 2.0 * grad_penalty
+            loss = vol_loss + cfg.surf_weight * surf_loss
         wandb.log({"train/loss": loss.item()})
 
         optimizer.zero_grad()
