@@ -19,6 +19,9 @@ dependencies = [
     "matplotlib",
 ]
 
+[tool.setuptools.packages.find]
+exclude = ["k8s*", "instructions*"]
+
 [project.optional-dependencies]
 dev = [
     "ipython",
