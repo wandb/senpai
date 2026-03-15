@@ -237,8 +237,9 @@ for epoch in range(MAX_EPOCHS):
         peak_mem_gb = 0.0
 
     tag = ""
-    if val_loss < best_val:
-        best_val = val_loss
+    current_surf_p = mae_surf[2].item()  # pressure channel MAE
+    if current_surf_p < best_val:
+        best_val = current_surf_p
         best_metrics = {
             "mae_vol_Ux": mae_vol[0].item(),
             "mae_vol_Uy": mae_vol[1].item(),
