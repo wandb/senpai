@@ -146,12 +146,14 @@ class TransolverBlock(nn.Module):
                 nn.GELU(),
                 nn.Linear(hidden_dim // 2, out_dim),
             )
+            self.out_skip = nn.Linear(hidden_dim, out_dim)
 
     def forward(self, fx):
         fx = self.attn(self.ln_1(fx)) + fx
         fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            h = self.ln_3(fx)
+            return self.mlp2(h) + self.out_skip(h)
         return fx
 
 
