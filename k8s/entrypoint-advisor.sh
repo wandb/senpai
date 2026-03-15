@@ -57,13 +57,12 @@ apt-get update && apt-get install -y gh gettext-base
 # gh uses GITHUB_TOKEN env var automatically, no explicit login needed
 echo "=== gh auth ready (using GITHUB_TOKEN env var) ==="
 
-# --- Set role-specific CLAUDE.md, overides dev CLAUDE.md ---
-cp instructions/ADVISOR-CLAUDE.md CLAUDE.md
+# --- Stash role files outside the git tree so checkouts can't clobber them ---
+cp "$WORKDIR/instructions/ADVISOR-CLAUDE.md" /tmp/advisor-claude.md
+PROMPT="$(envsubst '$STUDENT_NAMES $RESEARCH_TAG $ADVISOR_BRANCH' < "$WORKDIR/instructions/prompt-advisor.md")"
 
 # --- Launch Claude Code in Ralph Loop ---
 export IS_SANDBOX=1
-
-PROMPT="$(envsubst '$STUDENT_NAMES $RESEARCH_TAG $ADVISOR_BRANCH' < "$WORKDIR/instructions/prompt-advisor.md")"
 
 LOGDIR="/workspace/senpai/advisor_logs"
 mkdir -p "$LOGDIR"
@@ -74,6 +73,9 @@ while true; do
     LOGFILE="$LOGDIR/iteration_${ITERATION}_$(date +%Y%m%d_%H%M%S).jsonl"
     echo "=== Advisor Loop iteration $ITERATION ($(date)) ==="
     echo "=== Log: $LOGFILE ==="
+
+    # Restore CLAUDE.md each iteration — advisor git checkouts during PR review can clobber it
+    cp /tmp/advisor-claude.md "$WORKDIR/CLAUDE.md"
 
     if [ "$ITERATION" -eq 1 ]; then
         claude -p "$PROMPT" --model "claude-opus-4-6[1m]" --output-format stream-json --verbose --dangerously-skip-permissions > "$LOGFILE" 2>&1 || true
