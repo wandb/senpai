@@ -151,7 +151,7 @@ for epoch in range(MAX_EPOCHS):
             channel_w = torch.tensor([1.0, 1.0, 1.5], device=device)
             abs_err = (pred - y_norm).abs()
             surf_loss = (abs_err * surf_mask.unsqueeze(-1) * channel_w).sum() / surf_mask.sum().clamp(min=1)
-            loss = vol_loss + cfg.surf_weight * surf_loss
+            loss = 0.5 * vol_loss + cfg.surf_weight * surf_loss
         wandb.log({"train/loss": loss.item()})
 
         optimizer.zero_grad()
