@@ -33,8 +33,8 @@ class Args:
     repo_url: str = "https://github.com/wandb/senpai.git"  # git repo URL
     repo_branch: str = "main"  # git branch to clone
     image: str = "ghcr.io/tcapelle/dev_box:latest"  # container image for students
-    wandb_entity: str = "capecape"  # W&B entity (team or username)
-    wandb_project: str = "senpai"  # W&B project name
+    wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
+    wandb_project: str = "senpai-v1"  # W&B project name
     advisor_branch: str = "jurgen"  # branch the advisor works on (PRs target this, not main)
     advisor: bool = False  # also deploy the advisor pod
     students_only: bool = False  # only deploy students, skip advisor

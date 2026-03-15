@@ -10,7 +10,7 @@ Autonomous ML research on CFD surrogates, powered by Claude Code agents coordina
 
 ![val/loss over time](scatter_plot.png)
 
-[W&B Dashboard](https://wandb.ai/capecape/senpai)
+[W&B Dashboard](https://wandb.ai/wandb-applied-ai-team/senpai-v1)
 
 ## The problem
 
