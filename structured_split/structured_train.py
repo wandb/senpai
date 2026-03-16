@@ -340,8 +340,10 @@ for epoch in range(MAX_EPOCHS):
         abs_err = (pred - y_norm).abs()
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
+        channel_w = torch.tensor([1.0, 1.0, 2.0], device=device)
+        weighted_abs_err = abs_err * channel_w.unsqueeze(0).unsqueeze(0)
         vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-        surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        surf_loss = (weighted_abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + surf_weight * surf_loss
 
         optimizer.zero_grad()
@@ -392,6 +394,8 @@ for epoch in range(MAX_EPOCHS):
                 pred = pred.float()
                 sq_err = (pred - y_norm) ** 2
                 abs_err = (pred - y_norm).abs()
+                channel_w = torch.tensor([1.0, 1.0, 2.0], device=device)
+                weighted_abs_err = abs_err * channel_w.unsqueeze(0).unsqueeze(0)
 
                 vol_mask = mask & ~is_surface
                 surf_mask = mask & is_surface
@@ -399,7 +403,7 @@ for epoch in range(MAX_EPOCHS):
                     (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item(),
                     1e12
                 )
-                val_surf += (abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+                val_surf += (weighted_abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
                 n_vbatches += 1
 
                 # Denormalize: phys_stats → Cp space → original scale
