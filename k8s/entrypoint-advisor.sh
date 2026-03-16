@@ -17,6 +17,10 @@ echo "Students: $STUDENT_NAMES"
 # Repo already cloned by the deployment args block
 cd "$WORKDIR"
 
+# --- Stash role files BEFORE advisor branch checkout (jurgen may not have them) ---
+cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" /tmp/CLAUDE-ADVISOR.md
+cp "$WORKDIR/instructions/prompt-advisor.md" /tmp/prompt-advisor.md
+
 uv pip install --system -e .
 
 # --- Git identity ---
@@ -32,10 +36,6 @@ else
     git checkout -b "$ADVISOR_BRANCH"
     git push -u origin "$ADVISOR_BRANCH"
 fi
-
-# --- Stash role files from the advisor branch (after checkout so we get the right version) ---
-cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" /tmp/CLAUDE-ADVISOR.md
-cp "$WORKDIR/instructions/prompt-advisor.md" /tmp/prompt-advisor.md
 
 # --- Install Claude Code ---
 curl -fsSL https://claude.ai/install.sh | bash
