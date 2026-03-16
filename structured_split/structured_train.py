@@ -314,6 +314,11 @@ for epoch in range(MAX_EPOCHS):
     progress = epoch / MAX_EPOCHS
     surf_weight = sw_start + (sw_end - sw_start) * progress
 
+    # Attention temperature annealing: exponential decay 2.0 → 0.1 over training
+    temp_start, temp_end = 2.0, 0.1
+    current_temp = temp_start * (temp_end / temp_start) ** progress
+    model.set_temperature(current_temp)
+
     # --- Train ---
     model.train()
     epoch_vol = 0.0
@@ -349,7 +354,7 @@ for epoch in range(MAX_EPOCHS):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "train/attn_temp": current_temp, "global_step": global_step})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()

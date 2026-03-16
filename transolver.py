@@ -76,6 +76,10 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout),
         )
 
+    def set_temperature(self, temp_value):
+        """Override the learned temperature with a fixed value."""
+        self.temperature.data.fill_(temp_value)
+
     def forward(self, x):
         # x: (B, N, C)
         bsz, num_points, _ = x.shape
@@ -216,6 +220,10 @@ class Transolver(nn.Module):
         )
         self.initialize_weights()
         self.placeholder = nn.Parameter((1 / n_hidden) * torch.rand(n_hidden, dtype=torch.float))
+
+    def set_temperature(self, temp_value):
+        for block in self.blocks:
+            block.attn.set_temperature(temp_value)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
