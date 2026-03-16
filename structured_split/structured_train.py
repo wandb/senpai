@@ -182,7 +182,7 @@ model_config = dict(
     fun_dim=X_DIM - 2,  # X_DIM=24; fun_dim + space_dim must equal x.shape[-1]
     out_dim=3,
     n_hidden=128,
-    n_layers=2,
+    n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
     n_head=4,
     slice_num=64,
     mlp_ratio=2,
