@@ -452,7 +452,7 @@ model_config = dict(
 model = Transolver(**model_config).to(device)
 
 sw_predictor = nn.Sequential(
-    nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 1), nn.Softplus()
+    nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 1), nn.Sigmoid()
 ).to(device)
 
 n_params = sum(p.numel() for p in model.parameters())
@@ -599,8 +599,8 @@ for epoch in range(MAX_EPOCHS):
                 global_feats.append(feats)
             global_feats = torch.stack(global_feats)  # [B, 4]
 
-        # Predict per-sample surface weight (range ~[5, 35])
-        sw_per_sample = sw_predictor(global_feats).squeeze(-1) * 20.0 + 5.0  # [B]
+        # Predict per-sample surface weight (range [10, 25])
+        sw_per_sample = sw_predictor(global_feats).squeeze(-1) * 15.0 + 10.0  # [B]
 
         # Compute per-sample surface loss
         surf_loss_per_sample = torch.zeros(x.shape[0], device=device)
@@ -610,7 +610,8 @@ for epoch in range(MAX_EPOCHS):
             if sm.sum() > 0:
                 surf_loss_per_sample[b] = (abs_err[b] * sm.unsqueeze(-1)).sum() / sm.sum()
 
-        loss = vol_loss_total + (sw_per_sample * surf_loss_per_sample).mean()
+        sw_reg = 0.1 * (sw_per_sample - 20.0).pow(2).mean()
+        loss = vol_loss_total + (sw_per_sample * surf_loss_per_sample).mean() + sw_reg
 
         # Multi-scale loss: coarse spatial pooling
         coarse_pool_size = 64
