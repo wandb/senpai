@@ -218,26 +218,39 @@ val_loaders = {
     for name, subset in val_splits.items()
 }
 
-# --- Physics normalization stats (computed over training set) ---
-# Compute mean/std of Cp-normalized targets so the model sees O(1) values.
-print("Computing physics normalization stats...")
-_phys_sum = torch.zeros(3, device=device)
-_phys_sq_sum = torch.zeros(3, device=device)
-_phys_n = 0.0
+# --- Physics normalization stats (computed over training set, split by surface/volume) ---
+# Separate stats ensure each node type sees well-centered O(1) values.
+print("Computing physics normalization stats (split surface/volume)...")
+_surf_sum = torch.zeros(3, device=device)
+_surf_sq = torch.zeros(3, device=device)
+_surf_n = 0.0
+_vol_sum = torch.zeros(3, device=device)
+_vol_sq = torch.zeros(3, device=device)
+_vol_n = 0.0
 _stats_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
 with torch.no_grad():
     for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc="Phys stats", leave=False):
-        _y, _mask = _y.to(device), _mask.to(device)
+        _y, _mask, _is_surf = _y.to(device), _mask.to(device), _is_surf.to(device)
         _Um, _q = _umag_q(_y, _mask)
         _yp = _phys_norm(_y, _Um, _q)
-        _m = _mask.float().unsqueeze(-1)  # [B, N, 1]
-        _phys_sum += (_yp * _m).sum(dim=(0, 1))
-        _phys_sq_sum += (_yp ** 2 * _m).sum(dim=(0, 1))
-        _phys_n += _mask.float().sum().item()
-_pmean = (_phys_sum / _phys_n).float()
-_pstd = ((_phys_sq_sum / _phys_n - _pmean ** 2).clamp(min=0.0).sqrt()).clamp(min=1e-6).float()
-phys_stats = {"y_mean": _pmean, "y_std": _pstd}
-print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
+        _sm = (_mask & _is_surf).float().unsqueeze(-1)
+        _vm = (_mask & ~_is_surf).float().unsqueeze(-1)
+        _surf_sum += (_yp * _sm).sum(dim=(0, 1))
+        _surf_sq += (_yp ** 2 * _sm).sum(dim=(0, 1))
+        _surf_n += _sm.sum().item()
+        _vol_sum += (_yp * _vm).sum(dim=(0, 1))
+        _vol_sq += (_yp ** 2 * _vm).sum(dim=(0, 1))
+        _vol_n += _vm.sum().item()
+surf_phys_stats = {
+    "y_mean": (_surf_sum / _surf_n).float(),
+    "y_std": ((_surf_sq / _surf_n - (_surf_sum / _surf_n) ** 2).clamp(min=0).sqrt()).clamp(min=1e-6).float(),
+}
+vol_phys_stats = {
+    "y_mean": (_vol_sum / _vol_n).float(),
+    "y_std": ((_vol_sq / _vol_n - (_vol_sum / _vol_n) ** 2).clamp(min=0).sqrt()).clamp(min=1e-6).float(),
+}
+print(f"  Surf Cp stats — mean: {surf_phys_stats['y_mean'].tolist()}, std: {surf_phys_stats['y_std'].tolist()}")
+print(f"  Vol  Cp stats — mean: {vol_phys_stats['y_mean'].tolist()}, std: {vol_phys_stats['y_std'].tolist()}")
 
 model_config = dict(
     space_dim=2,
@@ -329,7 +342,10 @@ for epoch in range(MAX_EPOCHS):
         x = (x - stats["x_mean"]) / stats["x_std"]
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
-        y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+        surf_m = is_surface.unsqueeze(-1)
+        vol_m = (~is_surface & mask).unsqueeze(-1)
+        y_norm = (surf_m * (y_phys - surf_phys_stats["y_mean"]) / surf_phys_stats["y_std"]
+                  + vol_m * (y_phys - vol_phys_stats["y_mean"]) / vol_phys_stats["y_std"])
         if model.training:
             y_norm = y_norm + 0.01 * torch.randn_like(y_norm)
 
@@ -385,7 +401,10 @@ for epoch in range(MAX_EPOCHS):
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
-                y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                surf_m = is_surface.unsqueeze(-1)
+                vol_m = (~is_surface & mask).unsqueeze(-1)
+                y_norm = (surf_m * (y_phys - surf_phys_stats["y_mean"]) / surf_phys_stats["y_std"]
+                          + vol_m * (y_phys - vol_phys_stats["y_mean"]) / vol_phys_stats["y_std"])
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = model({"x": x})["preds"]
@@ -402,8 +421,9 @@ for epoch in range(MAX_EPOCHS):
                 val_surf += (abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
                 n_vbatches += 1
 
-                # Denormalize: phys_stats → Cp space → original scale
-                pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                # Denormalize: split phys_stats → Cp space → original scale
+                pred_phys = (surf_m * (pred * surf_phys_stats["y_std"] + surf_phys_stats["y_mean"])
+                             + vol_m * (pred * vol_phys_stats["y_std"] + vol_phys_stats["y_mean"]))
                 pred_orig = _phys_denorm(pred_phys, Umag, q)
                 y_clamped = y.clamp(-1e6, 1e6)
                 err = (pred_orig - y_clamped).abs()
