@@ -453,6 +453,10 @@ model = Transolver(**model_config).to(device)
 
 n_params = sum(p.numel() for p in model.parameters())
 
+ema_decay = 0.999
+ema_model = Transolver(**model_config).to(device)
+ema_model.load_state_dict(model.state_dict())
+
 
 class Lookahead:
     def __init__(self, base_optimizer, k=5, alpha=0.5):
@@ -609,6 +613,9 @@ for epoch in range(MAX_EPOCHS):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        with torch.no_grad():
+            for ema_p, p in zip(ema_model.parameters(), model.parameters()):
+                ema_p.data.mul_(ema_decay).add_(p.data, alpha=1 - ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -623,6 +630,7 @@ for epoch in range(MAX_EPOCHS):
 
     # --- Validate across all splits ---
     model.eval()
+    ema_model.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -649,7 +657,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = model({"x": x})["preds"]
+                    pred = ema_model({"x": x})["preds"]
                 pred = pred.float()
                 sq_err = (pred - y_norm) ** 2
                 abs_err = (pred - y_norm).abs()
@@ -728,7 +736,7 @@ for epoch in range(MAX_EPOCHS):
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
-        torch.save(model.state_dict(), model_path)
+        torch.save(ema_model.state_dict(), model_path)
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
