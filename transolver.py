@@ -140,17 +140,25 @@ class TransolverBlock(nn.Module):
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
-            self.mlp2 = nn.Sequential(
+            # Simple velocity head (Ux, Uy)
+            self.vel_head = nn.Linear(hidden_dim, 2)
+            # Deeper pressure head (p) - more capacity for the harder task
+            self.p_head = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.GELU(),
-                nn.Linear(hidden_dim, out_dim),
+                nn.Linear(hidden_dim, 64),
+                nn.GELU(),
+                nn.Linear(64, 1),
             )
 
     def forward(self, fx):
         fx = self.attn(self.ln_1(fx)) + fx
         fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            h = self.ln_3(fx)
+            vel_out = self.vel_head(h)   # [B, N, 2] for Ux, Uy
+            p_out = self.p_head(h)       # [B, N, 1] for pressure
+            return torch.cat([vel_out, p_out], dim=-1)  # [B, N, 3]
         return fx
 
 
