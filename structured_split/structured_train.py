@@ -247,6 +247,7 @@ for epoch in range(MAX_EPOCHS):
     model.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
+    epoch_grad_penalty = 0.0
     n_batches = 0
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
@@ -266,22 +267,41 @@ for epoch in range(MAX_EPOCHS):
         surf_mask = mask & is_surface
         vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
         surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
-        loss = vol_loss + cfg.surf_weight * surf_loss
+
+        # Surface Cp gradient penalty
+        grad_penalty = torch.tensor(0.0, device=device)
+        for b in range(pred.shape[0]):
+            surf_idx = torch.where(surf_mask[b])[0]
+            if len(surf_idx) < 3:
+                continue
+            x_coords = x[b, surf_idx, :2]
+            centroid = x_coords.mean(dim=0)
+            angles = torch.atan2(x_coords[:, 1] - centroid[1], x_coords[:, 0] - centroid[0])
+            sort_idx = angles.argsort()
+            sorted_surf = surf_idx[sort_idx]
+            dp_pred = pred[b, sorted_surf[1:], 2] - pred[b, sorted_surf[:-1], 2]
+            dp_true = y_norm[b, sorted_surf[1:], 2] - y_norm[b, sorted_surf[:-1], 2]
+            grad_penalty = grad_penalty + (dp_pred - dp_true).abs().mean()
+        grad_penalty = grad_penalty / pred.shape[0]
+
+        loss = vol_loss + cfg.surf_weight * surf_loss + 2.0 * grad_penalty
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "global_step": global_step})
+        wandb.log({"train/loss": loss.item(), "train/grad_penalty": grad_penalty.item(), "global_step": global_step})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
+        epoch_grad_penalty += grad_penalty.item()
         n_batches += 1
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
     epoch_vol /= n_batches
     epoch_surf /= n_batches
+    epoch_grad_penalty /= n_batches
 
     # --- Validate across all splits ---
     model.eval()
@@ -360,6 +380,7 @@ for epoch in range(MAX_EPOCHS):
     metrics = {
         "train/vol_loss": epoch_vol,
         "train/surf_loss": epoch_surf,
+        "train/grad_penalty": epoch_grad_penalty,
         "val/loss": mean_val_loss,
         "lr": scheduler.get_last_lr()[0],
         "epoch_time_s": dt,
