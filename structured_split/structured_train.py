@@ -255,7 +255,8 @@ model_config = dict(
 model = Transolver(**model_config).to(device)
 
 n_params = sum(p.numel() for p in model.parameters())
-optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,
+                               betas=(0.9, 0.95))
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=3)
 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS - 3)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
