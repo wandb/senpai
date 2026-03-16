@@ -538,14 +538,19 @@ for epoch in range(MAX_EPOCHS):
 
     t0 = time.time()
 
-    # Cyclic surface weight: oscillate with increasing baseline and decreasing amplitude
+    # Cyclic surface weight: oscillate with increasing baseline and decreasing amplitude.
+    # Cycles start after epoch 10 to let the model stabilize first.
     sw_low, sw_high = 5.0, 30.0
-    cycle_length = 30  # epochs per cycle
-    cycle_pos = (epoch % cycle_length) / cycle_length  # 0 to 1 within cycle
+    cycle_start_epoch = 10
+    cycle_length = 40  # epochs per cycle
     baseline = sw_low + (sw_high - sw_low) * (epoch / MAX_EPOCHS)  # slowly rising floor
-    amplitude = (sw_high - sw_low) * 0.3 * (1 - epoch / MAX_EPOCHS)  # shrinking oscillation
-    surf_weight = baseline + amplitude * math.sin(2 * math.pi * cycle_pos)
-    surf_weight = max(sw_low, min(sw_high, surf_weight))
+    if epoch < cycle_start_epoch:
+        surf_weight = baseline
+    else:
+        cycle_pos = ((epoch - cycle_start_epoch) % cycle_length) / cycle_length  # 0→1 within cycle
+        amplitude = (sw_high - sw_low) * 0.15 * (1 - epoch / MAX_EPOCHS)  # shrinking oscillation
+        surf_weight = baseline + amplitude * math.sin(2 * math.pi * cycle_pos)
+        surf_weight = max(sw_low, min(sw_high, surf_weight))
 
     # --- Train ---
     model.train()
