@@ -85,7 +85,7 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOC
 
 # --- wandb ---
 run = wandb.init(
-    project=os.environ.get("WANDB_PROJECT", "senpai"),
+    project=os.environ.get("WANDB_PROJECT", "senpai-v1"),
     group=cfg.wandb_group,
     name=cfg.wandb_name,
     tags=[cfg.agent] if cfg.agent else [],
