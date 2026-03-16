@@ -253,8 +253,10 @@ for epoch in range(MAX_EPOCHS):
     epoch_surf = 0.0
     n_batches = 0
 
+    ACCUM_STEPS = 2
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
-    for x, y, is_surface, mask in pbar:
+    optimizer.zero_grad()
+    for i, (x, y, is_surface, mask) in enumerate(pbar):
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -273,14 +275,16 @@ for epoch in range(MAX_EPOCHS):
         surf_mask = mask & is_surface
         vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
         surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
-        loss = vol_loss + cfg.surf_weight * surf_loss
-
-        optimizer.zero_grad()
+        loss = (vol_loss + cfg.surf_weight * surf_loss) / ACCUM_STEPS
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        global_step += 1
-        wandb.log({"train/loss": loss.item(), "global_step": global_step})
+
+        is_last_batch = (i + 1) == len(train_loader)
+        if (i + 1) % ACCUM_STEPS == 0 or is_last_batch:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            global_step += 1
+            wandb.log({"train/loss": loss.item() * ACCUM_STEPS, "global_step": global_step})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
