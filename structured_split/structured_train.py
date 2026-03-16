@@ -254,6 +254,11 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 
+ema_decay = 0.999
+ema_model = Transolver(**model_config).to(device)
+ema_model.load_state_dict(model.state_dict())
+ema_model.eval()
+
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=3)
@@ -286,6 +291,8 @@ wandb.define_metric("train/*", step_metric="global_step")
 wandb.define_metric("val/*", step_metric="global_step")
 for _sname in VAL_SPLIT_NAMES:
     wandb.define_metric(f"{_sname}/*", step_metric="global_step")
+    wandb.define_metric(f"ema_{_sname}/*", step_metric="global_step")
+wandb.define_metric("ema_val/*", step_metric="global_step")
 wandb.define_metric("lr", step_metric="global_step")
 wandb.define_metric("epoch_time_s", step_metric="global_step")
 wandb.define_metric("val_predictions", step_metric="global_step")
@@ -300,6 +307,79 @@ best_val = float("inf")
 best_metrics = {}
 global_step = 0
 train_start = time.time()
+
+
+def _run_validation(mdl, prefix=""):
+    """Run validation loop for mdl. Returns (metrics_per_split, mean_val_loss)."""
+    mdl.eval()
+    metrics_per_split = {}
+    for split_name, vloader in val_loaders.items():
+        val_vol = 0.0
+        val_surf = 0.0
+        mae_surf = torch.zeros(3, device=device)
+        mae_vol = torch.zeros(3, device=device)
+        n_surf = torch.zeros(3, device=device)
+        n_vol = torch.zeros(3, device=device)
+        n_vbatches = 0
+        with torch.no_grad():
+            for x, y, is_surface, mask in tqdm(
+                vloader, desc=f"[{prefix}{split_name}]", leave=False
+            ):
+                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                is_surface = is_surface.to(device, non_blocking=True)
+                mask = mask.to(device, non_blocking=True)
+                x = (x - stats["x_mean"]) / stats["x_std"]
+                Umag, q = _umag_q(y, mask)
+                y_phys = _phys_norm(y, Umag, q)
+                y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    pred = mdl({"x": x})["preds"]
+                pred = pred.float()
+                sq_err = (pred - y_norm) ** 2
+                abs_err = (pred - y_norm).abs()
+                vol_mask = mask & ~is_surface
+                surf_mask = mask & is_surface
+                val_vol += min(
+                    (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item(),
+                    1e12
+                )
+                val_surf += (abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+                n_vbatches += 1
+                pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                pred_orig = _phys_denorm(pred_phys, Umag, q)
+                y_clamped = y.clamp(-1e6, 1e6)
+                err = (pred_orig - y_clamped).abs()
+                finite = err.isfinite()
+                err = err.where(finite, torch.zeros_like(err))
+                mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                n_surf += (surf_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+                n_vol += (vol_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+        val_vol /= max(n_vbatches, 1)
+        val_surf /= max(n_vbatches, 1)
+        split_loss = val_vol + cfg.surf_weight * val_surf
+        mae_surf /= n_surf.clamp(min=1)
+        mae_vol /= n_vol.clamp(min=1)
+        key = f"{prefix}{split_name}"
+        metrics_per_split[key] = {
+            f"{key}/vol_loss":    val_vol,
+            f"{key}/surf_loss":   val_surf,
+            f"{key}/loss":        split_loss,
+            f"{key}/mae_vol_Ux":  mae_vol[0].item(),
+            f"{key}/mae_vol_Uy":  mae_vol[1].item(),
+            f"{key}/mae_vol_p":   mae_vol[2].item(),
+            f"{key}/mae_surf_Ux": mae_surf[0].item(),
+            f"{key}/mae_surf_Uy": mae_surf[1].item(),
+            f"{key}/mae_surf_p":  mae_surf[2].item(),
+        }
+    finite_losses = [
+        metrics_per_split[f"{prefix}{name}"][f"{prefix}{name}/loss"]
+        for name in VAL_SPLIT_NAMES
+        if not (torch.tensor(metrics_per_split[f"{prefix}{name}"][f"{prefix}{name}/loss"]).isnan() or
+                torch.tensor(metrics_per_split[f"{prefix}{name}"][f"{prefix}{name}/loss"]).isinf())
+    ]
+    mean_loss = sum(finite_losses) / max(len(finite_losses), 1)
+    return metrics_per_split, mean_loss
 
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
@@ -343,6 +423,9 @@ for epoch in range(MAX_EPOCHS):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        with torch.no_grad():
+            for ema_p, m_p in zip(ema_model.parameters(), model.parameters()):
+                ema_p.data.mul_(ema_decay).add_(m_p.data, alpha=1 - ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "global_step": global_step})
 
@@ -355,85 +438,11 @@ for epoch in range(MAX_EPOCHS):
     epoch_vol /= n_batches
     epoch_surf /= n_batches
 
-    # --- Validate across all splits ---
-    model.eval()
-    val_metrics_per_split: dict[str, dict] = {}
-    val_loss_sum = 0.0
+    # --- Validate: regular model ---
+    val_metrics_per_split, mean_val_loss = _run_validation(model)
 
-    for split_name, vloader in val_loaders.items():
-        val_vol = 0.0
-        val_surf = 0.0
-        mae_surf = torch.zeros(3, device=device)
-        mae_vol = torch.zeros(3, device=device)
-        n_surf = torch.zeros(3, device=device)
-        n_vol = torch.zeros(3, device=device)
-        n_vbatches = 0
-
-        with torch.no_grad():
-            for x, y, is_surface, mask in tqdm(
-                vloader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [{split_name}]", leave=False
-            ):
-                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-                is_surface = is_surface.to(device, non_blocking=True)
-                mask = mask.to(device, non_blocking=True)
-
-                x = (x - stats["x_mean"]) / stats["x_std"]
-                Umag, q = _umag_q(y, mask)
-                y_phys = _phys_norm(y, Umag, q)
-                y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
-
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = model({"x": x})["preds"]
-                pred = pred.float()
-                sq_err = (pred - y_norm) ** 2
-                abs_err = (pred - y_norm).abs()
-
-                vol_mask = mask & ~is_surface
-                surf_mask = mask & is_surface
-                val_vol += min(
-                    (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item(),
-                    1e12
-                )
-                val_surf += (abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
-                n_vbatches += 1
-
-                # Denormalize: phys_stats → Cp space → original scale
-                pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
-                pred_orig = _phys_denorm(pred_phys, Umag, q)
-                y_clamped = y.clamp(-1e6, 1e6)
-                err = (pred_orig - y_clamped).abs()
-                finite = err.isfinite()
-                err = err.where(finite, torch.zeros_like(err))
-                mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
-                mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
-                n_surf += (surf_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
-                n_vol += (vol_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
-
-        val_vol /= max(n_vbatches, 1)
-        val_surf /= max(n_vbatches, 1)
-        split_loss = val_vol + cfg.surf_weight * val_surf
-        mae_surf /= n_surf.clamp(min=1)
-        mae_vol /= n_vol.clamp(min=1)
-
-        val_metrics_per_split[split_name] = {
-            f"{split_name}/vol_loss":    val_vol,
-            f"{split_name}/surf_loss":   val_surf,
-            f"{split_name}/loss":        split_loss,
-            f"{split_name}/mae_vol_Ux":  mae_vol[0].item(),
-            f"{split_name}/mae_vol_Uy":  mae_vol[1].item(),
-            f"{split_name}/mae_vol_p":   mae_vol[2].item(),
-            f"{split_name}/mae_surf_Ux": mae_surf[0].item(),
-            f"{split_name}/mae_surf_Uy": mae_surf[1].item(),
-            f"{split_name}/mae_surf_p":  mae_surf[2].item(),
-        }
-        val_loss_sum += split_loss
-
-    # val/loss = mean across finite splits; NaN-robust for checkpoint selection
-    finite_losses = [val_metrics_per_split[name][f"{name}/loss"]
-                     for name in VAL_SPLIT_NAMES
-                     if not (torch.tensor(val_metrics_per_split[name][f"{name}/loss"]).isnan() or
-                             torch.tensor(val_metrics_per_split[name][f"{name}/loss"]).isinf())]
-    mean_val_loss = sum(finite_losses) / max(len(finite_losses), 1)
+    # --- Validate: EMA model ---
+    ema_val_metrics_per_split, ema_mean_val_loss = _run_validation(ema_model, prefix="ema_")
 
     dt = time.time() - t0
 
@@ -442,10 +451,13 @@ for epoch in range(MAX_EPOCHS):
         "train/vol_loss": epoch_vol,
         "train/surf_loss": epoch_surf,
         "val/loss": mean_val_loss,
+        "ema_val/loss": ema_mean_val_loss,
         "lr": scheduler.get_last_lr()[0],
         "epoch_time_s": dt,
     }
     for split_metrics in val_metrics_per_split.values():
+        metrics.update(split_metrics)
+    for split_metrics in ema_val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
     wandb.log(metrics)
@@ -455,24 +467,33 @@ for epoch in range(MAX_EPOCHS):
     else:
         peak_mem_gb = 0.0
 
+    # Checkpoint: save the better of model vs ema_model
+    best_loss = min(mean_val_loss, ema_mean_val_loss)
     tag = ""
-    if mean_val_loss < best_val:
-        best_val = mean_val_loss
-        best_metrics = {"epoch": epoch + 1, "val_loss": mean_val_loss}
-        for split_metrics in val_metrics_per_split.values():
+    if best_loss < best_val:
+        best_val = best_loss
+        use_ema = ema_mean_val_loss <= mean_val_loss
+        save_metrics = ema_val_metrics_per_split if use_ema else val_metrics_per_split
+        best_metrics = {"epoch": epoch + 1, "val_loss": best_loss, "use_ema": use_ema}
+        for split_metrics in save_metrics.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
-        torch.save(model.state_dict(), model_path)
-        tag = f" * -> {model_path}"
+        state = ema_model.state_dict() if use_ema else model.state_dict()
+        torch.save(state, model_path)
+        tag = f" * (ema={use_ema}) -> {model_path}"
 
     split_summary = "  ".join(
         f"{name}={val_metrics_per_split[name][f'{name}/loss']:.4f}"
         for name in VAL_SPLIT_NAMES
     )
+    ema_summary = "  ".join(
+        f"{name}={ema_val_metrics_per_split[f'ema_{name}'][f'ema_{name}/loss']:.4f}"
+        for name in VAL_SPLIT_NAMES
+    )
     print(
         f"Epoch {epoch+1:3d} ({dt:.0f}s) [{peak_mem_gb:.1f}GB]  "
         f"train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  "
-        f"val[{split_summary}]{tag}"
+        f"val[{split_summary}]  ema[{ema_summary}]{tag}"
     )
 
 
@@ -482,10 +503,12 @@ print("\n" + "=" * 70)
 print(f"TRAINING COMPLETE ({total_time:.1f} min)")
 print("=" * 70)
 if best_metrics:
-    print(f"Best model at epoch {best_metrics['epoch']}  (val/loss={best_metrics['val_loss']:.4f})")
+    use_ema = best_metrics.get("use_ema", False)
+    pfx = "ema_" if use_ema else ""
+    print(f"Best model at epoch {best_metrics['epoch']}  (val/loss={best_metrics['val_loss']:.4f}, use_ema={use_ema})")
     for split_name in VAL_SPLIT_NAMES:
-        k_p = f"best_{split_name}/mae_surf_p"
-        k_l = f"best_{split_name}/loss"
+        k_p = f"best_{pfx}{split_name}/mae_surf_p"
+        k_l = f"best_{pfx}{split_name}/loss"
         if k_p in best_metrics:
             print(f"  {split_name:30s}  loss={best_metrics[k_l]:.4f}  mae_surf_p={best_metrics[k_p]:.1f}")
 else:
