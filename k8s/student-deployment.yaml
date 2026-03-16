@@ -68,6 +68,8 @@ spec:
           value: "{{WANDB_ENTITY}}"
         - name: WANDB_PROJECT
           value: "{{WANDB_PROJECT}}"
+        - name: WANDB_MODE
+          value: "online"
         resources:
           requests:
             cpu: "120"
