@@ -46,7 +46,7 @@ sys.path.insert(0, str(Path(__file__).parent))  # structured_split dir
 from prepare_multi import MultiFieldDataset, X_DIM
 
 
-MAX_TIMEOUT = 10.0  # minutes
+MAX_TIMEOUT = 30.0  # minutes
 MAX_EPOCHS = 50
 
 

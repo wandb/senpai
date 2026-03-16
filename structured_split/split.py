@@ -34,6 +34,9 @@ sys.path.insert(0, str(Path(__file__).parent))  # structured_split dir
 from prepare_multi import MultiFieldDataset
 
 SEED = 42
+# Retain this fraction of each source (evenly spaced to preserve condition coverage).
+# 0.70 → 30% reduction while keeping balanced representation across all data sources.
+SAMPLE_FRACTION = 0.70
 OUT_DIR = Path(__file__).parent
 OUT_MANIFEST = OUT_DIR / "split_manifest.json"
 OUT_STATS = OUT_DIR / "split_stats.json"
@@ -52,7 +55,7 @@ PICKLE_FILES = [
 ]
 
 # Expected total across all 7 files
-EXPECTED_TOTAL = 2699
+FILE_SIZES_TOTAL = 2699  # total samples across all 7 pickle files
 
 
 def extract_metadata(pickle_files):
@@ -108,8 +111,30 @@ def extract_metadata(pickle_files):
     return records
 
 
+def _subsample(idxs: list, fraction: float, rng=None) -> list:
+    """Return an evenly-spaced subset preserving condition-space coverage.
+
+    Uses fixed stride (not random) so the subset spans the full index range.
+    For the racecar_single case, pass rng to shuffle before subsampling so
+    the val holdout is random rather than always the first 10%.
+    """
+    n = max(1, round(len(idxs) * fraction))
+    if n >= len(idxs):
+        return idxs
+    if rng is not None:
+        arr = np.array(idxs)
+        rng.shuffle(arr)
+        return arr[:n].tolist()
+    step = len(idxs) / n
+    return [idxs[round(i * step)] for i in range(n)]
+
+
 def assign_splits(records):
     """Assign every sample to exactly one split.
+
+    Applies SAMPLE_FRACTION evenly to each data source so the 30% reduction
+    is balanced: racecar_single, racecar_tandem (train+val), cruise (train+val)
+    are all reduced proportionally.
 
     Returns:
         splits       — {split_name: [global_idx, ...]}
@@ -126,40 +151,43 @@ def assign_splits(records):
     for rec in records:
         by_file.setdefault(rec["file_idx"], []).append(rec)
 
-    # --- Rule 1: raceCar_single (file_idx=0) → 90% train, 10% val_in_dist ---
-    single_idxs = np.array([r["global_idx"] for r in by_file[0]])
-    rng.shuffle(single_idxs)
-    n_val = max(1, round(len(single_idxs) * 0.10))
-    splits["val_in_dist"].extend(single_idxs[:n_val].tolist())
-    train_single = single_idxs[n_val:].tolist()
+    # --- Rule 1: raceCar_single (file_idx=0) → subsample, then 90/10 train/val ---
+    # Shuffle first so val holdout is a random draw, not always the last N samples.
+    single_all = [r["global_idx"] for r in by_file[0]]
+    single_keep = _subsample(single_all, SAMPLE_FRACTION, rng=rng)
+    n_val = max(1, round(len(single_keep) * 0.10))
+    splits["val_in_dist"].extend(single_keep[:n_val])
+    train_single = single_keep[n_val:]
     splits["train"].extend(train_single)
     domain_groups["racecar_single"].extend(train_single)
 
-    # --- Rule 2: raceCar tandem Part1+3 (file_idx=1,3) → 100% train ---
-    tandem_train = (
-        [r["global_idx"] for r in by_file[1]] +
-        [r["global_idx"] for r in by_file[3]]
-    )
-    splits["train"].extend(tandem_train)
-    domain_groups["racecar_tandem"].extend(tandem_train)
+    # --- Rule 2: raceCar tandem Part1+3 (file_idx=1,3) → subsample → train ---
+    # Evenly spaced so both low and high stagger/gap values are retained.
+    for fi in (1, 3):
+        idxs = [r["global_idx"] for r in by_file[fi]]
+        kept = _subsample(idxs, SAMPLE_FRACTION)
+        splits["train"].extend(kept)
+        domain_groups["racecar_tandem"].extend(kept)
 
-    # --- Rule 3: raceCar tandem Part2 (file_idx=2) → 100% val_tandem_transfer ---
-    # Front foil is NACA 6416; it does NOT appear as a tandem front foil in training.
-    splits["val_tandem_transfer"].extend([r["global_idx"] for r in by_file[2]])
+    # --- Rule 3: raceCar tandem Part2 (file_idx=2) → subsample → val_tandem_transfer ---
+    idxs_p2 = [r["global_idx"] for r in by_file[2]]
+    splits["val_tandem_transfer"].extend(_subsample(idxs_p2, SAMPLE_FRACTION))
 
-    # --- Rule 4: cruise Part1+3 (file_idx=4,6) → frontier/interior split ---
-    # Frontier = top 20% by L2 distance from centroid in normalized [AoA, gap, stagger].
-    cruise_p1p3 = by_file[4] + by_file[6]
+    # --- Rule 4: cruise Part1+3 (file_idx=4,6) → subsample first, then frontier split ---
+    # Subsample before the frontier computation so the frontier 20% is drawn from
+    # the kept subset (preserving the OOD character of the frontier samples).
+    cruise_p1p3_all = by_file[4] + by_file[6]
+    cruise_keep_idxs = _subsample(list(range(len(cruise_p1p3_all))), SAMPLE_FRACTION)
+    cruise_p1p3 = [cruise_p1p3_all[i] for i in cruise_keep_idxs]
+
     feats = np.array(
         [[r["aoa0"], r["gap"], r["stagger"]] for r in cruise_p1p3],
         dtype=np.float64,
     )
-
     feat_min = feats.min(axis=0)
     feat_max = feats.max(axis=0)
     feat_range = np.where(feat_max - feat_min > 0, feat_max - feat_min, 1.0)
     feats_norm = (feats - feat_min) / feat_range
-
     centroid = feats_norm.mean(axis=0)
     dists = np.linalg.norm(feats_norm - centroid, axis=1)
 
@@ -175,9 +203,9 @@ def assign_splits(records):
     splits["train"].extend(cruise_train_idxs)
     domain_groups["cruise"].extend(cruise_train_idxs)
 
-    # --- Rule 5: cruise Part2 (file_idx=5) → 100% val_ood_re ---
-    # Re=4.445M — entirely outside training Re range. Clean OOD Re test.
-    splits["val_ood_re"].extend([r["global_idx"] for r in by_file[5]])
+    # --- Rule 5: cruise Part2 (file_idx=5) → subsample → val_ood_re ---
+    idxs_p5 = [r["global_idx"] for r in by_file[5]]
+    splits["val_ood_re"].extend(_subsample(idxs_p5, SAMPLE_FRACTION))
 
     # --- Limitation 3 check: NACA overlap for val_tandem_transfer validity ---
     # val_tandem_transfer is meaningful as a "transfer" test only if the tandem
@@ -354,9 +382,9 @@ def main():
     # Validate no leakage and correct total
     all_idx = [i for v in splits.values() for i in v]
     assert len(all_idx) == len(set(all_idx)), "BUG: duplicate indices across splits!"
-    assert len(all_idx) == EXPECTED_TOTAL, (
-        f"Expected {EXPECTED_TOTAL} samples, got {len(all_idx)}"
-    )
+    expected_approx = round(FILE_SIZES_TOTAL * SAMPLE_FRACTION)
+    print(f"\n  Total assigned: {len(all_idx)} samples "
+          f"(target ≈{expected_approx}, fraction={SAMPLE_FRACTION:.0%})")
 
     manifest = {
         "version": 1,
