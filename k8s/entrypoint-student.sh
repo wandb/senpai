@@ -50,6 +50,9 @@ export IS_SANDBOX=1
 
 PROMPT="$(envsubst '$STUDENT_NAME' < "$WORKDIR/instructions/prompt-student.md")"
 
+# --- Start Weave thread logger in background ---
+python3 "$WORKDIR/tools/weave_logger.py" --role student --agent-name "$STUDENT_NAME" --workdir "$WORKDIR" &
+
 ITERATION=0
 while true; do
     ITERATION=$((ITERATION + 1))

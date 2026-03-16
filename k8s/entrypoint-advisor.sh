@@ -67,6 +67,9 @@ export IS_SANDBOX=1
 LOGDIR="/workspace/senpai/advisor_logs"
 mkdir -p "$LOGDIR"
 
+# --- Start Weave thread logger in background ---
+python3 "$WORKDIR/tools/weave_logger.py" --role advisor --agent-name advisor --workdir "$WORKDIR" &
+
 ITERATION=0
 while true; do
     ITERATION=$((ITERATION + 1))
