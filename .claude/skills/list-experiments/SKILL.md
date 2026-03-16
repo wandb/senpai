@@ -5,7 +5,7 @@ description: Use this skill whenever you need to list all of the experiment idea
 
 # Experiment List Sill
 
-Use this code or a close modification of it to download a list of our experiment results. It downloads 2 files:
+Use this code or a close modification of it to download a list of our experiment results from a particular branch. It downloads 2 files:
 
 1. A summary file with the experiment metadata, hypothesis and results
 2. The full experiment details which includes the abvoe as well as the full instructions (code etc) and baseline details given to the agent that executed the experiment
@@ -17,9 +17,10 @@ import subprocess, json, sys, os, re
 from datetime import datetime
 
 FIELDS = "number,title,body,state,labels,url"
+BASE_BRANCH = <branch-fetch-PRs-from>  # only fetch PRs targeting this branch
 
 def fetch(n=None):
-    cmd = ["gh", "pr", "view", n, "--json", FIELDS] if n else ["gh", "pr", "list", "--json", FIELDS, "--limit", "10000"]
+    cmd = ["gh", "pr", "view", n, "--json", FIELDS] if n else ["gh", "pr", "list", "--json", FIELDS, "--limit", "10000", "--base", BASE_BRANCH]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode: sys.exit(r.stderr)
     return json.loads(r.stdout)

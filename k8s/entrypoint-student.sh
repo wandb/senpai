@@ -7,11 +7,6 @@
 set -e
 set -o pipefail
 
-# --- Config from environment ---
-REPO_URL="${SENPAI_REPO_URL:?SENPAI_REPO_URL is required}"
-REPO_BRANCH="${SENPAI_REPO_BRANCH:-main}"
-STUDENT_NAME="${SENPAI_STUDENT_NAME:?SENPAI_STUDENT_NAME is required}"
-
 WORKDIR="/workspace/senpai"
 
 echo "=== Senpai Student: $STUDENT_NAME ==="
@@ -42,8 +37,8 @@ apt-get update && apt-get install -y gh gettext-base
 # gh uses GITHUB_TOKEN env var automatically, no explicit login needed
 echo "=== gh auth ready (using GITHUB_TOKEN env var) ==="
 
-# --- Set role-specific CLAUDE.md, overides dev CLAUDE.md ---
-cp instructions/CLAUDE-STUDENT.md CLAUDE.md
+# --- Stash role files outside git tree so branch checkouts can't clobber them ---
+cp instructions/CLAUDE-STUDENT.md /tmp/CLAUDE-STUDENT.md
 
 # --- Launch Claude Code in Ralph Loop ---
 export IS_SANDBOX=1
@@ -57,6 +52,13 @@ ITERATION=0
 while true; do
     ITERATION=$((ITERATION + 1))
     echo "=== Ralph Loop iteration $ITERATION ($(date)) ==="
+
+    # Clean dirty git state from previous iteration (crashed mid-implementation)
+    git checkout -- . 2>/dev/null || true
+    git clean -fd 2>/dev/null || true
+
+    # Restore CLAUDE.md after git clean — git checkout clobbers it with the dev version
+    cp /tmp/CLAUDE-STUDENT.md "$WORKDIR/CLAUDE.md"
 
     if [ "$ITERATION" -eq 1 ]; then
         claude -p "$PROMPT" --dangerously-skip-permissions || true

@@ -35,17 +35,17 @@ spec:
         - |
           set -e
           git config --global url."https://${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
-          git clone --branch "$SENPAI_REPO_BRANCH" "$SENPAI_REPO_URL" /workspace/senpai
+          git clone --branch "$REPO_BRANCH" "$REPO_URL" /workspace/senpai
           cd /workspace/senpai
           bash k8s/entrypoint-advisor.sh
         env:
-        - name: SENPAI_REPO_URL
+        - name: REPO_URL
           value: "{{REPO_URL}}"
-        - name: SENPAI_REPO_BRANCH
+        - name: REPO_BRANCH
           value: "{{REPO_BRANCH}}"
-        - name: SENPAI_RESEARCH_TAG
+        - name: RESEARCH_TAG
           value: "{{RESEARCH_TAG}}"
-        - name: SENPAI_STUDENT_NAMES
+        - name: STUDENT_NAMES
           value: "{{STUDENT_NAMES}}"
         - name: WANDB_API_KEY
           valueFrom:
@@ -66,7 +66,7 @@ spec:
           value: "{{WANDB_ENTITY}}"
         - name: WANDB_PROJECT
           value: "{{WANDB_PROJECT}}"
-        - name: SENPAI_ADVISOR_BRANCH
+        - name: ADVISOR_BRANCH
           value: "{{ADVISOR_BRANCH}}"
         resources:
           requests:

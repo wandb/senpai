@@ -7,12 +7,6 @@
 set -e
 set -o pipefail
 
-REPO_URL="${SENPAI_REPO_URL:?SENPAI_REPO_URL is required}"
-REPO_BRANCH="${SENPAI_REPO_BRANCH:-main}"
-RESEARCH_TAG="${SENPAI_RESEARCH_TAG:?SENPAI_RESEARCH_TAG is required}"
-STUDENT_NAMES="${SENPAI_STUDENT_NAMES:?SENPAI_STUDENT_NAMES is required}"
-ADVISOR_BRANCH="${SENPAI_ADVISOR_BRANCH:-advisor}"
-
 WORKDIR="/workspace/senpai"
 
 echo "=== Senpai Advisor ==="
@@ -25,6 +19,11 @@ if [ ! -d "$WORKDIR/.git" ]; then
     git clone --branch "$REPO_BRANCH" "$REPO_URL" "$WORKDIR"
 fi
 cd "$WORKDIR"
+
+# --- Stash role files before advisor branch checkout can clobber them ---
+cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" /tmp/CLAUDE-ADVISOR.md
+PROMPT="$(envsubst '$STUDENT_NAMES $RESEARCH_TAG $ADVISOR_BRANCH' < "$WORKDIR/instructions/prompt-advisor.md")"
+
 uv pip install --system -e .
 
 # --- Git identity ---
@@ -56,10 +55,6 @@ echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githu
 apt-get update && apt-get install -y gh gettext-base
 # gh uses GITHUB_TOKEN env var automatically, no explicit login needed
 echo "=== gh auth ready (using GITHUB_TOKEN env var) ==="
-
-# --- Stash role files outside the git tree so checkouts can't clobber them ---
-cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" /tmp/CLAUDE-ADVISOR.md
-PROMPT="$(envsubst '$STUDENT_NAMES $RESEARCH_TAG $ADVISOR_BRANCH' < "$WORKDIR/instructions/prompt-advisor.md")"
 
 # --- Launch Claude Code in Ralph Loop ---
 export IS_SANDBOX=1
