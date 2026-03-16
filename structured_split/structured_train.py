@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import json
+import math
 import os
 import time
 import torch
@@ -72,6 +73,11 @@ if cfg.debug:
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}" + (" [DEBUG MODE]" if cfg.debug else ""))
+
+# Random Fourier Features — fixed (not learned), applied to raw spatial coords
+N_FOURIER = 32
+SIGMA = 10.0  # frequency scale
+B_matrix = (torch.randn(2, N_FOURIER) * SIGMA).to(device)
 
 # --- Load split manifest and normalization stats ---
 with open(cfg.manifest) as f:
@@ -179,7 +185,7 @@ val_loaders = {
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2,  # X_DIM=24; fun_dim + space_dim must equal x.shape[-1]
+    fun_dim=(X_DIM + 2 * N_FOURIER) - 2,  # 24 + 64 Fourier dims - 2 space = 86
     out_dim=3,
     n_hidden=128,
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
@@ -259,7 +265,13 @@ for epoch in range(MAX_EPOCHS):
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
 
-        x = (x - stats["x_mean"]) / stats["x_std"]
+        # Fourier features from raw spatial coords (before normalization)
+        pos = x[:, :, :2]  # [B, N, 2]
+        fourier = torch.cat([
+            torch.sin(2 * math.pi * pos @ B_matrix),
+            torch.cos(2 * math.pi * pos @ B_matrix),
+        ], dim=-1)  # [B, N, 64]
+        x = torch.cat([(x - stats["x_mean"]) / stats["x_std"], fourier], dim=-1)  # [B, N, 88]
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
         if model.training:
             y_norm = y_norm + 0.01 * torch.randn_like(y_norm)
@@ -313,7 +325,13 @@ for epoch in range(MAX_EPOCHS):
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
 
-                x = (x - stats["x_mean"]) / stats["x_std"]
+                # Fourier features from raw spatial coords (before normalization)
+                pos = x[:, :, :2]  # [B, N, 2]
+                fourier = torch.cat([
+                    torch.sin(2 * math.pi * pos @ B_matrix),
+                    torch.cos(2 * math.pi * pos @ B_matrix),
+                ], dim=-1)  # [B, N, 64]
+                x = torch.cat([(x - stats["x_mean"]) / stats["x_std"], fourier], dim=-1)  # [B, N, 88]
                 y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
