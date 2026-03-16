@@ -263,7 +263,7 @@ class Transolver(nn.Module):
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            trunc_normal_(module.weight, std=0.02)
+            nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
         elif isinstance(module, (nn.LayerNorm, nn.BatchNorm1d)):
