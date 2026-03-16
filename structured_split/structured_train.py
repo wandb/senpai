@@ -451,6 +451,20 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 
+# Apply spectral normalization to all Linear layers for OOD robustness
+from torch.nn.utils import spectral_norm
+for name, module in model.named_modules():
+    if isinstance(module, nn.Linear):
+        # Get parent module and attribute name
+        parts = name.rsplit('.', 1)
+        if len(parts) == 2:
+            parent = dict(model.named_modules())[parts[0]]
+            attr = parts[1]
+        else:
+            parent = model
+            attr = parts[0]
+        spectral_norm(getattr(parent, attr))
+
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=5)
