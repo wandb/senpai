@@ -338,8 +338,20 @@ for epoch in range(MAX_EPOCHS):
         pred = pred.float()
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
-        vol_mask = mask & ~is_surface
-        surf_mask = mask & is_surface
+        if model.training:
+            vol_subsample_ratio = 0.25
+            train_mask = mask.clone()
+            for b_idx in range(x.shape[0]):
+                vol_nodes = torch.where(train_mask[b_idx] & ~is_surface[b_idx])[0]
+                n_keep = max(int(len(vol_nodes) * vol_subsample_ratio), 1)
+                perm = torch.randperm(len(vol_nodes), device=device)
+                drop_nodes = vol_nodes[perm[n_keep:]]
+                train_mask[b_idx, drop_nodes] = False
+            vol_mask = train_mask & ~is_surface
+            surf_mask = train_mask & is_surface  # unchanged — all surface kept
+        else:
+            vol_mask = mask & ~is_surface
+            surf_mask = mask & is_surface
         vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
         surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + surf_weight * surf_loss
