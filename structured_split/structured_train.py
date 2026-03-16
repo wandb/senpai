@@ -47,6 +47,30 @@ sys.path.insert(0, str(Path(__file__).parent))  # structured_split dir
 from prepare_multi import MultiFieldDataset, X_DIM
 
 
+class DomainWeightedSubset(torch.utils.data.Dataset):
+    """Wraps a dataset to attach a per-sample domain loss weight."""
+    def __init__(self, base_ds, indices, idx_to_group, domain_weights):
+        self.base_ds = base_ds
+        self.indices = indices
+        self.idx_to_group = idx_to_group
+        self.domain_weights = domain_weights
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, i):
+        global_idx = self.indices[i]
+        x, y, is_surface = self.base_ds[global_idx]
+        weight = self.domain_weights[self.idx_to_group[global_idx]]
+        return x, y, is_surface, weight
+
+
+def domain_collate(batch):
+    weights = torch.tensor([item[3] for item in batch], dtype=torch.float32)
+    x, y, is_surface, mask = pad_collate([item[:3] for item in batch])
+    return x, y, is_surface, mask, weights
+
+
 MAX_TIMEOUT = 30.0  # minutes
 MAX_EPOCHS = 50
 
@@ -149,6 +173,16 @@ for name, idxs in manifest["domain_groups"].items():
     for i in idxs:
         idx_to_group[i] = name
 
+domain_loss_weight = {
+    "racecar_single": 1.0,
+    "racecar_tandem": 1.5,
+    "cruise": 1.5,
+}
+
+domain_weighted_train_ds = DomainWeightedSubset(
+    ds, train_ds.indices, idx_to_group, domain_loss_weight
+)
+
 # Use train_ds.indices (not manifest directly) so weights always match the
 # actual train set — robust whether or not debug mode truncated it.
 sample_weights = torch.tensor(
@@ -158,19 +192,20 @@ sample_weights = torch.tensor(
 
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
+train_loader_kwargs = {**loader_kwargs, "collate_fn": domain_collate}
 
 if cfg.debug:
     # Avoid sampler/length mismatch when train_ds is truncated
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
-                              shuffle=True, **loader_kwargs)
+    train_loader = DataLoader(domain_weighted_train_ds, batch_size=cfg.batch_size,
+                              shuffle=True, **train_loader_kwargs)
 else:
     sampler = WeightedRandomSampler(
         weights=sample_weights,
         num_samples=len(train_ds),
         replacement=True,
     )
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
-                              sampler=sampler, **loader_kwargs)
+    train_loader = DataLoader(domain_weighted_train_ds, batch_size=cfg.batch_size,
+                              sampler=sampler, **train_loader_kwargs)
 
 val_loaders = {
     name: DataLoader(subset, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
@@ -250,10 +285,11 @@ for epoch in range(MAX_EPOCHS):
     n_batches = 0
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
-    for x, y, is_surface, mask in pbar:
+    for x, y, is_surface, mask, domain_w in pbar:
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
+        domain_w = domain_w.to(device, non_blocking=True)
 
         x = (x - stats["x_mean"]) / stats["x_std"]
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
@@ -265,7 +301,10 @@ for epoch in range(MAX_EPOCHS):
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
         vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-        surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        # Per-sample domain-weighted surface L1 loss: weight tandem/cruise samples 1.5x
+        surf_nodes = surf_mask.sum(dim=1).float().clamp(min=1)  # [B]
+        surf_abs_err = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2))  # [B]
+        surf_loss = (surf_abs_err / surf_nodes * domain_w).mean()
         loss = vol_loss + cfg.surf_weight * surf_loss
 
         optimizer.zero_grad()
