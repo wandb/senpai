@@ -261,6 +261,8 @@ for epoch in range(MAX_EPOCHS):
 
         x = (x - stats["x_mean"]) / stats["x_std"]
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
+        if model.training:
+            y_norm = y_norm + 0.01 * torch.randn_like(y_norm)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pred = model({"x": x})["preds"]
