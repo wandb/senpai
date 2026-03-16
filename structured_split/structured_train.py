@@ -533,12 +533,16 @@ for epoch in range(MAX_EPOCHS):
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pred = model({"x": x})["preds"]
         pred = pred.float()
-        sq_err = (pred - y_norm) ** 2
-        abs_err = (pred - y_norm).abs()
+        raw_err = (pred - y_norm).abs()
+
+        # Dead-zone L1 for surface: ignore errors below epsilon in normalized space
+        epsilon = 0.05  # ~5% of typical std
+        surf_err = torch.where(raw_err < epsilon, torch.zeros_like(raw_err), raw_err - epsilon / 2)
+
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
-        vol_loss = (abs_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-        surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        vol_loss = (raw_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
+        surf_loss = (surf_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + surf_weight * surf_loss
 
         optimizer.zero_grad()
