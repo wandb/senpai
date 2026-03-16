@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import json
+import math
 import os
 import time
 import torch
@@ -193,7 +194,7 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 swa_model = AveragedModel(model)
-swa_start_epoch = int(MAX_EPOCHS * 0.6)  # Start SWA at 60% of training
+swa_start_min = MAX_TIMEOUT * 0.6  # Start SWA at 60% of wall-clock budget
 
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -296,6 +297,7 @@ for epoch in range(MAX_EPOCHS):
     model.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
+    n_valid_splits = 0
 
     for split_name, vloader in val_loaders.items():
         val_vol = 0.0
@@ -356,14 +358,12 @@ for epoch in range(MAX_EPOCHS):
             f"{split_name}/mae_surf_Uy": mae_surf[1].item(),
             f"{split_name}/mae_surf_p":  mae_surf[2].item(),
         }
-        val_loss_sum += split_loss
+        if math.isfinite(split_loss):
+            val_loss_sum += split_loss
+            n_valid_splits += 1
 
-    # val/loss = mean across finite splits; NaN-robust for checkpoint selection
-    finite_losses = [val_metrics_per_split[name][f"{name}/loss"]
-                     for name in VAL_SPLIT_NAMES
-                     if not (torch.tensor(val_metrics_per_split[name][f"{name}/loss"]).isnan() or
-                             torch.tensor(val_metrics_per_split[name][f"{name}/loss"]).isinf())]
-    mean_val_loss = sum(finite_losses) / max(len(finite_losses), 1)
+    # val/loss = mean across valid (finite) splits; NaN splits skipped for checkpointing
+    mean_val_loss = val_loss_sum / n_valid_splits if n_valid_splits > 0 else float("nan")
 
     dt = time.time() - t0
 
@@ -405,8 +405,8 @@ for epoch in range(MAX_EPOCHS):
         f"val[{split_summary}]{tag}"
     )
 
-    # --- SWA update ---
-    if epoch >= swa_start_epoch:
+    # --- SWA update (time-based: start after 60% of wall-clock budget) ---
+    if (time.time() - train_start) / 60.0 >= swa_start_min:
         swa_model.update_parameters(model)
 
 
@@ -480,7 +480,7 @@ if swa_model.n_averaged > 0:
 
     torch.save(swa_model.module.state_dict(), model_dir / "swa_checkpoint.pt")
 
-    print(f"SWA model (epochs {swa_start_epoch+1}-end):")
+    print(f"SWA model (averaged {swa_model.n_averaged} checkpoints from last 40% of training):")
     for split_name in VAL_SPLIT_NAMES:
         k_p = f"swa/{split_name}/mae_surf_p"
         k_l = f"swa/{split_name}/loss"
