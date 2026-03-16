@@ -451,6 +451,10 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 
+from torch.optim.swa_utils import AveragedModel, update_bn
+swa_model = AveragedModel(model)
+swa_start_epoch = 70
+
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=5)
@@ -677,6 +681,18 @@ for epoch in range(MAX_EPOCHS):
         f"val[{split_summary}]{tag}"
     )
 
+    if epoch >= swa_start_epoch:
+        swa_model.update_parameters(model)
+
+
+# Apply SWA if we collected enough snapshots
+if epoch + 1 > swa_start_epoch:
+    print("Updating SWA batch norm statistics...")
+    update_bn(train_loader, swa_model, device=device)
+    # Swap model for final save and visualization
+    model.load_state_dict(swa_model.module.state_dict())
+    torch.save(model.state_dict(), model_path)
+    print("SWA model saved.")
 
 # --- Final summary ---
 total_time = (time.time() - train_start) / 60.0
