@@ -491,9 +491,11 @@ if best_metrics:
     print(f"Best model at epoch {best_metrics['epoch']}  (val/loss={best_metrics['val_loss']:.4f})")
     for split_name in VAL_SPLIT_NAMES:
         k_p = f"best_{split_name}/mae_surf_p"
+        k_cp = f"best_{split_name}/mae_surf_Cp"
         k_l = f"best_{split_name}/loss"
         if k_p in best_metrics:
-            print(f"  {split_name:30s}  loss={best_metrics[k_l]:.4f}  mae_surf_p={best_metrics[k_p]:.1f}")
+            cp_str = f"  mae_surf_Cp={best_metrics[k_cp]:.4f}" if k_cp in best_metrics else ""
+            print(f"  {split_name:30s}  loss={best_metrics[k_l]:.4f}  mae_surf_p={best_metrics[k_p]:.1f}{cp_str}")
 else:
     print("No completed epochs (timeout too short?).")
 
