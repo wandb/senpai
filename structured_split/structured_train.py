@@ -451,6 +451,10 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 
+sw_predictor = nn.Sequential(
+    nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 1), nn.Softplus()
+).to(device)
+
 n_params = sum(p.numel() for p in model.parameters())
 
 
@@ -482,7 +486,10 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
-base_opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+base_opt = torch.optim.AdamW(
+    list(model.parameters()) + list(sw_predictor.parameters()),
+    lr=cfg.lr, weight_decay=cfg.weight_decay
+)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=5)
 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=MAX_EPOCHS - 5)
@@ -583,9 +590,27 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_mask_train = vol_mask
 
-        vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
-        surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
-        loss = vol_loss + surf_weight * surf_loss
+        # Extract global features from normalized x: use mean of cols 2:6 over valid nodes
+        with torch.no_grad():
+            global_feats = []
+            for b in range(x.shape[0]):
+                valid = mask[b]
+                feats = x[b, valid, 2:6].mean(dim=0)  # [4]
+                global_feats.append(feats)
+            global_feats = torch.stack(global_feats)  # [B, 4]
+
+        # Predict per-sample surface weight (range ~[5, 35])
+        sw_per_sample = sw_predictor(global_feats).squeeze(-1) * 20.0 + 5.0  # [B]
+
+        # Compute per-sample surface loss
+        surf_loss_per_sample = torch.zeros(x.shape[0], device=device)
+        vol_loss_total = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+        for b in range(x.shape[0]):
+            sm = surf_mask[b]
+            if sm.sum() > 0:
+                surf_loss_per_sample[b] = (abs_err[b] * sm.unsqueeze(-1)).sum() / sm.sum()
+
+        loss = vol_loss_total + (sw_per_sample * surf_loss_per_sample).mean()
 
         # Multi-scale loss: coarse spatial pooling
         coarse_pool_size = 64
@@ -610,12 +635,12 @@ for epoch in range(MAX_EPOCHS):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        wandb.log({"train/loss": loss.item(), "train/surf_weight": sw_per_sample.mean().item(), "global_step": global_step})
 
-        epoch_vol += vol_loss.item()
-        epoch_surf += surf_loss.item()
+        epoch_vol += vol_loss_total.item()
+        epoch_surf += surf_loss_per_sample.mean().item()
         n_batches += 1
-        pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
+        pbar.set_postfix(vol=f"{vol_loss_total.item():.3f}", surf=f"{surf_loss_per_sample.mean().item():.3f}")
 
     scheduler.step()
     epoch_vol /= n_batches
