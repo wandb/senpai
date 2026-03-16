@@ -29,6 +29,7 @@ from pathlib import Path
 # Reach repo root so we can import prepare, transolver, utils
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -537,10 +538,14 @@ for epoch in range(MAX_EPOCHS):
 
     t0 = time.time()
 
-    # Dynamic surface weight: linear ramp from 5 → 30 over training
-    sw_start, sw_end = 5.0, 30.0
-    progress = epoch / MAX_EPOCHS
-    surf_weight = sw_start + (sw_end - sw_start) * progress
+    # Cyclic surface weight: oscillate with increasing baseline and decreasing amplitude
+    sw_low, sw_high = 5.0, 30.0
+    cycle_length = 30  # epochs per cycle
+    cycle_pos = (epoch % cycle_length) / cycle_length  # 0 to 1 within cycle
+    baseline = sw_low + (sw_high - sw_low) * (epoch / MAX_EPOCHS)  # slowly rising floor
+    amplitude = (sw_high - sw_low) * 0.3 * (1 - epoch / MAX_EPOCHS)  # shrinking oscillation
+    surf_weight = baseline + amplitude * math.sin(2 * math.pi * cycle_pos)
+    surf_weight = max(sw_low, min(sw_high, surf_weight))
 
     # --- Train ---
     model.train()
