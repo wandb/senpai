@@ -541,6 +541,22 @@ for epoch in range(MAX_EPOCHS):
         surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + surf_weight * surf_loss
 
+        # Auxiliary cosine similarity on velocity channels at surface nodes
+        cos_loss = torch.tensor(0.0, device=pred.device)
+        n_cos = 0
+        for b_idx in range(pred.shape[0]):
+            s = surf_mask[b_idx]
+            if s.sum() < 2:
+                continue
+            pred_vel = pred[b_idx, s, :2]   # [S, 2] — Ux, Uy predictions
+            tgt_vel = y_norm[b_idx, s, :2]  # [S, 2] — Ux, Uy targets
+            # Flatten to 1D vectors and compute cosine similarity
+            cos_sim = F.cosine_similarity(pred_vel.reshape(1, -1), tgt_vel.reshape(1, -1))
+            cos_loss = cos_loss + (1 - cos_sim)
+            n_cos += 1
+        cos_loss = cos_loss / max(n_cos, 1)
+        loss = loss + 3.0 * cos_loss  # lighter weight than previous pressure version (5.0)
+
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
