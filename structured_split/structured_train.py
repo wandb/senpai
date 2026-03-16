@@ -537,8 +537,27 @@ for epoch in range(MAX_EPOCHS):
         abs_err = (pred - y_norm).abs()
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
-        vol_loss = (abs_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-        surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+
+        # Per-sample surface loss for hard example mining
+        B = pred.shape[0]
+        with torch.no_grad():
+            sample_surf = torch.zeros(B, device=pred.device)
+            for b in range(B):
+                sm = surf_mask[b]
+                if sm.sum() > 0:
+                    sample_surf[b] = (abs_err[b] * sm.unsqueeze(-1)).sum() / sm.sum()
+
+        # Keep top 50% hardest samples
+        n_keep = max(B // 2, 1)
+        _, hard_idx = sample_surf.topk(n_keep)
+        hard_batch = torch.zeros(B, dtype=torch.bool, device=pred.device)
+        hard_batch[hard_idx] = True
+
+        # Recompute losses with only hard samples
+        hard_vol_mask = vol_mask & hard_batch.unsqueeze(1)
+        hard_surf_mask = surf_mask & hard_batch.unsqueeze(1)
+        vol_loss = (abs_err * hard_vol_mask.unsqueeze(-1)).sum() / hard_vol_mask.sum().clamp(min=1)
+        surf_loss = (abs_err * hard_surf_mask.unsqueeze(-1)).sum() / hard_surf_mask.sum().clamp(min=1)
         loss = vol_loss + surf_weight * surf_loss
 
         optimizer.zero_grad()
