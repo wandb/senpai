@@ -14,7 +14,7 @@ from pathlib import Path
 import weave
 
 
-POLL_INTERVAL = 10  # seconds
+POLL_INTERVAL = 60  # seconds
 STATE_FILE = Path.home() / ".claude" / "weave_logger_state.json"
 
 
@@ -75,7 +75,10 @@ def process_session_file(session_file: Path, state: dict, agent_name: str, role:
     with open(session_file, encoding="utf-8", errors="replace") as f:
         for raw in f:
             if raw := raw.strip():
-                obj = json.loads(raw)
+                try:
+                    obj = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
                 if obj.get("type") in ("user", "assistant") and "uuid" in obj:
                     all_messages[obj["uuid"]] = obj
         f.seek(file_state["offset"])
@@ -84,7 +87,10 @@ def process_session_file(session_file: Path, state: dict, agent_name: str, role:
     for raw in new_lines:
         if not (raw := raw.strip()):
             continue
-        obj = json.loads(raw)
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
 
         if obj.get("type") != "assistant":
             continue
