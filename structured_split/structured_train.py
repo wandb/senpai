@@ -542,11 +542,11 @@ for epoch in range(MAX_EPOCHS):
         loss = vol_loss + surf_weight * surf_loss
 
         # Multi-scale loss: coarse spatial pooling
-        coarse_pool_size = 64
+        coarse_pool_size = 32
         B, N, C = pred.shape
         n_groups = N // coarse_pool_size
         if n_groups > 1:
-            # Pool predictions and targets over groups of 64 nodes
+            # Pool predictions and targets over groups of 32 nodes
             pred_trunc = pred[:, :n_groups * coarse_pool_size]
             y_trunc = y_norm[:, :n_groups * coarse_pool_size]
             mask_trunc = mask[:, :n_groups * coarse_pool_size]
@@ -557,7 +557,7 @@ for epoch in range(MAX_EPOCHS):
 
             coarse_err = (pred_coarse - y_coarse).abs()
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
-            loss = loss + 2.0 * coarse_loss
+            loss = loss + 1.0 * coarse_loss
 
         optimizer.zero_grad()
         loss.backward()
