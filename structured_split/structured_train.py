@@ -452,11 +452,42 @@ model_config = dict(
 model = Transolver(**model_config).to(device)
 
 n_params = sum(p.numel() for p in model.parameters())
-optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=5)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS - 5)
+
+
+class Lookahead:
+    def __init__(self, base_optimizer, k=5, alpha=0.5):
+        self.base_optimizer = base_optimizer
+        self.k = k
+        self.alpha = alpha
+        self.slow_params = [
+            [p.data.clone() for p in group['params']]
+            for group in base_optimizer.param_groups
+        ]
+        self.step_count = 0
+
+    def step(self):
+        self.base_optimizer.step()
+        self.step_count += 1
+        if self.step_count % self.k == 0:
+            for slow, group in zip(self.slow_params, self.base_optimizer.param_groups):
+                for s, p in zip(slow, group['params']):
+                    s.data.add_(self.alpha * (p.data - s.data))
+                    p.data.copy_(s.data)
+
+    def zero_grad(self):
+        self.base_optimizer.zero_grad()
+
+    @property
+    def param_groups(self):
+        return self.base_optimizer.param_groups
+
+
+base_opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+optimizer = Lookahead(base_opt, k=5, alpha=0.5)
+warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=5)
+cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=MAX_EPOCHS - 5)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
-    optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[5]
+    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[5]
 )
 
 # --- wandb ---
