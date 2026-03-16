@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: devpod
+spec:
+  containers:
+    - name: devpod
+      image: ghcr.io/tcapelle/dev_box:latest
+      volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+        - name: dataset
+          mountPath: /mnt/new-pvc
+  volumes:
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 32Gi
+    - name: dataset
+      persistentVolumeClaim:
+        claimName: new-pvc

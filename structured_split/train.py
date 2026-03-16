@@ -99,10 +99,31 @@ train_ds = Subset(ds, manifest["splits"]["train"])
 VAL_SPLIT_NAMES = ["val_in_dist", "val_tandem_transfer", "val_ood_cond", "val_ood_re"]
 val_splits = {name: Subset(ds, manifest["splits"][name]) for name in VAL_SPLIT_NAMES}
 
-# --- Debug truncation ---
+# --- Debug truncation: sample across all domain groups, not just first N ---
 if cfg.debug:
-    train_ds = Subset(ds, manifest["splits"]["train"][:8])
-    val_splits = {k: Subset(ds, v.indices[:4]) for k, v in val_splits.items()}
+    import random as _rnd
+    _rng = _rnd.Random(42)
+
+    def _stratified_sample(indices: list, n: int) -> list:
+        """Pick n samples spread evenly across the index list."""
+        if len(indices) <= n:
+            return indices
+        step = max(1, len(indices) // n)
+        return indices[::step][:n]
+
+    # 2 samples per domain group → 6 train total (covers all 3 pickle families)
+    _train_all = manifest["splits"]["train"]
+    _dg = manifest["domain_groups"]
+    _debug_train = (
+        _stratified_sample(_dg["racecar_single"], 2) +
+        _stratified_sample(_dg["racecar_tandem"], 2) +
+        _stratified_sample(_dg["cruise"], 2)
+    )
+    train_ds = Subset(ds, _debug_train)
+
+    # 1 sample per val split (ensures all 4 W&B tracks appear)
+    val_splits = {k: Subset(ds, _stratified_sample(manifest["splits"][k], 2))
+                  for k in VAL_SPLIT_NAMES}
 
 print(f"Train: {len(train_ds)}, " +
       ", ".join(f"{k}: {len(v)}" for k, v in val_splits.items()))

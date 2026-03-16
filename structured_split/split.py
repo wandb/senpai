@@ -218,8 +218,9 @@ def compute_stats(pickle_files, train_indices):
     train_sorted = sorted(train_indices, key=lambda i: ds.index[i])
     n = len(train_sorted)
 
+    from prepare_multi import X_DIM
     print(f"  Pass 1/2 (mean) over {n} training samples ...")
-    sum_x = torch.zeros(18)
+    sum_x = torch.zeros(X_DIM)
     sum_y = torch.zeros(3)
     total_nodes = 0
 
@@ -235,7 +236,7 @@ def compute_stats(pickle_files, train_indices):
     mean_y = sum_y / total_nodes
 
     print(f"  Pass 2/2 (std) over {n} training samples ...")
-    sq_x = torch.zeros(18)
+    sq_x = torch.zeros(X_DIM)
     sq_y = torch.zeros(3)
 
     for i, idx in enumerate(train_sorted):
@@ -259,7 +260,91 @@ def compute_stats(pickle_files, train_indices):
     }
 
 
+def make_quick_manifest():
+    """Generate a debug manifest and placeholder stats instantly — no pickle loading.
+
+    Uses known file sizes from DATASET_REPORT to build global index offsets directly.
+    Stats use identity normalization (mean=0, std=1) — fine for debug smoke-tests
+    since we only care about the training loop running, not absolute loss values.
+
+    Run:  python structured_split/split.py --quick
+    """
+    from prepare_multi import X_DIM
+
+    # Known sample counts per file — from DATASET_REPORT.md
+    # Order must match PICKLE_FILES exactly.
+    FILE_SIZES = [899, 300, 300, 300, 300, 300, 300]
+    offsets = []
+    acc = 0
+    for n in FILE_SIZES:
+        offsets.append(acc)
+        acc += n
+
+    # file_idx → domain group name (train only — files 0,1,3,4,6)
+    FILE_DOMAIN = {0: "racecar_single", 1: "racecar_tandem", 3: "racecar_tandem",
+                   4: "cruise", 6: "cruise"}
+
+    def _pick(file_idx, local_indices):
+        return [offsets[file_idx] + i for i in local_indices]
+
+    # 2 samples per domain in train (spread across file)
+    train = (
+        _pick(0, [0, 450]) +           # racecar_single
+        _pick(1, [0, 150]) +           # racecar_tandem P1
+        _pick(3, [0, 150]) +           # racecar_tandem P3
+        _pick(4, [0, 150]) +           # cruise P1
+        _pick(6, [0, 150])             # cruise P3
+    )
+    domain_groups = {
+        "racecar_single": _pick(0, [0, 450]),
+        "racecar_tandem": _pick(1, [0, 150]) + _pick(3, [0, 150]),
+        "cruise":         _pick(4, [0, 150]) + _pick(6, [0, 150]),
+    }
+
+    splits = {
+        "train":               sorted(train),
+        "val_in_dist":         _pick(0, [200, 600]),
+        "val_tandem_transfer": _pick(2, [0, 150]),
+        "val_ood_cond":        _pick(4, [290]) + _pick(6, [290]),
+        "val_ood_re":          _pick(5, [0, 150]),
+    }
+
+    manifest = {
+        "version": 1,
+        "created": datetime.now(timezone.utc).isoformat() + " [QUICK/DEBUG]",
+        "pickle_paths": [str(p) for p in PICKLE_FILES],
+        "splits": splits,
+        "domain_groups": domain_groups,
+        "split_counts": {k: len(v) for k, v in splits.items()},
+    }
+
+    with open(OUT_MANIFEST, "w") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"Wrote {OUT_MANIFEST} (quick debug manifest)")
+    for k, v in manifest["split_counts"].items():
+        print(f"  {k:30s}: {v:4d} samples")
+
+    # Identity normalization — debug only
+    stats = {
+        "version": 1,
+        "n_train_samples": len(train),
+        "n_train_nodes": 0,
+        "y_mean": [0.0, 0.0, 0.0],
+        "y_std":  [1.0, 1.0, 1.0],
+        "x_mean": [0.0] * X_DIM,
+        "x_std":  [1.0] * X_DIM,
+    }
+    with open(OUT_STATS, "w") as f:
+        json.dump(stats, f, indent=2)
+    print(f"Wrote {OUT_STATS} (identity normalization — debug only)")
+
+
 def main():
+    import sys as _sys
+    if "--quick" in _sys.argv:
+        make_quick_manifest()
+        return
+
     print("=== Phase 1: Metadata extraction ===")
     records = extract_metadata(PICKLE_FILES)
 
