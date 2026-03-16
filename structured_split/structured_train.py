@@ -194,7 +194,8 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 swa_model = AveragedModel(model)
-swa_start_min = MAX_TIMEOUT * 0.6  # Start SWA at 60% of wall-clock budget
+# swa_start_epoch is set after epoch 0 based on actual epoch time (60% of estimated total epochs)
+swa_start_epoch = MAX_EPOCHS  # default: no SWA (updated after first epoch)
 
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -405,8 +406,14 @@ for epoch in range(MAX_EPOCHS):
         f"val[{split_summary}]{tag}"
     )
 
-    # --- SWA update (time-based: start after 60% of wall-clock budget) ---
-    if (time.time() - train_start) / 60.0 >= swa_start_min:
+    # After epoch 0: estimate total epochs from actual epoch time, set SWA start at 60%
+    if epoch == 0:
+        est_epochs = min(MAX_EPOCHS, int(MAX_TIMEOUT * 60 / dt))
+        swa_start_epoch = max(1, int(est_epochs * 0.6))
+        print(f"  → Estimated {est_epochs} total epochs; SWA starts at epoch {swa_start_epoch} (60%)")
+
+    # --- SWA update (epoch-based: start after 60% of estimated total epochs) ---
+    if epoch >= swa_start_epoch:
         swa_model.update_parameters(model)
 
 
@@ -437,13 +444,19 @@ if swa_model.n_averaged > 0:
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
-                pred = swa_model({"x": x})["preds"]
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    pred = swa_model({"x": x})["preds"]
+                pred = pred.float()
                 sq_err = (pred - y_norm) ** 2
+                abs_err = (pred - y_norm).abs()
 
                 vol_mask = mask & ~is_surface
                 surf_mask = mask & is_surface
-                val_vol += (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
-                val_surf += (sq_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+                val_vol += min(
+                    (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item(),
+                    1e12
+                )
+                val_surf += (abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
                 n_vbatches += 1
 
                 pred_orig = pred * stats["y_std"] + stats["y_mean"]
@@ -470,9 +483,14 @@ if swa_model.n_averaged > 0:
             f"swa/{split_name}/mae_surf_Uy": mae_surf[1].item(),
             f"swa/{split_name}/mae_surf_p":  mae_surf[2].item(),
         }
-        swa_val_loss_sum += split_loss
+        if math.isfinite(split_loss):
+            swa_val_loss_sum += split_loss
 
-    swa_mean_loss = swa_val_loss_sum / len(val_loaders)
+    swa_n_valid = sum(
+        1 for sm in swa_val_metrics_per_split.values()
+        if math.isfinite(list(sm.values())[2])  # index 2 = split loss
+    )
+    swa_mean_loss = swa_val_loss_sum / swa_n_valid if swa_n_valid > 0 else float("nan")
     swa_log: dict = {"swa/val_loss": swa_mean_loss, "global_step": global_step}
     for split_metrics in swa_val_metrics_per_split.values():
         swa_log.update(split_metrics)
