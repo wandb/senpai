@@ -36,8 +36,7 @@ class Args:
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
     wandb_project: str = "senpai-v1"  # W&B project name
     advisor_branch: str = "jurgen"  # branch the advisor works on (PRs target this, not main)
-    advisor: bool = False  # also deploy the advisor pod
-    students_only: bool = False  # only deploy students, skip advisor
+    advisor: bool = False  # also deploy the advisor pod (default: students only)
     dry_run: bool = False  # print manifests without applying
 
 
@@ -79,6 +78,7 @@ def render_student(template: str, student_name: str, tag: str, args: Args) -> st
         "STUDENT_NAME": student_name,
         "RESEARCH_TAG": tag,
         "IMAGE": args.image,
+        "ADVISOR_BRANCH": args.advisor_branch,
     })
     return configmap + "\n---\n" + deployment
 
@@ -142,7 +142,7 @@ def main():
             kubectl_apply(manifest, f"student {name}")
 
     # --- Deploy advisor ---
-    if args.advisor or not args.students_only:
+    if args.advisor:
         manifest = render_advisor(advisor_template, args.tag, student_list, args)
         if args.dry_run:
             print("--- Advisor ---")
@@ -153,7 +153,7 @@ def main():
 
     if not args.dry_run:
         print(f"\nLaunched {len(student_list)} students: {', '.join(student_list)}")
-        if args.advisor or not args.students_only:
+        if args.advisor:
             print("Launched advisor pod")
         print(f"\nMonitor:")
         print(f"  kubectl get deployments -l research-tag={args.tag}")

@@ -37,7 +37,7 @@ Read `program.md` for the full research context, constraints, metrics, and file 
      git fetch origin
      git checkout <branch>
      ```
-   - Note: PRs target the `advisor` branch, not `main`.
+   - Note: PRs target the advisor's branch (specified in your prompt), not `main`.
 
 3. **Implement the hypothesis**
    - Follow the instructions in the PR body.
@@ -49,7 +49,7 @@ Read `program.md` for the full research context, constraints, metrics, and file 
    ```bash
    python structured_split/structured_train.py --agent <your-name> --wandb_name "<your-name>/<description>" [--wandb_group "<idea>"]
    ```
-   - **Timeout**: Each run is capped at 5 minutes.
+   - **Timeout**: Each run is capped at 30 minutes.
    - Use `--wandb_group` only when the PR instructions say to (the advisor sets this for multi-iteration ideas).
    - If the run crashes, check the log. Fix typos/import errors and re-run. If the idea is fundamentally broken, report that in the results.
    - Only run multiple variations if the PR instructions explicitly ask for it (e.g. "try surface weight 5, 10, 20"). Otherwise, run the single experiment described.

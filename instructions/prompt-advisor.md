@@ -10,7 +10,7 @@ Read CLAUDE.md for your full workflow, and program.md for the research context a
 
 Your students are: $STUDENT_NAMES
 Research tag: $RESEARCH_TAG
-W&B project: wandb-applied-ai-team/senpai
+W&B project: $WANDB_ENTITY/$WANDB_PROJECT
 
 IMPORTANT: You work on the '$ADVISOR_BRANCH' branch, NOT main. All PRs target '$ADVISOR_BRANCH' as base. When creating branches, checkout from '$ADVISOR_BRANCH'. When merging, squash-merge into '$ADVISOR_BRANCH'.
 
