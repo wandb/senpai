@@ -154,6 +154,23 @@ class TransolverBlock(nn.Module):
         return fx
 
 
+class ConditioningMLP(nn.Module):
+    """FiLM conditioning: maps scalar condition to (gamma, beta) for feature modulation."""
+    def __init__(self, cond_dim, hidden_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(cond_dim, 64),
+            nn.GELU(),
+            nn.Linear(64, 2 * hidden_dim),  # gamma and beta
+        )
+
+    def forward(self, c):
+        # c: [B, cond_dim]
+        out = self.net(c)  # [B, 2*hidden_dim]
+        gamma, beta = out.chunk(2, dim=-1)  # each [B, hidden_dim]
+        return gamma, beta
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -214,6 +231,7 @@ class Transolver(nn.Module):
                 for idx in range(n_layers)
             ]
         )
+        self.film = ConditioningMLP(cond_dim=1, hidden_dim=n_hidden)  # 1 = log_Re
         self.initialize_weights()
         self.placeholder = nn.Parameter((1 / n_hidden) * torch.rand(n_hidden, dtype=torch.float))
 
@@ -261,8 +279,6 @@ class Transolver(nn.Module):
         x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
         if x is None:
             raise ValueError("Missing required input tensor: x")
-        if condition is not None:
-            raise ValueError("Transolver does not support conditioning inputs")
 
         if self.unified_pos:
             if pos is None:
@@ -272,6 +288,11 @@ class Transolver(nn.Module):
 
         fx = self.preprocess(x)
         fx = fx + self.placeholder[None, None, :]
+
+        # FiLM conditioning on log_Re (index 13 in normalized x)
+        log_re = x[:, 0, 13:14]  # [B, 1] — same for all nodes in a sample
+        gamma, beta = self.film(log_re)  # [B, n_hidden]
+        fx = (1 + gamma.unsqueeze(1)) * fx + beta.unsqueeze(1)
 
         for block in self.blocks:
             fx = block(fx)
