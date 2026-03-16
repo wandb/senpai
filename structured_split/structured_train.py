@@ -53,7 +53,7 @@ MAX_EPOCHS = 100
 
 @dataclass
 class Config:
-    lr: float = 3e-3
+    lr: float = 8e-3
     weight_decay: float = 1e-4
     batch_size: int = 4
     surf_weight: float = 20.0
