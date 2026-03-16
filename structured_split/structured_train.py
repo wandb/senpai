@@ -194,10 +194,9 @@ model = Transolver(**model_config).to(device)
 
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=3)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS - 3)
-scheduler = torch.optim.lr_scheduler.SequentialLR(
-    optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[3]
+warmup_epochs = 3
+scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    optimizer, T_0=30, T_mult=2, eta_min=1e-5
 )
 
 # --- wandb ---
@@ -237,6 +236,7 @@ with open(model_dir / "config.yaml", "w") as f:
 best_val = float("inf")
 best_metrics = {}
 global_step = 0
+cycle1_state = None
 train_start = time.time()
 
 for epoch in range(MAX_EPOCHS):
@@ -244,6 +244,10 @@ for epoch in range(MAX_EPOCHS):
     if elapsed_min >= MAX_TIMEOUT:
         print(f"Wall-clock limit reached ({elapsed_min:.1f} min >= {MAX_TIMEOUT} min). Stopping.")
         break
+
+    if epoch == warmup_epochs + 30:  # End of cycle 1
+        cycle1_state = {k: v.clone() for k, v in model.state_dict().items()}
+        print(f"  Saved cycle1 checkpoint at epoch {epoch}")
 
     t0 = time.time()
 
@@ -287,7 +291,11 @@ for epoch in range(MAX_EPOCHS):
         n_batches += 1
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
-    scheduler.step()
+    if epoch < warmup_epochs:
+        for pg in optimizer.param_groups:
+            pg['lr'] = cfg.lr * (epoch + 1) / warmup_epochs
+    else:
+        scheduler.step(epoch - warmup_epochs)
     epoch_vol /= n_batches
     epoch_surf /= n_batches
 
@@ -371,7 +379,7 @@ for epoch in range(MAX_EPOCHS):
         "train/vol_loss": epoch_vol,
         "train/surf_loss": epoch_surf,
         "val/loss": mean_val_loss,
-        "lr": scheduler.get_last_lr()[0],
+        "lr": optimizer.param_groups[0]['lr'],
         "epoch_time_s": dt,
     }
     for split_metrics in val_metrics_per_split.values():
@@ -404,6 +412,78 @@ for epoch in range(MAX_EPOCHS):
         f"val[{split_summary}]{tag}"
     )
 
+
+# --- Checkpoint averaging: cycle1 + best ---
+if cycle1_state is not None and best_metrics:
+    print("\nAveraging cycle1 and best checkpoints...")
+    best_state = torch.load(model_path, map_location=device, weights_only=True)
+    avg_state = {k: (cycle1_state[k].float() + best_state[k].float()) / 2 for k in best_state}
+    model.load_state_dict(avg_state)
+
+    model.eval()
+    avg_metrics = {}
+    for split_name, vloader in val_loaders.items():
+        avg_vol = 0.0
+        avg_surf = 0.0
+        avg_mae_surf = torch.zeros(3, device=device)
+        avg_n_surf = 0
+        avg_n_vol = 0
+        avg_mae_vol = torch.zeros(3, device=device)
+        avg_n_vbatches = 0
+        with torch.no_grad():
+            for x, y, is_surface, mask in vloader:
+                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                is_surface = is_surface.to(device, non_blocking=True)
+                mask = mask.to(device, non_blocking=True)
+                x = (x - stats["x_mean"]) / stats["x_std"]
+                y_norm = (y - stats["y_mean"]) / stats["y_std"]
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    pred = model({"x": x})["preds"]
+                pred = pred.float()
+                sq_err = (pred - y_norm) ** 2
+                abs_err = (pred - y_norm).abs()
+                vol_mask = mask & ~is_surface
+                surf_mask = mask & is_surface
+                avg_vol += min(
+                    (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item(),
+                    1e12
+                )
+                avg_surf += (abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+                avg_n_vbatches += 1
+                pred_orig = pred * stats["y_std"] + stats["y_mean"]
+                err = (pred_orig - y).abs()
+                avg_mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                avg_mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                avg_n_surf += surf_mask.sum().item()
+                avg_n_vol += vol_mask.sum().item()
+        avg_vol /= max(avg_n_vbatches, 1)
+        avg_surf /= max(avg_n_vbatches, 1)
+        avg_mae_surf /= max(avg_n_surf, 1)
+        avg_mae_vol /= max(avg_n_vol, 1)
+        avg_split_loss = avg_vol + cfg.surf_weight * avg_surf
+        avg_metrics[split_name] = {
+            f"avg_{split_name}/loss": avg_split_loss,
+            f"avg_{split_name}/mae_surf_p": avg_mae_surf[2].item(),
+            f"avg_{split_name}/mae_surf_Ux": avg_mae_surf[0].item(),
+            f"avg_{split_name}/mae_surf_Uy": avg_mae_surf[1].item(),
+        }
+    finite_avg = [avg_metrics[n][f"avg_{n}/loss"] for n in VAL_SPLIT_NAMES
+                  if not (torch.tensor(avg_metrics[n][f"avg_{n}/loss"]).isnan() or
+                          torch.tensor(avg_metrics[n][f"avg_{n}/loss"]).isinf())]
+    mean_avg_loss = sum(finite_avg) / max(len(finite_avg), 1)
+    all_avg = {"avg/loss": mean_avg_loss}
+    for m in avg_metrics.values():
+        all_avg.update(m)
+    all_avg["global_step"] = global_step
+    wandb.log(all_avg)
+    wandb.summary.update({k: v for k, v in all_avg.items() if k != "global_step"})
+    print(f"Averaged model val/loss={mean_avg_loss:.4f}")
+    for split_name in VAL_SPLIT_NAMES:
+        k_p = f"avg_{split_name}/mae_surf_p"
+        if k_p in avg_metrics.get(split_name, {}):
+            print(f"  {split_name:30s}  mae_surf_p={avg_metrics[split_name][k_p]:.1f}")
+    # Save averaged checkpoint
+    torch.save(avg_state, model_path)
 
 # --- Final summary ---
 total_time = (time.time() - train_start) / 60.0
