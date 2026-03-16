@@ -20,8 +20,8 @@ from transolver import Transolver
 from utils import visualize, dataset_stats
 
 
-MAX_TIMEOUT = 5.0 # minutes
-MAX_EPOCHS = 50
+MAX_TIMEOUT = 20.0 # minutes
+MAX_EPOCHS = 100
 @dataclass
 class Config:
     lr: float = 5e-4
