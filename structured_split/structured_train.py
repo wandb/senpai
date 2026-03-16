@@ -543,6 +543,10 @@ for epoch in range(MAX_EPOCHS):
 
         optimizer.zero_grad()
         loss.backward()
+        # Gradient centralization: subtract mean for weight matrices
+        for p in model.parameters():
+            if p.grad is not None and p.grad.ndim > 1:
+                p.grad.data -= p.grad.data.mean(dim=tuple(range(1, p.grad.ndim)), keepdim=True)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         global_step += 1
