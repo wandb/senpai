@@ -148,9 +148,10 @@ for name, idxs in manifest["domain_groups"].items():
     for i in idxs:
         idx_to_group[i] = name
 
-train_indices = manifest["splits"]["train"]
+# Use train_ds.indices (not manifest directly) so weights always match the
+# actual train set — robust whether or not debug mode truncated it.
 sample_weights = torch.tensor(
-    [1.0 / group_sizes[idx_to_group[i]] for i in train_indices],
+    [1.0 / group_sizes[idx_to_group[i]] for i in train_ds.indices],
     dtype=torch.float64,
 )
 
@@ -212,6 +213,16 @@ run = wandb.init(
     mode=os.environ.get("WANDB_MODE", "online"),
 )
 
+# All metrics use global_step (gradient updates) as the x-axis.
+wandb.define_metric("global_step")
+wandb.define_metric("train/*", step_metric="global_step")
+wandb.define_metric("val/*", step_metric="global_step")
+for _sname in VAL_SPLIT_NAMES:
+    wandb.define_metric(f"{_sname}/*", step_metric="global_step")
+wandb.define_metric("lr", step_metric="global_step")
+wandb.define_metric("epoch_time_s", step_metric="global_step")
+wandb.define_metric("val_predictions", step_metric="global_step")
+
 model_dir = Path(f"models/model-{run.id}")
 model_dir.mkdir(parents=True)
 model_path = model_dir / "checkpoint.pt"
@@ -220,6 +231,7 @@ with open(model_dir / "config.yaml", "w") as f:
 
 best_val = float("inf")
 best_metrics = {}
+global_step = 0
 train_start = time.time()
 
 for epoch in range(MAX_EPOCHS):
@@ -253,11 +265,12 @@ for epoch in range(MAX_EPOCHS):
         vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
         surf_loss = (sq_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + cfg.surf_weight * surf_loss
-        wandb.log({"train/loss": loss.item()})
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        global_step += 1
+        wandb.log({"train/loss": loss.item(), "global_step": global_step})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -343,7 +356,8 @@ for epoch in range(MAX_EPOCHS):
     }
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
-    wandb.log(metrics, commit=False)
+    metrics["global_step"] = global_step
+    wandb.log(metrics)
 
     if torch.cuda.is_available():
         peak_mem_gb = torch.cuda.max_memory_allocated() / 1e9
@@ -396,6 +410,6 @@ if best_metrics:
     images = visualize(model, val_splits["val_in_dist"], stats, device,
                        n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
     if images:
-        wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images]})
+        wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
 
 wandb.finish()

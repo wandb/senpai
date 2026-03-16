@@ -102,7 +102,7 @@ class MultiFieldDataset(Dataset):
     Supports multiple pickle files and the same cache_size semantics:
         0  → eager load everything into RAM
         -1 → pure lazy loading (no cache)
-        >0 → LRU cache up to N samples
+        >0 → capacity-limited cache up to N samples (no eviction)
     """
 
     def __init__(self, pickle_paths: list, cache_size: int = 0):

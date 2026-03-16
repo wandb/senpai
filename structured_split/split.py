@@ -308,10 +308,6 @@ def make_quick_manifest():
         offsets.append(acc)
         acc += n
 
-    # file_idx → domain group name (train only — files 0,1,3,4,6)
-    FILE_DOMAIN = {0: "racecar_single", 1: "racecar_tandem", 3: "racecar_tandem",
-                   4: "cruise", 6: "cruise"}
-
     def _pick(file_idx, local_indices):
         return [offsets[file_idx] + i for i in local_indices]
 
