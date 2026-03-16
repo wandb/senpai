@@ -332,7 +332,7 @@ MAX_EPOCHS = 100
 @dataclass
 class Config:
     lr: float = 3e-3
-    weight_decay: float = 1e-4
+    weight_decay: float = 5e-5
     batch_size: int = 4
     surf_weight: float = 20.0
     manifest: str = "structured_split/split_manifest.json"
