@@ -572,7 +572,7 @@ for epoch in range(MAX_EPOCHS):
         # Progressive resolution: subsample volume nodes in loss early in training
         # Ramps from 10% → 100% of volume nodes over first 40 epochs
         if epoch < 40:
-            vol_keep_ratio = 0.1 + 0.9 * (epoch / 40)
+            vol_keep_ratio = 0.05 + 0.95 * (epoch / 40)
             vol_indices = vol_mask.nonzero(as_tuple=False)
             n_vol = vol_indices.shape[0]
             n_keep = max(int(n_vol * vol_keep_ratio), 1)
