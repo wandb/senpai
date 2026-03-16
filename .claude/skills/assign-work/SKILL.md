@@ -5,13 +5,21 @@ description: Use this skill to distribute research hypotheses to idle students b
 
 # Assign Work to Students
 
+## Environment variables
+
+These are set via the ConfigMap and available in all shell commands:
+- `$ADVISOR_BRANCH` — the branch you work on (PRs target this as base)
+- `$STUDENT_NAMES` — comma-separated list of student names
+- `$WANDB_ENTITY` / `$WANDB_PROJECT` — W&B coordinates
+- `$RESEARCH_TAG` — current research tag
+
 For each idle student (no `status:wip` PR), create a branch and draft PR assigning them a hypothesis.
 
 ## Steps per assignment
 
 1. Ensure you're on the latest advisor branch:
 ```bash
-git checkout <advisor-branch> && git pull origin <advisor-branch>
+git checkout $ADVISOR_BRANCH && git pull origin $ADVISOR_BRANCH
 ```
 
 2. Create an experiment branch:
@@ -26,12 +34,12 @@ gh pr create --draft \
   --title "<hypothesis title>" \
   --body "<PR body — use template below>" \
   --label "senpai" --label "student:<name>" --label "status:wip" \
-  --base <advisor-branch> --head exp/<hypothesis-name>
+  --base $ADVISOR_BRANCH --head exp/<hypothesis-name>
 ```
 
 4. Return to the advisor branch before the next assignment:
 ```bash
-git checkout <advisor-branch>
+git checkout $ADVISOR_BRANCH
 ```
 
 ## PR body template
