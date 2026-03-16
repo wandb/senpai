@@ -539,14 +539,30 @@ for epoch in range(MAX_EPOCHS):
         surf_mask = mask & is_surface
         vol_loss = (abs_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
         surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
-        loss = vol_loss + surf_weight * surf_loss
+        # Gradient surgery: project volume gradient to avoid conflicting with surface gradient
+        optimizer.zero_grad()
+        (surf_weight * surf_loss).backward(retain_graph=True)
+        g_surf = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
 
         optimizer.zero_grad()
-        loss.backward()
+        vol_loss.backward()
+        g_vol = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
+
+        # Project volume gradient to remove conflict with surface gradient
+        for name, p in model.named_parameters():
+            if name in g_surf and name in g_vol:
+                gs = g_surf[name]
+                gv = g_vol[name]
+                dot = (gs * gv).sum()
+                if dot < 0:  # Conflict exists
+                    gv = gv - (dot / (gs.norm()**2 + 1e-8)) * gs
+                p.grad = gv + g_surf[name]
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        loss_val = vol_loss.item() + surf_weight * surf_loss.item()
+        wandb.log({"train/loss": loss_val, "train/surf_weight": surf_weight, "global_step": global_step})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
