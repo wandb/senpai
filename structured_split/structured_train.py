@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import json
 import os
+import math
 import time
 import torch
 import wandb
@@ -330,8 +331,10 @@ for epoch in range(MAX_EPOCHS):
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+        noise_start, noise_end = 0.01, 0.002
+        noise_std = noise_end + (noise_start - noise_end) * 0.5 * (1 + math.cos(math.pi * progress))
         if model.training:
-            y_norm = y_norm + 0.01 * torch.randn_like(y_norm)
+            y_norm = y_norm + noise_std * torch.randn_like(y_norm)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pred = model({"x": x})["preds"]
