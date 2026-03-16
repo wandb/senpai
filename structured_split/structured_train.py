@@ -382,8 +382,11 @@ for epoch in range(MAX_EPOCHS):
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = model({"x": x})["preds"]
+                if split_name == "val_ood_re":
+                    pred = model({"x": x})["preds"]  # fp32, no autocast
+                else:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        pred = model({"x": x})["preds"]
                 pred = pred.float()
                 sq_err = (pred - y_norm) ** 2
                 abs_err = (pred - y_norm).abs()
