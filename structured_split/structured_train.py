@@ -253,7 +253,7 @@ model_config = dict(
     output_dims=[1, 1, 1],
 )
 
-model = Transolver(dropout=0.05, **model_config).to(device)
+model = Transolver(**model_config).to(device)
 
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
