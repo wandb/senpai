@@ -54,37 +54,10 @@ def find_human_text(start_uuid: str, all_messages: dict) -> str:
             if isinstance(content, list):
                 texts = [b.get("text", "") for b in content
                          if isinstance(b, dict) and b.get("type") == "text"]
-                joined = "\n".join(t for t in texts if t)
-                if joined:
+                if joined := "\n".join(t for t in texts if t):
                     return joined
         current = msg.get("parentUuid")
     return ""
-
-
-def _log_turn(client, file_state: dict, session_id: str,
-              messages: list[dict], model: str, usage: dict, attrs: dict) -> None:
-    """Log one agent turn as a child call under the session-level parent trace."""
-    if not file_state.get("parent_call_id"):
-        parent = client.create_call(
-            "claude_session", inputs={"session_id": session_id, **attrs}, use_stack=False,
-        )
-        file_state["parent_call_id"] = parent.id
-        file_state["trace_id"] = parent.trace_id
-    else:
-        parent = _CallStub(id=file_state["parent_call_id"], trace_id=file_state["trace_id"])
-
-    turn_call = client.create_call(
-        "agent_turn",
-        inputs={"messages": messages, "model": model, "usage": usage, **attrs},
-        parent=parent,
-        use_stack=False,
-    )
-    turn_call.summary = {"usage": {model: {
-        "input_tokens": usage["input_tokens"],
-        "output_tokens": usage["output_tokens"],
-        "requests": 1,
-    }}}
-    client.finish_call(turn_call, output={"role": "assistant", "content": messages[-1]["content"]})
 
 
 def process_session_file(session_file: Path, state: dict, agent_name: str, role: str, client) -> None:
@@ -93,44 +66,34 @@ def process_session_file(session_file: Path, state: dict, agent_name: str, role:
     file_state = state.setdefault(session_id, {"offset": 0, "logged": []})
     logged_set = set(file_state["logged"])
 
-    prev_offset = file_state["offset"]
     file_size = session_file.stat().st_size
-    if file_size <= prev_offset:
+    if file_size <= file_state["offset"]:
         return
 
     # Read whole file to build parentUuid chain, then re-seek to only walk new lines
     all_messages: dict[str, dict] = {}
     with open(session_file, encoding="utf-8", errors="replace") as f:
         for raw in f:
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
+            if raw := raw.strip():
                 obj = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if obj.get("type") in ("user", "assistant") and "uuid" in obj:
-                all_messages[obj["uuid"]] = obj
-        f.seek(prev_offset)
+                if obj.get("type") in ("user", "assistant") and "uuid" in obj:
+                    all_messages[obj["uuid"]] = obj
+        f.seek(file_state["offset"])
         new_lines = f.readlines()
 
     for raw in new_lines:
-        raw = raw.strip()
-        if not raw:
+        if not (raw := raw.strip()):
             continue
-        try:
-            obj = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
+        obj = json.loads(raw)
 
         if obj.get("type") != "assistant":
             continue
-        msg = obj.get("message", {})
+        msg = obj["message"]
         if msg.get("stop_reason") != "end_turn":
             continue
 
-        uuid = obj.get("uuid")
-        if not uuid or uuid in logged_set:
+        uuid = obj["uuid"]
+        if uuid in logged_set:
             continue
 
         assistant_text = extract_text(msg.get("content", []))
@@ -139,9 +102,7 @@ def process_session_file(session_file: Path, state: dict, agent_name: str, role:
             continue
 
         user_text = find_human_text(obj.get("parentUuid"), all_messages)
-        messages = []
-        if user_text:
-            messages.append({"role": "user", "content": user_text})
+        messages = [{"role": "user", "content": user_text}] if user_text else []
         messages.append({"role": "assistant", "content": assistant_text})
 
         usage_raw = msg.get("usage", {})
@@ -153,15 +114,26 @@ def process_session_file(session_file: Path, state: dict, agent_name: str, role:
             "cache_read_tokens": usage_raw.get("cache_read_input_tokens", 0),
             "cache_creation_tokens": usage_raw.get("cache_creation_input_tokens", 0),
         }
-        attrs = {
-            "agent_name": agent_name,
-            "role": role,
-            "git_branch": obj.get("gitBranch", "unknown"),
-            "session_id": session_id,
-        }
+        model = msg.get("model", "unknown")
+        attrs = {"agent_name": agent_name, "role": role,
+                 "git_branch": obj.get("gitBranch", "unknown"), "session_id": session_id}
 
-        _log_turn(client=client, file_state=file_state, session_id=session_id,
-                  messages=messages, model=msg.get("model", "unknown"), usage=usage, attrs=attrs)
+        # Create or restore the session-level parent trace
+        if not file_state.get("parent_call_id"):
+            parent = client.create_call("claude_session", inputs={"session_id": session_id, **attrs}, use_stack=False)
+            file_state["parent_call_id"] = parent.id
+            file_state["trace_id"] = parent.trace_id
+        else:
+            parent = _CallStub(id=file_state["parent_call_id"], trace_id=file_state["trace_id"])
+
+        turn_call = client.create_call(
+            "agent_turn",
+            inputs={"messages": messages, "model": model, "usage": usage, **attrs},
+            parent=parent, use_stack=False,
+        )
+        turn_call.summary = {"usage": {model: {"input_tokens": usage["input_tokens"],
+                                               "output_tokens": usage["output_tokens"], "requests": 1}}}
+        client.finish_call(turn_call, output={"role": "assistant", "content": messages[-1]["content"]})
 
         logged_set.add(uuid)
         print(f"[weave_logger] turn logged  session={session_id[:8]}  uuid={uuid[:8]}"
@@ -171,55 +143,31 @@ def process_session_file(session_file: Path, state: dict, agent_name: str, role:
     file_state["logged"] = list(logged_set)
 
 
-def compute_project_dir(workdir: str) -> Path:
-    """Derive ~/.claude/projects/<hash>/ — Claude Code hashes the path by replacing / with -."""
-    return Path.home() / ".claude" / "projects" / workdir.replace("/", "-")
-
-
-def run(args: argparse.Namespace) -> None:
-    project_dir = Path(args.project_dir) if args.project_dir else compute_project_dir(args.workdir)
-
-    entity = args.wandb_entity or os.environ.get("WANDB_ENTITY", "wandb-applied-ai-team")
-    project = args.wandb_project or os.environ.get("WANDB_PROJECT", "senpai-v1")
-    if not entity or not project:
-        raise SystemExit("[weave_logger] WANDB_ENTITY and WANDB_PROJECT must be set")
-
-    client = weave.init(f"{entity}/{project}")
-    print(f"[weave_logger] started\n  watching : {project_dir}\n  role     : {args.role}"
-          f"\n  agent    : {args.agent_name}\n  poll     : {POLL_INTERVAL}s\n", flush=True)
-
-    while True:
-        state: dict = {}
-        if STATE_FILE.exists():
-            try:
-                state = json.loads(STATE_FILE.read_text())
-            except (json.JSONDecodeError, OSError):
-                pass
-
-        if project_dir.exists():
-            for session_file in sorted(project_dir.glob("*.jsonl")):
-                try:
-                    process_session_file(session_file, state, args.agent_name, args.role, client)
-                except Exception as exc:
-                    print(f"[weave_logger] error on {session_file.name}: {exc}")
-
-        try:
-            STATE_FILE.write_text(json.dumps(state, indent=2))
-        except OSError as exc:
-            print(f"[weave_logger] failed to save state: {exc}")
-
-        time.sleep(POLL_INTERVAL)
-
-
 def main() -> None:
     p = argparse.ArgumentParser(description="Weave trace logger daemon for senpai Claude Code agents")
     p.add_argument("--role", required=True, choices=["advisor", "student"])
-    p.add_argument("--agent-name", required=True, help="advisor or student name (e.g. frieren)")
-    p.add_argument("--workdir", default="/workspace/senpai", help="Claude Code working directory")
+    p.add_argument("--agent-name", required=True)
+    p.add_argument("--workdir", default="/workspace/senpai")
     p.add_argument("--project-dir", default=None, help="Override ~/.claude/projects/<hash>/ path")
-    p.add_argument("--wandb-entity", default="", help="W&B entity (falls back to $WANDB_ENTITY)")
-    p.add_argument("--wandb-project", default="", help="W&B project (falls back to $WANDB_PROJECT)")
-    run(p.parse_args())
+    p.add_argument("--wandb-entity", default="")
+    p.add_argument("--wandb-project", default="")
+    args = p.parse_args()
+
+    project_dir = Path(args.project_dir) if args.project_dir else (
+        Path.home() / ".claude" / "projects" / args.workdir.replace("/", "-")
+    )
+    entity = args.wandb_entity or os.environ.get("WANDB_ENTITY", "wandb-applied-ai-team")
+    project = args.wandb_project or os.environ.get("WANDB_PROJECT", "senpai-v1")
+
+    client = weave.init(f"{entity}/{project}")
+    print(f"[weave_logger] started  watching={project_dir}  role={args.role}  agent={args.agent_name}", flush=True)
+
+    while True:
+        state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+        for session_file in sorted(project_dir.glob("*.jsonl")):
+            process_session_file(session_file, state, args.agent_name, args.role, client)
+        STATE_FILE.write_text(json.dumps(state, indent=2))
+        time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
