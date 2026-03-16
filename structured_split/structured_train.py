@@ -523,6 +523,16 @@ for epoch in range(MAX_EPOCHS):
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
 
+        # Mixup augmentation
+        if model.training:
+            lam = torch.distributions.Beta(0.2, 0.2).sample().item()
+            idx = torch.randperm(x.size(0), device=x.device)
+            x = lam * x + (1 - lam) * x[idx]
+            y = lam * y + (1 - lam) * y[idx]
+            # Mix masks: use intersection (both samples must have real nodes)
+            mask = mask & mask[idx]
+            is_surface = is_surface & is_surface[idx]
+
         x = (x - stats["x_mean"]) / stats["x_std"]
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
