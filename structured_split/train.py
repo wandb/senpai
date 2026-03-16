@@ -28,7 +28,6 @@ from pathlib import Path
 # Reach repo root so we can import prepare, transolver, utils
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import json
 import os
 import time
 import torch
@@ -36,14 +35,13 @@ import wandb
 import yaml
 from dataclasses import dataclass, asdict
 from tqdm import tqdm
-from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
+from torch.utils.data import DataLoader, WeightedRandomSampler
 import simple_parsing as sp
 
-from prepare import pad_collate
 from transolver import Transolver
 from utils import visualize
 sys.path.insert(0, str(Path(__file__).parent))  # structured_split dir
-from prepare_multi import MultiFieldDataset, X_DIM
+from prepare_multi import X_DIM, pad_collate, load_structured_split, VAL_SPLIT_NAMES
 
 
 MAX_TIMEOUT = 30.0  # minutes
@@ -72,88 +70,10 @@ if cfg.debug:
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}" + (" [DEBUG MODE]" if cfg.debug else ""))
 
-# --- Load split manifest and normalization stats ---
-with open(cfg.manifest) as f:
-    manifest = json.load(f)
-with open(cfg.stats_file) as f:
-    stats_data = json.load(f)
-
-# --- Build combined dataset from all 7 pickle files in manifest order ---
-# cache_size=0  → eager load everything into RAM (~42GB on GPU node)
-# cache_size=-1 → lazy loading (use in debug to avoid OOM on dev machines)
-_cache_size = -1 if cfg.debug else 0
-ds = MultiFieldDataset(
-    [Path(p) for p in manifest["pickle_paths"]],
-    cache_size=_cache_size,
+train_ds, val_splits, stats, sample_weights = load_structured_split(
+    cfg.manifest, cfg.stats_file, debug=cfg.debug,
 )
-
-# Validate all manifest indices are in bounds (works for both full and quick manifests)
-all_manifest_idx = [i for v in manifest["splits"].values() for i in v]
-max_idx = max(all_manifest_idx) if all_manifest_idx else 0
-assert max_idx < len(ds), (
-    f"Manifest references index {max_idx} but dataset only has {len(ds)} samples. "
-    "Pickle files may have changed — re-run split.py."
-)
-
-# --- Build Subset objects for each split ---
-train_ds = Subset(ds, manifest["splits"]["train"])
-
-VAL_SPLIT_NAMES = ["val_in_dist", "val_tandem_transfer", "val_ood_cond", "val_ood_re"]
-val_splits = {name: Subset(ds, manifest["splits"][name]) for name in VAL_SPLIT_NAMES}
-
-# --- Debug truncation: sample across all domain groups, not just first N ---
-if cfg.debug:
-    import random as _rnd
-    _rng = _rnd.Random(42)
-
-    def _stratified_sample(indices: list, n: int) -> list:
-        """Pick n samples spread evenly across the index list."""
-        if len(indices) <= n:
-            return indices
-        step = max(1, len(indices) // n)
-        return indices[::step][:n]
-
-    # 2 samples per domain group → 6 train total (covers all 3 pickle families)
-    _train_all = manifest["splits"]["train"]
-    _dg = manifest["domain_groups"]
-    _debug_train = (
-        _stratified_sample(_dg["racecar_single"], 2) +
-        _stratified_sample(_dg["racecar_tandem"], 2) +
-        _stratified_sample(_dg["cruise"], 2)
-    )
-    train_ds = Subset(ds, _debug_train)
-
-    # 1 sample per val split (ensures all 4 W&B tracks appear)
-    val_splits = {k: Subset(ds, _stratified_sample(manifest["splits"][k], 2))
-                  for k in VAL_SPLIT_NAMES}
-
-print(f"Train: {len(train_ds)}, " +
-      ", ".join(f"{k}: {len(v)}" for k, v in val_splits.items()))
-
-# --- Normalization stats (computed over training set only by split.py) ---
-stats = {
-    "y_mean": torch.tensor(stats_data["y_mean"], dtype=torch.float32).to(device),
-    "y_std":  torch.tensor(stats_data["y_std"],  dtype=torch.float32).to(device),
-    "x_mean": torch.tensor(stats_data["x_mean"], dtype=torch.float32).to(device),
-    "x_std":  torch.tensor(stats_data["x_std"],  dtype=torch.float32).to(device),
-}
-
-# --- Balanced domain sampler ---
-# Each of the 3 domain groups (racecar_single, racecar_tandem, cruise) gets equal
-# expected weight, regardless of raw sample count. Prevents the 809-sample
-# racecar_single group from dominating the 240+480 tandem+cruise groups.
-group_sizes = {name: len(idxs) for name, idxs in manifest["domain_groups"].items()}
-idx_to_group: dict[int, str] = {}
-for name, idxs in manifest["domain_groups"].items():
-    for i in idxs:
-        idx_to_group[i] = name
-
-# Use train_ds.indices (not manifest directly) so weights always match the
-# actual train set — robust whether or not debug mode truncated it.
-sample_weights = torch.tensor(
-    [1.0 / group_sizes[idx_to_group[i]] for i in train_ds.indices],
-    dtype=torch.float64,
-)
+stats = {k: v.to(device) for k, v in stats.items()}
 
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
