@@ -453,11 +453,17 @@ model = Transolver(**model_config).to(device)
 
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=5)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS - 5)
-scheduler = torch.optim.lr_scheduler.SequentialLR(
-    optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[5]
-)
+# Trapezoidal LR: warmup 5 epochs, hold until epoch 80, linear decay to 1e-5
+def trapezoid_lr(epoch):
+    if epoch < 5:
+        return 0.1 + 0.9 * (epoch / 5)  # warmup from 0.1x to 1.0x
+    elif epoch < 80:
+        return 1.0  # constant peak LR
+    else:
+        # Linear decay from 1.0x to 0.003x over epochs 80-100
+        return 1.0 - 0.997 * (epoch - 80) / 20
+
+scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, trapezoid_lr)
 
 # --- wandb ---
 run = wandb.init(
