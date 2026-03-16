@@ -22,7 +22,6 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 import weave
 
@@ -42,7 +41,7 @@ class _CallStub:
 
     id: str
     trace_id: str
-    thread_id: Optional[str] = None
+    thread_id: str | None = None
     _children: list = field(default_factory=list)
 
 
@@ -106,7 +105,7 @@ def _log_turn(
     client,
     file_state: dict,
     session_id: str,
-    messages: list,
+    messages: list[dict],
     model: str,
     usage: dict,
     attrs: dict,
