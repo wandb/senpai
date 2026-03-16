@@ -326,7 +326,7 @@ for epoch in range(MAX_EPOCHS):
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         if model.training:
-            y_norm = y_norm + 0.01 * torch.randn_like(y_norm)
+            y_norm = y_norm + 0.02 * torch.randn_like(y_norm)  # was 0.01 — increased for surface-only training
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pred = model({"x": x})["preds"]
@@ -337,7 +337,7 @@ for epoch in range(MAX_EPOCHS):
         surf_mask = mask & is_surface
         vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
         surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
-        loss = vol_loss + cfg.surf_weight * surf_loss
+        loss = surf_loss  # surface-only — no volume loss, no surf_weight needed
 
         optimizer.zero_grad()
         loss.backward()
@@ -408,7 +408,7 @@ for epoch in range(MAX_EPOCHS):
 
         val_vol /= max(n_vbatches, 1)
         val_surf /= max(n_vbatches, 1)
-        split_loss = val_vol + cfg.surf_weight * val_surf
+        split_loss = val_surf  # surface-only — checkpoint selection on surface loss only
         mae_surf /= max(n_surf, 1)
         mae_vol /= max(n_vol, 1)
 
