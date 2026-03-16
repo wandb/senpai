@@ -7,20 +7,66 @@ The root `train.py` is a simpler single-dataset script for earlier experiments.
 
 ---
 
-## What it does
+## Why a structured benchmark?
 
-Instead of a random 90/10 split on one dataset, this implements a structured benchmark
-across all 7 data sources with four distinct validation tracks that test different
-types of generalization:
+A naive random 90/10 split mostly tests **interpolation**: the model sees the same
+airfoil families, nearby (Re, α, gap, stagger) values, and often the same front/rear
+shapes in both train and test. That hides the paper's central question — whether
+single-airfoil pretraining actually helps on unseen tandem configurations.
 
-| Val split | Source | Tests |
-|-----------|--------|-------|
-| `val_in_dist` | raceCar single (10% holdout) | Interpolation sanity |
-| `val_tandem_transfer` | raceCar tandem Part2 (front=NACA6416) | Single→tandem transfer |
-| `val_ood_cond` | cruise Part1+3 frontier 20% | Condition extrapolation (extreme AoA/gap/stagger) |
-| `val_ood_re` | cruise Part2 Re=4.445M | Reynolds number extrapolation |
+The structured split instead tests four orthogonal failure modes:
+
+| Track | What it tests | Why it matters |
+|-------|--------------|----------------|
+| `val_in_dist` | Interpolation on seen shapes and conditions | Sanity check; should be easy |
+| `val_tandem_transfer` | Tandem pair with a front foil (NACA6416) absent from tandem training | Core claim: does single-foil data transfer to unseen tandem front shapes? |
+| `val_ood_cond` | Cruise cases in the frontier 20% of the joint (AoA, gap, stagger) space | Condition extrapolation — far from the training distribution centroid |
+| `val_ood_re` | All cruise Part2 cases (Re=4.445M, entirely outside training Re range) | Reynolds-number extrapolation — a clean OOD physics shift |
+
+These four tracks map directly onto the paper's evaluation axes: **composition**,
+**transfer**, **condition OOD**, and **physics OOD**. Reporting each separately
+prevents a single global MSE from masking failures on harder sub-tasks (e.g. near-wall
+regions, wake prediction on novel pairs).
+
+### Split assignment rules
+
+The seven pickle files are divided as follows:
+
+| File | Samples | Assignment |
+|------|---------|------------|
+| `raceCar_single` (file 0) | 899 | 70% subsample → 90% train, 10% `val_in_dist` |
+| `raceCar_tandem Part1` (file 1, front=NACA2412) | 300 | 70% subsample → train |
+| `raceCar_tandem Part2` (file 2, front=NACA6416) | 300 | 70% subsample → `val_tandem_transfer` |
+| `raceCar_tandem Part3` (file 3, front=NACA9412) | 300 | 70% subsample → train |
+| `cruise Part1` (file 4, Re=1.475M) | 300 | 70% subsample → interior 80% train, frontier 20% `val_ood_cond` |
+| `cruise Part2` (file 5, Re=4.445M) | 300 | 70% subsample → `val_ood_re` |
+| `cruise Part3` (file 6, Re=802K) | 300 | 70% subsample → interior 80% train, frontier 20% `val_ood_cond` |
+
+**Key design choices:**
+
+- **Part2 files go entirely to val.** raceCar tandem Part2 uses NACA6416 as the front
+  foil, which does not appear as a tandem front foil in any training file. This makes
+  `val_tandem_transfer` a true held-out shape test rather than a re-split of seen pairs.
+  Similarly, cruise Part2's Re=4.445M is above the training ceiling (~1.5M), giving a
+  clean physics-OOD track.
+
+- **Frontier detection for `val_ood_cond`.** Cruise Parts 1+3 are split by distance from
+  the centroid in normalized (AoA, gap, stagger) space. The outermost 20% of cases —
+  those with the most extreme combined conditions — are held out. This is better than
+  holding out tails of a single variable, which would leave near-duplicates in train.
+
+- **30% subsampling** (SAMPLE_FRACTION=0.70) is applied proportionally to every source
+  before splitting, so no domain is disproportionately thinned.
 
 **1,889 samples** retained (70% of 2,699, balanced across sources): **1,322 train** + 567 val (63 + 210 + 84 + 210).
+
+### Training sampler
+
+Even after structured splitting, raw sample counts are unbalanced (raceCar single has
+~4× more training samples than cruise). A `WeightedRandomSampler` gives each of the
+three domain groups — `racecar_single`, `racecar_tandem`, `cruise` — equal expected
+weight per minibatch, preventing the largest domain from dominating the loss and
+obscuring transfer performance on the smaller tandem/cruise groups.
 
 Also improves over the root `train.py` by:
 - 24-dim input features (adds foil-2 NACA/AoA, gap, stagger)
