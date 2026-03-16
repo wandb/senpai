@@ -265,11 +265,11 @@ for epoch in range(MAX_EPOCHS):
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pred = model({"x": x})["preds"]
         pred = pred.float()
-        sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
-        vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
+        huber_err = torch.nn.functional.huber_loss(pred, y_norm, reduction="none", delta=1.0)
+        vol_loss = (huber_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
         surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + cfg.surf_weight * surf_loss
 
@@ -317,13 +317,13 @@ for epoch in range(MAX_EPOCHS):
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = model({"x": x})["preds"]
                 pred = pred.float()
-                sq_err = (pred - y_norm) ** 2
                 abs_err = (pred - y_norm).abs()
 
                 vol_mask = mask & ~is_surface
                 surf_mask = mask & is_surface
+                huber_err = torch.nn.functional.huber_loss(pred, y_norm, reduction="none", delta=1.0)
                 val_vol += min(
-                    (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item(),
+                    (huber_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item(),
                     1e12
                 )
                 val_surf += (abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
