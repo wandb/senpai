@@ -365,6 +365,7 @@ for epoch in range(MAX_EPOCHS):
         val_surf = 0.0
         mae_surf = torch.zeros(3, device=device)
         mae_vol = torch.zeros(3, device=device)
+        mae_surf_cp = torch.zeros(3, device=device)
         n_surf = 0
         n_vol = 0
         n_vbatches = 0
@@ -403,6 +404,10 @@ for epoch in range(MAX_EPOCHS):
                 err = (pred_orig - y).abs()
                 mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
                 mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
+
+                # Cp-space MAE (no denorm multiplication — finite for all Re)
+                err_cp = (pred_phys - y_phys).abs()
+                mae_surf_cp += (err_cp * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
                 n_surf += surf_mask.sum().item()
                 n_vol += vol_mask.sum().item()
 
@@ -411,17 +416,21 @@ for epoch in range(MAX_EPOCHS):
         split_loss = val_vol + cfg.surf_weight * val_surf
         mae_surf /= max(n_surf, 1)
         mae_vol /= max(n_vol, 1)
+        mae_surf_cp /= max(n_surf, 1)
 
         val_metrics_per_split[split_name] = {
-            f"{split_name}/vol_loss":    val_vol,
-            f"{split_name}/surf_loss":   val_surf,
-            f"{split_name}/loss":        split_loss,
-            f"{split_name}/mae_vol_Ux":  mae_vol[0].item(),
-            f"{split_name}/mae_vol_Uy":  mae_vol[1].item(),
-            f"{split_name}/mae_vol_p":   mae_vol[2].item(),
-            f"{split_name}/mae_surf_Ux": mae_surf[0].item(),
-            f"{split_name}/mae_surf_Uy": mae_surf[1].item(),
-            f"{split_name}/mae_surf_p":  mae_surf[2].item(),
+            f"{split_name}/vol_loss":       val_vol,
+            f"{split_name}/surf_loss":      val_surf,
+            f"{split_name}/loss":           split_loss,
+            f"{split_name}/mae_vol_Ux":     mae_vol[0].item(),
+            f"{split_name}/mae_vol_Uy":     mae_vol[1].item(),
+            f"{split_name}/mae_vol_p":      mae_vol[2].item(),
+            f"{split_name}/mae_surf_Ux":    mae_surf[0].item(),
+            f"{split_name}/mae_surf_Uy":    mae_surf[1].item(),
+            f"{split_name}/mae_surf_p":     mae_surf[2].item(),
+            f"{split_name}/mae_surf_Cp":    mae_surf_cp[2].item(),
+            f"{split_name}/mae_surf_Cv_Ux": mae_surf_cp[0].item(),
+            f"{split_name}/mae_surf_Cv_Uy": mae_surf_cp[1].item(),
         }
         val_loss_sum += split_loss
 
