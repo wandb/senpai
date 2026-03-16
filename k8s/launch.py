@@ -78,6 +78,7 @@ def render_student(template: str, student_name: str, tag: str, args: Args) -> st
         "STUDENT_NAME": student_name,
         "RESEARCH_TAG": tag,
         "IMAGE": args.image,
+        "ADVISOR_BRANCH": args.advisor_branch,
     })
     return configmap + "\n---\n" + deployment
 
