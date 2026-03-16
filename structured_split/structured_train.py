@@ -33,6 +33,7 @@ import json
 import os
 import time
 import torch
+from torch.optim.swa_utils import AveragedModel, update_bn
 import wandb
 import yaml
 from dataclasses import dataclass, asdict
@@ -191,6 +192,8 @@ model_config = dict(
 )
 
 model = Transolver(**model_config).to(device)
+swa_model = AveragedModel(model)
+swa_start_epoch = int(MAX_EPOCHS * 0.6)  # Start SWA at 60% of training
 
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -401,6 +404,90 @@ for epoch in range(MAX_EPOCHS):
         f"train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  "
         f"val[{split_summary}]{tag}"
     )
+
+    # --- SWA update ---
+    if epoch >= swa_start_epoch:
+        swa_model.update_parameters(model)
+
+
+# --- SWA validation (run after training if SWA was active) ---
+if swa_model.n_averaged > 0:
+    print(f"\nRunning SWA validation (averaged over {swa_model.n_averaged} checkpoints)...")
+    swa_model.eval()
+    swa_val_metrics_per_split: dict[str, dict] = {}
+    swa_val_loss_sum = 0.0
+
+    for split_name, vloader in val_loaders.items():
+        val_vol = 0.0
+        val_surf = 0.0
+        mae_surf = torch.zeros(3, device=device)
+        mae_vol = torch.zeros(3, device=device)
+        n_surf = 0
+        n_vol = 0
+        n_vbatches = 0
+
+        with torch.no_grad():
+            for x, y, is_surface, mask in tqdm(
+                vloader, desc=f"SWA [{split_name}]", leave=False
+            ):
+                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                is_surface = is_surface.to(device, non_blocking=True)
+                mask = mask.to(device, non_blocking=True)
+
+                x = (x - stats["x_mean"]) / stats["x_std"]
+                y_norm = (y - stats["y_mean"]) / stats["y_std"]
+
+                pred = swa_model({"x": x})["preds"]
+                sq_err = (pred - y_norm) ** 2
+
+                vol_mask = mask & ~is_surface
+                surf_mask = mask & is_surface
+                val_vol += (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
+                val_surf += (sq_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+                n_vbatches += 1
+
+                pred_orig = pred * stats["y_std"] + stats["y_mean"]
+                err = (pred_orig - y).abs()
+                mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                n_surf += surf_mask.sum().item()
+                n_vol += vol_mask.sum().item()
+
+        val_vol /= max(n_vbatches, 1)
+        val_surf /= max(n_vbatches, 1)
+        split_loss = val_vol + cfg.surf_weight * val_surf
+        mae_surf /= max(n_surf, 1)
+        mae_vol /= max(n_vol, 1)
+
+        swa_val_metrics_per_split[split_name] = {
+            f"swa/{split_name}/vol_loss":    val_vol,
+            f"swa/{split_name}/surf_loss":   val_surf,
+            f"swa/{split_name}/loss":        split_loss,
+            f"swa/{split_name}/mae_vol_Ux":  mae_vol[0].item(),
+            f"swa/{split_name}/mae_vol_Uy":  mae_vol[1].item(),
+            f"swa/{split_name}/mae_vol_p":   mae_vol[2].item(),
+            f"swa/{split_name}/mae_surf_Ux": mae_surf[0].item(),
+            f"swa/{split_name}/mae_surf_Uy": mae_surf[1].item(),
+            f"swa/{split_name}/mae_surf_p":  mae_surf[2].item(),
+        }
+        swa_val_loss_sum += split_loss
+
+    swa_mean_loss = swa_val_loss_sum / len(val_loaders)
+    swa_log: dict = {"swa/val_loss": swa_mean_loss, "global_step": global_step}
+    for split_metrics in swa_val_metrics_per_split.values():
+        swa_log.update(split_metrics)
+    wandb.log(swa_log)
+
+    torch.save(swa_model.module.state_dict(), model_dir / "swa_checkpoint.pt")
+
+    print(f"SWA model (epochs {swa_start_epoch+1}-end):")
+    for split_name in VAL_SPLIT_NAMES:
+        k_p = f"swa/{split_name}/mae_surf_p"
+        k_l = f"swa/{split_name}/loss"
+        if k_p in swa_val_metrics_per_split.get(split_name, {}):
+            print(f"  {split_name:30s}  loss={swa_val_metrics_per_split[split_name][k_l]:.4f}  mae_surf_p={swa_val_metrics_per_split[split_name][k_p]:.1f}")
+
+    wandb.summary.update({"swa_" + k.replace("/", "_"): v for k, v in swa_log.items() if k != "global_step"})
 
 
 # --- Final summary ---
