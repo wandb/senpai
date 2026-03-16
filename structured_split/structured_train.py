@@ -267,7 +267,6 @@ for epoch in range(MAX_EPOCHS):
         pred = pred.float()
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
-
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
         vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
@@ -317,6 +316,7 @@ for epoch in range(MAX_EPOCHS):
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = model({"x": x})["preds"]
+                pred = pred.float()
                 sq_err = (pred - y_norm) ** 2
                 abs_err = (pred - y_norm).abs()
 
@@ -355,7 +355,7 @@ for epoch in range(MAX_EPOCHS):
         }
         val_loss_sum += split_loss
 
-    # NaN-robust: skip splits with NaN/Inf loss for checkpoint selection
+    # val/loss = mean across finite splits; NaN-robust for checkpoint selection
     finite_losses = [val_metrics_per_split[name][f"{name}/loss"]
                      for name in VAL_SPLIT_NAMES
                      if not (torch.tensor(val_metrics_per_split[name][f"{name}/loss"]).isnan() or
