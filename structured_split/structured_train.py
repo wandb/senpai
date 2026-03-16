@@ -541,6 +541,26 @@ for epoch in range(MAX_EPOCHS):
         surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + surf_weight * surf_loss
 
+        # Surface smoothness penalty (total variation along airfoil)
+        smooth_loss = torch.tensor(0.0, device=pred.device)
+        n_smooth = 0
+        for b_idx in range(pred.shape[0]):
+            s = surf_mask[b_idx]
+            if s.sum() < 3:
+                continue
+            surf_pred = pred[b_idx, s]   # [S, 3]
+            surf_pos = x[b_idx, s, :2]  # [S, 2] — spatial coords (already normalized)
+            # Sort by angle around origin for approximate surface ordering
+            angles = torch.atan2(surf_pos[:, 1], surf_pos[:, 0])
+            sorted_idx = angles.argsort()
+            sorted_pred = surf_pred[sorted_idx]
+            # Total variation: sum of absolute differences between consecutive nodes
+            tv = (sorted_pred[1:] - sorted_pred[:-1]).abs().mean()
+            smooth_loss = smooth_loss + tv
+            n_smooth += 1
+        smooth_loss = smooth_loss / max(n_smooth, 1)
+        loss = loss + 0.5 * smooth_loss
+
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
