@@ -20,7 +20,7 @@ types of generalization:
 | `val_ood_cond` | cruise Part1+3 frontier 20% | Condition extrapolation (extreme AoA/gap/stagger) |
 | `val_ood_re` | cruise Part2 Re=4.445M | Reynolds number extrapolation |
 
-Training corpus: **1,322 samples** (70% of 2,699 total, balanced across sources).
+**1,889 samples** retained (70% of 2,699, balanced across sources): **1,322 train** + 567 val (63 + 210 + 84 + 210).
 
 Also improves over the root `train.py` by:
 - 24-dim input features (adds foil-2 NACA/AoA, gap, stagger)
@@ -77,10 +77,10 @@ python structured_split/split.py --quick
 ```bash
 python k8s/launch.py \
   --tag <research-tag> \
-  --repo_branch structured-split \
   --wandb_project senpai-testing \
   [--n_students 4]
 ```
 
-The `--repo_branch structured-split` flag ensures student pods clone this branch,
-which includes `structured_train.py`, the committed manifest, and the stats file.
+`launch.py` defaults to `--repo_branch main`. Once this branch is merged to main,
+student pods will clone main and get `structured_train.py`, the committed manifest,
+and the stats file automatically.
