@@ -50,4 +50,3 @@ run*.log
 results.tsv
 experiment_log/
 advisor_logs/
-tools/test_weave_logger.sh
