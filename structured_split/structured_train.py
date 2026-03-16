@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import json
+import math
 import os
 import time
 import torch
@@ -326,7 +327,10 @@ for epoch in range(MAX_EPOCHS):
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         if model.training:
-            y_norm = y_norm + 0.01 * torch.randn_like(y_norm)
+            noise_start, noise_end = 0.03, 0.001
+            progress = epoch / MAX_EPOCHS
+            noise_std = noise_end + (noise_start - noise_end) * 0.5 * (1 + math.cos(math.pi * progress))
+            y_norm = y_norm + noise_std * torch.randn_like(y_norm)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pred = model({"x": x})["preds"]
@@ -441,6 +445,7 @@ for epoch in range(MAX_EPOCHS):
     metrics = {
         "train/vol_loss": epoch_vol,
         "train/surf_loss": epoch_surf,
+        "train/noise_std": noise_std,
         "val/loss": mean_val_loss,
         "lr": scheduler.get_last_lr()[0],
         "epoch_time_s": dt,
