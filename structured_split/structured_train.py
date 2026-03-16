@@ -254,8 +254,14 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 
+# Learnable per-channel log-variance for uncertainty weighting (Kendall et al. 2018)
+log_vars = torch.zeros(3, device=device, requires_grad=True)  # [Ux, Uy, p]
+
 n_params = sum(p.numel() for p in model.parameters())
-optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+optimizer = torch.optim.AdamW(
+    list(model.parameters()) + [log_vars],
+    lr=cfg.lr, weight_decay=cfg.weight_decay
+)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=3)
 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS - 3)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
@@ -341,15 +347,26 @@ for epoch in range(MAX_EPOCHS):
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
         vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-        surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        # Per-channel uncertainty weighting (Kendall et al. 2018)
+        precision = torch.exp(-log_vars)  # [3]
+        weighted_abs_err = abs_err * precision.unsqueeze(0).unsqueeze(0)  # [B, N, 3]
+        surf_loss = (weighted_abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        surf_loss = surf_loss + log_vars.sum()  # regularization: prevent precision collapse
         loss = vol_loss + surf_weight * surf_loss
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(list(model.parameters()) + [log_vars], max_norm=1.0)
         optimizer.step()
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        wandb.log({
+            "train/loss": loss.item(),
+            "train/surf_weight": surf_weight,
+            "train/weight_Ux": precision[0].item(),
+            "train/weight_Uy": precision[1].item(),
+            "train/weight_p": precision[2].item(),
+            "global_step": global_step,
+        })
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
