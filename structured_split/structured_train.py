@@ -53,7 +53,7 @@ MAX_EPOCHS = 50
 
 @dataclass
 class Config:
-    lr: float = 5e-4
+    lr: float = 3e-3
     weight_decay: float = 1e-4
     batch_size: int = 4
     surf_weight: float = 20.0
@@ -194,7 +194,11 @@ model = Transolver(**model_config).to(device)
 
 n_params = sum(p.numel() for p in model.parameters())
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
+warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=3)
+cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS - 3)
+scheduler = torch.optim.lr_scheduler.SequentialLR(
+    optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[3]
+)
 
 # --- wandb ---
 run = wandb.init(
@@ -258,7 +262,9 @@ for epoch in range(MAX_EPOCHS):
         x = (x - stats["x_mean"]) / stats["x_std"]
         y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
-        pred = model({"x": x})["preds"]
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            pred = model({"x": x})["preds"]
+        pred = pred.float()
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
 
@@ -270,6 +276,7 @@ for epoch in range(MAX_EPOCHS):
 
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         global_step += 1
         wandb.log({"train/loss": loss.item(), "global_step": global_step})
@@ -308,7 +315,8 @@ for epoch in range(MAX_EPOCHS):
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 y_norm = (y - stats["y_mean"]) / stats["y_std"]
 
-                pred = model({"x": x})["preds"]
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    pred = model({"x": x})["preds"]
                 sq_err = (pred - y_norm) ** 2
                 abs_err = (pred - y_norm).abs()
 
