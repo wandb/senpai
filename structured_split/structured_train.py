@@ -73,6 +73,9 @@ if cfg.debug:
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}" + (" [DEBUG MODE]" if cfg.debug else ""))
 
+# Channel weighting: 1.5x on pressure (Cp) channel
+channel_w = torch.tensor([1.0, 1.0, 1.5], device=device)
+
 # --- Load split manifest and normalization stats ---
 with open(cfg.manifest) as f:
     manifest = json.load(f)
@@ -340,8 +343,9 @@ for epoch in range(MAX_EPOCHS):
         abs_err = (pred - y_norm).abs()
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
-        vol_loss = (abs_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-        surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        weighted_abs_err = abs_err * channel_w.unsqueeze(0).unsqueeze(0)
+        vol_loss = (weighted_abs_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
+        surf_loss = (weighted_abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + surf_weight * surf_loss
 
         optimizer.zero_grad()
