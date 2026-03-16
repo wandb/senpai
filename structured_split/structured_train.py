@@ -337,14 +337,28 @@ for epoch in range(MAX_EPOCHS):
         surf_mask = mask & is_surface
         vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
         surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
-        loss = vol_loss + cfg.surf_weight * surf_loss
+
+        # Auxiliary cosine similarity loss on surface pressure distribution
+        cos_loss = 0.0
+        for b in range(pred.shape[0]):
+            surf_idx = torch.where(surf_mask[b])[0]
+            if len(surf_idx) < 2:
+                continue
+            p_pred = pred[b, surf_idx, 2]  # pressure channel
+            p_true = y_norm[b, surf_idx, 2]
+            cos_sim = torch.nn.functional.cosine_similarity(p_pred.unsqueeze(0), p_true.unsqueeze(0))
+            cos_loss = cos_loss + (1 - cos_sim)
+        cos_loss = cos_loss / pred.shape[0]
+
+        loss = vol_loss + cfg.surf_weight * surf_loss + 5.0 * cos_loss
 
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "global_step": global_step})
+        cos_loss_val = cos_loss.item() if hasattr(cos_loss, "item") else float(cos_loss)
+        wandb.log({"train/loss": loss.item(), "train/cos_loss": cos_loss_val, "global_step": global_step})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
