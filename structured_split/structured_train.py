@@ -104,7 +104,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.scale = dim_head**-0.5
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
-        self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
+        self.register_buffer('temperature', torch.ones(1) * 1.0)
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
@@ -485,8 +485,8 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
-attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale'])]
-other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale'])]
+attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'slice_weight', 'attn_scale'])]
+other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'slice_weight', 'attn_scale'])]
 base_opt = torch.optim.AdamW([
     {'params': attn_params, 'lr': cfg.lr * 0.5},
     {'params': other_params, 'lr': cfg.lr}
@@ -544,6 +544,11 @@ for epoch in range(MAX_EPOCHS):
         break
 
     t0 = time.time()
+
+    # Temperature annealing: 1.0 → 0.25 over first 60 epochs
+    temp_val = 1.0 - 0.75 * min(epoch / 60.0, 1.0)
+    for block in model.blocks:
+        block.attn.temperature.fill_(temp_val)
 
     # Dynamic surface weight: linear ramp from 5 → 30 over training
     sw_start, sw_end = 5.0, 30.0
