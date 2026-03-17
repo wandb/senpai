@@ -26,7 +26,7 @@ Give the sub-agent these instructions plus any additional context you have (curr
 
 4. Return a **ranked list** of the most promising new ideas, each with:
    - A clear hypothesis statement
-   - Specific, actionable instructions for implementation in `structured_split/structured_train.py`
+   - Specific, actionable instructions for implementation in `train.py`
    - Why this idea is worth trying (connection to past results or theoretical reasoning)
 
 ## Prioritization

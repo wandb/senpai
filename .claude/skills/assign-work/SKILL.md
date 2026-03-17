@@ -51,7 +51,7 @@ Every PR must follow this structure:
 <what we think will improve metrics and why>
 
 ## Instructions
-<specific changes to make to structured_split/structured_train.py — be concrete>
+<specific changes to make to train.py — be concrete>
 
 ## Baseline
 <current best metrics for reference>
