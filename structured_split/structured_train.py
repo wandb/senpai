@@ -118,8 +118,9 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout),
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
+        self.pos_bias_mlp = nn.Sequential(nn.Linear(1, 16), nn.GELU(), nn.Linear(16, heads))
 
-    def forward(self, x):
+    def forward(self, x, raw_xy=None):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -146,6 +147,16 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         q_norm = F.normalize(q_slice_token, dim=-1)
         k_norm = F.normalize(k_slice_token, dim=-1)
         attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
+
+        if raw_xy is not None:
+            # Relative position bias: compute slice centroids and pairwise distances
+            sw = slice_weights.mean(dim=1)  # [B, N, S]: avg over heads
+            centroids = torch.einsum('bns,bnd->bsd', sw, raw_xy)  # [B, S, 2]
+            dist = torch.cdist(centroids, centroids)  # [B, S, S]
+            pos_bias = self.pos_bias_mlp(dist.unsqueeze(-1))  # [B, S, S, n_head]
+            pos_bias = pos_bias.permute(0, 3, 1, 2)  # [B, n_head, S, S]
+            attn_logits = attn_logits + pos_bias
+
         attn_weights = F.softmax(attn_logits, dim=-1)
         out_slice_token = torch.matmul(attn_weights, v_slice_token)
 
@@ -186,8 +197,8 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx):
-        fx = self.attn(self.ln_1(fx)) + fx
+    def forward(self, fx, raw_xy=None):
+        fx = self.attn(self.ln_1(fx), raw_xy=raw_xy) + fx
         fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
             return self.mlp2(self.ln_3(fx))
@@ -314,11 +325,12 @@ class Transolver(nn.Module):
             new_pos = self.get_grid(pos)
             x = torch.cat((x, new_pos), dim=-1)
 
+        raw_xy = x[:, :, :self.space_dim].float()  # [B, N, 2] — raw spatial coordinates
         fx = self.preprocess(x)
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks:
-            fx = block(fx)
+            fx = block(fx, raw_xy=raw_xy)
         self._validate_output_dims(fx)
         return {"preds": fx}
 
