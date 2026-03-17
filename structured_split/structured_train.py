@@ -617,6 +617,11 @@ for epoch in range(MAX_EPOCHS):
         tandem_boost = torch.where(is_tandem, 1.5, 1.0).to(device)
         surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         surf_loss = (surf_per_sample * tandem_boost).mean()
+        # Stochastic surface weight: sample Uniform(10, 40) per batch during training
+        if model.training:
+            surf_weight = torch.empty(1, device=device).uniform_(10.0, 40.0).item()
+        else:
+            surf_weight = 25.0
         loss = vol_loss + surf_weight * surf_loss
 
         # Multi-scale loss: coarse spatial pooling
