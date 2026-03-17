@@ -178,6 +178,8 @@ class TransolverBlock(nn.Module):
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        self.alpha_attn = nn.Parameter(torch.zeros(1))
+        self.alpha_mlp = nn.Parameter(torch.zeros(1))
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
             self.mlp2 = nn.Sequential(
@@ -187,8 +189,10 @@ class TransolverBlock(nn.Module):
             )
 
     def forward(self, fx):
-        fx = self.attn(self.ln_1(fx)) + fx
-        fx = self.mlp(self.ln_2(fx)) + fx
+        attn_output = self.attn(self.ln_1(fx))
+        fx = self.alpha_attn * attn_output + fx
+        mlp_output = self.mlp(self.ln_2(fx))
+        fx = self.alpha_mlp * mlp_output + fx
         if self.last_layer:
             return self.mlp2(self.ln_3(fx))
         return fx
@@ -485,8 +489,8 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
-attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale'])]
-other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale'])]
+attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'alpha_attn', 'alpha_mlp'])]
+other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'alpha_attn', 'alpha_mlp'])]
 base_opt = torch.optim.AdamW([
     {'params': attn_params, 'lr': cfg.lr * 0.5},
     {'params': other_params, 'lr': cfg.lr}
