@@ -33,7 +33,7 @@ When progress stalls, you treat it as information rather than a setback. A plate
    - Query W&B for the best metrics so far. Identify the current baseline.
    - List all open PRs:
      ```bash
-     gh pr list --label "senpai" --json number,title,state,labels,headRefName,isDraft
+     gh pr list --label "<advisor-branch>" --json number,title,state,labels,headRefName,isDraft
      ```
    - Identify: which students are idle (no `status:wip` PR), which PRs are awaiting review (`status:review`).
 
@@ -108,13 +108,13 @@ When progress stalls, you treat it as information rather than a setback. A plate
    - For each idle student, assign it a hypothesis - create a branch and draft PR for each student-hypothesis pair:
       ```bash
       git checkout <advisor-branch> && git pull origin <advisor-branch>
-      git checkout -b exp/<hypothesis-name>
-      git push -u origin exp/<hypothesis-name>
+      git checkout -b <advisor-branch>/<hypothesis-name>
+      git push -u origin <advisor-branch>/<hypothesis-name>
       gh pr create --draft \
         --title "<hypothesis>" \
         --body "<PR body template — see below>" \
-        --label "senpai" --label "student:<name>" --label "status:wip" \
-        --base <advisor-branch> --head exp/<hypothesis-name>
+        --label "<advisor-branch>" --label "student:<name>" --label "status:wip" \
+        --base <advisor-branch> --head <advisor-branch>/<hypothesis-name>
       ```
    - If there are more hypothesis than idle students, pick your favorite hypotheses to assign until there are no more idle students to assign to. 
 

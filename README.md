@@ -20,7 +20,7 @@ The model is a [Transolver](https://arxiv.org/abs/2402.02366) with physics-aware
 
 ## How it works
 
-An **advisor** agent (no GPU) creates hypothesis PRs with detailed instructions and assigns them to **student** agents (GPU nodes). Students implement, run experiments, and report results on the PR. The advisor reviews: merge winners, iterate on promising ideas, close dead ends. Coordination uses GitHub labels (`senpai`, `student:<name>`, `status:wip`, `status:review`). W&B tracks metrics.
+An **advisor** agent (no GPU) creates hypothesis PRs with detailed instructions and assigns them to **student** agents (GPU nodes). Students implement, run experiments, and report results on the PR. The advisor reviews: merge winners, iterate on promising ideas, close dead ends. Coordination uses GitHub labels (`<advisor-name>`, `student:<name>`, `status:wip`, `status:review`). W&B tracks metrics.
 
 ## Architecture
 
