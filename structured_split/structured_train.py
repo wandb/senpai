@@ -571,11 +571,12 @@ for epoch in range(MAX_EPOCHS):
         is_tandem = raw_gap.abs() > 0.5
         B = y_norm.shape[0]
         sample_stds = torch.ones(B, 1, 3, device=device)
+        channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
         if model.training:
             for b in range(B):
                 if not is_tandem[b]:
                     valid = mask[b]
-                    sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=0.1)
+                    sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
             y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -672,10 +673,11 @@ for epoch in range(MAX_EPOCHS):
                 is_tandem = raw_gap.abs() > 0.5
                 B = y_norm.shape[0]
                 sample_stds = torch.ones(B, 1, 3, device=device)
+                channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
                 for b in range(B):
                     if not is_tandem[b]:
                         valid = mask[b]
-                        sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=0.1)
+                        sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
