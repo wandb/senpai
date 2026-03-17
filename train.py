@@ -474,7 +474,7 @@ model = Transolver(**model_config).to(device)
 
 from copy import deepcopy
 swa_model = None
-swa_start_epoch = 60
+swa_start_epoch = 45
 swa_n = 0
 
 n_params = sum(p.numel() for p in model.parameters())
@@ -572,7 +572,7 @@ for epoch in range(MAX_EPOCHS):
 
     if epoch >= swa_start_epoch:
         for pg in base_opt.param_groups:
-            pg['lr'] = 5e-4  # flat LR for SWA phase
+            pg['lr'] = 2e-4  # flat LR for SWA phase
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
