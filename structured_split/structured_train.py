@@ -183,6 +183,7 @@ class TransolverBlock(nn.Module):
             self.mlp2 = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.GELU(),
+                nn.Dropout(0.1),
                 nn.Linear(hidden_dim, out_dim),
             )
 
