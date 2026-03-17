@@ -259,6 +259,7 @@ class Transolver(nn.Module):
         self.initialize_weights()
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
+        self.input_skip = nn.Linear(fun_dim + space_dim, out_dim)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -321,6 +322,7 @@ class Transolver(nn.Module):
 
         for block in self.blocks:
             fx = block(fx)
+        fx = fx + self.input_skip(x)  # geometry shortcut: linear skip from input to output
         self._validate_output_dims(fx)
         return {"preds": fx}
 
