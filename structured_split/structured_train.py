@@ -186,12 +186,14 @@ class TransolverBlock(nn.Module):
                 nn.GELU(),
                 nn.Linear(hidden_dim, out_dim),
             )
+            self.normal_head = nn.Linear(hidden_dim, 2)
 
     def forward(self, fx):
         fx = self.attn(self.ln_1(fx)) + fx
         fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            h = self.ln_3(fx)
+            return self.mlp2(h), self.normal_head(h)
         return fx
 
 
@@ -318,10 +320,14 @@ class Transolver(nn.Module):
         fx = self.preprocess(x)
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
+        normals = None
         for block in self.blocks:
-            fx = block(fx)
+            if block.last_layer:
+                fx, normals = block(fx)
+            else:
+                fx = block(fx)
         self._validate_output_dims(fx)
-        return {"preds": fx}
+        return {"preds": fx, "normals": normals}
 
 
 # ---------------------------------------------------------------------------
@@ -566,8 +572,9 @@ for epoch in range(MAX_EPOCHS):
             y_norm = y_norm + 0.01 * torch.randn_like(y_norm)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            pred = model({"x": x})["preds"]
-        pred = pred.float()
+            out = model({"x": x})
+        pred = out["preds"].float()
+        normals_pred = out["normals"].float()
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         vol_mask = mask & ~is_surface
@@ -608,6 +615,14 @@ for epoch in range(MAX_EPOCHS):
             coarse_err = (pred_coarse - y_coarse).abs()
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
             loss = loss + 1.0 * coarse_loss
+
+        # Auxiliary surface normal prediction loss
+        # GT: centroid-outward unit normals computed from finite diff of surface positions
+        surf_centroid = (x[:, :, :2] * surf_mask.float().unsqueeze(-1)).sum(1) / surf_mask.float().sum(1, keepdim=True).clamp(min=1)
+        gt_normals = F.normalize(x[:, :, :2] - surf_centroid.unsqueeze(1), dim=-1)
+        normal_cos = (F.normalize(normals_pred, dim=-1) * gt_normals).sum(-1)
+        normal_loss = ((1 - normal_cos) * surf_mask.float()).sum() / surf_mask.float().sum().clamp(min=1)
+        loss = loss + 0.1 * normal_loss
 
         optimizer.zero_grad()
         loss.backward()
