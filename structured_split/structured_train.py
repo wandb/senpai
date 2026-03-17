@@ -185,12 +185,17 @@ class TransolverBlock(nn.Module):
                 nn.GELU(),
                 nn.Linear(hidden_dim, out_dim),
             )
+            self.uncertainty_head = nn.Linear(hidden_dim, 3)
+            nn.init.zeros_(self.uncertainty_head.bias)
 
     def forward(self, fx):
         fx = self.attn(self.ln_1(fx)) + fx
         fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            fx_norm = self.ln_3(fx)
+            preds = self.mlp2(fx_norm)
+            log_var = self.uncertainty_head(fx_norm).clamp(-4, 4)
+            return preds, log_var
         return fx
 
 
@@ -319,6 +324,10 @@ class Transolver(nn.Module):
 
         for block in self.blocks:
             fx = block(fx)
+        if isinstance(fx, tuple):
+            preds, log_var = fx
+            self._validate_output_dims(preds)
+            return {"preds": preds, "log_var": log_var}
         self._validate_output_dims(fx)
         return {"preds": fx}
 
@@ -589,8 +598,11 @@ for epoch in range(MAX_EPOCHS):
             y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            pred = model({"x": x})["preds"]
-        pred = pred.float()
+            out = model({"x": x})
+        pred = out["preds"].float()
+        log_var = out.get("log_var", None)
+        if log_var is not None:
+            log_var = log_var.float()
         if model.training:
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
@@ -615,7 +627,11 @@ for epoch in range(MAX_EPOCHS):
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem = (x[:, 0, 21].abs() > 0.01)
         tandem_boost = torch.where(is_tandem, 1.5, 1.0).to(device)
-        surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        if log_var is not None:
+            hetero_loss = 0.5 * (torch.exp(-log_var) * abs_err + log_var)
+            surf_per_sample = (hetero_loss * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        else:
+            surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         surf_loss = (surf_per_sample * tandem_boost).mean()
         loss = vol_loss + surf_weight * surf_loss
 
