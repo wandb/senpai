@@ -457,7 +457,9 @@ model = Transolver(**model_config).to(device)
 from copy import deepcopy
 ema_model = None
 ema_start_epoch = 65
-ema_decay = 0.998
+ema_decay_attn = 0.99   # attention params: more responsive
+ema_decay_mlp = 0.999   # MLP params: smoother
+ATTN_KEYS = ('Wqkv', 'temperature', 'slice_weight', 'attn_scale')
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -646,8 +648,9 @@ for epoch in range(MAX_EPOCHS):
                 ema_model = deepcopy(model)
             else:
                 with torch.no_grad():
-                    for ep, mp in zip(ema_model.parameters(), model.parameters()):
-                        ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
+                    for (name, ep), (_, mp) in zip(ema_model.named_parameters(), model.named_parameters()):
+                        decay = ema_decay_attn if any(k in name for k in ATTN_KEYS) else ema_decay_mlp
+                        ep.data.mul_(decay).add_(mp.data, alpha=1 - decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
