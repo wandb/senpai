@@ -603,7 +603,11 @@ for epoch in range(MAX_EPOCHS):
             vol_mask_train = vol_mask
 
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
-        surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        # Per-sample channel weighting: heavier pressure weight for tandem samples
+        channel_w = torch.ones(B, 1, 3, device=device)
+        channel_w[is_tandem, :, 2] = 3.0
+        channel_w = channel_w / channel_w.mean(dim=-1, keepdim=True)
+        surf_loss = (abs_err * channel_w * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + surf_weight * surf_loss
 
         # Multi-scale loss: coarse spatial pooling
