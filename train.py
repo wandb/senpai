@@ -605,7 +605,15 @@ for epoch in range(MAX_EPOCHS):
             for b in range(B):
                 if not is_tandem[b]:
                     valid = mask[b]
-                    sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+                    vals = y_norm[b, valid]  # [n_valid, 3]
+                    # Velocity channels: std as before
+                    sample_stds[b, 0, :2] = vals[:, :2].std(dim=0).clamp(min=channel_clamps[:2])
+                    # Pressure channel: IQR for robustness to stagnation/suction outliers
+                    p_vals = vals[:, 2].float()
+                    q75 = torch.quantile(p_vals, 0.75)
+                    q25 = torch.quantile(p_vals, 0.25)
+                    iqr_std = (q75 - q25).clamp(min=channel_clamps[2].item()) * 0.7413
+                    sample_stds[b, 0, 2] = iqr_std
             y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -731,7 +739,13 @@ for epoch in range(MAX_EPOCHS):
                 for b in range(B):
                     if not is_tandem[b]:
                         valid = mask[b]
-                        sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+                        vals = y_norm[b, valid]  # [n_valid, 3]
+                        sample_stds[b, 0, :2] = vals[:, :2].std(dim=0).clamp(min=channel_clamps[:2])
+                        p_vals = vals[:, 2].float()
+                        q75 = torch.quantile(p_vals, 0.75)
+                        q25 = torch.quantile(p_vals, 0.25)
+                        iqr_std = (q75 - q25).clamp(min=channel_clamps[2].item()) * 0.7413
+                        sample_stds[b, 0, 2] = iqr_std
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
