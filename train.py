@@ -245,6 +245,17 @@ class Transolver(nn.Module):
         else:
             self.preprocess = MLP(fun_dim + space_dim, n_hidden * 2, n_hidden, n_layers=1, res=True, act=act)
 
+        # Pressure-aware branch: pos(2) + saf(2) + dsdf(8) + is_surface(1) + log_Re(1) = 14 features
+        self.pressure_preprocess = nn.Sequential(
+            nn.Linear(14, 64), nn.GELU(), nn.Linear(64, 32)
+        )
+        # Project combined 128+32=160 back to n_hidden; init to identity on main branch
+        self.combine_proj = nn.Linear(160, n_hidden)
+        with torch.no_grad():
+            self.combine_proj.weight.zero_()
+            self.combine_proj.weight[:n_hidden, :n_hidden].copy_(torch.eye(n_hidden))
+            self.combine_proj.bias.zero_()
+
         self.n_hidden = n_hidden
         self.space_dim = space_dim
         self.blocks = nn.ModuleList(
@@ -328,6 +339,8 @@ class Transolver(nn.Module):
 
         raw_xy = x[:, :, :2]
         fx = self.preprocess(x)
+        fp = self.pressure_preprocess(x[:, :, :14])
+        fx = self.combine_proj(torch.cat([fx, fp], dim=-1))
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
