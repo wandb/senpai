@@ -629,8 +629,11 @@ for epoch in range(MAX_EPOCHS):
             y_trunc = y_norm[:, :n_groups * coarse_pool_size]
             mask_trunc = mask[:, :n_groups * coarse_pool_size]
 
-            pred_coarse = pred_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
-            y_coarse = y_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
+            # Masked mean: exclude zero-padded nodes from group averages
+            mask_4d = mask_trunc.reshape(B, n_groups, coarse_pool_size, 1).float()
+            count = mask_4d.sum(dim=2).clamp(min=1)  # [B, n_groups, 1]
+            pred_coarse = (pred_trunc.reshape(B, n_groups, coarse_pool_size, C) * mask_4d).sum(dim=2) / count
+            y_coarse = (y_trunc.reshape(B, n_groups, coarse_pool_size, C) * mask_4d).sum(dim=2) / count
             mask_coarse = mask_trunc.reshape(B, n_groups, coarse_pool_size).any(dim=2)
 
             coarse_err = (pred_coarse - y_coarse).abs()
