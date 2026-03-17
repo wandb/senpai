@@ -566,11 +566,22 @@ for epoch in range(MAX_EPOCHS):
         if model.training:
             y_norm = y_norm + 0.01 * torch.randn_like(y_norm)
 
+        with torch.no_grad():
+            # Per-sample, per-channel std of targets (only valid nodes)
+            y_std_per_sample = []
+            for b in range(y_norm.shape[0]):
+                valid = mask[b]
+                if valid.sum() > 1:
+                    y_std_per_sample.append(y_norm[b, valid].std(dim=0).clamp(min=0.1))
+                else:
+                    y_std_per_sample.append(torch.ones(3, device=device))
+            y_std_ps = torch.stack(y_std_per_sample).unsqueeze(1)  # [B, 1, 3]
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pred = model({"x": x})["preds"]
         pred = pred.float()
         sq_err = (pred - y_norm) ** 2
-        abs_err = (pred - y_norm).abs()
+        abs_err = ((pred - y_norm) / y_std_ps).abs()
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
@@ -653,11 +664,20 @@ for epoch in range(MAX_EPOCHS):
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
+                y_std_per_sample = []
+                for b in range(y_norm.shape[0]):
+                    valid = mask[b]
+                    if valid.sum() > 1:
+                        y_std_per_sample.append(y_norm[b, valid].std(dim=0).clamp(min=0.1))
+                    else:
+                        y_std_per_sample.append(torch.ones(3, device=device))
+                y_std_ps = torch.stack(y_std_per_sample).unsqueeze(1)  # [B, 1, 3]
+
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = model({"x": x})["preds"]
                 pred = pred.float()
                 sq_err = (pred - y_norm) ** 2
-                abs_err = (pred - y_norm).abs()
+                abs_err = ((pred - y_norm) / y_std_ps).abs()
 
                 vol_mask = mask & ~is_surface
                 surf_mask = mask & is_surface
@@ -699,12 +719,18 @@ for epoch in range(MAX_EPOCHS):
         }
         val_loss_sum += split_loss
 
-    # val/loss = mean across finite splits; NaN-robust for checkpoint selection
+    # val/loss = mean across finite splits; NaN-robust for comparison
     finite_losses = [val_metrics_per_split[name][f"{name}/loss"]
                      for name in VAL_SPLIT_NAMES
                      if not (torch.tensor(val_metrics_per_split[name][f"{name}/loss"]).isnan() or
                              torch.tensor(val_metrics_per_split[name][f"{name}/loss"]).isinf())]
     mean_val_loss = sum(finite_losses) / max(len(finite_losses), 1)
+
+    # mean surface pressure MAE (used for checkpoint selection)
+    surf_p_vals = [val_metrics_per_split[name][f"{name}/mae_surf_p"]
+                   for name in VAL_SPLIT_NAMES]
+    finite_sp = [v for v in surf_p_vals if not (torch.tensor(v).isnan() or torch.tensor(v).isinf())]
+    mean_surf_p = sum(finite_sp) / max(len(finite_sp), 1)
 
     dt = time.time() - t0
 
@@ -713,6 +739,7 @@ for epoch in range(MAX_EPOCHS):
         "train/vol_loss": epoch_vol,
         "train/surf_loss": epoch_surf,
         "val/loss": mean_val_loss,
+        "val/mean_surf_p": mean_surf_p,
         "lr": scheduler.get_last_lr()[0],
         "epoch_time_s": dt,
     }
@@ -727,9 +754,9 @@ for epoch in range(MAX_EPOCHS):
         peak_mem_gb = 0.0
 
     tag = ""
-    if mean_val_loss < best_val:
-        best_val = mean_val_loss
-        best_metrics = {"epoch": epoch + 1, "val_loss": mean_val_loss}
+    if mean_surf_p < best_val:
+        best_val = mean_surf_p
+        best_metrics = {"epoch": epoch + 1, "val_loss": mean_val_loss, "mean_surf_p": mean_surf_p}
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
