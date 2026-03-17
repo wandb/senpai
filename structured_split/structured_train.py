@@ -563,6 +563,14 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         x = (x - stats["x_mean"]) / stats["x_std"]
+        # Symmetric AoA flip augmentation for non-tandem samples
+        if model.training:
+            is_tandem_pre = x[:, 0, 21].abs() > 0.5
+            flip_mask = torch.rand(x.shape[0], device=device) > 0.5
+            for b in range(x.shape[0]):
+                if flip_mask[b] and not is_tandem_pre[b]:
+                    y[b, :, 1] = -y[b, :, 1]  # Flip Uy
+                    x[b, :, 1] = -x[b, :, 1]  # Flip y-coord
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
