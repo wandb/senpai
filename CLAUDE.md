@@ -24,8 +24,8 @@ When asked for a large piece of work which seems vague or needs clarification, p
 ## Key docs
 
 - `program.md` — research context, goals, metrics, file constraints
-- `advisor.md` — advisor role workflow
-- `student.md` — student role workflow
+- `instructions/CLAUDE-ADVISOR.md` — advisor role workflow
+- `instructions/CLAUDE-STUDENT.md` — student role workflow
 
 ## Architecture
 

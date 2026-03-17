@@ -241,7 +241,7 @@ def compute_stats(pickle_files, train_indices):
     train_sorted = sorted(train_indices, key=lambda i: ds.index[i])
     n = len(train_sorted)
 
-    from prepare_multi import X_DIM
+    from structured_split.prepare_multi import X_DIM
     print(f"  Pass 1/2 (mean) over {n} training samples ...")
     sum_x = torch.zeros(X_DIM)
     sum_y = torch.zeros(3)
@@ -286,15 +286,15 @@ def compute_stats(pickle_files, train_indices):
 def make_quick_manifest():
     """Generate a debug manifest and placeholder stats instantly — no pickle loading.
 
-    Uses known file sizes from DATASET_REPORT to build global index offsets directly.
+    Uses known file sizes to build global index offsets directly.
     Stats use identity normalization (mean=0, std=1) — fine for debug smoke-tests
     since we only care about the training loop running, not absolute loss values.
 
     Run:  python structured_split/split.py --quick
     """
-    from prepare_multi import X_DIM
+    from structured_split.prepare_multi import X_DIM
 
-    # Known sample counts per file — from DATASET_REPORT.md
+    # Known sample counts per file (see README.md dataset inventory)
     # Order must match PICKLE_FILES exactly.
     FILE_SIZES = [899, 300, 300, 300, 300, 300, 300]
     offsets = []
