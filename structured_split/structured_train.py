@@ -487,7 +487,13 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
-base_opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+output_params = list(model.blocks[-1].mlp2.parameters())
+output_ids = {id(p) for p in output_params}
+backbone_params = [p for p in model.parameters() if id(p) not in output_ids]
+base_opt = torch.optim.AdamW([
+    {"params": backbone_params, "lr": cfg.lr},
+    {"params": output_params, "lr": 1e-2},
+], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=5)
 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=MAX_EPOCHS - 5, eta_min=1e-4)
