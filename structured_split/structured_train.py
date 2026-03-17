@@ -188,7 +188,10 @@ class TransolverBlock(nn.Module):
             )
 
     def forward(self, fx):
-        fx = self.attn(self.ln_1(fx)) + fx
+        if self.training and torch.rand(1).item() < 0.1:
+            pass  # skip attention (stochastic depth: residual only)
+        else:
+            fx = self.attn(self.ln_1(fx)) + fx
         fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
             return self.mlp2(self.ln_3(fx))
