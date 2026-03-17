@@ -575,8 +575,8 @@ for epoch in range(MAX_EPOCHS):
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
 
-    # Temperature annealing: warm (soft) -> cold (sharp) over 60 epochs
-    temp_mult = 2.0 - 1.5 * min(1.0, epoch / 60)
+    # Temperature warmup: gentle exploration phase (1.3 → 1.0) over first 20 epochs
+    temp_mult = 1.3 - 0.3 * min(1.0, epoch / 20)
 
     # --- Train ---
     model.train()
@@ -738,7 +738,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x}, temp_mult=temp_mult)["preds"]
+                    pred = eval_model({"x": x}, temp_mult=1.0)["preds"]
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
