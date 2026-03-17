@@ -493,7 +493,7 @@ class Lookahead:
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale'])]
 base_opt = torch.optim.AdamW([
-    {'params': attn_params, 'lr': cfg.lr * 0.5},
+    {'params': attn_params, 'lr': cfg.lr * 0.4},
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
@@ -552,7 +552,7 @@ for epoch in range(MAX_EPOCHS):
 
     # Dynamic surface weight: linear ramp from 5 → 30 over training
     sw_start, sw_end = 5.0, 30.0
-    progress = epoch / MAX_EPOCHS
+    progress = min(1.0, epoch / 75)
     surf_weight = sw_start + (sw_end - sw_start) * progress
 
     # --- Train ---
