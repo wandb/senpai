@@ -227,8 +227,9 @@ class Transolver(nn.Module):
         self.output_dims = output_dims
 
         if self.unified_pos:
+            preprocess_in = fun_dim + self.ref * self.ref * self.ref
             self.preprocess = MLP(
-                fun_dim + self.ref * self.ref * self.ref,
+                preprocess_in,
                 n_hidden * 2,
                 n_hidden,
                 n_layers=0,
@@ -236,7 +237,9 @@ class Transolver(nn.Module):
                 act=act,
             )
         else:
-            self.preprocess = MLP(fun_dim + space_dim, n_hidden * 2, n_hidden, n_layers=1, res=True, act=act)
+            preprocess_in = fun_dim + space_dim
+            self.preprocess = MLP(preprocess_in, n_hidden * 2, n_hidden, n_layers=1, res=True, act=act)
+        self.decoder = nn.Linear(n_hidden, preprocess_in)
 
         self.n_hidden = n_hidden
         self.space_dim = space_dim
@@ -608,6 +611,16 @@ for epoch in range(MAX_EPOCHS):
             coarse_err = (pred_coarse - y_coarse).abs()
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
             loss = loss + 1.0 * coarse_loss
+
+        # Denoising pretraining for preprocess MLP (epochs 0-4)
+        if epoch < 5:
+            recon_weight = max(0.0, 1.0 - epoch / 5)
+            x_corrupt = x + 0.1 * torch.randn_like(x)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                fx_noisy = model.preprocess(x_corrupt)
+            x_recon = model.decoder(fx_noisy.float())
+            recon_loss = (x_recon - x).abs().mean()
+            loss = loss + recon_weight * recon_loss
 
         optimizer.zero_grad()
         loss.backward()
