@@ -174,7 +174,7 @@ class TransolverBlock(nn.Module):
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
-        self.fourier_freqs = nn.Parameter(torch.tensor([1.0, 2.0, 4.0, 8.0, 16.0]) * 2 * 3.14159, requires_grad=False)
+        self.fourier_freqs = nn.Parameter(torch.tensor([1.0, 2.0, 4.0, 8.0, 16.0]) * 2 * 3.14159)
         # Input: 2 coords * 5 freqs * 2 (sin+cos) = 20 dims
         self.spatial_bias = nn.Sequential(nn.Linear(20, 32), nn.GELU(), nn.Linear(32, slice_num))
         self.ln_1_post = nn.LayerNorm(hidden_dim)
