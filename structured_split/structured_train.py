@@ -682,7 +682,7 @@ for epoch in range(MAX_EPOCHS):
 
         val_vol /= max(n_vbatches, 1)
         val_surf /= max(n_vbatches, 1)
-        split_loss = val_vol + cfg.surf_weight * val_surf
+        split_loss = val_vol + 30.0 * val_surf
         mae_surf /= n_surf.clamp(min=1)
         mae_vol /= n_vol.clamp(min=1)
 
