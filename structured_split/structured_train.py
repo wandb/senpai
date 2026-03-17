@@ -177,7 +177,9 @@ class TransolverBlock(nn.Module):
             slice_num=slice_num,
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
-        self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        self.w1 = nn.Linear(hidden_dim, hidden_dim * mlp_ratio)
+        self.w_gate = nn.Linear(hidden_dim, hidden_dim * mlp_ratio)
+        self.w2 = nn.Linear(hidden_dim * mlp_ratio, hidden_dim)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
             self.mlp2 = nn.Sequential(
@@ -188,7 +190,8 @@ class TransolverBlock(nn.Module):
 
     def forward(self, fx):
         fx = self.attn(self.ln_1(fx)) + fx
-        fx = self.mlp(self.ln_2(fx)) + fx
+        normed = self.ln_2(fx)
+        fx = fx + self.w2(self.w1(normed) * F.silu(self.w_gate(normed)))
         if self.last_layer:
             return self.mlp2(self.ln_3(fx))
         return fx
