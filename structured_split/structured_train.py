@@ -150,6 +150,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             dropout_p=dropout_p,
             is_causal=False,
         )
+        out_slice_token = out_slice_token + slice_token  # identity shortcut
 
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
