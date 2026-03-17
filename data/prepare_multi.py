@@ -28,7 +28,7 @@ import torch
 from torch.utils.data import Dataset, Subset
 from pathlib import Path
 
-from structured_split.prepare import load_pickle, DATA_ROOT, parse_naca, pad_collate  # noqa: F401 (re-export pad_collate)
+from data.prepare import load_pickle, DATA_ROOT, parse_naca, pad_collate  # noqa: F401 (re-export pad_collate)
 
 # Includes foil 2 surface (ID 7) — fixes the SURFACE_IDS=(5,6) gap in prepare.py
 SURFACE_IDS_MULTI = (5, 6, 7)
@@ -168,7 +168,7 @@ def _stratified_sample(indices: list, n: int) -> list:
     return indices[::step][:n]
 
 
-def load_structured_split(
+def load_data(
     manifest_path: str,
     stats_file: str,
     debug: bool = False,

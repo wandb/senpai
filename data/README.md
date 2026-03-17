@@ -1,4 +1,4 @@
-# structured_split
+# data
 
 Data preparation, benchmark splits, and normalization stats for the multi-domain TandemFoilSet experiment track.
 
@@ -92,7 +92,7 @@ Features:
 python train.py --agent <your-name> --wandb_name "<your-name>/<description>"
 
 # Debug run (6 train samples, 2 per val split, 3 epochs)
-python structured_split/split.py --quick   # fast manifest, no data loading
+python data/split.py --quick   # fast manifest, no data loading
 python train.py --debug
 ```
 
@@ -106,10 +106,10 @@ Only needed if you change `SAMPLE_FRACTION`, the file list, or the split logic:
 
 ```bash
 # Full run (~30-60 min — loads all 7 pickle files twice for two-pass stats)
-python structured_split/split.py
+python data/split.py
 
 # Quick debug manifest (instant — no data loading, identity normalization)
-python structured_split/split.py --quick
+python data/split.py --quick
 ```
 
 ---

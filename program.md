@@ -15,10 +15,10 @@ We are training a neural network surrogate for CFD (computational fluid dynamics
 ## Codebase
 
 - `train.py` — **primary training script + model architecture**. **Modifiable.** (Contains the Transolver model inline, plus training with 4 val tracks across 7 data sources.)
-- `structured_split/prepare.py` — dataset loading and collation. **Read-only.**
-- `structured_split/prepare_multi.py` — extended preprocessing (24-dim x, foil-2 features). **Read-only.**
-- `structured_split/utils.py` — visualization. **Read-only.**
-- `structured_split/README.md` — benchmark splits and dataset documentation.
+- `data/prepare.py` — dataset loading and collation. **Read-only.**
+- `data/prepare_multi.py` — extended preprocessing (24-dim x, foil-2 features). **Read-only.**
+- `data/utils.py` — visualization. **Read-only.**
+- `data/README.md` — benchmark splits and dataset documentation.
 
 No new packages beyond `pyproject.toml`.
 

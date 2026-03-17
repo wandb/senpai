@@ -14,7 +14,7 @@ Read `program.md` for the full research context, constraints, metrics, and file 
 
 - **You only work on assigned PRs.** Never create your own hypotheses, branches, or PRs.
 - **You only implement what the PR instructions say.** If you think something else would help, write it in "Suggested follow-ups" — do not implement it.
-- **You only modify `train.py`.** It contains both the model architecture and training loop. Never touch anything in `structured_split/` or any other file.
+- **You only modify `train.py`.** It contains both the model architecture and training loop. Never touch anything in `data/` or any other file.
 - **You do not install packages** beyond what's in `pyproject.toml`.
 - If you have no assigned PR, you wait. You do not go looking for other work.
 

@@ -4,7 +4,7 @@
 
 """Train Transolver with structured benchmark splits.
 
-Reads a split manifest and stats file produced by structured_split/split.py,
+Reads a split manifest and stats file produced by data/split.py,
 then trains with four separate val tracks:
   val_in_dist          — raceCar_single random holdout (interpolation sanity)
   val_tandem_transfer  — raceCar_tandem Part2 (unseen tandem front foil)
@@ -36,8 +36,8 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import simple_parsing as sp
 
-from structured_split.utils import visualize
-from structured_split.prepare_multi import X_DIM, pad_collate, load_structured_split, VAL_SPLIT_NAMES
+from data.utils import visualize
+from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
 
 
 # ---------------------------------------------------------------------------
@@ -325,8 +325,8 @@ class Config:
     weight_decay: float = 1e-4
     batch_size: int = 4
     surf_weight: float = 10.0
-    manifest: str = "structured_split/split_manifest.json"
-    stats_file: str = "structured_split/split_stats.json"
+    manifest: str = "data/split_manifest.json"
+    stats_file: str = "data/split_stats.json"
     wandb_group: str | None = None
     wandb_name: str | None = None
     agent: str | None = None
@@ -341,7 +341,7 @@ if cfg.debug:
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}" + (" [DEBUG MODE]" if cfg.debug else ""))
 
-train_ds, val_splits, stats, sample_weights = load_structured_split(
+train_ds, val_splits, stats, sample_weights = load_data(
     cfg.manifest, cfg.stats_file, debug=cfg.debug,
 )
 stats = {k: v.to(device) for k, v in stats.items()}

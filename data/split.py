@@ -8,7 +8,7 @@ Produces two committed JSON files used by train.py:
   split_manifest.json  — train/val indices with domain tags
   split_stats.json     — x/y normalization stats over training set only
 
-Run: python structured_split/split.py
+Run: python data/split.py
 
 KNOWN LIMITATIONS (inherited from read-only prepare.py):
   - Only NACA[0] and AoA[0] are encoded in x features. Foil 2 identity
@@ -25,8 +25,8 @@ import numpy as np
 from datetime import datetime, timezone
 from pathlib import Path
 
-from structured_split.prepare import DATA_ROOT, load_pickle
-from structured_split.prepare_multi import MultiFieldDataset
+from data.prepare import DATA_ROOT, load_pickle
+from data.prepare_multi import MultiFieldDataset
 
 SEED = 42
 # Retain this fraction of each source (evenly spaced to preserve condition coverage).
@@ -241,7 +241,7 @@ def compute_stats(pickle_files, train_indices):
     train_sorted = sorted(train_indices, key=lambda i: ds.index[i])
     n = len(train_sorted)
 
-    from structured_split.prepare_multi import X_DIM
+    from data.prepare_multi import X_DIM
     print(f"  Pass 1/2 (mean) over {n} training samples ...")
     sum_x = torch.zeros(X_DIM)
     sum_y = torch.zeros(3)
@@ -290,9 +290,9 @@ def make_quick_manifest():
     Stats use identity normalization (mean=0, std=1) — fine for debug smoke-tests
     since we only care about the training loop running, not absolute loss values.
 
-    Run:  python structured_split/split.py --quick
+    Run:  python data/split.py --quick
     """
-    from structured_split.prepare_multi import X_DIM
+    from data.prepare_multi import X_DIM
 
     # Known sample counts per file (see README.md dataset inventory)
     # Order must match PICKLE_FILES exactly.

@@ -61,7 +61,7 @@ graph TD
 senpai/
 ├── train.py                    # Training script + Transolver model (students modify this)
 ├── program.md                  # Research context, metrics, constraints
-├── structured_split/           # Data preparation and benchmark splits
+├── data/           # Data preparation and benchmark splits
 │   ├── prepare.py              #   Dataset loading and collation
 │   ├── prepare_multi.py        #   Extended preprocessing (24-dim x, foil-2 features)
 │   ├── utils.py                #   Visualization utilities
