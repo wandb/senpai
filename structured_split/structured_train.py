@@ -627,6 +627,14 @@ for epoch in range(MAX_EPOCHS):
     epoch_surf /= n_batches
 
     # --- Validate across all splits ---
+    # Swap in Lookahead slow weights for eval/checkpoint (they are smoother than fast weights)
+    _fast_backup = []
+    for slow_grp, opt_grp in zip(optimizer.slow_params, optimizer.base_optimizer.param_groups):
+        fb = []
+        for s, p in zip(slow_grp, opt_grp['params']):
+            fb.append(p.data.clone())
+            p.data.copy_(s.data)
+        _fast_backup.append(fb)
     model.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
@@ -698,6 +706,11 @@ for epoch in range(MAX_EPOCHS):
             f"{split_name}/mae_surf_p":  mae_surf[2].item(),
         }
         val_loss_sum += split_loss
+
+    # Restore fast weights for continued training
+    for fb_grp, opt_grp in zip(_fast_backup, optimizer.base_optimizer.param_groups):
+        for f, p in zip(fb_grp, opt_grp['params']):
+            p.data.copy_(f)
 
     # val/loss = mean across finite splits; NaN-robust for checkpoint selection
     finite_losses = [val_metrics_per_split[name][f"{name}/loss"]
