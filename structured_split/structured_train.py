@@ -456,6 +456,10 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 
+ema_state = None
+ema_start = 70
+ema_decay = 0.998
+
 n_params = sum(p.numel() for p in model.parameters())
 
 
@@ -614,6 +618,12 @@ for epoch in range(MAX_EPOCHS):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        if epoch >= ema_start:
+            if ema_state is None:
+                ema_state = {k: v.clone() for k, v in model.state_dict().items()}
+            else:
+                for k in ema_state:
+                    ema_state[k].mul_(ema_decay).add_(model.state_dict()[k], alpha=1 - ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -627,6 +637,9 @@ for epoch in range(MAX_EPOCHS):
     epoch_surf /= n_batches
 
     # --- Validate across all splits ---
+    if ema_state is not None:
+        orig_state = {k: v.clone() for k, v in model.state_dict().items()}
+        model.load_state_dict(ema_state)
     model.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
@@ -705,6 +718,9 @@ for epoch in range(MAX_EPOCHS):
                      if not (torch.tensor(val_metrics_per_split[name][f"{name}/loss"]).isnan() or
                              torch.tensor(val_metrics_per_split[name][f"{name}/loss"]).isinf())]
     mean_val_loss = sum(finite_losses) / max(len(finite_losses), 1)
+
+    if ema_state is not None:
+        model.load_state_dict(orig_state)
 
     dt = time.time() - t0
 
