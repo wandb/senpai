@@ -547,6 +547,12 @@ for epoch in range(MAX_EPOCHS):
     progress = epoch / MAX_EPOCHS
     surf_weight = sw_start + (sw_end - sw_start) * progress
 
+    # Temperature annealing: 0.5 -> 0.1 over training
+    target_temp = 0.5 - 0.4 * progress  # 0.5 at epoch 0, 0.1 at epoch MAX
+    with torch.no_grad():
+        for block in model.blocks:
+            block.attn.temperature.fill_(target_temp)
+
     # --- Train ---
     model.train()
     epoch_vol = 0.0
