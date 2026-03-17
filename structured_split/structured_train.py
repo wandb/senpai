@@ -187,8 +187,11 @@ class TransolverBlock(nn.Module):
             )
 
     def forward(self, fx):
-        fx = self.attn(self.ln_1(fx)) + fx
-        fx = self.mlp(self.ln_2(fx)) + fx
+        if self.training and torch.rand(1).item() < 0.1:
+            fx = self.mlp(self.ln_2(fx)) + fx
+        else:
+            fx = self.attn(self.ln_1(fx)) + fx
+            fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
             return self.mlp2(self.ln_3(fx))
         return fx
@@ -552,7 +555,7 @@ for epoch in range(MAX_EPOCHS):
 
     # Dynamic surface weight: linear ramp from 5 → 30 over training
     sw_start, sw_end = 5.0, 30.0
-    progress = epoch / MAX_EPOCHS
+    progress = min(1.0, epoch / 75)
     surf_weight = sw_start + (sw_end - sw_start) * progress
 
     # --- Train ---
