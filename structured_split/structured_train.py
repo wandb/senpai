@@ -589,7 +589,29 @@ for epoch in range(MAX_EPOCHS):
             vol_mask_train = vol_mask
 
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
-        surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+
+        # Compute per-node gradient weights from target
+        with torch.no_grad():
+            B, N, C = y_norm.shape
+            grad_w = torch.ones(B, N, device=device)
+            for b in range(B):
+                s_idx = surf_mask[b].nonzero(as_tuple=True)[0]
+                if len(s_idx) > 1:
+                    s_pos = x[b, s_idx, :2]  # [M, 2]
+                    s_p = y_norm[b, s_idx, 2]  # [M] pressure
+                    # Compute pairwise distances and pressure diffs for nearest neighbors
+                    dists = torch.cdist(s_pos, s_pos)  # [M, M]
+                    dists.fill_diagonal_(float('inf'))
+                    _, nn_idx = dists.topk(5, largest=False)  # 5 nearest neighbors
+                    p_diff = (s_p.unsqueeze(1) - s_p[nn_idx]).abs().mean(dim=1)  # [M]
+                    nn_dist = dists.gather(1, nn_idx).mean(dim=1).clamp(min=1e-6)
+                    local_grad = (p_diff / nn_dist).clamp(0, 10)
+                    # Normalize to [1, 3]
+                    if local_grad.max() > local_grad.min():
+                        local_grad = 1.0 + 2.0 * (local_grad - local_grad.min()) / (local_grad.max() - local_grad.min())
+                    grad_w[b, s_idx] = local_grad
+
+        surf_loss = (abs_err * grad_w.unsqueeze(-1) * surf_mask.unsqueeze(-1)).sum() / (grad_w * surf_mask.float()).sum().clamp(min=1)
         loss = vol_loss + surf_weight * surf_loss
 
         # Multi-scale loss: coarse spatial pooling
