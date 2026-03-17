@@ -110,8 +110,15 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout),
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
+        # Relative position bias for inter-slice attention
+        self.rel_pos_proj = nn.Sequential(
+            nn.Linear(2, 16), nn.GELU(), nn.Linear(16, 1)
+        )
+        # Zero-init so it starts as no-op
+        nn.init.zeros_(self.rel_pos_proj[-1].weight)
+        nn.init.zeros_(self.rel_pos_proj[-1].bias)
 
-    def forward(self, x, spatial_bias=None):
+    def forward(self, x, raw_xy=None, spatial_bias=None):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -140,7 +147,21 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
         q_norm = F.normalize(q_slice_token, dim=-1)
         k_norm = F.normalize(k_slice_token, dim=-1)
-        attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
+        # Compute relative position bias between slice pairs
+        if raw_xy is not None:
+            # Mean position of each slice: weighted avg of node positions
+            # slice_weights: [B, H, N, S], raw_xy: [B, N, 2]
+            sw_avg = slice_weights.mean(dim=1)  # [B, N, S] — avg across heads
+            slice_pos = torch.einsum("bns,bnd->bsd", sw_avg, raw_xy.float())  # [B, S, 2]
+            slice_count = sw_avg.sum(dim=1).clamp(min=1e-5)  # [B, S]
+            slice_pos = slice_pos / slice_count.unsqueeze(-1)  # normalize by count
+            # Pairwise position differences: [B, S, S, 2]
+            rel_pos = slice_pos.unsqueeze(2) - slice_pos.unsqueeze(1)
+            pos_bias = self.rel_pos_proj(rel_pos).squeeze(-1)  # [B, S, S]
+            # Add to attention logits (broadcast across heads)
+            attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale + pos_bias.unsqueeze(1)
+        else:
+            attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
         attn_weights = F.softmax(attn_logits, dim=-1)
         out_slice_token = torch.matmul(attn_weights, v_slice_token)
         out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
@@ -191,7 +212,7 @@ class TransolverBlock(nn.Module):
 
     def forward(self, fx, raw_xy=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb) + fx)
+        fx = self.ln_1_post(self.attn(self.ln_1(fx), raw_xy=raw_xy, spatial_bias=sb) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
