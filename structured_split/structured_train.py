@@ -458,6 +458,11 @@ model = Transolver(**model_config).to(device)
 
 n_params = sum(p.numel() for p in model.parameters())
 
+import copy
+ema_state = copy.deepcopy(model.state_dict())
+ema_decay = 0.9995
+ema_start = 60
+
 
 class Lookahead:
     def __init__(self, base_optimizer, k=5, alpha=0.5):
@@ -640,7 +645,18 @@ for epoch in range(MAX_EPOCHS):
     epoch_vol /= n_batches
     epoch_surf /= n_batches
 
+    if epoch >= ema_start:
+        if epoch == ema_start:
+            ema_state = copy.deepcopy(model.state_dict())
+        else:
+            with torch.no_grad():
+                for key in ema_state:
+                    ema_state[key].mul_(ema_decay).add_(model.state_dict()[key], alpha=1 - ema_decay)
+
     # --- Validate across all splits ---
+    if epoch >= ema_start:
+        orig_state = copy.deepcopy(model.state_dict())
+        model.load_state_dict(ema_state)
     model.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
@@ -752,6 +768,9 @@ for epoch in range(MAX_EPOCHS):
     else:
         peak_mem_gb = 0.0
 
+    if epoch >= ema_start:
+        model.load_state_dict(orig_state)
+
     tag = ""
     if mean_val_loss < best_val:
         best_val = mean_val_loss
@@ -759,7 +778,9 @@ for epoch in range(MAX_EPOCHS):
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
-        torch.save(model.state_dict(), model_path)
+        # Save EMA weights when in EMA phase (they produced the val result)
+        save_state = ema_state if epoch >= ema_start else model.state_dict()
+        torch.save(save_state, model_path)
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
