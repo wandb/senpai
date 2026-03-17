@@ -456,6 +456,9 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 
+swa_model = torch.optim.swa_utils.AveragedModel(model)
+swa_start = int(0.8 * MAX_EPOCHS)
+
 n_params = sum(p.numel() for p in model.parameters())
 
 
@@ -623,11 +626,14 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
+    if epoch >= swa_start:
+        swa_model.update_parameters(model)
     epoch_vol /= n_batches
     epoch_surf /= n_batches
 
     # --- Validate across all splits ---
-    model.eval()
+    eval_model = swa_model if epoch >= swa_start else model
+    eval_model.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -654,7 +660,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = model({"x": x})["preds"]
+                    pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
                 sq_err = (pred - y_norm) ** 2
                 abs_err = (pred - y_norm).abs()
@@ -733,7 +739,8 @@ for epoch in range(MAX_EPOCHS):
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
-        torch.save(model.state_dict(), model_path)
+        save_state = swa_model.module.state_dict() if epoch >= swa_start else model.state_dict()
+        torch.save(save_state, model_path)
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
@@ -746,6 +753,8 @@ for epoch in range(MAX_EPOCHS):
         f"val[{split_summary}]{tag}"
     )
 
+
+torch.optim.swa_utils.update_bn(train_loader, swa_model, device=device)
 
 # --- Final summary ---
 total_time = (time.time() - train_start) / 60.0
