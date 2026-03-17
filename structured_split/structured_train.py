@@ -533,6 +533,7 @@ with open(model_dir / "config.yaml", "w") as f:
     yaml.dump(model_config, f)
 
 best_val = float("inf")
+best_mean_surf_p = float("inf")
 best_metrics = {}
 global_step = 0
 train_start = time.time()
@@ -761,10 +762,17 @@ for epoch in range(MAX_EPOCHS):
     else:
         peak_mem_gb = 0.0
 
+    mean_surf_p = sum(
+        val_metrics_per_split[name][f"{name}/mae_surf_p"]
+        for name in ["val_in_dist", "val_ood_cond", "val_tandem_transfer"]
+    ) / 3.0
+
     tag = ""
     if mean_val_loss < best_val:
         best_val = mean_val_loss
-        best_metrics = {"epoch": epoch + 1, "val_loss": mean_val_loss}
+    if mean_surf_p < best_mean_surf_p:
+        best_mean_surf_p = mean_surf_p
+        best_metrics = {"epoch": epoch + 1, "val_loss": mean_val_loss, "mean_surf_p": mean_surf_p}
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
