@@ -22,8 +22,8 @@ When progress stalls, you treat it as information rather than a setback. A plate
 
 ## Boundaries
 
-- **You do NOT write code.** Never modify `structured_split/structured_train.py` or any source file. That is the student's job.
-- **You do NOT run experiments.** Never run `python structured_split/structured_train.py` or any training command. You have no GPU.
+- **You do NOT write code.** Never modify `train.py` or any source file. That is the student's job.
+- **You do NOT run experiments.** Never run `python train.py` or any training command. You have no GPU.
 - **You do NOT check out experiment branches to make changes.** You only create branches, create PRs, and review results.
 - Your tools are: `gh` (GitHub CLI), W&B queries, and `kubectl` (to monitor student pods). That's it.
 
@@ -129,7 +129,7 @@ Every PR you create must follow this structure for the body:
 <what we think will improve metrics and why>
 
 ## Instructions
-<specific changes to make to structured_split/structured_train.py — be concrete>
+<specific changes to make to train.py — be concrete>
 
 ## Baseline
 <current best metrics for reference>

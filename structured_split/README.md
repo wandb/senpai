@@ -1,9 +1,8 @@
 # structured_split
 
-Benchmark split and training for the multi-domain TandemFoilSet experiment track.
+Data preparation, benchmark splits, and normalization stats for the multi-domain TandemFoilSet experiment track.
 
-The root `train.py` is a simpler single-dataset script for earlier experiments.
-**This directory is the active research track.**
+The training script lives at the repo root (`train.py`).
 
 ---
 
@@ -68,11 +67,10 @@ three domain groups — `racecar_single`, `racecar_tandem`, `cruise` — equal e
 weight per minibatch, preventing the largest domain from dominating the loss and
 obscuring transfer performance on the smaller tandem/cruise groups.
 
-Also improves over the root `train.py` by:
+Features:
 - 24-dim input features (adds foil-2 NACA/AoA, gap, stagger)
 - `SURFACE_IDS` includes boundary ID 7 (foil-2 surface nodes)
 - Balanced domain sampler (racecar_single / racecar_tandem / cruise equally weighted)
-- 30-minute training timeout
 
 ---
 
@@ -80,7 +78,6 @@ Also improves over the root `train.py` by:
 
 | File | Purpose |
 |------|---------|
-| `structured_train.py` | **Main training script** — run this instead of root `train.py` |
 | `split.py` | One-time script to regenerate the manifest and stats |
 | `prepare_multi.py` | Extended preprocessing: 24-dim x, foil-2 features, boundary ID 7 |
 | `split_manifest.json` | Committed train/val indices (run `split.py` to regenerate) |
@@ -92,12 +89,11 @@ Also improves over the root `train.py` by:
 
 ```bash
 # Standard run (manifest and stats default to the committed files)
-python structured_split/structured_train.py \
-  --agent <your-name> --wandb_name "<your-name>/<description>"
+python train.py --agent <your-name> --wandb_name "<your-name>/<description>"
 
 # Debug run (6 train samples, 2 per val split, 3 epochs)
 python structured_split/split.py --quick   # fast manifest, no data loading
-python structured_split/structured_train.py --debug
+python train.py --debug
 ```
 
 **W&B project:** `wandb-applied-ai-team / senpai-v1`
@@ -128,5 +124,5 @@ python k8s/launch.py \
 ```
 
 `launch.py` defaults to `--repo_branch main`. Once this branch is merged to main,
-student pods will clone main and get `structured_train.py`, the committed manifest,
+student pods will clone main and get `train.py`, the committed manifest,
 and the stats file automatically.

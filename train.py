@@ -4,9 +4,6 @@
 
 """Train Transolver with structured benchmark splits.
 
-This is the primary training script for the structured-split experiment track.
-(The root train.py is a separate, simpler single-dataset script for earlier work.)
-
 Reads a split manifest and stats file produced by structured_split/split.py,
 then trains with four separate val tracks:
   val_in_dist          — raceCar_single random holdout (interpolation sanity)
@@ -14,20 +11,14 @@ then trains with four separate val tracks:
   val_ood_cond         — cruise Part1+3 frontier 20% (extreme AoA/gap/stagger)
   val_ood_re           — cruise Part2 Re=4.445M (fully OOD Reynolds number)
 
-Run (manifest and stats default to the committed files):
-  python structured_split/structured_train.py --agent <name> --wandb_name "<name>/<desc>"
+Run:
+  python train.py --agent <name> --wandb_name "<name>/<desc>"
 
 KNOWN LIMITATIONS (inherited from read-only prepare.py):
   - Only NACA[0] and AoA[0] are encoded in x. Foil 2 is implicit in dsdf/saf.
   - SURFACE_IDS=(5,6) misses boundary ID 7 (foil 2 surface in tandem data).
     Tandem surface loss is therefore underweighted.
 """
-
-import sys
-from pathlib import Path
-
-# Reach repo root so we can import prepare, transolver, utils
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import os
 import time
@@ -46,12 +37,11 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 import simple_parsing as sp
 
 from utils import visualize
-sys.path.insert(0, str(Path(__file__).parent))  # structured_split dir
-from prepare_multi import X_DIM, pad_collate, load_structured_split, VAL_SPLIT_NAMES
+from structured_split.prepare_multi import X_DIM, pad_collate, load_structured_split, VAL_SPLIT_NAMES
 
 
 # ---------------------------------------------------------------------------
-# Transolver model (inlined from repo root transolver.py so students can
+# Transolver model (inlined so students can
 # modify architecture and training script in a single file)
 # ---------------------------------------------------------------------------
 
