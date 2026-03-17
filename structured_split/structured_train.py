@@ -29,6 +29,7 @@ from pathlib import Path
 # Reach repo root so we can import prepare, transolver, utils
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -135,6 +136,9 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             .contiguous()
         )
         slice_weights = self.softmax(self.in_project_slice(x_mid) / self.temperature)
+        frac = slice_weights.mean(dim=2)
+        entropy = -(frac * (frac + 1e-8).log()).sum(dim=-1).mean()
+        self._entropy_penalty = (math.log(self.in_project_slice.out_features) - entropy)
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
@@ -631,6 +635,8 @@ for epoch in range(MAX_EPOCHS):
             coarse_err = (pred_coarse - y_coarse).abs()
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
             loss = loss + 1.0 * coarse_loss
+
+        loss = loss + 0.01 * model.blocks[0].attn._entropy_penalty
 
         optimizer.zero_grad()
         loss.backward()
