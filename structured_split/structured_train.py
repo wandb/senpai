@@ -241,14 +241,14 @@ class Transolver(nn.Module):
         if self.unified_pos:
             self.preprocess = MLP(
                 fun_dim + self.ref * self.ref * self.ref,
-                n_hidden * 2,
+                256,
                 n_hidden,
                 n_layers=0,
                 res=False,
                 act=act,
             )
         else:
-            self.preprocess = MLP(fun_dim + space_dim, n_hidden * 2, n_hidden, n_layers=1, res=True, act=act)
+            self.preprocess = MLP(fun_dim + space_dim, 256, n_hidden, n_layers=1, res=True, act=act)
 
         self.n_hidden = n_hidden
         self.space_dim = space_dim
@@ -457,11 +457,11 @@ model_config = dict(
     space_dim=2,
     fun_dim=X_DIM - 2,  # X_DIM=24; fun_dim + space_dim must equal x.shape[-1]
     out_dim=3,
-    n_hidden=128,
+    n_hidden=192,
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
     n_head=4,
     slice_num=32,  # was 64 — fewer slices for faster attention, more epochs
-    mlp_ratio=2,
+    mlp_ratio=1,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
 )
