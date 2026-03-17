@@ -541,6 +541,8 @@ best_val = float("inf")
 best_metrics = {}
 global_step = 0
 train_start = time.time()
+prev_vol_loss = 1.0
+prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
@@ -550,10 +552,8 @@ for epoch in range(MAX_EPOCHS):
 
     t0 = time.time()
 
-    # Dynamic surface weight: linear ramp from 5 → 30 over training
-    sw_start, sw_end = 5.0, 30.0
-    progress = min(1.0, epoch / 75)
-    surf_weight = sw_start + (sw_end - sw_start) * progress
+    # Adaptive surface weight: loss-ratio based, clamped [5, 50]
+    surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
 
     # --- Train ---
     model.train()
@@ -659,6 +659,8 @@ for epoch in range(MAX_EPOCHS):
     scheduler.step()
     epoch_vol /= n_batches
     epoch_surf /= n_batches
+    prev_vol_loss = epoch_vol
+    prev_surf_loss = epoch_surf
 
     # --- Validate across all splits ---
     eval_model = ema_model if ema_model is not None else model
