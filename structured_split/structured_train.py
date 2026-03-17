@@ -457,7 +457,9 @@ model = Transolver(**model_config).to(device)
 from copy import deepcopy
 ema_model = None
 ema_start_epoch = 65
-ema_decay = 0.998
+ema_min_decay = 0.99
+ema_max_decay = 0.9995
+ema_grad_norm = 1.0  # smoothed gradient norm for adaptive decay
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -639,15 +641,19 @@ for epoch in range(MAX_EPOCHS):
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         if epoch >= ema_start_epoch:
             if ema_model is None:
                 ema_model = deepcopy(model)
             else:
+                # Adaptive EMA decay: sigmoid ramp from 0.99 (large gradients) to 0.9995 (small gradients)
+                ema_grad_norm = 0.99 * ema_grad_norm + 0.01 * grad_norm.item()
+                t = torch.sigmoid(torch.tensor(-5.0 * (ema_grad_norm - 0.4))).item()
+                ema_decay_step = ema_min_decay + (ema_max_decay - ema_min_decay) * t
                 with torch.no_grad():
                     for ep, mp in zip(ema_model.parameters(), model.parameters()):
-                        ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
+                        ep.data.mul_(ema_decay_step).add_(mp.data, alpha=1 - ema_decay_step)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
