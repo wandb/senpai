@@ -646,8 +646,13 @@ for epoch in range(MAX_EPOCHS):
                 ema_model = deepcopy(model)
             else:
                 with torch.no_grad():
-                    for ep, mp in zip(ema_model.parameters(), model.parameters()):
-                        ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
+                    ema_state = dict(ema_model.named_parameters())
+                    for name, param in model.named_parameters():
+                        ema_param = ema_state[name]
+                        if 'mlp2' in name:
+                            ema_param.mul_(0.995).add_(param.data, alpha=0.005)
+                        else:
+                            ema_param.mul_(0.998).add_(param.data, alpha=0.002)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
