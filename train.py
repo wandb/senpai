@@ -105,6 +105,13 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.to_k = nn.Linear(dim_head, dim_head, bias=False)
         self.to_v = nn.Linear(dim_head, dim_head, bias=False)
         self.slice_residual_scale = nn.Parameter(torch.tensor(0.1))
+        self.coarse_slice_num = slice_num // 2
+        self.in_project_slice_coarse = nn.Linear(dim_head, self.coarse_slice_num)
+        torch.nn.init.orthogonal_(self.in_project_slice_coarse.weight)
+        self.coarse_to_q = nn.Linear(dim_head, dim_head, bias=False)
+        self.coarse_to_k = nn.Linear(dim_head, dim_head, bias=False)
+        self.coarse_to_v = nn.Linear(dim_head, dim_head, bias=False)
+        self.scale_mix = nn.Parameter(torch.tensor(0.0))  # sigmoid(0) = 0.5 → equal mix
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout),
@@ -147,6 +154,28 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
+
+        # --- Coarse branch (coarse_slice_num slices) ---
+        coarse_logits = self.in_project_slice_coarse(x_mid) / self.temperature
+        if spatial_bias is not None:
+            sb_coarse = spatial_bias[:, :, :, ::2] if spatial_bias.dim() == 4 else spatial_bias[:, :, ::2]
+            coarse_logits = coarse_logits + 0.1 * sb_coarse.unsqueeze(1)
+        coarse_weights = self.softmax(coarse_logits)
+        coarse_norm = coarse_weights.sum(2)
+        coarse_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, coarse_weights)
+        coarse_token = coarse_token / ((coarse_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
+        cq = F.normalize(self.coarse_to_q(coarse_token), dim=-1)
+        ck = F.normalize(self.coarse_to_k(coarse_token), dim=-1)
+        cv = self.coarse_to_v(coarse_token)
+        c_attn = F.softmax(torch.matmul(cq, ck.transpose(-2, -1)) * self.attn_scale, dim=-1)
+        out_coarse = torch.matmul(c_attn, cv)
+        out_coarse = out_coarse + self.slice_residual_scale * coarse_token
+        out_x_coarse = torch.einsum("bhgc,bhng->bhnc", out_coarse, coarse_weights)
+        out_x_coarse = rearrange(out_x_coarse, "b h n d -> b n (h d)")
+
+        # Learnable mix of fine and coarse
+        mix = torch.sigmoid(self.scale_mix)
+        out_x = mix * out_x + (1 - mix) * out_x_coarse
         return self.to_out(out_x)
 
 
