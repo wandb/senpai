@@ -559,6 +559,10 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         x = (x - stats["x_mean"]) / stats["x_std"]
+        if model.training:
+            chan_mask = (torch.rand(1, 1, x.shape[-1], device=x.device) > 0.05).float()
+            chan_mask[:, :, :2] = 1.0
+            x = x * chan_mask / 0.95
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
