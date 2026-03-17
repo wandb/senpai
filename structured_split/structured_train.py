@@ -485,12 +485,20 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
-attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale'])]
-other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale'])]
+no_decay_names = ['bias', 'ln_', 'LayerNorm', 'placeholder_scale', 'placeholder_shift', 'temperature', 'attn_scale']
+attn_keywords = ['Wqkv', 'temperature', 'slice_weight', 'attn_scale']
+
+attn_decay = [p for n, p in model.named_parameters() if any(k in n for k in attn_keywords) and not any(nd in n for nd in no_decay_names)]
+attn_no_decay = [p for n, p in model.named_parameters() if any(k in n for k in attn_keywords) and any(nd in n for nd in no_decay_names)]
+other_decay = [p for n, p in model.named_parameters() if not any(k in n for k in attn_keywords) and not any(nd in n for nd in no_decay_names)]
+other_no_decay = [p for n, p in model.named_parameters() if not any(k in n for k in attn_keywords) and any(nd in n for nd in no_decay_names)]
+
 base_opt = torch.optim.AdamW([
-    {'params': attn_params, 'lr': cfg.lr * 0.5},
-    {'params': other_params, 'lr': cfg.lr}
-], weight_decay=cfg.weight_decay)
+    {'params': attn_decay, 'lr': cfg.lr * 0.5, 'weight_decay': 1e-4},
+    {'params': attn_no_decay, 'lr': cfg.lr * 0.5, 'weight_decay': 0.0},
+    {'params': other_decay, 'lr': cfg.lr, 'weight_decay': 1e-4},
+    {'params': other_no_decay, 'lr': cfg.lr, 'weight_decay': 0.0},
+], weight_decay=1e-4)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=5)
 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=75, eta_min=1e-4)
