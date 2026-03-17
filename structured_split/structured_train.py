@@ -192,8 +192,8 @@ class TransolverBlock(nn.Module):
 
     def forward(self, fx, raw_xy=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.attn(self.ln_1(fx), spatial_bias=sb) + fx
-        fx = self.mlp(self.ln_2(fx)) + fx
+        fx = self.ln_1(self.attn(fx, spatial_bias=sb) + fx)
+        fx = self.ln_2(self.mlp(fx) + fx)
         if self.last_layer:
             return self.mlp2(self.ln_3(fx))
         return fx
