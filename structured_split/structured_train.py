@@ -591,6 +591,11 @@ for epoch in range(MAX_EPOCHS):
         surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + surf_weight * surf_loss
 
+        # Gradient matching: penalize errors in spatial derivatives
+        grad_pred = pred[:, 1:] - pred[:, :-1]
+        grad_true = y_norm[:, 1:] - y_norm[:, :-1]
+        loss = loss + 0.1 * (grad_pred - grad_true).abs().mean()
+
         # Multi-scale loss: coarse spatial pooling
         coarse_pool_size = 64
         B, N, C = pred.shape
