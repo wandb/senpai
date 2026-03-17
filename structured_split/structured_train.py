@@ -545,10 +545,13 @@ for epoch in range(MAX_EPOCHS):
 
     t0 = time.time()
 
-    # Dynamic surface weight: linear ramp from 5 → 30 over training
-    sw_start, sw_end = 5.0, 30.0
-    progress = epoch / MAX_EPOCHS
-    surf_weight = sw_start + (sw_end - sw_start) * progress
+    # Dual-phase surface weight: vol-first (2→10) for ep 0-40, surf-heavy (20→40) for ep 40+
+    if epoch < 40:
+        surf_weight = 2.0 + (10.0 - 2.0) * min(epoch / 40, 1.0)
+        tandem_boost_factor = 1.0
+    else:
+        surf_weight = 20.0 + (40.0 - 20.0) * min((epoch - 40) / 40, 1.0)
+        tandem_boost_factor = 2.0
 
     # --- Train ---
     model.train()
@@ -608,7 +611,7 @@ for epoch in range(MAX_EPOCHS):
 
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem = (x[:, 0, 21].abs() > 0.01)
-        tandem_boost = torch.where(is_tandem, 1.5, 1.0).to(device)
+        tandem_boost = torch.where(is_tandem, tandem_boost_factor, 1.0).to(device)
         surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         surf_loss = (surf_per_sample * tandem_boost).mean()
         loss = vol_loss + surf_weight * surf_loss
