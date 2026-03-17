@@ -104,7 +104,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.scale = dim_head**-0.5
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
-        self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
+        self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.25)
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
@@ -589,7 +589,9 @@ for epoch in range(MAX_EPOCHS):
             vol_mask_train = vol_mask
 
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
-        surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        surf_channel_w = torch.tensor([1.0, 1.0, 2.0], device=device)
+        surf_channel_w = surf_channel_w / surf_channel_w.mean()
+        surf_loss = (abs_err * surf_channel_w * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + surf_weight * surf_loss
 
         # Multi-scale loss: coarse spatial pooling
