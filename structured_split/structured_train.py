@@ -637,6 +637,14 @@ for epoch in range(MAX_EPOCHS):
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
             loss = loss + 1.0 * coarse_loss
 
+        # Tail loss: extra penalty on worst 5% of valid nodes per sample
+        node_err_mean = abs_err.mean(dim=-1)  # [B, N]
+        node_err_masked = node_err_mean * mask.float()
+        threshold = torch.quantile(node_err_masked, 0.95, dim=1, keepdim=True).clamp(min=1e-6)
+        tail_mask = (node_err_masked >= threshold) & mask
+        tail_loss = (abs_err * tail_mask.unsqueeze(-1)).sum() / tail_mask.sum().clamp(min=1)
+        loss = loss + 0.5 * tail_loss
+
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
