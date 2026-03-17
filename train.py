@@ -373,6 +373,7 @@ if cfg.debug:
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}" + (" [DEBUG MODE]" if cfg.debug else ""))
+channel_wt = torch.tensor([1.0, 1.0, 3.0], device=device)  # [Ux, Uy, p] — upweight pressure
 
 train_ds, val_splits, stats, sample_weights = load_data(
     cfg.manifest, cfg.stats_file, debug=cfg.debug,
@@ -617,7 +618,7 @@ for epoch in range(MAX_EPOCHS):
         if model.training:
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
-        abs_err = (pred - y_norm).abs()
+        abs_err = (pred - y_norm).abs() * channel_wt  # upweight pressure channel
         if epoch < 10:
             is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
             sample_mask = (~is_tandem_curr).float()[:, None, None]
@@ -739,7 +740,7 @@ for epoch in range(MAX_EPOCHS):
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
-                abs_err = (pred_loss - y_norm_scaled).abs()
+                abs_err = (pred_loss - y_norm_scaled).abs() * channel_wt  # upweight pressure channel
 
                 vol_mask = mask & ~is_surface
                 surf_mask = mask & is_surface
