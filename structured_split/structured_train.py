@@ -552,7 +552,7 @@ for epoch in range(MAX_EPOCHS):
 
     # Dynamic surface weight: linear ramp from 5 → 30 over training
     sw_start, sw_end = 5.0, 30.0
-    progress = epoch / MAX_EPOCHS
+    progress = min(1.0, epoch / 75)
     surf_weight = sw_start + (sw_end - sw_start) * progress
 
     # --- Train ---
@@ -635,7 +635,23 @@ for epoch in range(MAX_EPOCHS):
 
             coarse_err = (pred_coarse - y_coarse).abs()
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
-            loss = loss + 1.0 * coarse_loss
+            loss = loss + 0.5 * coarse_loss
+
+        # Multi-scale loss: coarse spatial pooling (pool 256)
+        coarse_pool_size_256 = 256
+        n_groups_256 = N // coarse_pool_size_256
+        if n_groups_256 > 1:
+            pred_trunc_256 = pred[:, :n_groups_256 * coarse_pool_size_256]
+            y_trunc_256 = y_norm[:, :n_groups_256 * coarse_pool_size_256]
+            mask_trunc_256 = mask[:, :n_groups_256 * coarse_pool_size_256]
+
+            pred_coarse_256 = pred_trunc_256.reshape(B, n_groups_256, coarse_pool_size_256, C).mean(dim=2)
+            y_coarse_256 = y_trunc_256.reshape(B, n_groups_256, coarse_pool_size_256, C).mean(dim=2)
+            mask_coarse_256 = mask_trunc_256.reshape(B, n_groups_256, coarse_pool_size_256).any(dim=2)
+
+            coarse_err_256 = (pred_coarse_256 - y_coarse_256).abs()
+            coarse_loss_256 = (coarse_err_256 * mask_coarse_256.unsqueeze(-1)).sum() / mask_coarse_256.sum().clamp(min=1)
+            loss = loss + 0.5 * coarse_loss_256
 
         optimizer.zero_grad()
         loss.backward()
