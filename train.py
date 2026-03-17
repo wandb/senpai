@@ -517,10 +517,17 @@ base_opt = torch.optim.AdamW([
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=5)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=75, eta_min=1e-4)
-scheduler = torch.optim.lr_scheduler.SequentialLR(
-    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[5]
+# Get the LR for each param group from base_opt
+param_group_lrs = [pg['lr'] for pg in base_opt.param_groups]
+scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    base_opt,
+    max_lr=[lr * 2.0 for lr in param_group_lrs],  # 2x peak
+    epochs=75,
+    steps_per_epoch=len(train_loader),
+    pct_start=0.1,       # 10% warmup (~7 epochs)
+    anneal_strategy='cos',
+    div_factor=10,        # start at max_lr/10
+    final_div_factor=100, # end at max_lr/1000
 )
 
 # --- wandb ---
@@ -672,6 +679,7 @@ for epoch in range(MAX_EPOCHS):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        scheduler.step()
         if epoch >= ema_start_epoch:
             if ema_model is None:
                 ema_model = deepcopy(model)
@@ -687,7 +695,6 @@ for epoch in range(MAX_EPOCHS):
         n_batches += 1
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
-    scheduler.step()
     epoch_vol /= n_batches
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
