@@ -317,6 +317,11 @@ class Transolver(nn.Module):
         fx = self.preprocess(x)
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
+        is_surface_flag = data.get("is_surface", None) if isinstance(data, dict) else None
+        if is_surface_flag is not None:
+            surf_boost = 1.0 + 0.5 * is_surface_flag.unsqueeze(-1).float()
+            fx = fx * surf_boost
+
         for block in self.blocks:
             fx = block(fx)
         self._validate_output_dims(fx)
@@ -584,7 +589,7 @@ for epoch in range(MAX_EPOCHS):
             y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            pred = model({"x": x})["preds"]
+            pred = model({"x": x, "is_surface": is_surface})["preds"]
         pred = pred.float()
         if model.training:
             pred = pred / sample_stds
@@ -688,7 +693,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = model({"x": x})["preds"]
+                    pred = model({"x": x, "is_surface": is_surface})["preds"]
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
