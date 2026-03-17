@@ -105,6 +105,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
         self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
+        self.tandem_temp_scale = nn.Parameter(torch.tensor(1.0))
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
@@ -119,7 +120,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
 
-    def forward(self, x, spatial_bias=None):
+    def forward(self, x, spatial_bias=None, tandem_mask=None):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -134,7 +135,12 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             .permute(0, 2, 1, 3)
             .contiguous()
         )
-        slice_logits = self.in_project_slice(x_mid) / self.temperature
+        if tandem_mask is not None:
+            is_tandem = tandem_mask.float().view(bsz, 1, 1, 1)
+            eff_temp = self.temperature * (1.0 + (self.tandem_temp_scale - 1.0) * is_tandem)
+        else:
+            eff_temp = self.temperature
+        slice_logits = self.in_project_slice(x_mid) / eff_temp
         if spatial_bias is not None:
             slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
         slice_weights = self.softmax(slice_logits)
@@ -194,9 +200,9 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx, raw_xy=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.attn(self.ln_1(fx), spatial_bias=sb) + fx
+        fx = self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx
         fx = self.mlp(self.ln_2(fx)) + fx
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
@@ -327,12 +333,14 @@ class Transolver(nn.Module):
             new_pos = self.get_grid(pos)
             x = torch.cat((x, new_pos), dim=-1)
 
+        # Detect tandem: NACA1[2] feature at index 21 (non-zero for tandem, zero for single-foil)
+        tandem_mask = x[:, 0, 21].abs() > 0.5 if x.shape[-1] > 21 else None
         raw_xy = x[:, :, :2]
         fx = self.preprocess(x)
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks:
-            fx = block(fx, raw_xy=raw_xy)
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=tandem_mask)
         self._validate_output_dims(fx)
         return {"preds": fx}
 
