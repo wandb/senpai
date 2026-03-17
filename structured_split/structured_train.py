@@ -270,6 +270,9 @@ class Transolver(nn.Module):
             ]
         )
         self.initialize_weights()
+        self.out_skip = nn.Linear(n_hidden, out_dim)
+        nn.init.zeros_(self.out_skip.weight)
+        nn.init.zeros_(self.out_skip.bias)
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
@@ -332,6 +335,7 @@ class Transolver(nn.Module):
 
         raw_xy = x[:, :, :2]
         fx = self.preprocess(x)
+        fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
@@ -341,6 +345,7 @@ class Transolver(nn.Module):
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
 
         fx = self.blocks[-1](fx, raw_xy=raw_xy)
+        fx = fx + self.out_skip(fx_pre)
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred}
 
