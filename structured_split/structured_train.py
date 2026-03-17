@@ -472,15 +472,19 @@ class Lookahead:
             for group in base_optimizer.param_groups
         ]
         self.step_count = 0
+        self._current_epoch = 0
 
     def step(self):
         self.base_optimizer.step()
         self.step_count += 1
         if self.step_count % self.k == 0:
+            sigma = 1e-4 * max(0, 1.0 - self._current_epoch / 75.0)
             for slow, group in zip(self.slow_params, self.base_optimizer.param_groups):
                 for s, p in zip(slow, group['params']):
                     s.data.add_(self.alpha * (p.data - s.data))
                     p.data.copy_(s.data)
+                    if sigma > 0:
+                        s.data.add_(sigma * torch.randn_like(s.data))
 
     def zero_grad(self):
         self.base_optimizer.zero_grad()
@@ -551,6 +555,7 @@ for epoch in range(MAX_EPOCHS):
         break
 
     t0 = time.time()
+    optimizer._current_epoch = epoch
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
