@@ -570,7 +570,19 @@ for epoch in range(MAX_EPOCHS):
             pred = model({"x": x})["preds"]
         pred = pred.float()
         sq_err = (pred - y_norm) ** 2
-        abs_err = (pred - y_norm).abs()
+        with torch.no_grad():
+            # Per-sample, per-channel std of targets (only valid nodes)
+            y_std_per_sample = []
+            for b in range(y_norm.shape[0]):
+                valid = mask[b]
+                if valid.sum() > 1:
+                    y_std_per_sample.append(y_norm[b, valid].std(dim=0).clamp(min=0.1))
+                else:
+                    y_std_per_sample.append(torch.ones(3, device=device))
+            y_std_ps = torch.stack(y_std_per_sample).unsqueeze(1)  # [B, 1, 3]
+
+        # Normalize residuals by per-sample std
+        abs_err = ((pred - y_norm) / y_std_ps).abs()
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
