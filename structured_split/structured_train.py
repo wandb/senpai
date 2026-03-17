@@ -462,8 +462,7 @@ model = Transolver(**model_config).to(device)
 
 from copy import deepcopy
 ema_model = None
-ema_start_epoch = 65
-ema_decay = 0.998
+ema_start_epoch = 55
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -648,12 +647,14 @@ for epoch in range(MAX_EPOCHS):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         if epoch >= ema_start_epoch:
+            ema_progress = min(1.0, (epoch - ema_start_epoch) / 10.0)
+            current_decay = 0.99 + ema_progress * 0.008
             if ema_model is None:
                 ema_model = deepcopy(model)
             else:
                 with torch.no_grad():
                     for ep, mp in zip(ema_model.parameters(), model.parameters()):
-                        ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
+                        ep.data.mul_(current_decay).add_(mp.data, alpha=1 - current_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
