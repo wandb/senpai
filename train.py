@@ -269,6 +269,16 @@ class Transolver(nn.Module):
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        # Surface feature injection: lightweight MLP that modulates features for surface nodes
+        # Gradient-stopped on the surface mask to prevent destabilizing main pathway
+        self.surf_inject = nn.Sequential(
+            nn.Linear(n_hidden, 32),
+            nn.GELU(),
+            nn.Linear(32, n_hidden),
+        )
+        # Zero-init output layer so it starts as no-op
+        nn.init.zeros_(self.surf_inject[2].weight)
+        nn.init.zeros_(self.surf_inject[2].bias)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -330,6 +340,12 @@ class Transolver(nn.Module):
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
+
+        # Surface feature injection with gradient-stopped mask
+        # is_surface is at feature index 12 (normalized); threshold to recover binary flag
+        is_surf = (x[:, :, 12] > 0).float().detach()  # [B, N] — detach stops gradient through mask
+        surf_modulation = self.surf_inject(fx)  # [B, N, n_hidden]
+        fx = fx + surf_modulation * is_surf.unsqueeze(-1)  # only surface nodes get the modulation
 
         for block in self.blocks[:-1]:
             fx = block(fx, raw_xy=raw_xy)
