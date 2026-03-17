@@ -182,7 +182,7 @@ class TransolverBlock(nn.Module):
             self.ln_3 = nn.LayerNorm(hidden_dim)
             self.mlp2 = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
+                nn.SiLU(),
                 nn.Linear(hidden_dim, out_dim),
             )
 
@@ -448,6 +448,7 @@ model_config = dict(
     n_head=4,
     slice_num=32,  # was 64 — fewer slices for faster attention, more epochs
     mlp_ratio=2,
+    act="silu",
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
 )
