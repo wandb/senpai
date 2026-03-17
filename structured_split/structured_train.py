@@ -154,6 +154,28 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         return self.to_out(out_x)
 
 
+class LearnedActivation(nn.Module):
+    """Piecewise-linear activation with 16 breakpoints in [-4, 4], learnable values init to GELU."""
+
+    def __init__(self):
+        super().__init__()
+        xs = torch.linspace(-4.0, 4.0, 16)
+        self.register_buffer("xs", xs)
+        ys = torch.nn.functional.gelu(xs)
+        self.ys = nn.Parameter(ys.clone())
+
+    def forward(self, x):
+        xs = self.xs  # [16]
+        ys = self.ys  # [16]
+        xc = x.clamp(xs[0].item(), xs[-1].item())
+        idx = torch.searchsorted(xs.contiguous(), xc.contiguous(), right=True).clamp(1, 15)
+        lo = idx - 1
+        x0, x1 = xs[lo], xs[idx]
+        y0, y1 = ys[lo], ys[idx]
+        t = (xc - x0) / (x1 - x0)
+        return y0 + t * (y1 - y0)
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -182,7 +204,7 @@ class TransolverBlock(nn.Module):
             self.ln_3 = nn.LayerNorm(hidden_dim)
             self.mlp2 = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
+                LearnedActivation(),
                 nn.Linear(hidden_dim, out_dim),
             )
 
