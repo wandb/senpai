@@ -557,6 +557,11 @@ model_path = model_dir / "checkpoint.pt"
 with open(model_dir / "config.yaml", "w") as f:
     yaml.dump(model_config, f)
 
+def _log_cosh(diff):
+    """log(cosh(x)) — smooth L1. L2-like near 0, L1-like for large errors."""
+    return diff.abs() + F.softplus(-2.0 * diff.abs()) - 0.6931
+
+
 best_val = float("inf")
 best_metrics = {}
 global_step = 0
@@ -642,7 +647,8 @@ for epoch in range(MAX_EPOCHS):
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem = (x[:, 0, 21].abs() > 0.01)
         tandem_boost = torch.where(is_tandem, 1.5, 1.0).to(device)
-        surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        lc_err = _log_cosh(pred - y_norm)
+        surf_per_sample = (lc_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         surf_loss = (surf_per_sample * tandem_boost).mean()
         loss = vol_loss + surf_weight * surf_loss
 
