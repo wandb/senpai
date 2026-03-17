@@ -619,6 +619,16 @@ for epoch in range(MAX_EPOCHS):
         surf_loss = (surf_per_sample * tandem_boost).mean()
         loss = vol_loss + surf_weight * surf_loss
 
+        # Cosine similarity loss on surface pressure profiles (channel 2 = p)
+        # Encourages correct pressure shape/distribution along the surface.
+        surf_float = surf_mask.float()
+        pred_surf_p = pred[:, :, 2] * surf_float  # [B, N]
+        tgt_surf_p = y_norm[:, :, 2] * surf_float  # [B, N]
+        pred_p_norm = pred_surf_p / pred_surf_p.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        tgt_p_norm = tgt_surf_p / tgt_surf_p.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        cosine_surf_p_loss = (1.0 - (pred_p_norm * tgt_p_norm).sum(dim=1)).mean()
+        loss = loss + 1.0 * cosine_surf_p_loss
+
         # Multi-scale loss: coarse spatial pooling
         coarse_pool_size = 64
         B, N, C = pred.shape
