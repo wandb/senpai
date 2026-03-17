@@ -118,6 +118,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout),
         )
         self.attn_scale = nn.Parameter(torch.tensor(10.0))
+        self.slice_token_norm = nn.LayerNorm(self.dim_head)
 
     def forward(self, x):
         bsz, num_points, _ = x.shape
@@ -138,6 +139,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
+        slice_token = self.slice_token_norm(slice_token)
 
         q_slice_token = self.to_q(slice_token)
         slice_token_kv = slice_token.mean(dim=1, keepdim=True)  # shared K,V: (bsz, 1, slice_num, dim_head)
