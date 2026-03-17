@@ -22,8 +22,6 @@ The model is a [Transolver](https://arxiv.org/abs/2402.02366) with physics-aware
 
 An **advisor** agent (no GPU) creates hypothesis PRs with detailed instructions and assigns them to **student** agents (GPU nodes). Students implement, run experiments, and report results on the PR. The advisor reviews: merge winners, iterate on promising ideas, close dead ends. Coordination uses GitHub labels (`senpai`, `student:<name>`, `status:wip`, `status:review`). W&B tracks metrics.
 
-See `advisor.md`, `student.md`, and `program.md` for the full protocols.
-
 ## Architecture
 
 ![k9s deployments](k9s.png)
@@ -51,24 +49,53 @@ graph TD
     A["Advisor creates draft PR"] -->|"student:name + status:wip"| B["Student picks up PR"]
     B --> C["Implements hypothesis, runs experiments"]
     C -->|"status:review"| D["Advisor reviews"]
-    D -->|Merge| E["Improvement lands on main"]
+    D -->|Merge| E["Improvement lands on advisor branch"]
     D -->|Request changes| F["status:wip — student iterates"]
     D -->|Close| G["Dead end, branch deleted"]
     F --> B
 ```
 
-## Key files
+## Repo layout
 
-| File | Purpose |
-|------|---------|
-| `program.md` | Shared context: problem, constraints, metrics |
-| `advisor.md` | Advisor protocol: hypotheses, review, merge/close |
-| `student.md` | Student protocol: poll, implement, experiment, report |
-| `structured_split/structured_train.py` | **Primary training script** (modifiable by students) |
-| `transolver.py` | Model architecture (modifiable by students) |
-| `train.py` | Earlier single-dataset script (kept for reference, not active track) |
-| `.claude/skills/wandb-primary/` | W&B query skill (advisor + students) |
-| `.claude/skills/list-experiments/` | Experiment log skill (advisor only, stripped from students) |
+```
+senpai/
+├── train.py                    # Training script + Transolver model (students modify this)
+├── program.md                  # Research context, metrics, constraints
+├── data/           # Data preparation and benchmark splits
+│   ├── prepare.py              #   Dataset loading and collation
+│   ├── prepare_multi.py        #   Extended preprocessing (24-dim x, foil-2 features)
+│   ├── utils.py                #   Visualization utilities
+│   ├── split.py                #   One-time split manifest generator
+│   ├── split_manifest.json     #   Committed train/val indices
+│   └── split_stats.json        #   Committed normalization stats
+├── instructions/               # Role-specific Claude Code instructions
+│   ├── CLAUDE-ADVISOR.md       #   Advisor workflow
+│   ├── CLAUDE-STUDENT.md       #   Student workflow
+│   ├── prompt-advisor.md       #   Advisor prompt template
+│   └── prompt-student.md       #   Student prompt template
+├── k8s/                        # Kubernetes deployment
+│   ├── launch.py               #   Deploy advisor + student pods
+│   ├── advisor-deployment.yaml #   Advisor pod spec (CPU only)
+│   ├── student-deployment.yaml #   Student pod spec (8x GPU)
+│   ├── entrypoint-advisor.sh   #   Advisor startup script
+│   └── entrypoint-student.sh   #   Student startup script
+└── .claude/skills/             # Claude Code skills
+    ├── wandb-primary/          #   W&B + Weave queries
+    └── list-experiments/       #   Experiment history (advisor only)
+```
+
+## Running
+
+```bash
+# Train locally
+python train.py --agent <name> --wandb_name "<name>/<description>"
+
+# Debug (3 epochs, tiny subset)
+python train.py --debug
+
+# Deploy to k8s
+python k8s/launch.py --tag <research-tag> --n_students 4 --advisor
+```
 
 ## References
 
@@ -76,7 +103,7 @@ graph TD
 ```bibtex
 @inproceedings{
 lim2026tandemfoilset,
-title={**TandemFoilSet**: Datasets for Flow Field Prediction of Tandem-Airfoil Through the Reuse of Single Airfoils},
+title={{TandemFoilSet}: Datasets for Flow Field Prediction of Tandem-Airfoil Through the Reuse of Single Airfoils},
 author={Wei Xian Lim and Loh Sher En Jessica and Zenong Li and Thant Zin Oo and Wai Lee Chan and Adams Wai-Kin Kong},
 booktitle={The Fourteenth International Conference on Learning Representations},
 year={2026},

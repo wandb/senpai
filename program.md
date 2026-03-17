@@ -14,15 +14,11 @@ We are training a neural network surrogate for CFD (computational fluid dynamics
 
 ## Codebase
 
-- `structured_split/structured_train.py` — **primary training script + model architecture** for the structured benchmark. **Modifiable.** (Contains the Transolver model inline, plus training with 4 val tracks across 7 data sources.)
-- `transolver.py` — reference copy of the Transolver model (repo root). **Read-only.** The active copy lives in `structured_split/structured_train.py`.
-- `prepare.py` — dataset loading and collation. **Read-only.**
-- `structured_split/prepare_multi.py` — extended preprocessing (24-dim x, foil-2 features). **Read-only.**
-- `utils.py` — visualization. **Read-only.**
-- `DATASET_REPORT.md` — dataset documentation.
-- `structured_split/README.md` — benchmark split documentation.
-
-> `train.py` (repo root) is an earlier, simpler single-dataset script. It is kept for reference but is not the active experiment track.
+- `train.py` — **primary training script + model architecture**. **Modifiable.** (Contains the Transolver model inline, plus training with 4 val tracks across 7 data sources.)
+- `data/prepare.py` — dataset loading and collation. **Read-only.**
+- `data/prepare_multi.py` — extended preprocessing (24-dim x, foil-2 features). **Read-only.**
+- `data/utils.py` — visualization. **Read-only.**
+- `data/README.md` — benchmark splits and dataset documentation.
 
 No new packages beyond `pyproject.toml`.
 

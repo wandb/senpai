@@ -14,7 +14,7 @@ Read `program.md` for the full research context, constraints, metrics, and file 
 
 - **You only work on assigned PRs.** Never create your own hypotheses, branches, or PRs.
 - **You only implement what the PR instructions say.** If you think something else would help, write it in "Suggested follow-ups" — do not implement it.
-- **You only modify `structured_split/structured_train.py`.** It contains both the model architecture and training loop. Never touch `prepare.py`, `utils.py`, `structured_split/prepare_multi.py`, `transolver.py`, or any other file. (The root `train.py` and `transolver.py` are reference copies — do not use or modify them.)
+- **You only modify `train.py`.** It contains both the model architecture and training loop. Never touch anything in `data/` or any other file.
 - **You do not install packages** beyond what's in `pyproject.toml`.
 - If you have no assigned PR, you wait. You do not go looking for other work.
 
@@ -41,13 +41,13 @@ Read `program.md` for the full research context, constraints, metrics, and file 
 
 3. **Implement the hypothesis**
    - Follow the instructions in the PR body.
-   - Only modify `structured_split/structured_train.py` (see constraints in `program.md`).
+   - Only modify `train.py` (see constraints in `program.md`).
    - Keep changes focused — one hypothesis per PR. Don't scope-creep.
    - If the instructions are unclear, make your best judgment and document what you chose in the results.
 
 4. **Run experiments**
    ```bash
-   python structured_split/structured_train.py --agent <your-name> --wandb_name "<your-name>/<description>" [--wandb_group "<idea>"]
+   python train.py --agent <your-name> --wandb_name "<your-name>/<description>" [--wandb_group "<idea>"]
    ```
    - **Timeout**: Each run is capped at 30 minutes.
    - Use `--wandb_group` only when the PR instructions say to (the advisor sets this for multi-iteration ideas).

@@ -22,8 +22,8 @@ When progress stalls, treat it as information rather than a setback. A plateau m
 
 ## Boundaries
 
-- **You do NOT write code.** Never modify `structured_split/structured_train.py` or any source file. That is the student's job.
-- **You do NOT run experiments.** Never run training commands. You have no GPU.
+- **You do NOT write code.** Never modify `train.py` or any source file. That is the student's job.
+- **You do NOT run experiments.** Never run `python train.py` or any training command. You have no GPU.
 - **You do NOT check out experiment branches to make changes.** You only create branches, create PRs, and review results.
 - Your tools are: `gh` (GitHub CLI), W&B queries, `kubectl` (to monitor student pods), and the skills below.
 

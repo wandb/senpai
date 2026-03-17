@@ -4,11 +4,11 @@
 
 """One-time offline script: generate split manifest and normalization stats.
 
-Produces two committed JSON files used by structured_split/train.py:
+Produces two committed JSON files used by train.py:
   split_manifest.json  — train/val indices with domain tags
   split_stats.json     — x/y normalization stats over training set only
 
-Run: python structured_split/split.py
+Run: python data/split.py
 
 KNOWN LIMITATIONS (inherited from read-only prepare.py):
   - Only NACA[0] and AoA[0] are encoded in x features. Foil 2 identity
@@ -20,18 +20,13 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     tandem" rather than true single→tandem transfer.
 """
 
-import sys
 import json
 import numpy as np
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Reach repo root for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from prepare import DATA_ROOT, load_pickle
-sys.path.insert(0, str(Path(__file__).parent))  # structured_split dir
-from prepare_multi import MultiFieldDataset
+from data.prepare import DATA_ROOT, load_pickle
+from data.prepare_multi import MultiFieldDataset
 
 SEED = 42
 # Retain this fraction of each source (evenly spaced to preserve condition coverage).
@@ -43,7 +38,7 @@ OUT_STATS = OUT_DIR / "split_stats.json"
 
 # Files in the exact order FullFieldDataset will see them.
 # global_idx = sum(file_sample_counts[:file_idx]) + local_idx
-# This ordering must match what structured_split/train.py passes to FullFieldDataset.
+# This ordering must match what train.py passes to FullFieldDataset.
 PICKLE_FILES = [
     DATA_ROOT / "raceCar_single_randomFields.pickle",        # file_idx 0
     DATA_ROOT / "raceCar_randomFields_mgn_Part1.pickle",     # file_idx 1 (front=2412)
@@ -235,7 +230,7 @@ def assign_splits(records):
 def compute_stats(pickle_files, train_indices):
     """Compute x/y normalization stats over training samples (two-pass).
 
-    Uses MultiFieldDataset (24-dim x) so stats match structured_split/train.py.
+    Uses MultiFieldDataset (24-dim x) so stats match train.py.
     Sorts train_indices by (file_idx, local_idx) for sequential file I/O.
     """
     import torch
@@ -246,7 +241,7 @@ def compute_stats(pickle_files, train_indices):
     train_sorted = sorted(train_indices, key=lambda i: ds.index[i])
     n = len(train_sorted)
 
-    from prepare_multi import X_DIM
+    from data.prepare_multi import X_DIM
     print(f"  Pass 1/2 (mean) over {n} training samples ...")
     sum_x = torch.zeros(X_DIM)
     sum_y = torch.zeros(3)
@@ -291,15 +286,15 @@ def compute_stats(pickle_files, train_indices):
 def make_quick_manifest():
     """Generate a debug manifest and placeholder stats instantly — no pickle loading.
 
-    Uses known file sizes from DATASET_REPORT to build global index offsets directly.
+    Uses known file sizes to build global index offsets directly.
     Stats use identity normalization (mean=0, std=1) — fine for debug smoke-tests
     since we only care about the training loop running, not absolute loss values.
 
-    Run:  python structured_split/split.py --quick
+    Run:  python data/split.py --quick
     """
-    from prepare_multi import X_DIM
+    from data.prepare_multi import X_DIM
 
-    # Known sample counts per file — from DATASET_REPORT.md
+    # Known sample counts per file (see README.md dataset inventory)
     # Order must match PICKLE_FILES exactly.
     FILE_SIZES = [899, 300, 300, 300, 300, 300, 300]
     offsets = []
