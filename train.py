@@ -330,11 +330,13 @@ class Transolver(nn.Module):
         raw_xy = x[:, :, :2]
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
-        aux_surf_pred = self.aux_surf_head(fx_pre)  # [B, N, 3]
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
             fx = block(fx, raw_xy=raw_xy)
+
+        # Aux surface prediction from pre-output-block hidden features (attention-enriched)
+        aux_surf_pred = self.aux_surf_head(fx)  # [B, N, 3]
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
@@ -674,7 +676,8 @@ for epoch in range(MAX_EPOCHS):
             aux_surf_pred = aux_surf_pred / sample_stds
         aux_surf_err = (aux_surf_pred - y_norm).abs()
         aux_surf_loss = (aux_surf_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
-        loss = loss + 0.05 * aux_surf_loss
+        aux_weight = 0.01 * max(0.0, 1.0 - epoch / 50)
+        loss = loss + aux_weight * aux_surf_loss
 
         optimizer.zero_grad()
         loss.backward()
