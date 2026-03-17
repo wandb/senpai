@@ -636,6 +636,10 @@ for epoch in range(MAX_EPOCHS):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        with torch.no_grad():
+            for block in model.blocks:
+                block.attn.attn_scale.data.clamp_(5.0, 20.0)
+                block.attn.temperature.data.clamp_(0.2, 1.0)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
