@@ -497,6 +497,8 @@ base_opt = torch.optim.AdamW([
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
+log_task_weights = nn.Parameter(torch.zeros(2, device=device))
+task_weight_opt = torch.optim.Adam([log_task_weights], lr=0.025)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=5)
 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=75, eta_min=1e-4)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
@@ -617,7 +619,24 @@ for epoch in range(MAX_EPOCHS):
         tandem_boost = torch.where(is_tandem, 1.5, 1.0).to(device)
         surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         surf_loss = (surf_per_sample * tandem_boost).mean()
-        loss = vol_loss + surf_weight * surf_loss
+
+        # GradNorm: update log_task_weights every 50 steps
+        if global_step % 50 == 0:
+            last_params = [p for p in model.blocks[-1].parameters() if p.requires_grad]
+            g_v = torch.autograd.grad(vol_loss, last_params, retain_graph=True, allow_unused=True)
+            g_v_norm_val = sum(g.norm() ** 2 for g in g_v if g is not None).sqrt().item()
+            g_s = torch.autograd.grad(surf_weight * surf_loss, last_params, retain_graph=True, allow_unused=True)
+            g_s_norm_val = sum(g.norm() ** 2 for g in g_s if g is not None).sqrt().item()
+            if g_v_norm_val > 0 and g_s_norm_val > 0:
+                w_gn = F.softmax(log_task_weights, dim=0) * 2.0
+                G_mean = (w_gn[0].detach().item() * g_v_norm_val + w_gn[1].detach().item() * g_s_norm_val) / 2.0
+                gn_loss = (w_gn[0] * g_v_norm_val - G_mean).abs() + (w_gn[1] * g_s_norm_val - G_mean).abs()
+                task_weight_opt.zero_grad()
+                gn_loss.backward()
+                task_weight_opt.step()
+
+        weights = F.softmax(log_task_weights.detach(), dim=0) * 2.0
+        loss = weights[0] * vol_loss + weights[1] * surf_weight * surf_loss
 
         # Multi-scale loss: coarse spatial pooling
         coarse_pool_size = 64
