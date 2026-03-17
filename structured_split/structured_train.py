@@ -552,7 +552,7 @@ for epoch in range(MAX_EPOCHS):
 
     # Dynamic surface weight: linear ramp from 5 → 30 over training
     sw_start, sw_end = 5.0, 30.0
-    progress = epoch / MAX_EPOCHS
+    progress = min(1.0, epoch / 75)
     surf_weight = sw_start + (sw_end - sw_start) * progress
 
     # --- Train ---
@@ -597,6 +597,17 @@ for epoch in range(MAX_EPOCHS):
         abs_err = (pred - y_norm).abs()
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
+
+        # OHEM: keep only hardest 50% of surface nodes per sample
+        with torch.no_grad():
+            surf_err_per_node = abs_err.sum(dim=-1)
+            for b in range(B):
+                s_nodes = surf_mask[b].nonzero(as_tuple=True)[0]
+                if len(s_nodes) > 2:
+                    errs = surf_err_per_node[b, s_nodes]
+                    threshold = errs.median()
+                    easy = s_nodes[errs < threshold]
+                    surf_mask[b, easy] = False
 
         # Progressive resolution: subsample volume nodes in loss early in training
         # Ramps from 10% → 100% of volume nodes over first 40 epochs
