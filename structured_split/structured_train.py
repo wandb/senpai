@@ -185,9 +185,17 @@ class TransolverBlock(nn.Module):
                 nn.GELU(),
                 nn.Linear(hidden_dim, out_dim),
             )
+        # FiLM layers for surface-conditioned LayerNorm (zero-init for identity at start)
+        self.film_gamma = nn.Linear(hidden_dim, hidden_dim)
+        self.film_beta = nn.Linear(hidden_dim, hidden_dim)
 
-    def forward(self, fx):
-        fx = self.attn(self.ln_1(fx)) + fx
+    def forward(self, fx, surf_ctx=None):
+        ln_out = self.ln_1(fx)
+        if surf_ctx is not None:
+            gamma = self.film_gamma(surf_ctx)  # (B, n_hidden)
+            beta = self.film_beta(surf_ctx)    # (B, n_hidden)
+            ln_out = ln_out * (1 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+        fx = self.attn(ln_out) + fx
         fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
             return self.mlp2(self.ln_3(fx))
@@ -255,6 +263,12 @@ class Transolver(nn.Module):
             ]
         )
         self.initialize_weights()
+        # Zero-init FiLM layers so they start as identity (no modulation)
+        for block in self.blocks:
+            nn.init.zeros_(block.film_gamma.weight)
+            nn.init.zeros_(block.film_gamma.bias)
+            nn.init.zeros_(block.film_beta.weight)
+            nn.init.zeros_(block.film_beta.bias)
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
 
@@ -301,7 +315,7 @@ class Transolver(nn.Module):
         if sum(self.output_dims) != preds.shape[-1]:
             raise ValueError("Sum of output_dims must match preds last dimension")
 
-    def forward(self, data, pos=None, condition=None):
+    def forward(self, data, pos=None, condition=None, surf_mask=None):
         x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
         if x is None:
             raise ValueError("Missing required input tensor: x")
@@ -317,8 +331,15 @@ class Transolver(nn.Module):
         fx = self.preprocess(x)
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
+        # Compute surface context for FiLM: mean of surface node features
+        if surf_mask is not None:
+            surf_float = surf_mask.float().unsqueeze(-1)  # (B, N, 1)
+            surf_ctx = (fx * surf_float).sum(1) / surf_float.sum(1).clamp(min=1)  # (B, n_hidden)
+        else:
+            surf_ctx = None
+
         for block in self.blocks:
-            fx = block(fx)
+            fx = block(fx, surf_ctx=surf_ctx)
         self._validate_output_dims(fx)
         return {"preds": fx}
 
@@ -588,15 +609,16 @@ for epoch in range(MAX_EPOCHS):
                     sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
             y_norm = y_norm / sample_stds
 
+        vol_mask = mask & ~is_surface
+        surf_mask = mask & is_surface
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            pred = model({"x": x})["preds"]
+            pred = model({"x": x}, surf_mask=surf_mask)["preds"]
         pred = pred.float()
         if model.training:
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
-        vol_mask = mask & ~is_surface
-        surf_mask = mask & is_surface
 
         # Progressive resolution: subsample volume nodes in loss early in training
         # Ramps from 10% → 100% of volume nodes over first 40 epochs
@@ -703,15 +725,15 @@ for epoch in range(MAX_EPOCHS):
                         sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
                 y_norm_scaled = y_norm / sample_stds
 
+                vol_mask = mask & ~is_surface
+                surf_mask = mask & is_surface
+
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    pred = eval_model({"x": x}, surf_mask=surf_mask)["preds"]
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
-
-                vol_mask = mask & ~is_surface
-                surf_mask = mask & is_surface
                 val_vol += min(
                     (abs_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item(),
                     1e12
