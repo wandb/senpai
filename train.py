@@ -269,6 +269,9 @@ class Transolver(nn.Module):
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        # Boundary-type embedding: 0=volume, 1=surface-foil1, 2=surface-foil2
+        self.boundary_embed = nn.Embedding(3, n_hidden)
+        nn.init.normal_(self.boundary_embed.weight, std=0.02)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -330,6 +333,27 @@ class Transolver(nn.Module):
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
+
+        # Boundary type: 0=volume, 1=surface-foil1, 2=surface-foil2
+        # is_surface at feature index 12 is normalized; threshold to recover binary
+        is_surf_norm = x[:, :, 12]
+        is_surf_flag = (is_surf_norm > 0).long()  # 1=surface, 0=volume
+        btype = is_surf_flag.clone()
+
+        # For tandem samples, split surface into foil1/foil2 by x-coordinate
+        # gap feature at index 21; normalized but tandem samples have clearly nonzero values
+        gap_feat = x[:, 0, 21]
+        is_tandem = gap_feat.abs() > 0.5
+        for b in range(x.shape[0]):
+            if is_tandem[b]:
+                surf_nodes = (btype[b] == 1)
+                if surf_nodes.sum() > 10:
+                    surf_x = raw_xy[b, surf_nodes, 0]
+                    median_x = surf_x.median()
+                    foil2_mask = surf_nodes & (raw_xy[b, :, 0] > median_x)
+                    btype[b][foil2_mask] = 2
+
+        fx = fx + self.boundary_embed(btype)
 
         for block in self.blocks[:-1]:
             fx = block(fx, raw_xy=raw_xy)
