@@ -570,7 +570,9 @@ for epoch in range(MAX_EPOCHS):
             pred = model({"x": x})["preds"]
         pred = pred.float()
         sq_err = (pred - y_norm) ** 2
-        abs_err = (pred - y_norm).abs()
+        # Clamp residuals to [-3, 3] to reduce outlier influence
+        diff = (pred - y_norm).clamp(-3.0, 3.0)
+        abs_err = diff.abs()
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
