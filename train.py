@@ -420,18 +420,44 @@ def _phys_denorm(y_p, Umag, q):
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
 
+
+class IndexedDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        x, y, is_surf = self.dataset[idx]
+        return x, y, is_surf, idx
+
+
+def pad_collate_with_idx(batch):
+    xs = [b[0] for b in batch]
+    ys = [b[1] for b in batch]
+    surfs = [b[2] for b in batch]
+    idxs = torch.tensor([b[3] for b in batch])
+    x_pad, y_pad, surf_pad, mask = pad_collate(list(zip(xs, ys, surfs)))
+    return x_pad, y_pad, surf_pad, mask, idxs
+
+
+train_ds_indexed = IndexedDataset(train_ds)
+indexed_loader_kwargs = dict(collate_fn=pad_collate_with_idx, num_workers=4, pin_memory=True,
+                             persistent_workers=True, prefetch_factor=2)
+
 if cfg.debug:
     # Avoid sampler/length mismatch when train_ds is truncated
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
-                              shuffle=True, **loader_kwargs)
+    train_loader = DataLoader(train_ds_indexed, batch_size=cfg.batch_size,
+                              shuffle=True, **indexed_loader_kwargs)
 else:
     sampler = WeightedRandomSampler(
         weights=sample_weights,
         num_samples=len(train_ds),
         replacement=True,
     )
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
-                              sampler=sampler, **loader_kwargs)
+    train_loader = DataLoader(train_ds_indexed, batch_size=cfg.batch_size,
+                              sampler=sampler, **indexed_loader_kwargs)
 
 val_loaders = {
     name: DataLoader(subset, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
@@ -564,6 +590,11 @@ train_start = time.time()
 prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 
+# Hard example mining: per-sample loss EMA tracker
+n_train = len(train_ds)
+sample_loss_ema = torch.zeros(n_train)
+loss_ema_decay = 0.9
+
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
     if elapsed_min >= MAX_TIMEOUT:
@@ -582,7 +613,7 @@ for epoch in range(MAX_EPOCHS):
     n_batches = 0
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
-    for x, y, is_surface, mask in pbar:
+    for x, y, is_surface, mask, batch_idxs in pbar:
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -668,6 +699,13 @@ for epoch in range(MAX_EPOCHS):
         re_loss = F.mse_loss(re_pred, log_re_target)
         loss = loss + 0.01 * re_loss
 
+        # Update per-sample loss EMA for hard example mining
+        with torch.no_grad():
+            per_sample_loss = abs_err.mean(dim=(1, 2))  # [B]
+            for i, idx in enumerate(batch_idxs):
+                old = sample_loss_ema[idx]
+                sample_loss_ema[idx] = loss_ema_decay * old + (1 - loss_ema_decay) * per_sample_loss[i].cpu()
+
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -692,6 +730,14 @@ for epoch in range(MAX_EPOCHS):
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
     prev_surf_loss = epoch_surf
+
+    # Update sampler weights based on per-sample loss EMA (hard example mining)
+    if epoch >= 5 and not cfg.debug:
+        loss_weights = sample_loss_ema.clone()
+        loss_weights = loss_weights / (loss_weights.mean() + 1e-8)  # normalize to mean=1
+        loss_weights = loss_weights.clamp(0.5, 3.0)  # cap at 3x upweight
+        new_weights = torch.tensor(sample_weights) * loss_weights.double()
+        sampler.weights = new_weights
 
     # --- Validate across all splits ---
     eval_model = ema_model if ema_model is not None else model
