@@ -536,6 +536,8 @@ best_val = float("inf")
 best_metrics = {}
 global_step = 0
 train_start = time.time()
+ema_val_loss = None
+ema_decay = 0.9
 
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
@@ -762,8 +764,12 @@ for epoch in range(MAX_EPOCHS):
         peak_mem_gb = 0.0
 
     tag = ""
-    if mean_val_loss < best_val:
-        best_val = mean_val_loss
+    if ema_val_loss is None:
+        ema_val_loss = mean_val_loss
+    else:
+        ema_val_loss = ema_decay * ema_val_loss + (1 - ema_decay) * mean_val_loss
+    if ema_val_loss < best_val:
+        best_val = ema_val_loss
         best_metrics = {"epoch": epoch + 1, "val_loss": mean_val_loss}
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
