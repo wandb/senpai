@@ -456,8 +456,8 @@ model = Transolver(**model_config).to(device)
 
 from copy import deepcopy
 ema_model = None
-ema_start_epoch = 65
-ema_decay = 0.998
+ema_start_epoch = 60
+ema_decay = 0.999
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -552,7 +552,7 @@ for epoch in range(MAX_EPOCHS):
 
     # Dynamic surface weight: linear ramp from 5 → 30 over training
     sw_start, sw_end = 5.0, 30.0
-    progress = epoch / MAX_EPOCHS
+    progress = min(1.0, epoch / 75)
     surf_weight = sw_start + (sw_end - sw_start) * progress
 
     # --- Train ---
@@ -782,7 +782,8 @@ for epoch in range(MAX_EPOCHS):
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
-        torch.save(model.state_dict(), model_path)
+        save_model = ema_model if ema_model is not None else model
+        torch.save(save_model.state_dict(), model_path)
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
