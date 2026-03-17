@@ -644,7 +644,27 @@ for epoch in range(MAX_EPOCHS):
         tandem_boost = torch.where(is_tandem, 1.5, 1.0).to(device)
         surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         surf_loss = (surf_per_sample * tandem_boost).mean()
-        loss = vol_loss + surf_weight * surf_loss
+
+        # Gradient-penalty: finite-difference smoothness on surface predictions
+        grad_loss = torch.tensor(0.0, device=device)
+        for b in range(B):
+            s_mask = surf_mask[b]
+            if s_mask.sum() < 2:
+                continue
+            s_idx = s_mask.nonzero(as_tuple=True)[0]
+            # Sort surface nodes by x-coordinate for meaningful finite differences
+            x_coords = x[b, s_idx, 0]  # x-position (feature index 0, already normalized)
+            sort_order = x_coords.argsort()
+            s_idx_sorted = s_idx[sort_order]
+            # Finite differences on all 3 channels in normalized space
+            p_pred = pred[b, s_idx_sorted]    # [n_surf, 3]
+            p_targ = y_norm[b, s_idx_sorted]  # [n_surf, 3]
+            dp_pred = p_pred[1:] - p_pred[:-1]
+            dp_targ = p_targ[1:] - p_targ[:-1]
+            grad_loss = grad_loss + (dp_pred - dp_targ).abs().mean()
+        grad_loss = grad_loss / max(B, 1)
+
+        loss = vol_loss + surf_weight * surf_loss + 0.1 * grad_loss
 
         # Multi-scale loss: coarse spatial pooling
         coarse_pool_size = 64
@@ -680,7 +700,7 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), model.parameters()):
                         ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "train/grad_loss": grad_loss.item(), "global_step": global_step})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
