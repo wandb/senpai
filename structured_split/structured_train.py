@@ -496,11 +496,14 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
+aux_surf_head = nn.Sequential(nn.Linear(128, 64), nn.GELU(), nn.Linear(64, 3)).to(device)
+
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 base_opt = torch.optim.AdamW([
     {'params': attn_params, 'lr': cfg.lr * 0.5},
-    {'params': other_params, 'lr': cfg.lr}
+    {'params': other_params, 'lr': cfg.lr},
+    {'params': aux_surf_head.parameters(), 'lr': cfg.lr},
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=5)
@@ -643,9 +646,16 @@ for epoch in range(MAX_EPOCHS):
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
             loss = loss + 1.0 * coarse_loss
 
+        # Auxiliary surface supervision on preprocess features (deep supervision)
+        fx_pre = model.preprocess(x)
+        aux_pred = aux_surf_head(fx_pre.detach())
+        aux_err = (aux_pred - y_norm).abs()
+        aux_loss = (aux_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        loss = loss + 0.1 * aux_loss
+
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(aux_surf_head.parameters()), max_norm=1.0)
         optimizer.step()
         if epoch >= ema_start_epoch:
             if ema_model is None:
