@@ -559,6 +559,17 @@ for epoch in range(MAX_EPOCHS):
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
 
+        if model.training:
+            # Node dropout: keep 75% of nodes
+            keep_prob = 0.75
+            node_keep = torch.rand(x.shape[0], x.shape[1], device=device) < keep_prob
+            node_keep = node_keep | is_surface  # ALWAYS keep surface nodes
+            node_keep = node_keep & mask  # Only among valid nodes
+            # Zero out dropped nodes in x (they still exist but carry no signal)
+            x = x * node_keep.unsqueeze(-1).float()
+            # Exclude dropped nodes from loss
+            mask = mask & node_keep
+
         x = (x - stats["x_mean"]) / stats["x_std"]
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
