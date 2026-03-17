@@ -266,7 +266,7 @@ class Transolver(nn.Module):
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             if module.weight.dim() >= 2:
-                nn.init.orthogonal_(module.weight, gain=1.0)
+                nn.init.xavier_uniform_(module.weight)
             else:
                 nn.init.normal_(module.weight, std=0.01)
             if module.bias is not None:
