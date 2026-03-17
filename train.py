@@ -111,7 +111,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
 
-    def forward(self, x, spatial_bias=None):
+    def forward(self, x, spatial_bias=None, temp_mult=1.0):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -126,7 +126,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             .permute(0, 2, 1, 3)
             .contiguous()
         )
-        slice_logits = self.in_project_slice(x_mid) / self.temperature
+        slice_logits = self.in_project_slice(x_mid) / (self.temperature * temp_mult)
         if spatial_bias is not None:
             slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
         slice_weights = self.softmax(slice_logits)
@@ -189,9 +189,9 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx, raw_xy=None):
+    def forward(self, fx, raw_xy=None, temp_mult=1.0):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb) + fx)
+        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, temp_mult=temp_mult) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
@@ -313,7 +313,7 @@ class Transolver(nn.Module):
         if sum(self.output_dims) != preds.shape[-1]:
             raise ValueError("Sum of output_dims must match preds last dimension")
 
-    def forward(self, data, pos=None, condition=None):
+    def forward(self, data, pos=None, condition=None, temp_mult=1.0):
         x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
         if x is None:
             raise ValueError("Missing required input tensor: x")
@@ -332,12 +332,12 @@ class Transolver(nn.Module):
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy)
+            fx = block(fx, raw_xy=raw_xy, temp_mult=temp_mult)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, temp_mult=temp_mult)
         fx = fx + self.out_skip(fx_pre)
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred}
@@ -575,6 +575,9 @@ for epoch in range(MAX_EPOCHS):
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
 
+    # Temperature annealing: warm (soft) -> cold (sharp) over 60 epochs
+    temp_mult = 2.0 - 1.5 * min(1.0, epoch / 60)
+
     # --- Train ---
     model.train()
     epoch_vol = 0.0
@@ -609,7 +612,7 @@ for epoch in range(MAX_EPOCHS):
             y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x}, temp_mult=temp_mult)
             pred = out["preds"]
             re_pred = out["re_pred"]
         pred = pred.float()
@@ -735,7 +738,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    pred = eval_model({"x": x}, temp_mult=temp_mult)["preds"]
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
