@@ -656,6 +656,19 @@ for epoch in range(MAX_EPOCHS):
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = model({"x": x})["preds"]
                 pred = pred.float()
+                # Test-time augmentation: y-flip
+                x_flip = x.clone()
+                x_flip[:, :, 1] *= -1  # flip y-coordinate
+                # Also flip AoA features (indices 14 for AoA0_rad, 18 for AoA1_rad)
+                x_flip[:, :, 14] *= -1
+                x_flip[:, :, 18] *= -1
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    pred_flip = model({"x": x_flip})["preds"]
+                pred_flip = pred_flip.float()
+                # Flip back: negate Uy prediction (channel 1)
+                pred_flip[:, :, 1] *= -1
+                # Average
+                pred = (pred + pred_flip) / 2
                 sq_err = (pred - y_norm) ** 2
                 abs_err = (pred - y_norm).abs()
 
