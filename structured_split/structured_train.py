@@ -117,8 +117,9 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout),
         )
+        self.pos_bias_net = nn.Sequential(nn.Linear(1, 16), nn.GELU(), nn.Linear(16, heads))
 
-    def forward(self, x):
+    def forward(self, x, pos=None):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -141,14 +142,18 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         q_slice_token = self.to_q(slice_token)
         k_slice_token = self.to_k(slice_token)
         v_slice_token = self.to_v(slice_token)
-        dropout_p = self.dropout.p if self.training else 0.0
-        out_slice_token = F.scaled_dot_product_attention(
-            q_slice_token,
-            k_slice_token,
-            v_slice_token,
-            dropout_p=dropout_p,
-            is_causal=False,
-        )
+        attn_logits = torch.einsum("bhgd,bhtd->bhgt", q_slice_token, k_slice_token) * (self.dim_head ** -0.5)
+        if pos is not None:
+            # Compute mean position per slice: [bsz, heads, slice_num, 2]
+            slice_pos = torch.einsum("bnc,bhng->bhgc", pos, slice_weights) / (slice_norm + 1e-5).unsqueeze(-1)
+            slice_pos_mean = slice_pos.mean(1)  # [bsz, slice_num, 2]
+            diff = slice_pos_mean.unsqueeze(2) - slice_pos_mean.unsqueeze(1)  # [bsz, S, S, 2]
+            dist = diff.norm(dim=-1, keepdim=True)  # [bsz, S, S, 1]
+            attn_logits = attn_logits + self.pos_bias_net(dist).permute(0, 3, 1, 2)
+        attn_weights = F.softmax(attn_logits, dim=-1)
+        if self.training and self.dropout.p > 0:
+            attn_weights = F.dropout(attn_weights, p=self.dropout.p, training=self.training)
+        out_slice_token = attn_weights @ v_slice_token
 
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
@@ -187,8 +192,8 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx):
-        fx = self.attn(self.ln_1(fx)) + fx
+    def forward(self, fx, pos=None):
+        fx = self.attn(self.ln_1(fx), pos=pos) + fx
         fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
             return self.mlp2(self.ln_3(fx))
@@ -315,11 +320,12 @@ class Transolver(nn.Module):
             new_pos = self.get_grid(pos)
             x = torch.cat((x, new_pos), dim=-1)
 
+        pos = x[:, :, :self.space_dim]  # spatial coordinates for relative position encoding
         fx = self.preprocess(x)
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks:
-            fx = block(fx)
+            fx = block(fx, pos=pos)
         self._validate_output_dims(fx)
         return {"preds": fx}
 
