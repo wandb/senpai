@@ -634,7 +634,8 @@ for epoch in range(MAX_EPOCHS):
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(attn_params, max_norm=0.5)
+        torch.nn.utils.clip_grad_norm_(other_params, max_norm=2.0)
         optimizer.step()
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
