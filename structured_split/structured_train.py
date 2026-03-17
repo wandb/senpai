@@ -634,7 +634,16 @@ for epoch in range(MAX_EPOCHS):
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        def adaptive_gradient_clipping(model, clip_factor=0.01, eps=1e-3):
+            for p in model.parameters():
+                if p.grad is None: continue
+                p_norm = p.data.norm(2).clamp(min=eps)
+                g_norm = p.grad.data.norm(2).clamp(min=eps)
+                max_norm = p_norm * clip_factor
+                clip_coef = max_norm / g_norm
+                if clip_coef < 1.0:
+                    p.grad.data.mul_(clip_coef)
+        adaptive_gradient_clipping(model, clip_factor=0.01)
         optimizer.step()
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
