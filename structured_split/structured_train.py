@@ -552,7 +552,7 @@ for epoch in range(MAX_EPOCHS):
 
     # Dynamic surface weight: linear ramp from 5 → 30 over training
     sw_start, sw_end = 5.0, 30.0
-    progress = epoch / MAX_EPOCHS
+    progress = min(1.0, epoch / 75)
     surf_weight = sw_start + (sw_end - sw_start) * progress
 
     # --- Train ---
@@ -782,7 +782,8 @@ for epoch in range(MAX_EPOCHS):
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
-        torch.save(model.state_dict(), model_path)
+        save_model = ema_model if ema_model is not None else model
+        torch.save(save_model.state_dict(), model_path)
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
