@@ -255,6 +255,10 @@ class Transolver(nn.Module):
             ]
         )
         self.initialize_weights()
+        # Keep orthogonal init for in_project_slice (slice assignment weights)
+        for m in self.modules():
+            if hasattr(m, 'in_project_slice') and isinstance(m.in_project_slice, nn.Linear):
+                torch.nn.init.orthogonal_(m.in_project_slice.weight)
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
 
@@ -264,7 +268,7 @@ class Transolver(nn.Module):
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             if module.weight.dim() >= 2:
-                nn.init.orthogonal_(module.weight, gain=1.0)
+                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='linear')
             else:
                 nn.init.normal_(module.weight, std=0.01)
             if module.bias is not None:
