@@ -254,6 +254,10 @@ class Transolver(nn.Module):
                 for idx in range(n_layers)
             ]
         )
+        self.surf_q = nn.Linear(n_hidden, 32)
+        self.surf_k = nn.Linear(n_hidden, 32)
+        self.surf_v = nn.Linear(n_hidden, 32)
+        self.surf_out = nn.Linear(32, n_hidden)
         self.initialize_weights()
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
@@ -317,7 +321,15 @@ class Transolver(nn.Module):
         fx = self.preprocess(x)
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
+            if i == len(self.blocks) - 1:
+                # Cross-attention before final projection; subsample K,V to cap memory
+                max_kv = 2048
+                q = self.surf_q(fx)
+                k = self.surf_k(fx[:, :max_kv])
+                v = self.surf_v(fx[:, :max_kv])
+                attn = F.softmax(torch.matmul(q, k.transpose(-2, -1)) / 5.66, dim=-1)
+                fx = fx + self.surf_out(torch.matmul(attn, v))
             fx = block(fx)
         self._validate_output_dims(fx)
         return {"preds": fx}
