@@ -488,7 +488,7 @@ class Lookahead:
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight'])]
 base_opt = torch.optim.AdamW([
-    {'params': attn_params, 'lr': cfg.lr * 0.5},
+    {'params': attn_params, 'lr': cfg.lr * 0.25},
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
