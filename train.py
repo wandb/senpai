@@ -174,7 +174,7 @@ class TransolverBlock(nn.Module):
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
-        self.spatial_bias = nn.Sequential(nn.Linear(2, 32), nn.GELU(), nn.Linear(32, slice_num))
+        self.spatial_bias = nn.Sequential(nn.Linear(6, 32), nn.GELU(), nn.Linear(32, slice_num))
         self.ln_1_post = nn.LayerNorm(hidden_dim)
         self.ln_2_post = nn.LayerNorm(hidden_dim)
         self.se_fc1 = nn.Linear(hidden_dim, hidden_dim // 4)
@@ -189,8 +189,15 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx, raw_xy=None):
-        sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
+    def forward(self, fx, raw_xy=None, raw_x_extra=None):
+        if raw_xy is not None:
+            if raw_x_extra is not None:
+                sb_input = torch.cat([raw_xy, raw_x_extra], dim=-1)  # [B, N, 6]
+            else:
+                sb_input = F.pad(raw_xy, (0, 4))  # zero-pad to 6D for safety
+            sb = self.spatial_bias(sb_input)
+        else:
+            sb = None
         fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
@@ -327,17 +334,18 @@ class Transolver(nn.Module):
             x = torch.cat((x, new_pos), dim=-1)
 
         raw_xy = x[:, :, :2]
+        raw_x_extra = x[:, :, 2:6]  # saf(2) + dsdf first 2
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy)
+            fx = block(fx, raw_xy=raw_xy, raw_x_extra=raw_x_extra)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, raw_x_extra=raw_x_extra)
         fx = fx + self.out_skip(fx_pre)
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred}
