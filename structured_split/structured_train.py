@@ -23,6 +23,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     Tandem surface loss is therefore underweighted.
 """
 
+import math
 import sys
 from pathlib import Path
 
@@ -440,9 +441,12 @@ _pstd = ((_phys_sq_sum / _phys_n - _pmean ** 2).clamp(min=0.0).sqrt()).clamp(min
 phys_stats = {"y_mean": _pmean, "y_std": _pstd}
 print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
+# Random Fourier Features: project 2D position into 64-dim frequency space
+fourier_B = torch.randn(2, 32) * 10  # frozen, shape [2, 32]
+
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2,  # X_DIM=24; fun_dim + space_dim must equal x.shape[-1]
+    fun_dim=X_DIM - 2 + 64,  # 22 + 64 RFF features; fun_dim + space_dim must equal x.shape[-1]
     out_dim=3,
     n_hidden=128,
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
@@ -454,6 +458,7 @@ model_config = dict(
 )
 
 model = Transolver(**model_config).to(device)
+fourier_B = fourier_B.to(device)
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -559,6 +564,10 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         x = (x - stats["x_mean"]) / stats["x_std"]
+        pos = x[:, :, :2]
+        ff = torch.cat([torch.sin(2 * math.pi * pos @ fourier_B),
+                        torch.cos(2 * math.pi * pos @ fourier_B)], dim=-1)
+        x = torch.cat([x, ff], dim=-1)
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
@@ -648,6 +657,10 @@ for epoch in range(MAX_EPOCHS):
                 mask = mask.to(device, non_blocking=True)
 
                 x = (x - stats["x_mean"]) / stats["x_std"]
+                pos = x[:, :, :2]
+                ff = torch.cat([torch.sin(2 * math.pi * pos @ fourier_B),
+                                torch.cos(2 * math.pi * pos @ fourier_B)], dim=-1)
+                x = torch.cat([x, ff], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
