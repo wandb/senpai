@@ -118,8 +118,9 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout),
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
+        self.spatial_gate = nn.Sequential(nn.Linear(2, 32), nn.GELU(), nn.Linear(32, slice_num), nn.Sigmoid())
 
-    def forward(self, x, spatial_bias=None):
+    def forward(self, x):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -135,8 +136,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             .contiguous()
         )
         slice_logits = self.in_project_slice(x_mid) / self.temperature
-        if spatial_bias is not None:
-            slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
+        gate = self.spatial_gate(x[:, :, :2])
+        slice_logits = slice_logits * (1.0 + 0.1 * gate.unsqueeze(1))
         slice_weights = self.softmax(slice_logits)
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
@@ -181,7 +182,6 @@ class TransolverBlock(nn.Module):
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
-        self.spatial_bias = nn.Sequential(nn.Linear(2, 32), nn.GELU(), nn.Linear(32, slice_num))
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
             self.mlp2 = nn.Sequential(
@@ -191,8 +191,7 @@ class TransolverBlock(nn.Module):
             )
 
     def forward(self, fx, raw_xy=None):
-        sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.attn(self.ln_1(fx), spatial_bias=sb) + fx
+        fx = self.attn(self.ln_1(fx)) + fx
         fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
             return self.mlp2(self.ln_3(fx))
@@ -496,8 +495,8 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
-attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
-other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_gate'])]
+other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_gate'])]
 base_opt = torch.optim.AdamW([
     {'params': attn_params, 'lr': cfg.lr * 0.5},
     {'params': other_params, 'lr': cfg.lr}
