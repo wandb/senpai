@@ -104,7 +104,6 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.scale = dim_head**-0.5
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
-        self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
@@ -118,7 +117,9 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, x):
+    def forward(self, x, temperature=None):
+        if temperature is None:
+            temperature = 0.5
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -133,7 +134,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             .permute(0, 2, 1, 3)
             .contiguous()
         )
-        slice_weights = self.softmax(self.in_project_slice(x_mid) / self.temperature)
+        slice_weights = self.softmax(self.in_project_slice(x_mid) / temperature)
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
@@ -188,8 +189,8 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx):
-        fx = self.attn(self.ln_1(fx)) + fx
+    def forward(self, fx, temperature=None):
+        fx = self.attn(self.ln_1(fx), temperature=temperature) + fx
         fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
             return self.mlp2(self.ln_3(fx))
@@ -316,11 +317,13 @@ class Transolver(nn.Module):
             new_pos = self.get_grid(pos)
             x = torch.cat((x, new_pos), dim=-1)
 
+        temperature = data.get("temperature", None) if isinstance(data, Mapping) else None
+
         fx = self.preprocess(x)
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks:
-            fx = block(fx)
+            fx = block(fx, temperature=temperature)
         self._validate_output_dims(fx)
         return {"preds": fx}
 
@@ -547,6 +550,9 @@ for epoch in range(MAX_EPOCHS):
     progress = epoch / MAX_EPOCHS
     surf_weight = sw_start + (sw_end - sw_start) * progress
 
+    # Temperature annealing: 1.0 → 0.1 over training
+    temp = max(0.1, 1.0 - 0.9 * epoch / MAX_EPOCHS)
+
     # --- Train ---
     model.train()
     epoch_vol = 0.0
@@ -567,7 +573,7 @@ for epoch in range(MAX_EPOCHS):
             y_norm = y_norm + 0.01 * torch.randn_like(y_norm)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            pred = model({"x": x})["preds"]
+            pred = model({"x": x, "temperature": temp})["preds"]
         pred = pred.float()
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
@@ -654,7 +660,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = model({"x": x})["preds"]
+                    pred = model({"x": x, "temperature": temp})["preds"]
                 pred = pred.float()
                 sq_err = (pred - y_norm) ** 2
                 abs_err = (pred - y_norm).abs()
