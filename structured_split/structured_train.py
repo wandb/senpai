@@ -531,6 +531,7 @@ with open(model_dir / "config.yaml", "w") as f:
 best_val = float("inf")
 best_metrics = {}
 global_step = 0
+ema_pred = None
 train_start = time.time()
 
 for epoch in range(MAX_EPOCHS):
@@ -568,6 +569,11 @@ for epoch in range(MAX_EPOCHS):
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pred = model({"x": x})["preds"]
         pred = pred.float()
+        if ema_pred is None or ema_pred.shape != pred.shape:
+            ema_pred = pred.detach()
+        else:
+            ema_pred = 0.99 * ema_pred + 0.01 * pred.detach()
+        ema_loss = 0.1 * F.mse_loss(pred, ema_pred.detach())
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         vol_mask = mask & ~is_surface
@@ -589,7 +595,7 @@ for epoch in range(MAX_EPOCHS):
 
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
-        loss = vol_loss + surf_weight * surf_loss
+        loss = vol_loss + surf_weight * surf_loss + ema_loss
 
         # Multi-scale loss: coarse spatial pooling
         coarse_pool_size = 64
