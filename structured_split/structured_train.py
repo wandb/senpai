@@ -610,6 +610,20 @@ for epoch in range(MAX_EPOCHS):
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
             loss = loss + 1.0 * coarse_loss
 
+        # Surface-specific coarse loss
+        surf_pool_size = 32
+        B, N, C = pred.shape
+        surf_indices = surf_mask.nonzero(as_tuple=False)
+        if surf_indices.shape[0] > surf_pool_size * 2:
+            surf_pred = pred[surf_indices[:, 0], surf_indices[:, 1]]
+            surf_target = y_norm[surf_indices[:, 0], surf_indices[:, 1]]
+            n_sg = surf_pred.shape[0] // surf_pool_size
+            if n_sg > 1:
+                sp = surf_pred[:n_sg * surf_pool_size].reshape(n_sg, surf_pool_size, C).mean(dim=1)
+                st = surf_target[:n_sg * surf_pool_size].reshape(n_sg, surf_pool_size, C).mean(dim=1)
+                surf_coarse_loss = (sp - st).abs().mean()
+                loss = loss + 2.0 * surf_coarse_loss
+
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
