@@ -589,7 +589,11 @@ for epoch in range(MAX_EPOCHS):
             vol_mask_train = vol_mask
 
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
-        surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        # Asymmetric pressure loss: 1.5x penalty for underpredicting |p|
+        abs_err_asym = abs_err.clone()
+        p_under = (pred[:, :, 2].abs() < y_norm[:, :, 2].abs())
+        abs_err_asym[:, :, 2] = torch.where(p_under, abs_err[:, :, 2] * 1.5, abs_err[:, :, 2])
+        surf_loss = (abs_err_asym * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + surf_weight * surf_loss
 
         # Multi-scale loss: coarse spatial pooling
