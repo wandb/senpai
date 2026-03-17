@@ -229,14 +229,14 @@ class Transolver(nn.Module):
         if self.unified_pos:
             self.preprocess = MLP(
                 fun_dim + self.ref * self.ref * self.ref,
-                n_hidden * 2,
+                n_hidden * 3,
                 n_hidden,
                 n_layers=0,
                 res=False,
                 act=act,
             )
         else:
-            self.preprocess = MLP(fun_dim + space_dim, n_hidden * 2, n_hidden, n_layers=1, res=True, act=act)
+            self.preprocess = MLP(fun_dim + space_dim, n_hidden * 3, n_hidden, n_layers=1, res=True, act=act)
 
         self.n_hidden = n_hidden
         self.space_dim = space_dim
