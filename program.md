@@ -18,8 +18,7 @@ We are training a neural network surrogate for CFD (computational fluid dynamics
 - `structured_split/prepare.py` — dataset loading and collation. **Read-only.**
 - `structured_split/prepare_multi.py` — extended preprocessing (24-dim x, foil-2 features). **Read-only.**
 - `structured_split/utils.py` — visualization. **Read-only.**
-- `DATASET_REPORT.md` — dataset documentation.
-- `structured_split/README.md` — benchmark split documentation.
+- `structured_split/README.md` — benchmark splits and dataset documentation.
 
 No new packages beyond `pyproject.toml`.
 
