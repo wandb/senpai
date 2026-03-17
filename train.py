@@ -23,6 +23,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
 import os
 import time
 from collections.abc import Mapping
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -108,6 +109,9 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout),
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
+        # Sigmoid-gated residual bypass for slice tokens
+        # sigmoid(-2.2) ≈ 0.1, matching the original scalar init
+        self.slice_gate_bias = nn.Parameter(torch.full((1, self.heads, 1, 1), -2.2))
 
     def forward(self, x, spatial_bias=None):
         bsz, num_points, _ = x.shape
@@ -131,6 +135,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
+        slice_token_residual = slice_token  # save before attention for gated bypass
 
         q_slice_token = self.to_q(slice_token)
         slice_token_kv = slice_token.mean(dim=1, keepdim=True)  # shared K,V: (bsz, 1, slice_num, dim_head)
@@ -141,6 +146,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
         attn_weights = F.softmax(attn_logits, dim=-1)
         out_slice_token = torch.matmul(attn_weights, v_slice_token)
+        gate = torch.sigmoid(self.slice_gate_bias)
+        out_slice_token = gate * slice_token_residual + (1 - gate) * out_slice_token
 
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
