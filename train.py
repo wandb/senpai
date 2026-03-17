@@ -23,6 +23,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
 import os
 import time
 from collections.abc import Mapping
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -351,7 +352,7 @@ MAX_EPOCHS = 100
 
 @dataclass
 class Config:
-    lr: float = 3e-3
+    lr: float = 4.24e-3
     weight_decay: float = 1e-4
     batch_size: int = 4
     surf_weight: float = 20.0
@@ -573,11 +574,13 @@ for epoch in range(MAX_EPOCHS):
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
 
     # --- Train ---
+    ACCUM_STEPS = 2
     model.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
 
+    optimizer.zero_grad()
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     for x, y, is_surface, mask in pbar:
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
@@ -665,10 +668,12 @@ for epoch in range(MAX_EPOCHS):
         re_loss = F.mse_loss(re_pred, log_re_target)
         loss = loss + 0.01 * re_loss
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        scaled_loss = loss / ACCUM_STEPS
+        scaled_loss.backward()
+        if (n_batches + 1) % ACCUM_STEPS == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
         if epoch >= ema_start_epoch:
             if ema_model is None:
                 ema_model = deepcopy(model)
