@@ -449,6 +449,7 @@ model_config = dict(
     n_head=4,
     slice_num=32,  # was 64 — fewer slices for faster attention, more epochs
     mlp_ratio=2,
+    dropout=0.02,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
 )
@@ -566,8 +567,11 @@ for epoch in range(MAX_EPOCHS):
             y_norm = y_norm + 0.01 * torch.randn_like(y_norm)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            pred = model({"x": x})["preds"]
-        pred = pred.float()
+            pred1 = model({"x": x})["preds"]
+            pred2 = model({"x": x})["preds"]
+        pred1 = pred1.float()
+        pred2 = pred2.float()
+        pred = (pred1 + pred2) / 2
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         vol_mask = mask & ~is_surface
@@ -608,6 +612,10 @@ for epoch in range(MAX_EPOCHS):
             coarse_err = (pred_coarse - y_coarse).abs()
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
             loss = loss + 1.0 * coarse_loss
+
+        # R-Drop: consistency regularization between two forward passes
+        rdrop_loss = F.mse_loss(pred1, pred2)
+        loss = loss + 0.5 * rdrop_loss
 
         optimizer.zero_grad()
         loss.backward()
