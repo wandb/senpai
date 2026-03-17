@@ -138,6 +138,11 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         if spatial_bias is not None:
             slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
         slice_weights = self.softmax(slice_logits)
+        topk_vals, topk_idx = slice_weights.topk(16, dim=-1)
+        mask = torch.zeros_like(slice_weights)
+        mask.scatter_(-1, topk_idx, 1.0)
+        slice_weights = slice_weights * mask
+        slice_weights = slice_weights / slice_weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
