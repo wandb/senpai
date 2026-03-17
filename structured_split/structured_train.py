@@ -272,6 +272,7 @@ class Transolver(nn.Module):
         self.initialize_weights()
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
+        self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -333,10 +334,15 @@ class Transolver(nn.Module):
         fx = self.preprocess(x)
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
-        for block in self.blocks:
+        for block in self.blocks[:-1]:
             fx = block(fx, raw_xy=raw_xy)
+
+        # Auxiliary Re prediction from pre-output-head hidden representation
+        re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
+
+        fx = self.blocks[-1](fx, raw_xy=raw_xy)
         self._validate_output_dims(fx)
-        return {"preds": fx}
+        return {"preds": fx, "re_pred": re_pred}
 
 
 # ---------------------------------------------------------------------------
@@ -605,8 +611,11 @@ for epoch in range(MAX_EPOCHS):
             y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            pred = model({"x": x})["preds"]
+            out = model({"x": x})
+            pred = out["preds"]
+            re_pred = out["re_pred"]
         pred = pred.float()
+        re_pred = re_pred.float()
         if model.training:
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
@@ -656,6 +665,10 @@ for epoch in range(MAX_EPOCHS):
             coarse_err = (pred_coarse - y_coarse).abs()
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
             loss = loss + 1.0 * coarse_loss
+
+        log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
+        re_loss = F.mse_loss(re_pred, log_re_target)
+        loss = loss + 0.01 * re_loss
 
         optimizer.zero_grad()
         loss.backward()
