@@ -24,6 +24,7 @@ import os
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -400,21 +401,40 @@ def _umag_q(y, mask):
     return Umag, q
 
 
-def _phys_norm(y, Umag, q):
-    """Normalize Ux→Ux/Umag, Uy→Uy/Umag, p→p/q (Cp)."""
+def _phys_norm(y, Umag, q, mask=None, is_surface=None):
+    """Normalize Ux→Ux/Umag, Uy→Uy/Umag, p→(p-p_stag)/q (delta-Cp).
+
+    Centers pressure on per-sample stagnation pressure (max surface p), making
+    the distribution zero-mean and symmetric: stagnation=0, suction=negative.
+    Returns (y_p, p_stag) so the caller can reverse the centering.
+    """
     y_p = y.clone()
     y_p[:, :, 0:1] = y[:, :, 0:1] / Umag
     y_p[:, :, 1:2] = y[:, :, 1:2] / Umag
-    y_p[:, :, 2:3] = y[:, :, 2:3] / q
-    return y_p
+    B = y.shape[0]
+    p_stag = torch.zeros(B, 1, 1, device=y.device)
+    for b in range(B):
+        if mask is not None and is_surface is not None:
+            valid_surf = mask[b] & is_surface[b]
+            if valid_surf.sum() > 0:
+                p_stag[b, 0, 0] = y[b, valid_surf, 2].max()
+            elif mask is not None and mask[b].sum() > 0:
+                p_stag[b, 0, 0] = y[b, mask[b], 2].max()
+        else:
+            p_stag[b, 0, 0] = y[b, :, 2].max()
+    y_p[:, :, 2:3] = (y[:, :, 2:3] - p_stag) / q
+    return y_p, p_stag
 
 
-def _phys_denorm(y_p, Umag, q):
-    """Reverse physics normalization: Ux/Umag→Ux, Uy/Umag→Uy, Cp→p."""
+def _phys_denorm(y_p, Umag, q, p_stag=None):
+    """Reverse physics normalization: Ux/Umag→Ux, Uy/Umag→Uy, delta-Cp→p."""
     y = y_p.clone()
     y[:, :, 0:1] = y_p[:, :, 0:1].clamp(-50, 50) * Umag
     y[:, :, 1:2] = y_p[:, :, 1:2].clamp(-50, 50) * Umag
-    y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-100, 100) * q
+    if p_stag is not None:
+        y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-100, 100) * q + p_stag
+    else:
+        y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-100, 100) * q
     return y
 
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
@@ -448,8 +468,9 @@ _stats_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, *
 with torch.no_grad():
     for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc="Phys stats", leave=False):
         _y, _mask = _y.to(device), _mask.to(device)
+        _is_surf = _is_surf.to(device)
         _Um, _q = _umag_q(_y, _mask)
-        _yp = _phys_norm(_y, _Um, _q)
+        _yp, _ = _phys_norm(_y, _Um, _q, mask=_mask, is_surface=_is_surf)
         _m = _mask.float().unsqueeze(-1)  # [B, N, 1]
         _phys_sum += (_yp * _m).sum(dim=(0, 1))
         _phys_sq_sum += (_yp ** 2 * _m).sum(dim=(0, 1))
@@ -589,7 +610,7 @@ for epoch in range(MAX_EPOCHS):
 
         x = (x - stats["x_mean"]) / stats["x_std"]
         Umag, q = _umag_q(y, mask)
-        y_phys = _phys_norm(y, Umag, q)
+        y_phys, _ = _phys_norm(y, Umag, q, mask=mask, is_surface=is_surface)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         if model.training:
             noise_scale = torch.tensor([0.01, 0.01, 0.005], device=device)
@@ -719,7 +740,7 @@ for epoch in range(MAX_EPOCHS):
 
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 Umag, q = _umag_q(y, mask)
-                y_phys = _phys_norm(y, Umag, q)
+                y_phys, p_stag = _phys_norm(y, Umag, q, mask=mask, is_surface=is_surface)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
                 # Per-sample std normalization: skip tandem samples
@@ -750,9 +771,9 @@ for epoch in range(MAX_EPOCHS):
                 val_surf += (abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
                 n_vbatches += 1
 
-                # Denormalize: phys_stats → Cp space → original scale
+                # Denormalize: phys_stats → delta-Cp space → original scale
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
-                pred_orig = _phys_denorm(pred_phys, Umag, q)
+                pred_orig = _phys_denorm(pred_phys, Umag, q, p_stag=p_stag)
                 y_clamped = y.clamp(-1e6, 1e6)
                 err = (pred_orig - y_clamped).abs()
                 finite = err.isfinite()
