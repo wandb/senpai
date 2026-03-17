@@ -257,7 +257,7 @@ class Transolver(nn.Module):
         )
         self.initialize_weights()
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
-        self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
+        self.placeholder_shift = nn.Parameter(torch.full((n_hidden,), 0.1))
 
     def initialize_weights(self):
         self.apply(self._init_weights)
