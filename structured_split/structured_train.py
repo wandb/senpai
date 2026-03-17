@@ -530,6 +530,7 @@ with open(model_dir / "config.yaml", "w") as f:
     yaml.dump(model_config, f)
 
 best_val = float("inf")
+best_surf_p = float("inf")
 best_metrics = {}
 global_step = 0
 train_start = time.time()
@@ -752,8 +753,15 @@ for epoch in range(MAX_EPOCHS):
     else:
         peak_mem_gb = 0.0
 
+    # Checkpoint by mean surface pressure MAE across all splits
+    surf_p_vals = [val_metrics_per_split[s][f"{s}/mae_surf_p"]
+                   for s in VAL_SPLIT_NAMES
+                   if s in val_metrics_per_split]
+    mean_surf_p = sum(surf_p_vals) / max(len(surf_p_vals), 1)
+
     tag = ""
-    if mean_val_loss < best_val:
+    if mean_surf_p < best_surf_p:
+        best_surf_p = mean_surf_p
         best_val = mean_val_loss
         best_metrics = {"epoch": epoch + 1, "val_loss": mean_val_loss}
         for split_metrics in val_metrics_per_split.values():
