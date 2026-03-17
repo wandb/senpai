@@ -589,7 +589,13 @@ for epoch in range(MAX_EPOCHS):
             vol_mask_train = vol_mask
 
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
-        surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        surf_err = pred - y_norm
+        surf_huber = torch.where(
+            surf_err.abs() < 0.1,
+            0.5 * surf_err ** 2 / 0.1,
+            surf_err.abs() - 0.5 * 0.1,
+        )
+        surf_loss = (surf_huber * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + surf_weight * surf_loss
 
         # Multi-scale loss: coarse spatial pooling
