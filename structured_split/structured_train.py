@@ -619,8 +619,8 @@ for epoch in range(MAX_EPOCHS):
         surf_loss = (surf_per_sample * tandem_boost).mean()
         loss = vol_loss + surf_weight * surf_loss
 
-        # Multi-scale loss: coarse spatial pooling
-        coarse_pool_size = 64
+        # Multi-scale loss: coarse spatial pooling (dynamic schedule: 256->32 over epochs 0-40)
+        coarse_pool_size = max(32, 256 - int(224 * min(1.0, epoch / 40)))
         B, N, C = pred.shape
         n_groups = N // coarse_pool_size
         if n_groups > 1:
