@@ -237,7 +237,7 @@ class Transolver(nn.Module):
                 act=act,
             )
         else:
-            self.preprocess = MLP(fun_dim + space_dim, n_hidden * 2, n_hidden, n_layers=1, res=True, act=act)
+            self.preprocess = MLP(fun_dim + space_dim, n_hidden * 3, n_hidden, n_layers=1, res=True, act=act)  # was n_hidden*2
 
         self.n_hidden = n_hidden
         self.space_dim = space_dim
