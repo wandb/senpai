@@ -443,7 +443,7 @@ print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2,  # X_DIM=24; fun_dim + space_dim must equal x.shape[-1]
+    fun_dim=X_DIM - 2 + 4,  # X_DIM=24 + 4 cross-term features = 28; fun_dim + space_dim must equal x.shape[-1]
     out_dim=3,
     n_hidden=128,
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
@@ -560,6 +560,16 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         x = (x - stats["x_mean"]) / stats["x_std"]
+        # Physics interaction features: explicit cross-terms encoding known physics
+        # x layout: pos(0:2), saf(2:4), dsdf(4:12), is_surf(12), log_Re(13), AoA0(14), ...
+        # Indices used: pos_x=0, pos_y=1, idx2=2, log_Re=13, AoA0=14
+        x_inter = torch.stack([
+            x[:, :, 0] * x[:, :, 14],   # pos_x * AoA0
+            x[:, :, 1] * x[:, :, 14],   # pos_y * AoA0
+            x[:, :, 2] * x[:, :, 13],   # idx2 * log_Re
+            x[:, :, 0] * x[:, :, 13],   # pos_x * log_Re
+        ], dim=-1)
+        x = torch.cat([x, x_inter], dim=-1)  # [B, N, 28]
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
@@ -649,6 +659,14 @@ for epoch in range(MAX_EPOCHS):
                 mask = mask.to(device, non_blocking=True)
 
                 x = (x - stats["x_mean"]) / stats["x_std"]
+                # Physics interaction features (same as training)
+                x_inter = torch.stack([
+                    x[:, :, 0] * x[:, :, 14],   # pos_x * AoA0
+                    x[:, :, 1] * x[:, :, 14],   # pos_y * AoA0
+                    x[:, :, 2] * x[:, :, 13],   # idx2 * log_Re
+                    x[:, :, 0] * x[:, :, 13],   # pos_x * log_Re
+                ], dim=-1)
+                x = torch.cat([x, x_inter], dim=-1)  # [B, N, 28]
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
