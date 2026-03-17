@@ -359,6 +359,15 @@ train_ds, val_splits, stats, sample_weights = load_structured_split(
 )
 stats = {k: v.to(device) for k, v in stats.items()}
 
+# Identify tandem samples for curriculum learning
+import json as _json
+with open(cfg.manifest) as _f:
+    _manifest_data = _json.load(_f)
+_tandem_global = set(_manifest_data["domain_groups"].get("racecar_tandem", []))
+train_is_tandem = torch.tensor(
+    [i in _tandem_global for i in train_ds.indices], dtype=torch.bool
+)
+
 
 def _umag_q(y, mask):
     """Per-sample reference velocity and dynamic pressure from mean velocity.
@@ -551,6 +560,21 @@ for epoch in range(MAX_EPOCHS):
         break
 
     t0 = time.time()
+
+    # Curriculum sampling: zero tandem weight epochs 0-14, ramp 15-39, full from 40
+    if not cfg.debug:
+        if epoch < 15:
+            tandem_scale = 0.0
+        elif epoch < 40:
+            tandem_scale = (epoch - 15) / 25.0
+        else:
+            tandem_scale = 1.0
+        curriculum_weights = sample_weights.clone()
+        curriculum_weights[train_is_tandem] *= tandem_scale
+        curriculum_weights = curriculum_weights.clamp(min=1e-10)
+        cur_sampler = WeightedRandomSampler(curriculum_weights, num_samples=len(train_ds), replacement=True)
+        curriculum_loader_kwargs = {**loader_kwargs, "persistent_workers": False}
+        train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, sampler=cur_sampler, **curriculum_loader_kwargs)
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
