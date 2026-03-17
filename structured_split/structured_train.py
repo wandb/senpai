@@ -492,10 +492,11 @@ base_opt = torch.optim.AdamW([
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=5)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=MAX_EPOCHS - 5, eta_min=1e-4)
+warmup_sched = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=5)
+stable_sched = torch.optim.lr_scheduler.ConstantLR(base_opt, factor=1.0, total_iters=50)
+decay_sched = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=1.0, end_factor=1e-4/cfg.lr, total_iters=45)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
-    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[5]
+    base_opt, schedulers=[warmup_sched, stable_sched, decay_sched], milestones=[5, 55]
 )
 
 # --- wandb ---
