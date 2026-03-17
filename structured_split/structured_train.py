@@ -656,6 +656,21 @@ for epoch in range(MAX_EPOCHS):
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = model({"x": x})["preds"]
                 pred = pred.float()
+
+                # TTA: y-flip augmentation
+                x_denorm = x * stats["x_std"] + stats["x_mean"]
+                x_flip = x_denorm.clone()
+                x_flip[:, :, 1] *= -1   # flip y coordinate (index 1)
+                for aidx in [14, 18]:   # AoA foil1 and foil2
+                    if aidx < x_flip.shape[-1]:
+                        x_flip[:, :, aidx] *= -1
+                x_flip = (x_flip - stats["x_mean"]) / stats["x_std"]
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    pred_flip = model({"x": x_flip})["preds"]
+                pred_flip = pred_flip.float()
+                pred_flip[:, :, 1] *= -1  # flip Uy back
+                pred = (pred + pred_flip) / 2
+
                 sq_err = (pred - y_norm) ** 2
                 abs_err = (pred - y_norm).abs()
 
