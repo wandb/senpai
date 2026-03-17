@@ -610,7 +610,24 @@ for epoch in range(MAX_EPOCHS):
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
             loss = loss + 1.0 * coarse_loss
 
+        # GradNorm-balanced backward
         optimizer.zero_grad()
+        vol_term = vol_loss
+        surf_term = surf_weight * surf_loss
+        # Get gradient norms for each term
+        vol_term.backward(retain_graph=True)
+        vol_gnorm = sum(p.grad.norm()**2 for p in model.parameters() if p.grad is not None).sqrt().item()
+        optimizer.zero_grad()
+        surf_term.backward(retain_graph=True)
+        surf_gnorm = sum(p.grad.norm()**2 for p in model.parameters() if p.grad is not None).sqrt().item()
+        optimizer.zero_grad()
+        # Balance: scale to equal gradient norm
+        target_gnorm = (vol_gnorm + surf_gnorm) / 2
+        vol_scale = target_gnorm / max(vol_gnorm, 1e-8)
+        surf_scale = target_gnorm / max(surf_gnorm, 1e-8)
+        loss = vol_scale * vol_loss + surf_scale * surf_weight * surf_loss
+        if n_groups > 1:
+            loss = loss + 1.0 * coarse_loss
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
