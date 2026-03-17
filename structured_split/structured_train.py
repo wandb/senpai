@@ -187,7 +187,9 @@ class TransolverBlock(nn.Module):
             )
 
     def forward(self, fx):
-        fx = self.attn(self.ln_1(fx)) + fx
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            attn_out = self.attn(self.ln_1(fx))
+        fx = attn_out.to(fx.dtype) + fx
         fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
             return self.mlp2(self.ln_3(fx))
@@ -583,9 +585,7 @@ for epoch in range(MAX_EPOCHS):
                     sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
             y_norm = y_norm / sample_stds
 
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            pred = model({"x": x})["preds"]
-        pred = pred.float()
+        pred = model({"x": x})["preds"]
         if model.training:
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
@@ -687,9 +687,7 @@ for epoch in range(MAX_EPOCHS):
                         sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
                 y_norm_scaled = y_norm / sample_stds
 
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = model({"x": x})["preds"]
-                pred = pred.float()
+                pred = model({"x": x})["preds"]
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
