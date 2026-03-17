@@ -632,6 +632,14 @@ for epoch in range(MAX_EPOCHS):
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
             loss = loss + 1.0 * coarse_loss
 
+        coarse2_size = 256
+        n_g2 = N // coarse2_size
+        if n_g2 > 1:
+            p2 = pred[:, :n_g2*coarse2_size].reshape(B, n_g2, coarse2_size, C).mean(2)
+            y2 = y_norm[:, :n_g2*coarse2_size].reshape(B, n_g2, coarse2_size, C).mean(2)
+            m2 = mask[:, :n_g2*coarse2_size].reshape(B, n_g2, coarse2_size).any(2)
+            loss = loss + 0.5 * ((p2-y2).abs() * m2.unsqueeze(-1)).sum() / m2.sum().clamp(1)
+
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
