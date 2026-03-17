@@ -458,40 +458,12 @@ model = Transolver(**model_config).to(device)
 n_params = sum(p.numel() for p in model.parameters())
 
 
-class Lookahead:
-    def __init__(self, base_optimizer, k=5, alpha=0.5):
-        self.base_optimizer = base_optimizer
-        self.k = k
-        self.alpha = alpha
-        self.slow_params = [
-            [p.data.clone() for p in group['params']]
-            for group in base_optimizer.param_groups
-        ]
-        self.step_count = 0
-
-    def step(self):
-        self.base_optimizer.step()
-        self.step_count += 1
-        if self.step_count % self.k == 0:
-            for slow, group in zip(self.slow_params, self.base_optimizer.param_groups):
-                for s, p in zip(slow, group['params']):
-                    s.data.add_(self.alpha * (p.data - s.data))
-                    p.data.copy_(s.data)
-
-    def zero_grad(self):
-        self.base_optimizer.zero_grad()
-
-    @property
-    def param_groups(self):
-        return self.base_optimizer.param_groups
-
-
-base_opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-optimizer = Lookahead(base_opt, k=10, alpha=0.8)
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=5)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=MAX_EPOCHS - 5, eta_min=1e-5)
+optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+sam_rho = 0.05
+warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=5)
+cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS - 5, eta_min=1e-5)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
-    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[5]
+    optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[5]
 )
 
 # --- wandb ---
@@ -609,8 +581,42 @@ for epoch in range(MAX_EPOCHS):
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
             loss = loss + 1.0 * coarse_loss
 
+        # SAM first step: compute gradients at w
         optimizer.zero_grad()
         loss.backward()
+        # Compute perturbation e_hat = rho * grad / ||grad||
+        grad_norm = torch.stack([
+            p.grad.detach().norm() for p in model.parameters() if p.grad is not None
+        ]).norm()
+        eps_hat = [
+            sam_rho * p.grad.detach() / (grad_norm + 1e-12) if p.grad is not None else None
+            for p in model.parameters()
+        ]
+        with torch.no_grad():
+            for p, e in zip(model.parameters(), eps_hat):
+                if e is not None:
+                    p.add_(e)
+        # SAM second step: compute gradients at w + e_hat
+        optimizer.zero_grad()
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            pred2 = model({"x": x})["preds"]
+        pred2 = pred2.float()
+        abs_err2 = (pred2 - y_norm).abs()
+        vol_loss2 = (abs_err2 * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+        surf_loss2 = (abs_err2 * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        loss2 = vol_loss2 + surf_weight * surf_loss2
+        if n_groups > 1:
+            pred2_trunc = pred2[:, :n_groups * coarse_pool_size]
+            pred2_coarse = pred2_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
+            coarse_err2 = (pred2_coarse - y_coarse).abs()
+            coarse_loss2 = (coarse_err2 * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
+            loss2 = loss2 + 1.0 * coarse_loss2
+        loss2.backward()
+        # Restore params to w
+        with torch.no_grad():
+            for p, e in zip(model.parameters(), eps_hat):
+                if e is not None:
+                    p.sub_(e)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         global_step += 1
