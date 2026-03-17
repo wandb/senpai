@@ -533,6 +533,7 @@ best_val = float("inf")
 best_metrics = {}
 global_step = 0
 train_start = time.time()
+teachers = []
 
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
@@ -609,6 +610,12 @@ for epoch in range(MAX_EPOCHS):
             coarse_err = (pred_coarse - y_coarse).abs()
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
             loss = loss + 1.0 * coarse_loss
+
+        if epoch > 60 and teachers:
+            with torch.no_grad():
+                teacher_preds = torch.stack([t({"x": x})["preds"].float() for t in teachers]).mean(0)
+            kd_loss = (pred - teacher_preds).abs().mean()
+            loss = loss + 0.5 * kd_loss
 
         optimizer.zero_grad()
         loss.backward()
@@ -745,6 +752,18 @@ for epoch in range(MAX_EPOCHS):
         f"train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  "
         f"val[{split_summary}]{tag}"
     )
+
+    if epoch + 1 in [40, 50, 60]:
+        torch.save(model.state_dict(), model_dir / f"ckpt_{epoch+1}.pt")
+
+    if epoch == 60:
+        import copy
+        teachers = []
+        for ep in [40, 50, 60]:
+            t = copy.deepcopy(model)
+            t.load_state_dict(torch.load(model_dir / f"ckpt_{ep}.pt", map_location=device))
+            t.eval()
+            teachers.append(t)
 
 
 # --- Final summary ---
