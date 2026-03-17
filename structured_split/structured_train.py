@@ -23,6 +23,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     Tandem surface loss is therefore underweighted.
 """
 
+import math
 import sys
 from pathlib import Path
 
@@ -530,6 +531,7 @@ with open(model_dir / "config.yaml", "w") as f:
     yaml.dump(model_config, f)
 
 best_val = float("inf")
+best_surf_p = float("inf")
 best_metrics = {}
 global_step = 0
 train_start = time.time()
@@ -732,6 +734,12 @@ for epoch in range(MAX_EPOCHS):
                              torch.tensor(val_metrics_per_split[name][f"{name}/loss"]).isinf())]
     mean_val_loss = sum(finite_losses) / max(len(finite_losses), 1)
 
+    # Mean surface pressure MAE across all splits (used for checkpoint selection)
+    surf_p_vals = [val_metrics_per_split[name][f"{name}/mae_surf_p"]
+                   for name in VAL_SPLIT_NAMES]
+    finite_surf_p = [v for v in surf_p_vals if math.isfinite(v)]
+    mean_surf_p = sum(finite_surf_p) / max(len(finite_surf_p), 1)
+
     dt = time.time() - t0
 
     # --- Log to wandb ---
@@ -739,6 +747,7 @@ for epoch in range(MAX_EPOCHS):
         "train/vol_loss": epoch_vol,
         "train/surf_loss": epoch_surf,
         "val/loss": mean_val_loss,
+        "val/mean_surf_p": mean_surf_p,
         "lr": scheduler.get_last_lr()[0],
         "epoch_time_s": dt,
     }
@@ -753,9 +762,10 @@ for epoch in range(MAX_EPOCHS):
         peak_mem_gb = 0.0
 
     tag = ""
-    if mean_val_loss < best_val:
+    if mean_surf_p < best_surf_p:
+        best_surf_p = mean_surf_p
         best_val = mean_val_loss
-        best_metrics = {"epoch": epoch + 1, "val_loss": mean_val_loss}
+        best_metrics = {"epoch": epoch + 1, "val_loss": mean_val_loss, "mean_surf_p": mean_surf_p}
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
@@ -779,7 +789,7 @@ print("\n" + "=" * 70)
 print(f"TRAINING COMPLETE ({total_time:.1f} min)")
 print("=" * 70)
 if best_metrics:
-    print(f"Best model at epoch {best_metrics['epoch']}  (val/loss={best_metrics['val_loss']:.4f})")
+    print(f"Best model at epoch {best_metrics['epoch']}  (val/loss={best_metrics['val_loss']:.4f}  mean_surf_p={best_metrics.get('mean_surf_p', float('nan')):.2f})")
     for split_name in VAL_SPLIT_NAMES:
         k_p = f"best_{split_name}/mae_surf_p"
         k_l = f"best_{split_name}/loss"
