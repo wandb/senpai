@@ -190,7 +190,8 @@ class TransolverBlock(nn.Module):
         fx = self.attn(self.ln_1(fx)) + fx
         fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            with torch.amp.autocast('cuda', enabled=False):
+                return self.mlp2(self.ln_3(fx.float()))
         return fx
 
 
