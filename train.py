@@ -644,7 +644,23 @@ for epoch in range(MAX_EPOCHS):
         tandem_boost = torch.where(is_tandem, 1.5, 1.0).to(device)
         surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         surf_loss = (surf_per_sample * tandem_boost).mean()
+        # Stagnation-point pressure anchoring
+        # Find the node with highest target pressure on each surface (stagnation point)
+        # y_norm shape: [B, N, 3], channel 2 is pressure
+        B_size = y_norm.shape[0]
+        stag_loss = torch.tensor(0.0, device=device)
+        for b in range(B_size):
+            surf_nodes = surf_mask[b]  # [N] boolean mask
+            if surf_nodes.sum() > 0:
+                surf_p_target = y_norm[b, surf_nodes, 2]  # [n_surf]
+                stag_idx = surf_p_target.argmax()
+                surf_indices = surf_nodes.nonzero(as_tuple=True)[0]
+                stag_node = surf_indices[stag_idx]
+                stag_err = abs_err[b, stag_node, :]  # [3] — Ux, Uy, p error at stagnation
+                stag_loss = stag_loss + stag_err[2]  # only pressure channel
+        stag_loss = stag_loss / B_size
         loss = vol_loss + surf_weight * surf_loss
+        loss = loss + 0.5 * stag_loss
 
         # Multi-scale loss: coarse spatial pooling
         coarse_pool_size = 64
@@ -680,7 +696,7 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), model.parameters()):
                         ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "train/stag_loss": stag_loss.item(), "global_step": global_step})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
