@@ -23,6 +23,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
 import os
 import time
 from collections.abc import Mapping
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -263,6 +264,14 @@ class Transolver(nn.Module):
         self.out_skip = nn.Linear(n_hidden, out_dim)
         nn.init.zeros_(self.out_skip.weight)
         nn.init.zeros_(self.out_skip.bias)
+
+        # Random Fourier Features for positional encoding
+        rff_dim = 32
+        self.register_buffer('rff_W', torch.randn(2, rff_dim) * 4.0)  # sigma=4.0
+        self.register_buffer('rff_b', torch.rand(rff_dim) * 2 * 3.14159)
+        self.rff_proj = nn.Linear(rff_dim, n_hidden)
+        nn.init.zeros_(self.rff_proj.weight)
+        nn.init.zeros_(self.rff_proj.bias)
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
@@ -326,6 +335,9 @@ class Transolver(nn.Module):
         raw_xy = x[:, :, :2]
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
+        # Add RFF positional encoding
+        rff = (2.0 / 32) ** 0.5 * torch.cos(raw_xy @ self.rff_W + self.rff_b)  # [B, N, 32]
+        fx = fx + 0.1 * self.rff_proj(rff)
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
