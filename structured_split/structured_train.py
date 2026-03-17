@@ -575,17 +575,17 @@ for epoch in range(MAX_EPOCHS):
             noise_scale = torch.tensor([0.01, 0.01, 0.005], device=device)
             y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
 
-        # Per-sample std normalization: skip tandem samples (gap feature index 21)
+        # Per-sample std normalization (vectorized): skip tandem samples (gap feature index 21)
         raw_gap = x[:, 0, 21]
         is_tandem = raw_gap.abs() > 0.5
-        B = y_norm.shape[0]
-        sample_stds = torch.ones(B, 1, 3, device=device)
         channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
         if model.training:
-            for b in range(B):
-                if not is_tandem[b]:
-                    valid = mask[b]
-                    sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+            m = mask.float().unsqueeze(-1)  # (B, N, 1)
+            n_valid = m.sum(dim=1).clamp(min=1)  # (B, 1)
+            y_mean_s = (y_norm * m).sum(dim=1) / n_valid  # (B, 3)
+            y_var_s = ((y_norm - y_mean_s.unsqueeze(1)) ** 2 * m).sum(dim=1) / (n_valid - 1).clamp(min=1)  # (B, 3)
+            y_std_s = y_var_s.sqrt().clamp(min=channel_clamps)  # (B, 3)
+            sample_stds = torch.where(is_tandem[:, None], torch.ones_like(y_std_s), y_std_s).unsqueeze(1)  # (B, 1, 3)
             y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -689,16 +689,16 @@ for epoch in range(MAX_EPOCHS):
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
-                # Per-sample std normalization: skip tandem samples
+                # Per-sample std normalization (vectorized): skip tandem samples
                 raw_gap = x[:, 0, 21]
                 is_tandem = raw_gap.abs() > 0.5
-                B = y_norm.shape[0]
-                sample_stds = torch.ones(B, 1, 3, device=device)
                 channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
-                for b in range(B):
-                    if not is_tandem[b]:
-                        valid = mask[b]
-                        sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+                m_val = mask.float().unsqueeze(-1)  # (B, N, 1)
+                n_valid_val = m_val.sum(dim=1).clamp(min=1)  # (B, 1)
+                y_mean_val = (y_norm * m_val).sum(dim=1) / n_valid_val  # (B, 3)
+                y_var_val = ((y_norm - y_mean_val.unsqueeze(1)) ** 2 * m_val).sum(dim=1) / (n_valid_val - 1).clamp(min=1)  # (B, 3)
+                y_std_val = y_var_val.sqrt().clamp(min=channel_clamps)  # (B, 3)
+                sample_stds = torch.where(is_tandem[:, None], torch.ones_like(y_std_val), y_std_val).unsqueeze(1)  # (B, 1, 3)
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
