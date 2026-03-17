@@ -490,11 +490,17 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
-attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale'])]
-other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale'])]
+no_wd_names = ['bias', 'ln_1', 'ln_2', 'ln_3', 'placeholder_scale', 'placeholder_shift']
+attn_param_names = ['Wqkv', 'temperature', 'slice_weight', 'attn_scale']
+attn_p, wd_p, nowd_p = [], [], []
+for n, p in model.named_parameters():
+    if any(k in n for k in attn_param_names): attn_p.append(p)
+    elif any(k in n for k in no_wd_names): nowd_p.append(p)
+    else: wd_p.append(p)
 base_opt = torch.optim.AdamW([
-    {'params': attn_params, 'lr': cfg.lr * 0.5},
-    {'params': other_params, 'lr': cfg.lr}
+    {'params': attn_p, 'lr': cfg.lr * 0.5, 'weight_decay': cfg.weight_decay},
+    {'params': wd_p, 'lr': cfg.lr, 'weight_decay': cfg.weight_decay},
+    {'params': nowd_p, 'lr': cfg.lr, 'weight_decay': 0.0},
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=5)
@@ -550,9 +556,9 @@ for epoch in range(MAX_EPOCHS):
 
     t0 = time.time()
 
-    # Dynamic surface weight: linear ramp from 5 → 30 over training
+    # Dynamic surface weight: linear ramp from 5 → 30 over first 75 epochs
     sw_start, sw_end = 5.0, 30.0
-    progress = epoch / MAX_EPOCHS
+    progress = min(1.0, epoch / 75)
     surf_weight = sw_start + (sw_end - sw_start) * progress
 
     # --- Train ---
@@ -782,7 +788,8 @@ for epoch in range(MAX_EPOCHS):
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
-        torch.save(model.state_dict(), model_path)
+        save_model = ema_model if ema_model is not None else model
+        torch.save(save_model.state_dict(), model_path)
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
