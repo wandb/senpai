@@ -22,8 +22,8 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
 
 import os
 import time
-from collections.abc import Mapping
 from pathlib import Path
+from collections.abc import Mapping
 
 import torch
 import torch.nn as nn
@@ -105,6 +105,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.to_k = nn.Linear(dim_head, dim_head, bias=False)
         self.to_v = nn.Linear(dim_head, dim_head, bias=False)
         self.slice_residual_scale = nn.Parameter(torch.tensor(0.1))
+        self.slice_head_mod = nn.Parameter(torch.ones(self.heads, 1, 1))
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout),
@@ -143,7 +144,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
         attn_weights = F.softmax(attn_logits, dim=-1)
         out_slice_token = torch.matmul(attn_weights, v_slice_token)
-        out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
+        out_slice_token = out_slice_token + self.slice_residual_scale * self.slice_head_mod * slice_token
 
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
