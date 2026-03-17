@@ -1,1 +1,1 @@
-# Experiment: adaptive-sw
+experiment: Dynamic coarse pool size (256→32 schedule over 40 epochs)
