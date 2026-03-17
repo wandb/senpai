@@ -558,6 +558,13 @@ for epoch in range(MAX_EPOCHS):
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
 
+        # Y-flip augmentation (50% probability): negate y-pos and Uy
+        if model.training and torch.rand(1).item() < 0.5:
+            x = x.clone()
+            x[:, :, 1] = -x[:, :, 1]  # negate y-position
+            y = y.clone()
+            y[:, :, 1] = -y[:, :, 1]  # negate Uy
+
         x = (x - stats["x_mean"]) / stats["x_std"]
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
