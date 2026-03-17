@@ -588,9 +588,15 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_mask_train = vol_mask
 
-        vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+        # dsdf is x[:, :, 2:10] (8-dim signed distance field features)
+        dsdf_raw = x[:, :, 2:10] * stats["x_std"][2:10] + stats["x_mean"][2:10]
+        min_dist = dsdf_raw.abs().min(dim=-1).values  # [B, N]
+        smooth_surf_w = torch.exp(-min_dist / 0.1).clamp(min=0.1)  # [B, N]
+        # Apply as multiplicative weight on volume loss
+        weighted_vol_loss = (abs_err * vol_mask.unsqueeze(-1) * smooth_surf_w.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
         surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
-        loss = vol_loss + surf_weight * surf_loss
+        vol_loss = weighted_vol_loss
+        loss = weighted_vol_loss + surf_weight * surf_loss
 
         # Multi-scale loss: coarse spatial pooling
         coarse_pool_size = 64
