@@ -258,6 +258,7 @@ class Transolver(nn.Module):
         self.initialize_weights()
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
+        self.boundary_embed = nn.Embedding(8, 8)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -314,6 +315,19 @@ class Transolver(nn.Module):
                 raise ValueError("Missing required input tensor: pos")
             new_pos = self.get_grid(pos)
             x = torch.cat((x, new_pos), dim=-1)
+
+        # Zone-aware boundary embedding: derive boundary_id from is_surface and quadrant
+        is_surface_flag = data.get("is_surface")  # [B, N] bool tensor, optional
+        if is_surface_flag is not None:
+            surf_int = is_surface_flag.long()  # 0 or 1
+        else:
+            # Derive from x[:,12] (is_surface feature after normalization — threshold at 0)
+            surf_int = (x[..., 12] > 0).long()
+        # Zone proxy: quadrant based on pos (x[:,0] and x[:,1])
+        zone = (x[..., 0] >= 0).long() * 2 + (x[..., 1] >= 0).long()  # 0-3
+        boundary_id = (surf_int * 4 + zone).clamp(0, 7)  # 0-7
+        embed = self.boundary_embed(boundary_id)  # [B, N, 8]
+        x = torch.cat([x, embed], dim=-1)  # [B, N, X_DIM+8]
 
         fx = self.preprocess(x)
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
@@ -442,7 +456,7 @@ print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2,  # X_DIM=24; fun_dim + space_dim must equal x.shape[-1]
+    fun_dim=X_DIM - 2 + 8,  # X_DIM=24 + 8 boundary embed dims; space_dim=2
     out_dim=3,
     n_hidden=128,
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
@@ -566,7 +580,7 @@ for epoch in range(MAX_EPOCHS):
             y_norm = y_norm + 0.01 * torch.randn_like(y_norm)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            pred = model({"x": x})["preds"]
+            pred = model({"x": x, "is_surface": is_surface})["preds"]
         pred = pred.float()
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
@@ -653,7 +667,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = model({"x": x})["preds"]
+                    pred = model({"x": x, "is_surface": is_surface})["preds"]
                 pred = pred.float()
                 sq_err = (pred - y_norm) ** 2
                 abs_err = (pred - y_norm).abs()
