@@ -138,10 +138,9 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
 
-        q_slice_token = self.to_q(slice_token)
-        slice_token_kv = slice_token.mean(dim=1, keepdim=True)  # shared K,V: (bsz, 1, slice_num, dim_head)
-        k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
-        v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
+        q_slice_token = self.to_q(slice_token.mean(1, keepdim=True)).expand(-1, self.heads, -1, -1)
+        k_slice_token = self.to_k(slice_token)
+        v_slice_token = self.to_v(slice_token)
         dropout_p = self.dropout.p if self.training else 0.0
         out_slice_token = F.scaled_dot_product_attention(
             q_slice_token,
