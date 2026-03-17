@@ -642,7 +642,19 @@ for epoch in range(MAX_EPOCHS):
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem = (x[:, 0, 21].abs() > 0.01)
         tandem_boost = torch.where(is_tandem, 1.5, 1.0).to(device)
-        surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        # Gradient-weighted surface loss: weight nodes by target pressure magnitude
+        # Nodes with larger |p| are at stagnation/suction peaks — harder and more important
+        p_target_mag = y_norm[:, :, 2].abs()  # [B, N] — magnitude of normalized pressure
+        # Normalize weights per sample so they average to 1.0 (preserves overall scale)
+        surf_p_weights = torch.ones_like(p_target_mag)
+        for b in range(y_norm.shape[0]):
+            s = surf_mask[b]
+            if s.sum() > 0:
+                w = 1.0 + 2.0 * p_target_mag[b, s]  # alpha=2.0: 3x weight at |p|=1 vs |p|=0
+                surf_p_weights[b, s] = w / w.mean()  # normalize to mean=1
+
+        weighted_abs_err = abs_err * surf_p_weights.unsqueeze(-1)
+        surf_per_sample = (weighted_abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         surf_loss = (surf_per_sample * tandem_boost).mean()
         loss = vol_loss + surf_weight * surf_loss
 
