@@ -546,6 +546,7 @@ with open(model_dir / "config.yaml", "w") as f:
 best_val = float("inf")
 best_metrics = {}
 global_step = 0
+val_ema = None  # EMA-smoothed val loss for checkpoint selection
 train_start = time.time()
 prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
@@ -763,6 +764,12 @@ for epoch in range(MAX_EPOCHS):
                              torch.tensor(val_metrics_per_split[name][f"{name}/loss"]).isinf())]
     mean_val_loss = sum(finite_losses) / max(len(finite_losses), 1)
 
+    # EMA-smoothed val loss for checkpoint selection
+    if val_ema is None:
+        val_ema = mean_val_loss
+    else:
+        val_ema = 0.9 * val_ema + 0.1 * mean_val_loss
+
     dt = time.time() - t0
 
     # --- Log to wandb ---
@@ -770,6 +777,7 @@ for epoch in range(MAX_EPOCHS):
         "train/vol_loss": epoch_vol,
         "train/surf_loss": epoch_surf,
         "val/loss": mean_val_loss,
+        "val/ema_loss": val_ema,
         "lr": scheduler.get_last_lr()[0],
         "epoch_time_s": dt,
     }
@@ -784,8 +792,8 @@ for epoch in range(MAX_EPOCHS):
         peak_mem_gb = 0.0
 
     tag = ""
-    if mean_val_loss < best_val:
-        best_val = mean_val_loss
+    if val_ema < best_val:
+        best_val = val_ema
         best_metrics = {"epoch": epoch + 1, "val_loss": mean_val_loss}
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
