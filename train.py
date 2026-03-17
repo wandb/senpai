@@ -22,6 +22,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
 
 import os
 import time
+from pathlib import Path
 from collections.abc import Mapping
 
 import torch
@@ -103,6 +104,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.to_q = nn.Linear(dim_head, dim_head, bias=False)
         self.to_k = nn.Linear(dim_head, dim_head, bias=False)
         self.to_v = nn.Linear(dim_head, dim_head, bias=False)
+        self.slice_residual_scale = nn.Parameter(torch.tensor(0.1))
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout),
@@ -141,6 +143,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
         attn_weights = F.softmax(attn_logits, dim=-1)
         out_slice_token = torch.matmul(attn_weights, v_slice_token)
+        out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
 
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
@@ -189,7 +192,11 @@ class TransolverBlock(nn.Module):
     def forward(self, fx, raw_xy=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb) + fx)
-        fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
+        mlp_out = self.mlp(self.ln_2(fx))
+        if self.training:
+            drop_mask = (torch.rand(fx.shape[0], 1, 1, device=fx.device) > 0.1).float()
+            mlp_out = mlp_out * drop_mask / 0.9
+        fx = self.ln_2_post(mlp_out + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
