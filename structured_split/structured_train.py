@@ -455,6 +455,7 @@ model_config = dict(
 )
 
 model = Transolver(**model_config).to(device)
+coarse_channel_w = nn.Parameter(torch.tensor([1.0, 1.0, 2.0], device=device))
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -487,7 +488,10 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
-base_opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+base_opt = torch.optim.AdamW(
+    list(model.parameters()) + [coarse_channel_w],
+    lr=cfg.lr, weight_decay=cfg.weight_decay
+)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=5)
 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=MAX_EPOCHS - 5, eta_min=1e-4)
@@ -607,6 +611,7 @@ for epoch in range(MAX_EPOCHS):
             mask_coarse = mask_trunc.reshape(B, n_groups, coarse_pool_size).any(dim=2)
 
             coarse_err = (pred_coarse - y_coarse).abs()
+            coarse_err = coarse_err * F.softmax(coarse_channel_w, dim=0) * 3
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
             loss = loss + 1.0 * coarse_loss
 
