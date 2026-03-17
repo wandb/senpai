@@ -67,6 +67,16 @@ ACTIVATION = {
 }
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
+
 class MLP(nn.Module):
     def __init__(self, n_input, n_hidden, n_output, n_layers=1, act="gelu", res=True):
         super().__init__()
@@ -170,7 +180,7 @@ class TransolverBlock(nn.Module):
     ):
         super().__init__()
         self.last_layer = last_layer
-        self.ln_1 = nn.LayerNorm(hidden_dim)
+        self.ln_1 = RMSNorm(hidden_dim)
         self.attn = Physics_Attention_Irregular_Mesh(
             hidden_dim,
             heads=num_heads,
@@ -178,10 +188,10 @@ class TransolverBlock(nn.Module):
             dropout=dropout,
             slice_num=slice_num,
         )
-        self.ln_2 = nn.LayerNorm(hidden_dim)
+        self.ln_2 = RMSNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         if self.last_layer:
-            self.ln_3 = nn.LayerNorm(hidden_dim)
+            self.ln_3 = RMSNorm(hidden_dim)
             self.mlp2 = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.GELU(),
