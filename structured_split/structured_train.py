@@ -139,9 +139,10 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
 
         q_slice_token = self.to_q(slice_token)
-        slice_token_kv = slice_token.mean(dim=1, keepdim=True)  # shared K,V: (bsz, 1, slice_num, dim_head)
-        k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
-        v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
+        # GQA: 2 K,V groups for 4 Q heads (2 heads share each K,V group)
+        slice_token_kv = slice_token.reshape(bsz, 2, 2, slice_token.shape[2], self.dim_head).mean(2).repeat_interleave(2, 1)
+        k_slice_token = self.to_k(slice_token_kv)
+        v_slice_token = self.to_v(slice_token_kv)
         dropout_p = self.dropout.p if self.training else 0.0
         out_slice_token = F.scaled_dot_product_attention(
             q_slice_token,
