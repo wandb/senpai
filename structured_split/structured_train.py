@@ -108,7 +108,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
-        self.in_project_slice = nn.Linear(dim_head, slice_num)
+        self.in_project_slice = nn.Linear(dim_head + 2, slice_num)
         torch.nn.init.orthogonal_(self.in_project_slice.weight)
         self.to_q = nn.Linear(dim_head, dim_head, bias=False)
         self.to_k = nn.Linear(dim_head, dim_head, bias=False)
@@ -119,7 +119,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
 
-    def forward(self, x):
+    def forward(self, x, pos_2d=None):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -134,7 +134,12 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             .permute(0, 2, 1, 3)
             .contiguous()
         )
-        slice_weights = self.softmax(self.in_project_slice(x_mid) / self.temperature)
+        if pos_2d is not None:
+            pos_h = pos_2d.unsqueeze(1).expand(-1, self.heads, -1, -1)
+            slice_input = torch.cat([x_mid, pos_h], dim=-1)
+        else:
+            slice_input = x_mid
+        slice_weights = self.softmax(self.in_project_slice(slice_input) / self.temperature)
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
@@ -186,8 +191,8 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx):
-        fx = self.attn(self.ln_1(fx)) + fx
+    def forward(self, fx, pos_2d=None):
+        fx = self.attn(self.ln_1(fx), pos_2d=pos_2d) + fx
         fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
             return self.mlp2(self.ln_3(fx))
@@ -314,11 +319,12 @@ class Transolver(nn.Module):
             new_pos = self.get_grid(pos)
             x = torch.cat((x, new_pos), dim=-1)
 
+        pos_2d = x[:, :, :2]
         fx = self.preprocess(x)
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks:
-            fx = block(fx)
+            fx = block(fx, pos_2d=pos_2d)
         self._validate_output_dims(fx)
         return {"preds": fx}
 
