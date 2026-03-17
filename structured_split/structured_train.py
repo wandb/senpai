@@ -564,7 +564,10 @@ for epoch in range(MAX_EPOCHS):
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         if model.training:
-            y_norm = y_norm + 0.01 * torch.randn_like(y_norm)
+            noise_start, noise_end = 0.02, 0.003
+            noise_scale = noise_start + (noise_end - noise_start) * (epoch / MAX_EPOCHS)
+            noise_channel_w = torch.tensor([1.0, 1.0, 1.5], device=device)
+            y_norm = y_norm + noise_scale * noise_channel_w * torch.randn_like(y_norm)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pred = model({"x": x})["preds"]
