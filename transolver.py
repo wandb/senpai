@@ -71,6 +71,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.to_q = nn.Linear(dim_head, dim_head, bias=False)
         self.to_k = nn.Linear(dim_head, dim_head, bias=False)
         self.to_v = nn.Linear(dim_head, dim_head, bias=False)
+        self.slice_residual_scale = nn.Parameter(torch.tensor(0.1))
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout),
@@ -108,6 +109,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             dropout_p=dropout_p,
             is_causal=False,
         )  # B H G D
+        out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
 
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
