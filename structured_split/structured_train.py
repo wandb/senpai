@@ -574,17 +574,32 @@ for epoch in range(MAX_EPOCHS):
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
-        # Progressive resolution: subsample volume nodes in loss early in training
-        # Ramps from 10% → 100% of volume nodes over first 40 epochs
+        # Progressive resolution: subsample far-field volume nodes early in training
+        # Near-surface volume nodes (bottom 25% dsdf) are always kept at full resolution
         if epoch < 40:
             vol_keep_ratio = 0.05 + 0.95 * (epoch / 40)
             vol_indices = vol_mask.nonzero(as_tuple=False)
-            n_vol = vol_indices.shape[0]
-            n_keep = max(int(n_vol * vol_keep_ratio), 1)
-            perm = torch.randperm(n_vol, device=vol_mask.device)[:n_keep]
+
+            # Identify near-surface volume nodes using dsdf features (indices 4:12 in x)
+            dsdf = x[vol_indices[:, 0], vol_indices[:, 1], 4:12]
+            dsdf_norm = dsdf.norm(dim=-1)
+            near_surf_threshold = dsdf_norm.quantile(0.25)  # keep 25% closest to surface
+            near_surf_mask = dsdf_norm <= near_surf_threshold
+
+            # Keep all near-surface nodes + random sample of far-field
+            far_field_indices = vol_indices[~near_surf_mask]
+            n_far = far_field_indices.shape[0]
+            n_keep_far = max(int(n_far * vol_keep_ratio), 1)
+            perm = torch.randperm(n_far, device=vol_mask.device)[:n_keep_far]
+
             vol_mask_train = torch.zeros_like(vol_mask)
-            if n_keep > 0:
-                vol_mask_train[vol_indices[perm, 0], vol_indices[perm, 1]] = True
+            # Always include near-surface volume nodes
+            near_idx = vol_indices[near_surf_mask]
+            vol_mask_train[near_idx[:, 0], near_idx[:, 1]] = True
+            # Add random far-field sample
+            if n_keep_far > 0:
+                kept_far = far_field_indices[perm]
+                vol_mask_train[kept_far[:, 0], kept_far[:, 1]] = True
         else:
             vol_mask_train = vol_mask
 
