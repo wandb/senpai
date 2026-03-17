@@ -182,17 +182,19 @@ class TransolverBlock(nn.Module):
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
-            self.mlp2 = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, out_dim),
-            )
+            self.mlp2_vol = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim))
+            self.mlp2_surf = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim))
 
-    def forward(self, fx):
+    def forward(self, fx, is_surface=None):
         fx = self.attn(self.ln_1(fx)) + fx
         fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            h = self.ln_3(fx)
+            out = self.mlp2_vol(h)
+            if is_surface is not None:
+                surf_h = h[is_surface]
+                out[is_surface] = self.mlp2_surf(surf_h)
+            return out
         return fx
 
 
@@ -257,6 +259,14 @@ class Transolver(nn.Module):
             ]
         )
         self.initialize_weights()
+        # Xavier init for split decoder heads
+        last_block = self.blocks[-1]
+        for seq in [last_block.mlp2_vol, last_block.mlp2_surf]:
+            for m in seq.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
 
@@ -319,8 +329,9 @@ class Transolver(nn.Module):
         fx = self.preprocess(x)
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
+        is_surface = data.get("is_surface", None) if isinstance(data, Mapping) else None
         for block in self.blocks:
-            fx = block(fx)
+            fx = block(fx, is_surface=is_surface)
         self._validate_output_dims(fx)
         return {"preds": fx}
 
@@ -567,7 +578,7 @@ for epoch in range(MAX_EPOCHS):
             y_norm = y_norm + 0.01 * torch.randn_like(y_norm)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            pred = model({"x": x})["preds"]
+            pred = model({"x": x, "is_surface": is_surface})["preds"]
         pred = pred.float()
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
@@ -654,7 +665,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = model({"x": x})["preds"]
+                    pred = model({"x": x, "is_surface": is_surface})["preds"]
                 pred = pred.float()
                 sq_err = (pred - y_norm) ** 2
                 abs_err = (pred - y_norm).abs()
