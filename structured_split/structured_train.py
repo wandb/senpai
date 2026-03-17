@@ -402,16 +402,40 @@ def _phys_denorm(y_p, Umag, q):
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
 
+
+class CyclicSampler(torch.utils.data.Sampler):
+    def __init__(self, dataset, weights, epoch_fn):
+        self.dataset = dataset
+        self.weights = weights
+        self.epoch_fn = epoch_fn
+        # Pre-compute Re-sorted indices
+        re_vals = []
+        for i in range(len(dataset)):
+            x, y, _ = dataset[i]
+            re_vals.append(x[0, 13].item())  # log_Re at first node
+        self.sorted_indices = sorted(range(len(dataset)), key=lambda i: re_vals[i])
+
+    def __iter__(self):
+        epoch = self.epoch_fn()
+        if epoch % 2 == 0:
+            # Random weighted sampling
+            idx = list(torch.multinomial(self.weights, len(self.dataset), replacement=True).numpy())
+        else:
+            idx = self.sorted_indices.copy()
+        return iter(idx)
+
+    def __len__(self):
+        return len(self.dataset)
+
+
+current_epoch = [0]
+
 if cfg.debug:
     # Avoid sampler/length mismatch when train_ds is truncated
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
                               shuffle=True, **loader_kwargs)
 else:
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(train_ds),
-        replacement=True,
-    )
+    sampler = CyclicSampler(train_ds, sample_weights, lambda: current_epoch[0])
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
                               sampler=sampler, **loader_kwargs)
 
@@ -535,6 +559,7 @@ global_step = 0
 train_start = time.time()
 
 for epoch in range(MAX_EPOCHS):
+    current_epoch[0] = epoch
     elapsed_min = (time.time() - train_start) / 60.0
     if elapsed_min >= MAX_TIMEOUT:
         print(f"Wall-clock limit reached ({elapsed_min:.1f} min >= {MAX_TIMEOUT} min). Stopping.")
