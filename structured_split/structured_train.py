@@ -458,6 +458,10 @@ model = Transolver(**model_config).to(device)
 
 n_params = sum(p.numel() for p in model.parameters())
 
+swa_state_dict = None
+swa_count = 0
+swa_start_epoch = int(MAX_EPOCHS * 0.8)  # last 20%
+
 
 class Lookahead:
     def __init__(self, base_optimizer, k=5, alpha=0.5):
@@ -736,6 +740,15 @@ for epoch in range(MAX_EPOCHS):
         torch.save(model.state_dict(), model_path)
         tag = f" * -> {model_path}"
 
+    if epoch >= swa_start_epoch:
+        if swa_state_dict is None:
+            swa_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
+            swa_count = 1
+        else:
+            for k, v in model.state_dict().items():
+                swa_state_dict[k] += v
+            swa_count += 1
+
     split_summary = "  ".join(
         f"{name}={val_metrics_per_split[name][f'{name}/loss']:.4f}"
         for name in VAL_SPLIT_NAMES
@@ -745,6 +758,91 @@ for epoch in range(MAX_EPOCHS):
         f"train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  "
         f"val[{split_summary}]{tag}"
     )
+
+
+# --- SWA: average weights and re-validate ---
+if swa_state_dict is not None and swa_count > 0:
+    avg_sd = {k: v / swa_count for k, v in swa_state_dict.items()}
+    model.load_state_dict(avg_sd)
+    print(f"SWA: averaged {swa_count} checkpoints from epoch {swa_start_epoch}+")
+
+    # Re-run validation with SWA weights
+    model.eval()
+    swa_val_per_split: dict[str, dict] = {}
+    with torch.no_grad():
+        for split_name, vloader in val_loaders.items():
+            swa_vol = 0.0
+            swa_surf = 0.0
+            swa_mae_surf = torch.zeros(3, device=device)
+            swa_mae_vol = torch.zeros(3, device=device)
+            swa_n_surf = torch.zeros(3, device=device)
+            swa_n_vol = torch.zeros(3, device=device)
+            swa_nb = 0
+            for x, y, is_surface, mask in vloader:
+                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                is_surface = is_surface.to(device, non_blocking=True)
+                mask = mask.to(device, non_blocking=True)
+                x = (x - stats["x_mean"]) / stats["x_std"]
+                Umag, q = _umag_q(y, mask)
+                y_phys = _phys_norm(y, Umag, q)
+                y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    pred = model({"x": x})["preds"]
+                pred = pred.float()
+                abs_err = (pred - y_norm).abs()
+                vol_mask = mask & ~is_surface
+                surf_mask = mask & is_surface
+                swa_vol += min(
+                    (abs_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item(),
+                    1e12
+                )
+                swa_surf += (abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+                swa_nb += 1
+                pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                pred_orig = _phys_denorm(pred_phys, Umag, q)
+                y_clamped = y.clamp(-1e6, 1e6)
+                err = (pred_orig - y_clamped).abs()
+                finite = err.isfinite()
+                err = err.where(finite, torch.zeros_like(err))
+                swa_mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                swa_mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                swa_n_surf += (surf_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+                swa_n_vol += (vol_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+            swa_vol /= max(swa_nb, 1)
+            swa_surf /= max(swa_nb, 1)
+            swa_split_loss = swa_vol + cfg.surf_weight * swa_surf
+            swa_mae_surf /= swa_n_surf.clamp(min=1)
+            swa_mae_vol /= swa_n_vol.clamp(min=1)
+            swa_val_per_split[split_name] = {
+                f"{split_name}/vol_loss":    swa_vol,
+                f"{split_name}/surf_loss":   swa_surf,
+                f"{split_name}/loss":        swa_split_loss,
+                f"{split_name}/mae_vol_Ux":  swa_mae_vol[0].item(),
+                f"{split_name}/mae_vol_Uy":  swa_mae_vol[1].item(),
+                f"{split_name}/mae_vol_p":   swa_mae_vol[2].item(),
+                f"{split_name}/mae_surf_Ux": swa_mae_surf[0].item(),
+                f"{split_name}/mae_surf_Uy": swa_mae_surf[1].item(),
+                f"{split_name}/mae_surf_p":  swa_mae_surf[2].item(),
+            }
+
+    swa_finite = [swa_val_per_split[n][f"{n}/loss"] for n in VAL_SPLIT_NAMES
+                  if not (torch.tensor(swa_val_per_split[n][f"{n}/loss"]).isnan() or
+                          torch.tensor(swa_val_per_split[n][f"{n}/loss"]).isinf())]
+    swa_val_loss = sum(swa_finite) / max(len(swa_finite), 1)
+    swa_metrics = {"swa/val_loss": swa_val_loss}
+    for sm in swa_val_per_split.values():
+        swa_metrics.update({f"swa/{k}": v for k, v in sm.items()})
+    wandb.log(swa_metrics)
+    print(f"SWA val/loss: {swa_val_loss:.4f}")
+
+    if swa_val_loss < best_val:
+        best_val = swa_val_loss
+        best_metrics = {"epoch": "SWA", "val_loss": swa_val_loss}
+        for sm in swa_val_per_split.values():
+            for k, v in sm.items():
+                best_metrics[f"best_{k}"] = v
+        torch.save(model.state_dict(), model_path)
+        print(f"SWA improved best_val → {best_val:.4f}, saved to {model_path}")
 
 
 # --- Final summary ---
