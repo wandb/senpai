@@ -179,7 +179,10 @@ class TransolverBlock(nn.Module):
             slice_num=slice_num,
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
-        self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        swiglu_dim = int(hidden_dim * mlp_ratio * 2 / 3)
+        self.mlp_gate = nn.Linear(hidden_dim, swiglu_dim)
+        self.mlp_up = nn.Linear(hidden_dim, swiglu_dim)
+        self.mlp_down = nn.Linear(swiglu_dim, hidden_dim)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
             self.mlp2 = nn.Sequential(
@@ -190,7 +193,8 @@ class TransolverBlock(nn.Module):
 
     def forward(self, fx):
         fx = self.attn(self.ln_1(fx)) + fx
-        fx = self.mlp(self.ln_2(fx)) + fx
+        h = self.ln_2(fx)
+        fx = self.mlp_down(F.silu(self.mlp_gate(h)) * self.mlp_up(h)) + fx
         if self.last_layer:
             return self.mlp2(self.ln_3(fx))
         return fx
@@ -455,6 +459,12 @@ model_config = dict(
 )
 
 model = Transolver(**model_config).to(device)
+
+# Xavier init for SwiGLU layers (override orthogonal init from initialize_weights)
+for block in model.blocks:
+    for layer in [block.mlp_gate, block.mlp_up, block.mlp_down]:
+        nn.init.xavier_uniform_(layer.weight)
+        nn.init.constant_(layer.bias, 0)
 
 n_params = sum(p.numel() for p in model.parameters())
 
