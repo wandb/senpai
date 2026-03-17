@@ -185,12 +185,19 @@ class TransolverBlock(nn.Module):
                 nn.GELU(),
                 nn.Linear(hidden_dim, out_dim),
             )
+            self.output_gate = nn.Sequential(
+                nn.Linear(hidden_dim, out_dim),
+                nn.Sigmoid(),
+            )
 
     def forward(self, fx):
         fx = self.attn(self.ln_1(fx)) + fx
         fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            ln3_fx = self.ln_3(fx)
+            fx_out = self.mlp2(ln3_fx)
+            gate = self.output_gate(ln3_fx)
+            return fx_out * gate
         return fx
 
 
@@ -255,6 +262,10 @@ class Transolver(nn.Module):
             ]
         )
         self.initialize_weights()
+        # Re-initialize gate bias to +2.0 for near-identity start
+        for block in self.blocks:
+            if block.last_layer:
+                block.output_gate[0].bias.data.fill_(2.0)
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
 
