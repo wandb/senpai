@@ -456,6 +456,9 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 
+ema_decay = 0.999
+ema_state = {k: v.clone() for k, v in model.state_dict().items()}
+
 n_params = sum(p.numel() for p in model.parameters())
 
 
@@ -614,6 +617,9 @@ for epoch in range(MAX_EPOCHS):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        with torch.no_grad():
+            for k, v in model.state_dict().items():
+                ema_state[k].mul_(ema_decay).add_(v, alpha=1 - ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -627,6 +633,8 @@ for epoch in range(MAX_EPOCHS):
     epoch_surf /= n_batches
 
     # --- Validate across all splits ---
+    fast_state = {k: v.clone() for k, v in model.state_dict().items()}
+    model.load_state_dict(ema_state)
     model.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
@@ -699,6 +707,8 @@ for epoch in range(MAX_EPOCHS):
         }
         val_loss_sum += split_loss
 
+    model.load_state_dict(fast_state)
+
     # val/loss = mean across finite splits; NaN-robust for checkpoint selection
     finite_losses = [val_metrics_per_split[name][f"{name}/loss"]
                      for name in VAL_SPLIT_NAMES
@@ -733,7 +743,7 @@ for epoch in range(MAX_EPOCHS):
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
-        torch.save(model.state_dict(), model_path)
+        torch.save(ema_state, model_path)
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
