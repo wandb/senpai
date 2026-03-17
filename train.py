@@ -269,6 +269,14 @@ class Transolver(nn.Module):
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        # Re-dependent output modulation: log_Re -> 3 per-channel scaling factors
+        self.re_output_mod = nn.Sequential(
+            nn.Linear(1, 16), nn.GELU(), nn.Linear(16, 3)
+        )
+        # Initialize output layer to zeros — scale starts as 1.0 (identity)
+        with torch.no_grad():
+            self.re_output_mod[-1].weight.zero_()
+            self.re_output_mod[-1].bias.zero_()
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -339,6 +347,10 @@ class Transolver(nn.Module):
 
         fx = self.blocks[-1](fx, raw_xy=raw_xy)
         fx = fx + self.out_skip(fx_pre)
+        # Re-dependent output modulation
+        log_re = x[:, 0:1, 13:14]  # [B, 1, 1] — same for all nodes in a sample
+        re_scale = 1.0 + 0.1 * self.re_output_mod(log_re)  # [B, 1, 3] — centered at 1.0
+        fx = fx * re_scale  # [B, N, 3] * [B, 1, 3] broadcasts
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred}
 
