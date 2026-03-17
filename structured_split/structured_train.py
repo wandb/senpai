@@ -333,6 +333,7 @@ MAX_EPOCHS = 100
 class Config:
     lr: float = 3e-3
     weight_decay: float = 1e-4
+    eta_min: float = 1e-5
     batch_size: int = 4
     surf_weight: float = 20.0
     manifest: str = "structured_split/split_manifest.json"
@@ -484,11 +485,9 @@ class Lookahead:
 
 base_opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=MAX_EPOCHS - 10)
-scheduler = torch.optim.lr_scheduler.SequentialLR(
-    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[10]
-)
+warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.05, total_iters=10)
+cosine = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=MAX_EPOCHS - 10, eta_min=cfg.eta_min)
+scheduler = torch.optim.lr_scheduler.SequentialLR(base_opt, [warmup, cosine], milestones=[10])
 
 # --- wandb ---
 run = wandb.init(
