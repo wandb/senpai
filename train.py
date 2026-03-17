@@ -646,6 +646,24 @@ for epoch in range(MAX_EPOCHS):
         surf_loss = (surf_per_sample * tandem_boost).mean()
         loss = vol_loss + surf_weight * surf_loss
 
+        # Cosine similarity loss on surface pressure profile
+        # Measures shape agreement, not just pointwise error
+        cos_loss = torch.tensor(0.0, device=device)
+        n_cos = 0
+        pred_for_cos = pred  # already in normalized space (divided by sample_stds if training)
+        for b in range(pred_for_cos.shape[0]):
+            s = surf_mask[b]
+            if s.sum() > 10:  # need enough surface nodes for meaningful cosine sim
+                p_pred = pred_for_cos[b, s, 2]   # predicted pressure, surface only
+                p_true = y_norm[b, s, 2]          # target pressure, surface only
+                # Cosine similarity: 1.0 = perfect agreement, -1.0 = opposite
+                cos_sim = F.cosine_similarity(p_pred.unsqueeze(0), p_true.unsqueeze(0))
+                cos_loss = cos_loss + (1.0 - cos_sim)  # minimize 1 - cos_sim
+                n_cos += 1
+        if n_cos > 0:
+            cos_loss = cos_loss / n_cos
+            loss = loss + 0.3 * cos_loss
+
         # Multi-scale loss: coarse spatial pooling
         coarse_pool_size = 64
         B, N, C = pred.shape
@@ -680,7 +698,7 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), model.parameters()):
                         ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "train/cos_loss": cos_loss.item() if isinstance(cos_loss, torch.Tensor) else 0.0, "global_step": global_step})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
