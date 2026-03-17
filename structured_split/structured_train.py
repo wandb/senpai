@@ -444,7 +444,7 @@ model_config = dict(
     space_dim=2,
     fun_dim=X_DIM - 2,  # X_DIM=24; fun_dim + space_dim must equal x.shape[-1]
     out_dim=3,
-    n_hidden=128,
+    n_hidden=192,
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
     n_head=4,
     slice_num=32,  # was 64 — fewer slices for faster attention, more epochs
