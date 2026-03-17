@@ -616,6 +616,13 @@ for epoch in range(MAX_EPOCHS):
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
+        # Focal weighting: upweight high-error surface nodes (gamma=0.5)
+        with torch.no_grad():
+            surf_err_only = abs_err * surf_mask.unsqueeze(-1)
+            mean_surf_err = surf_err_only.sum() / surf_mask.sum().clamp(min=1) / 3
+            focal_weight = (abs_err / mean_surf_err.clamp(min=0.01)).pow(0.5)
+            focal_weight = focal_weight.detach()
+
         # Progressive resolution: subsample volume nodes in loss early in training
         # Ramps from 10% → 100% of volume nodes over first 40 epochs
         if epoch < 40:
@@ -633,8 +640,7 @@ for epoch in range(MAX_EPOCHS):
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem = (x[:, 0, 21].abs() > 0.01)
         tandem_boost = torch.where(is_tandem, 1.5, 1.0).to(device)
-        surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
-        surf_loss = (surf_per_sample * tandem_boost).mean()
+        surf_loss = (abs_err * focal_weight * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + surf_weight * surf_loss
 
         # Multi-scale loss: coarse spatial pooling
