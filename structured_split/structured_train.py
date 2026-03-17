@@ -441,9 +441,24 @@ _pstd = ((_phys_sq_sum / _phys_n - _pmean ** 2).clamp(min=0.0).sqrt()).clamp(min
 phys_stats = {"y_mean": _pmean, "y_std": _pstd}
 print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
+def sinusoidal_pos_enc(pos, num_freqs=6):
+    """Multi-frequency sinusoidal encoding of (x,y) coordinates.
+
+    Args:
+        pos: [B, N, 2] coordinate tensor
+        num_freqs: number of frequency bands (default 6 → 24 extra dims)
+    Returns:
+        [B, N, 2*2*num_freqs] encoding
+    """
+    freqs = 2.0 ** torch.arange(num_freqs, device=pos.device).float()  # [num_freqs]
+    pos_scaled = pos.unsqueeze(-1) * freqs  # [B, N, 2, num_freqs]
+    enc = torch.cat([pos_scaled.sin(), pos_scaled.cos()], dim=-1)  # [B, N, 2, 2*num_freqs]
+    return enc.reshape(pos.shape[0], pos.shape[1], -1)  # [B, N, 2*2*num_freqs=24]
+
+
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2,  # X_DIM=24; fun_dim + space_dim must equal x.shape[-1]
+    fun_dim=48 - 2,  # X_DIM=24 + 24 sinusoidal features = 48; fun_dim + space_dim must equal x.shape[-1]
     out_dim=3,
     n_hidden=128,
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
@@ -560,6 +575,8 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         x = (x - stats["x_mean"]) / stats["x_std"]
+        pos_enc = sinusoidal_pos_enc(x[:, :, :2], num_freqs=6)  # 24 extra features
+        x = torch.cat([x, pos_enc], dim=-1)  # 24+24=48 dim
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
@@ -649,6 +666,8 @@ for epoch in range(MAX_EPOCHS):
                 mask = mask.to(device, non_blocking=True)
 
                 x = (x - stats["x_mean"]) / stats["x_std"]
+                pos_enc = sinusoidal_pos_enc(x[:, :, :2], num_freqs=6)  # 24 extra features
+                x = torch.cat([x, pos_enc], dim=-1)  # 24+24=48 dim
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
