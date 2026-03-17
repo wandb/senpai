@@ -454,6 +454,21 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 
+# Spectral reparametrization: decompose final Linear(n_hidden, out_dim) via SVD
+# Freeze U and Vh; learn only sigma (singular values)
+with torch.no_grad():
+    W = model.blocks[-1].mlp2[-1].weight.data
+    U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+    model.register_buffer('out_U', U)
+    model.register_buffer('out_Vh', Vh)
+    model.out_sigma = nn.Parameter(S)
+    model.blocks[-1].mlp2[-1].weight.requires_grad = False
+_out_bias = model.blocks[-1].mlp2[-1].bias
+def _spectral_forward(x):
+    W_eff = model.out_U @ torch.diag(model.out_sigma) @ model.out_Vh
+    return F.linear(x, W_eff, _out_bias)
+model.blocks[-1].mlp2[-1].forward = _spectral_forward
+
 from copy import deepcopy
 ema_model = None
 ema_start_epoch = 65
