@@ -178,6 +178,9 @@ class TransolverBlock(nn.Module):
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        # Per-channel affine after attention: learnable scale and shift
+        self.post_attn_gamma = nn.Parameter(torch.ones(hidden_dim))
+        self.post_attn_beta = nn.Parameter(torch.zeros(hidden_dim))
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
             self.mlp2 = nn.Sequential(
@@ -188,6 +191,7 @@ class TransolverBlock(nn.Module):
 
     def forward(self, fx):
         fx = self.attn(self.ln_1(fx)) + fx
+        fx = fx * self.post_attn_gamma + self.post_attn_beta  # per-channel affine after attention
         fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
             return self.mlp2(self.ln_3(fx))
