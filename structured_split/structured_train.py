@@ -182,17 +182,23 @@ class TransolverBlock(nn.Module):
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
+            self.film_gen = nn.Sequential(nn.Linear(2, 64), nn.GELU(), nn.Linear(64, 2 * hidden_dim))
             self.mlp2 = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.GELU(),
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx):
+    def forward(self, fx, pos=None):
         fx = self.attn(self.ln_1(fx)) + fx
         fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            h = self.ln_3(fx)
+            film = self.film_gen(pos)
+            gamma, beta = film.chunk(2, dim=-1)
+            h_first = self.mlp2[0](h)
+            h_act = self.mlp2[1](gamma * h_first + beta)
+            return self.mlp2[2](h_act)
         return fx
 
 
@@ -319,8 +325,9 @@ class Transolver(nn.Module):
         fx = self.preprocess(x)
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
-        for block in self.blocks:
+        for block in self.blocks[:-1]:
             fx = block(fx)
+        fx = self.blocks[-1](fx, pos=x[:, :, :2])
         self._validate_output_dims(fx)
         return {"preds": fx}
 
