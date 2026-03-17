@@ -190,7 +190,8 @@ class TransolverBlock(nn.Module):
 
     def forward(self, fx):
         fx = self.attn(self.ln_1(fx)) + fx
-        fx = self.mlp(self.ln_2(fx)) + fx
+        fx_res = fx
+        fx = self.ln_2(self.mlp(fx) + fx_res)
         if self.last_layer:
             return self.mlp2(self.ln_3(fx))
         return fx
