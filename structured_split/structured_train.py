@@ -23,6 +23,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     Tandem surface loss is therefore underweighted.
 """
 
+import math
 import sys
 from pathlib import Path
 
@@ -658,13 +659,15 @@ for epoch in range(MAX_EPOCHS):
                 pred = pred.float()
                 sq_err = (pred - y_norm) ** 2
                 abs_err = (pred - y_norm).abs()
+                abs_err = abs_err.clamp(max=1e6)
 
                 vol_mask = mask & ~is_surface
                 surf_mask = mask & is_surface
-                val_vol += min(
-                    (abs_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item(),
-                    1e12
-                )
+                batch_vol = (abs_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
+                if math.isfinite(batch_vol):
+                    val_vol += min(batch_vol, 1e6)
+                else:
+                    val_vol += 0.0
                 val_surf += (abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
                 n_vbatches += 1
 
