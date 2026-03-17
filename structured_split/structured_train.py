@@ -336,7 +336,7 @@ MAX_EPOCHS = 100
 class Config:
     lr: float = 3e-3
     weight_decay: float = 1e-4
-    batch_size: int = 4
+    batch_size: int = 8
     surf_weight: float = 20.0
     manifest: str = "structured_split/split_manifest.json"
     stats_file: str = "structured_split/split_stats.json"
@@ -488,8 +488,8 @@ class Lookahead:
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale'])]
 base_opt = torch.optim.AdamW([
-    {'params': attn_params, 'lr': cfg.lr * 0.5},
-    {'params': other_params, 'lr': cfg.lr}
+    {'params': attn_params, 'lr': 4.2e-3 * 0.5},
+    {'params': other_params, 'lr': 4.2e-3}
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=5)
