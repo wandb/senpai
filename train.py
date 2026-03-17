@@ -174,7 +174,9 @@ class TransolverBlock(nn.Module):
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
-        self.spatial_bias = nn.Sequential(nn.Linear(2, 32), nn.GELU(), nn.Linear(32, slice_num))
+        self.fourier_freqs = nn.Parameter(torch.tensor([1.0, 2.0, 4.0, 8.0, 16.0]) * 2 * 3.14159, requires_grad=False)
+        # Input: 2 coords * 5 freqs * 2 (sin+cos) = 20 dims
+        self.spatial_bias = nn.Sequential(nn.Linear(20, 32), nn.GELU(), nn.Linear(32, slice_num))
         self.ln_1_post = nn.LayerNorm(hidden_dim)
         self.ln_2_post = nn.LayerNorm(hidden_dim)
         self.se_fc1 = nn.Linear(hidden_dim, hidden_dim // 4)
@@ -190,7 +192,14 @@ class TransolverBlock(nn.Module):
             )
 
     def forward(self, fx, raw_xy=None):
-        sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
+        if raw_xy is not None:
+            # Fourier features: [sin(f*x), cos(f*x), sin(f*y), cos(f*y)] for each freq
+            xy_scaled = raw_xy.unsqueeze(-1) * self.fourier_freqs  # [B, N, 2, 5]
+            ff = torch.cat([xy_scaled.sin(), xy_scaled.cos()], dim=-1)  # [B, N, 2, 10]
+            ff = ff.reshape(raw_xy.shape[0], raw_xy.shape[1], -1)  # [B, N, 20]
+            sb = self.spatial_bias(ff)
+        else:
+            sb = None
         fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
