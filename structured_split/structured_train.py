@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import os
 import time
+import math
 from collections.abc import Mapping
 
 import torch
@@ -557,6 +558,12 @@ for epoch in range(MAX_EPOCHS):
         break
 
     t0 = time.time()
+
+    # Weight decay cosine schedule: 1e-3 → 1e-5 over epochs 5..75
+    wd_progress = max(0, epoch - 5) / 70
+    current_wd = 1e-5 + 0.5 * (1e-3 - 1e-5) * (1 + math.cos(math.pi * wd_progress))
+    for param_group in base_opt.param_groups:
+        param_group['weight_decay'] = current_wd
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
