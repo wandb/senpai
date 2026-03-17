@@ -543,9 +543,9 @@ for epoch in range(MAX_EPOCHS):
     t0 = time.time()
 
     # Dynamic surface weight: linear ramp from 5 → 30 over training
-    sw_start, sw_end = 5.0, 30.0
+    sw_start, sw_end = 1.0, 30.0
     progress = epoch / MAX_EPOCHS
-    surf_weight = sw_start + (sw_end - sw_start) * progress
+    surf_weight = sw_end * (sw_start / sw_end) ** (1 - progress)
 
     # --- Train ---
     model.train()
