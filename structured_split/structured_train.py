@@ -706,6 +706,11 @@ for epoch in range(MAX_EPOCHS):
                              torch.tensor(val_metrics_per_split[name][f"{name}/loss"]).isinf())]
     mean_val_loss = sum(finite_losses) / max(len(finite_losses), 1)
 
+    surf_p_vals = [val_metrics_per_split[name][f"{name}/mae_surf_p"]
+                   for name in VAL_SPLIT_NAMES]
+    finite_sp = [v for v in surf_p_vals if not (torch.tensor(v).isnan() or torch.tensor(v).isinf())]
+    mean_surf_p = sum(finite_sp) / max(len(finite_sp), 1)
+
     dt = time.time() - t0
 
     # --- Log to wandb ---
@@ -713,6 +718,7 @@ for epoch in range(MAX_EPOCHS):
         "train/vol_loss": epoch_vol,
         "train/surf_loss": epoch_surf,
         "val/loss": mean_val_loss,
+        "val/mean_surf_p": mean_surf_p,
         "lr": scheduler.get_last_lr()[0],
         "epoch_time_s": dt,
     }
@@ -727,9 +733,9 @@ for epoch in range(MAX_EPOCHS):
         peak_mem_gb = 0.0
 
     tag = ""
-    if mean_val_loss < best_val:
-        best_val = mean_val_loss
-        best_metrics = {"epoch": epoch + 1, "val_loss": mean_val_loss}
+    if mean_surf_p < best_val:
+        best_val = mean_surf_p
+        best_metrics = {"epoch": epoch + 1, "val_loss": mean_val_loss, "mean_surf_p": mean_surf_p}
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
