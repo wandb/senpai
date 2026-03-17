@@ -36,7 +36,7 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import simple_parsing as sp
 
-from utils import visualize
+from structured_split.utils import visualize
 from structured_split.prepare_multi import X_DIM, pad_collate, load_structured_split, VAL_SPLIT_NAMES
 
 

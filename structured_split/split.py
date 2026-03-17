@@ -25,7 +25,7 @@ import numpy as np
 from datetime import datetime, timezone
 from pathlib import Path
 
-from prepare import DATA_ROOT, load_pickle
+from structured_split.prepare import DATA_ROOT, load_pickle
 from structured_split.prepare_multi import MultiFieldDataset
 
 SEED = 42

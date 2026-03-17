@@ -15,9 +15,9 @@ We are training a neural network surrogate for CFD (computational fluid dynamics
 ## Codebase
 
 - `train.py` — **primary training script + model architecture**. **Modifiable.** (Contains the Transolver model inline, plus training with 4 val tracks across 7 data sources.)
-- `prepare.py` — dataset loading and collation. **Read-only.**
+- `structured_split/prepare.py` — dataset loading and collation. **Read-only.**
 - `structured_split/prepare_multi.py` — extended preprocessing (24-dim x, foil-2 features). **Read-only.**
-- `utils.py` — visualization. **Read-only.**
+- `structured_split/utils.py` — visualization. **Read-only.**
 - `DATASET_REPORT.md` — dataset documentation.
 - `structured_split/README.md` — benchmark split documentation.
 
