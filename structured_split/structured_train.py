@@ -113,10 +113,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.to_q = nn.Linear(dim_head, dim_head, bias=False)
         self.to_k = nn.Linear(dim_head, dim_head, bias=False)
         self.to_v = nn.Linear(dim_head, dim_head, bias=False)
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, dim),
-            nn.Dropout(dropout),
-        )
+        self.to_out_gate = nn.Linear(inner_dim, dim)
+        self.to_out_val = nn.Linear(inner_dim, dim)
 
     def forward(self, x):
         bsz, num_points, _ = x.shape
@@ -153,7 +151,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
-        return self.to_out(out_x)
+        return self.to_out_val(out_x) * torch.sigmoid(self.to_out_gate(out_x))
 
 
 class TransolverBlock(nn.Module):
