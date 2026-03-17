@@ -456,6 +456,16 @@ model = Transolver(**model_config).to(device)
 
 n_params = sum(p.numel() for p in model.parameters())
 
+# Residual prior: init output head bias to mean normalized target so model starts
+# predicting mean flow and only needs to learn residuals.
+with torch.no_grad():
+    last_block = model.blocks[-1]
+    for module in reversed(list(last_block.mlp2.modules())):
+        if isinstance(module, nn.Linear):
+            if module.bias is not None:
+                module.bias.copy_(phys_stats['y_mean'] / phys_stats['y_std'])
+            break
+
 
 class Lookahead:
     def __init__(self, base_optimizer, k=5, alpha=0.5):
