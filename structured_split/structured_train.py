@@ -460,6 +460,8 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 
+log_ch_wt = nn.Parameter(torch.zeros(3, device=device))
+
 from copy import deepcopy
 ema_model = None
 ema_start_epoch = 65
@@ -500,7 +502,8 @@ attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['W
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 base_opt = torch.optim.AdamW([
     {'params': attn_params, 'lr': cfg.lr * 0.5},
-    {'params': other_params, 'lr': cfg.lr}
+    {'params': other_params, 'lr': cfg.lr},
+    {'params': [log_ch_wt], 'lr': cfg.lr},
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=5)
@@ -600,7 +603,8 @@ for epoch in range(MAX_EPOCHS):
         if model.training:
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
-        abs_err = (pred - y_norm).abs()
+        ch_wt = F.softmax(log_ch_wt, dim=0) * 3.0
+        abs_err = (pred - y_norm).abs() * ch_wt[None, None, :]
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
