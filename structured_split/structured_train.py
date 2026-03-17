@@ -565,11 +565,15 @@ for epoch in range(MAX_EPOCHS):
         if model.training:
             y_norm = y_norm + 0.01 * torch.randn_like(y_norm)
 
+        # Predict residual from spatial mean (anomaly prediction)
+        y_mean_spatial = (y_norm * mask.unsqueeze(-1)).sum(1, keepdim=True) / mask.float().sum(1, keepdim=True).unsqueeze(-1).clamp(min=1)
+        y_target = y_norm - y_mean_spatial
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pred = model({"x": x})["preds"]
         pred = pred.float()
-        sq_err = (pred - y_norm) ** 2
-        abs_err = (pred - y_norm).abs()
+        sq_err = (pred - y_target) ** 2
+        abs_err = (pred - y_target).abs()
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
@@ -598,7 +602,7 @@ for epoch in range(MAX_EPOCHS):
         if n_groups > 1:
             # Pool predictions and targets over groups of 64 nodes
             pred_trunc = pred[:, :n_groups * coarse_pool_size]
-            y_trunc = y_norm[:, :n_groups * coarse_pool_size]
+            y_trunc = y_target[:, :n_groups * coarse_pool_size]
             mask_trunc = mask[:, :n_groups * coarse_pool_size]
 
             pred_coarse = pred_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
@@ -652,11 +656,15 @@ for epoch in range(MAX_EPOCHS):
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
+                # Predict residual from spatial mean (anomaly prediction)
+                y_mean_spatial = (y_norm * mask.unsqueeze(-1)).sum(1, keepdim=True) / mask.float().sum(1, keepdim=True).unsqueeze(-1).clamp(min=1)
+                y_target = y_norm - y_mean_spatial
+
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = model({"x": x})["preds"]
                 pred = pred.float()
-                sq_err = (pred - y_norm) ** 2
-                abs_err = (pred - y_norm).abs()
+                sq_err = (pred - y_target) ** 2
+                abs_err = (pred - y_target).abs()
 
                 vol_mask = mask & ~is_surface
                 surf_mask = mask & is_surface
@@ -667,8 +675,8 @@ for epoch in range(MAX_EPOCHS):
                 val_surf += (abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
                 n_vbatches += 1
 
-                # Denormalize: phys_stats → Cp space → original scale
-                pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                # Denormalize: add spatial mean back to pred, then phys_stats → Cp space → original scale
+                pred_phys = (pred + y_mean_spatial) * phys_stats["y_std"] + phys_stats["y_mean"]
                 pred_orig = _phys_denorm(pred_phys, Umag, q)
                 y_clamped = y.clamp(-1e6, 1e6)
                 err = (pred_orig - y_clamped).abs()
