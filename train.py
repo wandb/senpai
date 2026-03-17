@@ -147,7 +147,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
-        return self.to_out(out_x)
+        out = self.to_out(out_x)
+        return out, slice_weights  # slice_weights: [B, heads, N, slice_num]
 
 
 class TransolverBlock(nn.Module):
@@ -191,15 +192,16 @@ class TransolverBlock(nn.Module):
 
     def forward(self, fx, raw_xy=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb) + fx)
+        attn_out, slice_weights = self.attn(self.ln_1(fx), spatial_bias=sb)
+        fx = self.ln_1_post(attn_out + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
-        return fx
+            return self.mlp2(self.ln_3(fx)), slice_weights
+        return fx, slice_weights
 
 
 class Transolver(nn.Module):
@@ -332,15 +334,15 @@ class Transolver(nn.Module):
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy)
+            fx, _ = block(fx, raw_xy=raw_xy)  # discard intermediate slice weights
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy)
+        fx, slice_weights = self.blocks[-1](fx, raw_xy=raw_xy)
         fx = fx + self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred}
+        return {"preds": fx, "re_pred": re_pred, "slice_weights": slice_weights}
 
 
 # ---------------------------------------------------------------------------
@@ -668,6 +670,16 @@ for epoch in range(MAX_EPOCHS):
         re_loss = F.mse_loss(re_pred, log_re_target)
         loss = loss + 0.01 * re_loss
 
+        # Slice entropy regularization: maximize entropy of slice assignment
+        # slice_weights: [B, heads, N, slice_num]
+        slice_wts = out["slice_weights"]
+        # Average assignment probability per slice across nodes: [B, heads, slice_num]
+        avg_slice_prob = slice_wts.mean(dim=2)
+        # Entropy: -sum(p * log(p))
+        slice_entropy = -(avg_slice_prob * (avg_slice_prob + 1e-8).log()).sum(dim=-1).mean()
+        # Maximize entropy (minimize negative entropy) — weight 0.01
+        loss = loss - 0.01 * slice_entropy
+
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -680,7 +692,12 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), model.parameters()):
                         ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        wandb.log({
+            "train/loss": loss.item(),
+            "train/surf_weight": surf_weight,
+            "train/slice_entropy": slice_entropy.item(),
+            "global_step": global_step,
+        })
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
