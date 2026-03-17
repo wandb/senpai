@@ -628,7 +628,9 @@ for epoch in range(MAX_EPOCHS):
             mask_coarse = mask_trunc.reshape(B, n_groups, coarse_pool_size).any(dim=2)
 
             coarse_err = (pred_coarse - y_coarse).abs()
-            coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
+            surf_in_group = surf_mask[:, :n_groups * coarse_pool_size].reshape(B, n_groups, coarse_pool_size).any(dim=2)
+            coarse_wt = torch.where(surf_in_group, 3.0, 1.0).unsqueeze(-1)
+            coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1) * coarse_wt).sum() / (mask_coarse.unsqueeze(-1) * coarse_wt).sum().clamp(min=1)
             loss = loss + 1.0 * coarse_loss
 
         optimizer.zero_grad()
