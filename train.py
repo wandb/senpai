@@ -23,6 +23,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
 import os
 import time
 from collections.abc import Mapping
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -266,6 +267,9 @@ class Transolver(nn.Module):
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.aux_surf_head = nn.Linear(n_hidden, 3)
+        nn.init.zeros_(self.aux_surf_head.weight)
+        nn.init.zeros_(self.aux_surf_head.bias)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -326,6 +330,7 @@ class Transolver(nn.Module):
         raw_xy = x[:, :, :2]
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
+        aux_surf_pred = self.aux_surf_head(fx_pre)  # [B, N, 3]
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
@@ -337,7 +342,7 @@ class Transolver(nn.Module):
         fx = self.blocks[-1](fx, raw_xy=raw_xy)
         fx = fx + self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred}
+        return {"preds": fx, "re_pred": re_pred, "aux_surf_pred": aux_surf_pred}
 
 
 # ---------------------------------------------------------------------------
@@ -664,6 +669,12 @@ for epoch in range(MAX_EPOCHS):
         log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
         re_loss = F.mse_loss(re_pred, log_re_target)
         loss = loss + 0.01 * re_loss
+        aux_surf_pred = out["aux_surf_pred"].float()
+        if model.training:
+            aux_surf_pred = aux_surf_pred / sample_stds
+        aux_surf_err = (aux_surf_pred - y_norm).abs()
+        aux_surf_loss = (aux_surf_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        loss = loss + 0.05 * aux_surf_loss
 
         optimizer.zero_grad()
         loss.backward()
