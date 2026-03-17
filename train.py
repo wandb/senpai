@@ -23,6 +23,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
 import os
 import time
 from collections.abc import Mapping
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -141,6 +142,13 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
         attn_weights = F.softmax(attn_logits, dim=-1)
         out_slice_token = torch.matmul(attn_weights, v_slice_token)
+
+        # Per-head attention dropout: zero one random head per sample during training
+        if self.training:
+            drop_head = torch.randint(0, self.heads, (bsz,), device=out_slice_token.device)
+            head_mask = torch.ones(bsz, self.heads, 1, 1, device=out_slice_token.device)
+            head_mask.scatter_(1, drop_head.unsqueeze(1).unsqueeze(2).unsqueeze(3), 0.0)
+            out_slice_token = out_slice_token * head_mask * (self.heads / (self.heads - 1))
 
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
