@@ -330,11 +330,12 @@ class Transolver(nn.Module):
 
 MAX_TIMEOUT = 30.0  # minutes
 MAX_EPOCHS = 100
+accum_steps = 2  # gradient accumulation steps
 
 
 @dataclass
 class Config:
-    lr: float = 3e-3
+    lr: float = 6e-3
     weight_decay: float = 1e-4
     batch_size: int = 4
     surf_weight: float = 20.0
@@ -491,7 +492,7 @@ base_opt = torch.optim.AdamW([
     {'params': attn_params, 'lr': cfg.lr * 0.5},
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
-optimizer = Lookahead(base_opt, k=10, alpha=0.8)
+optimizer = Lookahead(base_opt, k=20, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=5)
 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=MAX_EPOCHS - 5, eta_min=1e-4)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
@@ -555,6 +556,8 @@ for epoch in range(MAX_EPOCHS):
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
+    step = 0
+    optimizer.zero_grad()
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     for x, y, is_surface, mask in pbar:
@@ -631,17 +634,28 @@ for epoch in range(MAX_EPOCHS):
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
             loss = loss + 1.0 * coarse_loss
 
-        optimizer.zero_grad()
+        loss_val = loss.item()
+        loss = loss / accum_steps
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        if (step + 1) % accum_steps == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            global_step += 1
+        step += 1
+        wandb.log({"train/loss": loss_val, "train/surf_weight": surf_weight, "global_step": global_step})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
         n_batches += 1
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
+
+    # Flush any remaining accumulated gradients at end of epoch
+    if step % accum_steps != 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        optimizer.zero_grad()
+        global_step += 1
 
     scheduler.step()
     epoch_vol /= n_batches
