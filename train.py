@@ -269,6 +269,14 @@ class Transolver(nn.Module):
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        # Surface-local self-attention refinement
+        self.surf_attn_q = nn.Linear(n_hidden, 64)
+        self.surf_attn_k = nn.Linear(n_hidden, 64)
+        self.surf_attn_v = nn.Linear(n_hidden, 64)
+        self.surf_attn_out = nn.Linear(64, n_hidden)
+        # Zero-init output so it starts as identity (no-op)
+        nn.init.zeros_(self.surf_attn_out.weight)
+        nn.init.zeros_(self.surf_attn_out.bias)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -336,6 +344,22 @@ class Transolver(nn.Module):
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
+
+        # Surface-only local attention refinement (before final projection)
+        is_surf_feat = x[:, :, 12]  # is_surface feature (index 12 in the 24-dim input)
+        surf_flag = (is_surf_feat > 0)  # [B, N] boolean
+        for b in range(fx.shape[0]):
+            s_idx = surf_flag[b].nonzero(as_tuple=True)[0]
+            if s_idx.numel() < 4:
+                continue
+            s_feat = fx[b, s_idx]  # [n_surf, hidden]
+            sq = self.surf_attn_q(s_feat)  # [n_surf, 64]
+            sk = self.surf_attn_k(s_feat)
+            sv = self.surf_attn_v(s_feat)
+            attn = torch.matmul(sq, sk.transpose(-1, -2)) / 8.0  # sqrt(64) = 8
+            attn = F.softmax(attn, dim=-1)
+            s_out = self.surf_attn_out(torch.matmul(attn, sv))
+            fx[b, s_idx] = fx[b, s_idx] + s_out  # residual add
 
         fx = self.blocks[-1](fx, raw_xy=raw_xy)
         fx = fx + self.out_skip(fx_pre)
