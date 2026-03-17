@@ -117,7 +117,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout),
         )
-        self.attn_scale = nn.Parameter(torch.tensor(10.0))
+        self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
 
     def forward(self, x):
         bsz, num_points, _ = x.shape
@@ -485,8 +485,8 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
-attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight'])]
-other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight'])]
+attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale'])]
+other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale'])]
 base_opt = torch.optim.AdamW([
     {'params': attn_params, 'lr': cfg.lr * 0.5},
     {'params': other_params, 'lr': cfg.lr}
