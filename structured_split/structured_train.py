@@ -460,6 +460,8 @@ ema_start_epoch = 65
 ema_decay = 0.998
 
 n_params = sum(p.numel() for p in model.parameters())
+output_scale = nn.Parameter(torch.ones(3, device=device))
+output_bias = nn.Parameter(torch.zeros(3, device=device))
 
 
 class Lookahead:
@@ -491,7 +493,7 @@ class Lookahead:
 
 
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale'])]
-other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale'])]
+other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale'])] + [output_scale, output_bias]
 base_opt = torch.optim.AdamW([
     {'params': attn_params, 'lr': cfg.lr * 0.5},
     {'params': other_params, 'lr': cfg.lr}
@@ -591,6 +593,7 @@ for epoch in range(MAX_EPOCHS):
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pred = model({"x": x})["preds"]
         pred = pred.float()
+        pred = pred * output_scale[None, None, :] + output_bias[None, None, :]
         if model.training:
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
@@ -704,6 +707,7 @@ for epoch in range(MAX_EPOCHS):
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
+                pred = pred * output_scale[None, None, :] + output_bias[None, None, :]
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
