@@ -594,7 +594,13 @@ for epoch in range(MAX_EPOCHS):
         if model.training:
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
-        abs_err = (pred - y_norm).abs()
+        ema_blend = min(0.1, 0.1 * (epoch - 20) / 10) if epoch >= 20 else 0.0
+        if ema_blend > 0:
+            with torch.no_grad():
+                y_blend = (1 - ema_blend) * y_norm + ema_blend * pred.detach()
+            abs_err = (pred - y_blend).abs()
+        else:
+            abs_err = (pred - y_norm).abs()
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
