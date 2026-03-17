@@ -182,6 +182,8 @@ class TransolverBlock(nn.Module):
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         self.spatial_bias = nn.Sequential(nn.Linear(2, 32), nn.GELU(), nn.Linear(32, slice_num))
+        self.gamma_attn = nn.Parameter(torch.ones(hidden_dim) * 0.5)
+        self.gamma_mlp = nn.Parameter(torch.ones(hidden_dim) * 0.5)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
             self.mlp2 = nn.Sequential(
@@ -192,8 +194,8 @@ class TransolverBlock(nn.Module):
 
     def forward(self, fx, raw_xy=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.attn(self.ln_1(fx), spatial_bias=sb) + fx
-        fx = self.mlp(self.ln_2(fx)) + fx
+        fx = self.gamma_attn * self.attn(self.ln_1(fx), spatial_bias=sb) + fx
+        fx = self.gamma_mlp * self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
             return self.mlp2(self.ln_3(fx))
         return fx
