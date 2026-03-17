@@ -148,7 +148,11 @@ class TransolverBlock(nn.Module):
 
     def forward(self, fx):
         fx = self.attn(self.ln_1(fx)) + fx
-        fx = self.mlp(self.ln_2(fx)) + fx
+        mlp_out = self.mlp(self.ln_2(fx))
+        if self.training:
+            drop_mask = (torch.rand(fx.shape[0], 1, 1, device=fx.device) > 0.1).float()
+            mlp_out = mlp_out * drop_mask / 0.9  # rescale
+        fx = mlp_out + fx
         if self.last_layer:
             return self.mlp2(self.ln_3(fx))
         return fx
