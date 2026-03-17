@@ -607,7 +607,7 @@ for epoch in range(MAX_EPOCHS):
 
             coarse_err = (pred_coarse - y_coarse).abs()
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
-            loss = loss + 2.0 * coarse_loss
+            loss = loss + 1.0 * coarse_loss
 
         optimizer.zero_grad()
         loss.backward()
