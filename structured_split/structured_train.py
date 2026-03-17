@@ -360,6 +360,7 @@ train_ds, val_splits, stats, sample_weights = load_structured_split(
     cfg.manifest, cfg.stats_file, debug=cfg.debug,
 )
 stats = {k: v.to(device) for k, v in stats.items()}
+surf_channel_weight = torch.tensor([1.0, 1.0, 3.0], device=device)
 
 
 def _umag_q(y, mask):
@@ -589,7 +590,8 @@ for epoch in range(MAX_EPOCHS):
             vol_mask_train = vol_mask
 
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
-        surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+        weighted_surf_err = abs_err * surf_channel_weight[None, None, :]
+        surf_loss = (weighted_surf_err * surf_mask.unsqueeze(-1)).sum() / (surf_mask.sum().clamp(min=1) * surf_channel_weight.mean())
         loss = vol_loss + surf_weight * surf_loss
 
         # Multi-scale loss: coarse spatial pooling
