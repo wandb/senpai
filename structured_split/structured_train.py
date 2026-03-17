@@ -602,7 +602,12 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_mask_train = vol_mask
 
-        vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+        dsdf_features = x[:, :, 2:10]
+        dsdf_norm = dsdf_features.norm(dim=-1)
+        prox_weight = 1.0 + 2.0 * torch.exp(-dsdf_norm * 5.0)
+        prox_weight = prox_weight * vol_mask
+        prox_weight = prox_weight / prox_weight.sum(dim=1, keepdim=True).clamp(min=1) * vol_mask.sum(dim=1, keepdim=True).clamp(min=1)
+        vol_loss = (abs_err * prox_weight.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
         surf_loss = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
         loss = vol_loss + surf_weight * surf_loss
 
