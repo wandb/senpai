@@ -119,7 +119,42 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
 
-    def forward(self, x):
+    def _run_slice_attn(self, fx_mid, x_mid, node_mask=None):
+        """Run slice-based attention on (optionally masked) nodes.
+
+        node_mask: [bsz, N] float mask; if provided, non-masked nodes are
+        excluded from slice aggregation via large-negative logit masking.
+        """
+        if node_mask is not None:
+            # Mask out non-quadrant nodes: set their slice logits to -inf before softmax
+            qm = node_mask.unsqueeze(1).unsqueeze(-1)  # [bsz, 1, N, 1]
+            sw_logits = self.in_project_slice(x_mid) / self.temperature  # [bsz, h, N, S]
+            sw_logits = sw_logits + (node_mask - 1).unsqueeze(1).unsqueeze(-1) * 1e9
+            slice_weights = self.softmax(sw_logits)
+        else:
+            slice_weights = self.softmax(self.in_project_slice(x_mid) / self.temperature)
+            qm = 1.0
+
+        slice_norm = slice_weights.sum(2)
+        slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid * qm, slice_weights)
+        slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
+
+        q_st = self.to_q(slice_token)
+        st_kv = slice_token.mean(dim=1, keepdim=True)
+        k_st = self.to_k(st_kv).expand(-1, self.heads, -1, -1)
+        v_st = self.to_v(st_kv).expand(-1, self.heads, -1, -1)
+        q_norm = F.normalize(q_st, dim=-1)
+        k_norm = F.normalize(k_st, dim=-1)
+        attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
+        attn_weights = F.softmax(attn_logits, dim=-1)
+        out_slice_token = torch.matmul(attn_weights, v_st)
+
+        out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
+        if node_mask is not None:
+            out_x = out_x * qm
+        return out_x
+
+    def forward(self, x, x_raw=None):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -134,22 +169,20 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             .permute(0, 2, 1, 3)
             .contiguous()
         )
-        slice_weights = self.softmax(self.in_project_slice(x_mid) / self.temperature)
-        slice_norm = slice_weights.sum(2)
-        slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
-        slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
 
-        q_slice_token = self.to_q(slice_token)
-        slice_token_kv = slice_token.mean(dim=1, keepdim=True)  # shared K,V: (bsz, 1, slice_num, dim_head)
-        k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
-        v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
-        q_norm = F.normalize(q_slice_token, dim=-1)
-        k_norm = F.normalize(k_slice_token, dim=-1)
-        attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
-        attn_weights = F.softmax(attn_logits, dim=-1)
-        out_slice_token = torch.matmul(attn_weights, v_slice_token)
+        if x_raw is not None:
+            # Windowed attention: 4 spatial quadrants from median x,y split
+            pos = x_raw[:, :, :2]
+            med_x = pos[:, :, 0].median(dim=1, keepdim=True).values  # [bsz, 1]
+            med_y = pos[:, :, 1].median(dim=1, keepdim=True).values  # [bsz, 1]
+            q_assign = (pos[:, :, 0] > med_x).long() * 2 + (pos[:, :, 1] > med_y).long()  # [bsz, N]
+            out_x = torch.zeros(bsz, self.heads, num_points, self.dim_head, device=x.device, dtype=x.dtype)
+            for q_id in range(4):
+                quad_mask = (q_assign == q_id).float()
+                out_x += self._run_slice_attn(fx_mid, x_mid, node_mask=quad_mask)
+        else:
+            out_x = self._run_slice_attn(fx_mid, x_mid)
 
-        out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
         return self.to_out(out_x)
 
@@ -186,8 +219,8 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx):
-        fx = self.attn(self.ln_1(fx)) + fx
+    def forward(self, fx, x_raw=None):
+        fx = self.attn(self.ln_1(fx), x_raw=x_raw) + fx
         fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
             return self.mlp2(self.ln_3(fx))
@@ -318,7 +351,7 @@ class Transolver(nn.Module):
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks:
-            fx = block(fx)
+            fx = block(fx, x_raw=x)
         self._validate_output_dims(fx)
         return {"preds": fx}
 
