@@ -239,6 +239,7 @@ class Transolver(nn.Module):
 
         self.n_hidden = n_hidden
         self.space_dim = space_dim
+        self.pos_enc = MLP(space_dim, n_hidden * 2, n_hidden, n_layers=1, res=False, act=act)
         self.blocks = nn.ModuleList(
             [
                 TransolverBlock(
@@ -316,6 +317,7 @@ class Transolver(nn.Module):
 
         fx = self.preprocess(x)
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
+        fx = fx + self.pos_enc(x[:, :, :self.space_dim])
 
         for block in self.blocks:
             fx = block(fx)
