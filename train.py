@@ -588,6 +588,16 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         x = (x - stats["x_mean"]) / stats["x_std"]
+        # Input feature dropout: randomly zero non-spatial features during training
+        # Preserves positions (features 0-1) and is_surface (feature 12)
+        if model.training:
+            feat_drop_mask = torch.ones(1, 1, x.shape[2], device=device)
+            # Only drop features 2-11 (saf, dsdf) and 13-23 (Re, AoA, NACA, gap, stagger)
+            drop_indices = list(range(2, 12)) + list(range(13, x.shape[2]))
+            for idx in drop_indices:
+                if torch.rand(1).item() < 0.1:  # 10% drop probability per feature
+                    feat_drop_mask[0, 0, idx] = 0.0
+            x = x * feat_drop_mask
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
