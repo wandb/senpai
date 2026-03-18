@@ -611,6 +611,19 @@ for epoch in range(MAX_EPOCHS):
                     sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
             y_norm = y_norm / sample_stds
 
+        # Progressive resolution: 50% -> 100% over first 30 epochs
+        node_frac = min(1.0, 0.5 + 0.5 * epoch / 30)
+        if node_frac < 1.0 and model.training:
+            # Subsample volume nodes (keep ALL surface nodes)
+            for b in range(B):
+                vol_idx = (mask[b] & ~is_surface[b]).nonzero(as_tuple=True)[0]
+                n_keep = int(vol_idx.shape[0] * node_frac)
+                if n_keep < vol_idx.shape[0]:
+                    perm = torch.randperm(vol_idx.shape[0], device=device)[:n_keep]
+                    drop_idx = vol_idx[~torch.isin(torch.arange(vol_idx.shape[0], device=device), perm)]
+                    mask[b, drop_idx] = False
+                    x[b, drop_idx] = 0  # zero dropped nodes
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model({"x": x})
             pred = out["preds"]
@@ -627,20 +640,7 @@ for epoch in range(MAX_EPOCHS):
             abs_err = abs_err * sample_mask
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
-
-        # Progressive resolution: subsample volume nodes in loss early in training
-        # Ramps from 10% → 100% of volume nodes over first 40 epochs
-        if epoch < 40:
-            vol_keep_ratio = 0.05 + 0.95 * (epoch / 40)
-            vol_indices = vol_mask.nonzero(as_tuple=False)
-            n_vol = vol_indices.shape[0]
-            n_keep = max(int(n_vol * vol_keep_ratio), 1)
-            perm = torch.randperm(n_vol, device=vol_mask.device)[:n_keep]
-            vol_mask_train = torch.zeros_like(vol_mask)
-            if n_keep > 0:
-                vol_mask_train[vol_indices[perm, 0], vol_indices[perm, 1]] = True
-        else:
-            vol_mask_train = vol_mask
+        vol_mask_train = vol_mask
 
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem = (x[:, 0, 21].abs() > 0.01)
