@@ -560,6 +560,7 @@ with open(model_dir / "config.yaml", "w") as f:
 best_val = float("inf")
 best_metrics = {}
 global_step = 0
+top_checkpoints = []  # list of (val_loss, state_dict) tuples, max 3
 train_start = time.time()
 prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
@@ -833,6 +834,13 @@ for epoch in range(MAX_EPOCHS):
         torch.save(save_model.state_dict(), model_path)
         tag = f" * -> {model_path}"
 
+    # Save to top-3 list
+    state_copy = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+    top_checkpoints.append((val_loss_3split, state_copy))
+    top_checkpoints.sort(key=lambda x: x[0])
+    if len(top_checkpoints) > 3:
+        top_checkpoints.pop()  # remove worst
+
     split_summary = "  ".join(
         f"{name}={val_metrics_per_split[name][f'{name}/loss']:.4f}"
         for name in VAL_SPLIT_NAMES
@@ -843,6 +851,105 @@ for epoch in range(MAX_EPOCHS):
         f"val[{split_summary}]{tag}"
     )
 
+
+# --- Checkpoint averaging ---
+if len(top_checkpoints) >= 2:
+    print(f"\nAveraging {len(top_checkpoints)} best checkpoints...")
+    avg_state = {}
+    for key in top_checkpoints[0][1]:
+        avg_state[key] = sum(ckpt[1][key].float() for ckpt in top_checkpoints) / len(top_checkpoints)
+        avg_state[key] = avg_state[key].to(top_checkpoints[0][1][key].dtype)
+    model.load_state_dict({k: v.to(device) for k, v in avg_state.items()})
+    torch.save(avg_state, model_path)
+
+    # Re-evaluate with averaged model
+    model.eval()
+    avg_metrics_per_split: dict[str, dict] = {}
+    _avg_3split_names = ["val_in_dist", "val_tandem_transfer", "val_ood_cond"]
+    with torch.no_grad():
+        for split_name, vloader in val_loaders.items():
+            val_vol = 0.0
+            val_surf = 0.0
+            mae_surf = torch.zeros(3, device=device)
+            mae_vol = torch.zeros(3, device=device)
+            n_surf = torch.zeros(3, device=device)
+            n_vol = torch.zeros(3, device=device)
+            n_vbatches = 0
+            for x, y, is_surface, mask in vloader:
+                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                is_surface = is_surface.to(device, non_blocking=True)
+                mask = mask.to(device, non_blocking=True)
+                x = (x - stats["x_mean"]) / stats["x_std"]
+                Umag, q = _umag_q(y, mask)
+                y_phys = _phys_norm(y, Umag, q)
+                y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                raw_gap = x[:, 0, 21]
+                is_tandem = raw_gap.abs() > 0.5
+                B = y_norm.shape[0]
+                sample_stds = torch.ones(B, 1, 3, device=device)
+                channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
+                for b in range(B):
+                    if not is_tandem[b]:
+                        valid = mask[b]
+                        sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+                y_norm_scaled = y_norm / sample_stds
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    pred = model({"x": x})["preds"]
+                pred = pred.float()
+                pred_loss = pred / sample_stds
+                abs_err = (pred_loss - y_norm_scaled).abs().nan_to_num(0.0)
+                vol_mask = mask & ~is_surface
+                surf_mask = mask & is_surface
+                val_vol += min((abs_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item(), 1e6)
+                val_surf += min((abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item(), 1e6)
+                n_vbatches += 1
+                pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                pred_orig = _phys_denorm(pred_phys, Umag, q)
+                y_clamped = y.clamp(-1e6, 1e6)
+                err = (pred_orig - y_clamped).abs()
+                finite = err.isfinite()
+                err = err.where(finite, torch.zeros_like(err))
+                mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                n_surf += (surf_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+                n_vol += (vol_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+            val_vol /= max(n_vbatches, 1)
+            val_surf /= max(n_vbatches, 1)
+            val_vol = float(torch.tensor(val_vol).nan_to_num(0.0).clamp(max=1e6))
+            val_surf = float(torch.tensor(val_surf).nan_to_num(0.0).clamp(max=1e6))
+            split_loss = val_vol + cfg.surf_weight * val_surf
+            mae_surf /= n_surf.clamp(min=1)
+            mae_vol /= n_vol.clamp(min=1)
+            avg_metrics_per_split[split_name] = {
+                f"{split_name}/vol_loss":    val_vol,
+                f"{split_name}/surf_loss":   val_surf,
+                f"{split_name}/loss":        split_loss,
+                f"{split_name}/mae_vol_Ux":  mae_vol[0].item(),
+                f"{split_name}/mae_vol_Uy":  mae_vol[1].item(),
+                f"{split_name}/mae_vol_p":   mae_vol[2].item(),
+                f"{split_name}/mae_surf_Ux": mae_surf[0].item(),
+                f"{split_name}/mae_surf_Uy": mae_surf[1].item(),
+                f"{split_name}/mae_surf_p":  mae_surf[2].item(),
+            }
+    _avg_3split_losses = [avg_metrics_per_split[n][f"{n}/loss"] for n in _avg_3split_names
+                          if not (torch.tensor(avg_metrics_per_split[n][f"{n}/loss"]).isnan() or
+                                  torch.tensor(avg_metrics_per_split[n][f"{n}/loss"]).isinf())]
+    avg_val_loss_3split = sum(_avg_3split_losses) / max(len(_avg_3split_losses), 1)
+
+    avg_wandb = {"checkpoint_avg/val_loss": avg_val_loss_3split}
+    for split_metrics in avg_metrics_per_split.values():
+        for k, v in split_metrics.items():
+            avg_wandb[f"checkpoint_avg/{k}"] = v
+    wandb.log(avg_wandb)
+
+    print(f"Averaged checkpoint val/loss: {avg_val_loss_3split:.4f}  (best single: {best_val:.4f})")
+    if avg_val_loss_3split < best_val:
+        print("  -> Averaged checkpoint is better — updating best_metrics")
+        best_val = avg_val_loss_3split
+        best_metrics = {"epoch": "avg", "val_loss": avg_val_loss_3split}
+        for split_metrics in avg_metrics_per_split.values():
+            for k, v in split_metrics.items():
+                best_metrics[f"best_{k}"] = v
 
 # --- Final summary ---
 total_time = (time.time() - train_start) / 60.0
