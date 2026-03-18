@@ -625,11 +625,16 @@ for epoch in range(MAX_EPOCHS):
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
-        # Volume-node subsampling curriculum: randomly drop 50% of volume nodes in loss
-        # for epochs 0-29, giving ~2x throughput in early training; full mesh from epoch 30
-        if epoch < 30:
-            vol_drop = torch.rand_like(vol_mask.float()) < 0.5
-            vol_mask_train = vol_mask & ~vol_drop
+        # Progressive resolution: faster ramp 5%→100% over 25 epochs, full mesh from epoch 25
+        if epoch < 25:
+            vol_keep_ratio = 0.05 + 0.95 * (epoch / 25)
+            vol_indices = vol_mask.nonzero(as_tuple=False)
+            n_vol = vol_indices.shape[0]
+            n_keep = max(int(n_vol * vol_keep_ratio), 1)
+            perm = torch.randperm(n_vol, device=vol_mask.device)[:n_keep]
+            vol_mask_train = torch.zeros_like(vol_mask)
+            if n_keep > 0:
+                vol_mask_train[vol_indices[perm, 0], vol_indices[perm, 1]] = True
         else:
             vol_mask_train = vol_mask
 
