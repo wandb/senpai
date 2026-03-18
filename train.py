@@ -271,6 +271,7 @@ class Transolver(nn.Module):
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.fourier_freqs = nn.Parameter(torch.tensor([1.0, 2.0, 4.0, 8.0]))
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -595,9 +596,9 @@ for epoch in range(MAX_EPOCHS):
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         x = torch.cat([x, curv], dim=-1)
-        # Fourier positional encoding: append sin/cos of (x,y) at 4 frequencies
+        # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
-        freqs = 2.0 ** torch.arange(4, device=x.device, dtype=x.dtype)
+        freqs = model.fourier_freqs.abs()
         xy_scaled = raw_xy.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
@@ -734,9 +735,9 @@ for epoch in range(MAX_EPOCHS):
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                 x = torch.cat([x, curv], dim=-1)
-                # Fourier positional encoding: append sin/cos of (x,y) at 4 frequencies
+                # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
-                freqs = 2.0 ** torch.arange(4, device=x.device, dtype=x.dtype)
+                freqs = model.fourier_freqs.abs()
                 xy_scaled = raw_xy.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
@@ -837,6 +838,9 @@ for epoch in range(MAX_EPOCHS):
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
+    learned_freqs = model.fourier_freqs.abs().detach().cpu().tolist()
+    for i, f in enumerate(learned_freqs):
+        metrics[f"fourier_freq_{i}"] = f
     wandb.log(metrics)
 
     if torch.cuda.is_available():
