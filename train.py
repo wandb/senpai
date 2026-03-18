@@ -741,7 +741,21 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    pred_orig = eval_model({"x": x})["preds"]
+                    # TTA: vertical flip for non-tandem samples
+                    x_flip = x.clone()
+                    x_flip[:, :, 1] = -x_flip[:, :, 1]    # flip y position
+                    x_flip[:, :, 3] = -x_flip[:, :, 3]    # flip saf y-component
+                    for ch in [5, 7, 9, 11]:               # flip dsdf y-related channels
+                        x_flip[:, :, ch] = -x_flip[:, :, ch]
+                    x_flip[:, :, 14] = -x_flip[:, :, 14]  # flip AoA0
+                    x_flip[:, :, 18] = -x_flip[:, :, 18]  # flip AoA1
+                    pred_flip = eval_model({"x": x_flip})["preds"]
+                    pred_flip[:, :, 1] = -pred_flip[:, :, 1]  # un-flip Uy
+                    pred = pred_orig.clone()
+                    for b in range(pred_orig.shape[0]):
+                        if not is_tandem[b]:
+                            pred[b] = (pred_orig[b] + pred_flip[b]) / 2.0
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
