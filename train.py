@@ -651,10 +651,15 @@ for epoch in range(MAX_EPOCHS):
         B, N, C = pred.shape
         n_groups = N // coarse_pool_size
         if n_groups > 1:
-            # Pool predictions and targets over groups of 64 nodes
-            pred_trunc = pred[:, :n_groups * coarse_pool_size]
-            y_trunc = y_norm[:, :n_groups * coarse_pool_size]
-            mask_trunc = mask[:, :n_groups * coarse_pool_size]
+            # Sort nodes by x-coordinate for spatially meaningful coarse groups
+            sort_idx = x[:, :, 0].argsort(dim=1)  # sort by x position
+            pred_sorted = pred.gather(1, sort_idx.unsqueeze(-1).expand_as(pred))
+            y_sorted = y_norm.gather(1, sort_idx.unsqueeze(-1).expand_as(y_norm))
+            mask_sorted = mask.gather(1, sort_idx)
+
+            pred_trunc = pred_sorted[:, :n_groups * coarse_pool_size]
+            y_trunc = y_sorted[:, :n_groups * coarse_pool_size]
+            mask_trunc = mask_sorted[:, :n_groups * coarse_pool_size]
 
             pred_coarse = pred_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
             y_coarse = y_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
