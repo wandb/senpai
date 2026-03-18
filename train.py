@@ -474,6 +474,10 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 
+log_var_vol = nn.Parameter(torch.zeros(1, device=device))
+log_var_surf = nn.Parameter(torch.zeros(1, device=device))
+log_var_coarse = nn.Parameter(torch.zeros(1, device=device))
+
 from copy import deepcopy
 ema_model = None
 ema_start_epoch = 40
@@ -512,9 +516,11 @@ class Lookahead:
 
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+loss_params = [log_var_vol, log_var_surf, log_var_coarse]
 base_opt = torch.optim.AdamW([
     {'params': attn_params, 'lr': cfg.lr * 0.5},
-    {'params': other_params, 'lr': cfg.lr}
+    {'params': other_params, 'lr': cfg.lr},
+    {'params': loss_params, 'lr': cfg.lr, 'weight_decay': 0.0},
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=5)
@@ -571,9 +577,6 @@ for epoch in range(MAX_EPOCHS):
         break
 
     t0 = time.time()
-
-    # Adaptive surface weight: loss-ratio based, clamped [5, 50]
-    surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
 
     # --- Train ---
     model.train()
@@ -647,12 +650,12 @@ for epoch in range(MAX_EPOCHS):
         tandem_boost = torch.where(is_tandem, 1.5, 1.0).to(device)
         surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         surf_loss = (surf_per_sample * tandem_boost).mean()
-        loss = vol_loss + surf_weight * surf_loss
 
         # Multi-scale loss: coarse spatial pooling
         coarse_pool_size = 64
         B, N, C = pred.shape
         n_groups = N // coarse_pool_size
+        coarse_loss = torch.tensor(0.0, device=device)
         if n_groups > 1:
             # Pool predictions and targets over groups of 64 nodes
             pred_trunc = pred[:, :n_groups * coarse_pool_size]
@@ -665,11 +668,15 @@ for epoch in range(MAX_EPOCHS):
 
             coarse_err = (pred_coarse - y_coarse).abs()
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
-            loss = loss + 1.0 * coarse_loss
 
         log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
         re_loss = F.mse_loss(re_pred, log_re_target)
-        loss = loss + 0.01 * re_loss
+
+        # Homoscedastic multi-task loss (Kendall et al. 2018)
+        loss = (torch.exp(-log_var_vol) * vol_loss + 0.5 * log_var_vol +
+                torch.exp(-log_var_surf) * surf_loss + 0.5 * log_var_surf +
+                torch.exp(-log_var_coarse) * coarse_loss + 0.5 * log_var_coarse +
+                0.01 * re_loss)
 
         optimizer.zero_grad()
         loss.backward()
@@ -683,7 +690,10 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), model.parameters()):
                         ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        wandb.log({"train/loss": loss.item(), "global_step": global_step,
+                   "learned/vol_weight": torch.exp(-log_var_vol).item(),
+                   "learned/surf_weight": torch.exp(-log_var_surf).item(),
+                   "learned/coarse_weight": torch.exp(-log_var_coarse).item()})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
