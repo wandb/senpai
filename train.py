@@ -572,6 +572,11 @@ for epoch in range(MAX_EPOCHS):
 
     t0 = time.time()
 
+    # Beta2 warmup: 0.99 -> 0.999 over first 20 epochs
+    target_beta2 = 0.99 + 0.009 * min(1.0, epoch / 20)
+    for pg in base_opt.param_groups:
+        pg['betas'] = (pg['betas'][0], target_beta2)
+
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
 
