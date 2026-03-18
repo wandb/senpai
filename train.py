@@ -174,7 +174,7 @@ class TransolverBlock(nn.Module):
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
-        self.spatial_bias = nn.Sequential(nn.Linear(2, 32), nn.GELU(), nn.Linear(32, slice_num))
+        self.spatial_bias = nn.Sequential(nn.Linear(4, 32), nn.GELU(), nn.Linear(32, slice_num))
         self.ln_1_post = nn.LayerNorm(hidden_dim)
         self.ln_2_post = nn.LayerNorm(hidden_dim)
         self.se_fc1 = nn.Linear(hidden_dim, hidden_dim // 4)
@@ -326,7 +326,7 @@ class Transolver(nn.Module):
             new_pos = self.get_grid(pos)
             x = torch.cat((x, new_pos), dim=-1)
 
-        raw_xy = x[:, :, :2]
+        raw_xy = x[:, :, :4]  # 4D: (x, y, saf_0, saf_1) for richer spatial bias
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
