@@ -461,7 +461,7 @@ print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 1,  # X_DIM=24 + 1 curvature proxy; fun_dim + space_dim must equal x.shape[-1]
+    fun_dim=X_DIM - 2 + 2,  # X_DIM=24 + 1 curvature proxy + 1 aniso; fun_dim + space_dim must equal x.shape[-1]
     out_dim=3,
     n_hidden=128,
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
@@ -590,7 +590,11 @@ for epoch in range(MAX_EPOCHS):
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
-        x = torch.cat([x, curv], dim=-1)
+        dsdf_abs = x[:, :, 2:10].abs()
+        dsdf_max = dsdf_abs.max(dim=-1, keepdim=True).values
+        dsdf_min = dsdf_abs.min(dim=-1, keepdim=True).values.clamp(min=0.01)
+        aniso = (dsdf_max / dsdf_min) * is_surface.float().unsqueeze(-1)
+        x = torch.cat([x, curv, aniso], dim=-1)
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
@@ -723,7 +727,11 @@ for epoch in range(MAX_EPOCHS):
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
-                x = torch.cat([x, curv], dim=-1)
+                dsdf_abs = x[:, :, 2:10].abs()
+                dsdf_max = dsdf_abs.max(dim=-1, keepdim=True).values
+                dsdf_min = dsdf_abs.min(dim=-1, keepdim=True).values.clamp(min=0.01)
+                aniso = (dsdf_max / dsdf_min) * is_surface.float().unsqueeze(-1)
+                x = torch.cat([x, curv, aniso], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
