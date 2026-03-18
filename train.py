@@ -596,6 +596,7 @@ for epoch in range(MAX_EPOCHS):
         freqs = 2.0 ** torch.arange(4, device=x.device, dtype=x.dtype)
         xy_scaled = raw_xy.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+        fourier_pe = fourier_pe * is_surface.float().unsqueeze(-1)  # surface-only
         x = torch.cat([x, fourier_pe], dim=-1)
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
@@ -735,6 +736,7 @@ for epoch in range(MAX_EPOCHS):
                 freqs = 2.0 ** torch.arange(4, device=x.device, dtype=x.dtype)
                 xy_scaled = raw_xy.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+                fourier_pe = fourier_pe * is_surface.float().unsqueeze(-1)  # surface-only
                 x = torch.cat([x, fourier_pe], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
