@@ -666,7 +666,7 @@ for epoch in range(MAX_EPOCHS):
 
         log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
         re_loss = F.mse_loss(re_pred, log_re_target)
-        loss = loss + 0.01 * re_loss
+        loss = loss + 0.02 * re_loss
 
         optimizer.zero_grad()
         loss.backward()
