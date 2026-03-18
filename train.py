@@ -95,6 +95,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.scale = dim_head**-0.5
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
+        self.attn_dropout = nn.Dropout(p=0.05)
         self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
 
         self.in_project_x = nn.Linear(dim, inner_dim)
@@ -141,7 +142,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         q_norm = F.normalize(q_slice_token, dim=-1)
         k_norm = F.normalize(k_slice_token, dim=-1)
         attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
-        attn_weights = F.softmax(attn_logits, dim=-1)
+        attn_weights = self.attn_dropout(F.softmax(attn_logits, dim=-1))
         out_slice_token = torch.matmul(attn_weights, v_slice_token)
         out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
 
