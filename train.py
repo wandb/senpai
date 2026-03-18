@@ -668,6 +668,18 @@ for epoch in range(MAX_EPOCHS):
         re_loss = F.mse_loss(re_pred, log_re_target)
         loss = loss + 0.01 * re_loss
 
+        # Bernoulli consistency: total pressure should be nearly constant on surface
+        pred_phys = pred * phys_stats['y_std'] + phys_stats['y_mean']
+        p_total = pred_phys[:, :, 2:3] + 0.5 * (pred_phys[:, :, 0:1]**2 + pred_phys[:, :, 1:2]**2)
+        # Only for surface nodes, non-tandem samples
+        p_total_surf = p_total.squeeze(-1) * surf_mask.float()
+        # Per-sample variance of total pressure on surface
+        n_surf_per_sample = surf_mask.float().sum(dim=1).clamp(min=1)
+        p_total_mean = (p_total_surf.sum(dim=1) / n_surf_per_sample).unsqueeze(1)
+        p_total_var = ((p_total_surf - p_total_mean * surf_mask.float())**2 * surf_mask.float()).sum(dim=1) / n_surf_per_sample
+        physics_loss = p_total_var.mean()
+        loss = loss + 0.001 * physics_loss
+
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
