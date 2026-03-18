@@ -622,6 +622,10 @@ for epoch in range(MAX_EPOCHS):
             is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
             sample_mask = (~is_tandem_curr).float()[:, None, None]
             abs_err = abs_err * sample_mask
+        # Asymmetric loss: MSE for velocity (channels 0,1), L1 for pressure (channel 2)
+        err_mixed = torch.cat([sq_err[:, :, 0:2], abs_err[:, :, 2:3]], dim=-1)
+        if epoch < 10:
+            err_mixed = err_mixed * sample_mask
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
@@ -639,10 +643,10 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_mask_train = vol_mask
 
-        vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+        vol_loss = (err_mixed * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem = (x[:, 0, 21].abs() > 0.01)
         tandem_boost = torch.where(is_tandem, 1.5, 1.0).to(device)
-        surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        surf_per_sample = (err_mixed * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         surf_loss = (surf_per_sample * tandem_boost).mean()
         loss = vol_loss + surf_weight * surf_loss
 
