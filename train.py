@@ -355,7 +355,7 @@ MAX_EPOCHS = 100
 @dataclass
 class Config:
     lr: float = 3e-3
-    weight_decay: float = 1e-4
+    weight_decay: float = 0.0
     batch_size: int = 4
     surf_weight: float = 20.0
     manifest: str = "data/split_manifest.json"
@@ -618,10 +618,6 @@ for epoch in range(MAX_EPOCHS):
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
-        if epoch < 10:
-            is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
-            sample_mask = (~is_tandem_curr).float()[:, None, None]
-            abs_err = abs_err * sample_mask
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
