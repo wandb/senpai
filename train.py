@@ -274,6 +274,7 @@ class Transolver(nn.Module):
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs = nn.Parameter(torch.tensor([1.0, 2.0, 4.0, 8.0]))
+        self.surface_boost = nn.Parameter(torch.tensor(0.5))
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -336,6 +337,9 @@ class Transolver(nn.Module):
         raw_xy = x[:, :, :2]
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
+        # Amplify surface node features (is_surface is at normalized input index 12)
+        surf_indicator = (x[:, :, 12:13] > 0).float()
+        fx = fx * (1.0 + self.surface_boost.abs() * surf_indicator)
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
