@@ -591,6 +591,11 @@ for epoch in range(MAX_EPOCHS):
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+        # Bernoulli pressure baseline: Cp ≈ 1 - (Ux/Umag)^2 - (Uy/Umag)^2
+        with torch.no_grad():
+            p_baseline_phys = 1.0 - (y_phys[:, :, 0] ** 2 + y_phys[:, :, 1] ** 2)
+            y_baseline_norm = torch.zeros_like(y_norm)
+            y_baseline_norm[:, :, 2] = (p_baseline_phys - phys_stats["y_mean"][2]) / phys_stats["y_std"][2]
         if model.training:
             noise_scale = torch.tensor([0.01, 0.01, 0.005], device=device)
             y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
@@ -607,6 +612,7 @@ for epoch in range(MAX_EPOCHS):
                     valid = mask[b]
                     sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
             y_norm = y_norm / sample_stds
+            y_baseline_scaled = y_baseline_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model({"x": x})
@@ -616,8 +622,9 @@ for epoch in range(MAX_EPOCHS):
         re_pred = re_pred.float()
         if model.training:
             pred = pred / sample_stds
-        sq_err = (pred - y_norm) ** 2
-        abs_err = (pred - y_norm).abs()
+        y_residual = y_norm - y_baseline_scaled
+        sq_err = (pred - y_residual) ** 2
+        abs_err = (pred - y_residual).abs()
         if epoch < 10:
             is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
             sample_mask = (~is_tandem_curr).float()[:, None, None]
@@ -653,7 +660,7 @@ for epoch in range(MAX_EPOCHS):
         if n_groups > 1:
             # Pool predictions and targets over groups of 64 nodes
             pred_trunc = pred[:, :n_groups * coarse_pool_size]
-            y_trunc = y_norm[:, :n_groups * coarse_pool_size]
+            y_trunc = y_residual[:, :n_groups * coarse_pool_size]
             mask_trunc = mask[:, :n_groups * coarse_pool_size]
 
             pred_coarse = pred_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
@@ -721,6 +728,10 @@ for epoch in range(MAX_EPOCHS):
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                with torch.no_grad():
+                    p_baseline_phys = 1.0 - (y_phys[:, :, 0] ** 2 + y_phys[:, :, 1] ** 2)
+                    y_baseline_norm = torch.zeros_like(y_norm)
+                    y_baseline_norm[:, :, 2] = (p_baseline_phys - phys_stats["y_mean"][2]) / phys_stats["y_std"][2]
 
                 # Per-sample std normalization: skip tandem samples
                 raw_gap = x[:, 0, 21]
@@ -733,13 +744,15 @@ for epoch in range(MAX_EPOCHS):
                         valid = mask[b]
                         sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
                 y_norm_scaled = y_norm / sample_stds
+                y_baseline_scaled = y_baseline_norm / sample_stds
+                y_residual_scaled = y_norm_scaled - y_baseline_scaled
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
                 pred_loss = pred / sample_stds
-                sq_err = (pred_loss - y_norm_scaled) ** 2
-                abs_err = (pred_loss - y_norm_scaled).abs()
+                sq_err = (pred_loss - y_residual_scaled) ** 2
+                abs_err = (pred_loss - y_residual_scaled).abs()
 
                 vol_mask = mask & ~is_surface
                 surf_mask = mask & is_surface
@@ -750,8 +763,11 @@ for epoch in range(MAX_EPOCHS):
                 val_surf += (abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
                 n_vbatches += 1
 
-                # Denormalize: phys_stats → Cp space → original scale
+                # Denormalize: add Bernoulli baseline, then phys_stats → Cp space → original scale
+                # Model predicts (y_phys - p_baseline) / phys_std for pressure channel
+                # so to recover y_phys: pred * phys_std + p_baseline (no phys_mean for pressure)
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                pred_phys[:, :, 2] = pred_phys[:, :, 2] - phys_stats["y_mean"][2] + p_baseline_phys
                 pred_orig = _phys_denorm(pred_phys, Umag, q)
                 y_clamped = y.clamp(-1e6, 1e6)
                 err = (pred_orig - y_clamped).abs()
