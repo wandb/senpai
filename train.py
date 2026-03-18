@@ -249,6 +249,8 @@ class Transolver(nn.Module):
 
         self.n_hidden = n_hidden
         self.space_dim = space_dim
+        self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
+        nn.init.eye_(self.feature_cross.weight)  # start as identity
         self.blocks = nn.ModuleList(
             [
                 TransolverBlock(
@@ -329,6 +331,8 @@ class Transolver(nn.Module):
             new_pos = self.get_grid(pos)
             x = torch.cat((x, new_pos), dim=-1)
 
+        x_cross = x * self.feature_cross(x)
+        x = x + 0.1 * x_cross  # residual with small scale
         raw_xy = x[:, :, :2]
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
