@@ -475,9 +475,10 @@ model_config = dict(
 model = Transolver(**model_config).to(device)
 
 from copy import deepcopy
-ema_model = None
-ema_start_epoch = 65
-ema_decay = 0.998
+# Snapshot averaging: collect model state at end of each cosine cycle
+snapshots = []
+snapshot_epochs = [24, 44, 64]  # end of each 20-epoch cycle (0-indexed)
+avg_model = None
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -518,9 +519,11 @@ base_opt = torch.optim.AdamW([
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=5)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=75, eta_min=1e-4)
+cosine_restart_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    base_opt, T_0=20, T_mult=1, eta_min=1e-4
+)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
-    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[5]
+    base_opt, schedulers=[warmup_scheduler, cosine_restart_scheduler], milestones=[5]
 )
 
 # --- wandb ---
@@ -672,13 +675,6 @@ for epoch in range(MAX_EPOCHS):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-        if epoch >= ema_start_epoch:
-            if ema_model is None:
-                ema_model = deepcopy(model)
-            else:
-                with torch.no_grad():
-                    for ep, mp in zip(ema_model.parameters(), model.parameters()):
-                        ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -693,8 +689,20 @@ for epoch in range(MAX_EPOCHS):
     prev_vol_loss = epoch_vol
     prev_surf_loss = epoch_surf
 
+    # Collect snapshot at end of each cosine cycle
+    if epoch in snapshot_epochs:
+        snapshots.append(deepcopy(model.state_dict()))
+        print(f"  Snapshot collected at epoch {epoch+1} ({len(snapshots)} total)")
+
+        # Build averaged model from all snapshots so far
+        avg_model = deepcopy(model)
+        avg_state = avg_model.state_dict()
+        for key in avg_state:
+            avg_state[key] = sum(s[key] for s in snapshots) / len(snapshots)
+        avg_model.load_state_dict(avg_state)
+
     # --- Validate across all splits ---
-    eval_model = ema_model if ema_model is not None else model
+    eval_model = avg_model if avg_model is not None else model
     eval_model.eval()
     model.eval()
     val_metrics_per_split: dict[str, dict] = {}
@@ -815,7 +823,7 @@ for epoch in range(MAX_EPOCHS):
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
-        save_model = ema_model if ema_model is not None else model
+        save_model = avg_model if avg_model is not None else model
         torch.save(save_model.state_dict(), model_path)
         tag = f" * -> {model_path}"
 
