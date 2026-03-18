@@ -20,6 +20,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     Tandem surface loss is therefore underweighted.
 """
 
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -573,7 +574,8 @@ for epoch in range(MAX_EPOCHS):
     t0 = time.time()
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
-    surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+    floor = 5.0 + 15.0 * (1.0 - math.cos(math.pi * epoch / MAX_EPOCHS)) / 2.0
+    surf_weight = max(floor, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
 
     # --- Train ---
     model.train()
