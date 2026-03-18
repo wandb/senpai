@@ -183,11 +183,13 @@ class TransolverBlock(nn.Module):
         nn.init.zeros_(self.se_fc2.bias)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
-            self.mlp2 = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, out_dim),
-            )
+            self.n_output_heads = 3
+            self.mlp2_heads = nn.ModuleList([
+                nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim))
+                for _ in range(self.n_output_heads)
+            ])
+            for i, head in enumerate(self.mlp2_heads):
+                head[-1].bias.data += 0.01 * torch.randn_like(head[-1].bias.data) * (i + 1)
 
     def forward(self, fx, raw_xy=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
@@ -198,7 +200,14 @@ class TransolverBlock(nn.Module):
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            fx_ln = self.ln_3(fx)
+            head_preds = [head(fx_ln) for head in self.mlp2_heads]
+            if self.training:
+                drop_idx = torch.randint(0, self.n_output_heads, (1,)).item()
+                active = [p for i, p in enumerate(head_preds) if i != drop_idx]
+                return sum(active) / len(active)
+            else:
+                return sum(head_preds) / self.n_output_heads
         return fx
 
 
