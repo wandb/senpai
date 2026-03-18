@@ -660,7 +660,7 @@ for epoch in range(MAX_EPOCHS):
             y_coarse = y_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
             mask_coarse = mask_trunc.reshape(B, n_groups, coarse_pool_size).any(dim=2)
 
-            coarse_err = (pred_coarse - y_coarse).abs()
+            coarse_err = (pred_coarse[:, :, 2:3] - y_coarse[:, :, 2:3]).abs()
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
             loss = loss + 1.0 * coarse_loss
 
