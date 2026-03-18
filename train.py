@@ -95,7 +95,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.scale = dim_head**-0.5
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
-        self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
+        self.register_buffer('temperature', torch.ones([1, heads, 1, 1]) * 0.5)
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
@@ -575,6 +575,20 @@ for epoch in range(MAX_EPOCHS):
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
 
+    # Temperature schedule: 1.0 → 0.15 over epochs 0-50, then hold at 0.15
+    if epoch < 10:
+        temp_val = 1.0  # soft attention during tandem-free phase
+    elif epoch < 50:
+        temp_val = 1.0 - 0.85 * (epoch - 10) / 40  # linear anneal
+    else:
+        temp_val = 0.15  # sharp attention for fine-tuning phase
+
+    for block in model.blocks:
+        block.attn.temperature.fill_(temp_val)
+    if ema_model is not None:
+        for block in ema_model.blocks:
+            block.attn.temperature.fill_(temp_val)
+
     # --- Train ---
     model.train()
     epoch_vol = 0.0
@@ -683,7 +697,7 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), model.parameters()):
                         ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "train/temperature": temp_val, "global_step": global_step})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
