@@ -354,7 +354,7 @@ MAX_EPOCHS = 100
 
 @dataclass
 class Config:
-    lr: float = 3e-3
+    lr: float = 4.24e-3  # sqrt(2) * 3e-3
     weight_decay: float = 0.0
     batch_size: int = 4
     surf_weight: float = 20.0
@@ -557,6 +557,7 @@ model_path = model_dir / "checkpoint.pt"
 with open(model_dir / "config.yaml", "w") as f:
     yaml.dump(model_config, f)
 
+ACCUM_STEPS = 2
 best_val = float("inf")
 best_metrics = {}
 global_step = 0
@@ -580,6 +581,7 @@ for epoch in range(MAX_EPOCHS):
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
+    optimizer.zero_grad()
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     for x, y, is_surface, mask in pbar:
@@ -677,19 +679,22 @@ for epoch in range(MAX_EPOCHS):
         re_loss = F.mse_loss(re_pred, log_re_target)
         loss = loss + 0.01 * re_loss
 
-        optimizer.zero_grad()
+        loss = loss / ACCUM_STEPS
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        if epoch >= ema_start_epoch:
-            if ema_model is None:
-                ema_model = deepcopy(model)
-            else:
-                with torch.no_grad():
-                    for ep, mp in zip(ema_model.parameters(), model.parameters()):
-                        ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
-        global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+
+        if (n_batches + 1) % ACCUM_STEPS == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            if epoch >= ema_start_epoch:
+                if ema_model is None:
+                    ema_model = deepcopy(model)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_model.parameters(), model.parameters()):
+                            ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
+            global_step += 1
+            wandb.log({"train/loss": loss.item() * ACCUM_STEPS, "train/surf_weight": surf_weight, "global_step": global_step})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
