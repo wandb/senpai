@@ -675,10 +675,10 @@ for epoch in range(MAX_EPOCHS):
         slice_wts = out["slice_weights"]
         # Average assignment probability per slice across nodes: [B, heads, slice_num]
         avg_slice_prob = slice_wts.mean(dim=2)
-        # Entropy: -sum(p * log(p))
+        # Entropy: -sum(p * log(p)); max = log(32) ≈ 3.47 nats
         slice_entropy = -(avg_slice_prob * (avg_slice_prob + 1e-8).log()).sum(dim=-1).mean()
-        # Maximize entropy (minimize negative entropy) — weight 0.01
-        loss = loss - 0.01 * slice_entropy
+        # Maximize entropy (minimize negative entropy) — weight 0.001 (gentler than 0.01)
+        loss = loss - 0.001 * slice_entropy
 
         optimizer.zero_grad()
         loss.backward()
