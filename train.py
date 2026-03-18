@@ -851,10 +851,17 @@ for epoch in range(MAX_EPOCHS):
 
     # 3-split val/loss (in_dist + tandem + ood_cond) — used for checkpoint selection
     _3split_names = ["val_in_dist", "val_tandem_transfer", "val_ood_cond"]
-    _3split_losses = [val_metrics_per_split[n][f"{n}/loss"] for n in _3split_names
-                      if not (torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isnan() or
-                              torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isinf())]
-    val_loss_3split = sum(_3split_losses) / max(len(_3split_losses), 1)
+    _3split_weights = {'val_in_dist': 1.0, 'val_tandem_transfer': 2.0, 'val_ood_cond': 1.0}
+    # Compute weighted average instead of simple average
+    total_w = 0
+    weighted_sum = 0
+    for n in _3split_names:
+        loss_val = val_metrics_per_split[n][f"{n}/loss"]
+        if not (torch.tensor(loss_val).isnan() or torch.tensor(loss_val).isinf()):
+            w = _3split_weights.get(n, 1.0)
+            weighted_sum += w * loss_val
+            total_w += w
+    val_loss_3split = weighted_sum / max(total_w, 1)
     ema_val_loss = val_loss_3split if ema_val_loss == float("inf") else ema_decay_val * ema_val_loss + (1 - ema_decay_val) * val_loss_3split
 
     # 4-split val/loss (all splits including ood_re)
