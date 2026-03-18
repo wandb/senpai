@@ -244,6 +244,7 @@ class Transolver(nn.Module):
             )
         else:
             self.preprocess = MLP(fun_dim + space_dim, n_hidden * 2, n_hidden, n_layers=1, res=True, act=act)
+            self.preprocess_tandem = MLP(fun_dim + space_dim, n_hidden * 2, n_hidden, n_layers=0, res=False, act=act)
 
         self.n_hidden = n_hidden
         self.space_dim = space_dim
@@ -327,7 +328,11 @@ class Transolver(nn.Module):
             x = torch.cat((x, new_pos), dim=-1)
 
         raw_xy = x[:, :, :2]
-        fx = self.preprocess(x)
+        # Detect tandem samples: gap feature at index 21 (normalized gap != 0 means tandem)
+        is_tandem_sample = (x[:, 0, 21].abs() > 0.5)  # [B]
+        fx_single = self.preprocess(x)
+        fx_tandem = self.preprocess_tandem(x)
+        fx = torch.where(is_tandem_sample[:, None, None], fx_tandem, fx_single)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
