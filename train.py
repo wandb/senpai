@@ -588,6 +588,8 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         x = (x - stats["x_mean"]) / stats["x_std"]
+        if model.training:
+            x[:, :, :2] = x[:, :, :2] + 0.01 * torch.randn_like(x[:, :, :2])  # jitter spatial coords
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
