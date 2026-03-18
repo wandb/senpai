@@ -187,7 +187,7 @@ class TransolverBlock(nn.Module):
             self.ln_3 = nn.LayerNorm(hidden_dim)
             self.mlp2 = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
+                nn.SiLU(),  # was nn.GELU()
                 nn.Linear(hidden_dim, out_dim),
             )
 
@@ -196,7 +196,7 @@ class TransolverBlock(nn.Module):
         fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
-        se = F.gelu(self.se_fc1(se))
+        se = F.silu(self.se_fc1(se))  # was F.gelu
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
         if self.last_layer:
@@ -270,7 +270,7 @@ class Transolver(nn.Module):
         nn.init.zeros_(self.out_skip.bias)
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
-        self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.SiLU(), nn.Linear(32, 1))
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -472,6 +472,7 @@ model_config = dict(
     mlp_ratio=2,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
+    act="silu",  # was default "gelu"
 )
 
 model = Transolver(**model_config).to(device)
