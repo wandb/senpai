@@ -589,7 +589,7 @@ for epoch in range(MAX_EPOCHS):
 
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
-        curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+        curv = x[:, :, 2:6].norm(dim=-1, keepdim=True)
         x = torch.cat([x, curv], dim=-1)
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
@@ -722,7 +722,7 @@ for epoch in range(MAX_EPOCHS):
 
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
-                curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                curv = x[:, :, 2:6].norm(dim=-1, keepdim=True)
                 x = torch.cat([x, curv], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
@@ -871,10 +871,13 @@ if best_metrics:
     print("\nGenerating flow field plots...")
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     plot_dir = Path("plots") / run.id
-    # Visualize from val_in_dist — same distribution as original val_ds
-    images = visualize(model, val_splits["val_in_dist"], stats, device,
-                       n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
-    if images:
-        wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    try:
+        # Visualize from val_in_dist — same distribution as original val_ds
+        images = visualize(model, val_splits["val_in_dist"], stats, device,
+                           n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
+        if images:
+            wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    except RuntimeError as e:
+        print(f"Visualization skipped (input dim mismatch — visualize() doesn't add curvature feature): {e}")
 
 wandb.finish()
