@@ -591,6 +591,7 @@ for epoch in range(MAX_EPOCHS):
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         x = torch.cat([x, curv], dim=-1)
+        curv_weight = (1.0 + 0.5 * curv.squeeze(-1)).detach()  # [B, N]
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
@@ -645,7 +646,9 @@ for epoch in range(MAX_EPOCHS):
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem = (x[:, 0, 21].abs() > 0.01)
         tandem_boost = torch.where(is_tandem, 1.5, 1.0).to(device)
-        surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        weighted_surf_err = abs_err * surf_mask.unsqueeze(-1) * curv_weight.unsqueeze(-1)
+        surf_denom = (surf_mask.float() * curv_weight).sum(dim=1).clamp(min=1)
+        surf_per_sample = weighted_surf_err.sum(dim=(1, 2)) / surf_denom
         surf_loss = (surf_per_sample * tandem_boost).mean()
         loss = vol_loss + surf_weight * surf_loss
 
@@ -871,8 +874,18 @@ if best_metrics:
     print("\nGenerating flow field plots...")
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     plot_dir = Path("plots") / run.id
+
+    class _VizWrapper:
+        """Appends zero curvature (24→25 dim) so visualize() works with the curvature-augmented model."""
+        def __init__(self, m): self.m = m
+        def eval(self): self.m.eval(); return self
+        def __call__(self, data, **kw):
+            x = data["x"]
+            curv = torch.zeros(*x.shape[:-1], 1, device=x.device, dtype=x.dtype)
+            return self.m({"x": torch.cat([x, curv], dim=-1)}, **kw)
+
     # Visualize from val_in_dist — same distribution as original val_ds
-    images = visualize(model, val_splits["val_in_dist"], stats, device,
+    images = visualize(_VizWrapper(model), val_splits["val_in_dist"], stats, device,
                        n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
     if images:
         wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
