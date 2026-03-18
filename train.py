@@ -235,7 +235,7 @@ class Transolver(nn.Module):
 
         if self.unified_pos:
             self.preprocess = MLP(
-                fun_dim + self.ref * self.ref * self.ref,
+                fun_dim + space_dim + self.ref * self.ref * self.ref,
                 n_hidden * 2,
                 n_hidden,
                 n_layers=0,
@@ -468,6 +468,8 @@ model_config = dict(
     n_head=4,
     slice_num=32,  # was 64 — fewer slices for faster attention, more epochs
     mlp_ratio=2,
+    unified_pos=True,
+    ref=8,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
 )
@@ -612,7 +614,8 @@ for epoch in range(MAX_EPOCHS):
             y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            pos3d = torch.cat([x[:, :, :2], torch.zeros_like(x[:, :, :1])], dim=-1)
+            out = model({"x": x, "pos": pos3d})
             pred = out["preds"]
             re_pred = out["re_pred"]
         pred = pred.float()
@@ -741,7 +744,8 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    pos3d = torch.cat([x[:, :, :2], torch.zeros_like(x[:, :, :1])], dim=-1)
+                    pred = eval_model({"x": x, "pos": pos3d})["preds"]
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
