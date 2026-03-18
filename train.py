@@ -588,6 +588,10 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         x = (x - stats["x_mean"]) / stats["x_std"]
+        if model.training:
+            x_noise = torch.zeros_like(x)
+            x_noise[:, :, 2:] = 0.02 * torch.randn_like(x[:, :, 2:])  # noise on non-spatial features
+            x = x + x_noise
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
