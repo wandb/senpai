@@ -273,6 +273,7 @@ class Transolver(nn.Module):
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs = nn.Parameter(torch.tensor([1.0, 2.0, 4.0, 8.0]))
 
     def initialize_weights(self):
@@ -343,11 +344,12 @@ class Transolver(nn.Module):
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
+        aoa_pred = self.aoa_head(fx.mean(dim=1))
 
         fx = self.blocks[-1](fx, raw_xy=raw_xy)
         fx = fx + self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred}
+        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
 
 # ---------------------------------------------------------------------------
@@ -634,8 +636,10 @@ for epoch in range(MAX_EPOCHS):
             out = model({"x": x})
             pred = out["preds"]
             re_pred = out["re_pred"]
+            aoa_pred = out["aoa_pred"]
         pred = pred.float()
         re_pred = re_pred.float()
+        aoa_pred = aoa_pred.float()
         if model.training:
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
@@ -689,6 +693,9 @@ for epoch in range(MAX_EPOCHS):
         log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
         re_loss = F.mse_loss(re_pred, log_re_target)
         loss = loss + 0.01 * re_loss
+        aoa_target = x[:, 0, 14:15]  # AoA0_rad from normalized input
+        aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
+        loss = loss + 0.01 * aoa_loss
 
         optimizer.zero_grad()
         loss.backward()
