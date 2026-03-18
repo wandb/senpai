@@ -183,11 +183,20 @@ class TransolverBlock(nn.Module):
         nn.init.zeros_(self.se_fc2.bias)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
-            self.mlp2 = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, out_dim),
+            # Branch 1: rank-1 (amplitude per node × mode per sample)
+            self.amplitude = nn.Linear(hidden_dim, 1)  # per-node scalar
+            self.mode = nn.Sequential(
+                nn.Linear(hidden_dim, 32), nn.GELU(), nn.Linear(32, 3)
+            )  # applied to mean-pooled features → 3D mode vector
+            # Branch 2: residual full MLP (reduced hidden)
+            self.residual_mlp = nn.Sequential(
+                nn.Linear(hidden_dim, 64), nn.GELU(), nn.Linear(64, 3)
             )
+            # Initialize amplitude and mode with small weights so training starts near-current behavior
+            nn.init.normal_(self.amplitude.weight, std=0.01)
+            nn.init.zeros_(self.amplitude.bias)
+            nn.init.normal_(self.mode[-1].weight, std=0.01)
+            nn.init.zeros_(self.mode[-1].bias)
 
     def forward(self, fx, raw_xy=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
@@ -198,7 +207,12 @@ class TransolverBlock(nn.Module):
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            h = self.ln_3(fx)
+            amp = self.amplitude(h)  # [B, N, 1]
+            mode = self.mode(h.mean(dim=1, keepdim=True))  # [B, 1, 3]
+            rank1 = amp * mode  # [B, N, 3]
+            residual = self.residual_mlp(h)  # [B, N, 3]
+            return rank1 + residual
         return fx
 
 
@@ -364,9 +378,13 @@ class Config:
     wandb_name: str | None = None
     agent: str | None = None
     debug: bool = False
+    seed: int = 42
 
 
 cfg = sp.parse(Config)
+
+torch.manual_seed(cfg.seed)
+torch.cuda.manual_seed_all(cfg.seed)
 
 if cfg.debug:
     MAX_EPOCHS = 3
