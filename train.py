@@ -277,6 +277,10 @@ class Transolver(nn.Module):
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs = nn.Parameter(torch.tensor([1.0, 2.0, 4.0, 8.0]))
+        self.film_net = nn.Sequential(nn.Linear(2, 64), nn.GELU(), nn.Linear(64, 2 * n_hidden))
+        nn.init.zeros_(self.film_net[-1].weight)
+        nn.init.zeros_(self.film_net[-1].bias)
+        self.film_net[-1].bias.data[:n_hidden] = 1.0  # gamma=1, beta=0
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -340,6 +344,11 @@ class Transolver(nn.Module):
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
+
+        re_aoa = torch.stack([x[:, 0, 13], x[:, 0, 14]], dim=-1)
+        film_out = self.film_net(re_aoa)
+        gamma, beta = film_out.chunk(2, dim=-1)
+        fx = gamma.unsqueeze(1) * fx + beta.unsqueeze(1)
 
         for block in self.blocks[:-1]:
             fx = block(fx, raw_xy=raw_xy)
