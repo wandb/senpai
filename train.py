@@ -269,6 +269,7 @@ class Transolver(nn.Module):
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.zone_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 3))
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -336,11 +337,12 @@ class Transolver(nn.Module):
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
+        zone_pred = self.zone_head(fx)  # [B, N, 3] — 3 zone classes
 
         fx = self.blocks[-1](fx, raw_xy=raw_xy)
         fx = fx + self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred}
+        return {"preds": fx, "re_pred": re_pred, "zone_pred": zone_pred}
 
 
 # ---------------------------------------------------------------------------
@@ -587,6 +589,17 @@ for epoch in range(MAX_EPOCHS):
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
 
+        # Zone proxy targets (from raw dsdf before normalization)
+        B, N, _ = x.shape
+        dsdf_mag = x[:, :, 4:12].norm(dim=-1)  # [B, N] — raw dsdf magnitude
+        vol_mask_z = (~is_surface) & mask
+        vol_dsdf = dsdf_mag[vol_mask_z]
+        z_thresh = vol_dsdf.median() if vol_dsdf.numel() > 0 else torch.tensor(0.3)
+        zone_target = torch.zeros(B, N, dtype=torch.long, device=device)
+        zone_target[is_surface & mask] = 2  # surface → zone 2
+        zone_target[(~is_surface) & mask & (dsdf_mag < z_thresh)] = 1  # near-surface → zone 1
+        zone_target[~mask] = -1  # ignore padding
+
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -670,6 +683,11 @@ for epoch in range(MAX_EPOCHS):
         log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
         re_loss = F.mse_loss(re_pred, log_re_target)
         loss = loss + 0.01 * re_loss
+
+        zone_loss = F.cross_entropy(
+            out["zone_pred"].float().reshape(-1, 3), zone_target.reshape(-1), ignore_index=-1
+        )
+        loss = loss + 0.01 * zone_loss
 
         optimizer.zero_grad()
         loss.backward()
