@@ -17,9 +17,8 @@ echo "Students: $STUDENT_NAMES"
 # Repo already cloned by the deployment args block
 cd "$WORKDIR"
 
-# --- Stash role files BEFORE advisor branch checkout (jurgen may not have them) ---
-cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" /tmp/CLAUDE-ADVISOR.md
-cp "$WORKDIR/instructions/prompt-advisor.md" /tmp/prompt-advisor.md
+# --- Install role instructions ---
+cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
 
 uv pip install --system -e .
 
@@ -55,7 +54,7 @@ echo "=== gh auth ready (using GITHUB_TOKEN env var) ==="
 
 # --- Build prompt (bash heredoc expansion — no envsubst needed) ---
 PROMPT="$(eval "cat <<_PROMPT_EOF_
-$(cat /tmp/prompt-advisor.md)
+$(cat "$WORKDIR/instructions/prompt-advisor.md")
 _PROMPT_EOF_")"
 
 # --- Launch Claude Code in Ralph Loop ---
@@ -74,8 +73,8 @@ while true; do
     echo "=== Advisor Loop iteration $ITERATION ($(date)) ==="
     echo "=== Log: $LOGFILE ==="
 
-    # Restore CLAUDE.md each iteration — advisor git checkouts during PR review can clobber it
-    cp /tmp/CLAUDE-ADVISOR.md "$WORKDIR/CLAUDE.md"
+    # Restore CLAUDE.md — branch checkouts clobber it
+    cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
 
     if [ "$ITERATION" -eq 1 ]; then
         claude -p "$PROMPT" --model "claude-opus-4-6[1m]" --output-format stream-json --verbose --dangerously-skip-permissions > "$LOGFILE" 2>&1 || true

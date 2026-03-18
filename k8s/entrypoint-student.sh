@@ -33,15 +33,14 @@ apt-get update && apt-get install -y gh
 # gh uses GITHUB_TOKEN env var automatically, no explicit login needed
 echo "=== gh auth ready (using GITHUB_TOKEN env var) ==="
 
-# --- Stash role files outside git tree so branch checkouts can't clobber them ---
-cp instructions/CLAUDE-STUDENT.md /tmp/CLAUDE-STUDENT.md
-cp instructions/prompt-student.md /tmp/prompt-student.md
+# --- Install role instructions ---
+cp instructions/CLAUDE-STUDENT.md "$WORKDIR/CLAUDE.md"
 
 # --- Launch Claude Code in Ralph Loop ---
 export IS_SANDBOX=1
 
 PROMPT="$(eval "cat <<_PROMPT_EOF_
-$(cat /tmp/prompt-student.md)
+$(cat "$WORKDIR/instructions/prompt-student.md")
 _PROMPT_EOF_")"
 
 # --- Start Weave thread logger in background ---
@@ -52,12 +51,12 @@ while true; do
     ITERATION=$((ITERATION + 1))
     echo "=== Ralph Loop iteration $ITERATION ($(date)) ==="
 
-    # Return to the cloned branch between iterations so the student starts clean
-    git checkout "$REPO_BRANCH" 2>/dev/null || true
-    git checkout -- CLAUDE.md 2>/dev/null || true
+    # Return to latest advisor branch so student starts from the current baseline
+    git checkout "$ADVISOR_BRANCH" 2>/dev/null || true
+    git pull origin "$ADVISOR_BRANCH" 2>/dev/null || true
 
-    # Restore CLAUDE.md — branch checkout clobbers it with the repo version
-    cp /tmp/CLAUDE-STUDENT.md "$WORKDIR/CLAUDE.md"
+    # Restore CLAUDE.md — branch checkouts clobber it
+    cp "$WORKDIR/instructions/CLAUDE-STUDENT.md" "$WORKDIR/CLAUDE.md"
 
     if [ "$ITERATION" -eq 1 ]; then
         claude -p "$PROMPT" --dangerously-skip-permissions || true
