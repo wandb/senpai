@@ -645,7 +645,17 @@ for epoch in range(MAX_EPOCHS):
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem = (x[:, 0, 21].abs() > 0.01)
         tandem_boost = torch.where(is_tandem, 1.5, 1.0).to(device)
-        surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        # Surface loss: Huber (smooth L1) instead of L1
+        huber_delta = 1.0
+        err_surf_raw = pred - y_norm
+        if epoch < 10:
+            err_surf_raw = err_surf_raw * sample_mask
+        abs_err_surf = torch.where(
+            err_surf_raw.abs() < huber_delta,
+            0.5 * err_surf_raw ** 2 / huber_delta,  # quadratic region
+            err_surf_raw.abs() - 0.5 * huber_delta,  # linear region
+        )
+        surf_per_sample = (abs_err_surf * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         surf_loss = (surf_per_sample * tandem_boost).mean()
         loss = vol_loss + surf_weight * surf_loss
 
@@ -871,10 +881,13 @@ if best_metrics:
     print("\nGenerating flow field plots...")
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     plot_dir = Path("plots") / run.id
-    # Visualize from val_in_dist — same distribution as original val_ds
-    images = visualize(model, val_splits["val_in_dist"], stats, device,
-                       n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
-    if images:
-        wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    try:
+        # Visualize from val_in_dist — same distribution as original val_ds
+        images = visualize(model, val_splits["val_in_dist"], stats, device,
+                           n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
+        if images:
+            wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    except RuntimeError as e:
+        print(f"Visualization skipped (input dim mismatch — visualize() doesn't add curvature feature): {e}")
 
 wandb.finish()
