@@ -465,8 +465,8 @@ model_config = dict(
     space_dim=2,
     fun_dim=X_DIM - 2 + 1 + 16,  # X_DIM=24 + 1 curvature proxy + 16 Fourier PE; fun_dim + space_dim must equal x.shape[-1]
     out_dim=3,
-    n_hidden=160,  # was 128
-    n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
+    n_hidden=128,  # was 160 — reduce width for 2-layer budget
+    n_layers=2,    # was 1
     n_head=4,
     slice_num=32,  # was 64 — fewer slices for faster attention, more epochs
     mlp_ratio=2,
