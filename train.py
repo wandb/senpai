@@ -183,20 +183,13 @@ class TransolverBlock(nn.Module):
         nn.init.zeros_(self.se_fc2.bias)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
-            # Branch 1: rank-1 (amplitude per node × mode per sample)
-            self.amplitude = nn.Linear(hidden_dim, 1)  # per-node scalar
+            # Rank-3: 3 amplitude vectors × 3 mode vectors
+            self.amplitude = nn.Linear(hidden_dim, 3)  # per-node, 3 scalars
             self.mode = nn.Sequential(
-                nn.Linear(hidden_dim, 32), nn.GELU(), nn.Linear(32, 3)
-            )  # applied to mean-pooled features → 3D mode vector
-            # Branch 2: residual full MLP (reduced hidden)
-            self.residual_mlp = nn.Sequential(
-                nn.Linear(hidden_dim, 64), nn.GELU(), nn.Linear(64, 3)
-            )
-            # Initialize amplitude and mode with small weights so training starts near-current behavior
-            nn.init.normal_(self.amplitude.weight, std=0.01)
-            nn.init.zeros_(self.amplitude.bias)
-            nn.init.normal_(self.mode[-1].weight, std=0.01)
-            nn.init.zeros_(self.mode[-1].bias)
+                nn.Linear(hidden_dim, 32), nn.GELU(), nn.Linear(32, 3 * 3)
+            )  # applied to mean-pooled features → 9 values (3 modes × 3 channels)
+            # FULL residual MLP (same capacity as baseline)
+            self.mlp2 = MLP(hidden_dim, hidden_dim, out_dim, n_layers=0, res=False, act=act)
 
     def forward(self, fx, raw_xy=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
@@ -208,11 +201,11 @@ class TransolverBlock(nn.Module):
         fx = fx * se
         if self.last_layer:
             h = self.ln_3(fx)
-            amp = self.amplitude(h)  # [B, N, 1]
-            mode = self.mode(h.mean(dim=1, keepdim=True))  # [B, 1, 3]
-            rank1 = amp * mode  # [B, N, 3]
-            residual = self.residual_mlp(h)  # [B, N, 3]
-            return rank1 + residual
+            amp = self.amplitude(h)  # [B, N, 3]
+            mode = self.mode(h.mean(dim=1, keepdim=True)).reshape(fx.shape[0], 1, 3, 3)  # [B, 1, 3, 3]
+            rank_k = (amp.unsqueeze(-1) * mode).sum(dim=-2)  # [B, N, 3]
+            residual = self.mlp2(h)  # [B, N, 3]
+            return rank_k * 0.1 + residual  # rank-k as bonus, not replacement
         return fx
 
 
