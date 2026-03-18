@@ -654,18 +654,18 @@ for epoch in range(MAX_EPOCHS):
         B, N, C = pred.shape
         n_groups = N // coarse_pool_size
         if n_groups > 1:
-            # Pool predictions and targets over groups of 64 nodes
-            pred_trunc = pred[:, :n_groups * coarse_pool_size]
-            y_trunc = y_norm[:, :n_groups * coarse_pool_size]
+            # Pressure-only coarse loss (channel index 2)
+            pred_trunc = pred[:, :n_groups * coarse_pool_size, 2:3]  # pressure only
+            y_trunc = y_norm[:, :n_groups * coarse_pool_size, 2:3]
             mask_trunc = mask[:, :n_groups * coarse_pool_size]
 
-            pred_coarse = pred_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
-            y_coarse = y_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
+            pred_coarse = pred_trunc.reshape(B, n_groups, coarse_pool_size, 1).mean(dim=2)
+            y_coarse = y_trunc.reshape(B, n_groups, coarse_pool_size, 1).mean(dim=2)
             mask_coarse = mask_trunc.reshape(B, n_groups, coarse_pool_size).any(dim=2)
 
             coarse_err = (pred_coarse - y_coarse).abs()
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
-            loss = loss + 1.0 * coarse_loss
+            loss = loss + 2.0 * coarse_loss  # amplified weight
 
         log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
         re_loss = F.mse_loss(re_pred, log_re_target)
@@ -872,9 +872,12 @@ if best_metrics:
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     plot_dir = Path("plots") / run.id
     # Visualize from val_in_dist — same distribution as original val_ds
-    images = visualize(model, val_splits["val_in_dist"], stats, device,
-                       n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
-    if images:
-        wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    try:
+        images = visualize(model, val_splits["val_in_dist"], stats, device,
+                           n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
+        if images:
+            wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    except Exception as e:
+        print(f"Visualization skipped: {e}")
 
 wandb.finish()
