@@ -572,8 +572,10 @@ for epoch in range(MAX_EPOCHS):
 
     t0 = time.time()
 
-    # Adaptive surface weight: loss-ratio based, clamped [5, 50]
-    surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+    # Progressive surface weight: start low, ramp to high
+    base_surf = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+    surf_ramp = 0.5 + 1.5 * min(epoch / 50, 1.0)  # ramps 0.5→2.0 over 50 epochs
+    surf_weight = base_surf * surf_ramp
 
     # --- Train ---
     model.train()
