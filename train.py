@@ -60,6 +60,18 @@ ACTIVATION = {
 }
 
 
+class GatedMLP(nn.Module):
+    def __init__(self, n_input, n_hidden, n_output, act='gelu'):
+        super().__init__()
+        act_fn = ACTIVATION[act]
+        self.gate_proj = nn.Linear(n_input, n_hidden)
+        self.up_proj = nn.Linear(n_input, n_hidden)
+        self.down_proj = nn.Linear(n_hidden, n_output)
+        self.act = act_fn()
+    def forward(self, x):
+        return self.down_proj(torch.sigmoid(self.gate_proj(x)) * self.act(self.up_proj(x)))
+
+
 class MLP(nn.Module):
     def __init__(self, n_input, n_hidden, n_output, n_layers=1, act="gelu", res=True):
         super().__init__()
@@ -245,7 +257,7 @@ class Transolver(nn.Module):
                 act=act,
             )
         else:
-            self.preprocess = MLP(fun_dim + space_dim, n_hidden * 2, n_hidden, n_layers=1, res=True, act=act)
+            self.preprocess = GatedMLP(fun_dim + space_dim, n_hidden * 2, n_hidden)
 
         self.n_hidden = n_hidden
         self.space_dim = space_dim
