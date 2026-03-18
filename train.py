@@ -335,7 +335,7 @@ class Transolver(nn.Module):
             x = torch.cat((x, new_pos), dim=-1)
 
         x_cross = x * self.feature_cross(x)
-        x = x + 0.1 * x_cross  # residual with small scale
+        x = x + 0.2 * x_cross  # residual with small scale
         raw_xy = x[:, :, :2]
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
