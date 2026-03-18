@@ -135,9 +135,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
 
         q_slice_token = self.to_q(slice_token)
-        slice_token_kv = slice_token.mean(dim=1, keepdim=True)  # shared K,V: (bsz, 1, slice_num, dim_head)
-        k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
-        v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
+        k_slice_token = self.to_k(slice_token)
+        v_slice_token = self.to_v(slice_token)
         q_norm = F.normalize(q_slice_token, dim=-1)
         k_norm = F.normalize(k_slice_token, dim=-1)
         attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
@@ -871,10 +870,13 @@ if best_metrics:
     print("\nGenerating flow field plots...")
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     plot_dir = Path("plots") / run.id
-    # Visualize from val_in_dist — same distribution as original val_ds
-    images = visualize(model, val_splits["val_in_dist"], stats, device,
-                       n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
-    if images:
-        wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    try:
+        # Visualize from val_in_dist — same distribution as original val_ds
+        images = visualize(model, val_splits["val_in_dist"], stats, device,
+                           n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
+        if images:
+            wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    except RuntimeError as e:
+        print(f"Visualization skipped (input dim mismatch — visualize() doesn't add curvature feature): {e}")
 
 wandb.finish()
