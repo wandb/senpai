@@ -269,6 +269,7 @@ class Transolver(nn.Module):
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.output_decorr = nn.Parameter(torch.eye(3))
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -339,6 +340,7 @@ class Transolver(nn.Module):
 
         fx = self.blocks[-1](fx, raw_xy=raw_xy)
         fx = fx + self.out_skip(fx_pre)
+        fx = fx @ self.output_decorr  # [B, N, 3] @ [3, 3] = [B, N, 3]
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred}
 
@@ -670,6 +672,10 @@ for epoch in range(MAX_EPOCHS):
         log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
         re_loss = F.mse_loss(re_pred, log_re_target)
         loss = loss + 0.01 * re_loss
+
+        I = torch.eye(3, device=device)
+        ortho_loss = ((model.output_decorr.T @ model.output_decorr - I) ** 2).sum()
+        loss = loss + 0.001 * ortho_loss
 
         optimizer.zero_grad()
         loss.backward()
