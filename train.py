@@ -35,6 +35,7 @@ from einops import rearrange
 from timm.layers import trunc_normal_
 from tqdm import tqdm
 from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.checkpoint import checkpoint as ckpt_fn
 import simple_parsing as sp
 
 from data.utils import visualize
@@ -332,7 +333,7 @@ class Transolver(nn.Module):
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy)
+            fx = ckpt_fn(block, fx, raw_xy, use_reentrant=False)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
@@ -354,9 +355,9 @@ MAX_EPOCHS = 100
 
 @dataclass
 class Config:
-    lr: float = 3e-3
+    lr: float = 6e-3
     weight_decay: float = 0.0
-    batch_size: int = 4
+    batch_size: int = 8
     surf_weight: float = 20.0
     manifest: str = "data/split_manifest.json"
     stats_file: str = "data/split_stats.json"
