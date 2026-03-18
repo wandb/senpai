@@ -355,7 +355,7 @@ MAX_EPOCHS = 100
 @dataclass
 class Config:
     lr: float = 3e-3
-    weight_decay: float = 1e-4
+    weight_decay: float = 0.0
     batch_size: int = 4
     surf_weight: float = 20.0
     manifest: str = "data/split_manifest.json"
@@ -645,24 +645,6 @@ for epoch in range(MAX_EPOCHS):
         surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         surf_loss = (surf_per_sample * tandem_boost).mean()
         loss = vol_loss + surf_weight * surf_loss
-
-        # Multi-scale loss: coarse spatial pooling
-        coarse_pool_size = 64
-        B, N, C = pred.shape
-        n_groups = N // coarse_pool_size
-        if n_groups > 1:
-            # Pool predictions and targets over groups of 64 nodes
-            pred_trunc = pred[:, :n_groups * coarse_pool_size]
-            y_trunc = y_norm[:, :n_groups * coarse_pool_size]
-            mask_trunc = mask[:, :n_groups * coarse_pool_size]
-
-            pred_coarse = pred_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
-            y_coarse = y_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
-            mask_coarse = mask_trunc.reshape(B, n_groups, coarse_pool_size).any(dim=2)
-
-            coarse_err = (pred_coarse - y_coarse).abs()
-            coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
-            loss = loss + 1.0 * coarse_loss
 
         log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
         re_loss = F.mse_loss(re_pred, log_re_target)
