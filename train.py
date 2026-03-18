@@ -588,8 +588,8 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         x = (x - stats["x_mean"]) / stats["x_std"]
-        # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
-        curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+        # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for all nodes
+        curv = x[:, :, 2:6].norm(dim=-1, keepdim=True)
         x = torch.cat([x, curv], dim=-1)
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
@@ -721,8 +721,8 @@ for epoch in range(MAX_EPOCHS):
                 mask = mask.to(device, non_blocking=True)
 
                 x = (x - stats["x_mean"]) / stats["x_std"]
-                # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
-                curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for all nodes
+                curv = x[:, :, 2:6].norm(dim=-1, keepdim=True)
                 x = torch.cat([x, curv], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
