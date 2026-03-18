@@ -465,11 +465,11 @@ model_config = dict(
     space_dim=2,
     fun_dim=X_DIM - 2 + 1 + 16,  # X_DIM=24 + 1 curvature proxy + 16 Fourier PE; fun_dim + space_dim must equal x.shape[-1]
     out_dim=3,
-    n_hidden=160,  # was 128
+    n_hidden=256,  # wider attention (was 160)
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
     n_head=4,
     slice_num=32,  # was 64 — fewer slices for faster attention, more epochs
-    mlp_ratio=2,
+    mlp_ratio=1,   # lean FFN to compensate for wider attention (was 2)
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
 )
