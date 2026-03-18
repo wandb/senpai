@@ -620,10 +620,10 @@ for epoch in range(MAX_EPOCHS):
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
-        if model.training:
-            noise_progress = min(1.0, epoch / 60)
-            vel_noise = 0.015 * (1 - noise_progress) + 0.003 * noise_progress
-            p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
+        if model.training and epoch < 55:
+            noise_progress = min(1.0, epoch / 55)
+            vel_noise = 0.015 * (1 - noise_progress)
+            p_noise = 0.008 * (1 - noise_progress)
             noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
             y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
 
