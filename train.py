@@ -20,6 +20,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     Tandem surface loss is therefore underweighted.
 """
 
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -588,6 +589,17 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         x = (x - stats["x_mean"]) / stats["x_std"]
+        # Coordinate rotation augmentation (physics-preserving, ±15°)
+        rot_cos, rot_sin = 1.0, 0.0
+        if model.training and torch.rand(1).item() < 0.5:
+            theta = (torch.rand(1).item() * 30 - 15) * math.pi / 180
+            rot_cos, rot_sin = math.cos(theta), math.sin(theta)
+            x_new = x.clone()
+            x_new[:, :, 0] = rot_cos * x[:, :, 0] - rot_sin * x[:, :, 1]
+            x_new[:, :, 1] = rot_sin * x[:, :, 0] + rot_cos * x[:, :, 1]
+            x_new[:, :, 2] = rot_cos * x[:, :, 2] - rot_sin * x[:, :, 3]
+            x_new[:, :, 3] = rot_sin * x[:, :, 2] + rot_cos * x[:, :, 3]
+            x = x_new
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         x = torch.cat([x, curv], dim=-1)
@@ -595,6 +607,11 @@ for epoch in range(MAX_EPOCHS):
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         if model.training:
+            if rot_cos != 1.0:  # rotation was applied
+                y_new = y_norm.clone()
+                y_new[:, :, 0] = rot_cos * y_norm[:, :, 0] - rot_sin * y_norm[:, :, 1]
+                y_new[:, :, 1] = rot_sin * y_norm[:, :, 0] + rot_cos * y_norm[:, :, 1]
+                y_norm = y_new
             noise_scale = torch.tensor([0.01, 0.01, 0.005], device=device)
             y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
 
