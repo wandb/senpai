@@ -573,6 +573,8 @@ with open(model_dir / "config.yaml", "w") as f:
     yaml.dump(model_config, f)
 
 best_val = float("inf")
+ema_val_loss = float("inf")
+ema_decay_val = 0.9
 best_metrics = {}
 global_step = 0
 train_start = time.time()
@@ -855,6 +857,7 @@ for epoch in range(MAX_EPOCHS):
                       if not (torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isnan() or
                               torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isinf())]
     val_loss_3split = sum(_3split_losses) / max(len(_3split_losses), 1)
+    ema_val_loss = val_loss_3split if ema_val_loss == float("inf") else ema_decay_val * ema_val_loss + (1 - ema_decay_val) * val_loss_3split
 
     # 4-split val/loss (all splits including ood_re)
     _4split_losses = [val_metrics_per_split[n][f"{n}/loss"] for n in VAL_SPLIT_NAMES
@@ -888,8 +891,8 @@ for epoch in range(MAX_EPOCHS):
         peak_mem_gb = 0.0
 
     tag = ""
-    if val_loss_3split < best_val:
-        best_val = val_loss_3split
+    if ema_val_loss < best_val:
+        best_val = ema_val_loss
         best_metrics = {"epoch": epoch + 1, "val_loss": val_loss_3split}
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
