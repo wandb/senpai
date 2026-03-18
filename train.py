@@ -671,6 +671,15 @@ for epoch in range(MAX_EPOCHS):
         re_loss = F.mse_loss(re_pred, log_re_target)
         loss = loss + 0.01 * re_loss
 
+        if epoch >= ema_start_epoch and ema_model is not None:
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    ema_pred = ema_model({"x": x})["preds"].float()
+            # Consistency: MSE between online and EMA on surface nodes only
+            consist_err = (pred - ema_pred.detach()) ** 2
+            consist_loss = (consist_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            loss = loss + 0.1 * consist_loss
+
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
