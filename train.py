@@ -664,6 +664,20 @@ for epoch in range(MAX_EPOCHS):
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
             loss = loss + 1.0 * coarse_loss
 
+        # Second-scale coarse pooling (pool_size=128)
+        coarse_pool_size_2 = 128
+        n_groups_2 = N // coarse_pool_size_2
+        if n_groups_2 > 1:
+            pred_trunc_2 = pred[:, :n_groups_2 * coarse_pool_size_2]
+            y_trunc_2 = y_norm[:, :n_groups_2 * coarse_pool_size_2]
+            mask_trunc_2 = mask[:, :n_groups_2 * coarse_pool_size_2]
+            pred_coarse_2 = pred_trunc_2.reshape(B, n_groups_2, coarse_pool_size_2, C).mean(dim=2)
+            y_coarse_2 = y_trunc_2.reshape(B, n_groups_2, coarse_pool_size_2, C).mean(dim=2)
+            mask_coarse_2 = mask_trunc_2.reshape(B, n_groups_2, coarse_pool_size_2).any(dim=2)
+            coarse_err_2 = (pred_coarse_2 - y_coarse_2).abs()
+            coarse_loss_2 = (coarse_err_2 * mask_coarse_2.unsqueeze(-1)).sum() / mask_coarse_2.sum().clamp(min=1)
+            loss = loss + 0.5 * coarse_loss_2  # lower weight for coarser scale
+
         log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
         re_loss = F.mse_loss(re_pred, log_re_target)
         loss = loss + 0.01 * re_loss
