@@ -617,11 +617,17 @@ for epoch in range(MAX_EPOCHS):
         if model.training:
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
-        abs_err = (pred - y_norm).abs()
+        abs_err = (pred - y_norm).abs()  # full gradient, used for surf_loss
+
+        # Volume: use 50% gradient reduction (soft stop-gradient)
+        pred_vol_mixed = 0.5 * pred.detach() + 0.5 * pred
+        abs_err_vol = (pred_vol_mixed - y_norm).abs()
+
         if epoch < 10:
             is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
             sample_mask = (~is_tandem_curr).float()[:, None, None]
             abs_err = abs_err * sample_mask
+            abs_err_vol = abs_err_vol * sample_mask
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
@@ -639,7 +645,7 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_mask_train = vol_mask
 
-        vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+        vol_loss = (abs_err_vol * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem = (x[:, 0, 21].abs() > 0.01)
         tandem_boost = torch.where(is_tandem, 1.5, 1.0).to(device)
         surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
@@ -802,6 +808,13 @@ for epoch in range(MAX_EPOCHS):
 
     dt = time.time() - t0
 
+    # Select checkpoint by average surface pressure MAE across 3 splits
+    _3split_names = ["val_in_dist", "val_tandem_transfer", "val_ood_cond"]
+    _surf_p_metric = sum(
+        val_metrics_per_split[n].get(f"{n}/mae_surf_p", float('inf'))
+        for n in _3split_names
+    ) / len(_3split_names)
+
     # --- Log to wandb ---
     metrics = {
         "train/vol_loss": epoch_vol,
@@ -809,6 +822,7 @@ for epoch in range(MAX_EPOCHS):
         "val/loss": val_loss_3split,
         "val/loss_3split": val_loss_3split,
         "val/loss_4split": val_loss_4split,
+        "val/surf_p_3split": _surf_p_metric,
         "lr": scheduler.get_last_lr()[0],
         "epoch_time_s": dt,
     }
@@ -823,9 +837,9 @@ for epoch in range(MAX_EPOCHS):
         peak_mem_gb = 0.0
 
     tag = ""
-    if val_loss_3split < best_val:
-        best_val = val_loss_3split
-        best_metrics = {"epoch": epoch + 1, "val_loss": val_loss_3split}
+    if _surf_p_metric < best_val:
+        best_val = _surf_p_metric
+        best_metrics = {"epoch": epoch + 1, "val_loss": val_loss_3split, "surf_p_metric": _surf_p_metric}
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
