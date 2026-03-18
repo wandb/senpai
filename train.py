@@ -40,6 +40,8 @@ import simple_parsing as sp
 from data.utils import visualize
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
 
+torch.set_float32_matmul_precision('high')
+
 
 # ---------------------------------------------------------------------------
 # Transolver model (inlined so students can
@@ -463,7 +465,7 @@ model_config = dict(
     space_dim=2,
     fun_dim=X_DIM - 2 + 1 + 16,  # X_DIM=24 + 1 curvature proxy + 16 Fourier PE; fun_dim + space_dim must equal x.shape[-1]
     out_dim=3,
-    n_hidden=128,
+    n_hidden=160,  # was 128
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
     n_head=4,
     slice_num=32,  # was 64 — fewer slices for faster attention, more epochs
@@ -473,6 +475,8 @@ model_config = dict(
 )
 
 model = Transolver(**model_config).to(device)
+model = torch.compile(model, mode="reduce-overhead")
+_base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
@@ -683,10 +687,10 @@ for epoch in range(MAX_EPOCHS):
         optimizer.step()
         if epoch >= ema_start_epoch:
             if ema_model is None:
-                ema_model = deepcopy(model)
+                ema_model = deepcopy(_base_model)
             else:
                 with torch.no_grad():
-                    for ep, mp in zip(ema_model.parameters(), model.parameters()):
+                    for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
