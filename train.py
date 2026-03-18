@@ -673,7 +673,11 @@ for epoch in range(MAX_EPOCHS):
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        with torch.no_grad():
+            total_norm = torch.norm(torch.stack([p.grad.norm() for p in model.parameters() if p.grad is not None]))
+        if global_step % 10 == 0:
+            wandb.log({"train/grad_norm": total_norm.item()}, commit=False)
         optimizer.step()
         if epoch >= ema_start_epoch:
             if ema_model is None:
@@ -872,9 +876,12 @@ if best_metrics:
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     plot_dir = Path("plots") / run.id
     # Visualize from val_in_dist — same distribution as original val_ds
-    images = visualize(model, val_splits["val_in_dist"], stats, device,
-                       n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
-    if images:
-        wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    try:
+        images = visualize(model, val_splits["val_in_dist"], stats, device,
+                           n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
+        if images:
+            wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    except Exception as e:
+        print(f"Visualization skipped: {e}")
 
 wandb.finish()
