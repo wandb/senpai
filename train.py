@@ -269,6 +269,13 @@ class Transolver(nn.Module):
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.surface_refine = nn.Sequential(
+            nn.Linear(n_hidden + 3, 64),  # hidden + first-pass pred
+            nn.GELU(),
+            nn.Linear(64, 3),
+        )
+        nn.init.zeros_(self.surface_refine[-1].weight)
+        nn.init.zeros_(self.surface_refine[-1].bias)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -335,10 +342,17 @@ class Transolver(nn.Module):
             fx = block(fx, raw_xy=raw_xy)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
+        fx_hidden = fx  # save hidden features for surface refinement
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
 
         fx = self.blocks[-1](fx, raw_xy=raw_xy)
-        fx = fx + self.out_skip(fx_pre)
+        fx = fx + self.out_skip(fx_pre)  # first-pass prediction [B, N, 3]
+
+        # Surface refinement: small residual correction from hidden + first-pass
+        refine_input = torch.cat([fx_hidden, fx.detach()], dim=-1)  # [B, N, n_hidden+3]
+        correction = self.surface_refine(refine_input)  # [B, N, 3]
+        fx = fx + 0.1 * correction
+
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred}
 
@@ -872,9 +886,12 @@ if best_metrics:
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     plot_dir = Path("plots") / run.id
     # Visualize from val_in_dist — same distribution as original val_ds
-    images = visualize(model, val_splits["val_in_dist"], stats, device,
-                       n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
-    if images:
-        wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    try:
+        images = visualize(model, val_splits["val_in_dist"], stats, device,
+                           n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
+        if images:
+            wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    except Exception as e:
+        print(f"Visualization skipped: {e}")
 
 wandb.finish()
