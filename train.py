@@ -465,7 +465,7 @@ model_config = dict(
     out_dim=3,
     n_hidden=128,
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
-    n_head=4,
+    n_head=2,
     slice_num=32,  # was 64 — fewer slices for faster attention, more epochs
     mlp_ratio=2,
     output_fields=["Ux", "Uy", "p"],
@@ -670,7 +670,7 @@ for epoch in range(MAX_EPOCHS):
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
         optimizer.step()
         if epoch >= ema_start_epoch:
             if ema_model is None:
