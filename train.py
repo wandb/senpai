@@ -563,6 +563,8 @@ global_step = 0
 train_start = time.time()
 prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
+introduce_tandem = False
+prev_val_in_dist_loss = float('inf')
 
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
@@ -618,7 +620,7 @@ for epoch in range(MAX_EPOCHS):
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
-        if epoch < 10:
+        if not introduce_tandem:
             is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
             sample_mask = (~is_tandem_curr).float()[:, None, None]
             abs_err = abs_err * sample_mask
@@ -842,6 +844,11 @@ for epoch in range(MAX_EPOCHS):
         f"train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  "
         f"val[{split_summary}]{tag}"
     )
+    if not introduce_tandem and epoch >= 5:
+        in_dist_loss = val_metrics_per_split.get('val_in_dist', {}).get('val_in_dist/loss', float('inf'))
+        if in_dist_loss < 2.0:
+            introduce_tandem = True
+            print(f"  [CURRICULUM] Introducing tandem at epoch {epoch+1} (val_in_dist/loss={in_dist_loss:.3f})")
 
 
 # --- Final summary ---
