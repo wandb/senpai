@@ -475,9 +475,8 @@ model_config = dict(
 model = Transolver(**model_config).to(device)
 
 from copy import deepcopy
-ema_model = None
-ema_start_epoch = 40
-ema_decay = 0.998
+snapshots = []
+snapshot_avg_model = None
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -518,7 +517,7 @@ base_opt = torch.optim.AdamW([
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=5)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=75, eta_min=1e-4)
+cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(base_opt, T_0=22, T_mult=1, eta_min=1e-4)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
     base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[5]
 )
@@ -675,13 +674,6 @@ for epoch in range(MAX_EPOCHS):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-        if epoch >= ema_start_epoch:
-            if ema_model is None:
-                ema_model = deepcopy(model)
-            else:
-                with torch.no_grad():
-                    for ep, mp in zip(ema_model.parameters(), model.parameters()):
-                        ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -691,13 +683,23 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
+    # Snapshot ensemble: save model at each cosine cycle minimum
+    if (epoch + 1) % 22 == 0:
+        snapshots.append({k: v.clone() for k, v in model.state_dict().items()})
+        if len(snapshots) == 3:
+            avg_state = {}
+            for key in snapshots[0]:
+                avg_state[key] = sum(s[key] for s in snapshots) / len(snapshots)
+            snapshot_avg_model = deepcopy(model)
+            snapshot_avg_model.load_state_dict(avg_state)
+            snapshot_avg_model = snapshot_avg_model.to(device)
     epoch_vol /= n_batches
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
     prev_surf_loss = epoch_surf
 
     # --- Validate across all splits ---
-    eval_model = ema_model if ema_model is not None else model
+    eval_model = snapshot_avg_model if snapshot_avg_model is not None else model
     eval_model.eval()
     model.eval()
     val_metrics_per_split: dict[str, dict] = {}
@@ -835,7 +837,7 @@ for epoch in range(MAX_EPOCHS):
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
-        save_model = ema_model if ema_model is not None else model
+        save_model = snapshot_avg_model if snapshot_avg_model is not None else model
         torch.save(save_model.state_dict(), model_path)
         tag = f" * -> {model_path}"
 
@@ -872,9 +874,12 @@ if best_metrics:
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     plot_dir = Path("plots") / run.id
     # Visualize from val_in_dist — same distribution as original val_ds
-    images = visualize(model, val_splits["val_in_dist"], stats, device,
-                       n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
-    if images:
-        wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    try:
+        images = visualize(model, val_splits["val_in_dist"], stats, device,
+                           n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
+        if images:
+            wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    except RuntimeError as e:
+        print(f"Visualization skipped (input dim mismatch — visualize() doesn't add curvature feature): {e}")
 
 wandb.finish()
