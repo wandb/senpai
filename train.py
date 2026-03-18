@@ -355,7 +355,7 @@ MAX_EPOCHS = 100
 @dataclass
 class Config:
     lr: float = 3e-3
-    weight_decay: float = 1e-4
+    weight_decay: float = 0.0
     batch_size: int = 4
     surf_weight: float = 20.0
     manifest: str = "data/split_manifest.json"
@@ -591,10 +591,6 @@ for epoch in range(MAX_EPOCHS):
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
-        if model.training:
-            noise_scale = torch.tensor([0.01, 0.01, 0.005], device=device)
-            y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
-
         # Per-sample std normalization: skip tandem samples (gap feature index 21)
         raw_gap = x[:, 0, 21]
         is_tandem = raw_gap.abs() > 0.5
