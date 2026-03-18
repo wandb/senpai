@@ -671,6 +671,31 @@ for epoch in range(MAX_EPOCHS):
         re_loss = F.mse_loss(re_pred, log_re_target)
         loss = loss + 0.01 * re_loss
 
+        spectral_loss = torch.tensor(0.0, device=device)
+        for b in range(B):
+            s_idx = surf_mask[b].nonzero(as_tuple=True)[0]
+            if len(s_idx) < 8:
+                continue
+            # Order surface nodes by SAF (arc-length) for 1D signal
+            saf_vals = x[b, s_idx, 2]  # SAF x-component as proxy for ordering
+            order = saf_vals.argsort()
+
+            pred_p = pred[b, s_idx[order], 2]  # predicted pressure, ordered
+            true_p = y_norm[b, s_idx[order], 2]  # target pressure, ordered
+
+            # 1D DFT
+            fft_pred = torch.fft.rfft(pred_p)
+            fft_true = torch.fft.rfft(true_p)
+
+            # Frequency weights: gently upweight high frequencies
+            n_freq = fft_pred.shape[0]
+            freq_weight = 1.0 + 0.5 * torch.arange(n_freq, device=device).float() / max(n_freq - 1, 1)
+
+            spectral_loss += ((fft_pred - fft_true).abs() * freq_weight).mean()
+
+        spectral_loss = spectral_loss / B
+        loss = loss + 0.1 * spectral_loss
+
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
