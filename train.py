@@ -461,7 +461,7 @@ print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 1,  # X_DIM=24 + 1 curvature proxy; fun_dim + space_dim must equal x.shape[-1]
+    fun_dim=X_DIM - 2 + 2,  # X_DIM=24 + 1 curvature proxy + 1 surface-normal angle; fun_dim + space_dim must equal x.shape[-1]
     out_dim=3,
     n_hidden=128,
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
@@ -590,7 +590,8 @@ for epoch in range(MAX_EPOCHS):
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
-        x = torch.cat([x, curv], dim=-1)
+        surf_angle = torch.atan2(x[:, :, 3:4], x[:, :, 2:3]) * is_surface.float().unsqueeze(-1)
+        x = torch.cat([x, curv, surf_angle], dim=-1)
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
@@ -723,7 +724,8 @@ for epoch in range(MAX_EPOCHS):
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
-                x = torch.cat([x, curv], dim=-1)
+                surf_angle = torch.atan2(x[:, :, 3:4], x[:, :, 2:3]) * is_surface.float().unsqueeze(-1)
+                x = torch.cat([x, curv, surf_angle], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
@@ -872,9 +874,12 @@ if best_metrics:
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     plot_dir = Path("plots") / run.id
     # Visualize from val_in_dist — same distribution as original val_ds
-    images = visualize(model, val_splits["val_in_dist"], stats, device,
-                       n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
-    if images:
-        wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    try:
+        images = visualize(model, val_splits["val_in_dist"], stats, device,
+                           n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
+        if images:
+            wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    except Exception as e:
+        print(f"Visualization skipped: {e}")
 
 wandb.finish()
