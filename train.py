@@ -417,6 +417,17 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
 
+# Double tandem sample weights
+tandem_indices = []
+for i in range(len(train_ds)):
+    x_i = train_ds[i][0]
+    if x_i[:, -8:].abs().sum() > 0.01:  # tandem detection
+        tandem_indices.append(i)
+if tandem_indices:
+    for idx in tandem_indices:
+        sample_weights[idx] *= 2.0
+print(f"Tandem samples detected: {len(tandem_indices)}/{len(train_ds)} (weights doubled)")
+
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
 
