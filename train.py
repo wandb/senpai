@@ -461,7 +461,7 @@ print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 1 + 16,  # X_DIM=24 + 1 curvature proxy + 16 Fourier PE; fun_dim + space_dim must equal x.shape[-1]
+    fun_dim=X_DIM - 2 + 1 + 1 + 16,  # +1 curvature, +1 wall_dist, +16 Fourier PE
     out_dim=3,
     n_hidden=128,
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
@@ -591,6 +591,9 @@ for epoch in range(MAX_EPOCHS):
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         x = torch.cat([x, curv], dim=-1)
+        # Wall-distance proxy: dsdf norm for volume nodes (complement surface curvature)
+        wall_dist = x[:, :, 2:6].norm(dim=-1, keepdim=True) * (~is_surface.bool()).float().unsqueeze(-1)
+        x = torch.cat([x, wall_dist], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 frequencies
         raw_xy = x[:, :, :2]
         freqs = 2.0 ** torch.arange(4, device=x.device, dtype=x.dtype)
@@ -730,6 +733,9 @@ for epoch in range(MAX_EPOCHS):
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                 x = torch.cat([x, curv], dim=-1)
+                # Wall-distance proxy: dsdf norm for volume nodes (complement surface curvature)
+                wall_dist = x[:, :, 2:6].norm(dim=-1, keepdim=True) * (~is_surface.bool()).float().unsqueeze(-1)
+                x = torch.cat([x, wall_dist], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 frequencies
                 raw_xy = x[:, :, :2]
                 freqs = 2.0 ** torch.arange(4, device=x.device, dtype=x.dtype)
