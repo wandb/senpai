@@ -662,6 +662,7 @@ for epoch in range(MAX_EPOCHS):
             vol_mask_train = vol_mask
 
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+        vol_loss = vol_loss * 0.1  # surface gradient dominance
         is_tandem = (x[:, 0, 21].abs() > 0.01)
         tandem_boost = torch.where(is_tandem, 1.5, 1.0).to(device)
         surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
