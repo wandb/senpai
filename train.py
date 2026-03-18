@@ -109,6 +109,10 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout),
         )
+        # Depthwise conv across slice dimension for token mixing
+        self.slice_conv = nn.Conv1d(dim_head, dim_head, kernel_size=3, padding=1, groups=dim_head)
+        nn.init.zeros_(self.slice_conv.weight)
+        nn.init.zeros_(self.slice_conv.bias)
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
 
     def forward(self, x, spatial_bias=None):
@@ -143,6 +147,11 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
         attn_weights = F.softmax(attn_logits, dim=-1)
         out_slice_token = torch.matmul(attn_weights, v_slice_token)
+        # Token mixing: depthwise conv across slices
+        B_s, H_s, S_s, D_s = out_slice_token.shape
+        conv_in = out_slice_token.reshape(B_s * H_s, S_s, D_s).permute(0, 2, 1)  # [B*H, D, S]
+        conv_out = self.slice_conv(conv_in).permute(0, 2, 1).reshape(B_s, H_s, S_s, D_s)
+        out_slice_token = out_slice_token + conv_out
         out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
 
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
