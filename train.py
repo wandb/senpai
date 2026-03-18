@@ -598,8 +598,12 @@ for epoch in range(MAX_EPOCHS):
         x = torch.cat([x, curv], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
+        # Normalize xy to [0,1] per-sample for consistent Fourier encoding
+        xy_min = raw_xy.amin(dim=1, keepdim=True)
+        xy_max = raw_xy.amax(dim=1, keepdim=True)
+        xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
         freqs = model.fourier_freqs.abs()
-        xy_scaled = raw_xy.unsqueeze(-1) * freqs  # [B, N, 2, 4]
+        xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
         Umag, q = _umag_q(y, mask)
@@ -737,8 +741,12 @@ for epoch in range(MAX_EPOCHS):
                 x = torch.cat([x, curv], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
+                # Normalize xy to [0,1] per-sample for consistent Fourier encoding
+                xy_min = raw_xy.amin(dim=1, keepdim=True)
+                xy_max = raw_xy.amax(dim=1, keepdim=True)
+                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
                 freqs = model.fourier_freqs.abs()
-                xy_scaled = raw_xy.unsqueeze(-1) * freqs  # [B, N, 2, 4]
+                xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
                 Umag, q = _umag_q(y, mask)
