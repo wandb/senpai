@@ -21,6 +21,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
 """
 
 import os
+import random
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -269,6 +270,7 @@ class Transolver(nn.Module):
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.zone_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 3))
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -336,11 +338,12 @@ class Transolver(nn.Module):
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
+        zone_pred = self.zone_head(fx_pre)  # [B, N, 3] — per-node zone logits
 
         fx = self.blocks[-1](fx, raw_xy=raw_xy)
         fx = fx + self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred}
+        return {"preds": fx, "re_pred": re_pred, "zone_pred": zone_pred}
 
 
 # ---------------------------------------------------------------------------
@@ -364,9 +367,15 @@ class Config:
     wandb_name: str | None = None
     agent: str | None = None
     debug: bool = False
+    seed: int = 42
 
 
 cfg = sp.parse(Config)
+
+random.seed(cfg.seed)
+torch.manual_seed(cfg.seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(cfg.seed)
 
 if cfg.debug:
     MAX_EPOCHS = 3
@@ -617,6 +626,7 @@ for epoch in range(MAX_EPOCHS):
             re_pred = out["re_pred"]
         pred = pred.float()
         re_pred = re_pred.float()
+        zone_pred = out["zone_pred"].float()  # [B, N, 3]
         if model.training:
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
@@ -670,6 +680,17 @@ for epoch in range(MAX_EPOCHS):
         log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
         re_loss = F.mse_loss(re_pred, log_re_target)
         loss = loss + 0.01 * re_loss
+
+        # Zone prediction auxiliary: surface=2, near-surface=1, background=0
+        N = pred.shape[1]
+        dsdf_mag = x[:, :, 2:6].norm(dim=-1)  # [B, N]
+        dsdf_mag_median = dsdf_mag[mask].median()
+        zone_labels = torch.zeros(B, N, dtype=torch.long, device=device)
+        zone_labels[surf_mask] = 2
+        near_surf_mask = mask & ~is_surface & (dsdf_mag < dsdf_mag_median)
+        zone_labels[near_surf_mask] = 1
+        zone_loss = F.cross_entropy(zone_pred[mask], zone_labels[mask])
+        loss = loss + 0.01 * zone_loss
 
         optimizer.zero_grad()
         loss.backward()
