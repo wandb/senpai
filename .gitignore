@@ -20,8 +20,8 @@ venv/
 .idea/
 
 # Claude Code
-.claude/
-!.claude/skills/
+# .claude/
+# !.claude/skills/
 
 # OS
 .DS_Store
