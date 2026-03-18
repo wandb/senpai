@@ -412,9 +412,9 @@ def _phys_norm(y, Umag, q):
 def _phys_denorm(y_p, Umag, q):
     """Reverse physics normalization: Ux/Umag→Ux, Uy/Umag→Uy, Cp→p."""
     y = y_p.clone()
-    y[:, :, 0:1] = y_p[:, :, 0:1].clamp(-50, 50) * Umag
-    y[:, :, 1:2] = y_p[:, :, 1:2].clamp(-50, 50) * Umag
-    y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-100, 100) * q
+    y[:, :, 0:1] = y_p[:, :, 0:1].clamp(-10, 10) * Umag
+    y[:, :, 1:2] = y_p[:, :, 1:2].clamp(-10, 10) * Umag
+    y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
 
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
@@ -740,14 +740,18 @@ for epoch in range(MAX_EPOCHS):
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
+                abs_err = abs_err.nan_to_num(0.0)
 
                 vol_mask = mask & ~is_surface
                 surf_mask = mask & is_surface
                 val_vol += min(
                     (abs_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item(),
-                    1e12
+                    1e6
                 )
-                val_surf += (abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+                val_surf += min(
+                    (abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item(),
+                    1e6
+                )
                 n_vbatches += 1
 
                 # Denormalize: phys_stats → Cp space → original scale
@@ -764,6 +768,8 @@ for epoch in range(MAX_EPOCHS):
 
         val_vol /= max(n_vbatches, 1)
         val_surf /= max(n_vbatches, 1)
+        val_vol = float(torch.tensor(val_vol).nan_to_num(0.0).clamp(max=1e6))
+        val_surf = float(torch.tensor(val_surf).nan_to_num(0.0).clamp(max=1e6))
         split_loss = val_vol + cfg.surf_weight * val_surf
         mae_surf /= n_surf.clamp(min=1)
         mae_vol /= n_vol.clamp(min=1)
@@ -781,12 +787,18 @@ for epoch in range(MAX_EPOCHS):
         }
         val_loss_sum += split_loss
 
-    # val/loss = mean across finite splits; NaN-robust for checkpoint selection
-    finite_losses = [val_metrics_per_split[name][f"{name}/loss"]
-                     for name in VAL_SPLIT_NAMES
-                     if not (torch.tensor(val_metrics_per_split[name][f"{name}/loss"]).isnan() or
-                             torch.tensor(val_metrics_per_split[name][f"{name}/loss"]).isinf())]
-    mean_val_loss = sum(finite_losses) / max(len(finite_losses), 1)
+    # 3-split val/loss (in_dist + tandem + ood_cond) — used for checkpoint selection
+    _3split_names = ["val_in_dist", "val_tandem_transfer", "val_ood_cond"]
+    _3split_losses = [val_metrics_per_split[n][f"{n}/loss"] for n in _3split_names
+                      if not (torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isnan() or
+                              torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isinf())]
+    val_loss_3split = sum(_3split_losses) / max(len(_3split_losses), 1)
+
+    # 4-split val/loss (all splits including ood_re)
+    _4split_losses = [val_metrics_per_split[n][f"{n}/loss"] for n in VAL_SPLIT_NAMES
+                      if not (torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isnan() or
+                              torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isinf())]
+    val_loss_4split = sum(_4split_losses) / max(len(_4split_losses), 1)
 
     dt = time.time() - t0
 
@@ -794,7 +806,9 @@ for epoch in range(MAX_EPOCHS):
     metrics = {
         "train/vol_loss": epoch_vol,
         "train/surf_loss": epoch_surf,
-        "val/loss": mean_val_loss,
+        "val/loss": val_loss_3split,
+        "val/loss_3split": val_loss_3split,
+        "val/loss_4split": val_loss_4split,
         "lr": scheduler.get_last_lr()[0],
         "epoch_time_s": dt,
     }
@@ -809,9 +823,9 @@ for epoch in range(MAX_EPOCHS):
         peak_mem_gb = 0.0
 
     tag = ""
-    if mean_val_loss < best_val:
-        best_val = mean_val_loss
-        best_metrics = {"epoch": epoch + 1, "val_loss": mean_val_loss}
+    if val_loss_3split < best_val:
+        best_val = val_loss_3split
+        best_metrics = {"epoch": epoch + 1, "val_loss": val_loss_3split}
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
