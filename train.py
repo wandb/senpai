@@ -647,7 +647,8 @@ for epoch in range(MAX_EPOCHS):
         tandem_boost = torch.where(is_tandem, 1.5, 1.0).to(device)
         surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         surf_loss = (surf_per_sample * tandem_boost).mean()
-        loss = vol_loss + surf_weight * surf_loss
+        vol_loss_scaled = vol_loss * 0.5 + vol_loss.detach() * 0.5  # halves vol gradient magnitude
+        loss = vol_loss_scaled + surf_weight * surf_loss
 
         # Multi-scale loss: coarse spatial pooling
         coarse_pool_size = 64
