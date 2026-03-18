@@ -165,6 +165,15 @@ class TransolverBlock(nn.Module):
         super().__init__()
         self.last_layer = last_layer
         self.ln_1 = nn.LayerNorm(hidden_dim)
+        self.film_fc = nn.Sequential(
+            nn.Linear(2, 32),  # input: [log_Re, AoA0]
+            nn.GELU(),
+            nn.Linear(32, 2 * hidden_dim)  # output: gamma (scale) and beta (shift)
+        )
+        # Zero-init so FiLM starts as identity transform
+        nn.init.zeros_(self.film_fc[-1].weight)
+        nn.init.zeros_(self.film_fc[-1].bias)
+        self.film_fc[-1].bias.data[:hidden_dim] = 1.0  # gamma=1, beta=0 initially
         self.attn = Physics_Attention_Irregular_Mesh(
             hidden_dim,
             heads=num_heads,
@@ -189,9 +198,14 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx, raw_xy=None):
+    def forward(self, fx, raw_xy=None, cond=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb) + fx)
+        fx_normed = self.ln_1(fx)
+        if cond is not None:
+            film = self.film_fc(cond)  # [B, 2*hidden_dim]
+            gamma, beta = film.chunk(2, dim=-1)  # each [B, hidden_dim]
+            fx_normed = gamma.unsqueeze(1) * fx_normed + beta.unsqueeze(1)
+        fx = self.ln_1_post(self.attn(fx_normed, spatial_bias=sb) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
@@ -327,17 +341,19 @@ class Transolver(nn.Module):
             x = torch.cat((x, new_pos), dim=-1)
 
         raw_xy = x[:, :, :2]
+        # Extract flow regime conditioning: log_Re (index 13) and AoA0 (index 14)
+        cond = x[:, 0, [13, 14]]  # [B, 2] — sample-level features (same for all nodes)
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy)
+            fx = block(fx, raw_xy=raw_xy, cond=cond)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, cond=cond)
         fx = fx + self.out_skip(fx_pre)
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred}
