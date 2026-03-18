@@ -639,7 +639,17 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_mask_train = vol_mask
 
-        vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+        # Huber loss for volume nodes: quadratic near zero, linear for large errors
+        # delta=0.5 means quadratic for |error| < 0.5, linear beyond
+        vol_diff = (pred - y_norm) * vol_mask_train.unsqueeze(-1)
+        vol_abs = vol_diff.abs()
+        huber_delta = 0.5
+        vol_huber = torch.where(
+            vol_abs < huber_delta,
+            0.5 * vol_diff ** 2 / huber_delta,  # quadratic regime (normalized to match L1 scale at delta)
+            vol_abs - 0.5 * huber_delta           # linear regime
+        )
+        vol_loss = vol_huber.sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem = (x[:, 0, 21].abs() > 0.01)
         tandem_boost = torch.where(is_tandem, 1.5, 1.0).to(device)
         surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
