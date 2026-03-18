@@ -642,7 +642,25 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_mask_train = vol_mask
 
-        vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+        # Inverse-distance weighting: upweight volume nodes near the surface (boundary layer)
+        with torch.no_grad():
+            vol_pos = x[:, :, :2]  # [B, N, 2] normalized positions
+            vol_weights = torch.ones(B, x.shape[1], device=device)
+            for b in range(B):
+                s_idx = surf_mask[b].nonzero(as_tuple=True)[0]
+                if len(s_idx) > 0:
+                    s_pos = vol_pos[b, s_idx]  # [S, 2]
+                    if len(s_idx) > 500:  # subsample to keep cdist fast
+                        s_pos = s_pos[torch.randperm(len(s_idx), device=device)[:500]]
+                    dists = torch.cdist(vol_pos[b].unsqueeze(0), s_pos.unsqueeze(0)).squeeze(0)
+                    dist_to_surf = dists.min(dim=-1).values  # [N]
+                    inv_dist = 1.0 / (dist_to_surf + 0.01)
+                    valid = mask[b]
+                    if valid.sum() > 0:
+                        inv_dist = inv_dist / inv_dist[valid].mean()
+                    vol_weights[b] = inv_dist
+
+        vol_loss = (abs_err * vol_mask_train.unsqueeze(-1) * vol_weights.unsqueeze(-1)).sum() / (vol_mask_train.float() * vol_weights).sum().clamp(min=1)
         is_tandem = (x[:, 0, 21].abs() > 0.01)
         tandem_boost = torch.where(is_tandem, 1.5, 1.0).to(device)
         surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
