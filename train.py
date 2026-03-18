@@ -354,9 +354,9 @@ MAX_EPOCHS = 100
 
 @dataclass
 class Config:
-    lr: float = 3e-3
+    lr: float = 4.2e-3
     weight_decay: float = 0.0
-    batch_size: int = 4
+    batch_size: int = 8
     surf_weight: float = 20.0
     manifest: str = "data/split_manifest.json"
     stats_file: str = "data/split_stats.json"
@@ -473,6 +473,8 @@ model_config = dict(
 )
 
 model = Transolver(**model_config).to(device)
+model = torch.compile(model, mode='reduce-overhead')
+_model_unwrapped = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
@@ -517,10 +519,10 @@ base_opt = torch.optim.AdamW([
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=5)
+warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=7)
 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=75, eta_min=1e-4)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
-    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[5]
+    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[7]
 )
 
 # --- wandb ---
@@ -683,10 +685,10 @@ for epoch in range(MAX_EPOCHS):
         optimizer.step()
         if epoch >= ema_start_epoch:
             if ema_model is None:
-                ema_model = deepcopy(model)
+                ema_model = deepcopy(_model_unwrapped)
             else:
                 with torch.no_grad():
-                    for ep, mp in zip(ema_model.parameters(), model.parameters()):
+                    for ep, mp in zip(ema_model.parameters(), _model_unwrapped.parameters()):
                         ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
@@ -847,7 +849,7 @@ for epoch in range(MAX_EPOCHS):
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
-        save_model = ema_model if ema_model is not None else model
+        save_model = ema_model if ema_model is not None else _model_unwrapped
         torch.save(save_model.state_dict(), model_path)
         tag = f" * -> {model_path}"
 
@@ -881,7 +883,7 @@ if best_metrics:
     wandb.summary.update({"best_" + k: v for k, v in best_metrics.items()})
 
     print("\nGenerating flow field plots...")
-    vis_model = ema_model if ema_model is not None else model
+    vis_model = ema_model if ema_model is not None else _model_unwrapped
     vis_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     vis_model.eval()
     plot_dir = Path("plots") / run.id
