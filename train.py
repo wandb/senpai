@@ -276,7 +276,7 @@ class Transolver(nn.Module):
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
-        self.fourier_freqs = nn.Parameter(torch.tensor([1.0, 2.0, 4.0, 8.0]))
+        self.fourier_freqs = nn.Parameter(torch.tensor([0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0]))
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -473,7 +473,7 @@ print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 1 + 16,  # X_DIM=24 + 1 curvature proxy + 16 Fourier PE; fun_dim + space_dim must equal x.shape[-1]
+    fun_dim=X_DIM - 2 + 1 + 32,  # 8 freqs * 2 coords * 2 (sin+cos) = 32
     out_dim=3,
     n_hidden=192,  # was 160
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
