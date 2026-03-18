@@ -611,6 +611,12 @@ for epoch in range(MAX_EPOCHS):
                     sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
             y_norm = y_norm / sample_stds
 
+        if model.training:
+            # Feature dropout: randomly zero one input channel per batch
+            drop_ch = torch.randint(0, x.shape[-1], (1,)).item()
+            x = x.clone()
+            x[:, :, drop_ch] = 0.0
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model({"x": x})
             pred = out["preds"]
