@@ -189,17 +189,21 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx, raw_xy=None):
+    def get_hidden(self, fx, raw_xy=None):
+        """Returns SE-gated hidden features before the output head."""
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
-        fx = fx * se
+        return fx * se
+
+    def forward(self, fx, raw_xy=None):
+        h = self.get_hidden(fx, raw_xy=raw_xy)
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
-        return fx
+            return self.mlp2(self.ln_3(h))
+        return h
 
 
 class Transolver(nn.Module):
@@ -269,6 +273,13 @@ class Transolver(nn.Module):
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.surface_refine = nn.Sequential(
+            nn.Linear(n_hidden + out_dim, 64),
+            nn.GELU(),
+            nn.Linear(64, out_dim),
+        )
+        nn.init.zeros_(self.surface_refine[-1].weight)
+        nn.init.zeros_(self.surface_refine[-1].bias)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -319,6 +330,7 @@ class Transolver(nn.Module):
             raise ValueError("Missing required input tensor: x")
         if condition is not None:
             raise ValueError("Transolver does not support conditioning inputs")
+        is_surface = data.get("is_surface") if isinstance(data, Mapping) else None
 
         if self.unified_pos:
             if pos is None:
@@ -337,8 +349,16 @@ class Transolver(nn.Module):
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy)
-        fx = fx + self.out_skip(fx_pre)
+        # Two-stage surface refinement: get hidden features, then first pass, then refine
+        h = self.blocks[-1].get_hidden(fx, raw_xy=raw_xy)
+        first_pass = self.blocks[-1].mlp2(self.blocks[-1].ln_3(h)) + self.out_skip(fx_pre)
+        refine_input = torch.cat([h, first_pass], dim=-1)  # [B, N, n_hidden + out_dim]
+        correction = self.surface_refine(refine_input)
+        if is_surface is not None:
+            surf_mask = is_surface.float().unsqueeze(-1)  # [B, N, 1]
+            fx = first_pass + correction * surf_mask
+        else:
+            fx = first_pass + correction
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred}
 
@@ -612,7 +632,7 @@ for epoch in range(MAX_EPOCHS):
             y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x, "is_surface": is_surface})
             pred = out["preds"]
             re_pred = out["re_pred"]
         pred = pred.float()
@@ -741,7 +761,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    pred = eval_model({"x": x, "is_surface": is_surface})["preds"]
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
