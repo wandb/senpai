@@ -595,27 +595,12 @@ for epoch in range(MAX_EPOCHS):
             noise_scale = torch.tensor([0.01, 0.01, 0.005], device=device)
             y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
 
-        # Per-sample std normalization: skip tandem samples (gap feature index 21)
-        raw_gap = x[:, 0, 21]
-        is_tandem = raw_gap.abs() > 0.5
-        B = y_norm.shape[0]
-        sample_stds = torch.ones(B, 1, 3, device=device)
-        channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
-        if model.training:
-            for b in range(B):
-                if not is_tandem[b]:
-                    valid = mask[b]
-                    sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
-            y_norm = y_norm / sample_stds
-
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model({"x": x})
             pred = out["preds"]
             re_pred = out["re_pred"]
         pred = pred.float()
         re_pred = re_pred.float()
-        if model.training:
-            pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         if epoch < 10:
@@ -722,24 +707,11 @@ for epoch in range(MAX_EPOCHS):
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
-                # Per-sample std normalization: skip tandem samples
-                raw_gap = x[:, 0, 21]
-                is_tandem = raw_gap.abs() > 0.5
-                B = y_norm.shape[0]
-                sample_stds = torch.ones(B, 1, 3, device=device)
-                channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
-                for b in range(B):
-                    if not is_tandem[b]:
-                        valid = mask[b]
-                        sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
-                y_norm_scaled = y_norm / sample_stds
-
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
-                pred_loss = pred / sample_stds
-                sq_err = (pred_loss - y_norm_scaled) ** 2
-                abs_err = (pred_loss - y_norm_scaled).abs()
+                sq_err = (pred - y_norm) ** 2
+                abs_err = (pred - y_norm).abs()
 
                 vol_mask = mask & ~is_surface
                 surf_mask = mask & is_surface
