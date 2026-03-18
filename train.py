@@ -176,7 +176,11 @@ class TransolverBlock(nn.Module):
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
-        self.spatial_bias = nn.Sequential(nn.Linear(2, 32), nn.GELU(), nn.Linear(32, slice_num))
+        self.spatial_bias = nn.Sequential(
+            nn.Linear(2, 64), nn.GELU(),
+            nn.Linear(64, 64), nn.GELU(),
+            nn.Linear(64, slice_num)
+        )
         self.ln_1_post = nn.LayerNorm(hidden_dim)
         self.ln_2_post = nn.LayerNorm(hidden_dim)
         self.se_fc1 = nn.Linear(hidden_dim, hidden_dim // 4)
