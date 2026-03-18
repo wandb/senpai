@@ -183,10 +183,12 @@ class TransolverBlock(nn.Module):
         nn.init.zeros_(self.se_fc2.bias)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
-            self.mlp2 = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, out_dim),
+            # Separate heads: velocity (2 channels) and pressure (1 channel)
+            self.head_velocity = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2)
+            )
+            self.head_pressure = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 1)
             )
 
     def forward(self, fx, raw_xy=None):
@@ -198,7 +200,10 @@ class TransolverBlock(nn.Module):
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            h = self.ln_3(fx)
+            vel = self.head_velocity(h)   # [B, N, 2]
+            pres = self.head_pressure(h)  # [B, N, 1]
+            return torch.cat([vel, pres], dim=-1)  # [B, N, 3]
         return fx
 
 
