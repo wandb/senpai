@@ -189,7 +189,7 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx, raw_xy=None):
+    def forward(self, fx, raw_xy=None, return_hidden=False):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
@@ -198,6 +198,8 @@ class TransolverBlock(nn.Module):
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
         if self.last_layer:
+            if return_hidden:
+                return self.mlp2(self.ln_3(fx)), fx  # (out_dim, n_hidden)
             return self.mlp2(self.ln_3(fx))
         return fx
 
@@ -337,9 +339,10 @@ class Transolver(nn.Module):
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
-        zone_pred = self.zone_head(fx)  # [B, N, 3] — 3 zone classes
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy)
+        # Run last block and capture post-attention hidden state for zone prediction
+        fx, fx_hidden = self.blocks[-1](fx, raw_xy=raw_xy, return_hidden=True)
+        zone_pred = self.zone_head(fx_hidden)  # [B, N, 3] — applied post-attention
         fx = fx + self.out_skip(fx_pre)
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred, "zone_pred": zone_pred}
@@ -687,7 +690,7 @@ for epoch in range(MAX_EPOCHS):
         zone_loss = F.cross_entropy(
             out["zone_pred"].float().reshape(-1, 3), zone_target.reshape(-1), ignore_index=-1
         )
-        loss = loss + 0.01 * zone_loss
+        loss = loss + 0.1 * zone_loss
 
         optimizer.zero_grad()
         loss.backward()
