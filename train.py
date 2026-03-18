@@ -269,6 +269,15 @@ class Transolver(nn.Module):
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        # FiLM conditioning on global flow parameters
+        self.cond_net = nn.Sequential(
+            nn.Linear(4, 32),  # input: [log_Re, AoA0, AoA1, gap]
+            nn.GELU(),
+            nn.Linear(32, n_hidden * 2),  # output: scale and shift
+        )
+        nn.init.zeros_(self.cond_net[-1].weight)
+        nn.init.zeros_(self.cond_net[-1].bias)
+        self.cond_net[-1].bias.data[:n_hidden] = 1.0  # scale starts at 1, shift starts at 0
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -336,6 +345,13 @@ class Transolver(nn.Module):
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
+
+        # FiLM conditioning on global flow parameters before final block
+        cond = x[:, 0, [13, 14, 18, 22]]  # [B, 4] — log_Re, AoA0, AoA1, gap (same for all nodes)
+        film_params = self.cond_net(cond)  # [B, n_hidden*2]
+        scale = film_params[:, :self.n_hidden].unsqueeze(1)  # [B, 1, n_hidden]
+        shift = film_params[:, self.n_hidden:].unsqueeze(1)  # [B, 1, n_hidden]
+        fx = fx * scale + shift  # modulate before final block
 
         fx = self.blocks[-1](fx, raw_xy=raw_xy)
         fx = fx + self.out_skip(fx_pre)
@@ -871,10 +887,13 @@ if best_metrics:
     print("\nGenerating flow field plots...")
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     plot_dir = Path("plots") / run.id
-    # Visualize from val_in_dist — same distribution as original val_ds
-    images = visualize(model, val_splits["val_in_dist"], stats, device,
-                       n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
-    if images:
-        wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    try:
+        # Visualize from val_in_dist — same distribution as original val_ds
+        images = visualize(model, val_splits["val_in_dist"], stats, device,
+                           n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
+        if images:
+            wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    except RuntimeError as e:
+        print(f"Visualization skipped (input dim mismatch — visualize() doesn't add curvature feature): {e}")
 
 wandb.finish()
