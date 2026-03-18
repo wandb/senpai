@@ -244,6 +244,8 @@ class Transolver(nn.Module):
             )
         else:
             self.preprocess = MLP(fun_dim + space_dim, n_hidden * 2, n_hidden, n_layers=1, res=True, act=act)
+        self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
+        nn.init.eye_(self.feature_cross.weight)  # start as identity — no effect at init
 
         self.n_hidden = n_hidden
         self.space_dim = space_dim
@@ -327,6 +329,8 @@ class Transolver(nn.Module):
             x = torch.cat((x, new_pos), dim=-1)
 
         raw_xy = x[:, :, :2]
+        x_cross = x * self.feature_cross(x)  # element-wise product of x with linear transform of x
+        x = x + 0.1 * x_cross  # residual with small scale — preserves original features
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
