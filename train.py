@@ -475,12 +475,9 @@ model_config = dict(
 model = Transolver(**model_config).to(device)
 
 from copy import deepcopy
-ema_fast = None  # starts epoch 40, decay 0.995 — for velocity channels
-ema_slow = None  # starts epoch 55, decay 0.999 — for pressure channel
-ema_fast_start = 40
-ema_slow_start = 55
-ema_fast_decay = 0.995
-ema_slow_decay = 0.999
+ema_model = None
+ema_start_epoch = 40  # was 65 — earlier start gives more averaging epochs
+ema_decay = 0.998
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -675,22 +672,13 @@ for epoch in range(MAX_EPOCHS):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-        # Fast EMA (velocity channels)
-        if epoch >= ema_fast_start:
-            if ema_fast is None:
-                ema_fast = deepcopy(model)
+        if epoch >= ema_start_epoch:
+            if ema_model is None:
+                ema_model = deepcopy(model)
             else:
                 with torch.no_grad():
-                    for ep, mp in zip(ema_fast.parameters(), model.parameters()):
-                        ep.data.mul_(ema_fast_decay).add_(mp.data, alpha=1 - ema_fast_decay)
-        # Slow EMA (pressure channel)
-        if epoch >= ema_slow_start:
-            if ema_slow is None:
-                ema_slow = deepcopy(model)
-            else:
-                with torch.no_grad():
-                    for ep, mp in zip(ema_slow.parameters(), model.parameters()):
-                        ep.data.mul_(ema_slow_decay).add_(mp.data, alpha=1 - ema_slow_decay)
+                    for ep, mp in zip(ema_model.parameters(), model.parameters()):
+                        ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -706,11 +694,8 @@ for epoch in range(MAX_EPOCHS):
     prev_surf_loss = epoch_surf
 
     # --- Validate across all splits ---
-    eval_model_fast = ema_fast if ema_fast is not None else model
-    eval_model_slow = ema_slow if ema_slow is not None else (ema_fast if ema_fast is not None else model)
-    eval_model = eval_model_fast  # primary for the eval loop structure
-    eval_model_fast.eval()
-    eval_model_slow.eval()
+    eval_model = ema_model if ema_model is not None else model
+    eval_model.eval()
     model.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
@@ -750,15 +735,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    out_fast = eval_model_fast({"x": x})
-                    pred_fast = out_fast["preds"]
-                    if ema_slow is not None and ema_slow is not eval_model_fast:
-                        out_slow = eval_model_slow({"x": x})
-                        pred_slow = out_slow["preds"]
-                        pred = pred_fast.clone()
-                        pred[:, :, 2:3] = pred_slow[:, :, 2:3]  # pressure from slow EMA
-                    else:
-                        pred = pred_fast
+                    pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
@@ -838,7 +815,7 @@ for epoch in range(MAX_EPOCHS):
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
-        save_model = ema_fast if ema_fast is not None else model
+        save_model = ema_model if ema_model is not None else model
         torch.save(save_model.state_dict(), model_path)
         tag = f" * -> {model_path}"
 
