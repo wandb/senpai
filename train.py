@@ -740,9 +740,23 @@ for epoch in range(MAX_EPOCHS):
                         sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
                 y_norm_scaled = y_norm / sample_stds
 
+                n_tta = 5
+                B_val, N_val = x.shape[0], x.shape[1]
+
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
-                pred = pred.float()
+                    # Always include original full prediction
+                    pred_full = eval_model({"x": x})["preds"].float()
+
+                    preds_tta = [pred_full]
+                    for _ in range(n_tta - 1):
+                        # Randomly mask 20% of volume nodes (keep all surface + masked nodes)
+                        keep = torch.rand(B_val, N_val, device=device) < 0.8
+                        keep = keep | is_surface | ~mask  # always keep surface and padding
+                        x_masked = x * keep.unsqueeze(-1).float()
+                        pred_i = eval_model({"x": x_masked})["preds"].float()
+                        preds_tta.append(pred_i)
+
+                    pred = torch.stack(preds_tta).mean(0)
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
