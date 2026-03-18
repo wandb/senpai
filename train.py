@@ -619,6 +619,25 @@ for epoch in range(MAX_EPOCHS):
         re_pred = re_pred.float()
         if model.training:
             pred = pred / sample_stds
+        # Smooth surface predictions: each surface node averages with its 2 nearest surface neighbors
+        B, N, C = pred.shape
+        pred_smooth = pred.clone()
+        for b in range(B):
+            s_mask = mask[b] & is_surface[b]  # [N]
+            if s_mask.sum() < 3:
+                continue
+            s_idx = s_mask.nonzero(as_tuple=True)[0]
+            s_pos = x[b, s_idx, :2]  # [S, 2] - surface positions
+            # Sort surface nodes by angle from centroid for 1D ordering
+            centroid = s_pos.mean(0)
+            angles = torch.atan2(s_pos[:, 1] - centroid[1], s_pos[:, 0] - centroid[0])
+            order = angles.argsort()
+            s_idx_ordered = s_idx[order]
+            # 1D convolution: average with neighbors (kernel size 3)
+            s_pred = pred[b, s_idx_ordered]  # [S, C]
+            s_smoothed = (s_pred.roll(1, 0) + s_pred + s_pred.roll(-1, 0)) / 3.0
+            pred_smooth[b, s_idx_ordered] = s_smoothed
+        pred = pred_smooth
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         if epoch < 10:
@@ -743,6 +762,25 @@ for epoch in range(MAX_EPOCHS):
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
+                # Smooth surface predictions: each surface node averages with its 2 nearest surface neighbors
+                B, N, C = pred.shape
+                pred_smooth = pred.clone()
+                for b in range(B):
+                    s_mask = mask[b] & is_surface[b]  # [N]
+                    if s_mask.sum() < 3:
+                        continue
+                    s_idx = s_mask.nonzero(as_tuple=True)[0]
+                    s_pos = x[b, s_idx, :2]  # [S, 2] - surface positions
+                    # Sort surface nodes by angle from centroid for 1D ordering
+                    centroid = s_pos.mean(0)
+                    angles = torch.atan2(s_pos[:, 1] - centroid[1], s_pos[:, 0] - centroid[0])
+                    order = angles.argsort()
+                    s_idx_ordered = s_idx[order]
+                    # 1D convolution: average with neighbors (kernel size 3)
+                    s_pred = pred[b, s_idx_ordered]  # [S, C]
+                    s_smoothed = (s_pred.roll(1, 0) + s_pred + s_pred.roll(-1, 0)) / 3.0
+                    pred_smooth[b, s_idx_ordered] = s_smoothed
+                pred = pred_smooth
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
