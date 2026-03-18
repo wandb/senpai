@@ -647,7 +647,7 @@ for epoch in range(MAX_EPOCHS):
         loss = vol_loss + surf_weight * surf_loss
 
         # Multi-scale loss: coarse spatial pooling
-        coarse_pool_size = 64
+        coarse_pool_size = 128
         B, N, C = pred.shape
         n_groups = N // coarse_pool_size
         if n_groups > 1:
