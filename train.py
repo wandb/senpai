@@ -348,7 +348,7 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-MAX_TIMEOUT = 30.0  # minutes
+MAX_TIMEOUT = 14.0  # minutes per model — train two models sequentially
 MAX_EPOCHS = 100
 
 
@@ -472,14 +472,11 @@ model_config = dict(
     output_dims=[1, 1, 1],
 )
 
-model = Transolver(**model_config).to(device)
-
 from copy import deepcopy
-ema_model = None
 ema_start_epoch = 40
 ema_decay = 0.998
 
-n_params = sum(p.numel() for p in model.parameters())
+n_params = sum(p.numel() for p in Transolver(**model_config).parameters())
 
 
 class Lookahead:
@@ -509,19 +506,6 @@ class Lookahead:
     def param_groups(self):
         return self.base_optimizer.param_groups
 
-
-attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
-other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
-base_opt = torch.optim.AdamW([
-    {'params': attn_params, 'lr': cfg.lr * 0.5},
-    {'params': other_params, 'lr': cfg.lr}
-], weight_decay=cfg.weight_decay)
-optimizer = Lookahead(base_opt, k=10, alpha=0.8)
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=5)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=75, eta_min=1e-4)
-scheduler = torch.optim.lr_scheduler.SequentialLR(
-    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[5]
-)
 
 # --- wandb ---
 run = wandb.init(
@@ -553,346 +537,487 @@ wandb.define_metric("val_predictions", step_metric="global_step")
 
 model_dir = Path(f"models/model-{run.id}")
 model_dir.mkdir(parents=True)
-model_path = model_dir / "checkpoint.pt"
+model_a_path = model_dir / "model_a.pt"
+model_b_path = model_dir / "model_b.pt"
 with open(model_dir / "config.yaml", "w") as f:
     yaml.dump(model_config, f)
 
-best_val = float("inf")
-best_metrics = {}
 global_step = 0
-train_start = time.time()
-prev_vol_loss = 1.0
-prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 
-for epoch in range(MAX_EPOCHS):
-    elapsed_min = (time.time() - train_start) / 60.0
-    if elapsed_min >= MAX_TIMEOUT:
-        print(f"Wall-clock limit reached ({elapsed_min:.1f} min >= {MAX_TIMEOUT} min). Stopping.")
-        break
 
-    t0 = time.time()
+def train_model(seed, save_path):
+    global global_step
+    torch.manual_seed(seed)
+    model = Transolver(**model_config).to(device)
+    ema_model = None
 
-    # Adaptive surface weight: loss-ratio based, clamped [5, 50]
-    surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+    attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+    other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+    base_opt = torch.optim.AdamW([
+        {'params': attn_params, 'lr': cfg.lr * 0.5},
+        {'params': other_params, 'lr': cfg.lr}
+    ], weight_decay=cfg.weight_decay)
+    optimizer = Lookahead(base_opt, k=10, alpha=0.8)
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=5)
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=75, eta_min=1e-4)
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[5]
+    )
 
-    # --- Train ---
-    model.train()
-    epoch_vol = 0.0
-    epoch_surf = 0.0
-    n_batches = 0
+    best_val = float("inf")
+    best_metrics = {}
+    train_start = time.time()
+    prev_vol_loss = 1.0
+    prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
-    for x, y, is_surface, mask in pbar:
-        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-        is_surface = is_surface.to(device, non_blocking=True)
-        mask = mask.to(device, non_blocking=True)
+    for epoch in range(MAX_EPOCHS):
+        elapsed_min = (time.time() - train_start) / 60.0
+        if elapsed_min >= MAX_TIMEOUT:
+            print(f"Wall-clock limit reached ({elapsed_min:.1f} min >= {MAX_TIMEOUT} min). Stopping.")
+            break
 
-        x = (x - stats["x_mean"]) / stats["x_std"]
-        # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
-        curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
-        x = torch.cat([x, curv], dim=-1)
-        Umag, q = _umag_q(y, mask)
-        y_phys = _phys_norm(y, Umag, q)
-        y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
-        if model.training:
-            noise_scale = torch.tensor([0.01, 0.01, 0.005], device=device)
-            y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
+        t0 = time.time()
 
-        # Per-sample std normalization: skip tandem samples (gap feature index 21)
-        raw_gap = x[:, 0, 21]
-        is_tandem = raw_gap.abs() > 0.5
-        B = y_norm.shape[0]
-        sample_stds = torch.ones(B, 1, 3, device=device)
-        channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
-        if model.training:
-            for b in range(B):
-                if not is_tandem[b]:
-                    valid = mask[b]
-                    sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
-            y_norm = y_norm / sample_stds
+        # Adaptive surface weight: loss-ratio based, clamped [5, 50]
+        surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
 
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
-            pred = out["preds"]
-            re_pred = out["re_pred"]
-        pred = pred.float()
-        re_pred = re_pred.float()
-        if model.training:
-            pred = pred / sample_stds
-        sq_err = (pred - y_norm) ** 2
-        abs_err = (pred - y_norm).abs()
-        if epoch < 10:
-            is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
-            sample_mask = (~is_tandem_curr).float()[:, None, None]
-            abs_err = abs_err * sample_mask
-        vol_mask = mask & ~is_surface
-        surf_mask = mask & is_surface
+        # --- Train ---
+        model.train()
+        epoch_vol = 0.0
+        epoch_surf = 0.0
+        n_batches = 0
 
-        # Progressive resolution: subsample volume nodes in loss early in training
-        # Ramps from 10% → 100% of volume nodes over first 40 epochs
-        if epoch < 40:
-            vol_keep_ratio = 0.05 + 0.95 * (epoch / 40)
-            vol_indices = vol_mask.nonzero(as_tuple=False)
-            n_vol = vol_indices.shape[0]
-            n_keep = max(int(n_vol * vol_keep_ratio), 1)
-            perm = torch.randperm(n_vol, device=vol_mask.device)[:n_keep]
-            vol_mask_train = torch.zeros_like(vol_mask)
-            if n_keep > 0:
-                vol_mask_train[vol_indices[perm, 0], vol_indices[perm, 1]] = True
-        else:
-            vol_mask_train = vol_mask
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
+        for x, y, is_surface, mask in pbar:
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            is_surface = is_surface.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
 
-        vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
-        is_tandem = (x[:, 0, 21].abs() > 0.01)
-        tandem_boost = torch.where(is_tandem, 1.5, 1.0).to(device)
-        surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
-        surf_loss = (surf_per_sample * tandem_boost).mean()
-        loss = vol_loss + surf_weight * surf_loss
+            x = (x - stats["x_mean"]) / stats["x_std"]
+            # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
+            curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+            x = torch.cat([x, curv], dim=-1)
+            Umag, q = _umag_q(y, mask)
+            y_phys = _phys_norm(y, Umag, q)
+            y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+            if model.training:
+                noise_scale = torch.tensor([0.01, 0.01, 0.005], device=device)
+                y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
 
-        # Multi-scale loss: coarse spatial pooling
-        coarse_pool_size = 64
-        B, N, C = pred.shape
-        n_groups = N // coarse_pool_size
-        if n_groups > 1:
-            # Pool predictions and targets over groups of 64 nodes
-            pred_trunc = pred[:, :n_groups * coarse_pool_size]
-            y_trunc = y_norm[:, :n_groups * coarse_pool_size]
-            mask_trunc = mask[:, :n_groups * coarse_pool_size]
-
-            pred_coarse = pred_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
-            y_coarse = y_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
-            mask_coarse = mask_trunc.reshape(B, n_groups, coarse_pool_size).any(dim=2)
-
-            coarse_err = (pred_coarse - y_coarse).abs()
-            coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
-            loss = loss + 1.0 * coarse_loss
-
-        log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
-        re_loss = F.mse_loss(re_pred, log_re_target)
-        loss = loss + 0.01 * re_loss
-
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        if epoch >= ema_start_epoch:
-            if ema_model is None:
-                ema_model = deepcopy(model)
-            else:
-                with torch.no_grad():
-                    for ep, mp in zip(ema_model.parameters(), model.parameters()):
-                        ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
-        global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
-
-        epoch_vol += vol_loss.item()
-        epoch_surf += surf_loss.item()
-        n_batches += 1
-        pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
-
-    scheduler.step()
-    epoch_vol /= n_batches
-    epoch_surf /= n_batches
-    prev_vol_loss = epoch_vol
-    prev_surf_loss = epoch_surf
-
-    # --- Validate across all splits ---
-    eval_model = ema_model if ema_model is not None else model
-    eval_model.eval()
-    model.eval()
-    val_metrics_per_split: dict[str, dict] = {}
-    val_loss_sum = 0.0
-
-    for split_name, vloader in val_loaders.items():
-        val_vol = 0.0
-        val_surf = 0.0
-        mae_surf = torch.zeros(3, device=device)
-        mae_vol = torch.zeros(3, device=device)
-        n_surf = torch.zeros(3, device=device)
-        n_vol = torch.zeros(3, device=device)
-        n_vbatches = 0
-
-        with torch.no_grad():
-            for x, y, is_surface, mask in tqdm(
-                vloader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [{split_name}]", leave=False
-            ):
-                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-                is_surface = is_surface.to(device, non_blocking=True)
-                mask = mask.to(device, non_blocking=True)
-
-                x = (x - stats["x_mean"]) / stats["x_std"]
-                # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
-                curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
-                x = torch.cat([x, curv], dim=-1)
-                Umag, q = _umag_q(y, mask)
-                y_phys = _phys_norm(y, Umag, q)
-                y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
-
-                # Per-sample std normalization: skip tandem samples
-                raw_gap = x[:, 0, 21]
-                is_tandem = raw_gap.abs() > 0.5
-                B = y_norm.shape[0]
-                sample_stds = torch.ones(B, 1, 3, device=device)
-                channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
+            # Per-sample std normalization: skip tandem samples (gap feature index 21)
+            raw_gap = x[:, 0, 21]
+            is_tandem = raw_gap.abs() > 0.5
+            B = y_norm.shape[0]
+            sample_stds = torch.ones(B, 1, 3, device=device)
+            channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
+            if model.training:
                 for b in range(B):
                     if not is_tandem[b]:
                         valid = mask[b]
                         sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
-                y_norm_scaled = y_norm / sample_stds
+                y_norm = y_norm / sample_stds
 
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
-                pred = pred.float()
-                pred_loss = pred / sample_stds
-                sq_err = (pred_loss - y_norm_scaled) ** 2
-                abs_err = (pred_loss - y_norm_scaled).abs()
-                abs_err = abs_err.nan_to_num(0.0)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out = model({"x": x})
+                pred = out["preds"]
+                re_pred = out["re_pred"]
+            pred = pred.float()
+            re_pred = re_pred.float()
+            if model.training:
+                pred = pred / sample_stds
+            sq_err = (pred - y_norm) ** 2
+            abs_err = (pred - y_norm).abs()
+            if epoch < 10:
+                is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
+                sample_mask = (~is_tandem_curr).float()[:, None, None]
+                abs_err = abs_err * sample_mask
+            vol_mask = mask & ~is_surface
+            surf_mask = mask & is_surface
 
-                vol_mask = mask & ~is_surface
-                surf_mask = mask & is_surface
-                val_vol += min(
-                    (abs_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item(),
-                    1e6
-                )
-                val_surf += min(
-                    (abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item(),
-                    1e6
-                )
-                n_vbatches += 1
+            # Progressive resolution: subsample volume nodes in loss early in training
+            # Ramps from 10% → 100% of volume nodes over first 40 epochs
+            if epoch < 40:
+                vol_keep_ratio = 0.05 + 0.95 * (epoch / 40)
+                vol_indices = vol_mask.nonzero(as_tuple=False)
+                n_vol = vol_indices.shape[0]
+                n_keep = max(int(n_vol * vol_keep_ratio), 1)
+                perm = torch.randperm(n_vol, device=vol_mask.device)[:n_keep]
+                vol_mask_train = torch.zeros_like(vol_mask)
+                if n_keep > 0:
+                    vol_mask_train[vol_indices[perm, 0], vol_indices[perm, 1]] = True
+            else:
+                vol_mask_train = vol_mask
 
-                # Denormalize: phys_stats → Cp space → original scale
-                pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
-                pred_orig = _phys_denorm(pred_phys, Umag, q)
-                y_clamped = y.clamp(-1e6, 1e6)
-                err = (pred_orig - y_clamped).abs()
-                finite = err.isfinite()
-                err = err.where(finite, torch.zeros_like(err))
-                mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
-                mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
-                n_surf += (surf_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
-                n_vol += (vol_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+            vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+            is_tandem = (x[:, 0, 21].abs() > 0.01)
+            tandem_boost = torch.where(is_tandem, 1.5, 1.0).to(device)
+            surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            surf_loss = (surf_per_sample * tandem_boost).mean()
+            loss = vol_loss + surf_weight * surf_loss
 
-        val_vol /= max(n_vbatches, 1)
-        val_surf /= max(n_vbatches, 1)
-        val_vol = float(torch.tensor(val_vol).nan_to_num(0.0).clamp(max=1e6))
-        val_surf = float(torch.tensor(val_surf).nan_to_num(0.0).clamp(max=1e6))
-        split_loss = val_vol + cfg.surf_weight * val_surf
-        mae_surf /= n_surf.clamp(min=1)
-        mae_vol /= n_vol.clamp(min=1)
+            # Multi-scale loss: coarse spatial pooling
+            coarse_pool_size = 64
+            B, N, C = pred.shape
+            n_groups = N // coarse_pool_size
+            if n_groups > 1:
+                # Pool predictions and targets over groups of 64 nodes
+                pred_trunc = pred[:, :n_groups * coarse_pool_size]
+                y_trunc = y_norm[:, :n_groups * coarse_pool_size]
+                mask_trunc = mask[:, :n_groups * coarse_pool_size]
 
-        val_metrics_per_split[split_name] = {
-            f"{split_name}/vol_loss":    val_vol,
-            f"{split_name}/surf_loss":   val_surf,
-            f"{split_name}/loss":        split_loss,
-            f"{split_name}/mae_vol_Ux":  mae_vol[0].item(),
-            f"{split_name}/mae_vol_Uy":  mae_vol[1].item(),
-            f"{split_name}/mae_vol_p":   mae_vol[2].item(),
-            f"{split_name}/mae_surf_Ux": mae_surf[0].item(),
-            f"{split_name}/mae_surf_Uy": mae_surf[1].item(),
-            f"{split_name}/mae_surf_p":  mae_surf[2].item(),
+                pred_coarse = pred_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
+                y_coarse = y_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
+                mask_coarse = mask_trunc.reshape(B, n_groups, coarse_pool_size).any(dim=2)
+
+                coarse_err = (pred_coarse - y_coarse).abs()
+                coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
+                loss = loss + 1.0 * coarse_loss
+
+            log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
+            re_loss = F.mse_loss(re_pred, log_re_target)
+            loss = loss + 0.01 * re_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            if epoch >= ema_start_epoch:
+                if ema_model is None:
+                    ema_model = deepcopy(model)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_model.parameters(), model.parameters()):
+                            ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
+            global_step += 1
+            wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+
+            epoch_vol += vol_loss.item()
+            epoch_surf += surf_loss.item()
+            n_batches += 1
+            pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
+
+        scheduler.step()
+        epoch_vol /= n_batches
+        epoch_surf /= n_batches
+        prev_vol_loss = epoch_vol
+        prev_surf_loss = epoch_surf
+
+        # --- Validate across all splits ---
+        eval_model = ema_model if ema_model is not None else model
+        eval_model.eval()
+        model.eval()
+        val_metrics_per_split: dict[str, dict] = {}
+        val_loss_sum = 0.0
+
+        for split_name, vloader in val_loaders.items():
+            val_vol = 0.0
+            val_surf = 0.0
+            mae_surf = torch.zeros(3, device=device)
+            mae_vol = torch.zeros(3, device=device)
+            n_surf = torch.zeros(3, device=device)
+            n_vol = torch.zeros(3, device=device)
+            n_vbatches = 0
+
+            with torch.no_grad():
+                for x, y, is_surface, mask in tqdm(
+                    vloader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [{split_name}]", leave=False
+                ):
+                    x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                    is_surface = is_surface.to(device, non_blocking=True)
+                    mask = mask.to(device, non_blocking=True)
+
+                    x = (x - stats["x_mean"]) / stats["x_std"]
+                    # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
+                    curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                    x = torch.cat([x, curv], dim=-1)
+                    Umag, q = _umag_q(y, mask)
+                    y_phys = _phys_norm(y, Umag, q)
+                    y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+
+                    # Per-sample std normalization: skip tandem samples
+                    raw_gap = x[:, 0, 21]
+                    is_tandem = raw_gap.abs() > 0.5
+                    B = y_norm.shape[0]
+                    sample_stds = torch.ones(B, 1, 3, device=device)
+                    channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
+                    for b in range(B):
+                        if not is_tandem[b]:
+                            valid = mask[b]
+                            sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+                    y_norm_scaled = y_norm / sample_stds
+
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        pred = eval_model({"x": x})["preds"]
+                    pred = pred.float()
+                    pred_loss = pred / sample_stds
+                    sq_err = (pred_loss - y_norm_scaled) ** 2
+                    abs_err = (pred_loss - y_norm_scaled).abs()
+                    abs_err = abs_err.nan_to_num(0.0)
+
+                    vol_mask = mask & ~is_surface
+                    surf_mask = mask & is_surface
+                    val_vol += min(
+                        (abs_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item(),
+                        1e6
+                    )
+                    val_surf += min(
+                        (abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item(),
+                        1e6
+                    )
+                    n_vbatches += 1
+
+                    # Denormalize: phys_stats → Cp space → original scale
+                    pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                    pred_orig = _phys_denorm(pred_phys, Umag, q)
+                    y_clamped = y.clamp(-1e6, 1e6)
+                    err = (pred_orig - y_clamped).abs()
+                    finite = err.isfinite()
+                    err = err.where(finite, torch.zeros_like(err))
+                    mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                    mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                    n_surf += (surf_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+                    n_vol += (vol_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+
+            val_vol /= max(n_vbatches, 1)
+            val_surf /= max(n_vbatches, 1)
+            val_vol = float(torch.tensor(val_vol).nan_to_num(0.0).clamp(max=1e6))
+            val_surf = float(torch.tensor(val_surf).nan_to_num(0.0).clamp(max=1e6))
+            split_loss = val_vol + cfg.surf_weight * val_surf
+            mae_surf /= n_surf.clamp(min=1)
+            mae_vol /= n_vol.clamp(min=1)
+
+            val_metrics_per_split[split_name] = {
+                f"{split_name}/vol_loss":    val_vol,
+                f"{split_name}/surf_loss":   val_surf,
+                f"{split_name}/loss":        split_loss,
+                f"{split_name}/mae_vol_Ux":  mae_vol[0].item(),
+                f"{split_name}/mae_vol_Uy":  mae_vol[1].item(),
+                f"{split_name}/mae_vol_p":   mae_vol[2].item(),
+                f"{split_name}/mae_surf_Ux": mae_surf[0].item(),
+                f"{split_name}/mae_surf_Uy": mae_surf[1].item(),
+                f"{split_name}/mae_surf_p":  mae_surf[2].item(),
+            }
+            val_loss_sum += split_loss
+
+        # 3-split val/loss (in_dist + tandem + ood_cond) — used for checkpoint selection
+        _3split_names = ["val_in_dist", "val_tandem_transfer", "val_ood_cond"]
+        _3split_losses = [val_metrics_per_split[n][f"{n}/loss"] for n in _3split_names
+                          if not (torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isnan() or
+                                  torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isinf())]
+        val_loss_3split = sum(_3split_losses) / max(len(_3split_losses), 1)
+
+        # 4-split val/loss (all splits including ood_re)
+        _4split_losses = [val_metrics_per_split[n][f"{n}/loss"] for n in VAL_SPLIT_NAMES
+                          if not (torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isnan() or
+                                  torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isinf())]
+        val_loss_4split = sum(_4split_losses) / max(len(_4split_losses), 1)
+
+        dt = time.time() - t0
+
+        # --- Log to wandb ---
+        metrics = {
+            "train/vol_loss": epoch_vol,
+            "train/surf_loss": epoch_surf,
+            "val/loss": val_loss_3split,
+            "val/loss_3split": val_loss_3split,
+            "val/loss_4split": val_loss_4split,
+            "lr": scheduler.get_last_lr()[0],
+            "epoch_time_s": dt,
         }
-        val_loss_sum += split_loss
-
-    # 3-split val/loss (in_dist + tandem + ood_cond) — used for checkpoint selection
-    _3split_names = ["val_in_dist", "val_tandem_transfer", "val_ood_cond"]
-    _3split_losses = [val_metrics_per_split[n][f"{n}/loss"] for n in _3split_names
-                      if not (torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isnan() or
-                              torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isinf())]
-    val_loss_3split = sum(_3split_losses) / max(len(_3split_losses), 1)
-
-    # 4-split val/loss (all splits including ood_re)
-    _4split_losses = [val_metrics_per_split[n][f"{n}/loss"] for n in VAL_SPLIT_NAMES
-                      if not (torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isnan() or
-                              torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isinf())]
-    val_loss_4split = sum(_4split_losses) / max(len(_4split_losses), 1)
-
-    dt = time.time() - t0
-
-    # --- Log to wandb ---
-    metrics = {
-        "train/vol_loss": epoch_vol,
-        "train/surf_loss": epoch_surf,
-        "val/loss": val_loss_3split,
-        "val/loss_3split": val_loss_3split,
-        "val/loss_4split": val_loss_4split,
-        "lr": scheduler.get_last_lr()[0],
-        "epoch_time_s": dt,
-    }
-    for split_metrics in val_metrics_per_split.values():
-        metrics.update(split_metrics)
-    metrics["global_step"] = global_step
-    wandb.log(metrics)
-
-    if torch.cuda.is_available():
-        peak_mem_gb = torch.cuda.max_memory_allocated() / 1e9
-    else:
-        peak_mem_gb = 0.0
-
-    tag = ""
-    if val_loss_3split < best_val:
-        best_val = val_loss_3split
-        best_metrics = {"epoch": epoch + 1, "val_loss": val_loss_3split}
         for split_metrics in val_metrics_per_split.values():
-            for k, v in split_metrics.items():
-                best_metrics[f"best_{k}"] = v
-        save_model = ema_model if ema_model is not None else model
-        torch.save(save_model.state_dict(), model_path)
-        tag = f" * -> {model_path}"
+            metrics.update(split_metrics)
+        metrics["global_step"] = global_step
+        wandb.log(metrics)
 
-    split_summary = "  ".join(
-        f"{name}={val_metrics_per_split[name][f'{name}/loss']:.4f}"
-        for name in VAL_SPLIT_NAMES
-    )
-    print(
-        f"Epoch {epoch+1:3d} ({dt:.0f}s) [{peak_mem_gb:.1f}GB]  "
-        f"train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  "
-        f"val[{split_summary}]{tag}"
-    )
+        if torch.cuda.is_available():
+            peak_mem_gb = torch.cuda.max_memory_allocated() / 1e9
+        else:
+            peak_mem_gb = 0.0
 
+        tag = ""
+        if val_loss_3split < best_val:
+            best_val = val_loss_3split
+            best_metrics = {"epoch": epoch + 1, "val_loss": val_loss_3split}
+            for split_metrics in val_metrics_per_split.values():
+                for k, v in split_metrics.items():
+                    best_metrics[f"best_{k}"] = v
+            save_model = ema_model if ema_model is not None else model
+            torch.save(save_model.state_dict(), save_path)
+            tag = f" * -> {save_path}"
+
+        split_summary = "  ".join(
+            f"{name}={val_metrics_per_split[name][f'{name}/loss']:.4f}"
+            for name in VAL_SPLIT_NAMES
+        )
+        print(
+            f"Epoch {epoch+1:3d} ({dt:.0f}s) [{peak_mem_gb:.1f}GB]  "
+            f"train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  "
+            f"val[{split_summary}]{tag}"
+        )
+
+    return best_metrics
+
+
+# --- Train two models with different seeds ---
+print("\n" + "=" * 60)
+print("Training model A (seed=0, 14 min)...")
+print("=" * 60)
+best_metrics_a = train_model(0, model_a_path)
+
+print("\n" + "=" * 60)
+print("Training model B (seed=42, 14 min)...")
+print("=" * 60)
+best_metrics_b = train_model(42, model_b_path)
+
+# --- Ensemble validation: load best checkpoints and average predictions ---
+print("\nRunning ensemble validation (average of both models)...")
+model_a_eval = Transolver(**model_config).to(device)
+model_b_eval = Transolver(**model_config).to(device)
+if model_a_path.exists():
+    model_a_eval.load_state_dict(torch.load(model_a_path, map_location=device, weights_only=True))
+if model_b_path.exists():
+    model_b_eval.load_state_dict(torch.load(model_b_path, map_location=device, weights_only=True))
+model_a_eval.eval()
+model_b_eval.eval()
+
+ensemble_val_metrics_per_split: dict[str, dict] = {}
+for split_name, vloader in val_loaders.items():
+    mae_surf = torch.zeros(3, device=device)
+    mae_vol = torch.zeros(3, device=device)
+    n_surf = torch.zeros(3, device=device)
+    n_vol = torch.zeros(3, device=device)
+    val_vol = 0.0
+    val_surf = 0.0
+    n_vbatches = 0
+
+    with torch.no_grad():
+        for x, y, is_surface, mask in tqdm(vloader, desc=f"Ensemble [{split_name}]", leave=False):
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            is_surface = is_surface.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
+
+            x = (x - stats["x_mean"]) / stats["x_std"]
+            curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+            x = torch.cat([x, curv], dim=-1)
+            Umag, q = _umag_q(y, mask)
+            y_phys = _phys_norm(y, Umag, q)
+            y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+
+            raw_gap = x[:, 0, 21]
+            is_tandem = raw_gap.abs() > 0.5
+            B = y_norm.shape[0]
+            sample_stds = torch.ones(B, 1, 3, device=device)
+            channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
+            for b in range(B):
+                if not is_tandem[b]:
+                    valid = mask[b]
+                    sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+            y_norm_scaled = y_norm / sample_stds
+
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                pred_a = model_a_eval({"x": x})["preds"].float()
+                pred_b = model_b_eval({"x": x})["preds"].float()
+            pred = 0.5 * pred_a + 0.5 * pred_b
+            pred_loss = pred / sample_stds
+            abs_err = (pred_loss - y_norm_scaled).abs().nan_to_num(0.0)
+
+            vol_mask = mask & ~is_surface
+            surf_mask = mask & is_surface
+            val_vol += min(
+                (abs_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item(),
+                1e6
+            )
+            val_surf += min(
+                (abs_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item(),
+                1e6
+            )
+            n_vbatches += 1
+
+            pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+            pred_orig = _phys_denorm(pred_phys, Umag, q)
+            y_clamped = y.clamp(-1e6, 1e6)
+            err = (pred_orig - y_clamped).abs()
+            finite = err.isfinite()
+            err = err.where(finite, torch.zeros_like(err))
+            mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
+            mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
+            n_surf += (surf_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+            n_vol += (vol_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+
+    val_vol /= max(n_vbatches, 1)
+    val_surf /= max(n_vbatches, 1)
+    val_vol = float(torch.tensor(val_vol).nan_to_num(0.0).clamp(max=1e6))
+    val_surf = float(torch.tensor(val_surf).nan_to_num(0.0).clamp(max=1e6))
+    split_loss = val_vol + cfg.surf_weight * val_surf
+    mae_surf /= n_surf.clamp(min=1)
+    mae_vol /= n_vol.clamp(min=1)
+    ensemble_val_metrics_per_split[split_name] = {
+        f"{split_name}/vol_loss":    val_vol,
+        f"{split_name}/surf_loss":   val_surf,
+        f"{split_name}/loss":        split_loss,
+        f"{split_name}/mae_vol_Ux":  mae_vol[0].item(),
+        f"{split_name}/mae_vol_Uy":  mae_vol[1].item(),
+        f"{split_name}/mae_vol_p":   mae_vol[2].item(),
+        f"{split_name}/mae_surf_Ux": mae_surf[0].item(),
+        f"{split_name}/mae_surf_Uy": mae_surf[1].item(),
+        f"{split_name}/mae_surf_p":  mae_surf[2].item(),
+    }
+
+_3split_names = ["val_in_dist", "val_tandem_transfer", "val_ood_cond"]
+ensemble_3split_losses = [
+    ensemble_val_metrics_per_split[n][f"{n}/loss"] for n in _3split_names
+    if not (torch.tensor(ensemble_val_metrics_per_split[n][f"{n}/loss"]).isnan() or
+            torch.tensor(ensemble_val_metrics_per_split[n][f"{n}/loss"]).isinf())
+]
+ensemble_val_loss = sum(ensemble_3split_losses) / max(len(ensemble_3split_losses), 1)
+
+ensemble_log = {"val/ensemble_loss": ensemble_val_loss, "global_step": global_step}
+for split_metrics in ensemble_val_metrics_per_split.values():
+    for k, v in split_metrics.items():
+        ensemble_log[f"ensemble/{k}"] = v
+wandb.log(ensemble_log)
 
 # --- Final summary ---
-total_time = (time.time() - train_start) / 60.0
 print("\n" + "=" * 70)
-print(f"TRAINING COMPLETE ({total_time:.1f} min)")
+print("ENSEMBLE TRAINING COMPLETE")
 print("=" * 70)
-if best_metrics:
-    print(f"Best model at epoch {best_metrics['epoch']}  (val/loss={best_metrics['val_loss']:.4f})")
-    for split_name in VAL_SPLIT_NAMES:
-        k_p = f"best_{split_name}/mae_surf_p"
-        k_l = f"best_{split_name}/loss"
-        if k_p in best_metrics:
-            print(f"  {split_name:30s}  loss={best_metrics[k_l]:.4f}  mae_surf_p={best_metrics[k_p]:.1f}")
-else:
-    print("No completed epochs (timeout too short?).")
+print(f"Ensemble val/loss (3-split): {ensemble_val_loss:.4f}")
+for split_name in VAL_SPLIT_NAMES:
+    k_p = f"{split_name}/mae_surf_p"
+    k_l = f"{split_name}/loss"
+    m = ensemble_val_metrics_per_split.get(split_name, {})
+    if k_p in m:
+        print(f"  {split_name:30s}  loss={m[k_l]:.4f}  mae_surf_p={m[k_p]:.1f}")
 
-if best_metrics:
-    wandb.summary.update({"best_" + k: v for k, v in best_metrics.items()})
+best_metrics = {"ensemble_val_loss": ensemble_val_loss}
+for split_metrics in ensemble_val_metrics_per_split.values():
+    for k, v in split_metrics.items():
+        best_metrics[k] = v
+wandb.summary.update({"best_" + k: v for k, v in best_metrics.items()})
 
-    print("\nGenerating flow field plots...")
-    vis_model = ema_model if ema_model is not None else model
-    vis_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-    vis_model.eval()
-    plot_dir = Path("plots") / run.id
-    n = 1 if cfg.debug else 4
-    for split_name, split_ds in val_splits.items():
-        samples = []
-        for i in range(min(n, len(split_ds))):
-            x, y_true, is_surface = split_ds[i]
-            with torch.no_grad():
-                x_dev = x.unsqueeze(0).to(device)
-                y_dev = y_true.unsqueeze(0).to(device)
-                is_surf_dev = is_surface.unsqueeze(0).to(device)
-                mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
-                x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
-                curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
-                x_n = torch.cat([x_n, curv], dim=-1)
-                Umag, q = _umag_q(y_dev, mask)
-                pred = vis_model({"x": x_n})["preds"].float()
-                pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
-                y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
-            samples.append((x[:, :2], y_true, y_pred, is_surface))
-        images = visualize(samples, out_dir=plot_dir / split_name)
-        if images:
-            wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+print("\nGenerating flow field plots...")
+vis_model = model_a_eval
+plot_dir = Path("plots") / run.id
+n = 1 if cfg.debug else 4
+for split_name, split_ds in val_splits.items():
+    samples = []
+    for i in range(min(n, len(split_ds))):
+        x, y_true, is_surface = split_ds[i]
+        with torch.no_grad():
+            x_dev = x.unsqueeze(0).to(device)
+            y_dev = y_true.unsqueeze(0).to(device)
+            is_surf_dev = is_surface.unsqueeze(0).to(device)
+            mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
+            x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
+            curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
+            x_n = torch.cat([x_n, curv], dim=-1)
+            Umag, q = _umag_q(y_dev, mask)
+            pred = vis_model({"x": x_n})["preds"].float()
+            pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+            y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
+        samples.append((x[:, :2], y_true, y_pred, is_surface))
+    images = visualize(samples, out_dir=plot_dir / split_name)
+    if images:
+        wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
 
 wandb.finish()
