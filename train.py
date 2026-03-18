@@ -815,6 +815,13 @@ for epoch in range(MAX_EPOCHS):
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
+    # Surface pressure selection metric: average mae_surf_p across 3 splits
+    _3split_names = ["val_in_dist", "val_tandem_transfer", "val_ood_cond"]
+    _surf_p_metric = sum(
+        val_metrics_per_split[n].get(f"{n}/mae_surf_p", float('inf'))
+        for n in _3split_names
+    ) / len(_3split_names)
+    metrics["val/surf_p_3split"] = _surf_p_metric
     wandb.log(metrics)
 
     if torch.cuda.is_available():
@@ -823,9 +830,10 @@ for epoch in range(MAX_EPOCHS):
         peak_mem_gb = 0.0
 
     tag = ""
-    if val_loss_3split < best_val:
-        best_val = val_loss_3split
-        best_metrics = {"epoch": epoch + 1, "val_loss": val_loss_3split}
+    # Select checkpoint by average surface pressure MAE (our actual metric)
+    if _surf_p_metric < best_val:
+        best_val = _surf_p_metric
+        best_metrics = {"epoch": epoch + 1, "val_loss": val_loss_3split, "surf_p_metric": _surf_p_metric}
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
