@@ -611,6 +611,15 @@ for epoch in range(MAX_EPOCHS):
                     sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
             y_norm = y_norm / sample_stds
 
+        if model.training:
+            # Mixup: interpolate between shuffled batch pairs
+            lam = torch.distributions.Beta(0.2, 0.2).sample().item()
+            idx = torch.randperm(B, device=device)
+            x = lam * x + (1 - lam) * x[idx]
+            y_norm = lam * y_norm + (1 - lam) * y_norm[idx]
+            mask = mask & mask[idx]
+            is_surface = is_surface & is_surface[idx]
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model({"x": x})
             pred = out["preds"]
