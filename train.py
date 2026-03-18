@@ -800,6 +800,14 @@ for epoch in range(MAX_EPOCHS):
                               torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isinf())]
     val_loss_3split = sum(_3split_losses) / max(len(_3split_losses), 1)
 
+    # 3-split mean surface pressure MAE — used for checkpoint selection
+    _3split_surf_p = []
+    for n in _3split_names:
+        sp = val_metrics_per_split[n].get(f"{n}/mae_surf_p", float("inf"))
+        if not (torch.tensor(sp).isnan() or torch.tensor(sp).isinf()):
+            _3split_surf_p.append(sp)
+    mean_surf_p = sum(_3split_surf_p) / max(len(_3split_surf_p), 1)
+
     # 4-split val/loss (all splits including ood_re)
     _4split_losses = [val_metrics_per_split[n][f"{n}/loss"] for n in VAL_SPLIT_NAMES
                       if not (torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isnan() or
@@ -814,6 +822,7 @@ for epoch in range(MAX_EPOCHS):
         "train/surf_loss": epoch_surf,
         "val/loss": val_loss_3split,
         "val/loss_3split": val_loss_3split,
+        "val/mean_surf_p": mean_surf_p,
         "val/loss_4split": val_loss_4split,
         "lr": scheduler.get_last_lr()[0],
         "epoch_time_s": dt,
@@ -829,9 +838,9 @@ for epoch in range(MAX_EPOCHS):
         peak_mem_gb = 0.0
 
     tag = ""
-    if val_loss_3split < best_val:
-        best_val = val_loss_3split
-        best_metrics = {"epoch": epoch + 1, "val_loss": val_loss_3split}
+    if mean_surf_p < best_val:
+        best_val = mean_surf_p
+        best_metrics = {"epoch": epoch + 1, "val_loss": val_loss_3split, "mean_surf_p": mean_surf_p}
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
