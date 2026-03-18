@@ -628,6 +628,11 @@ for epoch in range(MAX_EPOCHS):
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
+        # Proximity weighting: exponential decay by distance from surface
+        dsdf_mag = x[:, :, 2:6].norm(dim=-1)  # first 4 dsdf channels
+        vol_prox_weight = (1.0 + 2.0 * torch.exp(-dsdf_mag / 0.3)) * vol_mask.float()
+        vol_prox_weight = vol_prox_weight / vol_prox_weight.sum().clamp(min=1) * vol_mask.sum().clamp(min=1).float()
+
         # Progressive resolution: subsample volume nodes in loss early in training
         # Ramps from 10% → 100% of volume nodes over first 40 epochs
         if epoch < 40:
@@ -642,7 +647,10 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_mask_train = vol_mask
 
-        vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+        if model.training:
+            vol_loss = (abs_err * vol_prox_weight.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
+        else:
+            vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem = (x[:, 0, 21].abs() > 0.01)
         tandem_boost = torch.where(is_tandem, 1.5, 1.0).to(device)
         surf_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
