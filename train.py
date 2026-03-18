@@ -355,7 +355,7 @@ MAX_EPOCHS = 100
 @dataclass
 class Config:
     lr: float = 3e-3
-    weight_decay: float = 1e-4
+    weight_decay: float = 0.0
     batch_size: int = 4
     surf_weight: float = 20.0
     manifest: str = "data/split_manifest.json"
@@ -476,7 +476,7 @@ model = Transolver(**model_config).to(device)
 
 from copy import deepcopy
 ema_model = None
-ema_start_epoch = 65
+ema_start_epoch = 40
 ema_decay = 0.998
 
 n_params = sum(p.numel() for p in model.parameters())
