@@ -651,10 +651,27 @@ for epoch in range(MAX_EPOCHS):
         B, N, C = pred.shape
         n_groups = N // coarse_pool_size
         if n_groups > 1:
-            # Pool predictions and targets over groups of 64 nodes
-            pred_trunc = pred[:, :n_groups * coarse_pool_size]
-            y_trunc = y_norm[:, :n_groups * coarse_pool_size]
-            mask_trunc = mask[:, :n_groups * coarse_pool_size]
+            # Z-order (Morton) sort for spatially coherent groups
+            # Use raw_xy (features 0-1) before normalization for spatial coordinates
+            with torch.no_grad():
+                raw_pos = x[:, :, :2]  # x is already normalized, but relative ordering preserved
+                # Quantize to 10-bit integers for Morton code
+                x_q = ((raw_pos[:, :, 0] - raw_pos[:, :, 0].min(dim=1, keepdim=True).values) * 1023).long().clamp(0, 1023)
+                y_q = ((raw_pos[:, :, 1] - raw_pos[:, :, 1].min(dim=1, keepdim=True).values) * 1023).long().clamp(0, 1023)
+                # Interleave bits for Z-order curve (simplified: just x*1024+y)
+                morton = x_q * 1024 + y_q  # crude Z-order, but preserves 2D locality
+                # Set padded nodes to max so they sort to the end
+                morton = morton.masked_fill(~mask, morton.max() + 1)
+                sort_idx = morton.argsort(dim=1)
+
+            # Apply sort to predictions and targets for coarse loss only
+            pred_sorted = pred.gather(1, sort_idx.unsqueeze(-1).expand_as(pred))
+            y_sorted = y_norm.gather(1, sort_idx.unsqueeze(-1).expand_as(y_norm))
+            mask_sorted = mask.gather(1, sort_idx)
+
+            pred_trunc = pred_sorted[:, :n_groups * coarse_pool_size]
+            y_trunc = y_sorted[:, :n_groups * coarse_pool_size]
+            mask_trunc = mask_sorted[:, :n_groups * coarse_pool_size]
 
             pred_coarse = pred_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
             y_coarse = y_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
