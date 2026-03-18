@@ -15,8 +15,6 @@ echo "GPUs:   $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | 
 
 # Repo already cloned by the deployment args block
 cd "$WORKDIR"
-# Students don't plan experiments — only the advisor uses this skill
-rm -rf .claude/skills/list-experiments
 uv pip install --system -e .
 
 # --- Git identity for commits ---
