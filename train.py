@@ -269,6 +269,7 @@ class Transolver(nn.Module):
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.output_scale = nn.Parameter(torch.ones(3))  # [Ux, Uy, p]
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -339,6 +340,7 @@ class Transolver(nn.Module):
 
         fx = self.blocks[-1](fx, raw_xy=raw_xy)
         fx = fx + self.out_skip(fx_pre)
+        fx = fx * self.output_scale[None, None, :]  # learned per-channel scaling
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred}
 
