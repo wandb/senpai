@@ -628,6 +628,18 @@ for epoch in range(MAX_EPOCHS):
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
+        # OHEM: focus on top 30% hardest nodes (skip first 10 warmup epochs)
+        per_node_loss = abs_err.mean(dim=-1)  # [B, N]
+        if epoch >= 10:
+            for b in range(B):
+                valid = per_node_loss[b][mask[b]]
+                if valid.numel() > 0:
+                    threshold = torch.quantile(valid, 0.7)
+                    hard_mask = per_node_loss[b] >= threshold
+                    mask[b] = mask[b] & hard_mask
+                    surf_mask[b] = surf_mask[b] & hard_mask
+            vol_mask = mask & ~is_surface  # recompute after OHEM
+
         # Progressive resolution: subsample volume nodes in loss early in training
         # Ramps from 10% → 100% of volume nodes over first 40 epochs
         if epoch < 40:
