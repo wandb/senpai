@@ -95,12 +95,11 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.scale = dim_head**-0.5
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
-        self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
+        self.slice_prototypes = nn.Parameter(torch.randn(1, heads, slice_num, dim_head) * 0.02)
+        self.slice_scale = nn.Parameter(torch.tensor(10.0))
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
-        self.in_project_slice = nn.Linear(dim_head, slice_num)
-        torch.nn.init.orthogonal_(self.in_project_slice.weight)
         self.to_q = nn.Linear(dim_head, dim_head, bias=False)
         self.to_k = nn.Linear(dim_head, dim_head, bias=False)
         self.to_v = nn.Linear(dim_head, dim_head, bias=False)
@@ -126,7 +125,9 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             .permute(0, 2, 1, 3)
             .contiguous()
         )
-        slice_logits = self.in_project_slice(x_mid) / self.temperature
+        x_norm = F.normalize(x_mid, dim=-1)  # [B, H, N, D]
+        proto_norm = F.normalize(self.slice_prototypes, dim=-1)  # [1, H, S, D]
+        slice_logits = torch.einsum("bhnd,bhsd->bhns", x_norm, proto_norm) * self.slice_scale.clamp(1, 20)
         if spatial_bias is not None:
             slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
         slice_weights = self.softmax(slice_logits)
