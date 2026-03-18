@@ -572,8 +572,12 @@ for epoch in range(MAX_EPOCHS):
 
     t0 = time.time()
 
-    # Adaptive surface weight: loss-ratio based, clamped [5, 50]
-    surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+    # Adaptive surface weight with curriculum ramp: start at 1.0, reach dynamic value by epoch 30
+    dynamic_sw = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+    if epoch < 30:
+        surf_weight = 1.0 + (dynamic_sw - 1.0) * (epoch / 30)
+    else:
+        surf_weight = dynamic_sw
 
     # --- Train ---
     model.train()
@@ -683,7 +687,7 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), model.parameters()):
                         ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "train/surf_weight_effective": surf_weight, "global_step": global_step})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
