@@ -558,6 +558,7 @@ with open(model_dir / "config.yaml", "w") as f:
     yaml.dump(model_config, f)
 
 best_val = float("inf")
+top_checkpoints = []
 best_metrics = {}
 global_step = 0
 train_start = time.time()
@@ -838,6 +839,11 @@ for epoch in range(MAX_EPOCHS):
         save_model = ema_model if ema_model is not None else model
         torch.save(save_model.state_dict(), model_path)
         tag = f" * -> {model_path}"
+        state_copy = {k: v.cpu().clone() for k, v in save_model.state_dict().items()}
+        top_checkpoints.append((val_loss_3split, state_copy))
+        top_checkpoints.sort(key=lambda x: x[0])
+        if len(top_checkpoints) > 3:
+            top_checkpoints.pop()
 
     split_summary = "  ".join(
         f"{name}={val_metrics_per_split[name][f'{name}/loss']:.4f}"
@@ -849,6 +855,15 @@ for epoch in range(MAX_EPOCHS):
         f"val[{split_summary}]{tag}"
     )
 
+
+# --- Checkpoint averaging ---
+if len(top_checkpoints) >= 2:
+    avg_state = {}
+    for key in top_checkpoints[0][1]:
+        avg_state[key] = sum(c[1][key].float() for _, c in top_checkpoints) / len(top_checkpoints)
+        avg_state[key] = avg_state[key].to(top_checkpoints[0][1][key].dtype)
+    model.load_state_dict(avg_state)
+    torch.save(avg_state, model_path)
 
 # --- Final summary ---
 total_time = (time.time() - train_start) / 60.0
