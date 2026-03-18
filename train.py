@@ -364,12 +364,17 @@ class Config:
     wandb_name: str | None = None
     agent: str | None = None
     debug: bool = False
+    seed: int | None = None
 
 
 cfg = sp.parse(Config)
 
 if cfg.debug:
     MAX_EPOCHS = 3
+
+if cfg.seed is not None:
+    torch.manual_seed(cfg.seed)
+    torch.cuda.manual_seed_all(cfg.seed)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}" + (" [DEBUG MODE]" if cfg.debug else ""))
