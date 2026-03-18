@@ -244,6 +244,7 @@ class Transolver(nn.Module):
             )
         else:
             self.preprocess = MLP(fun_dim + space_dim, n_hidden * 2, n_hidden, n_layers=1, res=True, act=act)
+        self.preprocess_ln = nn.LayerNorm(n_hidden)
 
         self.n_hidden = n_hidden
         self.space_dim = space_dim
@@ -328,6 +329,7 @@ class Transolver(nn.Module):
 
         raw_xy = x[:, :, :2]
         fx = self.preprocess(x)
+        fx = self.preprocess_ln(fx)  # normalize preprocess output
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
