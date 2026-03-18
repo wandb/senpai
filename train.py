@@ -334,8 +334,8 @@ class Transolver(nn.Module):
         for block in self.blocks[:-1]:
             fx = block(fx, raw_xy=raw_xy)
 
-        # Auxiliary Re prediction from pre-output-head hidden representation
-        re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
+        # Auxiliary Re prediction from preprocess features
+        re_pred = self.re_head(fx_pre.mean(dim=1))  # [B, 1] — from preprocess features
 
         fx = self.blocks[-1](fx, raw_xy=raw_xy)
         fx = fx + self.out_skip(fx_pre)
