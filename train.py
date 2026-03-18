@@ -354,7 +354,7 @@ MAX_EPOCHS = 100
 
 @dataclass
 class Config:
-    lr: float = 4e-3
+    lr: float = 2e-3
     weight_decay: float = 0.0
     batch_size: int = 4
     surf_weight: float = 20.0
@@ -590,6 +590,10 @@ for epoch in range(MAX_EPOCHS):
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+        # z-score normalize curvature proxy over surface nodes
+        curv_mean = curv[curv > 0].mean() if (curv > 0).any() else curv.new_zeros(1)
+        curv_std = curv[curv > 0].std() if (curv > 0).any() else curv.new_ones(1)
+        curv = torch.where(is_surface.unsqueeze(-1), (curv - curv_mean) / (curv_std + 1e-8), curv)
         x = torch.cat([x, curv], dim=-1)
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
@@ -723,6 +727,10 @@ for epoch in range(MAX_EPOCHS):
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                # z-score normalize curvature proxy over surface nodes
+                curv_mean = curv[curv > 0].mean() if (curv > 0).any() else curv.new_zeros(1)
+                curv_std = curv[curv > 0].std() if (curv > 0).any() else curv.new_ones(1)
+                curv = torch.where(is_surface.unsqueeze(-1), (curv - curv_mean) / (curv_std + 1e-8), curv)
                 x = torch.cat([x, curv], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
