@@ -669,7 +669,9 @@ for epoch in range(MAX_EPOCHS):
             vol_indices = vol_mask.nonzero(as_tuple=False)
             n_vol = vol_indices.shape[0]
             n_keep = max(int(n_vol * vol_keep_ratio), 1)
-            perm = torch.randperm(n_vol, device=vol_mask.device)[:n_keep]
+            dsdf_norm = x[vol_indices[:, 0], vol_indices[:, 1], 2:10].norm(dim=-1)
+            keep_probs = dsdf_norm / (dsdf_norm.sum() + 1e-8)
+            perm = torch.multinomial(keep_probs, n_keep, replacement=False)
             vol_mask_train = torch.zeros_like(vol_mask)
             if n_keep > 0:
                 vol_mask_train[vol_indices[perm, 0], vol_indices[perm, 1]] = True
