@@ -112,8 +112,9 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout),
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
+        self.dist_decay = nn.Parameter(torch.tensor(1.0))
 
-    def forward(self, x, spatial_bias=None):
+    def forward(self, x, spatial_bias=None, raw_xy=None):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -143,6 +144,14 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         q_norm = F.normalize(q_slice_token, dim=-1)
         k_norm = F.normalize(k_slice_token, dim=-1)
         attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
+        if raw_xy is not None:
+            # Mean position per slice: (bsz, heads, slice_num, 2)
+            raw_xy_exp = raw_xy.unsqueeze(1).expand(-1, self.heads, -1, -1)
+            slice_pos = torch.einsum('bhnc,bhng->bhgc', raw_xy_exp, slice_weights) / (slice_norm + 1e-5).unsqueeze(-1)
+            # Pairwise distance between slices: (bsz, heads, slice_num, slice_num)
+            rel_dist = (slice_pos.unsqueeze(-2) - slice_pos.unsqueeze(-3)).norm(dim=-1)
+            pos_bias = -self.dist_decay.abs() * rel_dist
+            attn_logits = attn_logits + pos_bias
         attn_weights = F.softmax(attn_logits, dim=-1)
         out_slice_token = torch.matmul(attn_weights, v_slice_token)
         out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
@@ -193,7 +202,7 @@ class TransolverBlock(nn.Module):
 
     def forward(self, fx, raw_xy=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb) + fx)
+        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, raw_xy=raw_xy) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
