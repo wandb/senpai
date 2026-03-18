@@ -673,10 +673,16 @@ for epoch in range(MAX_EPOCHS):
         B, N, C = pred.shape
         n_groups = N // coarse_pool_size
         if n_groups > 1:
+            # Sort by x-coordinate for spatially coherent groups
+            raw_x_coord = x[:, :, 0]  # x-coordinate
+            sort_idx = raw_x_coord.argsort(dim=1)
+            pred_sorted = torch.gather(pred, 1, sort_idx.unsqueeze(-1).expand_as(pred))
+            y_sorted = torch.gather(y_norm, 1, sort_idx.unsqueeze(-1).expand_as(y_norm))
+            mask_sorted = torch.gather(mask, 1, sort_idx)
             # Pool predictions and targets over groups of 64 nodes
-            pred_trunc = pred[:, :n_groups * coarse_pool_size]
-            y_trunc = y_norm[:, :n_groups * coarse_pool_size]
-            mask_trunc = mask[:, :n_groups * coarse_pool_size]
+            pred_trunc = pred_sorted[:, :n_groups * coarse_pool_size]
+            y_trunc = y_sorted[:, :n_groups * coarse_pool_size]
+            mask_trunc = mask_sorted[:, :n_groups * coarse_pool_size]
 
             pred_coarse = pred_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
             y_coarse = y_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
