@@ -438,26 +438,37 @@ val_loaders = {
     for name, subset in val_splits.items()
 }
 
-# --- Physics normalization stats (computed over training set) ---
-# Compute mean/std of Cp-normalized targets so the model sees O(1) values.
-print("Computing physics normalization stats...")
-_phys_sum = torch.zeros(3, device=device)
-_phys_sq_sum = torch.zeros(3, device=device)
-_phys_n = 0.0
+# --- Physics normalization stats (computed over training set, split by domain) ---
+# Tandem and single-foil have different pressure distributions; separate stats give
+# each domain tighter normalization and better-scaled gradients.
+print("Computing physics normalization stats (split single/tandem)...")
+_ps = {k: [torch.zeros(3, device=device), torch.zeros(3, device=device), 0.0]
+       for k in ("single", "tandem")}
 _stats_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
 with torch.no_grad():
     for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc="Phys stats", leave=False):
-        _y, _mask = _y.to(device), _mask.to(device)
+        _x, _y, _mask = _x.to(device), _y.to(device), _mask.to(device)
+        _x_norm = (_x - stats["x_mean"]) / stats["x_std"]
+        _is_tan = _x_norm[:, 0, 21].abs() > 0.5  # [B]
         _Um, _q = _umag_q(_y, _mask)
         _yp = _phys_norm(_y, _Um, _q)
         _m = _mask.float().unsqueeze(-1)  # [B, N, 1]
-        _phys_sum += (_yp * _m).sum(dim=(0, 1))
-        _phys_sq_sum += (_yp ** 2 * _m).sum(dim=(0, 1))
-        _phys_n += _mask.float().sum().item()
-_pmean = (_phys_sum / _phys_n).float()
-_pstd = ((_phys_sq_sum / _phys_n - _pmean ** 2).clamp(min=0.0).sqrt()).clamp(min=1e-6).float()
-phys_stats = {"y_mean": _pmean, "y_std": _pstd}
-print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
+        for _key, _flag in (("tandem", _is_tan), ("single", ~_is_tan)):
+            _wt = _flag.float()[:, None, None]  # [B, 1, 1]
+            _ps[_key][0] += (_yp * _m * _wt).sum(dim=(0, 1))
+            _ps[_key][1] += (_yp ** 2 * _m * _wt).sum(dim=(0, 1))
+            _ps[_key][2] += (_m * _wt).sum().item()
+
+def _make_phys_stats(acc):
+    n = max(acc[2], 1.0)
+    mean = (acc[0] / n).float()
+    std = ((acc[1] / n - mean ** 2).clamp(min=0.0).sqrt()).clamp(min=1e-6).float()
+    return {"y_mean": mean, "y_std": std}
+
+phys_stats_single = _make_phys_stats(_ps["single"])
+phys_stats_tandem = _make_phys_stats(_ps["tandem"])
+print(f"  Single Cp — mean: {phys_stats_single['y_mean'].tolist()}, std: {phys_stats_single['y_std'].tolist()}")
+print(f"  Tandem Cp — mean: {phys_stats_tandem['y_mean'].tolist()}, std: {phys_stats_tandem['y_std'].tolist()}")
 
 model_config = dict(
     space_dim=2,
@@ -588,12 +599,17 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         x = (x - stats["x_mean"]) / stats["x_std"]
+        _is_tan_b = x[:, 0, 21].abs() > 0.5  # [B] — tandem detection for phys stats
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         x = torch.cat([x, curv], dim=-1)
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
-        y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+        # Per-domain phys normalization: tandem and single-foil have different distributions
+        _t = _is_tan_b.float().unsqueeze(-1)  # [B, 1]
+        y_mean_ps = _t * phys_stats_tandem["y_mean"] + (1 - _t) * phys_stats_single["y_mean"]  # [B, 3]
+        y_std_ps = _t * phys_stats_tandem["y_std"] + (1 - _t) * phys_stats_single["y_std"]    # [B, 3]
+        y_norm = (y_phys - y_mean_ps.unsqueeze(1)) / y_std_ps.unsqueeze(1)
         if model.training:
             noise_scale = torch.tensor([0.01, 0.01, 0.005], device=device)
             y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
@@ -726,7 +742,12 @@ for epoch in range(MAX_EPOCHS):
                 x = torch.cat([x, curv], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
-                y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                # Per-domain phys normalization
+                _is_tan_v = x[:, 0, 21].abs() > 0.5  # [B]
+                _tv = _is_tan_v.float().unsqueeze(-1)  # [B, 1]
+                y_mean_ps_v = _tv * phys_stats_tandem["y_mean"] + (1 - _tv) * phys_stats_single["y_mean"]
+                y_std_ps_v = _tv * phys_stats_tandem["y_std"] + (1 - _tv) * phys_stats_single["y_std"]
+                y_norm = (y_phys - y_mean_ps_v.unsqueeze(1)) / y_std_ps_v.unsqueeze(1)
 
                 # Per-sample std normalization: skip tandem samples
                 raw_gap = x[:, 0, 21]
@@ -760,8 +781,8 @@ for epoch in range(MAX_EPOCHS):
                 )
                 n_vbatches += 1
 
-                # Denormalize: phys_stats → Cp space → original scale
-                pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                # Denormalize: per-domain phys_stats → Cp space → original scale
+                pred_phys = pred * y_std_ps_v.unsqueeze(1) + y_mean_ps_v.unsqueeze(1)
                 pred_orig = _phys_denorm(pred_phys, Umag, q)
                 y_clamped = y.clamp(-1e6, 1e6)
                 err = (pred_orig - y_clamped).abs()
