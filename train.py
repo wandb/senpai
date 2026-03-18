@@ -563,6 +563,7 @@ global_step = 0
 train_start = time.time()
 prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
+y_noise_scale_factor = 1.0  # will be updated each epoch
 
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
@@ -595,7 +596,7 @@ for epoch in range(MAX_EPOCHS):
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         if model.training:
-            noise_scale = torch.tensor([0.01, 0.01, 0.005], device=device)
+            noise_scale = torch.tensor([0.01, 0.01, 0.005], device=device) * y_noise_scale_factor
             y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
 
         # Per-sample std normalization: skip tandem samples (gap feature index 21)
@@ -695,6 +696,9 @@ for epoch in range(MAX_EPOCHS):
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
     prev_surf_loss = epoch_surf
+    # Scale y-noise based on surface loss relative to initial
+    if epoch_surf > 0:
+        y_noise_scale_factor = min(2.0, max(0.1, epoch_surf / 0.2))  # 0.2 is initial surf_loss
 
     # --- Validate across all splits ---
     eval_model = ema_model if ema_model is not None else model
