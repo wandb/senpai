@@ -611,6 +611,15 @@ for epoch in range(MAX_EPOCHS):
                     sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
             y_norm = y_norm / sample_stds
 
+        # Stochastic node dropout: mask 10% of volume nodes
+        if model.training:
+            N = x.shape[1]
+            node_drop_mask = torch.rand(B, N, device=device) < 0.1
+            node_drop_mask = node_drop_mask & ~is_surface  # never drop surface nodes
+            node_drop_mask = node_drop_mask & mask          # only drop valid nodes
+            x = x * (~node_drop_mask).float().unsqueeze(-1)  # zero dropped features
+            mask = mask & ~node_drop_mask  # exclude from loss computation
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model({"x": x})
             pred = out["preds"]
