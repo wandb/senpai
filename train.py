@@ -269,6 +269,7 @@ class Transolver(nn.Module):
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.curv_weights = nn.Parameter(torch.ones(4) * 0.25)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -327,6 +328,10 @@ class Transolver(nn.Module):
             x = torch.cat((x, new_pos), dim=-1)
 
         raw_xy = x[:, :, :2]
+        w = F.softmax(self.curv_weights, dim=0)
+        is_surf_proxy = (x[:, :, 12:13] > 0).float()  # is_surface from feature 12
+        curv_weighted = (x[:, :, 2:6] * w[None, None, :]).norm(dim=-1, keepdim=True) * is_surf_proxy
+        x = torch.cat([x, curv_weighted], dim=-1)
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
@@ -588,9 +593,6 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         x = (x - stats["x_mean"]) / stats["x_std"]
-        # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
-        curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
-        x = torch.cat([x, curv], dim=-1)
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
@@ -721,9 +723,6 @@ for epoch in range(MAX_EPOCHS):
                 mask = mask.to(device, non_blocking=True)
 
                 x = (x - stats["x_mean"]) / stats["x_std"]
-                # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
-                curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
-                x = torch.cat([x, curv], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
