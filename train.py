@@ -595,7 +595,7 @@ for epoch in range(MAX_EPOCHS):
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         if model.training:
-            noise_scale = torch.tensor([0.01, 0.01, 0.005], device=device)
+            noise_scale = torch.tensor([0.01, 0.01, 0.02], device=device)
             y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
 
         # Per-sample std normalization: skip tandem samples (gap feature index 21)
