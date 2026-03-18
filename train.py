@@ -269,6 +269,7 @@ class Transolver(nn.Module):
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.boundary_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 2))
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -336,11 +337,12 @@ class Transolver(nn.Module):
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
+        boundary_pred = self.boundary_head(fx_pre)  # from preprocess features [B, N, 2]
 
         fx = self.blocks[-1](fx, raw_xy=raw_xy)
         fx = fx + self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred}
+        return {"preds": fx, "re_pred": re_pred, "boundary_pred": boundary_pred}
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +673,11 @@ for epoch in range(MAX_EPOCHS):
         re_loss = F.mse_loss(re_pred, log_re_target)
         loss = loss + 0.01 * re_loss
 
+        boundary_target = surf_mask.long()  # 0=volume, 1=surface
+        boundary_pred = out["boundary_pred"].float()
+        boundary_loss = F.cross_entropy(boundary_pred.reshape(-1, 2), boundary_target.reshape(-1))
+        loss = loss + 0.01 * boundary_loss
+
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -872,9 +879,12 @@ if best_metrics:
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     plot_dir = Path("plots") / run.id
     # Visualize from val_in_dist — same distribution as original val_ds
-    images = visualize(model, val_splits["val_in_dist"], stats, device,
-                       n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
-    if images:
-        wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    try:
+        images = visualize(model, val_splits["val_in_dist"], stats, device,
+                           n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
+        if images:
+            wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    except Exception as e:
+        print(f"Visualization skipped: {e}")
 
 wandb.finish()
