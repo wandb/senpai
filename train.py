@@ -90,6 +90,70 @@ class GatedMLP2(nn.Module):
         return self.down(h)
 
 
+class SurfaceRefiner(nn.Module):
+    """Learned surface smoothing: k nearest surface neighbor interpolation.
+
+    For each surface node, gather k nearest surface neighbors, compute
+    features (dx, dy, dist, curv_diff), learn per-neighbor weights via MLP,
+    and add a weighted neighbor average as a residual correction.
+    Zero-init output ensures identity at initialization.
+    """
+
+    def __init__(self, k=4):
+        super().__init__()
+        self.k = k
+        self.mlp = nn.Sequential(
+            nn.Linear(4, 16),
+            nn.GELU(),
+            nn.Linear(16, 1),
+        )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, pred, pos, curv, is_surface, mask):
+        """
+        pred:       [B, N, C] model predictions
+        pos:        [B, N, 2] xy positions (normalized)
+        curv:       [B, N, 1] curvature
+        is_surface: [B, N] bool
+        mask:       [B, N] bool (valid nodes)
+        Returns: [B, N, C] refined predictions
+        """
+        B, N, C = pred.shape
+        delta_list = []
+        for b in range(B):
+            surf_mask_b = is_surface[b] & mask[b]
+            surf_idx = surf_mask_b.nonzero(as_tuple=True)[0]  # [S]
+            S = surf_idx.shape[0]
+            delta_b = torch.zeros(N, C, device=pred.device, dtype=pred.dtype)
+            if S > self.k:
+                sp = pos[b, surf_idx].detach()    # [S, 2]
+                sc = curv[b, surf_idx, 0].detach()  # [S]
+                sp_pred = pred[b, surf_idx]           # [S, C] — carries grad
+
+                dm = torch.cdist(sp, sp)              # [S, S]
+                dm.fill_diagonal_(float('inf'))
+                nn_dist, nn_idx = dm.topk(self.k, dim=-1, largest=False)  # [S, k]
+
+                dxy = sp[nn_idx] - sp.unsqueeze(1)                         # [S, k, 2]
+                curv_diff = sc[nn_idx] - sc.unsqueeze(1)                   # [S, k]
+                feat = torch.cat(
+                    [dxy, nn_dist.unsqueeze(-1), curv_diff.unsqueeze(-1)],
+                    dim=-1,
+                )  # [S, k, 4]
+
+                weights = self.mlp(feat)              # [S, k, 1]
+                nn_pred = sp_pred[nn_idx]             # [S, k, C] — carries grad
+                neighbor_avg = (weights * nn_pred).sum(dim=1)  # [S, C]
+
+                idx_expand = surf_idx.unsqueeze(-1).expand(S, C)
+                delta_b = delta_b.scatter_add(0, idx_expand, 0.1 * neighbor_avg)
+            delta_list.append(delta_b)
+
+        delta = torch.stack(delta_list, dim=0)  # [B, N, C]
+        return pred + delta
+
+
 class MLP(nn.Module):
     def __init__(self, n_input, n_hidden, n_output, n_layers=1, act="gelu", res=True):
         super().__init__()
@@ -535,8 +599,11 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
+ema_surf_refiner = None
 ema_start_epoch = 40
 ema_decay = 0.998
+
+surf_refiner = SurfaceRefiner(k=4).to(device)
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -575,6 +642,7 @@ base_opt = torch.optim.AdamW([
     {'params': attn_params, 'lr': cfg.lr * 0.5},
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
+base_opt.add_param_group({'params': list(surf_refiner.parameters()), 'lr': cfg.lr})
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
@@ -640,6 +708,7 @@ for epoch in range(MAX_EPOCHS):
 
     # --- Train ---
     model.train()
+    surf_refiner.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
@@ -701,6 +770,7 @@ for epoch in range(MAX_EPOCHS):
         pred = pred.float()
         re_pred = re_pred.float()
         aoa_pred = aoa_pred.float()
+        pred = surf_refiner(pred, x[:, :, :2].detach(), x[:, :, 24:25].detach(), is_surface, mask)
         if model.training:
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
@@ -786,9 +856,12 @@ for epoch in range(MAX_EPOCHS):
         if epoch >= ema_start_epoch:
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
+                ema_surf_refiner = deepcopy(surf_refiner)
             else:
                 with torch.no_grad():
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
+                        ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
+                    for ep, mp in zip(ema_surf_refiner.parameters(), surf_refiner.parameters()):
                         ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
@@ -809,8 +882,10 @@ for epoch in range(MAX_EPOCHS):
 
     # --- Validate across all splits ---
     eval_model = ema_model if ema_model is not None else model
+    eval_surf_refiner = ema_surf_refiner if ema_surf_refiner is not None else surf_refiner
     eval_model.eval()
     model.eval()
+    surf_refiner.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -867,6 +942,7 @@ for epoch in range(MAX_EPOCHS):
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
+                pred = eval_surf_refiner(pred, x[:, :, :2], x[:, :, 24:25], is_surface, mask)
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
