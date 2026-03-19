@@ -393,11 +393,12 @@ class Transolver(nn.Module):
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
+        fx_hidden = fx  # [B, N, n_hidden] — save for contrastive loss
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred, "fx_hidden": fx_hidden}
 
 
 # ---------------------------------------------------------------------------
@@ -698,6 +699,7 @@ for epoch in range(MAX_EPOCHS):
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
+            fx_hidden = out.get("fx_hidden")
         pred = pred.float()
         re_pred = re_pred.float()
         aoa_pred = aoa_pred.float()
@@ -778,6 +780,26 @@ for epoch in range(MAX_EPOCHS):
         aoa_target = x[:, 0, 14:15]  # AoA0_rad from normalized input
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
+
+        # Contrastive loss: InfoNCE on surface embeddings (temperature=0.05, weight=0.01)
+        if fx_hidden is not None:
+            fx_h = fx_hidden.float()
+            surf_cnt = surf_mask.sum(dim=1, keepdim=True).float().clamp(min=1)
+            surf_embed = (fx_h * surf_mask.unsqueeze(-1).float()).sum(dim=1) / surf_cnt
+            surf_embed = F.normalize(surf_embed, dim=-1)
+            sim = surf_embed @ surf_embed.T / 0.05
+            src_labels = is_tandem.long()
+            B_ct = src_labels.shape[0]
+            eye_mask = torch.eye(B_ct, dtype=torch.bool, device=device)
+            pos_mask = (src_labels.unsqueeze(0) == src_labels.unsqueeze(1)) & ~eye_mask
+            has_pos = pos_mask.any(dim=1)
+            if has_pos.any():
+                sim_stable = sim - sim.amax(dim=1, keepdim=True).detach()
+                exp_sim = sim_stable.exp()
+                pos_sum = (exp_sim * pos_mask.float()).sum(dim=1).clamp(min=1e-8)
+                all_sum = (exp_sim * (~eye_mask).float()).sum(dim=1).clamp(min=1e-8)
+                ct_loss = -torch.log(pos_sum / all_sum)
+                loss = loss + 0.01 * ct_loss[has_pos].mean()
 
         optimizer.zero_grad()
         loss.backward()
