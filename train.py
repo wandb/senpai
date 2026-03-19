@@ -393,11 +393,12 @@ class Transolver(nn.Module):
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
+        hidden_pre_last = fx  # save for contrastive loss [B, N, n_hidden]
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred, "hidden": hidden_pre_last}
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +436,36 @@ train_ds, val_splits, stats, sample_weights = load_data(
     cfg.manifest, cfg.stats_file, debug=cfg.debug,
 )
 stats = {k: v.to(device) for k, v in stats.items()}
+
+# --- Build source ID mapping for contrastive loss ---
+import json as _json
+with open(cfg.manifest) as _mf:
+    _manifest_data = _json.load(_mf)
+_source_names = sorted(_manifest_data["domain_groups"])
+_source_to_id = {name: i for i, name in enumerate(_source_names)}
+_global_idx_to_source = {}
+for _sname, _sidxs in _manifest_data["domain_groups"].items():
+    for _si in _sidxs:
+        _global_idx_to_source[_si] = _source_to_id[_sname]
+
+from torch.utils.data import Dataset as _Dataset
+
+class _SourceDataset(_Dataset):
+    def __init__(self, subset, global_idx_to_source):
+        self.subset = subset
+        self.src = [global_idx_to_source.get(i, 0) for i in subset.indices]
+    def __len__(self):
+        return len(self.subset)
+    def __getitem__(self, idx):
+        x, y, is_surf = self.subset[idx]
+        return x, y, is_surf, self.src[idx]
+
+def _source_collate(batch):
+    main_items, src_ids = zip(*[(b[:3], b[3]) for b in batch])
+    x_pad, y_pad, surf_pad, mask = pad_collate(list(main_items))
+    return x_pad, y_pad, surf_pad, mask, torch.tensor(list(src_ids), dtype=torch.long)
+
+train_ds_src = _SourceDataset(train_ds, _global_idx_to_source)
 
 
 def _umag_q(y, mask):
@@ -476,19 +507,21 @@ def _phys_denorm(y_p, Umag, q):
 
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
+src_loader_kwargs = dict(collate_fn=_source_collate, num_workers=4, pin_memory=True,
+                         persistent_workers=True, prefetch_factor=2)
 
 if cfg.debug:
     # Avoid sampler/length mismatch when train_ds is truncated
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
-                              shuffle=True, **loader_kwargs)
+    train_loader = DataLoader(train_ds_src, batch_size=cfg.batch_size,
+                              shuffle=True, **src_loader_kwargs)
 else:
     sampler = WeightedRandomSampler(
         weights=sample_weights,
         num_samples=len(train_ds),
         replacement=True,
     )
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
-                              sampler=sampler, **loader_kwargs)
+    train_loader = DataLoader(train_ds_src, batch_size=cfg.batch_size,
+                              sampler=sampler, **src_loader_kwargs)
 
 val_loaders = {
     name: DataLoader(subset, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
@@ -645,10 +678,11 @@ for epoch in range(MAX_EPOCHS):
     n_batches = 0
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
-    for x, y, is_surface, mask in pbar:
+    for x, y, is_surface, mask, source_ids in pbar:
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
+        source_ids = source_ids.to(device, non_blocking=True)
 
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
@@ -698,9 +732,11 @@ for epoch in range(MAX_EPOCHS):
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
+            hidden = out["hidden"]
         pred = pred.float()
         re_pred = re_pred.float()
         aoa_pred = aoa_pred.float()
+        hidden = hidden.float()
         if model.training:
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
@@ -778,6 +814,22 @@ for epoch in range(MAX_EPOCHS):
         aoa_target = x[:, 0, 14:15]  # AoA0_rad from normalized input
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
+
+        # Contrastive loss: pull together surface embeddings from same data source
+        surf_embed = (hidden * is_surface.float().unsqueeze(-1)).sum(dim=1)
+        surf_embed = surf_embed / (is_surface.float().sum(dim=1, keepdim=True).clamp(min=1))
+        surf_embed = F.normalize(surf_embed, dim=-1)  # [B, n_hidden]
+        B_curr = surf_embed.shape[0]
+        eye_mask = torch.eye(B_curr, dtype=torch.bool, device=device)
+        pos_mask = (source_ids.unsqueeze(0) == source_ids.unsqueeze(1)) & ~eye_mask
+        if pos_mask.any():
+            sim = surf_embed @ surf_embed.T / 0.1  # [B, B]
+            sim_masked = sim.masked_fill(eye_mask, float('-inf'))
+            log_probs = F.log_softmax(sim_masked, dim=-1)
+            n_pos = pos_mask.float().sum(dim=1).clamp(min=1)
+            per_sample_loss = -(log_probs * pos_mask.float()).sum(dim=1) / n_pos
+            contrastive_loss = per_sample_loss[pos_mask.any(dim=1)].mean()
+            loss = loss + 0.005 * contrastive_loss
 
         optimizer.zero_grad()
         loss.backward()
