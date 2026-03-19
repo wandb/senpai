@@ -143,6 +143,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout),
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
+        self.register_buffer('slice_prototypes', torch.zeros(heads, slice_num, dim_head))
 
     def forward(self, x, spatial_bias=None, tandem_mask=None):
         bsz, num_points, _ = x.shape
@@ -169,6 +170,12 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
+
+        # EMA update of slice prototypes during training; blend current tokens with prototypes
+        if self.training:
+            with torch.no_grad():
+                self.slice_prototypes.lerp_(slice_token.detach().mean(0), 0.01)
+        slice_token = slice_token + 0.1 * self.slice_prototypes.unsqueeze(0)
 
         q_slice_token = self.to_q(slice_token)
         slice_token_kv = slice_token.mean(dim=1, keepdim=True)  # shared K,V: (bsz, 1, slice_num, dim_head)
@@ -318,6 +325,9 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        self.freq_net = nn.Sequential(nn.Linear(8, 16), nn.GELU(), nn.Linear(16, 4))
+        nn.init.zeros_(self.freq_net[-1].weight)
+        nn.init.zeros_(self.freq_net[-1].bias)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -660,9 +670,14 @@ for epoch in range(MAX_EPOCHS):
         xy_min = raw_xy.amin(dim=1, keepdim=True)
         xy_max = raw_xy.amax(dim=1, keepdim=True)
         xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-        freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-        xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+        B = x.shape[0]
+        cond = x[:, 0, 10:18]  # condition features (Re, AoA, and neighbors) [B, 8]
+        freq_offset = _base_model.freq_net(cond)  # [B, 4] per-sample frequency offsets
+        freqs_fixed = _base_model.fourier_freqs_fixed.to(device)  # [4]
+        freqs_learned = _base_model.fourier_freqs_learned.abs() + freq_offset  # [B, 4]
+        freqs = torch.cat([freqs_fixed.unsqueeze(0).expand(B, -1), freqs_learned], dim=-1)  # [B, 8]
+        xy_scaled = xy_norm.unsqueeze(-1) * freqs[:, None, None, :]  # [B, N, 2, 8]
+        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 32]
         x = torch.cat([x, fourier_pe], dim=-1)
         if model.training and epoch < 60:
             noise_scale = 0.05 * (1 - epoch / 60)
@@ -841,9 +856,14 @@ for epoch in range(MAX_EPOCHS):
                 xy_min = raw_xy.amin(dim=1, keepdim=True)
                 xy_max = raw_xy.amax(dim=1, keepdim=True)
                 xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-                xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+                B = x.shape[0]
+                cond = x[:, 0, 10:18]  # condition features [B, 8]
+                freq_offset = _base_model.freq_net(cond)  # [B, 4]
+                freqs_fixed = _base_model.fourier_freqs_fixed.to(device)  # [4]
+                freqs_learned = _base_model.fourier_freqs_learned.abs() + freq_offset  # [B, 4]
+                freqs = torch.cat([freqs_fixed.unsqueeze(0).expand(B, -1), freqs_learned], dim=-1)  # [B, 8]
+                xy_scaled = xy_norm.unsqueeze(-1) * freqs[:, None, None, :]  # [B, N, 2, 8]
+                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 32]
                 x = torch.cat([x, fourier_pe], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
