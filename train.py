@@ -783,8 +783,8 @@ for epoch in range(MAX_EPOCHS):
         loss = loss + 0.01 * aoa_loss
 
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
-        # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
-        is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
+        # Group B = tandem + extreme-Re (>1σ) only; ood_cond stays in Group A with in_dist
+        is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0)
         is_indist_pcgrad = ~is_ood_pcgrad
         use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
 
