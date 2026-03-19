@@ -310,6 +310,7 @@ class Transolver(nn.Module):
         self.out_skip = nn.Linear(n_hidden, out_dim)
         nn.init.zeros_(self.out_skip.weight)
         nn.init.zeros_(self.out_skip.bias)
+        self.mask_token = nn.Parameter(torch.zeros(fun_dim + space_dim))
         self.skip_gate = nn.Sequential(nn.Linear(n_hidden, 1), nn.Sigmoid())
         nn.init.constant_(self.skip_gate[0].bias, -2.0)  # starts nearly closed
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
@@ -693,6 +694,15 @@ for epoch in range(MAX_EPOCHS):
                     sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
             y_norm = y_norm / sample_stds
 
+        mask_idx = None
+        if model.training:
+            vol_mask_bool = mask & ~is_surface
+            rand_mask = torch.rand(B, x.shape[1], device=device) < 0.15
+            mask_idx = rand_mask & vol_mask_bool
+            if mask_idx.any():
+                mask_token_expanded = _base_model.mask_token.view(1, 1, -1).expand(B, x.shape[1], -1)
+                x = torch.where(mask_idx.unsqueeze(-1), mask_token_expanded, x)
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model({"x": x})
             pred = out["preds"]
@@ -747,6 +757,9 @@ for epoch in range(MAX_EPOCHS):
         tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
         loss = vol_loss + surf_weight * surf_loss
+        if mask_idx is not None and mask_idx.any():
+            mask_recon_loss = (pred[mask_idx] - y_norm[mask_idx]).abs().mean() * 0.05
+            loss = loss + mask_recon_loss
 
         # Multi-scale loss: coarse spatial pooling
         coarse_pool_size = 64
