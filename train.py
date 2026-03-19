@@ -174,10 +174,11 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         slice_token_kv = slice_token.mean(dim=1, keepdim=True)  # shared K,V: (bsz, 1, slice_num, dim_head)
         k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
         v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
-        q_norm = F.normalize(q_slice_token, dim=-1)
-        k_norm = F.normalize(k_slice_token, dim=-1)
-        attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
-        attn_weights = F.softmax(attn_logits, dim=-1)
+        with torch.amp.autocast('cuda', enabled=False):
+            q_norm = F.normalize(q_slice_token.float(), dim=-1)
+            k_norm = F.normalize(k_slice_token.float(), dim=-1)
+            attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale.float()
+            attn_weights = F.softmax(attn_logits, dim=-1).to(v_slice_token.dtype)
         out_slice_token = torch.matmul(attn_weights, v_slice_token)
         out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
 
