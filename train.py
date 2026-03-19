@@ -224,14 +224,15 @@ class TransolverBlock(nn.Module):
         nn.init.zeros_(self.se_fc2.weight)
         nn.init.zeros_(self.se_fc2.bias)
         if self.last_layer:
-            self.ln_3 = nn.LayerNorm(hidden_dim)
+            self.hidden_dim = hidden_dim
             self.mlp2 = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.GELU(),
                 nn.Linear(hidden_dim, out_dim),
             )
+            self.adaln_out = nn.Sequential(nn.Linear(4, 32), nn.GELU(), nn.Linear(32, 2 * hidden_dim))
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
@@ -240,7 +241,9 @@ class TransolverBlock(nn.Module):
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            gamma, beta = self.adaln_out(condition).chunk(2, dim=-1)  # each [B, hidden_dim]
+            fx = F.layer_norm(fx, [self.hidden_dim]) * (1 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+            return self.mlp2(fx)
         return fx
 
 
@@ -307,6 +310,11 @@ class Transolver(nn.Module):
             ]
         )
         self.initialize_weights()
+        # Zero-init adaln_out output layer so AdaLN starts as identity
+        for block in self.blocks:
+            if block.last_layer:
+                nn.init.zeros_(block.adaln_out[-1].weight)
+                nn.init.zeros_(block.adaln_out[-1].bias)
         self.out_skip = nn.Linear(n_hidden, out_dim)
         nn.init.zeros_(self.out_skip.weight)
         nn.init.zeros_(self.out_skip.bias)
@@ -382,6 +390,9 @@ class Transolver(nn.Module):
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
 
+        # Extract global condition: [log_Re, AoA0, gap, stagger] from node 0 (same for all nodes)
+        c = x[:, 0, :][:, [13, 14, 22, 23]]  # [B, 4]
+
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
@@ -393,7 +404,7 @@ class Transolver(nn.Module):
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=c)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
