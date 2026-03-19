@@ -704,11 +704,16 @@ for epoch in range(MAX_EPOCHS):
         if model.training:
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
-        abs_err = (pred - y_norm).abs()
+        err_raw = pred - y_norm
+        abs_err = err_raw.abs()
         if epoch < 10:
             is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
             sample_mask = (~is_tandem_curr).float()[:, None, None]
             abs_err = abs_err * sample_mask
+            err_raw = err_raw * sample_mask
+        # Asymmetric pinball loss (tau=0.45) for surface pressure only
+        err_p = err_raw[:, :, 2:3]
+        surf_pres_abs = torch.where(err_p > 0, 0.45 * err_p, 0.55 * (-err_p))
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
@@ -728,14 +733,14 @@ for epoch in range(MAX_EPOCHS):
 
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        surf_per_sample = (surf_pres_abs * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
         running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
         # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
         if epoch >= 30:
-            surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
+            surf_pres = surf_pres_abs  # pinball pressure errors [B, N, 1]
             surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
             surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
             thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
@@ -1014,6 +1019,14 @@ if best_metrics:
                 x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                 curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                 x_n = torch.cat([x_n, curv], dim=-1)
+                raw_xy_v = x_n[:, :, :2]
+                xy_min_v = raw_xy_v.amin(dim=1, keepdim=True)
+                xy_max_v = raw_xy_v.amax(dim=1, keepdim=True)
+                xy_norm_v = (raw_xy_v - xy_min_v) / (xy_max_v - xy_min_v + 1e-8)
+                freqs_v = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
+                xy_scaled_v = xy_norm_v.unsqueeze(-1) * freqs_v
+                fourier_pe_v = torch.cat([xy_scaled_v.sin().flatten(-2), xy_scaled_v.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, fourier_pe_v], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
