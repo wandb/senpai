@@ -144,7 +144,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
 
-    def forward(self, x, spatial_bias=None, tandem_mask=None):
+    def forward(self, x, spatial_bias=None, tandem_mask=None, is_surface=None):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -166,6 +166,10 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         if spatial_bias is not None:
             slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
         slice_weights = self.softmax(slice_logits)
+        if is_surface is not None:
+            # detach-vol-attn-grad: stop gradient for volume nodes' slice routing after ep30
+            surf_mask = is_surface[:, None, :, None]  # [B, 1, N, 1] → broadcasts to [B, H, N, slice_num]
+            slice_weights = torch.where(surf_mask, slice_weights, slice_weights.detach())
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
@@ -231,9 +235,9 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, is_surface=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
+        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask, is_surface=is_surface) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
@@ -368,6 +372,7 @@ class Transolver(nn.Module):
             raise ValueError("Missing required input tensor: x")
         if condition is not None:
             raise ValueError("Transolver does not support conditioning inputs")
+        is_surface = data.get("is_surface") if isinstance(data, dict) else None  # detach-vol-attn-grad
 
         if self.unified_pos:
             if pos is None:
@@ -387,13 +392,13 @@ class Transolver(nn.Module):
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, is_surface=is_surface)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, is_surface=is_surface)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
@@ -694,7 +699,11 @@ for epoch in range(MAX_EPOCHS):
             y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            # detach-vol-attn-grad: pass is_surface after ep30 to stop vol grad on slice routing
+            model_input = {"x": x}
+            if epoch >= 30:
+                model_input["is_surface"] = is_surface
+            out = model(model_input)
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
