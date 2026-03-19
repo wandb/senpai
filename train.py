@@ -230,8 +230,11 @@ class TransolverBlock(nn.Module):
                 nn.GELU(),
                 nn.Linear(hidden_dim, out_dim),
             )
+            self.adaln_out_mlp = nn.Sequential(nn.Linear(4, 32), nn.GELU(), nn.Linear(32, 2 * hidden_dim))
+            nn.init.zeros_(self.adaln_out_mlp[-1].weight)
+            nn.init.zeros_(self.adaln_out_mlp[-1].bias)
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
@@ -240,7 +243,12 @@ class TransolverBlock(nn.Module):
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            if condition is not None:
+                gamma, beta = self.adaln_out_mlp(condition).chunk(2, dim=-1)
+                fx_ln3 = F.layer_norm(fx, [fx.shape[-1]]) * (1 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+            else:
+                fx_ln3 = self.ln_3(fx)
+            return self.mlp2(fx_ln3)
         return fx
 
 
@@ -318,6 +326,9 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        self.input_skip_p = nn.Linear(fun_dim + space_dim, 1)
+        nn.init.zeros_(self.input_skip_p.weight)
+        nn.init.zeros_(self.input_skip_p.bias)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -375,6 +386,7 @@ class Transolver(nn.Module):
             new_pos = self.get_grid(pos)
             x = torch.cat((x, new_pos), dim=-1)
 
+        x_raw = x
         x_cross = x * self.feature_cross(x)
         x = x + 0.1 * x_cross  # residual with small scale
         raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:25]], dim=-1)  # x, y, curvature
@@ -393,9 +405,13 @@ class Transolver(nn.Module):
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+        # AdaLN condition: [Re, AoA, gap, stagger] from raw input features
+        adaln_cond = torch.cat([x_raw[:, 0, 13:15], x_raw[:, 0, 21:23]], dim=-1)  # [B, 4]
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=adaln_cond)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
+        # Pressure-only input skip: direct linear path for pressure channel
+        fx[:, :, 2:3] = fx[:, :, 2:3] + 0.1 * self.input_skip_p(x_raw)
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
