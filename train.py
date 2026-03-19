@@ -124,6 +124,19 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout),
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
+        self.rope_dim = dim_head // 2
+
+    def _apply_rope(self, x, seq_len):
+        d = self.rope_dim
+        pos = torch.arange(seq_len, device=x.device, dtype=x.dtype).unsqueeze(0).unsqueeze(0).unsqueeze(-1)
+        freqs = 1.0 / (10000 ** (torch.arange(0, d, 2, device=x.device, dtype=x.dtype) / d))
+        angles = pos * freqs
+        cos_a, sin_a = angles.cos(), angles.sin()
+        x1, x2, x_rest = x[..., :d:2], x[..., 1:d:2], x[..., d:]
+        rx1 = x1 * cos_a - x2 * sin_a
+        rx2 = x1 * sin_a + x2 * cos_a
+        rotated = torch.stack([rx1, rx2], dim=-1).flatten(-2)
+        return torch.cat([rotated, x_rest], dim=-1)
 
     def forward(self, x, spatial_bias=None):
         bsz, num_points, _ = x.shape
@@ -152,6 +165,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         slice_token_kv = slice_token.mean(dim=1, keepdim=True)  # shared K,V: (bsz, 1, slice_num, dim_head)
         k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
         v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
+        q_slice_token = self._apply_rope(q_slice_token, q_slice_token.shape[2])
+        k_slice_token = self._apply_rope(k_slice_token, k_slice_token.shape[2])
         q_norm = F.normalize(q_slice_token, dim=-1)
         k_norm = F.normalize(k_slice_token, dim=-1)
         attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
