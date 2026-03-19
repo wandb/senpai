@@ -395,6 +395,8 @@ class Transolver(nn.Module):
 
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
         gate = self.skip_gate(fx_pre)
+        if self.training:
+            gate = F.dropout(gate, p=0.15, training=True)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
