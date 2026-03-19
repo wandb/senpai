@@ -779,8 +779,42 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
-        optimizer.zero_grad()
-        loss.backward()
+        # PCGrad: tandem vs non-tandem gradient projection
+        nontandem_idx = (~is_tandem_batch).nonzero(as_tuple=True)[0]
+        tandem_idx = is_tandem_batch.nonzero(as_tuple=True)[0]
+        pcgrad_active = len(nontandem_idx) > 0 and len(tandem_idx) > 0
+
+        if pcgrad_active:
+            def _group_loss(idx):
+                ae = abs_err[idx]
+                vm = vol_mask_train[idx]
+                sm = surf_mask[idx]
+                vl = (ae * vm.unsqueeze(-1)).sum() / vm.sum().clamp(min=1)
+                sl = (ae * sm.unsqueeze(-1)).sum() / sm.sum().clamp(min=1)
+                return vl + surf_weight * sl
+
+            optimizer.zero_grad()
+            _group_loss(nontandem_idx).backward(retain_graph=True)
+            grads_A = [p.grad.clone() if p.grad is not None else torch.zeros_like(p)
+                       for p in model.parameters()]
+
+            optimizer.zero_grad()
+            _group_loss(tandem_idx).backward()
+            grads_B = [p.grad.clone() if p.grad is not None else torch.zeros_like(p)
+                       for p in model.parameters()]
+
+            optimizer.zero_grad()
+            for p, gA, gB in zip(model.parameters(), grads_A, grads_B):
+                gA_flat = gA.flatten()
+                gB_flat = gB.flatten()
+                dot = (gA_flat * gB_flat).sum()
+                if dot < 0:
+                    gA = gA - (dot / ((gB_flat * gB_flat).sum() + 1e-12)) * gB
+                    gB = gB - (dot / ((gA_flat * gA_flat).sum() + 1e-12)) * gA
+                p.grad = (gA + gB) / 2
+        else:
+            optimizer.zero_grad()
+            loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         if epoch >= ema_start_epoch:
