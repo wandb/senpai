@@ -498,7 +498,7 @@ model_config = dict(
 )
 
 model = Transolver(**model_config).to(device)
-model = torch.compile(model, mode="reduce-overhead")
+model = torch.compile(model)  # default mode: no CUDAGraphs (required for gradient accumulation)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
@@ -594,6 +594,7 @@ prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
+accum_steps = 2
 
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
@@ -613,7 +614,8 @@ for epoch in range(MAX_EPOCHS):
     n_batches = 0
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
-    for x, y, is_surface, mask in pbar:
+    optimizer.zero_grad()
+    for batch_idx, (x, y, is_surface, mask) in enumerate(pbar):
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -737,19 +739,20 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        if epoch >= ema_start_epoch:
-            if ema_model is None:
-                ema_model = deepcopy(_base_model)
-            else:
-                with torch.no_grad():
-                    for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
-                        ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
-        global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        (loss / accum_steps).backward()
+        if (batch_idx + 1) % accum_steps == 0 or batch_idx == len(train_loader) - 1:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            if epoch >= ema_start_epoch:
+                if ema_model is None:
+                    ema_model = deepcopy(_base_model)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
+                            ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
+            global_step += 1
+            wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
