@@ -523,7 +523,7 @@ model_config = dict(
     n_hidden=160,  # regime-h: narrower for finer routing
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
     n_head=4,
-    slice_num=48,  # regime-h: more slices for finer spatial decomposition
+    slice_num=64,  # regime-z: finer spatial routing (48→64)
     mlp_ratio=2,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
@@ -677,20 +677,21 @@ for epoch in range(MAX_EPOCHS):
             noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
             y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
 
-        # Per-sample std normalization: skip tandem samples (gap feature index 21)
+        # Per-sample std normalization: vectorized
         raw_gap = x[:, 0, 21]
         is_tandem = raw_gap.abs() > 0.5
         B = y_norm.shape[0]
-        sample_stds = torch.ones(B, 1, 3, device=device)
         channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
         tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+        sample_stds = torch.ones(B, 1, 3, device=device)
         if model.training:
-            for b in range(B):
-                valid = mask[b]
-                if is_tandem[b]:
-                    sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
-                else:
-                    sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+            valid_count = mask.float().sum(dim=1, keepdim=True).clamp(min=1)
+            masked_y = y_norm * mask.float().unsqueeze(-1)
+            y_mean = masked_y.sum(dim=1, keepdim=True) / valid_count.unsqueeze(-1)
+            y_var = ((masked_y - y_mean) ** 2 * mask.float().unsqueeze(-1)).sum(dim=1, keepdim=True) / valid_count.unsqueeze(-1)
+            sample_stds = y_var.sqrt()
+            clamps = torch.where(is_tandem[:, None, None], tandem_clamps, channel_clamps)
+            sample_stds = sample_stds.clamp(min=clamps)
             y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -849,19 +850,19 @@ for epoch in range(MAX_EPOCHS):
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
-                # Per-sample std normalization: skip tandem samples
+                # Per-sample std normalization: vectorized
                 raw_gap = x[:, 0, 21]
                 is_tandem = raw_gap.abs() > 0.5
                 B = y_norm.shape[0]
-                sample_stds = torch.ones(B, 1, 3, device=device)
                 channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
                 tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
-                for b in range(B):
-                    valid = mask[b]
-                    if is_tandem[b]:
-                        sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
-                    else:
-                        sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+                valid_count = mask.float().sum(dim=1, keepdim=True).clamp(min=1)
+                masked_y = y_norm * mask.float().unsqueeze(-1)
+                y_mean = masked_y.sum(dim=1, keepdim=True) / valid_count.unsqueeze(-1)
+                y_var = ((masked_y - y_mean) ** 2 * mask.float().unsqueeze(-1)).sum(dim=1, keepdim=True) / valid_count.unsqueeze(-1)
+                sample_stds = y_var.sqrt()
+                clamps = torch.where(is_tandem[:, None, None], tandem_clamps, channel_clamps)
+                sample_stds = sample_stds.clamp(min=clamps)
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
