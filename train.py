@@ -474,6 +474,33 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
 
+
+def _fisher_eval_loss(mdl, raw_batch, _stats, _phys_stats, _device):
+    """Evaluate simple L1 loss on a raw batch for Fisher perturbation accept/reject."""
+    fx, fy, fis, fm = raw_batch
+    fx_n = (fx - _stats["x_mean"]) / _stats["x_std"]
+    curv = fx_n[:, :, 2:6].norm(dim=-1, keepdim=True) * fis.float().unsqueeze(-1)
+    fx_n = torch.cat([fx_n, curv], dim=-1)
+    raw_xy = fx_n[:, :, :2]
+    xy_min = raw_xy.amin(dim=1, keepdim=True)
+    xy_max = raw_xy.amax(dim=1, keepdim=True)
+    xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+    freqs = torch.cat([mdl.fourier_freqs_fixed.to(_device), mdl.fourier_freqs_learned.abs()])
+    xy_sc = xy_norm.unsqueeze(-1) * freqs
+    fpe = torch.cat([xy_sc.sin().flatten(-2), xy_sc.cos().flatten(-2)], dim=-1)
+    fx_n = torch.cat([fx_n, fpe], dim=-1)
+    Umag_f, q_f = _umag_q(fy, fm)
+    y_phys_f = _phys_norm(fy, Umag_f, q_f)
+    y_norm_f = (y_phys_f - _phys_stats["y_mean"]) / _phys_stats["y_std"]
+    with torch.no_grad():
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            pred_f = mdl({"x": fx_n})["preds"]
+        pred_f = pred_f.float()
+        loss_f = (pred_f - y_norm_f).abs()
+        loss_f = (loss_f * fm.unsqueeze(-1)).sum() / fm.sum().clamp(min=1)
+    return loss_f.item()
+
+
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
 
@@ -626,6 +653,16 @@ prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
+
+# === Fisher-scaled perturbation: precompute val batch for accept/reject ===
+_FISHER_SCALE = 0.001
+_fisher_raw_batch = None
+for _fxb, _fyb, _fisb, _fmb in val_loaders["val_in_dist"]:
+    _fisher_raw_batch = (
+        _fxb.to(device), _fyb.to(device), _fisb.to(device), _fmb.to(device)
+    )
+    break
+_fisher_prev_loss = float("inf")  # reference before perturbation
 
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
@@ -783,6 +820,37 @@ for epoch in range(MAX_EPOCHS):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        # === Fisher-scaled perturbation (after Lookahead sync) ===
+        if optimizer.step_count % optimizer.k == 0 and _fisher_raw_batch is not None:
+            _base_model.eval()
+            # Compute reference loss before perturbation
+            _ref_loss = _fisher_eval_loss(_base_model, _fisher_raw_batch, stats, phys_stats, device)
+            # Save slow params, apply Fisher-scaled noise
+            _saved_slow = [
+                [s.data.clone() for s in sg]
+                for sg in optimizer.slow_params
+            ]
+            _accepted = True
+            with torch.no_grad():
+                for sg, pg in zip(optimizer.slow_params, optimizer.base_optimizer.param_groups):
+                    for s, p in zip(sg, pg['params']):
+                        _state = optimizer.base_optimizer.state.get(p, {})
+                        _v = _state.get('exp_avg_sq', None)
+                        if _v is not None:
+                            _noise_std = _FISHER_SCALE / (_v.sqrt() + 1e-8)
+                            s.data.add_(torch.randn_like(s.data) * _noise_std)
+                            p.data.copy_(s.data)
+            # Evaluate perturbed model
+            _new_loss = _fisher_eval_loss(_base_model, _fisher_raw_batch, stats, phys_stats, device)
+            if _new_loss > _ref_loss:
+                # Reject: restore slow and fast params
+                with torch.no_grad():
+                    for sg, pg, saved_g in zip(optimizer.slow_params, optimizer.base_optimizer.param_groups, _saved_slow):
+                        for s, p, sv in zip(sg, pg['params'], saved_g):
+                            s.data.copy_(sv)
+                            p.data.copy_(sv)
+                _accepted = False
+            _base_model.train()
         if epoch >= ema_start_epoch:
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
