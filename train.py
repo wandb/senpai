@@ -620,6 +620,9 @@ best_val = float("inf")
 ema_val_loss = float("inf")
 ema_decay_val = 0.9
 best_metrics = {}
+swa_snapshots: list[dict] = []
+swa_phase = False
+swa_scheduler = None
 global_step = 0
 train_start = time.time()
 prev_vol_loss = 1.0
@@ -798,7 +801,22 @@ for epoch in range(MAX_EPOCHS):
         n_batches += 1
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
-    scheduler.step()
+    # SWA phase: switch to cyclic cosine LR after epoch 47 (1-indexed)
+    if not swa_phase and epoch == 46:
+        swa_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            base_opt, T_0=5, T_mult=1, eta_min=5e-5
+        )
+        for pg in base_opt.param_groups:
+            pg['lr'] = 5e-4 * (0.5 if pg['lr'] < cfg.lr else 1.0)
+        swa_phase = True
+    if swa_phase:
+        swa_scheduler.step()
+        # Collect snapshot at cycle troughs: epochs 52, 57, 62 (1-indexed)
+        if (epoch + 1) in [52, 57, 62]:
+            swa_snapshots.append({k: v.clone() for k, v in _base_model.state_dict().items()})
+            print(f"  → SWA snapshot {len(swa_snapshots)} collected (epoch {epoch + 1})")
+    else:
+        scheduler.step()
     if epoch >= 50:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
@@ -977,6 +995,89 @@ for epoch in range(MAX_EPOCHS):
         f"val[{split_summary}]{tag}"
     )
 
+
+# --- SWA final evaluation ---
+if swa_snapshots:
+    print(f"\nAveraging {len(swa_snapshots)} SWA snapshots for final evaluation...")
+    swa_state = {k: sum(s[k].float() for s in swa_snapshots) / len(swa_snapshots)
+                 for k in swa_snapshots[0]}
+    swa_eval = deepcopy(_base_model)
+    swa_eval.load_state_dict(swa_state)
+    swa_eval.eval()
+    swa_split_losses = []
+    swa_log: dict = {}
+    for split_name, vloader in val_loaders.items():
+        vv, vs, nb = 0.0, 0.0, 0
+        ms = torch.zeros(3, device=device)
+        mv = torch.zeros(3, device=device)
+        ns = torch.zeros(3, device=device)
+        nv = torch.zeros(3, device=device)
+        with torch.no_grad():
+            for x, y, is_surface, mask in vloader:
+                x, y = x.to(device), y.to(device)
+                is_surface, mask = is_surface.to(device), mask.to(device)
+                x = (x - stats["x_mean"]) / stats["x_std"]
+                curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                x = torch.cat([x, curv], dim=-1)
+                raw_xy = x[:, :, :2]
+                xy_min = raw_xy.amin(dim=1, keepdim=True)
+                xy_max = raw_xy.amax(dim=1, keepdim=True)
+                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                freqs = torch.cat([swa_eval.fourier_freqs_fixed.to(device), swa_eval.fourier_freqs_learned.abs()])
+                xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                x = torch.cat([x, fourier_pe], dim=-1)
+                Umag, q = _umag_q(y, mask)
+                y_phys = _phys_norm(y, Umag, q)
+                y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                raw_gap = x[:, 0, 21]
+                is_tandem = raw_gap.abs() > 0.5
+                B = y_norm.shape[0]
+                ss = torch.ones(B, 1, 3, device=device)
+                cc = torch.tensor([0.1, 0.1, 0.5], device=device)
+                tc = torch.tensor([0.3, 0.3, 1.0], device=device)
+                for b in range(B):
+                    valid = mask[b]
+                    ss[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tc if is_tandem[b] else cc)
+                y_ns = y_norm / ss
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    pred = swa_eval({"x": x})["preds"].float()
+                ae = (pred / ss - y_ns).abs().nan_to_num(0.0)
+                vm = mask & ~is_surface
+                sm = mask & is_surface
+                vv += min((ae * vm.unsqueeze(-1)).sum().item() / vm.sum().clamp(min=1).item(), 1e6)
+                vs += min((ae[:, :, 2:3] * sm.unsqueeze(-1)).sum().item() / sm.sum().clamp(min=1).item(), 1e6)
+                nb += 1
+                po = _phys_denorm(pred * phys_stats["y_std"] + phys_stats["y_mean"], Umag, q)
+                err = (po - y.clamp(-1e6, 1e6)).abs()
+                fin = err.isfinite()
+                err = err.where(fin, torch.zeros_like(err))
+                ms += (err * sm.unsqueeze(-1)).sum(dim=(0, 1))
+                mv += (err * vm.unsqueeze(-1)).sum(dim=(0, 1))
+                ns += (sm.unsqueeze(-1) * fin).sum(dim=(0, 1)).float()
+                nv += (vm.unsqueeze(-1) * fin).sum(dim=(0, 1)).float()
+        vv /= max(nb, 1)
+        vs /= max(nb, 1)
+        sl = vv + cfg.surf_weight * vs
+        ms /= ns.clamp(min=1)
+        mv /= nv.clamp(min=1)
+        swa_split_losses.append(sl)
+        swa_log.update({
+            f"swa/{split_name}/loss": sl,
+            f"swa/{split_name}/mae_surf_Ux": ms[0].item(),
+            f"swa/{split_name}/mae_surf_Uy": ms[1].item(),
+            f"swa/{split_name}/mae_surf_p": ms[2].item(),
+            f"swa/{split_name}/mae_vol_p": mv[2].item(),
+        })
+        print(f"  SWA {split_name}: loss={sl:.4f}  mae_surf_p={ms[2].item():.2f}")
+    swa_val_total = sum(swa_split_losses) / len(swa_split_losses)
+    swa_log["swa/val_loss"] = swa_val_total
+    print(f"SWA val/loss={swa_val_total:.4f}  EMA best={best_val:.4f}")
+    wandb.log({**swa_log, "global_step": global_step})
+    if swa_val_total < best_val:
+        torch.save(swa_state, model_path)
+        best_val = swa_val_total
+        print("SWA model saved as new best checkpoint!")
 
 # --- Final summary ---
 total_time = (time.time() - train_start) / 60.0
