@@ -188,7 +188,7 @@ class TransolverBlock(nn.Module):
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
-        self.spatial_bias = nn.Sequential(nn.Linear(2, 32), nn.GELU(), nn.Linear(32, slice_num))
+        self.spatial_bias = nn.Sequential(nn.Linear(3, 32), nn.GELU(), nn.Linear(32, slice_num))
         self.ln_1_post = nn.LayerNorm(hidden_dim)
         self.ln_2_post = nn.LayerNorm(hidden_dim)
         self.se_fc1 = nn.Linear(hidden_dim, hidden_dim // 4)
@@ -350,18 +350,22 @@ class Transolver(nn.Module):
         x_cross = x * self.feature_cross(x)
         x = x + 0.1 * x_cross  # residual with small scale
         raw_xy = x[:, :, :2]
+        # Curvature is right before Fourier PE in the feature vector
+        n_fourier = 2 * 2 * (len(self.fourier_freqs_fixed) + len(self.fourier_freqs_learned))
+        curv = x[:, :, -(n_fourier + 1):-(n_fourier)]  # [B, N, 1]
+        raw_xy_curv = torch.cat([raw_xy, curv], dim=-1)  # [B, N, 3]
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy)
+            fx = block(fx, raw_xy=raw_xy_curv)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy_curv)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
