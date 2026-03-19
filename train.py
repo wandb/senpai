@@ -285,7 +285,10 @@ class Transolver(nn.Module):
                 act=act,
             )
         else:
-            self.preprocess = GatedMLP2(fun_dim + space_dim, n_hidden * 2, n_hidden)
+            # Factored preprocess: 3 parallel specialized branches
+            self.geom_branch = GatedMLP2(11, n_hidden * 2 // 3, n_hidden // 3)   # dsdf+saf+curvature
+            self.cond_branch = GatedMLP2(11, n_hidden * 2 // 3, n_hidden // 3)   # Re, AoA, NACA, gap
+            self.pos_branch = GatedMLP2(34, n_hidden * 2 // 3, n_hidden // 3)    # xy + Fourier PE
 
         self.n_hidden = n_hidden
         self.space_dim = space_dim
@@ -382,7 +385,14 @@ class Transolver(nn.Module):
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
 
-        fx = self.preprocess(x)
+        geom_feats = torch.cat([x[:, :, 2:12], x[:, :, 24:25]], dim=-1)   # [B, N, 11]
+        cond_feats = x[:, :, 13:24]                                          # [B, N, 11]
+        pos_feats = torch.cat([x[:, :, 0:2], x[:, :, 25:57]], dim=-1)      # [B, N, 34]
+        fx = torch.cat([
+            self.geom_branch(geom_feats),
+            self.cond_branch(cond_feats),
+            self.pos_branch(pos_feats),
+        ], dim=-1)  # [B, N, n_hidden]
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
