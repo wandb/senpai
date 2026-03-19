@@ -226,9 +226,9 @@ class TransolverBlock(nn.Module):
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
             self.mlp2 = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
+                nn.utils.parametrizations.spectral_norm(nn.Linear(hidden_dim, hidden_dim)),
                 nn.GELU(),
-                nn.Linear(hidden_dim, out_dim),
+                nn.utils.parametrizations.spectral_norm(nn.Linear(hidden_dim, out_dim)),
             )
 
     def forward(self, fx, raw_xy=None, tandem_mask=None):
