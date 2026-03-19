@@ -535,8 +535,8 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
-ema_start_epoch = 40
-ema_decay = 0.998
+ema_start_epoch = 25
+ema_decay = 0.997
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -577,7 +577,7 @@ base_opt = torch.optim.AdamW([
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
+cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=72, eta_min=5e-5)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
     base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[10]
 )
