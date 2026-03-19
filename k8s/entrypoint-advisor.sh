@@ -33,7 +33,7 @@ else
     git push -u origin "$ADVISOR_BRANCH"
 fi
 
-# --- Install role instructions (after checkout so we don't dirty the worktree) ---
+# --- Install role instructions ---
 cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
 
 # --- Install Claude Code ---
