@@ -21,10 +21,12 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
 """
 
 import os
+import random
 import time
 from collections.abc import Mapping
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -421,9 +423,16 @@ class Config:
     wandb_name: str | None = None
     agent: str | None = None
     debug: bool = False
+    seed: int = 0
 
 
 cfg = sp.parse(Config)
+
+torch.manual_seed(cfg.seed)
+np.random.seed(cfg.seed)
+random.seed(cfg.seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(cfg.seed)
 
 if cfg.debug:
     MAX_EPOCHS = 3
