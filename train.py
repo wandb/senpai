@@ -72,6 +72,24 @@ class GatedMLP(nn.Module):
         return self.down_proj(torch.sigmoid(self.gate_proj(x)) * self.act(self.up_proj(x)))
 
 
+class GatedMLP2(nn.Module):
+    """GatedMLP with a residual second gated layer."""
+    def __init__(self, n_input, n_hidden, n_output, act='gelu'):
+        super().__init__()
+        act_fn = ACTIVATION[act]
+        self.gate1 = nn.Linear(n_input, n_hidden)
+        self.up1 = nn.Linear(n_input, n_hidden)
+        self.gate2 = nn.Linear(n_hidden, n_hidden)
+        self.up2 = nn.Linear(n_hidden, n_hidden)
+        self.down = nn.Linear(n_hidden, n_output)
+        self.act = act_fn()
+
+    def forward(self, x):
+        h = torch.sigmoid(self.gate1(x)) * self.act(self.up1(x))
+        h = h + torch.sigmoid(self.gate2(h)) * self.act(self.up2(h))
+        return self.down(h)
+
+
 class MLP(nn.Module):
     def __init__(self, n_input, n_hidden, n_output, n_layers=1, act="gelu", res=True):
         super().__init__()
@@ -257,7 +275,7 @@ class Transolver(nn.Module):
                 act=act,
             )
         else:
-            self.preprocess = GatedMLP(fun_dim + space_dim, n_hidden * 2, n_hidden)
+            self.preprocess = GatedMLP2(fun_dim + space_dim, n_hidden * 2, n_hidden)
 
         self.n_hidden = n_hidden
         self.space_dim = space_dim
