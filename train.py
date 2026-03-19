@@ -143,6 +143,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout),
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
+        self.register_buffer('slice_prototypes', torch.zeros(1, heads, slice_num, dim_head))
 
     def forward(self, x, spatial_bias=None, tandem_mask=None):
         bsz, num_points, _ = x.shape
@@ -169,6 +170,13 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
+
+        # Slice memory: EMA update + blend with prototypes
+        if self.training:
+            with torch.no_grad():
+                mean_st = slice_token.float().mean(dim=0, keepdim=True)
+                self.slice_prototypes.lerp_(mean_st, 0.01)
+        slice_token = 0.8 * slice_token + 0.2 * self.slice_prototypes.to(dtype=slice_token.dtype)
 
         q_slice_token = self.to_q(slice_token)
         slice_token_kv = slice_token.mean(dim=1, keepdim=True)  # shared K,V: (bsz, 1, slice_num, dim_head)
@@ -421,9 +429,15 @@ class Config:
     wandb_name: str | None = None
     agent: str | None = None
     debug: bool = False
+    seed: int = 0
 
 
 cfg = sp.parse(Config)
+
+if cfg.seed != 0:
+    import random
+    random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
 
 if cfg.debug:
     MAX_EPOCHS = 3
