@@ -316,6 +316,9 @@ class Transolver(nn.Module):
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.input_skip = nn.Linear(fun_dim + space_dim, out_dim)  # input-skip-05: raw input shortcut
+        nn.init.zeros_(self.input_skip.weight)
+        nn.init.zeros_(self.input_skip.bias)
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
 
@@ -396,6 +399,7 @@ class Transolver(nn.Module):
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
+        fx = fx + 0.05 * self.input_skip(x)  # input-skip-05: raw input shortcut at scale 0.05
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
