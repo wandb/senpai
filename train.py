@@ -290,6 +290,7 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        self.surface_embed = nn.Embedding(2, 4)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -486,7 +487,7 @@ print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 1 + 32,  # 8 freqs * 2 coords * 2 (sin+cos) = 32
+    fun_dim=X_DIM - 2 + 1 + 32 + 3,  # 8 freqs * 2 coords * 2 (sin+cos) = 32; +3 for surface embed (4 replaces 1)
     out_dim=3,
     n_hidden=192,  # was 160
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
@@ -619,6 +620,9 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         x = (x - stats["x_mean"]) / stats["x_std"]
+        # Replace is_surface scalar (feature 12) with 4-dim learned embedding
+        surf_emb = model.surface_embed(is_surface.long())  # [B, N, 4]
+        x = torch.cat([x[:, :, :12], surf_emb, x[:, :, 13:]], dim=-1)
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         x = torch.cat([x, curv], dim=-1)
@@ -787,6 +791,9 @@ for epoch in range(MAX_EPOCHS):
                 mask = mask.to(device, non_blocking=True)
 
                 x = (x - stats["x_mean"]) / stats["x_std"]
+                # Replace is_surface scalar (feature 12) with 4-dim learned embedding
+                surf_emb = model.surface_embed(is_surface.long())  # [B, N, 4]
+                x = torch.cat([x[:, :, :12], surf_emb, x[:, :, 13:]], dim=-1)
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                 x = torch.cat([x, curv], dim=-1)
