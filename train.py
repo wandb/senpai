@@ -516,6 +516,8 @@ _pstd = ((_phys_sq_sum / _phys_n - _pmean ** 2).clamp(min=0.0).sqrt()).clamp(min
 phys_stats = {"y_mean": _pmean, "y_std": _pstd}
 print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
+COARSE_STRIDE = 8
+
 model_config = dict(
     space_dim=2,
     fun_dim=X_DIM - 2 + 1 + 32,  # 8 freqs * 2 coords * 2 (sin+cos) = 32
@@ -529,6 +531,26 @@ model_config = dict(
     output_dims=[1, 1, 1],
 )
 
+# Coarse-to-fine: lightweight model runs on every-8th-node, output concatenated as context
+_coarse_fun_dim = model_config['fun_dim']  # before adding coarse predictions
+model_config['fun_dim'] += 3  # append 3-dim coarse predictions to main model input
+
+coarse_model_config = dict(
+    space_dim=2,
+    fun_dim=_coarse_fun_dim,
+    out_dim=3,
+    n_hidden=64,
+    n_layers=1,
+    n_head=4,
+    slice_num=16,
+    mlp_ratio=2,
+    output_fields=["Ux", "Uy", "p"],
+    output_dims=[1, 1, 1],
+)
+coarse_model = Transolver(**coarse_model_config).to(device)
+coarse_model = torch.compile(coarse_model, mode="default")  # avoid CUDAGraph dynamic shape issues
+_base_coarse_model = coarse_model._orig_mod if hasattr(coarse_model, '_orig_mod') else coarse_model
+
 model = Transolver(**model_config).to(device)
 model = torch.compile(model, mode="reduce-overhead")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
@@ -539,6 +561,7 @@ ema_start_epoch = 40
 ema_decay = 0.998
 
 n_params = sum(p.numel() for p in model.parameters())
+n_coarse_params = sum(p.numel() for p in coarse_model.parameters())
 
 
 class Lookahead:
@@ -571,9 +594,11 @@ class Lookahead:
 
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+coarse_params = list(coarse_model.parameters())
 base_opt = torch.optim.AdamW([
     {'params': attn_params, 'lr': cfg.lr * 0.5},
-    {'params': other_params, 'lr': cfg.lr}
+    {'params': other_params, 'lr': cfg.lr},
+    {'params': coarse_params, 'lr': cfg.lr},
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
@@ -593,6 +618,8 @@ run = wandb.init(
         **asdict(cfg),
         "model_config": model_config,
         "n_params": n_params,
+        "coarse_model_config": coarse_model_config,
+        "n_coarse_params": n_coarse_params,
         "train_samples": len(train_ds),
         "val_samples": {k: len(v) for k, v in val_splits.items()},
         "split_manifest": cfg.manifest,
@@ -640,6 +667,7 @@ for epoch in range(MAX_EPOCHS):
 
     # --- Train ---
     model.train()
+    coarse_model.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
@@ -692,6 +720,16 @@ for epoch in range(MAX_EPOCHS):
                 else:
                     sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
             y_norm = y_norm / sample_stds
+
+        # Coarse-to-fine: run lightweight model on subsampled nodes, map back by index
+        x_coarse = x[:, ::COARSE_STRIDE, :]
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            coarse_pred = coarse_model({"x": x_coarse})["preds"].float()  # [B, N_c, 3]
+        N_fine = x.shape[1]
+        N_c = coarse_pred.shape[1]
+        ci = torch.arange(N_fine, device=device).div(COARSE_STRIDE, rounding_mode='floor').clamp(0, N_c - 1)
+        coarse_interp = coarse_pred[:, ci, :]  # [B, N, 3] — nearest coarse node by index
+        x = torch.cat([x, coarse_interp], dim=-1)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model({"x": x})
@@ -802,6 +840,7 @@ for epoch in range(MAX_EPOCHS):
     if epoch >= 50:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
+            _base_coarse_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
     epoch_vol /= n_batches
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
@@ -811,6 +850,7 @@ for epoch in range(MAX_EPOCHS):
     eval_model = ema_model if ema_model is not None else model
     eval_model.eval()
     model.eval()
+    coarse_model.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -863,6 +903,16 @@ for epoch in range(MAX_EPOCHS):
                     else:
                         sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
                 y_norm_scaled = y_norm / sample_stds
+
+                # Coarse-to-fine: same interpolation as training
+                x_coarse = x[:, ::COARSE_STRIDE, :]
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    coarse_pred = coarse_model({"x": x_coarse})["preds"].float()
+                N_fine = x.shape[1]
+                N_c = coarse_pred.shape[1]
+                ci = torch.arange(N_fine, device=device).div(COARSE_STRIDE, rounding_mode='floor').clamp(0, N_c - 1)
+                coarse_interp = coarse_pred[:, ci, :]
+                x = torch.cat([x, coarse_interp], dim=-1)
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = eval_model({"x": x})["preds"]
