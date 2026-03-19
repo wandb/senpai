@@ -518,7 +518,7 @@ print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 1 + 32,  # 8 freqs * 2 coords * 2 (sin+cos) = 32
+    fun_dim=X_DIM - 2 + 1 + 4 + 32,  # 8 freqs * 2 coords * 2 (sin+cos) = 32; +4 raw sdf
     out_dim=3,
     n_hidden=192,  # was 160
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
@@ -654,6 +654,8 @@ for epoch in range(MAX_EPOCHS):
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         x = torch.cat([x, curv], dim=-1)
+        raw_sdf = x[:, :, 2:6]  # directional sdf channels for all nodes
+        x = torch.cat([x, raw_sdf], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -835,6 +837,8 @@ for epoch in range(MAX_EPOCHS):
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                 x = torch.cat([x, curv], dim=-1)
+                raw_sdf = x[:, :, 2:6]  # directional sdf channels for all nodes
+                x = torch.cat([x, raw_sdf], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -1014,6 +1018,8 @@ if best_metrics:
                 x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                 curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                 x_n = torch.cat([x_n, curv], dim=-1)
+                raw_sdf = x_n[:, :, 2:6]
+                x_n = torch.cat([x_n, raw_sdf], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
