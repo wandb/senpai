@@ -231,7 +231,7 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, return_hidden=False):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
@@ -239,7 +239,7 @@ class TransolverBlock(nn.Module):
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
-        if self.last_layer:
+        if self.last_layer and not return_hidden:
             return self.mlp2(self.ln_3(fx))
         return fx
 
@@ -318,6 +318,7 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        self.surf_knn_alpha = nn.Parameter(torch.tensor(0.1))
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -356,14 +357,35 @@ class Transolver(nn.Module):
         x = data.get("x")
         pos = data.get("pos", pos)
         condition = data.get("condition", condition)
-        return x, pos, condition
+        is_surface = data.get("is_surface", None)
+        return x, pos, condition, is_surface
 
     def _validate_output_dims(self, preds):
         if sum(self.output_dims) != preds.shape[-1]:
             raise ValueError("Sum of output_dims must match preds last dimension")
 
+    def _surface_knn_smooth(self, fx, is_surface, coords, k=4):
+        """Blend each surface node's hidden repr with the mean of its k nearest surface neighbors."""
+        B, N, D = fx.shape
+        alpha = self.surf_knn_alpha.clamp(0.0, 1.0)
+        fx_out = fx.clone()
+        for b in range(B):
+            surf_idx = is_surface[b].nonzero(as_tuple=False).view(-1)
+            S = surf_idx.shape[0]
+            if S <= k:
+                continue
+            surf_coords = coords[b, surf_idx]           # [S, 2]
+            surf_feats = fx[b, surf_idx]                # [S, D]
+            diff = surf_coords.unsqueeze(0) - surf_coords.unsqueeze(1)  # [S, S, 2]
+            sq_dists = (diff ** 2).sum(-1)              # [S, S]
+            _, nn_idx = torch.topk(-sq_dists, min(k + 1, S), dim=-1)   # [S, k+1]
+            nn_idx = nn_idx[:, 1:]                      # [S, k] — exclude self
+            avg_neighbors = surf_feats[nn_idx].mean(dim=1)              # [S, D]
+            fx_out[b, surf_idx] = (1.0 - alpha) * surf_feats + alpha * avg_neighbors
+        return fx_out
+
     def forward(self, data, pos=None, condition=None):
-        x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
+        x, pos, condition, is_surface = self._unpack_inputs(data, pos=pos, condition=condition)
         if x is None:
             raise ValueError("Missing required input tensor: x")
         if condition is not None:
@@ -393,7 +415,14 @@ class Transolver(nn.Module):
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+        # Get hidden representation from last block before its output head
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, return_hidden=True)
+        # Apply surface KNN smoothing to hidden representations
+        if is_surface is not None:
+            fx = self._surface_knn_smooth(fx, is_surface, x[:, :, :2], k=4)
+        # Apply last block's output head
+        last_block = self.blocks[-1]
+        fx = last_block.mlp2(last_block.ln_3(fx))
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
@@ -694,7 +723,7 @@ for epoch in range(MAX_EPOCHS):
             y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x, "is_surface": is_surface})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -865,7 +894,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    pred = eval_model({"x": x, "is_surface": is_surface})["preds"]
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
@@ -1015,7 +1044,7 @@ if best_metrics:
                 curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                 x_n = torch.cat([x_n, curv], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
-                pred = vis_model({"x": x_n})["preds"].float()
+                pred = vis_model({"x": x_n, "is_surface": is_surf_dev})["preds"].float()
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
                 y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
             samples.append((x[:, :2], y_true, y_pred, is_surface))
