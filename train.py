@@ -312,6 +312,9 @@ class Transolver(nn.Module):
         nn.init.zeros_(self.out_skip.bias)
         self.skip_gate = nn.Sequential(nn.Linear(n_hidden, 1), nn.Sigmoid())
         nn.init.constant_(self.skip_gate[0].bias, -2.0)  # starts nearly closed
+        self.input_skip = nn.Linear(fun_dim + space_dim, out_dim)
+        nn.init.zeros_(self.input_skip.weight)
+        nn.init.zeros_(self.input_skip.bias)
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
@@ -396,6 +399,7 @@ class Transolver(nn.Module):
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
+        fx = fx + 0.1 * self.input_skip(x)
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
@@ -411,7 +415,7 @@ MAX_EPOCHS = 100
 
 @dataclass
 class Config:
-    lr: float = 2.5e-3
+    lr: float = 2.3e-3
     weight_decay: float = 0.0
     batch_size: int = 4
     surf_weight: float = 20.0
