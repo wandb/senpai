@@ -125,7 +125,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
 
-    def forward(self, x, spatial_bias=None):
+    def forward(self, x, spatial_bias=None, temp_offset=None):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -140,7 +140,10 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             .permute(0, 2, 1, 3)
             .contiguous()
         )
-        slice_logits = self.in_project_slice(x_mid) / self.temperature
+        temp = self.temperature
+        if temp_offset is not None:
+            temp = (temp + temp_offset.view(bsz, self.heads, 1, 1)).clamp(min=1e-4)
+        slice_logits = self.in_project_slice(x_mid) / temp
         if spatial_bias is not None:
             slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
         slice_weights = self.softmax(slice_logits)
@@ -203,9 +206,9 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx, raw_xy=None):
+    def forward(self, fx, raw_xy=None, temp_offset=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb) + fx)
+        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, temp_offset=temp_offset) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
@@ -288,6 +291,9 @@ class Transolver(nn.Module):
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.curv_temp_mlp = nn.Sequential(nn.Linear(1, 16), nn.GELU(), nn.Linear(16, n_head))
+        nn.init.zeros_(self.curv_temp_mlp[-1].weight)
+        nn.init.zeros_(self.curv_temp_mlp[-1].bias)
         self.fourier_freqs = nn.Parameter(torch.tensor([0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0]))
 
     def initialize_weights(self):
@@ -353,14 +359,19 @@ class Transolver(nn.Module):
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
+        # Curvature-conditioned attention temperature offset
+        curv_proxy = x[:, :, 2:6].norm(dim=-1)  # [B, N]
+        curv_mean = curv_proxy.mean(dim=1, keepdim=True)  # [B, 1]
+        temp_offset = self.curv_temp_mlp(curv_mean)  # [B, n_head]
+
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy)
+            fx = block(fx, raw_xy=raw_xy, temp_offset=temp_offset)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, temp_offset=temp_offset)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
