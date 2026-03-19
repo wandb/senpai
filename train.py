@@ -695,6 +695,20 @@ for epoch in range(MAX_EPOCHS):
         surf_loss = (surf_per_sample * tandem_boost).mean()
         loss = vol_loss + surf_weight * surf_loss
 
+        if epoch >= 10:
+            grad_loss = 0.0
+            for b in range(B):
+                s_mask_b = surf_mask[b]
+                if s_mask_b.sum() > 2:
+                    s_pred = pred[b, s_mask_b, 2]
+                    s_xy = x[:, :, :2][b, s_mask_b]  # use raw_xy
+                    cx, cy = s_xy[:, 0].mean(), s_xy[:, 1].mean()
+                    angles = torch.atan2(s_xy[:, 1] - cy, s_xy[:, 0] - cx)
+                    sort_idx = angles.argsort()
+                    diffs = (s_pred[sort_idx][1:] - s_pred[sort_idx][:-1]).abs()
+                    grad_loss = grad_loss + diffs.mean()
+            loss = loss + 0.01 * (grad_loss / max(B, 1))
+
         # Multi-scale loss: coarse spatial pooling
         coarse_pool_size = 64
         B, N, C = pred.shape
