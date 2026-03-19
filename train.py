@@ -786,7 +786,7 @@ for epoch in range(MAX_EPOCHS):
 
         if pcgrad_active:
             def _fwd_group_loss(idx):
-                x_g = x[idx]
+                x_g = x[idx].detach()  # detach: x shares grad path via fourier_freqs_learned
                 out_g = _base_model({"x": x_g})
                 pred_g = out_g["preds"].float() / sample_stds[idx]
                 ae_g = (pred_g - y_norm[idx]).abs()
