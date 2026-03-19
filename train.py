@@ -524,7 +524,7 @@ model_config = dict(
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
     n_head=4,
     slice_num=32,  # was 64 — fewer slices for faster attention, more epochs
-    mlp_ratio=2,
+    mlp_ratio=4,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
 )
