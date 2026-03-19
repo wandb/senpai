@@ -509,10 +509,14 @@ n_params = sum(p.numel() for p in model.parameters())
 
 
 class Lookahead:
-    def __init__(self, base_optimizer, k=5, alpha=0.5):
+    def __init__(self, base_optimizer, k=5, alpha=0.5, k_list=None):
         self.base_optimizer = base_optimizer
-        self.k = k
         self.alpha = alpha
+        n_groups = len(base_optimizer.param_groups)
+        if k_list is not None:
+            self.k_list = k_list
+        else:
+            self.k_list = [k] * n_groups
         self.slow_params = [
             [p.data.clone() for p in group['params']]
             for group in base_optimizer.param_groups
@@ -522,8 +526,8 @@ class Lookahead:
     def step(self):
         self.base_optimizer.step()
         self.step_count += 1
-        if self.step_count % self.k == 0:
-            for slow, group in zip(self.slow_params, self.base_optimizer.param_groups):
+        for k_i, slow, group in zip(self.k_list, self.slow_params, self.base_optimizer.param_groups):
+            if self.step_count % k_i == 0:
                 for s, p in zip(slow, group['params']):
                     s.data.add_(self.alpha * (p.data - s.data))
                     p.data.copy_(s.data)
@@ -542,7 +546,7 @@ base_opt = torch.optim.AdamW([
     {'params': attn_params, 'lr': cfg.lr * 0.5},
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
-optimizer = Lookahead(base_opt, k=10, alpha=0.8)
+optimizer = Lookahead(base_opt, alpha=0.8, k_list=[5, 10])
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
