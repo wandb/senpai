@@ -144,7 +144,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
 
-    def forward(self, x, spatial_bias=None, tandem_mask=None):
+    def forward(self, x, spatial_bias=None, tandem_mask=None, surface_mask=None):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -181,7 +181,18 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         out_slice_token = torch.matmul(attn_weights, v_slice_token)
         out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
 
-        out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
+        # Asymmetric surface reconstruction: surface nodes only attend to top-16 slice tokens
+        if surface_mask is not None:
+            top_k_vals = slice_weights.topk(16, dim=-1).values  # [B, H, N, 16]
+            threshold = top_k_vals[..., -1:]  # [B, H, N, 1] - 16th largest value per node
+            keep_mask = slice_weights >= threshold  # [B, H, N, G]
+            surf = surface_mask[:, None, :, None]  # [B, 1, N, 1]
+            slice_weights_recon = torch.where(surf & ~keep_mask, torch.zeros_like(slice_weights), slice_weights)
+            slice_weights_recon = slice_weights_recon / (slice_weights_recon.sum(-1, keepdim=True) + 1e-8)
+        else:
+            slice_weights_recon = slice_weights
+
+        out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights_recon)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
         return self.to_out(out_x)
 
@@ -231,9 +242,9 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, surface_mask=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
+        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask, surface_mask=surface_mask) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
@@ -368,6 +379,7 @@ class Transolver(nn.Module):
             raise ValueError("Missing required input tensor: x")
         if condition is not None:
             raise ValueError("Transolver does not support conditioning inputs")
+        surface_mask = data.get("surface_mask", None) if isinstance(data, dict) else None
 
         if self.unified_pos:
             if pos is None:
@@ -387,13 +399,13 @@ class Transolver(nn.Module):
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, surface_mask=surface_mask)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, surface_mask=surface_mask)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
@@ -693,8 +705,9 @@ for epoch in range(MAX_EPOCHS):
                     sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
             y_norm = y_norm / sample_stds
 
+        surf_mask_input = (is_surface & mask) if epoch >= 20 else None
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x, "surface_mask": surf_mask_input})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -864,8 +877,9 @@ for epoch in range(MAX_EPOCHS):
                         sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
                 y_norm_scaled = y_norm / sample_stds
 
+                val_surf_mask = (is_surface & mask) if epoch >= 20 else None
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    pred = eval_model({"x": x, "surface_mask": val_surf_mask})["preds"]
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
