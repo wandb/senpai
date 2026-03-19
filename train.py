@@ -210,8 +210,9 @@ class TransolverBlock(nn.Module):
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        # Input: (x, y, curvature) + (Re, AoA, gap, stagger) = 7 dims
         self.spatial_bias = nn.Sequential(
-            nn.Linear(3, 64), nn.GELU(),
+            nn.Linear(7, 64), nn.GELU(),
             nn.Linear(64, 64), nn.GELU(),
             nn.Linear(64, slice_num),
         )
@@ -231,8 +232,15 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None):
-        sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
+    def forward(self, fx, raw_xy=None, tandem_mask=None, cond=None):
+        if raw_xy is not None:
+            if cond is not None:
+                cond_exp = cond.unsqueeze(1).expand(-1, raw_xy.shape[1], -1)  # [B,N,4]
+                sb = self.spatial_bias(torch.cat([raw_xy, cond_exp], dim=-1))  # [B,N,7]
+            else:
+                sb = self.spatial_bias(torch.cat([raw_xy, torch.zeros(*raw_xy.shape[:2], 4, device=raw_xy.device, dtype=raw_xy.dtype)], dim=-1))
+        else:
+            sb = None
         fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
@@ -375,6 +383,8 @@ class Transolver(nn.Module):
             new_pos = self.get_grid(pos)
             x = torch.cat((x, new_pos), dim=-1)
 
+        # Extract condition for spatial routing: Re, AoA, gap, stagger
+        cond = x[:, 0, [13, 14, 21, 22]]  # [B, 4]
         x_cross = x * self.feature_cross(x)
         x = x + 0.1 * x_cross  # residual with small scale
         raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:25]], dim=-1)  # x, y, curvature
@@ -387,13 +397,13 @@ class Transolver(nn.Module):
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, cond=cond)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, cond=cond)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
