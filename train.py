@@ -411,7 +411,7 @@ MAX_EPOCHS = 100
 
 @dataclass
 class Config:
-    lr: float = 3e-3
+    lr: float = 2e-3
     weight_decay: float = 0.0
     batch_size: int = 4
     surf_weight: float = 20.0
@@ -520,11 +520,11 @@ model_config = dict(
     space_dim=2,
     fun_dim=X_DIM - 2 + 1 + 32,  # 8 freqs * 2 coords * 2 (sin+cos) = 32
     out_dim=3,
-    n_hidden=192,  # was 160
+    n_hidden=224,  # was 192
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
     n_head=4,
     slice_num=32,  # was 64 — fewer slices for faster attention, more epochs
-    mlp_ratio=2,
+    mlp_ratio=1,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
 )
@@ -535,7 +535,7 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
-ema_start_epoch = 40
+ema_start_epoch = 30
 ema_decay = 0.998
 
 n_params = sum(p.numel() for p in model.parameters())
@@ -572,7 +572,7 @@ class Lookahead:
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 base_opt = torch.optim.AdamW([
-    {'params': attn_params, 'lr': cfg.lr * 0.5},
+    {'params': attn_params, 'lr': cfg.lr},
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
@@ -664,19 +664,9 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
-        if model.training and epoch < 60:
-            noise_scale = 0.05 * (1 - epoch / 60)
-            x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
-        if model.training:
-            noise_progress = min(1.0, epoch / 60)
-            vel_noise = 0.015 * (1 - noise_progress) + 0.003 * noise_progress
-            p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
-            noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
-            y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
-
         # Per-sample std normalization: skip tandem samples (gap feature index 21)
         raw_gap = x[:, 0, 21]
         is_tandem = raw_gap.abs() > 0.5
@@ -1014,6 +1004,15 @@ if best_metrics:
                 x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                 curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                 x_n = torch.cat([x_n, curv], dim=-1)
+                raw_xy_v = x_n[:, :, :2]
+                xy_min_v = raw_xy_v.amin(dim=1, keepdim=True)
+                xy_max_v = raw_xy_v.amax(dim=1, keepdim=True)
+                xy_norm_v = (raw_xy_v - xy_min_v) / (xy_max_v - xy_min_v + 1e-8)
+                _base_vis = vis_model._orig_mod if hasattr(vis_model, '_orig_mod') else vis_model
+                freqs_v = torch.cat([_base_vis.fourier_freqs_fixed.to(device), _base_vis.fourier_freqs_learned.abs()])
+                xy_scaled_v = xy_norm_v.unsqueeze(-1) * freqs_v
+                fourier_pe_v = torch.cat([xy_scaled_v.sin().flatten(-2), xy_scaled_v.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, fourier_pe_v], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
