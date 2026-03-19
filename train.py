@@ -405,6 +405,82 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+class SurfaceRefiner(nn.Module):
+    """Learned k=8 nearest-neighbor surface interpolation kernel.
+
+    Input per (node, neighbor) pair: [dx, dy, dist, curvature_diff] → scalar weight.
+    Zero-init output layer → uniform (arithmetic-mean) weighting at init.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(4, 16),
+            nn.GELU(),
+            nn.Linear(16, 1),
+        )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, edge_feats):
+        """edge_feats: [S, k, 4] → weights [S, k, 1] (after softmax)."""
+        return torch.softmax(self.mlp(edge_feats), dim=1)
+
+
+def apply_surf_refiner(refiner, pred, x_full, is_surface, mask, k=8):
+    """surf_pred_refined = surf_pred + 0.1 * weighted_neighbor_avg.
+
+    refiner   : SurfaceRefiner
+    pred      : [B, N, C] float predictions
+    x_full    : [B, N, D] fully-preprocessed input (curvature at index X_DIM)
+    is_surface: [B, N] bool
+    mask      : [B, N] bool
+    """
+    B, N, C = pred.shape
+    corrections = []
+
+    for b in range(B):
+        surf_valid = is_surface[b] & mask[b]
+        surf_idx = surf_valid.nonzero(as_tuple=False).view(-1)  # [S]
+        S = surf_idx.shape[0]
+
+        if S < 2:
+            corrections.append(pred.new_zeros(N, C))
+            continue
+
+        k_actual = min(k, S - 1)
+
+        with torch.no_grad():
+            surf_xy = x_full[b, surf_idx, :2].float()             # [S, 2]
+            surf_curv = x_full[b, surf_idx, X_DIM:X_DIM + 1].float()  # [S, 1]
+            dists = torch.cdist(surf_xy.unsqueeze(0), surf_xy.unsqueeze(0)).squeeze(0)  # [S, S]
+            dists_no_self = dists.clone()
+            dists_no_self.fill_diagonal_(1e9)
+            _, nn_idx = dists_no_self.topk(k_actual, dim=1, largest=False)  # [S, k]
+            nn_xy = surf_xy[nn_idx]                                # [S, k, 2]
+            nn_curv = surf_curv[nn_idx]                            # [S, k, 1]
+            dx = nn_xy[:, :, 0:1] - surf_xy[:, 0:1].unsqueeze(1)  # [S, k, 1]
+            dy = nn_xy[:, :, 1:2] - surf_xy[:, 1:2].unsqueeze(1)  # [S, k, 1]
+            nn_dist = torch.gather(dists, 1, nn_idx).unsqueeze(-1)  # [S, k, 1]
+            curv_diff = nn_curv - surf_curv.unsqueeze(1)           # [S, k, 1]
+            edge_feats = torch.cat([dx, dy, nn_dist, curv_diff], dim=-1)  # [S, k, 4]
+
+        weights = refiner(edge_feats)                              # [S, k, 1]
+        surf_pred_vals = pred[b, surf_idx]                         # [S, C]
+        nn_pred_vals = surf_pred_vals[nn_idx]                      # [S, k, C]
+        weighted_avg = (weights * nn_pred_vals).sum(dim=1)         # [S, C]
+
+        corr_b = torch.scatter_add(
+            pred.new_zeros(N, C), 0,
+            surf_idx.unsqueeze(-1).expand(-1, C),
+            weighted_avg,
+        )
+        corrections.append(corr_b)
+
+    correction = torch.stack(corrections, dim=0)  # [B, N, C]
+    return pred + 0.1 * correction
+
+
 MAX_TIMEOUT = 30.0  # minutes
 MAX_EPOCHS = 100
 
@@ -533,6 +609,8 @@ model = Transolver(**model_config).to(device)
 model = torch.compile(model, mode="reduce-overhead")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
+surf_refiner = SurfaceRefiner().to(device)
+
 from copy import deepcopy
 ema_model = None
 ema_start_epoch = 40
@@ -573,7 +651,8 @@ attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['W
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 base_opt = torch.optim.AdamW([
     {'params': attn_params, 'lr': cfg.lr * 0.5},
-    {'params': other_params, 'lr': cfg.lr}
+    {'params': other_params, 'lr': cfg.lr},
+    {'params': list(surf_refiner.parameters()), 'lr': cfg.lr},
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
@@ -701,6 +780,7 @@ for epoch in range(MAX_EPOCHS):
         pred = pred.float()
         re_pred = re_pred.float()
         aoa_pred = aoa_pred.float()
+        pred = apply_surf_refiner(surf_refiner, pred, x, is_surface, mask)
         if model.training:
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
@@ -867,6 +947,7 @@ for epoch in range(MAX_EPOCHS):
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
+                pred = apply_surf_refiner(surf_refiner, pred, x, is_surface, mask)
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
