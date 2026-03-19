@@ -774,10 +774,10 @@ for epoch in range(MAX_EPOCHS):
 
         log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
         re_loss = F.mse_loss(re_pred, log_re_target)
-        loss = loss + 0.01 * re_loss
+        # aux disabled: loss = loss + 0.01 * re_loss
         aoa_target = x[:, 0, 14:15]  # AoA0_rad from normalized input
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
-        loss = loss + 0.01 * aoa_loss
+        # aux disabled: loss = loss + 0.01 * aoa_loss
 
         optimizer.zero_grad()
         loss.backward()
