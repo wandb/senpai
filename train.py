@@ -733,18 +733,15 @@ for epoch in range(MAX_EPOCHS):
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
         running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
-        # Asymmetric hard-node mining for non-tandem samples after epoch 30
+        # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
         if epoch >= 30:
-            B_hm, N_hm = abs_err.shape[:2]
             surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
-            hard_weights = torch.ones(B_hm, N_hm, 1, device=device)
-            with torch.no_grad():
-                for b in range(B_hm):
-                    if not is_tandem_batch[b] and surf_mask[b].any():
-                        node_errs = surf_pres[b, surf_mask[b], 0]
-                        thresh = node_errs.median()
-                        hard_nodes = surf_mask[b] & (surf_pres[b, :, 0] >= thresh)
-                        hard_weights[b, hard_nodes, 0] = 1.5
+            surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
+            surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
+            thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
+            thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
+            hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
+            hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
             surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
