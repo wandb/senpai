@@ -41,6 +41,7 @@ from data.utils import visualize
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
 
 torch.set_float32_matmul_precision('high')
+torch._functorch.config.donated_buffer = False  # needed for retain_graph=True in PCGrad
 
 
 # ---------------------------------------------------------------------------
@@ -530,7 +531,7 @@ model_config = dict(
 )
 
 model = Transolver(**model_config).to(device)
-model = torch.compile(model, mode="reduce-overhead")
+model = torch.compile(model, mode="default")  # "reduce-overhead" conflicts with retain_graph=True
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
@@ -749,6 +750,7 @@ for epoch in range(MAX_EPOCHS):
         loss = vol_loss + surf_weight * surf_loss
 
         # Multi-scale loss: coarse spatial pooling
+        coarse_loss = torch.tensor(0.0, device=device)
         coarse_pool_size = 64
         B, N, C = pred.shape
         n_groups = N // coarse_pool_size
@@ -779,8 +781,42 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
-        optimizer.zero_grad()
-        loss.backward()
+        # PCGrad: group A = non-tandem + non-extreme-Re, group B = tandem + extreme-Re
+        # "extreme-Re": normalized Re feature |x[:,0,13]| > 1.5 (>1.5 std from training mean)
+        pcg_b = is_tandem_batch | (x[:, 0, 13].abs() > 1.5)
+        pcg_a = ~pcg_b
+        if pcg_a.any() and pcg_b.any():
+            # Per-sample main loss for group splitting
+            vol_per_s = (abs_err * vol_mask_train.unsqueeze(-1)).sum(dim=(1, 2)) / vol_mask_train.float().sum(dim=1).clamp(min=1)
+            main_per_s = vol_per_s + surf_weight * (surf_per_sample * tandem_boost)
+            aux = coarse_loss + 0.01 * re_loss + 0.01 * aoa_loss
+            loss_a = main_per_s[pcg_a].mean() + aux
+            loss_b = main_per_s[pcg_b].mean() + aux
+            # Backward group A, store gradients
+            optimizer.zero_grad()
+            loss_a.backward(retain_graph=True)
+            grad_a = [p.grad.clone() if p.grad is not None else torch.zeros_like(p)
+                      for p in model.parameters()]
+            # Backward group B, store gradients
+            optimizer.zero_grad()
+            loss_b.backward()
+            grad_b = [p.grad.clone() if p.grad is not None else torch.zeros_like(p)
+                      for p in model.parameters()]
+            # PCGrad projection: for each param, remove conflicting components then average
+            optimizer.zero_grad()
+            for p, ga, gb in zip(model.parameters(), grad_a, grad_b):
+                dot = (ga * gb).sum()
+                if dot < 0:
+                    gb_sq = (gb * gb).sum().clamp(min=1e-12)
+                    ga = ga - dot / gb_sq * gb
+                dot2 = (ga * gb).sum()
+                if dot2 < 0:
+                    ga_sq = (ga * ga).sum().clamp(min=1e-12)
+                    gb = gb - dot2 / ga_sq * ga
+                p.grad = (ga + gb) / 2.0
+        else:
+            optimizer.zero_grad()
+            loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         if epoch >= ema_start_epoch:
