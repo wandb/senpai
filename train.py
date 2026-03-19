@@ -530,7 +530,7 @@ model_config = dict(
 )
 
 model = Transolver(**model_config).to(device)
-model = torch.compile(model, mode="reduce-overhead")
+model = torch.compile(model, mode="default")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
@@ -643,6 +643,8 @@ for epoch in range(MAX_EPOCHS):
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
+    accum_steps = 2
+    optimizer.zero_grad()
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     for x, y, is_surface, mask in pbar:
@@ -779,10 +781,11 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        (loss / accum_steps).backward()
+        if (n_batches + 1) % accum_steps == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
         if epoch >= ema_start_epoch:
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
