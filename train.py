@@ -219,6 +219,12 @@ class TransolverBlock(nn.Module):
         nn.init.zeros_(self.spatial_bias[-1].bias)
         self.ln_1_post = nn.LayerNorm(hidden_dim)
         self.ln_2_post = nn.LayerNorm(hidden_dim)
+        self.attn_se = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 4),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 4, hidden_dim),
+            nn.Sigmoid(),
+        )
         self.se_fc1 = nn.Linear(hidden_dim, hidden_dim // 4)
         self.se_fc2 = nn.Linear(hidden_dim // 4, hidden_dim)
         nn.init.zeros_(self.se_fc2.weight)
@@ -233,7 +239,9 @@ class TransolverBlock(nn.Module):
 
     def forward(self, fx, raw_xy=None, tandem_mask=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
+        attn_out = self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask)
+        attn_out = attn_out * self.attn_se(attn_out.mean(dim=1, keepdim=True))
+        fx = self.ln_1_post(attn_out + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
