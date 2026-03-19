@@ -225,11 +225,12 @@ class TransolverBlock(nn.Module):
         nn.init.zeros_(self.se_fc2.bias)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
-            self.mlp2 = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, out_dim),
-            )
+            dim_head = hidden_dim // num_heads
+            self.head_mlps = nn.ModuleList([
+                nn.Sequential(nn.Linear(dim_head, dim_head), nn.GELU(), nn.Linear(dim_head, out_dim))
+                for _ in range(num_heads)
+            ])
+            self.head_weights = nn.Parameter(torch.ones(num_heads) / num_heads)
 
     def forward(self, fx, raw_xy=None, tandem_mask=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
@@ -240,7 +241,12 @@ class TransolverBlock(nn.Module):
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            fx = self.ln_3(fx)
+            B, N, _ = fx.shape
+            fx_heads = fx.view(B, N, self.attn.heads, self.attn.dim_head)
+            outputs = [self.head_mlps[h](fx_heads[:, :, h]) for h in range(self.attn.heads)]
+            w = F.softmax(self.head_weights, dim=0)
+            return sum(w[h] * outputs[h] for h in range(self.attn.heads))
         return fx
 
 
