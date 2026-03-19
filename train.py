@@ -626,6 +626,7 @@ prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
+input_saliency = torch.ones(X_DIM, device=device)
 
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
@@ -651,6 +652,7 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         x = (x - stats["x_mean"]) / stats["x_std"]
+        x = x * input_saliency.unsqueeze(0).unsqueeze(0)
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         x = torch.cat([x, curv], dim=-1)
@@ -799,6 +801,43 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
+
+    # Gradient saliency update every 3 epochs
+    if epoch % 3 == 0:
+        _base_model.eval()
+        sal_x, sal_y, sal_is_surface, sal_mask = next(iter(train_loader))
+        sal_x = sal_x.to(device)
+        sal_y = sal_y.to(device)
+        sal_is_surface = sal_is_surface.to(device)
+        sal_mask = sal_mask.to(device)
+        sal_x_norm = (sal_x - stats["x_mean"]) / stats["x_std"]
+        sal_x_norm = sal_x_norm.requires_grad_(True)
+        sal_x_scaled = sal_x_norm * input_saliency.unsqueeze(0).unsqueeze(0)
+        sal_curv = sal_x_scaled[:, :, 2:6].norm(dim=-1, keepdim=True) * sal_is_surface.float().unsqueeze(-1)
+        sal_x_full = torch.cat([sal_x_scaled, sal_curv], dim=-1)
+        sal_raw_xy = sal_x_scaled[:, :, :2]
+        sal_xy_min = sal_raw_xy.amin(dim=1, keepdim=True)
+        sal_xy_max = sal_raw_xy.amax(dim=1, keepdim=True)
+        sal_xy_norm = (sal_raw_xy - sal_xy_min) / (sal_xy_max - sal_xy_min + 1e-8)
+        sal_freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+        sal_xy_scaled = sal_xy_norm.unsqueeze(-1) * sal_freqs
+        sal_fourier_pe = torch.cat([sal_xy_scaled.sin().flatten(-2), sal_xy_scaled.cos().flatten(-2)], dim=-1)
+        sal_x_full = torch.cat([sal_x_full, sal_fourier_pe], dim=-1)
+        sal_Umag, sal_q = _umag_q(sal_y, sal_mask)
+        sal_y_phys = _phys_norm(sal_y, sal_Umag, sal_q)
+        sal_y_norm = (sal_y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            sal_pred = _base_model({"x": sal_x_full})["preds"].float()
+        sal_surf_mask = sal_mask & sal_is_surface
+        sal_loss = ((sal_pred[:, :, 2] - sal_y_norm[:, :, 2]).abs() * sal_surf_mask.float()).sum() / sal_surf_mask.sum().clamp(min=1)
+        sal_loss.backward()
+        with torch.no_grad():
+            grad_mag = sal_x_norm.grad[:, :, :X_DIM].abs().mean(dim=(0, 1))  # [X_DIM]
+            mean_mag = grad_mag.mean().clamp(min=1e-8)
+            new_saliency = (grad_mag / mean_mag).clamp(0.5, 2.0)
+            input_saliency = new_saliency.detach()
+        _base_model.train()
+
     if epoch >= 50:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
