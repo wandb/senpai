@@ -310,8 +310,14 @@ class Transolver(nn.Module):
         self.out_skip = nn.Linear(n_hidden, out_dim)
         nn.init.zeros_(self.out_skip.weight)
         nn.init.zeros_(self.out_skip.bias)
-        self.skip_gate = nn.Sequential(nn.Linear(n_hidden, 1), nn.Sigmoid())
-        nn.init.constant_(self.skip_gate[0].bias, -2.0)  # starts nearly closed
+        self.n_head = n_head
+        _dim_head_skip = n_hidden // n_head
+        self.skip_gate = nn.ModuleList([
+            nn.Sequential(nn.Linear(_dim_head_skip, 1), nn.Sigmoid())
+            for _ in range(n_head)
+        ])
+        for _g in self.skip_gate:
+            nn.init.constant_(_g[0].bias, -2.0)  # starts nearly closed
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
@@ -394,8 +400,11 @@ class Transolver(nn.Module):
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
-        gate = self.skip_gate(fx_pre)
-        fx = fx + gate * self.out_skip(fx_pre)
+        _B, _N, _ = fx_pre.shape
+        _skip_heads = fx_pre.reshape(_B, _N, self.n_head, -1)  # [B, N, n_head, dim_head]
+        _gates = torch.stack([self.skip_gate[h](_skip_heads[:, :, h]) for h in range(self.n_head)], dim=2)  # [B, N, n_head, 1]
+        _gated_skip = (_skip_heads * _gates).reshape(_B, _N, -1)  # [B, N, n_hidden]
+        fx = fx + self.out_skip(_gated_skip)
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
