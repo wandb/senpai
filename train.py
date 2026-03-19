@@ -820,7 +820,10 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    if ema_model is not None:
+                        pred = 0.5 * eval_model({"x": x})["preds"] + 0.5 * model({"x": x})["preds"]
+                    else:
+                        pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
