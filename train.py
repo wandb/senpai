@@ -487,11 +487,11 @@ model_config = dict(
     space_dim=2,
     fun_dim=X_DIM - 2 + 1 + 32,  # 8 freqs * 2 coords * 2 (sin+cos) = 32
     out_dim=3,
-    n_hidden=192,  # was 160
-    n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
+    n_hidden=128,
+    n_layers=2,
     n_head=4,
     slice_num=32,  # was 64 — fewer slices for faster attention, more epochs
-    mlp_ratio=2,
+    mlp_ratio=1,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
 )
