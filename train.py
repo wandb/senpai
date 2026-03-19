@@ -799,9 +799,11 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
-    if epoch >= 50:
+    if epoch >= 30:
         with torch.no_grad():
-            _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
+            progress = min(1.0, (epoch - 30) / 30.0)
+            max_temp = 0.5 - progress * 0.35  # 0.5 → 0.15 over epochs 30-60
+            _base_model.blocks[0].attn.temperature.data.clamp_(max=max_temp)
     epoch_vol /= n_batches
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
