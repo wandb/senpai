@@ -60,6 +60,17 @@ ACTIVATION = {
 }
 
 
+class GRL(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x
+
+    @staticmethod
+    def backward(ctx, grad):
+        return -ctx.alpha * grad, None
+
+
 class GatedMLP(nn.Module):
     def __init__(self, n_input, n_hidden, n_output, act='gelu'):
         super().__init__()
@@ -318,6 +329,7 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        self.domain_classifier = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 3))
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -392,12 +404,13 @@ class Transolver(nn.Module):
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
+        domain_pred = self.domain_classifier(GRL.apply(fx.mean(dim=1), 1.0))  # [B, 3]
 
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred, "domain_pred": domain_pred}
 
 
 # ---------------------------------------------------------------------------
@@ -693,14 +706,23 @@ for epoch in range(MAX_EPOCHS):
                     sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
             y_norm = y_norm / sample_stds
 
+        # Domain labels: 0=single, 1=tandem, 2=cruise (derived from gap and Re features)
+        domain_label = torch.zeros(x.shape[0], dtype=torch.long, device=device)
+        is_tandem_dom = x[:, 0, 21].abs() > 0.5
+        is_cruise_dom = (~is_tandem_dom) & ((x[:, 0, 13].abs() > 1.5) | (x[:, 0, 14].abs() > 1.5))
+        domain_label[is_tandem_dom] = 1
+        domain_label[is_cruise_dom] = 2
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model({"x": x})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
+            domain_pred = out["domain_pred"]
         pred = pred.float()
         re_pred = re_pred.float()
         aoa_pred = aoa_pred.float()
+        domain_pred = domain_pred.float()
         if model.training:
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
@@ -778,6 +800,8 @@ for epoch in range(MAX_EPOCHS):
         aoa_target = x[:, 0, 14:15]  # AoA0_rad from normalized input
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
+        domain_loss = F.cross_entropy(domain_pred, domain_label)
+        loss = loss + 0.01 * domain_loss
 
         optimizer.zero_grad()
         loss.backward()
@@ -1014,6 +1038,14 @@ if best_metrics:
                 x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                 curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                 x_n = torch.cat([x_n, curv], dim=-1)
+                raw_xy_v = x_n[:, :, :2]
+                xy_min_v = raw_xy_v.amin(dim=1, keepdim=True)
+                xy_max_v = raw_xy_v.amax(dim=1, keepdim=True)
+                xy_norm_v = (raw_xy_v - xy_min_v) / (xy_max_v - xy_min_v + 1e-8)
+                freqs_v = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
+                xy_scaled_v = xy_norm_v.unsqueeze(-1) * freqs_v
+                fourier_pe_v = torch.cat([xy_scaled_v.sin().flatten(-2), xy_scaled_v.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, fourier_pe_v], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
