@@ -733,16 +733,33 @@ for epoch in range(MAX_EPOCHS):
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
         running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
-        # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
-        if epoch >= 30:
-            surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
-            surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
-            surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
-            thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
-            thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
-            hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
-            hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
-            surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        # Soft sigmoid reweighting for non-tandem samples after epoch 15
+        if epoch >= 15:
+            surf_pres = abs_err[:, :, 2:3]
+            surf_pres_flat = surf_pres[:, :, 0]
+            surf_pres_masked = surf_pres_flat.clone()
+            surf_pres_masked[~surf_mask] = -float('inf')
+
+            B = surf_pres_flat.shape[0]
+            ranks = torch.zeros_like(surf_pres_flat)
+            for b in range(B):
+                valid = surf_mask[b]
+                if valid.sum() > 1:
+                    vals = surf_pres_flat[b, valid]
+                    sorted_idx = vals.argsort()
+                    r = torch.zeros_like(vals)
+                    r[sorted_idx] = torch.linspace(0, 1, len(vals), device=vals.device)
+                    ranks[b, valid] = r
+
+            steepness = 4.0
+            soft_weights = (1.0 + 0.5 * torch.sigmoid(steepness * (ranks - 0.5))) * surf_mask.float()
+            soft_weights = soft_weights.unsqueeze(-1)
+            # Apply only to non-tandem samples
+            soft_weights = torch.where(
+                (~is_tandem_batch)[:, None, None].expand_as(soft_weights),
+                soft_weights, torch.ones_like(soft_weights)
+            )
+            surf_per_sample = (surf_pres * soft_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
