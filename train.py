@@ -494,6 +494,7 @@ val_loaders = {
     name: DataLoader(subset, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
     for name, subset in val_splits.items()
 }
+_fisher_val_batch = next(iter(val_loaders['val_in_dist']))  # cached for Fisher eval
 
 # --- Physics normalization stats (computed over training set) ---
 # Compute mean/std of Cp-normalized targets so the model sees O(1) values.
@@ -626,6 +627,34 @@ prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
+
+FISHER_SCALE = 0.0001
+FISHER_EPS = 1e-8
+
+def _fisher_eval():
+    """Evaluate model on cached val batch; return scalar loss."""
+    model.eval()
+    _fx, _fy, _fis, _fmask = [t.to(device) for t in _fisher_val_batch]
+    with torch.no_grad():
+        _fx = (_fx - stats["x_mean"]) / stats["x_std"]
+        _curv = _fx[:, :, 2:6].norm(dim=-1, keepdim=True) * _fis.float().unsqueeze(-1)
+        _fx = torch.cat([_fx, _curv], dim=-1)
+        _rxy = _fx[:, :, :2]
+        _xmin = _rxy.amin(1, keepdim=True); _xmax = _rxy.amax(1, keepdim=True)
+        _xn = (_rxy - _xmin) / (_xmax - _xmin + 1e-8)
+        _frqs = torch.cat([_base_model.fourier_freqs_fixed.to(device), _base_model.fourier_freqs_learned.abs()])
+        _fpe = torch.cat([(_xn.unsqueeze(-1) * _frqs).sin().flatten(-2), (_xn.unsqueeze(-1) * _frqs).cos().flatten(-2)], dim=-1)
+        _fx = torch.cat([_fx, _fpe], dim=-1)
+        _Um, _q = _umag_q(_fy, _fmask)
+        _yn = (_phys_norm(_fy, _Um, _q) - phys_stats["y_mean"]) / phys_stats["y_std"]
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            _p = model({"x": _fx})["preds"].float()
+        _ae = (_p - _yn).abs()
+        _sv = _fmask & _fis; _vv = _fmask & ~_fis
+        _loss = (_ae * _vv.unsqueeze(-1)).sum() / _vv.sum().clamp(min=1) + \
+                (_ae[:, :, 2:3] * _sv.unsqueeze(-1)).sum() / _sv.sum().clamp(min=1)
+    model.train()
+    return _loss.item()
 
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
@@ -783,6 +812,23 @@ for epoch in range(MAX_EPOCHS):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        # Fisher perturbation after each Lookahead sync
+        if optimizer.step_count % optimizer.k == 0:
+            _loss_before = _fisher_eval()
+            _saved = [[s.data.clone() for s in grp] for grp in optimizer.slow_params]
+            for _sg, _pg in zip(optimizer.slow_params, base_opt.param_groups):
+                for _s, _p in zip(_sg, _pg['params']):
+                    if _p in base_opt.state and 'exp_avg_sq' in base_opt.state[_p]:
+                        _v = base_opt.state[_p]['exp_avg_sq']
+                        _noise = FISHER_SCALE * torch.randn_like(_s) / (_v.sqrt() + FISHER_EPS)
+                        _s.data.add_(_noise)
+                        _p.data.copy_(_s.data)
+            _loss_after = _fisher_eval()
+            if _loss_after > _loss_before:  # reject: restore slow and fast weights
+                for _sg, _sv, _pg in zip(optimizer.slow_params, _saved, base_opt.param_groups):
+                    for _s, _sv_i, _p in zip(_sg, _sv, _pg['params']):
+                        _s.data.copy_(_sv_i)
+                        _p.data.copy_(_sv_i)
         if epoch >= ema_start_epoch:
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
