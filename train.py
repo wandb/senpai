@@ -164,7 +164,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
         slice_logits = self.in_project_slice(x_mid) / temp
         if spatial_bias is not None:
-            slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
+            slice_logits = slice_logits + 0.1 * spatial_bias
         slice_weights = self.softmax(slice_logits)
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
@@ -210,10 +210,11 @@ class TransolverBlock(nn.Module):
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        self.num_heads = num_heads
         self.spatial_bias = nn.Sequential(
             nn.Linear(3, 64), nn.GELU(),
             nn.Linear(64, 64), nn.GELU(),
-            nn.Linear(64, slice_num),
+            nn.Linear(64, slice_num * num_heads),
         )
         nn.init.zeros_(self.spatial_bias[-1].weight)
         nn.init.zeros_(self.spatial_bias[-1].bias)
@@ -232,7 +233,11 @@ class TransolverBlock(nn.Module):
             )
 
     def forward(self, fx, raw_xy=None, tandem_mask=None):
-        sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
+        if raw_xy is not None:
+            B, N = raw_xy.shape[:2]
+            sb = self.spatial_bias(raw_xy).reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)
+        else:
+            sb = None
         fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
