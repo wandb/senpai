@@ -518,7 +518,7 @@ print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 1 + 32,  # 8 freqs * 2 coords * 2 (sin+cos) = 32
+    fun_dim=X_DIM - 2 + 1 + 32 + 1,  # +1 curv proxy, +32 Fourier PE, +1 near-surface proximity
     out_dim=3,
     n_hidden=192,  # was 160
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
@@ -654,6 +654,10 @@ for epoch in range(MAX_EPOCHS):
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         x = torch.cat([x, curv], dim=-1)
+        # Near-surface proximity: smooth scalar ~1 near surface, ~0 far away
+        dsdf_norm = x[:, :, 2:10].norm(dim=-1, keepdim=True)
+        near_surface = torch.sigmoid(5.0 * (0.2 - dsdf_norm))
+        x = torch.cat([x, near_surface], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -835,6 +839,10 @@ for epoch in range(MAX_EPOCHS):
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                 x = torch.cat([x, curv], dim=-1)
+                # Near-surface proximity: smooth scalar ~1 near surface, ~0 far away
+                dsdf_norm = x[:, :, 2:10].norm(dim=-1, keepdim=True)
+                near_surface = torch.sigmoid(5.0 * (0.2 - dsdf_norm))
+                x = torch.cat([x, near_surface], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
