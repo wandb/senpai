@@ -576,11 +576,8 @@ base_opt = torch.optim.AdamW([
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
-scheduler = torch.optim.lr_scheduler.SequentialLR(
-    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[10]
-)
+# snapshot-ensemble-3cycle: CAWR replaces warmup+cosine; troughs at epochs 18, 36, 54
+scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(base_opt, T_0=18, T_mult=1, eta_min=5e-5)
 
 # --- wandb ---
 run = wandb.init(
@@ -626,6 +623,8 @@ prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
+snapshot_models = []  # snapshot-ensemble-3cycle: model copies at LR troughs
+snapshot_epochs_set = {18, 36, 54}
 
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
@@ -802,6 +801,11 @@ for epoch in range(MAX_EPOCHS):
     if epoch >= 50:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
+    # snapshot-ensemble-3cycle: save model copy at each LR trough
+    if (epoch + 1) in snapshot_epochs_set:
+        snap_src = ema_model if ema_model is not None else _base_model
+        snapshot_models.append({k: v.clone().cpu() for k, v in snap_src.state_dict().items()})
+        print(f"  [snapshot] Saved snapshot at epoch {epoch+1} ({len(snapshot_models)}/3)")
     epoch_vol /= n_batches
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
@@ -811,6 +815,16 @@ for epoch in range(MAX_EPOCHS):
     eval_model = ema_model if ema_model is not None else model
     eval_model.eval()
     model.eval()
+    # snapshot-ensemble-3cycle: load snapshots for ensemble eval if available
+    if len(snapshot_models) > 0:
+        _snap_evals = []
+        for snap_state in snapshot_models:
+            _sm = deepcopy(_base_model)
+            _sm.load_state_dict({k: v.to(device) for k, v in snap_state.items()})
+            _sm.eval()
+            _snap_evals.append(_sm)
+    else:
+        _snap_evals = None
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -865,7 +879,11 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    if _snap_evals is not None:  # snapshot-ensemble-3cycle: average predictions
+                        preds = [m({"x": x})["preds"] for m in _snap_evals]
+                        pred = torch.stack(preds).mean(dim=0)
+                    else:
+                        pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
