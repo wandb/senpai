@@ -289,6 +289,7 @@ class Transolver(nn.Module):
 
         self.n_hidden = n_hidden
         self.space_dim = space_dim
+        self.input_scale = nn.Parameter(torch.ones(fun_dim + space_dim))
         self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
         nn.init.eye_(self.feature_cross.weight)  # start as identity
         self.blocks = nn.ModuleList(
@@ -375,6 +376,7 @@ class Transolver(nn.Module):
             new_pos = self.get_grid(pos)
             x = torch.cat((x, new_pos), dim=-1)
 
+        x = x * self.input_scale  # saliency-guided feature scaling
         x_cross = x * self.feature_cross(x)
         x = x + 0.1 * x_cross  # residual with small scale
         raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:25]], dim=-1)  # x, y, curvature
@@ -806,6 +808,41 @@ for epoch in range(MAX_EPOCHS):
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
     prev_surf_loss = epoch_surf
+
+    # --- Saliency-guided input scale update (every 5 epochs) ---
+    if epoch % 5 == 0:
+        model.eval()
+        sal_x, sal_y, sal_is_surface, sal_mask = next(iter(train_loader))
+        sal_x = sal_x.to(device)
+        sal_y = sal_y.to(device)
+        sal_is_surface = sal_is_surface.to(device)
+        sal_mask = sal_mask.to(device)
+        sal_x = (sal_x - stats["x_mean"]) / stats["x_std"]
+        sal_curv = sal_x[:, :, 2:6].norm(dim=-1, keepdim=True) * sal_is_surface.float().unsqueeze(-1)
+        sal_x = torch.cat([sal_x, sal_curv], dim=-1)
+        sal_raw_xy = sal_x[:, :, :2]
+        sal_xy_min = sal_raw_xy.amin(dim=1, keepdim=True)
+        sal_xy_max = sal_raw_xy.amax(dim=1, keepdim=True)
+        sal_xy_norm = (sal_raw_xy - sal_xy_min) / (sal_xy_max - sal_xy_min + 1e-8)
+        sal_freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+        sal_xy_scaled = sal_xy_norm.unsqueeze(-1) * sal_freqs
+        sal_fourier_pe = torch.cat([sal_xy_scaled.sin().flatten(-2), sal_xy_scaled.cos().flatten(-2)], dim=-1)
+        sal_x = torch.cat([sal_x, sal_fourier_pe], dim=-1).requires_grad_(True)
+        sal_Umag, sal_q = _umag_q(sal_y, sal_mask)
+        sal_y_phys = _phys_norm(sal_y, sal_Umag, sal_q)
+        sal_y_norm = (sal_y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+        with torch.enable_grad():
+            sal_out = _base_model({"x": sal_x})
+            sal_pred = sal_out["preds"]
+            sal_surf_mask = sal_is_surface.bool()
+            sal_surf_err = (sal_pred - sal_y_norm).abs()
+            sal_surf_loss = (sal_surf_err * sal_surf_mask.unsqueeze(-1)).sum() / sal_surf_mask.sum().clamp(min=1)
+            sal_grad = torch.autograd.grad(sal_surf_loss, sal_x)[0]  # [B, N, D]
+        saliency = sal_grad.abs().mean(dim=(0, 1))  # [D]
+        saliency = F.normalize(saliency, dim=0)
+        with torch.no_grad():
+            _base_model.input_scale.data.mul_(0.9).add_(0.1 * saliency)
+        model.train()
 
     # --- Validate across all splits ---
     eval_model = ema_model if ema_model is not None else model
