@@ -170,6 +170,12 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
 
+        # Slice diversity loss: penalize high pairwise cosine similarity between slice tokens
+        st_norm = F.normalize(slice_token, dim=-1)  # [B, H, S, D]
+        cos_sim_matrix = torch.einsum("bhid,bhjd->bhij", st_norm, st_norm)  # [B, H, S, S]
+        S = slice_token.shape[2]
+        div_loss = ((cos_sim_matrix.sum(dim=(-2, -1)) - S) / (S * (S - 1))).mean()
+
         q_slice_token = self.to_q(slice_token)
         slice_token_kv = slice_token.mean(dim=1, keepdim=True)  # shared K,V: (bsz, 1, slice_num, dim_head)
         k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
@@ -183,7 +189,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
-        return self.to_out(out_x)
+        return self.to_out(out_x), div_loss
 
 
 class TransolverBlock(nn.Module):
@@ -227,15 +233,16 @@ class TransolverBlock(nn.Module):
 
     def forward(self, fx, raw_xy=None, tandem_mask=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
+        attn_out, div_loss = self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask)
+        fx = self.ln_1_post(attn_out + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
-        return fx
+            return self.mlp2(self.ln_3(fx)), div_loss
+        return fx, div_loss
 
 
 class Transolver(nn.Module):
@@ -380,18 +387,22 @@ class Transolver(nn.Module):
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
+        div_losses = []
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+            fx, dl = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+            div_losses.append(dl)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+        fx, dl = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+        div_losses.append(dl)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+        div_loss = sum(div_losses)
+        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred, "diversity_loss": div_loss}
 
 
 # ---------------------------------------------------------------------------
@@ -692,6 +703,7 @@ for epoch in range(MAX_EPOCHS):
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
+            diversity_loss = out.get("diversity_loss", 0.0)
         pred = pred.float()
         re_pred = re_pred.float()
         aoa_pred = aoa_pred.float()
@@ -762,6 +774,7 @@ for epoch in range(MAX_EPOCHS):
         aoa_target = x[:, 0, 14:15]  # AoA0_rad from normalized input
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
+        loss = loss + 0.01 * diversity_loss
 
         optimizer.zero_grad()
         loss.backward()
