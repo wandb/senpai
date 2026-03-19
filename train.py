@@ -577,7 +577,7 @@ base_opt = torch.optim.AdamW([
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
+cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=72, eta_min=5e-5)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
     base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[10]
 )
@@ -748,6 +748,20 @@ for epoch in range(MAX_EPOCHS):
         surf_loss = (surf_per_sample * tandem_boost).mean()
         loss = vol_loss + surf_weight * surf_loss
 
+        if epoch >= 10:
+            grad_loss = 0.0
+            for b in range(pred.shape[0]):
+                s_mask_b = surf_mask[b]
+                if s_mask_b.sum() > 2:
+                    s_pred = pred[b, s_mask_b, 2]
+                    s_xy = x[:, :, :2][b, s_mask_b]
+                    cx, cy = s_xy[:, 0].mean(), s_xy[:, 1].mean()
+                    angles = torch.atan2(s_xy[:, 1] - cy, s_xy[:, 0] - cx)
+                    sort_idx = angles.argsort()
+                    diffs = (s_pred[sort_idx][1:] - s_pred[sort_idx][:-1]).abs()
+                    grad_loss = grad_loss + diffs.mean()
+            loss = loss + 0.01 * (grad_loss / max(pred.shape[0], 1))
+
         # Multi-scale loss: coarse spatial pooling
         coarse_pool_size = 64
         B, N, C = pred.shape
@@ -799,9 +813,11 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
-    if epoch >= 50:
+    if epoch >= 30:
         with torch.no_grad():
-            _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
+            progress = min(1.0, (epoch - 30) / 30.0)
+            max_temp = 0.5 - progress * 0.35
+            _base_model.blocks[0].attn.temperature.data.clamp_(max=max_temp)
     epoch_vol /= n_batches
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
