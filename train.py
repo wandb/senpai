@@ -705,6 +705,8 @@ for epoch in range(MAX_EPOCHS):
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
+        node_weight = (abs_err / abs_err.mean(dim=1, keepdim=True).clamp(min=1e-8)).clamp(0.5, 2.0)
+        abs_err = abs_err * node_weight
         if epoch < 10:
             is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
             sample_mask = (~is_tandem_curr).float()[:, None, None]
