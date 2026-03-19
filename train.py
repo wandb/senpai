@@ -420,10 +420,13 @@ class Config:
     wandb_group: str | None = None
     wandb_name: str | None = None
     agent: str | None = None
+    seed: int = 42
     debug: bool = False
 
 
 cfg = sp.parse(Config)
+
+torch.manual_seed(cfg.seed)
 
 if cfg.debug:
     MAX_EPOCHS = 3
