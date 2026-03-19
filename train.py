@@ -634,6 +634,9 @@ for epoch in range(MAX_EPOCHS):
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+        # Log-compress pressure channel to reduce dynamic range
+        p_ch = y_norm[:, :, 2:3]
+        y_norm = torch.cat([y_norm[:, :, :2], p_ch.sign() * torch.log1p(p_ch.abs())], dim=-1)
         if model.training:
             noise_progress = min(1.0, epoch / 60)
             vel_noise = 0.015 * (1 - noise_progress) + 0.003 * noise_progress
@@ -799,6 +802,9 @@ for epoch in range(MAX_EPOCHS):
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                # Log-compress pressure channel (same as training)
+                p_ch = y_norm[:, :, 2:3]
+                y_norm = torch.cat([y_norm[:, :, :2], p_ch.sign() * torch.log1p(p_ch.abs())], dim=-1)
 
                 # Per-sample std normalization: skip tandem samples
                 raw_gap = x[:, 0, 21]
@@ -835,6 +841,9 @@ for epoch in range(MAX_EPOCHS):
                 )
                 n_vbatches += 1
 
+                # Undo log-pressure transform before stats denorm
+                p_pred = pred[:, :, 2:3]
+                pred = torch.cat([pred[:, :, :2], p_pred.sign() * torch.expm1(p_pred.abs())], dim=-1)
                 # Denormalize: phys_stats → Cp space → original scale
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
                 pred_orig = _phys_denorm(pred_phys, Umag, q)
