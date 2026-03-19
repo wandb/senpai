@@ -20,6 +20,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     Tandem surface loss is therefore underweighted.
 """
 
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -545,9 +546,16 @@ base_opt = torch.optim.AdamW([
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
+cosine1 = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=40, eta_min=5e-5)
+# Gentle restart: cosine from 5e-4 to 5e-5 over 22 epochs
+_restart_lr_max = 5e-4 / cfg.lr  # factor relative to base_lr
+_restart_lr_min = 5e-5 / cfg.lr
+cosine2 = torch.optim.lr_scheduler.LambdaLR(
+    base_opt,
+    lr_lambda=lambda ep: _restart_lr_min + (_restart_lr_max - _restart_lr_min) * (1 + math.cos(math.pi * min(ep, 22) / 22)) / 2
+)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
-    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[10]
+    base_opt, schedulers=[warmup_scheduler, cosine1, cosine2], milestones=[10, 50]
 )
 
 # --- wandb ---
