@@ -202,8 +202,14 @@ class TransolverBlock(nn.Module):
                 nn.GELU(),
                 nn.Linear(hidden_dim, out_dim),
             )
+            self.surf_cross_q = nn.Linear(hidden_dim, hidden_dim // 4)
+            self.surf_cross_k = nn.Linear(hidden_dim, hidden_dim // 4)
+            self.surf_cross_v = nn.Linear(hidden_dim, hidden_dim // 4)
+            self.surf_cross_out = nn.Linear(hidden_dim // 4, hidden_dim)
+            nn.init.zeros_(self.surf_cross_out.weight)
+            nn.init.zeros_(self.surf_cross_out.bias)
 
-    def forward(self, fx, raw_xy=None):
+    def forward(self, fx, raw_xy=None, is_surface=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
@@ -211,6 +217,13 @@ class TransolverBlock(nn.Module):
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
+        if is_surface is not None and self.last_layer:
+            q = self.surf_cross_q(fx)
+            k = self.surf_cross_k(fx)
+            v = self.surf_cross_v(fx)
+            attn = F.softmax(q @ k.transpose(-1, -2) / (q.shape[-1] ** 0.5), dim=-1)
+            cross_out = self.surf_cross_out(attn @ v) * is_surface.float().unsqueeze(-1)
+            fx = fx + cross_out
         if self.last_layer:
             return self.mlp2(self.ln_3(fx))
         return fx
@@ -349,6 +362,7 @@ class Transolver(nn.Module):
         x_cross = x * self.feature_cross(x)
         x = x + 0.1 * x_cross  # residual with small scale
         raw_xy = x[:, :, :2]
+        is_surface = (x[:, :, 12] > 0)  # [B, N] boolean surface indicator
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
@@ -360,7 +374,7 @@ class Transolver(nn.Module):
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, is_surface=is_surface)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
@@ -497,6 +511,9 @@ model_config = dict(
 )
 
 model = Transolver(**model_config).to(device)
+import torch._inductor.config as _inductor_config
+_inductor_config.shape_padding = False  # O(N^2) surf cross-attn triggers OOM in pad benchmarker
+_inductor_config.comprehensive_padding = False
 model = torch.compile(model, mode="reduce-overhead")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
