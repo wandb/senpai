@@ -17,9 +17,6 @@ echo "Students: $STUDENT_NAMES"
 # Repo already cloned by the deployment args block
 cd "$WORKDIR"
 
-# --- Install role instructions ---
-cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
-
 uv pip install --system -e .
 
 # --- Git identity ---
@@ -35,6 +32,9 @@ else
     git checkout -b "$ADVISOR_BRANCH"
     git push -u origin "$ADVISOR_BRANCH"
 fi
+
+# --- Install role instructions (after checkout so we don't dirty the worktree) ---
+cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
 
 # --- Install Claude Code ---
 curl -fsSL https://claude.ai/install.sh | bash
