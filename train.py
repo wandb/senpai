@@ -290,6 +290,7 @@ class Transolver(nn.Module):
         self.n_hidden = n_hidden
         self.space_dim = space_dim
         self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
+        self.mask_token = nn.Parameter(torch.zeros(fun_dim + space_dim))
         nn.init.eye_(self.feature_cross.weight)  # start as identity
         self.blocks = nn.ModuleList(
             [
@@ -664,6 +665,13 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
+        # Masked autoencoding: randomly mask 10% of volume node inputs
+        mae_mask = None
+        if model.training:
+            vol_mask_mae = mask & ~is_surface
+            mae_mask = (torch.rand(mask.shape, device=device) < 0.10) & vol_mask_mae
+            x[mae_mask] = _base_model.mask_token.to(x.dtype)
+
         if model.training and epoch < 60:
             noise_scale = 0.05 * (1 - epoch / 60)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -778,6 +786,9 @@ for epoch in range(MAX_EPOCHS):
         aoa_target = x[:, 0, 14:15]  # AoA0_rad from normalized input
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
+        if mae_mask is not None and mae_mask.any():
+            mask_recon_loss = (pred[mae_mask] - y_norm[mae_mask]).abs().mean() * 0.05
+            loss = loss + mask_recon_loss
 
         optimizer.zero_grad()
         loss.backward()
