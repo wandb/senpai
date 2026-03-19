@@ -529,6 +529,9 @@ model_config = dict(
     output_dims=[1, 1, 1],
 )
 
+torch.manual_seed(97); torch.cuda.manual_seed_all(97)
+import random; random.seed(97); import numpy as np; np.random.seed(97)
+
 model = Transolver(**model_config).to(device)
 model = torch.compile(model, mode="reduce-overhead")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
