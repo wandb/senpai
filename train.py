@@ -692,7 +692,26 @@ for epoch in range(MAX_EPOCHS):
 
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        if epoch >= 5:
+            grad_weights = torch.ones(B, abs_err.shape[1], device=device)
+            for b in range(B):
+                s_mask = surf_mask[b]
+                if s_mask.sum() < 2:
+                    continue
+                s_idx = s_mask.nonzero(as_tuple=True)[0]
+                s_x = raw_xy[b, s_idx, 0]
+                s_p = y_phys[b, s_idx, 2]
+                sort_order = s_x.argsort()
+                s_p_sorted = s_p[sort_order]
+                dp = torch.diff(s_p_sorted)
+                grad_mag = torch.cat([dp.abs(), dp[-1:].abs()])
+                unsort = sort_order.argsort()
+                grad_mag = grad_mag[unsort]
+                mean_grad = grad_mag.mean().clamp(min=1e-8)
+                grad_weights[b, s_idx] = 1.0 + 2.0 * grad_mag / mean_grad
+            surf_per_sample = (abs_err[:, :, 2] * surf_mask.float() * grad_weights).sum(dim=1) / surf_mask.sum(dim=1).clamp(min=1).float()
+        else:
+            surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
