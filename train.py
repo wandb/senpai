@@ -622,8 +622,6 @@ ema_decay_val = 0.9
 best_metrics = {}
 global_step = 0
 train_start = time.time()
-prev_vol_loss = 1.0
-prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
 
@@ -635,8 +633,11 @@ for epoch in range(MAX_EPOCHS):
 
     t0 = time.time()
 
-    # Adaptive surface weight: loss-ratio based, clamped [5, 50]
-    surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+    # Scheduled surface weight ramp: 10 → 50 over first 30 epochs, hold at 50
+    if epoch < 30:
+        surf_weight = 10.0 + (50.0 - 10.0) * (epoch / 30)
+    else:
+        surf_weight = 50.0
 
     # --- Train ---
     model.train()
@@ -804,9 +805,6 @@ for epoch in range(MAX_EPOCHS):
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
     epoch_vol /= n_batches
     epoch_surf /= n_batches
-    prev_vol_loss = epoch_vol
-    prev_surf_loss = epoch_surf
-
     # --- Validate across all splits ---
     eval_model = ema_model if ema_model is not None else model
     eval_model.eval()
