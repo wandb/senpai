@@ -411,7 +411,7 @@ MAX_EPOCHS = 100
 
 @dataclass
 class Config:
-    lr: float = 3e-3
+    lr: float = 4e-3
     weight_decay: float = 0.0
     batch_size: int = 4
     surf_weight: float = 20.0
@@ -541,45 +541,16 @@ ema_decay = 0.998
 n_params = sum(p.numel() for p in model.parameters())
 
 
-class Lookahead:
-    def __init__(self, base_optimizer, k=5, alpha=0.5):
-        self.base_optimizer = base_optimizer
-        self.k = k
-        self.alpha = alpha
-        self.slow_params = [
-            [p.data.clone() for p in group['params']]
-            for group in base_optimizer.param_groups
-        ]
-        self.step_count = 0
-
-    def step(self):
-        self.base_optimizer.step()
-        self.step_count += 1
-        if self.step_count % self.k == 0:
-            for slow, group in zip(self.slow_params, self.base_optimizer.param_groups):
-                for s, p in zip(slow, group['params']):
-                    s.data.add_(self.alpha * (p.data - s.data))
-                    p.data.copy_(s.data)
-
-    def zero_grad(self):
-        self.base_optimizer.zero_grad()
-
-    @property
-    def param_groups(self):
-        return self.base_optimizer.param_groups
-
-
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
-base_opt = torch.optim.AdamW([
+optimizer = torch.optim.AdamW([
     {'params': attn_params, 'lr': cfg.lr * 0.5},
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
-optimizer = Lookahead(base_opt, k=10, alpha=0.8)
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
+warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=10)
+cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=62, eta_min=5e-5)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
-    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[10]
+    optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[10]
 )
 
 # --- wandb ---
