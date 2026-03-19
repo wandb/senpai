@@ -411,7 +411,7 @@ MAX_EPOCHS = 100
 
 @dataclass
 class Config:
-    lr: float = 3e-3
+    lr: float = 5e-3
     weight_decay: float = 0.0
     batch_size: int = 4
     surf_weight: float = 20.0
@@ -799,9 +799,9 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
-    if epoch >= 50:
+    if epoch >= 40:
         with torch.no_grad():
-            _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
+            _base_model.blocks[0].attn.temperature.data.clamp_(max=0.15)
     epoch_vol /= n_batches
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
