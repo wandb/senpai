@@ -208,6 +208,13 @@ class TransolverBlock(nn.Module):
             dropout=dropout,
             slice_num=slice_num,
         )
+        self.coarse_attn = Physics_Attention_Irregular_Mesh(
+            hidden_dim,
+            heads=1,
+            dim_head=64,
+            slice_num=16,
+        )
+        self.coarse_scale = nn.Parameter(torch.tensor(0.1))
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         self.spatial_bias = nn.Sequential(
@@ -233,7 +240,10 @@ class TransolverBlock(nn.Module):
 
     def forward(self, fx, raw_xy=None, tandem_mask=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
+        x_norm = self.ln_1(fx)
+        fine_out = self.attn(x_norm, spatial_bias=sb, tandem_mask=tandem_mask)
+        coarse_out = self.coarse_attn(x_norm)
+        fx = self.ln_1_post(fine_out + self.coarse_scale * coarse_out + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
