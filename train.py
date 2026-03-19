@@ -231,7 +231,7 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, rank_ab=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
@@ -240,7 +240,12 @@ class TransolverBlock(nn.Module):
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            fx_ln3 = self.ln_3(fx)
+            fx_out = self.mlp2(fx_ln3)
+            if rank_ab is not None:
+                A, B = rank_ab
+                fx_out = fx_out + fx_ln3 @ A @ B
+            return fx_out
         return fx
 
 
@@ -288,6 +293,7 @@ class Transolver(nn.Module):
             self.preprocess = GatedMLP2(fun_dim + space_dim, n_hidden * 2, n_hidden)
 
         self.n_hidden = n_hidden
+        self.out_dim = out_dim
         self.space_dim = space_dim
         self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
         nn.init.eye_(self.feature_cross.weight)  # start as identity
@@ -318,6 +324,12 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        # Regime-conditioned rank-4 modulation hypernetwork
+        self.regime_proj = nn.Sequential(
+            nn.Linear(2, 16), nn.GELU(), nn.Linear(16, n_hidden * 4 + 4 * out_dim)
+        )
+        nn.init.zeros_(self.regime_proj[-1].weight)
+        nn.init.zeros_(self.regime_proj[-1].bias)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -393,7 +405,13 @@ class Transolver(nn.Module):
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+        # Regime-conditioned rank-4 modulation: condition on [log_Re, AoA]
+        log_re_aoa = x[:, 0, 13:15]  # [B, 2]
+        rank_out = self.regime_proj(log_re_aoa)  # [B, n_hidden*4 + 4*out_dim]
+        n_h = self.n_hidden
+        A = rank_out[:, :n_h * 4].reshape(-1, n_h, 4)   # [B, 192, 4]
+        B = rank_out[:, n_h * 4:].reshape(-1, 4, self.out_dim)  # [B, 4, 3]
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, rank_ab=(A, B))
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
