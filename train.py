@@ -421,9 +421,12 @@ class Config:
     wandb_name: str | None = None
     agent: str | None = None
     debug: bool = False
+    seed: int = 42
 
 
 cfg = sp.parse(Config)
+
+torch.manual_seed(cfg.seed)
 
 if cfg.debug:
     MAX_EPOCHS = 3
