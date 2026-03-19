@@ -209,7 +209,7 @@ class TransolverBlock(nn.Module):
             slice_num=slice_num,
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
-        self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        self.mlp = GatedMLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, act=act)
         self.spatial_bias = nn.Sequential(
             nn.Linear(3, 64), nn.GELU(),
             nn.Linear(64, 64), nn.GELU(),
