@@ -641,6 +641,7 @@ for epoch in range(MAX_EPOCHS):
     # --- Train ---
     model.train()
     epoch_vol = 0.0
+    epoch_vol_raw = 0.0
     epoch_surf = 0.0
     n_batches = 0
 
@@ -726,7 +727,8 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_mask_train = vol_mask
 
-        vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+        vol_loss_raw = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+        vol_loss = 0.05 * vol_loss_raw
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
         surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
@@ -794,6 +796,7 @@ for epoch in range(MAX_EPOCHS):
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
         epoch_vol += vol_loss.item()
+        epoch_vol_raw += vol_loss_raw.item()
         epoch_surf += surf_loss.item()
         n_batches += 1
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
@@ -803,8 +806,9 @@ for epoch in range(MAX_EPOCHS):
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
     epoch_vol /= n_batches
+    epoch_vol_raw /= n_batches
     epoch_surf /= n_batches
-    prev_vol_loss = epoch_vol
+    prev_vol_loss = epoch_vol_raw  # use raw (unscaled) for adaptive surf_weight ratio
     prev_surf_loss = epoch_surf
 
     # --- Validate across all splits ---
