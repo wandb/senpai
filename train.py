@@ -143,6 +143,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout),
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
+        self.register_buffer('slice_prototypes', torch.zeros(1, heads, slice_num, dim_head))
+        self.register_buffer('proto_initialized', torch.zeros(1, dtype=torch.bool))
 
     def forward(self, x, spatial_bias=None, tandem_mask=None):
         bsz, num_points, _ = x.shape
@@ -169,6 +171,15 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
+
+        if self.training:
+            batch_proto = slice_token.detach().mean(dim=0, keepdim=True)
+            if not self.proto_initialized.item():
+                self.slice_prototypes.copy_(batch_proto)
+                self.proto_initialized.fill_(True)
+            else:
+                self.slice_prototypes.copy_(0.99 * self.slice_prototypes + 0.01 * batch_proto)
+            slice_token = 0.9 * slice_token + 0.1 * self.slice_prototypes
 
         q_slice_token = self.to_q(slice_token)
         slice_token_kv = slice_token.mean(dim=1, keepdim=True)  # shared K,V: (bsz, 1, slice_num, dim_head)
