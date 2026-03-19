@@ -746,7 +746,9 @@ for epoch in range(MAX_EPOCHS):
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
-        loss = vol_loss + surf_weight * surf_loss
+        vol_per_sample = (abs_err * vol_mask_train.unsqueeze(-1)).sum(dim=(1, 2)) / (3.0 * vol_mask_train.sum(dim=1).clamp(min=1).float())
+        tandem_weight_15 = torch.where(is_tandem_batch, 1.5, 1.0).to(device)
+        loss = ((vol_per_sample + surf_weight * surf_per_sample * tandem_boost) * tandem_weight_15).mean()
 
         # Multi-scale loss: coarse spatial pooling
         coarse_pool_size = 64
