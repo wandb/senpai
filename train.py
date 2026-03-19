@@ -223,6 +223,11 @@ class TransolverBlock(nn.Module):
         self.se_fc2 = nn.Linear(hidden_dim // 4, hidden_dim)
         nn.init.zeros_(self.se_fc2.weight)
         nn.init.zeros_(self.se_fc2.bias)
+        _cond_dim = 4
+        self.adaln_1 = nn.Sequential(nn.Linear(_cond_dim, 32), nn.GELU(), nn.Linear(32, 2 * hidden_dim))
+        self.adaln_2 = nn.Sequential(nn.Linear(_cond_dim, 32), nn.GELU(), nn.Linear(32, 2 * hidden_dim))
+        self.adaln_1_post = nn.Sequential(nn.Linear(_cond_dim, 32), nn.GELU(), nn.Linear(32, 2 * hidden_dim))
+        self.adaln_2_post = nn.Sequential(nn.Linear(_cond_dim, 32), nn.GELU(), nn.Linear(32, 2 * hidden_dim))
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
             self.mlp2 = nn.Sequential(
@@ -230,16 +235,34 @@ class TransolverBlock(nn.Module):
                 nn.GELU(),
                 nn.Linear(hidden_dim, out_dim),
             )
+            self.adaln_3 = nn.Sequential(nn.Linear(_cond_dim, 32), nn.GELU(), nn.Linear(32, 2 * hidden_dim))
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, cond=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
-        fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
+        if cond is not None:
+            _d = fx.shape[-1]
+            _g, _b = self.adaln_1(cond).chunk(2, dim=-1)
+            _pre = F.layer_norm(fx, [_d]) * (1 + _g.unsqueeze(1)) + _b.unsqueeze(1)
+            _res = self.attn(_pre, spatial_bias=sb, tandem_mask=tandem_mask) + fx
+            _g, _b = self.adaln_1_post(cond).chunk(2, dim=-1)
+            fx = F.layer_norm(_res, [_d]) * (1 + _g.unsqueeze(1)) + _b.unsqueeze(1)
+            _g, _b = self.adaln_2(cond).chunk(2, dim=-1)
+            _pre = F.layer_norm(fx, [_d]) * (1 + _g.unsqueeze(1)) + _b.unsqueeze(1)
+            _res = self.mlp(_pre) + fx
+            _g, _b = self.adaln_2_post(cond).chunk(2, dim=-1)
+            fx = F.layer_norm(_res, [_d]) * (1 + _g.unsqueeze(1)) + _b.unsqueeze(1)
+        else:
+            fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
+            fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
         if self.last_layer:
+            if cond is not None:
+                _g, _b = self.adaln_3(cond).chunk(2, dim=-1)
+                fx = F.layer_norm(fx, [fx.shape[-1]]) * (1 + _g.unsqueeze(1)) + _b.unsqueeze(1)
+                return self.mlp2(fx)
             return self.mlp2(self.ln_3(fx))
         return fx
 
@@ -307,6 +330,14 @@ class Transolver(nn.Module):
             ]
         )
         self.initialize_weights()
+        # Zero-init AdaLN output layers so blocks start as identity transforms
+        for _block in self.blocks:
+            for _adaln in [_block.adaln_1, _block.adaln_2, _block.adaln_1_post, _block.adaln_2_post]:
+                nn.init.zeros_(_adaln[-1].weight)
+                nn.init.zeros_(_adaln[-1].bias)
+            if _block.last_layer:
+                nn.init.zeros_(_block.adaln_3[-1].weight)
+                nn.init.zeros_(_block.adaln_3[-1].bias)
         self.out_skip = nn.Linear(n_hidden, out_dim)
         nn.init.zeros_(self.out_skip.weight)
         nn.init.zeros_(self.out_skip.bias)
@@ -375,6 +406,8 @@ class Transolver(nn.Module):
             new_pos = self.get_grid(pos)
             x = torch.cat((x, new_pos), dim=-1)
 
+        # Extract condition before feature mixing: Re, AoA, gap, stagger
+        cond = x[:, 0, [13, 14, 21, 22]]  # [B, 4]
         x_cross = x * self.feature_cross(x)
         x = x + 0.1 * x_cross  # residual with small scale
         raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:25]], dim=-1)  # x, y, curvature
@@ -387,13 +420,13 @@ class Transolver(nn.Module):
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, cond=cond)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, cond=cond)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
