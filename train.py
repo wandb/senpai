@@ -520,7 +520,7 @@ model_config = dict(
     space_dim=2,
     fun_dim=X_DIM - 2 + 1 + 32,  # 8 freqs * 2 coords * 2 (sin+cos) = 32
     out_dim=3,
-    n_hidden=192,  # regime-w: full width with finer routing
+    n_hidden=176,  # nhidden176: midpoint between regime-h (160) and regime-w (192)
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
     n_head=4,
     slice_num=48,  # regime-h: more slices for finer spatial decomposition
