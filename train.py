@@ -318,6 +318,16 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        # Rank-8 conditioned output modulation: A[n_hidden,8] fixed, B[8,out_dim] conditioned
+        _rank = 8
+        self.rank_A = nn.Parameter(torch.empty(n_hidden, _rank))
+        nn.init.normal_(self.rank_A, std=0.01)
+        self.cond_B_mlp = nn.Sequential(
+            nn.Linear(4, 32), nn.GELU(),
+            nn.Linear(32, _rank * out_dim),
+        )
+        nn.init.zeros_(self.cond_B_mlp[-1].weight)
+        nn.init.zeros_(self.cond_B_mlp[-1].bias)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -375,6 +385,8 @@ class Transolver(nn.Module):
             new_pos = self.get_grid(pos)
             x = torch.cat((x, new_pos), dim=-1)
 
+        # Extract condition: Re, AoA, gap, stagger
+        cond = x[:, 0, [13, 14, 21, 22]]  # [B, 4]
         x_cross = x * self.feature_cross(x)
         x = x + 0.1 * x_cross  # residual with small scale
         raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:25]], dim=-1)  # x, y, curvature
@@ -396,6 +408,10 @@ class Transolver(nn.Module):
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
+        # Rank-8 modulation: fx_pre [B,N,192] @ rank_A [192,8] @ B_cond [B,8,3] → [B,N,3]
+        B_mat = self.cond_B_mlp(cond).reshape(cond.shape[0], 8, -1)  # [B, 8, out_dim]
+        rank_mod = torch.bmm(fx_pre @ self.rank_A, B_mat)  # [B, N, out_dim]
+        fx = fx + rank_mod
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
