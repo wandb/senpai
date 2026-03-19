@@ -728,21 +728,23 @@ for epoch in range(MAX_EPOCHS):
 
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        surf_pres_err = abs_err[:, :, 2:3]
+        surf_vel_err = 0.3 * abs_err[:, :, 0:1] + 0.1 * abs_err[:, :, 1:2]
+        surf_combined = surf_pres_err + surf_vel_err
+        surf_per_sample = (surf_combined * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
         running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
         # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
         if epoch >= 30:
-            surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
-            surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
-            surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
-            thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
+            surf_combined_flat = surf_combined[:, :, 0]  # [B, N]
+            surf_combined_masked = surf_combined_flat.masked_fill(~surf_mask, float('nan'))
+            thresh = torch.nanmedian(surf_combined_masked, dim=1).values  # [B]
             thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
-            hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
+            hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_combined_flat >= thresh[:, None])
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
-            surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            surf_per_sample = (surf_combined * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
