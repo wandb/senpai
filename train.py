@@ -225,10 +225,15 @@ class TransolverBlock(nn.Module):
         nn.init.zeros_(self.se_fc2.bias)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
-            self.mlp2 = nn.Sequential(
+            self.mlp2_vel = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.GELU(),
-                nn.Linear(hidden_dim, out_dim),
+                nn.Linear(hidden_dim, out_dim - 1),
+            )
+            self.mlp2_p = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 1),
             )
 
     def forward(self, fx, raw_xy=None, tandem_mask=None):
@@ -240,7 +245,8 @@ class TransolverBlock(nn.Module):
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            h = self.ln_3(fx)
+            return torch.cat([self.mlp2_vel(h), self.mlp2_p(h)], dim=-1)
         return fx
 
 
@@ -570,10 +576,14 @@ class Lookahead:
 
 
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
-other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+p_head_params = [p for n, p in model.named_parameters() if 'mlp2_p' in n]
+p_head_names = {n for n, p in model.named_parameters() if 'mlp2_p' in n}
+attn_names = {n for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])}
+other_params = [p for n, p in model.named_parameters() if n not in attn_names and n not in p_head_names]
 base_opt = torch.optim.AdamW([
     {'params': attn_params, 'lr': cfg.lr * 0.5},
-    {'params': other_params, 'lr': cfg.lr}
+    {'params': other_params, 'lr': cfg.lr},
+    {'params': p_head_params, 'lr': cfg.lr * 3.0},
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
