@@ -144,7 +144,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
 
-    def forward(self, x, spatial_bias=None, tandem_mask=None):
+    def forward(self, x, spatial_bias=None, tandem_mask=None, is_surface=None, top_k=None):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -181,7 +181,17 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         out_slice_token = torch.matmul(attn_weights, v_slice_token)
         out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
 
-        out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
+        # Asymmetric top-K masking: surface nodes use only top-K slice tokens for reconstruction
+        if is_surface is not None and top_k is not None:
+            topk_idx = slice_weights.topk(top_k, dim=-1).indices  # [B, H, N, K]
+            topk_mask = torch.zeros_like(slice_weights).scatter_(-1, topk_idx, 1.0)
+            surf = is_surface.float().unsqueeze(1).unsqueeze(-1)  # [B, 1, N, 1]
+            scatter_weights = slice_weights * (surf * topk_mask + (1.0 - surf))
+            scatter_weights = scatter_weights / (scatter_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        else:
+            scatter_weights = slice_weights
+
+        out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, scatter_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
         return self.to_out(out_x)
 
@@ -231,9 +241,9 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, is_surface=None, top_k=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
+        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask, is_surface=is_surface, top_k=top_k) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
@@ -382,18 +392,25 @@ class Transolver(nn.Module):
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
 
+        # Asymmetric top-K surface reconstruction: active after epoch 20
+        _epoch = getattr(self, '_epoch', 0)
+        _top_k = getattr(self, '_top_k', None)
+        surf_topk = _top_k if (_top_k is not None and _epoch >= 20) else None
+        # Infer surface mask from normalized feature index 12 (is_surface: 0=vol, 1=surf)
+        is_surf_model = x[:, :, 12] > 0 if surf_topk is not None else None
+
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, is_surface=is_surf_model, top_k=surf_topk)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, is_surface=is_surf_model, top_k=surf_topk)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
@@ -530,6 +547,8 @@ model_config = dict(
 )
 
 model = Transolver(**model_config).to(device)
+model._top_k = 8  # asymmetric surface top-K (active after epoch 20)
+model._epoch = 0
 model = torch.compile(model, mode="reduce-overhead")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
@@ -639,6 +658,10 @@ for epoch in range(MAX_EPOCHS):
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
 
     # --- Train ---
+    model._epoch = epoch
+    if ema_model is not None:
+        ema_model._epoch = epoch
+        ema_model._top_k = model._top_k
     model.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
