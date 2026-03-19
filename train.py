@@ -577,7 +577,8 @@ base_opt = torch.optim.AdamW([
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
+T_SNAPSHOT = 13  # epochs per cosine cycle (4 cycles)
+cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(base_opt, T_0=T_SNAPSHOT, eta_min=5e-5)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
     base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[10]
 )
@@ -626,6 +627,10 @@ prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
+# Snapshot ensemble: save EMA model at trough of each cosine cycle
+WARMUP_EPOCHS = 10
+snapshot_models = []
+snapshot_save_epochs = {WARMUP_EPOCHS + k * T_SNAPSHOT - 1 for k in range(1, 5)}  # 0-indexed: 22, 35, 48, 61
 
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
@@ -799,6 +804,14 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
+
+    # Save snapshot at each cosine cycle trough
+    if epoch in snapshot_save_epochs:
+        snap = deepcopy(ema_model if ema_model is not None else _base_model)
+        snap.eval()
+        snapshot_models.append(snap)
+        print(f"Saved snapshot #{len(snapshot_models)} at epoch {epoch+1}")
+
     if epoch >= 50:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
@@ -864,9 +877,16 @@ for epoch in range(MAX_EPOCHS):
                         sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
                 y_norm_scaled = y_norm / sample_stds
 
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
-                pred = pred.float()
+                if snapshot_models:
+                    preds_list = []
+                    for snap_m in snapshot_models:
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            preds_list.append(snap_m({"x": x})["preds"].float())
+                    pred = torch.stack(preds_list).mean(dim=0)
+                else:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        pred = eval_model({"x": x})["preds"]
+                    pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
