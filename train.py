@@ -288,7 +288,8 @@ class Transolver(nn.Module):
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
-        self.fourier_freqs = nn.Parameter(torch.tensor([0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0]))
+        self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])
+        self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -625,7 +626,7 @@ for epoch in range(MAX_EPOCHS):
         xy_min = raw_xy.amin(dim=1, keepdim=True)
         xy_max = raw_xy.amax(dim=1, keepdim=True)
         xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-        freqs = model.fourier_freqs.abs()
+        freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
@@ -785,7 +786,7 @@ for epoch in range(MAX_EPOCHS):
                 xy_min = raw_xy.amin(dim=1, keepdim=True)
                 xy_max = raw_xy.amax(dim=1, keepdim=True)
                 xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                freqs = model.fourier_freqs.abs()
+                freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
@@ -890,7 +891,7 @@ for epoch in range(MAX_EPOCHS):
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
-    learned_freqs = model.fourier_freqs.abs().detach().cpu().tolist()
+    learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
     wandb.log(metrics)
@@ -958,6 +959,14 @@ if best_metrics:
                 x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                 curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                 x_n = torch.cat([x_n, curv], dim=-1)
+                raw_xy = x_n[:, :, :2]
+                xy_min = raw_xy.amin(dim=1, keepdim=True)
+                xy_max = raw_xy.amax(dim=1, keepdim=True)
+                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                freqs = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
+                xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, fourier_pe], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
