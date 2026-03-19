@@ -316,6 +316,9 @@ class Transolver(nn.Module):
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.input_skip = nn.Linear(fun_dim + space_dim, out_dim)
+        nn.init.zeros_(self.input_skip.weight)
+        nn.init.zeros_(self.input_skip.bias)
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
 
@@ -375,6 +378,7 @@ class Transolver(nn.Module):
             new_pos = self.get_grid(pos)
             x = torch.cat((x, new_pos), dim=-1)
 
+        x_orig = x  # save original input for input-skip
         x_cross = x * self.feature_cross(x)
         x = x + 0.1 * x_cross  # residual with small scale
         raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:25]], dim=-1)  # x, y, curvature
@@ -396,6 +400,7 @@ class Transolver(nn.Module):
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
+        fx = fx + 0.1 * self.input_skip(x_orig)
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
@@ -536,7 +541,7 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 from copy import deepcopy
 ema_model = None
 ema_start_epoch = 40
-ema_decay = 0.998
+ema_decay = 0.997
 
 n_params = sum(p.numel() for p in model.parameters())
 
