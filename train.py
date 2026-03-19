@@ -225,13 +225,16 @@ class TransolverBlock(nn.Module):
         nn.init.zeros_(self.se_fc2.bias)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
+            self.adaln_3_proj = nn.Linear(4, 2 * hidden_dim)  # fourier-adaln: cond→(scale,shift)
+            nn.init.zeros_(self.adaln_3_proj.weight)
+            nn.init.zeros_(self.adaln_3_proj.bias)  # zero-init: starts as identity (scale=0→1, shift=0)
             self.mlp2 = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.GELU(),
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, adaln_cond=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
@@ -240,7 +243,11 @@ class TransolverBlock(nn.Module):
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            fx_ln = self.ln_3(fx)
+            if adaln_cond is not None:  # fourier-adaln: apply AdaLN using flow condition
+                scale, shift = self.adaln_3_proj(adaln_cond).chunk(2, dim=-1)  # [B, hidden_dim] each
+                fx_ln = fx_ln * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+            return self.mlp2(fx_ln)
         return fx
 
 
@@ -317,7 +324,10 @@ class Transolver(nn.Module):
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
-        self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        # fourier-adaln: per-sample Fourier freqs conditioned on [Re, AoA, gap, stagger]
+        self.freq_net = nn.Sequential(nn.Linear(4, 16), nn.GELU(), nn.Linear(16, 4))
+        nn.init.zeros_(self.freq_net[-1].weight)
+        nn.init.zeros_(self.freq_net[-1].bias)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -382,6 +392,9 @@ class Transolver(nn.Module):
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
 
+        # fourier-adaln: condition for AdaLN output head: [Re, AoA, gap, stagger]
+        adaln_cond = x[:, 0, [13, 14, 21, 22]]  # [B, 4]
+
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
@@ -393,7 +406,7 @@ class Transolver(nn.Module):
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, adaln_cond=adaln_cond)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
@@ -660,9 +673,13 @@ for epoch in range(MAX_EPOCHS):
         xy_min = raw_xy.amin(dim=1, keepdim=True)
         xy_max = raw_xy.amax(dim=1, keepdim=True)
         xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-        freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-        xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+        # fourier-adaln: per-sample frequencies from freq_net([Re,AoA,gap,stagger])
+        _cond = x[:, 0, [13, 14, 21, 22]]  # [B, 4]
+        _freqs_per = _base_model.freq_net(_cond)  # [B, 4]
+        _freqs_fixed = model.fourier_freqs_fixed.to(device)  # [4]
+        freqs_all = torch.cat([_freqs_fixed.unsqueeze(0).expand(x.shape[0], -1), _freqs_per.abs()], dim=-1)  # [B, 8]
+        xy_scaled = xy_norm.unsqueeze(-1) * freqs_all[:, None, None, :]  # [B, N, 2, 8]
+        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 32]
         x = torch.cat([x, fourier_pe], dim=-1)
         if model.training and epoch < 60:
             noise_scale = 0.05 * (1 - epoch / 60)
@@ -841,9 +858,13 @@ for epoch in range(MAX_EPOCHS):
                 xy_min = raw_xy.amin(dim=1, keepdim=True)
                 xy_max = raw_xy.amax(dim=1, keepdim=True)
                 xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-                xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+                # fourier-adaln: per-sample frequencies from freq_net([Re,AoA,gap,stagger])
+                _cond = x[:, 0, [13, 14, 21, 22]]  # [B, 4]
+                _freqs_per = _base_model.freq_net(_cond)  # [B, 4]
+                _freqs_fixed = model.fourier_freqs_fixed.to(device)  # [4]
+                freqs_all = torch.cat([_freqs_fixed.unsqueeze(0).expand(x.shape[0], -1), _freqs_per.abs()], dim=-1)  # [B, 8]
+                xy_scaled = xy_norm.unsqueeze(-1) * freqs_all[:, None, None, :]  # [B, N, 2, 8]
+                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 32]
                 x = torch.cat([x, fourier_pe], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
@@ -946,7 +967,7 @@ for epoch in range(MAX_EPOCHS):
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
-    learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
+    learned_freqs = _base_model.freq_net[-1].bias.abs().detach().cpu().tolist()  # fourier-adaln: log bias as proxy
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
     wandb.log(metrics)
