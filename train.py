@@ -622,6 +622,9 @@ ema_decay_val = 0.9
 best_metrics = {}
 global_step = 0
 train_start = time.time()
+
+TOP_K = 5
+top5_checkpoints: list[dict] = []  # each: {"val_loss", "path", "epoch", "split_losses"}
 prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
@@ -967,6 +970,22 @@ for epoch in range(MAX_EPOCHS):
         torch.save(save_model.state_dict(), model_path)
         tag = f" * -> {model_path}"
 
+    # Top-5 checkpoint tracking for Pareto/Borda selection (by raw val_loss, not EMA)
+    _split_losses_now = {n: val_metrics_per_split[n][f"{n}/loss"] for n in VAL_SPLIT_NAMES}
+    if len(top5_checkpoints) < TOP_K or val_loss_3split < top5_checkpoints[-1]["val_loss"]:
+        _ckpt_path = model_dir / f"checkpoint_ep{epoch + 1}.pt"
+        _save_m = ema_model if ema_model is not None else model
+        torch.save(_save_m.state_dict(), _ckpt_path)
+        top5_checkpoints.append({
+            "val_loss": val_loss_3split, "path": _ckpt_path,
+            "epoch": epoch + 1, "split_losses": _split_losses_now,
+        })
+        top5_checkpoints.sort(key=lambda c: c["val_loss"])
+        while len(top5_checkpoints) > TOP_K:
+            _evicted = top5_checkpoints.pop()
+            if _evicted["path"].exists():
+                _evicted["path"].unlink()
+
     split_summary = "  ".join(
         f"{name}={val_metrics_per_split[name][f'{name}/loss']:.4f}"
         for name in VAL_SPLIT_NAMES
@@ -977,6 +996,91 @@ for epoch in range(MAX_EPOCHS):
         f"val[{split_summary}]{tag}"
     )
 
+
+# --- Pareto checkpoint selection via Borda count ---
+import shutil as _shutil
+if top5_checkpoints:
+    _n = len(top5_checkpoints)
+    _borda = [0] * _n
+    for _sn in VAL_SPLIT_NAMES:
+        _losses = [c["split_losses"].get(_sn, float("inf")) for c in top5_checkpoints]
+        for _rank, _idx in enumerate(sorted(range(_n), key=lambda i: _losses[i])):
+            _borda[_idx] += _rank
+    _best_idx = min(range(_n), key=lambda i: _borda[i])
+    _winner = top5_checkpoints[_best_idx]
+    print("\n--- Borda count checkpoint selection ---")
+    for i, c in enumerate(top5_checkpoints):
+        print(f"  ep{c['epoch']:3d}  val_loss={c['val_loss']:.4f}  borda={_borda[i]}")
+    print(f"  Winner: ep{_winner['epoch']} (borda={_borda[_best_idx]}, val_loss={_winner['val_loss']:.4f})")
+    _shutil.copy(_winner["path"], model_path)
+    if best_metrics:
+        best_metrics["pareto_epoch"] = _winner["epoch"]
+        best_metrics["pareto_val_loss"] = _winner["val_loss"]
+        best_metrics["pareto_borda_score"] = _borda[_best_idx]
+
+    # BONUS: Average top-2 by Borda score and evaluate
+    _borda_order = sorted(range(_n), key=lambda i: _borda[i])
+    if _n >= 2:
+        _sd1 = torch.load(top5_checkpoints[_borda_order[0]]["path"], map_location=device, weights_only=True)
+        _sd2 = torch.load(top5_checkpoints[_borda_order[1]]["path"], map_location=device, weights_only=True)
+        _avg_sd = {k: (_sd1[k].float() + _sd2[k].float()) / 2.0 for k in _sd1}
+        _avg_m = ema_model if ema_model is not None else model
+        _avg_m.load_state_dict(_avg_sd)
+        model.load_state_dict(_avg_sd)  # sync Fourier freqs used in forward pass
+        _avg_m.eval()
+        model.eval()
+        print("\n--- Evaluating top-2 weight average ---")
+        _avg_split_losses: dict[str, float] = {}
+        for _sn, _vl in val_loaders.items():
+            _vvol = 0.0; _vsurf = 0.0; _nvb = 0
+            with torch.no_grad():
+                for _x, _y, _is_surf, _mask in _vl:
+                    _x, _y = _x.to(device), _y.to(device)
+                    _is_surf = _is_surf.to(device); _mask = _mask.to(device)
+                    _x = (_x - stats["x_mean"]) / stats["x_std"]
+                    _curv = _x[:, :, 2:6].norm(dim=-1, keepdim=True) * _is_surf.float().unsqueeze(-1)
+                    _x = torch.cat([_x, _curv], dim=-1)
+                    _rxy = _x[:, :, :2]
+                    _xy_norm = (_rxy - _rxy.amin(dim=1, keepdim=True)) / (_rxy.amax(dim=1, keepdim=True) - _rxy.amin(dim=1, keepdim=True) + 1e-8)
+                    _freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                    _xys = _xy_norm.unsqueeze(-1) * _freqs
+                    _fpe = torch.cat([_xys.sin().flatten(-2), _xys.cos().flatten(-2)], dim=-1)
+                    _x = torch.cat([_x, _fpe], dim=-1)
+                    _Umag, _q = _umag_q(_y, _mask)
+                    _y_phys = _phys_norm(_y, _Umag, _q)
+                    _yn = (_y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                    _is_tandem = _x[:, 0, 21].abs() > 0.5
+                    _B = _yn.shape[0]
+                    _sstd = torch.ones(_B, 1, 3, device=device)
+                    _cc = torch.tensor([0.1, 0.1, 0.5], device=device)
+                    _tc = torch.tensor([0.3, 0.3, 1.0], device=device)
+                    for _b in range(_B):
+                        _sstd[_b, 0] = _yn[_b, _mask[_b]].std(dim=0).clamp(min=_tc if _is_tandem[_b] else _cc)
+                    _yns = _yn / _sstd
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _pred = _avg_m({"x": _x})["preds"]
+                    _pred = _pred.float() / _sstd
+                    _ae = (_pred - _yns).abs().nan_to_num(0.0)
+                    _vm = _mask & ~_is_surf; _sm = _mask & _is_surf
+                    _vvol += min((_ae * _vm.unsqueeze(-1)).sum().item() / _vm.sum().clamp(min=1).item(), 1e6)
+                    _vsurf += min((_ae[:, :, 2:3] * _sm.unsqueeze(-1)).sum().item() / _sm.sum().clamp(min=1).item(), 1e6)
+                    _nvb += 1
+            _vvol /= max(_nvb, 1); _vsurf /= max(_nvb, 1)
+            _avg_split_losses[_sn] = _vvol + cfg.surf_weight * _vsurf
+            print(f"  avg2_{_sn}: {_avg_split_losses[_sn]:.4f}")
+        _avg_total = sum(_avg_split_losses.values()) / len(_avg_split_losses)
+        print(f"  avg2_total: {_avg_total:.4f} (vs borda_winner={_winner['val_loss']:.4f})")
+        wandb.summary["avg_top2_val_loss"] = _avg_total
+        for _sn, _l in _avg_split_losses.items():
+            wandb.summary[f"avg_top2_{_sn}_loss"] = _l
+        if _avg_total < _winner["val_loss"]:
+            print("  Avg model is better — using it as final checkpoint.")
+            _avg_path = model_dir / "checkpoint_avg_top2.pt"
+            torch.save(_avg_sd, _avg_path)
+            _shutil.copy(_avg_path, model_path)
+    wandb.summary["pareto_val_loss"] = _winner["val_loss"]
+    wandb.summary["pareto_epoch"] = _winner["epoch"]
+    wandb.summary["pareto_borda_score"] = _borda[_best_idx]
 
 # --- Final summary ---
 total_time = (time.time() - train_start) / 60.0
