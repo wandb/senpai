@@ -318,6 +318,9 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        self.surf_refiner = nn.Sequential(nn.Linear(n_hidden + 3, 64), nn.GELU(), nn.Linear(64, 3))
+        nn.init.zeros_(self.surf_refiner[-1].weight)
+        nn.init.zeros_(self.surf_refiner[-1].bias)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -397,7 +400,7 @@ class Transolver(nn.Module):
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred, "fx_pre": fx_pre}
 
 
 # ---------------------------------------------------------------------------
@@ -701,6 +704,23 @@ for epoch in range(MAX_EPOCHS):
         pred = pred.float()
         re_pred = re_pred.float()
         aoa_pred = aoa_pred.float()
+        # Dual-pass surface refinement: correct surface predictions using k=8 nearest volume context
+        fx_pre_out = out["fx_pre"].float()
+        _delta_pred = torch.zeros_like(pred)
+        _smask = mask & is_surface
+        _vmask = mask & ~is_surface
+        for b in range(pred.shape[0]):
+            s_idx = _smask[b].nonzero(as_tuple=False).squeeze(-1)
+            v_idx = _vmask[b].nonzero(as_tuple=False).squeeze(-1)
+            if s_idx.numel() > 0 and v_idx.numel() > 0:
+                with torch.no_grad():
+                    dists = torch.cdist(x[b, s_idx, :2].unsqueeze(0), x[b, v_idx, :2].unsqueeze(0)).squeeze(0)
+                    k = min(8, v_idx.numel())
+                    nn_idx = dists.topk(k, dim=-1, largest=False).indices
+                vol_nb_mean = pred[b, v_idx[nn_idx], :].mean(dim=1)
+                refiner_in = torch.cat([fx_pre_out[b, s_idx, :], vol_nb_mean], dim=-1)
+                _delta_pred[b, s_idx, :] = 0.1 * _base_model.surf_refiner(refiner_in)
+        pred = pred + _delta_pred
         if model.training:
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
@@ -865,8 +885,26 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    _vout = eval_model({"x": x})
+                    pred = _vout["preds"]
                 pred = pred.float()
+                # Dual-pass surface refinement
+                _vfx_pre = _vout["fx_pre"].float()
+                _eval_refiner = ema_model.surf_refiner if ema_model is not None else _base_model.surf_refiner
+                _vdelta = torch.zeros_like(pred)
+                _vsmask = mask & is_surface
+                _vvmask = mask & ~is_surface
+                for b in range(pred.shape[0]):
+                    s_idx = _vsmask[b].nonzero(as_tuple=False).squeeze(-1)
+                    v_idx = _vvmask[b].nonzero(as_tuple=False).squeeze(-1)
+                    if s_idx.numel() > 0 and v_idx.numel() > 0:
+                        dists = torch.cdist(x[b, s_idx, :2].unsqueeze(0), x[b, v_idx, :2].unsqueeze(0)).squeeze(0)
+                        k = min(8, v_idx.numel())
+                        nn_idx = dists.topk(k, dim=-1, largest=False).indices
+                        vol_nb_mean = pred[b, v_idx[nn_idx], :].mean(dim=1)
+                        refiner_in = torch.cat([_vfx_pre[b, s_idx, :], vol_nb_mean], dim=-1)
+                        _vdelta[b, s_idx, :] = 0.1 * _eval_refiner(refiner_in)
+                pred = pred + _vdelta
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
