@@ -864,9 +864,18 @@ for epoch in range(MAX_EPOCHS):
                         sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
                 y_norm_scaled = y_norm / sample_stds
 
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
-                pred = pred.float()
+                # Test-time node dropout ensemble: 5 passes, each masking 20% of volume nodes
+                vol_nodes = mask & ~is_surface  # [B, N] — volume nodes to optionally mask
+                N_TTA = 5
+                pred_accum = None
+                for _tta in range(N_TTA):
+                    x_tta = x.clone()
+                    drop = (torch.rand(x.shape[:2], device=device) < 0.2) & vol_nodes
+                    x_tta[drop] = 0.0
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        pred_i = eval_model({"x": x_tta})["preds"].float()
+                    pred_accum = pred_i if pred_accum is None else pred_accum + pred_i
+                pred = pred_accum / N_TTA
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
