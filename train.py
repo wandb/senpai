@@ -240,7 +240,10 @@ class TransolverBlock(nn.Module):
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            # Run output head in full precision for better surface accuracy
+            with torch.amp.autocast("cuda", enabled=False):
+                fx = self.mlp2(self.ln_3(fx.float()))
+            return fx
         return fx
 
 
