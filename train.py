@@ -504,6 +504,9 @@ from copy import deepcopy
 ema_model = None
 ema_start_epoch = 40
 ema_decay = 0.998
+swa_model = None
+swa_start_epoch = 55
+swa_n = 0
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -737,6 +740,15 @@ for epoch in range(MAX_EPOCHS):
                 with torch.no_grad():
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
+        if epoch >= swa_start_epoch and (epoch - swa_start_epoch) % 3 == 0:
+            if swa_model is None:
+                swa_model = deepcopy(_base_model)
+                swa_n = 1
+            else:
+                swa_n += 1
+                with torch.no_grad():
+                    for sp, mp in zip(swa_model.parameters(), _base_model.parameters()):
+                        sp.data.add_((mp.data - sp.data) / swa_n)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -752,7 +764,7 @@ for epoch in range(MAX_EPOCHS):
     prev_surf_loss = epoch_surf
 
     # --- Validate across all splits ---
-    eval_model = ema_model if ema_model is not None else model
+    eval_model = swa_model if swa_model is not None else (ema_model if ema_model is not None else model)
     eval_model.eval()
     model.eval()
     val_metrics_per_split: dict[str, dict] = {}
