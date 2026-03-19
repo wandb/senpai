@@ -284,6 +284,11 @@ class Transolver(nn.Module):
         nn.init.zeros_(self.out_skip.bias)
         self.skip_gate = nn.Sequential(nn.Linear(n_hidden, 1), nn.Sigmoid())
         nn.init.constant_(self.skip_gate[0].bias, -2.0)  # starts nearly closed
+        self.pressure_skip = nn.Sequential(
+            nn.Linear(fun_dim + space_dim, 64), nn.GELU(), nn.Linear(64, 1)
+        )
+        nn.init.zeros_(self.pressure_skip[-1].weight)
+        nn.init.zeros_(self.pressure_skip[-1].bias)
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
@@ -363,6 +368,8 @@ class Transolver(nn.Module):
         fx = self.blocks[-1](fx, raw_xy=raw_xy)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
+        p_bias = self.pressure_skip(x)
+        fx = torch.cat([fx[:, :, :2], fx[:, :, 2:3] + 0.1 * p_bias], dim=-1)
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
