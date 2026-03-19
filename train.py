@@ -996,6 +996,80 @@ else:
 if best_metrics:
     wandb.summary.update({"best_" + k: v for k, v in best_metrics.items()})
 
+    # --- Model soup: average state_dicts from multiple seed checkpoints ---
+    # R18 seed run checkpoints (fern/seed-137-r18=w40a25qs, frieren/seed-42=pf05msie)
+    soup_candidates = [
+        Path("models/model-w40a25qs/checkpoint.pt"),
+        Path("models/model-pf05msie/checkpoint.pt"),
+    ]
+    soup_paths = [model_path] + [p for p in soup_candidates if p.exists()]
+    if len(soup_paths) > 1:
+        print(f"\nSoup: averaging {len(soup_paths)} checkpoints...")
+        state_dicts = [torch.load(p, map_location=device, weights_only=True) for p in soup_paths]
+        soup_sd = {k: sum(sd[k].float() for sd in state_dicts) / len(state_dicts)
+                   for k in state_dicts[0].keys()}
+        soup_model = ema_model if ema_model is not None else model
+        soup_model.load_state_dict(soup_sd)
+        soup_model.eval()
+        # Quick surface MAE check on each split
+        soup_surf_ps = {}
+        soup_losses = {}
+        with torch.no_grad():
+            for sname, vloader in val_loaders.items():
+                mae_s = torch.zeros(3, device=device)
+                ns = torch.zeros(3, device=device)
+                vv, vs, nb = 0.0, 0.0, 0
+                for x2, y2, is_surf2, mask2 in vloader:
+                    x2, y2 = x2.to(device), y2.to(device)
+                    is_surf2, mask2 = is_surf2.to(device), mask2.to(device)
+                    x2 = (x2 - stats["x_mean"]) / stats["x_std"]
+                    curv2 = x2[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf2.float().unsqueeze(-1)
+                    x2 = torch.cat([x2, curv2], dim=-1)
+                    rxy = x2[:, :, :2]
+                    xymn, xymc = rxy.amin(dim=1, keepdim=True), rxy.amax(dim=1, keepdim=True)
+                    xyn = (rxy - xymn) / (xymc - xymn + 1e-8)
+                    fq = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                    xys = xyn.unsqueeze(-1) * fq
+                    fpe = torch.cat([xys.sin().flatten(-2), xys.cos().flatten(-2)], dim=-1)
+                    x2 = torch.cat([x2, fpe], dim=-1)
+                    Um2, q2 = _umag_q(y2, mask2)
+                    yp2 = _phys_norm(y2, Um2, q2)
+                    yn2 = (yp2 - phys_stats["y_mean"]) / phys_stats["y_std"]
+                    B2 = yn2.shape[0]
+                    stds2 = torch.ones(B2, 1, 3, device=device)
+                    cc = torch.tensor([0.1, 0.1, 0.5], device=device)
+                    tc = torch.tensor([0.3, 0.3, 1.0], device=device)
+                    for b2 in range(B2):
+                        stds2[b2, 0] = yn2[b2, mask2[b2]].std(dim=0).clamp(min=tc if (x2[b2, 0, 21].abs() > 0.5) else cc)
+                    yn2s = yn2 / stds2
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        pr2 = soup_model({"x": x2})["preds"].float()
+                    pr2l = pr2 / stds2
+                    vm2, sm2 = mask2 & ~is_surf2, mask2 & is_surf2
+                    ae2 = (pr2l - yn2s).abs().nan_to_num(0.0)
+                    vv += min((ae2 * vm2.unsqueeze(-1)).sum().item() / vm2.sum().clamp(min=1).item(), 1e6)
+                    vs += min((ae2[:, :, 2:3] * sm2.unsqueeze(-1)).sum().item() / sm2.sum().clamp(min=1).item(), 1e6)
+                    nb += 1
+                    pp2 = _phys_denorm(pr2 * phys_stats["y_std"] + phys_stats["y_mean"], Um2, q2)
+                    er2 = (pp2 - y2.clamp(-1e6, 1e6)).abs()
+                    fi2 = er2.isfinite()
+                    mae_s += (er2.where(fi2, torch.zeros_like(er2)) * sm2.unsqueeze(-1)).sum(dim=(0, 1))
+                    ns += (sm2.unsqueeze(-1) * fi2).sum(dim=(0, 1)).float()
+                mae_s /= ns.clamp(min=1)
+                soup_surf_ps[sname] = mae_s[2].item()
+                soup_losses[sname] = vv / max(nb, 1) + cfg.surf_weight * (vs / max(nb, 1))
+        sl3 = sum(soup_losses[n] for n in ["val_in_dist", "val_tandem_transfer", "val_ood_cond"]) / 3
+        sm3 = sum(soup_surf_ps[n] for n in ["val_in_dist", "val_tandem_transfer", "val_ood_cond"]) / 3
+        print(f"SOUP ({len(soup_paths)} ckpts): loss_3split={sl3:.4f}  mean3_surf_p={sm3:.2f}")
+        for sn in VAL_SPLIT_NAMES:
+            print(f"  {sn}: loss={soup_losses.get(sn, '?'):.4f}  surf_p={soup_surf_ps.get(sn, '?'):.2f}")
+        wandb.summary.update({"soup_n_checkpoints": len(soup_paths), "soup_val_loss_3split": sl3,
+                               "soup_mean3_surf_p": sm3, **{f"soup_{k}_loss": v for k, v in soup_losses.items()},
+                               **{f"soup_{k}_surf_p": v for k, v in soup_surf_ps.items()}})
+    else:
+        print(f"\nSoup skipped: seed=137 (w40a25qs) and seed=42 (pf05msie) checkpoints not found locally.")
+        wandb.summary.update({"soup_n_checkpoints": 1, "soup_note": "skipped — seed checkpoints not on this machine"})
+
     print("\nGenerating flow field plots...")
     vis_model = ema_model if ema_model is not None else model
     vis_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
