@@ -512,7 +512,7 @@ print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 1 + 32,  # 8 freqs * 2 coords * 2 (sin+cos) = 32
+    fun_dim=X_DIM - 2 + 1 + 32 + 16,  # 8 freqs * 2 coords * 2 (sin+cos) = 32; + 16 saf local Fourier PE
     out_dim=3,
     n_hidden=192,  # was 160
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
@@ -658,6 +658,12 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
+        # SAF local Fourier PE: 4 fixed frequencies on foil-local arc-length fraction (cols 2:4)
+        saf = x[:, :, 2:4]  # [B, N, 2]
+        saf_freqs = torch.tensor([1.0, 2.0, 4.0, 8.0], device=device, dtype=x.dtype)
+        saf_scaled = saf.unsqueeze(-1) * saf_freqs  # [B, N, 2, 4]
+        saf_pe = torch.cat([saf_scaled.sin().flatten(-2), saf_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+        x = torch.cat([x, saf_pe], dim=-1)
         if model.training and epoch < 60:
             noise_scale = 0.05 * (1 - epoch / 60)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -826,6 +832,12 @@ for epoch in range(MAX_EPOCHS):
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
+                # SAF local Fourier PE: 4 fixed frequencies on foil-local arc-length fraction (cols 2:4)
+                saf = x[:, :, 2:4]  # [B, N, 2]
+                saf_freqs = torch.tensor([1.0, 2.0, 4.0, 8.0], device=device, dtype=x.dtype)
+                saf_scaled = saf.unsqueeze(-1) * saf_freqs  # [B, N, 2, 4]
+                saf_pe = torch.cat([saf_scaled.sin().flatten(-2), saf_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+                x = torch.cat([x, saf_pe], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
@@ -995,6 +1007,19 @@ if best_metrics:
                 x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                 curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                 x_n = torch.cat([x_n, curv], dim=-1)
+                raw_xy = x_n[:, :, :2]
+                xy_min = raw_xy.amin(dim=1, keepdim=True)
+                xy_max = raw_xy.amax(dim=1, keepdim=True)
+                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                vis_freqs = torch.cat([vis_model._orig_mod.fourier_freqs_fixed.to(device) if hasattr(vis_model, '_orig_mod') else vis_model.fourier_freqs_fixed.to(device), (vis_model._orig_mod.fourier_freqs_learned if hasattr(vis_model, '_orig_mod') else vis_model.fourier_freqs_learned).abs()])
+                xy_scaled = xy_norm.unsqueeze(-1) * vis_freqs
+                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, fourier_pe], dim=-1)
+                saf = x_n[:, :, 2:4]
+                saf_freqs = torch.tensor([1.0, 2.0, 4.0, 8.0], device=device, dtype=x_n.dtype)
+                saf_scaled = saf.unsqueeze(-1) * saf_freqs
+                saf_pe = torch.cat([saf_scaled.sin().flatten(-2), saf_scaled.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, saf_pe], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
