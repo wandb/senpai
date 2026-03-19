@@ -507,6 +507,11 @@ ema_decay = 0.998
 
 n_params = sum(p.numel() for p in model.parameters())
 
+# Kendall et al. 2018: learnable homoscedastic uncertainty weights
+log_var_vol = nn.Parameter(torch.zeros(1, device=device))
+log_var_surf = nn.Parameter(torch.zeros(1, device=device))
+log_var_coarse = nn.Parameter(torch.zeros(1, device=device))
+
 
 class Lookahead:
     def __init__(self, base_optimizer, k=5, alpha=0.5):
@@ -540,7 +545,7 @@ attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['W
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 base_opt = torch.optim.AdamW([
     {'params': attn_params, 'lr': cfg.lr * 0.5},
-    {'params': other_params, 'lr': cfg.lr}
+    {'params': other_params + [log_var_vol, log_var_surf, log_var_coarse], 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
@@ -700,7 +705,8 @@ for epoch in range(MAX_EPOCHS):
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
-        loss = vol_loss + surf_weight * surf_loss
+        loss = (torch.exp(-log_var_vol) * vol_loss + 0.5 * log_var_vol +
+                torch.exp(-log_var_surf) * surf_loss + 0.5 * log_var_surf)
 
         # Multi-scale loss: coarse spatial pooling
         coarse_pool_size = 64
@@ -724,7 +730,7 @@ for epoch in range(MAX_EPOCHS):
 
             coarse_err = (pred_coarse - y_coarse).abs()
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
-            loss = loss + 1.0 * coarse_loss
+            loss = loss + torch.exp(-log_var_coarse) * coarse_loss + 0.5 * log_var_coarse
 
         log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
         re_loss = F.mse_loss(re_pred, log_re_target)
@@ -745,7 +751,9 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight,
+                   "train/log_var_vol": log_var_vol.item(), "train/log_var_surf": log_var_surf.item(),
+                   "train/log_var_coarse": log_var_coarse.item(), "global_step": global_step})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
