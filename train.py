@@ -174,7 +174,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         # EMA prototype update (training only) + blend
         if self.training:
             proto_update = slice_token.detach().mean(dim=0)  # [heads, slice_num, dim_head]
-            self.slice_prototypes = 0.99 * self.slice_prototypes + 0.01 * proto_update
+            self.slice_prototypes.mul_(0.99).add_(proto_update, alpha=0.01)
         slice_token = 0.8 * slice_token + 0.2 * self.slice_prototypes.unsqueeze(0)
 
         q_slice_token = self.to_q(slice_token)
