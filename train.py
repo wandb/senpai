@@ -317,7 +317,9 @@ class Transolver(nn.Module):
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
-        self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        self.freq_net = nn.Sequential(nn.Linear(4, 16), nn.GELU(), nn.Linear(16, 4))
+        nn.init.zeros_(self.freq_net[-1].weight)
+        self.freq_net[-1].bias.data.copy_(torch.tensor([1.0, 3.0, 6.0, 16.0]))
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -660,8 +662,11 @@ for epoch in range(MAX_EPOCHS):
         xy_min = raw_xy.amin(dim=1, keepdim=True)
         xy_max = raw_xy.amax(dim=1, keepdim=True)
         xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-        freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-        xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
+        c = torch.cat([x[:, 0, 13:15], x[:, 0, 21:23]], dim=-1)  # [B, 4]: Re, AoA, gap, stagger
+        learned_freqs = _base_model.freq_net(c).abs()  # [B, 4]
+        freqs_fixed = _base_model.fourier_freqs_fixed.to(device)[None, :].expand(x.shape[0], -1)
+        freqs = torch.cat([freqs_fixed, learned_freqs], dim=-1)  # [B, 8]
+        xy_scaled = xy_norm.unsqueeze(-1) * freqs[:, None, None, :]  # [B, N, 2, 8]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
         if model.training and epoch < 60:
@@ -841,8 +846,11 @@ for epoch in range(MAX_EPOCHS):
                 xy_min = raw_xy.amin(dim=1, keepdim=True)
                 xy_max = raw_xy.amax(dim=1, keepdim=True)
                 xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-                xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
+                c = torch.cat([x[:, 0, 13:15], x[:, 0, 21:23]], dim=-1)  # [B, 4]: Re, AoA, gap, stagger
+                learned_freqs = _base_model.freq_net(c).abs()  # [B, 4]
+                freqs_fixed = _base_model.fourier_freqs_fixed.to(device)[None, :].expand(x.shape[0], -1)
+                freqs = torch.cat([freqs_fixed, learned_freqs], dim=-1)  # [B, 8]
+                xy_scaled = xy_norm.unsqueeze(-1) * freqs[:, None, None, :]  # [B, N, 2, 8]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
                 Umag, q = _umag_q(y, mask)
@@ -946,7 +954,8 @@ for epoch in range(MAX_EPOCHS):
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
-    learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
+    c_dummy = torch.zeros(1, 4, device=device)
+    learned_freqs = _base_model.freq_net(c_dummy).abs().detach().cpu()[0].tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
     wandb.log(metrics)
