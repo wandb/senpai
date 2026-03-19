@@ -617,6 +617,13 @@ for epoch in range(MAX_EPOCHS):
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
 
+        # Foil-swap augmentation: randomly swap foil identities for tandem samples
+        is_tandem_aug = x[:, 0, 22].abs() > 0.5
+        swap_mask = is_tandem_aug & (torch.rand(x.shape[0], device=device) > 0.5)
+        if swap_mask.any():
+            tmp = x[swap_mask, :, 14].clone(); x[swap_mask, :, 14] = x[swap_mask, :, 18]; x[swap_mask, :, 18] = tmp
+            tmp = x[swap_mask, :, 15:18].clone(); x[swap_mask, :, 15:18] = x[swap_mask, :, 19:22]; x[swap_mask, :, 19:22] = tmp
+
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
