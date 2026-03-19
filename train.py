@@ -20,6 +20,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     Tandem surface loss is therefore underweighted.
 """
 
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -288,8 +289,6 @@ class Transolver(nn.Module):
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
-        self.fourier_freqs = nn.Parameter(torch.tensor([0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0]))
-
     def initialize_weights(self):
         self.apply(self._init_weights)
 
@@ -397,6 +396,11 @@ if cfg.debug:
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}" + (" [DEBUG MODE]" if cfg.debug else ""))
+# Bernstein polynomial PE constants (degree-7, precomputed on device)
+_bern_degree = 7
+_bern_k = torch.arange(_bern_degree + 1, device=device, dtype=torch.float32)  # [8]
+_bern_binom = torch.tensor([math.comb(_bern_degree, k) for k in range(_bern_degree + 1)],
+                            device=device, dtype=torch.float32)  # [8]
 
 train_ds, val_splits, stats, sample_weights = load_data(
     cfg.manifest, cfg.stats_file, debug=cfg.debug,
@@ -485,7 +489,7 @@ print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 1 + 32,  # 8 freqs * 2 coords * 2 (sin+cos) = 32
+    fun_dim=X_DIM - 2 + 1 + 16,  # Bernstein degree-7: 8 basis * 2 coords = 16
     out_dim=3,
     n_hidden=192,  # was 160
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
@@ -621,16 +625,14 @@ for epoch in range(MAX_EPOCHS):
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         x = torch.cat([x, curv], dim=-1)
-        # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
+        # Bernstein polynomial PE: degree-7 on normalized [0,1] coords, 16 features
         raw_xy = x[:, :, :2]
-        # Normalize xy to [0,1] per-sample for consistent Fourier encoding
         xy_min = raw_xy.amin(dim=1, keepdim=True)
         xy_max = raw_xy.amax(dim=1, keepdim=True)
-        xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-        freqs = model.fourier_freqs.abs()
-        xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
-        x = torch.cat([x, fourier_pe], dim=-1)
+        xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)  # [B, N, 2]
+        t = xy_norm.unsqueeze(-1)  # [B, N, 2, 1]
+        bernstein_pe = (_bern_binom * t**_bern_k * (1 - t)**(_bern_degree - _bern_k)).flatten(-2)  # [B, N, 16]
+        x = torch.cat([x, bernstein_pe], dim=-1)
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
@@ -786,16 +788,14 @@ for epoch in range(MAX_EPOCHS):
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                 x = torch.cat([x, curv], dim=-1)
-                # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
+                # Bernstein polynomial PE: degree-7 on normalized [0,1] coords, 16 features
                 raw_xy = x[:, :, :2]
-                # Normalize xy to [0,1] per-sample for consistent Fourier encoding
                 xy_min = raw_xy.amin(dim=1, keepdim=True)
                 xy_max = raw_xy.amax(dim=1, keepdim=True)
-                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                freqs = model.fourier_freqs.abs()
-                xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
-                x = torch.cat([x, fourier_pe], dim=-1)
+                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)  # [B, N, 2]
+                t = xy_norm.unsqueeze(-1)  # [B, N, 2, 1]
+                bernstein_pe = (_bern_binom * t**_bern_k * (1 - t)**(_bern_degree - _bern_k)).flatten(-2)  # [B, N, 16]
+                x = torch.cat([x, bernstein_pe], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
@@ -897,9 +897,6 @@ for epoch in range(MAX_EPOCHS):
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
-    learned_freqs = model.fourier_freqs.abs().detach().cpu().tolist()
-    for i, f in enumerate(learned_freqs):
-        metrics[f"fourier_freq_{i}"] = f
     wandb.log(metrics)
 
     if torch.cuda.is_available():
