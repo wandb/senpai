@@ -692,6 +692,9 @@ for epoch in range(MAX_EPOCHS):
                 else:
                     sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
             y_norm = y_norm / sample_stds
+            smooth_alpha = 0.02
+            y_mean_sample = (y_norm * mask.float().unsqueeze(-1)).sum(dim=1, keepdim=True) / mask.float().sum(dim=1, keepdim=True).clamp(min=1)
+            y_norm = (1 - smooth_alpha) * y_norm + smooth_alpha * y_mean_sample
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model({"x": x})
