@@ -421,9 +421,17 @@ class Config:
     wandb_name: str | None = None
     agent: str | None = None
     debug: bool = False
+    seed: int = 0
 
 
 cfg = sp.parse(Config)
+
+if cfg.seed:
+    import random, numpy as np
+    torch.manual_seed(cfg.seed)
+    torch.cuda.manual_seed_all(cfg.seed)
+    np.random.seed(cfg.seed)
+    random.seed(cfg.seed)
 
 if cfg.debug:
     MAX_EPOCHS = 3
