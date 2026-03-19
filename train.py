@@ -518,7 +518,7 @@ print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 1 + 32,  # 8 freqs * 2 coords * 2 (sin+cos) = 32
+    fun_dim=X_DIM - 2 + 1 + 32 + 1,  # +1 for physics Cp prior feature
     out_dim=3,
     n_hidden=192,  # was 160
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
@@ -654,6 +654,11 @@ for epoch in range(MAX_EPOCHS):
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         x = torch.cat([x, curv], dim=-1)
+        # Physics Cp prior: y-component of unit surface normal, zero on volume nodes
+        dsdf_y = x[:, :, 3:4]  # y-component of dsdf gradient (normalized)
+        dsdf_norm = x[:, :, 2:4].norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        cp_proxy = -(dsdf_y / dsdf_norm) * is_surface.float().unsqueeze(-1)  # [B, N, 1]
+        x = torch.cat([x, cp_proxy], dim=-1)  # [B, N, 26]
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -661,8 +666,8 @@ for epoch in range(MAX_EPOCHS):
         xy_max = raw_xy.amax(dim=1, keepdim=True)
         xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
         freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-        xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+        xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 8]
+        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 32]
         x = torch.cat([x, fourier_pe], dim=-1)
         if model.training and epoch < 60:
             noise_scale = 0.05 * (1 - epoch / 60)
@@ -676,6 +681,7 @@ for epoch in range(MAX_EPOCHS):
             p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
             noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
             y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
+        y_norm[:, :, 2:3] = y_norm[:, :, 2:3] - cp_proxy  # residual: Cp minus physics prior
 
         # Per-sample std normalization: skip tandem samples (gap feature index 21)
         raw_gap = x[:, 0, 21]
@@ -835,6 +841,11 @@ for epoch in range(MAX_EPOCHS):
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                 x = torch.cat([x, curv], dim=-1)
+                # Physics Cp prior: y-component of unit surface normal, zero on volume nodes
+                dsdf_y = x[:, :, 3:4]  # y-component of dsdf gradient (normalized)
+                dsdf_norm = x[:, :, 2:4].norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                cp_proxy = -(dsdf_y / dsdf_norm) * is_surface.float().unsqueeze(-1)  # [B, N, 1]
+                x = torch.cat([x, cp_proxy], dim=-1)  # [B, N, 26]
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -842,12 +853,13 @@ for epoch in range(MAX_EPOCHS):
                 xy_max = raw_xy.amax(dim=1, keepdim=True)
                 xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
                 freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-                xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+                xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 8]
+                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 32]
                 x = torch.cat([x, fourier_pe], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                y_norm[:, :, 2:3] = y_norm[:, :, 2:3] - cp_proxy  # residual: subtract physics prior
 
                 # Per-sample std normalization: skip tandem samples
                 raw_gap = x[:, 0, 21]
@@ -884,8 +896,10 @@ for epoch in range(MAX_EPOCHS):
                 )
                 n_vbatches += 1
 
-                # Denormalize: phys_stats → Cp space → original scale
-                pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                # Denormalize: add physics prior back, then phys_stats → Cp space → original scale
+                pred_for_denorm = pred.clone()
+                pred_for_denorm[:, :, 2:3] = pred[:, :, 2:3] + cp_proxy  # add prior back
+                pred_phys = pred_for_denorm * phys_stats["y_std"] + phys_stats["y_mean"]
                 pred_orig = _phys_denorm(pred_phys, Umag, q)
                 y_clamped = y.clamp(-1e6, 1e6)
                 err = (pred_orig - y_clamped).abs()
