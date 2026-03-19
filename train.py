@@ -489,6 +489,9 @@ else:
     )
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
                               sampler=sampler, **loader_kwargs)
+    # Re-curriculum: extract log_Re (col 13) for each training sample
+    train_log_re = torch.tensor([float(train_ds[i][0][0, 13]) for i in range(len(train_ds))])
+    re_median = float(train_log_re.median())
 
 val_loaders = {
     name: DataLoader(subset, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
@@ -637,6 +640,17 @@ for epoch in range(MAX_EPOCHS):
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+
+    # Re-curriculum: update sampler weights (epoch 0-20: exclude hi-Re; 20-40: ramp in; 40+: full)
+    if not cfg.debug:
+        if epoch < 20:
+            hi_re_factor = 0.0
+        elif epoch < 40:
+            hi_re_factor = (epoch - 20) / 20.0
+        else:
+            hi_re_factor = 1.0
+        is_hi_re = (train_log_re > re_median).float()
+        sampler.weights = sample_weights * (1.0 - is_hi_re + hi_re_factor * is_hi_re)
 
     # --- Train ---
     model.train()
