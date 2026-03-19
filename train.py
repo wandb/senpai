@@ -171,9 +171,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
 
         q_slice_token = self.to_q(slice_token)
-        slice_token_kv = slice_token.mean(dim=1, keepdim=True)  # shared K,V: (bsz, 1, slice_num, dim_head)
-        k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
-        v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
+        k_slice_token = self.to_k(slice_token)
+        v_slice_token = self.to_v(slice_token)
         q_norm = F.normalize(q_slice_token, dim=-1)
         k_norm = F.normalize(k_slice_token, dim=-1)
         attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
