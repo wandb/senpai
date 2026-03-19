@@ -314,8 +314,10 @@ class Transolver(nn.Module):
         nn.init.constant_(self.skip_gate[0].bias, -2.0)  # starts nearly closed
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
-        self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
-        self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.n_head = n_head
+        _dim_head = n_hidden // n_head
+        self.re_head = nn.ModuleList([nn.Linear(_dim_head, 1) for _ in range(n_head)])
+        self.aoa_head = nn.ModuleList([nn.Linear(_dim_head, 1) for _ in range(n_head)])
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
 
@@ -389,9 +391,10 @@ class Transolver(nn.Module):
         for block in self.blocks[:-1]:
             fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem)
 
-        # Auxiliary Re prediction from pre-output-head hidden representation
-        re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
-        aoa_pred = self.aoa_head(fx.mean(dim=1))
+        # Auxiliary Re/AoA prediction: per-head spatial mean for head-specific OOD gradient
+        _fx_mean = fx.mean(dim=1).reshape(fx.shape[0], self.n_head, -1)  # [B, n_head, dim_head]
+        re_pred = torch.stack([self.re_head[h](_fx_mean[:, h]) for h in range(self.n_head)], dim=1).mean(dim=1)
+        aoa_pred = torch.stack([self.aoa_head[h](_fx_mean[:, h]) for h in range(self.n_head)], dim=1).mean(dim=1)
 
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
         gate = self.skip_gate(fx_pre)
