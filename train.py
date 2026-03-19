@@ -143,6 +143,14 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout),
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
+        self.attn_kernel = nn.Sequential(
+            nn.Linear(dim_head, dim_head // 4),
+            nn.GELU(),
+            nn.Linear(dim_head // 4, 1),
+        )
+        # Initialize to approximate cosine: final layer sums the features uniformly
+        nn.init.constant_(self.attn_kernel[-1].weight, 1.0 / dim_head)
+        nn.init.zeros_(self.attn_kernel[-1].bias)
 
     def forward(self, x, spatial_bias=None, tandem_mask=None):
         bsz, num_points, _ = x.shape
@@ -176,7 +184,11 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
         q_norm = F.normalize(q_slice_token, dim=-1)
         k_norm = F.normalize(k_slice_token, dim=-1)
-        attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
+        # Learned attention kernel: pass element-wise product of each (q, k) pair through MLP
+        q_exp = q_norm.unsqueeze(3)   # (bsz, heads, S, 1, dim_head)
+        k_exp = k_norm.unsqueeze(2)   # (bsz, heads, 1, S, dim_head)
+        pair_prod = q_exp * k_exp     # (bsz, heads, S, S, dim_head)
+        attn_logits = self.attn_kernel(pair_prod).squeeze(-1) * self.attn_scale  # (bsz, heads, S, S)
         attn_weights = F.softmax(attn_logits, dim=-1)
         out_slice_token = torch.matmul(attn_weights, v_slice_token)
         out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
