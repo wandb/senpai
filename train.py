@@ -676,6 +676,18 @@ for epoch in range(MAX_EPOCHS):
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
+        # Curriculum: after epoch 30, amplify hardest 30% of surface nodes by 2x
+        if epoch >= 30:
+            surf_p_err = abs_err[:, :, 2]  # pressure error [B, N]
+            hard_weight = torch.ones(surf_mask.shape[0], surf_mask.shape[1], device=device)
+            for b in range(surf_mask.shape[0]):
+                s_errs = surf_p_err[b][surf_mask[b]]
+                if s_errs.numel() > 1:
+                    threshold = s_errs.quantile(0.70)
+                    is_hard = surf_mask[b] & (surf_p_err[b] >= threshold)
+                    hard_weight[b] = torch.where(is_hard, hard_weight[b].new_full((), 2.0), hard_weight[b])
+            abs_err = abs_err * hard_weight.unsqueeze(-1)
+
         # Progressive resolution: subsample volume nodes in loss early in training
         # Ramps from 10% → 100% of volume nodes over first 40 epochs
         if epoch < 40:
