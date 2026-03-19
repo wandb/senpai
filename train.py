@@ -637,6 +637,11 @@ for epoch in range(MAX_EPOCHS):
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+    # Alternating 3:1 cadence: every 4th epoch uses surf_weight=40 (surface-focused)
+    if epoch % 4 == 3:
+        surf_weight = 40.0
+    else:
+        surf_weight = 5.0
 
     # --- Train ---
     model.train()
