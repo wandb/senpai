@@ -116,6 +116,18 @@ class MLP(nn.Module):
         return x
 
 
+class GradientScale(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.save_for_backward(torch.tensor(scale))
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        scale, = ctx.saved_tensors
+        return grad_output * scale.to(grad_output.device, grad_output.dtype), None
+
+
 class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
@@ -240,7 +252,10 @@ class TransolverBlock(nn.Module):
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            pred = self.mlp2(self.ln_3(fx))
+            pred_vel = GradientScale.apply(pred[:, :, :2], 0.5)
+            pred_p = GradientScale.apply(pred[:, :, 2:3], 2.0)
+            return torch.cat([pred_vel, pred_p], dim=-1)
         return fx
 
 
