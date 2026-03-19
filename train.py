@@ -635,8 +635,8 @@ for epoch in range(MAX_EPOCHS):
 
     t0 = time.time()
 
-    # Adaptive surface weight: loss-ratio based, clamped [5, 50]
-    surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+    # Fixed surface weight
+    surf_weight = 30.0
 
     # --- Train ---
     model.train()
@@ -664,18 +664,9 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
-        if model.training and epoch < 60:
-            noise_scale = 0.05 * (1 - epoch / 60)
-            x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
-        if model.training:
-            noise_progress = min(1.0, epoch / 60)
-            vel_noise = 0.015 * (1 - noise_progress) + 0.003 * noise_progress
-            p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
-            noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
-            y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
 
         # Per-sample std normalization: skip tandem samples (gap feature index 21)
         raw_gap = x[:, 0, 21]
@@ -733,16 +724,6 @@ for epoch in range(MAX_EPOCHS):
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
         running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
-        # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
-        if epoch >= 30:
-            surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
-            surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
-            surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
-            thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
-            thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
-            hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
-            hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
-            surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
