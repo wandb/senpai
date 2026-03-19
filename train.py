@@ -778,6 +778,18 @@ for epoch in range(MAX_EPOCHS):
         aoa_target = x[:, 0, 14:15]  # AoA0_rad from normalized input
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
+        # Spatial coherence: nearby nodes → similar output features (computed outside compile)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            B_sc, N_sc = pred.shape[:2]
+            idx_i = torch.randint(N_sc, (B_sc, 256), device=pred.device)
+            idx_j = torch.randint(N_sc, (B_sc, 256), device=pred.device)
+            ba = torch.arange(B_sc, device=pred.device).unsqueeze(1)
+            xy = x[:, :, :2]
+            dist_sq = ((xy[ba, idx_i] - xy[ba, idx_j]) ** 2).sum(-1)  # [B, 256]
+            sigma = dist_sq.median(dim=-1, keepdim=True).values.clamp(min=1e-6)
+            feat_dist = (pred[ba, idx_i] - pred[ba, idx_j]).norm(dim=-1)
+            spatial_coh_loss = (feat_dist * torch.exp(-dist_sq / sigma)).mean()
+        loss = loss + 0.001 * spatial_coh_loss
 
         optimizer.zero_grad()
         loss.backward()
