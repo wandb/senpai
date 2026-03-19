@@ -230,6 +230,11 @@ class TransolverBlock(nn.Module):
                 nn.GELU(),
                 nn.Linear(hidden_dim, out_dim),
             )
+            self.pressure_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.GELU(),
+                nn.Linear(hidden_dim // 2, 1),
+            )
 
     def forward(self, fx, raw_xy=None, tandem_mask=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
@@ -240,7 +245,10 @@ class TransolverBlock(nn.Module):
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            fx_norm = self.ln_3(fx)
+            out = self.mlp2(fx_norm)
+            p_pred = self.pressure_head(fx_norm)
+            return torch.cat([out[:, :, :2], p_pred], dim=-1)
         return fx
 
 
