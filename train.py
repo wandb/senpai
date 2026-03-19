@@ -788,8 +788,14 @@ for epoch in range(MAX_EPOCHS):
                 ema_model = deepcopy(_base_model)
             else:
                 with torch.no_grad():
-                    for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
-                        ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
+                    for (name, ep), (_, mp) in zip(
+                        ema_model.named_parameters(), _base_model.named_parameters()
+                    ):
+                        if any(k in name for k in ("Wqkv", "temperature", "spatial_bias")):
+                            decay = 0.999
+                        else:
+                            decay = 0.995
+                        ep.data.mul_(decay).add_(mp.data, alpha=1 - decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -1014,6 +1020,14 @@ if best_metrics:
                 x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                 curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                 x_n = torch.cat([x_n, curv], dim=-1)
+                raw_xy_v = x_n[:, :, :2]
+                xy_min_v = raw_xy_v.amin(dim=1, keepdim=True)
+                xy_max_v = raw_xy_v.amax(dim=1, keepdim=True)
+                xy_norm_v = (raw_xy_v - xy_min_v) / (xy_max_v - xy_min_v + 1e-8)
+                freqs_v = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
+                xy_scaled_v = xy_norm_v.unsqueeze(-1) * freqs_v
+                fourier_pe_v = torch.cat([xy_scaled_v.sin().flatten(-2), xy_scaled_v.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, fourier_pe_v], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
