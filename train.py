@@ -383,6 +383,24 @@ class Transolver(nn.Module):
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
 
         fx = self.preprocess(x)
+
+        # Surface k-NN context aggregation: each surface node gets mean of k=4 nearest surface neighbors
+        surf_flag = (x[:, :, 12] > 0)  # surface nodes (is_surface feature, positive after normalization)
+        xy_coords = x[:, :, :2]        # [B, N, 2]
+        knn_context = torch.zeros_like(fx)
+        for b in range(fx.shape[0]):
+            sidx = surf_flag[b].nonzero(as_tuple=True)[0]  # surface indices [S]
+            s = sidx.numel()
+            if s >= 2:
+                k = min(4, s - 1)
+                xy_s = xy_coords[b, sidx]  # [S, 2]
+                with torch.no_grad():
+                    dists = torch.cdist(xy_s, xy_s)  # [S, S]
+                    dists.fill_diagonal_(float('inf'))
+                    nn_idx = dists.topk(k, largest=False).indices  # [S, k]
+                knn_context[b, sidx] = fx[b, sidx][nn_idx].mean(dim=1)  # [S, D]
+        fx = fx + 0.1 * knn_context
+
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
