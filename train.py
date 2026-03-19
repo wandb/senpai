@@ -316,6 +316,9 @@ class Transolver(nn.Module):
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.tandem_correction = nn.Sequential(nn.Linear(n_hidden + 1, 64), nn.GELU(), nn.Linear(64, out_dim))
+        nn.init.zeros_(self.tandem_correction[-1].weight)
+        nn.init.zeros_(self.tandem_correction[-1].bias)
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
 
@@ -393,9 +396,17 @@ class Transolver(nn.Module):
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
+        fx_hidden = fx  # save hidden rep [B, N, n_hidden] for tandem correction
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
+
+        # Tandem-specific additive correction (zero-init, safe start)
+        B, N = fx_hidden.shape[:2]
+        is_tandem_flag = is_tandem.view(B, 1, 1).expand(B, N, 1)
+        tandem_corr = self.tandem_correction(torch.cat([fx_hidden, is_tandem_flag], dim=-1))
+        fx = fx + 0.1 * tandem_corr
+
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
