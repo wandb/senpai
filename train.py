@@ -635,8 +635,8 @@ for epoch in range(MAX_EPOCHS):
 
     t0 = time.time()
 
-    # Adaptive surface weight: loss-ratio based, clamped [5, 50]
-    surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+    # alt-vol-surf-epochs: fixed surf_weight based on epoch type (replaces adaptive)
+    surf_weight = 40.0 if epoch % 3 == 2 else 5.0
 
     # --- Train ---
     model.train()
@@ -650,6 +650,7 @@ for epoch in range(MAX_EPOCHS):
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
 
+        raw_dsdf_norm = x[:, :, 2:6].norm(dim=-1)  # alt-vol-surf-epochs: dsdf norm before normalization [B, N]
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -725,6 +726,8 @@ for epoch in range(MAX_EPOCHS):
                 vol_mask_train[vol_indices[perm, 0], vol_indices[perm, 1]] = True
         else:
             vol_mask_train = vol_mask
+        if epoch % 3 == 2:  # alt-vol-surf-epochs: surface epoch — near-surface volume only
+            vol_mask_train = (raw_dsdf_norm < 0.2) & vol_mask
 
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
