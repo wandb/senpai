@@ -779,27 +779,30 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
-        # PCGrad: tandem vs non-tandem gradient projection
+        # PCGrad: tandem vs non-tandem gradient projection (separate forward passes)
         nontandem_idx = (~is_tandem_batch).nonzero(as_tuple=True)[0]
         tandem_idx = is_tandem_batch.nonzero(as_tuple=True)[0]
         pcgrad_active = len(nontandem_idx) > 0 and len(tandem_idx) > 0
 
         if pcgrad_active:
-            def _group_loss(idx):
-                ae = abs_err[idx]
-                vm = vol_mask_train[idx]
-                sm = surf_mask[idx]
-                vl = (ae * vm.unsqueeze(-1)).sum() / vm.sum().clamp(min=1)
-                sl = (ae * sm.unsqueeze(-1)).sum() / sm.sum().clamp(min=1)
+            def _fwd_group_loss(idx):
+                x_g = x[idx]
+                out_g = model({"x": x_g})
+                pred_g = out_g["preds"].float() / sample_stds[idx]
+                ae_g = (pred_g - y_norm[idx]).abs()
+                vm_g = vol_mask_train[idx]
+                sm_g = surf_mask[idx]
+                vl = (ae_g * vm_g.unsqueeze(-1)).sum() / vm_g.sum().clamp(min=1)
+                sl = (ae_g * sm_g.unsqueeze(-1)).sum() / sm_g.sum().clamp(min=1)
                 return vl + surf_weight * sl
 
             optimizer.zero_grad()
-            _group_loss(nontandem_idx).backward(retain_graph=True)
+            _fwd_group_loss(nontandem_idx).backward()
             grads_A = [p.grad.clone() if p.grad is not None else torch.zeros_like(p)
                        for p in model.parameters()]
 
             optimizer.zero_grad()
-            _group_loss(tandem_idx).backward()
+            _fwd_group_loss(tandem_idx).backward()
             grads_B = [p.grad.clone() if p.grad is not None else torch.zeros_like(p)
                        for p in model.parameters()]
 
