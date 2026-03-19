@@ -223,6 +223,9 @@ class TransolverBlock(nn.Module):
         self.se_fc2 = nn.Linear(hidden_dim // 4, hidden_dim)
         nn.init.zeros_(self.se_fc2.weight)
         nn.init.zeros_(self.se_fc2.bias)
+        self.ada_ln_proj = nn.Linear(4, 2 * hidden_dim)
+        nn.init.zeros_(self.ada_ln_proj.weight)
+        nn.init.zeros_(self.ada_ln_proj.bias)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
             self.mlp2 = nn.Sequential(
@@ -231,9 +234,14 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, cond=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
+        x_normed = self.ln_1(fx)
+        if cond is not None:
+            scale_shift = self.ada_ln_proj(cond)  # [B, 2*hidden_dim]
+            scale, shift = scale_shift.chunk(2, dim=-1)
+            x_normed = (1 + scale.unsqueeze(1)) * x_normed + shift.unsqueeze(1)
+        fx = self.ln_1_post(self.attn(x_normed, spatial_bias=sb, tandem_mask=tandem_mask) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
@@ -310,6 +318,9 @@ class Transolver(nn.Module):
         self.out_skip = nn.Linear(n_hidden, out_dim)
         nn.init.zeros_(self.out_skip.weight)
         nn.init.zeros_(self.out_skip.bias)
+        self.input_skip = nn.Linear(fun_dim + space_dim, out_dim)
+        nn.init.zeros_(self.input_skip.weight)
+        nn.init.zeros_(self.input_skip.bias)
         self.skip_gate = nn.Sequential(nn.Linear(n_hidden, 1), nn.Sigmoid())
         nn.init.constant_(self.skip_gate[0].bias, -2.0)  # starts nearly closed
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
@@ -382,20 +393,24 @@ class Transolver(nn.Module):
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
 
+        # AdaLN condition: log_Re(13), AoA0(14), gap(22), stagger(23) — global per sample
+        cond = x[:, 0, [13, 14, 22, 23]]  # [B, 4]
+
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, cond=cond)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, cond=cond)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
+        fx = fx + 0.1 * self.input_skip(x)
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
