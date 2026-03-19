@@ -60,6 +60,18 @@ ACTIVATION = {
 }
 
 
+class GradientScale(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.save_for_backward(torch.tensor(scale))
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (scale,) = ctx.saved_tensors
+        return grad_output * scale.item(), None
+
+
 class GatedMLP(nn.Module):
     def __init__(self, n_input, n_hidden, n_output, act='gelu'):
         super().__init__()
@@ -396,6 +408,11 @@ class Transolver(nn.Module):
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
+        # Asymmetric gradient scaling: pressure 3x, velocity 0.5x
+        fx = torch.cat([
+            GradientScale.apply(fx[:, :, :2], 0.5),
+            GradientScale.apply(fx[:, :, 2:3], 3.0),
+        ], dim=-1)
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
