@@ -289,6 +289,9 @@ class Transolver(nn.Module):
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs = nn.Parameter(torch.tensor([0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0]))
+        self.surf_conv = nn.Conv1d(n_hidden, n_hidden, kernel_size=5, padding=2, groups=n_hidden)
+        nn.init.zeros_(self.surf_conv.weight)
+        nn.init.zeros_(self.surf_conv.bias)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -355,6 +358,25 @@ class Transolver(nn.Module):
 
         for block in self.blocks[:-1]:
             fx = block(fx, raw_xy=raw_xy)
+
+        # Surface local 1D conv: add boundary-layer-scale spatial context
+        is_surf = data.get("is_surface", None)
+        if is_surf is not None:
+            fx_new = fx.clone()
+            for b in range(fx.shape[0]):
+                s_mask = is_surf[b]
+                if s_mask.sum() < 2:
+                    continue
+                s_fx = fx[b, s_mask]  # (n_surf, C)
+                s_xy = raw_xy[b, s_mask]  # (n_surf, 2)
+                cx, cy = s_xy[:, 0].mean(), s_xy[:, 1].mean()
+                angles = torch.atan2(s_xy[:, 1] - cy, s_xy[:, 0] - cx)
+                sort_idx = angles.argsort()
+                inv_sort = sort_idx.argsort()
+                s_sorted = s_fx[sort_idx].T.unsqueeze(0)  # (1, C, n_surf)
+                conv_out = self.surf_conv(s_sorted).squeeze(0).T  # (n_surf, C)
+                fx_new[b, s_mask] = s_fx + conv_out[inv_sort]
+            fx = fx_new
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
@@ -658,7 +680,7 @@ for epoch in range(MAX_EPOCHS):
             y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x, "is_surface": is_surface})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -816,7 +838,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    pred = eval_model({"x": x, "is_surface": is_surface})["preds"]
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
