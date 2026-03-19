@@ -144,7 +144,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
 
-    def forward(self, x, spatial_bias=None, tandem_mask=None):
+    def forward(self, x, spatial_bias=None, tandem_mask=None, surf_mask=None, surf_topk=24):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -181,7 +181,17 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         out_slice_token = torch.matmul(attn_weights, v_slice_token)
         out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
 
-        out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
+        if surf_mask is not None:
+            # Surface nodes: restrict reconstruction to top-K slice tokens; volume nodes unchanged
+            _, topk_idx = slice_weights.topk(surf_topk, dim=-1)  # [B, H, N, K]
+            topk_binary = torch.zeros_like(slice_weights)
+            topk_binary.scatter_(-1, topk_idx, 1.0)
+            surf_ind = surf_mask[:, None, :, None].float()  # [B, 1, N, 1]
+            filtered_weights = slice_weights * (1.0 - surf_ind) + slice_weights * topk_binary * surf_ind
+            filtered_weights = filtered_weights / (filtered_weights.sum(dim=-1, keepdim=True) + 1e-8)
+            out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, filtered_weights)
+        else:
+            out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
         return self.to_out(out_x)
 
@@ -231,9 +241,10 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, surf_mask=None, surf_topk=24):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
+        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask,
+                                      surf_mask=surf_mask, surf_topk=surf_topk) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
@@ -318,6 +329,8 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        self.surf_topk_active = False
+        self.surf_topk = 24
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -386,14 +399,18 @@ class Transolver(nn.Module):
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
+        # Surface top-K masking (active after warm-up)
+        is_surface_data = data.get("is_surface", None) if isinstance(data, dict) else None
+        surf_mask = (is_surface_data.bool() if is_surface_data is not None and self.surf_topk_active else None)
+
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, surf_mask=surf_mask, surf_topk=self.surf_topk)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, surf_mask=surf_mask, surf_topk=self.surf_topk)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
@@ -694,7 +711,7 @@ for epoch in range(MAX_EPOCHS):
             y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x, "is_surface": is_surface})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -799,6 +816,8 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
+    if epoch == 20:
+        _base_model.surf_topk_active = True
     if epoch >= 50:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
@@ -865,7 +884,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    pred = eval_model({"x": x, "is_surface": is_surface})["preds"]
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
