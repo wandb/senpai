@@ -421,9 +421,17 @@ class Config:
     wandb_name: str | None = None
     agent: str | None = None
     debug: bool = False
+    seed: int | None = None
 
 
 cfg = sp.parse(Config)
+
+if cfg.seed is not None:
+    torch.manual_seed(cfg.seed)
+    import random, numpy as np
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    torch.cuda.manual_seed_all(cfg.seed)
 
 if cfg.debug:
     MAX_EPOCHS = 3
@@ -799,9 +807,9 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
-    if epoch >= 50:
+    if epoch >= 45:
         with torch.no_grad():
-            _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
+            _base_model.blocks[0].attn.temperature.data.clamp_(max=0.20)
     epoch_vol /= n_batches
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
