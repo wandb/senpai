@@ -143,6 +143,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout),
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
+        self.gumbel_temp = 2.0  # annealed externally; training only
 
     def forward(self, x, spatial_bias=None, tandem_mask=None):
         bsz, num_points, _ = x.shape
@@ -165,7 +166,11 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         slice_logits = self.in_project_slice(x_mid) / temp
         if spatial_bias is not None:
             slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
-        slice_weights = self.softmax(slice_logits)
+        if self.training:
+            gumbel_noise = -torch.log(-torch.log(torch.rand_like(slice_logits).clamp(min=1e-10)) + 1e-10)
+            slice_weights = F.softmax((slice_logits + gumbel_noise) / self.gumbel_temp, dim=-1)
+        else:
+            slice_weights = self.softmax(slice_logits)
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
@@ -398,6 +403,10 @@ class Transolver(nn.Module):
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+
+    def set_gumbel_temp(self, temp: float):
+        for block in self.blocks:
+            block.attn.gumbel_temp = temp
 
 
 # ---------------------------------------------------------------------------
@@ -799,6 +808,8 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
+    gumbel_temp = max(0.5, 2.0 - 1.5 * (epoch + 1) / 60.0)
+    _base_model.set_gumbel_temp(gumbel_temp)
     if epoch >= 50:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
