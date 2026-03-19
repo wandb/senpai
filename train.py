@@ -205,8 +205,10 @@ class TransolverBlock(nn.Module):
 
     def forward(self, fx, raw_xy=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb) + fx)
-        fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
+        if not (self.training and torch.rand(1).item() < 0.1):
+            fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb) + fx)
+        if not (self.training and torch.rand(1).item() < 0.1):
+            fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
