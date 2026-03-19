@@ -520,7 +520,7 @@ model_config = dict(
     space_dim=2,
     fun_dim=X_DIM - 2 + 1 + 32,  # 8 freqs * 2 coords * 2 (sin+cos) = 32
     out_dim=3,
-    n_hidden=160,  # regime-h: narrower for finer routing
+    n_hidden=192,  # regime-w: wider than regime-h for more capacity
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
     n_head=4,
     slice_num=48,  # regime-h: more slices for finer spatial decomposition
@@ -535,8 +535,8 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
-ema_start_epoch = 40
-ema_decay = 0.998
+ema_start_epoch = 30
+ema_decay = 0.997
 
 n_params = sum(p.numel() for p in model.parameters())
 
