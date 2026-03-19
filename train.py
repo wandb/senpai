@@ -576,11 +576,7 @@ base_opt = torch.optim.AdamW([
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
-scheduler = torch.optim.lr_scheduler.SequentialLR(
-    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[10]
-)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(base_opt, T_0=27, T_mult=1, eta_min=5e-5)
 
 # --- wandb ---
 run = wandb.init(
@@ -626,6 +622,7 @@ prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
+snapshot_models = []  # list of eval-mode snapshot models (saved at each 27-epoch cycle end)
 
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
@@ -807,6 +804,14 @@ for epoch in range(MAX_EPOCHS):
     prev_vol_loss = epoch_vol
     prev_surf_loss = epoch_surf
 
+    # Save snapshot at end of each 27-epoch cycle (epochs 27, 54)
+    if (epoch + 1) % 27 == 0 and len(snapshot_models) < 2:
+        snap = deepcopy(_base_model)
+        snap.eval()
+        for p in snap.parameters():
+            p.requires_grad_(False)
+        snapshot_models.append(snap)
+
     # --- Validate across all splits ---
     eval_model = ema_model if ema_model is not None else model
     eval_model.eval()
@@ -865,7 +870,10 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    if len(snapshot_models) >= 2:
+                        pred = torch.stack([sm({"x": x})["preds"] for sm in snapshot_models], 0).mean(0)
+                    else:
+                        pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
