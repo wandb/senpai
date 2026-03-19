@@ -186,6 +186,35 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         return self.to_out(out_x)
 
 
+class TandemCrossAttn(nn.Module):
+    """Cross-attention: foil-2 surface nodes (Q) attend to foil-1 surface nodes (KV).
+    Zero-init output projection for safe start."""
+
+    def __init__(self, feat_dim=3, bottleneck=32, num_heads=2):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = bottleneck // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.proj_q = nn.Linear(feat_dim, bottleneck)
+        self.proj_k = nn.Linear(feat_dim, bottleneck)
+        self.proj_v = nn.Linear(feat_dim, bottleneck)
+        self.proj_out = nn.Linear(bottleneck, feat_dim)
+        nn.init.zeros_(self.proj_out.weight)
+        nn.init.zeros_(self.proj_out.bias)
+
+    def forward(self, q_feats, kv_feats):
+        # q_feats: [nq, feat_dim], kv_feats: [nkv, feat_dim]
+        h, d = self.num_heads, self.head_dim
+        nq, nkv = q_feats.shape[0], kv_feats.shape[0]
+        Q = self.proj_q(q_feats).view(nq, h, d).permute(1, 0, 2)   # [h, nq, d]
+        K = self.proj_k(kv_feats).view(nkv, h, d).permute(1, 0, 2)  # [h, nkv, d]
+        V = self.proj_v(kv_feats).view(nkv, h, d).permute(1, 0, 2)  # [h, nkv, d]
+        attn = (Q @ K.transpose(-2, -1)) * self.scale               # [h, nq, nkv]
+        attn = attn.softmax(dim=-1)
+        out = (attn @ V).permute(1, 0, 2).contiguous().view(nq, h * d)  # [nq, bottleneck]
+        return self.proj_out(out)  # [nq, feat_dim]
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -316,6 +345,7 @@ class Transolver(nn.Module):
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.tandem_cross_attn = TandemCrossAttn(feat_dim=out_dim, bottleneck=32, num_heads=2)
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
 
@@ -703,6 +733,25 @@ for epoch in range(MAX_EPOCHS):
         aoa_pred = aoa_pred.float()
         if model.training:
             pred = pred / sample_stds
+        # Tandem cross-attention correction (applied outside compiled model to avoid CUDAGraph issues)
+        is_tandem_b = x[:, 0, 21].abs() > 0.01
+        if is_tandem_b.any():
+            corrections = torch.zeros_like(pred)
+            x_coord = x[:, :, 0]  # x-coordinates [B, N]
+            for b_idx in range(pred.shape[0]):
+                if not is_tandem_b[b_idx]:
+                    continue
+                surf_b = is_surface[b_idx] & mask[b_idx]  # surface + valid nodes [N]
+                if surf_b.sum() < 4:
+                    continue
+                med_x = x_coord[b_idx][surf_b].median()
+                foil1 = surf_b & (x_coord[b_idx] <= med_x)
+                foil2 = surf_b & (x_coord[b_idx] > med_x)
+                if foil1.sum() < 1 or foil2.sum() < 1:
+                    continue
+                corr = _base_model.tandem_cross_attn(pred[b_idx, foil2], pred[b_idx, foil1])
+                corrections[b_idx, foil2] = 0.1 * corr
+            pred = pred + corrections
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         if epoch < 10:
@@ -867,6 +916,25 @@ for epoch in range(MAX_EPOCHS):
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
+                # Tandem cross-attention correction
+                is_tandem_b = x[:, 0, 21].abs() > 0.01
+                if is_tandem_b.any():
+                    corrections = torch.zeros_like(pred)
+                    x_coord = x[:, :, 0]
+                    for b_idx in range(pred.shape[0]):
+                        if not is_tandem_b[b_idx]:
+                            continue
+                        surf_b = is_surface[b_idx] & mask[b_idx]
+                        if surf_b.sum() < 4:
+                            continue
+                        med_x = x_coord[b_idx][surf_b].median()
+                        foil1 = surf_b & (x_coord[b_idx] <= med_x)
+                        foil2 = surf_b & (x_coord[b_idx] > med_x)
+                        if foil1.sum() < 1 or foil2.sum() < 1:
+                            continue
+                        corr = _base_model.tandem_cross_attn(pred[b_idx, foil2], pred[b_idx, foil1])
+                        corrections[b_idx, foil2] = 0.1 * corr
+                    pred = pred + corrections
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
