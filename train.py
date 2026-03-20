@@ -318,6 +318,9 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        self.early_exit = nn.Sequential(
+            nn.LayerNorm(n_hidden), nn.Linear(n_hidden, n_hidden), nn.GELU(), nn.Linear(n_hidden, out_dim),
+        )
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -383,6 +386,7 @@ class Transolver(nn.Module):
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
 
         fx = self.preprocess(x)
+        early_pred = self.early_exit(fx)  # [B, N, 3]
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
@@ -397,7 +401,7 @@ class Transolver(nn.Module):
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred, "early_preds": early_pred}
 
 
 # ---------------------------------------------------------------------------
@@ -701,11 +705,14 @@ for epoch in range(MAX_EPOCHS):
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
+            early_pred = out["early_preds"]
         pred = pred.float()
         re_pred = re_pred.float()
         aoa_pred = aoa_pred.float()
+        early_pred = early_pred.float()
         if model.training:
             pred = pred / sample_stds
+            early_pred = early_pred / sample_stds
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         if epoch < 10:
@@ -783,6 +790,9 @@ for epoch in range(MAX_EPOCHS):
         aoa_target = x[:, 0, 14:15]  # AoA0_rad from normalized input
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
+        early_err = (early_pred - y_norm).abs()
+        early_loss = (early_err * mask.unsqueeze(-1)).sum() / mask.sum().clamp(min=1)
+        loss = loss + 0.2 * early_loss
 
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
