@@ -656,6 +656,9 @@ for epoch in range(MAX_EPOCHS):
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         dist_surf = x[:, :, 2:10].abs().min(dim=-1, keepdim=True).values  # [B, N, 1]
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+        if epoch < 30:
+            dist_feat = dist_feat * 1.0 + (dist_feat.detach() - dist_feat) * 0.7
+            # Forward: unchanged. Backward: gradient * 0.3
         x = torch.cat([x, curv, dist_feat], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
