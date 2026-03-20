@@ -970,11 +970,18 @@ for epoch in range(MAX_EPOCHS):
         val_loss_sum += split_loss
 
     # 4-split val/loss (all splits) — used for checkpoint selection
+    # weights = [in_dist, tandem, ood_cond, ood_re]: tandem 2x, ood_re 1.5x
     _checkpoint_names = VAL_SPLIT_NAMES  # all 4 splits instead of _3split_names
-    _checkpoint_losses = [val_metrics_per_split[n][f"{n}/loss"] for n in _checkpoint_names
-                          if not (torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isnan() or
-                                  torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isinf())]
-    val_loss_3split = sum(_checkpoint_losses) / max(len(_checkpoint_losses), 1)
+    _split_weights = {"val_in_dist": 1.0, "val_tandem_transfer": 2.0, "val_ood_cond": 1.0, "val_ood_re": 1.5}
+    _weighted_loss_sum = 0.0
+    _weight_total = 0.0
+    for n in _checkpoint_names:
+        v = val_metrics_per_split[n][f"{n}/loss"]
+        if not (torch.tensor(v).isnan() or torch.tensor(v).isinf()):
+            w = _split_weights[n]
+            _weighted_loss_sum += v * w
+            _weight_total += w
+    val_loss_3split = _weighted_loss_sum / max(_weight_total, 1e-8)
     ema_val_loss = val_loss_3split if ema_val_loss == float("inf") else ema_decay_val * ema_val_loss + (1 - ema_decay_val) * val_loss_3split
 
     # 4-split val/loss (all splits including ood_re)
