@@ -784,6 +784,17 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # Profile shape loss: cosine similarity on surface pressure
+        surf_mask_f = is_surface.float()  # [B, N]
+        pred_p = pred[:, :, 2] * surf_mask_f  # [B, N]
+        true_p = y_norm[:, :, 2] * surf_mask_f  # [B, N]
+        n_surf = surf_mask_f.sum(dim=1)  # [B]
+        valid = n_surf >= 2
+        if valid.any():
+            cos_sim = F.cosine_similarity(pred_p[valid], true_p[valid], dim=1)  # [B_valid]
+            profile_loss = (1 - cos_sim).mean()
+            loss = loss + 0.05 * profile_loss
+
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
