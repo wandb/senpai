@@ -679,7 +679,9 @@ for epoch in range(MAX_EPOCHS):
             vel_noise = 0.015 * (1 - noise_progress) + 0.003 * noise_progress
             p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
             noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
-            y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
+            target_noise = noise_scale * torch.randn_like(y_norm)
+            target_noise = target_noise * mask.unsqueeze(-1).float()  # zero noise on padded positions
+            y_norm = y_norm + target_noise
 
         # Per-sample std normalization: skip tandem samples (gap feature index 21)
         raw_gap = x[:, 0, 21]
