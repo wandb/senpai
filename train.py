@@ -318,6 +318,12 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        self.cond_hyper = nn.Sequential(
+            nn.Linear(3, 16), nn.GELU(),
+            nn.Linear(16, 6),  # 3 scales + 3 shifts for [Ux, Uy, p]
+        )
+        nn.init.zeros_(self.cond_hyper[-1].weight)
+        nn.init.zeros_(self.cond_hyper[-1].bias)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -396,6 +402,15 @@ class Transolver(nn.Module):
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
+        cond_input = torch.stack([
+            x[:, 0, 13],  # log_Re
+            x[:, 0, 14],  # AoA
+            (x[:, 0, 21].abs() > 0.01).float(),  # is_tandem
+        ], dim=-1)  # [B, 3]
+        cond_params = self.cond_hyper(cond_input)  # [B, 6]
+        cond_scale = 1.0 + 0.1 * cond_params[:, :3].unsqueeze(1)  # [B, 1, 3]
+        cond_shift = 0.1 * cond_params[:, 3:].unsqueeze(1)  # [B, 1, 3]
+        fx = fx * cond_scale + cond_shift
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
