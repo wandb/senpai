@@ -21,10 +21,12 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
 """
 
 import os
+import random
 import time
 from collections.abc import Mapping
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -515,6 +517,11 @@ _pmean = (_phys_sum / _phys_n).float()
 _pstd = ((_phys_sq_sum / _phys_n - _pmean ** 2).clamp(min=0.0).sqrt()).clamp(min=1e-6).float()
 phys_stats = {"y_mean": _pmean, "y_std": _pstd}
 print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
+
+random.seed(7)
+np.random.seed(7)
+torch.manual_seed(7)
+torch.cuda.manual_seed_all(7)
 
 model_config = dict(
     space_dim=2,
