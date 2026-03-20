@@ -311,7 +311,7 @@ class Transolver(nn.Module):
         nn.init.zeros_(self.out_skip.weight)
         nn.init.zeros_(self.out_skip.bias)
         self.skip_gate = nn.Sequential(nn.Linear(n_hidden, 1), nn.Sigmoid())
-        nn.init.constant_(self.skip_gate[0].bias, -2.0)  # starts nearly closed
+        nn.init.constant_(self.skip_gate[0].bias, -3.0)  # starts nearly closed
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
