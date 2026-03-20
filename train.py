@@ -132,8 +132,12 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
-        self.in_project_slice = nn.Linear(dim_head, slice_num)
-        torch.nn.init.orthogonal_(self.in_project_slice.weight)
+        self.slice_nums = [16, slice_num, slice_num + 32]  # coarse, medium, fine
+        self.in_project_slices = nn.ModuleList([
+            nn.Linear(dim_head, sn) for sn in self.slice_nums
+        ])
+        for proj in self.in_project_slices:
+            torch.nn.init.orthogonal_(proj.weight)
         self.to_q = nn.Linear(dim_head, dim_head, bias=False)
         self.to_k = nn.Linear(dim_head, dim_head, bias=False)
         self.to_v = nn.Linear(dim_head, dim_head, bias=False)
@@ -162,27 +166,30 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         temp = self.temperature
         if tandem_mask is not None:
             temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
-        slice_logits = self.in_project_slice(x_mid) / temp
-        if spatial_bias is not None:
-            slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
-        slice_weights = self.softmax(slice_logits)
-        slice_norm = slice_weights.sum(2)
-        slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
-        slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
-
-        q_slice_token = self.to_q(slice_token)
-        slice_token_kv = slice_token.mean(dim=1, keepdim=True)  # shared K,V: (bsz, 1, slice_num, dim_head)
-        k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
-        v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
-        q_norm = F.normalize(q_slice_token, dim=-1)
-        k_norm = F.normalize(k_slice_token, dim=-1)
-        attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
-        attn_weights = F.softmax(attn_logits, dim=-1)
-        out_slice_token = torch.matmul(attn_weights, v_slice_token)
-        out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
-
-        out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
-        out_x = rearrange(out_x, "b h n d -> b n (h d)")
+        outs = []
+        for h in range(self.heads):
+            sn = self.slice_nums[h]
+            x_h = x_mid[:, h:h+1, :, :]  # [B, 1, N, D]
+            fx_h = fx_mid[:, h:h+1, :, :]
+            temp_h = temp[:, h:h+1, :, :]
+            slice_logits = self.in_project_slices[h](x_h) / temp_h  # [B, 1, N, sn]
+            if spatial_bias is not None:
+                sb_h = spatial_bias[:, :, :sn].unsqueeze(1)
+                slice_logits = slice_logits + 0.1 * sb_h
+            sw = F.softmax(slice_logits, dim=-1)
+            sn_norm = sw.sum(2)
+            st = torch.einsum("bhnc,bhng->bhgc", fx_h, sw) / (sn_norm + 1e-5)[:, :, :, None]
+            q = self.to_q(st)
+            kv = st.mean(dim=1, keepdim=True)
+            k = self.to_k(kv).expand(-1, 1, -1, -1)
+            v = self.to_v(kv).expand(-1, 1, -1, -1)
+            qn = F.normalize(q, dim=-1)
+            kn = F.normalize(k, dim=-1)
+            attn = F.softmax(torch.matmul(qn, kn.transpose(-2, -1)) * self.attn_scale[:, h:h+1, :, :], dim=-1)
+            out_st = torch.matmul(attn, v) + self.slice_residual_scale * st
+            out_h = torch.einsum("bhgc,bhng->bhnc", out_st, sw)
+            outs.append(out_h.squeeze(1))  # [B, N, D]
+        out_x = torch.cat(outs, dim=-1)  # [B, N, H*D]
         return self.to_out(out_x)
 
 
@@ -213,7 +220,7 @@ class TransolverBlock(nn.Module):
         self.spatial_bias = nn.Sequential(
             nn.Linear(4, 64), nn.GELU(),
             nn.Linear(64, 64), nn.GELU(),
-            nn.Linear(64, slice_num),
+            nn.Linear(64, 80),  # max(slice_nums) for multi-scale heads
         )
         nn.init.zeros_(self.spatial_bias[-1].weight)
         nn.init.zeros_(self.spatial_bias[-1].bias)
