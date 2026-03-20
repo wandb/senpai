@@ -736,8 +736,8 @@ for epoch in range(MAX_EPOCHS):
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
         running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
-        # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
-        if epoch >= 30:
+        # Asymmetric hard-node mining for non-tandem samples after epoch 25 (vectorized)
+        if epoch >= 25:
             surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
             surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
             surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
