@@ -316,6 +316,8 @@ class Transolver(nn.Module):
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.dist_gate = nn.Sequential(nn.Linear(1, 32), nn.GELU(), nn.Linear(32, 1), nn.Sigmoid())
+        nn.init.constant_(self.dist_gate[-2].bias, 0.0)  # starts at sigmoid(0) = 0.5
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
 
@@ -394,6 +396,10 @@ class Transolver(nn.Module):
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+        # Extract dist_feat from input: it's at index 25 (after 24 raw + 1 curv)
+        dist_input = data["x"][:, :, 25:26]  # dist_feat = log1p(dist_surf * 10)
+        dist_scale = 1.0 + 0.5 * self.dist_gate(dist_input)  # range [1.0, 1.5] — boost near surface
+        fx = fx * dist_scale
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
