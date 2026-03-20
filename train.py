@@ -576,7 +576,7 @@ base_opt = torch.optim.AdamW([
     {'params': attn_params, 'lr': cfg.lr * 0.5},
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
-optimizer = Lookahead(base_opt, k=10, alpha=0.8)
+optimizer = Lookahead(base_opt, k=10, alpha=0.6)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
@@ -786,7 +786,7 @@ for epoch in range(MAX_EPOCHS):
 
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
-        is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
+        is_ood_pcgrad = is_tandem_batch
         is_indist_pcgrad = ~is_ood_pcgrad
         use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
 
