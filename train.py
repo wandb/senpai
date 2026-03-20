@@ -686,7 +686,7 @@ for epoch in range(MAX_EPOCHS):
         B = y_norm.shape[0]
         sample_stds = torch.ones(B, 1, 3, device=device)
         channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
-        tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+        tandem_clamps = torch.tensor([0.2, 0.2, 0.8], device=device)
         if model.training:
             for b in range(B):
                 valid = mask[b]
@@ -907,7 +907,7 @@ for epoch in range(MAX_EPOCHS):
                 B = y_norm.shape[0]
                 sample_stds = torch.ones(B, 1, 3, device=device)
                 channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
-                tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+                tandem_clamps = torch.tensor([0.2, 0.2, 0.8], device=device)
                 for b in range(B):
                     valid = mask[b]
                     if is_tandem[b]:
