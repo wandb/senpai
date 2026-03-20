@@ -709,10 +709,11 @@ for epoch in range(MAX_EPOCHS):
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
-        if epoch < 10:
-            is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
-            sample_mask = (~is_tandem_curr).float()[:, None, None]
-            abs_err = abs_err * sample_mask
+        if epoch < 20:
+            is_tandem_curr = (x[:, 0, 21].abs() > 0.5)  # correct gap feature detection
+            tandem_ramp = min(1.0, epoch / 20.0)  # ramp from 0 to 1 over 20 epochs
+            sample_weight = torch.where(is_tandem_curr, tandem_ramp, 1.0).float()[:, None, None]
+            abs_err = abs_err * sample_weight
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
