@@ -325,7 +325,7 @@ class Transolver(nn.Module):
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             if module.weight.dim() >= 2:
-                nn.init.orthogonal_(module.weight, gain=1.0)
+                nn.init.orthogonal_(module.weight, gain=0.8)
             else:
                 nn.init.normal_(module.weight, std=0.01)
             if module.bias is not None:
@@ -536,7 +536,7 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
-ema_start_epoch = 40
+ema_start_epoch = 42
 ema_decay = 0.998
 
 n_params = sum(p.numel() for p in model.parameters())
