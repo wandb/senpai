@@ -520,9 +520,9 @@ model_config = dict(
     space_dim=2,
     fun_dim=X_DIM - 2 + 2 + 32,  # +1 curv, +1 dist_feat, +32 fourier PE
     out_dim=3,
-    n_hidden=192,  # regime-w: full width with finer routing
-    n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
-    n_head=3,
+    n_hidden=128,  # reduced from 192 to compensate for 2nd layer (iso-FLOPs)
+    n_layers=2,    # depth experiment: 2 layers at reduced width
+    n_head=4,      # 4 heads × 32 dim/head = 128
     slice_num=48,  # regime-h: more slices for finer spatial decomposition
     mlp_ratio=2,
     output_fields=["Ux", "Uy", "p"],
