@@ -137,7 +137,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.to_q = nn.Linear(dim_head, dim_head, bias=False)
         self.to_k = nn.Linear(dim_head, dim_head, bias=False)
         self.to_v = nn.Linear(dim_head, dim_head, bias=False)
-        self.slice_residual_scale = nn.Parameter(torch.tensor(0.1))
+        self.slice_residual_scale = nn.Parameter(torch.tensor(0.2))
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout),
@@ -325,7 +325,7 @@ class Transolver(nn.Module):
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             if module.weight.dim() >= 2:
-                nn.init.orthogonal_(module.weight, gain=1.0)
+                nn.init.orthogonal_(module.weight, gain=0.8)
             else:
                 nn.init.normal_(module.weight, std=0.01)
             if module.bias is not None:
