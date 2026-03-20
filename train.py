@@ -576,7 +576,7 @@ base_opt = torch.optim.AdamW([
     {'params': attn_params, 'lr': cfg.lr * 0.5},
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
-optimizer = Lookahead(base_opt, k=10, alpha=0.8)
+optimizer = Lookahead(base_opt, k=10, alpha=0.6)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
@@ -667,18 +667,20 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
-        if model.training and epoch < 60:
-            noise_scale = 0.05 * (1 - epoch / 60)
-            x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
+        # input noise disabled
+        # if model.training and epoch < 60:
+        #     noise_scale = 0.05 * (1 - epoch / 60)
+        #     x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
-        if model.training:
-            noise_progress = min(1.0, epoch / 60)
-            vel_noise = 0.015 * (1 - noise_progress) + 0.003 * noise_progress
-            p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
-            noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
-            y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
+        # target noise disabled
+        # if model.training:
+        #     noise_progress = min(1.0, epoch / 60)
+        #     vel_noise = 0.015 * (1 - noise_progress) + 0.003 * noise_progress
+        #     p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
+        #     noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
+        #     y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
 
         # Per-sample std normalization: skip tandem samples (gap feature index 21)
         raw_gap = x[:, 0, 21]
@@ -786,7 +788,7 @@ for epoch in range(MAX_EPOCHS):
 
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
-        is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
+        is_ood_pcgrad = is_tandem_batch
         is_indist_pcgrad = ~is_ood_pcgrad
         use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
 
