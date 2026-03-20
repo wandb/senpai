@@ -318,6 +318,16 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        # Lightweight output calibration: predict per-sample scale and shift for output
+        self.calibration = nn.Sequential(
+            nn.Linear(3, 16),  # input: [log_Re, AoA, is_tandem]
+            nn.GELU(),
+            nn.Linear(16, 6),  # output: [scale_Ux, scale_Uy, scale_p, shift_Ux, shift_Uy, shift_p]
+        )
+        nn.init.zeros_(self.calibration[-1].weight)
+        nn.init.zeros_(self.calibration[-1].bias)
+        # Initialize bias to [1,1,1, 0,0,0] so starts as identity
+        self.calibration[-1].bias.data[:3] = 1.0
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -396,8 +406,17 @@ class Transolver(nn.Module):
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
+        # Output calibration: per-sample scale + shift based on flow conditions
+        log_re = x[:, 0, 13:14]  # [B, 1]
+        aoa = x[:, 0, 14:15]  # [B, 1]
+        is_tandem_flag = (x[:, 0, 21].abs() > 0.5).float().unsqueeze(1)  # [B, 1]
+        cond = torch.cat([log_re, aoa, is_tandem_flag], dim=1)  # [B, 3]
+        cal = self.calibration(cond)  # [B, 6]
+        scale = cal[:, :3].unsqueeze(1)  # [B, 1, 3]
+        shift = cal[:, 3:].unsqueeze(1)  # [B, 1, 3]
+        fx = fx * scale + shift
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred, "cal": cal}
 
 
 # ---------------------------------------------------------------------------
