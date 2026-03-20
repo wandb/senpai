@@ -21,7 +21,9 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
 """
 
 import os
+import random
 import time
+import numpy as np
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -529,6 +531,10 @@ model_config = dict(
     output_dims=[1, 1, 1],
 )
 
+random.seed(2024)
+np.random.seed(2024)
+torch.manual_seed(2024)
+torch.cuda.manual_seed_all(2024)
 model = Transolver(**model_config).to(device)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode="default")
