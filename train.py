@@ -316,6 +316,7 @@ class Transolver(nn.Module):
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.umag_head = nn.Sequential(nn.Linear(2, 16), nn.GELU(), nn.Linear(16, 1), nn.Softplus())
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
 
@@ -397,7 +398,8 @@ class Transolver(nn.Module):
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+        umag_pred = self.umag_head(x[:, 0, [13, 14]].float())  # [B, 1], predicted Umag from log_Re, AoA
+        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred, "umag_pred": umag_pred}
 
 
 # ---------------------------------------------------------------------------
@@ -701,9 +703,11 @@ for epoch in range(MAX_EPOCHS):
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
+            umag_pred = out["umag_pred"]
         pred = pred.float()
         re_pred = re_pred.float()
         aoa_pred = aoa_pred.float()
+        umag_pred = umag_pred.float()
         if model.training:
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
@@ -783,6 +787,8 @@ for epoch in range(MAX_EPOCHS):
         aoa_target = x[:, 0, 14:15]  # AoA0_rad from normalized input
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
+        umag_loss = (umag_pred - Umag.squeeze(-1)).pow(2).mean()
+        loss = loss + 0.01 * umag_loss
 
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
@@ -917,7 +923,9 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    val_out = eval_model({"x": x})
+                    pred = val_out["preds"]
+                    umag_pred_val = val_out["umag_pred"].float()  # [B, 1]
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
@@ -937,8 +945,11 @@ for epoch in range(MAX_EPOCHS):
                 n_vbatches += 1
 
                 # Denormalize: phys_stats → Cp space → original scale
+                # Use predicted Umag (from input features) for second-pass denormalization
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
-                pred_orig = _phys_denorm(pred_phys, Umag, q)
+                pred_umag = umag_pred_val.unsqueeze(-1).clamp(min=1.0)  # [B, 1, 1]
+                pred_q = 0.5 * pred_umag ** 2
+                pred_orig = _phys_denorm(pred_phys, pred_umag, pred_q)
                 y_clamped = y.clamp(-1e6, 1e6)
                 err = (pred_orig - y_clamped).abs()
                 finite = err.isfinite()
