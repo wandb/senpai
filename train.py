@@ -508,9 +508,13 @@ with torch.no_grad():
         _Um, _q = _umag_q(_y, _mask)
         _yp = _phys_norm(_y, _Um, _q)
         _m = _mask.float().unsqueeze(-1)  # [B, N, 1]
-        _phys_sum += (_yp * _m).sum(dim=(0, 1))
-        _phys_sq_sum += (_yp ** 2 * _m).sum(dim=(0, 1))
-        _phys_n += _mask.float().sum().item()
+        # Per-sample means: each sample contributes equally regardless of node count
+        _n_nodes = _m.sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1, 1]
+        _sample_mean = (_yp * _m).sum(dim=1) / _n_nodes.squeeze(1)  # [B, 3]
+        _sample_sq_mean = (_yp ** 2 * _m).sum(dim=1) / _n_nodes.squeeze(1)  # [B, 3]
+        _phys_sum += _sample_mean.sum(dim=0)
+        _phys_sq_sum += _sample_sq_mean.sum(dim=0)
+        _phys_n += _mask.shape[0]  # count samples, not nodes
 _pmean = (_phys_sum / _phys_n).float()
 _pstd = ((_phys_sq_sum / _phys_n - _pmean ** 2).clamp(min=0.0).sqrt()).clamp(min=1e-6).float()
 phys_stats = {"y_mean": _pmean, "y_std": _pstd}
