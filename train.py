@@ -536,7 +536,7 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
-ema_start_epoch = 40
+ema_start_epoch = 42
 ema_decay = 0.998
 
 n_params = sum(p.numel() for p in model.parameters())
