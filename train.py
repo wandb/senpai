@@ -694,7 +694,7 @@ for epoch in range(MAX_EPOCHS):
                     sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
                 else:
                     sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
-            y_norm = y_norm / sample_stds
+            y_norm = y_norm * sample_stds.clamp(max=3.0)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model({"x": x})
@@ -705,7 +705,7 @@ for epoch in range(MAX_EPOCHS):
         re_pred = re_pred.float()
         aoa_pred = aoa_pred.float()
         if model.training:
-            pred = pred / sample_stds
+            pred = pred * sample_stds.clamp(max=3.0)
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         if epoch < 10:
