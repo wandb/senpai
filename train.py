@@ -812,21 +812,27 @@ for epoch in range(MAX_EPOCHS):
 
             ga_flat = torch.cat([g.view(-1) for g in grads_a if g is not None])
             gb_flat = torch.cat([p.grad.view(-1) for p in model.parameters() if p.grad is not None])
-            dot_ab = (ga_flat @ gb_flat).item()
-            gb_ns = float((gb_flat @ gb_flat).item()) + 1e-8
-            ga_ns = float((ga_flat @ ga_flat).item()) + 1e-8
-            for p, ga in zip(model.parameters(), grads_a):
-                gb = p.grad
-                if ga is None and gb is None:
-                    continue
-                if ga is None:
-                    pass  # keep gb
-                elif gb is None:
-                    p.grad = ga
-                elif dot_ab < 0:
-                    p.grad = ((ga - (dot_ab / gb_ns) * gb) + (gb - (dot_ab / ga_ns) * ga)) * 0.5
-                else:
-                    p.grad = (ga + gb) * 0.5
+            cos_sim = F.cosine_similarity(ga_flat.unsqueeze(0), gb_flat.unsqueeze(0)).item()
+
+            if cos_sim < 0:
+                scale = 1.0 + cos_sim  # 0 to 1 for cos in [-1, 0)
+                for p, ga in zip(model.parameters(), grads_a):
+                    gb = p.grad
+                    if ga is None or gb is None:
+                        if ga is not None:
+                            p.grad = ga
+                        continue
+                    ga_n = ga / (ga.norm() + 1e-8)
+                    gb_n = gb / (gb.norm() + 1e-8)
+                    ga_proj = (ga * gb_n).sum() * gb_n
+                    gb_proj = (gb * ga_n).sum() * ga_n
+                    p.grad = ((ga - (1 - scale) * ga_proj) + (gb - (1 - scale) * gb_proj)) * 0.5
+            else:
+                for p, ga in zip(model.parameters(), grads_a):
+                    if ga is not None and p.grad is not None:
+                        p.grad = (ga + p.grad) * 0.5
+                    elif ga is not None:
+                        p.grad = ga
         else:
             optimizer.zero_grad()
             loss.backward()
