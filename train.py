@@ -231,8 +231,12 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, dist_feat=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
+        # Sharpen attention near surface using dist_feat
+        if sb is not None and dist_feat is not None:
+            proximity_boost = torch.exp(-dist_feat * 3.0)  # [B, N, 1] -> 1.0 at surface, ~0 far away
+            sb = sb * (1.0 + 0.5 * proximity_boost)  # amplify spatial bias near surface
         fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
@@ -378,6 +382,7 @@ class Transolver(nn.Module):
         x_cross = x * self.feature_cross(x)
         x = x + 0.1 * x_cross  # residual with small scale
         raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)  # x, y, curvature, dist
+        dist_feat_for_attn = x[:, :, 25:26]  # dist_feat channel for attention gating
 
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
@@ -387,13 +392,13 @@ class Transolver(nn.Module):
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, dist_feat=dist_feat_for_attn)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, dist_feat=dist_feat_for_attn)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
