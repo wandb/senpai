@@ -715,6 +715,19 @@ for epoch in range(MAX_EPOCHS):
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
+        # EMA teacher consistency loss (after EMA is initialized)
+        ema_loss_val = 0.0
+        if ema_model is not None and epoch >= 45:
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    ema_pred = ema_model({"x": x})["preds"]
+                ema_pred = ema_pred.float()
+                if model.training:
+                    ema_pred = ema_pred / sample_stds
+            # L1 consistency loss on surface pressure only
+            ema_diff = (pred - ema_pred)[:, :, 2:3].abs()  # pressure channel
+            ema_loss_val = (ema_diff * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+
         # Progressive resolution: subsample volume nodes in loss early in training
         # Ramps from 10% → 100% of volume nodes over first 40 epochs
         if epoch < 40:
@@ -783,6 +796,8 @@ for epoch in range(MAX_EPOCHS):
         aoa_target = x[:, 0, 14:15]  # AoA0_rad from normalized input
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
+        if ema_loss_val > 0:
+            loss = loss + 0.5 * ema_loss_val  # 0.5 weight to not dominate
 
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
