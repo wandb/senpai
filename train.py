@@ -162,7 +162,11 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         temp = self.temperature
         if tandem_mask is not None:
             temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
-        slice_logits = self.in_project_slice(x_mid) / temp
+        if spatial_bias is not None:
+            per_node_temp = self.temperature * (1.0 + 0.1 * spatial_bias.abs().mean(dim=-1, keepdim=True).unsqueeze(1))
+        else:
+            per_node_temp = temp
+        slice_logits = self.in_project_slice(x_mid) / per_node_temp
         if spatial_bias is not None:
             slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
         slice_weights = self.softmax(slice_logits)
