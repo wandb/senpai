@@ -437,21 +437,21 @@ train_ds, val_splits, stats, sample_weights = load_data(
 stats = {k: v.to(device) for k, v in stats.items()}
 
 
-def _umag_q(y, mask):
+def _umag_q(y, mask, is_surface=None):
     """Per-sample reference velocity and dynamic pressure from mean velocity.
 
-    Uses mean velocity of actual (unpadded) nodes as Umag proxy. For CFD flow
-    over airfoils, the domain-mean velocity tracks the freestream magnitude
-    across Re numbers (surface no-slip nodes reduce the mean slightly, but
-    consistently across all samples).
+    Uses mean velocity of volume (non-surface) nodes as Umag proxy. Excluding
+    surface no-slip nodes avoids the downward bias from near-zero velocities
+    at the airfoil surface.
 
     Returns:
         Umag: [B, 1, 1], dynamic velocity magnitude, clamped ≥ 1.0
         q:    [B, 1, 1], dynamic pressure = 0.5 * Umag^2
     """
-    n_nodes = mask.float().sum(dim=1, keepdim=True).clamp(min=1.0)  # [B, 1]
-    Ux_mean = (y[:, :, 0] * mask.float()).sum(dim=1, keepdim=True) / n_nodes  # [B, 1]
-    Uy_mean = (y[:, :, 1] * mask.float()).sum(dim=1, keepdim=True) / n_nodes  # [B, 1]
+    vol_mask = mask & ~is_surface if is_surface is not None else mask
+    n = vol_mask.float().sum(dim=1, keepdim=True).clamp(min=1.0)  # [B, 1]
+    Ux_mean = (y[:, :, 0] * vol_mask.float()).sum(dim=1, keepdim=True) / n  # [B, 1]
+    Uy_mean = (y[:, :, 1] * vol_mask.float()).sum(dim=1, keepdim=True) / n  # [B, 1]
     Umag = (Ux_mean ** 2 + Uy_mean ** 2).sqrt().clamp(min=1.0).unsqueeze(-1)  # [B, 1, 1]
     q = 0.5 * Umag ** 2
     return Umag, q
@@ -505,7 +505,8 @@ _stats_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, *
 with torch.no_grad():
     for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc="Phys stats", leave=False):
         _y, _mask = _y.to(device), _mask.to(device)
-        _Um, _q = _umag_q(_y, _mask)
+        _is_surf_dev = _is_surf.to(device)
+        _Um, _q = _umag_q(_y, _mask, _is_surf_dev)
         _yp = _phys_norm(_y, _Um, _q)
         _m = _mask.float().unsqueeze(-1)  # [B, N, 1]
         _phys_sum += (_yp * _m).sum(dim=(0, 1))
@@ -670,7 +671,7 @@ for epoch in range(MAX_EPOCHS):
         if model.training and epoch < 60:
             noise_scale = 0.05 * (1 - epoch / 60)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
-        Umag, q = _umag_q(y, mask)
+        Umag, q = _umag_q(y, mask, is_surface)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         if model.training:
@@ -897,7 +898,7 @@ for epoch in range(MAX_EPOCHS):
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
-                Umag, q = _umag_q(y, mask)
+                Umag, q = _umag_q(y, mask, is_surface)
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
@@ -1068,7 +1069,7 @@ if best_metrics:
                 dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)
                 x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
-                Umag, q = _umag_q(y_dev, mask)
+                Umag, q = _umag_q(y_dev, mask, is_surf_dev)
                 pred = vis_model({"x": x_n})["preds"].float()
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
                 y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
