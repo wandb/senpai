@@ -34,7 +34,7 @@ from dataclasses import dataclass, asdict
 from einops import rearrange
 from timm.layers import trunc_normal_
 from tqdm import tqdm
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, WeightedRandomSampler, Sampler
 import simple_parsing as sp
 
 from data.utils import visualize
@@ -477,18 +477,39 @@ def _phys_denorm(y_p, Umag, q):
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
 
+
+class SortedBatchSampler(Sampler):
+    """Groups similar-sized samples into batches to minimize padding waste.
+    Batch order is shuffled each iteration for training randomness.
+    """
+    def __init__(self, sizes, batch_size, drop_last=True):
+        sorted_indices = sorted(range(len(sizes)), key=lambda i: sizes[i])
+        self.batches = [
+            sorted_indices[i:i + batch_size]
+            for i in range(0, len(sorted_indices), batch_size)
+        ]
+        if drop_last and self.batches and len(self.batches[-1]) < batch_size:
+            self.batches = self.batches[:-1]
+
+    def __iter__(self):
+        perm = torch.randperm(len(self.batches)).tolist()
+        for i in perm:
+            yield self.batches[i]
+
+    def __len__(self):
+        return len(self.batches)
+
+
 if cfg.debug:
     # Avoid sampler/length mismatch when train_ds is truncated
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
                               shuffle=True, **loader_kwargs)
 else:
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(train_ds),
-        replacement=True,
-    )
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
-                              sampler=sampler, **loader_kwargs)
+    # Pre-compute sample sizes once for sorted batching
+    print("Pre-computing sample sizes for sorted batch sampler...")
+    sample_sizes = [train_ds[i][0].shape[0] for i in range(len(train_ds))]
+    batch_sampler = SortedBatchSampler(sample_sizes, cfg.batch_size, drop_last=True)
+    train_loader = DataLoader(train_ds, batch_sampler=batch_sampler, **loader_kwargs)
 
 val_loaders = {
     name: DataLoader(subset, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
