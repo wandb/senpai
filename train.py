@@ -529,6 +529,8 @@ model_config = dict(
     output_dims=[1, 1, 1],
 )
 
+torch.manual_seed(1)
+torch.cuda.manual_seed_all(1)
 model = Transolver(**model_config).to(device)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode="default")
