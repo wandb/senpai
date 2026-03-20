@@ -224,7 +224,7 @@ class TransolverBlock(nn.Module):
         nn.init.zeros_(self.se_fc2.weight)
         nn.init.zeros_(self.se_fc2.bias)
         if self.last_layer:
-            self.ln_3 = nn.LayerNorm(hidden_dim)
+            self.ln_3 = nn.GroupNorm(3, hidden_dim)
             self.mlp2 = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.GELU(),
@@ -240,7 +240,8 @@ class TransolverBlock(nn.Module):
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            fx_ln = self.ln_3(fx.transpose(1, 2)).transpose(1, 2)  # (B,C,N) for GroupNorm
+            return self.mlp2(fx_ln)
         return fx
 
 
