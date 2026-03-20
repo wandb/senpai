@@ -752,34 +752,37 @@ for epoch in range(MAX_EPOCHS):
         surf_loss = (surf_per_sample * tandem_boost).mean()
         loss = vol_loss + surf_weight * surf_loss
 
-        # Multi-scale loss: coarse spatial pooling
+        # Multi-scale coarse loss: cascade at 3 pool sizes
         _coarse_loss = None
-        coarse_pool_size = 64
-        B, N, C = pred.shape
-        n_groups = N // coarse_pool_size
-        if n_groups > 1:
-            # Sort by x-coordinate for spatially coherent groups
-            raw_x_coord = x[:, :, 0]  # x-coordinate
-            sort_idx = raw_x_coord.argsort(dim=1)
-            pred_sorted = torch.gather(pred, 1, sort_idx.unsqueeze(-1).expand_as(pred))
-            y_sorted = torch.gather(y_norm, 1, sort_idx.unsqueeze(-1).expand_as(y_norm))
-            mask_sorted = torch.gather(mask, 1, sort_idx)
-            # Pool predictions and targets over groups of 64 nodes
-            pred_trunc = pred_sorted[:, :n_groups * coarse_pool_size]
-            y_trunc = y_sorted[:, :n_groups * coarse_pool_size]
-            mask_trunc = mask_sorted[:, :n_groups * coarse_pool_size]
+        for coarse_pool_size in [32, 64, 128]:
+            B, N, C = pred.shape
+            n_groups = N // coarse_pool_size
+            if n_groups > 1:
+                raw_x_coord = x[:, :, 0]
+                sort_idx = raw_x_coord.argsort(dim=1)
+                pred_sorted = torch.gather(pred, 1, sort_idx.unsqueeze(-1).expand_as(pred))
+                y_sorted = torch.gather(y_norm, 1, sort_idx.unsqueeze(-1).expand_as(y_norm))
+                mask_sorted = torch.gather(mask, 1, sort_idx)
+                pred_trunc = pred_sorted[:, :n_groups * coarse_pool_size]
+                y_trunc = y_sorted[:, :n_groups * coarse_pool_size]
+                mask_trunc = mask_sorted[:, :n_groups * coarse_pool_size]
 
-            mask_trunc_f = mask_trunc.float().reshape(B, n_groups, coarse_pool_size).unsqueeze(-1)  # [B, G, P, 1]
-            pred_g = pred_trunc.reshape(B, n_groups, coarse_pool_size, C)
-            y_g = y_trunc.reshape(B, n_groups, coarse_pool_size, C)
-            pred_coarse = (pred_g * mask_trunc_f).sum(dim=2) / mask_trunc_f.sum(dim=2).clamp(min=1)
-            y_coarse = (y_g * mask_trunc_f).sum(dim=2) / mask_trunc_f.sum(dim=2).clamp(min=1)
-            mask_coarse = mask_trunc.reshape(B, n_groups, coarse_pool_size).any(dim=2)
+                mask_trunc_f = mask_trunc.float().reshape(B, n_groups, coarse_pool_size).unsqueeze(-1)
+                pred_g = pred_trunc.reshape(B, n_groups, coarse_pool_size, C)
+                y_g = y_trunc.reshape(B, n_groups, coarse_pool_size, C)
+                pred_coarse = (pred_g * mask_trunc_f).sum(dim=2) / mask_trunc_f.sum(dim=2).clamp(min=1)
+                y_coarse = (y_g * mask_trunc_f).sum(dim=2) / mask_trunc_f.sum(dim=2).clamp(min=1)
+                mask_coarse = mask_trunc.reshape(B, n_groups, coarse_pool_size).any(dim=2)
 
-            coarse_err = (pred_coarse - y_coarse).abs()
-            coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
-            _coarse_loss = coarse_loss
-            loss = loss + 1.0 * coarse_loss
+                coarse_err = (pred_coarse - y_coarse).abs()
+                cl = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
+                if _coarse_loss is None:
+                    _coarse_loss = cl
+                else:
+                    _coarse_loss = _coarse_loss + cl
+
+        if _coarse_loss is not None:
+            loss = loss + 0.5 * _coarse_loss  # reduced per-scale weight since we have 3 scales
 
         log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
         re_loss = F.mse_loss(re_pred, log_re_target)
