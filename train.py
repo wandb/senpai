@@ -652,8 +652,8 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         x = (x - stats["x_mean"]) / stats["x_std"]
-        # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
-        curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+        # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for all nodes
+        curv = x[:, :, 2:6].norm(dim=-1, keepdim=True)
         dist_surf = x[:, :, 2:10].abs().min(dim=-1, keepdim=True).values  # [B, N, 1]
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         x = torch.cat([x, curv, dist_feat], dim=-1)
@@ -882,8 +882,8 @@ for epoch in range(MAX_EPOCHS):
                 mask = mask.to(device, non_blocking=True)
 
                 x = (x - stats["x_mean"]) / stats["x_std"]
-                # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
-                curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for all nodes
+                curv = x[:, :, 2:6].norm(dim=-1, keepdim=True)
                 dist_surf = x[:, :, 2:10].abs().min(dim=-1, keepdim=True).values  # [B, N, 1]
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 x = torch.cat([x, curv, dist_feat], dim=-1)
@@ -1064,7 +1064,7 @@ if best_metrics:
                 is_surf_dev = is_surface.unsqueeze(0).to(device)
                 mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
                 x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
-                curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
+                curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True)
                 dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)
                 x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
