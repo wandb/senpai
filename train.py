@@ -217,6 +217,13 @@ class TransolverBlock(nn.Module):
         )
         nn.init.zeros_(self.spatial_bias[-1].weight)
         nn.init.zeros_(self.spatial_bias[-1].bias)
+        self.content_bias = nn.Sequential(
+            nn.Linear(hidden_dim, 64), nn.GELU(),
+            nn.Linear(64, slice_num),
+        )
+        nn.init.zeros_(self.content_bias[-1].weight)
+        nn.init.zeros_(self.content_bias[-1].bias)
+        self.routing_blend = nn.Parameter(torch.tensor(0.0))  # sigmoid(0)=0.5
         self.ln_1_post = nn.LayerNorm(hidden_dim)
         self.ln_2_post = nn.LayerNorm(hidden_dim)
         self.se_fc1 = nn.Linear(hidden_dim, hidden_dim // 4)
@@ -232,7 +239,13 @@ class TransolverBlock(nn.Module):
             )
 
     def forward(self, fx, raw_xy=None, tandem_mask=None):
-        sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
+        if raw_xy is not None:
+            sb_spatial = self.spatial_bias(raw_xy)
+            sb_content = self.content_bias(self.ln_1(fx))
+            blend = torch.sigmoid(self.routing_blend)
+            sb = (1 - blend) * sb_spatial + blend * sb_content
+        else:
+            sb = None
         fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
