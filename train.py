@@ -225,11 +225,12 @@ class TransolverBlock(nn.Module):
         nn.init.zeros_(self.se_fc2.bias)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
-            self.mlp2 = nn.Sequential(
+            self.mlp2_trunk = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.GELU(),
-                nn.Linear(hidden_dim, out_dim),
             )
+            self.vel_out = nn.Linear(hidden_dim, 2)
+            self.pres_out = nn.Linear(hidden_dim, 1)
 
     def forward(self, fx, raw_xy=None, tandem_mask=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
@@ -240,7 +241,8 @@ class TransolverBlock(nn.Module):
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            h = self.mlp2_trunk(self.ln_3(fx))
+            return torch.cat([self.vel_out(h), self.pres_out(h)], dim=-1)
         return fx
 
 
