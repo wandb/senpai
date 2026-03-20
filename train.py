@@ -578,9 +578,12 @@ base_opt = torch.optim.AdamW([
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
+# 3 equal cycles of 17 epochs, each restarting at progressively lower peak
+restart_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    base_opt, T_0=17, T_mult=1, eta_min=5e-5
+)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
-    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[10]
+    base_opt, schedulers=[warmup_scheduler, restart_scheduler], milestones=[10]
 )
 
 # --- wandb ---
@@ -849,6 +852,10 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
+    # Decay peak LR by 0.6x at each restart boundary (after warmup)
+    if epoch > 10 and (epoch - 10) % 17 == 0 and epoch > 11:
+        for pg in base_opt.param_groups:
+            pg['initial_lr'] = pg['initial_lr'] * 0.6
     if epoch >= 50:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
