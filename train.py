@@ -684,17 +684,25 @@ for epoch in range(MAX_EPOCHS):
         raw_gap = x[:, 0, 21]
         is_tandem = raw_gap.abs() > 0.5
         B = y_norm.shape[0]
-        sample_stds = torch.ones(B, 1, 3, device=device)
         channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
         tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
         if model.training:
-            for b in range(B):
-                valid = mask[b]
-                if is_tandem[b]:
-                    sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
-                else:
-                    sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+            mask_f = mask.float().unsqueeze(-1)  # [B, N, 1]
+            n_valid = mask_f.sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1, 1]
+            y_mean = (y_norm * mask_f).sum(dim=1, keepdim=True) / n_valid  # [B, 1, 3]
+            y_centered = (y_norm - y_mean) * mask_f  # [B, N, 3]
+            n_bessel = (n_valid - 1).clamp(min=1)  # Bessel correction (matches .std())
+            y_var = (y_centered ** 2).sum(dim=1, keepdim=True) / n_bessel  # [B, 1, 3]
+            sample_stds_raw = y_var.sqrt()  # [B, 1, 3]
+            clamp_vals = torch.where(
+                is_tandem[:, None, None].expand_as(sample_stds_raw),
+                tandem_clamps[None, None, :].expand_as(sample_stds_raw),
+                channel_clamps[None, None, :].expand_as(sample_stds_raw),
+            )
+            sample_stds = torch.maximum(sample_stds_raw, clamp_vals)
             y_norm = y_norm / sample_stds
+        else:
+            sample_stds = torch.ones(B, 1, 3, device=device)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model({"x": x})
@@ -905,15 +913,21 @@ for epoch in range(MAX_EPOCHS):
                 raw_gap = x[:, 0, 21]
                 is_tandem = raw_gap.abs() > 0.5
                 B = y_norm.shape[0]
-                sample_stds = torch.ones(B, 1, 3, device=device)
                 channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
                 tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
-                for b in range(B):
-                    valid = mask[b]
-                    if is_tandem[b]:
-                        sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
-                    else:
-                        sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+                mask_f = mask.float().unsqueeze(-1)  # [B, N, 1]
+                n_valid = mask_f.sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1, 1]
+                y_mean = (y_norm * mask_f).sum(dim=1, keepdim=True) / n_valid  # [B, 1, 3]
+                y_centered = (y_norm - y_mean) * mask_f  # [B, N, 3]
+                n_bessel = (n_valid - 1).clamp(min=1)  # Bessel correction (matches .std())
+                y_var = (y_centered ** 2).sum(dim=1, keepdim=True) / n_bessel  # [B, 1, 3]
+                sample_stds_raw = y_var.sqrt()  # [B, 1, 3]
+                clamp_vals = torch.where(
+                    is_tandem[:, None, None].expand_as(sample_stds_raw),
+                    tandem_clamps[None, None, :].expand_as(sample_stds_raw),
+                    channel_clamps[None, None, :].expand_as(sample_stds_raw),
+                )
+                sample_stds = torch.maximum(sample_stds_raw, clamp_vals)
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
