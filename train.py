@@ -474,7 +474,7 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
 
-loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
+loader_kwargs = dict(collate_fn=pad_collate, num_workers=8, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
 
 if cfg.debug:
