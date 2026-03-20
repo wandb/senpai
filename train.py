@@ -750,7 +750,16 @@ for epoch in range(MAX_EPOCHS):
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
-        loss = vol_loss + surf_weight * surf_loss
+
+        # Near-surface volume loss: volume nodes within boundary layer contribute to surface-like loss
+        near_surf_threshold = 0.02  # physical distance threshold (in raw dsdf units)
+        near_surf_mask = vol_mask_train & (dist_surf.squeeze(-1) < near_surf_threshold)
+        if near_surf_mask.any():
+            near_surf_loss = (abs_err[:, :, 2:3] * near_surf_mask.unsqueeze(-1)).sum() / near_surf_mask.sum().clamp(min=1)
+        else:
+            near_surf_loss = torch.tensor(0.0, device=device)
+
+        loss = vol_loss + surf_weight * surf_loss + 5.0 * near_surf_loss
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
@@ -1073,6 +1082,14 @@ if best_metrics:
                 dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)
                 x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                raw_xy_vis = x_n[:, :, :2]
+                xy_min_vis = raw_xy_vis.amin(dim=1, keepdim=True)
+                xy_max_vis = raw_xy_vis.amax(dim=1, keepdim=True)
+                xy_norm_vis = (raw_xy_vis - xy_min_vis) / (xy_max_vis - xy_min_vis + 1e-8)
+                freqs_vis = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
+                xy_scaled_vis = xy_norm_vis.unsqueeze(-1) * freqs_vis
+                fourier_pe_vis = torch.cat([xy_scaled_vis.sin().flatten(-2), xy_scaled_vis.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, fourier_pe_vis], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
