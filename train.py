@@ -535,9 +535,11 @@ model = torch.compile(model, mode="default")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
-ema_model = None
+ema_fast = None
+ema_slow = None
 ema_start_epoch = 40
-ema_decay = 0.998
+ema_decay_fast = 0.995
+ema_decay_slow = 0.9995
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -834,12 +836,15 @@ for epoch in range(MAX_EPOCHS):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         if epoch >= ema_start_epoch:
-            if ema_model is None:
-                ema_model = deepcopy(_base_model)
+            if ema_fast is None:
+                ema_fast = deepcopy(_base_model)
+                ema_slow = deepcopy(_base_model)
             else:
                 with torch.no_grad():
-                    for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
-                        ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
+                    for ep, mp in zip(ema_fast.parameters(), _base_model.parameters()):
+                        ep.data.mul_(ema_decay_fast).add_(mp.data, alpha=1 - ema_decay_fast)
+                    for ep, mp in zip(ema_slow.parameters(), _base_model.parameters()):
+                        ep.data.mul_(ema_decay_slow).add_(mp.data, alpha=1 - ema_decay_slow)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -858,7 +863,7 @@ for epoch in range(MAX_EPOCHS):
     prev_surf_loss = epoch_surf
 
     # --- Validate across all splits ---
-    eval_model = ema_model if ema_model is not None else model
+    eval_model = ema_fast if ema_fast is not None else model
     eval_model.eval()
     model.eval()
     val_metrics_per_split: dict[str, dict] = {}
@@ -919,6 +924,11 @@ for epoch in range(MAX_EPOCHS):
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
+                if ema_slow is not None:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        pred_slow = ema_slow({"x": x})["preds"]
+                    pred_slow = pred_slow.float()
+                    pred = 0.6 * pred + 0.4 * pred_slow
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
@@ -1015,7 +1025,7 @@ for epoch in range(MAX_EPOCHS):
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
-        save_model = ema_model if ema_model is not None else model
+        save_model = ema_fast if ema_fast is not None else model
         torch.save(save_model.state_dict(), model_path)
         tag = f" * -> {model_path}"
 
@@ -1049,7 +1059,7 @@ if best_metrics:
     wandb.summary.update({"best_" + k: v for k, v in best_metrics.items()})
 
     print("\nGenerating flow field plots...")
-    vis_model = ema_model if ema_model is not None else model
+    vis_model = ema_fast if ema_fast is not None else model
     vis_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     vis_model.eval()
     plot_dir = Path("plots") / run.id
