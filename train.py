@@ -751,6 +751,13 @@ for epoch in range(MAX_EPOCHS):
         surf_loss = (surf_per_sample * tandem_boost).mean()
         loss = vol_loss + surf_weight * surf_loss
 
+        # Cosine similarity profile loss: penalizes shape distortion of surface pressure profile
+        surf_p_pred = pred[:, :, 2] * is_surface.float()
+        surf_p_true = y_norm[:, :, 2] * is_surface.float()
+        cos_sim = F.cosine_similarity(surf_p_pred, surf_p_true, dim=1)
+        profile_loss = (1 - cos_sim).mean()
+        loss = loss + 0.1 * profile_loss
+
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
         coarse_pool_size = 64
@@ -800,8 +807,8 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + 0.1 * profile_loss
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + 0.1 * profile_loss
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
