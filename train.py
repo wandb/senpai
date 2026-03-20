@@ -654,8 +654,11 @@ for epoch in range(MAX_EPOCHS):
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
-        dist_surf = x[:, :, 2:10].abs().min(dim=-1, keepdim=True).values  # [B, N, 1]
-        dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+        dsdf_channels = x[:, :, 2:10]  # [B, N, 8]
+        abs_dsdf = dsdf_channels.abs()
+        min_idx = abs_dsdf.min(dim=-1, keepdim=True).indices
+        signed_dist = torch.gather(dsdf_channels, -1, min_idx)  # [B, N, 1] — signed!
+        dist_feat = torch.sign(signed_dist) * torch.log1p(signed_dist.abs() * 10.0)
         x = torch.cat([x, curv, dist_feat], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
@@ -884,8 +887,11 @@ for epoch in range(MAX_EPOCHS):
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
-                dist_surf = x[:, :, 2:10].abs().min(dim=-1, keepdim=True).values  # [B, N, 1]
-                dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+                dsdf_channels = x[:, :, 2:10]  # [B, N, 8]
+                abs_dsdf = dsdf_channels.abs()
+                min_idx = abs_dsdf.min(dim=-1, keepdim=True).indices
+                signed_dist = torch.gather(dsdf_channels, -1, min_idx)  # [B, N, 1] — signed!
+                dist_feat = torch.sign(signed_dist) * torch.log1p(signed_dist.abs() * 10.0)
                 x = torch.cat([x, curv, dist_feat], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
