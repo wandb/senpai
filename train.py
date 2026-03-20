@@ -413,7 +413,7 @@ MAX_EPOCHS = 100
 class Config:
     lr: float = 2.6e-3
     weight_decay: float = 0.0
-    batch_size: int = 4
+    batch_size: int = 3
     surf_weight: float = 20.0
     manifest: str = "data/split_manifest.json"
     stats_file: str = "data/split_stats.json"
@@ -622,6 +622,7 @@ ema_val_loss = float("inf")
 ema_decay_val = 0.9
 best_metrics = {}
 global_step = 0
+accum_steps = 2  # gradient accumulation: effective batch = batch_size * accum_steps = 6
 train_start = time.time()
 prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
@@ -644,6 +645,7 @@ for epoch in range(MAX_EPOCHS):
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
+    batch_idx = 0
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     for x, y, is_surface, mask in pbar:
@@ -790,62 +792,29 @@ for epoch in range(MAX_EPOCHS):
         is_indist_pcgrad = ~is_ood_pcgrad
         use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
 
-        if use_pcgrad:
-            n_a = is_indist_pcgrad.float().sum().clamp(min=1)
-            n_b = is_ood_pcgrad.float().sum().clamp(min=1)
-            vol_mask_a = vol_mask_train & is_indist_pcgrad.unsqueeze(1)
-            vol_mask_b = vol_mask_train & is_ood_pcgrad.unsqueeze(1)
-            vol_loss_a = (abs_err * vol_mask_a.unsqueeze(-1)).sum() / vol_mask_a.sum().clamp(min=1)
-            vol_loss_b = (abs_err * vol_mask_b.unsqueeze(-1)).sum() / vol_mask_b.sum().clamp(min=1)
-            surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
-            surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
-            coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-
+        # Gradient accumulation: zero at start of accumulation window
+        # PCGrad disabled for accumulation compatibility (retain_graph conflicts with accum)
+        if batch_idx % accum_steps == 0:
             optimizer.zero_grad()
-            loss_a.backward(retain_graph=True)
-            grads_a = [p.grad.clone() if p.grad is not None else None
-                       for p in model.parameters()]
-            optimizer.zero_grad()
-            loss_b.backward()
+        (loss / accum_steps).backward()
 
-            ga_flat = torch.cat([g.view(-1) for g in grads_a if g is not None])
-            gb_flat = torch.cat([p.grad.view(-1) for p in model.parameters() if p.grad is not None])
-            dot_ab = (ga_flat @ gb_flat).item()
-            gb_ns = float((gb_flat @ gb_flat).item()) + 1e-8
-            ga_ns = float((ga_flat @ ga_flat).item()) + 1e-8
-            for p, ga in zip(model.parameters(), grads_a):
-                gb = p.grad
-                if ga is None and gb is None:
-                    continue
-                if ga is None:
-                    pass  # keep gb
-                elif gb is None:
-                    p.grad = ga
-                elif dot_ab < 0:
-                    p.grad = ((ga - (dot_ab / gb_ns) * gb) + (gb - (dot_ab / ga_ns) * ga)) * 0.5
+        if (batch_idx + 1) % accum_steps == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            if epoch >= ema_start_epoch:
+                if ema_model is None:
+                    ema_model = deepcopy(_base_model)
                 else:
-                    p.grad = (ga + gb) * 0.5
-        else:
-            optimizer.zero_grad()
-            loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        if epoch >= ema_start_epoch:
-            if ema_model is None:
-                ema_model = deepcopy(_base_model)
-            else:
-                with torch.no_grad():
-                    for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
-                        ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
-        global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
+                            ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
+            global_step += 1
+            wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
         n_batches += 1
+        batch_idx += 1
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
