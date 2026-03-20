@@ -211,7 +211,7 @@ class TransolverBlock(nn.Module):
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         self.spatial_bias = nn.Sequential(
-            nn.Linear(4, 64), nn.GELU(),
+            nn.Linear(5, 64), nn.GELU(),
             nn.Linear(64, 64), nn.GELU(),
             nn.Linear(64, slice_num),
         )
@@ -377,7 +377,9 @@ class Transolver(nn.Module):
 
         x_cross = x * self.feature_cross(x)
         x = x + 0.1 * x_cross  # residual with small scale
-        raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)  # x, y, curvature, dist
+        saf_magnitude = x[:, :, 2:4].norm(dim=-1, keepdim=True)  # saf magnitude as zone proxy
+        zone_proxy = torch.log1p(saf_magnitude)  # higher near surface, lower in far-field
+        raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26], zone_proxy], dim=-1)  # x, y, curv, dist, zone
 
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
