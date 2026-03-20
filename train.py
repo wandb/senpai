@@ -533,6 +533,9 @@ model = Transolver(**model_config).to(device)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode="default")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+# Start with sharp temperature (0.1), will warm to 0.5 over epochs 0-14
+with torch.no_grad():
+    _base_model.blocks[0].attn.temperature.data.fill_(0.1)
 
 from copy import deepcopy
 ema_model = None
@@ -847,6 +850,11 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
+    if epoch < 15:
+        # Warm temperature from 0.1 to 0.5 over epochs 0-14 (sharp→moderate)
+        target_temp = 0.1 + (0.5 - 0.1) * (epoch / 14.0)
+        with torch.no_grad():
+            _base_model.blocks[0].attn.temperature.data.clamp_(min=0.1, max=target_temp)
     if epoch >= 50:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
