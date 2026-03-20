@@ -325,7 +325,7 @@ class Transolver(nn.Module):
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             if module.weight.dim() >= 2:
-                nn.init.orthogonal_(module.weight, gain=1.0)
+                nn.init.orthogonal_(module.weight, gain=0.8)
             else:
                 nn.init.normal_(module.weight, std=0.01)
             if module.bias is not None:
@@ -577,7 +577,7 @@ base_opt = torch.optim.AdamW([
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.2, total_iters=10)
+warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.3, total_iters=10)
 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
     base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[10]
