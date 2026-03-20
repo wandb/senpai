@@ -317,7 +317,8 @@ class Transolver(nn.Module):
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
-        self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        self.fourier_freqs_learned = nn.Parameter(torch.tensor([2.0, 5.0, 10.0, 20.0]))
+        self.fourier_freqs_learned.requires_grad_(False)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
