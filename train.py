@@ -786,7 +786,7 @@ for epoch in range(MAX_EPOCHS):
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
         is_indist_pcgrad = ~is_ood_pcgrad
-        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
+        use_pcgrad = (epoch >= 20) and is_indist_pcgrad.any() and is_ood_pcgrad.any()
 
         if use_pcgrad:
             n_a = is_indist_pcgrad.float().sum().clamp(min=1)
