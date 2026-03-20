@@ -291,6 +291,7 @@ class Transolver(nn.Module):
         self.space_dim = space_dim
         self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
         nn.init.eye_(self.feature_cross.weight)  # start as identity
+        self.feature_cross.weight.requires_grad_(False)
         self.blocks = nn.ModuleList(
             [
                 TransolverBlock(
@@ -376,7 +377,7 @@ class Transolver(nn.Module):
             x = torch.cat((x, new_pos), dim=-1)
 
         x_cross = x * self.feature_cross(x)
-        x = x + 0.1 * x_cross  # residual with small scale
+        x = x + 0.2 * x_cross  # residual with small scale
         raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)  # x, y, curvature, dist
 
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
