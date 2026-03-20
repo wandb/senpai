@@ -789,14 +789,24 @@ for epoch in range(MAX_EPOCHS):
         use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
 
         if use_pcgrad:
-            n_a = is_indist_pcgrad.float().sum().clamp(min=1)
+            # Identify ood_cond-like samples (extreme AoA) within Group A
+            is_ood_cond_in_A = (x[:, 0, 14].abs() > 1.0) & is_indist_pcgrad  # extreme AoA but in Group A
+
+            # Create per-sample weights for Group A
+            w_a = torch.ones(x.shape[0], device=device)
+            w_a[is_ood_cond_in_A] = 2.0  # 2x weight for ood_cond samples
+
             n_b = is_ood_pcgrad.float().sum().clamp(min=1)
-            vol_mask_a = vol_mask_train & is_indist_pcgrad.unsqueeze(1)
             vol_mask_b = vol_mask_train & is_ood_pcgrad.unsqueeze(1)
-            vol_loss_a = (abs_err * vol_mask_a.unsqueeze(-1)).sum() / vol_mask_a.sum().clamp(min=1)
             vol_loss_b = (abs_err * vol_mask_b.unsqueeze(-1)).sum() / vol_mask_b.sum().clamp(min=1)
-            surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
+
+            # Weighted Group A loss
+            weighted_indist = is_indist_pcgrad.float() * w_a
+            n_a_weighted = weighted_indist.sum().clamp(min=1)
+            surf_loss_a = (surf_per_sample * weighted_indist * tandem_boost).sum() / n_a_weighted
+            vol_mask_a = vol_mask_train & is_indist_pcgrad.unsqueeze(1)
+            vol_loss_a = (abs_err * (vol_mask_a.float() * w_a.unsqueeze(1)).unsqueeze(-1)).sum() / (vol_mask_a.float() * w_a.unsqueeze(1)).sum().clamp(min=1)
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
             loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
             loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
