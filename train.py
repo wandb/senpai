@@ -143,8 +143,10 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout),
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
+        self.pos_to_qk = nn.Linear(4, self.dim_head, bias=False)
+        nn.init.normal_(self.pos_to_qk.weight, std=0.01)
 
-    def forward(self, x, spatial_bias=None, tandem_mask=None):
+    def forward(self, x, spatial_bias=None, tandem_mask=None, raw_xy=None):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -170,9 +172,18 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
 
-        q_slice_token = self.to_q(slice_token)
+        # Sinusoidal PE from per-slice spatial centroids
+        if raw_xy is not None:
+            slice_centroid = torch.einsum("bhng,bnd->bhgd", slice_weights, raw_xy[:, :, :2])  # [B, H, G, 2]
+            slice_centroid = slice_centroid / (slice_norm.unsqueeze(-1) + 1e-5)
+            pos_enc = torch.cat([slice_centroid.sin(), slice_centroid.cos()], dim=-1)  # [B, H, G, 4]
+            pos_proj = self.pos_to_qk(pos_enc)  # [B, H, G, dim_head]
+        else:
+            pos_proj = None
+
+        q_slice_token = self.to_q(slice_token) + (pos_proj if pos_proj is not None else 0)
         slice_token_kv = slice_token.mean(dim=1, keepdim=True)  # shared K,V: (bsz, 1, slice_num, dim_head)
-        k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
+        k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1) + (pos_proj if pos_proj is not None else 0)
         v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
         q_norm = F.normalize(q_slice_token, dim=-1)
         k_norm = F.normalize(k_slice_token, dim=-1)
@@ -233,7 +244,8 @@ class TransolverBlock(nn.Module):
 
     def forward(self, fx, raw_xy=None, tandem_mask=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
+        xy2d = raw_xy[:, :, :2] if raw_xy is not None else None
+        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask, raw_xy=xy2d) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
