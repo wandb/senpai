@@ -784,9 +784,9 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
-        # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
-        # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
-        is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
+        # PCGrad: in-dist (Group A) vs tandem-only (Group B) gradient projection
+        # Group B = tandem only, Group A = rest (in-dist + OOD cond/Re)
+        is_ood_pcgrad = is_tandem_batch
         is_indist_pcgrad = ~is_ood_pcgrad
         use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
 
@@ -849,6 +849,41 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
+
+    # Error-based curriculum: update sampler weights after epoch 25, every 5 epochs
+    if epoch >= 25 and (epoch - 25) % 5 == 0 and not cfg.debug:
+        model.eval()
+        sample_losses = torch.zeros(len(train_ds), device='cpu')
+        with torch.no_grad():
+            for idx in range(len(train_ds)):
+                s_x, s_y, s_is_surf = train_ds[idx]
+                s_x = s_x.unsqueeze(0).to(device)
+                s_y = s_y.unsqueeze(0).to(device)
+                s_mask = torch.ones(1, s_x.shape[1], dtype=torch.bool, device=device)
+                s_x_n = (s_x - stats["x_mean"]) / stats["x_std"]
+                curv = s_x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * s_is_surf.unsqueeze(0).to(device).float().unsqueeze(-1)
+                dist_s = s_x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
+                dist_f = torch.log1p(dist_s * 10.0)
+                s_x_n = torch.cat([s_x_n, curv, dist_f], dim=-1)
+                raw_xy = s_x_n[:, :, :2]
+                xy_min = raw_xy.amin(dim=1, keepdim=True)
+                xy_max = raw_xy.amax(dim=1, keepdim=True)
+                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                s_x_n = torch.cat([s_x_n, fourier_pe], dim=-1)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    pred = model({"x": s_x_n})["preds"].float()
+                loss_i = (pred.squeeze(0) - s_y.to(device)).abs().mean()
+                sample_losses[idx] = loss_i.cpu()
+        # Boost: 1.5x for above-median loss samples
+        median_loss = sample_losses.median()
+        new_weights = torch.where(sample_losses > median_loss, sample_losses * 1.5, sample_losses)
+        new_weights = new_weights / new_weights.sum() * len(train_ds)
+        sampler.weights = new_weights.double()
+        model.train()
+
     if epoch >= 50:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
