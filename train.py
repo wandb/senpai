@@ -861,6 +861,7 @@ for epoch in range(MAX_EPOCHS):
     eval_model = ema_model if ema_model is not None else model
     eval_model.eval()
     model.eval()
+    use_ensemble = (ema_model is not None) and (epoch >= 54)
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -917,7 +918,12 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    pred_ema = eval_model({"x": x})["preds"]
+                    if use_ensemble:
+                        pred_fast = model({"x": x})["preds"]
+                        pred = (pred_ema.float() + pred_fast.float()) * 0.5
+                    else:
+                        pred = pred_ema.float()
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
