@@ -137,7 +137,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.to_q = nn.Linear(dim_head, dim_head, bias=False)
         self.to_k = nn.Linear(dim_head, dim_head, bias=False)
         self.to_v = nn.Linear(dim_head, dim_head, bias=False)
-        self.slice_residual_scale = nn.Parameter(torch.tensor(0.1))
+        self.slice_residual_scale = nn.Parameter(torch.tensor(0.2))
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout),
