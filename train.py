@@ -535,9 +535,8 @@ model = torch.compile(model, mode="default")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
-ema_model = None
-ema_start_epoch = 40
-ema_decay = 0.998
+swad_start_epoch = 40
+swad_snapshots = []
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -833,13 +832,6 @@ for epoch in range(MAX_EPOCHS):
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-        if epoch >= ema_start_epoch:
-            if ema_model is None:
-                ema_model = deepcopy(_base_model)
-            else:
-                with torch.no_grad():
-                    for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
-                        ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -858,7 +850,7 @@ for epoch in range(MAX_EPOCHS):
     prev_surf_loss = epoch_surf
 
     # --- Validate across all splits ---
-    eval_model = ema_model if ema_model is not None else model
+    eval_model = _base_model
     eval_model.eval()
     model.eval()
     val_metrics_per_split: dict[str, dict] = {}
@@ -976,6 +968,8 @@ for epoch in range(MAX_EPOCHS):
                                   torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isinf())]
     val_loss_3split = sum(_checkpoint_losses) / max(len(_checkpoint_losses), 1)
     ema_val_loss = val_loss_3split if ema_val_loss == float("inf") else ema_decay_val * ema_val_loss + (1 - ema_decay_val) * val_loss_3split
+    if epoch >= swad_start_epoch:
+        swad_snapshots.append(({k: v.clone() for k, v in _base_model.state_dict().items()}, val_loss_3split))
 
     # 4-split val/loss (all splits including ood_re)
     _4split_losses = [val_metrics_per_split[n][f"{n}/loss"] for n in VAL_SPLIT_NAMES
@@ -1015,8 +1009,7 @@ for epoch in range(MAX_EPOCHS):
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
-        save_model = ema_model if ema_model is not None else model
-        torch.save(save_model.state_dict(), model_path)
+        torch.save(_base_model.state_dict(), model_path)
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
@@ -1029,6 +1022,23 @@ for epoch in range(MAX_EPOCHS):
         f"val[{split_summary}]{tag}"
     )
 
+
+# --- SWAD: find best contiguous window and average weights ---
+if swad_snapshots:
+    best_avg = float('inf')
+    best_start, best_end = 0, len(swad_snapshots)
+    for w in range(3, len(swad_snapshots) + 1):
+        for s in range(len(swad_snapshots) - w + 1):
+            avg = sum(x[1] for x in swad_snapshots[s:s+w]) / w
+            if avg < best_avg:
+                best_avg, best_start, best_end = avg, s, s + w
+    avg_sd = {}
+    n = best_end - best_start
+    for key in swad_snapshots[0][0]:
+        avg_sd[key] = sum(swad_snapshots[i][0][key] for i in range(best_start, best_end)) / n
+    _base_model.load_state_dict(avg_sd)
+    print(f"SWAD: averaged epochs {swad_start_epoch + best_start + 1}–{swad_start_epoch + best_end} "
+          f"(window={n}, avg_val_loss={best_avg:.4f})")
 
 # --- Final summary ---
 total_time = (time.time() - train_start) / 60.0
@@ -1049,7 +1059,7 @@ if best_metrics:
     wandb.summary.update({"best_" + k: v for k, v in best_metrics.items()})
 
     print("\nGenerating flow field plots...")
-    vis_model = ema_model if ema_model is not None else model
+    vis_model = _base_model
     vis_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     vis_model.eval()
     plot_dir = Path("plots") / run.id
