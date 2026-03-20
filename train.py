@@ -627,12 +627,20 @@ prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
+PHASE1_MINUTES = 20.0
+phase = 1
 
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
     if elapsed_min >= MAX_TIMEOUT:
         print(f"Wall-clock limit reached ({elapsed_min:.1f} min >= {MAX_TIMEOUT} min). Stopping.")
         break
+
+    if phase == 1 and elapsed_min >= PHASE1_MINUTES:
+        phase = 2
+        for pg in base_opt.param_groups:
+            pg['lr'] = pg['lr'] * 0.3
+        print(f"PHASE 2: dist_feat active, LR reduced, epoch {epoch+1}")
 
     t0 = time.time()
 
@@ -656,6 +664,8 @@ for epoch in range(MAX_EPOCHS):
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         dist_surf = x[:, :, 2:10].abs().min(dim=-1, keepdim=True).values  # [B, N, 1]
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+        if phase == 1:
+            dist_feat = torch.zeros_like(dist_feat)
         x = torch.cat([x, curv, dist_feat], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
@@ -886,6 +896,8 @@ for epoch in range(MAX_EPOCHS):
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                 dist_surf = x[:, :, 2:10].abs().min(dim=-1, keepdim=True).values  # [B, N, 1]
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+                if phase == 1:
+                    dist_feat = torch.zeros_like(dist_feat)
                 x = torch.cat([x, curv, dist_feat], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
