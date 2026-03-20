@@ -832,6 +832,45 @@ for epoch in range(MAX_EPOCHS):
             loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        # SAM-lite: every 3rd step on non-PCGrad batches
+        sam_rho = 0.05
+        use_sam = (global_step % 3 == 0) and not use_pcgrad and epoch >= 10
+
+        if use_sam:
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
+            if grad_norm > 0:
+                with torch.no_grad():
+                    old_params = []
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            old_params.append(p.data.clone())
+                            eps = sam_rho * p.grad / (grad_norm + 1e-12)
+                            p.data.add_(eps)
+                        else:
+                            old_params.append(None)
+
+                # Step 2: compute gradient at perturbed point
+                optimizer.zero_grad()
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    out2 = model({"x": x.detach()})
+                    pred2 = out2["preds"].float()
+                if model.training:
+                    pred2 = pred2 / sample_stds
+                abs_err2 = (pred2 - y_norm).abs()
+                vol_loss2 = (abs_err2 * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+                surf_per2 = (abs_err2[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+                surf_loss2 = (surf_per2 * tandem_boost).mean()
+                loss2 = vol_loss2 + surf_weight * surf_loss2
+                loss2.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                # Step 3: restore original params, then step with SAM gradient
+                with torch.no_grad():
+                    for p, old_p in zip(model.parameters(), old_params):
+                        if old_p is not None:
+                            p.data.copy_(old_p)
+
         optimizer.step()
         if epoch >= ema_start_epoch:
             if ema_model is None:
