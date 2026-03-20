@@ -776,8 +776,14 @@ for epoch in range(MAX_EPOCHS):
             y_coarse = (y_g * mask_trunc_f).sum(dim=2) / mask_trunc_f.sum(dim=2).clamp(min=1)
             mask_coarse = mask_trunc.reshape(B, n_groups, coarse_pool_size).any(dim=2)
 
+            # Distance-based group weighting: near-surface groups get higher weight
+            dist_sorted = torch.gather(dist_surf.squeeze(-1), 1, sort_idx)[:, :n_groups * coarse_pool_size]
+            dist_g = dist_sorted.reshape(B, n_groups, coarse_pool_size)
+            group_mean_dist = (dist_g * mask_trunc.reshape(B, n_groups, coarse_pool_size).float()).sum(dim=2) / mask_trunc.reshape(B, n_groups, coarse_pool_size).float().sum(dim=2).clamp(min=1)
+            coarse_group_weight = (1.0 + 2.0 * torch.exp(-group_mean_dist * 3.0)).unsqueeze(-1)  # [B, G, 1]
+
             coarse_err = (pred_coarse - y_coarse).abs()
-            coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
+            coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1) * coarse_group_weight).sum() / (mask_coarse.unsqueeze(-1) * coarse_group_weight).sum().clamp(min=1)
             _coarse_loss = coarse_loss
             loss = loss + 1.0 * coarse_loss
 
