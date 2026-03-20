@@ -694,6 +694,7 @@ for epoch in range(MAX_EPOCHS):
                     sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
                 else:
                     sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+            sample_stds[:, :, 0:2] = 1.0  # skip velocity normalization, keep only pressure std
             y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -914,6 +915,7 @@ for epoch in range(MAX_EPOCHS):
                         sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
                     else:
                         sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+                sample_stds[:, :, 0:2] = 1.0  # skip velocity normalization, keep only pressure std
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
