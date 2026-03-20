@@ -575,7 +575,7 @@ other_params = [p for n, p in model.named_parameters() if not any(k in n for k i
 base_opt = torch.optim.AdamW([
     {'params': attn_params, 'lr': cfg.lr * 0.5},
     {'params': other_params, 'lr': cfg.lr}
-], weight_decay=cfg.weight_decay)
+], weight_decay=cfg.weight_decay, betas=(0.85, 0.999))
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.2, total_iters=10)
 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
