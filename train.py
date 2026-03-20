@@ -20,6 +20,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     Tandem surface loss is therefore underweighted.
 """
 
+import numpy as np
 import os
 import time
 from collections.abc import Mapping
@@ -693,6 +694,21 @@ for epoch in range(MAX_EPOCHS):
                 else:
                     sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
             y_norm = y_norm / sample_stds
+
+        if model.training and epoch >= 5:
+            # Mixup: only mix non-tandem samples (tandem has different geometry)
+            non_tandem = ~is_tandem  # [B]
+            non_tandem_idx = non_tandem.nonzero(as_tuple=True)[0]
+            if len(non_tandem_idx) >= 2:
+                lam = np.random.beta(0.3, 0.3)
+                # Shuffle non-tandem indices
+                perm = non_tandem_idx[torch.randperm(len(non_tandem_idx), device=device)]
+                # Mix features and targets for non-tandem samples
+                x[non_tandem_idx] = lam * x[non_tandem_idx] + (1 - lam) * x[perm]
+                y_norm[non_tandem_idx] = lam * y_norm[non_tandem_idx] + (1 - lam) * y_norm[perm]
+                # For masks: use intersection (only nodes valid in both samples)
+                mask[non_tandem_idx] = mask[non_tandem_idx] & mask[perm]
+                is_surface[non_tandem_idx] = is_surface[non_tandem_idx] & is_surface[perm]
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model({"x": x})
