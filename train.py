@@ -661,8 +661,11 @@ for epoch in range(MAX_EPOCHS):
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
-        xy_min = raw_xy.amin(dim=1, keepdim=True)
-        xy_max = raw_xy.amax(dim=1, keepdim=True)
+        xy_for_range = raw_xy.clone()
+        xy_for_range[~mask] = float('inf')
+        xy_min = xy_for_range.amin(dim=1, keepdim=True)
+        xy_for_range[~mask] = float('-inf')
+        xy_max = xy_for_range.amax(dim=1, keepdim=True)
         xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
         freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
@@ -895,8 +898,11 @@ for epoch in range(MAX_EPOCHS):
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
-                xy_min = raw_xy.amin(dim=1, keepdim=True)
-                xy_max = raw_xy.amax(dim=1, keepdim=True)
+                xy_for_range = raw_xy.clone()
+                xy_for_range[~mask] = float('inf')
+                xy_min = xy_for_range.amin(dim=1, keepdim=True)
+                xy_for_range[~mask] = float('-inf')
+                xy_max = xy_for_range.amax(dim=1, keepdim=True)
                 xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
                 freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
