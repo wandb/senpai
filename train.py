@@ -469,9 +469,9 @@ def _phys_norm(y, Umag, q):
 def _phys_denorm(y_p, Umag, q):
     """Reverse physics normalization: Ux/Umag→Ux, Uy/Umag→Uy, Cp→p."""
     y = y_p.clone()
-    y[:, :, 0:1] = y_p[:, :, 0:1].clamp(-10, 10) * Umag
-    y[:, :, 1:2] = y_p[:, :, 1:2].clamp(-10, 10) * Umag
-    y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
+    y[:, :, 0:1] = y_p[:, :, 0:1].clamp(-5, 5) * Umag
+    y[:, :, 1:2] = y_p[:, :, 1:2].clamp(-5, 5) * Umag
+    y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-10, 10) * q
     return y
 
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
