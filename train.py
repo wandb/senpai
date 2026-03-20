@@ -318,6 +318,7 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        self.dist_gate = nn.Parameter(torch.tensor(-2.0))  # sigmoid(-2.0) ≈ 0.12, starts nearly closed
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -656,6 +657,7 @@ for epoch in range(MAX_EPOCHS):
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         dist_surf = x[:, :, 2:10].abs().min(dim=-1, keepdim=True).values  # [B, N, 1]
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+        dist_feat = dist_feat * torch.sigmoid(model.dist_gate)
         x = torch.cat([x, curv, dist_feat], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
@@ -886,6 +888,7 @@ for epoch in range(MAX_EPOCHS):
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                 dist_surf = x[:, :, 2:10].abs().min(dim=-1, keepdim=True).values  # [B, N, 1]
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+                dist_feat = dist_feat * torch.sigmoid(model.dist_gate)
                 x = torch.cat([x, curv, dist_feat], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
