@@ -741,7 +741,7 @@ for epoch in range(MAX_EPOCHS):
             surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
             surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
             surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
-            thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
+            thresh = torch.nanquantile(surf_pres_masked.nan_to_num(0.0), 0.75, dim=1)  # [B]
             thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
             hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
