@@ -628,6 +628,17 @@ prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
 
+# Precompute boosted weights for curriculum phase (tandem 2x, extreme Re 1.5x)
+if not cfg.debug:
+    boosted_weights = sample_weights.clone()
+    for idx in range(len(train_ds)):
+        x_i, _, _ = train_ds[idx]
+        if x_i[0, 21].abs() > 0.01:  # tandem sample (NACA1[2] != 0)
+            boosted_weights[idx] *= 2.0
+        re_val = x_i[0, 13].item()  # log(Re) normalized
+        if abs(re_val) > 1.0:  # extreme Re
+            boosted_weights[idx] *= 1.5
+
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
     if elapsed_min >= MAX_TIMEOUT:
@@ -635,6 +646,11 @@ for epoch in range(MAX_EPOCHS):
         break
 
     t0 = time.time()
+
+    # At epoch 20, switch to difficulty-boosted sampler
+    if epoch == 20 and not cfg.debug:
+        sampler = WeightedRandomSampler(boosted_weights, len(train_ds), replacement=True)
+        train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, sampler=sampler, **loader_kwargs)
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
