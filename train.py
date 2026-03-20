@@ -142,7 +142,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout),
         )
-        self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
+        self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 5.0)
 
     def forward(self, x, spatial_bias=None, tandem_mask=None):
         bsz, num_points, _ = x.shape
