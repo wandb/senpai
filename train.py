@@ -753,7 +753,7 @@ for epoch in range(MAX_EPOCHS):
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
-        coarse_pool_size = 64
+        coarse_pool_size = 48
         B, N, C = pred.shape
         n_groups = N // coarse_pool_size
         if n_groups > 1:
