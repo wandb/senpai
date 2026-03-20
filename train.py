@@ -557,9 +557,14 @@ class Lookahead:
         self.base_optimizer.step()
         self.step_count += 1
         if self.step_count % self.k == 0:
+            current_lr = self.base_optimizer.param_groups[0]['lr']
             for slow, group in zip(self.slow_params, self.base_optimizer.param_groups):
                 for s, p in zip(slow, group['params']):
                     s.data.add_(self.alpha * (p.data - s.data))
+                    # Stochastic perturbation scaled by LR (decays naturally)
+                    if s.dim() >= 2:  # only perturb weight matrices, not biases
+                        noise = torch.randn_like(s.data) * current_lr * 0.1
+                        s.data.add_(noise)
                     p.data.copy_(s.data)
 
     def zero_grad(self):
