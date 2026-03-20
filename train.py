@@ -660,8 +660,12 @@ for epoch in range(MAX_EPOCHS):
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
-        xy_min = raw_xy.amin(dim=1, keepdim=True)
-        xy_max = raw_xy.amax(dim=1, keepdim=True)
+        # Mask out padding before computing min/max to avoid contamination
+        big_val = 1e6
+        xy_for_min = raw_xy.where(mask.unsqueeze(-1), torch.full_like(raw_xy, big_val))
+        xy_for_max = raw_xy.where(mask.unsqueeze(-1), torch.full_like(raw_xy, -big_val))
+        xy_min = xy_for_min.amin(dim=1, keepdim=True)
+        xy_max = xy_for_max.amax(dim=1, keepdim=True)
         xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
         freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
@@ -890,8 +894,12 @@ for epoch in range(MAX_EPOCHS):
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
-                xy_min = raw_xy.amin(dim=1, keepdim=True)
-                xy_max = raw_xy.amax(dim=1, keepdim=True)
+                # Mask out padding before computing min/max
+                big_val = 1e6
+                xy_for_min = raw_xy.where(mask.unsqueeze(-1), torch.full_like(raw_xy, big_val))
+                xy_for_max = raw_xy.where(mask.unsqueeze(-1), torch.full_like(raw_xy, -big_val))
+                xy_min = xy_for_min.amin(dim=1, keepdim=True)
+                xy_max = xy_for_max.amax(dim=1, keepdim=True)
                 xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
                 freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
