@@ -219,8 +219,8 @@ class TransolverBlock(nn.Module):
         nn.init.zeros_(self.spatial_bias[-1].bias)
         self.ln_1_post = nn.LayerNorm(hidden_dim)
         self.ln_2_post = nn.LayerNorm(hidden_dim)
-        self.se_fc1 = nn.Linear(hidden_dim, hidden_dim // 4)
-        self.se_fc2 = nn.Linear(hidden_dim // 4, hidden_dim)
+        self.se_fc1 = nn.Linear(hidden_dim, hidden_dim // 8)
+        self.se_fc2 = nn.Linear(hidden_dim // 8, hidden_dim)
         nn.init.zeros_(self.se_fc2.weight)
         nn.init.zeros_(self.se_fc2.bias)
         if self.last_layer:
