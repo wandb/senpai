@@ -524,7 +524,7 @@ model_config = dict(
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
     n_head=3,
     slice_num=48,  # regime-h: more slices for finer spatial decomposition
-    mlp_ratio=2,
+    mlp_ratio=3,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
 )
