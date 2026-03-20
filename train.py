@@ -41,6 +41,8 @@ from data.utils import visualize
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
 
 torch.set_float32_matmul_precision('high')
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
 
 
 # ---------------------------------------------------------------------------
@@ -710,7 +712,7 @@ for epoch in range(MAX_EPOCHS):
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         if epoch < 10:
-            is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
+            is_tandem_curr = (x[:, 0, 21].abs() > 0.5)  # gap feature, same threshold as line 685
             sample_mask = (~is_tandem_curr).float()[:, None, None]
             abs_err = abs_err * sample_mask
         vol_mask = mask & ~is_surface
