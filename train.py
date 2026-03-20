@@ -670,7 +670,9 @@ for epoch in range(MAX_EPOCHS):
         x = torch.cat([x, fourier_pe], dim=-1)
         if model.training and epoch < 60:
             noise_scale = 0.05 * (1 - epoch / 60)
-            x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
+            input_noise = noise_scale * torch.randn_like(x[:, :, 2:25])
+            input_noise = input_noise * mask.unsqueeze(-1).float()  # zero noise on padded positions
+            x[:, :, 2:25] = x[:, :, 2:25] + input_noise
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
