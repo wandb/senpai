@@ -211,7 +211,7 @@ class TransolverBlock(nn.Module):
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         self.spatial_bias = nn.Sequential(
-            nn.Linear(4, 64), nn.GELU(),
+            nn.Linear(3, 64), nn.GELU(),
             nn.Linear(64, 64), nn.GELU(),
             nn.Linear(64, slice_num),
         )
@@ -377,7 +377,7 @@ class Transolver(nn.Module):
 
         x_cross = x * self.feature_cross(x)
         x = x + 0.1 * x_cross  # residual with small scale
-        raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)  # x, y, curvature, dist
+        raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:25]], dim=-1)  # x, y, curvature
 
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
@@ -518,7 +518,7 @@ print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + 32,  # +1 curv, +1 dist_feat, +32 fourier PE
+    fun_dim=X_DIM - 2 + 1 + 32,  # +1 curv, +32 fourier PE (no dist_feat)
     out_dim=3,
     n_hidden=192,  # regime-w: full width with finer routing
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
@@ -654,9 +654,7 @@ for epoch in range(MAX_EPOCHS):
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
-        dist_surf = x[:, :, 2:10].abs().min(dim=-1, keepdim=True).values  # [B, N, 1]
-        dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
-        x = torch.cat([x, curv, dist_feat], dim=-1)
+        x = torch.cat([x, curv], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -884,9 +882,7 @@ for epoch in range(MAX_EPOCHS):
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
-                dist_surf = x[:, :, 2:10].abs().min(dim=-1, keepdim=True).values  # [B, N, 1]
-                dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
-                x = torch.cat([x, curv, dist_feat], dim=-1)
+                x = torch.cat([x, curv], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -1065,9 +1061,7 @@ if best_metrics:
                 mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
                 x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                 curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
-                dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
-                dist_feat = torch.log1p(dist_surf * 10.0)
-                x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                x_n = torch.cat([x_n, curv], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
