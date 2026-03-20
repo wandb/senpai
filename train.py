@@ -730,7 +730,10 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_mask_train = vol_mask
 
-        vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+        # Distance-based weighting: nodes closer to surface get higher weight
+        # dist_surf is [B, N, 1], already computed from raw dsdf
+        vol_dist_weight = 1.0 + 2.0 * torch.exp(-dist_surf * 5.0)  # peaks at 3.0 near surface, 1.0 far away
+        vol_loss = (abs_err * vol_mask_train.unsqueeze(-1) * vol_dist_weight).sum() / (vol_mask_train.unsqueeze(-1) * vol_dist_weight).sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
         surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
