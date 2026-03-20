@@ -654,6 +654,7 @@ for epoch in range(MAX_EPOCHS):
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+        curv_raw = curv[:, :, 0].detach()  # [B, N], 0 for non-surface; saved for loss weighting
         x = torch.cat([x, curv], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
@@ -729,7 +730,11 @@ for epoch in range(MAX_EPOCHS):
 
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        # Curvature-based surface weights: [1, 3] range for surface nodes, 1 for non-surface
+        curv_max = curv_raw.amax(dim=1, keepdim=True).clamp(min=1e-5)  # per-sample max
+        curv_weight = 1.0 + 2.0 * (curv_raw / curv_max)  # [B, N], range [1,3] for surface, 1 for non-surf
+        curv_surf_mean = (curv_weight * surf_mask.float()).sum(dim=1) / surf_mask.float().sum(dim=1).clamp(min=1)  # [B]
+        surf_per_sample = (abs_err[:, :, 2:3] * curv_weight.unsqueeze(-1) * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / (surf_mask.float().sum(dim=1) * curv_surf_mean).clamp(min=1)
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
@@ -742,8 +747,11 @@ for epoch in range(MAX_EPOCHS):
             thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
             thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
             hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
-            hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
-            surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            # Combined weight: hard-node × curvature, normalized to keep magnitude stable
+            hard_w = (hard_mask.float() * 0.5 + 1.0)  # [B, N], 1.5 hard / 1.0 else
+            combined_w = curv_weight * hard_w  # [B, N]
+            combined_w_mean = (combined_w * surf_mask.float()).sum(dim=1) / surf_mask.float().sum(dim=1).clamp(min=1)  # [B]
+            surf_per_sample = (surf_pres_flat * combined_w * surf_mask.float()).sum(dim=1) / (surf_mask.float().sum(dim=1) * combined_w_mean).clamp(min=1)
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
