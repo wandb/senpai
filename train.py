@@ -40,6 +40,8 @@ import simple_parsing as sp
 from data.utils import visualize
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
 
+torch.set_float32_matmul_precision('high')
+
 
 # ---------------------------------------------------------------------------
 # Transolver model (inlined so students can
@@ -56,6 +58,36 @@ ACTIVATION = {
     "ELU": nn.ELU,
     "silu": nn.SiLU,
 }
+
+
+class GatedMLP(nn.Module):
+    def __init__(self, n_input, n_hidden, n_output, act='gelu'):
+        super().__init__()
+        act_fn = ACTIVATION[act]
+        self.gate_proj = nn.Linear(n_input, n_hidden)
+        self.up_proj = nn.Linear(n_input, n_hidden)
+        self.down_proj = nn.Linear(n_hidden, n_output)
+        self.act = act_fn()
+    def forward(self, x):
+        return self.down_proj(torch.sigmoid(self.gate_proj(x)) * self.act(self.up_proj(x)))
+
+
+class GatedMLP2(nn.Module):
+    """GatedMLP with a residual second gated layer."""
+    def __init__(self, n_input, n_hidden, n_output, act='gelu'):
+        super().__init__()
+        act_fn = ACTIVATION[act]
+        self.gate1 = nn.Linear(n_input, n_hidden)
+        self.up1 = nn.Linear(n_input, n_hidden)
+        self.gate2 = nn.Linear(n_hidden, n_hidden)
+        self.up2 = nn.Linear(n_hidden, n_hidden)
+        self.down = nn.Linear(n_hidden, n_output)
+        self.act = act_fn()
+
+    def forward(self, x):
+        h = torch.sigmoid(self.gate1(x)) * self.act(self.up1(x))
+        h = h + torch.sigmoid(self.gate2(h)) * self.act(self.up2(h))
+        return self.down(h)
 
 
 class MLP(nn.Module):
@@ -96,6 +128,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
         self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
+        self.tandem_temp_offset = nn.Parameter(torch.zeros(1, heads, 1, 1))
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
@@ -104,12 +137,14 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.to_q = nn.Linear(dim_head, dim_head, bias=False)
         self.to_k = nn.Linear(dim_head, dim_head, bias=False)
         self.to_v = nn.Linear(dim_head, dim_head, bias=False)
+        self.slice_residual_scale = nn.Parameter(torch.tensor(0.1))
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout),
         )
+        self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
 
-    def forward(self, x):
+    def forward(self, x, spatial_bias=None, tandem_mask=None):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -124,22 +159,27 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             .permute(0, 2, 1, 3)
             .contiguous()
         )
-        slice_weights = self.softmax(self.in_project_slice(x_mid) / self.temperature)
+        temp = self.temperature
+        if tandem_mask is not None:
+            temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
+        slice_logits = self.in_project_slice(x_mid) / temp
+        if spatial_bias is not None:
+            slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
+        slice_weights = self.softmax(slice_logits)
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
 
         q_slice_token = self.to_q(slice_token)
-        k_slice_token = self.to_k(slice_token)
-        v_slice_token = self.to_v(slice_token)
-        dropout_p = self.dropout.p if self.training else 0.0
-        out_slice_token = F.scaled_dot_product_attention(
-            q_slice_token,
-            k_slice_token,
-            v_slice_token,
-            dropout_p=dropout_p,
-            is_causal=False,
-        )
+        slice_token_kv = slice_token.mean(dim=1, keepdim=True)  # shared K,V: (bsz, 1, slice_num, dim_head)
+        k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
+        v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
+        q_norm = F.normalize(q_slice_token, dim=-1)
+        k_norm = F.normalize(k_slice_token, dim=-1)
+        attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
+        attn_weights = F.softmax(attn_logits, dim=-1)
+        out_slice_token = torch.matmul(attn_weights, v_slice_token)
+        out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
 
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
@@ -170,6 +210,19 @@ class TransolverBlock(nn.Module):
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        self.spatial_bias = nn.Sequential(
+            nn.Linear(4, 64), nn.GELU(),
+            nn.Linear(64, 64), nn.GELU(),
+            nn.Linear(64, slice_num),
+        )
+        nn.init.zeros_(self.spatial_bias[-1].weight)
+        nn.init.zeros_(self.spatial_bias[-1].bias)
+        self.ln_1_post = nn.LayerNorm(hidden_dim)
+        self.ln_2_post = nn.LayerNorm(hidden_dim)
+        self.se_fc1 = nn.Linear(hidden_dim, hidden_dim // 4)
+        self.se_fc2 = nn.Linear(hidden_dim // 4, hidden_dim)
+        nn.init.zeros_(self.se_fc2.weight)
+        nn.init.zeros_(self.se_fc2.bias)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
             self.mlp2 = nn.Sequential(
@@ -178,9 +231,14 @@ class TransolverBlock(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-    def forward(self, fx):
-        fx = self.attn(self.ln_1(fx)) + fx
-        fx = self.mlp(self.ln_2(fx)) + fx
+    def forward(self, fx, raw_xy=None, tandem_mask=None):
+        sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
+        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
+        fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
+        se = fx.mean(dim=1, keepdim=True)
+        se = F.gelu(self.se_fc1(se))
+        se = torch.sigmoid(self.se_fc2(se))
+        fx = fx * se
         if self.last_layer:
             return self.mlp2(self.ln_3(fx))
         return fx
@@ -227,10 +285,12 @@ class Transolver(nn.Module):
                 act=act,
             )
         else:
-            self.preprocess = MLP(fun_dim + space_dim, n_hidden * 2, n_hidden, n_layers=0, res=False, act=act)
+            self.preprocess = GatedMLP2(fun_dim + space_dim, n_hidden * 2, n_hidden)
 
         self.n_hidden = n_hidden
         self.space_dim = space_dim
+        self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
+        nn.init.eye_(self.feature_cross.weight)  # start as identity
         self.blocks = nn.ModuleList(
             [
                 TransolverBlock(
@@ -247,14 +307,27 @@ class Transolver(nn.Module):
             ]
         )
         self.initialize_weights()
-        self.placeholder = nn.Parameter((1 / n_hidden) * torch.rand(n_hidden, dtype=torch.float))
+        self.out_skip = nn.Linear(n_hidden, out_dim)
+        nn.init.zeros_(self.out_skip.weight)
+        nn.init.zeros_(self.out_skip.bias)
+        self.skip_gate = nn.Sequential(nn.Linear(n_hidden, 1), nn.Sigmoid())
+        nn.init.constant_(self.skip_gate[0].bias, -2.0)  # starts nearly closed
+        self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
+        self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
+        self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
+        self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
 
     def initialize_weights(self):
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            trunc_normal_(module.weight, std=0.02)
+            if module.weight.dim() >= 2:
+                nn.init.orthogonal_(module.weight, gain=1.0)
+            else:
+                nn.init.normal_(module.weight, std=0.01)
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
         elif isinstance(module, (nn.LayerNorm, nn.BatchNorm1d)):
@@ -302,13 +375,29 @@ class Transolver(nn.Module):
             new_pos = self.get_grid(pos)
             x = torch.cat((x, new_pos), dim=-1)
 
-        fx = self.preprocess(x)
-        fx = fx + self.placeholder[None, None, :]
+        x_cross = x * self.feature_cross(x)
+        x = x + 0.1 * x_cross  # residual with small scale
+        raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)  # x, y, curvature, dist
 
-        for block in self.blocks:
-            fx = block(fx)
+        # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
+        is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
+
+        fx = self.preprocess(x)
+        fx_pre = fx  # save for skip
+        fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
+
+        for block in self.blocks[:-1]:
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+
+        # Auxiliary Re prediction from pre-output-head hidden representation
+        re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
+        aoa_pred = self.aoa_head(fx.mean(dim=1))
+
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+        gate = self.skip_gate(fx_pre)
+        fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx}
+        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
 
 # ---------------------------------------------------------------------------
@@ -317,15 +406,15 @@ class Transolver(nn.Module):
 
 
 MAX_TIMEOUT = 30.0  # minutes
-MAX_EPOCHS = 50
+MAX_EPOCHS = 100
 
 
 @dataclass
 class Config:
-    lr: float = 5e-4
-    weight_decay: float = 1e-4
+    lr: float = 2.6e-3
+    weight_decay: float = 0.0
     batch_size: int = 4
-    surf_weight: float = 10.0
+    surf_weight: float = 20.0
     manifest: str = "data/split_manifest.json"
     stats_file: str = "data/split_stats.json"
     wandb_group: str | None = None
@@ -380,9 +469,9 @@ def _phys_norm(y, Umag, q):
 def _phys_denorm(y_p, Umag, q):
     """Reverse physics normalization: Ux/Umag→Ux, Uy/Umag→Uy, Cp→p."""
     y = y_p.clone()
-    y[:, :, 0:1] = y_p[:, :, 0:1].clamp(-50, 50) * Umag
-    y[:, :, 1:2] = y_p[:, :, 1:2].clamp(-50, 50) * Umag
-    y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-100, 100) * q
+    y[:, :, 0:1] = y_p[:, :, 0:1].clamp(-10, 10) * Umag
+    y[:, :, 1:2] = y_p[:, :, 1:2].clamp(-10, 10) * Umag
+    y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
 
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
@@ -406,24 +495,93 @@ val_loaders = {
     for name, subset in val_splits.items()
 }
 
+# --- Physics normalization stats (computed over training set) ---
+# Compute mean/std of Cp-normalized targets so the model sees O(1) values.
+print("Computing physics normalization stats...")
+_phys_sum = torch.zeros(3, device=device)
+_phys_sq_sum = torch.zeros(3, device=device)
+_phys_n = 0.0
+_stats_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
+with torch.no_grad():
+    for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc="Phys stats", leave=False):
+        _y, _mask = _y.to(device), _mask.to(device)
+        _Um, _q = _umag_q(_y, _mask)
+        _yp = _phys_norm(_y, _Um, _q)
+        _m = _mask.float().unsqueeze(-1)  # [B, N, 1]
+        _phys_sum += (_yp * _m).sum(dim=(0, 1))
+        _phys_sq_sum += (_yp ** 2 * _m).sum(dim=(0, 1))
+        _phys_n += _mask.float().sum().item()
+_pmean = (_phys_sum / _phys_n).float()
+_pstd = ((_phys_sq_sum / _phys_n - _pmean ** 2).clamp(min=0.0).sqrt()).clamp(min=1e-6).float()
+phys_stats = {"y_mean": _pmean, "y_std": _pstd}
+print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
+
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2,  # X_DIM=24; fun_dim + space_dim must equal x.shape[-1]
+    fun_dim=X_DIM - 2 + 2 + 32,  # +1 curv, +1 dist_feat, +32 fourier PE
     out_dim=3,
-    n_hidden=128,
-    n_layers=5,
-    n_head=4,
-    slice_num=64,
+    n_hidden=192,  # regime-w: full width with finer routing
+    n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
+    n_head=3,
+    slice_num=48,  # regime-h: more slices for finer spatial decomposition
     mlp_ratio=2,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
 )
 
 model = Transolver(**model_config).to(device)
+torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
+model = torch.compile(model, mode="default")
+_base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+
+from copy import deepcopy
+ema_model = None
+ema_start_epoch = 40
+ema_decay = 0.998
 
 n_params = sum(p.numel() for p in model.parameters())
-optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
+
+
+class Lookahead:
+    def __init__(self, base_optimizer, k=5, alpha=0.5):
+        self.base_optimizer = base_optimizer
+        self.k = k
+        self.alpha = alpha
+        self.slow_params = [
+            [p.data.clone() for p in group['params']]
+            for group in base_optimizer.param_groups
+        ]
+        self.step_count = 0
+
+    def step(self):
+        self.base_optimizer.step()
+        self.step_count += 1
+        if self.step_count % self.k == 0:
+            for slow, group in zip(self.slow_params, self.base_optimizer.param_groups):
+                for s, p in zip(slow, group['params']):
+                    s.data.add_(self.alpha * (p.data - s.data))
+                    p.data.copy_(s.data)
+
+    def zero_grad(self):
+        self.base_optimizer.zero_grad()
+
+    @property
+    def param_groups(self):
+        return self.base_optimizer.param_groups
+
+
+attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+base_opt = torch.optim.AdamW([
+    {'params': attn_params, 'lr': cfg.lr * 0.5},
+    {'params': other_params, 'lr': cfg.lr}
+], weight_decay=cfg.weight_decay)
+optimizer = Lookahead(base_opt, k=10, alpha=0.8)
+warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.2, total_iters=10)
+cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
+scheduler = torch.optim.lr_scheduler.SequentialLR(
+    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[10]
+)
 
 # --- wandb ---
 run = wandb.init(
@@ -460,9 +618,15 @@ with open(model_dir / "config.yaml", "w") as f:
     yaml.dump(model_config, f)
 
 best_val = float("inf")
+ema_val_loss = float("inf")
+ema_decay_val = 0.9
 best_metrics = {}
 global_step = 0
 train_start = time.time()
+prev_vol_loss = 1.0
+prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
+running_tandem_loss = 0.05
+running_nontandem_loss = 0.05
 
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
@@ -471,6 +635,9 @@ for epoch in range(MAX_EPOCHS):
         break
 
     t0 = time.time()
+
+    # Adaptive surface weight: loss-ratio based, clamped [5, 50]
+    surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
 
     # --- Train ---
     model.train()
@@ -484,23 +651,201 @@ for epoch in range(MAX_EPOCHS):
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
 
+        raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
+        dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+        dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         x = (x - stats["x_mean"]) / stats["x_std"]
-        y_norm = (y - stats["y_mean"]) / stats["y_std"]
+        # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
+        curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+        x = torch.cat([x, curv, dist_feat], dim=-1)
+        # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
+        raw_xy = x[:, :, :2]
+        # Normalize xy to [0,1] per-sample for consistent Fourier encoding
+        xy_min = raw_xy.amin(dim=1, keepdim=True)
+        xy_max = raw_xy.amax(dim=1, keepdim=True)
+        xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+        freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+        xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
+        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+        x = torch.cat([x, fourier_pe], dim=-1)
+        if model.training and epoch < 60:
+            noise_scale = 0.05 * (1 - epoch / 60)
+            x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
+        Umag, q = _umag_q(y, mask)
+        y_phys = _phys_norm(y, Umag, q)
+        y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+        if model.training:
+            noise_progress = min(1.0, epoch / 60)
+            vel_noise = 0.015 * (1 - noise_progress) + 0.003 * noise_progress
+            p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
+            noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
+            y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
 
-        pred = model({"x": x})["preds"]
+        # Per-sample std normalization: skip tandem samples (gap feature index 21)
+        raw_gap = x[:, 0, 21]
+        is_tandem = raw_gap.abs() > 0.5
+        B = y_norm.shape[0]
+        sample_stds = torch.ones(B, 1, 3, device=device)
+        channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
+        tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+        if model.training:
+            for b in range(B):
+                valid = mask[b]
+                if is_tandem[b]:
+                    sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
+                else:
+                    sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+            y_norm = y_norm / sample_stds
+
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            out = model({"x": x})
+            pred = out["preds"]
+            re_pred = out["re_pred"]
+            aoa_pred = out["aoa_pred"]
+        pred = pred.float()
+        re_pred = re_pred.float()
+        aoa_pred = aoa_pred.float()
+        if model.training:
+            pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
-
+        abs_err = (pred - y_norm).abs()
+        if epoch < 10:
+            is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
+            sample_mask = (~is_tandem_curr).float()[:, None, None]
+            abs_err = abs_err * sample_mask
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
-        vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-        surf_loss = (sq_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
-        loss = vol_loss + cfg.surf_weight * surf_loss
 
-        optimizer.zero_grad()
-        loss.backward()
+        # Progressive resolution: subsample volume nodes in loss early in training
+        # Ramps from 10% → 100% of volume nodes over first 40 epochs
+        if epoch < 40:
+            vol_keep_ratio = 0.05 + 0.95 * (epoch / 40)
+            vol_indices = vol_mask.nonzero(as_tuple=False)
+            n_vol = vol_indices.shape[0]
+            n_keep = max(int(n_vol * vol_keep_ratio), 1)
+            perm = torch.randperm(n_vol, device=vol_mask.device)[:n_keep]
+            vol_mask_train = torch.zeros_like(vol_mask)
+            if n_keep > 0:
+                vol_mask_train[vol_indices[perm, 0], vol_indices[perm, 1]] = True
+        else:
+            vol_mask_train = vol_mask
+
+        vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+        is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
+        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
+        nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
+        running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
+        running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
+        # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
+        if epoch >= 30:
+            surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
+            surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
+            surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
+            thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
+            thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
+            hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
+            hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
+            surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
+        tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
+        surf_loss = (surf_per_sample * tandem_boost).mean()
+        loss = vol_loss + surf_weight * surf_loss
+
+        # Multi-scale loss: coarse spatial pooling
+        _coarse_loss = None
+        coarse_pool_size = 64
+        B, N, C = pred.shape
+        n_groups = N // coarse_pool_size
+        if n_groups > 1:
+            # Sort by x-coordinate for spatially coherent groups
+            raw_x_coord = x[:, :, 0]  # x-coordinate
+            sort_idx = raw_x_coord.argsort(dim=1)
+            pred_sorted = torch.gather(pred, 1, sort_idx.unsqueeze(-1).expand_as(pred))
+            y_sorted = torch.gather(y_norm, 1, sort_idx.unsqueeze(-1).expand_as(y_norm))
+            mask_sorted = torch.gather(mask, 1, sort_idx)
+            # Pool predictions and targets over groups of 64 nodes
+            pred_trunc = pred_sorted[:, :n_groups * coarse_pool_size]
+            y_trunc = y_sorted[:, :n_groups * coarse_pool_size]
+            mask_trunc = mask_sorted[:, :n_groups * coarse_pool_size]
+
+            mask_trunc_f = mask_trunc.float().reshape(B, n_groups, coarse_pool_size).unsqueeze(-1)  # [B, G, P, 1]
+            pred_g = pred_trunc.reshape(B, n_groups, coarse_pool_size, C)
+            y_g = y_trunc.reshape(B, n_groups, coarse_pool_size, C)
+            pred_coarse = (pred_g * mask_trunc_f).sum(dim=2) / mask_trunc_f.sum(dim=2).clamp(min=1)
+            y_coarse = (y_g * mask_trunc_f).sum(dim=2) / mask_trunc_f.sum(dim=2).clamp(min=1)
+            mask_coarse = mask_trunc.reshape(B, n_groups, coarse_pool_size).any(dim=2)
+
+            coarse_err = (pred_coarse - y_coarse).abs()
+            coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
+            _coarse_loss = coarse_loss
+            loss = loss + 1.0 * coarse_loss
+
+        log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
+        re_loss = F.mse_loss(re_pred, log_re_target)
+        loss = loss + 0.01 * re_loss
+        aoa_target = x[:, 0, 14:15]  # AoA0_rad from normalized input
+        aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
+        loss = loss + 0.01 * aoa_loss
+
+        # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
+        # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
+        is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
+        is_indist_pcgrad = ~is_ood_pcgrad
+        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
+
+        if use_pcgrad:
+            n_a = is_indist_pcgrad.float().sum().clamp(min=1)
+            n_b = is_ood_pcgrad.float().sum().clamp(min=1)
+            vol_mask_a = vol_mask_train & is_indist_pcgrad.unsqueeze(1)
+            vol_mask_b = vol_mask_train & is_ood_pcgrad.unsqueeze(1)
+            vol_loss_a = (abs_err * vol_mask_a.unsqueeze(-1)).sum() / vol_mask_a.sum().clamp(min=1)
+            vol_loss_b = (abs_err * vol_mask_b.unsqueeze(-1)).sum() / vol_mask_b.sum().clamp(min=1)
+            surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
+            surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
+            coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+
+            optimizer.zero_grad()
+            loss_a.backward(retain_graph=True)
+            grads_a = [p.grad.clone() if p.grad is not None else None
+                       for p in model.parameters()]
+            optimizer.zero_grad()
+            loss_b.backward()
+
+            ga_flat = torch.cat([g.view(-1) for g in grads_a if g is not None])
+            gb_flat = torch.cat([p.grad.view(-1) for p in model.parameters() if p.grad is not None])
+            dot_ab = (ga_flat @ gb_flat).item()
+            gb_ns = float((gb_flat @ gb_flat).item()) + 1e-8
+            ga_ns = float((ga_flat @ ga_flat).item()) + 1e-8
+            for p, ga in zip(model.parameters(), grads_a):
+                gb = p.grad
+                if ga is None and gb is None:
+                    continue
+                if ga is None:
+                    pass  # keep gb
+                elif gb is None:
+                    p.grad = ga
+                elif dot_ab < 0:
+                    p.grad = ((ga - (dot_ab / gb_ns) * gb) + (gb - (dot_ab / ga_ns) * ga)) * 0.5
+                else:
+                    p.grad = (ga + gb) * 0.5
+        else:
+            optimizer.zero_grad()
+            loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        if epoch >= ema_start_epoch:
+            if ema_model is None:
+                ema_model = deepcopy(_base_model)
+            else:
+                with torch.no_grad():
+                    for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
+                        ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "global_step": global_step})
+        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -508,10 +853,17 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
+    if epoch >= 50:
+        with torch.no_grad():
+            _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
     epoch_vol /= n_batches
     epoch_surf /= n_batches
+    prev_vol_loss = epoch_vol
+    prev_surf_loss = epoch_surf
 
     # --- Validate across all splits ---
+    eval_model = ema_model if ema_model is not None else model
+    eval_model.eval()
     model.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
@@ -521,8 +873,8 @@ for epoch in range(MAX_EPOCHS):
         val_surf = 0.0
         mae_surf = torch.zeros(3, device=device)
         mae_vol = torch.zeros(3, device=device)
-        n_surf = 0
-        n_vol = 0
+        n_surf = torch.zeros(3, device=device)
+        n_vol = torch.zeros(3, device=device)
         n_vbatches = 0
 
         with torch.no_grad():
@@ -533,30 +885,81 @@ for epoch in range(MAX_EPOCHS):
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
 
+                raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
+                dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+                dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 x = (x - stats["x_mean"]) / stats["x_std"]
-                y_norm = (y - stats["y_mean"]) / stats["y_std"]
+                # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
+                curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                x = torch.cat([x, curv, dist_feat], dim=-1)
+                # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
+                raw_xy = x[:, :, :2]
+                # Normalize xy to [0,1] per-sample for consistent Fourier encoding
+                xy_min = raw_xy.amin(dim=1, keepdim=True)
+                xy_max = raw_xy.amax(dim=1, keepdim=True)
+                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
+                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+                x = torch.cat([x, fourier_pe], dim=-1)
+                Umag, q = _umag_q(y, mask)
+                y_phys = _phys_norm(y, Umag, q)
+                y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
-                pred = model({"x": x})["preds"]
-                sq_err = (pred - y_norm) ** 2
+                # Per-sample std normalization: skip tandem samples
+                raw_gap = x[:, 0, 21]
+                is_tandem = raw_gap.abs() > 0.5
+                B = y_norm.shape[0]
+                sample_stds = torch.ones(B, 1, 3, device=device)
+                channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
+                tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+                for b in range(B):
+                    valid = mask[b]
+                    if is_tandem[b]:
+                        sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
+                    else:
+                        sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+                y_norm_scaled = y_norm / sample_stds
+
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    pred = eval_model({"x": x})["preds"]
+                pred = pred.float()
+                pred_loss = pred / sample_stds
+                sq_err = (pred_loss - y_norm_scaled) ** 2
+                abs_err = (pred_loss - y_norm_scaled).abs()
+                abs_err = abs_err.nan_to_num(0.0)
 
                 vol_mask = mask & ~is_surface
                 surf_mask = mask & is_surface
-                val_vol += (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
-                val_surf += (sq_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+                val_vol += min(
+                    (abs_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item(),
+                    1e6
+                )
+                val_surf += min(
+                    (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item(),
+                    1e6
+                )
                 n_vbatches += 1
 
-                pred_orig = pred * stats["y_std"] + stats["y_mean"]
-                err = (pred_orig - y).abs()
+                # Denormalize: phys_stats → Cp space → original scale
+                pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                pred_orig = _phys_denorm(pred_phys, Umag, q)
+                y_clamped = y.clamp(-1e6, 1e6)
+                err = (pred_orig - y_clamped).abs()
+                finite = err.isfinite()
+                err = err.where(finite, torch.zeros_like(err))
                 mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
                 mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
-                n_surf += surf_mask.sum().item()
-                n_vol += vol_mask.sum().item()
+                n_surf += (surf_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+                n_vol += (vol_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
 
         val_vol /= max(n_vbatches, 1)
         val_surf /= max(n_vbatches, 1)
+        val_vol = float(torch.tensor(val_vol).nan_to_num(0.0).clamp(max=1e6))
+        val_surf = float(torch.tensor(val_surf).nan_to_num(0.0).clamp(max=1e6))
         split_loss = val_vol + cfg.surf_weight * val_surf
-        mae_surf /= max(n_surf, 1)
-        mae_vol /= max(n_vol, 1)
+        mae_surf /= n_surf.clamp(min=1)
+        mae_vol /= n_vol.clamp(min=1)
 
         val_metrics_per_split[split_name] = {
             f"{split_name}/vol_loss":    val_vol,
@@ -571,8 +974,19 @@ for epoch in range(MAX_EPOCHS):
         }
         val_loss_sum += split_loss
 
-    # val/loss = mean across all splits; used for checkpoint selection
-    mean_val_loss = val_loss_sum / len(val_loaders)
+    # 4-split val/loss (all splits) — used for checkpoint selection
+    _checkpoint_names = VAL_SPLIT_NAMES  # all 4 splits instead of _3split_names
+    _checkpoint_losses = [val_metrics_per_split[n][f"{n}/loss"] for n in _checkpoint_names
+                          if not (torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isnan() or
+                                  torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isinf())]
+    val_loss_3split = sum(_checkpoint_losses) / max(len(_checkpoint_losses), 1)
+    ema_val_loss = val_loss_3split if ema_val_loss == float("inf") else ema_decay_val * ema_val_loss + (1 - ema_decay_val) * val_loss_3split
+
+    # 4-split val/loss (all splits including ood_re)
+    _4split_losses = [val_metrics_per_split[n][f"{n}/loss"] for n in VAL_SPLIT_NAMES
+                      if not (torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isnan() or
+                              torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isinf())]
+    val_loss_4split = sum(_4split_losses) / max(len(_4split_losses), 1)
 
     dt = time.time() - t0
 
@@ -580,13 +994,18 @@ for epoch in range(MAX_EPOCHS):
     metrics = {
         "train/vol_loss": epoch_vol,
         "train/surf_loss": epoch_surf,
-        "val/loss": mean_val_loss,
+        "val/loss": val_loss_3split,
+        "val/loss_3split": val_loss_3split,
+        "val/loss_4split": val_loss_4split,
         "lr": scheduler.get_last_lr()[0],
         "epoch_time_s": dt,
     }
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
+    learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
+    for i, f in enumerate(learned_freqs):
+        metrics[f"fourier_freq_{i}"] = f
     wandb.log(metrics)
 
     if torch.cuda.is_available():
@@ -595,13 +1014,14 @@ for epoch in range(MAX_EPOCHS):
         peak_mem_gb = 0.0
 
     tag = ""
-    if mean_val_loss < best_val:
-        best_val = mean_val_loss
-        best_metrics = {"epoch": epoch + 1, "val_loss": mean_val_loss}
+    if ema_val_loss < best_val:
+        best_val = ema_val_loss
+        best_metrics = {"epoch": epoch + 1, "val_loss": val_loss_3split}
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
-        torch.save(model.state_dict(), model_path)
+        save_model = ema_model if ema_model is not None else model
+        torch.save(save_model.state_dict(), model_path)
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
@@ -634,11 +1054,31 @@ if best_metrics:
     wandb.summary.update({"best_" + k: v for k, v in best_metrics.items()})
 
     print("\nGenerating flow field plots...")
-    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    vis_model = ema_model if ema_model is not None else model
+    vis_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    vis_model.eval()
     plot_dir = Path("plots") / run.id
     n = 1 if cfg.debug else 4
     for split_name, split_ds in val_splits.items():
-        images = visualize(model, split_ds, stats, device, n_samples=n, out_dir=plot_dir / split_name)
+        samples = []
+        for i in range(min(n, len(split_ds))):
+            x, y_true, is_surface = split_ds[i]
+            with torch.no_grad():
+                x_dev = x.unsqueeze(0).to(device)
+                y_dev = y_true.unsqueeze(0).to(device)
+                is_surf_dev = is_surface.unsqueeze(0).to(device)
+                mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
+                x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
+                curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
+                dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
+                dist_feat = torch.log1p(dist_surf * 10.0)
+                x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                Umag, q = _umag_q(y_dev, mask)
+                pred = vis_model({"x": x_n})["preds"].float()
+                pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
+            samples.append((x[:, :2], y_true, y_pred, is_surface))
+        images = visualize(samples, out_dir=plot_dir / split_name)
         if images:
             wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
 

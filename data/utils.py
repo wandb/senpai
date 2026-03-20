@@ -108,27 +108,21 @@ def plot_samples(dataset, indices=None, n_samples=4, prefix="data_sample", out_d
     return saved
 
 
-def visualize(model, val_ds, stats, device, n_samples=4, out_dir=None):
+def visualize(samples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], out_dir=None):
     """Generate flow field comparison plots: velocity (magnitude+arrows) and pressure.
 
     Layout: 2 rows (velocity, pressure) x 3 cols (GT, Predicted, Error).
+
+    Args:
+        samples: list of (pos, y_true, y_pred, is_surface) tuples, all CPU tensors.
+                 pos: (N, 2), y_true/y_pred: (N, 3), is_surface: (N,) bool.
     """
     out_dir = Path(out_dir) if out_dir else OUT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
-    model.eval()
     saved = []
 
-    indices = list(range(min(n_samples, len(val_ds))))
-    for sample_idx in indices:
-        x, y_true, is_surface = val_ds[sample_idx]
-
-        with torch.no_grad():
-            x_dev = x.unsqueeze(0).to(device)
-            x_norm = (x_dev - stats["x_mean"]) / stats["x_std"]
-            pred_norm = model({"x": x_norm})["preds"]
-            y_pred = (pred_norm * stats["y_std"] + stats["y_mean"]).squeeze(0).cpu()
-
-        pos = x[:, :2].numpy()
+    for sample_idx, (pos_t, y_true, y_pred, is_surface) in enumerate(samples):
+        pos = pos_t.numpy()
         y_true_np = y_true.numpy()
         y_pred_np = y_pred.numpy()
         is_surf_np = is_surface.numpy()
