@@ -577,10 +577,10 @@ base_opt = torch.optim.AdamW([
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.2, total_iters=10)
+warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.2, total_iters=15)
 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
-    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[10]
+    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[15]
 )
 
 # --- wandb ---
@@ -660,9 +660,12 @@ for epoch in range(MAX_EPOCHS):
         x = torch.cat([x, curv, dist_feat], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
-        # Normalize xy to [0,1] per-sample for consistent Fourier encoding
-        xy_min = raw_xy.amin(dim=1, keepdim=True)
-        xy_max = raw_xy.amax(dim=1, keepdim=True)
+        # Normalize xy to [0,1] per-sample for consistent Fourier encoding (skip padded nodes)
+        xy_for_range = raw_xy.clone()
+        xy_for_range[~mask.unsqueeze(-1).expand_as(raw_xy)] = float('inf')
+        xy_min = xy_for_range.amin(dim=1, keepdim=True)
+        xy_for_range[~mask.unsqueeze(-1).expand_as(raw_xy)] = float('-inf')
+        xy_max = xy_for_range.amax(dim=1, keepdim=True)
         xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
         freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
@@ -710,7 +713,7 @@ for epoch in range(MAX_EPOCHS):
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         if epoch < 10:
-            is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
+            is_tandem_curr = (x[:, 0, 21].abs() > 0.5)
             sample_mask = (~is_tandem_curr).float()[:, None, None]
             abs_err = abs_err * sample_mask
         vol_mask = mask & ~is_surface
@@ -894,9 +897,12 @@ for epoch in range(MAX_EPOCHS):
                 x = torch.cat([x, curv, dist_feat], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
-                # Normalize xy to [0,1] per-sample for consistent Fourier encoding
-                xy_min = raw_xy.amin(dim=1, keepdim=True)
-                xy_max = raw_xy.amax(dim=1, keepdim=True)
+                # Normalize xy to [0,1] per-sample for consistent Fourier encoding (skip padded nodes)
+                xy_for_range = raw_xy.clone()
+                xy_for_range[~mask.unsqueeze(-1).expand_as(raw_xy)] = float('inf')
+                xy_min = xy_for_range.amin(dim=1, keepdim=True)
+                xy_for_range[~mask.unsqueeze(-1).expand_as(raw_xy)] = float('-inf')
+                xy_max = xy_for_range.amax(dim=1, keepdim=True)
                 xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
                 freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
