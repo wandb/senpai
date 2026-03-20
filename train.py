@@ -238,6 +238,8 @@ class TransolverBlock(nn.Module):
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
+        if self.training and torch.rand(1).item() < 0.15:
+            se = torch.ones_like(se)  # skip SE modulation
         fx = fx * se
         if self.last_layer:
             return self.mlp2(self.ln_3(fx))
