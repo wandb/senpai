@@ -709,10 +709,6 @@ for epoch in range(MAX_EPOCHS):
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
-        if epoch < 10:
-            is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
-            sample_mask = (~is_tandem_curr).float()[:, None, None]
-            abs_err = abs_err * sample_mask
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
@@ -1073,6 +1069,14 @@ if best_metrics:
                 dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)
                 x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                raw_xy_vis = x_n[:, :, :2]
+                xy_min_vis = raw_xy_vis.amin(dim=1, keepdim=True)
+                xy_max_vis = raw_xy_vis.amax(dim=1, keepdim=True)
+                xy_norm_vis = (raw_xy_vis - xy_min_vis) / (xy_max_vis - xy_min_vis + 1e-8)
+                freqs_vis = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
+                xy_scaled_vis = xy_norm_vis.unsqueeze(-1) * freqs_vis
+                fourier_pe_vis = torch.cat([xy_scaled_vis.sin().flatten(-2), xy_scaled_vis.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, fourier_pe_vis], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
