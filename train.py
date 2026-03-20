@@ -530,8 +530,7 @@ model_config = dict(
 )
 
 model = Transolver(**model_config).to(device)
-torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
-model = torch.compile(model, mode="default")
+model = torch.compile(model, mode="reduce-overhead")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
@@ -750,7 +749,6 @@ for epoch in range(MAX_EPOCHS):
         loss = vol_loss + surf_weight * surf_loss
 
         # Multi-scale loss: coarse spatial pooling
-        _coarse_loss = None
         coarse_pool_size = 64
         B, N, C = pred.shape
         n_groups = N // coarse_pool_size
@@ -772,7 +770,6 @@ for epoch in range(MAX_EPOCHS):
 
             coarse_err = (pred_coarse - y_coarse).abs()
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
-            _coarse_loss = coarse_loss
             loss = loss + 1.0 * coarse_loss
 
         log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
@@ -782,53 +779,8 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
-        # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
-        # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
-        is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
-        is_indist_pcgrad = ~is_ood_pcgrad
-        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
-
-        if use_pcgrad:
-            n_a = is_indist_pcgrad.float().sum().clamp(min=1)
-            n_b = is_ood_pcgrad.float().sum().clamp(min=1)
-            vol_mask_a = vol_mask_train & is_indist_pcgrad.unsqueeze(1)
-            vol_mask_b = vol_mask_train & is_ood_pcgrad.unsqueeze(1)
-            vol_loss_a = (abs_err * vol_mask_a.unsqueeze(-1)).sum() / vol_mask_a.sum().clamp(min=1)
-            vol_loss_b = (abs_err * vol_mask_b.unsqueeze(-1)).sum() / vol_mask_b.sum().clamp(min=1)
-            surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
-            surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
-            coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-
-            optimizer.zero_grad()
-            loss_a.backward(retain_graph=True)
-            grads_a = [p.grad.clone() if p.grad is not None else None
-                       for p in model.parameters()]
-            optimizer.zero_grad()
-            loss_b.backward()
-
-            ga_flat = torch.cat([g.view(-1) for g in grads_a if g is not None])
-            gb_flat = torch.cat([p.grad.view(-1) for p in model.parameters() if p.grad is not None])
-            dot_ab = (ga_flat @ gb_flat).item()
-            gb_ns = float((gb_flat @ gb_flat).item()) + 1e-8
-            ga_ns = float((ga_flat @ ga_flat).item()) + 1e-8
-            for p, ga in zip(model.parameters(), grads_a):
-                gb = p.grad
-                if ga is None and gb is None:
-                    continue
-                if ga is None:
-                    pass  # keep gb
-                elif gb is None:
-                    p.grad = ga
-                elif dot_ab < 0:
-                    p.grad = ((ga - (dot_ab / gb_ns) * gb) + (gb - (dot_ab / ga_ns) * ga)) * 0.5
-                else:
-                    p.grad = (ga + gb) * 0.5
-        else:
-            optimizer.zero_grad()
-            loss.backward()
-
+        optimizer.zero_grad()
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         if epoch >= ema_start_epoch:
