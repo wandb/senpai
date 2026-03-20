@@ -538,6 +538,11 @@ from copy import deepcopy
 ema_model = None
 ema_start_epoch = 40
 ema_decay = 0.998
+# dual-ema: two EMA models at different decay rates
+ema_model_fast = None  # decay=0.995, captures recent updates
+ema_model_slow = None  # decay=0.999, long-term smoothing
+ema_decay_fast = 0.995
+ema_decay_slow = 0.999
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -834,10 +839,16 @@ for epoch in range(MAX_EPOCHS):
         if epoch >= ema_start_epoch:
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
+                ema_model_fast = deepcopy(_base_model)  # dual-ema: initialize fast EMA
+                ema_model_slow = deepcopy(_base_model)  # dual-ema: initialize slow EMA
             else:
                 with torch.no_grad():
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
+                    for ep, mp in zip(ema_model_fast.parameters(), _base_model.parameters()):  # dual-ema
+                        ep.data.mul_(ema_decay_fast).add_(mp.data, alpha=1 - ema_decay_fast)
+                    for ep, mp in zip(ema_model_slow.parameters(), _base_model.parameters()):  # dual-ema
+                        ep.data.mul_(ema_decay_slow).add_(mp.data, alpha=1 - ema_decay_slow)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -913,7 +924,10 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    if ema_model_fast is not None:  # dual-ema: average fast+slow EMA predictions
+                        pred = 0.5 * ema_model_fast({"x": x})["preds"] + 0.5 * ema_model_slow({"x": x})["preds"]
+                    else:
+                        pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
