@@ -318,6 +318,7 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        self.boundary_embed = nn.Embedding(4, 4)  # 4 boundary types: volume, upper, lower, foil2
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -377,10 +378,10 @@ class Transolver(nn.Module):
 
         x_cross = x * self.feature_cross(x)
         x = x + 0.1 * x_cross  # residual with small scale
-        raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)  # x, y, curvature, dist
+        raw_xy = torch.cat([x[:, :, :2], x[:, :, 27:29]], dim=-1)  # x, y, curvature, dist
 
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
-        is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
+        is_tandem = (x[:, 0, 24].abs() > 0.01).float()[:, None, None, None]
 
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
@@ -518,7 +519,7 @@ print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + 32,  # +1 curv, +1 dist_feat, +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + 32 + 3,  # +1 curv, +1 dist_feat, +32 fourier PE, +3 boundary embed (4d replaces 1d)
     out_dim=3,
     n_hidden=192,  # regime-w: full width with finer routing
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
@@ -652,6 +653,19 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         x = (x - stats["x_mean"]) / stats["x_std"]
+        # Boundary type embedding: replace scalar is_surface (col 12) with 4-dim learned embedding
+        # Types: 0=volume, 1=surface_upper, 2=surface_lower, 3=surface_foil2 (tandem)
+        _B = x.shape[0]
+        saf_sign = (x[:, :, 2] > 0).long()  # saf[0]>0 → upper surface
+        is_tandem_b = x[:, 0, 21].abs() > 0.5  # naca1[2] as tandem proxy (index 21 pre-replacement)
+        boundary_type = torch.zeros(_B, x.shape[1], dtype=torch.long, device=device)
+        boundary_type[is_surface & (saf_sign == 1)] = 1  # upper surface
+        boundary_type[is_surface & (saf_sign == 0)] = 2  # lower surface
+        for _b in range(_B):
+            if is_tandem_b[_b]:
+                boundary_type[_b, is_surface[_b] & (x[_b, :, 0] > 0.5)] = 3  # foil2 (downstream)
+        btype_emb = _base_model.boundary_embed(boundary_type)  # [B, N, 4]
+        x = torch.cat([x[:, :, :12], btype_emb, x[:, :, 13:]], dim=-1)  # replace col 12 (1d→4d)
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         dist_surf = x[:, :, 2:10].abs().min(dim=-1, keepdim=True).values  # [B, N, 1]
@@ -681,7 +695,7 @@ for epoch in range(MAX_EPOCHS):
             y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
 
         # Per-sample std normalization: skip tandem samples (gap feature index 21)
-        raw_gap = x[:, 0, 21]
+        raw_gap = x[:, 0, 24]
         is_tandem = raw_gap.abs() > 0.5
         B = y_norm.shape[0]
         sample_stds = torch.ones(B, 1, 3, device=device)
@@ -730,7 +744,7 @@ for epoch in range(MAX_EPOCHS):
             vol_mask_train = vol_mask
 
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
-        is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
+        is_tandem_batch = (x[:, 0, 24].abs() > 0.01)
         surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
@@ -777,16 +791,16 @@ for epoch in range(MAX_EPOCHS):
             _coarse_loss = coarse_loss
             loss = loss + 1.0 * coarse_loss
 
-        log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
+        log_re_target = x[:, 0, 16:17]  # log(Re) from input features (same for all nodes)
         re_loss = F.mse_loss(re_pred, log_re_target)
         loss = loss + 0.01 * re_loss
-        aoa_target = x[:, 0, 14:15]  # AoA0_rad from normalized input
+        aoa_target = x[:, 0, 17:18]  # AoA0_rad from normalized input
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
-        is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
+        is_ood_pcgrad = is_tandem_batch | (x[:, 0, 16] > 1.0) | (x[:, 0, 17].abs() > 1.0)
         is_indist_pcgrad = ~is_ood_pcgrad
         use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
 
@@ -882,6 +896,18 @@ for epoch in range(MAX_EPOCHS):
                 mask = mask.to(device, non_blocking=True)
 
                 x = (x - stats["x_mean"]) / stats["x_std"]
+                # Boundary type embedding: replace scalar is_surface (col 12) with 4-dim learned embedding
+                _Bv = x.shape[0]
+                saf_sign_v = (x[:, :, 2] > 0).long()
+                is_tandem_bv = x[:, 0, 21].abs() > 0.5
+                boundary_type_v = torch.zeros(_Bv, x.shape[1], dtype=torch.long, device=device)
+                boundary_type_v[is_surface & (saf_sign_v == 1)] = 1
+                boundary_type_v[is_surface & (saf_sign_v == 0)] = 2
+                for _bv in range(_Bv):
+                    if is_tandem_bv[_bv]:
+                        boundary_type_v[_bv, is_surface[_bv] & (x[_bv, :, 0] > 0.5)] = 3
+                btype_emb_v = _base_model.boundary_embed(boundary_type_v)
+                x = torch.cat([x[:, :, :12], btype_emb_v, x[:, :, 13:]], dim=-1)
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                 dist_surf = x[:, :, 2:10].abs().min(dim=-1, keepdim=True).values  # [B, N, 1]
@@ -902,7 +928,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
                 # Per-sample std normalization: skip tandem samples
-                raw_gap = x[:, 0, 21]
+                raw_gap = x[:, 0, 24]
                 is_tandem = raw_gap.abs() > 0.5
                 B = y_norm.shape[0]
                 sample_stds = torch.ones(B, 1, 3, device=device)
