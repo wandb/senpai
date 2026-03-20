@@ -939,6 +939,18 @@ for epoch in range(MAX_EPOCHS):
                 # Denormalize: phys_stats → Cp space → original scale
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
                 pred_orig = _phys_denorm(pred_phys, Umag, q)
+                # Laplacian smoothing on surface pressure at inference
+                for b_idx in range(pred_orig.shape[0]):
+                    surf_nodes = surf_mask[b_idx]  # [N] bool
+                    if surf_nodes.sum() < 6:
+                        continue
+                    surf_pos = x[b_idx, surf_nodes, :2].float()  # [Ns, 2]
+                    surf_pred_p = pred_orig[b_idx, surf_nodes, 2]  # [Ns]
+                    dists = torch.cdist(surf_pos, surf_pos)  # [Ns, Ns]
+                    _, nn_idx = dists.topk(7, dim=1, largest=False)  # [Ns, 7] (incl self)
+                    nn_preds = surf_pred_p[nn_idx[:, 1:]]  # [Ns, 6] (exclude self)
+                    smoothed = 0.5 * surf_pred_p + 0.5 * nn_preds.mean(dim=1)
+                    pred_orig[b_idx, surf_nodes, 2] = smoothed
                 y_clamped = y.clamp(-1e6, 1e6)
                 err = (pred_orig - y_clamped).abs()
                 finite = err.isfinite()
