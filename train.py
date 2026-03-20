@@ -143,6 +143,11 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout),
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
+        self.rel_pos_bias = nn.Parameter(torch.zeros(heads, slice_num, slice_num))
+        with torch.no_grad():
+            for i in range(slice_num):
+                for j in range(slice_num):
+                    self.rel_pos_bias.data[:, i, j] = -0.1 * abs(i - j)
 
     def forward(self, x, spatial_bias=None, tandem_mask=None):
         bsz, num_points, _ = x.shape
@@ -177,6 +182,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         q_norm = F.normalize(q_slice_token, dim=-1)
         k_norm = F.normalize(k_slice_token, dim=-1)
         attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
+        attn_logits = attn_logits + self.rel_pos_bias.unsqueeze(0)  # [1, H, S, S]
         attn_weights = F.softmax(attn_logits, dim=-1)
         out_slice_token = torch.matmul(attn_weights, v_slice_token)
         out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
