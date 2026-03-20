@@ -831,6 +831,11 @@ for epoch in range(MAX_EPOCHS):
             optimizer.zero_grad()
             loss.backward()
 
+        # Gradient centralization: zero-mean gradients for weight matrices
+        for p in model.parameters():
+            if p.grad is not None and p.grad.dim() >= 2:
+                p.grad.data.sub_(p.grad.data.mean(dim=tuple(range(1, p.grad.dim())), keepdim=True))
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         if epoch >= ema_start_epoch:
