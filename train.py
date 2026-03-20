@@ -680,20 +680,16 @@ for epoch in range(MAX_EPOCHS):
             noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
             y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
 
-        # Per-sample std normalization: skip tandem samples (gap feature index 21)
+        # Per-sample std normalization: uniform clamps for all samples including tandem
         raw_gap = x[:, 0, 21]
         is_tandem = raw_gap.abs() > 0.5
         B = y_norm.shape[0]
         sample_stds = torch.ones(B, 1, 3, device=device)
         channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
-        tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
         if model.training:
             for b in range(B):
                 valid = mask[b]
-                if is_tandem[b]:
-                    sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
-                else:
-                    sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+                sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
             y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -901,19 +897,15 @@ for epoch in range(MAX_EPOCHS):
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
-                # Per-sample std normalization: skip tandem samples
+                # Per-sample std normalization: uniform clamps for all samples including tandem
                 raw_gap = x[:, 0, 21]
                 is_tandem = raw_gap.abs() > 0.5
                 B = y_norm.shape[0]
                 sample_stds = torch.ones(B, 1, 3, device=device)
                 channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
-                tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
                 for b in range(B):
                     valid = mask[b]
-                    if is_tandem[b]:
-                        sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
-                    else:
-                        sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+                    sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
