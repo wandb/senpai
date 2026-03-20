@@ -223,6 +223,7 @@ class TransolverBlock(nn.Module):
         self.se_fc2 = nn.Linear(hidden_dim // 4, hidden_dim)
         nn.init.zeros_(self.se_fc2.weight)
         nn.init.zeros_(self.se_fc2.bias)
+        self.register_buffer('sb_ema', None)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
             self.mlp2 = nn.Sequential(
@@ -232,7 +233,19 @@ class TransolverBlock(nn.Module):
             )
 
     def forward(self, fx, raw_xy=None, tandem_mask=None):
-        sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
+        if raw_xy is not None:
+            sb = self.spatial_bias(raw_xy)  # [B, N, slice_num]
+            if self.training:
+                # Scalar EMA: mean over B and N to handle variable mesh sizes
+                sb_mean = sb.detach().mean(dim=(0, 1), keepdim=True)  # [1, 1, slice_num]
+                if self.sb_ema is None:
+                    self.sb_ema = sb_mean
+                else:
+                    self.sb_ema = 0.9 * self.sb_ema + 0.1 * sb_mean
+                # Straight-through regularization toward running mean
+                sb = sb + 0.3 * (self.sb_ema.expand_as(sb) - sb).detach()
+        else:
+            sb = None
         fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
