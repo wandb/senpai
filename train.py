@@ -664,8 +664,14 @@ for epoch in range(MAX_EPOCHS):
         xy_max = raw_xy.amax(dim=1, keepdim=True)
         xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
         freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-        xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+        xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 8]
+        sin_pe = xy_scaled.sin()  # [B, N, 2, 8]
+        cos_pe = xy_scaled.cos()  # [B, N, 2, 8]
+        inv_freq_weight = 1.0 / freqs.clamp(min=0.1)
+        inv_freq_weight = inv_freq_weight / inv_freq_weight.mean()
+        sin_pe = sin_pe * inv_freq_weight
+        cos_pe = cos_pe * inv_freq_weight
+        fourier_pe = torch.cat([sin_pe.flatten(-2), cos_pe.flatten(-2)], dim=-1)  # [B, N, 32]
         x = torch.cat([x, fourier_pe], dim=-1)
         if model.training and epoch < 60:
             noise_scale = 0.05 * (1 - epoch / 60)
@@ -894,8 +900,14 @@ for epoch in range(MAX_EPOCHS):
                 xy_max = raw_xy.amax(dim=1, keepdim=True)
                 xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
                 freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-                xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+                xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 8]
+                sin_pe = xy_scaled.sin()
+                cos_pe = xy_scaled.cos()
+                inv_freq_weight = 1.0 / freqs.clamp(min=0.1)
+                inv_freq_weight = inv_freq_weight / inv_freq_weight.mean()
+                sin_pe = sin_pe * inv_freq_weight
+                cos_pe = cos_pe * inv_freq_weight
+                fourier_pe = torch.cat([sin_pe.flatten(-2), cos_pe.flatten(-2)], dim=-1)  # [B, N, 32]
                 x = torch.cat([x, fourier_pe], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
