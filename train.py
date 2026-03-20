@@ -318,6 +318,7 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        self.preprocess_dropout = nn.Dropout(p=0.03)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -383,7 +384,8 @@ class Transolver(nn.Module):
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
 
         fx = self.preprocess(x)
-        fx_pre = fx  # save for skip
+        fx_pre = fx  # save for skip (BEFORE dropout, so skip has clean features)
+        fx = self.preprocess_dropout(fx)
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
