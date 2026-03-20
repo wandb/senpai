@@ -318,6 +318,8 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        self.zone_embed = nn.Sequential(nn.Linear(1, 8), nn.GELU())
+        nn.init.zeros_(self.zone_embed[0].bias)  # start near zero effect
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -374,6 +376,11 @@ class Transolver(nn.Module):
                 raise ValueError("Missing required input tensor: pos")
             new_pos = self.get_grid(pos)
             x = torch.cat((x, new_pos), dim=-1)
+
+        # Zone proxy: proximity to nearest refinement boundary (≈1 near foils, ≈0 far)
+        zone_proxy = 1.0 / (1.0 + x[:, :, 2:10].abs().min(dim=-1, keepdim=True).values * 5.0)
+        zone_feat = self.zone_embed(zone_proxy)  # [B, N, 8]
+        x = torch.cat([x, zone_feat], dim=-1)
 
         x_cross = x * self.feature_cross(x)
         x = x + 0.1 * x_cross  # residual with small scale
@@ -518,7 +525,7 @@ print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 1 + 32,  # 8 freqs * 2 coords * 2 (sin+cos) = 32
+    fun_dim=X_DIM - 2 + 1 + 32 + 8,  # 8 freqs * 2 coords * 2 (sin+cos) = 32, +8 zone embed
     out_dim=3,
     n_hidden=192,  # regime-w: full width with finer routing
     n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
