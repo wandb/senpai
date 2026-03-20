@@ -768,8 +768,11 @@ for epoch in range(MAX_EPOCHS):
             y_trunc = y_sorted[:, :n_groups * coarse_pool_size]
             mask_trunc = mask_sorted[:, :n_groups * coarse_pool_size]
 
-            pred_coarse = pred_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
-            y_coarse = y_trunc.reshape(B, n_groups, coarse_pool_size, C).mean(dim=2)
+            mask_trunc_f = mask_trunc.float().reshape(B, n_groups, coarse_pool_size).unsqueeze(-1)
+            pred_g = pred_trunc.reshape(B, n_groups, coarse_pool_size, C)
+            y_g = y_trunc.reshape(B, n_groups, coarse_pool_size, C)
+            pred_coarse = (pred_g * mask_trunc_f).sum(dim=2) / mask_trunc_f.sum(dim=2).clamp(min=1)
+            y_coarse = (y_g * mask_trunc_f).sum(dim=2) / mask_trunc_f.sum(dim=2).clamp(min=1)
             mask_coarse = mask_trunc.reshape(B, n_groups, coarse_pool_size).any(dim=2)
 
             coarse_err = (pred_coarse - y_coarse).abs()
