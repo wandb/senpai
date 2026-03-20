@@ -651,6 +651,7 @@ for epoch in range(MAX_EPOCHS):
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
 
+        raw_gap_pre_std = x[:, 0, 21]  # save before standardization: gap=0 for single-foil, >0 for tandem
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -680,9 +681,10 @@ for epoch in range(MAX_EPOCHS):
             noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
             y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
 
-        # Per-sample std normalization: skip tandem samples (gap feature index 21)
-        raw_gap = x[:, 0, 21]
-        is_tandem = raw_gap.abs() > 0.5
+        # Per-sample std normalization: use raw gap (before standardization) for tandem detection
+        # Bug fix: standardized gap for single-foil (gap=0) is ≈-0.531 which exceeds the old 0.5
+        # threshold, causing single-foil to be wrongly normalized with tandem clamps.
+        is_tandem = raw_gap_pre_std.abs() > 0.1
         B = y_norm.shape[0]
         sample_stds = torch.ones(B, 1, 3, device=device)
         channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
@@ -881,6 +883,7 @@ for epoch in range(MAX_EPOCHS):
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
 
+                raw_gap_pre_std = x[:, 0, 21]  # save before standardization for tandem detection
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -901,9 +904,8 @@ for epoch in range(MAX_EPOCHS):
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
-                # Per-sample std normalization: skip tandem samples
-                raw_gap = x[:, 0, 21]
-                is_tandem = raw_gap.abs() > 0.5
+                # Per-sample std normalization: use raw gap for tandem detection (bug fix)
+                is_tandem = raw_gap_pre_std.abs() > 0.1
                 B = y_norm.shape[0]
                 sample_stds = torch.ones(B, 1, 3, device=device)
                 channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
