@@ -655,7 +655,7 @@ for epoch in range(MAX_EPOCHS):
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         dist_surf = x[:, :, 2:10].abs().min(dim=-1, keepdim=True).values  # [B, N, 1]
-        dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+        dist_feat = torch.log1p(dist_surf * 20.0)  # log-scale for better gradient flow
         x = torch.cat([x, curv, dist_feat], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
@@ -885,7 +885,7 @@ for epoch in range(MAX_EPOCHS):
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                 dist_surf = x[:, :, 2:10].abs().min(dim=-1, keepdim=True).values  # [B, N, 1]
-                dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+                dist_feat = torch.log1p(dist_surf * 20.0)  # log-scale for better gradient flow
                 x = torch.cat([x, curv, dist_feat], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
@@ -1066,7 +1066,7 @@ if best_metrics:
                 x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                 curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                 dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
-                dist_feat = torch.log1p(dist_surf * 10.0)
+                dist_feat = torch.log1p(dist_surf * 20.0)
                 x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
