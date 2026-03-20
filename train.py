@@ -20,6 +20,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     Tandem surface loss is therefore underweighted.
 """
 
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -849,6 +850,11 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
+    if epoch >= 45:
+        progress = min(1.0, (epoch - 45) / 10.0)
+        override_lr = cfg.lr * 0.5 * (1 + math.cos(math.pi * progress))
+        for pg in optimizer.param_groups:
+            pg['lr'] = max(override_lr, 5e-5)
     if epoch >= 50:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
