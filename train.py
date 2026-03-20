@@ -230,8 +230,10 @@ class TransolverBlock(nn.Module):
                 nn.GELU(),
                 nn.Linear(hidden_dim, out_dim),
             )
+            self.film_scale = nn.Linear(2, hidden_dim, bias=False)
+            self.film_bias = nn.Linear(2, hidden_dim, bias=False)
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, cond=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
@@ -240,7 +242,11 @@ class TransolverBlock(nn.Module):
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            fx_normed = self.ln_3(fx)
+            if cond is not None:
+                cond_expanded = cond.unsqueeze(1).expand(-1, fx_normed.shape[1], -1)  # [B, N, 2]
+                fx_normed = fx_normed * (1 + self.film_scale(cond_expanded)) + self.film_bias(cond_expanded)
+            return self.mlp2(fx_normed)
         return fx
 
 
@@ -307,6 +313,9 @@ class Transolver(nn.Module):
             ]
         )
         self.initialize_weights()
+        # Zero-init FiLM layers so they start as identity (no effect at t=0)
+        nn.init.zeros_(self.blocks[-1].film_scale.weight)
+        nn.init.zeros_(self.blocks[-1].film_bias.weight)
         self.out_skip = nn.Linear(n_hidden, out_dim)
         nn.init.zeros_(self.out_skip.weight)
         nn.init.zeros_(self.out_skip.bias)
@@ -393,7 +402,8 @@ class Transolver(nn.Module):
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+        cond = torch.cat([re_pred, aoa_pred], dim=-1)  # [B, 2]
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, cond=cond)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
