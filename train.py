@@ -316,6 +316,9 @@ class Transolver(nn.Module):
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.mean_head = nn.Sequential(
+            nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 3)
+        )
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
 
@@ -383,6 +386,7 @@ class Transolver(nn.Module):
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
 
         fx = self.preprocess(x)
+        mean_pred = self.mean_head(fx.mean(dim=1))  # [B, 3] — predict sample mean
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
@@ -397,7 +401,7 @@ class Transolver(nn.Module):
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred, "mean_pred": mean_pred}
 
 
 # ---------------------------------------------------------------------------
@@ -685,6 +689,7 @@ for epoch in range(MAX_EPOCHS):
         is_tandem = raw_gap.abs() > 0.5
         B = y_norm.shape[0]
         sample_stds = torch.ones(B, 1, 3, device=device)
+        sample_means = torch.zeros(B, 1, 3, device=device)
         channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
         tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
         if model.training:
@@ -695,6 +700,12 @@ for epoch in range(MAX_EPOCHS):
                 else:
                     sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
             y_norm = y_norm / sample_stds
+            # Residual decomposition: subtract per-sample spatial mean
+            for b in range(B):
+                valid = mask[b]
+                if valid.any():
+                    sample_means[b, 0] = y_norm[b, valid].mean(dim=0)
+            y_norm = y_norm - sample_means
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model({"x": x})
@@ -704,6 +715,7 @@ for epoch in range(MAX_EPOCHS):
         pred = pred.float()
         re_pred = re_pred.float()
         aoa_pred = aoa_pred.float()
+        mean_pred = out["mean_pred"].float()
         if model.training:
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
@@ -783,6 +795,9 @@ for epoch in range(MAX_EPOCHS):
         aoa_target = x[:, 0, 14:15]  # AoA0_rad from normalized input
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
+        if model.training:
+            mean_loss = F.mse_loss(mean_pred, sample_means.squeeze(1))
+            loss = loss + 0.1 * mean_loss
 
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
@@ -915,11 +930,22 @@ for epoch in range(MAX_EPOCHS):
                     else:
                         sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
                 y_norm_scaled = y_norm / sample_stds
+                # Residual decomposition at validation: subtract per-sample spatial mean
+                sample_means_val = torch.zeros(B, 1, 3, device=device)
+                for b in range(B):
+                    valid = mask[b]
+                    if valid.any():
+                        sample_means_val[b, 0] = y_norm_scaled[b, valid].mean(dim=0)
+                y_norm_scaled = y_norm_scaled - sample_means_val
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    _eval_out = eval_model({"x": x})
+                    pred = _eval_out["preds"]
+                    mean_pred_val = _eval_out["mean_pred"]
                 pred = pred.float()
-                pred_loss = pred / sample_stds
+                mean_pred_val = mean_pred_val.float()
+                # Reconstruct full prediction: residual/sample_stds + predicted mean
+                pred_loss = pred / sample_stds + mean_pred_val.unsqueeze(1)
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
                 abs_err = abs_err.nan_to_num(0.0)
@@ -937,7 +963,8 @@ for epoch in range(MAX_EPOCHS):
                 n_vbatches += 1
 
                 # Denormalize: phys_stats → Cp space → original scale
-                pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                pred_full_unscaled = pred_loss * sample_stds  # back to y_norm_unscaled space
+                pred_phys = pred_full_unscaled * phys_stats["y_std"] + phys_stats["y_mean"]
                 pred_orig = _phys_denorm(pred_phys, Umag, q)
                 y_clamped = y.clamp(-1e6, 1e6)
                 err = (pred_orig - y_clamped).abs()
