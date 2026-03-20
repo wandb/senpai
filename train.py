@@ -166,6 +166,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         if spatial_bias is not None:
             slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
         slice_weights = self.softmax(slice_logits)
+        self._last_slice_weights = slice_weights.detach()  # [B, H, N, S] saved for entropy reg; detached to allow deepcopy for EMA
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
@@ -783,6 +784,16 @@ for epoch in range(MAX_EPOCHS):
         aoa_target = x[:, 0, 14:15]  # AoA0_rad from normalized input
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
+
+        # Entropy regularization: encourage diverse slice usage (prevent routing collapse)
+        import math
+        if hasattr(_base_model.blocks[0].attn, '_last_slice_weights'):
+            sw = _base_model.blocks[0].attn._last_slice_weights
+            avg_assign = sw.mean(dim=2)  # [B, H, S]
+            entropy = -(avg_assign * (avg_assign + 1e-8).log()).sum(dim=-1).mean()
+            max_ent = math.log(48)
+            entropy_loss = 0.01 * (max_ent - entropy)
+            loss = loss + entropy_loss
 
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
