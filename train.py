@@ -164,7 +164,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
         slice_logits = self.in_project_slice(x_mid) / temp
         if spatial_bias is not None:
-            slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
+            slice_logits = slice_logits + 0.05 * spatial_bias.unsqueeze(1)
         slice_weights = self.softmax(slice_logits)
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
