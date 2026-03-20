@@ -49,7 +49,7 @@ torch.set_float32_matmul_precision('high')
 # ---------------------------------------------------------------------------
 
 ACTIVATION = {
-    "gelu": nn.GELU,
+    "gelu": nn.SiLU,
     "tanh": nn.Tanh,
     "sigmoid": nn.Sigmoid,
     "relu": nn.ReLU,
@@ -211,8 +211,8 @@ class TransolverBlock(nn.Module):
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         self.spatial_bias = nn.Sequential(
-            nn.Linear(3, 64), nn.GELU(),
-            nn.Linear(64, 64), nn.GELU(),
+            nn.Linear(3, 64), nn.SiLU(),
+            nn.Linear(64, 64), nn.SiLU(),
             nn.Linear(64, slice_num),
         )
         nn.init.zeros_(self.spatial_bias[-1].weight)
@@ -227,7 +227,7 @@ class TransolverBlock(nn.Module):
             self.ln_3 = nn.LayerNorm(hidden_dim)
             self.mlp2 = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
+                nn.SiLU(),
                 nn.Linear(hidden_dim, out_dim),
             )
 
@@ -314,8 +314,8 @@ class Transolver(nn.Module):
         nn.init.constant_(self.skip_gate[0].bias, -2.0)  # starts nearly closed
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
-        self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
-        self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.SiLU(), nn.Linear(32, 1))
+        self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.SiLU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
 
