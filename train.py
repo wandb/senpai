@@ -41,6 +41,8 @@ from data.utils import visualize
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
 
 torch.set_float32_matmul_precision('high')
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
 
 
 # ---------------------------------------------------------------------------
@@ -577,10 +579,10 @@ base_opt = torch.optim.AdamW([
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.2, total_iters=10)
+warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.2, total_iters=15)
 cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
-    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[10]
+    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[15]
 )
 
 # --- wandb ---
