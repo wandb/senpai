@@ -755,6 +755,20 @@ for epoch in range(MAX_EPOCHS):
         _coarse_loss = None
         coarse_pool_size = 64
         B, N, C = pred.shape
+
+        # Stagnation point anchoring loss
+        if epoch >= 10:
+            # Find approximate stagnation points: min velocity magnitude on surface
+            vel_mag = (pred[:, :, 0:2] ** 2).sum(dim=-1).sqrt()  # [B, N]
+            vel_surf = vel_mag.masked_fill(~surf_mask, float('inf'))
+            stag_idx = vel_surf.argmin(dim=1)  # [B] index of stagnation node per sample
+            # Get predicted pressure at stagnation in normalized space
+            stag_pred_p = pred[torch.arange(B, device=device), stag_idx, 2]  # [B]
+            # Target: stagnation Cp = 1.0, in z-scored space: (1.0 - y_mean_p) / y_std_p
+            stag_target = (1.0 - phys_stats["y_mean"][2]) / phys_stats["y_std"][2]
+            stag_loss = F.mse_loss(stag_pred_p, stag_target.expand_as(stag_pred_p))
+            loss = loss + 0.1 * stag_loss
+
         n_groups = N // coarse_pool_size
         if n_groups > 1:
             # Sort by x-coordinate for spatially coherent groups
