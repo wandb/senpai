@@ -875,7 +875,7 @@ for epoch in range(MAX_EPOCHS):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.first_step()
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                out2 = model({"x": x.detach()})
             pred2 = out2["preds"].float()
             re_pred2 = out2["re_pred"].float()
             aoa_pred2 = out2["aoa_pred"].float()
@@ -886,7 +886,7 @@ for epoch in range(MAX_EPOCHS):
             surf_ps2 = (abs_err2[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
             surf_loss2 = (surf_ps2 * tandem_boost).mean()
             loss2 = vol_loss2 + surf_weight * surf_loss2
-            loss2 = loss2 + 0.01 * F.mse_loss(re_pred2, log_re_target) + 0.01 * F.mse_loss(aoa_pred2, aoa_target)
+            loss2 = loss2 + 0.01 * F.mse_loss(re_pred2, log_re_target.detach()) + 0.01 * F.mse_loss(aoa_pred2, aoa_target.detach())
             loss2.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.second_step()
