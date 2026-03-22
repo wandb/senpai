@@ -26,7 +26,7 @@ curl -fsSL https://claude.ai/install.sh | bash
 export PATH="$HOME/.claude/bin:$PATH"
 
 # --- Install Weave Claude Code Plugin ---
-source "$(dirname "$0")/install-weave-cc-plugin.sh"
+source "$WORKDIR/tools/install-weave-cc-plugin.sh"
 
 # --- Install gh CLI ---
 curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
@@ -46,8 +46,6 @@ PROMPT="$(eval "cat <<_PROMPT_EOF_
 $(cat "$WORKDIR/instructions/prompt-student.md")
 _PROMPT_EOF_")"
 
-# --- Start Weave thread logger in background ---
-python3 "$WORKDIR/tools/weave_logger.py" --role student --agent-name "$STUDENT_NAME" --workdir "$WORKDIR" &
 
 ITERATION=0
 while true; do

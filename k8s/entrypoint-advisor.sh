@@ -41,7 +41,7 @@ curl -fsSL https://claude.ai/install.sh | bash
 export PATH="$HOME/.claude/bin:$PATH"
 
 # --- Install Weave Claude Plugin ---
-source "$(dirname "$0")/install-weave-cc-plugin.sh"
+source "$WORKDIR/tools/install-weave-cc-plugin.sh"
 
 # --- Install kubectl ---
 curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
@@ -71,8 +71,6 @@ export IS_SANDBOX=1
 LOGDIR="/workspace/senpai/advisor_logs"
 mkdir -p "$LOGDIR"
 
-# --- Start Weave thread logger in background ---
-python3 "$WORKDIR/tools/weave_logger.py" --role advisor --agent-name advisor --workdir "$WORKDIR" &
 
 ITERATION=0
 while true; do
