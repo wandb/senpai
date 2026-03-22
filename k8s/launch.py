@@ -38,8 +38,8 @@ class Args:
     advisor_branch: str = "noam"  # branch the advisor works on (PRs target this, not main)
     advisor: bool = False  # also deploy the advisor pod (default: students only)
     extra_instructions: str = ""  # extra prompt text for the advisor: a .md file path or a literal string
-    timeout_minutes: float = 180.0  # training run wall-clock limit (SENPAI_TIMEOUT_MINUTES)
-    max_epochs: int = 9999  # maximum training epochs, 9999 = effectively unlimited (SENPAI_MAX_EPOCHS)
+    timeout_minutes: float = 30.0  # training run wall-clock limit (SENPAI_TIMEOUT_MINUTES)
+    max_epochs: int = 50  # maximum training epochs (SENPAI_MAX_EPOCHS)
     dry_run: bool = False  # print manifests without applying
 
 
