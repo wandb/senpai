@@ -165,7 +165,8 @@ def main():
         print(f"\nMonitor:")
         print(f"  kubectl get deployments -l research-tag={args.tag}")
         print(f"  kubectl get deployment senpai-advisor")
-        print(f"  kubectl logs -f deployment/senpai-{student_list[0]}")
+        if student_list:
+            print(f"  kubectl logs -f deployment/senpai-{student_list[0]}")
         print(f"\nStop:")
         print(f"  kubectl delete deployments,configmaps -l research-tag={args.tag}")
 
