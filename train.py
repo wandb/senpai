@@ -405,8 +405,8 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-MAX_TIMEOUT = 30.0  # minutes
-MAX_EPOCHS = 100
+MAX_TIMEOUT = float(os.environ.get("SENPAI_TIMEOUT_MINUTES", "180"))
+MAX_EPOCHS = int(os.environ.get("SENPAI_MAX_EPOCHS", "500"))
 
 
 @dataclass
@@ -421,6 +421,20 @@ class Config:
     wandb_name: str | None = None
     agent: str | None = None
     debug: bool = False
+    # Architecture
+    n_layers: int = 1
+    n_hidden: int = 192
+    n_head: int = 3
+    slice_num: int = 48
+    # Schedule
+    warmup_iters: int = 10
+    cosine_t_max: int = 62
+    ema_start_epoch: int = 40
+    temp_anneal_epoch: int = 50
+    vol_ramp_end: int = 40
+    tandem_curr_end: int = 10
+    noise_anneal_denom: int = 60
+    hard_mining_epoch: int = 30
 
 
 cfg = sp.parse(Config)
@@ -520,10 +534,10 @@ model_config = dict(
     space_dim=2,
     fun_dim=X_DIM - 2 + 2 + 32,  # +1 curv, +1 dist_feat, +32 fourier PE
     out_dim=3,
-    n_hidden=192,  # regime-w: full width with finer routing
-    n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
-    n_head=3,
-    slice_num=48,  # regime-h: more slices for finer spatial decomposition
+    n_hidden=cfg.n_hidden,
+    n_layers=cfg.n_layers,
+    n_head=cfg.n_head,
+    slice_num=cfg.slice_num,
     mlp_ratio=2,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
@@ -536,7 +550,6 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
-ema_start_epoch = 40
 ema_decay = 0.998
 
 n_params = sum(p.numel() for p in model.parameters())
@@ -577,10 +590,10 @@ base_opt = torch.optim.AdamW([
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.2, total_iters=10)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
+warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.2, total_iters=cfg.warmup_iters)
+cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=cfg.cosine_t_max, eta_min=5e-5)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
-    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[10]
+    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[cfg.warmup_iters]
 )
 
 # --- wandb ---
@@ -668,14 +681,14 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
-        if model.training and epoch < 60:
-            noise_scale = 0.05 * (1 - epoch / 60)
+        if model.training and epoch < cfg.noise_anneal_denom:
+            noise_scale = 0.05 * (1 - epoch / max(cfg.noise_anneal_denom, 1))
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         if model.training:
-            noise_progress = min(1.0, epoch / 60)
+            noise_progress = min(1.0, epoch / max(cfg.noise_anneal_denom, 1))
             vel_noise = 0.015 * (1 - noise_progress) + 0.003 * noise_progress
             p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
             noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
@@ -709,7 +722,7 @@ for epoch in range(MAX_EPOCHS):
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
-        if epoch < 10:
+        if epoch < cfg.tandem_curr_end:
             is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
             sample_mask = (~is_tandem_curr).float()[:, None, None]
             abs_err = abs_err * sample_mask
@@ -717,9 +730,9 @@ for epoch in range(MAX_EPOCHS):
         surf_mask = mask & is_surface
 
         # Progressive resolution: subsample volume nodes in loss early in training
-        # Ramps from 10% → 100% of volume nodes over first 40 epochs
-        if epoch < 40:
-            vol_keep_ratio = 0.05 + 0.95 * (epoch / 40)
+        # Ramps from 10% → 100% of volume nodes over first vol_ramp_end epochs
+        if epoch < cfg.vol_ramp_end:
+            vol_keep_ratio = 0.05 + 0.95 * (epoch / max(cfg.vol_ramp_end, 1))
             vol_indices = vol_mask.nonzero(as_tuple=False)
             n_vol = vol_indices.shape[0]
             n_keep = max(int(n_vol * vol_keep_ratio), 1)
@@ -737,8 +750,8 @@ for epoch in range(MAX_EPOCHS):
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
         running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
-        # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
-        if epoch >= 30:
+        # Asymmetric hard-node mining for non-tandem samples after hard_mining_epoch (vectorized)
+        if epoch >= cfg.hard_mining_epoch:
             surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
             surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
             surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
@@ -837,7 +850,7 @@ for epoch in range(MAX_EPOCHS):
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-        if epoch >= ema_start_epoch:
+        if epoch >= cfg.ema_start_epoch:
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
             else:
@@ -853,7 +866,7 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
-    if epoch >= 50:
+    if epoch >= cfg.temp_anneal_epoch:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
     epoch_vol /= n_batches
