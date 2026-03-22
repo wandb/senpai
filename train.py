@@ -261,6 +261,9 @@ class Transolver(nn.Module):
         unified_pos=False,
         output_fields: list[str] | None = None,
         output_dims: list[int] | None = None,
+        pe_mode: str = "fourier",
+        use_surf_amp: bool = False,
+        use_grad_ckpt: bool = False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -316,8 +319,18 @@ class Transolver(nn.Module):
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
-        self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
-        self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        self.pe_mode = pe_mode
+        self.use_surf_amp = use_surf_amp
+        self.use_grad_ckpt = use_grad_ckpt
+        if pe_mode == "fourier":
+            self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
+            self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        elif pe_mode == "12fourier":
+            self.fourier_freqs_learned = nn.Parameter(torch.logspace(-1, 2, 12))
+        elif pe_mode == "sinusoidal":
+            self.fourier_freqs_fixed = torch.tensor([2.0 ** k for k in range(8)])  # non-learnable
+        if use_surf_amp:
+            self.surf_amp = nn.Parameter(torch.ones(n_hidden))
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -356,14 +369,15 @@ class Transolver(nn.Module):
         x = data.get("x")
         pos = data.get("pos", pos)
         condition = data.get("condition", condition)
-        return x, pos, condition
+        is_surface_data = data.get("is_surface", None)
+        return x, pos, condition, is_surface_data
 
     def _validate_output_dims(self, preds):
         if sum(self.output_dims) != preds.shape[-1]:
             raise ValueError("Sum of output_dims must match preds last dimension")
 
     def forward(self, data, pos=None, condition=None):
-        x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
+        x, pos, condition, is_surface_data = self._unpack_inputs(data, pos=pos, condition=condition)
         if x is None:
             raise ValueError("Missing required input tensor: x")
         if condition is not None:
@@ -383,11 +397,17 @@ class Transolver(nn.Module):
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
 
         fx = self.preprocess(x)
+        if self.use_surf_amp and is_surface_data is not None:
+            fx = fx * (1 + is_surface_data.unsqueeze(-1) * (self.surf_amp - 1))
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
-        for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+        if self.use_grad_ckpt:
+            for block in self.blocks[:-1]:
+                fx = grad_checkpoint(block, fx, raw_xy, is_tandem, use_reentrant=False)
+        else:
+            for block in self.blocks[:-1]:
+                fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
@@ -405,8 +425,8 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-MAX_TIMEOUT = 30.0  # minutes
-MAX_EPOCHS = 100
+MAX_TIMEOUT = 180.0  # minutes (3 hours for Phase 2)
+MAX_EPOCHS = 500
 
 
 @dataclass
@@ -421,6 +441,7 @@ class Config:
     wandb_name: str | None = None
     agent: str | None = None
     debug: bool = False
+    variant: str = "h224"  # GPU assignment: h224, iso-flops, 12fourier, ponly-surf, surf-amp, strong-noise, grad-ckpt, sinusoidal
 
 
 cfg = sp.parse(Config)
@@ -516,17 +537,28 @@ _pstd = ((_phys_sq_sum / _phys_n - _pmean ** 2).clamp(min=0.0).sqrt()).clamp(min
 phys_stats = {"y_mean": _pmean, "y_std": _pstd}
 print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
+# --- Phase 2 variant configuration ---
+_n_layers = 4 if cfg.variant == "grad-ckpt" else 2
+_n_hidden = {"h224": 224, "iso-flops": 128, "grad-ckpt": 256}.get(cfg.variant, 192)
+_n_head = 4
+_slice_num = 48
+_pe_features = 48 if cfg.variant == "12fourier" else 32
+_pe_mode = {"12fourier": "12fourier", "sinusoidal": "sinusoidal"}.get(cfg.variant, "fourier")
+
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + 32,  # +1 curv, +1 dist_feat, +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + _pe_features,  # +1 curv, +1 dist_feat, +PE features
     out_dim=3,
-    n_hidden=192,  # regime-w: full width with finer routing
-    n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
-    n_head=3,
-    slice_num=48,  # regime-h: more slices for finer spatial decomposition
+    n_hidden=_n_hidden,
+    n_layers=_n_layers,
+    n_head=_n_head,
+    slice_num=_slice_num,
     mlp_ratio=2,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
+    pe_mode=_pe_mode,
+    use_surf_amp=(cfg.variant == "surf-amp"),
+    use_grad_ckpt=(cfg.variant == "grad-ckpt"),
 )
 
 model = Transolver(**model_config).to(device)
@@ -534,9 +566,8 @@ torch._functorch.config.donated_buffer = False  # required for retain_graph=True
 model = torch.compile(model, mode="default")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
-from copy import deepcopy
 ema_model = None
-ema_start_epoch = 40
+ema_start_epoch = 48 if cfg.variant == "grad-ckpt" else 120
 ema_decay = 0.998
 
 n_params = sum(p.numel() for p in model.parameters())
@@ -577,10 +608,12 @@ base_opt = torch.optim.AdamW([
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.2, total_iters=10)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
+_warmup = 8 if cfg.variant == "grad-ckpt" else 20
+_T_max = 72 if cfg.variant == "grad-ckpt" else 180
+warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.2, total_iters=_warmup)
+cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=_T_max, eta_min=5e-5)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
-    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[10]
+    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[_warmup]
 )
 
 # --- wandb ---
@@ -658,26 +691,36 @@ for epoch in range(MAX_EPOCHS):
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         x = torch.cat([x, curv, dist_feat], dim=-1)
-        # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
+        # Positional encoding: variant-controlled
         raw_xy = x[:, :, :2]
-        # Normalize xy to [0,1] per-sample for consistent Fourier encoding
+        # Normalize xy to [0,1] per-sample for consistent PE
         xy_min = raw_xy.amin(dim=1, keepdim=True)
         xy_max = raw_xy.amax(dim=1, keepdim=True)
         xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-        freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-        xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+        if cfg.variant == "12fourier":
+            freqs = _base_model.fourier_freqs_learned.abs()
+        elif cfg.variant == "sinusoidal":
+            freqs = _base_model.fourier_freqs_fixed.to(device)
+        else:
+            freqs = torch.cat([_base_model.fourier_freqs_fixed.to(device), _base_model.fourier_freqs_learned.abs()])
+        xy_scaled = xy_norm.unsqueeze(-1) * freqs
+        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
         x = torch.cat([x, fourier_pe], dim=-1)
-        if model.training and epoch < 60:
-            noise_scale = 0.05 * (1 - epoch / 60)
+        if model.training and epoch < 120:
+            noise_scale = 0.05 * (1 - epoch / 120)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         if model.training:
-            noise_progress = min(1.0, epoch / 60)
-            vel_noise = 0.015 * (1 - noise_progress) + 0.003 * noise_progress
-            p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
+            if cfg.variant == "strong-noise":
+                noise_progress = min(1.0, epoch / 150)
+                vel_noise = 0.02 * (1 - noise_progress) + 0.001 * noise_progress
+                p_noise = 0.01 * (1 - noise_progress) + 0.0005 * noise_progress
+            else:
+                noise_progress = min(1.0, epoch / 120)
+                vel_noise = 0.015 * (1 - noise_progress) + 0.003 * noise_progress
+                p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
             noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
             y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
 
@@ -698,7 +741,7 @@ for epoch in range(MAX_EPOCHS):
             y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x, "is_surface": is_surface.float()})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -709,7 +752,7 @@ for epoch in range(MAX_EPOCHS):
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
-        if epoch < 10:
+        if epoch < 20:
             is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
             sample_mask = (~is_tandem_curr).float()[:, None, None]
             abs_err = abs_err * sample_mask
@@ -717,9 +760,9 @@ for epoch in range(MAX_EPOCHS):
         surf_mask = mask & is_surface
 
         # Progressive resolution: subsample volume nodes in loss early in training
-        # Ramps from 10% → 100% of volume nodes over first 40 epochs
-        if epoch < 40:
-            vol_keep_ratio = 0.05 + 0.95 * (epoch / 40)
+        # Ramps from 10% → 100% of volume nodes over first 80 epochs
+        if epoch < 80:
+            vol_keep_ratio = 0.05 + 0.95 * (epoch / 80)
             vol_indices = vol_mask.nonzero(as_tuple=False)
             n_vol = vol_indices.shape[0]
             n_keep = max(int(n_vol * vol_keep_ratio), 1)
@@ -853,7 +896,7 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
-    if epoch >= 50:
+    if epoch >= 140:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
     epoch_vol /= n_batches
@@ -892,15 +935,19 @@ for epoch in range(MAX_EPOCHS):
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                 x = torch.cat([x, curv, dist_feat], dim=-1)
-                # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
+                # Positional encoding: variant-controlled
                 raw_xy = x[:, :, :2]
-                # Normalize xy to [0,1] per-sample for consistent Fourier encoding
                 xy_min = raw_xy.amin(dim=1, keepdim=True)
                 xy_max = raw_xy.amax(dim=1, keepdim=True)
                 xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-                xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+                if cfg.variant == "12fourier":
+                    freqs = _base_model.fourier_freqs_learned.abs()
+                elif cfg.variant == "sinusoidal":
+                    freqs = _base_model.fourier_freqs_fixed.to(device)
+                else:
+                    freqs = torch.cat([_base_model.fourier_freqs_fixed.to(device), _base_model.fourier_freqs_learned.abs()])
+                xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                 x = torch.cat([x, fourier_pe], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
@@ -922,7 +969,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    pred = eval_model({"x": x, "is_surface": is_surface.float()})["preds"]
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
@@ -1003,9 +1050,10 @@ for epoch in range(MAX_EPOCHS):
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
-    learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
-    for i, f in enumerate(learned_freqs):
-        metrics[f"fourier_freq_{i}"] = f
+    if hasattr(_base_model, 'fourier_freqs_learned'):
+        learned_freqs = _base_model.fourier_freqs_learned.abs().detach().cpu().tolist()
+        for i, f in enumerate(learned_freqs):
+            metrics[f"fourier_freq_{i}"] = f
     wandb.log(metrics)
 
     if torch.cuda.is_available():
@@ -1073,8 +1121,21 @@ if best_metrics:
                 dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)
                 x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                raw_xy_n = x_n[:, :, :2]
+                xy_min_n = raw_xy_n.amin(dim=1, keepdim=True)
+                xy_max_n = raw_xy_n.amax(dim=1, keepdim=True)
+                xy_norm_n = (raw_xy_n - xy_min_n) / (xy_max_n - xy_min_n + 1e-8)
+                if cfg.variant == "12fourier":
+                    freqs_n = _base_model.fourier_freqs_learned.abs()
+                elif cfg.variant == "sinusoidal":
+                    freqs_n = _base_model.fourier_freqs_fixed.to(device)
+                else:
+                    freqs_n = torch.cat([_base_model.fourier_freqs_fixed.to(device), _base_model.fourier_freqs_learned.abs()])
+                xy_scaled_n = xy_norm_n.unsqueeze(-1) * freqs_n
+                fourier_pe_n = torch.cat([xy_scaled_n.sin().flatten(-2), xy_scaled_n.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, fourier_pe_n], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
-                pred = vis_model({"x": x_n})["preds"].float()
+                pred = vis_model({"x": x_n, "is_surface": is_surf_dev.float()})["preds"].float()
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
                 y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
             samples.append((x[:, :2], y_true, y_pred, is_surface))
