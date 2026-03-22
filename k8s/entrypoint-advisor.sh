@@ -21,6 +21,10 @@ cd "$WORKDIR"
 cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" /tmp/CLAUDE-ADVISOR.md
 cp "$WORKDIR/instructions/prompt-advisor.md" /tmp/prompt-advisor.md
 
+# --- Append extra startup instructions to prompt if provided ---
+[ -n "${EXTRA_INSTRUCTIONS_B64:-}" ] &&
+  { printf '\n\n# Finally, some additional instuctinos\n\n'; printf '%s' "$EXTRA_INSTRUCTIONS_B64" | base64 -d; printf '\n'; } >> /tmp/prompt-advisor.md
+
 uv pip install --system -e .
 
 # --- Git identity ---

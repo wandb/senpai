@@ -37,6 +37,7 @@ class Args:
     wandb_project: str = "senpai-v1"  # W&B project name
     advisor_branch: str = "jurgen"  # branch the advisor works on (PRs target this, not main)
     advisor: bool = False  # also deploy the advisor pod (default: students only)
+    extra_instructions: str = ""  # extra prompt text for the advisor: a .md file path or a literal string
     dry_run: bool = False  # print manifests without applying
 
 
@@ -84,18 +85,24 @@ def render_student(template: str, student_name: str, tag: str, args: Args) -> st
 
 
 def render_advisor(template: str, tag: str, student_list: list[str], args: Args) -> str:
+    import base64
+    data = {
+        "REPO_URL": args.repo_url,
+        "REPO_BRANCH": args.repo_branch,
+        "RESEARCH_TAG": tag,
+        "STUDENT_NAMES": ",".join(student_list),
+        "WANDB_ENTITY": args.wandb_entity,
+        "WANDB_PROJECT": args.wandb_project,
+        "ADVISOR_BRANCH": args.advisor_branch,
+    }
+    if args.extra_instructions:
+        p = Path(args.extra_instructions)
+        content = p.read_text() if p.exists() else args.extra_instructions
+        data["EXTRA_INSTRUCTIONS_B64"] = base64.b64encode(content.encode()).decode()
     configmap = render_configmap(
         name="senpai-config-advisor",
         labels={"app": "senpai", "role": "advisor", "research-tag": tag},
-        data={
-            "REPO_URL": args.repo_url,
-            "REPO_BRANCH": args.repo_branch,
-            "RESEARCH_TAG": tag,
-            "STUDENT_NAMES": ",".join(student_list),
-            "WANDB_ENTITY": args.wandb_entity,
-            "WANDB_PROJECT": args.wandb_project,
-            "ADVISOR_BRANCH": args.advisor_branch,
-        },
+        data=data,
     )
     deployment = render_template(template, {"RESEARCH_TAG": tag})
     return configmap + "\n---\n" + deployment
