@@ -25,6 +25,9 @@ git config user.email "senpai-$STUDENT_NAME@senpai"
 curl -fsSL https://claude.ai/install.sh | bash
 export PATH="$HOME/.claude/bin:$PATH"
 
+# --- Install Weave Claude Code Plugin ---
+source "$(dirname "$0")/install-weave-cc-plugin.sh"
+
 # --- Install gh CLI ---
 curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
 chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
