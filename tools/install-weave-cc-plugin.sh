@@ -9,6 +9,12 @@
 # WANDB_ENTITY and WANDB_PROJECT come from the K8s ConfigMap (via launch.py).
 # WANDB_API_KEY comes from the senpai-secrets K8s secret.
 
+# Configure SSH for GitHub using the mounted key
+mkdir -p ~/.ssh
+cp /run/secrets/ssh/id_ed25519 ~/.ssh/id_ed25519
+chmod 600 ~/.ssh/id_ed25519
+ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+
 if ! command -v npm &>/dev/null; then
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
     apt-get install -y nodejs
