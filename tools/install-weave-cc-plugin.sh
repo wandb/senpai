@@ -19,7 +19,7 @@ if ! command -v npm &>/dev/null; then
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
     apt-get install -y nodejs
 fi
-apt-get install -y netcat-openbsd
+apt-get update -qq && apt-get install -y netcat-openbsd
 npm install -g weave-claude-plugin
 export WEAVE_PROJECT="${WANDB_ENTITY}/${WANDB_PROJECT}"
 # WANDB_API_KEY is already exported by the pod — re-export to make it explicit
