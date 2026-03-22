@@ -53,6 +53,11 @@ Read `program.md` for the full research context, constraints, metrics, and file 
    - Use `--wandb_group` only when the PR instructions say to (the advisor sets this for multi-iteration ideas).
    - If the run crashes, check the log. Fix typos/import errors and re-run. If the idea is fundamentally broken, report that in the results.
    - Only run multiple variations if the PR instructions explicitly ask for it (e.g. "try surface weight 5, 10, 20"). Otherwise, run the single experiment described.
+   - **After each run finishes**, check for new advisor comments before continuing:
+     ```bash
+     gh pr view <number> --comments
+     ```
+     If the advisor has left new instructions (e.g. to try a different variant, abort the current direction, or adjust parameters), follow them instead of proceeding with the original plan.
 
 5. **Report results**
    Update the PR body with the Results section (template in `program.md`):

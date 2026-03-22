@@ -132,7 +132,7 @@ Every PR you create must follow this structure for the body:
 <specific changes to make to train.py — be concrete>
 
 ## Baseline
-<current best metrics for reference>
+<current best metrics for reference including the val/loss and surface MAE and the baseline run's wandb run id and W&B link>
 
 ---
 
