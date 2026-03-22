@@ -405,8 +405,8 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-MAX_TIMEOUT = 30.0  # minutes
-MAX_EPOCHS = 100
+MAX_TIMEOUT = 180.0  # minutes
+MAX_EPOCHS = 500
 
 
 @dataclass
@@ -421,6 +421,26 @@ class Config:
     wandb_name: str | None = None
     agent: str | None = None
     debug: bool = False
+    # Schedule params (tuned for 3-hour / 500-epoch runs)
+    warmup_total_iters: int = 20
+    warmup_start_factor: float = 0.2
+    cosine_T_max: int = 200
+    cosine_eta_min: float = 1e-5
+    ema_start_epoch: int = 40
+    ema_decay: float = 0.998
+    temp_anneal_epoch: int = 50
+    vol_ramp_epochs: int = 40
+    tandem_curriculum_epochs: int = 10
+    noise_anneal_epochs: int = 60
+    scheduler_type: str = "sequential"  # "sequential", "warm_restarts", "onecycle"
+    cosine_T_0: int = 50       # warm_restarts only
+    cosine_T_mult: int = 2     # warm_restarts only
+    onecycle_max_lr: float = 3e-3        # onecycle only
+    onecycle_epochs: int = 200           # onecycle only
+    onecycle_pct_start: float = 0.15    # onecycle only
+    onecycle_div_factor: float = 10.0   # onecycle only
+    onecycle_final_div_factor: float = 100.0  # onecycle only
+    use_lookahead: bool = True
 
 
 cfg = sp.parse(Config)
@@ -521,7 +541,7 @@ model_config = dict(
     fun_dim=X_DIM - 2 + 2 + 32,  # +1 curv, +1 dist_feat, +32 fourier PE
     out_dim=3,
     n_hidden=192,  # regime-w: full width with finer routing
-    n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
+    n_layers=2,
     n_head=3,
     slice_num=48,  # regime-h: more slices for finer spatial decomposition
     mlp_ratio=2,
@@ -536,8 +556,6 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
-ema_start_epoch = 40
-ema_decay = 0.998
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -576,12 +594,40 @@ base_opt = torch.optim.AdamW([
     {'params': attn_params, 'lr': cfg.lr * 0.5},
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
-optimizer = Lookahead(base_opt, k=10, alpha=0.8)
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.2, total_iters=10)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
-scheduler = torch.optim.lr_scheduler.SequentialLR(
-    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[10]
-)
+if cfg.use_lookahead:
+    optimizer = Lookahead(base_opt, k=10, alpha=0.8)
+else:
+    optimizer = base_opt
+if cfg.scheduler_type == "warm_restarts":
+    _warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
+    _restarts = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        base_opt, T_0=cfg.cosine_T_0, T_mult=cfg.cosine_T_mult, eta_min=cfg.cosine_eta_min
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        base_opt, schedulers=[_warmup, _restarts], milestones=[10]
+    )
+elif cfg.scheduler_type == "onecycle":
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        base_opt,
+        max_lr=[cfg.onecycle_max_lr * 0.5, cfg.onecycle_max_lr],
+        epochs=cfg.onecycle_epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=cfg.onecycle_pct_start,
+        div_factor=cfg.onecycle_div_factor,
+        final_div_factor=cfg.onecycle_final_div_factor,
+    )
+else:  # sequential (default)
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        base_opt, start_factor=cfg.warmup_start_factor, total_iters=cfg.warmup_total_iters
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        base_opt, T_max=cfg.cosine_T_max, eta_min=cfg.cosine_eta_min
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        base_opt, schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[cfg.warmup_total_iters]
+    )
+step_scheduler_per_batch = (cfg.scheduler_type == "onecycle")
 
 # --- wandb ---
 run = wandb.init(
@@ -668,14 +714,14 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
-        if model.training and epoch < 60:
-            noise_scale = 0.05 * (1 - epoch / 60)
+        if model.training and epoch < cfg.noise_anneal_epochs:
+            noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         if model.training:
-            noise_progress = min(1.0, epoch / 60)
+            noise_progress = min(1.0, epoch / cfg.noise_anneal_epochs)
             vel_noise = 0.015 * (1 - noise_progress) + 0.003 * noise_progress
             p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
             noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
@@ -709,7 +755,7 @@ for epoch in range(MAX_EPOCHS):
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
-        if epoch < 10:
+        if epoch < cfg.tandem_curriculum_epochs:
             is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
             sample_mask = (~is_tandem_curr).float()[:, None, None]
             abs_err = abs_err * sample_mask
@@ -718,8 +764,8 @@ for epoch in range(MAX_EPOCHS):
 
         # Progressive resolution: subsample volume nodes in loss early in training
         # Ramps from 10% → 100% of volume nodes over first 40 epochs
-        if epoch < 40:
-            vol_keep_ratio = 0.05 + 0.95 * (epoch / 40)
+        if epoch < cfg.vol_ramp_epochs:
+            vol_keep_ratio = 0.05 + 0.95 * (epoch / cfg.vol_ramp_epochs)
             vol_indices = vol_mask.nonzero(as_tuple=False)
             n_vol = vol_indices.shape[0]
             n_keep = max(int(n_vol * vol_keep_ratio), 1)
@@ -837,13 +883,18 @@ for epoch in range(MAX_EPOCHS):
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-        if epoch >= ema_start_epoch:
+        if step_scheduler_per_batch:
+            try:
+                scheduler.step()
+            except ValueError:
+                pass
+        if epoch >= cfg.ema_start_epoch:
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
             else:
                 with torch.no_grad():
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
-                        ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
+                        ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -852,8 +903,9 @@ for epoch in range(MAX_EPOCHS):
         n_batches += 1
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
-    scheduler.step()
-    if epoch >= 50:
+    if not step_scheduler_per_batch:
+        scheduler.step()
+    if epoch >= cfg.temp_anneal_epoch:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
     epoch_vol /= n_batches
