@@ -35,7 +35,7 @@ class Args:
     image: str = "ghcr.io/tcapelle/dev_box:latest"  # container image for students
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
     wandb_project: str = "senpai-v1"  # W&B project name
-    advisor_branch: str = "jurgen"  # branch the advisor works on (PRs target this, not main)
+    advisor_branch: str = "noam"  # branch the advisor works on (PRs target this, not main)
     advisor: bool = False  # also deploy the advisor pod (default: students only)
     extra_instructions: str = ""  # extra prompt text for the advisor: a .md file path or a literal string
     dry_run: bool = False  # print manifests without applying

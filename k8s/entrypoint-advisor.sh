@@ -17,14 +17,6 @@ echo "Students: $STUDENT_NAMES"
 # Repo already cloned by the deployment args block
 cd "$WORKDIR"
 
-# --- Stash role files BEFORE advisor branch checkout (jurgen may not have them) ---
-cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" /tmp/CLAUDE-ADVISOR.md
-cp "$WORKDIR/instructions/prompt-advisor.md" /tmp/prompt-advisor.md
-
-# --- Append extra startup instructions to prompt if provided ---
-[ -n "${EXTRA_INSTRUCTIONS_B64:-}" ] &&
-  { printf '\n\n# Finally, some additional instuctinos\n\n'; printf '%s' "$EXTRA_INSTRUCTIONS_B64" | base64 -d; printf '\n'; } >> /tmp/prompt-advisor.md
-
 uv pip install --system -e .
 
 # --- Git identity ---
@@ -40,6 +32,9 @@ else
     git checkout -b "$ADVISOR_BRANCH"
     git push -u origin "$ADVISOR_BRANCH"
 fi
+
+# --- Install role instructions ---
+cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
 
 # --- Install Claude Code ---
 curl -fsSL https://claude.ai/install.sh | bash
@@ -59,8 +54,13 @@ echo "=== gh auth ready (using GITHUB_TOKEN env var) ==="
 
 # --- Build prompt (bash heredoc expansion — no envsubst needed) ---
 PROMPT="$(eval "cat <<_PROMPT_EOF_
-$(cat /tmp/prompt-advisor.md)
+$(cat "$WORKDIR/instructions/prompt-advisor.md")
 _PROMPT_EOF_")"
+
+# --- Append extra startup instructions if provided ---
+if [ -n "${EXTRA_INSTRUCTIONS_B64:-}" ]; then
+    PROMPT="${PROMPT}"$'\n\n# Finally, some additional instructions\n\n'"$(printf '%s' "$EXTRA_INSTRUCTIONS_B64" | base64 -d)"
+fi
 
 # --- Launch Claude Code in Ralph Loop ---
 export IS_SANDBOX=1
@@ -78,8 +78,8 @@ while true; do
     echo "=== Advisor Loop iteration $ITERATION ($(date)) ==="
     echo "=== Log: $LOGFILE ==="
 
-    # Restore CLAUDE.md each iteration — advisor git checkouts during PR review can clobber it
-    cp /tmp/CLAUDE-ADVISOR.md "$WORKDIR/CLAUDE.md"
+    # Restore CLAUDE.md — branch checkouts clobber it
+    cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
 
     if [ "$ITERATION" -eq 1 ]; then
         claude -p "$PROMPT" --model "claude-opus-4-6[1m]" --output-format stream-json --verbose --dangerously-skip-permissions > "$LOGFILE" 2>&1 || true

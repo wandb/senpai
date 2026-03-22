@@ -23,6 +23,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
 import os
 import time
 from collections.abc import Mapping
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -635,10 +636,10 @@ if best_metrics:
     print("\nGenerating flow field plots...")
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     plot_dir = Path("plots") / run.id
-    # Visualize from val_in_dist — same distribution as original val_ds
-    images = visualize(model, val_splits["val_in_dist"], stats, device,
-                       n_samples=2 if cfg.debug else 4, out_dir=plot_dir)
-    if images:
-        wandb.log({"val_predictions": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    n = 1 if cfg.debug else 4
+    for split_name, split_ds in val_splits.items():
+        images = visualize(model, split_ds, stats, device, n_samples=n, out_dir=plot_dir / split_name)
+        if images:
+            wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
 
 wandb.finish()

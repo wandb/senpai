@@ -65,8 +65,7 @@ Read `program.md` for the full research context, constraints, metrics, and file 
 
 6. **Submit for review**
    ```bash
-   git add -A
-   git reset HEAD CLAUDE.md
+   git add train.py
    git commit -m "<concise description of changes>"
    git push origin <branch>
    gh pr ready <number>
