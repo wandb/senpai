@@ -23,11 +23,13 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
 import os
 import time
 from collections.abc import Mapping
+from copy import deepcopy
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 import wandb
 import yaml
 from dataclasses import dataclass, asdict
