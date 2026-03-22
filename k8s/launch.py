@@ -38,6 +38,8 @@ class Args:
     advisor_branch: str = "noam"  # branch the advisor works on (PRs target this, not main)
     advisor: bool = False  # also deploy the advisor pod (default: students only)
     extra_instructions: str = ""  # extra prompt text for the advisor: a .md file path or a literal string
+    timeout_minutes: float = 180.0  # training run wall-clock limit (SENPAI_TIMEOUT_MINUTES)
+    max_epochs: int = 9999  # maximum training epochs, 9999 = effectively unlimited (SENPAI_MAX_EPOCHS)
     dry_run: bool = False  # print manifests without applying
 
 
@@ -73,6 +75,8 @@ def render_student(template: str, student_name: str, tag: str, args: Args) -> st
             "WANDB_PROJECT": args.wandb_project,
             "ADVISOR_BRANCH": args.advisor_branch,
             "WANDB_MODE": "online",
+            "SENPAI_TIMEOUT_MINUTES": str(args.timeout_minutes),
+            "SENPAI_MAX_EPOCHS": str(args.max_epochs),
         },
     )
     deployment = render_template(template, {

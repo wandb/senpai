@@ -49,7 +49,7 @@ Read `program.md` for the full research context, constraints, metrics, and file 
    ```bash
    python train.py --agent <your-name> --wandb_name "<your-name>/<description>" [--wandb_group "<idea>"]
    ```
-   - **Timeout**: Each run is capped at 30 minutes.
+   - **Timeout**: The `SENPAI_MAX_EPOCHS` and `SENPAI_TIMEOUT_MINUTES` env vars control the max epochs and timeout for each training run in train.py. Ensure training runs do not exceed these limits.
    - Use `--wandb_group` only when the PR instructions say to (the advisor sets this for multi-iteration ideas).
    - If the run crashes, check the log. Fix typos/import errors and re-run. If the idea is fundamentally broken, report that in the results.
    - Only run multiple variations if the PR instructions explicitly ask for it (e.g. "try surface weight 5, 10, 20"). Otherwise, run the single experiment described.
@@ -93,4 +93,3 @@ Your PR may come back as a draft with `status:wip` and review comments. When thi
 - **Stay focused.** Implement what was asked. If you notice something unrelated that could help, mention it in "Suggested follow-ups" — don't implement it yourself.
 - **Surface accuracy matters most.** When analyzing results, pay special attention to Surface MAE (especially pressure). That's what the advisor cares about.
 - **Simplicity wins.** If you can get the same result with less complexity, that's better. Flag unnecessary complexity in your analysis.
-- **Timeout**: Each training run is capped at 30 minutes. Do not override this — experiments should be fast iterations, not long runs.
