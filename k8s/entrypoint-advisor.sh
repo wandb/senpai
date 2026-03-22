@@ -55,10 +55,8 @@ apt-get update && apt-get install -y gh
 # gh uses GITHUB_TOKEN env var automatically, no explicit login needed
 echo "=== gh auth ready (using GITHUB_TOKEN env var) ==="
 
-# --- Build prompt (bash heredoc expansion — no envsubst needed) ---
-PROMPT="$(eval "cat <<_PROMPT_EOF_
-$(cat "$WORKDIR/instructions/prompt-advisor.md")
-_PROMPT_EOF_")"
+# --- Build prompt ---
+PROMPT="$(envsubst < "$WORKDIR/instructions/prompt-advisor.md")"
 
 # --- Append extra startup instructions if provided ---
 if [ -n "${EXTRA_INSTRUCTIONS_B64:-}" ]; then

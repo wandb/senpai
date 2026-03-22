@@ -42,9 +42,7 @@ cp instructions/CLAUDE-STUDENT.md "$WORKDIR/CLAUDE.md"
 # --- Launch Claude Code in Ralph Loop ---
 export IS_SANDBOX=1
 
-PROMPT="$(eval "cat <<_PROMPT_EOF_
-$(cat "$WORKDIR/instructions/prompt-student.md")
-_PROMPT_EOF_")"
+PROMPT="$(envsubst < "$WORKDIR/instructions/prompt-student.md")"
 
 
 ITERATION=0
