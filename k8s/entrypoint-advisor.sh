@@ -56,7 +56,7 @@ apt-get update && apt-get install -y gh gettext-base
 echo "=== gh auth ready (using GITHUB_TOKEN env var) ==="
 
 # --- Build prompt ---
-PROMPT="$(envsubst < "$WORKDIR/instructions/prompt-advisor.md")"
+PROMPT="$(envsubst < "$WORKDIR/instructions/prompt-advisor.md" | sed '/^<!--$/,/^-->$/d')"
 
 # --- Append extra startup instructions if provided ---
 if [ -n "${EXTRA_INSTRUCTIONS_B64:-}" ]; then

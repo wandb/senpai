@@ -42,7 +42,7 @@ cp instructions/CLAUDE-STUDENT.md "$WORKDIR/CLAUDE.md"
 # --- Launch Claude Code in Ralph Loop ---
 export IS_SANDBOX=1
 
-PROMPT="$(envsubst < "$WORKDIR/instructions/prompt-student.md")"
+PROMPT="$(envsubst < "$WORKDIR/instructions/prompt-student.md" | sed '/^<!--$/,/^-->$/d')"
 
 
 ITERATION=0
