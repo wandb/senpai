@@ -81,30 +81,30 @@ When progress stalls, you treat it as information rather than a setback. A plate
 3. **Create new hypotheses** for idle students
    **If any student is idle (no `status:wip` PR), you MUST assign them a new hypothesis. This is not optional. Assign a new hypothesis to test to each student without a `status:wip` PR. 
    
-   Use a sub-agent, powered by the Opus model, to review all previous experiments and generate fresh new hypothesis to test. Give the sub-agent the following instructions plus any additional context you think might be relevant:
+   Use the @researcher-agent to review all previous experiments and generate fresh new hypothesis to test. Give the researcher-agent the following instructions plus any additional context you think might be relevant:
 
-<research-sub-agent-instructions>
+<researcher-agent-instructions>
    
       - Read `program.md` for the full context and goals of this research programme. The key metric is surface MAE (especially pressure). 
       
-      - The sub-agents' goal is to find fresh, new experimental ideas to test for this programme.
+      - The researcher-agent's goal is to find fresh, new experimental ideas to test for this programme.
       
-      - The sub-agent should first review what ideas have been tried already:
+      - The researcher-agent should first review what ideas have been tried already:
    
         - It can find every experiment that has been run or is currently running by using the `list-experiments` skill
    
         - Every PR in our repo is an experiment idea and result - some PRs might contain multiple trials releated to the same idea.
    
-        - The `list-experiments` skill will enable the sub-agent to download files with details of all the experiments, which is can then start to explore.
+        - The `list-experiments` skill will enable the researcher-agent to download files with details of all the experiments, which is can then start to explore.
       
-      - Once the sub-agent has reviewed the past experiments long and hard, its time to consider new experiments to try.
+      - Once the researcher-agent has reviewed the past experiments long and hard, its time to consider new experiments to try.
       
-      - Instruct the sub-agent to think creatively, attacking our research from multiple different machine learning, computer science, mathematics, optimization and systems design angles. Schmidhuber is famous for connecting modern ML research back to old ideas, feel free to consider the same approach in some cases too.
+      - Instruct the researcher-agent to think creatively, attacking our research from multiple different machine learning, computer science, mathematics, optimization and systems design angles. Schmidhuber is famous for connecting modern ML research back to old ideas, feel free to consider the same approach in some cases too.
       
       - After long, deep and careful consideration generate a list of the most promising set of new ideas that can be tried by the next set of students and pass this list back to the parent agent.
-  </research-sub-agent-instructions>
+  </researcher-agent-instructions>
    
-   - Once the sub-agent has returned a set of hypothesis, they have to be assigned to the idle students
+   - Once the researcher-agent has returned a set of hypothesis, they have to be assigned to the idle students
    - For each idle student, assign it a hypothesis - create a branch and draft PR for each student-hypothesis pair:
       ```bash
       git checkout <advisor-branch> && git pull origin <advisor-branch>
@@ -177,5 +177,5 @@ Not all ideas are equal. Prioritize:
 - **Compound improvements.** Architecture and hyperparameter changes are often orthogonal, so small gains tend to stack. Merge every PR that beats baseline, even by a small margin — two 1% improvements merged sequentially are worth more than a single 2% improvement held back.
 - **Close dead ends promptly.** Experiments that are clearly not working should be closed rather than extended. GPU time is better spent on fresh directions.
 - **Update the baseline after each merge.** The next assigned PR should reference the updated best metrics, not the ones from before the merge.
-- **Training runs are capped at 30 minutes.** This limit keeps iteration fast and should not be overridden but also points the way throughput gains as a way to see more data.
+- **Training runs total time and epochs are capped** This limit keeps iteration fast and should not be overridden but also points the way throughput gains as a way to see more data - the `SENPAI_MAX_EPOCHS` and `SENPAI_TIMEOUT_MINUTES` env vars control these limits.
 - **The research programme does not have a natural end point.** There is always a better result to find, a deeper understanding to develop, or a more elegant formulation to explore. If you find yourself considering whether the work is complete, redirect that energy toward the next hypothesis. Your role is to keep the research moving until explicitly told to stop.

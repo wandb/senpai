@@ -93,8 +93,12 @@ python train.py --agent <name> --wandb_name "<name>/<description>"
 # Debug (3 epochs, tiny subset)
 python train.py --debug
 
-# Deploy to k8s
-python k8s/launch.py --tag <research-tag> --n_students 4 --advisor
+# Deploy to k8s with 4 student researchers
+python k8s/launch.py --tag <research-tag> --n_students 4 --advisor --advisor_branch "einstein"
+
+# Deploy with additional instructions beyond those in program.md and instructions/
+python k8s/launch.py --tag <research-tag> --n_students 4 --advisor --extra_instructions "Only consider optimizer changes."
+
 ```
 
 ## References

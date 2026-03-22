@@ -17,9 +17,6 @@ echo "Students: $STUDENT_NAMES"
 # Repo already cloned by the deployment args block
 cd "$WORKDIR"
 
-# --- Install role instructions ---
-cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
-
 uv pip install --system -e .
 
 # --- Git identity ---
@@ -36,9 +33,15 @@ else
     git push -u origin "$ADVISOR_BRANCH"
 fi
 
+# --- Install role instructions ---
+cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
+
 # --- Install Claude Code ---
 curl -fsSL https://claude.ai/install.sh | bash
 export PATH="$HOME/.claude/bin:$PATH"
+
+# --- Install Weave Claude Plugin ---
+source "$WORKDIR/tools/install-weave-cc-plugin.sh"
 
 # --- Install kubectl ---
 curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
@@ -57,14 +60,17 @@ PROMPT="$(eval "cat <<_PROMPT_EOF_
 $(cat "$WORKDIR/instructions/prompt-advisor.md")
 _PROMPT_EOF_")"
 
+# --- Append extra startup instructions if provided ---
+if [ -n "${EXTRA_INSTRUCTIONS_B64:-}" ]; then
+    PROMPT="${PROMPT}"$'\n\n# Finally, some additional instructions\n\n'"$(printf '%s' "$EXTRA_INSTRUCTIONS_B64" | base64 -d)"
+fi
+
 # --- Launch Claude Code in Ralph Loop ---
 export IS_SANDBOX=1
 
 LOGDIR="/workspace/senpai/advisor_logs"
 mkdir -p "$LOGDIR"
 
-# --- Start Weave thread logger in background ---
-python3 "$WORKDIR/tools/weave_logger.py" --role advisor --agent-name advisor --workdir "$WORKDIR" &
 
 ITERATION=0
 while true; do

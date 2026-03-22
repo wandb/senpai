@@ -35,8 +35,11 @@ class Args:
     image: str = "ghcr.io/tcapelle/dev_box:latest"  # container image for students
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
     wandb_project: str = "senpai-v1"  # W&B project name
-    advisor_branch: str = "jurgen"  # branch the advisor works on (PRs target this, not main)
+    advisor_branch: str = "noam"  # branch the advisor works on (PRs target this, not main)
     advisor: bool = False  # also deploy the advisor pod (default: students only)
+    extra_instructions: str = ""  # extra prompt text for the advisor: a .md file path or a literal string
+    timeout_minutes: float = 30.0  # training run wall-clock limit (SENPAI_TIMEOUT_MINUTES)
+    max_epochs: int = 50  # maximum training epochs (SENPAI_MAX_EPOCHS)
     dry_run: bool = False  # print manifests without applying
 
 
@@ -72,6 +75,8 @@ def render_student(template: str, student_name: str, tag: str, args: Args) -> st
             "WANDB_PROJECT": args.wandb_project,
             "ADVISOR_BRANCH": args.advisor_branch,
             "WANDB_MODE": "online",
+            "SENPAI_TIMEOUT_MINUTES": str(args.timeout_minutes),
+            "SENPAI_MAX_EPOCHS": str(args.max_epochs),
         },
     )
     deployment = render_template(template, {
@@ -84,18 +89,24 @@ def render_student(template: str, student_name: str, tag: str, args: Args) -> st
 
 
 def render_advisor(template: str, tag: str, student_list: list[str], args: Args) -> str:
+    import base64
+    data = {
+        "REPO_URL": args.repo_url,
+        "REPO_BRANCH": args.repo_branch,
+        "RESEARCH_TAG": tag,
+        "STUDENT_NAMES": ",".join(student_list),
+        "WANDB_ENTITY": args.wandb_entity,
+        "WANDB_PROJECT": args.wandb_project,
+        "ADVISOR_BRANCH": args.advisor_branch,
+    }
+    if args.extra_instructions:
+        p = Path(args.extra_instructions)
+        content = p.read_text() if p.exists() else args.extra_instructions
+        data["EXTRA_INSTRUCTIONS_B64"] = base64.b64encode(content.encode()).decode()
     configmap = render_configmap(
         name="senpai-config-advisor",
         labels={"app": "senpai", "role": "advisor", "research-tag": tag},
-        data={
-            "REPO_URL": args.repo_url,
-            "REPO_BRANCH": args.repo_branch,
-            "RESEARCH_TAG": tag,
-            "STUDENT_NAMES": ",".join(student_list),
-            "WANDB_ENTITY": args.wandb_entity,
-            "WANDB_PROJECT": args.wandb_project,
-            "ADVISOR_BRANCH": args.advisor_branch,
-        },
+        data=data,
     )
     deployment = render_template(template, {"RESEARCH_TAG": tag})
     return configmap + "\n---\n" + deployment
@@ -158,7 +169,8 @@ def main():
         print(f"\nMonitor:")
         print(f"  kubectl get deployments -l research-tag={args.tag}")
         print(f"  kubectl get deployment senpai-advisor")
-        print(f"  kubectl logs -f deployment/senpai-{student_list[0]}")
+        if student_list:
+            print(f"  kubectl logs -f deployment/senpai-{student_list[0]}")
         print(f"\nStop:")
         print(f"  kubectl delete deployments,configmaps -l research-tag={args.tag}")
 
