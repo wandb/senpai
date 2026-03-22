@@ -405,8 +405,8 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-MAX_TIMEOUT = 30.0  # minutes
-MAX_EPOCHS = 100
+MAX_TIMEOUT = 180.0  # minutes
+MAX_EPOCHS = 500
 
 
 @dataclass
@@ -421,9 +421,37 @@ class Config:
     wandb_name: str | None = None
     agent: str | None = None
     debug: bool = False
+    # Experiment variant (selects regularization strategy)
+    variant: str = "wd1e-5"
 
 
 cfg = sp.parse(Config)
+
+# ---------------------------------------------------------------------------
+# Variant-specific hyperparameters
+# ---------------------------------------------------------------------------
+_VARIANT_CONFIGS = {
+    "wd1e-5":        dict(weight_decay=1e-5,  dropout=0.0,  lr=2.6e-3, grad_accum=1, use_sam=False, use_pcgrad=True,  compile_mode="default"),
+    "wd1e-4":        dict(weight_decay=1e-4,  dropout=0.0,  lr=2.6e-3, grad_accum=1, use_sam=False, use_pcgrad=True,  compile_mode="default"),
+    "dropout05":     dict(weight_decay=0.0,   dropout=0.05, lr=2.6e-3, grad_accum=1, use_sam=False, use_pcgrad=True,  compile_mode="default"),
+    "dropout10":     dict(weight_decay=0.0,   dropout=0.1,  lr=2.6e-3, grad_accum=1, use_sam=False, use_pcgrad=True,  compile_mode="default"),
+    "sam":           dict(weight_decay=0.0,   dropout=0.0,  lr=2.6e-3, grad_accum=1, use_sam=True,  use_pcgrad=False, compile_mode="default"),
+    "grad-accum-2x": dict(weight_decay=0.0,   dropout=0.0,  lr=1.3e-3, grad_accum=2, use_sam=False, use_pcgrad=False, compile_mode="default"),
+    "grad-accum-4x": dict(weight_decay=0.0,   dropout=0.0,  lr=6.5e-4, grad_accum=4, use_sam=False, use_pcgrad=False, compile_mode="default"),
+    "no-pcgrad":     dict(weight_decay=0.0,   dropout=0.0,  lr=2.6e-3, grad_accum=1, use_sam=False, use_pcgrad=False, compile_mode="reduce-overhead"),
+}
+if cfg.variant not in _VARIANT_CONFIGS:
+    raise ValueError(f"Unknown variant '{cfg.variant}'. Options: {list(_VARIANT_CONFIGS)}")
+_vcfg       = _VARIANT_CONFIGS[cfg.variant]
+_variant_wd     = _vcfg["weight_decay"]
+_variant_drop   = _vcfg["dropout"]
+_variant_lr     = _vcfg["lr"]
+_variant_gacc   = _vcfg["grad_accum"]
+_use_sam        = _vcfg["use_sam"]
+_use_pcgrad     = _vcfg["use_pcgrad"]
+_compile_mode   = _vcfg["compile_mode"]
+print(f"Variant: {cfg.variant}  wd={_variant_wd}  dropout={_variant_drop}  lr={_variant_lr}  "
+      f"grad_accum={_variant_gacc}  use_sam={_use_sam}  use_pcgrad={_use_pcgrad}  compile={_compile_mode}")
 
 if cfg.debug:
     MAX_EPOCHS = 3
@@ -521,8 +549,9 @@ model_config = dict(
     fun_dim=X_DIM - 2 + 2 + 32,  # +1 curv, +1 dist_feat, +32 fourier PE
     out_dim=3,
     n_hidden=192,  # regime-w: full width with finer routing
-    n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
+    n_layers=2,   # phase2: 2 layers with 3-hour budget
     n_head=3,
+    dropout=_variant_drop,
     slice_num=48,  # regime-h: more slices for finer spatial decomposition
     mlp_ratio=2,
     output_fields=["Ux", "Uy", "p"],
@@ -531,15 +560,56 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
-model = torch.compile(model, mode="default")
+model = torch.compile(model, mode=_compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
-ema_start_epoch = 40
+ema_start_epoch = 60 if _use_sam else 120  # SAM runs ~100 epochs; others up to 500
 ema_decay = 0.998
 
 n_params = sum(p.numel() for p in model.parameters())
+
+
+class SAM:
+    """Sharpness-Aware Minimization wrapper (Foret et al. 2021)."""
+    def __init__(self, param_groups, rho=0.05, lr=2.6e-3, weight_decay=0.0):
+        self.base_optimizer = torch.optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
+        self.param_groups = self.base_optimizer.param_groups
+        self.rho = rho
+        self._old_params: dict = {}
+
+    def first_step(self):
+        """Apply gradient-based perturbation: p += rho * g / ||g||."""
+        grad_norms = [p.grad.norm() for group in self.param_groups
+                      for p in group['params'] if p.grad is not None]
+        if not grad_norms:
+            return
+        grad_norm = torch.stack(grad_norms).norm()
+        scale = self.rho / (grad_norm + 1e-12)
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                self._old_params[id(p)] = p.data.clone()
+                p.data.add_(p.grad * scale)
+        self.base_optimizer.zero_grad()
+
+    def second_step(self):
+        """Restore weights and apply AdamW step using perturbed-point gradients."""
+        for group in self.param_groups:
+            for p in group['params']:
+                old = self._old_params.pop(id(p), None)
+                if old is not None:
+                    p.data.copy_(old)
+        self.base_optimizer.step()
+        self.base_optimizer.zero_grad()
+
+    def zero_grad(self):
+        self.base_optimizer.zero_grad()
+
+    def step(self):
+        self.base_optimizer.step()
 
 
 class Lookahead:
@@ -572,15 +642,23 @@ class Lookahead:
 
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
-base_opt = torch.optim.AdamW([
-    {'params': attn_params, 'lr': cfg.lr * 0.5},
-    {'params': other_params, 'lr': cfg.lr}
-], weight_decay=cfg.weight_decay)
-optimizer = Lookahead(base_opt, k=10, alpha=0.8)
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.2, total_iters=10)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
+_param_groups = [
+    {'params': attn_params, 'lr': _variant_lr * 0.5},
+    {'params': other_params, 'lr': _variant_lr},
+]
+if _use_sam:
+    # SAM: no Lookahead; adjusted schedule for ~100 epochs
+    optimizer = SAM(_param_groups, rho=0.05, lr=_variant_lr, weight_decay=_variant_wd)
+    base_opt = optimizer.base_optimizer
+    _warmup_iters, _T_max = 10, 90
+else:
+    base_opt = torch.optim.AdamW(_param_groups, weight_decay=_variant_wd)
+    optimizer = Lookahead(base_opt, k=10, alpha=0.8)
+    _warmup_iters, _T_max = 20, 180
+warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.2, total_iters=_warmup_iters)
+cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=_T_max, eta_min=5e-5)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
-    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[10]
+    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[_warmup_iters]
 )
 
 # --- wandb ---
@@ -622,6 +700,7 @@ ema_val_loss = float("inf")
 ema_decay_val = 0.9
 best_metrics = {}
 global_step = 0
+_accum_step = 0  # for gradient accumulation variants
 train_start = time.time()
 prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
@@ -668,14 +747,14 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
-        if model.training and epoch < 60:
-            noise_scale = 0.05 * (1 - epoch / 60)
+        if model.training and epoch < 120:
+            noise_scale = 0.05 * (1 - epoch / 120)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         if model.training:
-            noise_progress = min(1.0, epoch / 60)
+            noise_progress = min(1.0, epoch / 120)
             vel_noise = 0.015 * (1 - noise_progress) + 0.003 * noise_progress
             p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
             noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
@@ -709,7 +788,7 @@ for epoch in range(MAX_EPOCHS):
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
-        if epoch < 10:
+        if epoch < 20:
             is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
             sample_mask = (~is_tandem_curr).float()[:, None, None]
             abs_err = abs_err * sample_mask
@@ -717,9 +796,9 @@ for epoch in range(MAX_EPOCHS):
         surf_mask = mask & is_surface
 
         # Progressive resolution: subsample volume nodes in loss early in training
-        # Ramps from 10% → 100% of volume nodes over first 40 epochs
-        if epoch < 40:
-            vol_keep_ratio = 0.05 + 0.95 * (epoch / 40)
+        # Ramps from 10% → 100% of volume nodes over first 80 epochs
+        if epoch < 80:
+            vol_keep_ratio = 0.05 + 0.95 * (epoch / 80)
             vol_indices = vol_mask.nonzero(as_tuple=False)
             n_vol = vol_indices.shape[0]
             n_keep = max(int(n_vol * vol_keep_ratio), 1)
@@ -788,55 +867,88 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
-        # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
-        # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
-        is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
-        is_indist_pcgrad = ~is_ood_pcgrad
-        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
-
-        if use_pcgrad:
-            n_a = is_indist_pcgrad.float().sum().clamp(min=1)
-            n_b = is_ood_pcgrad.float().sum().clamp(min=1)
-            vol_mask_a = vol_mask_train & is_indist_pcgrad.unsqueeze(1)
-            vol_mask_b = vol_mask_train & is_ood_pcgrad.unsqueeze(1)
-            vol_loss_a = (abs_err * vol_mask_a.unsqueeze(-1)).sum() / vol_mask_a.sum().clamp(min=1)
-            vol_loss_b = (abs_err * vol_mask_b.unsqueeze(-1)).sum() / vol_mask_b.sum().clamp(min=1)
-            surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
-            surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
-            coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-
-            optimizer.zero_grad()
-            loss_a.backward(retain_graph=True)
-            grads_a = [p.grad.clone() if p.grad is not None else None
-                       for p in model.parameters()]
-            optimizer.zero_grad()
-            loss_b.backward()
-
-            ga_flat = torch.cat([g.view(-1) for g in grads_a if g is not None])
-            gb_flat = torch.cat([p.grad.view(-1) for p in model.parameters() if p.grad is not None])
-            dot_ab = (ga_flat @ gb_flat).item()
-            gb_ns = float((gb_flat @ gb_flat).item()) + 1e-8
-            ga_ns = float((ga_flat @ ga_flat).item()) + 1e-8
-            for p, ga in zip(model.parameters(), grads_a):
-                gb = p.grad
-                if ga is None and gb is None:
-                    continue
-                if ga is None:
-                    pass  # keep gb
-                elif gb is None:
-                    p.grad = ga
-                elif dot_ab < 0:
-                    p.grad = ((ga - (dot_ab / gb_ns) * gb) + (gb - (dot_ab / ga_ns) * ga)) * 0.5
-                else:
-                    p.grad = (ga + gb) * 0.5
-        else:
+        # Optimizer step: SAM / PCGrad / simple (with optional grad accumulation)
+        if _use_sam:
+            # SAM two-pass: first perturb, then step at perturbed point
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.first_step()
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out2 = model({"x": x})
+            pred2 = out2["preds"].float()
+            re_pred2 = out2["re_pred"].float()
+            aoa_pred2 = out2["aoa_pred"].float()
+            if model.training:
+                pred2 = pred2 / sample_stds
+            abs_err2 = (pred2 - y_norm).abs()
+            vol_loss2 = (abs_err2 * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+            surf_ps2 = (abs_err2[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            surf_loss2 = (surf_ps2 * tandem_boost).mean()
+            loss2 = vol_loss2 + surf_weight * surf_loss2
+            loss2 = loss2 + 0.01 * F.mse_loss(re_pred2, log_re_target) + 0.01 * F.mse_loss(aoa_pred2, aoa_target)
+            loss2.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.second_step()
+        elif _use_pcgrad:
+            # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
+            # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
+            is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
+            is_indist_pcgrad = ~is_ood_pcgrad
+            use_pcgrad_batch = is_indist_pcgrad.any() and is_ood_pcgrad.any()
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+            if use_pcgrad_batch:
+                n_a = is_indist_pcgrad.float().sum().clamp(min=1)
+                n_b = is_ood_pcgrad.float().sum().clamp(min=1)
+                vol_mask_a = vol_mask_train & is_indist_pcgrad.unsqueeze(1)
+                vol_mask_b = vol_mask_train & is_ood_pcgrad.unsqueeze(1)
+                vol_loss_a = (abs_err * vol_mask_a.unsqueeze(-1)).sum() / vol_mask_a.sum().clamp(min=1)
+                vol_loss_b = (abs_err * vol_mask_b.unsqueeze(-1)).sum() / vol_mask_b.sum().clamp(min=1)
+                surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
+                surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
+                coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
+                loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+
+                optimizer.zero_grad()
+                loss_a.backward(retain_graph=True)
+                grads_a = [p.grad.clone() if p.grad is not None else None
+                           for p in model.parameters()]
+                optimizer.zero_grad()
+                loss_b.backward()
+
+                ga_flat = torch.cat([g.view(-1) for g in grads_a if g is not None])
+                gb_flat = torch.cat([p.grad.view(-1) for p in model.parameters() if p.grad is not None])
+                dot_ab = (ga_flat @ gb_flat).item()
+                gb_ns = float((gb_flat @ gb_flat).item()) + 1e-8
+                ga_ns = float((ga_flat @ ga_flat).item()) + 1e-8
+                for p, ga in zip(model.parameters(), grads_a):
+                    gb = p.grad
+                    if ga is None and gb is None:
+                        continue
+                    if ga is None:
+                        pass  # keep gb
+                    elif gb is None:
+                        p.grad = ga
+                    elif dot_ab < 0:
+                        p.grad = ((ga - (dot_ab / gb_ns) * gb) + (gb - (dot_ab / ga_ns) * ga)) * 0.5
+                    else:
+                        p.grad = (ga + gb) * 0.5
+            else:
+                optimizer.zero_grad()
+                loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+        else:
+            # Simple backward with optional gradient accumulation
+            _accum_step += 1
+            if _accum_step % _variant_gacc == 1 or _variant_gacc == 1:
+                optimizer.zero_grad()
+            (loss / _variant_gacc).backward()
+            if _accum_step % _variant_gacc == 0 or _variant_gacc == 1:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
         if epoch >= ema_start_epoch:
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
@@ -853,7 +965,7 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
-    if epoch >= 50:
+    if epoch >= 140:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
     epoch_vol /= n_batches
@@ -1073,6 +1185,15 @@ if best_metrics:
                 dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)
                 x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                # Fourier positional encoding (must match training preprocessing)
+                raw_xy_vis = x_n[:, :, :2]
+                xy_min_vis = raw_xy_vis.amin(dim=1, keepdim=True)
+                xy_max_vis = raw_xy_vis.amax(dim=1, keepdim=True)
+                xy_norm_vis = (raw_xy_vis - xy_min_vis) / (xy_max_vis - xy_min_vis + 1e-8)
+                freqs_vis = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                xy_scaled_vis = xy_norm_vis.unsqueeze(-1) * freqs_vis
+                fourier_pe_vis = torch.cat([xy_scaled_vis.sin().flatten(-2), xy_scaled_vis.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, fourier_pe_vis], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
