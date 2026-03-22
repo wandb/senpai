@@ -119,7 +119,8 @@ class MLP(nn.Module):
 class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
-    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
+                 use_gumbel=False, use_adaptive_temp=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -129,6 +130,11 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
         self.tandem_temp_offset = nn.Parameter(torch.zeros(1, heads, 1, 1))
+        self.use_gumbel = use_gumbel
+        self.use_adaptive_temp = use_adaptive_temp
+        if use_adaptive_temp:
+            self.temp_proj = nn.Linear(dim_head, 1, bias=False)
+            nn.init.zeros_(self.temp_proj.weight)
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
@@ -162,7 +168,15 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         temp = self.temperature
         if tandem_mask is not None:
             temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
-        slice_logits = self.in_project_slice(x_mid) / temp
+        if self.use_adaptive_temp:
+            temp_adj = self.temp_proj(x_mid).squeeze(-1).unsqueeze(-1) * 0.1  # [B, H, N, 1]
+            temp = (temp + temp_adj).clamp(min=0.1)
+        slice_logits_raw = self.in_project_slice(x_mid)  # [B, H, N, slices] raw, before temp
+        if self.use_gumbel and self.training:
+            u = torch.rand_like(slice_logits_raw).clamp(1e-7, 1 - 1e-7)
+            gumbel_noise = -torch.log(-torch.log(u))
+            slice_logits_raw = slice_logits_raw + gumbel_noise
+        slice_logits = slice_logits_raw / temp
         if spatial_bias is not None:
             slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
         slice_weights = self.softmax(slice_logits)
@@ -197,6 +211,8 @@ class TransolverBlock(nn.Module):
         last_layer=False,
         out_dim=1,
         slice_num=32,
+        use_gumbel=False,
+        use_adaptive_temp=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -207,6 +223,8 @@ class TransolverBlock(nn.Module):
             dim_head=hidden_dim // num_heads,
             dropout=dropout,
             slice_num=slice_num,
+            use_gumbel=use_gumbel,
+            use_adaptive_temp=use_adaptive_temp,
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
@@ -261,6 +279,9 @@ class Transolver(nn.Module):
         unified_pos=False,
         output_fields: list[str] | None = None,
         output_dims: list[int] | None = None,
+        use_gumbel=False,
+        use_adaptive_temp=False,
+        use_surf_head=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -302,10 +323,13 @@ class Transolver(nn.Module):
                     out_dim=out_dim,
                     slice_num=slice_num,
                     last_layer=(idx == n_layers - 1),
+                    use_gumbel=use_gumbel,
+                    use_adaptive_temp=use_adaptive_temp,
                 )
                 for idx in range(n_layers)
             ]
         )
+        self.use_surf_head = use_surf_head
         self.initialize_weights()
         self.out_skip = nn.Linear(n_hidden, out_dim)
         nn.init.zeros_(self.out_skip.weight)
@@ -318,6 +342,10 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        if use_surf_head:
+            self.surf_head = nn.Sequential(
+                nn.Linear(n_hidden, n_hidden), nn.GELU(), nn.Linear(n_hidden, out_dim)
+            )
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -393,11 +421,17 @@ class Transolver(nn.Module):
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
+        # Surf head: separate output head for surface nodes (operates on hidden state)
+        surf_pred = self.surf_head(fx) if self.use_surf_head else None
+
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+        out = {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+        if surf_pred is not None:
+            out["surf_pred"] = surf_pred
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -405,8 +439,8 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-MAX_TIMEOUT = 30.0  # minutes
-MAX_EPOCHS = 100
+MAX_TIMEOUT = float(os.environ.get("SENPAI_TIMEOUT_MINUTES", "180.0"))
+MAX_EPOCHS = int(os.environ.get("SENPAI_MAX_EPOCHS", "500"))
 
 
 @dataclass
@@ -421,6 +455,7 @@ class Config:
     wandb_name: str | None = None
     agent: str | None = None
     debug: bool = False
+    variant: str = "baseline"  # curr30, surf2x, gumbel, adaptive-temp, mixup, pgrad, surf-head, tandem-interact
 
 
 cfg = sp.parse(Config)
@@ -516,17 +551,21 @@ _pstd = ((_phys_sq_sum / _phys_n - _pmean ** 2).clamp(min=0.0).sqrt()).clamp(min
 phys_stats = {"y_mean": _pmean, "y_std": _pstd}
 print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
+_extra_input = 1 if cfg.variant == "tandem-interact" else 0
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + 32,  # +1 curv, +1 dist_feat, +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + 32 + _extra_input,  # +1 curv, +1 dist_feat, +32 fourier PE, +1 tandem interact
     out_dim=3,
     n_hidden=192,  # regime-w: full width with finer routing
-    n_layers=1,       # was 2 — 1 layer for maximum epochs in 30 min
+    n_layers=2,
     n_head=3,
     slice_num=48,  # regime-h: more slices for finer spatial decomposition
     mlp_ratio=2,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
+    use_gumbel=(cfg.variant == "gumbel"),
+    use_adaptive_temp=(cfg.variant == "adaptive-temp"),
+    use_surf_head=(cfg.variant == "surf-head"),
 )
 
 model = Transolver(**model_config).to(device)
@@ -536,7 +575,7 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
-ema_start_epoch = 40
+ema_start_epoch = 120
 ema_decay = 0.998
 
 n_params = sum(p.numel() for p in model.parameters())
@@ -577,10 +616,10 @@ base_opt = torch.optim.AdamW([
     {'params': other_params, 'lr': cfg.lr}
 ], weight_decay=cfg.weight_decay)
 optimizer = Lookahead(base_opt, k=10, alpha=0.8)
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.2, total_iters=10)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=62, eta_min=5e-5)
+warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.2, total_iters=20)
+cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=180, eta_min=5e-5)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
-    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[10]
+    base_opt, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[20]
 )
 
 # --- wandb ---
@@ -652,6 +691,11 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
+        # tandem-interact: compute foil interaction feature from raw dsdf (before standardization)
+        if cfg.variant == "tandem-interact":
+            _foil1_dist = raw_dsdf[:, :, :4].norm(dim=-1, keepdim=True)  # [B, N, 1]
+            _foil2_dist = raw_dsdf[:, :, 4:8].norm(dim=-1, keepdim=True)  # [B, N, 1]
+            _interact_raw = _foil1_dist / (_foil2_dist + 1e-3)  # [B, N, 1]
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         x = (x - stats["x_mean"]) / stats["x_std"]
@@ -668,14 +712,22 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
-        if model.training and epoch < 60:
-            noise_scale = 0.05 * (1 - epoch / 60)
+        # tandem-interact: append interaction feature (non-tandem gets 1.0)
+        if cfg.variant == "tandem-interact":
+            _is_tandem_feat = (x[:, 0, 21].abs() > 0.01)
+            _interact_feat = torch.where(
+                _is_tandem_feat[:, None, None].expand_as(_interact_raw),
+                _interact_raw, torch.ones_like(_interact_raw)
+            )
+            x = torch.cat([x, _interact_feat], dim=-1)
+        if model.training and epoch < 120:
+            noise_scale = 0.05 * (1 - epoch / 120)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         if model.training:
-            noise_progress = min(1.0, epoch / 60)
+            noise_progress = min(1.0, epoch / 120)
             vel_noise = 0.015 * (1 - noise_progress) + 0.003 * noise_progress
             p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
             noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
@@ -697,6 +749,16 @@ for epoch in range(MAX_EPOCHS):
                     sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
             y_norm = y_norm / sample_stds
 
+        # Mixup augmentation: blend non-tandem samples only (GPU 4 variant)
+        if cfg.variant == "mixup" and model.training:
+            non_tandem = ~is_tandem
+            if non_tandem.sum() >= 2:
+                lam = float(torch.distributions.Beta(torch.tensor(0.2), torch.tensor(0.2)).sample())
+                nt_idx = non_tandem.nonzero(as_tuple=False).squeeze(1)
+                perm = nt_idx[torch.randperm(len(nt_idx))]
+                x[non_tandem] = lam * x[non_tandem] + (1 - lam) * x[perm]
+                y_norm[non_tandem] = lam * y_norm[non_tandem] + (1 - lam) * y_norm[perm]
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model({"x": x})
             pred = out["preds"]
@@ -705,11 +767,16 @@ for epoch in range(MAX_EPOCHS):
         pred = pred.float()
         re_pred = re_pred.float()
         aoa_pred = aoa_pred.float()
+        # surf-head: combine dedicated surface head with main prediction
+        if cfg.variant == "surf-head" and "surf_pred" in out:
+            surf_pred_raw = out["surf_pred"].float()
+            pred = torch.where(is_surface.unsqueeze(-1), 0.5 * pred + 0.5 * surf_pred_raw, pred)
         if model.training:
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
-        if epoch < 10:
+        _curr_epochs = 30 if cfg.variant == "curr30" else 20
+        if epoch < _curr_epochs:
             is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
             sample_mask = (~is_tandem_curr).float()[:, None, None]
             abs_err = abs_err * sample_mask
@@ -717,9 +784,9 @@ for epoch in range(MAX_EPOCHS):
         surf_mask = mask & is_surface
 
         # Progressive resolution: subsample volume nodes in loss early in training
-        # Ramps from 10% → 100% of volume nodes over first 40 epochs
-        if epoch < 40:
-            vol_keep_ratio = 0.05 + 0.95 * (epoch / 40)
+        # Ramps from 10% → 100% of volume nodes over first 80 epochs
+        if epoch < 80:
+            vol_keep_ratio = 0.05 + 0.95 * (epoch / 80)
             vol_indices = vol_mask.nonzero(as_tuple=False)
             n_vol = vol_indices.shape[0]
             n_keep = max(int(n_vol * vol_keep_ratio), 1)
@@ -747,10 +814,36 @@ for epoch in range(MAX_EPOCHS):
             hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
             surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
-        adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
+        # surf2x: double surface weight for tandem samples (separate from adaptive_boost)
+        if cfg.variant == "surf2x":
+            tandem_surf_multiplier = 2.0
+            surf_per_sample = surf_per_sample * torch.where(is_tandem_batch, tandem_surf_multiplier, 1.0).to(device)
+        _boost_max = 6.0 if cfg.variant == "curr30" else 4.0
+        adaptive_boost = max(1.0, min(_boost_max, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
         loss = vol_loss + surf_weight * surf_loss
+
+        # Pressure gradient regularization along surface (GPU 5 variant)
+        if cfg.variant == "pgrad":
+            _pgrad_penalties = []
+            _pgrad_threshold = 5.0
+            for _b in range(pred.shape[0]):
+                _surf_b = surf_mask[_b]  # [N] bool
+                if _surf_b.sum() < 2:
+                    continue
+                _pred_surf = pred[_b, _surf_b, :]  # [n_surf, 3]
+                _x_surf = x[_b, _surf_b, 0]  # [n_surf] x-coord
+                _sort_idx = _x_surf.argsort()
+                _pred_sorted = _pred_surf[_sort_idx]
+                _x_sorted = _x_surf[_sort_idx]
+                _dx = (_x_sorted[1:] - _x_sorted[:-1]).abs().clamp(min=1e-6)
+                _dp = _pred_sorted[1:, 2] - _pred_sorted[:-1, 2]
+                _pressure_grad = (_dp / _dx).abs()
+                _penalty = (_pressure_grad - _pgrad_threshold).clamp(min=0).mean()
+                _pgrad_penalties.append(_penalty)
+            if _pgrad_penalties:
+                loss = loss + 0.01 * torch.stack(_pgrad_penalties).mean()
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
@@ -853,7 +946,7 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     scheduler.step()
-    if epoch >= 50:
+    if epoch >= 140:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
     epoch_vol /= n_batches
@@ -886,6 +979,10 @@ for epoch in range(MAX_EPOCHS):
                 mask = mask.to(device, non_blocking=True)
 
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
+                if cfg.variant == "tandem-interact":
+                    _foil1_dist = raw_dsdf[:, :, :4].norm(dim=-1, keepdim=True)
+                    _foil2_dist = raw_dsdf[:, :, 4:8].norm(dim=-1, keepdim=True)
+                    _interact_raw = _foil1_dist / (_foil2_dist + 1e-3)
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 x = (x - stats["x_mean"]) / stats["x_std"]
@@ -902,6 +999,13 @@ for epoch in range(MAX_EPOCHS):
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
+                if cfg.variant == "tandem-interact":
+                    _is_tandem_feat = (x[:, 0, 21].abs() > 0.01)
+                    _interact_feat = torch.where(
+                        _is_tandem_feat[:, None, None].expand_as(_interact_raw),
+                        _interact_raw, torch.ones_like(_interact_raw)
+                    )
+                    x = torch.cat([x, _interact_feat], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
@@ -922,8 +1026,12 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    _val_out = eval_model({"x": x})
+                    pred = _val_out["preds"]
                 pred = pred.float()
+                if cfg.variant == "surf-head" and "surf_pred" in _val_out:
+                    _surf_pred_val = _val_out["surf_pred"].float()
+                    pred = torch.where(is_surface.unsqueeze(-1), 0.5 * pred + 0.5 * _surf_pred_val, pred)
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
@@ -1068,18 +1176,45 @@ if best_metrics:
                 y_dev = y_true.unsqueeze(0).to(device)
                 is_surf_dev = is_surface.unsqueeze(0).to(device)
                 mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
+                raw_dsdf_vis = x_dev[:, :, 2:10]
+                if cfg.variant == "tandem-interact":
+                    _foil1_vis = raw_dsdf_vis[:, :, :4].norm(dim=-1, keepdim=True)
+                    _foil2_vis = raw_dsdf_vis[:, :, 4:8].norm(dim=-1, keepdim=True)
+                    _interact_raw_vis = _foil1_vis / (_foil2_vis + 1e-3)
+                dist_surf_vis = raw_dsdf_vis.abs().min(dim=-1, keepdim=True).values
+                dist_feat_vis = torch.log1p(dist_surf_vis * 10.0)
                 x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                 curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
-                dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
-                dist_feat = torch.log1p(dist_surf * 10.0)
-                x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                x_n = torch.cat([x_n, curv, dist_feat_vis], dim=-1)
+                raw_xy_vis = x_n[:, :, :2]
+                xy_min_vis = raw_xy_vis.amin(dim=1, keepdim=True)
+                xy_max_vis = raw_xy_vis.amax(dim=1, keepdim=True)
+                xy_norm_vis = (raw_xy_vis - xy_min_vis) / (xy_max_vis - xy_min_vis + 1e-8)
+                freqs_vis = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
+                xy_scaled_vis = xy_norm_vis.unsqueeze(-1) * freqs_vis
+                fourier_pe_vis = torch.cat([xy_scaled_vis.sin().flatten(-2), xy_scaled_vis.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, fourier_pe_vis], dim=-1)
+                if cfg.variant == "tandem-interact":
+                    _is_tandem_vis = (x_n[:, 0, 21].abs() > 0.01)
+                    _interact_feat_vis = torch.where(
+                        _is_tandem_vis[:, None, None].expand_as(_interact_raw_vis),
+                        _interact_raw_vis, torch.ones_like(_interact_raw_vis)
+                    )
+                    x_n = torch.cat([x_n, _interact_feat_vis], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
-                pred = vis_model({"x": x_n})["preds"].float()
+                _vis_out = vis_model({"x": x_n})
+                pred = _vis_out["preds"].float()
+                if cfg.variant == "surf-head" and "surf_pred" in _vis_out:
+                    _surf_pred_vis = _vis_out["surf_pred"].float()
+                    pred = torch.where(is_surf_dev.unsqueeze(-1), 0.5 * pred + 0.5 * _surf_pred_vis, pred)
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
                 y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
             samples.append((x[:, :2], y_true, y_pred, is_surface))
-        images = visualize(samples, out_dir=plot_dir / split_name)
-        if images:
-            wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+        try:
+            images = visualize(samples, out_dir=plot_dir / split_name)
+            if images:
+                wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+        except Exception as _vis_err:
+            print(f"  [warn] visualization failed for {split_name}: {_vis_err}")
 
 wandb.finish()
