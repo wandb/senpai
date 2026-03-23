@@ -529,9 +529,17 @@ class Config:
     boundary_aware: bool = False       # GPU5: upweight near-wall volume nodes
     adaln_output: bool = False         # GPU6: AdaLN on output head
     soft_moe: bool = False             # GPU7: Soft MoE output
+    seed: int = 0                      # 0 = no explicit seeding; set for reproducible baseline runs
 
 
 cfg = sp.parse(Config)
+
+if cfg.seed != 0:
+    import random, numpy as np
+    torch.manual_seed(cfg.seed)
+    torch.cuda.manual_seed_all(cfg.seed)
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
 
 if cfg.debug:
     MAX_EPOCHS = 3
