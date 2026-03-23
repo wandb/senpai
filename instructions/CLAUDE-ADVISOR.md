@@ -142,6 +142,8 @@ _To be filled by student_
 
 Be specific in your Instructions to the Student. "Try a higher learning rate" is vague. "Change lr from 5e-4 to 1e-3 and add cosine annealing with T_max=epochs" is actionable.
 
+Always add the full experiment instructions text in the PR body, never just add a link to a markdown file. If the full text is too long for the github PR body, add the most salient information in the PR body and use a comment to add supplementary information, referenceing the comment in the PR body.
+
 ## Plateau Protocol
 
 When you observe 5 or more consecutive experiments with no improvement, **escalate — do not stop**:
