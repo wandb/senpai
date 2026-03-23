@@ -120,7 +120,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
-                 linear_no_attention=False, learned_kernel=False):
+                 linear_no_attention=False, learned_kernel=False,
+                 use_adaptive_temp=False, use_gumbel_routing=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -132,6 +133,14 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.tandem_temp_offset = nn.Parameter(torch.zeros(1, heads, 1, 1))
         self.linear_no_attention = linear_no_attention
         self.learned_kernel = learned_kernel
+        self.use_adaptive_temp = use_adaptive_temp
+        self.use_gumbel_routing = use_gumbel_routing
+        if use_adaptive_temp:
+            self.temp_proj = nn.Linear(dim_head, 1)
+            nn.init.zeros_(self.temp_proj.weight)
+            nn.init.zeros_(self.temp_proj.bias)
+        if use_gumbel_routing:
+            self.gumbel_scale = 1.0  # annealed by training loop
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
@@ -167,10 +176,17 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             .permute(0, 2, 1, 3)
             .contiguous()
         )
-        temp = self.temperature
+        if self.use_adaptive_temp:
+            # per-point temperature: [bsz, heads, num_points, 1] -> squeeze to broadcast
+            temp = (self.temperature + self.temp_proj(x_mid) * 0.1).clamp(min=0.01, max=2.0)
+        else:
+            temp = self.temperature
         if tandem_mask is not None:
             temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
         slice_logits = self.in_project_slice(x_mid) / temp
+        if self.use_gumbel_routing and self.training:
+            gumbel_noise = -torch.log(-torch.log(torch.rand_like(slice_logits) + 1e-8) + 1e-8)
+            slice_logits = slice_logits + self.gumbel_scale * gumbel_noise
         if spatial_bias is not None:
             slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
         slice_weights = self.softmax(slice_logits)
@@ -221,6 +237,8 @@ class TransolverBlock(nn.Module):
         field_decoder=False,
         adaln_output=False,
         soft_moe=False,
+        use_adaptive_temp=False,
+        use_gumbel_routing=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -236,9 +254,12 @@ class TransolverBlock(nn.Module):
             slice_num=slice_num,
             linear_no_attention=linear_no_attention,
             learned_kernel=learned_kernel,
+            use_adaptive_temp=use_adaptive_temp,
+            use_gumbel_routing=use_gumbel_routing,
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        self.mlp_dropout = nn.Dropout(dropout)
         self.spatial_bias = nn.Sequential(
             nn.Linear(4, 64), nn.GELU(),
             nn.Linear(64, 64), nn.GELU(),
@@ -282,7 +303,7 @@ class TransolverBlock(nn.Module):
     def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
-        fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
+        fx = self.ln_2_post(self.mlp_dropout(self.mlp(self.ln_2(fx))) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
@@ -327,6 +348,8 @@ class Transolver(nn.Module):
         adaln_output=False,
         soft_moe=False,
         uncertainty_loss=False,
+        use_adaptive_temp=False,
+        use_gumbel_routing=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -379,6 +402,8 @@ class Transolver(nn.Module):
                     field_decoder=field_decoder if (idx == n_layers - 1) else False,
                     adaln_output=adaln_output if (idx == n_layers - 1) else False,
                     soft_moe=soft_moe if (idx == n_layers - 1) else False,
+                    use_adaptive_temp=use_adaptive_temp,
+                    use_gumbel_routing=use_gumbel_routing,
                 )
                 for idx in range(n_layers)
             ]
@@ -529,6 +554,9 @@ class Config:
     boundary_aware: bool = False       # GPU5: upweight near-wall volume nodes
     adaln_output: bool = False         # GPU6: AdaLN on output head
     soft_moe: bool = False             # GPU7: Soft MoE output
+    dropout: float = 0.0
+    use_adaptive_temp: bool = False
+    use_gumbel_routing: bool = False
 
 
 cfg = sp.parse(Config)
@@ -641,6 +669,9 @@ model_config = dict(
     adaln_output=cfg.adaln_output,
     soft_moe=cfg.soft_moe,
     uncertainty_loss=cfg.uncertainty_loss,
+    dropout=cfg.dropout,
+    use_adaptive_temp=cfg.use_adaptive_temp,
+    use_gumbel_routing=cfg.use_gumbel_routing,
 )
 
 model = Transolver(**model_config).to(device)
@@ -774,6 +805,12 @@ running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
 
 for epoch in range(MAX_EPOCHS):
+    # Anneal Gumbel noise scale from 1.0 → 0.1 over training
+    if cfg.use_gumbel_routing:
+        gumbel_scale = 1.0 - 0.9 * min(1.0, epoch / max(1, MAX_EPOCHS - 1))
+        for _block in _base_model.blocks:
+            _block.attn.gumbel_scale = gumbel_scale
+
     elapsed_min = (time.time() - train_start) / 60.0
     if elapsed_min >= MAX_TIMEOUT:
         print(f"Wall-clock limit reached ({elapsed_min:.1f} min >= {MAX_TIMEOUT} min). Stopping.")
