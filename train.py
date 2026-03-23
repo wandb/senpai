@@ -250,6 +250,7 @@ class TransolverBlock(nn.Module):
         film_cond=False,
         decouple_slice=False,
         zone_temp=False,
+        per_foil_head=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -258,6 +259,7 @@ class TransolverBlock(nn.Module):
         self.soft_moe = soft_moe
         self.adaln_all = adaln_all
         self.film_cond = film_cond
+        self.per_foil_head = per_foil_head
         self.ln_1 = nn.LayerNorm(hidden_dim)
         self.attn = Physics_Attention_Irregular_Mesh(
             hidden_dim,
@@ -328,6 +330,13 @@ class TransolverBlock(nn.Module):
                 self.mlp2 = nn.Sequential(
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
+                if per_foil_head:
+                    self.mlp2_foil2 = nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                    )
+                    self.foil_gate = nn.Linear(hidden_dim, 1)
+                    nn.init.zeros_(self.foil_gate.weight)
+                    nn.init.zeros_(self.foil_gate.bias)
 
     def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
@@ -362,6 +371,14 @@ class TransolverBlock(nn.Module):
                 fx_ln = fx_ln * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
                 return self.mlp2(fx_ln)
             else:
+                if self.per_foil_head:
+                    out1 = self.mlp2(fx_ln)
+                    out2 = self.mlp2_foil2(fx_ln)
+                    gate = torch.sigmoid(self.foil_gate(fx_ln))  # [B, N, 1]
+                    if tandem_mask is not None:
+                        t = tandem_mask[:, 0, 0, :]  # [B, 1]
+                        gate = gate * t.unsqueeze(1)
+                    return out1 + gate * (out2 - out1)
                 return self.mlp2(fx_ln)
         return fx
 
@@ -395,6 +412,7 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        per_foil_head=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -457,6 +475,7 @@ class Transolver(nn.Module):
                     film_cond=film_cond,
                     decouple_slice=adaln_decouple,
                     zone_temp=adaln_zone_temp,
+                    per_foil_head=per_foil_head if (idx == n_layers - 1) else False,
                 )
                 for idx in range(n_layers)
             ]
@@ -643,9 +662,42 @@ class Config:
     tandem_ramp: bool = False          # gradual tandem surface loss warm-in (0→1 over epochs 10-50)
     foil2_dist: bool = False           # explicit foil-2 distance feature (from secondary dsdf)
     slice_num: int = 48                # slice count (default 48, GPU6: 96)
+    # Phase 2 R6: tandem deep-dive on new baseline
+    canonicalize: bool = False         # rotate coords by -AoA0 before standardization
+    per_foil_head: bool = False        # separate output heads for foil-1 vs foil-2
+    tandem_ramp_epochs: int = 40       # ramp window in epochs (default 40 → ends epoch 50)
+    tandem_ramp_3x: bool = False       # 3x tandem boost after warm-in completes
+    tandem_surfocus: bool = False      # increase surf_weight 1.5x during tandem ramp
+    surf_weight_mult: float = 1.0      # multiplicative factor on adaptive surf_weight
 
 
 cfg = sp.parse(Config)
+
+# --- R6: Auto-detect variant from wandb_name (all p2r6 variants share slice96 + tandem_ramp) ---
+_wname = cfg.wandb_name or ""
+if "p2r6" in _wname:
+    cfg.slice_num = 96
+    cfg.tandem_ramp = True
+    if "foil2-decouple" in _wname:
+        cfg.foil2_dist = True
+        cfg.adaln_decouple = True
+    elif "foil2-dist" in _wname:
+        cfg.foil2_dist = True
+    elif "decouple-zone" in _wname:
+        cfg.adaln_decouple = True
+    elif "ramp80-surfocus" in _wname:
+        cfg.tandem_ramp_epochs = 70
+        cfg.tandem_surfocus = True
+    elif "3x-surf" in _wname:
+        cfg.tandem_ramp_3x = True
+    elif "adaln-foil2" in _wname:
+        cfg.adaln_output = True
+        cfg.foil2_dist = True
+    elif "canonicalize" in _wname:
+        cfg.canonicalize = True
+    elif "per-foil" in _wname:
+        cfg.per_foil_head = True
+        cfg.surf_weight_mult = 1.5
 
 if cfg.debug:
     MAX_EPOCHS = 3
@@ -761,6 +813,7 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    per_foil_head=cfg.per_foil_head,
 )
 
 model = Transolver(**model_config).to(device)
@@ -965,6 +1018,17 @@ for epoch in range(MAX_EPOCHS):
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+
+        # R6: Canonicalize — rotate coords by -AoA0 before standardization
+        if cfg.canonicalize:
+            aoa_rad = x[:, 0, 14:15]  # AoA0_rad at index 14 (raw)
+            cos_a = torch.cos(-aoa_rad)
+            sin_a = torch.sin(-aoa_rad)
+            px = x[:, :, 0:1]; py = x[:, :, 1:2]
+            x = torch.cat([px * cos_a.unsqueeze(1) + py * sin_a.unsqueeze(1),
+                           -px * sin_a.unsqueeze(1) + py * cos_a.unsqueeze(1),
+                           x[:, :, 2:]], dim=-1)
+
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1077,11 +1141,19 @@ for epoch in range(MAX_EPOCHS):
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
             surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
+        # R6: surf_weight_mult scales adaptive surf_weight (for per-foil-1.5x)
+        eff_surf_weight = surf_weight * cfg.surf_weight_mult
         if cfg.tandem_ramp:
-            tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
+            tandem_weight = min(1.0, max(0.0, (epoch - 10) / float(cfg.tandem_ramp_epochs)))
+            # R6: ramp-3x — after warm-in, triple the tandem boost
+            if cfg.tandem_ramp_3x and tandem_weight >= 1.0:
+                adaptive_boost = min(12.0, adaptive_boost * 3.0)
             tandem_boost = torch.where(is_tandem_batch,
                                        torch.tensor(adaptive_boost * tandem_weight, device=device),
                                        torch.ones(B, device=device))
+            # R6: surfocus — increase surf_weight when tandem ramp still in progress
+            if cfg.tandem_surfocus and tandem_weight < 1.0:
+                eff_surf_weight = surf_weight * 1.5
         else:
             tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
@@ -1095,7 +1167,7 @@ for epoch in range(MAX_EPOCHS):
                     surf_uy_loss * torch.exp(-2 * bm.log_sigma_surf_uy) / 2 + bm.log_sigma_surf_uy +
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
         else:
-            loss = vol_loss + surf_weight * surf_loss
+            loss = vol_loss + eff_surf_weight * surf_loss
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
@@ -1149,8 +1221,8 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            loss_a = vol_loss_a + eff_surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            loss_b = vol_loss_b + eff_surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -1198,7 +1270,7 @@ for epoch in range(MAX_EPOCHS):
             surf_loss2 = (surf_ps2 * tandem_boost).mean()
             re_loss2 = F.mse_loss(re_pred2, log_re_target)
             aoa_loss2 = F.mse_loss(aoa_pred2, aoa_target)
-            loss2 = vol_loss2 + surf_weight * surf_loss2 + 0.01 * re_loss2 + 0.01 * aoa_loss2
+            loss2 = vol_loss2 + eff_surf_weight * surf_loss2 + 0.01 * re_loss2 + 0.01 * aoa_loss2
             loss2.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             sam_optimizer.restore()
@@ -1259,9 +1331,16 @@ for epoch in range(MAX_EPOCHS):
 
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
-                dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+                dist_feat = torch.log1p(dist_surf * 10.0)
+                if cfg.canonicalize:
+                    aoa_rad = x[:, 0, 14:15]
+                    cos_a = torch.cos(-aoa_rad)
+                    sin_a = torch.sin(-aoa_rad)
+                    px = x[:, :, 0:1]; py = x[:, :, 1:2]
+                    x = torch.cat([px * cos_a.unsqueeze(1) + py * sin_a.unsqueeze(1),
+                                   -px * sin_a.unsqueeze(1) + py * cos_a.unsqueeze(1),
+                                   x[:, :, 2:]], dim=-1)
                 x = (x - stats["x_mean"]) / stats["x_std"]
-                # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                 if cfg.foil2_dist:
                     foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
