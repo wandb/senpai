@@ -639,10 +639,10 @@ class Config:
     adaln_sam: bool = False            # SAM optimizer in last 25% of training
     film_cond: bool = False            # FiLM conditioning (simpler alternative to AdaLN)
     adaln_zone_temp: bool = False      # zone-aware temperature modulation
-    # Phase 2 R5: tandem warm-in combinations
-    tandem_ramp: bool = False          # gradual tandem surface loss warm-in (0→1 over epochs 10-50)
+    # Phase 2 R5/R6: tandem warm-in + slice tuning (ramp+slice96 is new baseline)
+    tandem_ramp: bool = True           # gradual tandem surface loss warm-in (0→1 over epochs 10-50)
     foil2_dist: bool = False           # explicit foil-2 distance feature (from secondary dsdf)
-    slice_num: int = 48                # slice count (default 48, GPU6: 96)
+    slice_num: int = 96                # slice count (96 is new baseline, 48 was old default)
 
 
 cfg = sp.parse(Config)
