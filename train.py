@@ -21,8 +21,10 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
 """
 
 import os
+import sys
 import time
 from collections.abc import Mapping
+from copy import deepcopy
 from pathlib import Path
 
 import torch
@@ -490,7 +492,7 @@ MAX_EPOCHS = 500
 
 @dataclass
 class Config:
-    lr: float = 2.6e-3
+    lr: float = 1.5e-3
     weight_decay: float = 0.0
     batch_size: int = 4
     surf_weight: float = 20.0
@@ -503,9 +505,9 @@ class Config:
     # Schedule params (tuned for 3-hour / 500-epoch runs)
     warmup_total_iters: int = 20
     warmup_start_factor: float = 0.2
-    cosine_T_max: int = 200
+    cosine_T_max: int = 230
     cosine_eta_min: float = 1e-5
-    ema_start_epoch: int = 40
+    ema_start_epoch: int = 140
     ema_decay: float = 0.998
     temp_anneal_epoch: int = 50
     vol_ramp_epochs: int = 40
@@ -521,7 +523,7 @@ class Config:
     onecycle_final_div_factor: float = 100.0  # onecycle only
     use_lookahead: bool = True
     # Architecture flags (one per GPU)
-    linear_no_attention: bool = False  # GPU0: skip Q/K/V in slice attention
+    linear_no_attention: bool = True   # LinearNO baseline for this branch
     field_decoder: bool = False        # GPU1: separate vel/pres output heads
     learned_kernel: bool = False       # GPU2: MLP attention kernel
     uncertainty_loss: bool = False     # GPU3: Kendall uncertainty weighting
@@ -529,6 +531,13 @@ class Config:
     boundary_aware: bool = False       # GPU5: upweight near-wall volume nodes
     adaln_output: bool = False         # GPU6: AdaLN on output head
     soft_moe: bool = False             # GPU7: Soft MoE output
+    # DiWA / SWA flags
+    diwa_soup: bool = False         # GPU0: average top checkpoints, evaluate only (no training)
+    diwa_greedy: bool = False       # GPU1: greedy DiWA selection, evaluate only (no training)
+    diwa_run_ids: str = ""          # space-separated local run IDs for DiWA checkpoints
+    swa: bool = False               # GPU7: stochastic weight averaging snapshots
+    swa_start_epoch: int = 180      # epoch to start collecting SWA snapshots
+    swa_freq: int = 5               # collect SWA snapshot every N epochs
 
 
 cfg = sp.parse(Config)
@@ -648,13 +657,13 @@ torch._functorch.config.donated_buffer = False  # required for retain_graph=True
 model = torch.compile(model, mode="default")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
-from copy import deepcopy
 ema_model = None
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
 swad_collecting = False
 swad_done = False
+swa_checkpoints: list = []
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -772,6 +781,200 @@ prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
+
+
+def _eval_model_full(eval_model, freq_src=None):
+    """Run full validation across all splits. Returns (val_loss_4split, metrics_per_split)."""
+    if freq_src is None:
+        freq_src = _base_model
+    eval_model.eval()
+    val_metrics_per_split: dict[str, dict] = {}
+    val_loss_total = 0.0
+    n_valid = 0
+    ch_cl = torch.tensor([0.1, 0.1, 0.5], device=device)
+    ta_cl = torch.tensor([0.3, 0.3, 1.0], device=device)
+    with torch.no_grad():
+        for split_name, vloader in val_loaders.items():
+            val_vol = val_surf = 0.0
+            mae_surf = torch.zeros(3, device=device)
+            mae_vol = torch.zeros(3, device=device)
+            n_surf = torch.zeros(3, device=device)
+            n_vol_c = torch.zeros(3, device=device)
+            n_vbatches = 0
+            for x, y, is_surface, mask in tqdm(vloader, desc=f"[diwa/{split_name}]", leave=False):
+                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                is_surface = is_surface.to(device, non_blocking=True)
+                mask = mask.to(device, non_blocking=True)
+                raw_dsdf = x[:, :, 2:10]
+                dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+                dist_feat = torch.log1p(dist_surf * 10.0)
+                x_n = (x - stats["x_mean"]) / stats["x_std"]
+                curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                raw_xy = x_n[:, :, :2]
+                xy_min = raw_xy.amin(dim=1, keepdim=True)
+                xy_max = raw_xy.amax(dim=1, keepdim=True)
+                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                freqs = torch.cat([freq_src.fourier_freqs_fixed.to(device), freq_src.fourier_freqs_learned.abs()])
+                xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, fourier_pe], dim=-1)
+                Umag, q = _umag_q(y, mask)
+                y_phys = _phys_norm(y, Umag, q)
+                y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                raw_gap = x_n[:, 0, 21]
+                is_tandem = raw_gap.abs() > 0.5
+                B = y_norm.shape[0]
+                sample_stds = torch.ones(B, 1, 3, device=device)
+                for b in range(B):
+                    valid = mask[b]
+                    sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=ta_cl if is_tandem[b] else ch_cl)
+                y_norm_scaled = y_norm / sample_stds
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    pred = eval_model({"x": x_n})["preds"]
+                pred = pred.float() / sample_stds
+                abs_err = (pred - y_norm_scaled).abs().nan_to_num(0.0)
+                vol_mask = mask & ~is_surface
+                surf_mask = mask & is_surface
+                val_vol += min(
+                    (abs_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item(), 1e6)
+                val_surf += min(
+                    (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item(), 1e6)
+                n_vbatches += 1
+                pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                pred_orig = _phys_denorm(pred_phys, Umag, q)
+                y_clamped = y.clamp(-1e6, 1e6)
+                err = (pred_orig - y_clamped).abs()
+                finite = err.isfinite()
+                err = err.where(finite, torch.zeros_like(err))
+                mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                n_surf += (surf_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+                n_vol_c += (vol_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+            val_vol /= max(n_vbatches, 1)
+            val_surf /= max(n_vbatches, 1)
+            split_loss = val_vol + cfg.surf_weight * val_surf
+            mae_surf /= n_surf.clamp(min=1)
+            mae_vol /= n_vol_c.clamp(min=1)
+            val_metrics_per_split[split_name] = {
+                f"{split_name}/loss":        split_loss,
+                f"{split_name}/vol_loss":    val_vol,
+                f"{split_name}/surf_loss":   val_surf,
+                f"{split_name}/mae_surf_Ux": mae_surf[0].item(),
+                f"{split_name}/mae_surf_Uy": mae_surf[1].item(),
+                f"{split_name}/mae_surf_p":  mae_surf[2].item(),
+                f"{split_name}/mae_vol_Ux":  mae_vol[0].item(),
+                f"{split_name}/mae_vol_Uy":  mae_vol[1].item(),
+                f"{split_name}/mae_vol_p":   mae_vol[2].item(),
+            }
+            val_loss_total += split_loss
+            n_valid += 1
+    val_loss = val_loss_total / max(n_valid, 1)
+    return val_loss, val_metrics_per_split
+
+
+def _load_diwa_checkpoints(run_ids):
+    """Load state_dicts for DiWA from local models/ directory."""
+    state_dicts = []
+    for rid in run_ids:
+        ckpt = Path(f"models/model-{rid}/checkpoint.pt")
+        if not ckpt.exists():
+            print(f"  DiWA: checkpoint not found for run {rid}, skipping")
+            continue
+        sd = torch.load(ckpt, map_location=device, weights_only=True)
+        state_dicts.append((rid, sd))
+        print(f"  DiWA: loaded {rid} ({ckpt})")
+    return state_dicts
+
+
+def _average_state_dicts(state_dicts):
+    """Average state_dicts, only for keys present with matching shapes in all."""
+    all_keys = set(state_dicts[0].keys())
+    for sd in state_dicts[1:]:
+        all_keys &= set(sd.keys())
+    avg = {}
+    for k in all_keys:
+        tensors = [sd[k].float() for sd in state_dicts]
+        if all(t.shape == tensors[0].shape for t in tensors):
+            avg[k] = torch.stack(tensors).mean(0)
+        else:
+            avg[k] = state_dicts[0][k]
+    return avg
+
+
+# ---------------------------------------------------------------------------
+# DiWA evaluation (GPU 0 & 1 only): load checkpoints, average, evaluate
+# ---------------------------------------------------------------------------
+if cfg.diwa_soup or cfg.diwa_greedy:
+    run_ids = cfg.diwa_run_ids.split() if cfg.diwa_run_ids.strip() else []
+    if not run_ids:
+        print("DiWA: no diwa_run_ids specified — nothing to do.")
+        wandb.finish()
+        sys.exit(0)
+
+    loaded = _load_diwa_checkpoints(run_ids)
+    if not loaded:
+        print("DiWA: no checkpoints loaded — exiting.")
+        wandb.finish()
+        sys.exit(0)
+
+    # Create a fresh model for evaluation (same architecture, not compiled)
+    diwa_model = Transolver(**model_config).to(device)
+
+    if cfg.diwa_soup:
+        print(f"DiWA soup: averaging {len(loaded)} checkpoints...")
+        avg_sd = _average_state_dicts([sd for _, sd in loaded])
+        result = diwa_model.load_state_dict(avg_sd, strict=False)
+        if result.missing_keys:
+            print(f"  Missing keys: {result.missing_keys[:5]}")
+        diwa_model.eval()
+        val_loss, vm = _eval_model_full(diwa_model, freq_src=diwa_model)
+        print(f"DiWA soup val/loss = {val_loss:.4f}")
+        metrics = {"diwa/val_loss": val_loss, "diwa/n_checkpoints": len(loaded), "global_step": 1}
+        for sm in vm.values():
+            metrics.update(sm)
+        wandb.log(metrics)
+        wandb.summary.update({"diwa_val_loss": val_loss})
+
+    elif cfg.diwa_greedy:
+        print(f"DiWA greedy: testing {len(loaded)} checkpoints starting from {loaded[0][0]}...")
+        # Start with the best checkpoint (assume first = best)
+        best_sd = loaded[0][1]
+        diwa_model.load_state_dict(best_sd, strict=False)
+        diwa_model.eval()
+        best_loss, _ = _eval_model_full(diwa_model, freq_src=diwa_model)
+        soup_ids = [loaded[0][0]]
+        soup_sds = [best_sd]
+        print(f"  Seed checkpoint {loaded[0][0]}: val_loss={best_loss:.4f}")
+
+        for rid, sd in loaded[1:]:
+            candidate_sds = soup_sds + [sd]
+            avg_sd = _average_state_dicts(candidate_sds)
+            diwa_model.load_state_dict(avg_sd, strict=False)
+            diwa_model.eval()
+            cand_loss, _ = _eval_model_full(diwa_model, freq_src=diwa_model)
+            if cand_loss < best_loss:
+                best_loss = cand_loss
+                soup_sds = candidate_sds
+                soup_ids.append(rid)
+                print(f"  + {rid}: val_loss={cand_loss:.4f} IMPROVED (soup={soup_ids})")
+            else:
+                print(f"  - {rid}: val_loss={cand_loss:.4f} no improvement, skipping")
+
+        # Final eval with greedy soup
+        final_avg = _average_state_dicts(soup_sds)
+        diwa_model.load_state_dict(final_avg, strict=False)
+        val_loss, vm = _eval_model_full(diwa_model, freq_src=diwa_model)
+        print(f"DiWA greedy final val/loss = {val_loss:.4f} (soup: {soup_ids})")
+        metrics = {"diwa/val_loss": val_loss, "diwa/n_checkpoints": len(soup_ids), "global_step": 1}
+        for sm in vm.values():
+            metrics.update(sm)
+        wandb.log(metrics)
+        wandb.summary.update({"diwa_val_loss": val_loss, "diwa_soup_ids": str(soup_ids)})
+
+    wandb.finish()
+    sys.exit(0)
+
 
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
@@ -1034,6 +1237,12 @@ for epoch in range(MAX_EPOCHS):
     prev_vol_loss = epoch_vol
     prev_surf_loss = epoch_surf
 
+    # SWA snapshot collection (epoch-level, after training step)
+    if cfg.swa and not cfg.swad and epoch >= cfg.swa_start_epoch and (epoch - cfg.swa_start_epoch) % cfg.swa_freq == 0:
+        snap = {k: v.cpu().clone() for k, v in _base_model.state_dict().items()}
+        swa_checkpoints.append(snap)
+        print(f"  SWA: collected snapshot #{len(swa_checkpoints)} (epoch {epoch+1})")
+
     # --- Validate across all splits ---
     eval_model = ema_model if ema_model is not None else model
     eval_model.eval()
@@ -1229,6 +1438,19 @@ for epoch in range(MAX_EPOCHS):
         f"val[{split_summary}]{tag}"
     )
 
+
+# --- SWA final averaging ---
+if cfg.swa and swa_checkpoints:
+    print(f"SWA: averaging {len(swa_checkpoints)} snapshots collected from epoch {cfg.swa_start_epoch}...")
+    avg_state = {
+        k: torch.stack([c[k].float() for c in swa_checkpoints]).mean(0).to(device)
+        for k in swa_checkpoints[0]
+    }
+    if ema_model is None:
+        ema_model = deepcopy(_base_model)
+    ema_model.load_state_dict(avg_state)
+    torch.save(ema_model.state_dict(), model_path)
+    print(f"SWA: averaging done. Model saved to {model_path}.")
 
 # --- Final summary ---
 total_time = (time.time() - train_start) / 60.0
