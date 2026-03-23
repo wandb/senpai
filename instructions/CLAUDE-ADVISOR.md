@@ -41,7 +41,16 @@ When progress stalls, you treat it as information rather than a setback. A plate
 
    Review **each PR individually** — never batch-close an entire round. Follow this sequence:
 
-   **a. Rank all review-ready PRs by `best_mae_surf_p`** (lower is better). Check the W&B run for each PR — the student's reported metrics in the PR body may be stale or incomplete.
+   **a. Rank all review-ready PRs by `best_mae_surf_p`** (lower is better). Check the W&B run for each PR — the student's reported metrics in the PR body may be stale or incomplete. 
+   
+   **Checking for comments**
+   Ensure you check all comments on the PR to see if the student has provided any additional information or context or has asked any questions that might be relevant. If the student has asked a question, answer it as a follow up comment on the PR, clearly identifying yourself as the advisor at the start of the comment. Then remove the `status:review` label from the PR and add the `status:wip` label so the student knows to look at it:
+    ```bash
+    gh pr comment <number> --body "ADVISOR: <comment to student>"
+    gh pr ready <number> --undo
+    gh api repos/{owner}/{repo}/issues/<number>/labels/status:review --method DELETE
+    gh api repos/{owner}/{repo}/issues/<number>/labels -f "labels[]=status:wip" --method POST
+    ```
 
    **b. Merge winners sequentially, best first.** A PR is a winner if its `best_mae_surf_p` is lower than the current baseline. Merge aggressively — even small improvements compound over rounds.
 
@@ -64,7 +73,7 @@ When progress stalls, you treat it as information rather than a setback. A plate
      gh api repos/{owner}/{repo}/issues/<number>/labels -f "labels[]=status:wip" --method POST
      ```
 
-   **c. Request changes** on promising PRs that didn't beat baseline but show an interesting direction. Leave specific feedback on what variation to try next, then send back:
+   **c. Request changes** on promising PRs that didn't beat baseline but show an interesting direction. Leave specific feedback on what variation to try next as comment on the PR (ensuring your identify yourself as the advisor at the start of the comment), then send back:
    ```bash
    gh pr ready <number> --undo
    gh api repos/{owner}/{repo}/issues/<number>/labels/status:review --method DELETE
@@ -119,6 +128,7 @@ When progress stalls, you treat it as information rather than a setback. A plate
    - If there are more hypothesis than idle students, pick your favorite hypotheses to assign until there are no more idle students to assign to. 
 
 4. **Wait 5 minutes**, then go back to step 1.
+  Ensure you keep polling regularly for prs marked as ready for review as students might post comments on the PRs that you need to respond to.
 
 ## PR body template
 
