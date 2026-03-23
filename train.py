@@ -120,7 +120,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
-                 linear_no_attention=False, learned_kernel=False):
+                 linear_no_attention=False, learned_kernel=False,
+                 decouple_slice=False, zone_temp=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -132,11 +133,22 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.tandem_temp_offset = nn.Parameter(torch.zeros(1, heads, 1, 1))
         self.linear_no_attention = linear_no_attention
         self.learned_kernel = learned_kernel
+        self.decouple_slice = decouple_slice
+        self.zone_temp = zone_temp
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
         self.in_project_slice = nn.Linear(dim_head, slice_num)
         torch.nn.init.orthogonal_(self.in_project_slice.weight)
+        if decouple_slice:
+            # Separate slice projection for tandem samples
+            self.in_project_slice_tandem = nn.Linear(dim_head, slice_num)
+            torch.nn.init.orthogonal_(self.in_project_slice_tandem.weight)
+        if zone_temp:
+            # Zone-aware temperature: learned offset from [is_tandem, gap_mag, re_feat]
+            self.zone_temp_proj = nn.Linear(3, heads)
+            nn.init.zeros_(self.zone_temp_proj.weight)
+            nn.init.zeros_(self.zone_temp_proj.bias)
         self.to_q = nn.Linear(dim_head, dim_head, bias=False)
         self.to_k = nn.Linear(dim_head, dim_head, bias=False)
         self.to_v = nn.Linear(dim_head, dim_head, bias=False)
@@ -152,7 +164,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
                 nn.Linear(dim_head, 1),
             )
 
-    def forward(self, x, spatial_bias=None, tandem_mask=None):
+    def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -168,9 +180,20 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             .contiguous()
         )
         temp = self.temperature
+        if self.zone_temp and zone_features is not None:
+            # zone_features: [B, 3] → per-head offset [B, heads] → [B, heads, 1, 1]
+            zone_offset = self.zone_temp_proj(zone_features).reshape(bsz, self.heads, 1, 1)
+            temp = temp + zone_offset
         if tandem_mask is not None:
             temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
-        slice_logits = self.in_project_slice(x_mid) / temp
+        temp = temp.clamp(min=1e-4)
+        if self.decouple_slice and tandem_mask is not None:
+            std_logits = self.in_project_slice(x_mid) / temp
+            tan_logits = self.in_project_slice_tandem(x_mid) / temp
+            is_tan = (tandem_mask > 0.5)  # [B, 1, 1, 1]
+            slice_logits = torch.where(is_tan.expand_as(std_logits), tan_logits, std_logits)
+        else:
+            slice_logits = self.in_project_slice(x_mid) / temp
         if spatial_bias is not None:
             slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
         slice_weights = self.softmax(slice_logits)
@@ -221,12 +244,20 @@ class TransolverBlock(nn.Module):
         field_decoder=False,
         adaln_output=False,
         soft_moe=False,
+        adaln_all=False,
+        adaln_cond_dim=2,
+        adaln_zero_init=True,
+        film_cond=False,
+        decouple_slice=False,
+        zone_temp=False,
     ):
         super().__init__()
         self.last_layer = last_layer
         self.field_decoder = field_decoder
         self.adaln_output = adaln_output
         self.soft_moe = soft_moe
+        self.adaln_all = adaln_all
+        self.film_cond = film_cond
         self.ln_1 = nn.LayerNorm(hidden_dim)
         self.attn = Physics_Attention_Irregular_Mesh(
             hidden_dim,
@@ -236,7 +267,26 @@ class TransolverBlock(nn.Module):
             slice_num=slice_num,
             linear_no_attention=linear_no_attention,
             learned_kernel=learned_kernel,
+            decouple_slice=decouple_slice,
+            zone_temp=zone_temp,
         )
+        if adaln_all:
+            # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
+            self.adaln_net = nn.Sequential(
+                nn.Linear(adaln_cond_dim, 128), nn.SiLU(),
+                nn.Linear(128, hidden_dim * 4),
+            )
+            if adaln_zero_init:
+                nn.init.zeros_(self.adaln_net[-1].weight)
+                nn.init.zeros_(self.adaln_net[-1].bias)
+        if film_cond:
+            # FiLM: cond → (gamma, beta) applied after SE layer
+            self.film_net = nn.Sequential(
+                nn.Linear(2, 64), nn.SiLU(),
+                nn.Linear(64, hidden_dim * 2),
+            )
+            nn.init.zeros_(self.film_net[-1].weight)
+            nn.init.zeros_(self.film_net[-1].bias)
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         self.spatial_bias = nn.Sequential(
@@ -279,14 +329,26 @@ class TransolverBlock(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
-        fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
+        if self.adaln_all and condition is not None:
+            cond_out = self.adaln_net(condition)  # [B, H*4]
+            s1, b1, s2, b2 = cond_out.chunk(4, dim=-1)  # each [B, H]
+            fx_norm = self.ln_1(fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
+            fx = self.ln_1_post(self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            fx_norm = self.ln_2(fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
+            fx = self.ln_2_post(self.mlp(fx_norm) + fx)
+        else:
+            fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
+        if self.film_cond and condition is not None:
+            film_out = self.film_net(condition)  # [B, H*2]
+            gamma, beta = film_out.chunk(2, dim=-1)  # each [B, H]
+            fx = gamma.unsqueeze(1) * fx + beta.unsqueeze(1)
         if self.last_layer:
             fx_ln = self.ln_3(fx)
             if self.soft_moe:
@@ -327,12 +389,22 @@ class Transolver(nn.Module):
         adaln_output=False,
         soft_moe=False,
         uncertainty_loss=False,
+        adaln_all_blocks=False,
+        adaln_4cond=False,
+        adaln_nozero=False,
+        film_cond=False,
+        adaln_decouple=False,
+        adaln_zone_temp=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.ref = ref
         self.unified_pos = unified_pos
         self.adaln_output = adaln_output
+        self.adaln_all_blocks = adaln_all_blocks
+        self.adaln_4cond = adaln_4cond
+        self.film_cond = film_cond
+        self.adaln_zone_temp = adaln_zone_temp
         if output_fields is None or output_dims is None:
             raise ValueError("output_fields and output_dims must be provided")
         if len(output_fields) != len(output_dims):
@@ -379,6 +451,12 @@ class Transolver(nn.Module):
                     field_decoder=field_decoder if (idx == n_layers - 1) else False,
                     adaln_output=adaln_output if (idx == n_layers - 1) else False,
                     soft_moe=soft_moe if (idx == n_layers - 1) else False,
+                    adaln_all=adaln_all_blocks,
+                    adaln_cond_dim=4 if adaln_4cond else 2,
+                    adaln_zero_init=not adaln_nozero,
+                    film_cond=film_cond,
+                    decouple_slice=adaln_decouple,
+                    zone_temp=adaln_zone_temp,
                 )
                 for idx in range(n_layers)
             ]
@@ -446,6 +524,29 @@ class Transolver(nn.Module):
         if condition is not None:
             raise ValueError("Transolver does not support conditioning inputs")
 
+        # Compute internal condition before feature_cross (indices are stable here)
+        use_cond = self.adaln_all_blocks or self.film_cond
+        if use_cond:
+            cond_2 = x[:, 0, 13:15]  # Re, AoA [B, 2]
+            if self.adaln_4cond:
+                gap_feat = x[:, 0, 21:22]  # gap feature [B, 1]
+                # surf_frac: fraction of nodes near a surface (curvature at index 24)
+                surf_frac = (x[:, :, 24].abs() > 0.01).float().mean(dim=1, keepdim=True)  # [B, 1]
+                block_condition = torch.cat([cond_2, gap_feat, surf_frac], dim=-1)  # [B, 4]
+            else:
+                block_condition = cond_2  # [B, 2]
+        else:
+            block_condition = None
+
+        # Compute zone features for zone-aware temperature
+        if self.adaln_zone_temp:
+            is_tandem_scalar = (x[:, 0, 21].abs() > 0.01).float()  # [B]
+            gap_mag = x[:, 0, 21].abs()  # [B]
+            re_feat = x[:, 0, 13]  # [B]
+            zone_features = torch.stack([is_tandem_scalar, gap_mag, re_feat], dim=-1)  # [B, 3]
+        else:
+            zone_features = None
+
         if self.unified_pos:
             if pos is None:
                 raise ValueError("Missing required input tensor: pos")
@@ -464,15 +565,15 @@ class Transolver(nn.Module):
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        # Extract Re/AoA condition for AdaLN (indices 13,14 in input x)
-        condition = x[:, 0, 13:15] if self.adaln_output else None
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=condition)
+        # Last block: use adaln_all condition if enabled, else fallback to adaln_output
+        last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
@@ -490,7 +591,7 @@ MAX_EPOCHS = 500
 
 @dataclass
 class Config:
-    lr: float = 2.6e-3
+    lr: float = 1.5e-3
     weight_decay: float = 0.0
     batch_size: int = 4
     surf_weight: float = 20.0
@@ -503,9 +604,9 @@ class Config:
     # Schedule params (tuned for 3-hour / 500-epoch runs)
     warmup_total_iters: int = 20
     warmup_start_factor: float = 0.2
-    cosine_T_max: int = 200
+    cosine_T_max: int = 230
     cosine_eta_min: float = 1e-5
-    ema_start_epoch: int = 40
+    ema_start_epoch: int = 140
     ema_decay: float = 0.998
     temp_anneal_epoch: int = 50
     vol_ramp_epochs: int = 40
@@ -529,6 +630,19 @@ class Config:
     boundary_aware: bool = False       # GPU5: upweight near-wall volume nodes
     adaln_output: bool = False         # GPU6: AdaLN on output head
     soft_moe: bool = False             # GPU7: Soft MoE output
+    # Phase 2 R4: AdaLN-Zero all blocks
+    n_hidden: int = 192                # model width (override default)
+    adaln_all_blocks: bool = False     # AdaLN-Zero on ALL TransolverBlocks
+    adaln_4cond: bool = False          # use 4-dim condition (Re, AoA, gap, surf_frac)
+    adaln_decouple: bool = False       # decoupled slice assignment for tandem
+    adaln_nozero: bool = False         # ablation: no zero-init on adaln projection
+    adaln_sam: bool = False            # SAM optimizer in last 25% of training
+    film_cond: bool = False            # FiLM conditioning (simpler alternative to AdaLN)
+    adaln_zone_temp: bool = False      # zone-aware temperature modulation
+    # Phase 2 R5: tandem warm-in combinations
+    tandem_ramp: bool = False          # gradual tandem surface loss warm-in (0→1 over epochs 10-50)
+    foil2_dist: bool = False           # explicit foil-2 distance feature (from secondary dsdf)
+    slice_num: int = 48                # slice count (default 48, GPU6: 96)
 
 
 cfg = sp.parse(Config)
@@ -626,12 +740,12 @@ print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + 32,  # +1 curv, +1 dist_feat, +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
     out_dim=3,
-    n_hidden=192,  # regime-w: full width with finer routing
+    n_hidden=cfg.n_hidden,
     n_layers=2,
     n_head=3,
-    slice_num=48,  # regime-h: more slices for finer spatial decomposition
+    slice_num=cfg.slice_num,
     mlp_ratio=2,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
@@ -641,6 +755,12 @@ model_config = dict(
     adaln_output=cfg.adaln_output,
     soft_moe=cfg.soft_moe,
     uncertainty_loss=cfg.uncertainty_loss,
+    adaln_all_blocks=cfg.adaln_all_blocks,
+    adaln_4cond=cfg.adaln_4cond,
+    adaln_nozero=cfg.adaln_nozero,
+    film_cond=cfg.film_cond,
+    adaln_decouple=cfg.adaln_decouple,
+    adaln_zone_temp=cfg.adaln_zone_temp,
 )
 
 model = Transolver(**model_config).to(device)
@@ -657,6 +777,50 @@ swad_collecting = False
 swad_done = False
 
 n_params = sum(p.numel() for p in model.parameters())
+
+
+class SAM:
+    """Sharpness-Aware Minimization (Foret et al., 2021).
+
+    Usage:
+        sam.perturb()          # perturb params in gradient direction
+        recompute loss/backward
+        sam.restore_and_step() # restore params, then call base_optimizer.step()
+    """
+    def __init__(self, base_optimizer, rho=0.05):
+        self.base_optimizer = base_optimizer
+        self.rho = rho
+
+    @property
+    def param_groups(self):
+        return self.base_optimizer.param_groups
+
+    def zero_grad(self):
+        self.base_optimizer.zero_grad()
+
+    def _grad_norm(self):
+        norms = [
+            p.grad.norm(2)
+            for group in self.param_groups
+            for p in group['params']
+            if p.grad is not None
+        ]
+        return torch.stack(norms).norm(2) if norms else torch.tensor(0.0)
+
+    def perturb(self):
+        scale = self.rho / (self._grad_norm() + 1e-12)
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is not None:
+                    p._sam_e_w = (p.grad * scale).detach()
+                    p.data.add_(p._sam_e_w)
+
+    def restore(self):
+        for group in self.param_groups:
+            for p in group['params']:
+                if hasattr(p, '_sam_e_w'):
+                    p.data.sub_(p._sam_e_w)
+                    del p._sam_e_w
 
 
 class Lookahead:
@@ -697,6 +861,8 @@ if cfg.use_lookahead:
     optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 else:
     optimizer = base_opt
+
+sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
     _warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
     _restarts = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -802,7 +968,11 @@ for epoch in range(MAX_EPOCHS):
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
-        x = torch.cat([x, curv, dist_feat], dim=-1)
+        if cfg.foil2_dist:
+            foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+            x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
+        else:
+            x = torch.cat([x, curv, dist_feat], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -854,7 +1024,9 @@ for epoch in range(MAX_EPOCHS):
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
-        if epoch < cfg.tandem_curriculum_epochs:
+        if cfg.tandem_ramp:
+            pass  # no hard curriculum; tandem_weight applied via tandem_boost below
+        elif epoch < cfg.tandem_curriculum_epochs:
             is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
             sample_mask = (~is_tandem_curr).float()[:, None, None]
             abs_err = abs_err * sample_mask
@@ -905,7 +1077,13 @@ for epoch in range(MAX_EPOCHS):
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
             surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
-        tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
+        if cfg.tandem_ramp:
+            tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
+            tandem_boost = torch.where(is_tandem_batch,
+                                       torch.tensor(adaptive_boost * tandem_weight, device=device),
+                                       torch.ones(B, device=device))
+        else:
+            tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
         if cfg.uncertainty_loss:
             bm = _base_model
@@ -1003,6 +1181,27 @@ for epoch in range(MAX_EPOCHS):
             loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        sam_active = sam_optimizer is not None and epoch >= int(MAX_EPOCHS * 0.75)
+        if sam_active and not use_pcgrad:
+            # SAM first step: perturb parameters toward gradient direction
+            sam_optimizer.perturb()
+            sam_optimizer.zero_grad()
+            # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out2 = model({"x": x})
+                pred2 = out2["preds"].float() / sample_stds
+                re_pred2 = out2["re_pred"].float()
+                aoa_pred2 = out2["aoa_pred"].float()
+            abs_err2 = (pred2 - y_norm).abs()
+            vol_loss2 = (abs_err2 * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+            surf_ps2 = (abs_err2[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            surf_loss2 = (surf_ps2 * tandem_boost).mean()
+            re_loss2 = F.mse_loss(re_pred2, log_re_target)
+            aoa_loss2 = F.mse_loss(aoa_pred2, aoa_target)
+            loss2 = vol_loss2 + surf_weight * surf_loss2 + 0.01 * re_loss2 + 0.01 * aoa_loss2
+            loss2.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            sam_optimizer.restore()
         optimizer.step()
         if step_scheduler_per_batch:
             try:
@@ -1064,7 +1263,11 @@ for epoch in range(MAX_EPOCHS):
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
-                x = torch.cat([x, curv, dist_feat], dim=-1)
+                if cfg.foil2_dist:
+                    foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                    x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
+                else:
+                    x = torch.cat([x, curv, dist_feat], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
