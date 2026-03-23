@@ -119,7 +119,8 @@ class MLP(nn.Module):
 class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
-    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
+                 linear_no_attention=False, learned_kernel=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -129,6 +130,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
         self.tandem_temp_offset = nn.Parameter(torch.zeros(1, heads, 1, 1))
+        self.linear_no_attention = linear_no_attention
+        self.learned_kernel = learned_kernel
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
@@ -143,6 +146,11 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout),
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
+        if learned_kernel:
+            self.kernel_mlp = nn.Sequential(
+                nn.Linear(2 * dim_head, dim_head), nn.GELU(),
+                nn.Linear(dim_head, 1),
+            )
 
     def forward(self, x, spatial_bias=None, tandem_mask=None):
         bsz, num_points, _ = x.shape
@@ -170,16 +178,27 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
 
-        q_slice_token = self.to_q(slice_token)
-        slice_token_kv = slice_token.mean(dim=1, keepdim=True)  # shared K,V: (bsz, 1, slice_num, dim_head)
-        k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
-        v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
-        q_norm = F.normalize(q_slice_token, dim=-1)
-        k_norm = F.normalize(k_slice_token, dim=-1)
-        attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
-        attn_weights = F.softmax(attn_logits, dim=-1)
-        out_slice_token = torch.matmul(attn_weights, v_slice_token)
-        out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
+        if self.linear_no_attention:
+            out_slice_token = slice_token
+        else:
+            q_slice_token = self.to_q(slice_token)
+            slice_token_kv = slice_token.mean(dim=1, keepdim=True)
+            k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
+            v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
+            if self.learned_kernel:
+                B, H, S, D = q_slice_token.shape
+                q_exp = q_slice_token.unsqueeze(-2).expand(B, H, S, S, D)
+                k_exp = k_slice_token.unsqueeze(-3).expand(B, H, S, S, D)
+                qk_cat = torch.cat([q_exp, k_exp], dim=-1)
+                attn_logits = self.kernel_mlp(qk_cat).squeeze(-1)
+                attn_weights = F.softmax(attn_logits, dim=-1)
+            else:
+                q_norm = F.normalize(q_slice_token, dim=-1)
+                k_norm = F.normalize(k_slice_token, dim=-1)
+                attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
+                attn_weights = F.softmax(attn_logits, dim=-1)
+            out_slice_token = torch.matmul(attn_weights, v_slice_token)
+            out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
 
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
@@ -197,9 +216,17 @@ class TransolverBlock(nn.Module):
         last_layer=False,
         out_dim=1,
         slice_num=32,
+        linear_no_attention=False,
+        learned_kernel=False,
+        field_decoder=False,
+        adaln_output=False,
+        soft_moe=False,
     ):
         super().__init__()
         self.last_layer = last_layer
+        self.field_decoder = field_decoder
+        self.adaln_output = adaln_output
+        self.soft_moe = soft_moe
         self.ln_1 = nn.LayerNorm(hidden_dim)
         self.attn = Physics_Attention_Irregular_Mesh(
             hidden_dim,
@@ -207,6 +234,8 @@ class TransolverBlock(nn.Module):
             dim_head=hidden_dim // num_heads,
             dropout=dropout,
             slice_num=slice_num,
+            linear_no_attention=linear_no_attention,
+            learned_kernel=learned_kernel,
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
@@ -225,13 +254,32 @@ class TransolverBlock(nn.Module):
         nn.init.zeros_(self.se_fc2.bias)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
-            self.mlp2 = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, out_dim),
-            )
+            if soft_moe:
+                self.gate_net = nn.Sequential(nn.Linear(hidden_dim, 2), nn.Softmax(dim=-1))
+                self.expert1 = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+                self.expert2 = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+            elif field_decoder:
+                self.vel_head = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2)
+                )
+                self.pres_head = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(), nn.Linear(hidden_dim * 2, 1)
+                )
+            elif adaln_output:
+                self.cond_net = nn.Sequential(nn.Linear(2, hidden_dim * 2), nn.GELU())
+                self.mlp2 = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+            else:
+                self.mlp2 = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
@@ -240,7 +288,19 @@ class TransolverBlock(nn.Module):
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            fx_ln = self.ln_3(fx)
+            if self.soft_moe:
+                gate = self.gate_net(fx_ln)  # [B, N, 2]
+                return gate[:, :, 0:1] * self.expert1(fx_ln) + gate[:, :, 1:2] * self.expert2(fx_ln)
+            elif self.field_decoder:
+                return torch.cat([self.vel_head(fx_ln), self.pres_head(fx_ln)], dim=-1)
+            elif self.adaln_output and condition is not None:
+                cond = self.cond_net(condition)  # [B, 2*H]
+                scale, shift = cond.chunk(2, dim=-1)  # [B, H]
+                fx_ln = fx_ln * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+                return self.mlp2(fx_ln)
+            else:
+                return self.mlp2(fx_ln)
         return fx
 
 
@@ -261,11 +321,18 @@ class Transolver(nn.Module):
         unified_pos=False,
         output_fields: list[str] | None = None,
         output_dims: list[int] | None = None,
+        linear_no_attention=False,
+        learned_kernel=False,
+        field_decoder=False,
+        adaln_output=False,
+        soft_moe=False,
+        uncertainty_loss=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.ref = ref
         self.unified_pos = unified_pos
+        self.adaln_output = adaln_output
         if output_fields is None or output_dims is None:
             raise ValueError("output_fields and output_dims must be provided")
         if len(output_fields) != len(output_dims):
@@ -274,6 +341,11 @@ class Transolver(nn.Module):
             raise ValueError("out_dim must equal sum(output_dims)")
         self.output_fields = output_fields
         self.output_dims = output_dims
+        if uncertainty_loss:
+            self.log_sigma_vol = nn.Parameter(torch.zeros(1))
+            self.log_sigma_surf_ux = nn.Parameter(torch.zeros(1))
+            self.log_sigma_surf_uy = nn.Parameter(torch.zeros(1))
+            self.log_sigma_surf_p = nn.Parameter(torch.zeros(1))
 
         if self.unified_pos:
             self.preprocess = MLP(
@@ -302,6 +374,11 @@ class Transolver(nn.Module):
                     out_dim=out_dim,
                     slice_num=slice_num,
                     last_layer=(idx == n_layers - 1),
+                    linear_no_attention=linear_no_attention,
+                    learned_kernel=learned_kernel,
+                    field_decoder=field_decoder if (idx == n_layers - 1) else False,
+                    adaln_output=adaln_output if (idx == n_layers - 1) else False,
+                    soft_moe=soft_moe if (idx == n_layers - 1) else False,
                 )
                 for idx in range(n_layers)
             ]
@@ -393,7 +470,9 @@ class Transolver(nn.Module):
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+        # Extract Re/AoA condition for AdaLN (indices 13,14 in input x)
+        condition = x[:, 0, 13:15] if self.adaln_output else None
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=condition)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
@@ -441,6 +520,15 @@ class Config:
     onecycle_div_factor: float = 10.0   # onecycle only
     onecycle_final_div_factor: float = 100.0  # onecycle only
     use_lookahead: bool = True
+    # Architecture flags (one per GPU)
+    linear_no_attention: bool = False  # GPU0: skip Q/K/V in slice attention
+    field_decoder: bool = False        # GPU1: separate vel/pres output heads
+    learned_kernel: bool = False       # GPU2: MLP attention kernel
+    uncertainty_loss: bool = False     # GPU3: Kendall uncertainty weighting
+    swad: bool = False                 # GPU4: SWAD weight averaging
+    boundary_aware: bool = False       # GPU5: upweight near-wall volume nodes
+    adaln_output: bool = False         # GPU6: AdaLN on output head
+    soft_moe: bool = False             # GPU7: Soft MoE output
 
 
 cfg = sp.parse(Config)
@@ -547,6 +635,12 @@ model_config = dict(
     mlp_ratio=2,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
+    linear_no_attention=cfg.linear_no_attention,
+    learned_kernel=cfg.learned_kernel,
+    field_decoder=cfg.field_decoder,
+    adaln_output=cfg.adaln_output,
+    soft_moe=cfg.soft_moe,
+    uncertainty_loss=cfg.uncertainty_loss,
 )
 
 model = Transolver(**model_config).to(device)
@@ -556,6 +650,11 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
+swad_initial_val = None
+swad_prev_val = float("inf")
+swad_checkpoints: list = []
+swad_collecting = False
+swad_done = False
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -776,7 +875,19 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_mask_train = vol_mask
 
-        vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+        if cfg.boundary_aware:
+            vol_dist = dist_feat[:, :, 0]  # [B, N], log1p-scaled dist-to-surface
+            valid_dists = vol_dist.masked_select(vol_mask_train)
+            if valid_dists.numel() > 10:
+                threshold = valid_dists.quantile(0.1)
+                near_wall = vol_mask_train & (vol_dist < threshold)
+                node_weight = (1.0 + near_wall.float()).unsqueeze(-1)  # 2x near-wall, 1x else
+                vol_loss = (abs_err * node_weight * vol_mask_train.float().unsqueeze(-1)).sum() / \
+                           (node_weight.squeeze(-1) * vol_mask_train.float()).sum().clamp(min=1)
+            else:
+                vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+        else:
+            vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
         surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
@@ -796,7 +907,17 @@ for epoch in range(MAX_EPOCHS):
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
-        loss = vol_loss + surf_weight * surf_loss
+        if cfg.uncertainty_loss:
+            bm = _base_model
+            surf_ux_loss = (abs_err[:, :, 0:1] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            surf_uy_loss = (abs_err[:, :, 1:2] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            surf_p_loss  = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            loss = (vol_loss    * torch.exp(-2 * bm.log_sigma_vol)    / 2 + bm.log_sigma_vol +
+                    surf_ux_loss * torch.exp(-2 * bm.log_sigma_surf_ux) / 2 + bm.log_sigma_surf_ux +
+                    surf_uy_loss * torch.exp(-2 * bm.log_sigma_surf_uy) / 2 + bm.log_sigma_surf_uy +
+                    surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
+        else:
+            loss = vol_loss + surf_weight * surf_loss
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
@@ -888,7 +1009,7 @@ for epoch in range(MAX_EPOCHS):
                 scheduler.step()
             except ValueError:
                 pass
-        if epoch >= cfg.ema_start_epoch:
+        if epoch >= cfg.ema_start_epoch and not cfg.swad:
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
             else:
@@ -1033,6 +1154,28 @@ for epoch in range(MAX_EPOCHS):
                                   torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isinf())]
     val_loss_3split = sum(_checkpoint_losses) / max(len(_checkpoint_losses), 1)
     ema_val_loss = val_loss_3split if ema_val_loss == float("inf") else ema_decay_val * ema_val_loss + (1 - ema_decay_val) * val_loss_3split
+
+    if cfg.swad:
+        if swad_initial_val is None:
+            swad_initial_val = val_loss_3split
+        if not swad_collecting and not swad_done:
+            if val_loss_3split < swad_initial_val * 0.5:
+                swad_collecting = True
+        if swad_collecting and not swad_done:
+            if val_loss_3split > swad_prev_val:
+                swad_done = True
+                if swad_checkpoints:
+                    avg_state = {k: torch.stack([c[k].float() for c in swad_checkpoints]).mean(0).to(device)
+                                 for k in swad_checkpoints[0]}
+                    if ema_model is None:
+                        ema_model = deepcopy(_base_model)
+                    ema_model.load_state_dict(avg_state)
+            else:
+                snap = {k: v.cpu().clone() for k, v in _base_model.state_dict().items()}
+                swad_checkpoints.append(snap)
+                if len(swad_checkpoints) > 20:
+                    swad_checkpoints.pop(0)
+            swad_prev_val = val_loss_3split
 
     # 4-split val/loss (all splits including ood_re)
     _4split_losses = [val_metrics_per_split[n][f"{n}/loss"] for n in VAL_SPLIT_NAMES
