@@ -25,6 +25,29 @@ git config user.email "senpai-$STUDENT_NAME@senpai"
 curl -fsSL https://claude.ai/install.sh | bash
 export PATH="$HOME/.claude/bin:$PATH"
 
+# --- Configure Claude Code: restart fresh when session exceeds token limit ---
+# Stop hook runs after each turn; check-context-limit.py flags a fresh restart
+# when the transcript exceeds SENPAI_TOKEN_LIMIT tokens (default 150k).
+mkdir -p "$HOME/.claude"
+cat > "$HOME/.claude/settings.json" << EOF
+{
+  "effortLevel": "high",
+  "alwaysThinkingEnabled": true,
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SENPAI_TOKEN_LIMIT=${SENPAI_TOKEN_LIMIT:-150000} python3 $WORKDIR/tools/check-context-limit.py"
+          }
+        ]
+      }
+    ]
+  }
+}
+EOF
+
 # --- Install Weave Claude Code Plugin ---
 source "$WORKDIR/tools/install-weave-cc-plugin.sh"
 
@@ -57,7 +80,9 @@ while true; do
     # Restore CLAUDE.md — branch checkouts clobber it
     cp "$WORKDIR/instructions/CLAUDE-STUDENT.md" "$WORKDIR/CLAUDE.md"
 
-    if [ "$ITERATION" -eq 1 ]; then
+    # Start fresh on first iteration, or if last session hit the token limit
+    if [ "$ITERATION" -eq 1 ] || [ -f /tmp/senpai_needs_fresh_start ]; then
+        rm -f /tmp/senpai_needs_fresh_start
         claude -p "$PROMPT" --dangerously-skip-permissions || true
     else
         claude -c -p "$PROMPT" --dangerously-skip-permissions || \
