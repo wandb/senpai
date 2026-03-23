@@ -221,12 +221,15 @@ class TransolverBlock(nn.Module):
         field_decoder=False,
         adaln_output=False,
         soft_moe=False,
+        adaln_all=False,
+        adaln_cond_dim=2,
     ):
         super().__init__()
         self.last_layer = last_layer
         self.field_decoder = field_decoder
         self.adaln_output = adaln_output
         self.soft_moe = soft_moe
+        self.adaln_all = adaln_all
         self.ln_1 = nn.LayerNorm(hidden_dim)
         self.attn = Physics_Attention_Irregular_Mesh(
             hidden_dim,
@@ -252,6 +255,9 @@ class TransolverBlock(nn.Module):
         self.se_fc2 = nn.Linear(hidden_dim // 4, hidden_dim)
         nn.init.zeros_(self.se_fc2.weight)
         nn.init.zeros_(self.se_fc2.bias)
+        if adaln_all:
+            # Scale/shift for attn pre-norm (ln_1) and MLP pre-norm (ln_2) — 4 vectors total
+            self.cond_net_all = nn.Sequential(nn.Linear(adaln_cond_dim, hidden_dim * 4), nn.GELU())
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
             if soft_moe:
@@ -281,8 +287,16 @@ class TransolverBlock(nn.Module):
 
     def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
-        fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
+        if self.adaln_all and condition is not None:
+            cond_all = self.cond_net_all(condition)  # [B, 4*H]
+            s1, sh1, s2, sh2 = cond_all.chunk(4, dim=-1)  # each [B, H]
+            fx_ln = self.ln_1(fx) * (1 + s1.unsqueeze(1)) + sh1.unsqueeze(1)
+            fx = self.ln_1_post(self.attn(fx_ln, spatial_bias=sb, tandem_mask=tandem_mask) + fx)
+            fx_ln = self.ln_2(fx) * (1 + s2.unsqueeze(1)) + sh2.unsqueeze(1)
+            fx = self.ln_2_post(self.mlp(fx_ln) + fx)
+        else:
+            fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
+            fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
@@ -327,12 +341,16 @@ class Transolver(nn.Module):
         adaln_output=False,
         soft_moe=False,
         uncertainty_loss=False,
+        adaln_all=False,
+        adaln_cond_dim=2,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.ref = ref
         self.unified_pos = unified_pos
         self.adaln_output = adaln_output
+        self.adaln_all = adaln_all
+        self.adaln_cond_dim = adaln_cond_dim
         if output_fields is None or output_dims is None:
             raise ValueError("output_fields and output_dims must be provided")
         if len(output_fields) != len(output_dims):
@@ -379,6 +397,8 @@ class Transolver(nn.Module):
                     field_decoder=field_decoder if (idx == n_layers - 1) else False,
                     adaln_output=adaln_output if (idx == n_layers - 1) else False,
                     soft_moe=soft_moe if (idx == n_layers - 1) else False,
+                    adaln_all=adaln_all,
+                    adaln_cond_dim=adaln_cond_dim,
                 )
                 for idx in range(n_layers)
             ]
@@ -463,15 +483,24 @@ class Transolver(nn.Module):
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
+        # Extract condition for AdaLN (Re/AoA, optionally gap/stagger/NACA)
+        if self.adaln_output or self.adaln_all:
+            if self.adaln_cond_dim == 4:
+                condition = torch.cat([x[:, 0, 13:15], x[:, 0, 22:24]], dim=-1)
+            elif self.adaln_cond_dim == 6:
+                condition = torch.cat([x[:, 0, 13:15], x[:, 0, 17:18], x[:, 0, 18:19], x[:, 0, 22:24]], dim=-1)
+            else:  # 2 (default): log_Re, AoA0
+                condition = x[:, 0, 13:15]
+        else:
+            condition = None
+
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=condition)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        # Extract Re/AoA condition for AdaLN (indices 13,14 in input x)
-        condition = x[:, 0, 13:15] if self.adaln_output else None
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=condition)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
@@ -527,8 +556,11 @@ class Config:
     uncertainty_loss: bool = False     # GPU3: Kendall uncertainty weighting
     swad: bool = False                 # GPU4: SWAD weight averaging
     boundary_aware: bool = False       # GPU5: upweight near-wall volume nodes
-    adaln_output: bool = False         # GPU6: AdaLN on output head
+    adaln_output: bool = False         # GPU6: AdaLN on output head (last block only)
     soft_moe: bool = False             # GPU7: Soft MoE output
+    # AdaLN scaling flags
+    adaln_all: bool = False            # Apply AdaLN conditioning to ALL TransolverBlocks
+    adaln_cond_dim: int = 2            # Condition dimensionality: 2=Re/AoA, 4=+gap/stagger, 6=+NACA/AoA1
 
 
 cfg = sp.parse(Config)
@@ -641,6 +673,8 @@ model_config = dict(
     adaln_output=cfg.adaln_output,
     soft_moe=cfg.soft_moe,
     uncertainty_loss=cfg.uncertainty_loss,
+    adaln_all=cfg.adaln_all,
+    adaln_cond_dim=cfg.adaln_cond_dim,
 )
 
 model = Transolver(**model_config).to(device)
