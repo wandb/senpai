@@ -591,7 +591,7 @@ MAX_EPOCHS = 500
 
 @dataclass
 class Config:
-    lr: float = 2.6e-3
+    lr: float = 1.5e-3
     weight_decay: float = 0.0
     batch_size: int = 4
     surf_weight: float = 20.0
@@ -604,9 +604,9 @@ class Config:
     # Schedule params (tuned for 3-hour / 500-epoch runs)
     warmup_total_iters: int = 20
     warmup_start_factor: float = 0.2
-    cosine_T_max: int = 200
+    cosine_T_max: int = 230
     cosine_eta_min: float = 1e-5
-    ema_start_epoch: int = 40
+    ema_start_epoch: int = 140
     ema_decay: float = 0.998
     temp_anneal_epoch: int = 50
     vol_ramp_epochs: int = 40
