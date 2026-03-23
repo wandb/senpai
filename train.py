@@ -520,6 +520,12 @@ class Config:
     onecycle_div_factor: float = 10.0   # onecycle only
     onecycle_final_div_factor: float = 100.0  # onecycle only
     use_lookahead: bool = True
+    # Model architecture scaling params
+    n_hidden: int = 192
+    n_layers: int = 2
+    n_head: int = 3
+    slice_num: int = 48
+    mlp_ratio: int = 2
     # Architecture flags (one per GPU)
     linear_no_attention: bool = False  # GPU0: skip Q/K/V in slice attention
     field_decoder: bool = False        # GPU1: separate vel/pres output heads
@@ -628,11 +634,11 @@ model_config = dict(
     space_dim=2,
     fun_dim=X_DIM - 2 + 2 + 32,  # +1 curv, +1 dist_feat, +32 fourier PE
     out_dim=3,
-    n_hidden=192,  # regime-w: full width with finer routing
-    n_layers=2,
-    n_head=3,
-    slice_num=48,  # regime-h: more slices for finer spatial decomposition
-    mlp_ratio=2,
+    n_hidden=cfg.n_hidden,
+    n_layers=cfg.n_layers,
+    n_head=cfg.n_head,
+    slice_num=cfg.slice_num,
+    mlp_ratio=cfg.mlp_ratio,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
     linear_no_attention=cfg.linear_no_attention,
