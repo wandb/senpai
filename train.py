@@ -23,6 +23,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
 import os
 import time
 from collections.abc import Mapping
+from copy import deepcopy
 from pathlib import Path
 
 import torch
@@ -221,12 +222,14 @@ class TransolverBlock(nn.Module):
         field_decoder=False,
         adaln_output=False,
         soft_moe=False,
+        zone_bias=False,
     ):
         super().__init__()
         self.last_layer = last_layer
         self.field_decoder = field_decoder
         self.adaln_output = adaln_output
         self.soft_moe = soft_moe
+        self.zone_bias = zone_bias
         self.ln_1 = nn.LayerNorm(hidden_dim)
         self.attn = Physics_Attention_Irregular_Mesh(
             hidden_dim,
@@ -252,6 +255,9 @@ class TransolverBlock(nn.Module):
         self.se_fc2 = nn.Linear(hidden_dim // 4, hidden_dim)
         nn.init.zeros_(self.se_fc2.weight)
         nn.init.zeros_(self.se_fc2.bias)
+        if zone_bias:
+            # Learned routing bias per zone: [0]=volume, [1]=surface (inferred from curvature)
+            self.zone_bias_param = nn.Parameter(torch.zeros(2, slice_num))
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
             if soft_moe:
@@ -281,6 +287,11 @@ class TransolverBlock(nn.Module):
 
     def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
+        if self.zone_bias and raw_xy is not None:
+            # raw_xy[:,:,2] = curvature proxy: non-zero for surface nodes
+            is_surf = (raw_xy[:, :, 2:3].abs() > 0.01).float()  # [B, N, 1]
+            zone_b = is_surf * self.zone_bias_param[1] + (1 - is_surf) * self.zone_bias_param[0]  # [B, N, S]
+            sb = (sb + zone_b) if sb is not None else zone_b
         fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask) + fx)
         fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
@@ -327,6 +338,7 @@ class Transolver(nn.Module):
         adaln_output=False,
         soft_moe=False,
         uncertainty_loss=False,
+        zone_bias=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -379,6 +391,7 @@ class Transolver(nn.Module):
                     field_decoder=field_decoder if (idx == n_layers - 1) else False,
                     adaln_output=adaln_output if (idx == n_layers - 1) else False,
                     soft_moe=soft_moe if (idx == n_layers - 1) else False,
+                    zone_bias=zone_bias,
                 )
                 for idx in range(n_layers)
             ]
@@ -529,6 +542,9 @@ class Config:
     boundary_aware: bool = False       # GPU5: upweight near-wall volume nodes
     adaln_output: bool = False         # GPU6: AdaLN on output head
     soft_moe: bool = False             # GPU7: Soft MoE output
+    zone_bias: bool = False            # learned per-zone routing bias (surf vs vol)
+    adaptive_temp: bool = False        # gradual temperature sharpening from epoch 80
+    ema_anneal: bool = False           # EMA decay anneals from 0.99→cfg.ema_decay
 
 
 cfg = sp.parse(Config)
@@ -641,6 +657,7 @@ model_config = dict(
     adaln_output=cfg.adaln_output,
     soft_moe=cfg.soft_moe,
     uncertainty_loss=cfg.uncertainty_loss,
+    zone_bias=cfg.zone_bias,
 )
 
 model = Transolver(**model_config).to(device)
@@ -648,7 +665,6 @@ torch._functorch.config.donated_buffer = False  # required for retain_graph=True
 model = torch.compile(model, mode="default")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
-from copy import deepcopy
 ema_model = None
 swad_initial_val = None
 swad_prev_val = float("inf")
@@ -1010,12 +1026,17 @@ for epoch in range(MAX_EPOCHS):
             except ValueError:
                 pass
         if epoch >= cfg.ema_start_epoch and not cfg.swad:
+            if cfg.ema_anneal:
+                ema_progress = min(1.0, (epoch - cfg.ema_start_epoch) / max(MAX_EPOCHS - cfg.ema_start_epoch, 1))
+                ema_decay = 0.99 + (cfg.ema_decay - 0.99) * ema_progress
+            else:
+                ema_decay = cfg.ema_decay
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
             else:
                 with torch.no_grad():
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
-                        ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+                        ep.data.mul_(ema_decay).add_(mp.data, alpha=1 - ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -1029,6 +1050,12 @@ for epoch in range(MAX_EPOCHS):
     if epoch >= cfg.temp_anneal_epoch:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
+    elif cfg.adaptive_temp and epoch >= 80:
+        # Gradual temperature sharpening: interpolate from 0.5 to 0.25 between epoch 80 and temp_anneal_epoch
+        progress = min(1.0, (epoch - 80) / max(cfg.temp_anneal_epoch - 80, 1))
+        adaptive_max_temp = 0.5 * (1 - progress) + 0.25 * progress
+        with torch.no_grad():
+            _base_model.blocks[0].attn.temperature.data.clamp_(max=adaptive_max_temp)
     epoch_vol /= n_batches
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
@@ -1263,11 +1290,20 @@ if best_metrics:
                 y_dev = y_true.unsqueeze(0).to(device)
                 is_surf_dev = is_surface.unsqueeze(0).to(device)
                 mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
+                raw_dsdf = x_dev[:, :, 2:10]
+                dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+                dist_feat = torch.log1p(dist_surf * 10.0)
                 x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                 curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
-                dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
-                dist_feat = torch.log1p(dist_surf * 10.0)
                 x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                raw_xy = x_n[:, :, :2]
+                xy_min = raw_xy.amin(dim=1, keepdim=True)
+                xy_max = raw_xy.amax(dim=1, keepdim=True)
+                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                freqs = torch.cat([_base_model.fourier_freqs_fixed.to(device), _base_model.fourier_freqs_learned.abs()])
+                xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, fourier_pe], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
