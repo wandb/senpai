@@ -733,7 +733,7 @@ elif cfg.wsd_schedule:
         else:
             progress = (epoch - stable_end) / max(decay_end - stable_end, 1)
             eta_ratio = 5e-5 / cfg.lr
-            return max(eta_ratio, (1.0 - progress) ** 0.5)
+            return max(eta_ratio, max(0.0, 1.0 - progress) ** 0.5)
     scheduler = torch.optim.lr_scheduler.LambdaLR(base_opt, lr_lambda=_wsd_lambda)
 else:  # sequential cosine (default)
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
