@@ -121,7 +121,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False):
+                 decouple_slice=False, zone_temp=False, pct_offset=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -131,6 +131,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
         self.tandem_temp_offset = nn.Parameter(torch.zeros(1, heads, 1, 1))
+        self.pct_offset = pct_offset
         self.linear_no_attention = linear_no_attention
         self.learned_kernel = learned_kernel
         self.decouple_slice = decouple_slice
@@ -163,8 +164,14 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
                 nn.Linear(2 * dim_head, dim_head), nn.GELU(),
                 nn.Linear(dim_head, 1),
             )
+        if pct_offset:
+            # PCT-style offset attention: LBR(Q_i - K_j) → scalar similarity
+            self.pct_offset_net = nn.Sequential(
+                nn.Linear(dim_head, dim_head), nn.LayerNorm(dim_head), nn.ReLU(),
+                nn.Linear(dim_head, 1),
+            )
 
-    def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None):
+    def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None, return_slice_weights=False):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -208,7 +215,15 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             slice_token_kv = slice_token.mean(dim=1, keepdim=True)
             k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
             v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
-            if self.learned_kernel:
+            if self.pct_offset:
+                # PCT-style: offset attention Q_i - K_j in slice space
+                B_p, H_p, S_p, D_p = q_slice_token.shape
+                q_exp = q_slice_token.unsqueeze(-2).expand(B_p, H_p, S_p, S_p, D_p)
+                k_exp = k_slice_token.unsqueeze(-3).expand(B_p, H_p, S_p, S_p, D_p)
+                offset = q_exp - k_exp  # [B, H, S, S, D]
+                attn_logits = self.pct_offset_net(offset).squeeze(-1)  # [B, H, S, S]
+                attn_weights = F.softmax(attn_logits, dim=-1)
+            elif self.learned_kernel:
                 B, H, S, D = q_slice_token.shape
                 q_exp = q_slice_token.unsqueeze(-2).expand(B, H, S, S, D)
                 k_exp = k_slice_token.unsqueeze(-3).expand(B, H, S, S, D)
@@ -225,7 +240,10 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
-        return self.to_out(out_x)
+        result = self.to_out(out_x)
+        if return_slice_weights:
+            return result, slice_weights  # slice_weights: [B, H, N, S]
+        return result
 
 
 class TransolverBlock(nn.Module):
@@ -250,6 +268,8 @@ class TransolverBlock(nn.Module):
         film_cond=False,
         decouple_slice=False,
         zone_temp=False,
+        dilated=False,
+        pct_offset=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -258,6 +278,7 @@ class TransolverBlock(nn.Module):
         self.soft_moe = soft_moe
         self.adaln_all = adaln_all
         self.film_cond = film_cond
+        self.dilated = dilated
         self.ln_1 = nn.LayerNorm(hidden_dim)
         self.attn = Physics_Attention_Irregular_Mesh(
             hidden_dim,
@@ -269,6 +290,7 @@ class TransolverBlock(nn.Module):
             learned_kernel=learned_kernel,
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
+            pct_offset=pct_offset,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -329,17 +351,47 @@ class TransolverBlock(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None,
+                extra_spatial_bias=None, return_slice_weights=False):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        if self.adaln_all and condition is not None:
+        if extra_spatial_bias is not None:
+            sb = extra_spatial_bias if sb is None else sb + extra_spatial_bias
+        _sw = None
+        if self.dilated and raw_xy is not None:
+            # Dilated slice attention: 3 parallel attentions at dilations 1, 2, 4
+            sort_idx = raw_xy[:, :, 0].argsort(dim=1)  # [B, N] by x-coord
+            fx_ln1 = self.ln_1(fx)
+            attn_outs = []
+            for dilation in [1, 2, 4]:
+                sub_idx = sort_idx[:, ::dilation]  # [B, N//d]
+                _H = fx.shape[-1]
+                _rxy_dim = raw_xy.shape[-1]
+                exp_idx = sub_idx.unsqueeze(-1).expand(-1, -1, _H)
+                rxy_sub = torch.gather(raw_xy, 1, sub_idx.unsqueeze(-1).expand(-1, -1, _rxy_dim))
+                fx_sub = torch.gather(fx_ln1, 1, exp_idx)
+                sb_sub = self.spatial_bias(rxy_sub)
+                attn_sub = self.attn(fx_sub, spatial_bias=sb_sub, tandem_mask=tandem_mask, zone_features=zone_features)
+                attn_full = torch.zeros_like(fx_ln1)
+                attn_full.scatter_(1, exp_idx, attn_sub.to(attn_full.dtype))
+                attn_outs.append(attn_full)
+            combined = (attn_outs[0] + attn_outs[1] + attn_outs[2]) / 3.0
+            fx = self.ln_1_post(combined + fx)
+            fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
+        elif self.adaln_all and condition is not None:
             cond_out = self.adaln_net(condition)  # [B, H*4]
             s1, b1, s2, b2 = cond_out.chunk(4, dim=-1)  # each [B, H]
             fx_norm = self.ln_1(fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
-            fx = self.ln_1_post(self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            attn_out = self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features)
+            fx = self.ln_1_post(attn_out + fx)
             fx_norm = self.ln_2(fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
             fx = self.ln_2_post(self.mlp(fx_norm) + fx)
         else:
-            fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            if return_slice_weights:
+                attn_out, _sw = self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask,
+                                          zone_features=zone_features, return_slice_weights=True)
+            else:
+                attn_out = self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features)
+            fx = self.ln_1_post(attn_out + fx)
             fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
@@ -363,6 +415,8 @@ class TransolverBlock(nn.Module):
                 return self.mlp2(fx_ln)
             else:
                 return self.mlp2(fx_ln)
+        if return_slice_weights and _sw is not None:
+            return fx, _sw
         return fx
 
 
@@ -395,6 +449,15 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        # Phase 3: multi-scale architecture variants (one per GPU)
+        unet_transolver=False,
+        coarse_refine=False,
+        hier_slice=False,
+        surf_refine=False,
+        pct_style=False,
+        dilated_slice=False,
+        progressive_width=False,
+        dual_path=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -405,6 +468,15 @@ class Transolver(nn.Module):
         self.adaln_4cond = adaln_4cond
         self.film_cond = film_cond
         self.adaln_zone_temp = adaln_zone_temp
+        # Store variant flags
+        self.unet_transolver = unet_transolver
+        self.coarse_refine = coarse_refine
+        self.hier_slice = hier_slice
+        self.surf_refine = surf_refine
+        self.pct_style = pct_style
+        self.dilated_slice = dilated_slice
+        self.progressive_width = progressive_width
+        self.dual_path = dual_path
         if output_fields is None or output_dims is None:
             raise ValueError("output_fields and output_dims must be provided")
         if len(output_fields) != len(output_dims):
@@ -435,32 +507,47 @@ class Transolver(nn.Module):
         self.space_dim = space_dim
         self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
         nn.init.eye_(self.feature_cross.weight)  # start as identity
-        self.blocks = nn.ModuleList(
-            [
-                TransolverBlock(
-                    num_heads=n_head,
-                    hidden_dim=n_hidden,
-                    dropout=dropout,
-                    act=act,
-                    mlp_ratio=mlp_ratio,
-                    out_dim=out_dim,
-                    slice_num=slice_num,
-                    last_layer=(idx == n_layers - 1),
-                    linear_no_attention=linear_no_attention,
-                    learned_kernel=learned_kernel,
-                    field_decoder=field_decoder if (idx == n_layers - 1) else False,
-                    adaln_output=adaln_output if (idx == n_layers - 1) else False,
-                    soft_moe=soft_moe if (idx == n_layers - 1) else False,
-                    adaln_all=adaln_all_blocks,
-                    adaln_cond_dim=4 if adaln_4cond else 2,
-                    adaln_zero_init=not adaln_nozero,
-                    film_cond=film_cond,
-                    decouple_slice=adaln_decouple,
-                    zone_temp=adaln_zone_temp,
-                )
+        def _make_block(idx, _last_layer=None, _slice_num=None, _dilated=False, _pct=False):
+            _ll = (idx == n_layers - 1) if _last_layer is None else _last_layer
+            _sn = slice_num if _slice_num is None else _slice_num
+            return TransolverBlock(
+                num_heads=n_head,
+                hidden_dim=n_hidden,
+                dropout=dropout,
+                act=act,
+                mlp_ratio=mlp_ratio,
+                out_dim=out_dim,
+                slice_num=_sn,
+                last_layer=_ll,
+                linear_no_attention=linear_no_attention,
+                learned_kernel=learned_kernel,
+                field_decoder=field_decoder if _ll else False,
+                adaln_output=adaln_output if _ll else False,
+                soft_moe=soft_moe if _ll else False,
+                adaln_all=adaln_all_blocks,
+                adaln_cond_dim=4 if adaln_4cond else 2,
+                adaln_zero_init=not adaln_nozero,
+                film_cond=film_cond,
+                decouple_slice=adaln_decouple,
+                zone_temp=adaln_zone_temp,
+                dilated=_dilated,
+                pct_offset=_pct,
+            )
+
+        if unet_transolver:
+            self.blocks = nn.ModuleList([_make_block(idx, _last_layer=False) for idx in range(n_layers)])
+        elif hier_slice:
+            self.blocks = nn.ModuleList([
+                _make_block(idx, _slice_num=(32 if idx == 0 else slice_num))
                 for idx in range(n_layers)
-            ]
-        )
+            ])
+        elif dilated_slice:
+            self.blocks = nn.ModuleList([_make_block(idx, _dilated=True) for idx in range(n_layers)])
+        elif pct_style:
+            self.blocks = nn.ModuleList([_make_block(idx, _pct=True) for idx in range(n_layers)])
+        else:
+            self.blocks = nn.ModuleList([_make_block(idx) for idx in range(n_layers)])
+
         self.initialize_weights()
         self.out_skip = nn.Linear(n_hidden, out_dim)
         nn.init.zeros_(self.out_skip.weight)
@@ -473,6 +560,104 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+
+        # ---- Phase 3: variant-specific submodules ----
+
+        if unet_transolver:
+            self.unet_out = nn.Sequential(
+                nn.LayerNorm(n_hidden), nn.Linear(n_hidden, n_hidden), nn.GELU(),
+                nn.Linear(n_hidden, out_dim)
+            )
+
+        if coarse_refine:
+            # Stage 1: coarse block on N//4 nodes
+            self.cr_coarse_block = TransolverBlock(
+                num_heads=n_head, hidden_dim=n_hidden, dropout=dropout, act=act,
+                mlp_ratio=mlp_ratio, out_dim=out_dim, slice_num=max(slice_num // 4, 8),
+                last_layer=False,
+            )
+            self.cr_coarse_head = nn.Sequential(nn.LayerNorm(n_hidden), nn.Linear(n_hidden, out_dim))
+            # Inject coarse prediction into refine path
+            self.cr_coarse_inject = nn.Linear(out_dim, n_hidden)
+            # Stage 2: refine block on all N nodes
+            self.cr_refine_block = TransolverBlock(
+                num_heads=n_head, hidden_dim=n_hidden, dropout=dropout, act=act,
+                mlp_ratio=mlp_ratio, out_dim=out_dim, slice_num=slice_num,
+                last_layer=False,
+            )
+            self.cr_refine_head = nn.Sequential(nn.LayerNorm(n_hidden), nn.Linear(n_hidden, out_dim))
+            nn.init.zeros_(self.cr_refine_head[-1].weight)
+            nn.init.zeros_(self.cr_refine_head[-1].bias)
+
+        if hier_slice:
+            # Project coarse slice weights [B,N,32] → fine slice bias [B,N,slice_num]
+            self.hier_coarse_to_fine = nn.Linear(32, slice_num)
+            nn.init.zeros_(self.hier_coarse_to_fine.weight)
+            nn.init.zeros_(self.hier_coarse_to_fine.bias)
+
+        if surf_refine:
+            _sr_h = n_hidden // 2  # 96 for n_hidden=192
+            _sr_heads = 3
+            _sr_dh = _sr_h // _sr_heads  # 32
+            _sr_slices = max(slice_num // 2, 16)
+            self.sr_proj_up = nn.Linear(out_dim, _sr_h)
+            self.sr_attn1 = Physics_Attention_Irregular_Mesh(
+                _sr_h, heads=_sr_heads, dim_head=_sr_dh, slice_num=_sr_slices
+            )
+            self.sr_ln1 = nn.LayerNorm(_sr_h)
+            self.sr_attn2 = Physics_Attention_Irregular_Mesh(
+                _sr_h, heads=_sr_heads, dim_head=_sr_dh, slice_num=_sr_slices
+            )
+            self.sr_ln2 = nn.LayerNorm(_sr_h)
+            self.sr_proj_down = nn.Linear(_sr_h, out_dim)
+            nn.init.zeros_(self.sr_proj_down.weight)
+            nn.init.zeros_(self.sr_proj_down.bias)
+            self.sr_spatial_bias = nn.Sequential(
+                nn.Linear(4, 64), nn.GELU(), nn.Linear(64, _sr_slices)
+            )
+            nn.init.zeros_(self.sr_spatial_bias[-1].weight)
+            nn.init.zeros_(self.sr_spatial_bias[-1].bias)
+
+        if progressive_width:
+            _d1, _d2, _d3 = 128, 192, 256
+            self.preprocess = GatedMLP2(fun_dim + space_dim, _d1 * 2, _d1)
+            self.placeholder_scale = nn.Parameter(torch.ones(_d1))
+            self.placeholder_shift = nn.Parameter(torch.zeros(_d1))
+            self.pw_block1 = TransolverBlock(
+                num_heads=4, hidden_dim=_d1, dropout=dropout, act=act,
+                mlp_ratio=mlp_ratio, out_dim=out_dim, slice_num=slice_num, last_layer=False,
+            )
+            self.pw_proj1_2 = nn.Linear(_d1, _d2)
+            self.pw_block2 = TransolverBlock(
+                num_heads=n_head, hidden_dim=_d2, dropout=dropout, act=act,
+                mlp_ratio=mlp_ratio, out_dim=out_dim, slice_num=slice_num, last_layer=False,
+            )
+            self.pw_proj2_3 = nn.Linear(_d2, _d3)
+            self.pw_block3 = TransolverBlock(
+                num_heads=4, hidden_dim=_d3, dropout=dropout, act=act,
+                mlp_ratio=mlp_ratio, out_dim=out_dim, slice_num=slice_num, last_layer=False,
+            )
+            self.pw_out = nn.Sequential(
+                nn.LayerNorm(_d3), nn.Linear(_d3, _d3), nn.GELU(), nn.Linear(_d3, out_dim)
+            )
+            self.pw_re_head = nn.Sequential(nn.Linear(_d2, 32), nn.GELU(), nn.Linear(32, 1))
+            self.pw_aoa_head = nn.Sequential(nn.Linear(_d2, 32), nn.GELU(), nn.Linear(32, 1))
+
+        if dual_path:
+            _dp_slices = max(slice_num // 2, 16)
+            self.dp_surf_block = TransolverBlock(
+                num_heads=n_head, hidden_dim=n_hidden, dropout=dropout, act=act,
+                mlp_ratio=mlp_ratio, out_dim=out_dim, slice_num=_dp_slices, last_layer=False,
+            )
+            self.dp_vol_block = TransolverBlock(
+                num_heads=n_head, hidden_dim=n_hidden, dropout=dropout, act=act,
+                mlp_ratio=mlp_ratio, out_dim=out_dim, slice_num=_dp_slices, last_layer=False,
+            )
+            self.dp_proj = nn.Linear(2 * n_hidden, n_hidden)
+            self.dp_out = nn.Sequential(
+                nn.LayerNorm(n_hidden), nn.Linear(n_hidden, n_hidden), nn.GELU(),
+                nn.Linear(n_hidden, out_dim)
+            )
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -523,6 +708,7 @@ class Transolver(nn.Module):
             raise ValueError("Missing required input tensor: x")
         if condition is not None:
             raise ValueError("Transolver does not support conditioning inputs")
+        is_surface = data.get("is_surface", None) if isinstance(data, Mapping) else None
 
         # Compute internal condition before feature_cross (indices are stable here)
         use_cond = self.adaln_all_blocks or self.film_cond
@@ -564,6 +750,107 @@ class Transolver(nn.Module):
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
+        # ---- Progressive Width (GPU 6) ----
+        if self.progressive_width:
+            fx = self.pw_block1(fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+            fx = self.pw_proj1_2(fx)
+            fx = self.pw_block2(fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+            re_pred = self.pw_re_head(fx.mean(dim=1))
+            aoa_pred = self.pw_aoa_head(fx.mean(dim=1))
+            fx = self.pw_proj2_3(fx)
+            fx = self.pw_block3(fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+            preds = self.pw_out(fx)
+            self._validate_output_dims(preds)
+            return {"preds": preds, "re_pred": re_pred, "aoa_pred": aoa_pred}
+
+        # ---- Coarse-to-Fine (GPU 1) ----
+        if self.coarse_refine:
+            bsz, N_full, _ = fx.shape
+            sort_idx = x[:, :, 0].argsort(dim=1)  # [B, N] by x-coord
+            coarse_idx = sort_idx[:, ::4]  # [B, ~N//4]
+            N_c = coarse_idx.shape[1]
+            H = fx.shape[-1]
+            _expand_c = coarse_idx.unsqueeze(-1).expand(-1, -1, H)
+            _expand_rxy_c = coarse_idx.unsqueeze(-1).expand(-1, -1, raw_xy.shape[-1])
+            fx_coarse_in = torch.gather(fx, 1, _expand_c)
+            rxy_coarse = torch.gather(raw_xy, 1, _expand_rxy_c)
+            # Stage 1: coarse prediction on N//4 nodes
+            fx_c = self.cr_coarse_block(fx_coarse_in, raw_xy=rxy_coarse, tandem_mask=is_tandem)
+            coarse_pred = self.cr_coarse_head(fx_c)  # [B, N//4, out_dim]
+            # Nearest-neighbour interpolation to full N (each node maps to x-sorted coarse node)
+            inv_sort = sort_idx.argsort(dim=1)  # sorted_pos for each original node [B, N]
+            coarse_nn = (inv_sort // 4).clamp(max=N_c - 1)  # [B, N]
+            coarse_interp = coarse_pred.gather(1, coarse_nn.unsqueeze(-1).expand(-1, -1, coarse_pred.shape[-1]))
+            # Stage 2: inject coarse info and refine
+            fx_refine = fx + self.cr_coarse_inject(coarse_interp)
+            fx_refine = self.cr_refine_block(fx_refine, raw_xy=raw_xy, tandem_mask=is_tandem)
+            residual = self.cr_refine_head(fx_refine)  # [B, N, out_dim]
+            re_pred = self.re_head(fx_refine.mean(dim=1))
+            aoa_pred = self.aoa_head(fx_refine.mean(dim=1))
+            gate = self.skip_gate(fx_pre)
+            preds = coarse_interp + residual + gate * self.out_skip(fx_pre)
+            self._validate_output_dims(preds)
+            return {"preds": preds, "re_pred": re_pred, "aoa_pred": aoa_pred}
+
+        # ---- U-Net Transolver (GPU 0) ----
+        if self.unet_transolver:
+            # Block 1: full N nodes
+            fx = self.blocks[0](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+            fx_skip = fx
+            # Downsample: keep every other node (by x-sort)
+            sort_idx = x[:, :, 0].argsort(dim=1)
+            down_idx = sort_idx[:, ::2]  # [B, N//2]
+            H = fx.shape[-1]
+            _exp_d = down_idx.unsqueeze(-1).expand(-1, -1, H)
+            _exp_rxy_d = down_idx.unsqueeze(-1).expand(-1, -1, raw_xy.shape[-1])
+            fx_down = torch.gather(fx, 1, _exp_d)
+            rxy_down = torch.gather(raw_xy, 1, _exp_rxy_d)
+            # Block 2: N//2 nodes
+            fx_coarse = self.blocks[1](fx_down, raw_xy=rxy_down, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+            # Upsample: scatter coarse features back (additive skip)
+            fx_up = torch.zeros_like(fx_skip)
+            fx_up.scatter_add_(1, _exp_d, fx_coarse.to(fx_up.dtype))
+            fx = fx_skip + fx_up
+            re_pred = self.re_head(fx.mean(dim=1))
+            aoa_pred = self.aoa_head(fx.mean(dim=1))
+            gate = self.skip_gate(fx_pre)
+            preds = self.unet_out(fx)  # [B, N, out_dim]
+            preds = preds + gate * self.out_skip(fx_pre)  # add preprocess skip
+            self._validate_output_dims(preds)
+            return {"preds": preds, "re_pred": re_pred, "aoa_pred": aoa_pred}
+
+        # ---- Dual Path (GPU 7) ----
+        if self.dual_path:
+            is_surf_f = is_surface.float().unsqueeze(-1) if is_surface is not None else torch.zeros(fx.shape[0], fx.shape[1], 1, device=fx.device, dtype=fx.dtype)
+            fx_surf = self.dp_surf_block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition)
+            fx_vol = self.dp_vol_block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition)
+            fx = self.dp_proj(torch.cat([fx_surf, fx_vol], dim=-1))
+            re_pred = self.re_head(fx.mean(dim=1))
+            aoa_pred = self.aoa_head(fx.mean(dim=1))
+            gate = self.skip_gate(fx_pre)
+            preds = self.dp_out(fx)  # [B, N, out_dim]
+            preds = preds + gate * self.out_skip(fx_pre)  # add preprocess skip
+            self._validate_output_dims(preds)
+            return {"preds": preds, "re_pred": re_pred, "aoa_pred": aoa_pred}
+
+        # ---- Hierarchical Slice (GPU 2) ----
+        if self.hier_slice:
+            fx, sw = self.blocks[0](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition,
+                                    zone_features=zone_features, return_slice_weights=True)
+            # sw: [B, H, N, 32] → project to [B, N, slice_num] as extra spatial bias for block[1]
+            sw_avg = sw.mean(dim=1)  # [B, N, 32]
+            extra_bias = self.hier_coarse_to_fine(sw_avg)  # [B, N, slice_num]
+            re_pred = self.re_head(fx.mean(dim=1))
+            aoa_pred = self.aoa_head(fx.mean(dim=1))
+            last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
+            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition,
+                                 zone_features=zone_features, extra_spatial_bias=extra_bias)
+            gate = self.skip_gate(fx_pre)
+            fx = fx + gate * self.out_skip(fx_pre)
+            self._validate_output_dims(fx)
+            return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+
+        # ---- Standard forward (baseline, pct_style, dilated_slice) ----
         for block in self.blocks[:-1]:
             fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
 
@@ -576,6 +863,18 @@ class Transolver(nn.Module):
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
+
+        # ---- Surface Refinement (GPU 3, post-processing) ----
+        if self.surf_refine:
+            sr_sb = self.sr_spatial_bias(raw_xy)  # [B, N, sr_slices]
+            sr_feat = F.gelu(self.sr_proj_up(fx))  # [B, N, sr_hidden]
+            sr_feat = self.sr_ln1(self.sr_attn1(sr_feat, spatial_bias=sr_sb) + sr_feat)
+            sr_feat = self.sr_ln2(self.sr_attn2(sr_feat, spatial_bias=sr_sb) + sr_feat)
+            sr_delta = self.sr_proj_down(sr_feat)  # [B, N, out_dim]
+            if is_surface is not None:
+                sr_delta = sr_delta * is_surface.float().unsqueeze(-1)
+            fx = fx + sr_delta
+
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
@@ -651,6 +950,15 @@ class Config:
     use_lion: bool = False        # GPU 4: Lion optimizer instead of AdamW
     rdrop: bool = False           # GPU 7: R-drop regularization
     rdrop_alpha: float = 1.0     # R-drop consistency loss weight
+    # Phase 3: multi-scale architecture variants (one per GPU)
+    unet_transolver: bool = False      # GPU0: U-Net encoder-decoder with skip connections
+    coarse_refine: bool = False        # GPU1: coarse-to-fine 2-stage prediction
+    hier_slice: bool = False           # GPU2: hierarchical slice attention (32→96)
+    surf_refine: bool = False          # GPU3: surface-aware refinement head
+    pct_style: bool = False            # GPU4: PCT-style offset attention
+    dilated_slice: bool = False        # GPU5: dilated slice attention (3 spatial scales)
+    progressive_width: bool = False    # GPU6: 3 blocks with 128→192→256 hidden dim
+    dual_path: bool = False            # GPU7: parallel surface+volume specialized blocks
 
 
 cfg = sp.parse(Config)
@@ -770,6 +1078,14 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    unet_transolver=cfg.unet_transolver,
+    coarse_refine=cfg.coarse_refine,
+    hier_slice=cfg.hier_slice,
+    surf_refine=cfg.surf_refine,
+    pct_style=cfg.pct_style,
+    dilated_slice=cfg.dilated_slice,
+    progressive_width=cfg.progressive_width,
+    dual_path=cfg.dual_path,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1059,7 +1375,7 @@ for epoch in range(MAX_EPOCHS):
             y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x, "is_surface": is_surface})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -1248,7 +1564,7 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                out2 = model({"x": x, "is_surface": is_surface})
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -1366,7 +1682,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    pred = eval_model({"x": x, "is_surface": is_surface})["preds"]
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
