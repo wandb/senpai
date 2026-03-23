@@ -16,12 +16,12 @@ RUN curl -fsSL https://claude.ai/install.sh | bash || true && \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli-stable.list > /dev/null && \
     apt-get update && apt-get install -y gh && rm -rf /var/lib/apt/lists/*
 
-# Install weave-claude-plugin, patch inactivity timeout (10 min → 12 h),
-# register the hook, and write default config.
+# Install weave-claude-plugin and patch inactivity timeout (10 min → 12 h).
+# `weave-claude-plugin install` must run at runtime (needs GitHub access to
+# clone the marketplace repo), so entrypoint scripts handle that step.
 RUN npm install -g weave-claude-plugin && \
     (sed -i "s/const INACTIVITY_TIMEOUT_MS = 10 \* 60 \* 1_000;/const INACTIVITY_TIMEOUT_MS = 12 * 60 * 60 * 1_000;/" \
-      "$(npm root -g)/weave-claude-plugin/dist/daemon.js" || true) && \
-    (weave-claude-plugin install || true)
+      "$(npm root -g)/weave-claude-plugin/dist/daemon.js" || true)
 
 RUN mkdir -p /root/.weave_claude_plugin/logs && \
     cat > /root/.weave_claude_plugin/settings.json <<'EOF'
