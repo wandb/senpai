@@ -391,6 +391,7 @@ class Transolver(nn.Module):
         uncertainty_loss=False,
         adaln_all_blocks=False,
         adaln_4cond=False,
+        adaln_6cond=False,
         adaln_nozero=False,
         film_cond=False,
         adaln_decouple=False,
@@ -403,6 +404,7 @@ class Transolver(nn.Module):
         self.adaln_output = adaln_output
         self.adaln_all_blocks = adaln_all_blocks
         self.adaln_4cond = adaln_4cond
+        self.adaln_6cond = adaln_6cond
         self.film_cond = film_cond
         self.adaln_zone_temp = adaln_zone_temp
         if output_fields is None or output_dims is None:
@@ -452,7 +454,7 @@ class Transolver(nn.Module):
                     adaln_output=adaln_output if (idx == n_layers - 1) else False,
                     soft_moe=soft_moe if (idx == n_layers - 1) else False,
                     adaln_all=adaln_all_blocks,
-                    adaln_cond_dim=4 if adaln_4cond else 2,
+                    adaln_cond_dim=6 if adaln_6cond else (4 if adaln_4cond else 2),
                     adaln_zero_init=not adaln_nozero,
                     film_cond=film_cond,
                     decouple_slice=adaln_decouple,
@@ -528,7 +530,15 @@ class Transolver(nn.Module):
         use_cond = self.adaln_all_blocks or self.film_cond
         if use_cond:
             cond_2 = x[:, 0, 13:15]  # Re, AoA [B, 2]
-            if self.adaln_4cond:
+            if self.adaln_6cond:
+                # 6-dim: Re, AoA0, gap-proxy(21), stagger(22), AoA1(18), naca_thick(17)
+                block_condition = torch.cat([
+                    cond_2,
+                    x[:, 0, 21:23],  # gap-proxy, stagger [B, 2]
+                    x[:, 0, 18:19],  # AoA1 [B, 1]
+                    x[:, 0, 17:18],  # NACA0 thickness [B, 1]
+                ], dim=-1)  # [B, 6]
+            elif self.adaln_4cond:
                 gap_feat = x[:, 0, 21:22]  # gap feature [B, 1]
                 # surf_frac: fraction of nodes near a surface (curvature at index 24)
                 surf_frac = (x[:, :, 24].abs() > 0.01).float().mean(dim=1, keepdim=True)  # [B, 1]
@@ -634,6 +644,7 @@ class Config:
     n_hidden: int = 192                # model width (override default)
     adaln_all_blocks: bool = False     # AdaLN-Zero on ALL TransolverBlocks
     adaln_4cond: bool = False          # use 4-dim condition (Re, AoA, gap, surf_frac)
+    adaln_6cond: bool = False          # use 6-dim condition (Re, AoA, gap, stagger, AoA1, naca_thick)
     adaln_decouple: bool = False       # decoupled slice assignment for tandem
     adaln_nozero: bool = False         # ablation: no zero-init on adaln projection
     adaln_sam: bool = False            # SAM optimizer in last 25% of training
@@ -757,6 +768,7 @@ model_config = dict(
     uncertainty_loss=cfg.uncertainty_loss,
     adaln_all_blocks=cfg.adaln_all_blocks,
     adaln_4cond=cfg.adaln_4cond,
+    adaln_6cond=cfg.adaln_6cond,
     adaln_nozero=cfg.adaln_nozero,
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
