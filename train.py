@@ -119,7 +119,8 @@ class MLP(nn.Module):
 class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
-    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
+                 use_gumbel=False, use_adaptive_temp=False, per_head_slices=None):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -132,8 +133,19 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
-        self.in_project_slice = nn.Linear(dim_head, slice_num)
+
+        # multiscale-slice: each head has a different effective slice count
+        self.per_head_slices = per_head_slices
+        _slice_dim = max(per_head_slices) if per_head_slices is not None else slice_num
+        self.in_project_slice = nn.Linear(dim_head, _slice_dim)
         torch.nn.init.orthogonal_(self.in_project_slice.weight)
+        if per_head_slices is not None:
+            _mask = torch.ones(1, heads, 1, _slice_dim, dtype=torch.bool)
+            for _h, _s in enumerate(per_head_slices):
+                if _s < _slice_dim:
+                    _mask[0, _h, 0, _s:] = False
+            self.register_buffer("slice_head_mask", _mask)
+
         self.to_q = nn.Linear(dim_head, dim_head, bias=False)
         self.to_k = nn.Linear(dim_head, dim_head, bias=False)
         self.to_v = nn.Linear(dim_head, dim_head, bias=False)
@@ -143,6 +155,12 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout),
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
+
+        self.use_gumbel = use_gumbel
+        self.use_adaptive_temp = use_adaptive_temp
+        if use_adaptive_temp:
+            self.temp_proj = nn.Linear(dim_head, 1, bias=False)
+            nn.init.zeros_(self.temp_proj.weight)
 
     def forward(self, x, spatial_bias=None, tandem_mask=None):
         bsz, num_points, _ = x.shape
@@ -162,7 +180,18 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         temp = self.temperature
         if tandem_mask is not None:
             temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
-        slice_logits = self.in_project_slice(x_mid) / temp
+        if self.use_adaptive_temp:
+            # Per-point temperature adjustment; zero-init so training starts identical to baseline
+            temp_adj = self.temp_proj(x_mid).squeeze(-1).unsqueeze(-1) * 0.1  # [B, H, N, 1]
+            temp = (temp + temp_adj).clamp(min=0.1)
+        slice_logits_raw = self.in_project_slice(x_mid)  # [B, H, N, slice_dim]
+        if self.use_gumbel and self.training:
+            u = torch.rand_like(slice_logits_raw).clamp(1e-7, 1 - 1e-7)
+            gumbel_noise = -torch.log(-torch.log(u))
+            slice_logits_raw = slice_logits_raw + gumbel_noise
+        slice_logits = slice_logits_raw / temp
+        if self.per_head_slices is not None:
+            slice_logits = slice_logits.masked_fill(~self.slice_head_mask, float('-inf'))
         if spatial_bias is not None:
             slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
         slice_weights = self.softmax(slice_logits)
@@ -197,8 +226,13 @@ class TransolverBlock(nn.Module):
         last_layer=False,
         out_dim=1,
         slice_num=32,
+        use_gumbel=False,
+        use_adaptive_temp=False,
+        per_head_slices=None,
+        use_zone_bias=False,
     ):
         super().__init__()
+        _eff_slice_num = max(per_head_slices) if per_head_slices is not None else slice_num
         self.last_layer = last_layer
         self.ln_1 = nn.LayerNorm(hidden_dim)
         self.attn = Physics_Attention_Irregular_Mesh(
@@ -206,14 +240,19 @@ class TransolverBlock(nn.Module):
             heads=num_heads,
             dim_head=hidden_dim // num_heads,
             dropout=dropout,
-            slice_num=slice_num,
+            slice_num=_eff_slice_num,
+            use_gumbel=use_gumbel,
+            use_adaptive_temp=use_adaptive_temp,
+            per_head_slices=per_head_slices,
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        # zone-bias: spatial_bias takes is_surface as a 5th input feature
+        _sb_in_dim = 5 if use_zone_bias else 4
         self.spatial_bias = nn.Sequential(
-            nn.Linear(4, 64), nn.GELU(),
+            nn.Linear(_sb_in_dim, 64), nn.GELU(),
             nn.Linear(64, 64), nn.GELU(),
-            nn.Linear(64, slice_num),
+            nn.Linear(64, _eff_slice_num),
         )
         nn.init.zeros_(self.spatial_bias[-1].weight)
         nn.init.zeros_(self.spatial_bias[-1].bias)
@@ -261,6 +300,10 @@ class Transolver(nn.Module):
         unified_pos=False,
         output_fields: list[str] | None = None,
         output_dims: list[int] | None = None,
+        use_gumbel=False,
+        use_adaptive_temp=False,
+        use_zone_bias=False,
+        per_head_slices=None,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -289,6 +332,7 @@ class Transolver(nn.Module):
 
         self.n_hidden = n_hidden
         self.space_dim = space_dim
+        self.use_zone_bias = use_zone_bias
         self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
         nn.init.eye_(self.feature_cross.weight)  # start as identity
         self.blocks = nn.ModuleList(
@@ -302,6 +346,10 @@ class Transolver(nn.Module):
                     out_dim=out_dim,
                     slice_num=slice_num,
                     last_layer=(idx == n_layers - 1),
+                    use_gumbel=use_gumbel,
+                    use_adaptive_temp=use_adaptive_temp,
+                    per_head_slices=per_head_slices,
+                    use_zone_bias=use_zone_bias,
                 )
                 for idx in range(n_layers)
             ]
@@ -378,6 +426,9 @@ class Transolver(nn.Module):
         x_cross = x * self.feature_cross(x)
         x = x + 0.1 * x_cross  # residual with small scale
         raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)  # x, y, curvature, dist
+        # zone-bias: append is_surface flag (index 12) as 5th spatial feature
+        if self.use_zone_bias:
+            raw_xy = torch.cat([raw_xy, x[:, :, 12:13]], dim=-1)
 
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
@@ -414,6 +465,7 @@ class Config:
     lr: float = 2.6e-3
     weight_decay: float = 0.0
     batch_size: int = 4
+    variant: str = "baseline"  # temp-gumbel, full-combo, 4pcgrad, tandem-finetune, interact-temp, multiscale-slice, zone-bias, ema-teacher
     surf_weight: float = 20.0
     manifest: str = "data/split_manifest.json"
     stats_file: str = "data/split_stats.json"
@@ -515,6 +567,31 @@ val_loaders = {
     for name, subset in val_splits.items()
 }
 
+# --- tandem-finetune: build tandem-only loader for the last 20% of training ---
+if cfg.variant == "tandem-finetune" and not cfg.debug:
+    import json as _json_tf
+    with open(cfg.manifest) as _mf:
+        _manifest_data = _json_tf.load(_mf)
+    _tandem_global = set(_manifest_data["domain_groups"].get("racecar_tandem", []))
+    _train_indices_set = set(train_ds.indices)
+    _tandem_train_idx = sorted(_tandem_global & _train_indices_set)
+    print(f"tandem-finetune: found {len(_tandem_train_idx)} tandem training samples")
+    if _tandem_train_idx:
+        _tandem_ds = torch.utils.data.Subset(train_ds.dataset, _tandem_train_idx)
+        _tandem_sampler = WeightedRandomSampler(
+            torch.ones(len(_tandem_ds), dtype=torch.float64),
+            num_samples=len(_tandem_ds),
+            replacement=True,
+        )
+        tandem_finetune_loader = DataLoader(_tandem_ds, batch_size=cfg.batch_size,
+                                            sampler=_tandem_sampler, **loader_kwargs)
+    else:
+        tandem_finetune_loader = train_loader
+    _finetune_epoch_start = int(0.8 * MAX_EPOCHS)
+else:
+    tandem_finetune_loader = None
+    _finetune_epoch_start = MAX_EPOCHS  # never switch
+
 # --- Physics normalization stats (computed over training set) ---
 # Compute mean/std of Cp-normalized targets so the model sees O(1) values.
 print("Computing physics normalization stats...")
@@ -536,17 +613,29 @@ _pstd = ((_phys_sq_sum / _phys_n - _pmean ** 2).clamp(min=0.0).sqrt()).clamp(min
 phys_stats = {"y_mean": _pmean, "y_std": _pstd}
 print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
+_use_gumbel = cfg.variant in ("temp-gumbel", "full-combo")
+_use_adaptive_temp = cfg.variant in ("temp-gumbel", "full-combo", "interact-temp")
+_use_zone_bias = (cfg.variant == "zone-bias")
+_per_head_slices = [16, 48, 80] if cfg.variant == "multiscale-slice" else None
+_extra_input = 1 if cfg.variant == "interact-temp" else 0
+_dropout = 0.05 if cfg.variant == "full-combo" else 0.0
+
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + 32,  # +1 curv, +1 dist_feat, +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + 32 + _extra_input,  # +1 curv, +1 dist_feat, +32 fourier PE, +1 interact
     out_dim=3,
     n_hidden=192,  # regime-w: full width with finer routing
     n_layers=2,
     n_head=3,
     slice_num=48,  # regime-h: more slices for finer spatial decomposition
     mlp_ratio=2,
+    dropout=_dropout,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
+    use_gumbel=_use_gumbel,
+    use_adaptive_temp=_use_adaptive_temp,
+    use_zone_bias=_use_zone_bias,
+    per_head_slices=_per_head_slices,
 )
 
 model = Transolver(**model_config).to(device)
@@ -590,10 +679,12 @@ class Lookahead:
 
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+# full-combo uses higher weight decay to regularize combined features
+_eff_weight_decay = 1e-5 if cfg.variant == "full-combo" else cfg.weight_decay
 base_opt = torch.optim.AdamW([
     {'params': attn_params, 'lr': cfg.lr * 0.5},
     {'params': other_params, 'lr': cfg.lr}
-], weight_decay=cfg.weight_decay)
+], weight_decay=_eff_weight_decay)
 if cfg.use_lookahead:
     optimizer = Lookahead(base_opt, k=10, alpha=0.8)
 else:
@@ -691,7 +782,12 @@ for epoch in range(MAX_EPOCHS):
     epoch_surf = 0.0
     n_batches = 0
 
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
+    # tandem-finetune: switch to tandem-only batches for last 20% of training
+    _active_loader = (tandem_finetune_loader
+                      if cfg.variant == "tandem-finetune" and tandem_finetune_loader is not None
+                      and epoch >= _finetune_epoch_start
+                      else train_loader)
+    pbar = tqdm(_active_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     for x, y, is_surface, mask in pbar:
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
@@ -700,6 +796,11 @@ for epoch in range(MAX_EPOCHS):
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+        # interact-temp: foil interaction ratio from raw dsdf (before standardization)
+        if cfg.variant == "interact-temp":
+            _f1_dist = x[:, :, 4:8].norm(dim=-1, keepdim=True)   # foil1 dsdf norm
+            _f2_dist = x[:, :, 8:12].norm(dim=-1, keepdim=True)   # foil2 dsdf norm
+            _interact_raw = _f1_dist / (_f2_dist.clamp(min=1e-3))
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -711,9 +812,17 @@ for epoch in range(MAX_EPOCHS):
         xy_max = raw_xy.amax(dim=1, keepdim=True)
         xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
         freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-        xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+        xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 8]
+        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 32]
         x = torch.cat([x, fourier_pe], dim=-1)
+        # interact-temp: append interaction feature as final input dimension
+        if cfg.variant == "interact-temp":
+            _is_tandem_feat = (x[:, 0, 21].abs() > 0.01)
+            _interact_feat = torch.where(
+                _is_tandem_feat[:, None, None].expand_as(_interact_raw),
+                _interact_raw, torch.ones_like(_interact_raw),
+            )
+            x = torch.cat([x, _interact_feat], dim=-1)
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -834,52 +943,112 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
-        # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
-        # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
-        is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
-        is_indist_pcgrad = ~is_ood_pcgrad
-        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
+        # ema-teacher: consistency loss against EMA model predictions (after epoch 100)
+        if cfg.variant == "ema-teacher" and epoch >= 100 and ema_model is not None:
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _ema_pred = ema_model({"x": x})["preds"].float()
+            loss = loss + 0.1 * F.mse_loss(pred, _ema_pred.detach())
 
-        if use_pcgrad:
-            n_a = is_indist_pcgrad.float().sum().clamp(min=1)
-            n_b = is_ood_pcgrad.float().sum().clamp(min=1)
-            vol_mask_a = vol_mask_train & is_indist_pcgrad.unsqueeze(1)
-            vol_mask_b = vol_mask_train & is_ood_pcgrad.unsqueeze(1)
-            vol_loss_a = (abs_err * vol_mask_a.unsqueeze(-1)).sum() / vol_mask_a.sum().clamp(min=1)
-            vol_loss_b = (abs_err * vol_mask_b.unsqueeze(-1)).sum() / vol_mask_b.sum().clamp(min=1)
-            surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
-            surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
-            coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-
-            optimizer.zero_grad()
-            loss_a.backward(retain_graph=True)
-            grads_a = [p.grad.clone() if p.grad is not None else None
-                       for p in model.parameters()]
-            optimizer.zero_grad()
-            loss_b.backward()
-
-            ga_flat = torch.cat([g.view(-1) for g in grads_a if g is not None])
-            gb_flat = torch.cat([p.grad.view(-1) for p in model.parameters() if p.grad is not None])
-            dot_ab = (ga_flat @ gb_flat).item()
-            gb_ns = float((gb_flat @ gb_flat).item()) + 1e-8
-            ga_ns = float((ga_flat @ ga_flat).item()) + 1e-8
-            for p, ga in zip(model.parameters(), grads_a):
-                gb = p.grad
-                if ga is None and gb is None:
-                    continue
-                if ga is None:
-                    pass  # keep gb
-                elif gb is None:
-                    p.grad = ga
-                elif dot_ab < 0:
-                    p.grad = ((ga - (dot_ab / gb_ns) * gb) + (gb - (dot_ab / ga_ns) * ga)) * 0.5
-                else:
-                    p.grad = (ga + gb) * 0.5
+        # Gradient management: 4pcgrad (variant) or 2pcgrad (default)
+        if cfg.variant == "4pcgrad":
+            # 4-group PCGrad: in_dist / tandem / ood_re / ood_cond
+            _pg_tandem = is_tandem_batch
+            _pg_ood_re = (~is_tandem_batch) & (x[:, 0, 13] > 1.0)
+            _pg_ood_cond = (~is_tandem_batch) & (~(x[:, 0, 13] > 1.0)) & (x[:, 0, 14].abs() > 1.0)
+            _pg_indist = ~(_pg_tandem | _pg_ood_re | _pg_ood_cond)
+            _coarse_s = _coarse_loss * 0.25 if _coarse_loss is not None else 0.0
+            _aux_s = 0.0025 * re_loss + 0.0025 * aoa_loss
+            _pcg_group_losses = []
+            for _gm in [_pg_indist, _pg_tandem, _pg_ood_re, _pg_ood_cond]:
+                if _gm.any():
+                    _ng = _gm.float().sum().clamp(min=1)
+                    _vm = vol_mask_train & _gm.unsqueeze(1)
+                    _sm = surf_mask & _gm.unsqueeze(1)
+                    _vl = (abs_err * _vm.unsqueeze(-1)).sum() / _vm.sum().clamp(min=1)
+                    _sp = (abs_err[:, :, 2:3] * _sm.unsqueeze(-1)).sum(dim=(1, 2)) / _sm.sum(dim=1).clamp(min=1).float()
+                    _sl = (_sp * _gm.float() * tandem_boost).sum() / _ng
+                    _pcg_group_losses.append(_vl + surf_weight * _sl + _coarse_s + _aux_s)
+            # Backward passes: retain graph for all but the last
+            _pcg_grads = []
+            for _gi, _gl in enumerate(_pcg_group_losses):
+                optimizer.zero_grad()
+                _gl.backward(retain_graph=(_gi < len(_pcg_group_losses) - 1))
+                _pcg_grads.append([p.grad.clone() if p.grad is not None else None
+                                    for p in model.parameters()])
+            # Pairwise gradient projection: project each gradient against all others
+            if len(_pcg_grads) > 1:
+                _proj = [[g.clone() if g is not None else None for g in gg] for gg in _pcg_grads]
+                for _ia in range(len(_proj)):
+                    for _ib in range(len(_proj)):
+                        if _ia == _ib:
+                            continue
+                        _ga = [g for g in _proj[_ia] if g is not None]
+                        _gb = [g for g in _pcg_grads[_ib] if g is not None]
+                        if not _ga or not _gb:
+                            continue
+                        _ga_flat = torch.cat([g.view(-1) for g in _ga])
+                        _gb_flat = torch.cat([g.view(-1) for g in _gb])
+                        _dot = (_ga_flat @ _gb_flat).item()
+                        if _dot < 0:
+                            _gb_ns = (_gb_flat @ _gb_flat).item() + 1e-8
+                            for _pi, _p in enumerate(model.parameters()):
+                                _ga_i = _proj[_ia][_pi]
+                                _gb_i = _pcg_grads[_ib][_pi]
+                                if _ga_i is not None and _gb_i is not None:
+                                    _proj[_ia][_pi] = _ga_i - (_dot / _gb_ns) * _gb_i
+                optimizer.zero_grad()
+                for _pi, _p in enumerate(model.parameters()):
+                    _gs = [_proj[_gi][_pi] for _gi in range(len(_proj)) if _proj[_gi][_pi] is not None]
+                    if _gs:
+                        _p.grad = torch.stack(_gs).mean(dim=0)
+            # (if only 1 group, grad already set from the single backward pass above)
         else:
-            optimizer.zero_grad()
-            loss.backward()
+            # Default 2-group PCGrad: in-dist (A) vs all-OOD (B)
+            is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
+            is_indist_pcgrad = ~is_ood_pcgrad
+            use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
+
+            if use_pcgrad:
+                n_a = is_indist_pcgrad.float().sum().clamp(min=1)
+                n_b = is_ood_pcgrad.float().sum().clamp(min=1)
+                vol_mask_a = vol_mask_train & is_indist_pcgrad.unsqueeze(1)
+                vol_mask_b = vol_mask_train & is_ood_pcgrad.unsqueeze(1)
+                vol_loss_a = (abs_err * vol_mask_a.unsqueeze(-1)).sum() / vol_mask_a.sum().clamp(min=1)
+                vol_loss_b = (abs_err * vol_mask_b.unsqueeze(-1)).sum() / vol_mask_b.sum().clamp(min=1)
+                surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
+                surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
+                coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
+                loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+
+                optimizer.zero_grad()
+                loss_a.backward(retain_graph=True)
+                grads_a = [p.grad.clone() if p.grad is not None else None
+                           for p in model.parameters()]
+                optimizer.zero_grad()
+                loss_b.backward()
+
+                ga_flat = torch.cat([g.view(-1) for g in grads_a if g is not None])
+                gb_flat = torch.cat([p.grad.view(-1) for p in model.parameters() if p.grad is not None])
+                dot_ab = (ga_flat @ gb_flat).item()
+                gb_ns = float((gb_flat @ gb_flat).item()) + 1e-8
+                ga_ns = float((ga_flat @ ga_flat).item()) + 1e-8
+                for p, ga in zip(model.parameters(), grads_a):
+                    gb = p.grad
+                    if ga is None and gb is None:
+                        continue
+                    if ga is None:
+                        pass  # keep gb
+                    elif gb is None:
+                        p.grad = ga
+                    elif dot_ab < 0:
+                        p.grad = ((ga - (dot_ab / gb_ns) * gb) + (gb - (dot_ab / ga_ns) * ga)) * 0.5
+                    else:
+                        p.grad = (ga + gb) * 0.5
+            else:
+                optimizer.zero_grad()
+                loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -940,6 +1109,11 @@ for epoch in range(MAX_EPOCHS):
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+                # interact-temp: foil interaction ratio (computed before standardization)
+                if cfg.variant == "interact-temp":
+                    _vf1_dist = x[:, :, 4:8].norm(dim=-1, keepdim=True)
+                    _vf2_dist = x[:, :, 8:12].norm(dim=-1, keepdim=True)
+                    _vinteract_raw = _vf1_dist / (_vf2_dist.clamp(min=1e-3))
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -951,9 +1125,17 @@ for epoch in range(MAX_EPOCHS):
                 xy_max = raw_xy.amax(dim=1, keepdim=True)
                 xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
                 freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-                xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+                xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 8]
+                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 32]
                 x = torch.cat([x, fourier_pe], dim=-1)
+                # interact-temp: append interaction feature
+                if cfg.variant == "interact-temp":
+                    _vis_tandem = (x[:, 0, 21].abs() > 0.01)
+                    _vinteract_feat = torch.where(
+                        _vis_tandem[:, None, None].expand_as(_vinteract_raw),
+                        _vinteract_raw, torch.ones_like(_vinteract_raw),
+                    )
+                    x = torch.cat([x, _vinteract_feat], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
@@ -1130,8 +1312,11 @@ if best_metrics:
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
                 y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
             samples.append((x[:, :2], y_true, y_pred, is_surface))
-        images = visualize(samples, out_dir=plot_dir / split_name)
-        if images:
-            wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+        try:
+            images = visualize(samples, out_dir=plot_dir / split_name)
+            if images:
+                wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+        except Exception as _vis_err:
+            print(f"  [warn] visualization failed for {split_name}: {_vis_err}")
 
 wandb.finish()
