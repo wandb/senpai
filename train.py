@@ -120,7 +120,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
-                 linear_no_attention=False, learned_kernel=False):
+                 linear_no_attention=False, learned_kernel=False,
+                 use_adaptive_temp=False, use_gumbel_anneal=False, use_decouple_slice=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -132,6 +133,9 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.tandem_temp_offset = nn.Parameter(torch.zeros(1, heads, 1, 1))
         self.linear_no_attention = linear_no_attention
         self.learned_kernel = learned_kernel
+        self.use_adaptive_temp = use_adaptive_temp
+        self.use_gumbel_anneal = use_gumbel_anneal
+        self.use_decouple_slice = use_decouple_slice
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
@@ -151,6 +155,14 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
                 nn.Linear(2 * dim_head, dim_head), nn.GELU(),
                 nn.Linear(dim_head, 1),
             )
+        if use_adaptive_temp:
+            self.temp_proj = nn.Linear(dim_head, 1, bias=False)
+            nn.init.zeros_(self.temp_proj.weight)
+        if use_gumbel_anneal:
+            self.register_buffer("gumbel_noise_scale", torch.tensor(1.0))
+        if use_decouple_slice:
+            self.in_project_deslice = nn.Linear(dim_head, slice_num)
+            torch.nn.init.orthogonal_(self.in_project_deslice.weight)
 
     def forward(self, x, spatial_bias=None, tandem_mask=None):
         bsz, num_points, _ = x.shape
@@ -170,7 +182,16 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         temp = self.temperature
         if tandem_mask is not None:
             temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
-        slice_logits = self.in_project_slice(x_mid) / temp
+        if self.use_adaptive_temp:
+            temp_adj = self.temp_proj(x_mid).squeeze(-1).unsqueeze(-1) * 0.1
+            temp = (temp + temp_adj).clamp(min=0.1)
+        slice_logits = self.in_project_slice(x_mid)
+        if self.use_gumbel_anneal and self.training:
+            noise_scale = self.gumbel_noise_scale.item()
+            u = torch.rand_like(slice_logits).clamp(1e-7, 1 - 1e-7)
+            gumbel_noise = -torch.log(-torch.log(u))
+            slice_logits = slice_logits + noise_scale * gumbel_noise
+        slice_logits = slice_logits / temp
         if spatial_bias is not None:
             slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
         slice_weights = self.softmax(slice_logits)
@@ -200,7 +221,14 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             out_slice_token = torch.matmul(attn_weights, v_slice_token)
             out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
 
-        out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
+        if self.use_decouple_slice:
+            deslice_logits = self.in_project_deslice(x_mid) / temp
+            if spatial_bias is not None:
+                deslice_logits = deslice_logits + 0.1 * spatial_bias.unsqueeze(1)
+            deslice_weights = self.softmax(deslice_logits)
+        else:
+            deslice_weights = slice_weights
+        out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, deslice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
         return self.to_out(out_x)
 
@@ -221,6 +249,10 @@ class TransolverBlock(nn.Module):
         field_decoder=False,
         adaln_output=False,
         soft_moe=False,
+        use_zone_bias=False,
+        use_adaptive_temp=False,
+        use_gumbel_anneal=False,
+        use_decouple_slice=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -236,11 +268,15 @@ class TransolverBlock(nn.Module):
             slice_num=slice_num,
             linear_no_attention=linear_no_attention,
             learned_kernel=learned_kernel,
+            use_adaptive_temp=use_adaptive_temp,
+            use_gumbel_anneal=use_gumbel_anneal,
+            use_decouple_slice=use_decouple_slice,
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        _sb_in_dim = 5 if use_zone_bias else 4
         self.spatial_bias = nn.Sequential(
-            nn.Linear(4, 64), nn.GELU(),
+            nn.Linear(_sb_in_dim, 64), nn.GELU(),
             nn.Linear(64, 64), nn.GELU(),
             nn.Linear(64, slice_num),
         )
@@ -327,6 +363,11 @@ class Transolver(nn.Module):
         adaln_output=False,
         soft_moe=False,
         uncertainty_loss=False,
+        use_zone_bias=False,
+        use_adaptive_temp=False,
+        use_gumbel_anneal=False,
+        use_decouple_slice=False,
+        use_tandem_head=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -361,6 +402,8 @@ class Transolver(nn.Module):
 
         self.n_hidden = n_hidden
         self.space_dim = space_dim
+        self.use_zone_bias = use_zone_bias
+        self.use_tandem_head = use_tandem_head
         self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
         nn.init.eye_(self.feature_cross.weight)  # start as identity
         self.blocks = nn.ModuleList(
@@ -379,6 +422,10 @@ class Transolver(nn.Module):
                     field_decoder=field_decoder if (idx == n_layers - 1) else False,
                     adaln_output=adaln_output if (idx == n_layers - 1) else False,
                     soft_moe=soft_moe if (idx == n_layers - 1) else False,
+                    use_zone_bias=use_zone_bias,
+                    use_adaptive_temp=use_adaptive_temp,
+                    use_gumbel_anneal=use_gumbel_anneal,
+                    use_decouple_slice=use_decouple_slice,
                 )
                 for idx in range(n_layers)
             ]
@@ -395,6 +442,13 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        if use_tandem_head:
+            self.tandem_head = nn.Sequential(
+                nn.Linear(n_hidden, n_hidden // 2), nn.GELU(),
+                nn.Linear(n_hidden // 2, out_dim),
+            )
+            nn.init.zeros_(self.tandem_head[-1].weight)
+            nn.init.zeros_(self.tandem_head[-1].bias)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -455,6 +509,8 @@ class Transolver(nn.Module):
         x_cross = x * self.feature_cross(x)
         x = x + 0.1 * x_cross  # residual with small scale
         raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)  # x, y, curvature, dist
+        if self.use_zone_bias:
+            raw_xy = torch.cat([raw_xy, x[:, :, 12:13]], dim=-1)  # add is_surface feature
 
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
@@ -470,11 +526,19 @@ class Transolver(nn.Module):
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
+        fx_hidden = fx  # save hidden rep for tandem-head
+
         # Extract Re/AoA condition for AdaLN (indices 13,14 in input x)
         condition = x[:, 0, 13:15] if self.adaln_output else None
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=condition)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
+
+        if self.use_tandem_head:
+            is_tandem_mask = (x[:, 0, 21].abs() > 0.01).float()[:, None, None]  # [B, 1, 1]
+            tandem_corr = 0.1 * self.tandem_head(fx_hidden)  # [B, N, out_dim]
+            fx = fx + tandem_corr * is_tandem_mask
+
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
@@ -529,9 +593,26 @@ class Config:
     boundary_aware: bool = False       # GPU5: upweight near-wall volume nodes
     adaln_output: bool = False         # GPU6: AdaLN on output head
     soft_moe: bool = False             # GPU7: Soft MoE output
+    # R3 tandem variants
+    variant: str = "baseline"  # zone-bias, adaptive-temp, gumbel, tandem-3x, zone-temp, decouple-slice, tandem-head, tandem-full
 
 
 cfg = sp.parse(Config)
+
+# Variant-specific overrides (R3 tandem attack on LinearNO)
+_r3_variants = ("zone-bias", "adaptive-temp", "gumbel", "tandem-3x",
+                "zone-temp", "decouple-slice", "tandem-head", "tandem-full")
+if cfg.variant in _r3_variants:
+    cfg.linear_no_attention = True
+    cfg.cosine_T_max = 230
+    cfg.ema_start_epoch = 140
+    cfg.temp_anneal_epoch = 160
+_use_zone_bias = cfg.variant in ("zone-bias", "zone-temp", "tandem-full")
+_use_adaptive_temp = cfg.variant in ("adaptive-temp", "zone-temp", "tandem-full")
+_use_gumbel_anneal = cfg.variant in ("gumbel", "tandem-full")
+_use_tandem_3x = (cfg.variant == "tandem-3x")
+_use_decouple_slice = cfg.variant in ("decouple-slice", "tandem-full")
+_use_tandem_head = (cfg.variant == "tandem-head")
 
 if cfg.debug:
     MAX_EPOCHS = 3
@@ -641,6 +722,11 @@ model_config = dict(
     adaln_output=cfg.adaln_output,
     soft_moe=cfg.soft_moe,
     uncertainty_loss=cfg.uncertainty_loss,
+    use_zone_bias=_use_zone_bias,
+    use_adaptive_temp=_use_adaptive_temp,
+    use_gumbel_anneal=_use_gumbel_anneal,
+    use_decouple_slice=_use_decouple_slice,
+    use_tandem_head=_use_tandem_head,
 )
 
 model = Transolver(**model_config).to(device)
@@ -784,6 +870,12 @@ for epoch in range(MAX_EPOCHS):
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
 
+    # Gumbel noise annealing: scale from 1.0 → 0.1 over training
+    if _use_gumbel_anneal:
+        _gumbel_scale = max(0.1, 1.0 - 0.9 * epoch / max(MAX_EPOCHS, 1))
+        for _blk in _base_model.blocks:
+            _blk.attn.gumbel_noise_scale.fill_(_gumbel_scale)
+
     # --- Train ---
     model.train()
     epoch_vol = 0.0
@@ -905,7 +997,12 @@ for epoch in range(MAX_EPOCHS):
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
             surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
-        tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
+        if _use_tandem_3x:
+            tandem_boost = torch.where(is_tandem_batch,
+                                       torch.tensor(3.0, device=device),
+                                       torch.tensor(1.0, device=device))
+        else:
+            tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
         if cfg.uncertainty_loss:
             bm = _base_model
