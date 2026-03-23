@@ -529,6 +529,9 @@ class Config:
     boundary_aware: bool = False       # GPU5: upweight near-wall volume nodes
     adaln_output: bool = False         # GPU6: AdaLN on output head
     soft_moe: bool = False             # GPU7: Soft MoE output
+    # Gradient method flags
+    gradient_method: str = "pcgrad"    # pcgrad, config_4group, config_surfvol, mconfig, mgda, nashmtl
+    config_decouple: bool = False      # GPU6: decouple tandem surf/vol as extra ConFIG groups
 
 
 cfg = sp.parse(Config)
@@ -655,6 +658,7 @@ swad_prev_val = float("inf")
 swad_checkpoints: list = []
 swad_collecting = False
 swad_done = False
+_mconfig_momentum = None  # M-ConFIG: running unit-gradient momentum
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -761,6 +765,113 @@ model_dir.mkdir(parents=True)
 model_path = model_dir / "checkpoint.pt"
 with open(model_dir / "config.yaml", "w") as f:
     yaml.dump(model_config, f)
+
+def _multi_grad_update(model, optimizer, group_losses):
+    """Apply ConFIG gradient update. group_losses is a list of scalar tensors."""
+    active = [l for l in group_losses if l is not None]
+    if not active or len(active) == 1:
+        optimizer.zero_grad()
+        (active[0] if active else group_losses[0]).backward()
+        return
+
+    grads = []
+    for i, loss in enumerate(active):
+        optimizer.zero_grad()
+        loss.backward(retain_graph=(i < len(active) - 1))
+        g = torch.cat([
+            p.grad.detach().view(-1) if p.grad is not None else torch.zeros(p.numel(), device=p.device)
+            for p in model.parameters()
+        ])
+        grads.append(g)
+
+    norms = [g.norm() for g in grads]
+    valid = [(g, n) for g, n in zip(grads, norms) if n.item() > 1e-8]
+    if not valid:
+        return
+    unit_grads = [g / n for g, n in valid]
+    norm_vals = [n.item() for _, n in valid]
+    K = len(valid)
+    avg_dir = torch.stack(unit_grads).mean(0)
+    avg_norm = avg_dir.norm()
+    if avg_norm.item() < 1e-8:
+        return
+    h_mean = K / sum(1.0 / nv for nv in norm_vals)
+    config_g = h_mean * (avg_dir / avg_norm)
+
+    optimizer.zero_grad()
+    offset = 0
+    for p in model.parameters():
+        n = p.numel()
+        p.grad = config_g[offset:offset + n].view_as(p).clone()
+        offset += n
+
+
+def _mgda_grad_update(model, optimizer, loss_a, loss_b):
+    """MGDA 2-task: find Pareto-optimal gradient combination."""
+    optimizer.zero_grad()
+    loss_a.backward(retain_graph=True)
+    g1 = torch.cat([
+        p.grad.detach().view(-1) if p.grad is not None else torch.zeros(p.numel(), device=p.device)
+        for p in model.parameters()
+    ])
+    optimizer.zero_grad()
+    loss_b.backward()
+    g2 = torch.cat([
+        p.grad.detach().view(-1) if p.grad is not None else torch.zeros(p.numel(), device=p.device)
+        for p in model.parameters()
+    ])
+    diff = g2 - g1
+    denom = (diff @ diff).item()
+    alpha = (diff @ g2).item() / denom if denom > 1e-10 else 0.5
+    alpha = max(0.0, min(1.0, alpha))
+    combined = alpha * g1 + (1.0 - alpha) * g2
+    optimizer.zero_grad()
+    offset = 0
+    for p in model.parameters():
+        n = p.numel()
+        p.grad = combined[offset:offset + n].view_as(p).clone()
+        offset += n
+
+
+def _nashmtl_grad_update(model, optimizer, group_losses, n_iter=20):
+    """NashMTL via Frank-Wolfe: find Nash bargaining weights."""
+    active = [l for l in group_losses if l is not None]
+    if not active or len(active) == 1:
+        optimizer.zero_grad()
+        (active[0] if active else group_losses[0]).backward()
+        return
+
+    grads = []
+    for i, loss in enumerate(active):
+        optimizer.zero_grad()
+        loss.backward(retain_graph=(i < len(active) - 1))
+        g = torch.cat([
+            p.grad.detach().view(-1) if p.grad is not None else torch.zeros(p.numel(), device=p.device)
+            for p in model.parameters()
+        ])
+        grads.append(g)
+
+    K = len(grads)
+    G = torch.stack(grads)
+    GTG = G @ G.T  # K x K
+    alpha = torch.ones(K, device=grads[0].device) / K
+
+    for step in range(n_iter):
+        Galpha = GTG @ alpha
+        k = (alpha * Galpha).argmin().item()
+        e_k = torch.zeros(K, device=alpha.device)
+        e_k[k] = 1.0
+        lr_fw = 2.0 / (step + 2.0)
+        alpha = (1.0 - lr_fw) * alpha + lr_fw * e_k
+
+    combined = (alpha.unsqueeze(-1) * G).sum(0)
+    optimizer.zero_grad()
+    offset = 0
+    for p in model.parameters():
+        n = p.numel()
+        p.grad = combined[offset:offset + n].view_as(p).clone()
+        offset += n
+
 
 best_val = float("inf")
 ema_val_loss = float("inf")
@@ -955,49 +1066,144 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
-        # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
-        # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
-        is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
-        is_indist_pcgrad = ~is_ood_pcgrad
-        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
+        # Gradient method dispatch
+        coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
+        aux = 0.005 * re_loss + 0.005 * aoa_loss
 
-        if use_pcgrad:
-            n_a = is_indist_pcgrad.float().sum().clamp(min=1)
-            n_b = is_ood_pcgrad.float().sum().clamp(min=1)
-            vol_mask_a = vol_mask_train & is_indist_pcgrad.unsqueeze(1)
-            vol_mask_b = vol_mask_train & is_ood_pcgrad.unsqueeze(1)
-            vol_loss_a = (abs_err * vol_mask_a.unsqueeze(-1)).sum() / vol_mask_a.sum().clamp(min=1)
-            vol_loss_b = (abs_err * vol_mask_b.unsqueeze(-1)).sum() / vol_mask_b.sum().clamp(min=1)
-            surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
-            surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
-            coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+        if cfg.gradient_method == "pcgrad":
+            # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
+            is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
+            is_indist_pcgrad = ~is_ood_pcgrad
+            use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
 
-            optimizer.zero_grad()
-            loss_a.backward(retain_graph=True)
-            grads_a = [p.grad.clone() if p.grad is not None else None
-                       for p in model.parameters()]
-            optimizer.zero_grad()
-            loss_b.backward()
+            if use_pcgrad:
+                n_a = is_indist_pcgrad.float().sum().clamp(min=1)
+                n_b = is_ood_pcgrad.float().sum().clamp(min=1)
+                vol_mask_a = vol_mask_train & is_indist_pcgrad.unsqueeze(1)
+                vol_mask_b = vol_mask_train & is_ood_pcgrad.unsqueeze(1)
+                vol_loss_a = (abs_err * vol_mask_a.unsqueeze(-1)).sum() / vol_mask_a.sum().clamp(min=1)
+                vol_loss_b = (abs_err * vol_mask_b.unsqueeze(-1)).sum() / vol_mask_b.sum().clamp(min=1)
+                surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
+                surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
+                loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + aux
+                loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + aux
 
-            ga_flat = torch.cat([g.view(-1) for g in grads_a if g is not None])
-            gb_flat = torch.cat([p.grad.view(-1) for p in model.parameters() if p.grad is not None])
-            dot_ab = (ga_flat @ gb_flat).item()
-            gb_ns = float((gb_flat @ gb_flat).item()) + 1e-8
-            ga_ns = float((ga_flat @ ga_flat).item()) + 1e-8
-            for p, ga in zip(model.parameters(), grads_a):
-                gb = p.grad
-                if ga is None and gb is None:
-                    continue
-                if ga is None:
-                    pass  # keep gb
-                elif gb is None:
-                    p.grad = ga
-                elif dot_ab < 0:
-                    p.grad = ((ga - (dot_ab / gb_ns) * gb) + (gb - (dot_ab / ga_ns) * ga)) * 0.5
-                else:
-                    p.grad = (ga + gb) * 0.5
+                optimizer.zero_grad()
+                loss_a.backward(retain_graph=True)
+                grads_a = [p.grad.clone() if p.grad is not None else None
+                           for p in model.parameters()]
+                optimizer.zero_grad()
+                loss_b.backward()
+
+                ga_flat = torch.cat([g.view(-1) for g in grads_a if g is not None])
+                gb_flat = torch.cat([p.grad.view(-1) for p in model.parameters() if p.grad is not None])
+                dot_ab = (ga_flat @ gb_flat).item()
+                gb_ns = float((gb_flat @ gb_flat).item()) + 1e-8
+                ga_ns = float((ga_flat @ ga_flat).item()) + 1e-8
+                for p, ga in zip(model.parameters(), grads_a):
+                    gb = p.grad
+                    if ga is None and gb is None:
+                        continue
+                    if ga is None:
+                        pass
+                    elif gb is None:
+                        p.grad = ga
+                    elif dot_ab < 0:
+                        p.grad = ((ga - (dot_ab / gb_ns) * gb) + (gb - (dot_ab / ga_ns) * ga)) * 0.5
+                    else:
+                        p.grad = (ga + gb) * 0.5
+            else:
+                optimizer.zero_grad()
+                loss.backward()
+
+        elif cfg.gradient_method in ("config_4group", "mconfig"):
+            # ConFIG 4-group: in_dist, tandem, ood_re, ood_cond
+            is_ood_re = ~is_tandem_batch & (x[:, 0, 13] > 1.0)
+            is_ood_cond = ~is_tandem_batch & (x[:, 0, 14].abs() > 1.0) & ~is_ood_re
+            is_indist_g = ~is_tandem_batch & ~is_ood_re & ~is_ood_cond
+
+            def _gloss(mask):
+                if not mask.any():
+                    return None
+                n = mask.float().sum().clamp(min=1)
+                vm = vol_mask_train & mask.unsqueeze(1)
+                vl = (abs_err * vm.unsqueeze(-1)).sum() / vm.sum().clamp(min=1)
+                sl = (surf_per_sample * mask.float() * tandem_boost).sum() / n
+                return vl + surf_weight * sl + coarse_shared + aux
+
+            groups = [_gloss(is_indist_g), _gloss(is_tandem_batch),
+                      _gloss(is_ood_re), _gloss(is_ood_cond)]
+            if cfg.config_decouple and is_tandem_batch.any():
+                # Extra group: tandem surface pressure only (decoupled)
+                tan_surf_p = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1) *
+                              is_tandem_batch.unsqueeze(-1).unsqueeze(-1)).sum() / \
+                             (surf_mask * is_tandem_batch.unsqueeze(-1)).sum().clamp(min=1)
+                groups.append(surf_weight * tan_surf_p + coarse_shared + aux)
+
+            active = [g for g in groups if g is not None]
+            if not active:
+                optimizer.zero_grad()
+                loss.backward()
+            elif cfg.gradient_method == "mconfig":
+                # M-ConFIG: compute gradient for one random group, update momentum
+                k = torch.randint(0, len(active), (1,)).item()
+                optimizer.zero_grad()
+                active[k].backward()
+                g_k = torch.cat([
+                    p.grad.detach().view(-1) if p.grad is not None else torch.zeros(p.numel(), device=p.device)
+                    for p in model.parameters()
+                ])
+                g_k_norm = g_k.norm().item()
+                if g_k_norm > 1e-8:
+                    g_k_unit = g_k / g_k_norm
+                    if _mconfig_momentum is None:
+                        _mconfig_momentum = g_k_unit.clone()
+                    else:
+                        _mconfig_momentum = 0.9 * _mconfig_momentum + 0.1 * g_k_unit
+                        mn = _mconfig_momentum.norm().item()
+                        if mn > 1e-8:
+                            _mconfig_momentum = _mconfig_momentum / mn
+                    config_g = _mconfig_momentum * g_k_norm
+                    optimizer.zero_grad()
+                    offset = 0
+                    for p in model.parameters():
+                        n = p.numel()
+                        p.grad = config_g[offset:offset + n].view_as(p).clone()
+                        offset += n
+            else:
+                _multi_grad_update(model, optimizer, active)
+
+        elif cfg.gradient_method == "config_surfvol":
+            # ConFIG 2-group: surface vs volume
+            surf_g = surf_weight * surf_loss + coarse_shared + aux
+            vol_g = vol_loss + coarse_shared + aux
+            _multi_grad_update(model, optimizer, [vol_g, surf_g])
+
+        elif cfg.gradient_method == "mgda":
+            # MGDA 2-task: surface vs volume
+            surf_g = surf_weight * surf_loss + coarse_shared + aux
+            vol_g = vol_loss + coarse_shared + aux
+            _mgda_grad_update(model, optimizer, vol_g, surf_g)
+
+        elif cfg.gradient_method == "nashmtl":
+            # NashMTL: 4-group Nash bargaining
+            is_ood_re = ~is_tandem_batch & (x[:, 0, 13] > 1.0)
+            is_ood_cond = ~is_tandem_batch & (x[:, 0, 14].abs() > 1.0) & ~is_ood_re
+            is_indist_g = ~is_tandem_batch & ~is_ood_re & ~is_ood_cond
+
+            def _gloss_n(mask):
+                if not mask.any():
+                    return None
+                n = mask.float().sum().clamp(min=1)
+                vm = vol_mask_train & mask.unsqueeze(1)
+                vl = (abs_err * vm.unsqueeze(-1)).sum() / vm.sum().clamp(min=1)
+                sl = (surf_per_sample * mask.float() * tandem_boost).sum() / n
+                return vl + surf_weight * sl + coarse_shared + aux
+
+            groups_n = [_gloss_n(is_indist_g), _gloss_n(is_tandem_batch),
+                        _gloss_n(is_ood_re), _gloss_n(is_ood_cond)]
+            _nashmtl_grad_update(model, optimizer, groups_n)
+
         else:
             optimizer.zero_grad()
             loss.backward()
