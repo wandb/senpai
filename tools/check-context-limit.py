@@ -3,16 +3,23 @@
 Claude Code Stop hook: write /tmp/senpai_needs_fresh_start when the session
 transcript exceeds SENPAI_TOKEN_LIMIT (default 150000 tokens).
 
-Token count is approximated from content character lengths (÷4).
+Uses the Anthropic token-counting API for an exact count.
+Requires ANTHROPIC_API_KEY in the environment.
+
+Configurable env vars:
+  SENPAI_TOKEN_LIMIT  — token threshold (default: 150000)
+  SENPAI_MODEL        — model name for counting (default: claude-sonnet-4-6)
 """
 
 import json
 import os
 import sys
 
+import anthropic
 
-def estimate_tokens(transcript_path: str) -> int:
-    total_chars = 0
+
+def load_messages(transcript_path: str) -> list:
+    messages = []
     with open(transcript_path) as f:
         for line in f:
             line = line.strip()
@@ -22,14 +29,14 @@ def estimate_tokens(transcript_path: str) -> int:
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                total_chars += len(content)
-            elif isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict):
-                        total_chars += len(block.get("text", ""))
-    return total_chars // 4
+            role = msg.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            content = msg.get("content")
+            if not content:
+                continue
+            messages.append({"role": role, "content": content})
+    return messages
 
 
 def main() -> None:
@@ -38,14 +45,22 @@ def main() -> None:
     if not transcript or not os.path.exists(transcript):
         return
 
+    messages = load_messages(transcript)
+    if not messages:
+        return
+
     limit = int(os.environ.get("SENPAI_TOKEN_LIMIT", "150000"))
-    tokens = estimate_tokens(transcript)
+    model = os.environ.get("SENPAI_MODEL", "claude-sonnet-4-6")
+
+    client = anthropic.Anthropic()
+    response = client.messages.count_tokens(model=model, messages=messages)
+    tokens = response.input_tokens
 
     if tokens >= limit:
-        print(f"[check-context-limit] ~{tokens:,} tokens >= limit {limit:,} — flagging fresh restart", flush=True)
+        print(f"[check-context-limit] {tokens:,} tokens >= limit {limit:,} — flagging fresh restart", flush=True)
         open("/tmp/senpai_needs_fresh_start", "w").close()
     else:
-        print(f"[check-context-limit] ~{tokens:,} tokens (limit {limit:,})", flush=True)
+        print(f"[check-context-limit] {tokens:,} tokens (limit {limit:,})", flush=True)
 
 
 if __name__ == "__main__":
