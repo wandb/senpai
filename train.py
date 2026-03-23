@@ -327,6 +327,7 @@ class Transolver(nn.Module):
         adaln_output=False,
         soft_moe=False,
         uncertainty_loss=False,
+        kendall_loss=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -346,6 +347,11 @@ class Transolver(nn.Module):
             self.log_sigma_surf_ux = nn.Parameter(torch.zeros(1))
             self.log_sigma_surf_uy = nn.Parameter(torch.zeros(1))
             self.log_sigma_surf_p = nn.Parameter(torch.zeros(1))
+        if kendall_loss:
+            self.log_sigma_vol_vel = nn.Parameter(torch.zeros(1))
+            self.log_sigma_vol_p = nn.Parameter(torch.zeros(1))
+            self.log_sigma_surf_vel = nn.Parameter(torch.zeros(1))
+            self.log_sigma_surf_p_k = nn.Parameter(torch.zeros(1))
 
         if self.unified_pos:
             self.preprocess = MLP(
@@ -490,7 +496,7 @@ MAX_EPOCHS = 500
 
 @dataclass
 class Config:
-    lr: float = 2.6e-3
+    lr: float = 1.5e-3
     weight_decay: float = 0.0
     batch_size: int = 4
     surf_weight: float = 20.0
@@ -503,9 +509,9 @@ class Config:
     # Schedule params (tuned for 3-hour / 500-epoch runs)
     warmup_total_iters: int = 20
     warmup_start_factor: float = 0.2
-    cosine_T_max: int = 200
+    cosine_T_max: int = 230
     cosine_eta_min: float = 1e-5
-    ema_start_epoch: int = 40
+    ema_start_epoch: int = 140
     ema_decay: float = 0.998
     temp_anneal_epoch: int = 50
     vol_ramp_epochs: int = 40
@@ -529,6 +535,12 @@ class Config:
     boundary_aware: bool = False       # GPU5: upweight near-wall volume nodes
     adaln_output: bool = False         # GPU6: AdaLN on output head
     soft_moe: bool = False             # GPU7: Soft MoE output
+    # R4 loss innovation flags
+    gmse_alpha: float = 0.0          # GPU0,1,4: GMSE gradient-weighted surface pressure loss (0=disabled)
+    spectral_surf: bool = False      # GPU2,4: Spectral pressure loss (first 16 Fourier modes, weight=0.5)
+    pressure_only_surf: bool = False # GPU5: Pressure-only surface loss (current default; no-op flag for documentation)
+    huber_surf_p: bool = False       # GPU6: Huber loss for surface pressure (delta=1.0)
+    kendall_loss: bool = False       # GPU7: Adaptive per-field sigma weights (4 log_sigma groups)
 
 
 cfg = sp.parse(Config)
@@ -641,6 +653,7 @@ model_config = dict(
     adaln_output=cfg.adaln_output,
     soft_moe=cfg.soft_moe,
     uncertainty_loss=cfg.uncertainty_loss,
+    kendall_loss=cfg.kendall_loss,
 )
 
 model = Transolver(**model_config).to(device)
@@ -889,21 +902,50 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        # Unweighted surf_per_sample for tandem EMA tracking only
+        surf_per_sample_track = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        surf_per_sample = surf_per_sample_track
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
         running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
+
+        # GMSE: gradient-magnitude weights for surface pressure loss
+        _gmse_w = None
+        if cfg.gmse_alpha > 0.0 and surf_mask.any():
+            _gmse_w = torch.ones(B, x.shape[1], device=device)
+            for _b in range(B):
+                _s_idx = surf_mask[_b].nonzero(as_tuple=True)[0]
+                if _s_idx.numel() >= 3:
+                    _xc = x[_b, _s_idx, 0]
+                    _ord = _xc.argsort()
+                    _ss = _s_idx[_ord]
+                    _p = y_norm[_b, _ss, 2].detach()
+                    _gp = torch.zeros_like(_p)
+                    _gp[1:-1] = (_p[2:] - _p[:-2]).abs() / 2
+                    _gp[0] = (_p[1] - _p[0]).abs()
+                    _gp[-1] = (_p[-1] - _p[-2]).abs()
+                    _gmse_w[_b, _ss] = 1.0 + cfg.gmse_alpha * _gp / _gp.mean().clamp(min=1e-8)
+
+        # Surface pressure error tensor (Huber or L1)
+        if cfg.huber_surf_p:
+            _surf_p_err = F.huber_loss(pred[:, :, 2:3], y_norm[:, :, 2:3], reduction='none', delta=1.0)
+        else:
+            _surf_p_err = abs_err[:, :, 2:3]
+
         # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
         if epoch >= 30:
-            surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
-            surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
+            surf_pres_flat = _surf_p_err[:, :, 0]
             surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
-            thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
-            thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
+            thresh = torch.nanmedian(surf_pres_masked, dim=1).values
+            thresh = thresh.nan_to_num(float('inf'))
             hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
-            surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            _combined_w = hard_weights * (_gmse_w.unsqueeze(-1) if _gmse_w is not None else 1.0)
+            surf_per_sample = (_surf_p_err * _combined_w * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        elif _gmse_w is not None or cfg.huber_surf_p:
+            surf_per_sample = (_surf_p_err * (_gmse_w.unsqueeze(-1) if _gmse_w is not None else 1.0) * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
@@ -916,6 +958,17 @@ for epoch in range(MAX_EPOCHS):
                     surf_ux_loss * torch.exp(-2 * bm.log_sigma_surf_ux) / 2 + bm.log_sigma_surf_ux +
                     surf_uy_loss * torch.exp(-2 * bm.log_sigma_surf_uy) / 2 + bm.log_sigma_surf_uy +
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
+        elif cfg.kendall_loss:
+            # Kendall uncertainty: 4 log_sigma groups — vol_vel, vol_p, surf_vel, surf_p
+            bm = _base_model
+            vol_vel_loss_k  = (abs_err[:, :, :2] * vol_mask_train.unsqueeze(-1)).sum() / (vol_mask_train.sum().clamp(min=1) * 2)
+            vol_p_loss_k    = (abs_err[:, :, 2:3] * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+            surf_vel_loss_k = (abs_err[:, :, :2] * surf_mask.unsqueeze(-1)).sum() / (surf_mask.sum().clamp(min=1) * 2)
+            # surf_loss already has tandem_boost and hard-node/GMSE weighting
+            loss = (vol_vel_loss_k  * torch.exp(-2 * bm.log_sigma_vol_vel)  / 2 + bm.log_sigma_vol_vel +
+                    vol_p_loss_k    * torch.exp(-2 * bm.log_sigma_vol_p)    / 2 + bm.log_sigma_vol_p +
+                    surf_vel_loss_k * torch.exp(-2 * bm.log_sigma_surf_vel) / 2 + bm.log_sigma_surf_vel +
+                    surf_loss       * torch.exp(-2 * bm.log_sigma_surf_p_k) / 2 + bm.log_sigma_surf_p_k)
         else:
             loss = vol_loss + surf_weight * surf_loss
 
@@ -955,11 +1008,31 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # Spectral pressure loss: L1 on first 16 Fourier modes of sorted surface nodes
+        if cfg.spectral_surf and surf_mask.any():
+            _spectral_loss = torch.tensor(0.0, device=device)
+            _n_spectral = 0
+            for _b in range(B):
+                _s_idx = surf_mask[_b].nonzero(as_tuple=True)[0]
+                if _s_idx.numel() >= 8:
+                    _xc = x[_b, _s_idx, 0]
+                    _ord = _xc.argsort()
+                    _ss = _s_idx[_ord]
+                    _p_pred_s = pred[_b, _ss, 2]
+                    _p_gt_s = y_norm[_b, _ss, 2]
+                    _fft_pred_s = torch.fft.rfft(_p_pred_s)
+                    _fft_gt_s = torch.fft.rfft(_p_gt_s)
+                    _nm = min(16, _fft_pred_s.shape[0])
+                    _spectral_loss = _spectral_loss + (_fft_pred_s[:_nm] - _fft_gt_s[:_nm]).abs().mean()
+                    _n_spectral += 1
+            if _n_spectral > 0:
+                loss = loss + 0.5 * _spectral_loss / _n_spectral
+
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
         is_indist_pcgrad = ~is_ood_pcgrad
-        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
+        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any() and not cfg.kendall_loss
 
         if use_pcgrad:
             n_a = is_indist_pcgrad.float().sum().clamp(min=1)
