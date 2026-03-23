@@ -39,6 +39,13 @@ Read `program.md` for the full research context, constraints, metrics, and file 
      ```
    - Note: PRs target the advisor's branch (specified in your prompt), not `main`.
 
+   **Asking questions to the advisor**
+   You can comment on the PR if you need any more information from the advisor or need to ask any questions. Ensure to identify yourself as the student at the start of the comment. Then remove the `status:wip` label and mark the PR with the `status:review` label so the advisor knows to look at it:
+   ```bash
+   gh pr comment <number> -b "STUDENT: <question or comment to advisor>"
+   gh api repos/{owner}/{repo}/issues/<number>/labels/status:wip --method DELETE
+   gh api repos/{owner}/{repo}/issues/<number>/labels -f "labels[]=status:review" --method POST
+
 3. **Implement the hypothesis**
    - Follow the instructions in the PR body.
    - Only modify `train.py` (see constraints in `program.md`).
@@ -89,6 +96,7 @@ Read `program.md` for the full research context, constraints, metrics, and file 
 Your PR may come back as a draft with `status:wip` and review comments. When this happens:
 - Read the review comments carefully.
 - Address the feedback — this might mean tweaking parameters, trying a variation, or fixing an issue.
+- You can comment on the PR if you need any more information from the advisor or need to ask any questions. Ensure to identify yourself as the student at the start of the comment.
 - Run new experiments and update the results.
 - Re-submit for review (step 6).
 
