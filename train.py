@@ -120,7 +120,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
-                 linear_no_attention=False, learned_kernel=False):
+                 linear_no_attention=False, learned_kernel=False,
+                 use_adaptive_temp=False, use_decouple_slice=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -132,6 +133,14 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.tandem_temp_offset = nn.Parameter(torch.zeros(1, heads, 1, 1))
         self.linear_no_attention = linear_no_attention
         self.learned_kernel = learned_kernel
+        self.use_adaptive_temp = use_adaptive_temp
+        self.use_decouple_slice = use_decouple_slice
+        if use_adaptive_temp:
+            self.temp_proj = nn.Linear(dim_head, 1, bias=False)
+            nn.init.zeros_(self.temp_proj.weight)
+        if use_decouple_slice:
+            self.in_project_deslice = nn.Linear(dim_head, slice_num)
+            torch.nn.init.orthogonal_(self.in_project_deslice.weight)
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
@@ -170,6 +179,9 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         temp = self.temperature
         if tandem_mask is not None:
             temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
+        if self.use_adaptive_temp:
+            temp_adj = self.temp_proj(x_mid).squeeze(-1).unsqueeze(-1) * 0.1
+            temp = (temp + temp_adj).clamp(min=0.1)
         slice_logits = self.in_project_slice(x_mid) / temp
         if spatial_bias is not None:
             slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
@@ -200,7 +212,14 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             out_slice_token = torch.matmul(attn_weights, v_slice_token)
             out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
 
-        out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
+        if self.use_decouple_slice:
+            deslice_logits = self.in_project_deslice(x_mid) / temp
+            if spatial_bias is not None:
+                deslice_logits = deslice_logits + 0.1 * spatial_bias.unsqueeze(1)
+            deslice_weights = self.softmax(deslice_logits)
+        else:
+            deslice_weights = slice_weights
+        out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, deslice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
         return self.to_out(out_x)
 
@@ -221,6 +240,9 @@ class TransolverBlock(nn.Module):
         field_decoder=False,
         adaln_output=False,
         soft_moe=False,
+        use_zone_bias=False,
+        use_adaptive_temp=False,
+        use_decouple_slice=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -236,11 +258,14 @@ class TransolverBlock(nn.Module):
             slice_num=slice_num,
             linear_no_attention=linear_no_attention,
             learned_kernel=learned_kernel,
+            use_adaptive_temp=use_adaptive_temp,
+            use_decouple_slice=use_decouple_slice,
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        _sb_in_dim = 5 if use_zone_bias else 4
         self.spatial_bias = nn.Sequential(
-            nn.Linear(4, 64), nn.GELU(),
+            nn.Linear(_sb_in_dim, 64), nn.GELU(),
             nn.Linear(64, 64), nn.GELU(),
             nn.Linear(64, slice_num),
         )
@@ -327,12 +352,18 @@ class Transolver(nn.Module):
         adaln_output=False,
         soft_moe=False,
         uncertainty_loss=False,
+        use_zone_bias=False,
+        use_adaptive_temp=False,
+        use_decouple_slice=False,
+        use_surf2vol=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.ref = ref
         self.unified_pos = unified_pos
         self.adaln_output = adaln_output
+        self.use_zone_bias = use_zone_bias
+        self.use_surf2vol = use_surf2vol
         if output_fields is None or output_dims is None:
             raise ValueError("output_fields and output_dims must be provided")
         if len(output_fields) != len(output_dims):
@@ -379,6 +410,9 @@ class Transolver(nn.Module):
                     field_decoder=field_decoder if (idx == n_layers - 1) else False,
                     adaln_output=adaln_output if (idx == n_layers - 1) else False,
                     soft_moe=soft_moe if (idx == n_layers - 1) else False,
+                    use_zone_bias=use_zone_bias,
+                    use_adaptive_temp=use_adaptive_temp,
+                    use_decouple_slice=use_decouple_slice,
                 )
                 for idx in range(n_layers)
             ]
@@ -395,6 +429,8 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        if use_surf2vol:
+            self.surf2vol_gate = nn.Parameter(torch.tensor(0.1))
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -439,6 +475,30 @@ class Transolver(nn.Module):
         if sum(self.output_dims) != preds.shape[-1]:
             raise ValueError("Sum of output_dims must match preds last dimension")
 
+    def _surf2vol_agg(self, fx, pos, is_surface, k=8):
+        """Distance-weighted aggregation from k nearest surface nodes to each volume node."""
+        B, N, H = fx.shape
+        out = torch.zeros_like(fx)
+        for b in range(B):
+            surf_idx = is_surface[b].nonzero(as_tuple=True)[0]
+            if surf_idx.numel() == 0:
+                continue
+            surf_pos = pos[b, surf_idx].float()
+            surf_feat = fx[b, surf_idx]
+            vol_idx = (~is_surface[b]).nonzero(as_tuple=True)[0]
+            if vol_idx.numel() == 0:
+                continue
+            vol_pos = pos[b, vol_idx].float()
+            with torch.no_grad():
+                dists = torch.cdist(vol_pos, surf_pos)  # [N_vol, N_surf]
+                k_eff = min(k, surf_idx.numel())
+                topk_d, topk_i = dists.topk(k_eff, dim=1, largest=False)
+                w = 1.0 / (topk_d + 1e-6)
+                w = (w / w.sum(dim=-1, keepdim=True)).to(fx.dtype)
+            agg = (surf_feat[topk_i].float() * w.float().unsqueeze(-1)).sum(dim=1)  # [N_vol, H]
+            out[b, vol_idx] = agg.to(out.dtype)
+        return out
+
     def forward(self, data, pos=None, condition=None):
         x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
         if x is None:
@@ -455,12 +515,22 @@ class Transolver(nn.Module):
         x_cross = x * self.feature_cross(x)
         x = x + 0.1 * x_cross  # residual with small scale
         raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)  # x, y, curvature, dist
+        if self.use_zone_bias:
+            raw_xy = torch.cat([raw_xy, x[:, :, 12:13]], dim=-1)  # append is_surface feature
 
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
 
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
+
+        if self.use_surf2vol:
+            is_surface_in = data.get("is_surface") if isinstance(data, Mapping) else None
+            if is_surface_in is not None:
+                x_pos = x[:, :, :2]
+                surf_agg = self._surf2vol_agg(fx, x_pos, is_surface_in, k=8)
+                fx = fx + self.surf2vol_gate * surf_agg
+
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
@@ -520,6 +590,7 @@ class Config:
     onecycle_div_factor: float = 10.0   # onecycle only
     onecycle_final_div_factor: float = 100.0  # onecycle only
     use_lookahead: bool = True
+    variant: str = "baseline"  # R4: surf2vol, canonicalize, decouple-zone, foil2-dist, geompnn-combo, tandem-ramp, slice96, tandem-all
     # Architecture flags (one per GPU)
     linear_no_attention: bool = False  # GPU0: skip Q/K/V in slice attention
     field_decoder: bool = False        # GPU1: separate vel/pres output heads
@@ -532,6 +603,20 @@ class Config:
 
 
 cfg = sp.parse(Config)
+
+# --- R4 variant overrides ---
+_r4_variants = ("surf2vol", "canonicalize", "decouple-zone", "foil2-dist",
+                 "geompnn-combo", "tandem-ramp", "slice96", "tandem-all")
+if cfg.variant in _r4_variants:
+    cfg.lr = 1.5e-3
+    cfg.cosine_T_max = 230
+    cfg.ema_start_epoch = 140
+_use_surf2vol      = cfg.variant in ("surf2vol", "geompnn-combo", "tandem-all")
+_use_canonicalize  = cfg.variant in ("canonicalize", "geompnn-combo")
+_use_decouple_zone = cfg.variant in ("decouple-zone", "tandem-all")
+_use_foil2dist     = cfg.variant in ("foil2-dist", "tandem-all")
+_use_tandem_ramp   = (cfg.variant == "tandem-ramp")
+_use_slice96       = (cfg.variant == "slice96")
 
 if cfg.debug:
     MAX_EPOCHS = 3
@@ -624,14 +709,16 @@ _pstd = ((_phys_sq_sum / _phys_n - _pmean ** 2).clamp(min=0.0).sqrt()).clamp(min
 phys_stats = {"y_mean": _pmean, "y_std": _pstd}
 print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
+_slice_num_cfg = 96 if _use_slice96 else 48
+_fun_dim_extra  = 1 if _use_foil2dist else 0
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + 32,  # +1 curv, +1 dist_feat, +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + 32 + _fun_dim_extra,  # +1 curv, +1 dist_feat, +32 fourier PE [+1 foil2-dist]
     out_dim=3,
     n_hidden=192,  # regime-w: full width with finer routing
     n_layers=2,
     n_head=3,
-    slice_num=48,  # regime-h: more slices for finer spatial decomposition
+    slice_num=_slice_num_cfg,
     mlp_ratio=2,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
@@ -641,6 +728,10 @@ model_config = dict(
     adaln_output=cfg.adaln_output,
     soft_moe=cfg.soft_moe,
     uncertainty_loss=cfg.uncertainty_loss,
+    use_zone_bias=_use_decouple_zone,
+    use_adaptive_temp=_use_decouple_zone,
+    use_decouple_slice=_use_decouple_zone,
+    use_surf2vol=_use_surf2vol,
 )
 
 model = Transolver(**model_config).to(device)
@@ -799,10 +890,20 @@ for epoch in range(MAX_EPOCHS):
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+        if _use_canonicalize:
+            aoa0 = x[:, 0, 14]  # AoA0_rad (before standardization)
+            cos_a = aoa0.cos()[:, None]
+            sin_a = aoa0.sin()[:, None]
+            px, py = x[:, :, 0].clone(), x[:, :, 1].clone()
+            x[:, :, 0] = px * cos_a + py * sin_a
+            x[:, :, 1] = -px * sin_a + py * cos_a
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         x = torch.cat([x, curv, dist_feat], dim=-1)
+        if _use_foil2dist:
+            foil2_dist = torch.log1p(raw_dsdf.abs().max(dim=-1, keepdim=True).values * 10.0)
+            x = torch.cat([x, foil2_dist], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -843,7 +944,7 @@ for epoch in range(MAX_EPOCHS):
             y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x, "is_surface": is_surface})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -854,7 +955,12 @@ for epoch in range(MAX_EPOCHS):
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
-        if epoch < cfg.tandem_curriculum_epochs:
+        if _use_tandem_ramp:
+            tandem_ramp_w = min(1.0, max(0.0, (epoch - cfg.tandem_curriculum_epochs) / 40.0))
+            is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
+            ramp_mask = (1.0 - is_tandem_curr.float() * (1.0 - tandem_ramp_w)).unsqueeze(-1).unsqueeze(-1)
+            abs_err = abs_err * ramp_mask
+        elif epoch < cfg.tandem_curriculum_epochs:
             is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
             sample_mask = (~is_tandem_curr).float()[:, None, None]
             abs_err = abs_err * sample_mask
@@ -1061,10 +1167,20 @@ for epoch in range(MAX_EPOCHS):
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+                if _use_canonicalize:
+                    aoa0 = x[:, 0, 14]
+                    cos_a = aoa0.cos()[:, None]
+                    sin_a = aoa0.sin()[:, None]
+                    px, py = x[:, :, 0].clone(), x[:, :, 1].clone()
+                    x[:, :, 0] = px * cos_a + py * sin_a
+                    x[:, :, 1] = -px * sin_a + py * cos_a
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                 x = torch.cat([x, curv, dist_feat], dim=-1)
+                if _use_foil2dist:
+                    foil2_dist = torch.log1p(raw_dsdf.abs().max(dim=-1, keepdim=True).values * 10.0)
+                    x = torch.cat([x, foil2_dist], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -1095,7 +1211,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    pred = eval_model({"x": x, "is_surface": is_surface})["preds"]
                 pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
@@ -1263,13 +1379,23 @@ if best_metrics:
                 y_dev = y_true.unsqueeze(0).to(device)
                 is_surf_dev = is_surface.unsqueeze(0).to(device)
                 mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
+                raw_dsdf_vis = x_dev[:, :, 2:10]
+                dist_surf_vis = raw_dsdf_vis.abs().min(dim=-1, keepdim=True).values
+                dist_feat_vis = torch.log1p(dist_surf_vis * 10.0)
+                if _use_canonicalize:
+                    aoa0_v = x_dev[:, 0, 14]
+                    cos_av = aoa0_v.cos()[:, None]; sin_av = aoa0_v.sin()[:, None]
+                    px_v, py_v = x_dev[:, :, 0].clone(), x_dev[:, :, 1].clone()
+                    x_dev[:, :, 0] = px_v * cos_av + py_v * sin_av
+                    x_dev[:, :, 1] = -px_v * sin_av + py_v * cos_av
                 x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                 curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
-                dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
-                dist_feat = torch.log1p(dist_surf * 10.0)
-                x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                x_n = torch.cat([x_n, curv, dist_feat_vis], dim=-1)
+                if _use_foil2dist:
+                    foil2_dist_vis = torch.log1p(raw_dsdf_vis.abs().max(dim=-1, keepdim=True).values * 10.0)
+                    x_n = torch.cat([x_n, foil2_dist_vis], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
-                pred = vis_model({"x": x_n})["preds"].float()
+                pred = vis_model({"x": x_n, "is_surface": is_surf_dev})["preds"].float()
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
                 y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
             samples.append((x[:, :2], y_true, y_pred, is_surface))
