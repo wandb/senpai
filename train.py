@@ -23,6 +23,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
 import os
 import time
 from collections.abc import Mapping
+from copy import deepcopy
 from pathlib import Path
 
 import torch
@@ -119,7 +120,7 @@ class MLP(nn.Module):
 class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
-    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64, use_rpb=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -129,6 +130,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
         self.tandem_temp_offset = nn.Parameter(torch.zeros(1, heads, 1, 1))
+        if use_rpb:
+            self.rpb = nn.Parameter(torch.zeros(slice_num, slice_num))
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
@@ -177,6 +180,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         q_norm = F.normalize(q_slice_token, dim=-1)
         k_norm = F.normalize(k_slice_token, dim=-1)
         attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
+        if hasattr(self, 'rpb'):
+            attn_logits = attn_logits + self.rpb
         attn_weights = F.softmax(attn_logits, dim=-1)
         out_slice_token = torch.matmul(attn_weights, v_slice_token)
         out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
@@ -197,6 +202,8 @@ class TransolverBlock(nn.Module):
         last_layer=False,
         out_dim=1,
         slice_num=32,
+        use_rpb=False,
+        head_dropout=0.0,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -207,6 +214,7 @@ class TransolverBlock(nn.Module):
             dim_head=hidden_dim // num_heads,
             dropout=dropout,
             slice_num=slice_num,
+            use_rpb=use_rpb,
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
@@ -225,11 +233,11 @@ class TransolverBlock(nn.Module):
         nn.init.zeros_(self.se_fc2.bias)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
-            self.mlp2 = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, out_dim),
-            )
+            mlp2_layers = [nn.Linear(hidden_dim, hidden_dim), nn.GELU()]
+            if head_dropout > 0.0:
+                mlp2_layers.append(nn.Dropout(head_dropout))
+            mlp2_layers.append(nn.Linear(hidden_dim, out_dim))
+            self.mlp2 = nn.Sequential(*mlp2_layers)
 
     def forward(self, fx, raw_xy=None, tandem_mask=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
@@ -261,6 +269,8 @@ class Transolver(nn.Module):
         unified_pos=False,
         output_fields: list[str] | None = None,
         output_dims: list[int] | None = None,
+        use_rpb=False,
+        head_dropout=0.0,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -302,6 +312,8 @@ class Transolver(nn.Module):
                     out_dim=out_dim,
                     slice_num=slice_num,
                     last_layer=(idx == n_layers - 1),
+                    use_rpb=use_rpb,
+                    head_dropout=head_dropout if idx == n_layers - 1 else 0.0,
                 )
                 for idx in range(n_layers)
             ]
@@ -441,6 +453,16 @@ class Config:
     onecycle_div_factor: float = 10.0   # onecycle only
     onecycle_final_div_factor: float = 100.0  # onecycle only
     use_lookahead: bool = True
+    # Model architecture overrides
+    n_hidden: int = 192
+    n_head: int = 3
+    slice_num: int = 48
+    head_dropout: float = 0.0
+    use_rpb: bool = False
+    ponly_surf: bool = False    # surface loss uses only pressure channel (channel 2)
+    # Training technique flags
+    pe_pad_fix: bool = False   # fix Fourier PE normalization to use mask (exclude padding)
+    noise_strong: bool = False  # strong→weak noise: vel 0.02→0.001, p 0.01→0.0005 over 150 epochs
 
 
 cfg = sp.parse(Config)
@@ -540,13 +562,15 @@ model_config = dict(
     space_dim=2,
     fun_dim=X_DIM - 2 + 2 + 32,  # +1 curv, +1 dist_feat, +32 fourier PE
     out_dim=3,
-    n_hidden=192,  # regime-w: full width with finer routing
+    n_hidden=cfg.n_hidden,
     n_layers=2,
-    n_head=3,
-    slice_num=48,  # regime-h: more slices for finer spatial decomposition
+    n_head=cfg.n_head,
+    slice_num=cfg.slice_num,
     mlp_ratio=2,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
+    head_dropout=cfg.head_dropout,
+    use_rpb=cfg.use_rpb,
 )
 
 model = Transolver(**model_config).to(device)
@@ -554,7 +578,6 @@ torch._functorch.config.donated_buffer = False  # required for retain_graph=True
 model = torch.compile(model, mode="default")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
-from copy import deepcopy
 ema_model = None
 
 n_params = sum(p.numel() for p in model.parameters())
@@ -707,8 +730,14 @@ for epoch in range(MAX_EPOCHS):
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
-        xy_min = raw_xy.amin(dim=1, keepdim=True)
-        xy_max = raw_xy.amax(dim=1, keepdim=True)
+        if cfg.pe_pad_fix:
+            valid_xy = raw_xy.masked_fill(~mask.unsqueeze(-1), float('inf'))
+            xy_min = valid_xy.amin(dim=1, keepdim=True).clamp(max=1e6)
+            valid_xy2 = raw_xy.masked_fill(~mask.unsqueeze(-1), float('-inf'))
+            xy_max = valid_xy2.amax(dim=1, keepdim=True).clamp(min=-1e6)
+        else:
+            xy_min = raw_xy.amin(dim=1, keepdim=True)
+            xy_max = raw_xy.amax(dim=1, keepdim=True)
         xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
         freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
@@ -721,9 +750,14 @@ for epoch in range(MAX_EPOCHS):
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         if model.training:
-            noise_progress = min(1.0, epoch / cfg.noise_anneal_epochs)
-            vel_noise = 0.015 * (1 - noise_progress) + 0.003 * noise_progress
-            p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
+            if cfg.noise_strong:
+                noise_progress = min(1.0, epoch / 150)
+                vel_noise = 0.02 * (1 - noise_progress) + 0.001 * noise_progress
+                p_noise = 0.01 * (1 - noise_progress) + 0.0005 * noise_progress
+            else:
+                noise_progress = min(1.0, epoch / cfg.noise_anneal_epochs)
+                vel_noise = 0.015 * (1 - noise_progress) + 0.003 * noise_progress
+                p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
             noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
             y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
 
@@ -778,7 +812,8 @@ for epoch in range(MAX_EPOCHS):
 
         vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        surf_err_channels = abs_err[:, :, 2:3] if cfg.ponly_surf else abs_err
+        surf_per_sample = (surf_err_channels * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
@@ -947,8 +982,14 @@ for epoch in range(MAX_EPOCHS):
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
-                xy_min = raw_xy.amin(dim=1, keepdim=True)
-                xy_max = raw_xy.amax(dim=1, keepdim=True)
+                if cfg.pe_pad_fix:
+                    valid_xy = raw_xy.masked_fill(~mask.unsqueeze(-1), float('inf'))
+                    xy_min = valid_xy.amin(dim=1, keepdim=True).clamp(max=1e6)
+                    valid_xy2 = raw_xy.masked_fill(~mask.unsqueeze(-1), float('-inf'))
+                    xy_max = valid_xy2.amax(dim=1, keepdim=True).clamp(min=-1e6)
+                else:
+                    xy_min = raw_xy.amin(dim=1, keepdim=True)
+                    xy_max = raw_xy.amax(dim=1, keepdim=True)
                 xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
                 freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
@@ -1120,11 +1161,20 @@ if best_metrics:
                 y_dev = y_true.unsqueeze(0).to(device)
                 is_surf_dev = is_surface.unsqueeze(0).to(device)
                 mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
+                raw_dsdf = x_dev[:, :, 2:10]
+                dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+                dist_feat = torch.log1p(dist_surf * 10.0)
                 x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                 curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
-                dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
-                dist_feat = torch.log1p(dist_surf * 10.0)
                 x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                raw_xy = x_n[:, :, :2]
+                xy_min = raw_xy.amin(dim=1, keepdim=True)
+                xy_max = raw_xy.amax(dim=1, keepdim=True)
+                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                freqs = torch.cat([_base_model.fourier_freqs_fixed.to(device), _base_model.fourier_freqs_learned.abs()])
+                xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, fourier_pe], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
