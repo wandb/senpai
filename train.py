@@ -529,6 +529,12 @@ class Config:
     boundary_aware: bool = False       # GPU5: upweight near-wall volume nodes
     adaln_output: bool = False         # GPU6: AdaLN on output head
     soft_moe: bool = False             # GPU7: Soft MoE output
+    # OOD generalization features
+    four_group_pcgrad: bool = False  # 4-group PCGrad: cruise_normal, cruise_extreme, racecar_single, racecar_tandem
+    ema_anneal: bool = False         # anneal EMA decay 0.99→0.999 through training
+    sam_late: bool = False           # SAM in last 25% of training, every 3rd step
+    sam_rho: float = 0.05            # SAM perturbation radius
+    wsd_schedule: bool = False       # Warmup-Stable-Decay LR schedule
 
 
 cfg = sp.parse(Config)
@@ -715,7 +721,21 @@ elif cfg.scheduler_type == "onecycle":
         div_factor=cfg.onecycle_div_factor,
         final_div_factor=cfg.onecycle_final_div_factor,
     )
-else:  # sequential (default)
+elif cfg.wsd_schedule:
+    def _wsd_lambda(epoch):
+        warmup_end = 20
+        stable_end = 170
+        decay_end = 230
+        if epoch < warmup_end:
+            return 0.2 + 0.8 * (epoch / max(warmup_end, 1))
+        elif epoch < stable_end:
+            return 1.0
+        else:
+            progress = (epoch - stable_end) / max(decay_end - stable_end, 1)
+            eta_ratio = 5e-5 / cfg.lr
+            return max(eta_ratio, (1.0 - progress) ** 0.5)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(base_opt, lr_lambda=_wsd_lambda)
+else:  # sequential cosine (default)
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         base_opt, start_factor=cfg.warmup_start_factor, total_iters=cfg.warmup_total_iters
     )
@@ -955,54 +975,135 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
-        # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
-        # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
-        is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
-        is_indist_pcgrad = ~is_ood_pcgrad
-        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
-
-        if use_pcgrad:
-            n_a = is_indist_pcgrad.float().sum().clamp(min=1)
-            n_b = is_ood_pcgrad.float().sum().clamp(min=1)
-            vol_mask_a = vol_mask_train & is_indist_pcgrad.unsqueeze(1)
-            vol_mask_b = vol_mask_train & is_ood_pcgrad.unsqueeze(1)
-            vol_loss_a = (abs_err * vol_mask_a.unsqueeze(-1)).sum() / vol_mask_a.sum().clamp(min=1)
-            vol_loss_b = (abs_err * vol_mask_b.unsqueeze(-1)).sum() / vol_mask_b.sum().clamp(min=1)
-            surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
-            surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
-            coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-
-            optimizer.zero_grad()
-            loss_a.backward(retain_graph=True)
-            grads_a = [p.grad.clone() if p.grad is not None else None
-                       for p in model.parameters()]
-            optimizer.zero_grad()
-            loss_b.backward()
-
-            ga_flat = torch.cat([g.view(-1) for g in grads_a if g is not None])
-            gb_flat = torch.cat([p.grad.view(-1) for p in model.parameters() if p.grad is not None])
-            dot_ab = (ga_flat @ gb_flat).item()
-            gb_ns = float((gb_flat @ gb_flat).item()) + 1e-8
-            ga_ns = float((ga_flat @ ga_flat).item()) + 1e-8
-            for p, ga in zip(model.parameters(), grads_a):
-                gb = p.grad
-                if ga is None and gb is None:
-                    continue
-                if ga is None:
-                    pass  # keep gb
-                elif gb is None:
-                    p.grad = ga
-                elif dot_ab < 0:
-                    p.grad = ((ga - (dot_ab / gb_ns) * gb) + (gb - (dot_ab / ga_ns) * ga)) * 0.5
-                else:
-                    p.grad = (ga + gb) * 0.5
+        # PCGrad: gradient projection between domain groups
+        if cfg.four_group_pcgrad:
+            # 4 groups: cruise_normal, cruise_extreme, racecar_single, racecar_tandem
+            _re = x[:, 0, 13]
+            _aoa = x[:, 0, 14].abs()
+            g_masks_all = [
+                ~is_tandem_batch & (_re <= 1.0) & (_aoa <= 1.0),  # cruise_normal
+                ~is_tandem_batch & (_re <= 1.0) & (_aoa > 1.0),   # cruise_extreme
+                ~is_tandem_batch & (_re > 1.0),                    # racecar_single
+                is_tandem_batch,                                    # racecar_tandem
+            ]
+            active_masks = [m for m in g_masks_all if m.any()]
+            if len(active_masks) >= 2:
+                n_active = len(active_masks)
+                shared = ((_coarse_loss / n_active) if _coarse_loss is not None else 0.0) + \
+                          re_loss * 0.01 / n_active + aoa_loss * 0.01 / n_active
+                group_losses = []
+                for gm in active_masks:
+                    n_g = gm.float().sum().clamp(min=1)
+                    vm = vol_mask_train & gm.unsqueeze(1)
+                    vl_g = (abs_err * vm.unsqueeze(-1)).sum() / vm.sum().clamp(min=1)
+                    sl_g = (surf_per_sample * gm.float() * tandem_boost).sum() / n_g
+                    group_losses.append(vl_g + surf_weight * sl_g + shared)
+                all_grads = []
+                for ki, gl in enumerate(group_losses):
+                    optimizer.zero_grad()
+                    gl.backward(retain_graph=(ki < n_active - 1))
+                    all_grads.append([p.grad.clone() if p.grad is not None else None
+                                       for p in model.parameters()])
+                # For each group i, project its gradient against all other groups' original grads
+                projected = [list(g) for g in all_grads]
+                for i in range(n_active):
+                    for j in range(n_active):
+                        if i == j:
+                            continue
+                        gi_flat = torch.cat([g.view(-1) for g in projected[i] if g is not None])
+                        gj_flat = torch.cat([g.view(-1) for g in all_grads[j] if g is not None])
+                        dot = (gi_flat @ gj_flat).item()
+                        if dot < 0:
+                            gj_ns = float((gj_flat @ gj_flat).item()) + 1e-8
+                            for pi, p in enumerate(model.parameters()):
+                                gi_k = projected[i][pi]
+                                gj_k = all_grads[j][pi]
+                                if gi_k is not None and gj_k is not None:
+                                    projected[i][pi] = gi_k - (dot / gj_ns) * gj_k
+                # Average projected gradients across groups
+                optimizer.zero_grad()
+                for pi, p in enumerate(model.parameters()):
+                    grads_k = [projected[ii][pi] for ii in range(n_active) if projected[ii][pi] is not None]
+                    if grads_k:
+                        p.grad = torch.stack(grads_k).mean(0)
+            else:
+                optimizer.zero_grad()
+                loss.backward()
         else:
-            optimizer.zero_grad()
-            loss.backward()
+            # 2-group PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
+            # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
+            is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
+            is_indist_pcgrad = ~is_ood_pcgrad
+            use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
+
+            if use_pcgrad:
+                n_a = is_indist_pcgrad.float().sum().clamp(min=1)
+                n_b = is_ood_pcgrad.float().sum().clamp(min=1)
+                vol_mask_a = vol_mask_train & is_indist_pcgrad.unsqueeze(1)
+                vol_mask_b = vol_mask_train & is_ood_pcgrad.unsqueeze(1)
+                vol_loss_a = (abs_err * vol_mask_a.unsqueeze(-1)).sum() / vol_mask_a.sum().clamp(min=1)
+                vol_loss_b = (abs_err * vol_mask_b.unsqueeze(-1)).sum() / vol_mask_b.sum().clamp(min=1)
+                surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
+                surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
+                coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
+                loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+
+                optimizer.zero_grad()
+                loss_a.backward(retain_graph=True)
+                grads_a = [p.grad.clone() if p.grad is not None else None
+                           for p in model.parameters()]
+                optimizer.zero_grad()
+                loss_b.backward()
+
+                ga_flat = torch.cat([g.view(-1) for g in grads_a if g is not None])
+                gb_flat = torch.cat([p.grad.view(-1) for p in model.parameters() if p.grad is not None])
+                dot_ab = (ga_flat @ gb_flat).item()
+                gb_ns = float((gb_flat @ gb_flat).item()) + 1e-8
+                ga_ns = float((ga_flat @ ga_flat).item()) + 1e-8
+                for p, ga in zip(model.parameters(), grads_a):
+                    gb = p.grad
+                    if ga is None and gb is None:
+                        continue
+                    if ga is None:
+                        pass  # keep gb
+                    elif gb is None:
+                        p.grad = ga
+                    elif dot_ab < 0:
+                        p.grad = ((ga - (dot_ab / gb_ns) * gb) + (gb - (dot_ab / ga_ns) * ga)) * 0.5
+                    else:
+                        p.grad = (ga + gb) * 0.5
+            else:
+                optimizer.zero_grad()
+                loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        if cfg.sam_late and epoch >= int(0.75 * MAX_EPOCHS) and global_step % 3 == 0:
+            # SAM: perturb weights, second forward, restore, then step
+            with torch.no_grad():
+                g_norm_sam = sum(p.grad.norm() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5 + 1e-12
+                e_ws = {}
+                for p in model.parameters():
+                    if p.grad is not None:
+                        e_w = cfg.sam_rho * p.grad / g_norm_sam
+                        p.data.add_(e_w)
+                        e_ws[id(p)] = (p, e_w)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out2 = model({"x": x.detach()})
+                pred2 = out2["preds"].float() / sample_stds
+                re_pred2 = out2["re_pred"].float()
+                aoa_pred2 = out2["aoa_pred"].float()
+            abs_err2 = (pred2 - y_norm).abs()
+            vl2 = (abs_err2 * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+            sp2 = (abs_err2[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            sl2 = (sp2 * tandem_boost).mean()
+            loss2 = vl2 + surf_weight * sl2 + 0.01 * F.mse_loss(re_pred2, log_re_target) + 0.01 * F.mse_loss(aoa_pred2.float(), aoa_target)
+            optimizer.zero_grad()
+            loss2.backward()
+            with torch.no_grad():
+                for p, e_w in e_ws.values():
+                    p.data.sub_(e_w)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         if step_scheduler_per_batch:
             try:
@@ -1013,9 +1114,14 @@ for epoch in range(MAX_EPOCHS):
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
             else:
+                if cfg.ema_anneal:
+                    _ema_progress = min(1.0, (epoch - cfg.ema_start_epoch) / max(MAX_EPOCHS - cfg.ema_start_epoch, 1))
+                    _ema_decay_cur = 0.99 + 0.009 * _ema_progress
+                else:
+                    _ema_decay_cur = cfg.ema_decay
                 with torch.no_grad():
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
-                        ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+                        ep.data.mul_(_ema_decay_cur).add_(mp.data, alpha=1 - _ema_decay_cur)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -1268,6 +1374,15 @@ if best_metrics:
                 dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)
                 x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                raw_xy_v = x_n[:, :, :2]
+                xy_min_v = raw_xy_v.amin(dim=1, keepdim=True)
+                xy_max_v = raw_xy_v.amax(dim=1, keepdim=True)
+                xy_norm_v = (raw_xy_v - xy_min_v) / (xy_max_v - xy_min_v + 1e-8)
+                _vb = vis_model._orig_mod if hasattr(vis_model, '_orig_mod') else vis_model
+                freqs_v = torch.cat([_vb.fourier_freqs_fixed.to(device), _vb.fourier_freqs_learned.abs()])
+                xy_scaled_v = xy_norm_v.unsqueeze(-1) * freqs_v
+                fourier_pe_v = torch.cat([xy_scaled_v.sin().flatten(-2), xy_scaled_v.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, fourier_pe_v], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
