@@ -1545,11 +1545,32 @@ if best_metrics:
                 y_dev = y_true.unsqueeze(0).to(device)
                 is_surf_dev = is_surface.unsqueeze(0).to(device)
                 mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
+                raw_dsdf_vis = x_dev[:, :, 2:10]
+                dist_surf_vis = raw_dsdf_vis.abs().min(dim=-1, keepdim=True).values
+                dist_feat_vis = torch.log1p(dist_surf_vis * 10.0)
+                if cfg.canonicalize:
+                    aoa_rad_vis = x_dev[:, 0, 14:15]
+                    cos_a_vis = torch.cos(-aoa_rad_vis)
+                    sin_a_vis = torch.sin(-aoa_rad_vis)
+                    px_vis = x_dev[:, :, 0:1]; py_vis = x_dev[:, :, 1:2]
+                    x_dev = torch.cat([px_vis * cos_a_vis.unsqueeze(1) + py_vis * sin_a_vis.unsqueeze(1),
+                                       -px_vis * sin_a_vis.unsqueeze(1) + py_vis * cos_a_vis.unsqueeze(1),
+                                       x_dev[:, :, 2:]], dim=-1)
                 x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                 curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
-                dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
-                dist_feat = torch.log1p(dist_surf * 10.0)
-                x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                if cfg.foil2_dist:
+                    foil2_dist_vis = torch.log1p(raw_dsdf_vis[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                    x_n = torch.cat([x_n, curv, dist_feat_vis, foil2_dist_vis], dim=-1)
+                else:
+                    x_n = torch.cat([x_n, curv, dist_feat_vis], dim=-1)
+                raw_xy_vis = x_n[:, :, :2]
+                xy_min_vis = raw_xy_vis.amin(dim=1, keepdim=True)
+                xy_max_vis = raw_xy_vis.amax(dim=1, keepdim=True)
+                xy_norm_vis = (raw_xy_vis - xy_min_vis) / (xy_max_vis - xy_min_vis + 1e-8)
+                freqs_vis = torch.cat([_base_model.fourier_freqs_fixed.to(device), _base_model.fourier_freqs_learned.abs()])
+                xy_scaled_vis = xy_norm_vis.unsqueeze(-1) * freqs_vis
+                fourier_pe_vis = torch.cat([xy_scaled_vis.sin().flatten(-2), xy_scaled_vis.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, fourier_pe_vis], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
