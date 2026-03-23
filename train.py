@@ -20,6 +20,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     Tandem surface loss is therefore underweighted.
 """
 
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -568,8 +569,9 @@ class Transolver(nn.Module):
             fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
-        re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
-        aoa_pred = self.aoa_head(fx.mean(dim=1))
+        hidden_mean = fx.mean(dim=1)  # [B, H] — save for contrastive loss
+        re_pred = self.re_head(hidden_mean)  # [B, 1]
+        aoa_pred = self.aoa_head(hidden_mean)
 
         # Last block: use adaln_all condition if enabled, else fallback to adaln_output
         last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
@@ -577,7 +579,7 @@ class Transolver(nn.Module):
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred, "hidden_mean": hidden_mean}
 
 
 # ---------------------------------------------------------------------------
@@ -651,6 +653,19 @@ class Config:
     use_lion: bool = False        # GPU 4: Lion optimizer instead of AdamW
     rdrop: bool = False           # GPU 7: R-drop regularization
     rdrop_alpha: float = 1.0     # R-drop consistency loss weight
+    # Phase 3: Loss innovation variants
+    surf_gradient_loss: bool = False   # surface pressure gradient loss along arc-length
+    surf_gradient_weight: float = 0.5  # weight for surf gradient loss
+    surf_gradient_start_epoch: int = 0  # epoch to start applying gradient loss
+    fourier_surface_loss: bool = False  # Fourier-space surface pressure loss
+    fourier_weight: float = 0.01        # weight for Fourier loss (normalized variant)
+    fourier_start_epoch: int = 0        # epoch to start Fourier loss
+    laplacian_reg: bool = False         # Laplacian smoothness regularization (k-NN)
+    huber_loss: bool = False            # Huber/smooth-L1 loss (beta=0.5)
+    logcosh_loss: bool = False          # log-cosh loss
+    pressure_3x: bool = False           # 3x weight on pressure channel in surface loss
+    contrastive_loss: bool = False      # contrastive representation loss on hidden features
+    contrastive_weight: float = 0.05    # weight for contrastive loss
 
 
 cfg = sp.parse(Config)
@@ -1069,7 +1084,14 @@ for epoch in range(MAX_EPOCHS):
         if model.training:
             pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
-        abs_err = (pred - y_norm).abs()
+        if cfg.huber_loss:
+            abs_err = F.smooth_l1_loss(pred, y_norm, reduction='none', beta=0.5)
+        elif cfg.logcosh_loss:
+            _diff = pred - y_norm
+            _abs_diff = _diff.abs()
+            abs_err = _abs_diff + torch.log1p(torch.exp(-2.0 * _abs_diff)) - math.log(2.0)
+        else:
+            abs_err = (pred - y_norm).abs()
         if cfg.tandem_ramp:
             pass  # no hard curriculum; tandem_weight applied via tandem_boost below
         elif epoch < cfg.tandem_curriculum_epochs:
@@ -1107,7 +1129,14 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        if cfg.pressure_3x:
+            # Weight channels [Ux, Uy, p] as [1, 1, 3] / 5
+            _chan_w = torch.tensor([1.0, 1.0, 3.0], device=device)  # [3]
+            _n_surf = surf_mask.sum(dim=1, keepdim=True).clamp(min=1).float()  # [B, 1]
+            _per_ch = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=1) / _n_surf  # [B, 3]
+            surf_per_sample = (_per_ch * _chan_w).sum(dim=-1) / _chan_w.sum()  # [B]
+        else:
+            surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
@@ -1142,6 +1171,62 @@ for epoch in range(MAX_EPOCHS):
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
         else:
             loss = vol_loss + surf_weight * surf_loss
+
+        # Phase 3: Spatial loss terms (surf gradient, Fourier, Laplacian)
+        _apply_grad = cfg.surf_gradient_loss and epoch >= cfg.surf_gradient_start_epoch
+        _apply_fourier = cfg.fourier_surface_loss and epoch >= cfg.fourier_start_epoch
+        if _apply_grad or _apply_fourier:
+            _grad_total = torch.tensor(0.0, device=device)
+            _fourier_total = torch.tensor(0.0, device=device)
+            _n_spatial = 0
+            for _b in range(B):
+                _sm = surf_mask[_b]
+                if _sm.sum() < 4:
+                    continue
+                _n_spatial += 1
+                _sxy = x[_b, _sm, :2]  # [S, 2]
+                _sp_pred = pred[_b, _sm, 2]  # [S] surface pressure pred
+                _sp_true = y_norm[_b, _sm, 2]  # [S] surface pressure true
+                if _apply_grad:
+                    # Sort by angle from centroid
+                    _cen = _sxy.mean(dim=0)
+                    _ang = torch.atan2(_sxy[:, 1] - _cen[1], _sxy[:, 0] - _cen[0])
+                    _si = _ang.argsort()
+                    _dp_pred = _sp_pred[_si][1:] - _sp_pred[_si][:-1]
+                    _dp_true = _sp_true[_si][1:] - _sp_true[_si][:-1]
+                    _grad_total = _grad_total + (_dp_pred - _dp_true).abs().mean()
+                if _apply_fourier:
+                    # Sort by x-coordinate, normalize FFT magnitudes to prevent scale blowup
+                    _si_x = _sxy[:, 0].argsort()
+                    _fft_pred = torch.fft.rfft(_sp_pred[_si_x])
+                    _fft_true = torch.fft.rfft(_sp_true[_si_x])
+                    _fft_norm = _fft_true.abs().mean().clamp(min=1e-8)
+                    _fourier_total = _fourier_total + ((_fft_pred.abs() - _fft_true.abs()) / _fft_norm).abs().mean()
+            if _n_spatial > 0:
+                if _apply_grad:
+                    loss = loss + cfg.surf_gradient_weight * _grad_total / _n_spatial
+                if _apply_fourier:
+                    loss = loss + cfg.fourier_weight * _fourier_total / _n_spatial
+
+        if cfg.laplacian_reg:
+            _k = 8
+            _lap_total = torch.tensor(0.0, device=device)
+            _n_lap = 0
+            for _b in range(B):
+                _sm = surf_mask[_b]
+                if _sm.sum() < _k + 1:
+                    continue
+                _sxy = x[_b, _sm, :2]  # [S, 2]
+                _sp = pred[_b, _sm]  # [S, 3]
+                _dist = torch.cdist(_sxy.unsqueeze(0), _sxy.unsqueeze(0)).squeeze(0)  # [S, S]
+                _, _ki = _dist.topk(_k + 1, dim=-1, largest=False)
+                _ki = _ki[:, 1:]  # [S, k] exclude self
+                _nbr = _sp[_ki]  # [S, k, 3]
+                _lap = _nbr.mean(dim=1) - _sp  # [S, 3]
+                _lap_total = _lap_total + _lap.abs().mean()
+                _n_lap += 1
+            if _n_lap > 0:
+                loss = loss + 0.1 * _lap_total / _n_lap
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
@@ -1188,6 +1273,15 @@ for epoch in range(MAX_EPOCHS):
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
+
+        # Phase 3: Contrastive representation loss
+        if cfg.contrastive_loss:
+            _hm = out["hidden_mean"].float()  # [B, H]
+            _cond = x[:, 0, 13:15]  # [B, 2] Re, AoA
+            _cond_sim = -torch.cdist(_cond, _cond)  # [B, B] negative distance = similarity
+            _repr_sim = F.cosine_similarity(_hm.unsqueeze(1), _hm.unsqueeze(0), dim=-1)  # [B, B]
+            _contrastive = F.mse_loss(_repr_sim, _cond_sim.softmax(dim=-1))
+            loss = loss + cfg.contrastive_weight * _contrastive
 
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
