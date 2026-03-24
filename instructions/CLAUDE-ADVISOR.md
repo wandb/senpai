@@ -136,7 +136,7 @@ Every PR you create must follow this structure for the body:
 
 ```markdown
 ## Hypothesis
-<what we think will improve metrics and why>
+<what we think will improve metrics and why - for non-trivial changes, include links to papers, blog posts, code, etc. that support the hypothesis if necessary>
 
 ## Instructions
 <specific changes to make to train.py — be concrete>
