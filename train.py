@@ -20,6 +20,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     Tandem surface loss is therefore underweighted.
 """
 
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -60,6 +61,16 @@ ACTIVATION = {
 }
 
 
+class SirenActivation(nn.Module):
+    """SIREN periodic activation: sin(omega_0 * x) (Sitzmann et al., NeurIPS 2020)."""
+    def __init__(self, omega_0: float = 30.0):
+        super().__init__()
+        self.omega_0 = omega_0
+
+    def forward(self, x):
+        return torch.sin(self.omega_0 * x)
+
+
 class GatedMLP(nn.Module):
     def __init__(self, n_input, n_hidden, n_output, act='gelu'):
         super().__init__()
@@ -73,16 +84,26 @@ class GatedMLP(nn.Module):
 
 
 class GatedMLP2(nn.Module):
-    """GatedMLP with a residual second gated layer."""
-    def __init__(self, n_input, n_hidden, n_output, act='gelu'):
+    """GatedMLP with a residual second gated layer.
+
+    When omega_0 > 0, uses SIREN activation sin(omega_0 * x) with proper
+    weight initialization (Sitzmann et al., NeurIPS 2020).
+    """
+    def __init__(self, n_input, n_hidden, n_output, act='gelu', omega_0: int = 0):
         super().__init__()
-        act_fn = ACTIVATION[act]
         self.gate1 = nn.Linear(n_input, n_hidden)
         self.up1 = nn.Linear(n_input, n_hidden)
         self.gate2 = nn.Linear(n_hidden, n_hidden)
         self.up2 = nn.Linear(n_hidden, n_hidden)
         self.down = nn.Linear(n_hidden, n_output)
-        self.act = act_fn()
+        if omega_0 > 0:
+            self.act = SirenActivation(omega_0)
+            # SIREN init: weights ~ U(-sqrt(6/fan_in)/omega_0, +sqrt(6/fan_in)/omega_0)
+            for lin in [self.up1, self.up2]:
+                bound = math.sqrt(6.0 / lin.weight.shape[1]) / omega_0
+                nn.init.uniform_(lin.weight, -bound, bound)
+        else:
+            self.act = ACTIVATION[act]()
 
     def forward(self, x):
         h = torch.sigmoid(self.gate1(x)) * self.act(self.up1(x))
@@ -250,6 +271,7 @@ class TransolverBlock(nn.Module):
         film_cond=False,
         decouple_slice=False,
         zone_temp=False,
+        output_siren_omega0: int = 0,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -325,9 +347,17 @@ class TransolverBlock(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
             else:
-                self.mlp2 = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
-                )
+                if output_siren_omega0 > 0:
+                    _bound = math.sqrt(6.0 / hidden_dim) / output_siren_omega0
+                    _lin = nn.Linear(hidden_dim, hidden_dim)
+                    nn.init.uniform_(_lin.weight, -_bound, _bound)
+                    self.mlp2 = nn.Sequential(
+                        _lin, SirenActivation(output_siren_omega0), nn.Linear(hidden_dim, out_dim)
+                    )
+                else:
+                    self.mlp2 = nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                    )
 
     def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
@@ -395,6 +425,9 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        preprocess_omega0: int = 0,
+        preprocess_act: str = "gelu",
+        output_siren_omega0: int = 0,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -429,7 +462,10 @@ class Transolver(nn.Module):
                 act=act,
             )
         else:
-            self.preprocess = GatedMLP2(fun_dim + space_dim, n_hidden * 2, n_hidden)
+            self.preprocess = GatedMLP2(
+                fun_dim + space_dim, n_hidden * 2, n_hidden,
+                act=preprocess_act, omega_0=preprocess_omega0,
+            )
 
         self.n_hidden = n_hidden
         self.space_dim = space_dim
@@ -457,6 +493,7 @@ class Transolver(nn.Module):
                     film_cond=film_cond,
                     decouple_slice=adaln_decouple,
                     zone_temp=adaln_zone_temp,
+                    output_siren_omega0=output_siren_omega0 if (idx == n_layers - 1) else 0,
                 )
                 for idx in range(n_layers)
             ]
@@ -649,12 +686,18 @@ class Config:
     grad_accum_steps: int = 1    # GPU 2: gradient accumulation (step every N batches)
     half_target_noise: bool = False  # GPU 3: reduce target noise by 50%
     use_lion: bool = False        # GPU 4: Lion optimizer instead of AdamW
+    no_lion: bool = False         # explicit override to disable Lion (safety flag)
     rdrop: bool = False           # GPU 7: R-drop regularization
     rdrop_alpha: float = 1.0     # R-drop consistency loss weight
     # Phase 3: compound experiments
     seed: int = -1                     # random seed (-1 = no seeding)
     n_layers: int = 2                  # number of TransolverBlocks (default 2)
     # Phase 3: data augmentation (training-only)
+    # Phase 3 R3: SIREN activations + physics features
+    siren_omega0: int = 0          # SIREN omega_0 in preprocess MLP (0=disabled, GELU used)
+    siren_output: bool = False     # use SIREN only in output mlp2, not preprocess
+    silu: bool = False             # SiLU activation in preprocess MLP (mutually exclusive with siren)
+    physfeat: bool = False         # add physics-based input features (BL thickness + chord pos)
     aug: str = "none"  # none|yflip|jitter|featdrop|mixup|scale|flip_jitter|aoa_perturb|cutmix
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
@@ -760,7 +803,7 @@ print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32 + (2 if cfg.physfeat else 0),  # +curv, +dist, [+foil2dist], +32 fourier PE, [+2 physfeat]
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -782,6 +825,9 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    preprocess_omega0=cfg.siren_omega0 if not cfg.siren_output else 0,
+    preprocess_act="silu" if cfg.silu else "gelu",
+    output_siren_omega0=cfg.siren_omega0 if cfg.siren_output else 0,
 )
 
 model = Transolver(**model_config).to(device)
@@ -930,7 +976,7 @@ class Lion(torch.optim.Optimizer):
 
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
-if cfg.use_lion:
+if cfg.use_lion and not cfg.no_lion:
     base_opt = Lion([
         {'params': attn_params, 'lr': cfg.lr * 0.5},
         {'params': other_params, 'lr': cfg.lr}
@@ -1110,6 +1156,11 @@ for epoch in range(MAX_EPOCHS):
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+        if cfg.physfeat:
+            _raw_x_coord = x[:, :, 0].clamp(min=0)          # chord x-position [B, N]
+            _raw_re = x[:, 0, 13].clamp(min=1e3).unsqueeze(1)  # Reynolds number [B, 1]
+            _bl_thick = 5.0 * torch.sqrt((_raw_x_coord / _raw_re).clamp(min=1e-12))  # [B, N]
+            physfeat_tensor = torch.stack([_bl_thick, x[:, :, 0]], dim=-1)  # [B, N, 2]
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1128,6 +1179,8 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
+        if cfg.physfeat:
+            x = torch.cat([x, physfeat_tensor], dim=-1)
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -1431,6 +1484,11 @@ for epoch in range(MAX_EPOCHS):
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+                if cfg.physfeat:
+                    _raw_x_coord = x[:, :, 0].clamp(min=0)
+                    _raw_re = x[:, 0, 13].clamp(min=1e3).unsqueeze(1)
+                    _bl_thick = 5.0 * torch.sqrt((_raw_x_coord / _raw_re).clamp(min=1e-12))
+                    physfeat_tensor = torch.stack([_bl_thick, x[:, :, 0]], dim=-1)
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1449,6 +1507,8 @@ for epoch in range(MAX_EPOCHS):
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
+                if cfg.physfeat:
+                    x = torch.cat([x, physfeat_tensor], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
                 y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
