@@ -654,12 +654,18 @@ class Config:
     # Phase 3 R3: normalization/prediction-space experiments
     no_perstd: bool = False           # GPU 0: remove per-sample std norm entirely
     no_perstd_p: bool = False         # GPU 1: remove per-sample std for pressure only
-    unified_clamps: bool = False      # GPU 2: unified clamps (0.2, 0.2, 0.7) for all
-    high_p_clamp: bool = False        # GPU 3: higher pressure clamp (2.0)
+    unified_clamps: bool = False      # GPU 2: unified clamps for all channels/samples
+    high_p_clamp: bool = False        # GPU 3: higher pressure clamp (2.0 by default)
     multiply_std: bool = False        # GPU 4: multiply instead of divide per-sample std
     raw_targets: bool = False         # GPU 5: skip physics norm, raw target space
     tight_denorm_clamps: bool = False  # GPU 6: tighter denorm clamps [-5,5]/[-10,10]
     log_pressure: bool = False        # GPU 7: log-transform Cp pressure channel
+    # Phase 3 R5: pressure clamp fine-tuning
+    p_clamp_val: float = 2.0          # Pressure clamp value when high_p_clamp=True
+    split_clamp: bool = False          # Single-foil: (0.1,0.1,1.0), tandem: (0.3,0.3,2.0)
+    unified_clamp_val: float = 0.7    # All-channel clamp value for unified_clamps
+    high_vel_clamp: bool = False       # Raise single-foil velocity clamps to 0.3 (with high_p_clamp)
+    asym_tan_clamp: bool = False       # Single (0.1,0.1,2.0), tandem (0.3,0.3,3.0)
     # Phase 3: compound experiments
     seed: int = -1                     # random seed (-1 = no seeding)
     n_layers: int = 2                  # number of TransolverBlocks (default 2)
@@ -1167,10 +1173,19 @@ for epoch in range(MAX_EPOCHS):
         sample_stds = torch.ones(B, 1, 3, device=device)
         if not cfg.no_perstd and not cfg.raw_targets:
             if cfg.unified_clamps:
-                channel_clamps = tandem_clamps = torch.tensor([0.2, 0.2, 0.7], device=device)
-            elif cfg.high_p_clamp:
+                v = cfg.unified_clamp_val
+                channel_clamps = tandem_clamps = torch.tensor([v, v, v], device=device)
+            elif cfg.asym_tan_clamp:
                 channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
+                tandem_clamps = torch.tensor([0.3, 0.3, 3.0], device=device)
+            elif cfg.split_clamp:
+                channel_clamps = torch.tensor([0.1, 0.1, 1.0], device=device)
                 tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
+            elif cfg.high_p_clamp:
+                pv = cfg.p_clamp_val
+                vel_v = 0.3 if cfg.high_vel_clamp else 0.1
+                channel_clamps = torch.tensor([vel_v, vel_v, pv], device=device)
+                tandem_clamps = torch.tensor([0.3, 0.3, pv], device=device)
             else:
                 channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
                 tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
@@ -1499,10 +1514,19 @@ for epoch in range(MAX_EPOCHS):
                 sample_stds = torch.ones(B, 1, 3, device=device)
                 if not cfg.no_perstd and not cfg.raw_targets:
                     if cfg.unified_clamps:
-                        channel_clamps = tandem_clamps = torch.tensor([0.2, 0.2, 0.7], device=device)
-                    elif cfg.high_p_clamp:
+                        v = cfg.unified_clamp_val
+                        channel_clamps = tandem_clamps = torch.tensor([v, v, v], device=device)
+                    elif cfg.asym_tan_clamp:
                         channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
+                        tandem_clamps = torch.tensor([0.3, 0.3, 3.0], device=device)
+                    elif cfg.split_clamp:
+                        channel_clamps = torch.tensor([0.1, 0.1, 1.0], device=device)
                         tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
+                    elif cfg.high_p_clamp:
+                        pv = cfg.p_clamp_val
+                        vel_v = 0.3 if cfg.high_vel_clamp else 0.1
+                        channel_clamps = torch.tensor([vel_v, vel_v, pv], device=device)
+                        tandem_clamps = torch.tensor([0.3, 0.3, pv], device=device)
                     else:
                         channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
                         tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
