@@ -651,6 +651,15 @@ class Config:
     use_lion: bool = False        # GPU 4: Lion optimizer instead of AdamW
     rdrop: bool = False           # GPU 7: R-drop regularization
     rdrop_alpha: float = 1.0     # R-drop consistency loss weight
+    # Phase 3 R3: normalization/prediction-space experiments
+    no_perstd: bool = False           # GPU 0: remove per-sample std norm entirely
+    no_perstd_p: bool = False         # GPU 1: remove per-sample std for pressure only
+    unified_clamps: bool = False      # GPU 2: unified clamps (0.2, 0.2, 0.7) for all
+    high_p_clamp: bool = False        # GPU 3: higher pressure clamp (2.0)
+    multiply_std: bool = False        # GPU 4: multiply instead of divide per-sample std
+    raw_targets: bool = False         # GPU 5: skip physics norm, raw target space
+    tight_denorm_clamps: bool = False  # GPU 6: tighter denorm clamps [-5,5]/[-10,10]
+    log_pressure: bool = False        # GPU 7: log-transform Cp pressure channel
     # Phase 3: compound experiments
     seed: int = -1                     # random seed (-1 = no seeding)
     n_layers: int = 2                  # number of TransolverBlocks (default 2)
@@ -749,6 +758,9 @@ with torch.no_grad():
         _y, _mask = _y.to(device), _mask.to(device)
         _Um, _q = _umag_q(_y, _mask)
         _yp = _phys_norm(_y, _Um, _q)
+        if cfg.log_pressure:
+            _yp = _yp.clone()
+            _yp[:, :, 2:3] = _yp[:, :, 2:3].abs().add(1).log() * _yp[:, :, 2:3].sign()
         _m = _mask.float().unsqueeze(-1)  # [B, N, 1]
         _phys_sum += (_yp * _m).sum(dim=(0, 1))
         _phys_sq_sum += (_yp ** 2 * _m).sum(dim=(0, 1))
@@ -757,6 +769,25 @@ _pmean = (_phys_sum / _phys_n).float()
 _pstd = ((_phys_sq_sum / _phys_n - _pmean ** 2).clamp(min=0.0).sqrt()).clamp(min=1e-6).float()
 phys_stats = {"y_mean": _pmean, "y_std": _pstd}
 print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
+
+if cfg.raw_targets:
+    print("Computing raw target stats (no physics normalization)...")
+    _raw_sum = torch.zeros(3, device=device)
+    _raw_sq_sum = torch.zeros(3, device=device)
+    _raw_n = 0.0
+    with torch.no_grad():
+        for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc="Raw stats", leave=False):
+            _y, _mask = _y.to(device), _mask.to(device)
+            _m = _mask.float().unsqueeze(-1)
+            _raw_sum += (_y * _m).sum(dim=(0, 1))
+            _raw_sq_sum += (_y ** 2 * _m).sum(dim=(0, 1))
+            _raw_n += _mask.float().sum().item()
+    _raw_mean = (_raw_sum / _raw_n).float()
+    _raw_std = ((_raw_sq_sum / _raw_n - _raw_mean ** 2).clamp(min=0.0).sqrt()).clamp(min=1e-6).float()
+    raw_stats = {"y_mean": _raw_mean, "y_std": _raw_std}
+    print(f"  Raw stats — mean: {_raw_mean.tolist()}, std: {_raw_std.tolist()}")
+else:
+    raw_stats = None
 
 model_config = dict(
     space_dim=2,
@@ -1132,8 +1163,14 @@ for epoch in range(MAX_EPOCHS):
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
         Umag, q = _umag_q(y, mask)
-        y_phys = _phys_norm(y, Umag, q)
-        y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+        if cfg.raw_targets:
+            y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
+        else:
+            y_phys = _phys_norm(y, Umag, q)
+            if cfg.log_pressure:
+                y_phys = y_phys.clone()
+                y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
+            y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         if model.training:
             noise_progress = min(1.0, epoch / cfg.noise_anneal_epochs)
             if cfg.half_target_noise:
@@ -1150,16 +1187,31 @@ for epoch in range(MAX_EPOCHS):
         is_tandem = raw_gap.abs() > 0.5
         B = y_norm.shape[0]
         sample_stds = torch.ones(B, 1, 3, device=device)
-        channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
-        tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
-        if model.training:
-            for b in range(B):
-                valid = mask[b]
-                if is_tandem[b]:
-                    sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
-                else:
-                    sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
-            y_norm = y_norm / sample_stds
+        if not cfg.no_perstd and not cfg.raw_targets:
+            if cfg.unified_clamps:
+                channel_clamps = tandem_clamps = torch.tensor([0.2, 0.2, 0.7], device=device)
+            elif cfg.high_p_clamp:
+                channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
+                tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
+            else:
+                channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
+                tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+            if model.training:
+                for b in range(B):
+                    valid = mask[b]
+                    if cfg.no_perstd_p:
+                        # Normalize velocity only; pressure keeps std=1
+                        vc = (tandem_clamps[:2] if is_tandem[b] else channel_clamps[:2])
+                        sample_stds[b, 0, :2] = y_norm[b, valid, :2].std(dim=0).clamp(min=vc)
+                    elif is_tandem[b]:
+                        sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
+                    else:
+                        sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+        if model.training and not cfg.no_perstd and not cfg.raw_targets:
+            if cfg.multiply_std:
+                y_norm = y_norm * sample_stds
+            else:
+                y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model({"x": x})
@@ -1169,8 +1221,11 @@ for epoch in range(MAX_EPOCHS):
         pred = pred.float()
         re_pred = re_pred.float()
         aoa_pred = aoa_pred.float()
-        if model.training:
-            pred = pred / sample_stds
+        if model.training and not cfg.no_perstd and not cfg.raw_targets:
+            if cfg.multiply_std:
+                pred = pred * sample_stds
+            else:
+                pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         if cfg.tandem_ramp:
@@ -1450,28 +1505,50 @@ for epoch in range(MAX_EPOCHS):
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
                 Umag, q = _umag_q(y, mask)
-                y_phys = _phys_norm(y, Umag, q)
-                y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                if cfg.raw_targets:
+                    y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
+                else:
+                    y_phys = _phys_norm(y, Umag, q)
+                    if cfg.log_pressure:
+                        y_phys = y_phys.clone()
+                        y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
+                    y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
                 # Per-sample std normalization: skip tandem samples
                 raw_gap = x[:, 0, 21]
                 is_tandem = raw_gap.abs() > 0.5
                 B = y_norm.shape[0]
                 sample_stds = torch.ones(B, 1, 3, device=device)
-                channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
-                tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
-                for b in range(B):
-                    valid = mask[b]
-                    if is_tandem[b]:
-                        sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
+                if not cfg.no_perstd and not cfg.raw_targets:
+                    if cfg.unified_clamps:
+                        channel_clamps = tandem_clamps = torch.tensor([0.2, 0.2, 0.7], device=device)
+                    elif cfg.high_p_clamp:
+                        channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
+                        tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
                     else:
-                        sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
-                y_norm_scaled = y_norm / sample_stds
+                        channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
+                        tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+                    for b in range(B):
+                        valid = mask[b]
+                        if cfg.no_perstd_p:
+                            vc = (tandem_clamps[:2] if is_tandem[b] else channel_clamps[:2])
+                            sample_stds[b, 0, :2] = y_norm[b, valid, :2].std(dim=0).clamp(min=vc)
+                        elif is_tandem[b]:
+                            sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
+                        else:
+                            sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+                if cfg.multiply_std:
+                    y_norm_scaled = y_norm * sample_stds
+                else:
+                    y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
-                pred_loss = pred / sample_stds
+                if cfg.multiply_std:
+                    pred_loss = pred * sample_stds
+                else:
+                    pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
                 abs_err = abs_err.nan_to_num(0.0)
@@ -1489,8 +1566,21 @@ for epoch in range(MAX_EPOCHS):
                 n_vbatches += 1
 
                 # Denormalize: phys_stats → Cp space → original scale
-                pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
-                pred_orig = _phys_denorm(pred_phys, Umag, q)
+                if cfg.raw_targets:
+                    pred_orig = pred * raw_stats["y_std"] + raw_stats["y_mean"]
+                else:
+                    pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                    if cfg.log_pressure:
+                        pred_phys = pred_phys.clone()
+                        pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
+                    if cfg.tight_denorm_clamps:
+                        _pd = pred_phys.clone()
+                        _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
+                        _pd[:, :, 1:2] = pred_phys[:, :, 1:2].clamp(-5, 5) * Umag
+                        _pd[:, :, 2:3] = pred_phys[:, :, 2:3].clamp(-10, 10) * q
+                        pred_orig = _pd
+                    else:
+                        pred_orig = _phys_denorm(pred_phys, Umag, q)
                 y_clamped = y.clamp(-1e6, 1e6)
                 err = (pred_orig - y_clamped).abs()
                 finite = err.isfinite()
@@ -1665,8 +1755,21 @@ if best_metrics:
                 x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
-                pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
-                y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
+                if cfg.raw_targets:
+                    y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
+                else:
+                    pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                    if cfg.log_pressure:
+                        pred_phys = pred_phys.clone()
+                        pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
+                    if cfg.tight_denorm_clamps:
+                        _pd = pred_phys.clone()
+                        _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
+                        _pd[:, :, 1:2] = pred_phys[:, :, 1:2].clamp(-5, 5) * Umag
+                        _pd[:, :, 2:3] = pred_phys[:, :, 2:3].clamp(-10, 10) * q
+                        y_pred = _pd.squeeze(0).cpu()
+                    else:
+                        y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
             samples.append((x[:, :2], y_true, y_pred, is_surface))
         images = visualize(samples, out_dir=plot_dir / split_name)
         if images:
