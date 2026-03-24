@@ -3,6 +3,8 @@ name: Build and Push Docker Image
 on:
   push:
     branches: [main, docker]
+    paths:
+      - Dockerfile
   workflow_dispatch:
 
 env:
