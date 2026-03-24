@@ -660,6 +660,10 @@ class Config:
     raw_targets: bool = False         # GPU 5: skip physics norm, raw target space
     tight_denorm_clamps: bool = False  # GPU 6: tighter denorm clamps [-5,5]/[-10,10]
     log_pressure: bool = False        # GPU 7: log-transform Cp pressure channel
+    # Phase 3 R4: normalization sweep
+    p_clamp_val: float = 0.0          # override pressure clamp (0=use default/high_p_clamp)
+    high_vel_clamp: bool = False      # raise single-foil vel clamps to 0.3 (match tandem)
+    all_clamps_2: bool = False        # set all clamps (vel+pressure) to 2.0
     # Phase 3: compound experiments
     seed: int = -1                     # random seed (-1 = no seeding)
     n_layers: int = 2                  # number of TransolverBlocks (default 2)
@@ -1190,12 +1194,14 @@ for epoch in range(MAX_EPOCHS):
         if not cfg.no_perstd and not cfg.raw_targets:
             if cfg.unified_clamps:
                 channel_clamps = tandem_clamps = torch.tensor([0.2, 0.2, 0.7], device=device)
-            elif cfg.high_p_clamp:
-                channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
-                tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
+            elif cfg.all_clamps_2:
+                channel_clamps = tandem_clamps = torch.tensor([2.0, 2.0, 2.0], device=device)
             else:
-                channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
-                tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+                _p_val = cfg.p_clamp_val if cfg.p_clamp_val > 0 else (2.0 if cfg.high_p_clamp else 0.5)
+                _p_tan = cfg.p_clamp_val if cfg.p_clamp_val > 0 else (2.0 if cfg.high_p_clamp else 1.0)
+                _ux = 0.3 if cfg.high_vel_clamp else 0.1
+                channel_clamps = torch.tensor([_ux, _ux, _p_val], device=device)
+                tandem_clamps = torch.tensor([0.3, 0.3, _p_tan], device=device)
             if model.training:
                 for b in range(B):
                     valid = mask[b]
@@ -1522,12 +1528,14 @@ for epoch in range(MAX_EPOCHS):
                 if not cfg.no_perstd and not cfg.raw_targets:
                     if cfg.unified_clamps:
                         channel_clamps = tandem_clamps = torch.tensor([0.2, 0.2, 0.7], device=device)
-                    elif cfg.high_p_clamp:
-                        channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
-                        tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
+                    elif cfg.all_clamps_2:
+                        channel_clamps = tandem_clamps = torch.tensor([2.0, 2.0, 2.0], device=device)
                     else:
-                        channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
-                        tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+                        _p_val = cfg.p_clamp_val if cfg.p_clamp_val > 0 else (2.0 if cfg.high_p_clamp else 0.5)
+                        _p_tan = cfg.p_clamp_val if cfg.p_clamp_val > 0 else (2.0 if cfg.high_p_clamp else 1.0)
+                        _ux = 0.3 if cfg.high_vel_clamp else 0.1
+                        channel_clamps = torch.tensor([_ux, _ux, _p_val], device=device)
+                        tandem_clamps = torch.tensor([0.3, 0.3, _p_tan], device=device)
                     for b in range(B):
                         valid = mask[b]
                         if cfg.no_perstd_p:
