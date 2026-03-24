@@ -651,9 +651,16 @@ class Config:
     use_lion: bool = False        # GPU 4: Lion optimizer instead of AdamW
     rdrop: bool = False           # GPU 7: R-drop regularization
     rdrop_alpha: float = 1.0     # R-drop consistency loss weight
+    # Phase 3: compound experiments
+    seed: int = -1                     # random seed (-1 = no seeding)
+    n_layers: int = 2                  # number of TransolverBlocks (default 2)
 
 
 cfg = sp.parse(Config)
+
+if cfg.seed >= 0:
+    torch.manual_seed(cfg.seed)
+    torch.cuda.manual_seed_all(cfg.seed)
 
 if cfg.debug:
     MAX_EPOCHS = 3
@@ -751,7 +758,7 @@ model_config = dict(
     fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
-    n_layers=2,
+    n_layers=cfg.n_layers,
     n_head=3,
     slice_num=cfg.slice_num,
     mlp_ratio=2,
