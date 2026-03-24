@@ -659,6 +659,10 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R3: node subsampling / throughput
+    vol_max_ratio: float = 1.0       # cap volume keep ratio permanently (1.0 = no cap)
+    surf_drop_ratio: float = 1.0     # fraction of surface nodes to keep in loss (1.0 = no dropout)
+    num_workers: int = 4             # DataLoader num_workers
 
 
 cfg = sp.parse(Config)
@@ -716,7 +720,7 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
 
-loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
+loader_kwargs = dict(collate_fn=pad_collate, num_workers=cfg.num_workers, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
 
 if cfg.debug:
@@ -1183,9 +1187,10 @@ for epoch in range(MAX_EPOCHS):
         surf_mask = mask & is_surface
 
         # Progressive resolution: subsample volume nodes in loss early in training
-        # Ramps from 10% → 100% of volume nodes over first 40 epochs
+        # Ramps from 5% → vol_max_ratio over first vol_ramp_epochs epochs.
+        # If vol_max_ratio < 1.0, permanently subsamples at that cap after ramp.
         if epoch < cfg.vol_ramp_epochs:
-            vol_keep_ratio = 0.05 + 0.95 * (epoch / cfg.vol_ramp_epochs)
+            vol_keep_ratio = 0.05 + (cfg.vol_max_ratio - 0.05) * (epoch / cfg.vol_ramp_epochs)
             vol_indices = vol_mask.nonzero(as_tuple=False)
             n_vol = vol_indices.shape[0]
             n_keep = max(int(n_vol * vol_keep_ratio), 1)
@@ -1193,8 +1198,28 @@ for epoch in range(MAX_EPOCHS):
             vol_mask_train = torch.zeros_like(vol_mask)
             if n_keep > 0:
                 vol_mask_train[vol_indices[perm, 0], vol_indices[perm, 1]] = True
+        elif cfg.vol_max_ratio < 1.0:
+            vol_indices = vol_mask.nonzero(as_tuple=False)
+            n_vol = vol_indices.shape[0]
+            n_keep = max(int(n_vol * cfg.vol_max_ratio), 1)
+            perm = torch.randperm(n_vol, device=vol_mask.device)[:n_keep]
+            vol_mask_train = torch.zeros_like(vol_mask)
+            if n_keep > 0:
+                vol_mask_train[vol_indices[perm, 0], vol_indices[perm, 1]] = True
         else:
             vol_mask_train = vol_mask
+
+        # Surface dropout: randomly subsample surface nodes in loss for regularization
+        if cfg.surf_drop_ratio < 1.0:
+            surf_indices = surf_mask.nonzero(as_tuple=False)
+            n_surf = surf_indices.shape[0]
+            n_surf_keep = max(int(n_surf * cfg.surf_drop_ratio), 1)
+            surf_perm = torch.randperm(n_surf, device=surf_mask.device)[:n_surf_keep]
+            surf_mask_train = torch.zeros_like(surf_mask)
+            if n_surf_keep > 0:
+                surf_mask_train[surf_indices[surf_perm, 0], surf_indices[surf_perm, 1]] = True
+        else:
+            surf_mask_train = surf_mask
 
         if cfg.boundary_aware:
             vol_dist = dist_feat[:, :, 0]  # [B, N], log1p-scaled dist-to-surface
@@ -1222,9 +1247,11 @@ for epoch in range(MAX_EPOCHS):
             surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
             thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
             thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
-            hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
+            hard_mask = (~is_tandem_batch)[:, None] & surf_mask_train & (surf_pres_flat >= thresh[:, None])
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
-            surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            surf_per_sample = (surf_pres * hard_weights * surf_mask_train.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask_train.sum(dim=1).clamp(min=1).float()
+        else:
+            surf_per_sample = (abs_err[:, :, 2:3] * surf_mask_train.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask_train.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         if cfg.tandem_ramp:
             tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
