@@ -668,6 +668,15 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R6: curriculum learning
+    curriculum_single_first: bool = False  # GPU 0: skip tandem batches for epoch < 50
+    curriculum_vol_first: bool = False      # GPU 1: set surf_weight=0 for epoch < 30
+    curriculum_progressive_surf: bool = False  # GPU 2: surf_weight ramp 0.1→10.0 over 200 epochs
+    curriculum_re: bool = False            # GPU 3: skip high-Re batches for epoch < 40
+    curriculum_tandem_first: bool = False  # GPU 4: skip non-tandem batches for epoch < 50
+    curriculum_error_sampling: bool = False  # GPU 5: oversample high-error samples after epoch 40
+    two_phase_lr: bool = False             # GPU 6: lr=5e-4 → 1e-4 at epoch 100
+    progressive_noise: bool = False        # GPU 7: start with 2x noise, reduce to 0 over 150 epochs
 
 
 cfg = sp.parse(Config)
@@ -939,16 +948,17 @@ class Lookahead:
 
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+_opt_lr = 5e-4 if cfg.two_phase_lr else cfg.lr
 if cfg.use_lion:
     base_opt = Lion([
-        {'params': attn_params, 'lr': cfg.lr * 0.5},
-        {'params': other_params, 'lr': cfg.lr}
+        {'params': attn_params, 'lr': _opt_lr * 0.5},
+        {'params': other_params, 'lr': _opt_lr}
     ], weight_decay=cfg.weight_decay)
     optimizer = base_opt  # Lion has its own momentum; skip Lookahead
 else:
     base_opt = torch.optim.AdamW([
-        {'params': attn_params, 'lr': cfg.lr * 0.5},
-        {'params': other_params, 'lr': cfg.lr}
+        {'params': attn_params, 'lr': _opt_lr * 0.5},
+        {'params': other_params, 'lr': _opt_lr}
     ], weight_decay=cfg.weight_decay)
     if cfg.use_lookahead:
         optimizer = Lookahead(base_opt, k=10, alpha=0.8)
@@ -956,7 +966,11 @@ else:
         optimizer = base_opt
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
-if cfg.scheduler_type == "warm_restarts":
+if cfg.two_phase_lr:
+    # Phase 1: lr=5e-4 (epochs 0-99), Phase 2: lr=1e-4 (epochs 100+)
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(base_opt, milestones=[100], gamma=(1e-4 / 5e-4))
+    step_scheduler_per_batch = False
+elif cfg.scheduler_type == "warm_restarts":
     _warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
     _restarts = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         base_opt, T_0=cfg.cosine_T_0, T_mult=cfg.cosine_T_mult, eta_min=cfg.cosine_eta_min
@@ -985,7 +999,7 @@ else:  # sequential (default)
         base_opt, schedulers=[warmup_scheduler, cosine_scheduler],
         milestones=[cfg.warmup_total_iters]
     )
-step_scheduler_per_batch = (cfg.scheduler_type == "onecycle")
+step_scheduler_per_batch = (cfg.scheduler_type == "onecycle") and not cfg.two_phase_lr
 
 # --- wandb ---
 run = wandb.init(
@@ -1042,6 +1056,11 @@ for epoch in range(MAX_EPOCHS):
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+    # Curriculum overrides for surface weight
+    if cfg.curriculum_vol_first and epoch < 30:
+        surf_weight = 0.0
+    elif cfg.curriculum_progressive_surf:
+        surf_weight = 0.1 + (10.0 - 0.1) * min(1.0, epoch / 200)
 
     # --- Train ---
     model.train()
@@ -1137,9 +1156,14 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
-        if model.training and epoch < cfg.noise_anneal_epochs:
-            noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
-            x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
+        if model.training:
+            if cfg.progressive_noise:
+                _pn_scale = 0.10 * max(0.0, 1.0 - epoch / 150)
+                if _pn_scale > 0:
+                    x[:, :, 2:25] = x[:, :, 2:25] + _pn_scale * torch.randn_like(x[:, :, 2:25])
+            elif epoch < cfg.noise_anneal_epochs:
+                noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
+                x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
         Umag, q = _umag_q(y, mask)
         if cfg.raw_targets:
             y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
@@ -1163,6 +1187,14 @@ for epoch in range(MAX_EPOCHS):
         # Per-sample std normalization: skip tandem samples (gap feature index 21)
         raw_gap = x[:, 0, 21]
         is_tandem = raw_gap.abs() > 0.5
+        # Curriculum: skip certain batches in early training
+        if model.training:
+            if cfg.curriculum_single_first and epoch < 50 and is_tandem.any():
+                continue
+            if cfg.curriculum_tandem_first and epoch < 50 and not is_tandem.any():
+                continue
+            if cfg.curriculum_re and epoch < 40 and (x[:, 0, 13] > 0).any():
+                continue
         B = y_norm.shape[0]
         sample_stds = torch.ones(B, 1, 3, device=device)
         if not cfg.no_perstd and not cfg.raw_targets:
@@ -1427,8 +1459,9 @@ for epoch in range(MAX_EPOCHS):
     if epoch >= cfg.temp_anneal_epoch:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
-    epoch_vol /= n_batches
-    epoch_surf /= n_batches
+    if n_batches > 0:
+        epoch_vol /= n_batches
+        epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
     prev_surf_loss = epoch_surf
 
@@ -1635,6 +1668,62 @@ for epoch in range(MAX_EPOCHS):
                       if not (torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isnan() or
                               torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isinf())]
     val_loss_4split = sum(_4split_losses) / max(len(_4split_losses), 1)
+
+    # Curriculum error sampling: rebuild DataLoader once at epoch 40 with high-error samples upweighted
+    if cfg.curriculum_error_sampling and epoch == 40:
+        print("Error sampling: computing per-sample training errors...")
+        _err_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
+        _sample_errors = []
+        _base_model.eval()
+        with torch.no_grad():
+            for _xe, _ye, _is_se, _maske in _err_loader:
+                _xe, _ye = _xe.to(device), _ye.to(device)
+                _is_se = _is_se.to(device)
+                _maske = _maske.to(device)
+                _raw_dsdfe = _xe[:, :, 2:10]
+                _dist_surfe = _raw_dsdfe.abs().min(dim=-1, keepdim=True).values
+                _dist_feate = torch.log1p(_dist_surfe * 10.0)
+                _xe = (_xe - stats["x_mean"]) / stats["x_std"]
+                _curve = _xe[:, :, 2:6].norm(dim=-1, keepdim=True) * _is_se.float().unsqueeze(-1)
+                if cfg.foil2_dist:
+                    _f2d = torch.log1p(_raw_dsdfe[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                    _xe = torch.cat([_xe, _curve, _dist_feate, _f2d], dim=-1)
+                else:
+                    _xe = torch.cat([_xe, _curve, _dist_feate], dim=-1)
+                _raw_xye = _xe[:, :, :2]
+                _xy_mine = _raw_xye.amin(dim=1, keepdim=True)
+                _xy_maxe = _raw_xye.amax(dim=1, keepdim=True)
+                _xy_norme = (_raw_xye - _xy_mine) / (_xy_maxe - _xy_mine + 1e-8)
+                _freqse = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                _xy_se = _xy_norme.unsqueeze(-1) * _freqse
+                _fpe = torch.cat([_xy_se.sin().flatten(-2), _xy_se.cos().flatten(-2)], dim=-1)
+                _xe = torch.cat([_xe, _fpe], dim=-1)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _prede = _base_model({"x": _xe})["preds"].float()
+                _Uma, _qa = _umag_q(_ye, _maske)
+                _ye_p = _phys_norm(_ye, _Uma, _qa)
+                _ye_n = (_ye_p - phys_stats["y_mean"]) / phys_stats["y_std"]
+                _surf_maske = _is_se.bool()
+                _abs_erre = (_prede - _ye_n).abs()
+                for _bi in range(_xe.shape[0]):
+                    _sm = _surf_maske[_bi]
+                    if _sm.any():
+                        _sample_errors.append(_abs_erre[_bi, _sm].mean().item())
+                    else:
+                        _sample_errors.append(0.0)
+        _base_model.train()
+        # Pad to full dataset length in case of uneven batches
+        while len(_sample_errors) < len(train_ds):
+            _sample_errors.append(0.0)
+        _errs = torch.tensor(_sample_errors[:len(train_ds)])
+        _thresh = _errs.quantile(0.9)
+        _new_weights = torch.where(_errs >= _thresh,
+                                   sample_weights[:len(_errs)] * 3.0,
+                                   sample_weights[:len(_errs)])
+        _err_sampler = WeightedRandomSampler(_new_weights, num_samples=len(train_ds), replacement=True)
+        train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, sampler=_err_sampler, **loader_kwargs)
+        n_upweighted = (_errs >= _thresh).sum().item()
+        print(f"Error sampling: {n_upweighted} high-error samples upweighted 3x")
 
     dt = time.time() - t0
 
