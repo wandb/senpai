@@ -395,9 +395,11 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        grad_checkpoint=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
+        self.grad_checkpoint = grad_checkpoint
         self.ref = ref
         self.unified_pos = unified_pos
         self.adaln_output = adaln_output
@@ -565,7 +567,12 @@ class Transolver(nn.Module):
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+            if self.grad_checkpoint:
+                def _ckpt(fx_in, b=block):
+                    return b(fx_in, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+                fx = torch.utils.checkpoint.checkpoint(_ckpt, fx, use_reentrant=False)
+            else:
+                fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
@@ -668,6 +675,8 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R3b: architecture exploration
+    grad_checkpoint: bool = False    # gradient checkpointing for middle blocks (saves memory for deep models)
 
 
 cfg = sp.parse(Config)
@@ -813,6 +822,7 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    grad_checkpoint=cfg.grad_checkpoint,
 )
 
 model = Transolver(**model_config).to(device)
