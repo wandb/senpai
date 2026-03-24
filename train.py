@@ -250,6 +250,9 @@ class TransolverBlock(nn.Module):
         film_cond=False,
         decouple_slice=False,
         zone_temp=False,
+        moe_tandem=False,
+        moe_wide_tandem=False,
+        per_zone_heads=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -258,6 +261,8 @@ class TransolverBlock(nn.Module):
         self.soft_moe = soft_moe
         self.adaln_all = adaln_all
         self.film_cond = film_cond
+        self.moe_tandem = moe_tandem
+        self.per_zone_heads = per_zone_heads
         self.ln_1 = nn.LayerNorm(hidden_dim)
         self.attn = Physics_Attention_Irregular_Mesh(
             hidden_dim,
@@ -324,12 +329,30 @@ class TransolverBlock(nn.Module):
                 self.mlp2 = nn.Sequential(
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
+            elif moe_tandem:
+                tandem_width = hidden_dim * 2 if moe_wide_tandem else hidden_dim
+                self.mlp2_single = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+                self.mlp2_tandem = nn.Sequential(
+                    nn.Linear(hidden_dim, tandem_width), nn.GELU(), nn.Linear(tandem_width, out_dim)
+                )
+            elif per_zone_heads:
+                self.head_bg = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+                self.head_foil1 = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+                self.head_foil2 = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
             else:
                 self.mlp2 = nn.Sequential(
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None, zone_mask=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         if self.adaln_all and condition is not None:
             cond_out = self.adaln_net(condition)  # [B, H*4]
@@ -361,6 +384,15 @@ class TransolverBlock(nn.Module):
                 scale, shift = cond.chunk(2, dim=-1)  # [B, H]
                 fx_ln = fx_ln * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
                 return self.mlp2(fx_ln)
+            elif self.moe_tandem:
+                # Hard routing per sample: tandem samples → mlp2_tandem, single → mlp2_single
+                is_tan = tandem_mask[:, 0, 0, :].unsqueeze(1)  # [B, 1, 1]
+                return is_tan * self.mlp2_tandem(fx_ln) + (1 - is_tan) * self.mlp2_single(fx_ln)
+            elif self.per_zone_heads and zone_mask is not None:
+                # zone_mask: [B, N, 3] — weights for bg, foil1, foil2
+                return (zone_mask[:, :, 0:1] * self.head_bg(fx_ln)
+                        + zone_mask[:, :, 1:2] * self.head_foil1(fx_ln)
+                        + zone_mask[:, :, 2:3] * self.head_foil2(fx_ln))
             else:
                 return self.mlp2(fx_ln)
         return fx
@@ -395,6 +427,10 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        moe_tandem=False,
+        moe_wide_tandem=False,
+        per_zone_heads=False,
+        tandem_cross_attn=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -405,6 +441,9 @@ class Transolver(nn.Module):
         self.adaln_4cond = adaln_4cond
         self.film_cond = film_cond
         self.adaln_zone_temp = adaln_zone_temp
+        self.moe_tandem = moe_tandem
+        self.per_zone_heads = per_zone_heads
+        self.tandem_cross_attn = tandem_cross_attn
         if output_fields is None or output_dims is None:
             raise ValueError("output_fields and output_dims must be provided")
         if len(output_fields) != len(output_dims):
@@ -457,6 +496,9 @@ class Transolver(nn.Module):
                     film_cond=film_cond,
                     decouple_slice=adaln_decouple,
                     zone_temp=adaln_zone_temp,
+                    moe_tandem=moe_tandem if (idx == n_layers - 1) else False,
+                    moe_wide_tandem=moe_wide_tandem if (idx == n_layers - 1) else False,
+                    per_zone_heads=per_zone_heads if (idx == n_layers - 1) else False,
                 )
                 for idx in range(n_layers)
             ]
@@ -467,6 +509,10 @@ class Transolver(nn.Module):
         nn.init.zeros_(self.out_skip.bias)
         self.skip_gate = nn.Sequential(nn.Linear(n_hidden, 1), nn.Sigmoid())
         nn.init.constant_(self.skip_gate[0].bias, -2.0)  # starts nearly closed
+        if tandem_cross_attn:
+            self.cross_proj = nn.Linear(n_hidden, n_hidden)
+            self.cross_gate = nn.Sequential(nn.Linear(n_hidden, 1), nn.Sigmoid())
+            nn.init.constant_(self.cross_gate[0].bias, -2.0)  # starts nearly closed
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
@@ -547,6 +593,18 @@ class Transolver(nn.Module):
         else:
             zone_features = None
 
+        # Compute per-zone node masks for per_zone_heads output routing
+        if self.per_zone_heads:
+            foil1_norm = x[:, :, 2:6].norm(dim=-1)   # [B, N]
+            foil2_norm = x[:, :, 6:10].norm(dim=-1)  # [B, N]
+            is_surf = (x[:, :, 24].abs() > 0.01)
+            is_foil1 = (is_surf & (foil1_norm <= foil2_norm)).float()
+            is_foil2 = (is_surf & (foil2_norm < foil1_norm)).float()
+            is_bg = (1.0 - is_surf.float())
+            per_zone_mask = torch.stack([is_bg, is_foil1, is_foil2], dim=-1)  # [B, N, 3]
+        else:
+            per_zone_mask = None
+
         if self.unified_pos:
             if pos is None:
                 raise ValueError("Missing required input tensor: pos")
@@ -571,9 +629,23 @@ class Transolver(nn.Module):
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
+        # Tandem cross-attention: inject foil1 surface mean into foil2 nodes before last block
+        if self.tandem_cross_attn:
+            f1_norm = x[:, :, 2:6].norm(dim=-1)   # [B, N]
+            f2_norm = x[:, :, 6:10].norm(dim=-1)  # [B, N]
+            is_surf_ca = (x[:, :, 24].abs() > 0.01).float()
+            is_f1 = (is_surf_ca * (f1_norm <= f2_norm).float()).unsqueeze(-1)  # [B, N, 1]
+            is_f2 = (is_surf_ca * (f2_norm < f1_norm).float()).unsqueeze(-1)   # [B, N, 1]
+            n_f1 = is_f1.sum(dim=1).clamp(min=1.0)                             # [B, 1]
+            foil1_mean = (fx * is_f1).sum(dim=1) / n_f1                        # [B, H]
+            foil1_feat = self.cross_proj(foil1_mean).unsqueeze(1)              # [B, 1, H]
+            gate = self.cross_gate(fx)                                          # [B, N, 1]
+            tandem_scalar = is_tandem[:, 0, 0, :].unsqueeze(1)                # [B, 1, 1]
+            fx = fx + tandem_scalar * gate * foil1_feat * is_f2
+
         # Last block: use adaln_all condition if enabled, else fallback to adaln_output
         last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features, zone_mask=per_zone_mask)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
@@ -659,6 +731,11 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R3: MoE tandem routing and per-zone/cross-attention architectures
+    moe_tandem: bool = False        # dual output heads (tandem vs single), hard-routed by sample
+    moe_wide_tandem: bool = False   # tandem head uses 2x hidden width
+    per_zone_heads: bool = False    # 3 output heads: background, foil1, foil2 surface
+    tandem_cross_attn: bool = False # inject foil1 surface mean into foil2 nodes (tandem only)
 
 
 cfg = sp.parse(Config)
@@ -782,6 +859,10 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    moe_tandem=cfg.moe_tandem,
+    moe_wide_tandem=cfg.moe_wide_tandem,
+    per_zone_heads=cfg.per_zone_heads,
+    tandem_cross_attn=cfg.tandem_cross_attn,
 )
 
 model = Transolver(**model_config).to(device)
