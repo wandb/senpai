@@ -5,21 +5,22 @@ metadata:
   labels:
     app: senpai
     role: test
+    research-tag: {{RESEARCH_TAG}}
 spec:
   containers:
   - name: test
-    image: ghcr.io/wandb/senpai:32da5cf
+    image: {{IMAGE}}
     command: ["/bin/bash", "-c"]
     args:
     - |
-      git clone --branch docker --depth 1 https://${GITHUB_TOKEN}@github.com/wandb/senpai.git /tmp/senpai
-      source /tmp/senpai/k8s/install-weave-cc-plugin.sh
+      git config --global url."https://${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+      git clone --branch "${REPO_BRANCH}" --depth 1 "${REPO_URL}" /workspaces/senpai
+      source /workspaces/senpai/k8s/install-weave-cc-plugin.sh
       sleep infinity
+    envFrom:
+    - configMapRef:
+        name: senpai-config-test
     env:
-    - name: WANDB_ENTITY
-      value: "wandb-applied-ai-team"
-    - name: WANDB_PROJECT
-      value: "senpai-v1"
     - name: WANDB_API_KEY
       valueFrom:
         secretKeyRef:

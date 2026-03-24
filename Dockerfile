@@ -27,7 +27,7 @@ RUN mkdir -p /root/.weave_claude_plugin/logs && \
     cat > /root/.weave_claude_plugin/settings.json <<'EOF'
 {
   "log_file": "/root/.weave_claude_plugin/logs/daemon.log",
-  "weave_project": "wandb-applied-ai-team/senpai-v1",
+  "weave_project": null,
   "wandb_api_key": null,
   "debug": false,
   "version": "0.1.0",
