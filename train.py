@@ -601,6 +601,7 @@ class Config:
     wandb_name: str | None = None
     agent: str | None = None
     debug: bool = False
+    seed: int = -1  # random seed (-1 = disabled)
     # Schedule params (tuned for 3-hour / 500-epoch runs)
     warmup_total_iters: int = 20
     warmup_start_factor: float = 0.2
@@ -771,6 +772,10 @@ model_config = dict(
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
 )
+
+if cfg.seed >= 0:
+    torch.manual_seed(cfg.seed)
+    torch.cuda.manual_seed_all(cfg.seed)
 
 model = Transolver(**model_config).to(device)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
