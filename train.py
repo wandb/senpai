@@ -454,6 +454,7 @@ class Transolver(nn.Module):
         coarse_refine=False,
         hier_slice=False,
         surf_refine=False,
+        surf_refine_lean=False,
         pct_style=False,
         dilated_slice=False,
         progressive_width=False,
@@ -473,6 +474,7 @@ class Transolver(nn.Module):
         self.coarse_refine = coarse_refine
         self.hier_slice = hier_slice
         self.surf_refine = surf_refine
+        self.surf_refine_lean = surf_refine_lean
         self.pct_style = pct_style
         self.dilated_slice = dilated_slice
         self.progressive_width = progressive_width
@@ -869,7 +871,8 @@ class Transolver(nn.Module):
             sr_sb = self.sr_spatial_bias(raw_xy)  # [B, N, sr_slices]
             sr_feat = F.gelu(self.sr_proj_up(fx))  # [B, N, sr_hidden]
             sr_feat = self.sr_ln1(self.sr_attn1(sr_feat, spatial_bias=sr_sb) + sr_feat)
-            sr_feat = self.sr_ln2(self.sr_attn2(sr_feat, spatial_bias=sr_sb) + sr_feat)
+            if not self.surf_refine_lean:
+                sr_feat = self.sr_ln2(self.sr_attn2(sr_feat, spatial_bias=sr_sb) + sr_feat)
             sr_delta = self.sr_proj_down(sr_feat)  # [B, N, out_dim]
             if is_surface is not None:
                 sr_delta = sr_delta * is_surface.float().unsqueeze(-1)
@@ -951,10 +954,12 @@ class Config:
     rdrop: bool = False           # GPU 7: R-drop regularization
     rdrop_alpha: float = 1.0     # R-drop consistency loss weight
     # Phase 3: multi-scale architecture variants (one per GPU)
+    n_layers: int = 2                  # number of Transolver blocks (default 2)
     unet_transolver: bool = False      # GPU0: U-Net encoder-decoder with skip connections
     coarse_refine: bool = False        # GPU1: coarse-to-fine 2-stage prediction
     hier_slice: bool = False           # GPU2: hierarchical slice attention (32→96)
     surf_refine: bool = False          # GPU3: surface-aware refinement head
+    surf_refine_lean: bool = False     # use 1 attention layer instead of 2 (less memory)
     pct_style: bool = False            # GPU4: PCT-style offset attention
     dilated_slice: bool = False        # GPU5: dilated slice attention (3 spatial scales)
     progressive_width: bool = False    # GPU6: 3 blocks with 128→192→256 hidden dim
@@ -1059,7 +1064,7 @@ model_config = dict(
     fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
-    n_layers=2,
+    n_layers=cfg.n_layers,
     n_head=3,
     slice_num=cfg.slice_num,
     mlp_ratio=2,
@@ -1082,6 +1087,7 @@ model_config = dict(
     coarse_refine=cfg.coarse_refine,
     hier_slice=cfg.hier_slice,
     surf_refine=cfg.surf_refine,
+    surf_refine_lean=cfg.surf_refine_lean,
     pct_style=cfg.pct_style,
     dilated_slice=cfg.dilated_slice,
     progressive_width=cfg.progressive_width,
