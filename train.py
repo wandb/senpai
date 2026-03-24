@@ -668,6 +668,15 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R6: target representation
+    predict_grad_p: bool = False     # GPU 0: surface pressure gradient supervision
+    relative_p: bool = False          # GPU 1: predict relative-to-surface-mean pressure
+    quantile_pred: bool = False       # GPU 2: multi-quantile pressure prediction heads
+    polar_velocity: bool = False      # GPU 3: polar (speed, angle) velocity targets
+    dual_output: bool = False         # GPU 4: surface-specific refinement MLP
+    residual_potflow: bool = False    # GPU 5: predict residual from Bernoulli baseline
+    two_stage_pressure: bool = False  # GPU 6: velocity-conditioned pressure head
+    p_channel_weight: float = 1.0    # GPU 7: extra weight on pressure channel in loss
 
 
 cfg = sp.parse(Config)
@@ -820,6 +829,21 @@ torch._functorch.config.donated_buffer = False  # required for retain_graph=True
 model = torch.compile(model, mode="default")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
+# Phase 3 R6: extra modules for target representation experiments
+_quantile_lo = nn.Linear(1, 1).to(device) if cfg.quantile_pred else None
+_quantile_hi = nn.Linear(1, 1).to(device) if cfg.quantile_pred else None
+if cfg.quantile_pred:
+    nn.init.constant_(_quantile_lo.bias, -0.1)
+    nn.init.constant_(_quantile_hi.bias, 0.1)
+_surf_refine = None
+if cfg.dual_output:
+    _surf_refine = nn.Sequential(nn.Linear(3, 32), nn.GELU(), nn.Linear(32, 3)).to(device)
+    nn.init.zeros_(_surf_refine[-1].weight); nn.init.zeros_(_surf_refine[-1].bias)
+_pressure_head = None
+if cfg.two_stage_pressure:
+    _pressure_head = nn.Sequential(nn.Linear(5, 64), nn.GELU(), nn.Linear(64, 1)).to(device)
+    nn.init.zeros_(_pressure_head[-1].weight); nn.init.zeros_(_pressure_head[-1].bias)
+
 from copy import deepcopy
 ema_model = None
 swad_initial_val = None
@@ -954,6 +978,14 @@ else:
         optimizer = Lookahead(base_opt, k=10, alpha=0.8)
     else:
         optimizer = base_opt
+
+# Add R6 extra module params to optimizer
+_r6_extra_params = []
+for _r6m in [_quantile_lo, _quantile_hi, _surf_refine, _pressure_head]:
+    if _r6m is not None:
+        _r6_extra_params.extend(list(_r6m.parameters()))
+if _r6_extra_params:
+    base_opt.add_param_group({'params': _r6_extra_params, 'lr': cfg.lr})
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
@@ -1191,6 +1223,35 @@ for epoch in range(MAX_EPOCHS):
             else:
                 y_norm = y_norm / sample_stds
 
+        # Phase 3 R6: target representation transformations (applied after per-sample std)
+        _r6_surf_p_mean = None  # for relative_p inverse in pred space
+        _r6_bernoulli_norm = None  # for residual_potflow inverse
+        if model.training:
+            if cfg.relative_p:
+                # Subtract per-sample surface-mean pressure so model predicts deviations
+                _r6_surf = mask & is_surface
+                _r6_pmean = torch.zeros(B, 1, 1, device=device)
+                for _r6b in range(B):
+                    if _r6_surf[_r6b].sum() > 0:
+                        _r6_pmean[_r6b, 0, 0] = y_norm[_r6b, _r6_surf[_r6b], 2].mean()
+                _r6_surf_p_mean = _r6_pmean
+                y_norm = y_norm.clone()
+                y_norm[:, :, 2:3] = y_norm[:, :, 2:3] - _r6_pmean
+            if cfg.residual_potflow and not cfg.raw_targets:
+                # Subtract Bernoulli Cp estimate for volume nodes; model predicts residual
+                _r6_vol_mask = (~is_surface).float().unsqueeze(-1)
+                _r6_bcp = (1.0 - y_phys[:, :, 0:1] ** 2 - y_phys[:, :, 1:2] ** 2) * _r6_vol_mask
+                _r6_bernoulli_norm = (_r6_bcp - phys_stats["y_mean"][2]) / phys_stats["y_std"][2]
+                y_norm = y_norm.clone()
+                y_norm[:, :, 2:3] = y_norm[:, :, 2:3] - _r6_bernoulli_norm
+            if cfg.polar_velocity:
+                # Convert normalized velocity targets to polar (speed, angle/pi)
+                y_norm = y_norm.clone()
+                _r6_ux = y_norm[:, :, 0].clone()
+                _r6_uy = y_norm[:, :, 1].clone()
+                y_norm[:, :, 0] = (_r6_ux ** 2 + _r6_uy ** 2).sqrt()
+                y_norm[:, :, 1] = torch.atan2(_r6_uy, _r6_ux) / 3.14159265
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model({"x": x})
             pred = out["preds"]
@@ -1204,6 +1265,26 @@ for epoch in range(MAX_EPOCHS):
                 pred = pred * sample_stds
             else:
                 pred = pred / sample_stds
+        # Phase 3 R6: post-prediction modifications (training only)
+        if model.training:
+            if cfg.polar_velocity:
+                # Convert polar predictions back to Cartesian for loss
+                _r6_sp = pred[:, :, 0:1]
+                _r6_an = pred[:, :, 1:2] * 3.14159265
+                pred = torch.cat([_r6_sp * _r6_an.cos(), _r6_sp * _r6_an.sin(), pred[:, :, 2:3]], dim=-1)
+            if cfg.dual_output and _surf_refine is not None:
+                # Surface-specific refinement: small MLP corrects surface predictions
+                _r6_sm = (mask & is_surface).unsqueeze(-1).float()
+                _r6_sp = pred * _r6_sm  # zero out non-surface for refine head
+                _r6_ref = _surf_refine(_r6_sp) * _r6_sm
+                pred = pred + _r6_ref
+            if cfg.two_stage_pressure and _pressure_head is not None:
+                # Velocity-conditioned pressure residual head
+                _r6_vel = pred[:, :, :2].detach()
+                _r6_cond = torch.cat([_r6_vel, x[:, :, 13:14], x[:, :, 14:15], x[:, :, 21:22]], dim=-1)
+                _r6_pres = _pressure_head(_r6_cond)
+                pred = pred.clone()
+                pred[:, :, 2:3] = pred[:, :, 2:3] + _r6_pres
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         if cfg.tandem_ramp:
@@ -1214,6 +1295,11 @@ for epoch in range(MAX_EPOCHS):
             abs_err = abs_err * sample_mask
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
+
+        # GPU 7: channel-weighted loss — upweight pressure channel
+        if cfg.p_channel_weight != 1.0 and model.training:
+            abs_err = abs_err.clone()
+            abs_err[:, :, 2:3] = abs_err[:, :, 2:3] * cfg.p_channel_weight
 
         # Progressive resolution: subsample volume nodes in loss early in training
         # Ramps from 10% → 100% of volume nodes over first 40 epochs
@@ -1278,6 +1364,31 @@ for epoch in range(MAX_EPOCHS):
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
         else:
             loss = vol_loss + surf_weight * surf_loss
+
+        # Phase 3 R6: auxiliary losses
+        if model.training:
+            # GPU 0: surface pressure gradient supervision
+            if cfg.predict_grad_p:
+                _r6g_loss = torch.zeros(1, device=device)
+                for _r6gb in range(B):
+                    _r6g_sm = surf_mask[_r6gb]
+                    if _r6g_sm.sum() >= 3:
+                        _r6g_sx = x[_r6gb, _r6g_sm, 0]
+                        _r6g_idx = _r6g_sx.argsort()
+                        _r6g_pp = pred[_r6gb, _r6g_sm, 2][_r6g_idx]
+                        _r6g_tp = y_norm[_r6gb, _r6g_sm, 2][_r6g_idx]
+                        _r6g_loss = _r6g_loss + (_r6g_pp[1:] - _r6g_pp[:-1] - (_r6g_tp[1:] - _r6g_tp[:-1])).abs().mean()
+                loss = loss + 0.05 * _r6g_loss / B
+            # GPU 2: quantile regression auxiliary loss
+            if cfg.quantile_pred and _quantile_lo is not None:
+                _r6q_tgt = y_norm[:, :, 2:3].detach()
+                _r6q_mid = pred[:, :, 2:3]
+                _r6q_lo = _r6q_mid + _quantile_lo(_r6q_mid.detach())
+                _r6q_hi = _r6q_mid + _quantile_hi(_r6q_mid.detach())
+                def _r6_pinball(qp, tau):
+                    err = _r6q_tgt - qp
+                    return torch.where(err >= 0, tau * err, (tau - 1) * err).abs().mean()
+                loss = loss + 0.1 * (_r6_pinball(_r6q_lo, 0.25) + _r6_pinball(_r6q_mid, 0.5) + _r6_pinball(_r6q_hi, 0.75))
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
@@ -1523,6 +1634,38 @@ for epoch in range(MAX_EPOCHS):
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
+                # Phase 3 R6: eval inverse transformations
+                with torch.no_grad():
+                    if cfg.polar_velocity:
+                        _r6e_sp = pred[:, :, 0:1]
+                        _r6e_an = pred[:, :, 1:2] * 3.14159265
+                        pred = torch.cat([_r6e_sp * _r6e_an.cos(), _r6e_sp * _r6e_an.sin(), pred[:, :, 2:3]], dim=-1)
+                    if cfg.relative_p and not cfg.raw_targets:
+                        _r6e_surf = mask & is_surface
+                        _r6e_pmean = torch.zeros(B, 1, 1, device=device)
+                        for _r6eb in range(B):
+                            if _r6e_surf[_r6eb].sum() > 0:
+                                _r6e_pmean[_r6eb, 0, 0] = y_norm[_r6eb, _r6e_surf[_r6eb], 2].mean()
+                        pred = pred.clone()
+                        pred[:, :, 2:3] = pred[:, :, 2:3] + _r6e_pmean
+                    if cfg.residual_potflow and not cfg.raw_targets:
+                        _r6e_vol = (~is_surface).float().unsqueeze(-1)
+                        _r6e_bcp = (1.0 - y_phys[:, :, 0:1] ** 2 - y_phys[:, :, 1:2] ** 2) * _r6e_vol
+                        _r6e_bern = (_r6e_bcp - phys_stats["y_mean"][2]) / phys_stats["y_std"][2]
+                        pred = pred.clone()
+                        pred[:, :, 2:3] = pred[:, :, 2:3] + _r6e_bern
+                    if cfg.dual_output and _surf_refine is not None:
+                        _surf_refine.eval()
+                        _r6e_sm = (mask & is_surface).unsqueeze(-1).float()
+                        _r6e_ref = _surf_refine(pred * _r6e_sm) * _r6e_sm
+                        pred = pred + _r6e_ref
+                    if cfg.two_stage_pressure and _pressure_head is not None:
+                        _pressure_head.eval()
+                        _r6e_vel = pred[:, :, :2]
+                        _r6e_cond = torch.cat([_r6e_vel, x[:, :, 13:14], x[:, :, 14:15], x[:, :, 21:22]], dim=-1)
+                        _r6e_pres = _pressure_head(_r6e_cond)
+                        pred = pred.clone()
+                        pred[:, :, 2:3] = pred[:, :, 2:3] + _r6e_pres
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
                 else:
