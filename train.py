@@ -654,7 +654,11 @@ class Config:
     # Phase 3: compound experiments
     seed: int = -1                     # random seed (-1 = no seeding)
     n_layers: int = 2                  # number of TransolverBlocks (default 2)
-    use_lion: bool = False             # use Lion optimizer instead of AdamW
+    # Phase 3: data augmentation (training-only)
+    aug: str = "none"  # none|yflip|jitter|featdrop|mixup|scale|flip_jitter|aoa_perturb|cutmix
+    aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
+    aug_start_epoch: int = 0        # delay augmentation onset until this epoch
+    aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
 
 
 cfg = sp.parse(Config)
@@ -904,7 +908,7 @@ class Lookahead:
 
 class Lion(torch.optim.Optimizer):
     """Lion optimizer (Chen et al., 2023) — sign-based updates, ~2x less memory than AdamW."""
-    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0):
+    def __init__(self, params, lr=3e-4, betas=(0.9, 0.99), weight_decay=0.0):
         defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
@@ -1043,6 +1047,65 @@ for epoch in range(MAX_EPOCHS):
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
+
+        # --- Data augmentation (training-only, applied before normalization) ---
+        if model.training and cfg.aug != "none" and epoch >= cfg.aug_start_epoch:
+            if cfg.aug in ("yflip", "flip_jitter"):
+                _flip = torch.rand(x.size(0), 1, 1, device=x.device) < 0.5
+                x[:, :, 1:2] = torch.where(_flip, -x[:, :, 1:2], x[:, :, 1:2])
+                y[:, :, 1:2] = torch.where(_flip, -y[:, :, 1:2], y[:, :, 1:2])
+                for _idx in [3, 5, 7, 9]:
+                    x[:, :, _idx:_idx+1] = torch.where(_flip, -x[:, :, _idx:_idx+1], x[:, :, _idx:_idx+1])
+            if cfg.aug in ("jitter", "flip_jitter"):
+                x[:, :, :2] = x[:, :, :2] + 0.001 * torch.randn_like(x[:, :, :2])
+            if cfg.aug == "featdrop":
+                _B_aug = x.size(0)
+                for _b in range(_B_aug):
+                    _drop = torch.randperm(22, device=x.device)[:2] + 2
+                    x[_b, :, _drop] = 0.0
+            if cfg.aug == "mixup":
+                _B_aug = x.size(0)
+                _beta_dist = torch.distributions.Beta(torch.tensor(0.2), torch.tensor(0.2))
+                _lam = _beta_dist.sample((_B_aug,)).to(x.device).view(_B_aug, 1, 1)
+                _mix_idx = torch.randperm(_B_aug, device=x.device)
+                x = _lam * x + (1 - _lam) * x[_mix_idx]
+                y = _lam * y + (1 - _lam) * y[_mix_idx]
+                mask = mask & mask[_mix_idx]
+            if cfg.aug == "scale":
+                _lo = 1.0 - cfg.aug_scale_range
+                _scale = torch.rand(x.size(0), 1, 1, device=x.device) * (2 * cfg.aug_scale_range) + _lo
+                x[:, :, :2] = x[:, :, :2] * _scale
+            if cfg.aug == "aoa_perturb":
+                _angle_deg = torch.rand(x.size(0), device=x.device) * 2.0 - 1.0
+                _angle_rad = _angle_deg * (torch.pi / 180.0)
+                _cos_a = torch.cos(_angle_rad).view(-1, 1, 1)
+                _sin_a = torch.sin(_angle_rad).view(-1, 1, 1)
+                _xc, _yc = x[:, :, 0:1].clone(), x[:, :, 1:2].clone()
+                x[:, :, 0:1] = _cos_a * _xc - _sin_a * _yc
+                x[:, :, 1:2] = _sin_a * _xc + _cos_a * _yc
+                _Ux, _Uy = y[:, :, 0:1].clone(), y[:, :, 1:2].clone()
+                y[:, :, 0:1] = _cos_a * _Ux - _sin_a * _Uy
+                y[:, :, 1:2] = _sin_a * _Ux + _cos_a * _Uy
+                if cfg.aug_full_dsdf_rot:
+                    # Rotate DSDF gradient pairs (x,y components at indices 2-9)
+                    for _xi, _yi in [(2, 3), (4, 5), (6, 7), (8, 9)]:
+                        _dx = x[:, :, _xi:_xi+1].clone()
+                        _dy = x[:, :, _yi:_yi+1].clone()
+                        x[:, :, _xi:_xi+1] = _cos_a * _dx - _sin_a * _dy
+                        x[:, :, _yi:_yi+1] = _sin_a * _dx + _cos_a * _dy
+            if cfg.aug == "cutmix":
+                _B_aug = x.size(0)
+                _cut_idx = torch.randperm(_B_aug, device=x.device)
+                _x0 = x[:, :, 0]
+                _x0_lo = _x0.min(dim=1).values
+                _x0_hi = _x0.max(dim=1).values
+                _x_start = _x0_lo + torch.rand(_B_aug, device=x.device) * (_x0_hi - _x0_lo - 0.3).clamp(min=0)
+                _x_end = _x_start + 0.3
+                for _b in range(_B_aug):
+                    _in_region = (_x0[_b] >= _x_start[_b]) & (_x0[_b] <= _x_end[_b])
+                    x[_b, _in_region] = x[_cut_idx[_b], _in_region]
+                    y[_b, _in_region] = y[_cut_idx[_b], _in_region]
+                    is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
