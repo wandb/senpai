@@ -654,6 +654,7 @@ class Config:
     # Phase 3: compound experiments
     seed: int = -1                     # random seed (-1 = no seeding)
     n_layers: int = 2                  # number of TransolverBlocks (default 2)
+    use_lion: bool = False             # use Lion optimizer instead of AdamW
 
 
 cfg = sp.parse(Config)
@@ -839,6 +840,38 @@ class SAM:
                 if hasattr(p, '_sam_e_w'):
                     p.data.sub_(p._sam_e_w)
                     del p._sam_e_w
+
+
+class Lion(torch.optim.Optimizer):
+    """Lion optimizer (Chen et al., 2023). Sign-based updates, ~2x less memory than AdamW.
+
+    Use lr ~3-10x lower than AdamW (e.g. lr=3e-4 instead of 1.5e-3).
+    """
+    def __init__(self, params, lr=3e-4, betas=(0.9, 0.99), weight_decay=0.0):
+        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if 'exp_avg' not in state:
+                    state['exp_avg'] = torch.zeros_like(p.data)
+                exp_avg = state['exp_avg']
+                b1, b2 = group['betas']
+                update = exp_avg * b1 + p.grad * (1 - b1)
+                p.data.add_(update.sign(), alpha=-group['lr'])
+                if group['weight_decay'] > 0:
+                    p.data.mul_(1 - group['lr'] * group['weight_decay'])
+                exp_avg.mul_(b2).add_(p.grad, alpha=1 - b2)
+        return loss
 
 
 class Lookahead:
