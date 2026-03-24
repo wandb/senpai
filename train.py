@@ -250,6 +250,7 @@ class TransolverBlock(nn.Module):
         film_cond=False,
         decouple_slice=False,
         zone_temp=False,
+        moe_tandem=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -258,6 +259,7 @@ class TransolverBlock(nn.Module):
         self.soft_moe = soft_moe
         self.adaln_all = adaln_all
         self.film_cond = film_cond
+        self.moe_tandem = moe_tandem
         self.ln_1 = nn.LayerNorm(hidden_dim)
         self.attn = Physics_Attention_Irregular_Mesh(
             hidden_dim,
@@ -324,6 +326,14 @@ class TransolverBlock(nn.Module):
                 self.mlp2 = nn.Sequential(
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
+            elif moe_tandem:
+                # Hard-routed dual output heads: tandem samples → mlp2_tandem, single → mlp2_single
+                self.mlp2_single = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+                self.mlp2_tandem = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
             else:
                 self.mlp2 = nn.Sequential(
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
@@ -361,6 +371,11 @@ class TransolverBlock(nn.Module):
                 scale, shift = cond.chunk(2, dim=-1)  # [B, H]
                 fx_ln = fx_ln * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
                 return self.mlp2(fx_ln)
+            elif self.moe_tandem and tandem_mask is not None:
+                # Hard routing: tandem_mask is [B,1,1,1] float in [0,1]
+                is_tan = tandem_mask[:, 0, 0, :]  # [B, 1]
+                is_tan = is_tan.unsqueeze(1)  # [B, 1, 1]
+                return is_tan * self.mlp2_tandem(fx_ln) + (1 - is_tan) * self.mlp2_single(fx_ln)
             else:
                 return self.mlp2(fx_ln)
         return fx
@@ -395,6 +410,7 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        moe_tandem=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -451,6 +467,7 @@ class Transolver(nn.Module):
                     field_decoder=field_decoder if (idx == n_layers - 1) else False,
                     adaln_output=adaln_output if (idx == n_layers - 1) else False,
                     soft_moe=soft_moe if (idx == n_layers - 1) else False,
+                    moe_tandem=moe_tandem if (idx == n_layers - 1) else False,
                     adaln_all=adaln_all_blocks,
                     adaln_cond_dim=4 if adaln_4cond else 2,
                     adaln_zero_init=not adaln_nozero,
@@ -659,6 +676,10 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R3b: compound improvements
+    high_p_clamp: bool = False      # raise pressure per-sample std clamp to 2.0 (single: 0.5→2.0, tandem: 1.0→2.0)
+    moe_tandem: bool = False        # dual output heads (tandem vs single), hard-routed per sample
+    tandem_fixed_weight: float = 0.0  # if >0, replace adaptive tandem boost with this fixed multiplier
 
 
 cfg = sp.parse(Config)
@@ -782,6 +803,7 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    moe_tandem=cfg.moe_tandem,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1150,8 +1172,12 @@ for epoch in range(MAX_EPOCHS):
         is_tandem = raw_gap.abs() > 0.5
         B = y_norm.shape[0]
         sample_stds = torch.ones(B, 1, 3, device=device)
-        channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
-        tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+        if cfg.high_p_clamp:
+            channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
+            tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
+        else:
+            channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
+            tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
         if model.training:
             for b in range(B):
                 valid = mask[b]
@@ -1226,7 +1252,12 @@ for epoch in range(MAX_EPOCHS):
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
             surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
-        if cfg.tandem_ramp:
+        if cfg.tandem_fixed_weight > 0.0:
+            # Fixed multiplier: bypass adaptive boost
+            tandem_boost = torch.where(is_tandem_batch,
+                                       torch.tensor(cfg.tandem_fixed_weight, device=device),
+                                       torch.ones(B, device=device))
+        elif cfg.tandem_ramp:
             tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
             tandem_boost = torch.where(is_tandem_batch,
                                        torch.tensor(adaptive_boost * tandem_weight, device=device),
@@ -1458,8 +1489,12 @@ for epoch in range(MAX_EPOCHS):
                 is_tandem = raw_gap.abs() > 0.5
                 B = y_norm.shape[0]
                 sample_stds = torch.ones(B, 1, 3, device=device)
-                channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
-                tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+                if cfg.high_p_clamp:
+                    channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
+                    tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
+                else:
+                    channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
+                    tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
                 for b in range(B):
                     valid = mask[b]
                     if is_tandem[b]:
