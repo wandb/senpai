@@ -659,6 +659,13 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R3: GradNorm loss balancing
+    use_gradnorm: bool = False        # GradNorm dynamic task weight balancing
+    gradnorm_alpha: float = 1.5       # GradNorm asymmetry parameter
+    gradnorm_3task: bool = False      # Split surface into tandem/non-tandem tasks
+    gradnorm_start_epoch: int = 0     # Delay GradNorm updates until this epoch
+    tandem_3x_weight: bool = False    # Fixed 3x tandem pressure weight (no GradNorm)
+    gradnorm_variance: bool = False   # Add variance penalty on per-sample surface errors
 
 
 cfg = sp.parse(Config)
@@ -946,6 +953,12 @@ else:
     else:
         optimizer = base_opt
 
+# GradNorm: trainable log-scale task weights (updated per-batch by gradient norm balancing)
+_gn_n_tasks = 3 if cfg.gradnorm_3task else 2
+gn_log_w = nn.Parameter(torch.zeros(_gn_n_tasks, device=device))  # log(w_i), init 0 → w_i=1
+gn_optim = torch.optim.Adam([gn_log_w], lr=1e-2) if cfg.use_gradnorm else None
+gn_init_losses = None  # set on first GradNorm-active batch (torch.Tensor)
+
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
     _warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
@@ -1226,7 +1239,9 @@ for epoch in range(MAX_EPOCHS):
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
             surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
-        if cfg.tandem_ramp:
+        if cfg.tandem_3x_weight:
+            tandem_boost = torch.where(is_tandem_batch, torch.tensor(3.0, device=device), torch.ones(B, device=device))
+        elif cfg.tandem_ramp:
             tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
             tandem_boost = torch.where(is_tandem_batch,
                                        torch.tensor(adaptive_boost * tandem_weight, device=device),
@@ -1243,6 +1258,20 @@ for epoch in range(MAX_EPOCHS):
                     surf_ux_loss * torch.exp(-2 * bm.log_sigma_surf_ux) / 2 + bm.log_sigma_surf_ux +
                     surf_uy_loss * torch.exp(-2 * bm.log_sigma_surf_uy) / 2 + bm.log_sigma_surf_uy +
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
+        elif cfg.use_gradnorm:
+            # GradNorm path: task losses without adaptive surf_weight/tandem_boost
+            _surf_base = surf_per_sample.mean()
+            if cfg.gradnorm_3task:
+                _n_tan = is_tandem_batch.float().sum().clamp(min=1)
+                _n_non = (~is_tandem_batch).float().sum().clamp(min=1)
+                _surf_tan = (surf_per_sample * is_tandem_batch.float()).sum() / _n_tan
+                _surf_non = (surf_per_sample * (~is_tandem_batch).float()).sum() / _n_non
+                _gn_task_losses = torch.stack([vol_loss, _surf_non, _surf_tan])
+            else:
+                _gn_task_losses = torch.stack([vol_loss, _surf_base])
+            _gn_w = gn_log_w.exp().detach()
+            loss = (_gn_w * _gn_task_losses).sum()
+            surf_loss = _surf_base  # for logging
         else:
             loss = vol_loss + surf_weight * surf_loss
 
@@ -1292,11 +1321,37 @@ for epoch in range(MAX_EPOCHS):
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
 
+        # GradNorm: update task weights based on gradient norm balance at last shared layer
+        if cfg.use_gradnorm and model.training and epoch >= cfg.gradnorm_start_epoch:
+            if gn_init_losses is None:
+                gn_init_losses = _gn_task_losses.detach().clone()
+            _shared_params = [p for p in model.blocks[-1].parameters() if p.requires_grad]
+            _gnorms_sq = []
+            for _Li in _gn_task_losses:
+                _gs = torch.autograd.grad(_Li, _shared_params, retain_graph=True, allow_unused=True)
+                _gnorms_sq.append(sum(_g.pow(2).sum() for _g in _gs if _g is not None).detach())
+            _gnorms = torch.stack(_gnorms_sq).sqrt()
+            with torch.no_grad():
+                _gn_w = gn_log_w.exp()
+                _G_i = _gn_w * _gnorms
+                _G_bar = _G_i.mean()
+                _L_hat = _gn_task_losses.detach() / gn_init_losses.clamp(min=1e-8)
+                _r_i = _L_hat / _L_hat.mean().clamp(min=1e-8)
+                _G_target = _G_bar * _r_i.pow(cfg.gradnorm_alpha)
+                gn_log_w.grad = ((_G_i - _G_target).sign() * _G_i).to(gn_log_w)
+            gn_optim.step()
+            with torch.no_grad():
+                gn_log_w.data -= gn_log_w.data.mean()  # renormalize: keep mean(w_i)=1
+
+        # Variance penalty on surface errors (GPU 7)
+        if cfg.gradnorm_variance and model.training:
+            loss = loss + 0.1 * surf_per_sample.var()
+
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
         is_indist_pcgrad = ~is_ood_pcgrad
-        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
+        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any() and not cfg.use_gradnorm
 
         if use_pcgrad:
             n_a = is_indist_pcgrad.float().sum().clamp(min=1)
