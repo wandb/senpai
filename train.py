@@ -21,6 +21,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
 """
 
 import os
+import random
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -585,8 +586,8 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-MAX_TIMEOUT = 180.0  # minutes
-MAX_EPOCHS = 500
+MAX_TIMEOUT = float(os.environ.get("SENPAI_TIMEOUT_MINUTES", "180"))
+MAX_EPOCHS = int(os.environ.get("SENPAI_MAX_EPOCHS", "500"))
 
 
 @dataclass
@@ -651,6 +652,14 @@ class Config:
     use_lion: bool = False        # GPU 4: Lion optimizer instead of AdamW
     rdrop: bool = False           # GPU 7: R-drop regularization
     rdrop_alpha: float = 1.0     # R-drop consistency loss weight
+    # Phase 3: Synthetic data & domain adaptation
+    synth_interp: bool = False         # GPU0/7: in-batch synthetic sample interpolation (25% prob)
+    tta_eval: bool = False             # GPU1/7: Test-Time Augmentation at validation (3-pass avg)
+    self_distill: bool = False         # GPU2: self-distillation with EMA model as teacher
+    phys_features: bool = False        # GPU3/7: add 4 physics-derived input features
+    adaptive_noise: bool = False       # GPU4: per-sample adaptive noise (tandem=less, easy=more)
+    surf_oversample: bool = False      # GPU5: count surface nodes twice in loss
+    cond_weight: bool = False          # GPU6: condition-aware (Re, AoA) sample weighting
 
 
 cfg = sp.parse(Config)
@@ -707,6 +716,31 @@ def _phys_denorm(y_p, Umag, q):
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
 
+if cfg.cond_weight and not cfg.debug:
+    # Condition-aware sample weighting: inverse density in (log_Re, AoA) space
+    print("Computing condition-aware sample weights...")
+    _re_vals, _aoa_vals = [], []
+    for _i in range(len(train_ds)):
+        _xi, _, _ = train_ds[_i]
+        _re_vals.append(_xi[0, 13].item())   # log_Re
+        _aoa_vals.append(_xi[0, 14].item())  # AoA0_rad
+    _re_t = torch.tensor(_re_vals)
+    _aoa_t = torch.tensor(_aoa_vals)
+    _n_bins = 10
+    _re_bins = torch.linspace(_re_t.min(), _re_t.max(), _n_bins + 1)
+    _aoa_bins = torch.linspace(_aoa_t.min(), _aoa_t.max(), _n_bins + 1)
+    _re_idx = torch.bucketize(_re_t, _re_bins[1:-1])
+    _aoa_idx = torch.bucketize(_aoa_t, _aoa_bins[1:-1])
+    _bin_counts = torch.zeros(_n_bins, _n_bins)
+    for _i in range(len(_re_idx)):
+        _bin_counts[_re_idx[_i], _aoa_idx[_i]] += 1
+    sample_weights = torch.tensor(
+        [1.0 / max(_bin_counts[_re_idx[_i], _aoa_idx[_i]].item(), 1.0)
+         for _i in range(len(train_ds))],
+        dtype=torch.float64,
+    )
+    print(f"  Condition weights: min={sample_weights.min():.4f}, max={sample_weights.max():.4f}")
+
 if cfg.debug:
     # Avoid sampler/length mismatch when train_ds is truncated
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
@@ -748,7 +782,7 @@ print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32 + (4 if cfg.phys_features else 0),  # +curv, +dist, [+foil2dist], +32 fourier PE, [+4 phys]
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=2,
@@ -1004,7 +1038,26 @@ for epoch in range(MAX_EPOCHS):
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
 
+        # Synthetic interpolation: with 25% prob per sample, interpolate with a same-type batch mate
+        if cfg.synth_interp and model.training:
+            _is_tan_raw = (x[:, 0, 21].abs() > 0.01)  # NACA1[2] proxy for tandem (pre-std)
+            _B_s = x.shape[0]
+            for _b in range(_B_s):
+                if random.random() < 0.25:
+                    _is_tan_b = _is_tan_raw[_b].item()
+                    _cands = [_i for _i in range(_B_s)
+                              if _i != _b and _is_tan_raw[_i].item() == _is_tan_b]
+                    if _cands:
+                        _b2 = random.choice(_cands)
+                        _n1 = int(mask[_b].sum().item())
+                        _n2 = int(mask[_b2].sum().item())
+                        if _n1 == _n2:  # only interpolate same-topology meshes
+                            _lam = random.uniform(0.3, 0.7)
+                            x[_b, :_n1] = _lam * x[_b, :_n1] + (1 - _lam) * x[_b2, :_n2]
+                            y[_b, :_n1] = _lam * y[_b, :_n1] + (1 - _lam) * y[_b2, :_n2]
+
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
+        _raw_x_pos = x[:, :, 0].clone() if cfg.phys_features else None  # save for chord pos
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         x = (x - stats["x_mean"]) / stats["x_std"]
@@ -1015,6 +1068,15 @@ for epoch in range(MAX_EPOCHS):
             x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
         else:
             x = torch.cat([x, curv, dist_feat], dim=-1)
+        # Physics-derived features (GPU3/7)
+        if cfg.phys_features:
+            _umag_proxy = (raw_dsdf[:, :, 0]**2 + raw_dsdf[:, :, 1]**2).sqrt().unsqueeze(-1)
+            _pgrad_proxy = raw_dsdf[:, :, 2:4].norm(dim=-1, keepdim=True)
+            _wall_decay = torch.exp(-dist_feat)  # exp(-log1p(10*d)) = 1/(1+10*d)
+            _xmin = _raw_x_pos.amin(dim=1, keepdim=True)
+            _xmax = _raw_x_pos.amax(dim=1, keepdim=True)
+            _chord_pos = (_raw_x_pos - _xmin) / (_xmax - _xmin + 1e-8)
+            x = torch.cat([x, _umag_proxy, _pgrad_proxy, _wall_decay, _chord_pos.unsqueeze(-1)], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -1022,12 +1084,21 @@ for epoch in range(MAX_EPOCHS):
         xy_max = raw_xy.amax(dim=1, keepdim=True)
         xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
         freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-        xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+        xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 8]
+        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 32]
         x = torch.cat([x, fourier_pe], dim=-1)
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
-            x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
+            if cfg.adaptive_noise:
+                # Harder samples (tandem) get less noise; easy samples get more
+                _is_tan_noise = (x[:, 0, 21].abs() > 0.5)  # tandem check (post-std)
+                _noise_factors = torch.where(_is_tan_noise,
+                                             torch.full((_is_tan_noise.shape[0],), 0.3, device=device),
+                                             torch.ones(_is_tan_noise.shape[0], device=device))
+                x[:, :, 2:25] = x[:, :, 2:25] + (noise_scale * _noise_factors[:, None, None]
+                                                   * torch.randn_like(x[:, :, 2:25]))
+            else:
+                x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
         Umag, q = _umag_q(y, mask)
         y_phys = _phys_norm(y, Umag, q)
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
@@ -1131,6 +1202,10 @@ for epoch in range(MAX_EPOCHS):
         else:
             tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
+        if cfg.surf_oversample:
+            # Count surface nodes a second time in vol_loss to amplify surface gradients
+            surf_in_vol = (abs_err * surf_mask.unsqueeze(-1)).sum() / (vol_mask_train.sum() + surf_mask.sum()).clamp(min=1)
+            vol_loss = vol_loss + surf_in_vol
         if cfg.uncertainty_loss:
             bm = _base_model
             surf_ux_loss = (abs_err[:, :, 0:1] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
@@ -1142,6 +1217,18 @@ for epoch in range(MAX_EPOCHS):
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
         else:
             loss = vol_loss + surf_weight * surf_loss
+        # Self-distillation: blend GT and EMA-teacher soft targets (active after EMA starts)
+        if cfg.self_distill and ema_model is not None:
+            ema_model.eval()
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                _teacher_pred = ema_model({"x": x})["preds"].float()
+            if model.training:
+                _teacher_pred = _teacher_pred / sample_stds
+            _distill_loss = (_teacher_pred.detach() - pred).abs()
+            _distill_loss_vol = (_distill_loss * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+            _distill_loss_surf = (_distill_loss[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            _distill_total = _distill_loss_vol + surf_weight * _distill_loss_surf
+            loss = 0.5 * loss + 0.5 * _distill_total
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
@@ -1326,6 +1413,7 @@ for epoch in range(MAX_EPOCHS):
                 mask = mask.to(device, non_blocking=True)
 
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
+                _raw_x_pos_v = x[:, :, 0].clone() if cfg.phys_features else None
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 x = (x - stats["x_mean"]) / stats["x_std"]
@@ -1336,6 +1424,15 @@ for epoch in range(MAX_EPOCHS):
                     x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
                 else:
                     x = torch.cat([x, curv, dist_feat], dim=-1)
+                # Physics-derived features (GPU3/7)
+                if cfg.phys_features:
+                    _umag_p_v = (raw_dsdf[:, :, 0]**2 + raw_dsdf[:, :, 1]**2).sqrt().unsqueeze(-1)
+                    _pgrad_p_v = raw_dsdf[:, :, 2:4].norm(dim=-1, keepdim=True)
+                    _wall_d_v = torch.exp(-dist_feat)
+                    _xmin_v = _raw_x_pos_v.amin(dim=1, keepdim=True)
+                    _xmax_v = _raw_x_pos_v.amax(dim=1, keepdim=True)
+                    _chord_v = (_raw_x_pos_v - _xmin_v) / (_xmax_v - _xmin_v + 1e-8)
+                    x = torch.cat([x, _umag_p_v, _pgrad_p_v, _wall_d_v, _chord_v.unsqueeze(-1)], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -1343,8 +1440,8 @@ for epoch in range(MAX_EPOCHS):
                 xy_max = raw_xy.amax(dim=1, keepdim=True)
                 xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
                 freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-                xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+                xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 8]
+                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 32]
                 x = torch.cat([x, fourier_pe], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 y_phys = _phys_norm(y, Umag, q)
@@ -1365,9 +1462,31 @@ for epoch in range(MAX_EPOCHS):
                         sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
                 y_norm_scaled = y_norm / sample_stds
 
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
-                pred = pred.float()
+                if cfg.tta_eval:
+                    # 3-pass TTA: original, y-flipped (AoA negated), and jittered
+                    _preds_tta = []
+                    # Pass 1: original
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _preds_tta.append(eval_model({"x": x})["preds"].float())
+                    # Pass 2: y-flip (negate y-pos and AoA, flip Uy in output)
+                    _x_yflip = x.clone()
+                    _x_yflip[:, :, 1] = -_x_yflip[:, :, 1]   # negate y coordinate
+                    _x_yflip[:, :, 14] = -_x_yflip[:, :, 14]  # negate AoA0_rad
+                    _x_yflip[:, :, 18] = -_x_yflip[:, :, 18]  # negate AoA1_rad
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _p_flip = eval_model({"x": _x_yflip})["preds"].float()
+                    _p_flip[:, :, 1] = -_p_flip[:, :, 1]  # flip Uy back
+                    _preds_tta.append(_p_flip)
+                    # Pass 3: small jitter on non-spatial features
+                    _x_jit = x.clone()
+                    _x_jit[:, :, 2:25] = _x_jit[:, :, 2:25] + 0.01 * torch.randn_like(_x_jit[:, :, 2:25])
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _preds_tta.append(eval_model({"x": _x_jit})["preds"].float())
+                    pred = torch.stack(_preds_tta).mean(0)
+                else:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        pred = eval_model({"x": x})["preds"]
+                    pred = pred.float()
                 pred_loss = pred / sample_stds
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
