@@ -659,6 +659,12 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R3: variance-based surface regularization + Cp direct prediction
+    var_surf_weight: float = 0.0    # weight for variance penalty on surface pressure node errors
+    var_surf_delay: int = 0         # epoch to start variance penalty (0 = from beginning)
+    var_all_channels: bool = False  # apply variance penalty to all channels (not just pressure)
+    max_error_weight: float = 0.0   # weight for max per-node surface pressure error penalty
+    cp_direct: bool = False         # skip per-sample std norm for pressure channel only
 
 
 cfg = sp.parse(Config)
@@ -1159,6 +1165,9 @@ for epoch in range(MAX_EPOCHS):
                     sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
                 else:
                     sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+            if cfg.cp_direct:
+                # Remove per-sample std norm for pressure channel only (channel 2)
+                sample_stds[:, :, 2] = 1.0
             y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -1245,6 +1254,29 @@ for epoch in range(MAX_EPOCHS):
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
         else:
             loss = vol_loss + surf_weight * surf_loss
+
+        # Variance/max-error penalty on surface pressure node errors (Phase 3 R3)
+        if (cfg.var_surf_weight > 0.0 or cfg.max_error_weight > 0.0) and epoch >= cfg.var_surf_delay:
+            surf_pres_per_node = abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)  # [B, N, 1]
+            if cfg.var_all_channels:
+                surf_pres_per_node = abs_err * surf_mask.unsqueeze(-1)  # all 3 channels
+            variance_penalty = torch.tensor(0.0, device=device)
+            max_penalty = torch.tensor(0.0, device=device)
+            n_valid = 0
+            for _b in range(B):
+                valid_surf = surf_mask[_b]
+                if valid_surf.sum() > 10:
+                    node_errors = surf_pres_per_node[_b, valid_surf]  # [N_surf, C]
+                    if cfg.var_surf_weight > 0.0:
+                        variance_penalty = variance_penalty + node_errors.std()
+                    if cfg.max_error_weight > 0.0:
+                        max_penalty = max_penalty + node_errors.max()
+                    n_valid += 1
+            if n_valid > 0:
+                if cfg.var_surf_weight > 0.0:
+                    loss = loss + cfg.var_surf_weight * variance_penalty / n_valid
+                if cfg.max_error_weight > 0.0:
+                    loss = loss + cfg.max_error_weight * max_penalty / n_valid
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
