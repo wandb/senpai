@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: senpai-image-test
+  labels:
+    app: senpai
+    role: test
+spec:
+  containers:
+  - name: test
+    image: ghcr.io/wandb/senpai:32da5cf
+    command: ["/bin/bash", "-c"]
+    args:
+    - |
+      git clone --branch docker --depth 1 https://${GITHUB_TOKEN}@github.com/wandb/senpai.git /tmp/senpai
+      source /tmp/senpai/k8s/install-weave-cc-plugin.sh
+      sleep infinity
+    env:
+    - name: WANDB_ENTITY
+      value: "wandb-applied-ai-team"
+    - name: WANDB_PROJECT
+      value: "senpai-v1"
+    - name: WANDB_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: senpai-secrets
+          key: wandb-api-key
+    - name: ANTHROPIC_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: senpai-secrets
+          key: anthropic-api-key
+    - name: GITHUB_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: senpai-secrets
+          key: github-token
+    resources:
+      requests:
+        cpu: "2"
+        memory: "4Gi"
+      limits:
+        cpu: "4"
+        memory: "8Gi"

@@ -7,23 +7,20 @@
 # Register the Weave Claude Code plugin at runtime.
 # The Docker image already has the npm package, timeout patch, and base config.
 # This script registers the marketplace + plugin with the `claude` CLI and
-# writes the runtime-specific config values.
+# persists the weave_project into settings.json for the daemon.
 #
-# Requires WANDB_ENTITY, WANDB_PROJECT, WANDB_API_KEY, and GITHUB_TOKEN.
+# Requires GITHUB_TOKEN and WANDB_API_KEY in the environment (from k8s secrets).
+# WANDB_API_KEY is read directly from the env var by the plugin — no need to
+# write it to settings.json.
 
 # Make git use GITHUB_TOKEN for HTTPS + SSH-style GitHub URLs (needed to clone
 # the private wandb/claude_code_weave_plugin marketplace repo).
 git config --global url."https://${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
 git config --global url."https://${GITHUB_TOKEN}@github.com/".insteadOf "git@github.com:"
 
-# Export WEAVE_PROJECT so the install command picks it up (skips interactive prompt).
-export WEAVE_PROJECT="${WANDB_ENTITY}/${WANDB_PROJECT}"
-
-# Register marketplace and install plugin (fully non-interactive with env vars set).
+# Register marketplace and install plugin (fully non-interactive).
 claude plugin marketplace add wandb/claude_code_weave_plugin || true
 claude plugin install weave@weave-claude-plugin --scope user || true
 
-# Persist project and API key into settings.json so the daemon reads them
-# when started as a background subprocess (env vars may not be inherited).
+# Persist weave_project into settings.json for the daemon.
 weave-claude-plugin config set weave_project "${WANDB_ENTITY}/${WANDB_PROJECT}" || true
-weave-claude-plugin config set wandb_api_key "${WANDB_API_KEY}" || true

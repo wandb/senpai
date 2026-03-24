@@ -26,7 +26,7 @@ curl -fsSL https://claude.ai/install.sh | bash
 export PATH="$HOME/.claude/bin:$PATH"
 
 # --- Install Weave Claude Code Plugin ---
-source "$WORKDIR/tools/install-weave-cc-plugin.sh"
+source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
 
 # --- Install gh CLI ---
 curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
