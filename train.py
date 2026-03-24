@@ -656,6 +656,7 @@ class Config:
     no_perstd_p: bool = False         # GPU 1: remove per-sample std for pressure only
     unified_clamps: bool = False      # GPU 2: unified clamps (0.2, 0.2, 0.7) for all
     high_p_clamp: bool = False        # GPU 3: higher pressure clamp (2.0)
+    p_clamp_single: float = 0.0      # if >0, override single-foil pressure clamp (tandem stays 2.0)
     multiply_std: bool = False        # GPU 4: multiply instead of divide per-sample std
     raw_targets: bool = False         # GPU 5: skip physics norm, raw target space
     tight_denorm_clamps: bool = False  # GPU 6: tighter denorm clamps [-5,5]/[-10,10]
@@ -1168,6 +1169,9 @@ for epoch in range(MAX_EPOCHS):
         if not cfg.no_perstd and not cfg.raw_targets:
             if cfg.unified_clamps:
                 channel_clamps = tandem_clamps = torch.tensor([0.2, 0.2, 0.7], device=device)
+            elif cfg.p_clamp_single > 0.0:
+                channel_clamps = torch.tensor([0.1, 0.1, cfg.p_clamp_single], device=device)
+                tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
             elif cfg.high_p_clamp:
                 channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
                 tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
@@ -1500,6 +1504,9 @@ for epoch in range(MAX_EPOCHS):
                 if not cfg.no_perstd and not cfg.raw_targets:
                     if cfg.unified_clamps:
                         channel_clamps = tandem_clamps = torch.tensor([0.2, 0.2, 0.7], device=device)
+                    elif cfg.p_clamp_single > 0.0:
+                        channel_clamps = torch.tensor([0.1, 0.1, cfg.p_clamp_single], device=device)
+                        tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
                     elif cfg.high_p_clamp:
                         channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
                         tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
