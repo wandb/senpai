@@ -643,6 +643,14 @@ class Config:
     tandem_ramp: bool = False          # gradual tandem surface loss warm-in (0→1 over epochs 10-50)
     foil2_dist: bool = False           # explicit foil-2 distance feature (from secondary dsdf)
     slice_num: int = 48                # slice count (default 48, GPU6: 96)
+    # Phase 3: training dynamics experiments
+    swa: bool = False             # GPU 0/6: uniform SWA weight averaging
+    swa_start_epoch: int = 200   # epoch to start SWA (GPU 0: 200, GPU 6: 160)
+    grad_accum_steps: int = 1    # GPU 2: gradient accumulation (step every N batches)
+    half_target_noise: bool = False  # GPU 3: reduce target noise by 50%
+    use_lion: bool = False        # GPU 4: Lion optimizer instead of AdamW
+    rdrop: bool = False           # GPU 7: R-drop regularization
+    rdrop_alpha: float = 1.0     # R-drop consistency loss weight
 
 
 cfg = sp.parse(Config)
@@ -747,6 +755,7 @@ model_config = dict(
     n_head=3,
     slice_num=cfg.slice_num,
     mlp_ratio=2,
+    dropout=0.05 if cfg.rdrop else 0.0,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
     linear_no_attention=cfg.linear_no_attention,
@@ -775,6 +784,8 @@ swad_prev_val = float("inf")
 swad_checkpoints: list = []
 swad_collecting = False
 swad_done = False
+swa_model = None
+swa_n = 0
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -851,16 +862,45 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
+class Lion(torch.optim.Optimizer):
+    """Lion optimizer (Chen et al., 2023) — sign-based updates, ~2x less memory than AdamW."""
+    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0):
+        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    def step(self, closure=None):
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if 'exp_avg' not in state:
+                    state['exp_avg'] = torch.zeros_like(p.data)
+                exp_avg = state['exp_avg']
+                b1, b2 = group['betas']
+                update = exp_avg * b1 + p.grad * (1 - b1)
+                p.data.add_(update.sign(), alpha=-group['lr'])
+                p.data.mul_(1 - group['lr'] * group['weight_decay'])
+                exp_avg.mul_(b2).add_(p.grad, alpha=1 - b2)
+
+
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
-base_opt = torch.optim.AdamW([
-    {'params': attn_params, 'lr': cfg.lr * 0.5},
-    {'params': other_params, 'lr': cfg.lr}
-], weight_decay=cfg.weight_decay)
-if cfg.use_lookahead:
-    optimizer = Lookahead(base_opt, k=10, alpha=0.8)
+if cfg.use_lion:
+    base_opt = Lion([
+        {'params': attn_params, 'lr': cfg.lr * 0.5},
+        {'params': other_params, 'lr': cfg.lr}
+    ], weight_decay=cfg.weight_decay)
+    optimizer = base_opt  # Lion has its own momentum; skip Lookahead
 else:
-    optimizer = base_opt
+    base_opt = torch.optim.AdamW([
+        {'params': attn_params, 'lr': cfg.lr * 0.5},
+        {'params': other_params, 'lr': cfg.lr}
+    ], weight_decay=cfg.weight_decay)
+    if cfg.use_lookahead:
+        optimizer = Lookahead(base_opt, k=10, alpha=0.8)
+    else:
+        optimizer = base_opt
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
@@ -957,7 +997,9 @@ for epoch in range(MAX_EPOCHS):
     n_batches = 0
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
-    for x, y, is_surface, mask in pbar:
+    if cfg.grad_accum_steps > 1:
+        optimizer.zero_grad()
+    for batch_idx, (x, y, is_surface, mask) in enumerate(pbar):
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -991,8 +1033,12 @@ for epoch in range(MAX_EPOCHS):
         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         if model.training:
             noise_progress = min(1.0, epoch / cfg.noise_anneal_epochs)
-            vel_noise = 0.015 * (1 - noise_progress) + 0.003 * noise_progress
-            p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
+            if cfg.half_target_noise:
+                vel_noise = 0.0075 * (1 - noise_progress) + 0.0015 * noise_progress
+                p_noise = 0.004 * (1 - noise_progress) + 0.0005 * noise_progress
+            else:
+                vel_noise = 0.015 * (1 - noise_progress) + 0.003 * noise_progress
+                p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
             noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
             y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
 
@@ -1133,6 +1179,16 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # R-drop: second forward pass with different dropout mask for consistency
+        rdrop_loss = torch.tensor(0.0, device=device)
+        if cfg.rdrop and model.training:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                rdrop_out = model({"x": x})
+                rdrop_pred = rdrop_out["preds"].float() / sample_stds
+            valid_mask = mask.float().unsqueeze(-1)
+            rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
+            loss = loss + cfg.rdrop_alpha * rdrop_loss
+
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
@@ -1177,12 +1233,16 @@ for epoch in range(MAX_EPOCHS):
                 else:
                     p.grad = (ga + gb) * 0.5
         else:
-            optimizer.zero_grad()
+            if cfg.grad_accum_steps <= 1:
+                optimizer.zero_grad()
             loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         sam_active = sam_optimizer is not None and epoch >= int(MAX_EPOCHS * 0.75)
-        if sam_active and not use_pcgrad:
+        _should_step = (cfg.grad_accum_steps <= 1 or
+                        (batch_idx + 1) % cfg.grad_accum_steps == 0 or
+                        batch_idx == len(train_loader) - 1)
+        if sam_active and not use_pcgrad and _should_step:
             # SAM first step: perturb parameters toward gradient direction
             sam_optimizer.perturb()
             sam_optimizer.zero_grad()
@@ -1202,13 +1262,16 @@ for epoch in range(MAX_EPOCHS):
             loss2.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             sam_optimizer.restore()
-        optimizer.step()
-        if step_scheduler_per_batch:
+        if use_pcgrad or _should_step:
+            optimizer.step()
+            if cfg.grad_accum_steps > 1 and not use_pcgrad:
+                optimizer.zero_grad()
+        if step_scheduler_per_batch and (use_pcgrad or _should_step):
             try:
                 scheduler.step()
             except ValueError:
                 pass
-        if epoch >= cfg.ema_start_epoch and not cfg.swad:
+        if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa:
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
             else:
@@ -1234,7 +1297,12 @@ for epoch in range(MAX_EPOCHS):
     prev_surf_loss = epoch_surf
 
     # --- Validate across all splits ---
-    eval_model = ema_model if ema_model is not None else model
+    if cfg.swa and swa_model is not None:
+        eval_model = swa_model
+    elif ema_model is not None:
+        eval_model = ema_model
+    else:
+        eval_model = model
     eval_model.eval()
     model.eval()
     val_metrics_per_split: dict[str, dict] = {}
@@ -1380,6 +1448,17 @@ for epoch in range(MAX_EPOCHS):
                     swad_checkpoints.pop(0)
             swad_prev_val = val_loss_3split
 
+    # SWA: uniform weight averaging after swa_start_epoch
+    if cfg.swa and epoch >= cfg.swa_start_epoch:
+        if swa_model is None:
+            swa_model = deepcopy(_base_model)
+            swa_n = 1
+        else:
+            with torch.no_grad():
+                for sp, mp in zip(swa_model.parameters(), _base_model.parameters()):
+                    sp.data = (sp.data * swa_n + mp.data) / (swa_n + 1)
+            swa_n += 1
+
     # 4-split val/loss (all splits including ood_re)
     _4split_losses = [val_metrics_per_split[n][f"{n}/loss"] for n in VAL_SPLIT_NAMES
                       if not (torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isnan() or
@@ -1418,7 +1497,12 @@ for epoch in range(MAX_EPOCHS):
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
-        save_model = ema_model if ema_model is not None else model
+        if cfg.swa and swa_model is not None:
+            save_model = swa_model
+        elif ema_model is not None:
+            save_model = ema_model
+        else:
+            save_model = model
         torch.save(save_model.state_dict(), model_path)
         tag = f" * -> {model_path}"
 
@@ -1452,7 +1536,12 @@ if best_metrics:
     wandb.summary.update({"best_" + k: v for k, v in best_metrics.items()})
 
     print("\nGenerating flow field plots...")
-    vis_model = ema_model if ema_model is not None else model
+    if cfg.swa and swa_model is not None:
+        vis_model = swa_model
+    elif ema_model is not None:
+        vis_model = ema_model
+    else:
+        vis_model = model
     vis_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     vis_model.eval()
     plot_dir = Path("plots") / run.id
