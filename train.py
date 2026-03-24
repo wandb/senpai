@@ -164,7 +164,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
                 nn.Linear(dim_head, 1),
             )
 
-    def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None):
+    def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None, raw_xy=None):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -228,6 +228,317 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         return self.to_out(out_x)
 
 
+# ---------------------------------------------------------------------------
+# Phase 3: Local attention and novel architecture variants
+# ---------------------------------------------------------------------------
+
+def _sliding_window_neighbors(feat, k: int, half: int):
+    """Extract k sliding-window neighbours (excl. self) via unfold.
+    k and half must be plain Python ints to avoid sympy issues in torch.compile.
+    feat: [B, H, N, Dh] → nb: [B, H, N, k, Dh].
+    Uses zero-padding at boundaries (avoids replicate Min/Max in inductor)."""
+    # Pad N dim: half left, (k-half) right. F.pad order: last-dim-first.
+    x_pad = F.pad(feat, (0, 0, half, k - half))  # [B, H, N+k, Dh], zero-padded
+    nb_ps = x_pad.unfold(2, k + 1, 1)            # [B, H, N, Dh, k+1]
+    nb_ps = nb_ps.permute(0, 1, 2, 4, 3)         # [B, H, N, k+1, Dh]
+    # Remove self (at window position half)
+    return torch.cat([nb_ps[:, :, :, :half, :], nb_ps[:, :, :, half + 1:, :]], dim=3)
+
+
+class LocalAttention(nn.Module):
+    """Sort-based local attention: each node attends to its k nearest neighbours
+    in x-sorted order.  Uses unfold instead of gather to avoid O(N·k) int64
+    index buffers during backward (which OOM at N≈100k with torch.compile)."""
+
+    def __init__(self, dim, k=32, heads=3, dim_head=64, dropout=0.0):
+        super().__init__()
+        self.dim  = dim   # store as Python int for static expand in compile
+        self.k    = k
+        self.half = k // 2  # static Python int – avoids dynamic shape issues in compile
+        self.heads = heads
+        self.dim_head = dim_head
+        self.inner_dim = heads * dim_head  # static Python int
+        self.scale = dim_head ** -0.5
+        self.to_qkv = nn.Linear(dim, 3 * self.inner_dim)
+        self.to_out = nn.Sequential(nn.Linear(self.inner_dim, dim), nn.Dropout(dropout))
+
+    def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None, raw_xy=None):
+        B, N = x.shape[0], x.shape[1]
+        k    = self.k     # Python int – static in torch.compile
+        half = self.half
+        dim  = self.dim   # Python int – static, avoids symbolic dim propagation
+
+        if raw_xy is not None:
+            sort_idx   = torch.argsort(raw_xy[:, :, 0], dim=1)
+            unsort_idx = torch.argsort(sort_idx, dim=1)
+            x_s = x.gather(1, sort_idx.unsqueeze(-1).expand(-1, -1, dim))
+        else:
+            x_s = x
+            unsort_idx = None
+
+        qkv = self.to_qkv(x_s).reshape(B, N, 3, self.heads, self.dim_head).permute(2, 0, 3, 1, 4)
+        q, k_feat, v_feat = qkv.unbind(0)  # each [B, H, N, Dh]
+
+        # Unfold-based neighbourhood extraction: [B, H, N, k, Dh]
+        k_nb = _sliding_window_neighbors(k_feat, k, half)
+        v_nb = _sliding_window_neighbors(v_feat, k, half)
+
+        # Dot-product attention over k neighbours
+        attn = (q.unsqueeze(-2) * k_nb).sum(-1) * self.scale  # [B, H, N, k]
+        attn = F.softmax(attn, dim=-1)
+        out = (attn.unsqueeze(-1) * v_nb).sum(-2)  # [B, H, N, Dh]
+
+        out = out.permute(0, 2, 1, 3).reshape(B, N, self.inner_dim)
+        out_s = self.to_out(out)
+
+        if unsort_idx is not None:
+            return out_s.gather(1, unsort_idx.unsqueeze(-1).expand(-1, -1, dim))
+        return out_s
+
+
+class GNNLayer(nn.Module):
+    """Sort-based message-passing pre-processor using sliding-window unfold.
+    Uses unfold (not gather) to avoid large int64 index buffers in backward."""
+
+    def __init__(self, dim, k=16):
+        super().__init__()
+        self.dim  = dim   # store as Python int for static expand in compile
+        self.k    = k
+        self.half = k // 2
+        self.edge_net = nn.Sequential(
+            nn.Linear(dim * 2, dim), nn.GELU(),
+            nn.Linear(dim, dim),
+        )
+        self.ln = nn.LayerNorm(dim)
+        nn.init.zeros_(self.edge_net[-1].weight)
+        nn.init.zeros_(self.edge_net[-1].bias)
+
+    def forward(self, fx, raw_xy):
+        B, N = fx.shape[0], fx.shape[1]
+        k    = self.k
+        half = self.half
+        dim  = self.dim   # Python int – static
+
+        sort_idx   = torch.argsort(raw_xy[:, :, 0], dim=1)
+        unsort_idx = torch.argsort(sort_idx, dim=1)
+        fx_s = fx.gather(1, sort_idx.unsqueeze(-1).expand(-1, -1, dim))
+
+        # Unfold neighbours (no large int64 gather buffers in backward)
+        x_t = fx_s.transpose(1, 2)  # [B, D, N]
+        x_pad = F.pad(x_t, (half, k - half)).transpose(1, 2)  # [B, N+k, D], zero-padded
+        nb_ps = x_pad.unfold(1, k + 1, 1).permute(0, 1, 3, 2)  # [B, N, k+1, D]
+        nb = torch.cat([nb_ps[:, :, :half, :], nb_ps[:, :, half + 1:, :]], dim=2)  # [B, N, k, D]
+
+        edge_in = torch.cat([fx_s.unsqueeze(2).expand(-1, -1, k, dim), nb], dim=-1)
+        msg = self.edge_net(edge_in).mean(dim=2)
+
+        out_s = self.ln(fx_s + msg)
+        return out_s.gather(1, unsort_idx.unsqueeze(-1).expand(-1, -1, dim))
+
+
+class MultiResAttention(nn.Module):
+    """Dual-resolution slice attention: coarse (32 slices) + fine (slice_num slices)
+    run in parallel; outputs concatenated and projected back to hidden dim."""
+
+    def __init__(self, dim, heads=3, dim_head=64, dropout=0.0,
+                 slice_num_coarse=32, slice_num_fine=96):
+        super().__init__()
+        self.coarse = Physics_Attention_Irregular_Mesh(
+            dim, heads, dim_head, dropout, slice_num_coarse)
+        self.fine = Physics_Attention_Irregular_Mesh(
+            dim, heads, dim_head, dropout, slice_num_fine)
+        # Internal spatial biases for each resolution
+        self.sb_coarse = nn.Sequential(
+            nn.Linear(4, 64), nn.GELU(), nn.Linear(64, 64), nn.GELU(),
+            nn.Linear(64, slice_num_coarse))
+        self.sb_fine = nn.Sequential(
+            nn.Linear(4, 64), nn.GELU(), nn.Linear(64, 64), nn.GELU(),
+            nn.Linear(64, slice_num_fine))
+        nn.init.zeros_(self.sb_coarse[-1].weight); nn.init.zeros_(self.sb_coarse[-1].bias)
+        nn.init.zeros_(self.sb_fine[-1].weight);   nn.init.zeros_(self.sb_fine[-1].bias)
+        self.proj = nn.Linear(dim * 2, dim)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None, raw_xy=None):
+        sb_c = self.sb_coarse(raw_xy) if raw_xy is not None else None
+        sb_f = self.sb_fine(raw_xy)   if raw_xy is not None else None
+        out_c = self.coarse(x, spatial_bias=sb_c, tandem_mask=tandem_mask, zone_features=zone_features)
+        out_f = self.fine(x,   spatial_bias=sb_f, tandem_mask=tandem_mask, zone_features=zone_features)
+        return self.proj(torch.cat([out_c, out_f], dim=-1))
+
+
+class WindowedSliceAttention(nn.Module):
+    """Swin-style windowed slice attention: sort nodes by x-coordinate, partition
+    into windows of W nodes, apply slice attention within each window.
+    Adds a shifted-window pass for cross-window communication."""
+
+    def __init__(self, dim, heads=3, dim_head=64, dropout=0.0,
+                 slice_num=24, window_size=256):
+        super().__init__()
+        self.window_size = window_size
+        n_slices = min(slice_num, window_size // 4)
+        self.attn = Physics_Attention_Irregular_Mesh(
+            dim, heads, dim_head, dropout, n_slices)
+        self.mix = nn.Linear(dim * 2, dim)
+        nn.init.zeros_(self.mix.bias)
+
+    def _windowed_pass(self, x, sort_idx):
+        B, N, D = x.shape
+        W = self.window_size
+        xs = x.gather(1, sort_idx.unsqueeze(-1).expand(-1, -1, D))  # x-sorted
+
+        N_pad = ((N + W - 1) // W) * W
+        if N_pad > N:
+            xs = F.pad(xs, (0, 0, 0, N_pad - N))
+        n_wins = N_pad // W
+        out_wins = self.attn(xs.reshape(B * n_wins, W, D))  # [B*n, W, D]
+        out_s = out_wins.reshape(B, N_pad, D)[:, :N]
+
+        unsort = torch.argsort(sort_idx, dim=1)
+        return out_s.gather(1, unsort.unsqueeze(-1).expand(-1, -1, D))
+
+    def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None, raw_xy=None):
+        if raw_xy is None:
+            return self.attn(x, spatial_bias=spatial_bias, tandem_mask=tandem_mask, zone_features=zone_features)
+        B, N, D = x.shape
+        x_coord = raw_xy[:, :, 0]
+        sort_idx = torch.argsort(x_coord, dim=1)
+
+        out_reg = self._windowed_pass(x, sort_idx)
+
+        # Shifted window: rotate sorted order by W//2
+        W = self.window_size
+        shift = W // 2
+        offset = (torch.arange(N, device=x.device) + shift) % N
+        shift_idx = sort_idx.gather(1, offset.unsqueeze(0).expand(B, -1))
+        out_shift = self._windowed_pass(x, shift_idx)
+
+        return self.mix(torch.cat([out_reg, out_shift], dim=-1))
+
+
+class AxialAttention(nn.Module):
+    """Strip-based axial slice attention: first pass along x-sorted strips, second
+    along y-sorted strips.  Uses the memory-efficient slice mechanism (not full MHA)
+    within each strip to avoid O(strip²) attention matrices at N≈100k."""
+
+    def __init__(self, dim, heads=3, dim_head=64, strip_size=512, slice_num=32, dropout=0.0):
+        super().__init__()
+        self.strip_size = strip_size
+        n_slices = min(slice_num, strip_size // 4)
+        self.x_attn = Physics_Attention_Irregular_Mesh(dim, heads, dim_head, dropout, n_slices)
+        self.y_attn = Physics_Attention_Irregular_Mesh(dim, heads, dim_head, dropout, n_slices)
+        self.ln_mid = nn.LayerNorm(dim)
+
+    def _strip_pass(self, x, sort_idx, attn):
+        B, N, D = x.shape
+        S = self.strip_size
+        xs = x.gather(1, sort_idx.unsqueeze(-1).expand(-1, -1, D))
+        N_pad = ((N + S - 1) // S) * S
+        if N_pad > N:
+            xs = F.pad(xs, (0, 0, 0, N_pad - N))
+        n_strips = N_pad // S
+        out = attn(xs.reshape(B * n_strips, S, D)).reshape(B, N_pad, D)[:, :N]
+        unsort = torch.argsort(sort_idx, dim=1)
+        return out.gather(1, unsort.unsqueeze(-1).expand(-1, -1, D))
+
+    def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None, raw_xy=None):
+        if raw_xy is None:
+            return x
+        x_sort = torch.argsort(raw_xy[:, :, 0], dim=1)
+        y_sort = torch.argsort(raw_xy[:, :, 1], dim=1)
+        out_x = self._strip_pass(x, x_sort, self.x_attn)
+        x = self.ln_mid(x + out_x)
+        return self._strip_pass(x, y_sort, self.y_attn)
+
+
+class SurfVolCrossBlock(nn.Module):
+    """Cross-attention between surface and volume node representations.
+
+    Uses the slice mechanism to compress each stream into S tokens, then
+    performs cross-attention between the two sets of tokens (O(S^2) not O(N^2)).
+    The attended tokens are broadcast back to all nodes.
+
+    Surface detection: raw_xy[:,:,3] = log1p(dist_to_surface * 10), 0 for surface nodes.
+    """
+
+    _SURF_THRESH = 0.1  # log1p(0.01 * 10) ≈ 0.095 → within ~1cm of surface
+
+    def __init__(self, dim, heads=3, dim_head=64, n_slice=32):
+        super().__init__()
+        self.heads = heads
+        self.dim_head = dim_head
+        self.n_slice = n_slice
+        inner_dim = heads * dim_head
+
+        self.in_proj = nn.Linear(dim, inner_dim)
+        self.temperature = nn.Parameter(torch.ones(1, heads, 1, 1) * 0.5)
+
+        self.surf_slice = nn.Linear(dim_head, n_slice)
+        self.vol_slice  = nn.Linear(dim_head, n_slice)
+        nn.init.orthogonal_(self.surf_slice.weight)
+        nn.init.orthogonal_(self.vol_slice.weight)
+
+        # Cross-attention: surface tokens → query vol tokens
+        self.q_sv = nn.Linear(dim_head, dim_head)
+        self.k_sv = nn.Linear(dim_head, dim_head)
+        self.v_sv = nn.Linear(dim_head, dim_head)
+        # Cross-attention: volume tokens → query surf tokens
+        self.q_vs = nn.Linear(dim_head, dim_head)
+        self.k_vs = nn.Linear(dim_head, dim_head)
+        self.v_vs = nn.Linear(dim_head, dim_head)
+
+        self.out_surf = nn.Linear(inner_dim, dim)
+        self.out_vol  = nn.Linear(inner_dim, dim)
+        nn.init.zeros_(self.out_surf.weight); nn.init.zeros_(self.out_surf.bias)
+        nn.init.zeros_(self.out_vol.weight);  nn.init.zeros_(self.out_vol.bias)
+        self.ln = nn.LayerNorm(dim)
+
+    def _slice_tokens(self, h, mask_float, slice_proj):
+        """Compute masked slice tokens.
+        h: [B, H, N, Dh], mask_float: [B, N] (1.0 for included nodes).
+        Returns tokens [B, H, S, Dh], weights [B, H, N, S].
+        """
+        logits = slice_proj(h) / self.temperature  # [B, H, N, S]
+        logits = logits - (1.0 - mask_float[:, None, :, None]) * 1e9
+        weights = F.softmax(logits, dim=-1) * mask_float[:, None, :, None]
+        norm = weights.sum(dim=2, keepdim=True).clamp(min=1e-5)  # [B, H, 1, S]
+        tokens = torch.einsum("bhns,bhnd->bhsd", weights, h) / norm.squeeze(2).unsqueeze(3)
+        return tokens, weights
+
+    def forward(self, fx, raw_xy):
+        B, N, D = fx.shape
+        dist = raw_xy[:, :, 3]  # log1p(dist_to_surface*10), 0 for surface
+        surf = (dist < self._SURF_THRESH).float()   # [B, N]
+        vol  = 1.0 - surf
+
+        h = self.in_proj(self.ln(fx)).reshape(B, N, self.heads, self.dim_head).permute(0, 2, 1, 3)
+
+        surf_tokens, surf_w = self._slice_tokens(h * surf[:, None, :, None], surf, self.surf_slice)
+        vol_tokens,  vol_w  = self._slice_tokens(h * vol[:, None, :, None],  vol,  self.vol_slice)
+
+        scale = self.dim_head ** -0.5
+        # Surf tokens attend to vol tokens
+        o_sv = torch.matmul(
+            F.softmax(torch.matmul(self.q_sv(surf_tokens), self.k_sv(vol_tokens).transpose(-2, -1)) * scale, dim=-1),
+            self.v_sv(vol_tokens))  # [B, H, S, Dh]
+        # Vol tokens attend to surf tokens
+        o_vs = torch.matmul(
+            F.softmax(torch.matmul(self.q_vs(vol_tokens), self.k_vs(surf_tokens).transpose(-2, -1)) * scale, dim=-1),
+            self.v_vs(surf_tokens))  # [B, H, S, Dh]
+
+        # Broadcast back: [B, H, S, Dh] × [B, H, N, S] → [B, H, N, Dh]
+        out_s = torch.einsum("bhsd,bhns->bhnd", o_sv, surf_w).permute(0, 2, 1, 3).reshape(B, N, -1)
+        out_v = torch.einsum("bhsd,bhns->bhnd", o_vs, vol_w).permute(0, 2, 1, 3).reshape(B, N, -1)
+
+        cross = surf[:, :, None] * self.out_surf(out_s) + vol[:, :, None] * self.out_vol(out_v)
+        return fx + cross
+
+
+# ---------------------------------------------------------------------------
+# End phase-3 variants
+# ---------------------------------------------------------------------------
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -250,6 +561,8 @@ class TransolverBlock(nn.Module):
         film_cond=False,
         decouple_slice=False,
         zone_temp=False,
+        attn_type="slice",   # "slice" | "local_knn" | "multi_res" | "windowed" | "axial"
+        knn_k=32,            # k for local_knn attention
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -259,17 +572,31 @@ class TransolverBlock(nn.Module):
         self.adaln_all = adaln_all
         self.film_cond = film_cond
         self.ln_1 = nn.LayerNorm(hidden_dim)
-        self.attn = Physics_Attention_Irregular_Mesh(
-            hidden_dim,
-            heads=num_heads,
-            dim_head=hidden_dim // num_heads,
-            dropout=dropout,
-            slice_num=slice_num,
-            linear_no_attention=linear_no_attention,
-            learned_kernel=learned_kernel,
-            decouple_slice=decouple_slice,
-            zone_temp=zone_temp,
-        )
+        dim_head = hidden_dim // num_heads
+        if attn_type == "local_knn":
+            self.attn = LocalAttention(hidden_dim, k=knn_k, heads=num_heads,
+                                       dim_head=dim_head, dropout=dropout)
+        elif attn_type == "multi_res":
+            self.attn = MultiResAttention(hidden_dim, num_heads, dim_head, dropout,
+                                          slice_num_coarse=32, slice_num_fine=slice_num)
+        elif attn_type == "windowed":
+            self.attn = WindowedSliceAttention(hidden_dim, num_heads, dim_head, dropout,
+                                               slice_num=slice_num // 4, window_size=256)
+        elif attn_type == "axial":
+            self.attn = AxialAttention(hidden_dim, num_heads, dim_head,
+                                       strip_size=512, dropout=dropout)
+        else:  # "slice" (default)
+            self.attn = Physics_Attention_Irregular_Mesh(
+                hidden_dim,
+                heads=num_heads,
+                dim_head=dim_head,
+                dropout=dropout,
+                slice_num=slice_num,
+                linear_no_attention=linear_no_attention,
+                learned_kernel=learned_kernel,
+                decouple_slice=decouple_slice,
+                zone_temp=zone_temp,
+            )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
             self.adaln_net = nn.Sequential(
@@ -335,11 +662,11 @@ class TransolverBlock(nn.Module):
             cond_out = self.adaln_net(condition)  # [B, H*4]
             s1, b1, s2, b2 = cond_out.chunk(4, dim=-1)  # each [B, H]
             fx_norm = self.ln_1(fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
-            fx = self.ln_1_post(self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            fx = self.ln_1_post(self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features, raw_xy=raw_xy) + fx)
             fx_norm = self.ln_2(fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
             fx = self.ln_2_post(self.mlp(fx_norm) + fx)
         else:
-            fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features, raw_xy=raw_xy) + fx)
             fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
@@ -395,6 +722,14 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        # Phase 3: novel attention variants
+        knn_attn: int = 0,           # k-NN attention k value (0 = disabled)
+        surf_vol_cross: bool = False, # surface–volume cross-attention block
+        gnn_preproc: bool = False,    # k-NN GNN preprocessing layer
+        local_global_hybrid: bool = False,  # block 0 local, block 1 global
+        multi_res: bool = False,      # dual-resolution slicing
+        windowed: bool = False,       # windowed slice attention
+        axial: bool = False,          # axial strip attention
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -433,8 +768,19 @@ class Transolver(nn.Module):
 
         self.n_hidden = n_hidden
         self.space_dim = space_dim
-        self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
-        nn.init.eye_(self.feature_cross.weight)  # start as identity
+
+        # Determine per-block attention type
+        def _attn_type(idx):
+            if multi_res:  return "multi_res"
+            if windowed:   return "windowed"
+            if axial:      return "axial"
+            if knn_attn > 0: return "local_knn"
+            if local_global_hybrid:
+                return "local_knn" if idx == 0 else "slice"
+            return "slice"
+
+        _knn_k = knn_attn if knn_attn > 0 else 32  # default k=32 for hybrid
+
         self.blocks = nn.ModuleList(
             [
                 TransolverBlock(
@@ -457,6 +803,8 @@ class Transolver(nn.Module):
                     film_cond=film_cond,
                     decouple_slice=adaln_decouple,
                     zone_temp=adaln_zone_temp,
+                    attn_type=_attn_type(idx),
+                    knn_k=_knn_k,
                 )
                 for idx in range(n_layers)
             ]
@@ -473,6 +821,13 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+
+        # Phase 3 optional modules
+        self.gnn_layer = GNNLayer(n_hidden, k=16) if gnn_preproc else None
+        self.surf_vol_cross_block = (
+            SurfVolCrossBlock(n_hidden, heads=n_head, dim_head=n_hidden // n_head, n_slice=32)
+            if surf_vol_cross else None
+        )
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -553,8 +908,6 @@ class Transolver(nn.Module):
             new_pos = self.get_grid(pos)
             x = torch.cat((x, new_pos), dim=-1)
 
-        x_cross = x * self.feature_cross(x)
-        x = x + 0.1 * x_cross  # residual with small scale
         raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)  # x, y, curvature, dist
 
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
@@ -562,10 +915,19 @@ class Transolver(nn.Module):
 
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
+
+        # Optional GNN preprocessing pass (before placeholder scaling)
+        if self.gnn_layer is not None:
+            fx = self.gnn_layer(fx, raw_xy)
+
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
             fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+
+        # Optional surface–volume cross-attention block (inserted before aux heads)
+        if self.surf_vol_cross_block is not None:
+            fx = self.surf_vol_cross_block(fx, raw_xy)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
@@ -643,6 +1005,14 @@ class Config:
     tandem_ramp: bool = False          # gradual tandem surface loss warm-in (0→1 over epochs 10-50)
     foil2_dist: bool = False           # explicit foil-2 distance feature (from secondary dsdf)
     slice_num: int = 48                # slice count (default 48, GPU6: 96)
+    # Phase 3: local attention and novel architecture variants
+    knn_attn: int = 0                  # GPU0/1: k-NN local attention (0=off, 32 or 64)
+    surf_vol_cross: bool = False       # GPU2: surface–volume cross-attention block
+    dual_resolution: bool = False      # GPU3: dual-resolution slicing (32+96 parallel)
+    windowed_slice: bool = False       # GPU4: windowed slice attention (Swin-style)
+    gnn_preproc: bool = False          # GPU5: k-NN graph message-passing preprocessing
+    axial_attn: bool = False           # GPU6: axial strip attention (x-pass + y-pass)
+    local_global_hybrid: bool = False  # GPU7: block-0 local (k-NN), block-1 global (slice)
 
 
 cfg = sp.parse(Config)
@@ -761,6 +1131,14 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    # Phase 3
+    knn_attn=cfg.knn_attn,
+    surf_vol_cross=cfg.surf_vol_cross,
+    gnn_preproc=cfg.gnn_preproc,
+    local_global_hybrid=cfg.local_global_hybrid,
+    multi_res=cfg.dual_resolution,
+    windowed=cfg.windowed_slice,
+    axial=cfg.axial_attn,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1471,13 +1849,26 @@ if best_metrics:
                 dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)
                 x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                # Add Fourier PE (same as training loop)
+                _raw_xy_vis = x_n[:, :, :2]
+                _xy_min_vis = _raw_xy_vis.amin(dim=1, keepdim=True)
+                _xy_max_vis = _raw_xy_vis.amax(dim=1, keepdim=True)
+                _xy_norm_vis = (_raw_xy_vis - _xy_min_vis) / (_xy_max_vis - _xy_min_vis + 1e-8)
+                _freqs_vis = torch.cat([_base_model.fourier_freqs_fixed.to(device),
+                                        _base_model.fourier_freqs_learned.abs()])
+                _xy_s_vis = _xy_norm_vis.unsqueeze(-1) * _freqs_vis
+                _fpe_vis = torch.cat([_xy_s_vis.sin().flatten(-2), _xy_s_vis.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, _fpe_vis], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
                 y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
             samples.append((x[:, :2], y_true, y_pred, is_surface))
-        images = visualize(samples, out_dir=plot_dir / split_name)
-        if images:
-            wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+        try:
+            images = visualize(samples, split_ds, stats, device, out_dir=plot_dir / split_name)
+            if images:
+                wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+        except Exception as e:
+            print(f"  [vis] {split_name} skipped: {e}")
 
 wandb.finish()
