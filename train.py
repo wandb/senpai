@@ -656,6 +656,9 @@ class Config:
     n_layers: int = 2                  # number of TransolverBlocks (default 2)
     # Phase 3: data augmentation (training-only)
     aug: str = "none"  # none|yflip|jitter|featdrop|mixup|scale|flip_jitter|aoa_perturb|cutmix
+    aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
+    aug_start_epoch: int = 0        # delay augmentation onset until this epoch
+    aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
 
 
 cfg = sp.parse(Config)
@@ -905,7 +908,7 @@ class Lookahead:
 
 class Lion(torch.optim.Optimizer):
     """Lion optimizer (Chen et al., 2023) — sign-based updates, ~2x less memory than AdamW."""
-    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0):
+    def __init__(self, params, lr=3e-4, betas=(0.9, 0.99), weight_decay=0.0):
         defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
@@ -1046,7 +1049,7 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         # --- Data augmentation (training-only, applied before normalization) ---
-        if model.training and cfg.aug != "none":
+        if model.training and cfg.aug != "none" and epoch >= cfg.aug_start_epoch:
             if cfg.aug in ("yflip", "flip_jitter"):
                 _flip = torch.rand(x.size(0), 1, 1, device=x.device) < 0.5
                 x[:, :, 1:2] = torch.where(_flip, -x[:, :, 1:2], x[:, :, 1:2])
@@ -1069,7 +1072,8 @@ for epoch in range(MAX_EPOCHS):
                 y = _lam * y + (1 - _lam) * y[_mix_idx]
                 mask = mask & mask[_mix_idx]
             if cfg.aug == "scale":
-                _scale = torch.rand(x.size(0), 1, 1, device=x.device) * 0.1 + 0.95
+                _lo = 1.0 - cfg.aug_scale_range
+                _scale = torch.rand(x.size(0), 1, 1, device=x.device) * (2 * cfg.aug_scale_range) + _lo
                 x[:, :, :2] = x[:, :, :2] * _scale
             if cfg.aug == "aoa_perturb":
                 _angle_deg = torch.rand(x.size(0), device=x.device) * 2.0 - 1.0
@@ -1082,6 +1086,13 @@ for epoch in range(MAX_EPOCHS):
                 _Ux, _Uy = y[:, :, 0:1].clone(), y[:, :, 1:2].clone()
                 y[:, :, 0:1] = _cos_a * _Ux - _sin_a * _Uy
                 y[:, :, 1:2] = _sin_a * _Ux + _cos_a * _Uy
+                if cfg.aug_full_dsdf_rot:
+                    # Rotate DSDF gradient pairs (x,y components at indices 2-9)
+                    for _xi, _yi in [(2, 3), (4, 5), (6, 7), (8, 9)]:
+                        _dx = x[:, :, _xi:_xi+1].clone()
+                        _dy = x[:, :, _yi:_yi+1].clone()
+                        x[:, :, _xi:_xi+1] = _cos_a * _dx - _sin_a * _dy
+                        x[:, :, _yi:_yi+1] = _sin_a * _dx + _cos_a * _dy
             if cfg.aug == "cutmix":
                 _B_aug = x.size(0)
                 _cut_idx = torch.randperm(_B_aug, device=x.device)
