@@ -1605,7 +1605,9 @@ for epoch in range(MAX_EPOCHS):
         scheduler.step()
     if epoch >= cfg.temp_anneal_epoch:
         with torch.no_grad():
-            _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
+            for _blk in _base_model.blocks:
+                if hasattr(_blk.attn, 'temperature'):
+                    _blk.attn.temperature.data.clamp_(max=0.25)
     epoch_vol /= n_batches
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
