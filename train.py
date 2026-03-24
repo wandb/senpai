@@ -1202,10 +1202,6 @@ for epoch in range(MAX_EPOCHS):
         else:
             tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
-        if cfg.surf_oversample:
-            # Count surface nodes a second time in vol_loss to amplify surface gradients
-            surf_in_vol = (abs_err * surf_mask.unsqueeze(-1)).sum() / (vol_mask_train.sum() + surf_mask.sum()).clamp(min=1)
-            vol_loss = vol_loss + surf_in_vol
         if cfg.uncertainty_loss:
             bm = _base_model
             surf_ux_loss = (abs_err[:, :, 0:1] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
@@ -1217,6 +1213,10 @@ for epoch in range(MAX_EPOCHS):
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
         else:
             loss = vol_loss + surf_weight * surf_loss
+        if cfg.surf_oversample:
+            # Clean impl: add surface MAE as a separate term (proper per-surface-node averaging)
+            extra_surf = (abs_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            loss = loss + extra_surf
         # Self-distillation: blend GT and EMA-teacher soft targets (active after EMA starts)
         if cfg.self_distill and ema_model is not None:
             ema_model.eval()
@@ -1463,25 +1463,13 @@ for epoch in range(MAX_EPOCHS):
                 y_norm_scaled = y_norm / sample_stds
 
                 if cfg.tta_eval:
-                    # 3-pass TTA: original, y-flipped (AoA negated), and jittered
+                    # 3-pass jitter-only TTA: average predictions with σ=0.01, 0.02, 0.03
                     _preds_tta = []
-                    # Pass 1: original
-                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        _preds_tta.append(eval_model({"x": x})["preds"].float())
-                    # Pass 2: y-flip (negate y-pos and AoA, flip Uy in output)
-                    _x_yflip = x.clone()
-                    _x_yflip[:, :, 1] = -_x_yflip[:, :, 1]   # negate y coordinate
-                    _x_yflip[:, :, 14] = -_x_yflip[:, :, 14]  # negate AoA0_rad
-                    _x_yflip[:, :, 18] = -_x_yflip[:, :, 18]  # negate AoA1_rad
-                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        _p_flip = eval_model({"x": _x_yflip})["preds"].float()
-                    _p_flip[:, :, 1] = -_p_flip[:, :, 1]  # flip Uy back
-                    _preds_tta.append(_p_flip)
-                    # Pass 3: small jitter on non-spatial features
-                    _x_jit = x.clone()
-                    _x_jit[:, :, 2:25] = _x_jit[:, :, 2:25] + 0.01 * torch.randn_like(_x_jit[:, :, 2:25])
-                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        _preds_tta.append(eval_model({"x": _x_jit})["preds"].float())
+                    for _sigma in [0.01, 0.02, 0.03]:
+                        _x_jit = x.clone()
+                        _x_jit[:, :, 2:25] = _x_jit[:, :, 2:25] + _sigma * torch.randn_like(_x_jit[:, :, 2:25])
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            _preds_tta.append(eval_model({"x": _x_jit})["preds"].float())
                     pred = torch.stack(_preds_tta).mean(0)
                 else:
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
