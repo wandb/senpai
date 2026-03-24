@@ -623,12 +623,12 @@ class Config:
     use_lookahead: bool = True
     # Architecture flags (one per GPU)
     linear_no_attention: bool = False  # GPU0: skip Q/K/V in slice attention
-    field_decoder: bool = False        # GPU1: separate vel/pres output heads
+    field_decoder: bool = True         # GPU1: separate vel/pres output heads
     learned_kernel: bool = False       # GPU2: MLP attention kernel
     uncertainty_loss: bool = False     # GPU3: Kendall uncertainty weighting
     swad: bool = False                 # GPU4: SWAD weight averaging
     boundary_aware: bool = False       # GPU5: upweight near-wall volume nodes
-    adaln_output: bool = False         # GPU6: AdaLN on output head
+    adaln_output: bool = True          # GPU6: AdaLN on output head
     soft_moe: bool = False             # GPU7: Soft MoE output
     # Phase 2 R4: AdaLN-Zero all blocks
     n_hidden: int = 192                # model width (override default)
@@ -648,17 +648,19 @@ class Config:
     swa_start_epoch: int = 200   # epoch to start SWA (GPU 0: 200, GPU 6: 160)
     grad_accum_steps: int = 1    # GPU 2: gradient accumulation (step every N batches)
     half_target_noise: bool = False  # GPU 3: reduce target noise by 50%
-    use_lion: bool = False        # GPU 4: Lion optimizer instead of AdamW
+    use_lion: bool = True         # GPU 4: Lion optimizer instead of AdamW
+    lion_beta1: float = 0.9      # Lion beta1 (default 0.9)
+    lion_beta2: float = 0.99     # Lion beta2 (default 0.99)
     rdrop: bool = False           # GPU 7: R-drop regularization
     rdrop_alpha: float = 1.0     # R-drop consistency loss weight
     # Phase 3: compound experiments
     seed: int = -1                     # random seed (-1 = no seeding)
     n_layers: int = 2                  # number of TransolverBlocks (default 2)
     # Phase 3: data augmentation (training-only)
-    aug: str = "none"  # none|yflip|jitter|featdrop|mixup|scale|flip_jitter|aoa_perturb|cutmix
+    aug: str = "aoa_perturb"  # none|yflip|jitter|featdrop|mixup|scale|flip_jitter|aoa_perturb|cutmix
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
-    aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    aug_full_dsdf_rot: bool = True   # also rotate DSDF gradient pairs in aoa_perturb
 
 
 cfg = sp.parse(Config)
@@ -906,35 +908,13 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
-class Lion(torch.optim.Optimizer):
-    """Lion optimizer (Chen et al., 2023) — sign-based updates, ~2x less memory than AdamW."""
-    def __init__(self, params, lr=3e-4, betas=(0.9, 0.99), weight_decay=0.0):
-        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
-        super().__init__(params, defaults)
-
-    def step(self, closure=None):
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                state = self.state[p]
-                if 'exp_avg' not in state:
-                    state['exp_avg'] = torch.zeros_like(p.data)
-                exp_avg = state['exp_avg']
-                b1, b2 = group['betas']
-                update = exp_avg * b1 + p.grad * (1 - b1)
-                p.data.add_(update.sign(), alpha=-group['lr'])
-                p.data.mul_(1 - group['lr'] * group['weight_decay'])
-                exp_avg.mul_(b2).add_(p.grad, alpha=1 - b2)
-
-
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 if cfg.use_lion:
     base_opt = Lion([
         {'params': attn_params, 'lr': cfg.lr * 0.5},
         {'params': other_params, 'lr': cfg.lr}
-    ], weight_decay=cfg.weight_decay)
+    ], betas=(cfg.lion_beta1, cfg.lion_beta2), weight_decay=cfg.weight_decay)
     optimizer = base_opt  # Lion has its own momentum; skip Lookahead
 else:
     base_opt = torch.optim.AdamW([
