@@ -668,6 +668,14 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R5: loss rebalancing
+    surf_weight_mult: float = 1.0      # multiplier applied to adaptive surf_weight
+    no_coarse_loss: bool = False       # disable coarse pooling loss entirely
+    coarse_loss_mult: float = 1.0     # weight multiplier for coarse pooling loss
+    no_tandem_boost: bool = False      # disable adaptive tandem boost (fix at 1.0)
+    fixed_tandem_boost: float = -1.0  # fixed tandem boost value (-1 = use adaptive)
+    surf_loss_fn: str = "l1"          # surface loss function: l1, l2, huber
+    huber_delta: float = 1.0          # delta parameter for Huber loss
 
 
 cfg = sp.parse(Config)
@@ -1041,7 +1049,7 @@ for epoch in range(MAX_EPOCHS):
     t0 = time.time()
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
-    surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+    surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8))) * cfg.surf_weight_mult
 
     # --- Train ---
     model.train()
@@ -1249,16 +1257,35 @@ for epoch in range(MAX_EPOCHS):
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
         running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
         # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
+        # Compute surface error tensor for loss using selected loss function
+        if cfg.surf_loss_fn == "l2":
+            _surf_err_loss = sq_err[:, :, 2:3]
+        elif cfg.surf_loss_fn == "huber":
+            _diff_p = pred[:, :, 2:3] - y_norm[:, :, 2:3]
+            _surf_err_loss = torch.where(
+                _diff_p.abs() < cfg.huber_delta,
+                0.5 * _diff_p ** 2 / cfg.huber_delta,
+                _diff_p.abs() - 0.5 * cfg.huber_delta,
+            )
+        else:  # l1
+            _surf_err_loss = abs_err[:, :, 2:3]
         if epoch >= 30:
-            surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
+            surf_pres = abs_err[:, :, 2:3]  # MAE pressure errors for identifying hard nodes [B, N, 1]
             surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
             surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
             thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
             thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
             hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
-            surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
-        adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
+            surf_per_sample = (_surf_err_loss * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        else:
+            surf_per_sample = (_surf_err_loss * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        if cfg.no_tandem_boost:
+            adaptive_boost = 1.0
+        elif cfg.fixed_tandem_boost > 0:
+            adaptive_boost = cfg.fixed_tandem_boost
+        else:
+            adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         if cfg.tandem_ramp:
             tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
             tandem_boost = torch.where(is_tandem_batch,
@@ -1306,7 +1333,8 @@ for epoch in range(MAX_EPOCHS):
             coarse_err = (pred_coarse - y_coarse).abs()
             coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
             _coarse_loss = coarse_loss
-            loss = loss + 1.0 * coarse_loss
+            if not cfg.no_coarse_loss:
+                loss = loss + cfg.coarse_loss_mult * coarse_loss
 
         log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
         re_loss = F.mse_loss(re_pred, log_re_target)
