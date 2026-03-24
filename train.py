@@ -740,6 +740,8 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R4: MoE + fixed tandem weight multiplier
+    moe_tan3x: bool = False         # replace adaptive tandem boost with fixed 3x multiplier
     # Phase 3 R3: MoE tandem routing and per-zone/cross-attention architectures
     moe_tandem: bool = False        # dual output heads (tandem vs single), hard-routed by sample
     moe_wide_tandem: bool = False   # tandem head uses 2x hidden width
@@ -1362,7 +1364,11 @@ for epoch in range(MAX_EPOCHS):
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
             surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
-        if cfg.tandem_ramp:
+        if cfg.moe_tan3x:
+            tandem_boost = torch.where(is_tandem_batch,
+                                       torch.tensor(3.0, device=device),
+                                       torch.ones(B, device=device))
+        elif cfg.tandem_ramp:
             tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
             tandem_boost = torch.where(is_tandem_batch,
                                        torch.tensor(adaptive_boost * tandem_weight, device=device),
