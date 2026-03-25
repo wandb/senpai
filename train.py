@@ -668,6 +668,14 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R8b: compound features
+    no_target_noise: bool = False     # disable annealing target noise on y_norm
+    distill: float = 0.0             # EMA distillation weight (0=off, try 0.1, 0.2)
+    multi_ema: bool = False           # 3 EMA streams at [0.995, 0.998, 0.999], avg at eval
+    surface_local: bool = False       # 2x surface loss weight
+    mesh_coarsen: bool = False        # random 20% volume node dropout in loss
+    local_re_feat: bool = False       # per-node local Re feat (log_Re * x_chord_frac)
+    le_te_dist_feat: bool = False     # per-node LE and TE distance features (2 feats)
 
 
 cfg = sp.parse(Config)
@@ -791,7 +799,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (1 if cfg.local_re_feat else 0) + (2 if cfg.le_te_dist_feat else 0) + 32,  # +curv, +dist, [+foil2dist], [+local_re], [+le_te_dist], +32 fourier PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -822,6 +830,9 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
+ema_models: list = []         # multi_ema: 3 EMA streams
+_MULTI_EMA_DECAYS = [0.995, 0.998, 0.999]
+teacher_model = None          # distillation EMA teacher
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -1137,6 +1148,19 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
+        if cfg.local_re_feat:
+            _log_re_all = x[:, :, 13:14]  # normalized log(Re), same for all nodes in sample
+            _local_re = _log_re_all * xy_norm[:, :, 0:1]  # chord-frac × log_Re [B, N, 1]
+            x = torch.cat([x, _local_re], dim=-1)
+        if cfg.le_te_dist_feat:
+            _x_all = x[:, :, 0]  # normalized x coord [B, N]
+            _surf_x = _x_all.masked_fill(~is_surface, float('inf'))
+            _le_x = _surf_x.min(dim=1, keepdim=True).values   # [B, 1]
+            _surf_x2 = _x_all.masked_fill(~is_surface, float('-inf'))
+            _te_x = _surf_x2.max(dim=1, keepdim=True).values  # [B, 1]
+            _le_dist = torch.log1p((_x_all - _le_x).clamp(min=0)).unsqueeze(-1)   # [B, N, 1]
+            _te_dist = torch.log1p((_te_x - _x_all).clamp(min=0)).unsqueeze(-1)   # [B, N, 1]
+            x = torch.cat([x, _le_dist, _te_dist], dim=-1)
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -1149,7 +1173,7 @@ for epoch in range(MAX_EPOCHS):
                 y_phys = y_phys.clone()
                 y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
             y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
-        if model.training:
+        if model.training and not cfg.no_target_noise:
             noise_progress = min(1.0, epoch / cfg.noise_anneal_epochs)
             if cfg.half_target_noise:
                 vel_noise = 0.0075 * (1 - noise_progress) + 0.0015 * noise_progress
@@ -1229,6 +1253,11 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_mask_train = vol_mask
 
+        if cfg.mesh_coarsen and model.training:
+            # Randomly drop 20% of volume nodes from the loss (data augmentation)
+            _coarsen_keep = torch.rand(vol_mask_train.shape, device=device) > 0.2
+            vol_mask_train = vol_mask_train & _coarsen_keep
+
         if cfg.boundary_aware:
             vol_dist = dist_feat[:, :, 0]  # [B, N], log1p-scaled dist-to-surface
             valid_dists = vol_dist.masked_select(vol_mask_train)
@@ -1277,7 +1306,8 @@ for epoch in range(MAX_EPOCHS):
                     surf_uy_loss * torch.exp(-2 * bm.log_sigma_surf_uy) / 2 + bm.log_sigma_surf_uy +
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
         else:
-            loss = vol_loss + surf_weight * surf_loss
+            _eff_surf_loss = surf_loss * 2.0 if cfg.surface_local else surf_loss
+            loss = vol_loss + surf_weight * _eff_surf_loss
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
@@ -1324,6 +1354,16 @@ for epoch in range(MAX_EPOCHS):
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
+
+        # EMA distillation: student matches teacher (EMA) predictions
+        if cfg.distill > 0 and teacher_model is not None:
+            with torch.no_grad():
+                teacher_model.eval()
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _teacher_pred = teacher_model({"x": x})["preds"].float()
+            _valid = mask.float().unsqueeze(-1)
+            _distill_loss = (((pred - _teacher_pred.detach()) ** 2) * _valid).sum() / _valid.sum().clamp(min=1)
+            loss = loss + cfg.distill * _distill_loss
 
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
@@ -1407,13 +1447,28 @@ for epoch in range(MAX_EPOCHS):
                 scheduler.step()
             except ValueError:
                 pass
-        if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa:
+        if cfg.multi_ema:
+            for _i, _decay in enumerate(_MULTI_EMA_DECAYS):
+                if len(ema_models) <= _i:
+                    ema_models.append(deepcopy(_base_model))
+                else:
+                    with torch.no_grad():
+                        for _ep, _mp in zip(ema_models[_i].parameters(), _base_model.parameters()):
+                            _ep.data.mul_(_decay).add_(_mp.data, alpha=1 - _decay)
+        elif epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa:
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
             else:
                 with torch.no_grad():
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+        if cfg.distill > 0:
+            if teacher_model is None:
+                teacher_model = deepcopy(_base_model)
+            else:
+                with torch.no_grad():
+                    for _tp, _mp in zip(teacher_model.parameters(), _base_model.parameters()):
+                        _tp.data.mul_(0.998).add_(_mp.data, alpha=0.002)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -1435,6 +1490,10 @@ for epoch in range(MAX_EPOCHS):
     # --- Validate across all splits ---
     if cfg.swa and swa_model is not None:
         eval_model = swa_model
+    elif cfg.multi_ema and len(ema_models) == 3:
+        eval_model = ema_models[1]  # middle decay (0.998) for checkpoint selection
+        for _m in ema_models:
+            _m.eval()
     elif ema_model is not None:
         eval_model = ema_model
     else:
@@ -1482,6 +1541,19 @@ for epoch in range(MAX_EPOCHS):
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
+                if cfg.local_re_feat:
+                    _log_re_all = x[:, :, 13:14]
+                    _local_re = _log_re_all * xy_norm[:, :, 0:1]
+                    x = torch.cat([x, _local_re], dim=-1)
+                if cfg.le_te_dist_feat:
+                    _x_all = x[:, :, 0]
+                    _surf_x = _x_all.masked_fill(~is_surface, float('inf'))
+                    _le_x = _surf_x.min(dim=1, keepdim=True).values
+                    _surf_x2 = _x_all.masked_fill(~is_surface, float('-inf'))
+                    _te_x = _surf_x2.max(dim=1, keepdim=True).values
+                    _le_dist = torch.log1p((_x_all - _le_x).clamp(min=0)).unsqueeze(-1)
+                    _te_dist = torch.log1p((_te_x - _x_all).clamp(min=0)).unsqueeze(-1)
+                    x = torch.cat([x, _le_dist, _te_dist], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
@@ -1521,7 +1593,11 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    if cfg.multi_ema and len(ema_models) == 3:
+                        _preds = [_m({"x": x})["preds"] for _m in ema_models]
+                        pred = (_preds[0] + _preds[1] + _preds[2]) / 3
+                    else:
+                        pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
@@ -1670,6 +1746,8 @@ for epoch in range(MAX_EPOCHS):
                 best_metrics[f"best_{k}"] = v
         if cfg.swa and swa_model is not None:
             save_model = swa_model
+        elif cfg.multi_ema and len(ema_models) == 3:
+            save_model = ema_models[1]  # middle decay for checkpoint
         elif ema_model is not None:
             save_model = ema_model
         else:
@@ -1709,6 +1787,8 @@ if best_metrics:
     print("\nGenerating flow field plots...")
     if cfg.swa and swa_model is not None:
         vis_model = swa_model
+    elif cfg.multi_ema and len(ema_models) == 3:
+        vis_model = ema_models[1]
     elif ema_model is not None:
         vis_model = ema_model
     else:
