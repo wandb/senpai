@@ -668,6 +668,12 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R8: bold data augmentation
+    input_noise: bool = False       # GPU2: std=0.01 Gaussian noise on xy and geometry features
+    no_target_noise: bool = False   # GPU3: disable target noise injection
+    mesh_coarsen: bool = False      # GPU4: randomly drop 10-20% of volume nodes per sample
+    full_flip_aug: bool = False     # GPU5: y-axis flip + AoA flip (physics-consistent)
+    re_scale_aug: bool = False      # GPU6: scale Re and pressure by random Re ratio
 
 
 cfg = sp.parse(Config)
@@ -1116,6 +1122,37 @@ for epoch in range(MAX_EPOCHS):
                     y[_b, _in_region] = y[_cut_idx[_b], _in_region]
                     is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
 
+        # Phase 3 R8: additional augmentations (applied before normalization)
+        if model.training:
+            if cfg.input_noise:
+                # Gaussian noise on xy coords and geometry features (saf + dsdf); std=0.01
+                x[:, :, :12] = x[:, :, :12] + 0.01 * torch.randn_like(x[:, :, :12])
+            if cfg.full_flip_aug:
+                # Physics-consistent y-axis flip: pos_y, DSDF/SAF y-components, AoA
+                _r8_flip = torch.rand(x.size(0), 1, 1, device=x.device) < 0.5
+                x[:, :, 1:2] = torch.where(_r8_flip, -x[:, :, 1:2], x[:, :, 1:2])
+                for _r8_idx in [3, 5, 7, 9]:
+                    x[:, :, _r8_idx:_r8_idx+1] = torch.where(_r8_flip, -x[:, :, _r8_idx:_r8_idx+1], x[:, :, _r8_idx:_r8_idx+1])
+                # Flip AoA (index 14 = aoa0_rad, index 18 = aoa1_rad)
+                x[:, :, 14:15] = torch.where(_r8_flip, -x[:, :, 14:15], x[:, :, 14:15])
+                x[:, :, 18:19] = torch.where(_r8_flip, -x[:, :, 18:19], x[:, :, 18:19])
+                y[:, :, 1:2] = torch.where(_r8_flip, -y[:, :, 1:2], y[:, :, 1:2])
+            if cfg.re_scale_aug:
+                # Scale Re and pressure by random factor: p ~ Re^0.5
+                _r8_log_scale = (torch.rand(x.size(0), device=x.device) - 0.5) * 1.386  # log(0.5) to log(2.0)
+                x[:, :, 13] = x[:, :, 13] + _r8_log_scale.unsqueeze(1)
+                _r8_p_scale = (_r8_log_scale * 0.5).exp().view(-1, 1, 1)
+                y[:, :, 2:3] = y[:, :, 2:3] * _r8_p_scale
+            if cfg.mesh_coarsen:
+                # Randomly drop 10-20% of volume (non-surface) nodes
+                _r8_vol = mask & (~is_surface)
+                for _r8b in range(x.size(0)):
+                    _r8_vol_idx = _r8_vol[_r8b].nonzero(as_tuple=True)[0]
+                    _r8_n_drop = int(len(_r8_vol_idx) * (torch.rand(1).item() * 0.1 + 0.1))
+                    if _r8_n_drop > 0 and len(_r8_vol_idx) > _r8_n_drop:
+                        _r8_perm = torch.randperm(len(_r8_vol_idx), device=x.device)[:_r8_n_drop]
+                        mask[_r8b, _r8_vol_idx[_r8_perm]] = False
+
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
@@ -1149,7 +1186,7 @@ for epoch in range(MAX_EPOCHS):
                 y_phys = y_phys.clone()
                 y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
             y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
-        if model.training:
+        if model.training and not cfg.no_target_noise:
             noise_progress = min(1.0, epoch / cfg.noise_anneal_epochs)
             if cfg.half_target_noise:
                 vel_noise = 0.0075 * (1 - noise_progress) + 0.0015 * noise_progress
