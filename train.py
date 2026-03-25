@@ -121,7 +121,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False):
+                 decouple_slice=False, zone_temp=False, patch_routing=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -135,6 +135,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.learned_kernel = learned_kernel
         self.decouple_slice = decouple_slice
         self.zone_temp = zone_temp
+        self.patch_routing = patch_routing
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
@@ -163,8 +164,11 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
                 nn.Linear(2 * dim_head, dim_head), nn.GELU(),
                 nn.Linear(dim_head, 1),
             )
+        if patch_routing:
+            self.in_project_slice_b = nn.Linear(dim_head, slice_num)
+            torch.nn.init.orthogonal_(self.in_project_slice_b.weight)
 
-    def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None):
+    def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None, patch_mask=None):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -192,6 +196,12 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             tan_logits = self.in_project_slice_tandem(x_mid) / temp
             is_tan = (tandem_mask > 0.5)  # [B, 1, 1, 1]
             slice_logits = torch.where(is_tan.expand_as(std_logits), tan_logits, std_logits)
+        elif self.patch_routing and patch_mask is not None:
+            # patch_mask: [B, N] bool — True = group A, False = group B
+            logits_a = self.in_project_slice(x_mid) / temp    # [B, H, N, S]
+            logits_b = self.in_project_slice_b(x_mid) / temp  # [B, H, N, S]
+            pm = patch_mask[:, None, :, None].expand_as(logits_a)
+            slice_logits = torch.where(pm, logits_a, logits_b)
         else:
             slice_logits = self.in_project_slice(x_mid) / temp
         if spatial_bias is not None:
@@ -250,6 +260,9 @@ class TransolverBlock(nn.Module):
         film_cond=False,
         decouple_slice=False,
         zone_temp=False,
+        patch_routing=False,
+        surf_vol_output=False,
+        local_agg=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -258,6 +271,9 @@ class TransolverBlock(nn.Module):
         self.soft_moe = soft_moe
         self.adaln_all = adaln_all
         self.film_cond = film_cond
+        self.patch_routing = patch_routing
+        self.surf_vol_output = surf_vol_output
+        self.local_agg = local_agg
         self.ln_1 = nn.LayerNorm(hidden_dim)
         self.attn = Physics_Attention_Irregular_Mesh(
             hidden_dim,
@@ -269,6 +285,7 @@ class TransolverBlock(nn.Module):
             learned_kernel=learned_kernel,
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
+            patch_routing=patch_routing,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -302,9 +319,18 @@ class TransolverBlock(nn.Module):
         self.se_fc2 = nn.Linear(hidden_dim // 4, hidden_dim)
         nn.init.zeros_(self.se_fc2.weight)
         nn.init.zeros_(self.se_fc2.bias)
+        if local_agg:
+            self.local_agg_scale = nn.Parameter(torch.zeros(1))
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
-            if soft_moe:
+            if surf_vol_output:
+                self.surf_head = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+                self.vol_head = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+            elif soft_moe:
                 self.gate_net = nn.Sequential(nn.Linear(hidden_dim, 2), nn.Softmax(dim=-1))
                 self.expert1 = nn.Sequential(
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
@@ -329,17 +355,37 @@ class TransolverBlock(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None, patch_mask=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
+        if self.local_agg and raw_xy is not None:
+            # Local spatial mean-pool: bin nodes into 16x16 grid, average per cell, add as residual
+            B, N, D = fx.shape
+            xy = raw_xy[:, :, :2]
+            xy_min = xy.amin(dim=1, keepdim=True)
+            xy_max = xy.amax(dim=1, keepdim=True)
+            xy_n = (xy - xy_min) / (xy_max - xy_min + 1e-8)
+            n_bins = 16
+            bx = (xy_n[:, :, 0] * n_bins).long().clamp(0, n_bins - 1)
+            by = (xy_n[:, :, 1] * n_bins).long().clamp(0, n_bins - 1)
+            cell = (bx * n_bins + by)  # [B, N]
+            n_cells = n_bins * n_bins
+            cell_e = cell.unsqueeze(-1)
+            cell_sum = torch.zeros(B, n_cells, D, device=fx.device, dtype=fx.dtype)
+            cell_cnt = torch.zeros(B, n_cells, 1, device=fx.device, dtype=fx.dtype)
+            cell_sum.scatter_add_(1, cell_e.expand(-1, -1, D), fx)
+            cell_cnt.scatter_add_(1, cell_e, torch.ones(B, N, 1, device=fx.device, dtype=fx.dtype))
+            cell_mean = cell_sum / (cell_cnt + 1e-8)
+            local_mean = cell_mean.gather(1, cell_e.expand(-1, -1, D))
+            fx = fx + self.local_agg_scale * local_mean
         if self.adaln_all and condition is not None:
             cond_out = self.adaln_net(condition)  # [B, H*4]
             s1, b1, s2, b2 = cond_out.chunk(4, dim=-1)  # each [B, H]
             fx_norm = self.ln_1(fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
-            fx = self.ln_1_post(self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            fx = self.ln_1_post(self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features, patch_mask=patch_mask) + fx)
             fx_norm = self.ln_2(fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
             fx = self.ln_2_post(self.mlp(fx_norm) + fx)
         else:
-            fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features, patch_mask=patch_mask) + fx)
             fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
@@ -351,7 +397,10 @@ class TransolverBlock(nn.Module):
             fx = gamma.unsqueeze(1) * fx + beta.unsqueeze(1)
         if self.last_layer:
             fx_ln = self.ln_3(fx)
-            if self.soft_moe:
+            if self.surf_vol_output and raw_xy is not None:
+                is_surf = (raw_xy[:, :, 2].abs() > 0.01).unsqueeze(-1).float()  # [B, N, 1]
+                return is_surf * self.surf_head(fx_ln) + (1 - is_surf) * self.vol_head(fx_ln)
+            elif self.soft_moe:
                 gate = self.gate_net(fx_ln)  # [B, N, 2]
                 return gate[:, :, 0:1] * self.expert1(fx_ln) + gate[:, :, 1:2] * self.expert2(fx_ln)
             elif self.field_decoder:
@@ -395,6 +444,14 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        progressive_slices=False,
+        progressive_slices_rev=False,
+        multi_scale_nodes=False,
+        block_skip=False,
+        surf_patch=False,
+        x_split_attn=False,
+        surf_vol_output=False,
+        local_agg=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -405,6 +462,10 @@ class Transolver(nn.Module):
         self.adaln_4cond = adaln_4cond
         self.film_cond = film_cond
         self.adaln_zone_temp = adaln_zone_temp
+        self.multi_scale_nodes = multi_scale_nodes
+        self.block_skip = block_skip
+        self.surf_patch = surf_patch
+        self.x_split_attn = x_split_attn
         if output_fields is None or output_dims is None:
             raise ValueError("output_fields and output_dims must be provided")
         if len(output_fields) != len(output_dims):
@@ -435,6 +496,21 @@ class Transolver(nn.Module):
         self.space_dim = space_dim
         self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
         nn.init.eye_(self.feature_cross.weight)  # start as identity
+        # Progressive slice counts: coarse-to-fine or fine-to-coarse across blocks
+        if progressive_slices:
+            _s = max(16, slice_num // 3)
+            _slice_nums = [_s, max(_s, slice_num * 2 // 3), slice_num]
+        elif progressive_slices_rev:
+            _s = max(16, slice_num // 3)
+            _slice_nums = [slice_num, max(_s, slice_num * 2 // 3), _s]
+        else:
+            _slice_nums = [slice_num] * n_layers
+        # Pad/truncate to n_layers (handles n_layers != 3)
+        while len(_slice_nums) < n_layers:
+            _slice_nums.append(slice_num)
+        _slice_nums = _slice_nums[:n_layers]
+        # Patch routing: active for surf_patch or x_split_attn
+        _patch_routing = surf_patch or x_split_attn
         self.blocks = nn.ModuleList(
             [
                 TransolverBlock(
@@ -444,7 +520,7 @@ class Transolver(nn.Module):
                     act=act,
                     mlp_ratio=mlp_ratio,
                     out_dim=out_dim,
-                    slice_num=slice_num,
+                    slice_num=_slice_nums[idx],
                     last_layer=(idx == n_layers - 1),
                     linear_no_attention=linear_no_attention,
                     learned_kernel=learned_kernel,
@@ -457,6 +533,9 @@ class Transolver(nn.Module):
                     film_cond=film_cond,
                     decouple_slice=adaln_decouple,
                     zone_temp=adaln_zone_temp,
+                    patch_routing=_patch_routing,
+                    surf_vol_output=surf_vol_output if (idx == n_layers - 1) else False,
+                    local_agg=local_agg,
                 )
                 for idx in range(n_layers)
             ]
@@ -467,6 +546,8 @@ class Transolver(nn.Module):
         nn.init.zeros_(self.out_skip.bias)
         self.skip_gate = nn.Sequential(nn.Linear(n_hidden, 1), nn.Sigmoid())
         nn.init.constant_(self.skip_gate[0].bias, -2.0)  # starts nearly closed
+        if block_skip:
+            self.block_skip_gate = nn.Parameter(torch.zeros(1))
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
@@ -560,12 +641,44 @@ class Transolver(nn.Module):
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
 
+        # Compute patch mask for surf_patch / x_split_attn
+        if self.surf_patch:
+            patch_mask = (x[:, :, 24].abs() > 0.01)  # [B, N] — True = surface node
+        elif self.x_split_attn:
+            x_med = x[:, :, 0].median(dim=1, keepdim=True).values
+            patch_mask = x[:, :, 0] >= x_med  # [B, N] — True = right half
+        else:
+            patch_mask = None
+
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
-        for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+        if self.multi_scale_nodes:
+            # Every-other-node subsampling for early blocks, full mesh for last block
+            fx_sub = fx[:, ::2, :]
+            rxy_sub = raw_xy[:, ::2, :]
+            pm_sub = patch_mask[:, ::2] if patch_mask is not None else None
+            for block in self.blocks[:-1]:
+                fx_sub = block(fx_sub, raw_xy=rxy_sub, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features, patch_mask=pm_sub)
+            # Upsample: scatter subsampled features back to full mesh (nearest-neighbour copy)
+            fx_full = torch.empty_like(fx)
+            fx_full[:, ::2, :] = fx_sub
+            fx_full[:, 1::2, :] = fx_sub[:, :fx.shape[1] // 2, :]  # odd nodes copy from even
+            fx = fx_full
+        elif self.block_skip:
+            fx_block0 = None
+            for i, block in enumerate(self.blocks[:-1]):
+                if i == 0:
+                    fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features, patch_mask=patch_mask)
+                    fx_block0 = fx
+                else:
+                    fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features, patch_mask=patch_mask)
+            if fx_block0 is not None:
+                fx = fx + torch.tanh(self.block_skip_gate) * fx_block0
+        else:
+            for block in self.blocks[:-1]:
+                fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features, patch_mask=patch_mask)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
@@ -573,7 +686,7 @@ class Transolver(nn.Module):
 
         # Last block: use adaln_all condition if enabled, else fallback to adaln_output
         last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features, patch_mask=patch_mask)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
@@ -668,6 +781,15 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R6: multi-scale & hierarchical processing
+    progressive_slices: bool = False      # coarse-to-fine slice counts per block [S//3, 2S//3, S]
+    progressive_slices_rev: bool = False  # fine-to-coarse slice counts per block [S, 2S//3, S//3]
+    multi_scale_nodes: bool = False       # every-other-node subsampling for early blocks
+    block_skip: bool = False              # gated skip connection from block 0 to block 2
+    surf_patch: bool = False              # surface/volume separate slice projections
+    x_split_attn: bool = False            # left/right x-split separate slice projections
+    surf_vol_output: bool = False         # separate output heads for surface vs volume nodes
+    local_agg: bool = False               # local spatial grid-cell mean-pool residual before each block
 
 
 cfg = sp.parse(Config)
@@ -813,6 +935,14 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    progressive_slices=cfg.progressive_slices,
+    progressive_slices_rev=cfg.progressive_slices_rev,
+    multi_scale_nodes=cfg.multi_scale_nodes,
+    block_skip=cfg.block_skip,
+    surf_patch=cfg.surf_patch,
+    x_split_attn=cfg.x_split_attn,
+    surf_vol_output=cfg.surf_vol_output,
+    local_agg=cfg.local_agg,
 )
 
 model = Transolver(**model_config).to(device)
