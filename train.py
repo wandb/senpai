@@ -379,6 +379,7 @@ class Transolver(nn.Module):
         fun_dim=1,
         out_dim=1,
         slice_num=32,
+        slice_nums=None,  # optional per-block list; overrides slice_num per block
         ref=8,
         unified_pos=False,
         output_fields: list[str] | None = None,
@@ -435,6 +436,7 @@ class Transolver(nn.Module):
         self.space_dim = space_dim
         self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
         nn.init.eye_(self.feature_cross.weight)  # start as identity
+        _block_slices = slice_nums if slice_nums is not None else [slice_num] * n_layers
         self.blocks = nn.ModuleList(
             [
                 TransolverBlock(
@@ -444,7 +446,7 @@ class Transolver(nn.Module):
                     act=act,
                     mlp_ratio=mlp_ratio,
                     out_dim=out_dim,
-                    slice_num=slice_num,
+                    slice_num=_block_slices[idx],
                     last_layer=(idx == n_layers - 1),
                     linear_no_attention=linear_no_attention,
                     learned_kernel=learned_kernel,
@@ -668,6 +670,9 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R7: progressive slice count per block
+    prog_slices: bool = False      # expanding slices per block: 32 → ... → slice_num
+    prog_slices_rev: bool = False  # contracting slices per block: slice_num → ... → 32
 
 
 cfg = sp.parse(Config)
@@ -789,6 +794,20 @@ if cfg.raw_targets:
 else:
     raw_stats = None
 
+_prog_slice_min = 32
+if cfg.prog_slices and cfg.n_layers > 1:
+    _prog_slice_nums = [
+        round(_prog_slice_min + (cfg.slice_num - _prog_slice_min) * i / (cfg.n_layers - 1))
+        for i in range(cfg.n_layers)
+    ]
+elif cfg.prog_slices_rev and cfg.n_layers > 1:
+    _prog_slice_nums = [
+        round(cfg.slice_num - (cfg.slice_num - _prog_slice_min) * i / (cfg.n_layers - 1))
+        for i in range(cfg.n_layers)
+    ]
+else:
+    _prog_slice_nums = None
+
 model_config = dict(
     space_dim=2,
     fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
@@ -797,6 +816,7 @@ model_config = dict(
     n_layers=cfg.n_layers,
     n_head=3,
     slice_num=cfg.slice_num,
+    slice_nums=_prog_slice_nums,
     mlp_ratio=2,
     dropout=0.05 if cfg.rdrop else 0.0,
     output_fields=["Ux", "Uy", "p"],
