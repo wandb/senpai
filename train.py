@@ -121,7 +121,9 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False):
+                 decouple_slice=False, zone_temp=False,
+                 use_sdpa=False, linear_attn=False, gated_attn=False,
+                 rope_attn=False, local_slice_k=0, performer_attn=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -135,6 +137,15 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.learned_kernel = learned_kernel
         self.decouple_slice = decouple_slice
         self.zone_temp = zone_temp
+        self.use_sdpa = use_sdpa
+        self.linear_attn = linear_attn
+        self.gated_attn = gated_attn
+        self.rope_attn = rope_attn
+        self.local_slice_k = local_slice_k
+        self.performer_attn = performer_attn
+        self.dropout_p = dropout
+        if gated_attn:
+            self.gate_proj = nn.Linear(dim, heads)
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
@@ -208,20 +219,77 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             slice_token_kv = slice_token.mean(dim=1, keepdim=True)
             k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
             v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
-            if self.learned_kernel:
+            if self.use_sdpa:
+                # Flash Attention via PyTorch SDPA (uses FlashAttention kernel when available)
+                out_slice_token = F.scaled_dot_product_attention(
+                    q_slice_token, k_slice_token, v_slice_token,
+                    dropout_p=self.dropout_p if self.training else 0.0,
+                )
+            elif self.linear_attn:
+                # Linear attention with ELU+1 kernel: O(S*D^2) instead of O(S^2*D)
+                phi_q = F.elu(q_slice_token) + 1.0
+                phi_k = F.elu(k_slice_token) + 1.0
+                kv = phi_k.transpose(-2, -1) @ v_slice_token       # [B, H, D, D]
+                z = phi_k.sum(dim=-2)                               # [B, H, D]
+                out_slice_token = phi_q @ kv                        # [B, H, S, D]
+                denom = (phi_q * z.unsqueeze(-2)).sum(-1, keepdim=True).clamp(min=1e-6)
+                out_slice_token = out_slice_token / denom
+            elif self.performer_attn:
+                # Performer FAVOR+: random feature approximation of softmax attention
+                B, H, S, D = q_slice_token.shape
+                n_rf = min(D, 64)
+                omega = torch.randn(D, n_rf, device=x.device, dtype=x.dtype) / (D ** 0.5)
+                scale = D ** (-0.25)
+                q_proj = q_slice_token @ omega * scale              # [B, H, S, n_rf]
+                k_proj = k_slice_token @ omega * scale              # [B, H, S, n_rf]
+                q_ns = (q_slice_token ** 2).sum(-1, keepdim=True) / (2.0 * D)
+                k_ns = (k_slice_token ** 2).sum(-1, keepdim=True) / (2.0 * D)
+                phi_q = (q_proj - q_ns).clamp(max=20).exp()
+                phi_k = (k_proj - k_ns).clamp(max=20).exp()
+                kv = phi_k.transpose(-2, -1) @ v_slice_token       # [B, H, n_rf, D]
+                z = phi_k.sum(dim=-2)                               # [B, H, n_rf]
+                out_slice_token = phi_q @ kv                        # [B, H, S, D]
+                denom = (phi_q * z.unsqueeze(-2)).sum(-1, keepdim=True).clamp(min=1e-6)
+                out_slice_token = out_slice_token / denom
+            elif self.learned_kernel:
                 B, H, S, D = q_slice_token.shape
                 q_exp = q_slice_token.unsqueeze(-2).expand(B, H, S, S, D)
                 k_exp = k_slice_token.unsqueeze(-3).expand(B, H, S, S, D)
                 qk_cat = torch.cat([q_exp, k_exp], dim=-1)
                 attn_logits = self.kernel_mlp(qk_cat).squeeze(-1)
                 attn_weights = F.softmax(attn_logits, dim=-1)
+                out_slice_token = torch.matmul(attn_weights, v_slice_token)
             else:
                 q_norm = F.normalize(q_slice_token, dim=-1)
                 k_norm = F.normalize(k_slice_token, dim=-1)
+                if self.rope_attn:
+                    # Rotary position embeddings using slice index as position
+                    B, H, S, D = q_norm.shape
+                    half_d = D // 2
+                    freqs = 1.0 / (10000 ** (torch.arange(half_d, device=x.device, dtype=x.dtype) / half_d))
+                    angles = torch.arange(S, device=x.device, dtype=x.dtype).unsqueeze(-1) * freqs  # [S, D/2]
+                    cos = angles.cos().view(1, 1, S, half_d)
+                    sin = angles.sin().view(1, 1, S, half_d)
+                    def _rot(t):
+                        t1, t2 = t[..., :half_d], t[..., half_d:half_d*2]
+                        return torch.cat([t1 * cos - t2 * sin, t1 * sin + t2 * cos], dim=-1)
+                    q_norm = _rot(q_norm)
+                    k_norm = _rot(k_norm)
                 attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
+                if self.local_slice_k > 0:
+                    # Local slice attention: each slice only attends to top-k nearest slices
+                    k_top = min(self.local_slice_k, attn_logits.shape[-1])
+                    topk_vals, topk_idx = attn_logits.topk(k_top, dim=-1)
+                    mask = torch.full_like(attn_logits, float('-inf'))
+                    mask.scatter_(-1, topk_idx, topk_vals)
+                    attn_logits = mask
                 attn_weights = F.softmax(attn_logits, dim=-1)
-            out_slice_token = torch.matmul(attn_weights, v_slice_token)
+                out_slice_token = torch.matmul(attn_weights, v_slice_token)
             out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
+            if self.gated_attn:
+                # Input-dependent gate per head (averaged over nodes → scalar per head)
+                gate = torch.sigmoid(self.gate_proj(x).mean(dim=1))  # [B, heads]
+                out_slice_token = out_slice_token * gate.unsqueeze(-1).unsqueeze(-1)
 
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
@@ -250,6 +318,12 @@ class TransolverBlock(nn.Module):
         film_cond=False,
         decouple_slice=False,
         zone_temp=False,
+        use_sdpa=False,
+        linear_attn=False,
+        gated_attn=False,
+        rope_attn=False,
+        local_slice_k=0,
+        performer_attn=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -269,6 +343,12 @@ class TransolverBlock(nn.Module):
             learned_kernel=learned_kernel,
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
+            use_sdpa=use_sdpa,
+            linear_attn=linear_attn,
+            gated_attn=gated_attn,
+            rope_attn=rope_attn,
+            local_slice_k=local_slice_k,
+            performer_attn=performer_attn,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -395,6 +475,12 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        use_sdpa=False,
+        linear_attn=False,
+        gated_attn=False,
+        rope_attn=False,
+        local_slice_k=0,
+        performer_attn=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -457,6 +543,12 @@ class Transolver(nn.Module):
                     film_cond=film_cond,
                     decouple_slice=adaln_decouple,
                     zone_temp=adaln_zone_temp,
+                    use_sdpa=use_sdpa,
+                    linear_attn=linear_attn,
+                    gated_attn=gated_attn,
+                    rope_attn=rope_attn,
+                    local_slice_k=local_slice_k,
+                    performer_attn=performer_attn,
                 )
                 for idx in range(n_layers)
             ]
@@ -668,6 +760,13 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R6: novel attention variants
+    use_sdpa: bool = False          # use PyTorch SDPA (FlashAttention) for slice attention
+    linear_attn: bool = False       # linear attention with ELU+1 kernel (O(S*D^2))
+    gated_attn: bool = False        # input-dependent sigmoid gate per head on attention output
+    rope_attn: bool = False         # rotary position embeddings on Q/K (slice index as position)
+    local_slice_k: int = 0          # local slice attention: each slice attends to top-k (0=global)
+    performer_attn: bool = False    # Performer FAVOR+ random feature approximation
 
 
 cfg = sp.parse(Config)
@@ -813,6 +912,12 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    use_sdpa=cfg.use_sdpa,
+    linear_attn=cfg.linear_attn,
+    gated_attn=cfg.gated_attn,
+    rope_attn=cfg.rope_attn,
+    local_slice_k=cfg.local_slice_k,
+    performer_attn=cfg.performer_attn,
 )
 
 model = Transolver(**model_config).to(device)
