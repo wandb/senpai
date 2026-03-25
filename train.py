@@ -668,6 +668,9 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    aoa_perturb_range: float = 1.0  # half-range in degrees for aoa_perturb augmentation
+    multi_ema: bool = False          # maintain 3 EMA streams (0.995/0.998/0.999), average at eval
+    surface_local: bool = False      # 2x multiplier on surface loss contribution
     # Phase 3 R6/R8: feature engineering
     wake_dist_feat: bool = False      # log wake-distance past trailing edge (1-dim)
     local_re_feat: bool = False       # log local Reynolds based on chord position (1-dim)
@@ -838,6 +841,8 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
+ema_models: list = []  # multi_ema: 3 EMA streams at decays [0.995, 0.998, 0.999]
+_MULTI_EMA_DECAYS = [0.995, 0.998, 0.999]
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -1101,7 +1106,7 @@ for epoch in range(MAX_EPOCHS):
                 _scale = torch.rand(x.size(0), 1, 1, device=x.device) * (2 * cfg.aug_scale_range) + _lo
                 x[:, :, :2] = x[:, :, :2] * _scale
             if cfg.aug == "aoa_perturb":
-                _angle_deg = torch.rand(x.size(0), device=x.device) * 2.0 - 1.0
+                _angle_deg = torch.rand(x.size(0), device=x.device) * 2.0 * cfg.aoa_perturb_range - cfg.aoa_perturb_range
                 _angle_rad = _angle_deg * (torch.pi / 180.0)
                 _cos_a = torch.cos(_angle_rad).view(-1, 1, 1)
                 _sin_a = torch.sin(_angle_rad).view(-1, 1, 1)
@@ -1328,7 +1333,8 @@ for epoch in range(MAX_EPOCHS):
                     surf_uy_loss * torch.exp(-2 * bm.log_sigma_surf_uy) / 2 + bm.log_sigma_surf_uy +
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
         else:
-            loss = vol_loss + surf_weight * surf_loss
+            _surf_loss_w = surf_loss * 2.0 if cfg.surface_local else surf_loss
+            loss = vol_loss + surf_weight * _surf_loss_w
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
@@ -1459,12 +1465,21 @@ for epoch in range(MAX_EPOCHS):
             except ValueError:
                 pass
         if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa:
-            if ema_model is None:
-                ema_model = deepcopy(_base_model)
+            if cfg.multi_ema:
+                for i, decay in enumerate(_MULTI_EMA_DECAYS):
+                    if len(ema_models) <= i:
+                        ema_models.append(deepcopy(_base_model))
+                    else:
+                        with torch.no_grad():
+                            for ep, mp in zip(ema_models[i].parameters(), _base_model.parameters()):
+                                ep.data.mul_(decay).add_(mp.data, alpha=1 - decay)
             else:
-                with torch.no_grad():
-                    for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
-                        ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+                if ema_model is None:
+                    ema_model = deepcopy(_base_model)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -1486,6 +1501,10 @@ for epoch in range(MAX_EPOCHS):
     # --- Validate across all splits ---
     if cfg.swa and swa_model is not None:
         eval_model = swa_model
+    elif cfg.multi_ema and len(ema_models) == 3:
+        eval_model = ema_models[1]  # use middle decay (0.998) for checkpoint selection
+        for _m in ema_models:
+            _m.eval()
     elif ema_model is not None:
         eval_model = ema_model
     else:
@@ -1607,7 +1626,11 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    if cfg.multi_ema and len(ema_models) == 3:
+                        _preds = [_m({"x": x})["preds"] for _m in ema_models]
+                        pred = (_preds[0] + _preds[1] + _preds[2]) / 3
+                    else:
+                        pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
@@ -1756,6 +1779,8 @@ for epoch in range(MAX_EPOCHS):
                 best_metrics[f"best_{k}"] = v
         if cfg.swa and swa_model is not None:
             save_model = swa_model
+        elif cfg.multi_ema and len(ema_models) == 3:
+            save_model = ema_models[1]  # save middle decay (0.998) checkpoint
         elif ema_model is not None:
             save_model = ema_model
         else:
@@ -1795,6 +1820,8 @@ if best_metrics:
     print("\nGenerating flow field plots...")
     if cfg.swa and swa_model is not None:
         vis_model = swa_model
+    elif cfg.multi_ema and len(ema_models) == 3:
+        vis_model = ema_models[1]
     elif ema_model is not None:
         vis_model = ema_model
     else:
