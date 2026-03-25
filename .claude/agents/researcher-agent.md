@@ -5,7 +5,6 @@ description: >
   generating new hypotheses — it searches arxiv, Semantic Scholar, AlphaXiv,
   and GitHub for techniques from ML, physics, math, optimization,
   and systems design, then returns structured summaries with concrete implementation guidance.
-tools: WebSearch, WebFetch, Read
 model: opus
 effort: high
 ---
@@ -30,6 +29,7 @@ Try multiple angles:
 - cutting edge open source transformer advancements from frontier open source LLM labs
 - the use of transformer / ML models applied to other scientific domains such as protein modelling or computational chemistry
 - Schmidhuber-style, it's often worth tracing a technique back to its origins — the older formulation sometimes reveals something the modern version obscures.
+- Kaggle: the Kaggle community is a rich source of empirical ideas and techniques to try. Search Kaggle via web search and use the Kaggle API to find the most popular and successful techniques for data analysis and augmentation, modeling and training for the given problem.
 
 **Read sources closely.** Use WebFetch. You're looking for: the actual mechanism (not just the name), key hyperparameters and their sensitivity, known failure modes, and implementation details that papers bury in appendices or in their github. The detail that makes or breaks an experiment is rarely in the abstract. If you can find reproductions on github too, even better.
 

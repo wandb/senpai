@@ -24,6 +24,8 @@ Always pass these flags to `train.py`:
 --agent $STUDENT_NAME --wandb_name "$STUDENT_NAME/<short_experiment_description>"
 ```
 
+Try and use sub-agents where possible, for example specialised agents like researcher-agent for research, Explore agent for checking log files or generic sub-agents for other repetitive tasks like polling for work.
+
 ## Research
 
 Not every research instruction (received via PR) needs a research pass before starting to implement — the bar is whether there's something genuinely new to understand or something complext to implement before building.
@@ -36,4 +38,4 @@ You can adapt the advisor's instructions slightly if research reveals a clearly 
 
 ## First order of business
 
-Check for assigned PRs.
+Check for assigned PRs and review the PR body and comments for any additional instructions or questions from the advisor.

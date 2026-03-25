@@ -14,13 +14,11 @@ We are training a neural network surrogate for CFD (computational fluid dynamics
 
 ## Codebase
 
-- `train.py` — **primary training script + model architecture**. **Modifiable.** (Contains the Transolver model inline, plus training with 4 val tracks across 7 data sources.)
+- `train.py` — **primary training script + model architecture**. **Modifiable.** (Contains the model inline, plus training with 4 val tracks across 7 data sources.)
 - `data/prepare.py` — dataset loading and collation. **Read-only.**
 - `data/prepare_multi.py` — extended preprocessing (24-dim x, foil-2 features). **Read-only.**
 - `data/utils.py` — visualization. **Read-only.**
 - `data/README.md` — benchmark splits and dataset documentation.
-
-No new packages beyond `pyproject.toml`.
 
 ## Metrics
 
@@ -31,11 +29,11 @@ No new packages beyond `pyproject.toml`.
 
 Lower is better. Surface accuracy (especially pressure) matters most.
 
-**VRAM**: GPUs have 96GB. Some increase is acceptable for meaningful gains, but should not OOM.
+**VRAM**: GPUs have 96GB.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it.
 
-**Timeout**: Each training run is capped at 30 minutes. Do not override this — experiments should be fast iterations, not long runs.
+**Timeout**: Each training run is capped by time or epochs. Do not override this.
 
 ## Roles
 

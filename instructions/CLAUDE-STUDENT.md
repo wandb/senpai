@@ -24,7 +24,7 @@ Read `program.md` for the full research context, constraints, metrics, and file 
    ```bash
    gh pr list --label "student:<your-name>" --label "status:wip" --json number,title,headRefName,body
    ```
-   If nothing is assigned, wait 60 seconds and poll again.
+   Ensure to always use a sub-agent to poll for work in order to preserve your context window. If nothing is assigned, wait 60 seconds and poll again.
 
 2. **Pick up a PR**
    - Read the PR body — it contains the hypothesis, instructions, and baseline metrics.
@@ -58,7 +58,6 @@ Read `program.md` for the full research context, constraints, metrics, and file 
    ```
    - **Timeout**: The `SENPAI_MAX_EPOCHS` and `SENPAI_TIMEOUT_MINUTES` env vars control the max epochs and timeout for each training run in train.py. Ensure training runs do not exceed these limits.
    - Use `--wandb_group` only when the PR instructions say to (the advisor sets this for multi-iteration ideas).
-   - If the run crashes, check the log. Fix typos/import errors and re-run. If the idea is fundamentally broken, report that in the results.
    - Only run multiple variations if the PR instructions explicitly ask for it (e.g. "try surface weight 5, 10, 20"). Otherwise, run the single experiment described.
    - **After each run finishes**, check for new advisor comments before continuing:
      ```bash
@@ -67,13 +66,22 @@ Read `program.md` for the full research context, constraints, metrics, and file 
      If the advisor has left new instructions (e.g. to try a different variant, abort the current direction, or adjust parameters), follow them instead of proceeding with the original plan.
 
 5. **Report results**
-   Update the PR body with the Results section (template in `program.md`):
+   Add a new PR comment with a Results section (template in `program.md`):
+   - Start your comment with: 
+   ```markdown
+   STUDENT <your-name>:
+
+   ## Results
+   
+   ```
    - All key metrics: val_loss, Surface MAE (Ux, Uy, p), Volume MAE
    - Comparison against the baseline numbers from the PR body
    - Peak memory usage
    - W&B run ID
    - **What happened** — honest analysis: did it work? why or why not?
    - **Suggested follow-ups** — what would you try next based on what you learned?
+
+   If there are results from a set of follow-up experiments (e.g. if the advisor comments with instructions to try a different variant), add these results to a new results comment, starting with the same format as above.
 
 6. **Submit for review**
    ```bash
@@ -90,6 +98,28 @@ Read `program.md` for the full research context, constraints, metrics, and file 
    **IMPORTANT:** Never use `gh pr edit --remove-label --add-label` — it strips other labels. Always use the API calls above to swap status labels individually.
 
 7. **Go back to step 1** and poll for the next assignment.
+
+### Give new experiments the best possible chance of success
+
+Consider that the baseline metrics you are trying to beat is already very well tuned. Ensure that the experiments you run give the best possible chance of success by carefully considering the likely best hyperparameters and training setup. 
+
+#### Handle errors and crashes
+
+Ensure experiments can run successfully. For big codebase changes, consider running 1 tiny debug run first using a sub-agent to check everything is working. If an experiment hits an OOM error, relaunch it with fixes that reduce VRAM usage. If it crashes for any other reason, investigate the cause fix the bug and relaunch the experiment. Comment in the PR with the details of the error, and timestamp so the advisor knows why an experiment might be delayed. If an idea if fundamentally broken, report that in the results.
+
+Note: Don't try to fix errors or failures that arise to our hard, fixed experiment timeout or epoch count limits cutting in.
+
+### If you find bugs, you fix them
+
+Your are at front line of this code base, if you find bugs in the codebase, including bugs not immediately related to the experiments you are running, it is your responsibility as a dilligent team member to fix them. Ensure you alert the advisor clearly in a separate bug-fix comment about any bug fixes you made so that they can review and merge them.
+
+### Always have rich wandb logging for every experiment
+
+Ensure that you log all relevant metrics and configs to wandb, especially when adding new metrics or configs particular to an experiment. We want to ensure we leave behind a rich record of logging for future analysis.
+
+### You can install new packages if necessary for an experiment
+
+Installing new packages using `uv` is fine if necessary for an experiment. Ensure that if they are really necessary for a successful experiment that `pyproject.toml` is updated as part of the PR.
 
 ## If the advisor requests changes
 
