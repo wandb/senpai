@@ -250,9 +250,11 @@ class TransolverBlock(nn.Module):
         film_cond=False,
         decouple_slice=False,
         zone_temp=False,
+        always_predict=False,
     ):
         super().__init__()
         self.last_layer = last_layer
+        self.always_predict = always_predict
         self.field_decoder = field_decoder
         self.adaln_output = adaln_output
         self.soft_moe = soft_moe
@@ -302,7 +304,7 @@ class TransolverBlock(nn.Module):
         self.se_fc2 = nn.Linear(hidden_dim // 4, hidden_dim)
         nn.init.zeros_(self.se_fc2.weight)
         nn.init.zeros_(self.se_fc2.bias)
-        if self.last_layer:
+        if self.last_layer or always_predict:
             self.ln_3 = nn.LayerNorm(hidden_dim)
             if soft_moe:
                 self.gate_net = nn.Sequential(nn.Linear(hidden_dim, 2), nn.Softmax(dim=-1))
@@ -329,7 +331,7 @@ class TransolverBlock(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None, active_last=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         if self.adaln_all and condition is not None:
             cond_out = self.adaln_net(condition)  # [B, H*4]
@@ -349,7 +351,8 @@ class TransolverBlock(nn.Module):
             film_out = self.film_net(condition)  # [B, H*2]
             gamma, beta = film_out.chunk(2, dim=-1)  # each [B, H]
             fx = gamma.unsqueeze(1) * fx + beta.unsqueeze(1)
-        if self.last_layer:
+        _is_last = self.last_layer if active_last is None else active_last
+        if _is_last and (self.last_layer or self.always_predict):
             fx_ln = self.ln_3(fx)
             if self.soft_moe:
                 gate = self.gate_net(fx_ln)  # [B, N, 2]
@@ -395,6 +398,7 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        prog_growth_init_layers=0,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -435,6 +439,8 @@ class Transolver(nn.Module):
         self.space_dim = space_dim
         self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
         nn.init.eye_(self.feature_cross.weight)  # start as identity
+        _prog = prog_growth_init_layers > 0
+        self.active_n_layers = prog_growth_init_layers if _prog else n_layers
         self.blocks = nn.ModuleList(
             [
                 TransolverBlock(
@@ -445,12 +451,13 @@ class Transolver(nn.Module):
                     mlp_ratio=mlp_ratio,
                     out_dim=out_dim,
                     slice_num=slice_num,
-                    last_layer=(idx == n_layers - 1),
+                    last_layer=(idx == n_layers - 1) and not _prog,
+                    always_predict=_prog,
                     linear_no_attention=linear_no_attention,
                     learned_kernel=learned_kernel,
-                    field_decoder=field_decoder if (idx == n_layers - 1) else False,
-                    adaln_output=adaln_output if (idx == n_layers - 1) else False,
-                    soft_moe=soft_moe if (idx == n_layers - 1) else False,
+                    field_decoder=field_decoder if ((idx == n_layers - 1) or _prog) else False,
+                    adaln_output=adaln_output if ((idx == n_layers - 1) or _prog) else False,
+                    soft_moe=soft_moe if ((idx == n_layers - 1) or _prog) else False,
                     adaln_all=adaln_all_blocks,
                     adaln_cond_dim=4 if adaln_4cond else 2,
                     adaln_zero_init=not adaln_nozero,
@@ -564,16 +571,17 @@ class Transolver(nn.Module):
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
-        for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+        _active = min(getattr(self, 'active_n_layers', len(self.blocks)), len(self.blocks))
+        for block in self.blocks[:_active - 1]:
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features, active_last=False)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
-        # Last block: use adaln_all condition if enabled, else fallback to adaln_output
+        # Last active block: use adaln_all condition if enabled, else fallback to adaln_output
         last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+        fx = self.blocks[_active - 1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features, active_last=True)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
@@ -668,6 +676,10 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R8: Progressive layer growth
+    prog_growth_layers: str = ""   # comma-sep layer counts e.g. "1,2,3"
+    prog_growth_epochs: str = ""   # comma-sep epoch thresholds e.g. "60,120"
+    multi_ema: bool = False        # 3 EMA streams (decays 0.990, 0.995, 0.999)
 
 
 cfg = sp.parse(Config)
@@ -789,12 +801,23 @@ if cfg.raw_targets:
 else:
     raw_stats = None
 
+# Progressive growth schedule: parse layers and epoch thresholds
+_prog_growth_schedule = []
+_prog_growth_max_layers = cfg.n_layers
+_prog_growth_init = 0
+if cfg.prog_growth_layers:
+    _pgl = [int(x) for x in cfg.prog_growth_layers.split(',')]
+    _pge = [int(x) for x in cfg.prog_growth_epochs.split(',')] if cfg.prog_growth_epochs else []
+    _prog_growth_init = _pgl[0]
+    _prog_growth_max_layers = max(_pgl[0], cfg.n_layers, _pgl[-1])
+    _prog_growth_schedule = list(zip(_pge, _pgl[1:]))
+
 model_config = dict(
     space_dim=2,
     fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
-    n_layers=cfg.n_layers,
+    n_layers=_prog_growth_max_layers,
     n_head=3,
     slice_num=cfg.slice_num,
     mlp_ratio=2,
@@ -813,6 +836,7 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    prog_growth_init_layers=_prog_growth_init,
 )
 
 model = Transolver(**model_config).to(device)
@@ -822,6 +846,10 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
+# Multi-EMA: 3 streams with different decay rates; averaged into a soup model for eval
+_multi_ema_decays = [0.990, 0.995, 0.999]
+_multi_ema_models = [None, None, None]  # initialized lazily at ema_start_epoch
+_soup_model = None  # weight-averaged model (model soup) from multi-EMA streams
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -1037,6 +1065,23 @@ for epoch in range(MAX_EPOCHS):
     if elapsed_min >= MAX_TIMEOUT:
         print(f"Wall-clock limit reached ({elapsed_min:.1f} min >= {MAX_TIMEOUT} min). Stopping.")
         break
+
+    # Progressive layer growth: activate next block at scheduled epoch
+    for _ge, _gl in _prog_growth_schedule:
+        if epoch == _ge:
+            print(f"[prog_growth] Growing model from {_base_model.active_n_layers} to {_gl} layers at epoch {epoch+1}")
+            _base_model.active_n_layers = _gl
+            _new_block = _base_model.blocks[_gl - 1]
+            with torch.no_grad():
+                if hasattr(_new_block, 'field_decoder') and _new_block.field_decoder and hasattr(_new_block, 'vel_head'):
+                    nn.init.zeros_(_new_block.vel_head[-1].weight)
+                    nn.init.zeros_(_new_block.vel_head[-1].bias)
+                    nn.init.zeros_(_new_block.pres_head[-1].weight)
+                    nn.init.zeros_(_new_block.pres_head[-1].bias)
+                elif hasattr(_new_block, 'mlp2'):
+                    nn.init.zeros_(_new_block.mlp2[-1].weight)
+                    nn.init.zeros_(_new_block.mlp2[-1].bias)
+            break
 
     t0 = time.time()
 
@@ -1414,6 +1459,14 @@ for epoch in range(MAX_EPOCHS):
                 with torch.no_grad():
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            if cfg.multi_ema:
+                for _mi, _md in enumerate(_multi_ema_decays):
+                    if _multi_ema_models[_mi] is None:
+                        _multi_ema_models[_mi] = deepcopy(_base_model)
+                    else:
+                        with torch.no_grad():
+                            for _ep, _mp in zip(_multi_ema_models[_mi].parameters(), _base_model.parameters()):
+                                _ep.data.mul_(_md).add_(_mp.data, alpha=1 - _md)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -1435,6 +1488,15 @@ for epoch in range(MAX_EPOCHS):
     # --- Validate across all splits ---
     if cfg.swa and swa_model is not None:
         eval_model = swa_model
+    elif cfg.multi_ema and all(_m is not None for _m in _multi_ema_models):
+        # Model soup: average weights from all 3 EMA streams for eval
+        if _soup_model is None:
+            _soup_model = deepcopy(_multi_ema_models[0])
+        _soup_state = {}
+        for _k in _multi_ema_models[0].state_dict().keys():
+            _soup_state[_k] = sum(_m.state_dict()[_k].float() for _m in _multi_ema_models) / len(_multi_ema_models)
+        _soup_model.load_state_dict(_soup_state)
+        eval_model = _soup_model
     elif ema_model is not None:
         eval_model = ema_model
     else:
@@ -1670,6 +1732,8 @@ for epoch in range(MAX_EPOCHS):
                 best_metrics[f"best_{k}"] = v
         if cfg.swa and swa_model is not None:
             save_model = swa_model
+        elif cfg.multi_ema and _soup_model is not None:
+            save_model = _soup_model
         elif ema_model is not None:
             save_model = ema_model
         else:
@@ -1709,6 +1773,8 @@ if best_metrics:
     print("\nGenerating flow field plots...")
     if cfg.swa and swa_model is not None:
         vis_model = swa_model
+    elif cfg.multi_ema and _soup_model is not None:
+        vis_model = _soup_model
     elif ema_model is not None:
         vis_model = ema_model
     else:
