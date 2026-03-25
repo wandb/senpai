@@ -121,7 +121,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False):
+                 decouple_slice=False, zone_temp=False,
+                 sparse_topk=0, topk_gumbel=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -135,6 +136,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.learned_kernel = learned_kernel
         self.decouple_slice = decouple_slice
         self.zone_temp = zone_temp
+        self.sparse_topk = sparse_topk
+        self.topk_gumbel = topk_gumbel
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
@@ -196,7 +199,23 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             slice_logits = self.in_project_slice(x_mid) / temp
         if spatial_bias is not None:
             slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
-        slice_weights = self.softmax(slice_logits)
+        if self.sparse_topk > 0:
+            # Sparse top-k slice assignment (Transolver++ direction)
+            # Optionally add Gumbel noise to logits for exploration (prevents dead slices)
+            if self.training and self.topk_gumbel:
+                u = torch.rand_like(slice_logits).clamp(min=1e-10)
+                gumbel_noise = -torch.log(-torch.log(u))
+                noisy_logits = slice_logits + 0.1 * gumbel_noise
+            else:
+                noisy_logits = slice_logits
+            soft_weights = self.softmax(slice_logits)           # [B, H, N, S] — for gradients
+            topk_idx = noisy_logits.topk(self.sparse_topk, dim=-1)[1]  # [B, H, N, k]
+            mask = torch.zeros_like(soft_weights).scatter_(-1, topk_idx, 1.0)
+            # Straight-through estimator: hard selection in forward, soft gradient in backward
+            slice_weights = soft_weights * mask
+            slice_weights = slice_weights / slice_weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        else:
+            slice_weights = self.softmax(slice_logits)
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
@@ -228,6 +247,105 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         return self.to_out(out_x)
 
 
+class INRDecoder(nn.Module):
+    """Coordinate-conditioned output decoder with shift-only FiLM modulation.
+
+    Replaces a plain linear/MLP output head with a 3-layer MLP whose per-layer
+    bias is modulated by the Transolver hidden features (inspired by MARIO,
+    NeurIPS ML4CFD 2024, which won 3rd place using this design on AirfRANS).
+
+    Zero-initialising the modulation networks ensures the decoder starts as a
+    pure coordinate-lookup (identity modulation), providing gradient stability
+    in early training.
+    """
+    def __init__(self, hidden_dim: int, coord_dim: int = 4, out_dim: int = 3,
+                 inr_hidden: int = 128, n_layers: int = 3):
+        super().__init__()
+        self.coord_proj = nn.Linear(coord_dim, inr_hidden)
+        self.mod_nets = nn.ModuleList([
+            nn.Linear(hidden_dim, inr_hidden) for _ in range(n_layers)
+        ])
+        self.layers = nn.ModuleList([
+            nn.Linear(inr_hidden, inr_hidden) for _ in range(n_layers)
+        ])
+        self.out = nn.Linear(inr_hidden, out_dim)
+        # Zero-init modulation → identity at start (stable training)
+        for mod in self.mod_nets:
+            nn.init.zeros_(mod.weight)
+            nn.init.zeros_(mod.bias)
+
+    def forward(self, h: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        """h: [B, N, hidden_dim], coords: [B, N, coord_dim] → [B, N, out_dim]."""
+        x = F.gelu(self.coord_proj(coords))
+        for layer, mod in zip(self.layers, self.mod_nets):
+            x = F.gelu(layer(x) + mod(h))
+        return self.out(x)
+
+
+class SpatialGridConv(nn.Module):
+    """Grid-based local spatial aggregation for large irregular meshes.
+
+    Assigns each node to a C×C grid cell, computes a mean of features per cell,
+    then averages over the 3×3 cell neighbourhood using avg_pool2d, and scatters
+    the result back to each node.  This achieves local-context aggregation in
+    O(N + C^2 * D) time without explicit graph construction (no torch_cluster).
+
+    Effective local neighbourhood size ≈ 9 cells × (N / C^2) nodes per cell.
+    Larger C → finer grid → fewer nodes per cell → tighter neighbourhood.
+
+    Applied *before* the Transolver blocks so that the global slice attention
+    can leverage local geometric context (OB-GNN / GeoMPNN philosophy).
+    """
+    def __init__(self, hidden_dim: int, grid_size: int = 64):
+        super().__init__()
+        self.grid_size = grid_size
+        # Combine neighbourhood aggregate with self-features (zero-init → identity start)
+        self.out_proj = nn.Linear(hidden_dim * 2, hidden_dim)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, fx: torch.Tensor, pos2d: torch.Tensor) -> torch.Tensor:
+        """fx: [B, N, D], pos2d: [B, N, 2] → [B, N, D]."""
+        B, N, D = fx.shape
+        G = self.grid_size
+        device = fx.device
+
+        # Per-sample coordinate normalisation to [0, G-1]
+        xmin = pos2d[:, :, 0].min(dim=1, keepdim=True).values   # [B, 1]
+        xmax = pos2d[:, :, 0].max(dim=1, keepdim=True).values
+        ymin = pos2d[:, :, 1].min(dim=1, keepdim=True).values
+        ymax = pos2d[:, :, 1].max(dim=1, keepdim=True).values
+        gx = ((pos2d[:, :, 0] - xmin) / (xmax - xmin + 1e-8) * (G - 1)).long().clamp(0, G - 1)  # [B, N]
+        gy = ((pos2d[:, :, 1] - ymin) / (ymax - ymin + 1e-8) * (G - 1)).long().clamp(0, G - 1)
+        cell_idx = gy * G + gx                                         # [B, N] in [0, G²-1]
+
+        # Vectorised scatter: pool features into grid cells across the batch
+        batch_offset = torch.arange(B, device=device).unsqueeze(1) * G * G  # [B, 1]
+        flat_cidx = (cell_idx + batch_offset).reshape(B * N)                # [B*N]
+        flat_feat = fx.reshape(B * N, D)
+
+        total_cells = B * G * G
+        dtype = flat_feat.dtype
+        cell_feat = torch.zeros(total_cells, D, device=device, dtype=dtype)
+        cell_cnt  = torch.zeros(total_cells, 1, device=device, dtype=dtype)
+        cell_feat.scatter_add_(0, flat_cidx.unsqueeze(-1).expand(-1, D), flat_feat)
+        cell_cnt.scatter_add_(0, flat_cidx.unsqueeze(-1),
+                               torch.ones(B * N, 1, device=device, dtype=dtype))
+        cell_feat = cell_feat / (cell_cnt + 1e-8)                     # mean pool [B*G², D]
+
+        # 3×3 neighbourhood average via avg_pool2d (spatial smoothing over grid)
+        cell_4d = cell_feat.reshape(B, G, G, D).permute(0, 3, 1, 2)  # [B, D, G, G]
+        nbr_avg = F.avg_pool2d(cell_4d, kernel_size=3, stride=1, padding=1)  # [B, D, G, G]
+
+        # Gather: each node looks up its cell's neighbourhood average
+        nbr_flat = nbr_avg.permute(0, 2, 3, 1).reshape(B * G * G, D)
+        node_agg = nbr_flat[flat_cidx].reshape(B, N, D)
+
+        # Residual combine
+        combined = torch.cat([fx, node_agg], dim=-1)                  # [B, N, 2D]
+        return fx + self.out_proj(combined)
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -250,6 +368,9 @@ class TransolverBlock(nn.Module):
         film_cond=False,
         decouple_slice=False,
         zone_temp=False,
+        inr_decoder=False,
+        sparse_topk=0,
+        topk_gumbel=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -258,6 +379,7 @@ class TransolverBlock(nn.Module):
         self.soft_moe = soft_moe
         self.adaln_all = adaln_all
         self.film_cond = film_cond
+        self.inr_decoder = inr_decoder
         self.ln_1 = nn.LayerNorm(hidden_dim)
         self.attn = Physics_Attention_Irregular_Mesh(
             hidden_dim,
@@ -269,6 +391,8 @@ class TransolverBlock(nn.Module):
             learned_kernel=learned_kernel,
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
+            sparse_topk=sparse_topk,
+            topk_gumbel=topk_gumbel,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -312,6 +436,11 @@ class TransolverBlock(nn.Module):
                 self.expert2 = nn.Sequential(
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
+            elif field_decoder and inr_decoder:
+                # INR coordinate-conditioned vel/pres decoders (MARIO-inspired, NeurIPS ML4CFD 2024)
+                # coords: [x, y, curvature, dist] (4-dim raw_xy)
+                self.vel_inr = INRDecoder(hidden_dim, coord_dim=4, out_dim=2)
+                self.pres_inr = INRDecoder(hidden_dim, coord_dim=4, out_dim=1)
             elif field_decoder:
                 self.vel_head = nn.Sequential(
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2)
@@ -319,6 +448,9 @@ class TransolverBlock(nn.Module):
                 self.pres_head = nn.Sequential(
                     nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(), nn.Linear(hidden_dim * 2, 1)
                 )
+            elif inr_decoder:
+                # Single INR head when field_decoder is not active
+                self.inr_head = INRDecoder(hidden_dim, coord_dim=4, out_dim=out_dim)
             elif adaln_output:
                 self.cond_net = nn.Sequential(nn.Linear(2, hidden_dim * 2), nn.GELU())
                 self.mlp2 = nn.Sequential(
@@ -354,8 +486,15 @@ class TransolverBlock(nn.Module):
             if self.soft_moe:
                 gate = self.gate_net(fx_ln)  # [B, N, 2]
                 return gate[:, :, 0:1] * self.expert1(fx_ln) + gate[:, :, 1:2] * self.expert2(fx_ln)
+            elif self.field_decoder and self.inr_decoder:
+                # INR coordinate-conditioned field decoders
+                coords = raw_xy  # [B, N, 4]: (x, y, curvature, dist)
+                return torch.cat([self.vel_inr(fx_ln, coords), self.pres_inr(fx_ln, coords)], dim=-1)
             elif self.field_decoder:
                 return torch.cat([self.vel_head(fx_ln), self.pres_head(fx_ln)], dim=-1)
+            elif self.inr_decoder:
+                coords = raw_xy  # [B, N, 4]
+                return self.inr_head(fx_ln, coords)
             elif self.adaln_output and condition is not None:
                 cond = self.cond_net(condition)  # [B, 2*H]
                 scale, shift = cond.chunk(2, dim=-1)  # [B, H]
@@ -395,6 +534,12 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        gnn_pre=False,
+        gnn_k=8,
+        gnn_layers=1,
+        inr_decoder=False,
+        sparse_topk=0,
+        topk_gumbel=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -405,6 +550,7 @@ class Transolver(nn.Module):
         self.adaln_4cond = adaln_4cond
         self.film_cond = film_cond
         self.adaln_zone_temp = adaln_zone_temp
+        self.gnn_pre = gnn_pre
         if output_fields is None or output_dims is None:
             raise ValueError("output_fields and output_dims must be provided")
         if len(output_fields) != len(output_dims):
@@ -435,6 +581,13 @@ class Transolver(nn.Module):
         self.space_dim = space_dim
         self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
         nn.init.eye_(self.feature_cross.weight)  # start as identity
+        # GNN pre-layers: enrich node features with local neighbourhood context
+        # before the global slice attention (OB-GNN / GeoMPNN inspired)
+        # gnn_k is reused as grid_size for SpatialGridConv (larger=finer grid)
+        if gnn_pre:
+            self.gnn_pre_layers = nn.ModuleList([
+                SpatialGridConv(n_hidden, grid_size=gnn_k) for _ in range(gnn_layers)
+            ])
         self.blocks = nn.ModuleList(
             [
                 TransolverBlock(
@@ -457,6 +610,9 @@ class Transolver(nn.Module):
                     film_cond=film_cond,
                     decouple_slice=adaln_decouple,
                     zone_temp=adaln_zone_temp,
+                    inr_decoder=inr_decoder if (idx == n_layers - 1) else False,
+                    sparse_topk=sparse_topk,
+                    topk_gumbel=topk_gumbel,
                 )
                 for idx in range(n_layers)
             ]
@@ -561,6 +717,12 @@ class Transolver(nn.Module):
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
 
         fx = self.preprocess(x)
+        # GNN pre-layers: enrich per-node features with local spatial context
+        # Uses x[:, :, :2] (normalised x, y coordinates) for grid cell assignment
+        if self.gnn_pre:
+            pos2d = x[:, :, :2]  # [B, N, 2] normalised coordinates
+            for gnn_layer in self.gnn_pre_layers:
+                fx = gnn_layer(fx, pos2d)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
@@ -668,6 +830,13 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R6: Bold architecture changes
+    gnn_pre: bool = False        # SpatialGridConv pre-layer before TransolverBlocks
+    gnn_k: int = 64              # grid_size for SpatialGridConv (64=~20 nodes/cell, 32=~82/cell)
+    gnn_layers: int = 1          # number of GNN pre-layers (1 or 2)
+    inr_decoder: bool = False    # INR coordinate-conditioned output decoder (MARIO-inspired)
+    sparse_topk: int = 0         # sparse top-k slice assignment (0=dense softmax, >0=top-k)
+    topk_gumbel: bool = False    # add Gumbel noise to top-k selection (prevents dead slices)
 
 
 cfg = sp.parse(Config)
@@ -813,6 +982,12 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    gnn_pre=cfg.gnn_pre,
+    gnn_k=cfg.gnn_k,
+    gnn_layers=cfg.gnn_layers,
+    inr_decoder=cfg.inr_decoder,
+    sparse_topk=cfg.sparse_topk,
+    topk_gumbel=cfg.topk_gumbel,
 )
 
 model = Transolver(**model_config).to(device)
