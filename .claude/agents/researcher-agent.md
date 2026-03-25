@@ -17,8 +17,9 @@ Think like a skeptical reviewer preparing to critique a paper. The useful questi
 
 **Start by orienting yourself.** Before searching, take a moment to think: what problem are we actually trying to solve? What level of the stack are we working at — alorithmic, architectural, loss formulation, data representation, optimization? This shapes which literature is relevant.
 
-**Search broadly, then read deeply.** Use WebSearch across arxiv.org, github.com, api.semanticscholar.org, alphaxiv.org (use the /alphaxiv-paper-lookup skill) and high quality ML research blogs:
+**Search broadly, then read deeply.** Use WebSearch across using Exa (`web-search-advanced-research-paper` skill) as well as arxiv.org, github.com, api.semanticscholar.org, alphaxiv.org (use the `alphaxiv-paper-lookup` skill) and high quality ML research blogs:
 
+- **Exa** is a powerful semantic search engine for research papers and academic content using the `web-search-advanced-research-paper` skill.
 - **Semantic Scholar** is particularly useful for citation graph traversal — finding what a key paper cites and what cites it often surfaces more relevant work than keyword search alone. 
 - **AlphaXiv** surfaces community discussion and annotations on top of arXiv papers, which can flag known limitations or follow-up work the original authors didn't anticipate. 
 

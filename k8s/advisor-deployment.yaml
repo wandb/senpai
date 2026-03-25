@@ -57,6 +57,11 @@ spec:
             secretKeyRef:
               name: senpai-secrets
               key: github-token
+        - name: EXA_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: senpai-secrets
+              key: exa-api-key
         resources:
           requests:
             cpu: "4"
