@@ -668,6 +668,10 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R6: spectral/frequency-domain features
+    n_fourier_bands: int = 8       # Fourier PE bands (default 8 = 4 fixed + 4 learned; each band → 4 input dims)
+    wavelet_sdf: bool = False       # Haar wavelet multi-scale SDF features (adds 12 input dims)
+    spectral_loss: float = 0.0      # weight for frequency-domain surface pressure loss
 
 
 cfg = sp.parse(Config)
@@ -791,7 +795,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + cfg.n_fourier_bands * 4 + (12 if cfg.wavelet_sdf else 0),  # +curv, +dist, [+foil2dist], +fourier PE, [+wavelet]
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -819,6 +823,13 @@ model = Transolver(**model_config).to(device)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode="default")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+
+if cfg.n_fourier_bands != 8:
+    _half = cfg.n_fourier_bands // 2
+    _log_fixed = torch.linspace(float(torch.log(torch.tensor(0.5))), float(torch.log(torch.tensor(64.0))), _half)
+    _log_learned = torch.linspace(float(torch.log(torch.tensor(1.0))), float(torch.log(torch.tensor(32.0))), _half)
+    _base_model.fourier_freqs_fixed = torch.exp(_log_fixed)  # stays CPU; .to(device) called in loop
+    _base_model.fourier_freqs_learned = nn.Parameter(torch.exp(_log_learned).to(device))
 
 from copy import deepcopy
 ema_model = None
@@ -1127,7 +1138,30 @@ for epoch in range(MAX_EPOCHS):
             x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
         else:
             x = torch.cat([x, curv, dist_feat], dim=-1)
-        # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
+        if cfg.wavelet_sdf:
+            # Haar wavelet multi-scale SDF features: decompose foil DSDF gradient pairs
+            # Each foil has 4 channels: [dx_dir1, dy_dir1, dx_dir2, dy_dir2]
+            _d1 = raw_dsdf[:, :, 0:4]  # foil 1 DSDF gradients [B, N, 4]
+            _d2 = raw_dsdf[:, :, 4:8]  # foil 2 DSDF gradients [B, N, 4]
+            # L1 Haar on x-gradients (channels 0,2) and y-gradients (channels 1,3)
+            _w1_ax = (_d1[:, :, 0:1] + _d1[:, :, 2:3]) * 0.7071  # approx x
+            _w1_dx = (_d1[:, :, 0:1] - _d1[:, :, 2:3]) * 0.7071  # detail x
+            _w1_ay = (_d1[:, :, 1:2] + _d1[:, :, 3:4]) * 0.7071  # approx y
+            _w1_dy = (_d1[:, :, 1:2] - _d1[:, :, 3:4]) * 0.7071  # detail y
+            # L2 Haar on x/y approxes
+            _w1_a2 = (_w1_ax + _w1_ay) * 0.7071   # L2 approx (overall mean gradient)
+            _w1_d2 = (_w1_ax - _w1_ay) * 0.7071   # L2 detail (x vs y asymmetry)
+            _w2_ax = (_d2[:, :, 0:1] + _d2[:, :, 2:3]) * 0.7071
+            _w2_dx = (_d2[:, :, 0:1] - _d2[:, :, 2:3]) * 0.7071
+            _w2_ay = (_d2[:, :, 1:2] + _d2[:, :, 3:4]) * 0.7071
+            _w2_dy = (_d2[:, :, 1:2] - _d2[:, :, 3:4]) * 0.7071
+            _w2_a2 = (_w2_ax + _w2_ay) * 0.7071
+            _w2_d2 = (_w2_ax - _w2_ay) * 0.7071
+            _wav = torch.cat([_w1_ax, _w1_dx, _w1_ay, _w1_dy, _w1_a2, _w1_d2,
+                               _w2_ax, _w2_dx, _w2_ay, _w2_dy, _w2_a2, _w2_d2], dim=-1)  # [B, N, 12]
+            _wav = torch.log1p(_wav.abs() * 10.0) * _wav.sign()  # log-sign scale
+            x = torch.cat([x, _wav], dim=-1)
+        # Fourier positional encoding: append sin/cos of (x,y) at learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
         xy_min = raw_xy.amin(dim=1, keepdim=True)
@@ -1278,6 +1312,16 @@ for epoch in range(MAX_EPOCHS):
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
         else:
             loss = vol_loss + surf_weight * surf_loss
+
+        if cfg.spectral_loss > 0.0:
+            # Spectral loss: penalize frequency-domain error in surface pressure prediction
+            # Zero non-surface nodes then FFT along node dimension
+            _sp_pred = pred[:, :, 2] * surf_mask.float()   # [B, N]
+            _sp_true = y_norm[:, :, 2] * surf_mask.float()  # [B, N]
+            _fft_pred = torch.fft.rfft(_sp_pred, dim=1)     # [B, N//2+1] complex
+            _fft_true = torch.fft.rfft(_sp_true, dim=1)
+            _spec_loss = (_fft_pred.abs() - _fft_true.abs()).abs().mean()
+            loss = loss + cfg.spectral_loss * _spec_loss
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
@@ -1472,7 +1516,26 @@ for epoch in range(MAX_EPOCHS):
                     x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
                 else:
                     x = torch.cat([x, curv, dist_feat], dim=-1)
-                # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
+                if cfg.wavelet_sdf:
+                    _d1 = raw_dsdf[:, :, 0:4]
+                    _d2 = raw_dsdf[:, :, 4:8]
+                    _w1_ax = (_d1[:, :, 0:1] + _d1[:, :, 2:3]) * 0.7071
+                    _w1_dx = (_d1[:, :, 0:1] - _d1[:, :, 2:3]) * 0.7071
+                    _w1_ay = (_d1[:, :, 1:2] + _d1[:, :, 3:4]) * 0.7071
+                    _w1_dy = (_d1[:, :, 1:2] - _d1[:, :, 3:4]) * 0.7071
+                    _w1_a2 = (_w1_ax + _w1_ay) * 0.7071
+                    _w1_d2 = (_w1_ax - _w1_ay) * 0.7071
+                    _w2_ax = (_d2[:, :, 0:1] + _d2[:, :, 2:3]) * 0.7071
+                    _w2_dx = (_d2[:, :, 0:1] - _d2[:, :, 2:3]) * 0.7071
+                    _w2_ay = (_d2[:, :, 1:2] + _d2[:, :, 3:4]) * 0.7071
+                    _w2_dy = (_d2[:, :, 1:2] - _d2[:, :, 3:4]) * 0.7071
+                    _w2_a2 = (_w2_ax + _w2_ay) * 0.7071
+                    _w2_d2 = (_w2_ax - _w2_ay) * 0.7071
+                    _wav = torch.cat([_w1_ax, _w1_dx, _w1_ay, _w1_dy, _w1_a2, _w1_d2,
+                                       _w2_ax, _w2_dx, _w2_ay, _w2_dy, _w2_a2, _w2_d2], dim=-1)
+                    _wav = torch.log1p(_wav.abs() * 10.0) * _wav.sign()
+                    x = torch.cat([x, _wav], dim=-1)
+                # Fourier positional encoding: append sin/cos of (x,y) at learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
                 xy_min = raw_xy.amin(dim=1, keepdim=True)
