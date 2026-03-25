@@ -1,1 +1,26 @@
+# senpai project configuration
+# All fields can be overridden via CLI: python k8s/launch.py --tag <tag> [--field value]
+
+# problem directory
 problem: cfd_tandemfoil
+
+# git
+repo_url: https://github.com/wandb/senpai.git
+repo_branch: main
+
+# docker image
+image: ghcr.io/wandb/senpai:latest
+
+# W&B
+wandb_entity: wandb-applied-ai-team
+wandb_project: senpai-v1
+
+# advisor
+advisor_branch: noam
+
+# training limits
+timeout_minutes: 30.0
+max_epochs: 50
+
+# students
+n_students: 4

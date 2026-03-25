@@ -95,11 +95,14 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/<descri
 # Debug (3 epochs, tiny subset)
 cd cfd_tandemfoil && python train.py --debug
 
-# Deploy to k8s with 4 student researchers
-python k8s/launch.py --tag <research-tag> --n_students 4 --advisor --advisor_branch "einstein"
+# Deploy to k8s (reads defaults from senpai.yaml, only --tag is required)
+python k8s/launch.py --tag <research-tag> --advisor
+
+# Override any config via CLI flags
+python k8s/launch.py --tag <research-tag> --advisor --n_students 6 --advisor_branch "einstein"
 
 # Deploy with additional instructions beyond those in cfd_tandemfoil/program.md
-python k8s/launch.py --tag <research-tag> --n_students 4 --advisor --extra_instructions "Only consider optimizer changes."
+python k8s/launch.py --tag <research-tag> --advisor --extra_instructions "Only consider optimizer changes."
 
 ```
 
