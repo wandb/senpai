@@ -78,9 +78,6 @@ spec:
           mountPath: /dev/shm
         - name: dataset
           mountPath: /mnt/new-pvc
-        - name: github-ssh-key
-          mountPath: /run/secrets/ssh
-          readOnly: true
       volumes:
       - name: dshm
         emptyDir:
@@ -89,13 +86,6 @@ spec:
       - name: dataset
         persistentVolumeClaim:
           claimName: new-pvc
-      - name: github-ssh-key
-        secret:
-          secretName: senpai-secrets
-          items:
-          - key: ssh-private-key
-            path: id_ed25519
-            mode: 0400
       tolerations:
       - key: "nvidia.com/gpu"
         operator: "Exists"

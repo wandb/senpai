@@ -32,7 +32,7 @@ class Args:
     n_students: int = 4  # number of students to launch (ignored if --names is provided)
     repo_url: str = "https://github.com/wandb/senpai.git"  # git repo URL
     repo_branch: str = "main"  # git branch to clone
-    image: str = "ghcr.io/tcapelle/dev_box:latest"  # container image for students
+    image: str = "ghcr.io/wandb/senpai:latest"  # container image for students
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
     wandb_project: str = "senpai-v1"  # W&B project name
     advisor_branch: str = "noam"  # branch the advisor works on (PRs target this, not main)

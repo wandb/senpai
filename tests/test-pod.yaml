@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: senpai-image-test
+  labels:
+    app: senpai
+    role: test
+    research-tag: {{RESEARCH_TAG}}
+spec:
+  containers:
+  - name: test
+    image: {{IMAGE}}
+    command: ["/bin/bash", "-c"]
+    args:
+    - |
+      git config --global url."https://${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+      git clone --branch "${REPO_BRANCH}" --depth 1 "${REPO_URL}" /workspaces/senpai
+      source /workspaces/senpai/k8s/install-weave-cc-plugin.sh
+      sleep infinity
+    envFrom:
+    - configMapRef:
+        name: senpai-config-test
+    env:
+    - name: WANDB_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: senpai-secrets
+          key: wandb-api-key
+    - name: ANTHROPIC_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: senpai-secrets
+          key: anthropic-api-key
+    - name: GITHUB_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: senpai-secrets
+          key: github-token
+    resources:
+      requests:
+        cpu: "2"
+        memory: "4Gi"
+      limits:
+        cpu: "4"
+        memory: "8Gi"
