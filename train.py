@@ -35,6 +35,7 @@ from einops import rearrange
 from timm.layers import trunc_normal_
 from tqdm import tqdm
 from torch.utils.data import DataLoader, WeightedRandomSampler
+import math
 import simple_parsing as sp
 
 from data.utils import visualize
@@ -668,6 +669,28 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R5: loss rebalancing
+    surf_weight_mult: float = 1.0      # multiplier applied to adaptive surf_weight
+    no_coarse_loss: bool = False       # disable coarse pooling loss entirely
+    coarse_loss_mult: float = 1.0     # weight multiplier for coarse pooling loss
+    no_tandem_boost: bool = False      # disable adaptive tandem boost (fix at 1.0)
+    fixed_tandem_boost: float = -1.0  # fixed tandem boost value (-1 = use adaptive)
+    surf_loss_fn: str = "l1"          # surface loss function: l1, l2, huber
+    huber_delta: float = 1.0          # delta parameter for Huber loss
+    # Phase 3 R6: residual & multi-fidelity prediction
+    residual_mode: bool = False          # GPU0: pretrain 1L model 80ep, train 3L on residual
+    residual_pretrain_epochs: int = 80   # epochs to pretrain the 1L prior model
+    coarse_to_fine: bool = False         # GPU1: auxiliary loss on 25% node subsample
+    self_distill: bool = False           # GPU2: EMA teacher consistency loss
+    self_distill_weight: float = 0.5     # weight for self-distillation MSE loss
+    snapshot_ensemble: bool = False      # GPU3: save ckpts every 20ep after ep100, avg last 5
+    progressive_mesh: bool = False       # GPU4: 50→100% nodes over 100ep (replaces 5→100% over 40ep)
+    multi_ema: bool = False              # GPU5: 3 EMA models (0.995/0.998/0.999), avg at eval
+    cyclic_late: bool = False            # GPU6: cyclic LR after ep150, avg cycle minima
+    cyclic_late_start: int = 150
+    cyclic_late_period: int = 20
+    cyclic_late_min_lr: float = 5e-5
+    cyclic_late_max_lr: float = 3e-4
 
 
 cfg = sp.parse(Config)
@@ -829,6 +852,17 @@ swad_collecting = False
 swad_done = False
 swa_model = None
 swa_n = 0
+
+# Phase 3 R6: state
+prior_model = None
+snapshot_ckpts: list = []
+snapshot_eval_model = None
+multi_ema_avg = None
+ema_model_995 = None
+ema_model_998 = None
+ema_model_999 = None
+cyclic_late_ckpts: list = []
+cyclic_late_avg = None
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -1032,6 +1066,83 @@ prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
 
+# Phase 3 R6: residual mode — pre-train 1-layer prior model
+if cfg.residual_mode:
+    print(f"Pre-training 1-layer prior model for {cfg.residual_pretrain_epochs} epochs...")
+    _prior_mc = {**model_config, 'n_layers': 1}
+    prior_model = torch.compile(Transolver(**_prior_mc).to(device), mode="default")
+    _ppa = [p for n, p in prior_model.named_parameters()
+            if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+    _ppo = [p for n, p in prior_model.named_parameters()
+            if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+    if cfg.use_lion:
+        _prior_opt = Lion([{'params': _ppa, 'lr': cfg.lr * 0.5}, {'params': _ppo, 'lr': cfg.lr}],
+                          weight_decay=cfg.weight_decay)
+    else:
+        _prior_opt = torch.optim.AdamW([{'params': _ppa, 'lr': cfg.lr * 0.5}, {'params': _ppo, 'lr': cfg.lr}],
+                                       weight_decay=cfg.weight_decay)
+    for _ep in range(cfg.residual_pretrain_epochs):
+        prior_model.train()
+        for _px, _py, _pis, _pmsk in train_loader:
+            _px, _py = _px.to(device), _py.to(device)
+            _pis, _pmsk = _pis.to(device), _pmsk.to(device)
+            _praw = _px[:, :, 2:10]
+            _pdist = torch.log1p(_praw.abs().min(dim=-1, keepdim=True).values * 10.0)
+            _px = (_px - stats["x_mean"]) / stats["x_std"]
+            _pcurv = _px[:, :, 2:6].norm(dim=-1, keepdim=True) * _pis.float().unsqueeze(-1)
+            if cfg.foil2_dist:
+                _pf2d = torch.log1p(_praw[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                _px = torch.cat([_px, _pcurv, _pdist, _pf2d], dim=-1)
+            else:
+                _px = torch.cat([_px, _pcurv, _pdist], dim=-1)
+            _prxy = _px[:, :, :2]
+            _pxmin = _prxy.amin(dim=1, keepdim=True)
+            _pxmax = _prxy.amax(dim=1, keepdim=True)
+            _pxyn = (_prxy - _pxmin) / (_pxmax - _pxmin + 1e-8)
+            _pfr = torch.cat([prior_model.fourier_freqs_fixed.to(device),
+                              prior_model.fourier_freqs_learned.abs()])
+            _pxys = _pxyn.unsqueeze(-1) * _pfr
+            _pfpe = torch.cat([_pxys.sin().flatten(-2), _pxys.cos().flatten(-2)], dim=-1)
+            _px = torch.cat([_px, _pfpe], dim=-1)
+            _pUmag, _pq = _umag_q(_py, _pmsk)
+            _pyn = (_phys_norm(_py, _pUmag, _pq) - phys_stats["y_mean"]) / phys_stats["y_std"]
+            _pB = _pyn.shape[0]
+            _psstds = torch.ones(_pB, 1, 3, device=device)
+            if not cfg.no_perstd and not cfg.raw_targets:
+                _pgap = _px[:, 0, 21]
+                _pistan = _pgap.abs() > 0.5
+                if cfg.high_p_clamp:
+                    _pcc = torch.tensor([0.1, 0.1, 2.0], device=device)
+                    _ptc = torch.tensor([0.3, 0.3, 2.0], device=device)
+                else:
+                    _pcc = torch.tensor([0.1, 0.1, 0.5], device=device)
+                    _ptc = torch.tensor([0.3, 0.3, 1.0], device=device)
+                for _pb in range(_pB):
+                    _pvc = _pmsk[_pb]
+                    if _pistan[_pb]:
+                        _psstds[_pb, 0] = _pyn[_pb, _pvc].std(dim=0).clamp(min=_ptc)
+                    else:
+                        _psstds[_pb, 0] = _pyn[_pb, _pvc].std(dim=0).clamp(min=_pcc)
+                _pyn = _pyn / _psstds
+            _pvm = _pmsk & ~_pis
+            _psm = _pmsk & _pis
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                _pp = prior_model({"x": _px})["preds"].float() / _psstds
+            _pae = (_pp - _pyn).abs()
+            _pvl = (_pae * _pvm.unsqueeze(-1)).sum() / _pvm.sum().clamp(min=1)
+            _psp = (_pae[:, :, 2:3] * _psm.unsqueeze(-1)).sum(dim=(1, 2)) / _psm.sum(dim=1).clamp(min=1).float()
+            _ploss = _pvl + 10.0 * _psp.mean()
+            _prior_opt.zero_grad()
+            _ploss.backward()
+            torch.nn.utils.clip_grad_norm_(prior_model.parameters(), max_norm=1.0)
+            _prior_opt.step()
+        if (_ep + 1) % 20 == 0:
+            print(f"  Prior pre-train epoch {_ep+1}/{cfg.residual_pretrain_epochs}")
+    for _p in prior_model.parameters():
+        _p.requires_grad_(False)
+    prior_model.eval()
+    print("Prior model pre-training done and frozen.")
+
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
     if elapsed_min >= MAX_TIMEOUT:
@@ -1204,6 +1315,21 @@ for epoch in range(MAX_EPOCHS):
                 pred = pred * sample_stds
             else:
                 pred = pred / sample_stds
+        # Residual mode: compute prior prediction and shift y_norm to be residual target
+        if cfg.residual_mode and prior_model is not None:
+            with torch.no_grad():
+                _pr_freqs = torch.cat([prior_model.fourier_freqs_fixed.to(device),
+                                       prior_model.fourier_freqs_learned.abs()])
+                _pr_xys = xy_norm.unsqueeze(-1) * _pr_freqs
+                _pr_fpe = torch.cat([_pr_xys.sin().flatten(-2), _pr_xys.cos().flatten(-2)], dim=-1)
+                x_for_prior = torch.cat([x[:, :, :-32], _pr_fpe], dim=-1)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _prior_p = prior_model({"x": x_for_prior})["preds"].float()
+                if cfg.multiply_std:
+                    _prior_p = _prior_p * sample_stds
+                else:
+                    _prior_p = _prior_p / sample_stds
+            y_norm = y_norm - _prior_p  # 3L model learns the residual
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         if cfg.tandem_ramp:
@@ -1216,8 +1342,21 @@ for epoch in range(MAX_EPOCHS):
         surf_mask = mask & is_surface
 
         # Progressive resolution: subsample volume nodes in loss early in training
-        # Ramps from 10% → 100% of volume nodes over first 40 epochs
-        if epoch < cfg.vol_ramp_epochs:
+        if cfg.progressive_mesh:
+            # Ramps from 50% → 100% over first 100 epochs (denser start than default 5→100%)
+            if epoch < 100:
+                vol_keep_ratio = 0.5 + 0.5 * (epoch / 100.0)
+                vol_indices = vol_mask.nonzero(as_tuple=False)
+                n_vol = vol_indices.shape[0]
+                n_keep = max(int(n_vol * vol_keep_ratio), 1)
+                perm = torch.randperm(n_vol, device=vol_mask.device)[:n_keep]
+                vol_mask_train = torch.zeros_like(vol_mask)
+                if n_keep > 0:
+                    vol_mask_train[vol_indices[perm, 0], vol_indices[perm, 1]] = True
+            else:
+                vol_mask_train = vol_mask
+        elif epoch < cfg.vol_ramp_epochs:
+            # Default: ramps from 5% → 100% over first 40 epochs
             vol_keep_ratio = 0.05 + 0.95 * (epoch / cfg.vol_ramp_epochs)
             vol_indices = vol_mask.nonzero(as_tuple=False)
             n_vol = vol_indices.shape[0]
@@ -1315,6 +1454,31 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # Coarse-to-fine: auxiliary loss on 25% random node subsample
+        if cfg.coarse_to_fine:
+            _ctf_indices = mask.nonzero(as_tuple=False)  # [M, 2]
+            if _ctf_indices.shape[0] > 0:
+                _ctf_n = max(_ctf_indices.shape[0] // 4, 1)
+                _ctf_perm = torch.randperm(_ctf_indices.shape[0], device=device)[:_ctf_n]
+                _ctf_mask = torch.zeros_like(mask)
+                _ctf_mask[_ctf_indices[_ctf_perm, 0], _ctf_indices[_ctf_perm, 1]] = True
+                _ctf_loss = (abs_err * _ctf_mask.unsqueeze(-1)).sum() / _ctf_mask.sum().clamp(min=1)
+                loss = loss + 0.5 * _ctf_loss
+
+        # Self-distillation: EMA teacher consistency loss
+        if cfg.self_distill and ema_model is not None:
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _ema_pred_raw = ema_model({"x": x})["preds"]
+                _ema_pred = _ema_pred_raw.float()
+                if cfg.multiply_std:
+                    _ema_pred = _ema_pred * sample_stds
+                else:
+                    _ema_pred = _ema_pred / sample_stds
+            _valid_m = mask.float().unsqueeze(-1)
+            _sd_loss = ((_ema_pred - pred) ** 2 * _valid_m).sum() / _valid_m.sum().clamp(min=1)
+            loss = loss + cfg.self_distill_weight * _sd_loss
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -1407,13 +1571,29 @@ for epoch in range(MAX_EPOCHS):
                 scheduler.step()
             except ValueError:
                 pass
-        if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa:
+        if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa and not cfg.multi_ema:
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
             else:
                 with torch.no_grad():
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+        if cfg.multi_ema and not cfg.swad and not cfg.swa:
+            if ema_model_995 is None:
+                ema_model_995 = deepcopy(_base_model)
+                ema_model_998 = deepcopy(_base_model)
+                ema_model_999 = deepcopy(_base_model)
+                multi_ema_avg = deepcopy(_base_model)
+            else:
+                with torch.no_grad():
+                    for _ema_m, _dm in [(ema_model_995, 0.995), (ema_model_998, 0.998), (ema_model_999, 0.999)]:
+                        for _ep, _mp in zip(_ema_m.parameters(), _base_model.parameters()):
+                            _ep.data.mul_(_dm).add_(_mp.data, alpha=1 - _dm)
+                    for _ap, _p5, _p8, _p9 in zip(multi_ema_avg.parameters(),
+                                                   ema_model_995.parameters(),
+                                                   ema_model_998.parameters(),
+                                                   ema_model_999.parameters()):
+                        _ap.data = (_p5.data + _p8.data + _p9.data) / 3.0
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -1424,6 +1604,35 @@ for epoch in range(MAX_EPOCHS):
 
     if not step_scheduler_per_batch:
         scheduler.step()
+    # Snapshot ensemble: save every 20 epochs after epoch 100
+    if cfg.snapshot_ensemble and epoch >= 100 and (epoch + 1) % 20 == 0:
+        _snap = {k: v.cpu().clone() for k, v in _base_model.state_dict().items()}
+        snapshot_ckpts.append(_snap)
+        if len(snapshot_ckpts) > 5:
+            snapshot_ckpts.pop(0)
+        if len(snapshot_ckpts) >= 2:
+            _avg_state = {k: torch.stack([c[k].float() for c in snapshot_ckpts]).mean(0).to(device)
+                          for k in snapshot_ckpts[0]}
+            if snapshot_eval_model is None:
+                snapshot_eval_model = deepcopy(_base_model)
+            snapshot_eval_model.load_state_dict(_avg_state)
+    # Cyclic late: override LR with cyclic cosine schedule and save cycle-minima snapshots
+    if cfg.cyclic_late and epoch >= cfg.cyclic_late_start:
+        _cl_ep = epoch - cfg.cyclic_late_start
+        _cl_phase = (_cl_ep % cfg.cyclic_late_period) / cfg.cyclic_late_period
+        _cl_lr = cfg.cyclic_late_min_lr + 0.5 * (cfg.cyclic_late_max_lr - cfg.cyclic_late_min_lr) * (1 - math.cos(math.pi * _cl_phase))
+        for _ci, _cpg in enumerate(base_opt.param_groups):
+            _cpg['lr'] = _cl_lr * (0.5 if _ci == 0 else 1.0)
+        if _cl_ep % cfg.cyclic_late_period == 0:
+            cyclic_late_ckpts.append({k: v.cpu().clone() for k, v in _base_model.state_dict().items()})
+            if len(cyclic_late_ckpts) > 5:
+                cyclic_late_ckpts.pop(0)
+            if len(cyclic_late_ckpts) >= 2:
+                _avg_state = {k: torch.stack([c[k].float() for c in cyclic_late_ckpts]).mean(0).to(device)
+                              for k in cyclic_late_ckpts[0]}
+                if cyclic_late_avg is None:
+                    cyclic_late_avg = deepcopy(_base_model)
+                cyclic_late_avg.load_state_dict(_avg_state)
     if epoch >= cfg.temp_anneal_epoch:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
@@ -1433,7 +1642,13 @@ for epoch in range(MAX_EPOCHS):
     prev_surf_loss = epoch_surf
 
     # --- Validate across all splits ---
-    if cfg.swa and swa_model is not None:
+    if cfg.snapshot_ensemble and snapshot_eval_model is not None:
+        eval_model = snapshot_eval_model
+    elif cfg.cyclic_late and cyclic_late_avg is not None:
+        eval_model = cyclic_late_avg
+    elif cfg.multi_ema and multi_ema_avg is not None:
+        eval_model = multi_ema_avg
+    elif cfg.swa and swa_model is not None:
         eval_model = swa_model
     elif ema_model is not None:
         eval_model = ema_model
@@ -1523,6 +1738,16 @@ for epoch in range(MAX_EPOCHS):
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
+                # Residual mode: add prior prediction back to get final output
+                if cfg.residual_mode and prior_model is not None:
+                    _vpr_freqs = torch.cat([prior_model.fourier_freqs_fixed.to(device),
+                                           prior_model.fourier_freqs_learned.abs()])
+                    _vpr_xys = xy_norm.unsqueeze(-1) * _vpr_freqs
+                    _vpr_fpe = torch.cat([_vpr_xys.sin().flatten(-2), _vpr_xys.cos().flatten(-2)], dim=-1)
+                    x_for_prior_v = torch.cat([x[:, :, :-32], _vpr_fpe], dim=-1)
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _vprior_raw = prior_model({"x": x_for_prior_v})["preds"]
+                    pred = pred + _vprior_raw.float()  # add prior in raw output space
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
                 else:
