@@ -121,7 +121,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False):
+                 decouple_slice=False, zone_temp=False,
+                 ada_temp=False, ada_temp_wide=False, ada_temp_domain=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -135,6 +136,9 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.learned_kernel = learned_kernel
         self.decouple_slice = decouple_slice
         self.zone_temp = zone_temp
+        self.ada_temp = ada_temp
+        self.ada_temp_wide = ada_temp_wide
+        self.ada_temp_domain = ada_temp_domain
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
@@ -149,6 +153,21 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             self.zone_temp_proj = nn.Linear(3, heads)
             nn.init.zeros_(self.zone_temp_proj.weight)
             nn.init.zeros_(self.zone_temp_proj.bias)
+        if ada_temp:
+            # Per-point adaptive temperature: base scalar + per-point MLP offset
+            self.temp_base = nn.Parameter(torch.tensor(0.5))
+            self.temp_proj = nn.Sequential(
+                nn.Linear(dim_head, slice_num), nn.GELU(), nn.Linear(slice_num, 1)
+            )
+            nn.init.zeros_(self.temp_proj[-1].weight)
+            nn.init.zeros_(self.temp_proj[-1].bias)
+            if ada_temp_domain:
+                # Separate temp projection for tandem samples
+                self.temp_proj_tandem = nn.Sequential(
+                    nn.Linear(dim_head, slice_num), nn.GELU(), nn.Linear(slice_num, 1)
+                )
+                nn.init.zeros_(self.temp_proj_tandem[-1].weight)
+                nn.init.zeros_(self.temp_proj_tandem[-1].bias)
         self.to_q = nn.Linear(dim_head, dim_head, bias=False)
         self.to_k = nn.Linear(dim_head, dim_head, bias=False)
         self.to_v = nn.Linear(dim_head, dim_head, bias=False)
@@ -179,14 +198,27 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             .permute(0, 2, 1, 3)
             .contiguous()
         )
-        temp = self.temperature
-        if self.zone_temp and zone_features is not None:
-            # zone_features: [B, 3] → per-head offset [B, heads] → [B, heads, 1, 1]
-            zone_offset = self.zone_temp_proj(zone_features).reshape(bsz, self.heads, 1, 1)
-            temp = temp + zone_offset
-        if tandem_mask is not None:
-            temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
-        temp = temp.clamp(min=1e-4)
+        if self.ada_temp:
+            # Per-point adaptive temperature: x_mid shape [B, H, N, dim_head]
+            tau = self.temp_base + self.temp_proj(x_mid)  # [B, H, N, 1]
+            if self.ada_temp_domain and tandem_mask is not None:
+                tau_tandem = self.temp_base + self.temp_proj_tandem(x_mid)
+                is_tan = (tandem_mask > 0.5).expand_as(tau)
+                tau = torch.where(is_tan, tau_tandem, tau)
+            if self.ada_temp_wide:
+                tau = tau.clamp(min=0.005, max=2.0)
+            else:
+                tau = tau.clamp(min=0.01, max=1.0)
+            temp = tau
+        else:
+            temp = self.temperature
+            if self.zone_temp and zone_features is not None:
+                # zone_features: [B, 3] → per-head offset [B, heads] → [B, heads, 1, 1]
+                zone_offset = self.zone_temp_proj(zone_features).reshape(bsz, self.heads, 1, 1)
+                temp = temp + zone_offset
+            if tandem_mask is not None:
+                temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
+            temp = temp.clamp(min=1e-4)
         if self.decouple_slice and tandem_mask is not None:
             std_logits = self.in_project_slice(x_mid) / temp
             tan_logits = self.in_project_slice_tandem(x_mid) / temp
@@ -250,6 +282,9 @@ class TransolverBlock(nn.Module):
         film_cond=False,
         decouple_slice=False,
         zone_temp=False,
+        ada_temp=False,
+        ada_temp_wide=False,
+        ada_temp_domain=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -269,6 +304,9 @@ class TransolverBlock(nn.Module):
             learned_kernel=learned_kernel,
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
+            ada_temp=ada_temp,
+            ada_temp_wide=ada_temp_wide,
+            ada_temp_domain=ada_temp_domain,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -395,6 +433,9 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        ada_temp=False,
+        ada_temp_wide=False,
+        ada_temp_domain=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -457,6 +498,9 @@ class Transolver(nn.Module):
                     film_cond=film_cond,
                     decouple_slice=adaln_decouple,
                     zone_temp=adaln_zone_temp,
+                    ada_temp=ada_temp,
+                    ada_temp_wide=ada_temp_wide,
+                    ada_temp_domain=ada_temp_domain,
                 )
                 for idx in range(n_layers)
             ]
@@ -668,6 +712,10 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R9: per-point adaptive slice temperature (Ada-Temp)
+    ada_temp: bool = False        # per-point adaptive temperature projection
+    ada_temp_wide: bool = False   # wider clamp range (0.005–2.0 instead of 0.01–1.0)
+    ada_temp_domain: bool = False  # separate temp projection for tandem samples
 
 
 cfg = sp.parse(Config)
@@ -813,6 +861,9 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    ada_temp=cfg.ada_temp,
+    ada_temp_wide=cfg.ada_temp_wide,
+    ada_temp_domain=cfg.ada_temp_domain,
 )
 
 model = Transolver(**model_config).to(device)
@@ -937,8 +988,8 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
-attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
-other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias', 'temp_base', 'temp_proj'])]
+other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias', 'temp_base', 'temp_proj'])]
 if cfg.use_lion:
     base_opt = Lion([
         {'params': attn_params, 'lr': cfg.lr * 0.5},
