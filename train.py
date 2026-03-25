@@ -668,6 +668,9 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R8b: EMA self-distillation
+    ema_distill: bool = False        # EMA teacher self-distillation
+    ema_distill_weight: float = 0.2  # weight for distillation loss (0.2 from askeladd R8)
 
 
 cfg = sp.parse(Config)
@@ -1278,6 +1281,23 @@ for epoch in range(MAX_EPOCHS):
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
         else:
             loss = vol_loss + surf_weight * surf_loss
+
+        # EMA self-distillation: mix main loss with EMA teacher consistency
+        if cfg.ema_distill and ema_model is not None:
+            ema_model.eval()
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _ema_pred = ema_model({"x": x})["preds"].float()
+            if not cfg.no_perstd and not cfg.raw_targets:
+                if cfg.multiply_std:
+                    _ema_pred = _ema_pred * sample_stds
+                else:
+                    _ema_pred = _ema_pred / sample_stds
+            _distill_abs = (pred - _ema_pred).abs()
+            _distill_vol = (_distill_abs * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
+            _distill_surf_p = (_distill_abs[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            _distill_loss = _distill_vol + surf_weight * _distill_surf_p
+            loss = (1 - cfg.ema_distill_weight) * loss + cfg.ema_distill_weight * _distill_loss
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
