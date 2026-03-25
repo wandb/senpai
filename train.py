@@ -668,6 +668,13 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R8: Self-distillation + EMA teacher variants
+    self_distill: bool = False          # use EMA predictions as soft targets during training
+    distill_weight: float = 0.1        # weight for distillation loss (0.1, 0.2, 0.15)
+    distill_start_epoch: int = -1      # epoch to start distillation (-1 = use ema_start_epoch)
+    distill_surface_only: bool = False  # only distill on surface pressure channel (channel 2)
+    multi_ema: bool = False             # maintain 3 EMA streams (decays 0.990, 0.995, 0.999)
+    ensemble_distill: bool = False      # use multi-EMA average as teacher (implies multi_ema)
 
 
 cfg = sp.parse(Config)
@@ -829,6 +836,8 @@ swad_collecting = False
 swad_done = False
 swa_model = None
 swa_n = 0
+multi_ema_models = [None, None, None]  # 3 EMA streams for cfg.multi_ema / cfg.ensemble_distill
+MULTI_EMA_DECAYS = [0.990, 0.995, 0.999]
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -1325,6 +1334,35 @@ for epoch in range(MAX_EPOCHS):
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
 
+        # Self-distillation: EMA teacher as soft targets (Phase 3 R8)
+        if (cfg.self_distill or cfg.ensemble_distill) and model.training:
+            _distill_start = cfg.distill_start_epoch if cfg.distill_start_epoch >= 0 else cfg.ema_start_epoch
+            _teacher_pred = None
+            if cfg.ensemble_distill and multi_ema_models[0] is not None and epoch >= _distill_start:
+                # Average predictions from all 3 EMA streams
+                _tpreds = []
+                for _em in multi_ema_models:
+                    if _em is not None:
+                        _em.eval()
+                        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            _tpreds.append(_em({"x": x})["preds"].float() / sample_stds)
+                if _tpreds:
+                    _teacher_pred = torch.stack(_tpreds).mean(0)
+            elif cfg.self_distill and ema_model is not None and epoch >= _distill_start:
+                ema_model.eval()
+                with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _teacher_pred = ema_model({"x": x})["preds"].float() / sample_stds
+            if _teacher_pred is not None:
+                _valid_f = mask.float().unsqueeze(-1)
+                if cfg.distill_surface_only:
+                    # Only distill on surface pressure (channel index 2)
+                    _sf = surf_mask.float().unsqueeze(-1)
+                    _d = (_teacher_pred[:, :, 2:3] - pred[:, :, 2:3]).abs()
+                    distill_loss = (_d * _sf).sum() / _sf.sum().clamp(min=1)
+                else:
+                    distill_loss = ((_teacher_pred - pred).abs() * _valid_f).sum() / _valid_f.sum().clamp(min=1)
+                loss = (1 - cfg.distill_weight) * loss + cfg.distill_weight * distill_loss
+
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
@@ -1414,6 +1452,15 @@ for epoch in range(MAX_EPOCHS):
                 with torch.no_grad():
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+        # Multi-EMA: 3 parallel EMA streams with different decays
+        if (cfg.multi_ema or cfg.ensemble_distill) and epoch >= cfg.ema_start_epoch:
+            for i, decay in enumerate(MULTI_EMA_DECAYS):
+                if multi_ema_models[i] is None:
+                    multi_ema_models[i] = deepcopy(_base_model)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(multi_ema_models[i].parameters(), _base_model.parameters()):
+                            ep.data.mul_(decay).add_(mp.data, alpha=1 - decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -1435,6 +1482,11 @@ for epoch in range(MAX_EPOCHS):
     # --- Validate across all splits ---
     if cfg.swa and swa_model is not None:
         eval_model = swa_model
+    elif (cfg.multi_ema or cfg.ensemble_distill) and multi_ema_models[2] is not None:
+        eval_model = multi_ema_models[2]  # slowest-decay EMA as primary eval model
+        for _em in multi_ema_models:
+            if _em is not None:
+                _em.eval()
     elif ema_model is not None:
         eval_model = ema_model
     else:
@@ -1520,9 +1572,17 @@ for epoch in range(MAX_EPOCHS):
                 else:
                     y_norm_scaled = y_norm / sample_stds
 
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
-                pred = pred.float()
+                if (cfg.multi_ema or cfg.ensemble_distill) and all(m is not None for m in multi_ema_models):
+                    # Ensemble: average predictions from all 3 EMA streams
+                    _all_preds = []
+                    for _em in multi_ema_models:
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            _all_preds.append(_em({"x": x})["preds"].float())
+                    pred = torch.stack(_all_preds).mean(0)
+                else:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        pred = eval_model({"x": x})["preds"]
+                    pred = pred.float()
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
                 else:
