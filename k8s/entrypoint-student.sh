@@ -21,20 +21,9 @@ uv pip install --system -e .
 git config user.name "senpai-$STUDENT_NAME"
 git config user.email "senpai-$STUDENT_NAME@senpai"
 
-# --- Install Claude Code ---
-curl -fsSL https://claude.ai/install.sh | bash
+# --- Register Weave Claude Code Plugin (tools already baked into Docker image) ---
 export PATH="$HOME/.claude/bin:$PATH"
-
-# --- Install Weave Claude Code Plugin ---
 source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
-
-# --- Install gh CLI ---
-curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli-stable.list > /dev/null
-apt-get update && apt-get install -y gh gettext-base
-# gh uses GITHUB_TOKEN env var automatically, no explicit login needed
-echo "=== gh auth ready (using GITHUB_TOKEN env var) ==="
 
 # --- Install role instructions ---
 cp instructions/CLAUDE-STUDENT.md "$WORKDIR/CLAUDE.md"

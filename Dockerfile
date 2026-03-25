@@ -2,9 +2,13 @@ FROM ghcr.io/coreweave/ml-containers/torch-extras:es-cuda-13-dev-99be449-base-cu
 
 # Install Node.js 22 + yq
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y nodejs netcat-openbsd && rm -rf /var/lib/apt/lists/* && \
+    apt-get install -y nodejs netcat-openbsd gettext-base && rm -rf /var/lib/apt/lists/* && \
     curl -fsSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq && \
     chmod +x /usr/local/bin/yq
+
+# Install kubectl
+RUN curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
+      -o /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl
 
 # Install uv
 RUN pip install uv

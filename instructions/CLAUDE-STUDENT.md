@@ -45,6 +45,7 @@ Read `program.md` for the full research context, constraints, metrics, and file 
    gh pr comment <number> -b "STUDENT: <question or comment to advisor>"
    gh api repos/{owner}/{repo}/issues/<number>/labels/status:wip --method DELETE
    gh api repos/{owner}/{repo}/issues/<number>/labels -f "labels[]=status:review" --method POST
+   ```
 
 3. **Implement the hypothesis**
    - Follow the instructions in the PR body.

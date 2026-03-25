@@ -10,8 +10,8 @@
 # persists the weave_project into settings.json for the daemon.
 #
 # Requires GITHUB_TOKEN and WANDB_API_KEY in the environment (from k8s secrets).
-# WANDB_API_KEY is read directly from the env var by the plugin — no need to
-# write it to settings.json.
+# WANDB_API_KEY is persisted to settings.json so the daemon subprocess can
+# read it (env vars may not be inherited by background processes).
 
 # Make git use GITHUB_TOKEN for HTTPS + SSH-style GitHub URLs (needed to clone
 # the private wandb/claude_code_weave_plugin marketplace repo).
@@ -22,5 +22,6 @@ git config --global url."https://${GITHUB_TOKEN}@github.com/".insteadOf "git@git
 claude plugin marketplace add wandb/claude_code_weave_plugin || true
 claude plugin install weave@weave-claude-plugin --scope user || true
 
-# Persist weave_project into settings.json for the daemon.
+# Persist weave_project and API key into settings.json for the daemon.
 weave-claude-plugin config set weave_project "${WANDB_ENTITY}/${WANDB_PROJECT}" || true
+weave-claude-plugin config set wandb_api_key "${WANDB_API_KEY}" || true
