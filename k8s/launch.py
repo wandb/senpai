@@ -15,6 +15,7 @@ import simple_parsing as sp
 
 STUDENT_TEMPLATE = Path(__file__).parent / "student-deployment.yaml"
 ADVISOR_TEMPLATE = Path(__file__).parent / "advisor-deployment.yaml"
+SENPAI_CONFIG = Path(__file__).parent.parent / "senpai.yaml"
 
 STUDENT_NAMES = [
     "frieren", "fern", "tanjiro", "nezuko", "alphonse", "edward",
@@ -28,6 +29,7 @@ STUDENT_NAMES = [
 class Args:
     """Launch senpai advisor and/or student agents on Kubernetes."""
     tag: str  # research tag (e.g. mar13)
+    problem: str = "cfd_tandemfoil"  # active problem directory (from senpai.yaml)
     names: str = ""  # comma-separated student names (e.g. "frieren,fern")
     n_students: int = 4  # number of students to launch (ignored if --names is provided)
     repo_url: str = "https://github.com/wandb/senpai.git"  # git repo URL
@@ -77,6 +79,7 @@ def render_student(template: str, student_name: str, tag: str, args: Args) -> st
             "WANDB_MODE": "online",
             "SENPAI_TIMEOUT_MINUTES": str(args.timeout_minutes),
             "SENPAI_MAX_EPOCHS": str(args.max_epochs),
+            "PROBLEM_DIR": args.problem,
         },
     )
     deployment = render_template(template, {
@@ -98,6 +101,7 @@ def render_advisor(template: str, tag: str, student_list: list[str], args: Args)
         "WANDB_ENTITY": args.wandb_entity,
         "WANDB_PROJECT": args.wandb_project,
         "ADVISOR_BRANCH": args.advisor_branch,
+        "PROBLEM_DIR": args.problem,
     }
     if args.extra_instructions:
         p = Path(args.extra_instructions)
@@ -128,7 +132,7 @@ def kubectl_apply(manifest: str, name: str):
 
 
 def main():
-    args = sp.parse(Args)
+    args = sp.parse(Args, config_path=str(SENPAI_CONFIG))
 
     # Resolve student list
     if args.names:

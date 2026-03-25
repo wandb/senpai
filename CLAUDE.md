@@ -23,9 +23,9 @@ When asked for a large piece of work which seems vague or needs clarification, p
 
 ## Key docs
 
-- `program.md` — research context, goals, metrics, file constraints
-- `instructions/CLAUDE-ADVISOR.md` — advisor role workflow
-- `instructions/CLAUDE-STUDENT.md` — student role workflow
+- `cfd_tandemfoil/program.md` — research context, goals, metrics, file constraints
+- `cfd_tandemfoil/instructions/CLAUDE-ADVISOR.md` — advisor role workflow
+- `cfd_tandemfoil/instructions/CLAUDE-STUDENT.md` — student role workflow
 
 ## Architecture
 
@@ -38,8 +38,8 @@ When asked for a large piece of work which seems vague or needs clarification, p
 - `k8s/entrypoint-advisor.sh` / `k8s/entrypoint-student.sh` — startup scripts
 - `k8s/launch.py` — helper to template and apply deployments
 
-## instructions/
+## cfd_tandemfoil/instructions/
 
 Role-specific CLAUDE.md files. The Student and Advisor both use Claude Code. At pod launch, the appropriate role-specific file is copied over this CLAUDE.md:
-- `instructions/CLAUDE-ADVISOR.md` → advisor pods
-- `instructions/CLAUDE-STUDENT.md` → student pods
+- `cfd_tandemfoil/instructions/CLAUDE-ADVISOR.md` → advisor pods
+- `cfd_tandemfoil/instructions/CLAUDE-STUDENT.md` → student pods

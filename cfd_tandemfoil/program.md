@@ -14,11 +14,11 @@ We are training a neural network surrogate for CFD (computational fluid dynamics
 
 ## Codebase
 
-- `train.py` — **primary training script + model architecture**. **Modifiable.** (Contains the model inline, plus training with 4 val tracks across 7 data sources.)
-- `data/prepare.py` — dataset loading and collation. **Read-only.**
-- `data/prepare_multi.py` — extended preprocessing (24-dim x, foil-2 features). **Read-only.**
-- `data/utils.py` — visualization. **Read-only.**
-- `data/README.md` — benchmark splits and dataset documentation.
+- `cfd_tandemfoil/train.py` — **primary training script + model architecture**. **Modifiable.** (Contains the model inline, plus training with 4 val tracks across 7 data sources.)
+- `cfd_tandemfoil/data/prepare.py` — dataset loading and collation. **Read-only.**
+- `cfd_tandemfoil/data/prepare_multi.py` — extended preprocessing (24-dim x, foil-2 features). **Read-only.**
+- `cfd_tandemfoil/data/utils.py` — visualization. **Read-only.**
+- `cfd_tandemfoil/data/README.md` — benchmark splits and dataset documentation.
 
 ## Metrics
 

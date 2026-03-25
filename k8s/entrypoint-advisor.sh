@@ -17,6 +17,8 @@ echo "Students: $STUDENT_NAMES"
 # Repo already cloned by the deployment args block
 cd "$WORKDIR"
 
+# PROBLEM_DIR comes from ConfigMap (set by launch.py from senpai.yaml)
+
 uv pip install --system -e .
 
 # --- Git identity ---
@@ -34,14 +36,14 @@ else
 fi
 
 # --- Install role instructions ---
-cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
+cp "$WORKDIR/$PROBLEM_DIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
 
 # --- Register Weave Claude Plugin (tools already baked into Docker image) ---
 export PATH="$HOME/.claude/bin:$PATH"
 source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
 
 # --- Build prompt ---
-PROMPT="$(envsubst < "$WORKDIR/instructions/prompt-advisor.md" | sed '/^<!--$/,/^-->$/d')"
+PROMPT="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-advisor.md" | sed '/^<!--$/,/^-->$/d')"
 
 # --- Append extra startup instructions if provided ---
 if [ -n "${EXTRA_INSTRUCTIONS_B64:-}" ]; then
@@ -63,7 +65,7 @@ while true; do
     echo "=== Log: $LOGFILE ==="
 
     # Restore CLAUDE.md — branch checkouts clobber it
-    cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
+    cp "$WORKDIR/$PROBLEM_DIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
 
     if [ "$ITERATION" -eq 1 ]; then
         claude -p "$PROMPT" --model "claude-opus-4-6[1m]" --output-format stream-json --verbose --dangerously-skip-permissions > "$LOGFILE" 2>&1 || true

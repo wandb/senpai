@@ -8,7 +8,7 @@ SPDX-PackageName: senpai
 
 Autonomous ML research on CFD surrogates, powered by Claude Code agents coordinated through GitHub PRs.
 
-![val/loss over time](scatter_plot.png)
+![val/loss over time](cfd_tandemfoil/scatter_plot.png)
 
 [W&B Dashboard](https://wandb.ai/wandb-applied-ai-team/senpai-v1)
 
@@ -59,20 +59,22 @@ graph TD
 
 ```
 senpai/
-├── train.py                    # Training script + Transolver model (students modify this)
-├── program.md                  # Research context, metrics, constraints
-├── data/           # Data preparation and benchmark splits
-│   ├── prepare.py              #   Dataset loading and collation
-│   ├── prepare_multi.py        #   Extended preprocessing (24-dim x, foil-2 features)
-│   ├── utils.py                #   Visualization utilities
-│   ├── split.py                #   One-time split manifest generator
-│   ├── split_manifest.json     #   Committed train/val indices
-│   └── split_stats.json        #   Committed normalization stats
-├── instructions/               # Role-specific Claude Code instructions
-│   ├── CLAUDE-ADVISOR.md       #   Advisor workflow
-│   ├── CLAUDE-STUDENT.md       #   Student workflow
-│   ├── prompt-advisor.md       #   Advisor prompt template
-│   └── prompt-student.md       #   Student prompt template
+├── senpai.yaml                 # Problem selector (points to cfd_tandemfoil/)
+├── cfd_tandemfoil/             # Problem directory
+│   ├── train.py                #   Training script + Transolver model (students modify this)
+│   ├── program.md              #   Research context, metrics, constraints
+│   ├── data/                   #   Data preparation and benchmark splits
+│   │   ├── prepare.py          #     Dataset loading and collation
+│   │   ├── prepare_multi.py    #     Extended preprocessing (24-dim x, foil-2 features)
+│   │   ├── utils.py            #     Visualization utilities
+│   │   ├── split.py            #     One-time split manifest generator
+│   │   ├── split_manifest.json #     Committed train/val indices
+│   │   └── split_stats.json    #     Committed normalization stats
+│   └── instructions/           #   Role-specific Claude Code instructions
+│       ├── CLAUDE-ADVISOR.md   #     Advisor workflow
+│       ├── CLAUDE-STUDENT.md   #     Student workflow
+│       ├── prompt-advisor.md   #     Advisor prompt template
+│       └── prompt-student.md   #     Student prompt template
 ├── k8s/                        # Kubernetes deployment
 │   ├── launch.py               #   Deploy advisor + student pods
 │   ├── advisor-deployment.yaml #   Advisor pod spec (CPU only)
@@ -88,15 +90,15 @@ senpai/
 
 ```bash
 # Train locally
-python train.py --agent <name> --wandb_name "<name>/<description>"
+cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/<description>"
 
 # Debug (3 epochs, tiny subset)
-python train.py --debug
+cd cfd_tandemfoil && python train.py --debug
 
 # Deploy to k8s with 4 student researchers
 python k8s/launch.py --tag <research-tag> --n_students 4 --advisor --advisor_branch "einstein"
 
-# Deploy with additional instructions beyond those in program.md and instructions/
+# Deploy with additional instructions beyond those in cfd_tandemfoil/program.md
 python k8s/launch.py --tag <research-tag> --n_students 4 --advisor --extra_instructions "Only consider optimizer changes."
 
 ```

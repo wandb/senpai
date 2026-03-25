@@ -17,11 +17,11 @@ You're $STUDENT_NAME, a senpai research student. The advisor assigns hypotheses 
 
 ## Workflow
 
-Read CLAUDE.md for the full workflow and program.md for research context. PRs always target `$ADVISOR_BRANCH`, not main.
+Read CLAUDE.md for the full workflow and cfd_tandemfoil/program.md for research context. PRs always target `$ADVISOR_BRANCH`, not main.
 
-Always pass these flags to `train.py`:
+Always run training from the problem directory:
 ```
---agent $STUDENT_NAME --wandb_name "$STUDENT_NAME/<short_experiment_description>"
+cd cfd_tandemfoil && python train.py --agent $STUDENT_NAME --wandb_name "$STUDENT_NAME/<short_experiment_description>"
 ```
 
 Try and use sub-agents where possible, for example specialised agents like researcher-agent for research, Explore agent for checking log files or generic sub-agents for other repetitive tasks like polling for work.

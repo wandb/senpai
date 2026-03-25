@@ -15,6 +15,9 @@ echo "GPUs:   $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | 
 
 # Repo already cloned by the deployment args block
 cd "$WORKDIR"
+
+# PROBLEM_DIR comes from ConfigMap (set by launch.py from senpai.yaml)
+
 uv pip install --system -e .
 
 # --- Git identity for commits ---
@@ -26,12 +29,12 @@ export PATH="$HOME/.claude/bin:$PATH"
 source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
 
 # --- Install role instructions ---
-cp instructions/CLAUDE-STUDENT.md "$WORKDIR/CLAUDE.md"
+cp "$WORKDIR/$PROBLEM_DIR/instructions/CLAUDE-STUDENT.md" "$WORKDIR/CLAUDE.md"
 
 # --- Launch Claude Code in Ralph Loop ---
 export IS_SANDBOX=1
 
-PROMPT="$(envsubst < "$WORKDIR/instructions/prompt-student.md" | sed '/^<!--$/,/^-->$/d')"
+PROMPT="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-student.md" | sed '/^<!--$/,/^-->$/d')"
 
 
 ITERATION=0
@@ -44,7 +47,7 @@ while true; do
     git pull origin "$ADVISOR_BRANCH" 2>/dev/null || true
 
     # Restore CLAUDE.md — branch checkouts clobber it
-    cp "$WORKDIR/instructions/CLAUDE-STUDENT.md" "$WORKDIR/CLAUDE.md"
+    cp "$WORKDIR/$PROBLEM_DIR/instructions/CLAUDE-STUDENT.md" "$WORKDIR/CLAUDE.md"
 
     if [ "$ITERATION" -eq 1 ]; then
         claude -p "$PROMPT" --dangerously-skip-permissions || true
