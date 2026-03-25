@@ -668,6 +668,11 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R7: snapshot ensemble via cyclic cosine
+    snapshot_ensemble: bool = False
+    snapshot_T_0: int = 60            # cycle length (epochs)
+    snapshot_n_cycles: int = 4        # number of cycles to save snapshots
+    snapshot_reset_momentum: bool = True  # reset optimizer momentum at each restart
 
 
 cfg = sp.parse(Config)
@@ -829,6 +834,8 @@ swad_collecting = False
 swad_done = False
 swa_model = None
 swa_n = 0
+snapshot_checkpoints: list = []  # CPU state_dicts saved at cycle minima
+_SNAP_WU_ITERS = 10               # warmup iters for snapshot scheduler
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -956,7 +963,15 @@ else:
         optimizer = base_opt
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
-if cfg.scheduler_type == "warm_restarts":
+if cfg.snapshot_ensemble:
+    _snap_wu = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
+    _snap_cawr = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        base_opt, T_0=cfg.snapshot_T_0, T_mult=1, eta_min=cfg.cosine_eta_min
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        base_opt, schedulers=[_snap_wu, _snap_cawr], milestones=[10]
+    )
+elif cfg.scheduler_type == "warm_restarts":
     _warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
     _restarts = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         base_opt, T_0=cfg.cosine_T_0, T_mult=cfg.cosine_T_mult, eta_min=cfg.cosine_eta_min
@@ -1427,6 +1442,21 @@ for epoch in range(MAX_EPOCHS):
     if epoch >= cfg.temp_anneal_epoch:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
+    # Snapshot ensemble: save checkpoint at each cycle minimum
+    if cfg.snapshot_ensemble:
+        _post_wu = epoch - _SNAP_WU_ITERS
+        if _post_wu >= 0 and (_post_wu % cfg.snapshot_T_0) == (cfg.snapshot_T_0 - 1):
+            _cycle_num = _post_wu // cfg.snapshot_T_0 + 1  # 1-indexed
+            if _cycle_num <= cfg.snapshot_n_cycles:
+                _snap_sd = {k: v.cpu().clone() for k, v in _base_model.state_dict().items()}
+                snapshot_checkpoints.append(_snap_sd)
+                print(f"Snapshot {_cycle_num}/{cfg.snapshot_n_cycles} saved at epoch {epoch + 1}")
+                if cfg.snapshot_reset_momentum and _cycle_num < cfg.snapshot_n_cycles:
+                    for _pstate in base_opt.state.values():
+                        for _mkey in ('m', 'exp_avg', 'exp_avg_sq'):
+                            if _mkey in _pstate:
+                                _pstate[_mkey].zero_()
+                wandb.log({"snapshot_count": len(snapshot_checkpoints), "global_step": global_step})
     epoch_vol /= n_batches
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
@@ -1687,6 +1717,150 @@ for epoch in range(MAX_EPOCHS):
         f"val[{split_summary}]{tag}"
     )
 
+
+# --- Snapshot ensemble final evaluation ---
+if cfg.snapshot_ensemble and len(snapshot_checkpoints) > 0:
+    print(f"\nSnapshot ensemble: evaluating {len(snapshot_checkpoints)} checkpoints...")
+    _orig_sd = {k: v.cpu().clone() for k, v in _base_model.state_dict().items()}
+    ens_summary = {}
+    for split_name, vloader in val_loaders.items():
+        # Collect per-batch preds from each snapshot (and cache y/mask on first pass)
+        snap_preds_list: list[list] = []
+        _sy: list = []   # y per batch
+        _sm: list = []   # mask per batch
+        _si: list = []   # is_surface per batch
+        _sg: list = []   # raw x[:,0,21] (gap) per batch
+        for s_idx, snap_sd in enumerate(snapshot_checkpoints):
+            _base_model.load_state_dict({k: v.to(device) for k, v in snap_sd.items()})
+            model.eval()
+            b_preds: list = []
+            with torch.no_grad():
+                for b_idx, (x_e, y_e, is_surf_e, mask_e) in enumerate(vloader):
+                    x_e = x_e.to(device, non_blocking=True)
+                    y_e = y_e.to(device, non_blocking=True)
+                    is_surf_e = is_surf_e.to(device, non_blocking=True)
+                    mask_e = mask_e.to(device, non_blocking=True)
+                    if s_idx == 0:
+                        _sy.append(y_e.cpu())
+                        _sm.append(mask_e.cpu())
+                        _si.append(is_surf_e.cpu())
+                        _sg.append(x_e[:, 0, 21].cpu())
+                    raw_dsdf_e = x_e[:, :, 2:10]
+                    dist_surf_e = raw_dsdf_e.abs().min(dim=-1, keepdim=True).values
+                    dist_feat_e = torch.log1p(dist_surf_e * 10.0)
+                    x_e = (x_e - stats["x_mean"]) / stats["x_std"]
+                    curv_e = x_e[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_e.float().unsqueeze(-1)
+                    if cfg.foil2_dist:
+                        fd2_e = torch.log1p(raw_dsdf_e[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                        x_e = torch.cat([x_e, curv_e, dist_feat_e, fd2_e], dim=-1)
+                    else:
+                        x_e = torch.cat([x_e, curv_e, dist_feat_e], dim=-1)
+                    rxy_e = x_e[:, :, :2]
+                    xy_min_e = rxy_e.amin(dim=1, keepdim=True)
+                    xy_max_e = rxy_e.amax(dim=1, keepdim=True)
+                    xy_n_e = (rxy_e - xy_min_e) / (xy_max_e - xy_min_e + 1e-8)
+                    freqs_e = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                    xy_sc_e = xy_n_e.unsqueeze(-1) * freqs_e
+                    fpe_e = torch.cat([xy_sc_e.sin().flatten(-2), xy_sc_e.cos().flatten(-2)], dim=-1)
+                    x_e = torch.cat([x_e, fpe_e], dim=-1)
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        pred_e = model({"x": x_e})["preds"].float()
+                    b_preds.append(pred_e.cpu())
+            snap_preds_list.append(b_preds)
+        # Compute metrics using averaged predictions
+        n_snaps = len(snapshot_checkpoints)
+        val_vol_e = 0.0
+        val_surf_e = 0.0
+        mae_surf_e = torch.zeros(3, device=device)
+        mae_vol_e = torch.zeros(3, device=device)
+        n_surf_e = torch.zeros(3, device=device)
+        n_vol_e = torch.zeros(3, device=device)
+        n_vb_e = 0
+        for b_idx in range(len(_sy)):
+            y_eb = _sy[b_idx].to(device)
+            mask_eb = _sm[b_idx].to(device)
+            is_surf_eb = _si[b_idx].to(device)
+            raw_gap_eb = _sg[b_idx].to(device)
+            avg_pred = torch.stack([snap_preds_list[s][b_idx] for s in range(n_snaps)]).mean(0).to(device)
+            Umag_e, q_e = _umag_q(y_eb, mask_eb)
+            if cfg.raw_targets:
+                y_norm_e = (y_eb - raw_stats["y_mean"]) / raw_stats["y_std"]
+            else:
+                y_ph_e = _phys_norm(y_eb, Umag_e, q_e)
+                if cfg.log_pressure:
+                    y_ph_e = y_ph_e.clone()
+                    y_ph_e[:, :, 2:3] = y_ph_e[:, :, 2:3].abs().add(1).log() * y_ph_e[:, :, 2:3].sign()
+                y_norm_e = (y_ph_e - phys_stats["y_mean"]) / phys_stats["y_std"]
+            is_tandem_e = raw_gap_eb.abs() > 0.5
+            B_e = y_norm_e.shape[0]
+            ss_e = torch.ones(B_e, 1, 3, device=device)
+            if not cfg.no_perstd and not cfg.raw_targets:
+                if cfg.unified_clamps:
+                    cc_e = tc_e = torch.tensor([0.2, 0.2, 0.7], device=device)
+                elif cfg.high_p_clamp:
+                    cc_e = torch.tensor([0.1, 0.1, 2.0], device=device)
+                    tc_e = torch.tensor([0.3, 0.3, 2.0], device=device)
+                else:
+                    cc_e = torch.tensor([0.1, 0.1, 0.5], device=device)
+                    tc_e = torch.tensor([0.3, 0.3, 1.0], device=device)
+                for b2 in range(B_e):
+                    valid = mask_eb[b2]
+                    if cfg.no_perstd_p:
+                        vc_e = (tc_e[:2] if is_tandem_e[b2] else cc_e[:2])
+                        ss_e[b2, 0, :2] = y_norm_e[b2, valid, :2].std(dim=0).clamp(min=vc_e)
+                    elif is_tandem_e[b2]:
+                        ss_e[b2, 0] = y_norm_e[b2, valid].std(dim=0).clamp(min=tc_e)
+                    else:
+                        ss_e[b2, 0] = y_norm_e[b2, valid].std(dim=0).clamp(min=cc_e)
+            if cfg.multiply_std:
+                pred_loss_e = avg_pred * ss_e
+                y_ns_e = y_norm_e * ss_e
+            else:
+                pred_loss_e = avg_pred / ss_e
+                y_ns_e = y_norm_e / ss_e
+            abs_err_e = (pred_loss_e - y_ns_e).abs().nan_to_num(0.0)
+            vol_mask_e = mask_eb & ~is_surf_eb
+            surf_mask_e = mask_eb & is_surf_eb
+            val_vol_e += min((abs_err_e * vol_mask_e.unsqueeze(-1)).sum().item() / vol_mask_e.sum().clamp(min=1).item(), 1e6)
+            val_surf_e += min((abs_err_e[:, :, 2:3] * surf_mask_e.unsqueeze(-1)).sum().item() / surf_mask_e.sum().clamp(min=1).item(), 1e6)
+            if cfg.raw_targets:
+                pred_orig_e = avg_pred * raw_stats["y_std"] + raw_stats["y_mean"]
+            else:
+                pred_ph_e = avg_pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                if cfg.log_pressure:
+                    pred_ph_e = pred_ph_e.clone()
+                    pred_ph_e[:, :, 2:3] = pred_ph_e[:, :, 2:3].sign() * (pred_ph_e[:, :, 2:3].abs().exp() - 1)
+                if cfg.tight_denorm_clamps:
+                    _pd_e = pred_ph_e.clone()
+                    _pd_e[:, :, 0:1] = pred_ph_e[:, :, 0:1].clamp(-5, 5) * Umag_e
+                    _pd_e[:, :, 1:2] = pred_ph_e[:, :, 1:2].clamp(-5, 5) * Umag_e
+                    _pd_e[:, :, 2:3] = pred_ph_e[:, :, 2:3].clamp(-10, 10) * q_e
+                    pred_orig_e = _pd_e
+                else:
+                    pred_orig_e = _phys_denorm(pred_ph_e, Umag_e, q_e)
+            y_cl_e = y_eb.clamp(-1e6, 1e6)
+            err_e = (pred_orig_e - y_cl_e).abs()
+            fin_e = err_e.isfinite()
+            err_e = err_e.where(fin_e, torch.zeros_like(err_e))
+            mae_surf_e += (err_e * surf_mask_e.unsqueeze(-1)).sum(dim=(0, 1))
+            mae_vol_e += (err_e * vol_mask_e.unsqueeze(-1)).sum(dim=(0, 1))
+            n_surf_e += (surf_mask_e.unsqueeze(-1) * fin_e).sum(dim=(0, 1)).float()
+            n_vol_e += (vol_mask_e.unsqueeze(-1) * fin_e).sum(dim=(0, 1)).float()
+            n_vb_e += 1
+        val_vol_e /= max(n_vb_e, 1)
+        val_surf_e /= max(n_vb_e, 1)
+        split_loss_e = val_vol_e + cfg.surf_weight * val_surf_e
+        mae_surf_e /= n_surf_e.clamp(min=1)
+        mae_vol_e /= n_vol_e.clamp(min=1)
+        ens_summary[f"ens/{split_name}/loss"] = split_loss_e
+        ens_summary[f"ens/{split_name}/mae_surf_p"] = mae_surf_e[2].item()
+        print(f"  Ens {split_name}: loss={split_loss_e:.4f}  mae_surf_p={mae_surf_e[2].item():.1f}")
+    _ens_4split = [ens_summary[f"ens/{n}/loss"] for n in VAL_SPLIT_NAMES if f"ens/{n}/loss" in ens_summary]
+    ens_summary["ens/val_loss"] = sum(_ens_4split) / max(len(_ens_4split), 1)
+    print(f"  Ensemble val/loss: {ens_summary['ens/val_loss']:.4f}")
+    wandb.summary.update(ens_summary)
+    # Restore model to best checkpoint state
+    _base_model.load_state_dict({k: v.to(device) for k, v in _orig_sd.items()})
 
 # --- Final summary ---
 total_time = (time.time() - train_start) / 60.0
