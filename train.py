@@ -250,6 +250,10 @@ class TransolverBlock(nn.Module):
         film_cond=False,
         decouple_slice=False,
         zone_temp=False,
+        domain_pres_head=False,
+        domain_vel_head=False,
+        domain_pres_zero_init=False,
+        domain_layernorm=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -258,6 +262,9 @@ class TransolverBlock(nn.Module):
         self.soft_moe = soft_moe
         self.adaln_all = adaln_all
         self.film_cond = film_cond
+        self.domain_pres_head = domain_pres_head
+        self.domain_vel_head = domain_vel_head
+        self.domain_layernorm = domain_layernorm
         self.ln_1 = nn.LayerNorm(hidden_dim)
         self.attn = Physics_Attention_Irregular_Mesh(
             hidden_dim,
@@ -304,6 +311,8 @@ class TransolverBlock(nn.Module):
         nn.init.zeros_(self.se_fc2.bias)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
+            if domain_layernorm:
+                self.ln_3_tandem = nn.LayerNorm(hidden_dim)
             if soft_moe:
                 self.gate_net = nn.Sequential(nn.Linear(hidden_dim, 2), nn.Softmax(dim=-1))
                 self.expert1 = nn.Sequential(
@@ -319,6 +328,15 @@ class TransolverBlock(nn.Module):
                 self.pres_head = nn.Sequential(
                     nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(), nn.Linear(hidden_dim * 2, 1)
                 )
+                if domain_pres_head:
+                    self.pres_head_tandem = nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(),
+                        nn.Linear(hidden_dim * 2, 1)
+                    )
+                if domain_vel_head:
+                    self.vel_head_tandem = nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2)
+                    )
             elif adaln_output:
                 self.cond_net = nn.Sequential(nn.Linear(2, hidden_dim * 2), nn.GELU())
                 self.mlp2 = nn.Sequential(
@@ -355,7 +373,19 @@ class TransolverBlock(nn.Module):
                 gate = self.gate_net(fx_ln)  # [B, N, 2]
                 return gate[:, :, 0:1] * self.expert1(fx_ln) + gate[:, :, 1:2] * self.expert2(fx_ln)
             elif self.field_decoder:
-                return torch.cat([self.vel_head(fx_ln), self.pres_head(fx_ln)], dim=-1)
+                if self.domain_layernorm and tandem_mask is not None:
+                    is_tan_3d = (tandem_mask > 0.5).squeeze(-1)  # [B, 1, 1]
+                    fx_ln = torch.where(is_tan_3d, self.ln_3_tandem(fx), fx_ln)
+                vel_out = self.vel_head(fx_ln)
+                if self.domain_vel_head and tandem_mask is not None:
+                    is_tan_3d = (tandem_mask > 0.5).squeeze(-1)  # [B, 1, 1]
+                    vel_out = torch.where(is_tan_3d, self.vel_head_tandem(fx_ln), vel_out)
+                if self.domain_pres_head and tandem_mask is not None:
+                    is_tan_3d = (tandem_mask > 0.5).squeeze(-1)  # [B, 1, 1]
+                    pres_out = torch.where(is_tan_3d, self.pres_head_tandem(fx_ln), self.pres_head(fx_ln))
+                else:
+                    pres_out = self.pres_head(fx_ln)
+                return torch.cat([vel_out, pres_out], dim=-1)
             elif self.adaln_output and condition is not None:
                 cond = self.cond_net(condition)  # [B, 2*H]
                 scale, shift = cond.chunk(2, dim=-1)  # [B, H]
@@ -395,6 +425,10 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        domain_pres_head=False,
+        domain_vel_head=False,
+        domain_pres_zero_init=False,
+        domain_layernorm=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -457,11 +491,26 @@ class Transolver(nn.Module):
                     film_cond=film_cond,
                     decouple_slice=adaln_decouple,
                     zone_temp=adaln_zone_temp,
+                    domain_pres_head=domain_pres_head if (idx == n_layers - 1) else False,
+                    domain_vel_head=domain_vel_head if (idx == n_layers - 1) else False,
+                    domain_pres_zero_init=domain_pres_zero_init,
+                    domain_layernorm=domain_layernorm if (idx == n_layers - 1) else False,
                 )
                 for idx in range(n_layers)
             ]
         )
         self.initialize_weights()
+        # Domain head init: copy or zero-init after orthogonal init is applied
+        if domain_pres_head or domain_vel_head:
+            last_block = self.blocks[-1]
+            if domain_pres_head and hasattr(last_block, 'pres_head_tandem'):
+                if domain_pres_zero_init:
+                    nn.init.zeros_(last_block.pres_head_tandem[-1].weight)
+                    nn.init.zeros_(last_block.pres_head_tandem[-1].bias)
+                else:
+                    last_block.pres_head_tandem.load_state_dict(last_block.pres_head.state_dict())
+            if domain_vel_head and hasattr(last_block, 'vel_head_tandem'):
+                last_block.vel_head_tandem.load_state_dict(last_block.vel_head.state_dict())
         self.out_skip = nn.Linear(n_hidden, out_dim)
         nn.init.zeros_(self.out_skip.weight)
         nn.init.zeros_(self.out_skip.bias)
@@ -668,6 +717,11 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R9: Domain-Specific Pressure Output Head
+    domain_pres_head: bool = False      # domain-specific pressure head (tandem vs single)
+    domain_vel_head: bool = False       # GPU 4: domain-specific velocity heads too
+    domain_pres_zero_init: bool = False # GPU 5: zero-init tandem pres head (learn from scratch)
+    domain_layernorm: bool = False      # GPU 7: domain-specific ln_3 for tandem vs single
 
 
 cfg = sp.parse(Config)
@@ -813,6 +867,10 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    domain_pres_head=cfg.domain_pres_head,
+    domain_vel_head=cfg.domain_vel_head,
+    domain_pres_zero_init=cfg.domain_pres_zero_init,
+    domain_layernorm=cfg.domain_layernorm,
 )
 
 model = Transolver(**model_config).to(device)
