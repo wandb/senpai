@@ -116,6 +116,32 @@ class MLP(nn.Module):
         return x
 
 
+class LoRAAdapter(nn.Module):
+    """Low-rank domain adapter: applies alpha * B(A(x)) only to tandem samples.
+
+    Used to provide lightweight domain-specific corrections to existing MLP/head
+    layers without modifying the shared weights.
+    """
+
+    def __init__(self, dim, rank=4, alpha=0.1):
+        super().__init__()
+        self.lora_A = nn.Linear(dim, rank, bias=False)
+        self.lora_B = nn.Linear(rank, dim, bias=False)
+        self.alpha = alpha
+        nn.init.kaiming_normal_(self.lora_A.weight)
+        nn.init.zeros_(self.lora_B.weight)  # zero-init B so LoRA starts as identity
+
+    def forward(self, x, is_tandem):
+        """
+        x: [B, N, dim]
+        is_tandem: [B] bool tensor
+        Returns x + tandem-masked low-rank correction.
+        """
+        lora_out = self.alpha * self.lora_B(self.lora_A(x))
+        mask = is_tandem[:, None, None].expand_as(lora_out)
+        return x + torch.where(mask, lora_out, torch.zeros_like(lora_out))
+
+
 class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
@@ -250,6 +276,10 @@ class TransolverBlock(nn.Module):
         film_cond=False,
         decouple_slice=False,
         zone_temp=False,
+        lora_rank: int = 0,
+        lora_alpha: float = 0.1,
+        lora_outonly: bool = False,
+        full_domain_dup: bool = False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -302,6 +332,18 @@ class TransolverBlock(nn.Module):
         self.se_fc2 = nn.Linear(hidden_dim // 4, hidden_dim)
         nn.init.zeros_(self.se_fc2.weight)
         nn.init.zeros_(self.se_fc2.bias)
+        # LoRA domain adapters
+        self.lora_outonly = lora_outonly
+        self.full_domain_dup = full_domain_dup
+        if lora_rank > 0 and not lora_outonly and not full_domain_dup:
+            self.lora_mlp = LoRAAdapter(hidden_dim, rank=lora_rank, alpha=lora_alpha)
+        else:
+            self.lora_mlp = None
+        if full_domain_dup:
+            # Full duplicate MLP for tandem samples (extreme baseline)
+            self.mlp_tandem = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        else:
+            self.mlp_tandem = None
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
             if soft_moe:
@@ -328,19 +370,49 @@ class TransolverBlock(nn.Module):
                 self.mlp2 = nn.Sequential(
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
+            # Output-head LoRA adapter (applied to all last-layer variants)
+            if lora_rank > 0 and not full_domain_dup:
+                self.lora_out = LoRAAdapter(out_dim, rank=lora_rank, alpha=lora_alpha)
+            else:
+                self.lora_out = None
+            if full_domain_dup:
+                # Tandem-specific output head
+                self.mlp2_tandem = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+            else:
+                self.mlp2_tandem = None
 
     def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
+        # Derive is_tandem bool [B] for LoRA adapters
+        is_tan = tandem_mask[:, 0, 0, 0].bool() if tandem_mask is not None else None
         if self.adaln_all and condition is not None:
             cond_out = self.adaln_net(condition)  # [B, H*4]
             s1, b1, s2, b2 = cond_out.chunk(4, dim=-1)  # each [B, H]
             fx_norm = self.ln_1(fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
             fx = self.ln_1_post(self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
             fx_norm = self.ln_2(fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
-            fx = self.ln_2_post(self.mlp(fx_norm) + fx)
+            if self.full_domain_dup and is_tan is not None:
+                shared_out = self.mlp(fx_norm)
+                tandem_out = self.mlp_tandem(fx_norm)
+                mlp_out = torch.where(is_tan[:, None, None].expand_as(shared_out), tandem_out, shared_out)
+                fx = self.ln_2_post(mlp_out + fx)
+            else:
+                fx = self.ln_2_post(self.mlp(fx_norm) + fx)
         else:
             fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
-            fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
+            if self.full_domain_dup and is_tan is not None:
+                fx_norm = self.ln_2(fx)
+                shared_out = self.mlp(fx_norm)
+                tandem_out = self.mlp_tandem(fx_norm)
+                mlp_out = torch.where(is_tan[:, None, None].expand_as(shared_out), tandem_out, shared_out)
+                fx = self.ln_2_post(mlp_out + fx)
+            else:
+                fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
+        # Apply MLP LoRA adapter (not for lora_outonly or full_domain_dup)
+        if self.lora_mlp is not None and is_tan is not None:
+            fx = self.lora_mlp(fx, is_tan)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
@@ -360,9 +432,18 @@ class TransolverBlock(nn.Module):
                 cond = self.cond_net(condition)  # [B, 2*H]
                 scale, shift = cond.chunk(2, dim=-1)  # [B, H]
                 fx_ln = fx_ln * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-                return self.mlp2(fx_ln)
+                out = self.mlp2(fx_ln)
             else:
-                return self.mlp2(fx_ln)
+                if self.full_domain_dup and is_tan is not None:
+                    shared_out = self.mlp2(fx_ln)
+                    tandem_out = self.mlp2_tandem(fx_ln)
+                    out = torch.where(is_tan[:, None, None].expand_as(shared_out), tandem_out, shared_out)
+                else:
+                    out = self.mlp2(fx_ln)
+            # Apply output-head LoRA adapter
+            if self.lora_out is not None and is_tan is not None:
+                out = self.lora_out(out, is_tan)
+            return out
         return fx
 
 
@@ -395,6 +476,11 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        lora_rank: int = 0,
+        lora_alpha: float = 0.1,
+        lora_outonly: bool = False,
+        full_domain_dup: bool = False,
+        domain_layernorm: bool = False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -405,6 +491,7 @@ class Transolver(nn.Module):
         self.adaln_4cond = adaln_4cond
         self.film_cond = film_cond
         self.adaln_zone_temp = adaln_zone_temp
+        self.domain_layernorm = domain_layernorm
         if output_fields is None or output_dims is None:
             raise ValueError("output_fields and output_dims must be provided")
         if len(output_fields) != len(output_dims):
@@ -457,11 +544,19 @@ class Transolver(nn.Module):
                     film_cond=film_cond,
                     decouple_slice=adaln_decouple,
                     zone_temp=adaln_zone_temp,
+                    lora_rank=lora_rank,
+                    lora_alpha=lora_alpha,
+                    lora_outonly=lora_outonly,
+                    full_domain_dup=full_domain_dup,
                 )
                 for idx in range(n_layers)
             ]
         )
         self.initialize_weights()
+        # Domain LayerNorm: learnable per-domain affine rescaling on model output
+        if domain_layernorm:
+            self.domain_scale = nn.Parameter(torch.ones(2, out_dim))
+            self.domain_shift = nn.Parameter(torch.zeros(2, out_dim))
         self.out_skip = nn.Linear(n_hidden, out_dim)
         nn.init.zeros_(self.out_skip.weight)
         nn.init.zeros_(self.out_skip.bias)
@@ -576,6 +671,11 @@ class Transolver(nn.Module):
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
+        if self.domain_layernorm:
+            dom_idx = (x[:, 0, 21].abs() > 0.01).long()  # [B], 0=single, 1=tandem
+            scale = self.domain_scale[dom_idx][:, None, :]  # [B, 1, out_dim]
+            shift = self.domain_shift[dom_idx][:, None, :]  # [B, 1, out_dim]
+            fx = fx * scale + shift
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
@@ -668,6 +768,12 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R10: LoRA domain adapters
+    lora_rank: int = 0            # LoRA rank (0 = disabled); use 4 or 8
+    lora_alpha: float = 0.1       # LoRA scaling factor (GPU2: 0.3)
+    lora_outonly: bool = False    # GPU6: apply LoRA only to output head, not MLP blocks
+    full_domain_dup: bool = False # GPU7: full duplicate MLP weights for tandem (LoRA extreme baseline)
+    domain_layernorm: bool = False # GPU4/5: learnable per-domain affine rescaling on model output
 
 
 cfg = sp.parse(Config)
@@ -813,6 +919,11 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    lora_rank=cfg.lora_rank,
+    lora_alpha=cfg.lora_alpha,
+    lora_outonly=cfg.lora_outonly,
+    full_domain_dup=cfg.full_domain_dup,
+    domain_layernorm=cfg.domain_layernorm,
 )
 
 model = Transolver(**model_config).to(device)
