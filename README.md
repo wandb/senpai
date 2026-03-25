@@ -18,7 +18,7 @@ The repo is **problem-agnostic** — all problem-specific code (model, training 
 
 Training a neural network surrogate for computational fluid dynamics on the [TandemFoilSet](https://openreview.net/forum?id=4Z0P4Nbosn) dataset. Given tandem-airfoil geometry and flow conditions, predict velocity (Ux, Uy) and pressure (p) at every mesh node. The model is a [Transolver](https://arxiv.org/abs/2402.02366) with physics-aware attention over irregular meshes. Key metric: surface MAE (especially pressure).
 
-![val/loss over time](cfd_tandemfoil/scatter_plot.png)
+![val/loss over time](animated_chart.gif)
 
 [W&B Dashboard](https://wandb.ai/wandb-applied-ai-team/senpai-v1)
 
