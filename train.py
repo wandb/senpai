@@ -121,7 +121,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False):
+                 decouple_slice=False, zone_temp=False, linearno=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -135,11 +135,16 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.learned_kernel = learned_kernel
         self.decouple_slice = decouple_slice
         self.zone_temp = zone_temp
+        self.linearno = linearno
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
         self.in_project_slice = nn.Linear(dim_head, slice_num)
         torch.nn.init.orthogonal_(self.in_project_slice.weight)
+        if linearno:
+            # Asymmetric de-slice projection (LinearNO: separate phi/psi)
+            self.in_project_deslice = nn.Linear(dim_head, slice_num)
+            torch.nn.init.orthogonal_(self.in_project_deslice.weight)
         if decouple_slice:
             # Separate slice projection for tandem samples
             self.in_project_slice_tandem = nn.Linear(dim_head, slice_num)
@@ -201,7 +206,14 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
 
-        if self.linear_no_attention:
+        if self.linearno:
+            # LinearNO: asymmetric projections, no slice attention
+            deslice_logits = self.in_project_deslice(x_mid) / temp
+            deslice_weights = F.softmax(deslice_logits, dim=2)  # softmax over N dimension
+            out_x = torch.einsum("bhgc,bhng->bhnc", slice_token, deslice_weights)
+            out_x = rearrange(out_x, "b h n d -> b n (h d)")
+            return self.to_out(out_x)
+        elif self.linear_no_attention:
             out_slice_token = slice_token
         else:
             q_slice_token = self.to_q(slice_token)
@@ -250,6 +262,7 @@ class TransolverBlock(nn.Module):
         film_cond=False,
         decouple_slice=False,
         zone_temp=False,
+        linearno=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -269,6 +282,7 @@ class TransolverBlock(nn.Module):
             learned_kernel=learned_kernel,
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
+            linearno=linearno,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -395,6 +409,7 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        linearno=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -457,6 +472,7 @@ class Transolver(nn.Module):
                     film_cond=film_cond,
                     decouple_slice=adaln_decouple,
                     zone_temp=adaln_zone_temp,
+                    linearno=linearno,
                 )
                 for idx in range(n_layers)
             ]
@@ -623,6 +639,7 @@ class Config:
     use_lookahead: bool = True
     # Architecture flags (one per GPU)
     linear_no_attention: bool = False  # GPU0: skip Q/K/V in slice attention
+    linearno: bool = False             # Phase 3 R7: LinearNO asymmetric projections (separate deslice)
     field_decoder: bool = False        # GPU1: separate vel/pres output heads
     learned_kernel: bool = False       # GPU2: MLP attention kernel
     uncertainty_loss: bool = False     # GPU3: Kendall uncertainty weighting
@@ -813,6 +830,7 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    linearno=cfg.linearno,
 )
 
 model = Transolver(**model_config).to(device)
