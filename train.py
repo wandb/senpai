@@ -395,6 +395,7 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        prog_slices=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -435,6 +436,13 @@ class Transolver(nn.Module):
         self.space_dim = space_dim
         self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
         nn.init.eye_(self.feature_cross.weight)  # start as identity
+        # Progressive slices: coarse-to-fine across blocks (e.g. 32→64→96 for n_layers=3, slice_num=96)
+        if prog_slices and n_layers > 1:
+            _step = max(1, slice_num // n_layers)
+            _slice_per_block = [max(1, _step * (i + 1)) for i in range(n_layers)]
+            _slice_per_block[-1] = slice_num  # ensure last block always uses full slice_num
+        else:
+            _slice_per_block = [slice_num] * n_layers
         self.blocks = nn.ModuleList(
             [
                 TransolverBlock(
@@ -444,7 +452,7 @@ class Transolver(nn.Module):
                     act=act,
                     mlp_ratio=mlp_ratio,
                     out_dim=out_dim,
-                    slice_num=slice_num,
+                    slice_num=_slice_per_block[idx],
                     last_layer=(idx == n_layers - 1),
                     linear_no_attention=linear_no_attention,
                     learned_kernel=learned_kernel,
@@ -668,6 +676,7 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    prog_slices: bool = False  # Phase 3 R7: progressive slice count across blocks (coarse-to-fine)
 
 
 cfg = sp.parse(Config)
@@ -813,6 +822,7 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    prog_slices=cfg.prog_slices,
 )
 
 model = Transolver(**model_config).to(device)
