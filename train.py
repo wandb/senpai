@@ -90,6 +90,27 @@ class GatedMLP2(nn.Module):
         return self.down(h)
 
 
+class LearnedNormNet(nn.Module):
+    """Condition-dependent normalization: (log_Re, AoA, gap, stagger) → (scale, shift) per channel.
+
+    Initialized to identity (scale=1, shift=0) so training starts from the same
+    point as per-sample std normalization.
+    """
+    def __init__(self, width=32, n_channels=3):
+        super().__init__()
+        self.fc1 = nn.Linear(4, width)
+        self.fc2 = nn.Linear(width, n_channels * 2)  # log_scale + shift
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)  # identity init: log_scale=0→scale=1, shift=0
+
+    def forward(self, cond):
+        h = F.silu(self.fc1(cond))
+        out = self.fc2(h)
+        log_scale = out[:, :3].clamp(-3, 3)
+        shift = out[:, 3:]
+        return log_scale.exp(), shift  # scale ∈ [e^-3, e^3], shift unrestricted
+
+
 class MLP(nn.Module):
     def __init__(self, n_input, n_hidden, n_output, n_layers=1, act="gelu", res=True):
         super().__init__()
@@ -319,6 +340,13 @@ class TransolverBlock(nn.Module):
                 self.pres_head = nn.Sequential(
                     nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(), nn.Linear(hidden_dim * 2, 1)
                 )
+                if out_dim > 3:
+                    # Extra head for log_var channels (hetero loss)
+                    self.hetero_head = nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim - 3)
+                    )
+                    nn.init.zeros_(self.hetero_head[-1].weight)
+                    nn.init.zeros_(self.hetero_head[-1].bias)  # init log_var=0
             elif adaln_output:
                 self.cond_net = nn.Sequential(nn.Linear(2, hidden_dim * 2), nn.GELU())
                 self.mlp2 = nn.Sequential(
@@ -355,7 +383,10 @@ class TransolverBlock(nn.Module):
                 gate = self.gate_net(fx_ln)  # [B, N, 2]
                 return gate[:, :, 0:1] * self.expert1(fx_ln) + gate[:, :, 1:2] * self.expert2(fx_ln)
             elif self.field_decoder:
-                return torch.cat([self.vel_head(fx_ln), self.pres_head(fx_ln)], dim=-1)
+                base = torch.cat([self.vel_head(fx_ln), self.pres_head(fx_ln)], dim=-1)
+                if hasattr(self, 'hetero_head'):
+                    return torch.cat([base, self.hetero_head(fx_ln)], dim=-1)
+                return base
             elif self.adaln_output and condition is not None:
                 cond = self.cond_net(condition)  # [B, 2*H]
                 scale, shift = cond.chunk(2, dim=-1)  # [B, H]
@@ -395,6 +426,9 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        learned_norm_mlp=False,
+        learned_norm_width=32,
+        hetero_loss="none",
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -413,6 +447,10 @@ class Transolver(nn.Module):
             raise ValueError("out_dim must equal sum(output_dims)")
         self.output_fields = output_fields
         self.output_dims = output_dims
+        self.hetero_loss = hetero_loss
+        self.learned_norm_mlp = learned_norm_mlp
+        if learned_norm_mlp:
+            self.learned_norm_net = LearnedNormNet(width=learned_norm_width)
         if uncertainty_loss:
             self.log_sigma_vol = nn.Parameter(torch.zeros(1))
             self.log_sigma_surf_ux = nn.Parameter(torch.zeros(1))
@@ -668,6 +706,17 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R7: compound R6 winners
+    multi_ema: bool = False                    # 3 EMA streams (0.995/0.998/0.999) averaged at validation
+    # Phase 3 R8: normalization and loss experiments
+    learned_norm_mlp: bool = False             # learned normalization MLP replaces per-sample std
+    learned_norm_width: int = 32               # MLP hidden width (32 or 16)
+    learned_norm_compound: bool = False        # keep per-sample std AND add learned norm on top
+    hetero_surf: bool = False                  # GPU3: heteroscedastic loss on surface pressure
+    hetero_all: bool = False                   # GPU4: heteroscedastic loss on all channels
+    use_gradnorm: bool = False                 # GPU6: GradNorm automatic loss balancing
+    gradnorm_alpha: float = 1.5               # GradNorm asymmetry parameter
+    surf_var_reg: bool = False                 # GPU7: std of per-sample surface pressure errors
 
 
 cfg = sp.parse(Config)
@@ -789,18 +838,33 @@ if cfg.raw_targets:
 else:
     raw_stats = None
 
+# Hetero loss adds log_var output channels
+if cfg.hetero_surf:
+    _out_dim = 4  # 3 fields + log_var_p
+    _output_fields = ["Ux", "Uy", "p", "log_var_p"]
+    _output_dims = [1, 1, 1, 1]
+elif cfg.hetero_all:
+    _out_dim = 6  # 3 fields + 3 log_var
+    _output_fields = ["Ux", "Uy", "p", "log_var_Ux", "log_var_Uy", "log_var_p"]
+    _output_dims = [1, 1, 1, 1, 1, 1]
+else:
+    _out_dim = 3
+    _output_fields = ["Ux", "Uy", "p"]
+    _output_dims = [1, 1, 1]
+_hetero_loss = "surf" if cfg.hetero_surf else ("all" if cfg.hetero_all else "none")
+
 model_config = dict(
     space_dim=2,
     fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
-    out_dim=3,
+    out_dim=_out_dim,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
     n_head=3,
     slice_num=cfg.slice_num,
     mlp_ratio=2,
     dropout=0.05 if cfg.rdrop else 0.0,
-    output_fields=["Ux", "Uy", "p"],
-    output_dims=[1, 1, 1],
+    output_fields=_output_fields,
+    output_dims=_output_dims,
     linear_no_attention=cfg.linear_no_attention,
     learned_kernel=cfg.learned_kernel,
     field_decoder=cfg.field_decoder,
@@ -813,6 +877,9 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    learned_norm_mlp=cfg.learned_norm_mlp,
+    learned_norm_width=cfg.learned_norm_width,
+    hetero_loss=_hetero_loss,
 )
 
 model = Transolver(**model_config).to(device)
@@ -822,6 +889,10 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
+# Phase 3 R7: multi-EMA
+ema_model_995 = None
+ema_model_998 = None
+ema_model_999 = None
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -986,6 +1057,11 @@ else:  # sequential (default)
         milestones=[cfg.warmup_total_iters]
     )
 step_scheduler_per_batch = (cfg.scheduler_type == "onecycle")
+
+# Phase 3 R8: GradNorm trainable task weights
+gn_log_w = nn.Parameter(torch.zeros(2, device=device)) if cfg.use_gradnorm else None
+gn_optim = torch.optim.Adam([gn_log_w], lr=1e-2) if cfg.use_gradnorm else None
+gn_init_losses = None
 
 # --- wandb ---
 run = wandb.init(
@@ -1185,7 +1261,22 @@ for epoch in range(MAX_EPOCHS):
                         sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
                     else:
                         sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
-        if model.training and not cfg.no_perstd and not cfg.raw_targets:
+        # Learned normalization: condition-dependent scale/shift replaces per-sample std
+        _ln_scale_exp = _ln_shift_exp = None
+        if cfg.learned_norm_mlp and model.training:
+            _ln_cond = torch.stack([x[:, 0, 13], x[:, 0, 14], x[:, 0, 22], x[:, 0, 23]], dim=-1)
+            _ln_scale, _ln_shift = _base_model.learned_norm_net(_ln_cond)
+            _ln_scale_exp = _ln_scale.unsqueeze(1)   # [B, 1, 3]
+            _ln_shift_exp = _ln_shift.unsqueeze(1)   # [B, 1, 3]
+            if not cfg.learned_norm_compound:
+                # Replace per-sample std norm entirely
+                y_norm = (y_norm - _ln_shift_exp) / _ln_scale_exp
+            else:
+                # Apply on top of per-sample std (compound)
+                if not cfg.no_perstd and not cfg.raw_targets:
+                    _y_perstd = y_norm / sample_stds if not cfg.multiply_std else y_norm * sample_stds
+                    y_norm = (_y_perstd - _ln_shift_exp) / _ln_scale_exp
+        elif model.training and not cfg.no_perstd and not cfg.raw_targets:
             if cfg.multiply_std:
                 y_norm = y_norm * sample_stds
             else:
@@ -1199,7 +1290,22 @@ for epoch in range(MAX_EPOCHS):
         pred = pred.float()
         re_pred = re_pred.float()
         aoa_pred = aoa_pred.float()
-        if model.training and not cfg.no_perstd and not cfg.raw_targets:
+        # Strip log_var channels for hetero loss
+        log_var = None
+        if cfg.hetero_surf:
+            log_var = pred[:, :, 3:4]
+            pred = pred[:, :, :3]
+        elif cfg.hetero_all:
+            log_var = pred[:, :, 3:6]
+            pred = pred[:, :, :3]
+        # Apply normalization to predictions (mirror what was done to y_norm)
+        if cfg.learned_norm_mlp and model.training and _ln_scale_exp is not None:
+            if not cfg.learned_norm_compound:
+                pred = (pred - _ln_shift_exp) / _ln_scale_exp
+            else:
+                _p_perstd = pred / sample_stds if not cfg.multiply_std else pred * sample_stds
+                pred = (_p_perstd - _ln_shift_exp) / _ln_scale_exp
+        elif model.training and not cfg.no_perstd and not cfg.raw_targets and not cfg.learned_norm_mlp:
             if cfg.multiply_std:
                 pred = pred * sample_stds
             else:
@@ -1276,8 +1382,27 @@ for epoch in range(MAX_EPOCHS):
                     surf_ux_loss * torch.exp(-2 * bm.log_sigma_surf_ux) / 2 + bm.log_sigma_surf_ux +
                     surf_uy_loss * torch.exp(-2 * bm.log_sigma_surf_uy) / 2 + bm.log_sigma_surf_uy +
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
+        elif cfg.hetero_surf and log_var is not None:
+            # Per-node heteroscedastic loss on surface pressure only
+            _surf_m = surf_mask.unsqueeze(-1).float()
+            _hetero_surf = 0.5 * ((-log_var).exp() * abs_err[:, :, 2:3] + log_var) * _surf_m
+            surf_hetero_loss = _hetero_surf.sum() / _surf_m.sum().clamp(min=1)
+            loss = vol_loss + surf_weight * surf_hetero_loss
+        elif cfg.hetero_all and log_var is not None:
+            # Per-node heteroscedastic loss on all channels, all valid nodes
+            _valid_m = mask.unsqueeze(-1).float()
+            _hetero_all = 0.5 * ((-log_var).exp() * abs_err + log_var) * _valid_m
+            loss = _hetero_all.sum() / _valid_m.sum().clamp(min=1)
+        elif cfg.use_gradnorm:
+            # GradNorm: task losses without adaptive surf_weight/tandem_boost
+            _gn_task_losses = torch.stack([vol_loss, surf_loss])
+            _gn_w = gn_log_w.exp().detach()
+            loss = (_gn_w * _gn_task_losses).sum()
         else:
             loss = vol_loss + surf_weight * surf_loss
+
+        if cfg.surf_var_reg:
+            loss = loss + 0.5 * surf_per_sample.std()
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
@@ -1371,7 +1496,7 @@ for epoch in range(MAX_EPOCHS):
         else:
             if cfg.grad_accum_steps <= 1:
                 optimizer.zero_grad()
-            loss.backward()
+            loss.backward(retain_graph=cfg.use_gradnorm)
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         sam_active = sam_optimizer is not None and epoch >= int(MAX_EPOCHS * 0.75)
@@ -1407,13 +1532,47 @@ for epoch in range(MAX_EPOCHS):
                 scheduler.step()
             except ValueError:
                 pass
-        if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa:
+        # GradNorm: update task weights based on gradient norm balance
+        if cfg.use_gradnorm and model.training:
+            if gn_init_losses is None:
+                gn_init_losses = _gn_task_losses.detach().clone()
+            _shared_params = [p for p in model.blocks[-1].parameters() if p.requires_grad]
+            _gnorms_sq = []
+            for _Li in _gn_task_losses:
+                _gs = torch.autograd.grad(_Li, _shared_params, retain_graph=True, allow_unused=True)
+                _gnorms_sq.append(sum(_g.pow(2).sum() for _g in _gs if _g is not None).detach())
+            _gnorms = torch.stack(_gnorms_sq).sqrt()
+            _gn_w = gn_log_w.exp()
+            _G_i = _gn_w * _gnorms
+            _G_bar = _G_i.mean()
+            _L_hat = _gn_task_losses.detach() / gn_init_losses.clamp(min=1e-8)
+            _r_i = _L_hat / _L_hat.mean().clamp(min=1e-8)
+            _G_target = _G_bar * _r_i.pow(cfg.gradnorm_alpha)
+            gn_log_w.grad = ((_G_i - _G_target).sign() * _G_i).to(gn_log_w)
+            gn_optim.step()
+            with torch.no_grad():
+                gn_log_w.data -= gn_log_w.data.mean()  # renormalize: mean(w_i) = 0
+        if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa and not cfg.multi_ema:
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
             else:
                 with torch.no_grad():
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+        # Phase 3 R7: multi-EMA (3 streams, averaged at eval)
+        if cfg.multi_ema and epoch >= cfg.ema_start_epoch:
+            if ema_model_995 is None:
+                ema_model_995 = deepcopy(_base_model)
+                ema_model_998 = deepcopy(_base_model)
+                ema_model_999 = deepcopy(_base_model)
+            else:
+                with torch.no_grad():
+                    for _ep, _mp in zip(ema_model_995.parameters(), _base_model.parameters()):
+                        _ep.data.mul_(0.995).add_(_mp.data, alpha=0.005)
+                    for _ep, _mp in zip(ema_model_998.parameters(), _base_model.parameters()):
+                        _ep.data.mul_(0.998).add_(_mp.data, alpha=0.002)
+                    for _ep, _mp in zip(ema_model_999.parameters(), _base_model.parameters()):
+                        _ep.data.mul_(0.999).add_(_mp.data, alpha=0.001)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -1433,7 +1592,14 @@ for epoch in range(MAX_EPOCHS):
     prev_surf_loss = epoch_surf
 
     # --- Validate across all splits ---
-    if cfg.swa and swa_model is not None:
+    _eval_multi_ema = None
+    if cfg.multi_ema and ema_model_995 is not None:
+        _eval_multi_ema = deepcopy(ema_model_995)
+        with torch.no_grad():
+            for _pa, _p998, _p999 in zip(_eval_multi_ema.parameters(), ema_model_998.parameters(), ema_model_999.parameters()):
+                _pa.data = (_pa.data + _p998.data + _p999.data) / 3
+        eval_model = _eval_multi_ema
+    elif cfg.swa and swa_model is not None:
         eval_model = swa_model
     elif ema_model is not None:
         eval_model = ema_model
@@ -1523,13 +1689,30 @@ for epoch in range(MAX_EPOCHS):
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
-                if cfg.multiply_std:
-                    pred_loss = pred * sample_stds
+                # Strip log_var channels for hetero loss (only first 3 channels are field values)
+                if cfg.hetero_surf or cfg.hetero_all:
+                    pred = pred[:, :, :3]
+                # Compute val_loss: apply same normalization as training
+                if cfg.learned_norm_mlp:
+                    _ln_cond_v = torch.stack([x[:, 0, 13], x[:, 0, 14], x[:, 0, 22], x[:, 0, 23]], dim=-1)
+                    _ln_s_v, _ln_sh_v = _base_model.learned_norm_net(_ln_cond_v)
+                    _ln_s_exp_v = _ln_s_v.unsqueeze(1)
+                    _ln_sh_exp_v = _ln_sh_v.unsqueeze(1)
+                    if not cfg.learned_norm_compound:
+                        pred_loss = (pred - _ln_sh_exp_v) / _ln_s_exp_v
+                        y_norm_scaled_v = (y_norm - _ln_sh_exp_v) / _ln_s_exp_v
+                    else:
+                        _ps = pred / sample_stds if not cfg.multiply_std else pred * sample_stds
+                        pred_loss = (_ps - _ln_sh_exp_v) / _ln_s_exp_v
+                        y_norm_scaled_v = (y_norm_scaled - _ln_sh_exp_v) / _ln_s_exp_v
+                    abs_err = (pred_loss - y_norm_scaled_v).abs().nan_to_num(0.0)
                 else:
-                    pred_loss = pred / sample_stds
-                sq_err = (pred_loss - y_norm_scaled) ** 2
-                abs_err = (pred_loss - y_norm_scaled).abs()
-                abs_err = abs_err.nan_to_num(0.0)
+                    if cfg.multiply_std:
+                        pred_loss = pred * sample_stds
+                    else:
+                        pred_loss = pred / sample_stds
+                    abs_err = (pred_loss - y_norm_scaled).abs().nan_to_num(0.0)
+                sq_err = abs_err ** 2
 
                 vol_mask = mask & ~is_surface
                 surf_mask = mask & is_surface
@@ -1542,6 +1725,10 @@ for epoch in range(MAX_EPOCHS):
                     1e6
                 )
                 n_vbatches += 1
+
+                # Reverse learned norm for denormalization (pred → y_norm space)
+                if cfg.learned_norm_mlp and not cfg.learned_norm_compound:
+                    pred = pred * _ln_s_exp_v + _ln_sh_exp_v  # → y_norm space
 
                 # Denormalize: phys_stats → Cp space → original scale
                 if cfg.raw_targets:
@@ -1668,7 +1855,9 @@ for epoch in range(MAX_EPOCHS):
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
-        if cfg.swa and swa_model is not None:
+        if cfg.multi_ema and _eval_multi_ema is not None:
+            save_model = _eval_multi_ema
+        elif cfg.swa and swa_model is not None:
             save_model = swa_model
         elif ema_model is not None:
             save_model = ema_model
