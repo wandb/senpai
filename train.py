@@ -669,6 +669,12 @@ class Config:
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
 
+    # Phase 3 R10: DB-MTL log-transform loss + DomainLN
+    dbmtl: bool = False              # log-transform all losses in PCGrad (DB-MTL)
+    dbmtl_surf_only: bool = False    # log-transform only surface loss (not volume)
+    pcgrad_normalize: bool = False   # normalize gradient magnitudes across PCGrad groups
+    domain_layernorm: bool = False   # domain-conditional output scaling (DomainOutputNorm)
+
 
 cfg = sp.parse(Config)
 
@@ -724,6 +730,25 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 1:2] = y_p[:, :, 1:2].clamp(-10, 10) * Umag
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
+
+
+class DomainOutputNorm(nn.Module):
+    """Domain-conditional output scaling/shifting (Phase 3 R10 DomainLN).
+    Clamped scale/shift to prevent divergence.
+    """
+    def __init__(self, n_channels: int = 3):
+        super().__init__()
+        self.scale_emb = nn.Embedding(2, n_channels)
+        self.shift_emb = nn.Embedding(2, n_channels)
+        nn.init.zeros_(self.scale_emb.weight)
+        nn.init.zeros_(self.shift_emb.weight)
+
+    def forward(self, pred: torch.Tensor, is_tandem: torch.Tensor) -> torch.Tensor:
+        domain_idx = is_tandem.long()
+        scale = self.scale_emb(domain_idx).unsqueeze(1).clamp(-0.5, 0.5)  # [B, 1, 3]
+        shift = self.shift_emb(domain_idx).unsqueeze(1).clamp(-1.0, 1.0)  # [B, 1, 3]
+        return pred * (1.0 + scale) + shift
+
 
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
@@ -829,6 +854,9 @@ swad_collecting = False
 swad_done = False
 swa_model = None
 swa_n = 0
+
+# Phase 3 R10: domain-conditional output norm
+domain_out_norm = DomainOutputNorm(n_channels=3).to(device) if cfg.domain_layernorm else None
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -939,16 +967,19 @@ class Lookahead:
 
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+domain_adapter_params = list(domain_out_norm.parameters()) if domain_out_norm is not None else []
 if cfg.use_lion:
     base_opt = Lion([
         {'params': attn_params, 'lr': cfg.lr * 0.5},
-        {'params': other_params, 'lr': cfg.lr}
+        {'params': other_params, 'lr': cfg.lr},
+        {'params': domain_adapter_params, 'lr': cfg.lr},
     ], weight_decay=cfg.weight_decay)
     optimizer = base_opt  # Lion has its own momentum; skip Lookahead
 else:
     base_opt = torch.optim.AdamW([
         {'params': attn_params, 'lr': cfg.lr * 0.5},
-        {'params': other_params, 'lr': cfg.lr}
+        {'params': other_params, 'lr': cfg.lr},
+        {'params': domain_adapter_params, 'lr': cfg.lr},
     ], weight_decay=cfg.weight_decay)
     if cfg.use_lookahead:
         optimizer = Lookahead(base_opt, k=10, alpha=0.8)
@@ -1204,6 +1235,10 @@ for epoch in range(MAX_EPOCHS):
                 pred = pred * sample_stds
             else:
                 pred = pred / sample_stds
+        # Apply domain-conditional output norm (Phase 3 R10)
+        if model.training and domain_out_norm is not None:
+            _is_tandem_early = (x[:, 0, 21].abs() > 0.01)
+            pred = domain_out_norm(pred, _is_tandem_early)
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         if cfg.tandem_ramp:
@@ -1341,8 +1376,16 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            # DB-MTL: log-transform losses to equalize scales (Phase 3 R10)
+            if cfg.dbmtl:
+                loss_a = torch.log(vol_loss_a + 1e-6) + surf_weight * torch.log(surf_loss_a + 1e-6) + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                loss_b = torch.log(vol_loss_b + 1e-6) + surf_weight * torch.log(surf_loss_b + 1e-6) + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            elif cfg.dbmtl_surf_only:
+                loss_a = vol_loss_a + surf_weight * torch.log(surf_loss_a + 1e-6) + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                loss_b = vol_loss_b + surf_weight * torch.log(surf_loss_b + 1e-6) + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            else:
+                loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -1350,6 +1393,16 @@ for epoch in range(MAX_EPOCHS):
                        for p in model.parameters()]
             optimizer.zero_grad()
             loss_b.backward()
+
+            # DB-MTL gradient magnitude normalization (Phase 3 R10)
+            if cfg.pcgrad_normalize:
+                _norm_a = torch.sqrt(sum(g.norm() ** 2 for g in grads_a if g is not None) + 1e-8)
+                _norm_b = torch.sqrt(sum(p.grad.norm() ** 2 for p in model.parameters() if p.grad is not None) + 1e-8)
+                _target = max(_norm_a, _norm_b)
+                grads_a = [g * (_target / _norm_a) if g is not None else None for g in grads_a]
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad = p.grad * (_target / _norm_b)
 
             ga_flat = torch.cat([g.view(-1) for g in grads_a if g is not None])
             gb_flat = torch.cat([p.grad.view(-1) for p in model.parameters() if p.grad is not None])
@@ -1523,6 +1576,11 @@ for epoch in range(MAX_EPOCHS):
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
+                # Apply domain-conditional output norm in val loop (Phase 3 R10)
+                if domain_out_norm is not None:
+                    domain_out_norm.eval()
+                    with torch.no_grad():
+                        pred = domain_out_norm(pred, is_tandem)
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
                 else:
