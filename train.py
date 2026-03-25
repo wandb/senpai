@@ -668,6 +668,8 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R8b: target noise ablation
+    no_target_noise: bool = False  # disable target noise injection (y_norm += noise)
 
 
 cfg = sp.parse(Config)
@@ -1149,7 +1151,7 @@ for epoch in range(MAX_EPOCHS):
                 y_phys = y_phys.clone()
                 y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
             y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
-        if model.training:
+        if model.training and not cfg.no_target_noise:
             noise_progress = min(1.0, epoch / cfg.noise_anneal_epochs)
             if cfg.half_target_noise:
                 vel_noise = 0.0075 * (1 - noise_progress) + 0.0015 * noise_progress
