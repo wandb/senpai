@@ -53,3 +53,6 @@ run*.log
 results.tsv
 experiment_log/
 advisor_logs/
+
+# Orchestrator session notes
+ORCHESTRATOR.md
