@@ -668,6 +668,11 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R7: compound R6 winners
+    prog_slices: bool = False                  # progressive slices: 32→64→96 at epochs 64/128
+    curriculum_error_sampling: bool = False    # oversample top-10% high-error samples 3x after epoch 40
+    multi_ema: bool = False                    # 3 EMA streams (0.995/0.998/0.999) averaged at validation
+    spectral_loss: float = 0.0                 # weight for frequency-domain surface pressure loss
 
 
 cfg = sp.parse(Config)
@@ -822,6 +827,9 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
+ema_model_995 = None
+ema_model_998 = None
+ema_model_999 = None
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -1027,6 +1035,12 @@ ema_decay_val = 0.9
 best_metrics = {}
 global_step = 0
 train_start = time.time()
+
+# Initialize progressive slices: suppress inactive slices before training starts
+if cfg.prog_slices:
+    with torch.no_grad():
+        for _blk in _base_model.blocks:
+            _blk.attn.in_project_slice.bias.data[32:] = -100.0
 prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
@@ -1042,6 +1056,22 @@ for epoch in range(MAX_EPOCHS):
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+
+    # Progressive slices: determine active slice count and handle transitions
+    if cfg.prog_slices:
+        _ps_limit = 32 if epoch < 64 else (64 if epoch < 128 else cfg.slice_num)
+        if epoch == 64:
+            for _blk in _base_model.blocks:
+                with torch.no_grad():
+                    nn.init.orthogonal_(_blk.attn.in_project_slice.weight.data[32:64])
+                    _blk.attn.in_project_slice.bias.data[32:64] = 0.0
+        elif epoch == 128:
+            for _blk in _base_model.blocks:
+                with torch.no_grad():
+                    nn.init.orthogonal_(_blk.attn.in_project_slice.weight.data[64:cfg.slice_num])
+                    _blk.attn.in_project_slice.bias.data[64:cfg.slice_num] = 0.0
+    else:
+        _ps_limit = cfg.slice_num
 
     # --- Train ---
     model.train()
@@ -1325,6 +1355,15 @@ for epoch in range(MAX_EPOCHS):
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
 
+        # Spectral loss: penalize frequency-domain error in surface pressure prediction
+        if cfg.spectral_loss > 0.0:
+            _sp_pred = pred[:, :, 2] * surf_mask.float()
+            _sp_true = y_norm[:, :, 2] * surf_mask.float()
+            _fft_pred = torch.fft.rfft(_sp_pred, dim=1)
+            _fft_true = torch.fft.rfft(_sp_true, dim=1)
+            _spec_loss = (_fft_pred.abs() - _fft_true.abs()).abs().mean()
+            loss = loss + cfg.spectral_loss * _spec_loss
+
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
@@ -1407,13 +1446,30 @@ for epoch in range(MAX_EPOCHS):
                 scheduler.step()
             except ValueError:
                 pass
-        if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa:
+        if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa and not cfg.multi_ema:
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
             else:
                 with torch.no_grad():
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+        if cfg.multi_ema and epoch >= cfg.ema_start_epoch:
+            if ema_model_995 is None:
+                ema_model_995 = deepcopy(_base_model)
+                ema_model_998 = deepcopy(_base_model)
+                ema_model_999 = deepcopy(_base_model)
+            else:
+                with torch.no_grad():
+                    for _ep, _mp in zip(ema_model_995.parameters(), _base_model.parameters()):
+                        _ep.data.mul_(0.995).add_(_mp.data, alpha=0.005)
+                    for _ep, _mp in zip(ema_model_998.parameters(), _base_model.parameters()):
+                        _ep.data.mul_(0.998).add_(_mp.data, alpha=0.002)
+                    for _ep, _mp in zip(ema_model_999.parameters(), _base_model.parameters()):
+                        _ep.data.mul_(0.999).add_(_mp.data, alpha=0.001)
+        if cfg.prog_slices:
+            with torch.no_grad():
+                for _blk in _base_model.blocks:
+                    _blk.attn.in_project_slice.bias.data[_ps_limit:] = -100.0
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -1433,7 +1489,14 @@ for epoch in range(MAX_EPOCHS):
     prev_surf_loss = epoch_surf
 
     # --- Validate across all splits ---
-    if cfg.swa and swa_model is not None:
+    _eval_multi_ema = None  # averaged multi-EMA model for this epoch (reused for checkpoint saving)
+    if cfg.multi_ema and ema_model_995 is not None:
+        _eval_multi_ema = deepcopy(ema_model_995)
+        with torch.no_grad():
+            for _pa, _p998, _p999 in zip(_eval_multi_ema.parameters(), ema_model_998.parameters(), ema_model_999.parameters()):
+                _pa.data = (_pa.data + _p998.data + _p999.data) / 3
+        eval_model = _eval_multi_ema
+    elif cfg.swa and swa_model is not None:
         eval_model = swa_model
     elif ema_model is not None:
         eval_model = ema_model
@@ -1636,6 +1699,61 @@ for epoch in range(MAX_EPOCHS):
                               torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isinf())]
     val_loss_4split = sum(_4split_losses) / max(len(_4split_losses), 1)
 
+    # Error sampling: rebuild DataLoader once at epoch 40 with high-error samples upweighted 3x
+    if cfg.curriculum_error_sampling and epoch == 40:
+        print("Error sampling: computing per-sample training errors...")
+        _err_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
+        _sample_errors = []
+        _base_model.eval()
+        with torch.no_grad():
+            for _xe, _ye, _is_se, _maske in _err_loader:
+                _xe, _ye = _xe.to(device), _ye.to(device)
+                _is_se = _is_se.to(device)
+                _maske = _maske.to(device)
+                _raw_dsdfe = _xe[:, :, 2:10]
+                _dist_surfe = _raw_dsdfe.abs().min(dim=-1, keepdim=True).values
+                _dist_feate = torch.log1p(_dist_surfe * 10.0)
+                _xe = (_xe - stats["x_mean"]) / stats["x_std"]
+                _curve = _xe[:, :, 2:6].norm(dim=-1, keepdim=True) * _is_se.float().unsqueeze(-1)
+                if cfg.foil2_dist:
+                    _f2d = torch.log1p(_raw_dsdfe[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                    _xe = torch.cat([_xe, _curve, _dist_feate, _f2d], dim=-1)
+                else:
+                    _xe = torch.cat([_xe, _curve, _dist_feate], dim=-1)
+                _raw_xye = _xe[:, :, :2]
+                _xy_mine = _raw_xye.amin(dim=1, keepdim=True)
+                _xy_maxe = _raw_xye.amax(dim=1, keepdim=True)
+                _xy_norme = (_raw_xye - _xy_mine) / (_xy_maxe - _xy_mine + 1e-8)
+                _freqse = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                _xy_se = _xy_norme.unsqueeze(-1) * _freqse
+                _fpe = torch.cat([_xy_se.sin().flatten(-2), _xy_se.cos().flatten(-2)], dim=-1)
+                _xe = torch.cat([_xe, _fpe], dim=-1)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _prede = _base_model({"x": _xe})["preds"].float()
+                _Uma, _qa = _umag_q(_ye, _maske)
+                _ye_p = _phys_norm(_ye, _Uma, _qa)
+                _ye_n = (_ye_p - phys_stats["y_mean"]) / phys_stats["y_std"]
+                _surf_maske = _is_se.bool()
+                _abs_erre = (_prede - _ye_n).abs()
+                for _bi in range(_xe.shape[0]):
+                    _sm = _surf_maske[_bi]
+                    if _sm.any():
+                        _sample_errors.append(_abs_erre[_bi, _sm].mean().item())
+                    else:
+                        _sample_errors.append(0.0)
+        _base_model.train()
+        while len(_sample_errors) < len(train_ds):
+            _sample_errors.append(0.0)
+        _errs = torch.tensor(_sample_errors[:len(train_ds)])
+        _thresh = _errs.quantile(0.9)
+        _new_weights = torch.where(_errs >= _thresh,
+                                   sample_weights[:len(_errs)] * 3.0,
+                                   sample_weights[:len(_errs)])
+        _err_sampler = WeightedRandomSampler(_new_weights, num_samples=len(train_ds), replacement=True)
+        train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, sampler=_err_sampler, **loader_kwargs)
+        n_upweighted = (_errs >= _thresh).sum().item()
+        print(f"Error sampling: {n_upweighted} high-error samples upweighted 3x")
+
     dt = time.time() - t0
 
     # --- Log to wandb ---
@@ -1668,7 +1786,9 @@ for epoch in range(MAX_EPOCHS):
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
-        if cfg.swa and swa_model is not None:
+        if cfg.multi_ema and _eval_multi_ema is not None:
+            save_model = _eval_multi_ema
+        elif cfg.swa and swa_model is not None:
             save_model = swa_model
         elif ema_model is not None:
             save_model = ema_model
