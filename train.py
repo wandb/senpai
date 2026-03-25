@@ -395,6 +395,9 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        surf_decoder_hidden_dim=0,
+        surf_decoder_pressure_only=False,
+        surf_decoder_self_attn=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -405,6 +408,10 @@ class Transolver(nn.Module):
         self.adaln_4cond = adaln_4cond
         self.film_cond = film_cond
         self.adaln_zone_temp = adaln_zone_temp
+        self.surf_decoder_hidden_dim = surf_decoder_hidden_dim
+        self.surf_decoder_pressure_only = surf_decoder_pressure_only
+        self.surf_decoder_self_attn = surf_decoder_self_attn
+        _use_surf_dec = surf_decoder_hidden_dim > 0
         if output_fields is None or output_dims is None:
             raise ValueError("output_fields and output_dims must be provided")
         if len(output_fields) != len(output_dims):
@@ -445,12 +452,12 @@ class Transolver(nn.Module):
                     mlp_ratio=mlp_ratio,
                     out_dim=out_dim,
                     slice_num=slice_num,
-                    last_layer=(idx == n_layers - 1),
+                    last_layer=(idx == n_layers - 1) and not _use_surf_dec,
                     linear_no_attention=linear_no_attention,
                     learned_kernel=learned_kernel,
-                    field_decoder=field_decoder if (idx == n_layers - 1) else False,
-                    adaln_output=adaln_output if (idx == n_layers - 1) else False,
-                    soft_moe=soft_moe if (idx == n_layers - 1) else False,
+                    field_decoder=field_decoder if (idx == n_layers - 1) and not _use_surf_dec else False,
+                    adaln_output=adaln_output if (idx == n_layers - 1) and not _use_surf_dec else False,
+                    soft_moe=soft_moe if (idx == n_layers - 1) and not _use_surf_dec else False,
                     adaln_all=adaln_all_blocks,
                     adaln_cond_dim=4 if adaln_4cond else 2,
                     adaln_zero_init=not adaln_nozero,
@@ -462,6 +469,30 @@ class Transolver(nn.Module):
             ]
         )
         self.initialize_weights()
+        if _use_surf_dec:
+            # Main output head (replaces last block's last_layer head)
+            self.surf_dec_ln_final = nn.LayerNorm(n_hidden)
+            if field_decoder:
+                self.surf_dec_vel_head = nn.Sequential(
+                    nn.Linear(n_hidden, n_hidden), nn.GELU(), nn.Linear(n_hidden, 2)
+                )
+                self.surf_dec_pres_head = nn.Sequential(
+                    nn.Linear(n_hidden, n_hidden * 2), nn.GELU(), nn.Linear(n_hidden * 2, 1)
+                )
+            else:
+                self.surf_dec_main_head = nn.Sequential(
+                    nn.Linear(n_hidden, n_hidden), nn.GELU(), nn.Linear(n_hidden, out_dim)
+                )
+            # Auxiliary surface MLP: H → surf_h → out_surf_dim, zero-init last layer
+            surf_out_dim = 1 if surf_decoder_pressure_only else out_dim
+            if surf_decoder_self_attn:
+                self.surf_dec_attn = nn.MultiheadAttention(n_hidden, num_heads=4, batch_first=True)
+            self.surf_dec_mlp = nn.Sequential(
+                nn.Linear(n_hidden, surf_decoder_hidden_dim), nn.GELU(),
+                nn.Linear(surf_decoder_hidden_dim, surf_out_dim),
+            )
+            nn.init.zeros_(self.surf_dec_mlp[-1].weight)
+            nn.init.zeros_(self.surf_dec_mlp[-1].bias)
         self.out_skip = nn.Linear(n_hidden, out_dim)
         nn.init.zeros_(self.out_skip.weight)
         nn.init.zeros_(self.out_skip.bias)
@@ -524,6 +555,11 @@ class Transolver(nn.Module):
         if condition is not None:
             raise ValueError("Transolver does not support conditioning inputs")
 
+        # Surface mask for surf_dec self-attention: curvature feature (index 24) is >0 only for
+        # surface nodes (volume nodes have exactly 0 curvature before feature_cross modifies x)
+        if self.surf_decoder_self_attn:
+            surf_mask_attn = x[:, :, 24].abs() > 0.01  # [B, N] bool
+
         # Compute internal condition before feature_cross (indices are stable here)
         use_cond = self.adaln_all_blocks or self.film_cond
         if use_cond:
@@ -574,10 +610,50 @@ class Transolver(nn.Module):
         # Last block: use adaln_all condition if enabled, else fallback to adaln_output
         last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
-        gate = self.skip_gate(fx_pre)
-        fx = fx + gate * self.out_skip(fx_pre)
-        self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+
+        if self.surf_decoder_hidden_dim > 0:
+            # Surface decoder path: blocks[-1] returned hidden features (not predictions)
+            fx_ln = self.surf_dec_ln_final(fx)
+            if hasattr(self, 'surf_dec_vel_head'):
+                preds = torch.cat([self.surf_dec_vel_head(fx_ln), self.surf_dec_pres_head(fx_ln)], dim=-1)
+            else:
+                preds = self.surf_dec_main_head(fx_ln)
+            gate = self.skip_gate(fx_pre)
+            preds = preds + gate * self.out_skip(fx_pre)
+            # Apply auxiliary surface MLP as all-node residual correction.
+            # Zero-init last layer ensures the model starts at baseline behavior.
+            # Training dynamics (surf_weight=20x) concentrate gradient at surface nodes,
+            # so the MLP naturally learns surface-focused corrections.
+            if self.surf_decoder_self_attn:
+                # Surface-only self-attention: extract surface nodes, attend, scatter back.
+                # Subsampled to max 512 surface nodes to avoid O(N²) memory on large meshes.
+                B, N, D = fx_ln.shape
+                attn_out_full = torch.zeros_like(fx_ln)
+                for b in range(B):
+                    surf_idx = surf_mask_attn[b].nonzero(as_tuple=True)[0]
+                    if len(surf_idx) == 0:
+                        continue
+                    if len(surf_idx) > 512:
+                        perm = torch.randperm(len(surf_idx), device=fx_ln.device)[:512]
+                        surf_idx = surf_idx[perm]
+                    surf_feats = fx_ln[b:b+1, surf_idx]  # [1, N_surf, D]
+                    ao, _ = self.surf_dec_attn(surf_feats, surf_feats, surf_feats)
+                    attn_out_full[b, surf_idx] = ao.squeeze(0).to(attn_out_full.dtype)
+                surf_input = fx_ln + attn_out_full
+            else:
+                surf_input = fx_ln
+            surf_delta = self.surf_dec_mlp(surf_input)  # [B, N, surf_out_dim]
+            if self.surf_decoder_pressure_only:
+                preds = torch.cat([preds[:, :, :2], preds[:, :, 2:3] + surf_delta], dim=-1)
+            else:
+                preds = preds + surf_delta
+            self._validate_output_dims(preds)
+            return {"preds": preds, "re_pred": re_pred, "aoa_pred": aoa_pred}
+        else:
+            gate = self.skip_gate(fx_pre)
+            fx = fx + gate * self.out_skip(fx_pre)
+            self._validate_output_dims(fx)
+            return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
 
 # ---------------------------------------------------------------------------
@@ -668,6 +744,10 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R7: auxiliary surface-local decoder
+    surf_dec_hidden: int = 0            # hidden dim of surface MLP (0=disabled)
+    surf_dec_pressure_only: bool = False  # output only pressure channel residual
+    surf_dec_self_attn: bool = False      # add surface-masked self-attention before MLP
 
 
 cfg = sp.parse(Config)
@@ -813,11 +893,19 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    surf_decoder_hidden_dim=cfg.surf_dec_hidden,
+    surf_decoder_pressure_only=cfg.surf_dec_pressure_only,
+    surf_decoder_self_attn=cfg.surf_dec_self_attn,
 )
 
 model = Transolver(**model_config).to(device)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
-model = torch.compile(model, mode="default")
+if cfg.surf_dec_hidden > 0:
+    # torch.compile has a symbolic shape issue with surf_dec forward branches;
+    # skip compilation (correctness confirmed via no-op compile test)
+    pass
+else:
+    model = torch.compile(model, mode="default")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
