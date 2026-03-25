@@ -668,6 +668,10 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R7: Learned per-sample normalization
+    learned_norm: bool = False            # replace per-sample std with learned MLP normalization
+    norm_net_width: int = 32              # hidden dim of norm_net MLP
+    norm_net_tandem: bool = False         # also condition on AoA1_rad (feature 18) for tandem
 
 
 cfg = sp.parse(Config)
@@ -724,6 +728,34 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 1:2] = y_p[:, :, 1:2].clamp(-10, 10) * Umag
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
+
+
+class LearnedNorm(nn.Module):
+    """Data-driven per-sample normalization.
+
+    norm_net(log_Re, AoA0, gap, stagger [, AoA1]) -> (scale_Ux, scale_Uy, scale_p,
+                                                       shift_Ux, shift_Uy, shift_p)
+    Initialized to identity: scales=1, shifts=0 (via zero-init last layer).
+    Replaces (or composes with) hand-tuned per-sample std clamps.
+    """
+    def __init__(self, in_dim: int = 4, hidden_dim: int = 32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 6),
+        )
+        # Zero-init output layer → identity at initialization
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, cond: torch.Tensor):
+        # cond: [B, in_dim]
+        out = self.net(cond)              # [B, 6]
+        scale = (1.0 + out[:, :3]).clamp(min=0.1).unsqueeze(1)   # [B, 1, 3]
+        shift = out[:, 3:].unsqueeze(1)                            # [B, 1, 3]
+        return scale, shift
+
 
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
@@ -832,6 +864,12 @@ swa_n = 0
 
 n_params = sum(p.numel() for p in model.parameters())
 
+# Learned normalization module (optional)
+norm_net = None
+if cfg.learned_norm:
+    _norm_in = 5 if cfg.norm_net_tandem else 4
+    norm_net = LearnedNorm(in_dim=_norm_in, hidden_dim=cfg.norm_net_width).to(device)
+
 
 class SAM:
     """Sharpness-Aware Minimization (Foret et al., 2021).
@@ -939,16 +977,19 @@ class Lookahead:
 
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+norm_net_params = list(norm_net.parameters()) if norm_net is not None else []
 if cfg.use_lion:
     base_opt = Lion([
         {'params': attn_params, 'lr': cfg.lr * 0.5},
-        {'params': other_params, 'lr': cfg.lr}
+        {'params': other_params, 'lr': cfg.lr},
+        {'params': norm_net_params, 'lr': cfg.lr},
     ], weight_decay=cfg.weight_decay)
     optimizer = base_opt  # Lion has its own momentum; skip Lookahead
 else:
     base_opt = torch.optim.AdamW([
         {'params': attn_params, 'lr': cfg.lr * 0.5},
-        {'params': other_params, 'lr': cfg.lr}
+        {'params': other_params, 'lr': cfg.lr},
+        {'params': norm_net_params, 'lr': cfg.lr},
     ], weight_decay=cfg.weight_decay)
     if cfg.use_lookahead:
         optimizer = Lookahead(base_opt, k=10, alpha=0.8)
@@ -1159,6 +1200,18 @@ for epoch in range(MAX_EPOCHS):
                 p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
             noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
             y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
+
+        # Learned per-sample normalization (Phase 3 R7)
+        # Applies BEFORE per-sample std, changing the model's output target space.
+        # Feature indices (from original 24-dim x, preserved after standardization):
+        #   13=log_Re, 14=AoA0, 22=gap, 23=stagger, [18=AoA1 if norm_net_tandem]
+        _ln_scale = _ln_shift = None
+        if cfg.learned_norm and norm_net is not None:
+            _norm_cond = x[:, 0, [13, 14, 22, 23]].float()
+            if cfg.norm_net_tandem:
+                _norm_cond = torch.cat([_norm_cond, x[:, 0, 18:19].float()], dim=-1)
+            _ln_scale, _ln_shift = norm_net(_norm_cond)  # [B, 1, 3] each
+            y_norm = (y_norm - _ln_shift) / _ln_scale
 
         # Per-sample std normalization: skip tandem samples (gap feature index 21)
         raw_gap = x[:, 0, 21]
@@ -1492,6 +1545,15 @@ for epoch in range(MAX_EPOCHS):
                         y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
                     y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
+                # Learned normalization (Phase 3 R7) — same conditioning as training
+                _val_ln_scale = _val_ln_shift = None
+                if cfg.learned_norm and norm_net is not None:
+                    _val_norm_cond = x[:, 0, [13, 14, 22, 23]].float()
+                    if cfg.norm_net_tandem:
+                        _val_norm_cond = torch.cat([_val_norm_cond, x[:, 0, 18:19].float()], dim=-1)
+                    _val_ln_scale, _val_ln_shift = norm_net(_val_norm_cond)
+                    y_norm = (y_norm - _val_ln_shift) / _val_ln_scale
+
                 # Per-sample std normalization: skip tandem samples
                 raw_gap = x[:, 0, 21]
                 is_tandem = raw_gap.abs() > 0.5
@@ -1542,6 +1604,10 @@ for epoch in range(MAX_EPOCHS):
                     1e6
                 )
                 n_vbatches += 1
+
+                # Reverse learned normalization before physical denorm
+                if cfg.learned_norm and _val_ln_scale is not None:
+                    pred = pred * _val_ln_scale + _val_ln_shift
 
                 # Denormalize: phys_stats → Cp space → original scale
                 if cfg.raw_targets:
