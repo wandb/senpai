@@ -121,7 +121,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False):
+                 decouple_slice=False, zone_temp=False, linearno=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -135,11 +135,16 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.learned_kernel = learned_kernel
         self.decouple_slice = decouple_slice
         self.zone_temp = zone_temp
+        self.linearno = linearno
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
         self.in_project_slice = nn.Linear(dim_head, slice_num)
         torch.nn.init.orthogonal_(self.in_project_slice.weight)
+        if linearno:
+            # Asymmetric de-slice projection (LinearNO: separate phi/psi)
+            self.in_project_deslice = nn.Linear(dim_head, slice_num)
+            torch.nn.init.orthogonal_(self.in_project_deslice.weight)
         if decouple_slice:
             # Separate slice projection for tandem samples
             self.in_project_slice_tandem = nn.Linear(dim_head, slice_num)
@@ -201,7 +206,14 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
 
-        if self.linear_no_attention:
+        if self.linearno:
+            # LinearNO: asymmetric projections, no slice attention
+            deslice_logits = self.in_project_deslice(x_mid) / temp
+            deslice_weights = F.softmax(deslice_logits, dim=2)
+            out_x = torch.einsum("bhgc,bhng->bhnc", slice_token, deslice_weights)
+            out_x = rearrange(out_x, "b h n d -> b n (h d)")
+            return self.to_out(out_x)
+        elif self.linear_no_attention:
             out_slice_token = slice_token
         else:
             q_slice_token = self.to_q(slice_token)
@@ -250,6 +262,7 @@ class TransolverBlock(nn.Module):
         film_cond=False,
         decouple_slice=False,
         zone_temp=False,
+        linearno=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -269,6 +282,7 @@ class TransolverBlock(nn.Module):
             learned_kernel=learned_kernel,
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
+            linearno=linearno,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -395,6 +409,7 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        linearno=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -457,6 +472,7 @@ class Transolver(nn.Module):
                     film_cond=film_cond,
                     decouple_slice=adaln_decouple,
                     zone_temp=adaln_zone_temp,
+                    linearno=linearno,
                 )
                 for idx in range(n_layers)
             ]
@@ -668,6 +684,10 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R8: no-attention compound
+    linearno: bool = False         # Phase 3 R8: LinearNO asymmetric projections (separate deslice)
+    multi_ema: bool = False        # Phase 3 R8: multi-EMA ensemble (3 streams: 0.995, 0.998, 0.999)
+    surf_local_2x: bool = False    # Phase 3 R8: double surface loss weight
 
 
 cfg = sp.parse(Config)
@@ -813,6 +833,7 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    linearno=cfg.linearno,
 )
 
 model = Transolver(**model_config).to(device)
@@ -822,6 +843,7 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
+ema_models_multi = None  # Phase 3 R8: multi-EMA (3 streams: 0.995, 0.998, 0.999)
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -1267,6 +1289,8 @@ for epoch in range(MAX_EPOCHS):
         else:
             tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
+        if cfg.surf_local_2x:
+            surf_loss = surf_loss * 2.0
         if cfg.uncertainty_loss:
             bm = _base_model
             surf_ux_loss = (abs_err[:, :, 0:1] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
@@ -1408,12 +1432,22 @@ for epoch in range(MAX_EPOCHS):
             except ValueError:
                 pass
         if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa:
-            if ema_model is None:
-                ema_model = deepcopy(_base_model)
+            if cfg.multi_ema:
+                if ema_models_multi is None:
+                    ema_models_multi = [deepcopy(_base_model) for _ in range(3)]
+                else:
+                    _mema_decays = [0.995, 0.998, 0.999]
+                    with torch.no_grad():
+                        for _ema_m, _decay in zip(ema_models_multi, _mema_decays):
+                            for ep, mp in zip(_ema_m.parameters(), _base_model.parameters()):
+                                ep.data.mul_(_decay).add_(mp.data, alpha=1 - _decay)
             else:
-                with torch.no_grad():
-                    for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
-                        ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+                if ema_model is None:
+                    ema_model = deepcopy(_base_model)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -1435,6 +1469,10 @@ for epoch in range(MAX_EPOCHS):
     # --- Validate across all splits ---
     if cfg.swa and swa_model is not None:
         eval_model = swa_model
+    elif cfg.multi_ema and ema_models_multi is not None:
+        eval_model = ema_models_multi[1]  # 0.998 stream as primary for logging/saving
+        for _m in ema_models_multi:
+            _m.eval()
     elif ema_model is not None:
         eval_model = ema_model
     else:
@@ -1521,7 +1559,11 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    if cfg.multi_ema and ema_models_multi is not None:
+                        _preds = [_m({"x": x})["preds"] for _m in ema_models_multi]
+                        pred = torch.stack(_preds, dim=0).mean(0)
+                    else:
+                        pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
@@ -1670,6 +1712,8 @@ for epoch in range(MAX_EPOCHS):
                 best_metrics[f"best_{k}"] = v
         if cfg.swa and swa_model is not None:
             save_model = swa_model
+        elif cfg.multi_ema and ema_models_multi is not None:
+            save_model = ema_models_multi[1]  # save 0.998 decay stream
         elif ema_model is not None:
             save_model = ema_model
         else:
