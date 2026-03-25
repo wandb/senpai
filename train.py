@@ -668,6 +668,13 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R9: Tandem curriculum + domain loss weighting
+    domain_coarse_weight: float = 1.0         # coarse loss multiplier for tandem samples
+    domain_coarse_weight_single: float = 1.0  # coarse loss multiplier for single samples
+    inverse_curriculum: bool = False           # GPU 5: heavy tandem first, then balance
+    inverse_curriculum_epochs: int = 40        # epochs for heavy-tandem phase
+    domain_layernorm: bool = False             # GPU 6: domain-conditional output scaling
+    domain_pres_head: bool = False             # GPU 7: tandem pressure residual adapter
 
 
 cfg = sp.parse(Config)
@@ -724,6 +731,43 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 1:2] = y_p[:, :, 1:2].clamp(-10, 10) * Umag
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
+
+class DomainOutputNorm(nn.Module):
+    """Domain-conditional output scaling/shifting (Phase 3 R9 DomainLayerNorm).
+    Applies per-domain (single=0, tandem=1) learned affine transform to predictions.
+    Initialized to identity (scale=0→effective 1, shift=0).
+    """
+    def __init__(self, n_channels: int = 3):
+        super().__init__()
+        self.scale_emb = nn.Embedding(2, n_channels)
+        self.shift_emb = nn.Embedding(2, n_channels)
+        nn.init.zeros_(self.scale_emb.weight)
+        nn.init.zeros_(self.shift_emb.weight)
+
+    def forward(self, pred: torch.Tensor, is_tandem: torch.Tensor) -> torch.Tensor:
+        domain_idx = is_tandem.long()           # [B]
+        scale = self.scale_emb(domain_idx).unsqueeze(1)   # [B, 1, 3]
+        shift = self.shift_emb(domain_idx).unsqueeze(1)   # [B, 1, 3]
+        return pred * (1.0 + scale) + shift
+
+
+class DomainPresAdapter(nn.Module):
+    """Tandem pressure residual adapter (Phase 3 R9 domain_pres_head).
+    Adds a small MLP residual to pressure predictions for tandem samples only.
+    Zero-initialized → identity at start.
+    """
+    def __init__(self, in_dim: int = 3, hidden_dim: int = 32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, pred: torch.Tensor) -> torch.Tensor:
+        return self.net(pred)  # [B, N, 1] pressure residual
+
 
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
@@ -829,6 +873,10 @@ swad_collecting = False
 swad_done = False
 swa_model = None
 swa_n = 0
+
+# Phase 3 R9: domain adapters
+domain_out_norm = DomainOutputNorm(n_channels=3).to(device) if cfg.domain_layernorm else None
+domain_pres_adapter = DomainPresAdapter(in_dim=3, hidden_dim=32).to(device) if cfg.domain_pres_head else None
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -939,16 +987,22 @@ class Lookahead:
 
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+domain_adapter_params = (
+    (list(domain_out_norm.parameters()) if domain_out_norm else []) +
+    (list(domain_pres_adapter.parameters()) if domain_pres_adapter else [])
+)
 if cfg.use_lion:
     base_opt = Lion([
         {'params': attn_params, 'lr': cfg.lr * 0.5},
-        {'params': other_params, 'lr': cfg.lr}
+        {'params': other_params, 'lr': cfg.lr},
+        {'params': domain_adapter_params, 'lr': cfg.lr},
     ], weight_decay=cfg.weight_decay)
     optimizer = base_opt  # Lion has its own momentum; skip Lookahead
 else:
     base_opt = torch.optim.AdamW([
         {'params': attn_params, 'lr': cfg.lr * 0.5},
-        {'params': other_params, 'lr': cfg.lr}
+        {'params': other_params, 'lr': cfg.lr},
+        {'params': domain_adapter_params, 'lr': cfg.lr},
     ], weight_decay=cfg.weight_decay)
     if cfg.use_lookahead:
         optimizer = Lookahead(base_opt, k=10, alpha=0.8)
@@ -1204,6 +1258,15 @@ for epoch in range(MAX_EPOCHS):
                 pred = pred * sample_stds
             else:
                 pred = pred / sample_stds
+        # Domain adapters (Phase 3 R9) — compute tandem flag early before main is_tandem_batch
+        if model.training and (domain_out_norm is not None or domain_pres_adapter is not None):
+            _is_tandem_early = (x[:, 0, 21].abs() > 0.01)
+            if domain_out_norm is not None:
+                pred = domain_out_norm(pred, _is_tandem_early)
+            if domain_pres_adapter is not None:
+                pres_res = domain_pres_adapter(pred)  # [B, N, 1]
+                _tandem_f = _is_tandem_early[:, None, None].float()
+                pred = torch.cat([pred[:, :, :2], pred[:, :, 2:3] + pres_res * _tandem_f], dim=-1)
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         if cfg.tandem_ramp:
@@ -1264,6 +1327,12 @@ for epoch in range(MAX_EPOCHS):
             tandem_boost = torch.where(is_tandem_batch,
                                        torch.tensor(adaptive_boost * tandem_weight, device=device),
                                        torch.ones(B, device=device))
+        elif cfg.inverse_curriculum and epoch < cfg.inverse_curriculum_epochs:
+            # Heavy tandem phase: 3x tandem, 0.3x single → ramps to 1x/1x by epoch 40
+            alpha = epoch / cfg.inverse_curriculum_epochs
+            tandem_w = float(3.0 - 2.0 * alpha)   # 3 → 1
+            single_w = float(0.3 + 0.7 * alpha)   # 0.3 → 1
+            tandem_boost = torch.where(is_tandem_batch, tandem_w, single_w).to(device)
         else:
             tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
@@ -1304,7 +1373,14 @@ for epoch in range(MAX_EPOCHS):
             mask_coarse = mask_trunc.reshape(B, n_groups, coarse_pool_size).any(dim=2)
 
             coarse_err = (pred_coarse - y_coarse).abs()
-            coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
+            # Domain-conditional coarse loss weighting (Phase 3 R9)
+            if cfg.domain_coarse_weight != 1.0 or cfg.domain_coarse_weight_single != 1.0:
+                _cw = torch.where(is_tandem_batch[:, None, None],
+                                  coarse_err.new_full((B, 1, 1), cfg.domain_coarse_weight),
+                                  coarse_err.new_full((B, 1, 1), cfg.domain_coarse_weight_single))
+                coarse_loss = (coarse_err * _cw * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
+            else:
+                coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
             _coarse_loss = coarse_loss
             loss = loss + 1.0 * coarse_loss
 
@@ -1523,6 +1599,14 @@ for epoch in range(MAX_EPOCHS):
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = eval_model({"x": x})["preds"]
                 pred = pred.float()
+                # Apply domain adapters in val loop (Phase 3 R9)
+                if domain_out_norm is not None or domain_pres_adapter is not None:
+                    if domain_out_norm is not None:
+                        pred = domain_out_norm(pred, is_tandem)
+                    if domain_pres_adapter is not None:
+                        pres_res = domain_pres_adapter(pred)  # [B, N, 1]
+                        _tandem_f = is_tandem[:, None, None].float()
+                        pred = torch.cat([pred[:, :, :2], pred[:, :, 2:3] + pres_res * _tandem_f], dim=-1)
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
                 else:
