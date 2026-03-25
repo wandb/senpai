@@ -196,6 +196,11 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             slice_logits = self.in_project_slice(x_mid) / temp
         if spatial_bias is not None:
             slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
+        if self.training and getattr(self, 'gumbel_noise', False):
+            _g = -torch.log(-torch.log(torch.rand_like(slice_logits) + 1e-8) + 1e-8)
+            _gtemp = getattr(self, 'gumbel_temp', 1.0)
+            _gscale = getattr(self, 'gumbel_scale', 1.0)
+            slice_logits = (slice_logits + _gscale * _g) / _gtemp
         slice_weights = self.softmax(slice_logits)
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
@@ -668,6 +673,10 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R9: Gumbel-Softmax slice assignment
+    gumbel: bool = False             # add Gumbel noise to slice logits during training
+    gumbel_scale: float = 1.0        # scale of Gumbel noise (0.5, 1.0, 2.0)
+    gumbel_temp_anneal: bool = False  # anneal Gumbel temperature from 1.0 → 0.1 over training
 
 
 cfg = sp.parse(Config)
@@ -822,6 +831,14 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
+
+# Phase 3 R9: set Gumbel attributes on all attention modules
+if cfg.gumbel:
+    for _m in _base_model.modules():
+        if isinstance(_m, Physics_Attention_Irregular_Mesh):
+            _m.gumbel_noise = True
+            _m.gumbel_scale = cfg.gumbel_scale
+            _m.gumbel_temp = 1.0
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -1039,6 +1056,13 @@ for epoch in range(MAX_EPOCHS):
         break
 
     t0 = time.time()
+
+    # Phase 3 R9: Gumbel temperature annealing (1.0 → 0.1 over training)
+    if cfg.gumbel and cfg.gumbel_temp_anneal:
+        _gtemp_now = max(0.1, 1.0 - (1.0 - 0.1) * epoch / max(1, MAX_EPOCHS - 1))
+        for _m in _base_model.modules():
+            if isinstance(_m, Physics_Attention_Irregular_Mesh):
+                _m.gumbel_temp = _gtemp_now
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
