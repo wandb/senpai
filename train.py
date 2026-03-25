@@ -668,6 +668,15 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R6/R8: feature engineering
+    wake_dist_feat: bool = False      # log wake-distance past trailing edge (1-dim)
+    local_re_feat: bool = False       # log local Reynolds based on chord position (1-dim)
+    sdf_normals_feat: bool = False    # unit surface normal from dsdf gradient (2-dim)
+    le_te_dist_feat: bool = False     # log distances to LE and TE (2-dim)
+    chord_frac_feat: bool = False     # fractional chord position (1-dim)
+    foil2_dir_feat: bool = False      # direction toward foil-2 surface, tandem only (2-dim)
+    surf_align_feat: bool = False     # cosine alignment between dsdf normal and AoA (1-dim)
+    bl_local_feat: bool = False       # boundary-layer Re estimate from wall distance (1-dim)
 
 
 cfg = sp.parse(Config)
@@ -789,9 +798,16 @@ if cfg.raw_targets:
 else:
     raw_stats = None
 
+_n_extra_feats = int(
+    cfg.wake_dist_feat + cfg.local_re_feat +
+    2 * cfg.sdf_normals_feat + 2 * cfg.le_te_dist_feat +
+    cfg.chord_frac_feat + 2 * cfg.foil2_dir_feat +
+    cfg.surf_align_feat + cfg.bl_local_feat
+)
+
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32 + _n_extra_feats,  # +curv, +dist, [+foil2dist], +32 fourier PE, [+extra]
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1117,6 +1133,10 @@ for epoch in range(MAX_EPOCHS):
                     is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
+        raw_pos = x[:, :, 0:2].clone()   # [B, N, 2] positions before normalization
+        raw_log_re = x[:, 0, 13].clone() # [B]
+        raw_aoa = x[:, 0, 14].clone()    # [B]
+        raw_gap_feat = x[:, 0, 22].clone()    # [B]
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         x = (x - stats["x_mean"]) / stats["x_std"]
@@ -1137,6 +1157,37 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
+        if _n_extra_feats > 0:
+            _lex = raw_pos[:, :, 0].masked_fill(~is_surface, 1e6).min(1).values    # [B]
+            _tex = raw_pos[:, :, 0].masked_fill(~is_surface, -1e6).max(1).values   # [B]
+            _xtra = []
+            if cfg.wake_dist_feat:
+                _xtra.append(torch.log1p((raw_pos[:, :, 0] - _tex[:, None]).clamp(min=0) * mask.float()).unsqueeze(-1))
+            if cfg.local_re_feat:
+                _cd = (raw_pos[:, :, 0] - _lex[:, None]).clamp(min=1e-4)
+                _xtra.append(((raw_log_re[:, None] + _cd.log() - 13.0) / 2.0).clamp(-3, 3).unsqueeze(-1))
+            if cfg.sdf_normals_feat:
+                _g = raw_dsdf[:, :, 2:4]
+                _xtra.append(_g / _g.norm(dim=-1, keepdim=True).clamp(min=1e-8))
+            if cfg.le_te_dist_feat:
+                _d_le = (raw_pos[:, :, 0] - _lex[:, None]).abs().clamp(min=1e-4)
+                _d_te = (raw_pos[:, :, 0] - _tex[:, None]).abs().clamp(min=1e-4)
+                _xtra.append(torch.stack([_d_le.log(), _d_te.log()], dim=-1))
+            if cfg.chord_frac_feat:
+                _clen = (_tex - _lex).clamp(min=1e-4)[:, None]
+                _xtra.append(((raw_pos[:, :, 0] - _lex[:, None]) / _clen).unsqueeze(-1))
+            if cfg.foil2_dir_feat:
+                _g2 = raw_dsdf[:, :, 4:6]
+                _g2n = _g2 / _g2.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                _xtra.append(_g2n * (raw_gap_feat.abs() > 0.01).float()[:, None, None])
+            if cfg.surf_align_feat:
+                _g = raw_dsdf[:, :, 2:4]
+                _gn = _g.norm(dim=-1).clamp(min=1e-8)
+                _cos = torch.cos(raw_aoa)[:, None]; _sin = torch.sin(raw_aoa)[:, None]
+                _xtra.append((_g[:, :, 0] / _gn * _cos + _g[:, :, 1] / _gn * _sin).unsqueeze(-1))
+            if cfg.bl_local_feat:
+                _xtra.append(((raw_log_re[:, None] + torch.log1p(dist_surf.squeeze(-1)) - 13.0) / 2.0).clamp(-3, 3).unsqueeze(-1))
+            x = torch.cat([x] + _xtra, dim=-1)
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -1462,6 +1513,10 @@ for epoch in range(MAX_EPOCHS):
                 mask = mask.to(device, non_blocking=True)
 
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
+                raw_pos = x[:, :, 0:2].clone()
+                raw_log_re = x[:, 0, 13].clone()
+                raw_aoa = x[:, 0, 14].clone()
+                raw_gap_feat = x[:, 0, 22].clone()
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 x = (x - stats["x_mean"]) / stats["x_std"]
@@ -1482,6 +1537,37 @@ for epoch in range(MAX_EPOCHS):
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
+                if _n_extra_feats > 0:
+                    _lex = raw_pos[:, :, 0].masked_fill(~is_surface, 1e6).min(1).values
+                    _tex = raw_pos[:, :, 0].masked_fill(~is_surface, -1e6).max(1).values
+                    _xtra = []
+                    if cfg.wake_dist_feat:
+                        _xtra.append(torch.log1p((raw_pos[:, :, 0] - _tex[:, None]).clamp(min=0) * mask.float()).unsqueeze(-1))
+                    if cfg.local_re_feat:
+                        _cd = (raw_pos[:, :, 0] - _lex[:, None]).clamp(min=1e-4)
+                        _xtra.append(((raw_log_re[:, None] + _cd.log() - 13.0) / 2.0).clamp(-3, 3).unsqueeze(-1))
+                    if cfg.sdf_normals_feat:
+                        _g = raw_dsdf[:, :, 2:4]
+                        _xtra.append(_g / _g.norm(dim=-1, keepdim=True).clamp(min=1e-8))
+                    if cfg.le_te_dist_feat:
+                        _d_le = (raw_pos[:, :, 0] - _lex[:, None]).abs().clamp(min=1e-4)
+                        _d_te = (raw_pos[:, :, 0] - _tex[:, None]).abs().clamp(min=1e-4)
+                        _xtra.append(torch.stack([_d_le.log(), _d_te.log()], dim=-1))
+                    if cfg.chord_frac_feat:
+                        _clen = (_tex - _lex).clamp(min=1e-4)[:, None]
+                        _xtra.append(((raw_pos[:, :, 0] - _lex[:, None]) / _clen).unsqueeze(-1))
+                    if cfg.foil2_dir_feat:
+                        _g2 = raw_dsdf[:, :, 4:6]
+                        _g2n = _g2 / _g2.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                        _xtra.append(_g2n * (raw_gap_feat.abs() > 0.01).float()[:, None, None])
+                    if cfg.surf_align_feat:
+                        _g = raw_dsdf[:, :, 2:4]
+                        _gn = _g.norm(dim=-1).clamp(min=1e-8)
+                        _cos = torch.cos(raw_aoa)[:, None]; _sin = torch.sin(raw_aoa)[:, None]
+                        _xtra.append((_g[:, :, 0] / _gn * _cos + _g[:, :, 1] / _gn * _sin).unsqueeze(-1))
+                    if cfg.bl_local_feat:
+                        _xtra.append(((raw_log_re[:, None] + torch.log1p(dist_surf.squeeze(-1)) - 13.0) / 2.0).clamp(-3, 3).unsqueeze(-1))
+                    x = torch.cat([x] + _xtra, dim=-1)
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
