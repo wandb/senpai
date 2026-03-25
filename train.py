@@ -395,6 +395,7 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        domain_layernorm=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -405,6 +406,7 @@ class Transolver(nn.Module):
         self.adaln_4cond = adaln_4cond
         self.film_cond = film_cond
         self.adaln_zone_temp = adaln_zone_temp
+        self.domain_layernorm = domain_layernorm
         if output_fields is None or output_dims is None:
             raise ValueError("output_fields and output_dims must be provided")
         if len(output_fields) != len(output_dims):
@@ -418,6 +420,10 @@ class Transolver(nn.Module):
             self.log_sigma_surf_ux = nn.Parameter(torch.zeros(1))
             self.log_sigma_surf_uy = nn.Parameter(torch.zeros(1))
             self.log_sigma_surf_p = nn.Parameter(torch.zeros(1))
+        if domain_layernorm:
+            # Learned per-domain affine rescaling of predictions: 2 domains × out_dim channels
+            self.domain_scale = nn.Parameter(torch.ones(2, out_dim))
+            self.domain_shift = nn.Parameter(torch.zeros(2, out_dim))
 
         if self.unified_pos:
             self.preprocess = MLP(
@@ -576,6 +582,11 @@ class Transolver(nn.Module):
         fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
+        if self.domain_layernorm:
+            dom_idx = (x[:, 0, 21].abs() > 0.01).long()  # [B], 0=single, 1=tandem
+            scale = self.domain_scale[dom_idx][:, None, :]  # [B, 1, out_dim]
+            shift = self.domain_shift[dom_idx][:, None, :]  # [B, 1, out_dim]
+            fx = fx * scale + shift
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
@@ -668,6 +679,11 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R9: domain-specific normalization stats
+    domain_norm_stats: bool = False    # compute/apply separate phys_stats for single vs tandem
+    domain_clamps: bool = False        # tighter per-sample std clamps for domain-normalized targets
+    domain_tandem_p_clamp: float = 1.0 # tandem pressure clamp for per-sample std (default 1.0, GPU5: 3.0)
+    domain_layernorm: bool = False     # learnable per-domain affine rescaling on model output
 
 
 cfg = sp.parse(Config)
@@ -770,6 +786,41 @@ _pstd = ((_phys_sq_sum / _phys_n - _pmean ** 2).clamp(min=0.0).sqrt()).clamp(min
 phys_stats = {"y_mean": _pmean, "y_std": _pstd}
 print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
+# --- Domain-specific stats (single foil vs tandem) ---
+phys_stats_single = phys_stats
+phys_stats_tandem = phys_stats
+if cfg.domain_norm_stats:
+    print("Computing domain-specific normalization stats (single vs tandem)...")
+    _dom_sum = {0: torch.zeros(3, device=device), 1: torch.zeros(3, device=device)}
+    _dom_sq = {0: torch.zeros(3, device=device), 1: torch.zeros(3, device=device)}
+    _dom_n = {0: 0.0, 1: 0.0}
+    with torch.no_grad():
+        for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc="Domain stats", leave=False):
+            _x, _y, _mask = _x.to(device), _y.to(device), _mask.to(device)
+            _is_tan_raw = _x[:, 0, 21].abs() > 0.001  # raw gap threshold
+            _Um, _q = _umag_q(_y, _mask)
+            _yp = _phys_norm(_y, _Um, _q)
+            if cfg.log_pressure:
+                _yp = _yp.clone()
+                _yp[:, :, 2:3] = _yp[:, :, 2:3].abs().add(1).log() * _yp[:, :, 2:3].sign()
+            for _dom, _sel in [(1, _is_tan_raw), (0, ~_is_tan_raw)]:
+                if not _sel.any():
+                    continue
+                _yp_sel = _yp[_sel]
+                _m_sel = _mask[_sel].float().unsqueeze(-1)
+                _dom_sum[_dom] += (_yp_sel * _m_sel).sum(dim=(0, 1))
+                _dom_sq[_dom] += (_yp_sel ** 2 * _m_sel).sum(dim=(0, 1))
+                _dom_n[_dom] += _mask[_sel].float().sum().item()
+    for _dom, _name in [(0, "single"), (1, "tandem")]:
+        _n = max(_dom_n[_dom], 1.0)
+        _dm = (_dom_sum[_dom] / _n).float()
+        _ds = ((_dom_sq[_dom] / _n - _dm ** 2).clamp(min=0.0).sqrt()).clamp(min=1e-6).float()
+        if _dom == 0:
+            phys_stats_single = {"y_mean": _dm, "y_std": _ds}
+        else:
+            phys_stats_tandem = {"y_mean": _dm, "y_std": _ds}
+        print(f"  {_name} stats — mean: {_dm.tolist()}, std: {_ds.tolist()}")
+
 if cfg.raw_targets:
     print("Computing raw target stats (no physics normalization)...")
     _raw_sum = torch.zeros(3, device=device)
@@ -813,6 +864,7 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    domain_layernorm=cfg.domain_layernorm,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1148,7 +1200,13 @@ for epoch in range(MAX_EPOCHS):
             if cfg.log_pressure:
                 y_phys = y_phys.clone()
                 y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
-            y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+            if cfg.domain_norm_stats:
+                _is_tan_flag = (x[:, 0, 21].abs() > 0.5)[:, None, None]
+                _ym = torch.where(_is_tan_flag, phys_stats_tandem["y_mean"][None], phys_stats_single["y_mean"][None])
+                _ys = torch.where(_is_tan_flag, phys_stats_tandem["y_std"][None], phys_stats_single["y_std"][None])
+                y_norm = (y_phys - _ym) / _ys
+            else:
+                y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         if model.training:
             noise_progress = min(1.0, epoch / cfg.noise_anneal_epochs)
             if cfg.half_target_noise:
@@ -1166,14 +1224,19 @@ for epoch in range(MAX_EPOCHS):
         B = y_norm.shape[0]
         sample_stds = torch.ones(B, 1, 3, device=device)
         if not cfg.no_perstd and not cfg.raw_targets:
-            if cfg.unified_clamps:
+            if cfg.domain_clamps:
+                # Tighter clamps after domain normalization (both domains in similar range)
+                channel_clamps = torch.tensor([0.1, 0.1, 0.3], device=device)
+                tandem_clamps = torch.tensor([0.2, 0.2, 0.5], device=device)
+            elif cfg.unified_clamps:
                 channel_clamps = tandem_clamps = torch.tensor([0.2, 0.2, 0.7], device=device)
             elif cfg.high_p_clamp:
                 channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
                 tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
             else:
                 channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
-                tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+                tandem_p = cfg.domain_tandem_p_clamp
+                tandem_clamps = torch.tensor([0.3, 0.3, tandem_p], device=device)
             if model.training:
                 for b in range(B):
                     valid = mask[b]
@@ -1490,7 +1553,13 @@ for epoch in range(MAX_EPOCHS):
                     if cfg.log_pressure:
                         y_phys = y_phys.clone()
                         y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
-                    y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                    if cfg.domain_norm_stats:
+                        _is_tan_flag = (x[:, 0, 21].abs() > 0.5)[:, None, None]
+                        _ym = torch.where(_is_tan_flag, phys_stats_tandem["y_mean"][None], phys_stats_single["y_mean"][None])
+                        _ys = torch.where(_is_tan_flag, phys_stats_tandem["y_std"][None], phys_stats_single["y_std"][None])
+                        y_norm = (y_phys - _ym) / _ys
+                    else:
+                        y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
                 # Per-sample std normalization: skip tandem samples
                 raw_gap = x[:, 0, 21]
@@ -1498,14 +1567,18 @@ for epoch in range(MAX_EPOCHS):
                 B = y_norm.shape[0]
                 sample_stds = torch.ones(B, 1, 3, device=device)
                 if not cfg.no_perstd and not cfg.raw_targets:
-                    if cfg.unified_clamps:
+                    if cfg.domain_clamps:
+                        channel_clamps = torch.tensor([0.1, 0.1, 0.3], device=device)
+                        tandem_clamps = torch.tensor([0.2, 0.2, 0.5], device=device)
+                    elif cfg.unified_clamps:
                         channel_clamps = tandem_clamps = torch.tensor([0.2, 0.2, 0.7], device=device)
                     elif cfg.high_p_clamp:
                         channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
                         tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
                     else:
                         channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
-                        tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+                        tandem_p = cfg.domain_tandem_p_clamp
+                        tandem_clamps = torch.tensor([0.3, 0.3, tandem_p], device=device)
                     for b in range(B):
                         valid = mask[b]
                         if cfg.no_perstd_p:
@@ -1547,7 +1620,13 @@ for epoch in range(MAX_EPOCHS):
                 if cfg.raw_targets:
                     pred_orig = pred * raw_stats["y_std"] + raw_stats["y_mean"]
                 else:
-                    pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                    if cfg.domain_norm_stats:
+                        _is_tan_flag = (x[:, 0, 21].abs() > 0.5)[:, None, None]
+                        _ym = torch.where(_is_tan_flag, phys_stats_tandem["y_mean"][None], phys_stats_single["y_mean"][None])
+                        _ys = torch.where(_is_tan_flag, phys_stats_tandem["y_std"][None], phys_stats_single["y_std"][None])
+                        pred_phys = pred * _ys + _ym
+                    else:
+                        pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
                     if cfg.log_pressure:
                         pred_phys = pred_phys.clone()
                         pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
@@ -1736,7 +1815,13 @@ if best_metrics:
                 if cfg.raw_targets:
                     y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                 else:
-                    pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                    if cfg.domain_norm_stats:
+                        _is_tan_flag = (x_n[:, 0, 21].abs() > 0.5)[:, None, None]
+                        _ym = torch.where(_is_tan_flag, phys_stats_tandem["y_mean"][None], phys_stats_single["y_mean"][None])
+                        _ys = torch.where(_is_tan_flag, phys_stats_tandem["y_std"][None], phys_stats_single["y_std"][None])
+                        pred_phys = pred * _ys + _ym
+                    else:
+                        pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
                     if cfg.log_pressure:
                         pred_phys = pred_phys.clone()
                         pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
