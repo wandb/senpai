@@ -116,6 +116,23 @@ class MLP(nn.Module):
         return x
 
 
+class DomainLayerNorm(nn.Module):
+    """Domain-specific LayerNorm: separate weight/bias for single-foil vs tandem (Phase 3 R9)."""
+    def __init__(self, dim):
+        super().__init__()
+        self.ln_single = nn.LayerNorm(dim)
+        self.ln_tandem = nn.LayerNorm(dim)
+        self.ln_tandem.weight.data.copy_(self.ln_single.weight.data)
+        self.ln_tandem.bias.data.copy_(self.ln_single.bias.data)
+
+    def forward(self, x, is_tandem=None):
+        # x: [B, N, D], is_tandem: [B] bool or None
+        if is_tandem is None:
+            return self.ln_single(x)
+        mask_t = is_tandem.view(-1, 1, 1).expand_as(x)
+        return torch.where(mask_t, self.ln_tandem(x), self.ln_single(x))
+
+
 class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
@@ -250,6 +267,7 @@ class TransolverBlock(nn.Module):
         film_cond=False,
         decouple_slice=False,
         zone_temp=False,
+        domain_layernorm=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -258,7 +276,9 @@ class TransolverBlock(nn.Module):
         self.soft_moe = soft_moe
         self.adaln_all = adaln_all
         self.film_cond = film_cond
-        self.ln_1 = nn.LayerNorm(hidden_dim)
+        self.domain_layernorm = domain_layernorm
+        _LN = DomainLayerNorm if domain_layernorm else nn.LayerNorm
+        self.ln_1 = _LN(hidden_dim)
         self.attn = Physics_Attention_Irregular_Mesh(
             hidden_dim,
             heads=num_heads,
@@ -287,7 +307,7 @@ class TransolverBlock(nn.Module):
             )
             nn.init.zeros_(self.film_net[-1].weight)
             nn.init.zeros_(self.film_net[-1].bias)
-        self.ln_2 = nn.LayerNorm(hidden_dim)
+        self.ln_2 = _LN(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         self.spatial_bias = nn.Sequential(
             nn.Linear(4, 64), nn.GELU(),
@@ -296,8 +316,8 @@ class TransolverBlock(nn.Module):
         )
         nn.init.zeros_(self.spatial_bias[-1].weight)
         nn.init.zeros_(self.spatial_bias[-1].bias)
-        self.ln_1_post = nn.LayerNorm(hidden_dim)
-        self.ln_2_post = nn.LayerNorm(hidden_dim)
+        self.ln_1_post = _LN(hidden_dim)
+        self.ln_2_post = _LN(hidden_dim)
         self.se_fc1 = nn.Linear(hidden_dim, hidden_dim // 4)
         self.se_fc2 = nn.Linear(hidden_dim // 4, hidden_dim)
         nn.init.zeros_(self.se_fc2.weight)
@@ -331,16 +351,24 @@ class TransolverBlock(nn.Module):
 
     def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
+        if self.domain_layernorm:
+            _is_tan = (tandem_mask[:, 0, 0, 0] > 0.5) if tandem_mask is not None else None
+            _ln1 = lambda x: self.ln_1(x, _is_tan)
+            _ln1p = lambda x: self.ln_1_post(x, _is_tan)
+            _ln2 = lambda x: self.ln_2(x, _is_tan)
+            _ln2p = lambda x: self.ln_2_post(x, _is_tan)
+        else:
+            _ln1, _ln1p, _ln2, _ln2p = self.ln_1, self.ln_1_post, self.ln_2, self.ln_2_post
         if self.adaln_all and condition is not None:
             cond_out = self.adaln_net(condition)  # [B, H*4]
             s1, b1, s2, b2 = cond_out.chunk(4, dim=-1)  # each [B, H]
-            fx_norm = self.ln_1(fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
-            fx = self.ln_1_post(self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
-            fx_norm = self.ln_2(fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
-            fx = self.ln_2_post(self.mlp(fx_norm) + fx)
+            fx_norm = _ln1(fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
+            fx = _ln1p(self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            fx_norm = _ln2(fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
+            fx = _ln2p(self.mlp(fx_norm) + fx)
         else:
-            fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
-            fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
+            fx = _ln1p(self.attn(_ln1(fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            fx = _ln2p(self.mlp(_ln2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
@@ -395,6 +423,9 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        domain_layernorm=False,
+        domain_layernorm_last=False,
+        domain_layernorm_fourier=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -405,6 +436,7 @@ class Transolver(nn.Module):
         self.adaln_4cond = adaln_4cond
         self.film_cond = film_cond
         self.adaln_zone_temp = adaln_zone_temp
+        self.domain_layernorm_fourier = domain_layernorm_fourier
         if output_fields is None or output_dims is None:
             raise ValueError("output_fields and output_dims must be provided")
         if len(output_fields) != len(output_dims):
@@ -457,6 +489,7 @@ class Transolver(nn.Module):
                     film_cond=film_cond,
                     decouple_slice=adaln_decouple,
                     zone_temp=adaln_zone_temp,
+                    domain_layernorm=domain_layernorm if not domain_layernorm_last else (idx == n_layers - 1),
                 )
                 for idx in range(n_layers)
             ]
@@ -473,6 +506,8 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        if domain_layernorm_fourier:
+            self.fourier_freqs_learned_tandem = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -668,6 +703,11 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R9: domain-specific LayerNorm
+    domain_layernorm: bool = False       # R9: replace LN with DomainLayerNorm in all blocks
+    domain_layernorm_last: bool = False  # R9: replace LN only in last block (GPU4)
+    domain_layernorm_clamps: bool = False  # R9: DomainLayerNorm + tighter single/wider tandem clamps (GPU5)
+    domain_layernorm_fourier: bool = False  # R9: domain-specific Fourier learned freqs (GPU6)
 
 
 cfg = sp.parse(Config)
@@ -813,6 +853,9 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    domain_layernorm=cfg.domain_layernorm or cfg.domain_layernorm_last or cfg.domain_layernorm_clamps or cfg.domain_layernorm_fourier,
+    domain_layernorm_last=cfg.domain_layernorm_last,
+    domain_layernorm_fourier=cfg.domain_layernorm_fourier,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1133,9 +1176,16 @@ for epoch in range(MAX_EPOCHS):
         xy_min = raw_xy.amin(dim=1, keepdim=True)
         xy_max = raw_xy.amax(dim=1, keepdim=True)
         xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-        freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-        xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+        if cfg.domain_layernorm_fourier:
+            _is_tan_dln = (x[:, 0, 21].abs() > 0.5)  # [B] bool, before PE appended
+            _freqs_s = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+            _freqs_t = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned_tandem.abs()])
+            _freqs_per = torch.where(_is_tan_dln[:, None], _freqs_t.unsqueeze(0), _freqs_s.unsqueeze(0))  # [B, 8]
+            xy_scaled = xy_norm.unsqueeze(-1) * _freqs_per[:, None, None, :]  # [B, N, 2, 8]
+        else:
+            freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+            xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 8]
+        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 32]
         x = torch.cat([x, fourier_pe], dim=-1)
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
@@ -1168,6 +1218,9 @@ for epoch in range(MAX_EPOCHS):
         if not cfg.no_perstd and not cfg.raw_targets:
             if cfg.unified_clamps:
                 channel_clamps = tandem_clamps = torch.tensor([0.2, 0.2, 0.7], device=device)
+            elif cfg.domain_layernorm_clamps:
+                channel_clamps = torch.tensor([0.05, 0.05, 1.5], device=device)   # tighter for single
+                tandem_clamps = torch.tensor([0.5, 0.5, 3.5], device=device)      # wider for tandem
             elif cfg.high_p_clamp:
                 channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
                 tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
@@ -1478,9 +1531,16 @@ for epoch in range(MAX_EPOCHS):
                 xy_min = raw_xy.amin(dim=1, keepdim=True)
                 xy_max = raw_xy.amax(dim=1, keepdim=True)
                 xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-                xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+                if cfg.domain_layernorm_fourier:
+                    _is_tan_dln = (x[:, 0, 21].abs() > 0.5)  # [B] bool, before PE appended
+                    _freqs_s = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                    _freqs_t = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned_tandem.abs()])
+                    _freqs_per = torch.where(_is_tan_dln[:, None], _freqs_t.unsqueeze(0), _freqs_s.unsqueeze(0))  # [B, 8]
+                    xy_scaled = xy_norm.unsqueeze(-1) * _freqs_per[:, None, None, :]  # [B, N, 2, 8]
+                else:
+                    freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                    xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 8]
+                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 32]
                 x = torch.cat([x, fourier_pe], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
@@ -1500,6 +1560,9 @@ for epoch in range(MAX_EPOCHS):
                 if not cfg.no_perstd and not cfg.raw_targets:
                     if cfg.unified_clamps:
                         channel_clamps = tandem_clamps = torch.tensor([0.2, 0.2, 0.7], device=device)
+                    elif cfg.domain_layernorm_clamps:
+                        channel_clamps = torch.tensor([0.05, 0.05, 1.5], device=device)
+                        tandem_clamps = torch.tensor([0.5, 0.5, 3.5], device=device)
                     elif cfg.high_p_clamp:
                         channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
                         tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
