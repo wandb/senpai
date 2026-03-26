@@ -747,6 +747,12 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 3 R12: Augmentation + regularization
+    dropout: float = 0.0               # attention dropout in TransolverBlocks
+    aug_aoa_range: float = 1.0         # AoA rotation range in degrees (±range)
+    aug_xy_noise: float = 0.0          # Gaussian noise std on xy coordinates
+    aug_feat_drop_prob: float = 0.0    # per-feature dropout probability (5% → 0.05)
+    aug_re_jitter: float = 0.0         # Re scaling jitter range (5% → 0.05)
 
 
 cfg = sp.parse(Config)
@@ -877,7 +883,7 @@ model_config = dict(
     n_head=3,
     slice_num=cfg.prog_slices_end if cfg.prog_slices else cfg.slice_num,
     mlp_ratio=2,
-    dropout=0.05 if cfg.rdrop else 0.0,
+    dropout=max(cfg.dropout, 0.05 if cfg.rdrop else 0.0),
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
     linear_no_attention=cfg.linear_no_attention,
@@ -1175,7 +1181,7 @@ for epoch in range(MAX_EPOCHS):
                 _scale = torch.rand(x.size(0), 1, 1, device=x.device) * (2 * cfg.aug_scale_range) + _lo
                 x[:, :, :2] = x[:, :, :2] * _scale
             if cfg.aug == "aoa_perturb":
-                _angle_deg = torch.rand(x.size(0), device=x.device) * 2.0 - 1.0
+                _angle_deg = torch.rand(x.size(0), device=x.device) * 2.0 * cfg.aug_aoa_range - cfg.aug_aoa_range
                 _angle_rad = _angle_deg * (torch.pi / 180.0)
                 _cos_a = torch.cos(_angle_rad).view(-1, 1, 1)
                 _sin_a = torch.sin(_angle_rad).view(-1, 1, 1)
@@ -1205,6 +1211,16 @@ for epoch in range(MAX_EPOCHS):
                     x[_b, _in_region] = x[_cut_idx[_b], _in_region]
                     y[_b, _in_region] = y[_cut_idx[_b], _in_region]
                     is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
+
+        if model.training and epoch >= cfg.aug_start_epoch:
+            if cfg.aug_xy_noise > 0.0:
+                x[:, :, :2] = x[:, :, :2] + cfg.aug_xy_noise * torch.randn_like(x[:, :, :2])
+            if cfg.aug_feat_drop_prob > 0.0:
+                _mask = (torch.rand(x.size(0), 1, x.size(2) - 2, device=x.device) < cfg.aug_feat_drop_prob)
+                x[:, :, 2:] = x[:, :, 2:].masked_fill(_mask.expand(-1, x.size(1), -1), 0.0)
+            if cfg.aug_re_jitter > 0.0:
+                _re_delta = (torch.rand(x.size(0), 1, 1, device=x.device) * 2 - 1) * cfg.aug_re_jitter
+                x[:, :, 13:14] = x[:, :, 13:14] + _re_delta
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
