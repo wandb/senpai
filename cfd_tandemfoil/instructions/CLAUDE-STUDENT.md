@@ -25,6 +25,25 @@ Read `cfd_tandemfoil/program.md` for the full research context, constraints, met
    gh pr list --label "student:<your-name>" --label "status:wip" --json number,title,headRefName,body
    ```
    Ensure to always use a sub-agent to poll for work in order to preserve your context window. If nothing is assigned, wait 60 seconds and poll again.
+   - **Check for human messages**, you use GitHub Issues to communicate with your human researcher team:
+     ```bash
+     # Issues addressed to you
+     gh issue list --label "human" --label "student:<your-name>" --state open --json number,title,updatedAt,comments
+     # Issues addressed to the whole team
+     gh issue list --label "human" --label "team" --state open --json number,title,updatedAt,comments
+     ```
+     For each open issue found addressed to you or the whole team, read the issue body and all comments:
+     ```bash
+     gh issue view <number> --json body,comments
+     ```
+     - If you haven't commented on this issue yet, respond.
+     - If you have commented, check whether the human posted a new comment after your last response. If so, respond to the new message. If not, skip — you're waiting for the human.
+     - Always prefix your response with `STUDENT <your-name>:`:
+       ```bash
+       gh issue comment <number> --body "STUDENT <your-name>: <your response>"
+       ```
+     - Human issues with urgent instructions take priority over existing experimental work - that includes killing experiments that are currently running if instructed to do so.
+     - **Never close human issues** — only the human does that.
 
 2. **Pick up a PR**
    - Read the PR body — it contains the hypothesis, instructions, and baseline metrics.
@@ -49,9 +68,10 @@ Read `cfd_tandemfoil/program.md` for the full research context, constraints, met
 
 3. **Implement the hypothesis**
    - Follow the instructions in the PR body.
+   - Ensure that the advisor-provided baseline command is correct and up to date, check BASELINE.md if needed to assess. Ask the advisor for clarification if needed via a comment on the PR, removing the `status:wip` label and marking the PR with the `status:review`.
    - Only modify `cfd_tandemfoil/train.py` (see constraints in `cfd_tandemfoil/program.md`).
    - Keep changes focused — one hypothesis per PR. Don't scope-creep.
-   - If the instructions are unclear, make your best judgment and document what you chose in the results.
+   - If the instructions are unclear ask for clarification from the advisor via a comment on the PR, removing the `status:wip` label and marking the PR with the `status:review`.
 
 4. **Run experiments**
    ```bash
@@ -77,6 +97,7 @@ Read `cfd_tandemfoil/program.md` for the full research context, constraints, met
    ```
    - All key metrics: val_loss, Surface MAE (Ux, Uy, p), Volume MAE
    - Comparison against the baseline numbers from the PR body
+   - Exact train.py command used to run the experiment
    - Peak memory usage
    - W&B run ID
    - **What happened** — honest analysis: did it work? why or why not?
@@ -112,7 +133,7 @@ Note: Don't try to fix errors or failures that arise to our hard, fixed experime
 
 ### If you find bugs, you fix them
 
-Your are at front line of this code base, if you find bugs in the codebase, including bugs not immediately related to the experiments you are running, it is your responsibility as a dilligent team member to fix them. Ensure you alert the advisor clearly in a separate bug-fix comment about any bug fixes you made so that they can review and merge them.
+Your are at front line of this code base, if you find bugs in the codebase, including bugs not immediately related to the experiments you are running, it is your responsibility as a dilligent team member to fix them. Ensure you alert the advisor clearly in a separate bug-fix PR comment about any bug fixes you made so that they can review and merge them. Run the bug fixes before you start your experiments.
 
 ### Always have rich wandb logging for every experiment
 
