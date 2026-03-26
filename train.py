@@ -116,12 +116,30 @@ class MLP(nn.Module):
         return x
 
 
+class DomainLayerNorm(nn.Module):
+    """Domain-specific LayerNorm: separate weight/bias for single-foil vs tandem (Phase 3 R10)."""
+    def __init__(self, dim, zeroinit=False):
+        super().__init__()
+        self.ln_single = nn.LayerNorm(dim)
+        self.ln_tandem = nn.LayerNorm(dim)
+        if not zeroinit:
+            self.ln_tandem.weight.data.copy_(self.ln_single.weight.data)
+            self.ln_tandem.bias.data.copy_(self.ln_single.bias.data)
+        # zeroinit: tandem defaults to weight=1, bias=0 (LayerNorm default) — identical to copy
+
+    def forward(self, x, is_tandem=None):
+        if is_tandem is None:
+            return self.ln_single(x)
+        mask_t = is_tandem.view(-1, 1, 1).expand_as(x)
+        return torch.where(mask_t, self.ln_tandem(x), self.ln_single(x))
+
+
 class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -135,6 +153,10 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.learned_kernel = learned_kernel
         self.decouple_slice = decouple_slice
         self.zone_temp = zone_temp
+        self.prog_slices = prog_slices
+        if prog_slices:
+            # Buffer for masking inactive slices; updated per-epoch by training loop
+            self.register_buffer('slice_mask', torch.zeros(slice_num))
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
@@ -196,6 +218,9 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             slice_logits = self.in_project_slice(x_mid) / temp
         if spatial_bias is not None:
             slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
+        if self.prog_slices:
+            # Apply slice mask: 0 for active slices, -1e9 for inactive (updated each epoch)
+            slice_logits = slice_logits + self.slice_mask
         slice_weights = self.softmax(slice_logits)
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
@@ -250,15 +275,22 @@ class TransolverBlock(nn.Module):
         film_cond=False,
         decouple_slice=False,
         zone_temp=False,
+        domain_layernorm=False,
+        dln_zeroinit=False,
+        domain_velhead=False,
+        prog_slices=False,
     ):
         super().__init__()
         self.last_layer = last_layer
         self.field_decoder = field_decoder
+        self.domain_velhead = domain_velhead
         self.adaln_output = adaln_output
         self.soft_moe = soft_moe
         self.adaln_all = adaln_all
         self.film_cond = film_cond
-        self.ln_1 = nn.LayerNorm(hidden_dim)
+        self.domain_layernorm = domain_layernorm
+        _LN = (lambda d: DomainLayerNorm(d, zeroinit=dln_zeroinit)) if domain_layernorm else nn.LayerNorm
+        self.ln_1 = _LN(hidden_dim)
         self.attn = Physics_Attention_Irregular_Mesh(
             hidden_dim,
             heads=num_heads,
@@ -269,6 +301,7 @@ class TransolverBlock(nn.Module):
             learned_kernel=learned_kernel,
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
+            prog_slices=prog_slices,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -287,7 +320,7 @@ class TransolverBlock(nn.Module):
             )
             nn.init.zeros_(self.film_net[-1].weight)
             nn.init.zeros_(self.film_net[-1].bias)
-        self.ln_2 = nn.LayerNorm(hidden_dim)
+        self.ln_2 = _LN(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         self.spatial_bias = nn.Sequential(
             nn.Linear(4, 64), nn.GELU(),
@@ -296,8 +329,8 @@ class TransolverBlock(nn.Module):
         )
         nn.init.zeros_(self.spatial_bias[-1].weight)
         nn.init.zeros_(self.spatial_bias[-1].bias)
-        self.ln_1_post = nn.LayerNorm(hidden_dim)
-        self.ln_2_post = nn.LayerNorm(hidden_dim)
+        self.ln_1_post = _LN(hidden_dim)
+        self.ln_2_post = _LN(hidden_dim)
         self.se_fc1 = nn.Linear(hidden_dim, hidden_dim // 4)
         self.se_fc2 = nn.Linear(hidden_dim // 4, hidden_dim)
         nn.init.zeros_(self.se_fc2.weight)
@@ -310,6 +343,14 @@ class TransolverBlock(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
                 self.expert2 = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+            elif domain_velhead:
+                # Domain-specific output heads: separate for single-foil vs tandem
+                self.velhead_single = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+                self.velhead_tandem = nn.Sequential(
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
             elif field_decoder:
@@ -331,16 +372,22 @@ class TransolverBlock(nn.Module):
 
     def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
+        # DomainLayerNorm helper: pass is_tandem when enabled, else plain call
+        dln_it = (tandem_mask.view(-1) > 0.5) if (self.domain_layernorm and tandem_mask is not None) else None
+        if self.domain_layernorm:
+            def _ln(m, x): return m(x, is_tandem=dln_it)
+        else:
+            def _ln(m, x): return m(x)
         if self.adaln_all and condition is not None:
             cond_out = self.adaln_net(condition)  # [B, H*4]
             s1, b1, s2, b2 = cond_out.chunk(4, dim=-1)  # each [B, H]
-            fx_norm = self.ln_1(fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
-            fx = self.ln_1_post(self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
-            fx_norm = self.ln_2(fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
-            fx = self.ln_2_post(self.mlp(fx_norm) + fx)
+            fx_norm = _ln(self.ln_1, fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
+            fx = _ln(self.ln_1_post, self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            fx_norm = _ln(self.ln_2, fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
+            fx = _ln(self.ln_2_post, self.mlp(fx_norm) + fx)
         else:
-            fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
-            fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
+            fx = _ln(self.ln_1_post, self.attn(_ln(self.ln_1, fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            fx = _ln(self.ln_2_post, self.mlp(_ln(self.ln_2, fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
@@ -354,6 +401,13 @@ class TransolverBlock(nn.Module):
             if self.soft_moe:
                 gate = self.gate_net(fx_ln)  # [B, N, 2]
                 return gate[:, :, 0:1] * self.expert1(fx_ln) + gate[:, :, 1:2] * self.expert2(fx_ln)
+            elif self.domain_velhead:
+                out_s = self.velhead_single(fx_ln)
+                out_t = self.velhead_tandem(fx_ln)
+                if tandem_mask is not None:
+                    is_tan = (tandem_mask.view(-1) > 0.5).view(-1, 1, 1)
+                    return torch.where(is_tan.expand_as(out_s), out_t, out_s)
+                return out_s
             elif self.field_decoder:
                 return torch.cat([self.vel_head(fx_ln), self.pres_head(fx_ln)], dim=-1)
             elif self.adaln_output and condition is not None:
@@ -395,6 +449,10 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        domain_layernorm=False,
+        dln_zeroinit=False,
+        domain_velhead=False,
+        prog_slices=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -457,6 +515,10 @@ class Transolver(nn.Module):
                     film_cond=film_cond,
                     decouple_slice=adaln_decouple,
                     zone_temp=adaln_zone_temp,
+                    domain_layernorm=domain_layernorm,
+                    dln_zeroinit=dln_zeroinit,
+                    domain_velhead=domain_velhead if (idx == n_layers - 1) else False,
+                    prog_slices=prog_slices,
                 )
                 for idx in range(n_layers)
             ]
@@ -668,6 +730,13 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R10: DomainLayerNorm compounds
+    domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
+    dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
+    domain_velhead: bool = False       # domain-specific output heads for single vs tandem
+    prog_slices: bool = False          # progressive slice warmup
+    prog_slices_end: int = 128         # max slice count for prog_slices
+    prog_slices_epochs: int = 100      # epochs to ramp slice_num → prog_slices_end
 
 
 cfg = sp.parse(Config)
@@ -796,7 +865,7 @@ model_config = dict(
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
     n_head=3,
-    slice_num=cfg.slice_num,
+    slice_num=cfg.prog_slices_end if cfg.prog_slices else cfg.slice_num,
     mlp_ratio=2,
     dropout=0.05 if cfg.rdrop else 0.0,
     output_fields=["Ux", "Uy", "p"],
@@ -813,6 +882,10 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    domain_layernorm=cfg.domain_layernorm,
+    dln_zeroinit=cfg.dln_zeroinit,
+    domain_velhead=cfg.domain_velhead,
+    prog_slices=cfg.prog_slices,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1427,6 +1500,17 @@ for epoch in range(MAX_EPOCHS):
     if epoch >= cfg.temp_anneal_epoch:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
+    if cfg.prog_slices:
+        # Progressive slice warmup: ramp active slices from cfg.slice_num → prog_slices_end
+        if epoch < cfg.prog_slices_epochs:
+            active = int(cfg.slice_num + (cfg.prog_slices_end - cfg.slice_num) * epoch / cfg.prog_slices_epochs)
+        else:
+            active = cfg.prog_slices_end
+        with torch.no_grad():
+            for _blk in _base_model.blocks:
+                if hasattr(_blk.attn, 'slice_mask'):
+                    _blk.attn.slice_mask.zero_()
+                    _blk.attn.slice_mask[active:].fill_(-1e9)
     epoch_vol /= n_batches
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
