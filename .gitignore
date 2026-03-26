@@ -53,3 +53,7 @@ run*.log
 results.tsv
 experiment_log/
 advisor_logs/
+student_logs/
+
+# Slidev
+presentation/node_modules/*
