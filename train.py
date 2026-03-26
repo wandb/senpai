@@ -139,7 +139,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False,
+                 domain_qkv=False, tandem_temp_offset_init=0.0):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -148,7 +149,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
         self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
-        self.tandem_temp_offset = nn.Parameter(torch.zeros(1, heads, 1, 1))
+        self.tandem_temp_offset = nn.Parameter(torch.ones(1, heads, 1, 1) * tandem_temp_offset_init)
+        self.domain_qkv = domain_qkv
         self.linear_no_attention = linear_no_attention
         self.learned_kernel = learned_kernel
         self.decouple_slice = decouple_slice
@@ -174,6 +176,10 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.to_q = nn.Linear(dim_head, dim_head, bias=False)
         self.to_k = nn.Linear(dim_head, dim_head, bias=False)
         self.to_v = nn.Linear(dim_head, dim_head, bias=False)
+        if domain_qkv:
+            self.to_q_tandem = nn.Linear(dim_head, dim_head, bias=False)
+            self.to_k_tandem = nn.Linear(dim_head, dim_head, bias=False)
+            self.to_v_tandem = nn.Linear(dim_head, dim_head, bias=False)
         self.slice_residual_scale = nn.Parameter(torch.tensor(0.1))
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, dim),
@@ -229,10 +235,22 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         if self.linear_no_attention:
             out_slice_token = slice_token
         else:
-            q_slice_token = self.to_q(slice_token)
-            slice_token_kv = slice_token.mean(dim=1, keepdim=True)
-            k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
-            v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
+            slice_token_kv = slice_token.mean(dim=1, keepdim=True)  # [B, 1, S, D]
+            if self.domain_qkv and tandem_mask is not None:
+                is_tan = (tandem_mask > 0.5)  # [B, 1, 1, 1]
+                q_slice_token = torch.where(
+                    is_tan, self.to_q_tandem(slice_token), self.to_q(slice_token)
+                )  # [B, H, S, D]
+                k_slice_token = torch.where(
+                    is_tan, self.to_k_tandem(slice_token_kv), self.to_k(slice_token_kv)
+                ).expand(-1, self.heads, -1, -1)  # [B, H, S, D]
+                v_slice_token = torch.where(
+                    is_tan, self.to_v_tandem(slice_token_kv), self.to_v(slice_token_kv)
+                ).expand(-1, self.heads, -1, -1)  # [B, H, S, D]
+            else:
+                q_slice_token = self.to_q(slice_token)
+                k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
+                v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
             if self.learned_kernel:
                 B, H, S, D = q_slice_token.shape
                 q_exp = q_slice_token.unsqueeze(-2).expand(B, H, S, S, D)
@@ -279,6 +297,9 @@ class TransolverBlock(nn.Module):
         dln_zeroinit=False,
         domain_velhead=False,
         prog_slices=False,
+        domain_slice_proj=False,
+        domain_qkv=False,
+        tandem_temp_offset_init=0.0,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -299,9 +320,11 @@ class TransolverBlock(nn.Module):
             slice_num=slice_num,
             linear_no_attention=linear_no_attention,
             learned_kernel=learned_kernel,
-            decouple_slice=decouple_slice,
+            decouple_slice=decouple_slice or domain_slice_proj,
             zone_temp=zone_temp,
             prog_slices=prog_slices,
+            domain_qkv=domain_qkv,
+            tandem_temp_offset_init=tandem_temp_offset_init,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -453,6 +476,9 @@ class Transolver(nn.Module):
         dln_zeroinit=False,
         domain_velhead=False,
         prog_slices=False,
+        domain_slice_proj=False,
+        domain_qkv=False,
+        tandem_temp_offset_init=0.0,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -519,6 +545,9 @@ class Transolver(nn.Module):
                     dln_zeroinit=dln_zeroinit,
                     domain_velhead=domain_velhead if (idx == n_layers - 1) else False,
                     prog_slices=prog_slices,
+                    domain_slice_proj=domain_slice_proj,
+                    domain_qkv=domain_qkv,
+                    tandem_temp_offset_init=tandem_temp_offset_init,
                 )
                 for idx in range(n_layers)
             ]
@@ -747,6 +776,10 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 3 R11: Domain-specific slice attention patterns
+    domain_slice_proj: bool = False    # domain-specific slice projection for single vs tandem
+    domain_qkv: bool = False           # domain-specific Q/K/V projections for single vs tandem
+    tandem_temp_offset: float = 0.0    # initial value for tandem temperature offset parameter
 
 
 cfg = sp.parse(Config)
@@ -896,6 +929,9 @@ model_config = dict(
     dln_zeroinit=cfg.dln_zeroinit,
     domain_velhead=cfg.domain_velhead,
     prog_slices=cfg.prog_slices,
+    domain_slice_proj=cfg.domain_slice_proj,
+    domain_qkv=cfg.domain_qkv,
+    tandem_temp_offset_init=cfg.tandem_temp_offset,
 )
 
 model = Transolver(**model_config).to(device)
