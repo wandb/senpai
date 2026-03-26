@@ -65,7 +65,7 @@ You are the principal research lead of this lab and you want to see your student
      ```bash
      gh pr merge <number> --squash
      ```
-   - **Update your baseline** immediately to the newly merged metrics. All subsequent reviews in this round compare against this updated baseline.
+   - **Update and document your baseline** immediately to the newly merged metrics. All subsequent reviews in this round compare against this updated baseline. In a BASELINE.md file, append the new baseline metrics, the PR #, the wandb run id and the full train.py command required to reproduce the baseline - then commit and push the BASELINE.md file to the advisor branch.
    - Pull the updated advisor branch before attempting the next merge:
      ```bash
      git checkout <advisor-branch> && git pull origin <advisor-branch>
