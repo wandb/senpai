@@ -25,8 +25,8 @@ git config user.email "senpai-$STUDENT_NAME@senpai"
 curl -fsSL https://claude.ai/install.sh | bash
 export PATH="$HOME/.claude/bin:$PATH"
 
-# --- Configure autocompact: compact at 75% of context window (~150k on 200k model) ---
-export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-75}"
+# --- Configure autocompact: compact at N% of context window (default 40% ≈ 80k on 200k) ---
+export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-40}"
 
 # --- Install Weave Claude Code Plugin ---
 source "$WORKDIR/tools/install-weave-cc-plugin.sh"
