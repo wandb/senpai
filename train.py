@@ -747,6 +747,10 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 3 R12: FAMO dynamic task weighting
+    use_famo: bool = False          # FAMO dynamic task balancing (3 tasks: single_surf, tandem_surf, volume)
+    famo_lr: float = 1e-3           # FAMO optimizer learning rate
+    famo_onset_epoch: int = 0       # delay FAMO start in epochs (0=from beginning)
 
 
 cfg = sp.parse(Config)
@@ -998,6 +1002,34 @@ class Lion(torch.optim.Optimizer):
         return loss
 
 
+class FAMO:
+    """Fast Adaptive Multitask Optimization (NeurIPS 2023).
+
+    Dynamically reweights 3 task losses (single_surf, tandem_surf, volume)
+    to ensure balanced loss decrease across tasks. Uses O(1) overhead (loss
+    history, not gradients), so it is compatible with Lion and Lookahead.
+    """
+    def __init__(self, n_tasks=3, lr=1e-3, device='cpu'):
+        self.log_weights = torch.zeros(n_tasks, requires_grad=True, device=device)
+        self.opt = torch.optim.Adam([self.log_weights], lr=lr)
+        self.prev_losses = None
+
+    def get_weights(self):
+        return torch.softmax(self.log_weights, dim=0)
+
+    def update(self, current_losses):
+        """Update task weights from loss ratios. current_losses: [n_tasks] detached tensor."""
+        if self.prev_losses is not None:
+            log_ratios = (torch.log(current_losses + 1e-8)
+                          - torch.log(self.prev_losses + 1e-8))
+            weighted_ratios = self.get_weights() * log_ratios
+            famo_loss = weighted_ratios.max()
+            self.opt.zero_grad()
+            famo_loss.backward()
+            self.opt.step()
+        self.prev_losses = current_losses.detach()
+
+
 class Lookahead:
     def __init__(self, base_optimizer, k=5, alpha=0.5):
         self.base_optimizer = base_optimizer
@@ -1046,6 +1078,7 @@ else:
         optimizer = base_opt
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
+famo = FAMO(n_tasks=3, lr=cfg.famo_lr, device=device) if cfg.use_famo else None
 if cfg.scheduler_type == "warm_restarts":
     _warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
     _restarts = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -1366,6 +1399,20 @@ for epoch in range(MAX_EPOCHS):
                     surf_ux_loss * torch.exp(-2 * bm.log_sigma_surf_ux) / 2 + bm.log_sigma_surf_ux +
                     surf_uy_loss * torch.exp(-2 * bm.log_sigma_surf_uy) / 2 + bm.log_sigma_surf_uy +
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
+        elif cfg.use_famo and famo is not None and epoch >= cfg.famo_onset_epoch:
+            # FAMO: split surface by domain, dynamic task weighting
+            _n_single = int((~is_tandem_batch).sum().item())
+            _n_tandem = int(is_tandem_batch.sum().item())
+            _single_surf = (surf_per_sample[~is_tandem_batch].mean()
+                            if _n_single > 0 else torch.zeros((), device=device))
+            _tandem_surf = (surf_per_sample[is_tandem_batch].mean()
+                            if _n_tandem > 0 else torch.zeros((), device=device))
+            _task_losses = torch.stack([_single_surf, _tandem_surf, vol_loss])
+            # Detach weights so model backward does not update log_weights
+            _famo_w = famo.get_weights().detach()
+            loss = (_famo_w * _task_losses * 3.0).sum()
+            # Update FAMO weight estimates from detached task losses
+            famo.update(_task_losses.detach())
         else:
             loss = vol_loss + surf_weight * surf_loss
 
@@ -1505,7 +1552,13 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _wlog = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if famo is not None and epoch >= cfg.famo_onset_epoch:
+            _fw = famo.get_weights().detach()
+            _wlog["famo/w_single"] = _fw[0].item()
+            _wlog["famo/w_tandem"] = _fw[1].item()
+            _wlog["famo/w_vol"] = _fw[2].item()
+        wandb.log(_wlog)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
