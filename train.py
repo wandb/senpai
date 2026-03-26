@@ -737,6 +737,16 @@ class Config:
     prog_slices: bool = False          # progressive slice warmup
     prog_slices_end: int = 128         # max slice count for prog_slices
     prog_slices_epochs: int = 100      # epochs to ramp slice_num → prog_slices_end
+    # Phase 3 R11: SWA / snapshot ensemble / EMA tuning
+    swa_cyclic: bool = False           # GPU 0/1: SWA with cyclic LR warm restarts
+    swa_cyclic_T: int = 40             # warm-restart cycle period in epochs
+    swa_cyclic_start: int = 100        # epoch to switch from cosine to cyclic schedule
+    two_phase_lr: bool = False         # GPU 5: lr=3e-4 for phase1, then lr=1e-4
+    two_phase_switch_epoch: int = 100  # epoch at which to switch phases
+    two_phase_lr_1: float = 3e-4       # phase 1 LR (overrides cfg.lr when active)
+    two_phase_lr_2: float = 1e-4       # phase 2 LR
+    snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
+    snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
 
 
 cfg = sp.parse(Config)
@@ -902,6 +912,12 @@ swad_collecting = False
 swad_done = False
 swa_model = None
 swa_n = 0
+swa_cyclic_model = None
+swa_cyclic_n = 0
+swa_cyclic_scheduler = None
+snapshot_avg_model = None
+snapshot_n = 0
+snapshot_epoch_list = [int(e) for e in cfg.snapshot_epochs_str.split(",")] if cfg.snapshot_ensemble else []
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -1012,16 +1028,17 @@ class Lookahead:
 
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+_base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
 if cfg.use_lion:
     base_opt = Lion([
-        {'params': attn_params, 'lr': cfg.lr * 0.5},
-        {'params': other_params, 'lr': cfg.lr}
+        {'params': attn_params, 'lr': _base_lr * 0.5},
+        {'params': other_params, 'lr': _base_lr}
     ], weight_decay=cfg.weight_decay)
     optimizer = base_opt  # Lion has its own momentum; skip Lookahead
 else:
     base_opt = torch.optim.AdamW([
-        {'params': attn_params, 'lr': cfg.lr * 0.5},
-        {'params': other_params, 'lr': cfg.lr}
+        {'params': attn_params, 'lr': _base_lr * 0.5},
+        {'params': other_params, 'lr': _base_lr}
     ], weight_decay=cfg.weight_decay)
     if cfg.use_lookahead:
         optimizer = Lookahead(base_opt, k=10, alpha=0.8)
@@ -1480,7 +1497,7 @@ for epoch in range(MAX_EPOCHS):
                 scheduler.step()
             except ValueError:
                 pass
-        if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa:
+        if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa and not cfg.swa_cyclic and not cfg.snapshot_ensemble:
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
             else:
@@ -1496,7 +1513,37 @@ for epoch in range(MAX_EPOCHS):
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
     if not step_scheduler_per_batch:
-        scheduler.step()
+        if cfg.swa_cyclic and epoch >= cfg.swa_cyclic_start:
+            if swa_cyclic_scheduler is None:
+                swa_cyclic_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    base_opt, T_0=cfg.swa_cyclic_T, eta_min=cfg.cosine_eta_min
+                )
+            swa_cyclic_scheduler.step()
+            # At cycle minimum (end of each T period), save checkpoint to running average
+            if (epoch - cfg.swa_cyclic_start + 1) % cfg.swa_cyclic_T == 0:
+                snap = {k: v.cpu().clone() for k, v in _base_model.state_dict().items()}
+                if swa_cyclic_model is None:
+                    swa_cyclic_model = deepcopy(_base_model)
+                    swa_cyclic_model.load_state_dict(snap)
+                    swa_cyclic_n = 1
+                else:
+                    with torch.no_grad():
+                        cs = swa_cyclic_model.state_dict()
+                        for k in snap:
+                            cs[k].mul_(swa_cyclic_n / (swa_cyclic_n + 1)).add_(snap[k].to(device) / (swa_cyclic_n + 1))
+                    swa_cyclic_n += 1
+        else:
+            scheduler.step()
+    # Two-phase LR: at switch epoch, reset optimizer LR and replace scheduler
+    if cfg.two_phase_lr and epoch + 1 == cfg.two_phase_switch_epoch:
+        lrs = [cfg.two_phase_lr_2 * 0.5, cfg.two_phase_lr_2]
+        for pg, new_lr in zip(base_opt.param_groups, lrs):
+            pg['lr'] = new_lr
+            pg['initial_lr'] = new_lr
+        remaining = max(1, cfg.cosine_T_max - cfg.two_phase_switch_epoch)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            base_opt, T_max=remaining, eta_min=cfg.cosine_eta_min
+        )
     if epoch >= cfg.temp_anneal_epoch:
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
@@ -1515,9 +1562,25 @@ for epoch in range(MAX_EPOCHS):
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
     prev_surf_loss = epoch_surf
+    # Snapshot ensemble: save running average at specified epochs
+    if cfg.snapshot_ensemble and (epoch + 1) in snapshot_epoch_list:
+        snap = {k: v.cpu().clone() for k, v in _base_model.state_dict().items()}
+        snapshot_n += 1
+        if snapshot_avg_model is None:
+            snapshot_avg_model = deepcopy(_base_model)
+            snapshot_avg_model.load_state_dict(snap)
+        else:
+            with torch.no_grad():
+                sa = snapshot_avg_model.state_dict()
+                for k in snap:
+                    sa[k].mul_((snapshot_n - 1) / snapshot_n).add_(snap[k].to(device) / snapshot_n)
 
     # --- Validate across all splits ---
-    if cfg.swa and swa_model is not None:
+    if cfg.swa_cyclic and swa_cyclic_model is not None:
+        eval_model = swa_cyclic_model
+    elif cfg.snapshot_ensemble and snapshot_avg_model is not None:
+        eval_model = snapshot_avg_model
+    elif cfg.swa and swa_model is not None:
         eval_model = swa_model
     elif ema_model is not None:
         eval_model = ema_model
@@ -1791,7 +1854,11 @@ if best_metrics:
     wandb.summary.update({"best_" + k: v for k, v in best_metrics.items()})
 
     print("\nGenerating flow field plots...")
-    if cfg.swa and swa_model is not None:
+    if cfg.swa_cyclic and swa_cyclic_model is not None:
+        vis_model = swa_cyclic_model
+    elif cfg.snapshot_ensemble and snapshot_avg_model is not None:
+        vis_model = snapshot_avg_model
+    elif cfg.swa and swa_model is not None:
         vis_model = swa_model
     elif ema_model is not None:
         vis_model = ema_model
