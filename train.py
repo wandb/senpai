@@ -670,6 +670,7 @@ class Config:
     cosine_eta_min: float = 1e-5
     ema_start_epoch: int = 140
     ema_decay: float = 0.998
+    multi_ema: bool = False    # GPU 5: 3 EMA models (decay=0.995, 0.999, 0.9995) averaged at inference
     temp_anneal_epoch: int = 50
     vol_ramp_epochs: int = 40
     tandem_curriculum_epochs: int = 10
@@ -918,6 +919,8 @@ swa_cyclic_scheduler = None
 snapshot_avg_model = None
 snapshot_n = 0
 snapshot_epoch_list = [int(e) for e in cfg.snapshot_epochs_str.split(",")] if cfg.snapshot_ensemble else []
+multi_ema_models: list = []  # list of (model, decay) for multi_ema
+_MULTI_EMA_DECAYS = [0.995, 0.999, 0.9995]
 
 n_params = sum(p.numel() for p in model.parameters())
 
@@ -1498,12 +1501,21 @@ for epoch in range(MAX_EPOCHS):
             except ValueError:
                 pass
         if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa and not cfg.swa_cyclic and not cfg.snapshot_ensemble:
-            if ema_model is None:
-                ema_model = deepcopy(_base_model)
+            if cfg.multi_ema:
+                if not multi_ema_models:
+                    multi_ema_models.extend([(deepcopy(_base_model), d) for d in _MULTI_EMA_DECAYS])
+                else:
+                    with torch.no_grad():
+                        for _ema_m, _ema_d in multi_ema_models:
+                            for ep, mp in zip(_ema_m.parameters(), _base_model.parameters()):
+                                ep.data.mul_(_ema_d).add_(mp.data, alpha=1 - _ema_d)
             else:
-                with torch.no_grad():
-                    for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
-                        ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+                if ema_model is None:
+                    ema_model = deepcopy(_base_model)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -1582,11 +1594,16 @@ for epoch in range(MAX_EPOCHS):
         eval_model = snapshot_avg_model
     elif cfg.swa and swa_model is not None:
         eval_model = swa_model
+    elif cfg.multi_ema and multi_ema_models:
+        eval_model = multi_ema_models[0][0]  # primary for checkpointing; inference averages all 3
     elif ema_model is not None:
         eval_model = ema_model
     else:
         eval_model = model
     eval_model.eval()
+    if cfg.multi_ema:
+        for _ema_m, _ in multi_ema_models:
+            _ema_m.eval()
     model.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
@@ -1667,9 +1684,14 @@ for epoch in range(MAX_EPOCHS):
                 else:
                     y_norm_scaled = y_norm / sample_stds
 
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
-                pred = pred.float()
+                if cfg.multi_ema and multi_ema_models:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _preds = [_m({"x": x})["preds"].float() for _m, _ in multi_ema_models]
+                    pred = torch.stack(_preds).mean(dim=0)
+                else:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        pred = eval_model({"x": x})["preds"]
+                    pred = pred.float()
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
                 else:
@@ -1817,6 +1839,8 @@ for epoch in range(MAX_EPOCHS):
                 best_metrics[f"best_{k}"] = v
         if cfg.swa and swa_model is not None:
             save_model = swa_model
+        elif cfg.multi_ema and multi_ema_models:
+            save_model = multi_ema_models[0][0]
         elif ema_model is not None:
             save_model = ema_model
         else:
@@ -1860,6 +1884,8 @@ if best_metrics:
         vis_model = snapshot_avg_model
     elif cfg.swa and swa_model is not None:
         vis_model = swa_model
+    elif cfg.multi_ema and multi_ema_models:
+        vis_model = multi_ema_models[0][0]
     elif ema_model is not None:
         vis_model = ema_model
     else:
