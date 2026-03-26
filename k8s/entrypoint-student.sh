@@ -16,8 +16,6 @@ echo "GPUs:   $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | 
 # Repo already cloned by the deployment args block
 cd "$WORKDIR"
 
-# PROBLEM_DIR comes from ConfigMap (set by launch.py from senpai.yaml)
-
 uv pip install --system -e .
 
 # --- Git identity for commits ---
@@ -34,11 +32,13 @@ uvx --from wandb-hivemind hivemind run &
 echo "=== Hivemind started (PID=$!) ==="
 
 # --- Install role instructions ---
-cp "$WORKDIR/$PROBLEM_DIR/instructions/CLAUDE-STUDENT.md" "$WORKDIR/CLAUDE.md"
+cp "$WORKDIR/instructions/CLAUDE-STUDENT.md" "$WORKDIR/CLAUDE.md"
 
 # --- Launch Claude Code in Ralph Loop ---
 export IS_SANDBOX=1
 
+# --- Build prompt ---
+# PROBLEM_DIR comes from ConfigMap (set by launch.py from senpai.yaml)
 PROMPT="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-student.md" | sed '/^<!--$/,/^-->$/d')"
 
 LOGDIR="/workspace/senpai/student_logs"
@@ -59,7 +59,7 @@ while true; do
     echo "=== GPU: $(nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null) ==="
 
     # Restore CLAUDE.md — branch checkouts clobber it
-    cp "$WORKDIR/$PROBLEM_DIR/instructions/CLAUDE-STUDENT.md" "$WORKDIR/CLAUDE.md"
+    cp "$WORKDIR/instructions/CLAUDE-STUDENT.md" "$WORKDIR/CLAUDE.md"
 
     START_TS=$(date +%s)
     EXIT_CODE=0

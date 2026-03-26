@@ -17,8 +17,6 @@ echo "Students: $STUDENT_NAMES"
 # Repo already cloned by the deployment args block
 cd "$WORKDIR"
 
-# PROBLEM_DIR comes from ConfigMap (set by launch.py from senpai.yaml)
-
 uv pip install --system -e .
 
 # --- Git identity ---
@@ -36,7 +34,7 @@ else
 fi
 
 # --- Install role instructions ---
-cp "$WORKDIR/$PROBLEM_DIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
+cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
 
 # --- Register Weave Claude Plugin (tools already baked into Docker image) ---
 export PATH="$HOME/.claude/bin:$PATH"
@@ -48,6 +46,7 @@ uvx --from wandb-hivemind hivemind run &
 echo "=== Hivemind started (PID=$!) ==="
 
 # --- Build prompt ---
+# PROBLEM_DIR comes from ConfigMap (set by launch.py from senpai.yaml)
 PROMPT="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-advisor.md" | sed '/^<!--$/,/^-->$/d')"
 
 # --- Append extra startup instructions if provided ---
@@ -71,7 +70,7 @@ while true; do
     echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) ==="
 
     # Restore CLAUDE.md — branch checkouts clobber it
-    cp "$WORKDIR/$PROBLEM_DIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
+    cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
 
     START_TS=$(date +%s)
     EXIT_CODE=0
