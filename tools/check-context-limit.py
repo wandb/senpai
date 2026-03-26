@@ -1,42 +1,52 @@
 #!/usr/bin/env python3
 """
-Claude Code Stop hook: write /tmp/senpai_needs_fresh_start when the session
-transcript exceeds SENPAI_TOKEN_LIMIT (default 150000 tokens).
+Claude Code Stop hook: monitors session token usage from transcript JSONL.
 
-Uses the Anthropic token-counting API for an exact count.
-Requires ANTHROPIC_API_KEY in the environment.
+Autocompact handles the primary compaction (via CLAUDE_AUTOCOMPACT_PCT_OVERRIDE).
+This hook is a safety net — if the context is STILL above the hard limit after
+autocompact, it flags a fresh restart for the Ralph loop.
+
+No external dependencies — reads token data already present in the JSONL.
 
 Configurable env vars:
-  SENPAI_TOKEN_LIMIT  — token threshold (default: 150000)
-  SENPAI_MODEL        — model name for counting (default: claude-sonnet-4-6)
+  SENPAI_TOKEN_HARD_LIMIT  — tokens above which to flag fresh restart (default: 180000)
 """
 
 import json
 import os
 import sys
 
-import anthropic
 
+def get_last_input_tokens(transcript_path: str) -> int | None:
+    """Get total input tokens from the last completed API response in the JSONL.
 
-def load_messages(transcript_path: str) -> list:
-    messages = []
+    Each assistant entry with a non-null stop_reason contains usage data from
+    the Anthropic API. The sum of input_tokens + cache tokens = full context size.
+    """
+    last_total = None
     with open(transcript_path) as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             try:
-                msg = json.loads(line)
+                entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            role = msg.get("role")
-            if role not in ("user", "assistant"):
+            if entry.get("type") != "assistant":
                 continue
-            content = msg.get("content")
-            if not content:
+            message = entry.get("message", {})
+            if not message.get("stop_reason"):
                 continue
-            messages.append({"role": role, "content": content})
-    return messages
+            usage = message.get("usage", {})
+            total = (
+                usage.get("input_tokens", 0)
+                + usage.get("cache_read_input_tokens", 0)
+                + usage.get("cache_creation_input_tokens", 0)
+            )
+            if total > 0:
+                last_total = total
+    return last_total
 
 
 def main() -> None:
@@ -45,22 +55,24 @@ def main() -> None:
     if not transcript or not os.path.exists(transcript):
         return
 
-    messages = load_messages(transcript)
-    if not messages:
+    tokens = get_last_input_tokens(transcript)
+    if tokens is None:
         return
 
-    limit = int(os.environ.get("SENPAI_TOKEN_LIMIT", "150000"))
-    model = os.environ.get("SENPAI_MODEL", "claude-sonnet-4-6")
+    hard_limit = int(os.environ.get("SENPAI_TOKEN_HARD_LIMIT", "180000"))
 
-    client = anthropic.Anthropic()
-    response = client.messages.count_tokens(model=model, messages=messages)
-    tokens = response.input_tokens
-
-    if tokens >= limit:
-        print(f"[check-context-limit] {tokens:,} tokens >= limit {limit:,} — flagging fresh restart", flush=True)
+    if tokens >= hard_limit:
+        print(
+            f"[context-monitor] {tokens:,} tokens >= hard limit {hard_limit:,}"
+            " — flagging fresh restart",
+            flush=True,
+        )
         open("/tmp/senpai_needs_fresh_start", "w").close()
     else:
-        print(f"[check-context-limit] {tokens:,} tokens (limit {limit:,})", flush=True)
+        print(
+            f"[context-monitor] {tokens:,} tokens (hard limit {hard_limit:,})",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

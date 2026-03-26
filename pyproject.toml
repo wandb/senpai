@@ -18,7 +18,6 @@ dependencies = [
     "weave",
     "tqdm",
     "matplotlib",
-    "anthropic",
 ]
 
 [tool.setuptools.packages.find]

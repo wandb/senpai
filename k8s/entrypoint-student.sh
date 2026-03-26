@@ -25,31 +25,35 @@ git config user.email "senpai-$STUDENT_NAME@senpai"
 curl -fsSL https://claude.ai/install.sh | bash
 export PATH="$HOME/.claude/bin:$PATH"
 
-# --- Configure Claude Code: restart fresh when session exceeds token limit ---
-# Stop hook runs after each turn; check-context-limit.py flags a fresh restart
-# when the transcript exceeds SENPAI_TOKEN_LIMIT tokens (default 150k).
-mkdir -p "$HOME/.claude"
-cat > "$HOME/.claude/settings.json" << EOF
-{
-  "effortLevel": "high",
-  "alwaysThinkingEnabled": true,
-  "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "SENPAI_TOKEN_LIMIT=${SENPAI_TOKEN_LIMIT:-150000} python3 $WORKDIR/tools/check-context-limit.py"
-          }
-        ]
-      }
-    ]
-  }
-}
-EOF
-
 # --- Install Weave Claude Code Plugin ---
+# Must come BEFORE settings.json so the plugin can merge its own hooks first.
 source "$WORKDIR/tools/install-weave-cc-plugin.sh"
+
+# --- Configure Claude Code: autocompact + safety-net Stop hook ---
+# 1. CLAUDE_AUTOCOMPACT_PCT_OVERRIDE triggers built-in compaction at 75% of
+#    the context window (~150k on a 200k model).  This is the primary mechanism.
+# 2. The Stop hook (check-context-limit.py) is a safety net: if context is STILL
+#    above SENPAI_TOKEN_HARD_LIMIT after autocompact, it flags a fresh restart.
+export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-75}"
+export SENPAI_TOKEN_HARD_LIMIT="${SENPAI_TOKEN_HARD_LIMIT:-180000}"
+
+# Merge our settings into whatever weave-claude-plugin already wrote.
+# Use python to do a proper JSON merge rather than overwriting.
+python3 -c "
+import json, pathlib
+p = pathlib.Path('$HOME/.claude/settings.json')
+cfg = json.loads(p.read_text()) if p.exists() else {}
+cfg['effortLevel'] = 'high'
+cfg.setdefault('env', {})['CLAUDE_AUTOCOMPACT_PCT_OVERRIDE'] = '${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE}'
+stop_hook = {
+    'hooks': [{
+        'type': 'command',
+        'command': 'python3 $WORKDIR/tools/check-context-limit.py'
+    }]
+}
+cfg.setdefault('hooks', {}).setdefault('Stop', []).append(stop_hook)
+p.write_text(json.dumps(cfg, indent=2))
+"
 
 # --- Install gh CLI ---
 curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
