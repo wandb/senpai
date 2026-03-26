@@ -25,6 +25,11 @@ git config user.email "senpai-$STUDENT_NAME@senpai"
 export PATH="$HOME/.claude/bin:$PATH"
 source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
 
+# --- Start Hivemind (streams CC session logs to hivemind.wandb.tools) ---
+mkdir -p ~/.claude/projects
+uvx --from wandb-hivemind hivemind run &
+echo "=== Hivemind started (PID=$!) ==="
+
 # --- Install role instructions ---
 cp instructions/CLAUDE-STUDENT.md "$WORKDIR/CLAUDE.md"
 
