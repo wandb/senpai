@@ -579,7 +579,7 @@ class Transolver(nn.Module):
         if sum(self.output_dims) != preds.shape[-1]:
             raise ValueError("Sum of output_dims must match preds last dimension")
 
-    def forward(self, data, pos=None, condition=None):
+    def forward(self, data, pos=None, condition=None, mix_info=None):
         x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
         if x is None:
             raise ValueError("Missing required input tensor: x")
@@ -626,8 +626,18 @@ class Transolver(nn.Module):
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
-        for block in self.blocks[:-1]:
+        # Manifold mixup at layer 0: after preprocess, before first block
+        if mix_info is not None and mix_info.get('layer') == 0:
+            _lam_mm, _perm_mm = mix_info['lam'], mix_info['perm']
+            fx = _lam_mm * fx + (1 - _lam_mm) * fx[_perm_mm]
+            fx_pre = _lam_mm * fx_pre + (1 - _lam_mm) * fx_pre[_perm_mm]
+
+        for _i_mm, block in enumerate(self.blocks[:-1]):
             fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+            # Manifold mixup at layer i+1: after block i, before next block
+            if mix_info is not None and mix_info.get('layer') == _i_mm + 1:
+                _lam_mm, _perm_mm = mix_info['lam'], mix_info['perm']
+                fx = _lam_mm * fx + (1 - _lam_mm) * fx[_perm_mm]
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
@@ -737,6 +747,14 @@ class Config:
     prog_slices: bool = False          # progressive slice warmup
     prog_slices_end: int = 128         # max slice count for prog_slices
     prog_slices_epochs: int = 100      # epochs to ramp slice_num → prog_slices_end
+    # Phase 3 R11: Data augmentation suite
+    xy_noise_std: float = 0.0        # Gaussian noise on raw xy coords before normalization
+    feat_drop_p: float = 0.0         # zero each feature channel with probability p (post-PE)
+    re_jitter_frac: float = 0.0      # multiply Re feature (idx 13) by U(1-f, 1+f)
+    target_smooth_alpha: float = 0.0  # blend target with nearest batch-neighbor (by Re/AoA)
+    manifold_mixup: bool = False      # mix hidden reps at random TransolverBlock layer
+    aoa_perturb_range: float = 1.0   # half-range (degrees) for aoa_perturb augmentation
+    dropout: float = 0.0             # standalone model dropout (independent of rdrop)
 
 
 cfg = sp.parse(Config)
@@ -867,7 +885,7 @@ model_config = dict(
     n_head=3,
     slice_num=cfg.prog_slices_end if cfg.prog_slices else cfg.slice_num,
     mlp_ratio=2,
-    dropout=0.05 if cfg.rdrop else 0.0,
+    dropout=cfg.dropout if cfg.dropout > 0 else (0.05 if cfg.rdrop else 0.0),
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
     linear_no_attention=cfg.linear_no_attention,
@@ -1158,7 +1176,7 @@ for epoch in range(MAX_EPOCHS):
                 _scale = torch.rand(x.size(0), 1, 1, device=x.device) * (2 * cfg.aug_scale_range) + _lo
                 x[:, :, :2] = x[:, :, :2] * _scale
             if cfg.aug == "aoa_perturb":
-                _angle_deg = torch.rand(x.size(0), device=x.device) * 2.0 - 1.0
+                _angle_deg = (torch.rand(x.size(0), device=x.device) * 2.0 - 1.0) * cfg.aoa_perturb_range
                 _angle_rad = _angle_deg * (torch.pi / 180.0)
                 _cos_a = torch.cos(_angle_rad).view(-1, 1, 1)
                 _sin_a = torch.sin(_angle_rad).view(-1, 1, 1)
@@ -1189,6 +1207,14 @@ for epoch in range(MAX_EPOCHS):
                     y[_b, _in_region] = y[_cut_idx[_b], _in_region]
                     is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
 
+        # R11: xy coordinate noise (applied to raw coords before normalization)
+        if cfg.xy_noise_std > 0 and model.training:
+            x[:, :, :2] = x[:, :, :2] + cfg.xy_noise_std * torch.randn_like(x[:, :, :2])
+        # R11: Re feature jitter (multiply Re at index 13 by U(1-f, 1+f))
+        if cfg.re_jitter_frac > 0 and model.training:
+            _re_scale = 1.0 + (torch.rand(x.size(0), device=x.device) * 2.0 - 1.0) * cfg.re_jitter_frac
+            x[:, :, 13] = x[:, :, 13] * _re_scale[:, None]
+
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
@@ -1210,6 +1236,10 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
+        # R11: feature channel dropout (per-channel Bernoulli, same mask for all nodes)
+        if cfg.feat_drop_p > 0 and model.training:
+            _fdrop = (torch.rand(x.size(0), 1, x.size(2), device=x.device) > cfg.feat_drop_p).float()
+            x = x * _fdrop
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -1232,6 +1262,14 @@ for epoch in range(MAX_EPOCHS):
                 p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
             noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
             y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
+
+        # R11: target smoothing — blend targets with nearest batch-neighbor (by Re/AoA config)
+        if cfg.target_smooth_alpha > 0 and model.training:
+            _cfg_feat = x[:, 0, 13:16].float()  # Re, AoA, gap (normalized)
+            _dists = torch.cdist(_cfg_feat, _cfg_feat)
+            _dists.fill_diagonal_(float('inf'))
+            _nn_idx = _dists.argmin(dim=1)
+            y_norm = (1 - cfg.target_smooth_alpha) * y_norm + cfg.target_smooth_alpha * y_norm[_nn_idx]
 
         # Per-sample std normalization: skip tandem samples (gap feature index 21)
         raw_gap = x[:, 0, 21]
@@ -1264,8 +1302,20 @@ for epoch in range(MAX_EPOCHS):
             else:
                 y_norm = y_norm / sample_stds
 
+        # R11: manifold mixup — mix targets and set up hidden-layer mixing info
+        _mix_info = None
+        if cfg.manifold_mixup and model.training:
+            import random as _rng
+            _mm_lam = float(torch.distributions.Beta(torch.tensor(0.4), torch.tensor(0.4)).sample())
+            _mm_perm = torch.randperm(B, device=device)
+            _mm_layer = _rng.randint(0, max(cfg.n_layers - 1, 0))
+            _mm_lam_t = torch.full((B, 1, 1), _mm_lam, device=device)
+            _mix_info = {'layer': _mm_layer, 'lam': _mm_lam_t, 'perm': _mm_perm}
+            y_norm = _mm_lam_t * y_norm + (1 - _mm_lam_t) * y_norm[_mm_perm]
+            mask = mask & mask[_mm_perm]
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x}, mix_info=_mix_info)
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
