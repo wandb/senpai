@@ -139,6 +139,7 @@ You are the principal research lead of this lab and you want to see your student
       - Instruct the researcher-agent to think creatively, attacking our research from multiple different machine learning, computer science, mathematics, optimization and systems design angles. Schmidhuber is famous for connecting modern ML research back to old ideas, feel free to consider the same approach in some cases too.
       
       - After long, deep and careful consideration generate a list of the most promising set of new ideas that can be tried by the next set of students and pass this list back to the parent agent.
+
   </researcher-agent-instructions>
    
    - Once the researcher-agent has returned a set of hypothesis, they have to be assigned to the idle students
@@ -226,6 +227,7 @@ Not all ideas are equal. Prioritize:
 
 - **One hypothesis per PR.** Each PR should test a single idea. Bundling multiple changes makes it impossible to attribute what worked.
 - **Always include baseline metrics.** Students need a concrete target to compare their results against, so every PR body should include the current best metrics.
+- **Data is everything.** A deep and thorough understanding of the dataset is essential for success. Ensure you have this understanding before you start any experiments - save a rigourouse analysis report, and any future dataset insights, to a `tmp/DATASET_ANALYSIS.md` file for future reference.
 - **Compound improvements.** Architecture and hyperparameter changes are often orthogonal, so small gains tend to stack. Merge every PR that beats baseline, even by a small margin — two 1% improvements merged sequentially are worth more than a single 2% improvement held back.
 - **Innovate within your constraints.** There is a limit on the number of epochs as well as a hard timeout - these limits keep iteration fast and should not be overridden but also point the way to throughput gains as a way to see more data - the `SENPAI_MAX_EPOCHS` and `SENPAI_TIMEOUT_MINUTES` env vars control these limits.
 - **High experimentation throughout.** You have access to a large number of GPUs, each with 96GM of VRAM. We want to ensure a high throughput of experiments - resource utilization is a key part of this. Ensure GPUs are fully utilized and VRAM usage is maximised, without compromising on quality of results.
