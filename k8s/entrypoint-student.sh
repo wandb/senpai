@@ -28,15 +28,6 @@ source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
 # --- Install role instructions ---
 cp instructions/CLAUDE-STUDENT.md "$WORKDIR/CLAUDE.md"
 
-# --- Environment snapshot ---
-echo "=== Environment ==="
-echo "Python:  $(python --version 2>&1)"
-echo "uv:      $(uv --version 2>&1)"
-echo "Claude:  $(claude --version 2>&1)"
-echo "Disk:    $(df -h /workspace | tail -1)"
-echo "GPU Mem: $(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null | head -1)"
-env | grep -E '^(STUDENT_|ADVISOR_|REPO_|RESEARCH_|WANDB_PROJECT|WANDB_ENTITY|SENPAI_|CLAUDE_AUTOCOMPACT)' | sort
-
 # --- Launch Claude Code in Ralph Loop ---
 export IS_SANDBOX=1
 
@@ -57,7 +48,6 @@ while true; do
     git pull origin "$ADVISOR_BRANCH" 2>/dev/null || true
 
     echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) ==="
-    echo "=== Disk: $(df -h /workspace | tail -1) ==="
     echo "=== GPU: $(nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null) ==="
 
     # Restore CLAUDE.md — branch checkouts clobber it

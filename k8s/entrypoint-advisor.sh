@@ -40,14 +40,6 @@ cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
 export PATH="$HOME/.claude/bin:$PATH"
 source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
 
-# --- Environment snapshot ---
-echo "=== Environment ==="
-echo "Python:  $(python --version 2>&1)"
-echo "uv:      $(uv --version 2>&1)"
-echo "Claude:  $(claude --version 2>&1)"
-echo "Disk:    $(df -h /workspace | tail -1)"
-env | grep -E '^(STUDENT_|ADVISOR_|REPO_|RESEARCH_|WANDB_PROJECT|WANDB_ENTITY|SENPAI_|CLAUDE_AUTOCOMPACT)' | sort
-
 # --- Build prompt ---
 PROMPT="$(envsubst < "$WORKDIR/instructions/prompt-advisor.md" | sed '/^<!--$/,/^-->$/d')"
 
@@ -70,7 +62,6 @@ while true; do
     echo "=== Advisor Loop iteration $ITERATION ($(date)) ==="
     echo "=== Log: $LOGFILE ==="
     echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) ==="
-    echo "=== Disk: $(df -h /workspace | tail -1) ==="
 
     # Restore CLAUDE.md — branch checkouts clobber it
     cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
