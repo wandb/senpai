@@ -34,7 +34,7 @@ else
 fi
 
 # --- Install role instructions ---
-cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
+cp "$WORKDIR/system_instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
 
 # --- Register Weave Claude Plugin (tools already baked into Docker image) ---
 export PATH="$HOME/.claude/bin:$PATH"
@@ -70,7 +70,7 @@ while true; do
     echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) ==="
 
     # Restore CLAUDE.md — branch checkouts clobber it
-    cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
+    cp "$WORKDIR/system_instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
 
     START_TS=$(date +%s)
     EXIT_CODE=0
