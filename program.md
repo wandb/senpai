@@ -22,10 +22,10 @@ We are training a neural network surrogate for CFD (computational fluid dynamics
 
 ## Metrics
 
-**The goal: lowest validation losses.** We track:
+**The goal: lowest validation surface MAE.** We track:
 - **Surface MAE** — mean absolute error on airfoil surface nodes (Ux, Uy, p). **Most important** — these are the quantities engineers care about.
 - **Volume MAE** — mean absolute error on volume (field) nodes.
-- **val/loss** — the combined validation loss (vol_loss + surf_weight * surf_loss).
+- **val/loss** — the combined validation loss.
 
 Lower is better. Surface accuracy (especially pressure) matters most.
 
@@ -37,4 +37,4 @@ Lower is better. Surface accuracy (especially pressure) matters most.
 
 ## Roles
 
-Research is coordinated through GitHub PRs with an advisor/student model.
+Research is coordinated through GitHub PRs with an advisor/student model. GitHub Issues are used for communication with the human researcher team.
