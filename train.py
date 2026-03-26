@@ -747,9 +747,14 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 3 R12: wider model experiments
+    warmup_epochs: int = -1            # alias for warmup_total_iters (overrides when > 0)
 
 
 cfg = sp.parse(Config)
+
+if cfg.warmup_epochs > 0:
+    cfg.warmup_total_iters = cfg.warmup_epochs
 
 if cfg.seed >= 0:
     torch.manual_seed(cfg.seed)
