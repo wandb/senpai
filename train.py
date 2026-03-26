@@ -116,6 +116,22 @@ class MLP(nn.Module):
         return x
 
 
+class DomainLayerNorm(nn.Module):
+    """Domain-specific LayerNorm: separate weight/bias for single-foil vs tandem (Phase 3 R9/R10)."""
+    def __init__(self, dim):
+        super().__init__()
+        self.ln_single = nn.LayerNorm(dim)
+        self.ln_tandem = nn.LayerNorm(dim)
+        self.ln_tandem.weight.data.copy_(self.ln_single.weight.data)
+        self.ln_tandem.bias.data.copy_(self.ln_single.bias.data)
+
+    def forward(self, x, is_tandem=None):
+        if is_tandem is None:
+            return self.ln_single(x)
+        mask_t = is_tandem.view(-1, 1, 1).expand_as(x)
+        return torch.where(mask_t, self.ln_tandem(x), self.ln_single(x))
+
+
 class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
@@ -250,6 +266,7 @@ class TransolverBlock(nn.Module):
         film_cond=False,
         decouple_slice=False,
         zone_temp=False,
+        domain_layernorm=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -258,7 +275,9 @@ class TransolverBlock(nn.Module):
         self.soft_moe = soft_moe
         self.adaln_all = adaln_all
         self.film_cond = film_cond
-        self.ln_1 = nn.LayerNorm(hidden_dim)
+        self.domain_layernorm = domain_layernorm
+        _LN = DomainLayerNorm if domain_layernorm else nn.LayerNorm
+        self.ln_1 = _LN(hidden_dim)
         self.attn = Physics_Attention_Irregular_Mesh(
             hidden_dim,
             heads=num_heads,
@@ -287,7 +306,7 @@ class TransolverBlock(nn.Module):
             )
             nn.init.zeros_(self.film_net[-1].weight)
             nn.init.zeros_(self.film_net[-1].bias)
-        self.ln_2 = nn.LayerNorm(hidden_dim)
+        self.ln_2 = _LN(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         self.spatial_bias = nn.Sequential(
             nn.Linear(4, 64), nn.GELU(),
@@ -296,8 +315,8 @@ class TransolverBlock(nn.Module):
         )
         nn.init.zeros_(self.spatial_bias[-1].weight)
         nn.init.zeros_(self.spatial_bias[-1].bias)
-        self.ln_1_post = nn.LayerNorm(hidden_dim)
-        self.ln_2_post = nn.LayerNorm(hidden_dim)
+        self.ln_1_post = _LN(hidden_dim)
+        self.ln_2_post = _LN(hidden_dim)
         self.se_fc1 = nn.Linear(hidden_dim, hidden_dim // 4)
         self.se_fc2 = nn.Linear(hidden_dim // 4, hidden_dim)
         nn.init.zeros_(self.se_fc2.weight)
@@ -331,16 +350,24 @@ class TransolverBlock(nn.Module):
 
     def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
+        if self.domain_layernorm:
+            _is_tan = (tandem_mask[:, 0, 0, 0] > 0.5) if tandem_mask is not None else None
+            _ln1 = lambda _x: self.ln_1(_x, _is_tan)
+            _ln1p = lambda _x: self.ln_1_post(_x, _is_tan)
+            _ln2 = lambda _x: self.ln_2(_x, _is_tan)
+            _ln2p = lambda _x: self.ln_2_post(_x, _is_tan)
+        else:
+            _ln1, _ln1p, _ln2, _ln2p = self.ln_1, self.ln_1_post, self.ln_2, self.ln_2_post
         if self.adaln_all and condition is not None:
             cond_out = self.adaln_net(condition)  # [B, H*4]
             s1, b1, s2, b2 = cond_out.chunk(4, dim=-1)  # each [B, H]
-            fx_norm = self.ln_1(fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
-            fx = self.ln_1_post(self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
-            fx_norm = self.ln_2(fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
-            fx = self.ln_2_post(self.mlp(fx_norm) + fx)
+            fx_norm = _ln1(fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
+            fx = _ln1p(self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            fx_norm = _ln2(fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
+            fx = _ln2p(self.mlp(fx_norm) + fx)
         else:
-            fx = self.ln_1_post(self.attn(self.ln_1(fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
-            fx = self.ln_2_post(self.mlp(self.ln_2(fx)) + fx)
+            fx = _ln1p(self.attn(_ln1(fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            fx = _ln2p(self.mlp(_ln2(fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
@@ -395,6 +422,7 @@ class Transolver(nn.Module):
         film_cond=False,
         adaln_decouple=False,
         adaln_zone_temp=False,
+        domain_layernorm=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -405,6 +433,7 @@ class Transolver(nn.Module):
         self.adaln_4cond = adaln_4cond
         self.film_cond = film_cond
         self.adaln_zone_temp = adaln_zone_temp
+        self.domain_layernorm = domain_layernorm
         if output_fields is None or output_dims is None:
             raise ValueError("output_fields and output_dims must be provided")
         if len(output_fields) != len(output_dims):
@@ -457,6 +486,7 @@ class Transolver(nn.Module):
                     film_cond=film_cond,
                     decouple_slice=adaln_decouple,
                     zone_temp=adaln_zone_temp,
+                    domain_layernorm=domain_layernorm,
                 )
                 for idx in range(n_layers)
             ]
@@ -668,6 +698,12 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    # Phase 3 R10: Spectral Fourier loss for surface pressure
+    spectral_weight: float = 0.0      # spectral loss weight (0=off, try 0.1/0.3/0.5/1.0)
+    spectral_tan_only: bool = False   # only apply spectral loss to tandem samples
+    spectral_log_freq: bool = False   # log frequency weighting (log(k+1)/log(K+1))
+    spectral_focal: bool = False      # focal: per-frequency adaptive weighting by error
+    domain_layer_norm: bool = False   # DomainLayerNorm: separate LN for single vs tandem
 
 
 cfg = sp.parse(Config)
@@ -813,6 +849,7 @@ model_config = dict(
     film_cond=cfg.film_cond,
     adaln_decouple=cfg.adaln_decouple,
     adaln_zone_temp=cfg.adaln_zone_temp,
+    domain_layernorm=cfg.domain_layer_norm,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1278,6 +1315,37 @@ for epoch in range(MAX_EPOCHS):
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
         else:
             loss = vol_loss + surf_weight * surf_loss
+
+        # Phase 3 R10: Spectral Fourier loss on surface pressure
+        if cfg.spectral_weight > 0 and model.training:
+            import math as _math
+            _spec_loss = torch.tensor(0.0, device=device)
+            _spec_count = 0
+            _is_tandem_b = (x[:, 0, 21].abs() > 0.01)  # [B] bool
+            for _b in range(B):
+                if cfg.spectral_tan_only and not _is_tandem_b[_b]:
+                    continue
+                _sidx = surf_mask[_b].nonzero(as_tuple=False).squeeze(-1)
+                if _sidx.numel() < 16:
+                    continue
+                _order = x[_b, _sidx, 0].argsort()
+                _sidx_s = _sidx[_order]
+                _pred_p = pred[_b, _sidx_s, 2].float()
+                _tgt_p = y_norm[_b, _sidx_s, 2].float()
+                _pfft = torch.fft.rfft(_pred_p)
+                _tfft = torch.fft.rfft(_tgt_p)
+                _K = _pfft.shape[0]
+                if cfg.spectral_focal:
+                    _ferr = (_pfft.abs() - _tfft.abs()).abs()
+                    _fw = (_ferr / (_ferr.mean() + 1e-8)).detach()
+                elif cfg.spectral_log_freq:
+                    _fw = torch.log1p(torch.arange(_K, device=device).float()) / _math.log(_K + 1)
+                else:
+                    _fw = torch.linspace(0, 1, _K, device=device)
+                _spec_loss = _spec_loss + (_fw * (_pfft.abs() - _tfft.abs()).abs()).mean()
+                _spec_count += 1
+            if _spec_count > 0:
+                loss = loss + cfg.spectral_weight * (_spec_loss / _spec_count)
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
