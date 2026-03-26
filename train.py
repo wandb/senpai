@@ -694,6 +694,7 @@ class Config:
     soft_moe: bool = False             # GPU7: Soft MoE output
     # Phase 2 R4: AdaLN-Zero all blocks
     n_hidden: int = 192                # model width (override default)
+    n_heads: int = 3                   # number of attention heads (Phase 3 R11)
     adaln_all_blocks: bool = False     # AdaLN-Zero on ALL TransolverBlocks
     adaln_4cond: bool = False          # use 4-dim condition (Re, AoA, gap, surf_frac)
     adaln_decouple: bool = False       # decoupled slice assignment for tandem
@@ -864,7 +865,7 @@ model_config = dict(
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
-    n_head=3,
+    n_head=cfg.n_heads,
     slice_num=cfg.prog_slices_end if cfg.prog_slices else cfg.slice_num,
     mlp_ratio=2,
     dropout=0.05 if cfg.rdrop else 0.0,
