@@ -61,9 +61,9 @@ def _naca4_geometry(naca_code_str, n_panels=80):
     beta = np.linspace(0, np.pi, n_panels // 2 + 1)
     xc = 0.5 * (1 - np.cos(beta))
 
-    # Thickness distribution (standard NACA formula, closed trailing edge)
+    # Thickness distribution (closed trailing edge variant: -0.1036 instead of -0.1015)
     yt = 5.0 * t * (0.2969 * np.sqrt(xc + 1e-12) - 0.1260 * xc
-                     - 0.3516 * xc**2 + 0.2843 * xc**3 - 0.1015 * xc**4)
+                     - 0.3516 * xc**2 + 0.2843 * xc**3 - 0.1036 * xc**4)
 
     # Camber line and its derivative
     if p_cam > 0 and m > 0:
@@ -83,9 +83,12 @@ def _naca4_geometry(naca_code_str, n_panels=80):
     xl = xc + yt * np.sin(theta)
     yl = yc - yt * np.cos(theta)
 
-    # Closed polygon: upper surface (TE→LE) then lower (LE→TE)
+    # Closed polygon: upper surface (TE→LE) then lower (LE→TE), with TE closure
     xp = np.concatenate([xu[::-1], xl[1:]])
     yp = np.concatenate([yu[::-1], yl[1:]])
+    # Ensure trailing edge is fully closed
+    xp[-1] = xp[0]
+    yp[-1] = yp[0]
     return np.stack([xp, yp], axis=-1)
 
 
@@ -192,6 +195,159 @@ def _hess_smith_solve(panels, aoa_deg):
 
     cp = np.clip(1.0 - Vt**2, -10.0, 2.0)  # clip extreme values
     return xm, ym, cp
+
+
+def _hess_smith_tandem(panels1, aoa1_deg, panels2, aoa2_deg, gap, stagger):
+    """Coupled Hess-Smith for tandem foils (both foils in one influence matrix).
+
+    Args:
+        panels1: (n1+1, 2) first foil polygon
+        aoa1_deg: AoA for freestream (same for both foils)
+        panels2: (n2+1, 2) second foil polygon (at origin)
+        aoa2_deg: AoA for second foil (may differ for independent AoA)
+        gap: chordwise offset for foil 2
+        stagger: cross-stream offset for foil 2
+
+    Returns:
+        xm, ym: midpoints for ALL panels (foil1 + foil2)
+        cp: Cp at each panel
+        n1: number of panels on foil 1 (to split results)
+    """
+    # Translate foil 2 by gap/stagger
+    panels2_t = panels2.copy()
+    panels2_t[:, 0] += gap
+    panels2_t[:, 1] += stagger
+
+    # Combine into single panel system
+    # Remove the closing point from foil 1 before concatenating
+    combined = np.vstack([panels1, panels2_t])
+
+    n1 = len(panels1) - 1
+    n2 = len(panels2_t) - 1
+    n_total = n1 + n2
+
+    xp = combined[:, 0]
+    yp = combined[:, 1]
+
+    # Build midpoints, lengths, angles for ALL panels
+    # Foil 1 panels: 0..n1-1, Foil 2 panels: n1..n_total-1
+    xm = np.zeros(n_total)
+    ym = np.zeros(n_total)
+    dx = np.zeros(n_total)
+    dy = np.zeros(n_total)
+
+    # Foil 1
+    for i in range(n1):
+        xm[i] = 0.5 * (panels1[i, 0] + panels1[i + 1, 0])
+        ym[i] = 0.5 * (panels1[i, 1] + panels1[i + 1, 1])
+        dx[i] = panels1[i + 1, 0] - panels1[i, 0]
+        dy[i] = panels1[i + 1, 1] - panels1[i, 1]
+
+    # Foil 2
+    for i in range(n2):
+        xm[n1 + i] = 0.5 * (panels2_t[i, 0] + panels2_t[i + 1, 0])
+        ym[n1 + i] = 0.5 * (panels2_t[i, 1] + panels2_t[i + 1, 1])
+        dx[n1 + i] = panels2_t[i + 1, 0] - panels2_t[i, 0]
+        dy[n1 + i] = panels2_t[i + 1, 1] - panels2_t[i, 1]
+
+    S = np.sqrt(dx**2 + dy**2)
+    S = np.maximum(S, 1e-12)
+    sin_t = dy / S
+    cos_t = dx / S
+    nx_arr = sin_t
+    ny_arr = -cos_t
+
+    # Use AoA from foil 1 as freestream (standard tandem assumption)
+    aoa = np.radians(aoa1_deg)
+    Uinf_x = np.cos(aoa)
+    Uinf_y = np.sin(aoa)
+
+    # Build panel start points for influence computation
+    xp_start = np.zeros(n_total)
+    yp_start = np.zeros(n_total)
+    for i in range(n1):
+        xp_start[i] = panels1[i, 0]
+        yp_start[i] = panels1[i, 1]
+    for i in range(n2):
+        xp_start[n1 + i] = panels2_t[i, 0]
+        yp_start[n1 + i] = panels2_t[i, 1]
+
+    # Vectorized influence coefficients (same as single-foil but for combined system)
+    dx_ij = xm[:, None] - xp_start[None, :]
+    dy_ij = ym[:, None] - yp_start[None, :]
+    x_loc = dx_ij * cos_t[None, :] + dy_ij * sin_t[None, :]
+    y_loc = -dx_ij * sin_t[None, :] + dy_ij * cos_t[None, :]
+    Sj = S[None, :]
+    r1_sq = np.maximum(x_loc**2 + y_loc**2, 1e-20)
+    r2_sq = np.maximum((x_loc - Sj)**2 + y_loc**2, 1e-20)
+    theta1 = np.arctan2(y_loc, x_loc)
+    theta2 = np.arctan2(y_loc, x_loc - Sj)
+    dtheta = theta2 - theta1
+    dtheta = (dtheta + np.pi) % (2 * np.pi) - np.pi
+    log_r = 0.5 * np.log(r2_sq / r1_sq)
+    inv2pi = 1.0 / (2.0 * np.pi)
+    u_s = inv2pi * log_r
+    v_s = inv2pi * dtheta
+    u_v = inv2pi * dtheta
+    v_v = -inv2pi * log_r
+    u_glob_s = u_s * cos_t[None, :] - v_s * sin_t[None, :]
+    v_glob_s = u_s * sin_t[None, :] + v_s * cos_t[None, :]
+    u_glob_v = u_v * cos_t[None, :] - v_v * sin_t[None, :]
+    v_glob_v = u_v * sin_t[None, :] + v_v * cos_t[None, :]
+
+    An = u_glob_s * nx_arr[:, None] + v_glob_s * ny_arr[:, None]
+    Bn = u_glob_v * nx_arr[:, None] + v_glob_v * ny_arr[:, None]
+    At = u_glob_s * cos_t[:, None] + v_glob_s * sin_t[:, None]
+    Bt = u_glob_v * cos_t[:, None] + v_glob_v * sin_t[:, None]
+    np.fill_diagonal(An, 0.5)
+    np.fill_diagonal(Bn, 0.0)
+    np.fill_diagonal(At, 0.0)
+    np.fill_diagonal(Bt, 0.5)
+
+    # Two Kutta conditions: one per foil (two vortex strengths)
+    # System: [An | Bn_foil1_sum | Bn_foil2_sum] [sigma] = [-Vn_inf]
+    #         [At_kutta1                        ] [gamma1]   [-Vt_kutta1]
+    #         [At_kutta2                        ] [gamma2]   [-Vt_kutta2]
+    N = n_total + 2
+    A_sys = np.zeros((N, N))
+    A_sys[:n_total, :n_total] = An
+
+    # Foil 1 vortex: column n_total
+    A_sys[:n_total, n_total] = Bn[:, :n1].sum(axis=1)
+    # Foil 2 vortex: column n_total+1
+    A_sys[:n_total, n_total + 1] = Bn[:, n1:].sum(axis=1)
+
+    # Kutta condition foil 1: Vt at TE panels 0 and n1-1 sum to zero
+    A_sys[n_total, :n_total] = At[0, :] + At[n1 - 1, :]
+    A_sys[n_total, n_total] = (Bt[0, :n1] + Bt[n1 - 1, :n1]).sum()
+    A_sys[n_total, n_total + 1] = (Bt[0, n1:] + Bt[n1 - 1, n1:]).sum()
+
+    # Kutta condition foil 2: Vt at TE panels n1 and n1+n2-1 sum to zero
+    A_sys[n_total + 1, :n_total] = At[n1, :] + At[n_total - 1, :]
+    A_sys[n_total + 1, n_total] = (Bt[n1, :n1] + Bt[n_total - 1, :n1]).sum()
+    A_sys[n_total + 1, n_total + 1] = (Bt[n1, n1:] + Bt[n_total - 1, n1:]).sum()
+
+    rhs = np.zeros(N)
+    rhs[:n_total] = -(Uinf_x * nx_arr + Uinf_y * ny_arr)
+    rhs[n_total] = -(Uinf_x * (cos_t[0] + cos_t[n1 - 1]) + Uinf_y * (sin_t[0] + sin_t[n1 - 1]))
+    rhs[n_total + 1] = -(Uinf_x * (cos_t[n1] + cos_t[n_total - 1]) + Uinf_y * (sin_t[n1] + sin_t[n_total - 1]))
+
+    try:
+        sol = np.linalg.solve(A_sys, rhs)
+    except np.linalg.LinAlgError:
+        return xm, ym, np.zeros(n_total), n1
+
+    sigma = sol[:n_total]
+    gamma1 = sol[n_total]
+    gamma2 = sol[n_total + 1]
+
+    # Tangential velocity
+    Vt = Uinf_x * cos_t + Uinf_y * sin_t + At.dot(sigma)
+    Vt[:n1] += gamma1 * Bt[:n1, :n1].sum(axis=1) + gamma2 * Bt[:n1, n1:].sum(axis=1)
+    Vt[n1:] += gamma1 * Bt[n1:, :n1].sum(axis=1) + gamma2 * Bt[n1:, n1:].sum(axis=1)
+
+    cp = np.clip(1.0 - Vt**2, -10.0, 2.0)
+    return xm, ym, cp, n1
 
 
 def compute_inviscid_cp_for_batch(x_batch, is_surface_batch, mask_batch, device,
@@ -1108,7 +1264,25 @@ if cfg.inviscid_prior:
 
             try:
                 _panels = _naca4_geometry(_naca0_str, n_panels=80)
-                if cfg.inviscid_thin_airfoil:
+
+                if _is_tandem:
+                    # Coupled tandem: solve both foils simultaneously
+                    _aoa1_rad = _x[0, 18].item()
+                    _aoa1_deg = np.degrees(_aoa1_rad)
+                    _naca1_enc = _x[0, 19:22].numpy()
+                    _naca1_m = int(round(_naca1_enc[0] * 9))
+                    _naca1_p = int(round(_naca1_enc[1] * 9))
+                    _naca1_t = int(round(_naca1_enc[2] * 24))
+                    _naca1_str = f"{_naca1_m}{_naca1_p}{_naca1_t:02d}"
+                    _stagger = _x[0, 23].item()
+
+                    if _naca1_t > 0:
+                        _panels2 = _naca4_geometry(_naca1_str, n_panels=80)
+                        _panel_x, _panel_y, _cp_panels, _n1 = _hess_smith_tandem(
+                            _panels, _aoa0_deg, _panels2, _aoa1_deg, _gap, _stagger)
+                    else:
+                        _panel_x, _panel_y, _cp_panels = _hess_smith_solve(_panels, _aoa0_deg)
+                elif cfg.inviscid_thin_airfoil:
                     _dx_p = np.diff(_panels[:, 0])
                     _dy_p = np.diff(_panels[:, 1])
                     _aoa = np.radians(_aoa0_deg)
@@ -1138,49 +1312,6 @@ if cfg.inviscid_prior:
                     _min_dist = _dists[np.arange(_n), _nearest]
                     _decay = np.exp(-5.0 * _min_dist)
                     _cp_arr = (_cp_vals * _decay).astype(np.float32)
-
-                # Handle tandem second foil
-                if _is_tandem:
-                    _aoa1_rad = _x[0, 18].item()
-                    _aoa1_deg = np.degrees(_aoa1_rad)
-                    _naca1_enc = _x[0, 19:22].numpy()
-                    _naca1_m = int(round(_naca1_enc[0] * 9))
-                    _naca1_p = int(round(_naca1_enc[1] * 9))
-                    _naca1_t = int(round(_naca1_enc[2] * 24))
-                    _naca1_str = f"{_naca1_m}{_naca1_p}{_naca1_t:02d}"
-                    _stagger = _x[0, 23].item()
-
-                    if _naca1_t > 0:
-                        _panels2 = _naca4_geometry(_naca1_str, n_panels=80)
-                        if cfg.inviscid_thin_airfoil:
-                            _dx2 = np.diff(_panels2[:, 0])
-                            _dy2 = np.diff(_panels2[:, 1])
-                            _aoa2 = np.radians(_aoa1_deg)
-                            _cos2 = _dx2 / np.sqrt(_dx2**2 + _dy2**2 + 1e-12)
-                            _sin2 = _dy2 / np.sqrt(_dx2**2 + _dy2**2 + 1e-12)
-                            _Vt2 = np.cos(_aoa2) * _cos2 + np.sin(_aoa2) * _sin2
-                            _cp2 = np.clip(1.0 - _Vt2**2, -10.0, 2.0)
-                            _p2x = 0.5 * (_panels2[:-1, 0] + _panels2[1:, 0])
-                            _p2y = 0.5 * (_panels2[:-1, 1] + _panels2[1:, 1])
-                        else:
-                            _p2x, _p2y, _cp2 = _hess_smith_solve(_panels2, _aoa1_deg)
-                        _p2_pts = np.stack([_p2x + _gap, _p2y + _stagger], axis=-1)
-
-                        _d2 = np.linalg.norm(_pos[:, None, :] - _p2_pts[None, :, :], axis=-1)
-                        _n2 = np.argmin(_d2, axis=1)
-                        _cp2_vals = _cp2[_n2]
-                        _d2_min = _d2[np.arange(_n), _n2]
-                        _d1_min = np.linalg.norm(_pos[:, None, :] - _panel_pts[None, :, :], axis=-1).min(axis=1)
-
-                        if cfg.inviscid_surface_only:
-                            _surf_idx = np.where(_surf_mask)[0]
-                            _closer2 = _d2_min[_surf_idx] < _d1_min[_surf_idx]
-                            _cp_arr[_surf_idx[_closer2]] = _cp2_vals[_surf_idx[_closer2]]
-                        else:
-                            _decay2 = np.exp(-5.0 * _d2_min)
-                            _cp2_decayed = (_cp2_vals * _decay2).astype(np.float32)
-                            _closer2 = _d2_min < _d1_min
-                            _cp_arr[_closer2] = _cp2_decayed[_closer2]
 
                 _cp_cache[_key] = torch.from_numpy(_cp_arr)
             except Exception as _e:
