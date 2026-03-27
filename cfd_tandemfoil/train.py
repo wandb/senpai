@@ -279,11 +279,16 @@ class TransolverBlock(nn.Module):
         dln_zeroinit=False,
         domain_velhead=False,
         prog_slices=False,
+        inr_decoder=False,
+        inr_vel_too=False,
+        inr_pe_dim=32,
     ):
         super().__init__()
         self.last_layer = last_layer
         self.field_decoder = field_decoder
         self.domain_velhead = domain_velhead
+        self.inr_decoder = inr_decoder
+        self.inr_vel_too = inr_vel_too
         self.adaln_output = adaln_output
         self.soft_moe = soft_moe
         self.adaln_all = adaln_all
@@ -347,19 +352,40 @@ class TransolverBlock(nn.Module):
                 )
             elif domain_velhead:
                 # Domain-specific output heads: separate for single-foil vs tandem
-                self.velhead_single = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
-                )
-                self.velhead_tandem = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
-                )
+                if inr_decoder:
+                    # INR + domain_velhead: domain-specific vel heads (2 dims) + INR pres head
+                    _vel_in = hidden_dim + inr_pe_dim if inr_vel_too else hidden_dim
+                    self.velhead_single = nn.Sequential(
+                        nn.Linear(_vel_in, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2)
+                    )
+                    self.velhead_tandem = nn.Sequential(
+                        nn.Linear(_vel_in, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2)
+                    )
+                    self.pres_head = nn.Sequential(
+                        nn.Linear(hidden_dim + inr_pe_dim, hidden_dim * 2), nn.GELU(),
+                        nn.Linear(hidden_dim * 2, 1)
+                    )
+                else:
+                    self.velhead_single = nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                    )
+                    self.velhead_tandem = nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                    )
             elif field_decoder:
+                _vel_in = hidden_dim + inr_pe_dim if (inr_decoder and inr_vel_too) else hidden_dim
                 self.vel_head = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2)
+                    nn.Linear(_vel_in, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2)
                 )
-                self.pres_head = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(), nn.Linear(hidden_dim * 2, 1)
-                )
+                if inr_decoder:
+                    self.pres_head = nn.Sequential(
+                        nn.Linear(hidden_dim + inr_pe_dim, hidden_dim * 2), nn.GELU(),
+                        nn.Linear(hidden_dim * 2, 1)
+                    )
+                else:
+                    self.pres_head = nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(), nn.Linear(hidden_dim * 2, 1)
+                    )
             elif adaln_output:
                 self.cond_net = nn.Sequential(nn.Linear(2, hidden_dim * 2), nn.GELU())
                 self.mlp2 = nn.Sequential(
@@ -370,7 +396,7 @@ class TransolverBlock(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None, fourier_pe=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         # DomainLayerNorm helper: pass is_tandem when enabled, else plain call
         dln_it = (tandem_mask.view(-1) > 0.5) if (self.domain_layernorm and tandem_mask is not None) else None
@@ -402,14 +428,31 @@ class TransolverBlock(nn.Module):
                 gate = self.gate_net(fx_ln)  # [B, N, 2]
                 return gate[:, :, 0:1] * self.expert1(fx_ln) + gate[:, :, 1:2] * self.expert2(fx_ln)
             elif self.domain_velhead:
-                out_s = self.velhead_single(fx_ln)
-                out_t = self.velhead_tandem(fx_ln)
-                if tandem_mask is not None:
-                    is_tan = (tandem_mask.view(-1) > 0.5).view(-1, 1, 1)
-                    return torch.where(is_tan.expand_as(out_s), out_t, out_s)
-                return out_s
+                if self.inr_decoder and fourier_pe is not None:
+                    # INR: domain vel heads output 2 dims, separate INR pres head
+                    _vel_in = torch.cat([fx_ln, fourier_pe], dim=-1) if self.inr_vel_too else fx_ln
+                    out_s = self.velhead_single(_vel_in)
+                    out_t = self.velhead_tandem(_vel_in)
+                    if tandem_mask is not None:
+                        is_tan = (tandem_mask.view(-1) > 0.5).view(-1, 1, 1)
+                        vel = torch.where(is_tan.expand_as(out_s), out_t, out_s)
+                    else:
+                        vel = out_s
+                    pres = self.pres_head(torch.cat([fx_ln, fourier_pe], dim=-1))
+                    return torch.cat([vel, pres], dim=-1)
+                else:
+                    out_s = self.velhead_single(fx_ln)
+                    out_t = self.velhead_tandem(fx_ln)
+                    if tandem_mask is not None:
+                        is_tan = (tandem_mask.view(-1) > 0.5).view(-1, 1, 1)
+                        return torch.where(is_tan.expand_as(out_s), out_t, out_s)
+                    return out_s
             elif self.field_decoder:
-                return torch.cat([self.vel_head(fx_ln), self.pres_head(fx_ln)], dim=-1)
+                if self.inr_decoder and fourier_pe is not None:
+                    _vel_in = torch.cat([fx_ln, fourier_pe], dim=-1) if self.inr_vel_too else fx_ln
+                    return torch.cat([self.vel_head(_vel_in), self.pres_head(torch.cat([fx_ln, fourier_pe], dim=-1))], dim=-1)
+                else:
+                    return torch.cat([self.vel_head(fx_ln), self.pres_head(fx_ln)], dim=-1)
             elif self.adaln_output and condition is not None:
                 cond = self.cond_net(condition)  # [B, 2*H]
                 scale, shift = cond.chunk(2, dim=-1)  # [B, H]
@@ -453,9 +496,13 @@ class Transolver(nn.Module):
         dln_zeroinit=False,
         domain_velhead=False,
         prog_slices=False,
+        inr_decoder=False,
+        inr_vel_too=False,
+        inr_pe_dim=32,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
+        self.inr_decoder = inr_decoder
         self.ref = ref
         self.unified_pos = unified_pos
         self.adaln_output = adaln_output
@@ -519,6 +566,9 @@ class Transolver(nn.Module):
                     dln_zeroinit=dln_zeroinit,
                     domain_velhead=domain_velhead if (idx == n_layers - 1) else False,
                     prog_slices=prog_slices,
+                    inr_decoder=inr_decoder if (idx == n_layers - 1) else False,
+                    inr_vel_too=inr_vel_too if (idx == n_layers - 1) else False,
+                    inr_pe_dim=inr_pe_dim,
                 )
                 for idx in range(n_layers)
             ]
@@ -581,6 +631,7 @@ class Transolver(nn.Module):
 
     def forward(self, data, pos=None, condition=None):
         x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
+        fourier_pe = data.get("fourier_pe") if isinstance(data, Mapping) else None
         if x is None:
             raise ValueError("Missing required input tensor: x")
         if condition is not None:
@@ -635,7 +686,8 @@ class Transolver(nn.Module):
 
         # Last block: use adaln_all condition if enabled, else fallback to adaln_output
         last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features,
+                             fourier_pe=fourier_pe if self.inr_decoder else None)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
@@ -747,6 +799,10 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: INR coordinate-conditioned decoder
+    inr_decoder: bool = False              # concatenate Fourier PE to pressure head input
+    inr_vel_too: bool = False              # also concatenate to velocity head
+    inr_raw_xy: bool = False               # use raw 2D xy instead of 32D Fourier PE
 
 
 cfg = sp.parse(Config)
@@ -896,6 +952,9 @@ model_config = dict(
     dln_zeroinit=cfg.dln_zeroinit,
     domain_velhead=cfg.domain_velhead,
     prog_slices=cfg.prog_slices,
+    inr_decoder=cfg.inr_decoder,
+    inr_vel_too=cfg.inr_vel_too,
+    inr_pe_dim=2 if cfg.inr_raw_xy else 32,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1281,8 +1340,16 @@ for epoch in range(MAX_EPOCHS):
             else:
                 y_norm = y_norm / sample_stds
 
+        # INR decoder: pass coordinate features to model
+        _model_data = {"x": x}
+        if cfg.inr_decoder:
+            if cfg.inr_raw_xy:
+                _model_data["fourier_pe"] = x[:, :, :2]  # raw 2D xy
+            else:
+                _model_data["fourier_pe"] = fourier_pe  # 32D Fourier PE
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model(_model_data)
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -1409,7 +1476,7 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x})
+                rdrop_out = model(_model_data)
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -1474,7 +1541,7 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                out2 = model(_model_data)
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -1667,8 +1734,16 @@ for epoch in range(MAX_EPOCHS):
                 else:
                     y_norm_scaled = y_norm / sample_stds
 
+                # INR decoder: pass coordinate features
+                _eval_data = {"x": x}
+                if cfg.inr_decoder:
+                    if cfg.inr_raw_xy:
+                        _eval_data["fourier_pe"] = x[:, :, :2]
+                    else:
+                        _eval_data["fourier_pe"] = fourier_pe
+
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    pred = eval_model(_eval_data)["preds"]
                 pred = pred.float()
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
@@ -1863,8 +1938,11 @@ if best_metrics:
     elif ema_model is not None:
         vis_model = ema_model
     else:
-        vis_model = model
-    vis_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        vis_model = _base_model  # use uncompiled model for vis (compile can fail on single-sample shapes)
+    _ckpt = torch.load(model_path, map_location=device, weights_only=True)
+    # Strip _orig_mod. prefix from torch.compile'd checkpoints
+    _ckpt = {k.removeprefix("_orig_mod."): v for k, v in _ckpt.items()}
+    vis_model.load_state_dict(_ckpt)
     vis_model.eval()
     plot_dir = Path("plots") / run.id
     n = 1 if cfg.debug else 4
@@ -1893,7 +1971,13 @@ if best_metrics:
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                 x_n = torch.cat([x_n, fourier_pe], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
-                pred = vis_model({"x": x_n})["preds"].float()
+                _vis_data = {"x": x_n}
+                if cfg.inr_decoder:
+                    if cfg.inr_raw_xy:
+                        _vis_data["fourier_pe"] = x_n[:, :, :2]
+                    else:
+                        _vis_data["fourier_pe"] = fourier_pe
+                pred = vis_model(_vis_data)["preds"].float()
                 if cfg.raw_targets:
                     y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                 else:
