@@ -754,6 +754,11 @@ class Config:
     vol_subsample_frac: float = 1.0     # fraction of volume nodes in loss after vol_ramp (0.8 = 80%)
     compile_mode: str = "default"       # torch.compile mode: "default", "max-autotune", "reduce-overhead"
     num_workers: int = 4                # data loader workers
+    # Phase 4: coarse-to-fine node curriculum
+    coarse_to_fine: bool = False        # physically remove volume nodes early, ramp to 100%
+    coarse_to_fine_start: float = 0.15  # start fraction of volume nodes
+    coarse_to_fine_epochs: int = 100    # epochs to ramp to 100%
+    coarse_surf_weight: float = -1.0    # override surf_weight during coarse phase (-1 = no override)
 
 
 cfg = sp.parse(Config)
@@ -1139,6 +1144,9 @@ for epoch in range(MAX_EPOCHS):
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+    # Override surf_weight during coarse-to-fine phase
+    if cfg.coarse_to_fine and cfg.coarse_surf_weight > 0 and epoch < cfg.coarse_to_fine_epochs:
+        surf_weight = cfg.coarse_surf_weight
 
     # --- Train ---
     model.train()
@@ -1153,6 +1161,34 @@ for epoch in range(MAX_EPOCHS):
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
+
+        # --- Coarse-to-fine: physically remove volume nodes for speedup ---
+        if cfg.coarse_to_fine and model.training:
+            frac = min(1.0, cfg.coarse_to_fine_start + (1.0 - cfg.coarse_to_fine_start) * epoch / cfg.coarse_to_fine_epochs)
+            if frac < 1.0:
+                B, N, D = x.shape
+                keep_masks = []
+                for b in range(B):
+                    surf_idx = is_surface[b].nonzero(as_tuple=True)[0]
+                    vol_idx = (~is_surface[b] & mask[b]).nonzero(as_tuple=True)[0]
+                    n_vol_keep = max(int(len(vol_idx) * frac), 1)
+                    vol_keep = vol_idx[torch.randperm(len(vol_idx), device=x.device)[:n_vol_keep]]
+                    keep_idx = torch.cat([surf_idx, vol_keep]).sort().values
+                    keep_masks.append(keep_idx)
+                # Compact: gather only kept nodes
+                max_keep = max(len(m) for m in keep_masks)
+                x_compact = torch.zeros(B, max_keep, D, device=x.device, dtype=x.dtype)
+                y_compact = torch.zeros(B, max_keep, 3, device=y.device, dtype=y.dtype)
+                mask_compact = torch.zeros(B, max_keep, dtype=torch.bool, device=x.device)
+                is_surface_compact = torch.zeros(B, max_keep, dtype=torch.bool, device=x.device)
+                for b in range(B):
+                    n = len(keep_masks[b])
+                    x_compact[b, :n] = x[b, keep_masks[b]]
+                    y_compact[b, :n] = y[b, keep_masks[b]]
+                    mask_compact[b, :n] = True
+                    is_surface_compact[b, :n] = is_surface[b, keep_masks[b]]
+                x, y, mask, is_surface = x_compact, y_compact, mask_compact, is_surface_compact
+                wandb.log({"train/coarse_frac": frac, "train/coarse_nodes": max_keep}, commit=False)
 
         # --- Data augmentation (training-only, applied before normalization) ---
         if model.training and cfg.aug != "none" and epoch >= cfg.aug_start_epoch:
