@@ -754,6 +754,12 @@ class Config:
     vol_subsample_frac: float = 1.0     # fraction of volume nodes in loss after vol_ramp (0.8 = 80%)
     compile_mode: str = "default"       # torch.compile mode: "default", "max-autotune", "reduce-overhead"
     num_workers: int = 4                # data loader workers
+    # Phase 4: surface-only training
+    surface_only_loss: bool = False     # eliminate volume loss entirely, train only on surface nodes
+    heavy_surface: bool = False         # minimal volume loss (0.01x) with fixed high surface weight
+    surf_weight_fixed: float = 100.0    # fixed surface weight for heavy_surface mode
+    surface_pressure_only: bool = False # only train on surface pressure channel (ignore surface velocity)
+    surface_curriculum: bool = False    # curriculum: ramp vol_weight from 1.0 to 0.0 over training
 
 
 cfg = sp.parse(Config)
@@ -1372,6 +1378,13 @@ for epoch in range(MAX_EPOCHS):
         else:
             tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
+
+        # Surface-only training: also compute full-channel surface loss for surface_only mode
+        if cfg.surface_only_loss and not cfg.surface_pressure_only:
+            # All 3 channels on surface (not just pressure)
+            surf_all_per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / (surf_mask.sum(dim=1).clamp(min=1).float() * 3)
+            surf_loss_full = (surf_all_per_sample * tandem_boost).mean()
+
         if cfg.uncertainty_loss:
             bm = _base_model
             surf_ux_loss = (abs_err[:, :, 0:1] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
@@ -1381,37 +1394,57 @@ for epoch in range(MAX_EPOCHS):
                     surf_ux_loss * torch.exp(-2 * bm.log_sigma_surf_ux) / 2 + bm.log_sigma_surf_ux +
                     surf_uy_loss * torch.exp(-2 * bm.log_sigma_surf_uy) / 2 + bm.log_sigma_surf_uy +
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
+        elif cfg.surface_only_loss:
+            # Surface-only: no volume loss at all
+            if cfg.surface_pressure_only:
+                # Only surface pressure channel
+                loss = surf_weight * surf_loss
+            else:
+                # All surface channels (pressure-weighted + full)
+                loss = surf_weight * surf_loss + 5.0 * surf_loss_full
+        elif cfg.heavy_surface:
+            # Minimal volume loss + fixed high surface weight
+            loss = 0.01 * vol_loss + cfg.surf_weight_fixed * surf_loss
+        elif cfg.surface_curriculum:
+            # Curriculum: ramp vol_weight from 1.0 → 0.0 over training
+            curriculum_progress = min(1.0, epoch / max(cfg.cosine_T_max * 0.6, 1.0))
+            vol_curriculum_weight = 1.0 - curriculum_progress
+            loss = vol_curriculum_weight * vol_loss + surf_weight * surf_loss
         else:
             loss = vol_loss + surf_weight * surf_loss
 
-        # Multi-scale loss: coarse spatial pooling
+        # Multi-scale loss: coarse spatial pooling (skip for surface_only_loss since it's volume-based)
         _coarse_loss = None
-        coarse_pool_size = 64
-        B, N, C = pred.shape
-        n_groups = N // coarse_pool_size
-        if n_groups > 1:
-            # Sort by x-coordinate for spatially coherent groups
-            raw_x_coord = x[:, :, 0]  # x-coordinate
-            sort_idx = raw_x_coord.argsort(dim=1)
-            pred_sorted = torch.gather(pred, 1, sort_idx.unsqueeze(-1).expand_as(pred))
-            y_sorted = torch.gather(y_norm, 1, sort_idx.unsqueeze(-1).expand_as(y_norm))
-            mask_sorted = torch.gather(mask, 1, sort_idx)
-            # Pool predictions and targets over groups of 64 nodes
-            pred_trunc = pred_sorted[:, :n_groups * coarse_pool_size]
-            y_trunc = y_sorted[:, :n_groups * coarse_pool_size]
-            mask_trunc = mask_sorted[:, :n_groups * coarse_pool_size]
+        if not cfg.surface_only_loss:
+            coarse_pool_size = 64
+            B, N, C = pred.shape
+            n_groups = N // coarse_pool_size
+            if n_groups > 1:
+                # Sort by x-coordinate for spatially coherent groups
+                raw_x_coord = x[:, :, 0]  # x-coordinate
+                sort_idx = raw_x_coord.argsort(dim=1)
+                pred_sorted = torch.gather(pred, 1, sort_idx.unsqueeze(-1).expand_as(pred))
+                y_sorted = torch.gather(y_norm, 1, sort_idx.unsqueeze(-1).expand_as(y_norm))
+                mask_sorted = torch.gather(mask, 1, sort_idx)
+                # Pool predictions and targets over groups of 64 nodes
+                pred_trunc = pred_sorted[:, :n_groups * coarse_pool_size]
+                y_trunc = y_sorted[:, :n_groups * coarse_pool_size]
+                mask_trunc = mask_sorted[:, :n_groups * coarse_pool_size]
 
-            mask_trunc_f = mask_trunc.float().reshape(B, n_groups, coarse_pool_size).unsqueeze(-1)  # [B, G, P, 1]
-            pred_g = pred_trunc.reshape(B, n_groups, coarse_pool_size, C)
-            y_g = y_trunc.reshape(B, n_groups, coarse_pool_size, C)
-            pred_coarse = (pred_g * mask_trunc_f).sum(dim=2) / mask_trunc_f.sum(dim=2).clamp(min=1)
-            y_coarse = (y_g * mask_trunc_f).sum(dim=2) / mask_trunc_f.sum(dim=2).clamp(min=1)
-            mask_coarse = mask_trunc.reshape(B, n_groups, coarse_pool_size).any(dim=2)
+                mask_trunc_f = mask_trunc.float().reshape(B, n_groups, coarse_pool_size).unsqueeze(-1)  # [B, G, P, 1]
+                pred_g = pred_trunc.reshape(B, n_groups, coarse_pool_size, C)
+                y_g = y_trunc.reshape(B, n_groups, coarse_pool_size, C)
+                pred_coarse = (pred_g * mask_trunc_f).sum(dim=2) / mask_trunc_f.sum(dim=2).clamp(min=1)
+                y_coarse = (y_g * mask_trunc_f).sum(dim=2) / mask_trunc_f.sum(dim=2).clamp(min=1)
+                mask_coarse = mask_trunc.reshape(B, n_groups, coarse_pool_size).any(dim=2)
 
-            coarse_err = (pred_coarse - y_coarse).abs()
-            coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
-            _coarse_loss = coarse_loss
-            loss = loss + 1.0 * coarse_loss
+                coarse_err = (pred_coarse - y_coarse).abs()
+                coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
+                _coarse_loss = coarse_loss
+                if cfg.surface_curriculum:
+                    loss = loss + vol_curriculum_weight * coarse_loss
+                else:
+                    loss = loss + 1.0 * coarse_loss
 
         log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
         re_loss = F.mse_loss(re_pred, log_re_target)
@@ -1520,7 +1553,13 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _train_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.surface_curriculum:
+            _train_log["train/vol_curriculum_weight"] = vol_curriculum_weight
+        if cfg.surface_only_loss or cfg.heavy_surface or cfg.surface_curriculum:
+            _train_log["train/surf_loss_raw"] = surf_loss.item()
+            _train_log["train/vol_loss_raw"] = vol_loss.item()
+        wandb.log(_train_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
