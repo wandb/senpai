@@ -60,6 +60,144 @@ ACTIVATION = {
 }
 
 
+class KANLayer(nn.Module):
+    """Kolmogorov-Arnold Network layer with B-spline basis functions.
+
+    Memory-efficient implementation: instead of materializing full
+    [B, N, in_features, n_basis] intermediate, we pre-contract the spline
+    weights with basis values per input dimension in groups to control memory.
+    """
+
+    def __init__(self, in_features, out_features, grid_size=5, spline_order=3):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.grid_size = grid_size
+        self.spline_order = spline_order
+
+        # Base linear transformation (like SiLU residual in original KAN)
+        self.base_weight = nn.Linear(in_features, out_features, bias=False)
+
+        # Spline parameters
+        h = 2.0 / grid_size
+        grid = torch.linspace(-1 - h * spline_order, 1 + h * spline_order,
+                              grid_size + 2 * spline_order + 1)
+        self.register_buffer('grid', grid)
+
+        # Spline coefficients: [out_features, in_features, n_basis]
+        n_basis = grid_size + spline_order
+        self.spline_weight = nn.Parameter(
+            torch.randn(out_features, in_features, n_basis) * 0.1
+        )
+
+        # Scaling
+        self.scale = nn.Parameter(torch.ones(out_features))
+
+    def _b_spline_basis(self, x):
+        """Compute B-spline basis values. x: [..., in_features] -> [..., in_features, n_basis]"""
+        x = x.unsqueeze(-1)  # [..., in_features, 1]
+        grid = self.grid
+
+        bases = ((x >= grid[:-1]) & (x < grid[1:])).float()
+
+        for k in range(1, self.spline_order + 1):
+            left_num = x - grid[:-(k + 1)]
+            left_den = grid[k:-1] - grid[:-(k + 1)] + 1e-8
+            left = left_num / left_den
+
+            right_num = grid[k + 1:] - x
+            right_den = grid[k + 1:] - grid[1:-k] + 1e-8
+            right = right_num / right_den
+
+            bases = left * bases[..., :-1] + right * bases[..., 1:]
+
+        return bases  # [..., in_features, n_basis]
+
+    @torch.compiler.disable
+    def forward(self, x):
+        """x: [..., in_features] -> [..., out_features]"""
+        # Base path (SiLU activation like residual)
+        base_out = F.silu(self.base_weight(x))
+
+        # Spline path - memory efficient: contract spline_weight over (in, n_basis)
+        x_norm = torch.tanh(x)
+        bases = self._b_spline_basis(x_norm)  # [..., in_features, n_basis]
+
+        # Contract basis with spline weights efficiently:
+        # spline_weight: [out, in, n_basis], bases: [..., in, n_basis]
+        # Reshape to matrix multiply: [..., in*n_basis] @ [in*n_basis, out]
+        lead_shape = bases.shape[:-2]
+        in_feat = self.in_features
+        n_basis = self.grid_size + self.spline_order
+        bases_flat = bases.reshape(*lead_shape, in_feat * n_basis)  # [..., in*n_basis]
+        w_flat = self.spline_weight.reshape(self.out_features, in_feat * n_basis)  # [out, in*n_basis]
+        spline_out = torch.matmul(bases_flat, w_flat.t())  # [..., out]
+
+        return self.scale * (base_out + spline_out)
+
+
+class KANBlock(nn.Module):
+    """KAN-MLP hybrid block replacing MLP in TransolverBlock.
+
+    Uses a standard MLP as the main path and adds a parallel KAN branch
+    through a low-rank bottleneck to keep memory manageable. The bottleneck
+    projects dim -> kan_bottleneck -> dim, with the KAN layer operating on
+    the small bottleneck dimension (default 32) where B-spline basis
+    computation is cheap.
+    """
+    KAN_BOTTLENECK = 32  # small enough for B-spline basis on large meshes
+
+    def __init__(self, dim, grid_size=5, spline_order=3, mlp_ratio=2):
+        super().__init__()
+        hidden = dim * mlp_ratio
+        # Standard MLP path (cheap, linear ops)
+        self.up_proj = nn.Linear(dim, hidden)
+        self.down_proj = nn.Linear(hidden, dim)
+        self.act = nn.GELU()
+        # Parallel KAN path through bottleneck
+        bn = self.KAN_BOTTLENECK
+        self.kan_down_proj = nn.Linear(dim, bn)
+        self.kan_layer = KANLayer(bn, bn, grid_size, spline_order)
+        self.kan_up_proj = nn.Linear(bn, dim)
+        nn.init.zeros_(self.kan_up_proj.weight)  # start as zero so KAN is a gradual addition
+        nn.init.zeros_(self.kan_up_proj.bias)
+
+    def forward(self, x):
+        # MLP path
+        mlp_out = self.down_proj(self.act(self.up_proj(x)))
+        # KAN path through bottleneck
+        kan_out = self.kan_up_proj(self.kan_layer(self.kan_down_proj(x)))
+        return mlp_out + kan_out
+
+
+class KANPreprocess(nn.Module):
+    """KAN-augmented preprocessor to replace GatedMLP2.
+
+    Uses linear projection as the main path with a parallel KAN branch
+    through a bottleneck for memory-efficient adaptive function approximation.
+    """
+    KAN_BOTTLENECK = 32
+
+    def __init__(self, n_input, n_hidden, n_output, grid_size=5, spline_order=3):
+        super().__init__()
+        # Main linear path
+        self.up_proj = nn.Linear(n_input, n_hidden)
+        self.down_proj = nn.Linear(n_hidden, n_output)
+        self.act = nn.GELU()
+        # Parallel KAN path through bottleneck
+        bn = self.KAN_BOTTLENECK
+        self.kan_down_proj = nn.Linear(n_input, bn)
+        self.kan_layer = KANLayer(bn, bn, grid_size, spline_order)
+        self.kan_up_proj = nn.Linear(bn, n_output)
+        nn.init.zeros_(self.kan_up_proj.weight)
+        nn.init.zeros_(self.kan_up_proj.bias)
+
+    def forward(self, x):
+        main_out = self.down_proj(self.act(self.up_proj(x)))
+        kan_out = self.kan_up_proj(self.kan_layer(self.kan_down_proj(x)))
+        return main_out + kan_out
+
+
 class GatedMLP(nn.Module):
     def __init__(self, n_input, n_hidden, n_output, act='gelu'):
         super().__init__()
@@ -279,6 +417,9 @@ class TransolverBlock(nn.Module):
         dln_zeroinit=False,
         domain_velhead=False,
         prog_slices=False,
+        kan_mlp=False,
+        kan_grid_size=5,
+        kan_spline_order=3,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -304,7 +445,7 @@ class TransolverBlock(nn.Module):
             prog_slices=prog_slices,
         )
         if adaln_all:
-            # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
+            # AdaLN-Zero: cond -> (scale1, bias1, scale2, bias2) for ln_1 and ln_2
             self.adaln_net = nn.Sequential(
                 nn.Linear(adaln_cond_dim, 128), nn.SiLU(),
                 nn.Linear(128, hidden_dim * 4),
@@ -313,7 +454,7 @@ class TransolverBlock(nn.Module):
                 nn.init.zeros_(self.adaln_net[-1].weight)
                 nn.init.zeros_(self.adaln_net[-1].bias)
         if film_cond:
-            # FiLM: cond → (gamma, beta) applied after SE layer
+            # FiLM: cond -> (gamma, beta) applied after SE layer
             self.film_net = nn.Sequential(
                 nn.Linear(2, 64), nn.SiLU(),
                 nn.Linear(64, hidden_dim * 2),
@@ -321,7 +462,10 @@ class TransolverBlock(nn.Module):
             nn.init.zeros_(self.film_net[-1].weight)
             nn.init.zeros_(self.film_net[-1].bias)
         self.ln_2 = _LN(hidden_dim)
-        self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        if kan_mlp:
+            self.mlp = KANBlock(hidden_dim, grid_size=kan_grid_size, spline_order=kan_spline_order, mlp_ratio=mlp_ratio)
+        else:
+            self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         self.spatial_bias = nn.Sequential(
             nn.Linear(4, 64), nn.GELU(),
             nn.Linear(64, 64), nn.GELU(),
@@ -453,6 +597,10 @@ class Transolver(nn.Module):
         dln_zeroinit=False,
         domain_velhead=False,
         prog_slices=False,
+        kan_mlp=False,
+        kan_grid_size=5,
+        kan_spline_order=3,
+        kan_preprocess=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -463,6 +611,10 @@ class Transolver(nn.Module):
         self.adaln_4cond = adaln_4cond
         self.film_cond = film_cond
         self.adaln_zone_temp = adaln_zone_temp
+        self.kan_mlp = kan_mlp
+        self.kan_grid_size = kan_grid_size
+        self.kan_spline_order = kan_spline_order
+        self.kan_preprocess = kan_preprocess
         if output_fields is None or output_dims is None:
             raise ValueError("output_fields and output_dims must be provided")
         if len(output_fields) != len(output_dims):
@@ -485,6 +637,11 @@ class Transolver(nn.Module):
                 n_layers=0,
                 res=False,
                 act=act,
+            )
+        elif kan_preprocess:
+            self.preprocess = KANPreprocess(
+                fun_dim + space_dim, n_hidden * 2, n_hidden,
+                grid_size=kan_grid_size, spline_order=kan_spline_order,
             )
         else:
             self.preprocess = GatedMLP2(fun_dim + space_dim, n_hidden * 2, n_hidden)
@@ -519,6 +676,9 @@ class Transolver(nn.Module):
                     dln_zeroinit=dln_zeroinit,
                     domain_velhead=domain_velhead if (idx == n_layers - 1) else False,
                     prog_slices=prog_slices,
+                    kan_mlp=kan_mlp,
+                    kan_grid_size=kan_grid_size,
+                    kan_spline_order=kan_spline_order,
                 )
                 for idx in range(n_layers)
             ]
@@ -747,6 +907,11 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: KAN-Hybrid (Kolmogorov-Arnold Network layers)
+    kan_mlp: bool = False              # Replace TransolverBlock MLPs with KAN
+    kan_grid_size: int = 5             # B-spline grid resolution
+    kan_spline_order: int = 3          # B-spline order
+    kan_preprocess: bool = False       # Also replace preprocess MLP with KAN
 
 
 cfg = sp.parse(Config)
@@ -896,6 +1061,10 @@ model_config = dict(
     dln_zeroinit=cfg.dln_zeroinit,
     domain_velhead=cfg.domain_velhead,
     prog_slices=cfg.prog_slices,
+    kan_mlp=cfg.kan_mlp,
+    kan_grid_size=cfg.kan_grid_size,
+    kan_spline_order=cfg.kan_spline_order,
+    kan_preprocess=cfg.kan_preprocess,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1801,6 +1970,16 @@ for epoch in range(MAX_EPOCHS):
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
+    # KAN-specific logging
+    if cfg.kan_mlp:
+        for blk_idx, blk in enumerate(_base_model.blocks):
+            if hasattr(blk.mlp, 'kan_layer'):
+                _kl = blk.mlp.kan_layer
+                metrics[f"kan/block{blk_idx}_spline_norm"] = _kl.spline_weight.data.norm().item()
+                metrics[f"kan/block{blk_idx}_scale_mean"] = _kl.scale.data.mean().item()
+        if cfg.kan_preprocess and hasattr(_base_model.preprocess, 'kan_layer'):
+            _kl = _base_model.preprocess.kan_layer
+            metrics["kan/preprocess_spline_norm"] = _kl.spline_weight.data.norm().item()
     wandb.log(metrics)
 
     if torch.cuda.is_available():
@@ -1882,6 +2061,16 @@ if best_metrics:
                 dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)
                 x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                # Fourier positional encoding (must match training loop)
+                _vis_xy = x_n[:, :, :2]
+                _vis_xy_min = _vis_xy.amin(dim=1, keepdim=True)
+                _vis_xy_max = _vis_xy.amax(dim=1, keepdim=True)
+                _vis_xy_norm = (_vis_xy - _vis_xy_min) / (_vis_xy_max - _vis_xy_min + 1e-8)
+                _vis_bm = vis_model._orig_mod if hasattr(vis_model, '_orig_mod') else vis_model
+                _vis_freqs = torch.cat([_vis_bm.fourier_freqs_fixed.to(device), _vis_bm.fourier_freqs_learned.abs()])
+                _vis_xy_sc = _vis_xy_norm.unsqueeze(-1) * _vis_freqs
+                _vis_fpe = torch.cat([_vis_xy_sc.sin().flatten(-2), _vis_xy_sc.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, _vis_fpe], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 if cfg.raw_targets:
