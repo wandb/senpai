@@ -253,6 +253,88 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         return self.to_out(out_x)
 
 
+class HyperConditioningNetwork(nn.Module):
+    """Generates per-layer modulation parameters from flow conditions.
+
+    Modes:
+    - 'adain': StyleGAN-style AdaIN (scale+bias per LayerNorm per block)
+    - 'lora': Low-rank weight perturbations per block
+    - 'film': FiLM-style scale+bias per block (applied after SE)
+    """
+
+    def __init__(self, cond_dim, n_layers, hidden_dim, mode='adain'):
+        super().__init__()
+        self.mode = mode
+        self.n_layers = n_layers
+
+        # Condition encoder: global features → latent
+        self.encoder = nn.Sequential(
+            nn.Linear(cond_dim, 128), nn.SiLU(),
+            nn.Linear(128, 128), nn.SiLU(),
+        )
+
+        if mode == 'adain':
+            # For each layer: generate (scale, bias) for each of 2 LayerNorms
+            self.layer_heads = nn.ModuleList([
+                nn.Linear(128, hidden_dim * 2)  # scale + bias
+                for _ in range(n_layers * 2)  # 2 LNs per block
+            ])
+            # Zero-initialize for stable start (identity modulation)
+            for head in self.layer_heads:
+                nn.init.zeros_(head.weight)
+                nn.init.zeros_(head.bias)
+
+        elif mode == 'lora':
+            # Low-rank updates: condition → rank-r weight perturbation per block
+            rank = 8
+            self.lora_down = nn.ModuleList([
+                nn.Linear(128, rank) for _ in range(n_layers)
+            ])
+            self.lora_up = nn.ModuleList([
+                nn.Linear(rank, hidden_dim) for _ in range(n_layers)
+            ])
+            # Zero-init the up projection so LoRA starts as zero
+            for up in self.lora_up:
+                nn.init.zeros_(up.weight)
+                nn.init.zeros_(up.bias)
+
+        elif mode == 'film':
+            # FiLM: scale+bias per block (applied after SE layer)
+            self.film_heads = nn.ModuleList([
+                nn.Linear(128, hidden_dim * 2) for _ in range(n_layers)
+            ])
+            for head in self.film_heads:
+                nn.init.zeros_(head.weight)
+                nn.init.zeros_(head.bias)
+
+    def forward(self, condition):
+        """condition: [B, cond_dim] → modulation params per layer."""
+        latent = self.encoder(condition)  # [B, 128]
+
+        if self.mode == 'adain':
+            mods = []
+            for head in self.layer_heads:
+                out = head(latent)  # [B, hidden_dim * 2]
+                scale, bias = out.chunk(2, dim=-1)
+                mods.append((scale, bias))
+            return mods  # list of (scale, bias) pairs, length = n_layers * 2
+
+        elif self.mode == 'lora':
+            deltas = []
+            for down, up in zip(self.lora_down, self.lora_up):
+                delta = up(down(latent))  # [B, hidden_dim]
+                deltas.append(delta)
+            return deltas  # list of deltas, length = n_layers
+
+        elif self.mode == 'film':
+            mods = []
+            for head in self.film_heads:
+                out = head(latent)  # [B, hidden_dim * 2]
+                gamma, beta = out.chunk(2, dim=-1)
+                mods.append((gamma, beta))
+            return mods  # list of (gamma, beta), length = n_layers
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -370,7 +452,7 @@ class TransolverBlock(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None, hyper_mods=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         # DomainLayerNorm helper: pass is_tandem when enabled, else plain call
         dln_it = (tandem_mask.view(-1) > 0.5) if (self.domain_layernorm and tandem_mask is not None) else None
@@ -378,20 +460,49 @@ class TransolverBlock(nn.Module):
             def _ln(m, x): return m(x, is_tandem=dln_it)
         else:
             def _ln(m, x): return m(x)
+        # Unpack hyper_mods: adain=(ln1_mod, ln2_mod), lora=delta, film=(gamma,beta)
+        hyper_adain_1 = hyper_adain_2 = hyper_lora = hyper_film = None
+        if hyper_mods is not None:
+            if isinstance(hyper_mods, dict):
+                hyper_adain_1 = hyper_mods.get('adain_1')
+                hyper_adain_2 = hyper_mods.get('adain_2')
+                hyper_lora = hyper_mods.get('lora')
+                hyper_film = hyper_mods.get('film')
         if self.adaln_all and condition is not None:
             cond_out = self.adaln_net(condition)  # [B, H*4]
             s1, b1, s2, b2 = cond_out.chunk(4, dim=-1)  # each [B, H]
             fx_norm = _ln(self.ln_1, fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
+            if hyper_adain_1 is not None:
+                hs, hb = hyper_adain_1
+                fx_norm = fx_norm * (1 + hs.unsqueeze(1)) + hb.unsqueeze(1)
             fx = _ln(self.ln_1_post, self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
             fx_norm = _ln(self.ln_2, fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
+            if hyper_adain_2 is not None:
+                hs, hb = hyper_adain_2
+                fx_norm = fx_norm * (1 + hs.unsqueeze(1)) + hb.unsqueeze(1)
             fx = _ln(self.ln_2_post, self.mlp(fx_norm) + fx)
         else:
-            fx = _ln(self.ln_1_post, self.attn(_ln(self.ln_1, fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
-            fx = _ln(self.ln_2_post, self.mlp(_ln(self.ln_2, fx)) + fx)
+            fx_ln1 = _ln(self.ln_1, fx)
+            if hyper_adain_1 is not None:
+                hs, hb = hyper_adain_1
+                fx_ln1 = fx_ln1 * (1 + hs.unsqueeze(1)) + hb.unsqueeze(1)
+            fx = _ln(self.ln_1_post, self.attn(fx_ln1, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            fx_ln2 = _ln(self.ln_2, fx)
+            if hyper_adain_2 is not None:
+                hs, hb = hyper_adain_2
+                fx_ln2 = fx_ln2 * (1 + hs.unsqueeze(1)) + hb.unsqueeze(1)
+            fx = _ln(self.ln_2_post, self.mlp(fx_ln2) + fx)
+        # LoRA: add condition-dependent bias after attention+MLP
+        if hyper_lora is not None:
+            fx = fx + hyper_lora.unsqueeze(1)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
         fx = fx * se
+        # HyperNetwork FiLM: scale/bias after SE layer
+        if hyper_film is not None:
+            gamma, beta = hyper_film
+            fx = (1 + gamma.unsqueeze(1)) * fx + beta.unsqueeze(1)
         if self.film_cond and condition is not None:
             film_out = self.film_net(condition)  # [B, H*2]
             gamma, beta = film_out.chunk(2, dim=-1)  # each [B, H]
@@ -453,9 +564,13 @@ class Transolver(nn.Module):
         dln_zeroinit=False,
         domain_velhead=False,
         prog_slices=False,
+        hyper_cond=False,
+        hyper_mode='adain',
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
+        self.hyper_cond = hyper_cond
+        self.hyper_mode = hyper_mode
         self.ref = ref
         self.unified_pos = unified_pos
         self.adaln_output = adaln_output
@@ -535,6 +650,11 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        if hyper_cond:
+            # Condition: [log_Re, AoA0, NACA0_thick, AoA1, gap, stagger] = 6 dims
+            self.hyper_net = HyperConditioningNetwork(
+                cond_dim=6, n_layers=n_layers, hidden_dim=n_hidden, mode=hyper_mode
+            )
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -578,6 +698,20 @@ class Transolver(nn.Module):
     def _validate_output_dims(self, preds):
         if sum(self.output_dims) != preds.shape[-1]:
             raise ValueError("Sum of output_dims must match preds last dimension")
+
+    def _get_block_hyper_mods(self, block_idx, hyper_mods_list):
+        """Package hypernetwork modulations for a specific block."""
+        if hyper_mods_list is None:
+            return None
+        if self.hyper_mode == 'adain':
+            return {
+                'adain_1': hyper_mods_list[block_idx * 2],
+                'adain_2': hyper_mods_list[block_idx * 2 + 1],
+            }
+        elif self.hyper_mode == 'lora':
+            return {'lora': hyper_mods_list[block_idx]}
+        elif self.hyper_mode == 'film':
+            return {'film': hyper_mods_list[block_idx]}
 
     def forward(self, data, pos=None, condition=None):
         x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
@@ -626,8 +760,22 @@ class Transolver(nn.Module):
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
-        for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+        # HyperNetwork conditioning: build condition vector and get modulations
+        hyper_mods_list = None
+        if self.hyper_cond:
+            hyper_cond_vec = torch.cat([
+                x[:, 0, 13:14],   # log_Re
+                x[:, 0, 14:15],   # AoA0_rad
+                x[:, 0, 17:18],   # NACA0 thickness
+                x[:, 0, 18:19],   # AoA1_rad
+                x[:, 0, 21:22],   # gap
+                x[:, 0, 22:23],   # stagger
+            ], dim=-1)  # [B, 6]
+            hyper_mods_list = self.hyper_net(hyper_cond_vec)
+
+        for idx, block in enumerate(self.blocks[:-1]):
+            hm = self._get_block_hyper_mods(idx, hyper_mods_list)
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features, hyper_mods=hm)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
@@ -635,7 +783,9 @@ class Transolver(nn.Module):
 
         # Last block: use adaln_all condition if enabled, else fallback to adaln_output
         last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+        last_idx = len(self.blocks) - 1
+        hm = self._get_block_hyper_mods(last_idx, hyper_mods_list)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features, hyper_mods=hm)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
@@ -747,6 +897,9 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: HyperNetwork conditioning
+    hyper_cond: bool = False           # enable hypernetwork flow-condition-adaptive modulation
+    hyper_mode: str = "adain"          # "adain", "lora", "film"
 
 
 cfg = sp.parse(Config)
@@ -896,6 +1049,8 @@ model_config = dict(
     dln_zeroinit=cfg.dln_zeroinit,
     domain_velhead=cfg.domain_velhead,
     prog_slices=cfg.prog_slices,
+    hyper_cond=cfg.hyper_cond,
+    hyper_mode=cfg.hyper_mode,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1910,8 +2065,11 @@ if best_metrics:
                     else:
                         y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
             samples.append((x[:, :2], y_true, y_pred, is_surface))
-        images = visualize(samples, out_dir=plot_dir / split_name)
-        if images:
-            wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+        try:
+            images = visualize(samples, out_dir=plot_dir / split_name)
+            if images:
+                wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+        except TypeError:
+            print(f"  Warning: visualize() call failed for {split_name} (signature mismatch), skipping plots")
 
 wandb.finish()
