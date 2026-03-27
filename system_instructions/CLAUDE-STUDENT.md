@@ -129,7 +129,7 @@ Consider that the baseline metrics you are trying to beat is already very well t
 
 Ensure experiments can run successfully. For big codebase changes, consider running 1 tiny debug run first using a sub-agent to check everything is working. If an experiment hits an OOM error, relaunch it with fixes that reduce VRAM usage. If it crashes for any other reason, investigate the cause fix the bug and relaunch the experiment. Comment in the PR with the details of the error, and timestamp so the advisor knows why an experiment might be delayed. If an idea if fundamentally broken, report that in the results.
 
-Note: Don't try to fix errors or failures that arise to our hard, fixed experiment timeout or epoch count limits cutting in.
+Note: Don't try to fix errors or failures that arise from our hard, fixed experiment timeout or epoch count limits cutting in.
 
 ### If you find bugs, you fix them
 

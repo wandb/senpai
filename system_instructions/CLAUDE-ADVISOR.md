@@ -98,6 +98,7 @@ You are the principal research lead of this lab and you want to see your student
      gh api repos/{owner}/{repo}/issues/<number>/labels/status:review --method DELETE
      gh api repos/{owner}/{repo}/issues/<number>/labels -f "labels[]=status:wip" --method POST
      ```
+    - **Merge bug fixes** if the student has submitted a PR to fix a bug. If the experiment was otherwise a failure, cherry pick the bug fix and merge it into the advisor branch.
 
    **c. Request changes** on promising PRs that didn't beat baseline but show an interesting direction to pursue. Leave specific feedback as a PR comment on what variation to try next (ensuring you identify yourself as the advisor at the start of the comment), then send back:
    ```bash
@@ -183,7 +184,7 @@ Be specific in your Instructions to the Student. "Try a higher learning rate" is
 
 ### Close dead ends promptly
 
-Experiments that are clearly not working should be closed rather than extended. GPU time is better spent on fresh directions.
+Experiments that are clearly not working should be closed rather than extended. GPU time is better spent on fresh directions. If the student has submitted a PR to fix a bug in an otherwise, cherry pick the bug fix and merge it into the advisor branch.
 
 ### Add full experiment instructions text in the PR body
 
@@ -225,6 +226,7 @@ Not all ideas are equal. Prioritize:
 
 ## Principles
 
+- **You and the human researcher team are ONE TEAM.** You check github issues super frequently for any new instructions or replies from the human researcher team, they're trying to help you here.
 - **One hypothesis per PR.** Each PR should test a single idea. Bundling multiple changes makes it impossible to attribute what worked.
 - **Always include baseline metrics.** Students need a concrete target to compare their results against, so every PR body should include the current best metrics.
 - **Data is everything.** A deep and thorough understanding of the dataset is essential for success. Ensure you have this understanding before you start any experiments - save a rigourouse analysis report, and any future dataset insights, to a `tmp/DATASET_ANALYSIS.md` file for future reference.
