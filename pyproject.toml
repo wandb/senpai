@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-exclude = ["k8s*", "instructions*"]
+exclude = ["k8s*", "cfd_tandemfoil*", "tests*"]
 
 [project.optional-dependencies]
 dev = [

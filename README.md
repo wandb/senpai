@@ -6,21 +6,21 @@ SPDX-PackageName: senpai
 
 # senpai
 
-Autonomous ML research on CFD surrogates, powered by Claude Code agents coordinated through GitHub PRs.
-
-![val/loss over time](scatter_plot.png)
-
-[W&B Dashboard](https://wandb.ai/wandb-applied-ai-team/senpai-v1)
-
-## The problem
-
-We're training a neural network surrogate for computational fluid dynamics (CFD) on the [TandemFoilSet](https://openreview.net/forum?id=4Z0P4Nbosn) dataset. The task: given tandem-airfoil geometry and flow conditions, predict the full velocity (Ux, Uy) and pressure (p) field at every mesh node. Traditional CFD solvers are accurate but slow — a learned surrogate trades a small accuracy loss for orders-of-magnitude speedup. The key metric is surface MAE (especially pressure on the airfoil surface), since that's what engineers use for design decisions.
-
-The model is a [Transolver](https://arxiv.org/abs/2402.02366) with physics-aware attention over irregular meshes.
+Autonomous ML research loop powered by Claude Code agents coordinated through GitHub PRs. Point it at a problem, deploy advisor + student agents on k8s, and let them iterate.
 
 ## How it works
 
-An **advisor** agent (no GPU) creates hypothesis PRs with detailed instructions and assigns them to **student** agents (GPU nodes). Students implement, run experiments, and report results on the PR. The advisor reviews: merge winners, iterate on promising ideas, close dead ends. Coordination uses GitHub labels (`<advisor-name>`, `student:<name>`, `status:wip`, `status:review`). W&B tracks metrics.
+An **advisor** agent (no GPU) creates hypothesis PRs and assigns them to **student** agents (GPU nodes). Students implement the hypothesis, run experiments, and report results. The advisor reviews: merges winners, iterates on promising ideas, closes dead ends. All coordination happens through GitHub labels and PRs. W&B tracks metrics.
+
+The repo is **problem-agnostic** — all problem-specific code (model, training script, data pipeline, instructions) lives in a self-contained folder. `senpai.yaml` at the root points to the active problem.
+
+### Current problem: CFD surrogates
+
+Training a neural network surrogate for computational fluid dynamics on the [TandemFoilSet](https://openreview.net/forum?id=4Z0P4Nbosn) dataset. Given tandem-airfoil geometry and flow conditions, predict velocity (Ux, Uy) and pressure (p) at every mesh node. The model is a [Transolver](https://arxiv.org/abs/2402.02366) with physics-aware attention over irregular meshes. Key metric: surface MAE (especially pressure).
+
+![val/loss over time](animated_chart.gif)
+
+[W&B Dashboard](https://wandb.ai/wandb-applied-ai-team/senpai-v1)
 
 ## Architecture
 
@@ -59,47 +59,77 @@ graph TD
 
 ```
 senpai/
-├── train.py                    # Training script + Transolver model (students modify this)
-├── program.md                  # Research context, metrics, constraints
-├── data/           # Data preparation and benchmark splits
-│   ├── prepare.py              #   Dataset loading and collation
-│   ├── prepare_multi.py        #   Extended preprocessing (24-dim x, foil-2 features)
-│   ├── utils.py                #   Visualization utilities
-│   ├── split.py                #   One-time split manifest generator
-│   ├── split_manifest.json     #   Committed train/val indices
-│   └── split_stats.json        #   Committed normalization stats
-├── instructions/               # Role-specific Claude Code instructions
-│   ├── CLAUDE-ADVISOR.md       #   Advisor workflow
-│   ├── CLAUDE-STUDENT.md       #   Student workflow
-│   ├── prompt-advisor.md       #   Advisor prompt template
-│   └── prompt-student.md       #   Student prompt template
-├── k8s/                        # Kubernetes deployment
-│   ├── launch.py               #   Deploy advisor + student pods
-│   ├── advisor-deployment.yaml #   Advisor pod spec (CPU only)
-│   ├── student-deployment.yaml #   Student pod spec (8x GPU)
-│   ├── entrypoint-advisor.sh   #   Advisor startup script
-│   └── entrypoint-student.sh   #   Student startup script
-└── .claude/skills/             # Claude Code skills
-    ├── wandb-primary/          #   W&B + Weave queries
-    └── list-experiments/       #   Experiment history (advisor only)
+├── senpai.yaml                    # Project config: active problem + all launch defaults
+├── cfd_tandemfoil/                # Problem directory (self-contained)
+│   ├── train.py                   #   Training script + model (students modify this)
+│   ├── program.md                 #   Research context, metrics, constraints
+│   ├── data/                      #   Data pipeline and benchmark splits
+│   └── instructions/              #   Role-specific Claude Code instructions
+│       ├── prompt-advisor.md      #     Task-specific Advisor prompt template
+│       └── prompt-student.md      #     Task-specific Student prompt template
+├── system_instructions/           # System-level Claude Code instructions
+│   ├── CLAUDE-ADVISOR.md          #     System-level Advisor workflow
+│   └── CLAUDE-STUDENT.md          #     System-level Student workflow
+├── k8s/                           # Kubernetes deployment (problem-agnostic)
+│   ├── launch.py                  #   Deploy advisor + student pods
+│   ├── advisor-deployment.yaml    #   Advisor pod spec (CPU only)
+│   ├── student-deployment.yaml    #   Student pod spec (8x GPU)
+│   ├── entrypoint-advisor.sh      #   Advisor startup script
+│   └── entrypoint-student.sh      #   Student startup script
+├── Dockerfile                     # ML container with Claude Code + tools
+└── .claude/                       # Claude Code skills and agents
+    ├── skills/wandb-primary/      #   W&B + Weave queries skill
+    ├── skills/list-experiments/   #   Experiment history skill
+    └── agents/researcher-agent.md #   Deep literature research agent
 ```
+
+## Configuration
+
+All project settings live in `senpai.yaml`:
+
+```yaml
+problem: cfd_tandemfoil        # which problem folder to use
+repo_url: https://github.com/wandb/senpai.git
+repo_branch: main
+image: ghcr.io/wandb/senpai:latest
+wandb_entity: wandb-applied-ai-team
+wandb_project: senpai-v1
+advisor_branch: noam
+timeout_minutes: 30.0
+max_epochs: 50
+n_students: 4
+```
+
+`launch.py` reads this via `simple_parsing` — every field can be overridden on the CLI.
 
 ## Running
 
 ```bash
 # Train locally
-python train.py --agent <name> --wandb_name "<name>/<description>"
+cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/<description>"
 
 # Debug (3 epochs, tiny subset)
-python train.py --debug
+cd cfd_tandemfoil && python train.py --debug
 
-# Deploy to k8s with 4 student researchers
-python k8s/launch.py --tag <research-tag> --n_students 4 --advisor --advisor_branch "einstein"
+# Deploy to k8s (reads defaults from senpai.yaml, only --tag is required)
+python k8s/launch.py --tag <research-tag> --advisor
 
-# Deploy with additional instructions beyond those in program.md and instructions/
-python k8s/launch.py --tag <research-tag> --n_students 4 --advisor --extra_instructions "Only consider optimizer changes."
+# Override config via CLI
+python k8s/launch.py --tag <research-tag> --advisor --n_students 6 --advisor_branch "einstein"
 
+# Pass extra instructions to the advisor
+python k8s/launch.py --tag <research-tag> --advisor --extra_instructions "Only consider optimizer changes."
 ```
+
+## Adding a new problem
+
+1. Create a new folder (e.g. `weather_prediction/`) with:
+   - `train.py` — training script + model
+   - `program.md` — research context, metrics, constraints
+   - `data/` — data pipeline
+   - `instructions/` — role-specific Claude Code instructions
+2. Set `problem: weather_prediction` in `senpai.yaml`
+3. Deploy as usual — `python k8s/launch.py --tag <tag> --advisor`
 
 ## References
 

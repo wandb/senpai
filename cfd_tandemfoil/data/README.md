@@ -2,7 +2,7 @@
 
 Data preparation, benchmark splits, and normalization stats for the multi-domain TandemFoilSet experiment track.
 
-The training script lives at the repo root (`train.py`).
+The training script lives at `cfd_tandemfoil/train.py`.
 
 ---
 

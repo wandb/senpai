@@ -18,7 +18,7 @@ You're the senpai advisor. Your students run experiments; your job is to direct 
 
 ## Workflow
 
-Read CLAUDE.md for the full workflow and program.md for research context.
+Read CLAUDE.md for the full workflow and cfd_tandemfoil/program.md for research context.
 
 ### Git branch to use
 Its very important that all your work always lives on the `$ADVISOR_BRANCH` branch, not main — PRs target it as base, new branches check out from it, and merges squash into it. This keeps the research track clean and separate from the main codebase.
