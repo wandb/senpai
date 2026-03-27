@@ -350,16 +350,8 @@ class TransolverBlock(nn.Module):
                 self.expert2 = nn.Sequential(
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
-            elif domain_velhead:
-                # Domain-specific output heads: separate for single-foil vs tandem
-                self.velhead_single = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
-                )
-                self.velhead_tandem = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
-                )
-            elif field_decoder and pressure_first:
-                # Pressure-first: predict p, then condition v on p
+            elif pressure_first:
+                # Pressure-first: predict p, then condition v on p (takes priority over domain_velhead/field_decoder)
                 if pressure_deep:
                     self.pres_head = nn.Sequential(
                         nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(),
@@ -373,6 +365,14 @@ class TransolverBlock(nn.Module):
                 # Velocity head conditioned on predicted pressure: input is hidden_dim + 1
                 self.vel_head_conditioned = nn.Sequential(
                     nn.Linear(hidden_dim + 1, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2)
+                )
+            elif domain_velhead:
+                # Domain-specific output heads: separate for single-foil vs tandem
+                self.velhead_single = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+                self.velhead_tandem = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
             elif field_decoder:
                 self.vel_head = nn.Sequential(
@@ -422,6 +422,13 @@ class TransolverBlock(nn.Module):
             if self.soft_moe:
                 gate = self.gate_net(fx_ln)  # [B, N, 2]
                 return gate[:, :, 0:1] * self.expert1(fx_ln) + gate[:, :, 1:2] * self.expert2(fx_ln)
+            elif self.pressure_first:
+                # Pressure-first: predict p, then condition v on p
+                p_pred = self.pres_head(fx_ln)  # [B, N, 1]
+                p_cond = p_pred if self.pressure_no_detach else p_pred.detach()
+                vel_input = torch.cat([fx_ln, p_cond], dim=-1)  # [B, N, H+1]
+                v_pred = self.vel_head_conditioned(vel_input)  # [B, N, 2]
+                return torch.cat([v_pred, p_pred], dim=-1)
             elif self.domain_velhead:
                 out_s = self.velhead_single(fx_ln)
                 out_t = self.velhead_tandem(fx_ln)
@@ -429,13 +436,6 @@ class TransolverBlock(nn.Module):
                     is_tan = (tandem_mask.view(-1) > 0.5).view(-1, 1, 1)
                     return torch.where(is_tan.expand_as(out_s), out_t, out_s)
                 return out_s
-            elif self.field_decoder and self.pressure_first:
-                # Pressure-first: predict p, then condition v on p
-                p_pred = self.pres_head(fx_ln)  # [B, N, 1]
-                p_cond = p_pred if self.pressure_no_detach else p_pred.detach()
-                vel_input = torch.cat([fx_ln, p_cond], dim=-1)  # [B, N, H+1]
-                v_pred = self.vel_head_conditioned(vel_input)  # [B, N, 2]
-                return torch.cat([v_pred, p_pred], dim=-1)
             elif self.field_decoder:
                 return torch.cat([self.vel_head(fx_ln), self.pres_head(fx_ln)], dim=-1)
             elif self.adaln_output and condition is not None:
