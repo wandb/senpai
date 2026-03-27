@@ -127,7 +127,7 @@ python k8s/launch.py --tag <research-tag> --advisor --extra_instructions "Only c
    - `train.py` — training script + model
    - `program.md` — research context, metrics, constraints
    - `data/` — data pipeline
-   - `instructions/` — role-specific Claude Code instructions (CLAUDE-ADVISOR.md, CLAUDE-STUDENT.md, prompts)
+   - `instructions/` — role-specific Claude Code instructions
 2. Set `problem: weather_prediction` in `senpai.yaml`
 3. Deploy as usual — `python k8s/launch.py --tag <tag> --advisor`
 
