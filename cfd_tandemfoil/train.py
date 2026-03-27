@@ -37,7 +37,11 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import simple_parsing as sp
 
-from data.utils import visualize
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+from data.utils import _scatter_field, _add_quiver, _setup_ax, _get_view_bounds
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
 
 torch.set_float32_matmul_precision('high')
@@ -747,6 +751,10 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: Spectral surface loss
+    spectral_surface_loss: bool = False
+    spectral_weight: float = 0.5
+    spectral_n_modes: int = 8
 
 
 cfg = sp.parse(Config)
@@ -1405,6 +1413,32 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # Spectral surface pressure loss
+        _spectral_loss_val = 0.0
+        if cfg.spectral_surface_loss:
+            spec_loss = torch.tensor(0.0, device=device)
+            n_spec = 0
+            for b in range(B):
+                surf_b = surf_mask[b]
+                if surf_b.sum() < 16:
+                    continue
+                surf_idx = surf_b.nonzero(as_tuple=True)[0]
+                x_coord = x[b, surf_idx, 0]
+                sort_order = x_coord.argsort()
+                pred_surf_p = pred[b, surf_idx[sort_order], 2]
+                tgt_surf_p = y_norm[b, surf_idx[sort_order], 2]
+                pred_fft = torch.fft.rfft(pred_surf_p)
+                tgt_fft = torch.fft.rfft(tgt_surf_p)
+                n_modes = min(cfg.spectral_n_modes, len(pred_fft))
+                spec_err = (pred_fft[:n_modes] - tgt_fft[:n_modes]).abs()
+                mode_weights = 1.0 / torch.arange(1, n_modes + 1, device=device).float()
+                spec_loss = spec_loss + (spec_err * mode_weights).mean()
+                n_spec += 1
+            if n_spec > 0:
+                spec_loss = spec_loss / n_spec
+                _spectral_loss_val = spec_loss.item()
+                loss = loss + cfg.spectral_weight * spec_loss
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -1431,8 +1465,9 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            spectral_shared = cfg.spectral_weight * spec_loss * 0.5 if (cfg.spectral_surface_loss and n_spec > 0) else 0.0
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + spectral_shared
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + spectral_shared
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -1505,7 +1540,10 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.spectral_surface_loss:
+            _log_dict["train/spectral_loss"] = _spectral_loss_val
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -1863,8 +1901,12 @@ if best_metrics:
     elif ema_model is not None:
         vis_model = ema_model
     else:
-        vis_model = model
-    vis_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        vis_model = _base_model
+    if hasattr(vis_model, '_orig_mod'):
+        vis_model = vis_model._orig_mod
+    _ckpt = torch.load(model_path, map_location=device, weights_only=True)
+    _stripped = {k.replace("_orig_mod.", "", 1) if k.startswith("_orig_mod.") else k: v for k, v in _ckpt.items()}
+    vis_model.load_state_dict(_stripped)
     vis_model.eval()
     plot_dir = Path("plots") / run.id
     n = 1 if cfg.debug else 4
@@ -1888,7 +1930,8 @@ if best_metrics:
                 xy_min = raw_xy.amin(dim=1, keepdim=True)
                 xy_max = raw_xy.amax(dim=1, keepdim=True)
                 xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                freqs = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
+                _vm = vis_model._orig_mod if hasattr(vis_model, '_orig_mod') else vis_model
+                freqs = torch.cat([_vm.fourier_freqs_fixed.to(device), _vm.fourier_freqs_learned.abs()])
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                 x_n = torch.cat([x_n, fourier_pe], dim=-1)
@@ -1910,7 +1953,44 @@ if best_metrics:
                     else:
                         y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
             samples.append((x[:, :2], y_true, y_pred, is_surface))
-        images = visualize(samples, out_dir=plot_dir / split_name)
+        _plot_dir = plot_dir / split_name
+        _plot_dir.mkdir(parents=True, exist_ok=True)
+        images = []
+        for si, (pos_t, yt, yp, is_surf_t) in enumerate(samples):
+            pos_np, yt_np, yp_np = pos_t.numpy(), yt.numpy(), yp.numpy()
+            is_surf_np = is_surf_t.numpy().astype(bool)
+            surf_pos = pos_np[is_surf_np]
+            x_lo, x_hi, y_lo, y_hi, near = _get_view_bounds(pos_np, surf_pos)
+            px, py = pos_np[near, 0], pos_np[near, 1]
+            gt_vmag = np.sqrt(yt_np[near, 0]**2 + yt_np[near, 1]**2)
+            pr_vmag = np.sqrt(yp_np[near, 0]**2 + yp_np[near, 1]**2)
+            fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+            fig.suptitle(f"{split_name} sample {si}", fontsize=14)
+            vv = (gt_vmag.min(), gt_vmag.max())
+            _scatter_field(axes[0, 0], fig, px, py, gt_vmag, cmap="viridis", vmin=vv[0], vmax=vv[1])
+            axes[0, 0].set_title("|U| GT")
+            _scatter_field(axes[0, 1], fig, px, py, pr_vmag, cmap="viridis", vmin=vv[0], vmax=vv[1])
+            axes[0, 1].set_title("|U| Pred")
+            ev = gt_vmag - pr_vmag
+            evm = max(abs(ev.min()), abs(ev.max()), 1e-6)
+            _scatter_field(axes[0, 2], fig, px, py, ev, cmap="RdBu_r", vmin=-evm, vmax=evm)
+            axes[0, 2].set_title("|U| Error")
+            vp = (yt_np[near, 2].min(), yt_np[near, 2].max())
+            _scatter_field(axes[1, 0], fig, px, py, yt_np[near, 2], cmap="RdBu_r", vmin=vp[0], vmax=vp[1])
+            axes[1, 0].set_title("p GT")
+            _scatter_field(axes[1, 1], fig, px, py, yp_np[near, 2], cmap="RdBu_r", vmin=vp[0], vmax=vp[1])
+            axes[1, 1].set_title("p Pred")
+            ep = yt_np[near, 2] - yp_np[near, 2]
+            epm = max(abs(ep.min()), abs(ep.max()), 1e-6)
+            _scatter_field(axes[1, 2], fig, px, py, ep, cmap="RdBu_r", vmin=-epm, vmax=epm)
+            axes[1, 2].set_title("p Error")
+            for ax in axes.flat:
+                _setup_ax(ax, x_lo, x_hi, y_lo, y_hi, surf_pos)
+            plt.tight_layout()
+            _path = _plot_dir / f"val_sample_{si}.png"
+            fig.savefig(_path, dpi=200)
+            plt.close(fig)
+            images.append(_path)
         if images:
             wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
 
