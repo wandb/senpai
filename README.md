@@ -65,10 +65,11 @@ senpai/
 │   ├── program.md                 #   Research context, metrics, constraints
 │   ├── data/                      #   Data pipeline and benchmark splits
 │   └── instructions/              #   Role-specific Claude Code instructions
-│       ├── CLAUDE-ADVISOR.md      #     Advisor workflow
-│       ├── CLAUDE-STUDENT.md      #     Student workflow
-│       ├── prompt-advisor.md      #     Advisor prompt template
-│       └── prompt-student.md      #     Student prompt template
+│       ├── prompt-advisor.md      #     Task-specific Advisor prompt template
+│       └── prompt-student.md      #     Task-specific Student prompt template
+├── system_instructions/           # System-level Claude Code instructions
+│   ├── CLAUDE-ADVISOR.md          #     System-level Advisor workflow
+│   └── CLAUDE-STUDENT.md          #     System-level Student workflow
 ├── k8s/                           # Kubernetes deployment (problem-agnostic)
 │   ├── launch.py                  #   Deploy advisor + student pods
 │   ├── advisor-deployment.yaml    #   Advisor pod spec (CPU only)
@@ -77,9 +78,9 @@ senpai/
 │   └── entrypoint-student.sh      #   Student startup script
 ├── Dockerfile                     # ML container with Claude Code + tools
 └── .claude/                       # Claude Code skills and agents
-    ├── skills/wandb-primary/      #   W&B + Weave queries
-    ├── skills/list-experiments/   #   Experiment history
-    └── agents/researcher-agent.md #   Deep literature research
+    ├── skills/wandb-primary/      #   W&B + Weave queries skill
+    ├── skills/list-experiments/   #   Experiment history skill
+    └── agents/researcher-agent.md #   Deep literature research agent
 ```
 
 ## Configuration
