@@ -25,6 +25,10 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,7 +41,7 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import simple_parsing as sp
 
-from data.utils import visualize
+from data.utils import _scatter_field, _add_quiver, _setup_ax, _get_view_bounds
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
 
 torch.set_float32_matmul_precision('high')
@@ -747,6 +751,16 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: Physics-Informed Loss + TTA + Gradient Penalty
+    physics_loss: bool = False
+    physics_div_weight: float = 0.1
+    physics_nopen_weight: float = 0.05
+    physics_ramp_start: int = 20       # epoch to start ramping physics loss
+    physics_ramp_end: int = 80         # epoch to reach full physics loss weight
+    tta: bool = False
+    tta_n_aug: int = 3                 # augmentations (1=yflip, 3=yflip+2aoa, 5=yflip+4aoa)
+    grad_penalty: bool = False
+    grad_penalty_weight: float = 0.01
 
 
 cfg = sp.parse(Config)
@@ -803,6 +817,142 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 1:2] = y_p[:, :, 1:2].clamp(-10, 10) * Umag
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
+
+
+def compute_physics_loss(pred_cp, raw_pos, raw_dsdf, mask, is_surface, k=8, n_sample=512):
+    """Compute divergence-free and no-penetration physics losses in Cp space.
+
+    Args:
+        pred_cp: [B, N, 3] predictions in Cp space (Ux/Umag, Uy/Umag, p/q) — WITH grad
+        raw_pos: [B, N, 2] raw node positions (before standardization) — no grad needed
+        raw_dsdf: [B, N, 8] raw dsdf features (SDF gradient ≈ surface normal)
+        mask: [B, N] valid node mask
+        is_surface: [B, N] surface node mask
+    Returns:
+        div_loss, nopen_loss: scalar losses
+    """
+    B, N, _ = raw_pos.shape
+    device = raw_pos.device
+
+    # --- No-penetration loss: U_pred · n ≈ 0 at surface nodes ---
+    dsdf_grad = raw_dsdf[:, :, 0:2]  # [B, N, 2] — SDF gradient ≈ outward normal
+    n_mag = dsdf_grad.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    n_hat = dsdf_grad / n_mag
+    U_pred = pred_cp[:, :, :2]  # [B, N, 2]
+    U_n = (U_pred * n_hat).sum(dim=-1)  # [B, N] — normal velocity component
+    surf_valid = is_surface & mask
+    n_surf = surf_valid.float().sum().clamp(min=1)
+    nopen_loss = (U_n.abs() * surf_valid.float()).sum() / n_surf
+
+    # --- Divergence loss: dUx/dx + dUy/dy ≈ 0 via k-NN LSQ gradient ---
+    total_div = torch.tensor(0.0, device=device)
+    total_div_count = 0
+
+    for b in range(B):
+        valid = mask[b]
+        valid_idx = valid.nonzero(as_tuple=True)[0]
+        n_valid = valid_idx.shape[0]
+        if n_valid < k + 2:
+            continue
+
+        n_q = min(n_sample, n_valid)
+        perm = torch.randperm(n_valid, device=device)[:n_q]
+        q_idx = valid_idx[perm]
+
+        q_pos = raw_pos[b, q_idx]        # [n_q, 2]
+        q_pred = pred_cp[b, q_idx]       # [n_q, 3] — has grad
+        all_pos = raw_pos[b, valid_idx]  # [n_valid, 2]
+        all_pred = pred_cp[b, valid_idx] # [n_valid, 3] — has grad
+
+        # k-NN indices (no grad needed for integer indices)
+        with torch.no_grad():
+            dists = torch.cdist(q_pos.unsqueeze(0), all_pos.unsqueeze(0)).squeeze(0)
+            _, knn_local = dists.topk(k + 1, dim=-1, largest=False)
+            knn_local = knn_local[:, 1:]  # [n_q, k] — skip self
+
+        # Gather neighbor values (WITH grad flow)
+        nb_pos = all_pos[knn_local]    # [n_q, k, 2]
+        nb_pred = all_pred[knn_local]  # [n_q, k, 3]
+
+        dx = nb_pos - q_pos.unsqueeze(1)    # [n_q, k, 2]
+        df = nb_pred - q_pred.unsqueeze(1)  # [n_q, k, 3]
+
+        # 2×2 normal equations for LSQ gradient
+        A11 = (dx[:, :, 0] ** 2).sum(1)
+        A12 = (dx[:, :, 0] * dx[:, :, 1]).sum(1)
+        A22 = (dx[:, :, 1] ** 2).sum(1)
+        det = (A11 * A22 - A12 ** 2).clamp(min=1e-10)
+
+        # dUx/dx and dUy/dy
+        bx0 = (dx[:, :, 0] * df[:, :, 0]).sum(1)
+        bx1 = (dx[:, :, 1] * df[:, :, 0]).sum(1)
+        by0 = (dx[:, :, 0] * df[:, :, 1]).sum(1)
+        by1 = (dx[:, :, 1] * df[:, :, 1]).sum(1)
+
+        dUx_dx = (A22 * bx0 - A12 * bx1) / det
+        dUy_dy = (-A12 * by0 + A11 * by1) / det
+
+        div = (dUx_dx + dUy_dy).abs()
+        total_div = total_div + div.sum()
+        total_div_count += n_q
+
+    div_loss = total_div / max(total_div_count, 1)
+    return div_loss, nopen_loss
+
+
+def compute_gradient_penalty(pred_cp, raw_pos, mask, k=8, n_sample=256):
+    """Spatial smoothness penalty: penalize large spatial gradients of all prediction channels.
+
+    Returns:
+        gp_loss: scalar, mean |grad(pred)|^2 over sampled nodes
+    """
+    B, N, _ = raw_pos.shape
+    device = raw_pos.device
+    total_gp = torch.tensor(0.0, device=device)
+    total_count = 0
+
+    for b in range(B):
+        valid = mask[b]
+        valid_idx = valid.nonzero(as_tuple=True)[0]
+        n_valid = valid_idx.shape[0]
+        if n_valid < k + 2:
+            continue
+
+        n_q = min(n_sample, n_valid)
+        perm = torch.randperm(n_valid, device=device)[:n_q]
+        q_idx = valid_idx[perm]
+
+        q_pos = raw_pos[b, q_idx]
+        q_pred = pred_cp[b, q_idx]
+        all_pos = raw_pos[b, valid_idx]
+        all_pred = pred_cp[b, valid_idx]
+
+        with torch.no_grad():
+            dists = torch.cdist(q_pos.unsqueeze(0), all_pos.unsqueeze(0)).squeeze(0)
+            _, knn_local = dists.topk(k + 1, dim=-1, largest=False)
+            knn_local = knn_local[:, 1:]
+
+        nb_pos = all_pos[knn_local]
+        nb_pred = all_pred[knn_local]
+
+        dx = nb_pos - q_pos.unsqueeze(1)
+        df = nb_pred - q_pred.unsqueeze(1)
+
+        A11 = (dx[:, :, 0] ** 2).sum(1)
+        A12 = (dx[:, :, 0] * dx[:, :, 1]).sum(1)
+        A22 = (dx[:, :, 1] ** 2).sum(1)
+        det = (A11 * A22 - A12 ** 2).clamp(min=1e-10)
+
+        for c in range(3):
+            b1 = (dx[:, :, 0] * df[:, :, c]).sum(1)
+            b2 = (dx[:, :, 1] * df[:, :, c]).sum(1)
+            dfdx = (A22 * b1 - A12 * b2) / det
+            dfdy = (-A12 * b1 + A11 * b2) / det
+            total_gp = total_gp + (dfdx ** 2 + dfdy ** 2).sum()
+        total_count += n_q * 3
+
+    return total_gp / max(total_count, 1)
+
 
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
@@ -1207,6 +1357,7 @@ for epoch in range(MAX_EPOCHS):
                     is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
+        raw_pos = x[:, :, :2].clone()  # save raw positions for physics loss
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         x = (x - stats["x_mean"]) / stats["x_std"]
@@ -1287,6 +1438,7 @@ for epoch in range(MAX_EPOCHS):
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
         pred = pred.float()
+        pred_raw = pred  # save raw model output for physics loss (before per-sample std)
         re_pred = re_pred.float()
         aoa_pred = aoa_pred.float()
         if model.training and not cfg.no_perstd and not cfg.raw_targets:
@@ -1415,6 +1567,31 @@ for epoch in range(MAX_EPOCHS):
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
 
+        # Physics-informed loss + gradient penalty
+        _physics_loss_total = None
+        _div_loss_val = 0.0
+        _nopen_loss_val = 0.0
+        _grad_pen_total = None
+        _grad_pen_val = 0.0
+        if (cfg.physics_loss or cfg.grad_penalty) and batch_idx % 4 == 0:
+            # Compute pred in Cp space (differentiable path from model output)
+            pred_cp = pred_raw * phys_stats["y_std"] + phys_stats["y_mean"]
+            if cfg.physics_loss:
+                physics_ramp = max(0.0, min(1.0, (epoch - cfg.physics_ramp_start) / max(cfg.physics_ramp_end - cfg.physics_ramp_start, 1)))
+                if physics_ramp > 0:
+                    div_loss, nopen_loss = compute_physics_loss(pred_cp, raw_pos, raw_dsdf, mask, is_surface)
+                    _physics_loss_total = (cfg.physics_div_weight * div_loss + cfg.physics_nopen_weight * nopen_loss) * physics_ramp
+                    _div_loss_val = div_loss.item()
+                    _nopen_loss_val = nopen_loss.item()
+                    loss = loss + _physics_loss_total
+            if cfg.grad_penalty:
+                grad_ramp = max(0.0, min(1.0, (epoch - 30) / 50.0))
+                if grad_ramp > 0:
+                    gp_loss = compute_gradient_penalty(pred_cp, raw_pos, mask)
+                    _grad_pen_total = cfg.grad_penalty_weight * gp_loss * grad_ramp
+                    _grad_pen_val = gp_loss.item()
+                    loss = loss + _grad_pen_total
+
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
@@ -1431,8 +1608,10 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            physics_shared = _physics_loss_total * 0.5 if _physics_loss_total is not None else 0.0
+            grad_pen_shared = _grad_pen_total * 0.5 if _grad_pen_total is not None else 0.0
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + physics_shared + grad_pen_shared
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + physics_shared + grad_pen_shared
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -1505,7 +1684,13 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.physics_loss:
+            _log_dict["train/div_loss"] = _div_loss_val
+            _log_dict["train/nopen_loss"] = _nopen_loss_val
+        if cfg.grad_penalty:
+            _log_dict["train/grad_penalty"] = _grad_pen_val
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -1591,6 +1776,28 @@ for epoch in range(MAX_EPOCHS):
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
+    def _preprocess_val(x_raw, is_surf_batch):
+        """Preprocess raw features for validation: standardize + curv + dist + fourier PE."""
+        _raw_dsdf = x_raw[:, :, 2:10]
+        _dist_surf = _raw_dsdf.abs().min(dim=-1, keepdim=True).values
+        _dist_feat = torch.log1p(_dist_surf * 10.0)
+        _x = (x_raw - stats["x_mean"]) / stats["x_std"]
+        _curv = _x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_batch.float().unsqueeze(-1)
+        if cfg.foil2_dist:
+            _f2d = torch.log1p(_raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+            _x = torch.cat([_x, _curv, _dist_feat, _f2d], dim=-1)
+        else:
+            _x = torch.cat([_x, _curv, _dist_feat], dim=-1)
+        _raw_xy = _x[:, :, :2]
+        _xy_min = _raw_xy.amin(dim=1, keepdim=True)
+        _xy_max = _raw_xy.amax(dim=1, keepdim=True)
+        _xy_norm = (_raw_xy - _xy_min) / (_xy_max - _xy_min + 1e-8)
+        _freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+        _xy_sc = _xy_norm.unsqueeze(-1) * _freqs
+        _fpe = torch.cat([_xy_sc.sin().flatten(-2), _xy_sc.cos().flatten(-2)], dim=-1)
+        _x = torch.cat([_x, _fpe], dim=-1)
+        return _x
+
     for split_name, vloader in val_loaders.items():
         val_vol = 0.0
         val_surf = 0.0
@@ -1608,27 +1815,8 @@ for epoch in range(MAX_EPOCHS):
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
 
-                raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
-                dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
-                dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
-                x = (x - stats["x_mean"]) / stats["x_std"]
-                # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
-                curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
-                if cfg.foil2_dist:
-                    foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
-                    x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
-                else:
-                    x = torch.cat([x, curv, dist_feat], dim=-1)
-                # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
-                raw_xy = x[:, :, :2]
-                # Normalize xy to [0,1] per-sample for consistent Fourier encoding
-                xy_min = raw_xy.amin(dim=1, keepdim=True)
-                xy_max = raw_xy.amax(dim=1, keepdim=True)
-                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-                xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
-                x = torch.cat([x, fourier_pe], dim=-1)
+                x_raw = x.clone()  # save raw features for TTA
+                x = _preprocess_val(x_raw, is_surface)
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
@@ -1667,9 +1855,65 @@ for epoch in range(MAX_EPOCHS):
                 else:
                     y_norm_scaled = y_norm / sample_stds
 
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
-                pred = pred.float()
+                # --- Model forward (with optional TTA) ---
+                if cfg.tta:
+                    _tta_preds_cp = []
+                    _y_std = phys_stats["y_std"]
+                    _y_mean = phys_stats["y_mean"]
+
+                    # Original prediction
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _p0 = eval_model({"x": x})["preds"].float()
+                    _tta_preds_cp.append(_p0 * _y_std + _y_mean)
+
+                    # Y-flip augmentation
+                    _xf = x_raw.clone()
+                    _xf[:, :, 1:2] = -_xf[:, :, 1:2]  # flip y position
+                    for _fi in [3, 5, 7, 9]:             # flip dsdf y-components
+                        _xf[:, :, _fi:_fi+1] = -_xf[:, :, _fi:_fi+1]
+                    _xf_proc = _preprocess_val(_xf, is_surface)
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _pf = eval_model({"x": _xf_proc})["preds"].float()
+                    _pf_cp = _pf * _y_std + _y_mean
+                    _pf_cp[:, :, 1:2] = -_pf_cp[:, :, 1:2]  # un-flip Uy in Cp space
+                    _tta_preds_cp.append(_pf_cp)
+
+                    # AoA perturbations (if tta_n_aug > 1)
+                    if cfg.tta_n_aug > 1:
+                        _n_aoa = cfg.tta_n_aug - 1
+                        _aoa_angles = [0.5, -0.5, 0.25, -0.25][:_n_aoa]
+                        for _adeg in _aoa_angles:
+                            _arad = _adeg * (torch.pi / 180.0)
+                            _ca = torch.cos(torch.tensor(_arad, device=device))
+                            _sa = torch.sin(torch.tensor(_arad, device=device))
+                            _xr = x_raw.clone()
+                            # Rotate positions
+                            _xc, _yc = _xr[:, :, 0:1].clone(), _xr[:, :, 1:2].clone()
+                            _xr[:, :, 0:1] = _ca * _xc - _sa * _yc
+                            _xr[:, :, 1:2] = _sa * _xc + _ca * _yc
+                            # Rotate dsdf/saf gradient pairs
+                            for _xi, _yi in [(2, 3), (4, 5), (6, 7), (8, 9)]:
+                                _dx = _xr[:, :, _xi:_xi+1].clone()
+                                _dy = _xr[:, :, _yi:_yi+1].clone()
+                                _xr[:, :, _xi:_xi+1] = _ca * _dx - _sa * _dy
+                                _xr[:, :, _yi:_yi+1] = _sa * _dx + _ca * _dy
+                            _xr_proc = _preprocess_val(_xr, is_surface)
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                _pr = eval_model({"x": _xr_proc})["preds"].float()
+                            _pr_cp = _pr * _y_std + _y_mean
+                            # Inverse-rotate velocity back: R(-theta)
+                            _ux, _uy = _pr_cp[:, :, 0:1].clone(), _pr_cp[:, :, 1:2].clone()
+                            _pr_cp[:, :, 0:1] = _ca * _ux + _sa * _uy
+                            _pr_cp[:, :, 1:2] = -_sa * _ux + _ca * _uy
+                            _tta_preds_cp.append(_pr_cp)
+
+                    # Average in Cp space, convert back to model output space
+                    _avg_cp = torch.stack(_tta_preds_cp).mean(dim=0)
+                    pred = (_avg_cp - _y_mean) / _y_std
+                else:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        pred = eval_model({"x": x})["preds"]
+                    pred = pred.float()
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
                 else:
@@ -1863,8 +2107,14 @@ if best_metrics:
     elif ema_model is not None:
         vis_model = ema_model
     else:
-        vis_model = model
-    vis_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        vis_model = _base_model  # use uncompiled model to avoid torch.compile shape issues
+    # Always unwrap torch.compile if present (e.g. swa/ema models could be compiled in future)
+    if hasattr(vis_model, '_orig_mod'):
+        vis_model = vis_model._orig_mod
+    # Load checkpoint, stripping _orig_mod. prefix if saved from compiled model
+    _ckpt = torch.load(model_path, map_location=device, weights_only=True)
+    _stripped = {k.replace("_orig_mod.", "", 1) if k.startswith("_orig_mod.") else k: v for k, v in _ckpt.items()}
+    vis_model.load_state_dict(_stripped)
     vis_model.eval()
     plot_dir = Path("plots") / run.id
     n = 1 if cfg.debug else 4
@@ -1877,11 +2127,7 @@ if best_metrics:
                 y_dev = y_true.unsqueeze(0).to(device)
                 is_surf_dev = is_surface.unsqueeze(0).to(device)
                 mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
-                x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
-                curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
-                dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
-                dist_feat = torch.log1p(dist_surf * 10.0)
-                x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                x_n = _preprocess_val(x_dev, is_surf_dev)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 if cfg.raw_targets:
@@ -1900,7 +2146,52 @@ if best_metrics:
                     else:
                         y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
             samples.append((x[:, :2], y_true, y_pred, is_surface))
-        images = visualize(samples, out_dir=plot_dir / split_name)
+        # Inline visualization of pre-computed samples
+        _plot_dir = plot_dir / split_name
+        _plot_dir.mkdir(parents=True, exist_ok=True)
+        images = []
+        for si, (pos_t, yt, yp, is_surf_t) in enumerate(samples):
+            pos_np = pos_t.numpy()
+            yt_np = yt.numpy()
+            yp_np = yp.numpy()
+            is_surf_np = is_surf_t.numpy().astype(bool)
+            surf_pos = pos_np[is_surf_np]
+            x_lo, x_hi, y_lo, y_hi, near = _get_view_bounds(pos_np, surf_pos)
+            px, py = pos_np[near, 0], pos_np[near, 1]
+            gt_ux, gt_uy, gt_p = yt_np[near, 0], yt_np[near, 1], yt_np[near, 2]
+            pr_ux, pr_uy, pr_p = yp_np[near, 0], yp_np[near, 1], yp_np[near, 2]
+            gt_vmag = np.sqrt(gt_ux**2 + gt_uy**2)
+            pr_vmag = np.sqrt(pr_ux**2 + pr_uy**2)
+            err_vmag = gt_vmag - pr_vmag
+            err_p = gt_p - pr_p
+            fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+            fig.suptitle(f"{split_name} sample {si}", fontsize=14)
+            vmin_v, vmax_v = gt_vmag.min(), gt_vmag.max()
+            _scatter_field(axes[0, 0], fig, px, py, gt_vmag, cmap="viridis", vmin=vmin_v, vmax=vmax_v)
+            axes[0, 0].set_title("|U| — Ground Truth")
+            _add_quiver(axes[0, 0], px, py, gt_ux, gt_uy)
+            _scatter_field(axes[0, 1], fig, px, py, pr_vmag, cmap="viridis", vmin=vmin_v, vmax=vmax_v)
+            axes[0, 1].set_title("|U| — Predicted")
+            _add_quiver(axes[0, 1], px, py, pr_ux, pr_uy)
+            err_v_max = max(abs(err_vmag.min()), abs(err_vmag.max()), 1e-6)
+            _scatter_field(axes[0, 2], fig, px, py, err_vmag, cmap="RdBu_r", vmin=-err_v_max, vmax=err_v_max)
+            axes[0, 2].set_title("|U| — Error")
+            vmin_p, vmax_p = gt_p.min(), gt_p.max()
+            _scatter_field(axes[1, 0], fig, px, py, gt_p, cmap="RdBu_r", vmin=vmin_p, vmax=vmax_p)
+            axes[1, 0].set_title("p — Ground Truth")
+            _scatter_field(axes[1, 1], fig, px, py, pr_p, cmap="RdBu_r", vmin=vmin_p, vmax=vmax_p)
+            axes[1, 1].set_title("p — Predicted")
+            err_p_max = max(abs(err_p.min()), abs(err_p.max()), 1e-6)
+            _scatter_field(axes[1, 2], fig, px, py, err_p, cmap="RdBu_r", vmin=-err_p_max, vmax=err_p_max)
+            axes[1, 2].set_title("p — Error")
+            for ax in axes.flat:
+                _setup_ax(ax, x_lo, x_hi, y_lo, y_hi, surf_pos)
+            plt.tight_layout()
+            _path = _plot_dir / f"val_sample_{si}.png"
+            fig.savefig(_path, dpi=200)
+            plt.close(fig)
+            images.append(_path)
+            print(f"  Saved {_path}")
         if images:
             wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
 
