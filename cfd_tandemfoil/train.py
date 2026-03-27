@@ -1820,7 +1820,7 @@ for epoch in range(MAX_EPOCHS):
         elif ema_model is not None:
             save_model = ema_model
         else:
-            save_model = model
+            save_model = _base_model
         torch.save(save_model.state_dict(), model_path)
         tag = f" * -> {model_path}"
 
@@ -1854,64 +1854,71 @@ if best_metrics:
     wandb.summary.update({"best_" + k: v for k, v in best_metrics.items()})
 
     print("\nGenerating flow field plots...")
-    if cfg.swa_cyclic and swa_cyclic_model is not None:
-        vis_model = swa_cyclic_model
-    elif cfg.snapshot_ensemble and snapshot_avg_model is not None:
-        vis_model = snapshot_avg_model
-    elif cfg.swa and swa_model is not None:
-        vis_model = swa_model
-    elif ema_model is not None:
-        vis_model = ema_model
-    else:
-        vis_model = model
-    vis_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-    vis_model.eval()
-    plot_dir = Path("plots") / run.id
-    n = 1 if cfg.debug else 4
-    for split_name, split_ds in val_splits.items():
-        samples = []
-        for i in range(min(n, len(split_ds))):
-            x, y_true, is_surface = split_ds[i]
-            with torch.no_grad():
-                x_dev = x.unsqueeze(0).to(device)
-                y_dev = y_true.unsqueeze(0).to(device)
-                is_surf_dev = is_surface.unsqueeze(0).to(device)
-                mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
-                raw_dsdf = x_dev[:, :, 2:10]
-                dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
-                dist_feat = torch.log1p(dist_surf * 10.0)
-                x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
-                curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
-                x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
-                # Fourier PE (must match training loop)
-                raw_xy = x_n[:, :, :2]
-                xy_min = raw_xy.amin(dim=1, keepdim=True)
-                xy_max = raw_xy.amax(dim=1, keepdim=True)
-                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                freqs = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
-                xy_scaled = xy_norm.unsqueeze(-1) * freqs
-                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
-                x_n = torch.cat([x_n, fourier_pe], dim=-1)
-                Umag, q = _umag_q(y_dev, mask)
-                pred = vis_model({"x": x_n})["preds"].float()
-                if cfg.raw_targets:
-                    y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
-                else:
-                    pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
-                    if cfg.log_pressure:
-                        pred_phys = pred_phys.clone()
-                        pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
-                    if cfg.tight_denorm_clamps:
-                        _pd = pred_phys.clone()
-                        _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
-                        _pd[:, :, 1:2] = pred_phys[:, :, 1:2].clamp(-5, 5) * Umag
-                        _pd[:, :, 2:3] = pred_phys[:, :, 2:3].clamp(-10, 10) * q
-                        y_pred = _pd.squeeze(0).cpu()
+    try:
+        if cfg.swa_cyclic and swa_cyclic_model is not None:
+            vis_model = swa_cyclic_model
+        elif cfg.snapshot_ensemble and snapshot_avg_model is not None:
+            vis_model = snapshot_avg_model
+        elif cfg.swa and swa_model is not None:
+            vis_model = swa_model
+        elif ema_model is not None:
+            vis_model = ema_model
+        else:
+            vis_model = _base_model
+        _sd = torch.load(model_path, map_location=device, weights_only=True)
+        # Strip _orig_mod. prefix from torch.compile state_dict keys if needed
+        _sd = {k.removeprefix("_orig_mod."): v for k, v in _sd.items()}
+        vis_model.load_state_dict(_sd)
+        vis_model.eval()
+        plot_dir = Path("plots") / run.id
+        n = 1 if cfg.debug else 4
+        for split_name, split_ds in val_splits.items():
+            samples = []
+            for i in range(min(n, len(split_ds))):
+                x, y_true, is_surface = split_ds[i]
+                with torch.no_grad():
+                    x_dev = x.unsqueeze(0).to(device)
+                    y_dev = y_true.unsqueeze(0).to(device)
+                    is_surf_dev = is_surface.unsqueeze(0).to(device)
+                    mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
+                    raw_dsdf = x_dev[:, :, 2:10]
+                    dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+                    dist_feat = torch.log1p(dist_surf * 10.0)
+                    x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
+                    curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
+                    x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                    # Fourier PE (must match training loop)
+                    raw_xy = x_n[:, :, :2]
+                    xy_min = raw_xy.amin(dim=1, keepdim=True)
+                    xy_max = raw_xy.amax(dim=1, keepdim=True)
+                    xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                    freqs = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
+                    xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                    fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                    x_n = torch.cat([x_n, fourier_pe], dim=-1)
+                    Umag, q = _umag_q(y_dev, mask)
+                    pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
+                    if cfg.raw_targets:
+                        y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                     else:
-                        y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
-            samples.append((x[:, :2], y_true, y_pred, is_surface))
-        images = visualize(samples, out_dir=plot_dir / split_name)
-        if images:
-            wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+                        pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                        if cfg.log_pressure:
+                            pred_phys = pred_phys.clone()
+                            pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
+                        if cfg.tight_denorm_clamps:
+                            _pd = pred_phys.clone()
+                            _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
+                            _pd[:, :, 1:2] = pred_phys[:, :, 1:2].clamp(-5, 5) * Umag
+                            _pd[:, :, 2:3] = pred_phys[:, :, 2:3].clamp(-10, 10) * q
+                            y_pred = _pd.squeeze(0).cpu()
+                        else:
+                            y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
+                samples.append((x[:, :2], y_true, y_pred, is_surface))
+            images = visualize(samples, out_dir=plot_dir / split_name)
+            if images:
+                wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    except Exception as e:
+        print(f"Warning: flow field visualization failed: {e}")
+        wandb.alert(title="Vis failed", text=str(e)[:200], level="WARN")
 
 wandb.finish()
