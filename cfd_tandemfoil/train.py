@@ -747,6 +747,9 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: Kitchen sink compound flags
+    disable_pcgrad: bool = False       # disable PCGrad (use simple combined loss)
+    val_every: int = 1                 # validate every N epochs (2 = skip every other)
 
 
 cfg = sp.parse(Config)
@@ -1419,7 +1422,7 @@ for epoch in range(MAX_EPOCHS):
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
         is_indist_pcgrad = ~is_ood_pcgrad
-        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
+        use_pcgrad = (not cfg.disable_pcgrad) and is_indist_pcgrad.any() and is_ood_pcgrad.any()
 
         if use_pcgrad:
             n_a = is_indist_pcgrad.float().sum().clamp(min=1)
@@ -1576,6 +1579,16 @@ for epoch in range(MAX_EPOCHS):
                     sa[k].mul_((snapshot_n - 1) / snapshot_n).add_(snap[k].to(device) / snapshot_n)
 
     # --- Validate across all splits ---
+    _skip_val = (cfg.val_every > 1 and (epoch + 1) % cfg.val_every != 0
+                 and epoch < MAX_EPOCHS - 1)  # always validate last epoch
+    if _skip_val:
+        dt = time.time() - t0
+        wandb.log({"train/vol_loss": epoch_vol, "train/surf_loss": epoch_surf,
+                    "lr": scheduler.get_last_lr()[0], "epoch_time_s": dt,
+                    "global_step": global_step})
+        print(f"Epoch {epoch+1:3d} ({dt:.0f}s)  train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  [val skipped]")
+        continue
+
     if cfg.swa_cyclic and swa_cyclic_model is not None:
         eval_model = swa_cyclic_model
     elif cfg.snapshot_ensemble and snapshot_avg_model is not None:
