@@ -20,6 +20,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     Tandem surface loss is therefore underweighted.
 """
 
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -626,8 +627,12 @@ class Transolver(nn.Module):
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
-        for block in self.blocks[:-1]:
+        _denoise_feat = None
+        _denoise_block = data.get("_denoise_after") if isinstance(data, Mapping) else None
+        for block_idx, block in enumerate(self.blocks[:-1]):
             fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+            if _denoise_block is not None and block_idx == _denoise_block:
+                _denoise_feat = fx.clone()
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
@@ -639,7 +644,10 @@ class Transolver(nn.Module):
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+        result = {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+        if _denoise_feat is not None:
+            result["denoise_feat"] = _denoise_feat
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -754,6 +762,11 @@ class Config:
     vol_subsample_frac: float = 1.0     # fraction of volume nodes in loss after vol_ramp (0.8 = 80%)
     compile_mode: str = "default"       # torch.compile mode: "default", "max-autotune", "reduce-overhead"
     num_workers: int = 4                # data loader workers
+    # Phase 4: Denoising auxiliary loss
+    denoise_aux: bool = False           # denoising score matching on intermediate features
+    denoise_weight: float = 0.05        # weight of denoising loss
+    denoise_noise_scale: float = 0.1    # noise scale for corruption
+    denoise_after_block: int = 1        # apply denoising after this block index (0-indexed)
 
 
 cfg = sp.parse(Config)
@@ -906,6 +919,16 @@ model_config = dict(
 )
 
 model = Transolver(**model_config).to(device)
+
+# Denoising auxiliary head (separate from main model for clean gradient flow)
+denoise_head = None
+if cfg.denoise_aux:
+    denoise_head = nn.Sequential(
+        nn.Linear(cfg.n_hidden, cfg.n_hidden), nn.GELU(),
+        nn.Linear(cfg.n_hidden, cfg.n_hidden),
+    ).to(device)
+    denoise_head = torch.compile(denoise_head, mode=cfg.compile_mode)
+
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
@@ -1036,17 +1059,18 @@ class Lookahead:
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
+_param_groups = [
+    {'params': attn_params, 'lr': _base_lr * 0.5},
+    {'params': other_params, 'lr': _base_lr},
+]
+if cfg.denoise_aux and denoise_head is not None:
+    _dh = denoise_head._orig_mod if hasattr(denoise_head, '_orig_mod') else denoise_head
+    _param_groups.append({'params': list(_dh.parameters()), 'lr': _base_lr})
 if cfg.use_lion:
-    base_opt = Lion([
-        {'params': attn_params, 'lr': _base_lr * 0.5},
-        {'params': other_params, 'lr': _base_lr}
-    ], weight_decay=cfg.weight_decay)
+    base_opt = Lion(_param_groups, weight_decay=cfg.weight_decay)
     optimizer = base_opt  # Lion has its own momentum; skip Lookahead
 else:
-    base_opt = torch.optim.AdamW([
-        {'params': attn_params, 'lr': _base_lr * 0.5},
-        {'params': other_params, 'lr': _base_lr}
-    ], weight_decay=cfg.weight_decay)
+    base_opt = torch.optim.AdamW(_param_groups, weight_decay=cfg.weight_decay)
     if cfg.use_lookahead:
         optimizer = Lookahead(base_opt, k=10, alpha=0.8)
     else:
@@ -1288,8 +1312,12 @@ for epoch in range(MAX_EPOCHS):
             else:
                 y_norm = y_norm / sample_stds
 
+        _model_input = {"x": x}
+        if cfg.denoise_aux and model.training:
+            _model_input["_denoise_after"] = cfg.denoise_after_block
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model(_model_input)
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -1420,6 +1448,18 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # Denoising auxiliary loss: score matching on intermediate features
+        _denoise_loss = torch.tensor(0.0, device=device)
+        if cfg.denoise_aux and model.training and "denoise_feat" in out:
+            fx_clean = out["denoise_feat"].detach().float()  # stop gradient to backbone
+            eps = torch.randn_like(fx_clean) * cfg.denoise_noise_scale
+            _alpha = 0.9
+            fx_noisy = math.sqrt(_alpha) * fx_clean + math.sqrt(1 - _alpha) * eps
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                eps_pred = denoise_head(fx_noisy)
+            _denoise_loss = F.mse_loss(eps_pred.float(), eps)
+            loss = loss + cfg.denoise_weight * _denoise_loss
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -1520,7 +1560,10 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _train_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.denoise_aux:
+            _train_log["train/denoise_loss"] = _denoise_loss.item()
+        wandb.log(_train_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
