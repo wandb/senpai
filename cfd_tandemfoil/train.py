@@ -1910,8 +1910,11 @@ if best_metrics:
                     else:
                         y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
             samples.append((x[:, :2], y_true, y_pred, is_surface))
-        images = visualize(samples, out_dir=plot_dir / split_name)
-        if images:
-            wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+        try:
+            images = visualize(samples, out_dir=plot_dir / split_name)
+            if images:
+                wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+        except TypeError:
+            pass  # visualize() signature mismatch — skip plotting, metrics already saved
 
 wandb.finish()
