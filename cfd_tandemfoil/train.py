@@ -37,7 +37,11 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import simple_parsing as sp
 
-from data.utils import visualize
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+from data.utils import _scatter_field, _add_quiver, _setup_ax, _get_view_bounds
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
 
 torch.set_float32_matmul_precision('high')
@@ -754,6 +758,11 @@ class Config:
     vol_subsample_frac: float = 1.0     # fraction of volume nodes in loss after vol_ramp (0.8 = 80%)
     compile_mode: str = "default"       # torch.compile mode: "default", "max-autotune", "reduce-overhead"
     num_workers: int = 4                # data loader workers
+    # Phase 4: Variance loss + Smooth MAE
+    smooth_l1: bool = False
+    smooth_l1_beta: float = 0.1
+    variance_loss: bool = False
+    variance_weight: float = 0.1
 
 
 cfg = sp.parse(Config)
@@ -1302,7 +1311,10 @@ for epoch in range(MAX_EPOCHS):
             else:
                 pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
-        abs_err = (pred - y_norm).abs()
+        if cfg.smooth_l1:
+            abs_err = F.smooth_l1_loss(pred, y_norm, reduction='none', beta=cfg.smooth_l1_beta)
+        else:
+            abs_err = (pred - y_norm).abs()
         if cfg.tandem_ramp:
             pass  # no hard curriculum; tandem_weight applied via tandem_boost below
         elif epoch < cfg.tandem_curriculum_epochs:
@@ -1420,6 +1432,23 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # Variance loss: penalize spatial variance of surface pressure errors
+        _var_loss_val = 0.0
+        if cfg.variance_loss:
+            var_penalty = torch.tensor(0.0, device=device)
+            n_var = 0
+            surf_p_err = (pred[:, :, 2:3] - y_norm[:, :, 2:3]).abs()
+            for b in range(B):
+                valid = surf_mask[b]
+                if valid.sum() > 10:
+                    err_b = surf_p_err[b, valid, 0]
+                    var_penalty = var_penalty + err_b.var()
+                    n_var += 1
+            if n_var > 0:
+                var_penalty = var_penalty / n_var
+                _var_loss_val = var_penalty.item()
+                loss = loss + cfg.variance_weight * var_penalty
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -1520,7 +1549,10 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.variance_loss:
+            _log_dict["train/variance_loss"] = _var_loss_val
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -1943,7 +1975,44 @@ if best_metrics:
                         else:
                             y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
                 samples.append((x[:, :2], y_true, y_pred, is_surface))
-            images = visualize(samples, out_dir=plot_dir / split_name)
+            _plot_dir = plot_dir / split_name
+            _plot_dir.mkdir(parents=True, exist_ok=True)
+            images = []
+            for si, (pos_t, yt, yp, is_surf_t) in enumerate(samples):
+                pos_np, yt_np, yp_np = pos_t.numpy(), yt.numpy(), yp.numpy()
+                is_surf_np = is_surf_t.numpy().astype(bool)
+                surf_pos = pos_np[is_surf_np]
+                x_lo, x_hi, y_lo, y_hi, near = _get_view_bounds(pos_np, surf_pos)
+                px, py = pos_np[near, 0], pos_np[near, 1]
+                gt_vmag = np.sqrt(yt_np[near, 0]**2 + yt_np[near, 1]**2)
+                pr_vmag = np.sqrt(yp_np[near, 0]**2 + yp_np[near, 1]**2)
+                fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+                fig.suptitle(f"{split_name} sample {si}", fontsize=14)
+                vv = (gt_vmag.min(), gt_vmag.max())
+                _scatter_field(axes[0, 0], fig, px, py, gt_vmag, cmap="viridis", vmin=vv[0], vmax=vv[1])
+                axes[0, 0].set_title("|U| GT")
+                _scatter_field(axes[0, 1], fig, px, py, pr_vmag, cmap="viridis", vmin=vv[0], vmax=vv[1])
+                axes[0, 1].set_title("|U| Pred")
+                ev = gt_vmag - pr_vmag
+                evm = max(abs(ev.min()), abs(ev.max()), 1e-6)
+                _scatter_field(axes[0, 2], fig, px, py, ev, cmap="RdBu_r", vmin=-evm, vmax=evm)
+                axes[0, 2].set_title("|U| Error")
+                vp = (yt_np[near, 2].min(), yt_np[near, 2].max())
+                _scatter_field(axes[1, 0], fig, px, py, yt_np[near, 2], cmap="RdBu_r", vmin=vp[0], vmax=vp[1])
+                axes[1, 0].set_title("p GT")
+                _scatter_field(axes[1, 1], fig, px, py, yp_np[near, 2], cmap="RdBu_r", vmin=vp[0], vmax=vp[1])
+                axes[1, 1].set_title("p Pred")
+                ep = yt_np[near, 2] - yp_np[near, 2]
+                epm = max(abs(ep.min()), abs(ep.max()), 1e-6)
+                _scatter_field(axes[1, 2], fig, px, py, ep, cmap="RdBu_r", vmin=-epm, vmax=epm)
+                axes[1, 2].set_title("p Error")
+                for ax in axes.flat:
+                    _setup_ax(ax, x_lo, x_hi, y_lo, y_hi, surf_pos)
+                plt.tight_layout()
+                _path = _plot_dir / f"val_sample_{si}.png"
+                fig.savefig(_path, dpi=200)
+                plt.close(fig)
+                images.append(_path)
             if images:
                 wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
     except Exception as e:
