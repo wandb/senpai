@@ -279,6 +279,7 @@ class TransolverBlock(nn.Module):
         dln_zeroinit=False,
         domain_velhead=False,
         prog_slices=False,
+        geo_cross_attn=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -289,6 +290,7 @@ class TransolverBlock(nn.Module):
         self.adaln_all = adaln_all
         self.film_cond = film_cond
         self.domain_layernorm = domain_layernorm
+        self.geo_cross_attn = geo_cross_attn
         _LN = (lambda d: DomainLayerNorm(d, zeroinit=dln_zeroinit)) if domain_layernorm else nn.LayerNorm
         self.ln_1 = _LN(hidden_dim)
         self.attn = Physics_Attention_Irregular_Mesh(
@@ -335,6 +337,13 @@ class TransolverBlock(nn.Module):
         self.se_fc2 = nn.Linear(hidden_dim // 4, hidden_dim)
         nn.init.zeros_(self.se_fc2.weight)
         nn.init.zeros_(self.se_fc2.bias)
+        if geo_cross_attn:
+            # Geometry cross-attention: Q from fx, K/V from geometry context tokens
+            self.geo_ln = nn.LayerNorm(hidden_dim)
+            self.geo_q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+            self.geo_k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+            self.geo_v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+            self.geo_gate = nn.Parameter(torch.zeros(1))  # zero-init: starts as identity
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
             if soft_moe:
@@ -370,7 +379,7 @@ class TransolverBlock(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None, geo_context=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         # DomainLayerNorm helper: pass is_tandem when enabled, else plain call
         dln_it = (tandem_mask.view(-1) > 0.5) if (self.domain_layernorm and tandem_mask is not None) else None
@@ -396,6 +405,17 @@ class TransolverBlock(nn.Module):
             film_out = self.film_net(condition)  # [B, H*2]
             gamma, beta = film_out.chunk(2, dim=-1)  # each [B, H]
             fx = gamma.unsqueeze(1) * fx + beta.unsqueeze(1)
+        if self.geo_cross_attn and geo_context is not None:
+            # Cross-attend to geometry context tokens [B, K, D]
+            fx_ln = self.geo_ln(fx)
+            Q = self.geo_q_proj(fx_ln)       # [B, N, D]
+            K = self.geo_k_proj(geo_context)  # [B, K, D]
+            V = self.geo_v_proj(geo_context)  # [B, K, D]
+            D = Q.shape[-1]
+            attn = torch.matmul(Q, K.transpose(-2, -1)) / (D ** 0.5)  # [B, N, K]
+            attn = F.softmax(attn, dim=-1)
+            geo_out = torch.matmul(attn, V)   # [B, N, D]
+            fx = fx + self.geo_gate * geo_out  # zero-init gate
         if self.last_layer:
             fx_ln = self.ln_3(fx)
             if self.soft_moe:
@@ -453,6 +473,8 @@ class Transolver(nn.Module):
         dln_zeroinit=False,
         domain_velhead=False,
         prog_slices=False,
+        geo_cross_attn=False,
+        geo_n_tokens=2,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -463,6 +485,8 @@ class Transolver(nn.Module):
         self.adaln_4cond = adaln_4cond
         self.film_cond = film_cond
         self.adaln_zone_temp = adaln_zone_temp
+        self.geo_cross_attn = geo_cross_attn
+        self.geo_n_tokens = geo_n_tokens
         if output_fields is None or output_dims is None:
             raise ValueError("output_fields and output_dims must be provided")
         if len(output_fields) != len(output_dims):
@@ -519,10 +543,20 @@ class Transolver(nn.Module):
                     dln_zeroinit=dln_zeroinit,
                     domain_velhead=domain_velhead if (idx == n_layers - 1) else False,
                     prog_slices=prog_slices,
+                    geo_cross_attn=geo_cross_attn,
                 )
                 for idx in range(n_layers)
             ]
         )
+        if geo_cross_attn:
+            # Geometry context: project flow conditions to D-dim token
+            self.geo_cond_proj = nn.Linear(10, n_hidden)  # Re, AoA, NACA, AoA1, gap, stagger (10 dims)
+            if geo_n_tokens >= 4:
+                # Additional volume mean token projection
+                self.geo_vol_proj = nn.Linear(n_hidden, n_hidden)
+            if geo_n_tokens >= 8:
+                # Learned query tokens for extra context
+                self.geo_learned_queries = nn.Parameter(torch.randn(1, geo_n_tokens - 4, n_hidden) * 0.02)
         self.initialize_weights()
         self.out_skip = nn.Linear(n_hidden, out_dim)
         nn.init.zeros_(self.out_skip.weight)
@@ -573,14 +607,15 @@ class Transolver(nn.Module):
         x = data.get("x")
         pos = data.get("pos", pos)
         condition = data.get("condition", condition)
-        return x, pos, condition
+        is_surface = data.get("is_surface")
+        return x, pos, condition, is_surface
 
     def _validate_output_dims(self, preds):
         if sum(self.output_dims) != preds.shape[-1]:
             raise ValueError("Sum of output_dims must match preds last dimension")
 
     def forward(self, data, pos=None, condition=None):
-        x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
+        x, pos, condition, is_surface = self._unpack_inputs(data, pos=pos, condition=condition)
         if x is None:
             raise ValueError("Missing required input tensor: x")
         if condition is not None:
@@ -626,8 +661,41 @@ class Transolver(nn.Module):
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
+        # Compute geometry context tokens ONCE per forward pass
+        geo_context = None
+        if self.geo_cross_attn:
+            geo_tokens = []
+            # Token 1: surface feature mean [B, 1, D]
+            if is_surface is not None:
+                surf_mask_f = is_surface.float().unsqueeze(-1)  # [B, N, 1]
+                n_surf = surf_mask_f.sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1, 1]
+                geo_token_surf = (fx * surf_mask_f).sum(dim=1, keepdim=True) / n_surf  # [B, 1, D]
+            else:
+                geo_token_surf = fx.mean(dim=1, keepdim=True)  # fallback: all-node mean
+            geo_tokens.append(geo_token_surf)
+            # Token 2: condition embedding [B, 1, D]
+            cond_feats = x[:, 0, 13:23]  # Re, AoA, NACA, AoA1, gap, stagger (10 dims)
+            geo_token_cond = self.geo_cond_proj(cond_feats).unsqueeze(1)  # [B, 1, D]
+            geo_tokens.append(geo_token_cond)
+            if self.geo_n_tokens >= 4:
+                # Token 3: volume feature mean [B, 1, D]
+                if is_surface is not None:
+                    vol_mask_f = (1.0 - is_surface.float()).unsqueeze(-1)  # [B, N, 1]
+                    n_vol = vol_mask_f.sum(dim=1, keepdim=True).clamp(min=1)
+                    geo_token_vol = self.geo_vol_proj((fx * vol_mask_f).sum(dim=1, keepdim=True) / n_vol)
+                else:
+                    geo_token_vol = self.geo_vol_proj(fx.mean(dim=1, keepdim=True))
+                geo_tokens.append(geo_token_vol)
+                # Token 4: all-node mean [B, 1, D]
+                geo_tokens.append(fx.mean(dim=1, keepdim=True))
+            if self.geo_n_tokens >= 8:
+                # Learned query tokens [1, K-4, D] → expanded to [B, K-4, D]
+                B_size = fx.shape[0]
+                geo_tokens.append(self.geo_learned_queries.expand(B_size, -1, -1))
+            geo_context = torch.cat(geo_tokens, dim=1)  # [B, K, D]
+
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features, geo_context=geo_context)
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
@@ -635,7 +703,7 @@ class Transolver(nn.Module):
 
         # Last block: use adaln_all condition if enabled, else fallback to adaln_output
         last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features, geo_context=geo_context)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
@@ -747,6 +815,9 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: Geometry Cross-Attention (GeoTransolver-style)
+    geo_cross_attn: bool = False       # add cross-attention to geometry context tokens in every block
+    geo_n_tokens: int = 2              # number of geometry context tokens (2=surf+cond, 4+=add vol etc.)
 
 
 cfg = sp.parse(Config)
@@ -896,6 +967,8 @@ model_config = dict(
     dln_zeroinit=cfg.dln_zeroinit,
     domain_velhead=cfg.domain_velhead,
     prog_slices=cfg.prog_slices,
+    geo_cross_attn=cfg.geo_cross_attn,
+    geo_n_tokens=cfg.geo_n_tokens,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1282,7 +1355,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x, "is_surface": is_surface})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -1409,7 +1482,7 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x})
+                rdrop_out = model({"x": x, "is_surface": is_surface})
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -1474,7 +1547,7 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                out2 = model({"x": x, "is_surface": is_surface})
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -1668,7 +1741,7 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    pred = eval_model({"x": x, "is_surface": is_surface})["preds"]
                 pred = pred.float()
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
@@ -1801,6 +1874,11 @@ for epoch in range(MAX_EPOCHS):
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
+    # Log geo cross-attention gate values
+    if cfg.geo_cross_attn:
+        for i, blk in enumerate(_base_model.blocks):
+            if hasattr(blk, 'geo_gate'):
+                metrics[f"geo_gate/block_{i}"] = blk.geo_gate.item()
     wandb.log(metrics)
 
     if torch.cuda.is_available():
@@ -1820,7 +1898,7 @@ for epoch in range(MAX_EPOCHS):
         elif ema_model is not None:
             save_model = ema_model
         else:
-            save_model = model
+            save_model = _base_model  # use non-compiled model for consistent state_dict keys
         torch.save(save_model.state_dict(), model_path)
         tag = f" * -> {model_path}"
 
@@ -1863,7 +1941,7 @@ if best_metrics:
     elif ema_model is not None:
         vis_model = ema_model
     else:
-        vis_model = model
+        vis_model = _base_model  # use non-compiled model for visualization (handles dynamic shapes)
     vis_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     vis_model.eval()
     plot_dir = Path("plots") / run.id
@@ -1893,7 +1971,7 @@ if best_metrics:
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                 x_n = torch.cat([x_n, fourier_pe], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
-                pred = vis_model({"x": x_n})["preds"].float()
+                pred = vis_model({"x": x_n, "is_surface": is_surf_dev})["preds"].float()
                 if cfg.raw_targets:
                     y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                 else:
