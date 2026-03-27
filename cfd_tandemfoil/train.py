@@ -37,10 +37,114 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import simple_parsing as sp
 
-from data.utils import visualize
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
 
 torch.set_float32_matmul_precision('high')
+
+
+# ---------------------------------------------------------------------------
+# Visualization helper for pre-computed predictions
+# ---------------------------------------------------------------------------
+_VIS_POINT_SIZE = 0.5
+_VIS_QUIVER_STRIDE = 50
+
+
+def _visualize_precomputed(samples, out_dir):
+    """Plot flow field comparisons from pre-computed (pos, y_true, y_pred, is_surface) tuples.
+
+    Returns list of saved image paths.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saved = []
+
+    for idx, (pos_t, y_true_t, y_pred_t, is_surf_t) in enumerate(samples):
+        pos = pos_t.numpy() if torch.is_tensor(pos_t) else pos_t
+        y_true_np = y_true_t.numpy() if torch.is_tensor(y_true_t) else y_true_t
+        y_pred_np = y_pred_t.numpy() if torch.is_tensor(y_pred_t) else y_pred_t
+        is_surf_np = is_surf_t.numpy() if torch.is_tensor(is_surf_t) else is_surf_t
+        is_surf_np = is_surf_np.astype(bool)
+
+        surf_pos = pos[is_surf_np]
+        # View bounds
+        x_lo, x_hi = -1.0, 2.0
+        y_lo = max(0.0, pos[:, 1].min())
+        y_hi = min(surf_pos[:, 1].mean() + 3.0, pos[:, 1].max()) if len(surf_pos) > 0 else pos[:, 1].max()
+        near = (
+            (pos[:, 0] >= x_lo) & (pos[:, 0] <= x_hi) &
+            (pos[:, 1] >= y_lo) & (pos[:, 1] <= y_hi)
+        )
+        px, py = pos[near, 0], pos[near, 1]
+
+        gt_ux, gt_uy, gt_p = y_true_np[near, 0], y_true_np[near, 1], y_true_np[near, 2]
+        pr_ux, pr_uy, pr_p = y_pred_np[near, 0], y_pred_np[near, 1], y_pred_np[near, 2]
+        gt_vmag = np.sqrt(gt_ux**2 + gt_uy**2)
+        pr_vmag = np.sqrt(pr_ux**2 + pr_uy**2)
+        err_vmag = gt_vmag - pr_vmag
+        err_p = gt_p - pr_p
+
+        fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+        fig.suptitle(f"Validation sample {idx}", fontsize=14)
+
+        # Row 0: Velocity magnitude
+        vmin_v, vmax_v = gt_vmag.min(), gt_vmag.max()
+        for ax_idx, (vals, title) in enumerate([
+            (gt_vmag, "|U| — Ground Truth"),
+            (pr_vmag, "|U| — Predicted"),
+        ]):
+            sc = axes[0, ax_idx].scatter(px, py, c=vals, s=_VIS_POINT_SIZE, cmap="viridis",
+                                         vmin=vmin_v, vmax=vmax_v, edgecolors="none", rasterized=True)
+            fig.colorbar(sc, ax=axes[0, ax_idx])
+            axes[0, ax_idx].set_title(title)
+        # Quiver arrows on GT and Pred
+        for ax_idx, (ux, uy) in enumerate([(gt_ux, gt_uy), (pr_ux, pr_uy)]):
+            s = _VIS_QUIVER_STRIDE
+            axes[0, ax_idx].quiver(px[::s], py[::s], ux[::s], uy[::s],
+                                   angles="xy", scale_units="xy", scale=150, width=0.002,
+                                   color="k", alpha=0.4, headwidth=3)
+        # Error velocity
+        err_v_max = max(abs(err_vmag.min()), abs(err_vmag.max()), 1e-6)
+        sc = axes[0, 2].scatter(px, py, c=err_vmag, s=_VIS_POINT_SIZE, cmap="RdBu_r",
+                                vmin=-err_v_max, vmax=err_v_max, edgecolors="none", rasterized=True)
+        fig.colorbar(sc, ax=axes[0, 2])
+        axes[0, 2].set_title("|U| — Error")
+
+        # Row 1: Pressure
+        vmin_p, vmax_p = gt_p.min(), gt_p.max()
+        for ax_idx, (vals, title) in enumerate([
+            (gt_p, "p — Ground Truth"),
+            (pr_p, "p — Predicted"),
+        ]):
+            sc = axes[1, ax_idx].scatter(px, py, c=vals, s=_VIS_POINT_SIZE, cmap="RdBu_r",
+                                         vmin=vmin_p, vmax=vmax_p, edgecolors="none", rasterized=True)
+            fig.colorbar(sc, ax=axes[1, ax_idx])
+            axes[1, ax_idx].set_title(title)
+        err_p_max = max(abs(err_p.min()), abs(err_p.max()), 1e-6)
+        sc = axes[1, 2].scatter(px, py, c=err_p, s=_VIS_POINT_SIZE, cmap="RdBu_r",
+                                vmin=-err_p_max, vmax=err_p_max, edgecolors="none", rasterized=True)
+        fig.colorbar(sc, ax=axes[1, 2])
+        axes[1, 2].set_title("p — Error")
+
+        for ax in axes.flat:
+            ax.set_aspect("equal")
+            ax.set_xlim(x_lo, x_hi)
+            ax.set_ylim(y_lo, y_hi)
+            if len(surf_pos) > 0:
+                ax.plot(surf_pos[:, 0], surf_pos[:, 1], "k.", markersize=0.3)
+
+        plt.tight_layout()
+        path = out_dir / f"val_sample_{idx}.png"
+        fig.savefig(path, dpi=200)
+        plt.close(fig)
+        saved.append(path)
+        print(f"  Saved {path}")
+
+    return saved
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +751,126 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+class MultiScaleTransolver(nn.Module):
+    """Two-scale Transolver: coarse global + fine local processing.
+
+    Processes mesh at two resolutions:
+    1. Coarse branch: random subsample -> TransolverBlock (32 slices) -> kNN upsample
+    2. Fine branch: merge with coarse context -> 2 TransolverBlocks (full slices)
+    """
+
+    def __init__(self, coarse_subsample=4096, space_dim=2, n_hidden=192,
+                 n_head=3, fun_dim=56, out_dim=3, slice_num=96,
+                 domain_layernorm=False, dln_zeroinit=False,
+                 output_fields=None, output_dims=None, **kwargs):
+        super().__init__()
+        self.coarse_subsample = coarse_subsample
+        self.n_hidden = n_hidden
+        self.output_fields = output_fields or ["Ux", "Uy", "p"]
+        self.output_dims = output_dims or [1, 1, 1]
+
+        # Shared preprocessing (same as Transolver)
+        self.preprocess = GatedMLP2(fun_dim + space_dim, n_hidden * 2, n_hidden)
+        self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
+        nn.init.eye_(self.feature_cross.weight)
+        self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
+        self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
+
+        # Coarse branch: fewer slices for global context
+        self.coarse_block = TransolverBlock(
+            num_heads=n_head, hidden_dim=n_hidden, dropout=0.0, slice_num=32,
+            domain_layernorm=domain_layernorm, dln_zeroinit=dln_zeroinit,
+        )
+        self.upsample_proj = nn.Linear(n_hidden, n_hidden)
+
+        # Merge coarse + fine features
+        self.merge = nn.Linear(n_hidden * 2, n_hidden)
+
+        # Fine branch: full slice count
+        self.fine_block1 = TransolverBlock(
+            num_heads=n_head, hidden_dim=n_hidden, dropout=0.0, slice_num=slice_num,
+            domain_layernorm=domain_layernorm, dln_zeroinit=dln_zeroinit,
+        )
+        self.fine_block2 = TransolverBlock(
+            num_heads=n_head, hidden_dim=n_hidden, dropout=0.0, slice_num=slice_num,
+            domain_layernorm=domain_layernorm, dln_zeroinit=dln_zeroinit,
+            last_layer=True, out_dim=out_dim, field_decoder=True,
+        )
+
+        # Auxiliary heads (same as Transolver)
+        self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+
+        # Fourier frequencies (needed by training loop)
+        self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])
+        self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            if module.weight.dim() >= 2:
+                nn.init.orthogonal_(module.weight, gain=1.0)
+            else:
+                nn.init.normal_(module.weight, std=0.01)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, (nn.LayerNorm, nn.BatchNorm1d)):
+            nn.init.constant_(module.bias, 0)
+            nn.init.constant_(module.weight, 1.0)
+
+    def forward(self, data):
+        x = data['x']
+        B, N, D = x.shape
+
+        x_cross = x * self.feature_cross(x)
+        x = x + 0.1 * x_cross
+        raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)  # x, y, curv, dist
+        is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
+
+        fx = self.preprocess(x)
+        fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
+
+        # --- Coarse branch ---
+        K = min(self.coarse_subsample, N)
+        if self.training:
+            # Random subsampling (better than linspace for non-spatially-ordered meshes)
+            idx_coarse = torch.randperm(N, device=x.device)[:K].sort().values
+        else:
+            # Deterministic for eval reproducibility
+            idx_coarse = torch.linspace(0, N - 1, K, device=x.device).long()
+        idx_coarse = idx_coarse.unsqueeze(0).expand(B, -1)  # [B, K]
+
+        fx_coarse = fx.gather(1, idx_coarse.unsqueeze(-1).expand(-1, -1, self.n_hidden))
+        raw_xy_coarse = raw_xy.gather(1, idx_coarse.unsqueeze(-1).expand(-1, -1, 4))
+        fx_coarse = self.coarse_block(fx_coarse, raw_xy=raw_xy_coarse, tandem_mask=is_tandem)
+
+        # Upsample via nearest-neighbor scatter (single-op, torch.compile friendly)
+        fine_xy = x[:, :, :2]
+        coarse_xy = fine_xy.gather(1, idx_coarse.unsqueeze(-1).expand(-1, -1, 2))
+        dists = torch.cdist(fine_xy, coarse_xy)          # [B, N, K]
+        nearest = dists.argmin(dim=-1)                     # [B, N]
+        fx_coarse_proj = self.upsample_proj(fx_coarse)     # [B, K, H]
+        H = fx_coarse_proj.shape[-1]
+        fx_coarse_up = fx_coarse_proj.gather(
+            1, nearest.unsqueeze(-1).expand(-1, -1, H)
+        )  # [B, N, H]
+
+        # Merge coarse context with fine features
+        fx = self.merge(torch.cat([fx, fx_coarse_up], dim=-1))
+
+        # --- Fine branch ---
+        fx = self.fine_block1(fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+        re_pred = self.re_head(fx.mean(dim=1))
+        aoa_pred = self.aoa_head(fx.mean(dim=1))
+        fx = self.fine_block2(fx, raw_xy=raw_xy, tandem_mask=is_tandem)
+
+        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+
+
 MAX_TIMEOUT = 180.0  # minutes
 MAX_EPOCHS = 500
 
@@ -747,6 +971,9 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: Multi-Scale Hierarchical Processing + Augmentation
+    multiscale: bool = False               # use MultiScaleTransolver architecture
+    multiscale_coarse_k: int = 4096        # coarse branch subsample count
 
 
 cfg = sp.parse(Config)
@@ -898,7 +1125,12 @@ model_config = dict(
     prog_slices=cfg.prog_slices,
 )
 
-model = Transolver(**model_config).to(device)
+if cfg.multiscale:
+    model = MultiScaleTransolver(
+        coarse_subsample=cfg.multiscale_coarse_k, **model_config
+    ).to(device)
+else:
+    model = Transolver(**model_config).to(device)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode="default")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
@@ -1205,6 +1437,52 @@ for epoch in range(MAX_EPOCHS):
                     x[_b, _in_region] = x[_cut_idx[_b], _in_region]
                     y[_b, _in_region] = y[_cut_idx[_b], _in_region]
                     is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
+            # Phase 4: RandomErasing — zero out random input feature channels
+            if cfg.aug == "random_erase":
+                _B_aug, _N_aug, _D_aug = x.shape
+                for _b in range(_B_aug):
+                    _n_erase = torch.randint(1, 4, (1,)).item()
+                    _erase_dims = torch.randperm(_D_aug - 2, device=x.device)[:_n_erase] + 2
+                    x[_b, :, _erase_dims] = 0.0
+            # Phase 4: Spatial CutOut — zero features in a spatial region
+            if cfg.aug == "spatial_cutout":
+                _B_aug = x.size(0)
+                for _b in range(_B_aug):
+                    _cx = x[_b, :, 0].mean() + torch.randn(1, device=x.device) * x[_b, :, 0].std() * 0.5
+                    _cy = x[_b, :, 1].mean() + torch.randn(1, device=x.device) * x[_b, :, 1].std() * 0.5
+                    _r = 0.1 + torch.rand(1, device=x.device).item() * 0.3
+                    _cut_mask = ((x[_b, :, 0] - _cx) ** 2 + (x[_b, :, 1] - _cy) ** 2) < _r ** 2
+                    x[_b, _cut_mask, 2:] = 0.0  # zero features but keep position
+            # Phase 4: Style perturbation — shift/scale global statistics of targets
+            if cfg.aug == "style_perturb":
+                _B_aug, _N_aug, _C_aug = y.shape
+                for _b in range(_B_aug):
+                    _sp_scale = 1.0 + 0.05 * torch.randn(1, _C_aug, device=y.device)
+                    _sp_shift = 0.02 * torch.randn(1, _C_aug, device=y.device) * y[_b].std(dim=0, keepdim=True)
+                    y[_b] = y[_b] * _sp_scale + _sp_shift
+            # Phase 4: Random augmentation mix — randomly pick one of the 3 new augs per batch
+            if cfg.aug == "random_aug_mix":
+                _aug_choice = torch.randint(0, 3, (1,)).item()
+                _B_aug = x.size(0)
+                if _aug_choice == 0:  # random_erase
+                    _D_aug = x.shape[2]
+                    for _b in range(_B_aug):
+                        _n_erase = torch.randint(1, 4, (1,)).item()
+                        _erase_dims = torch.randperm(_D_aug - 2, device=x.device)[:_n_erase] + 2
+                        x[_b, :, _erase_dims] = 0.0
+                elif _aug_choice == 1:  # spatial_cutout
+                    for _b in range(_B_aug):
+                        _cx = x[_b, :, 0].mean() + torch.randn(1, device=x.device) * x[_b, :, 0].std() * 0.5
+                        _cy = x[_b, :, 1].mean() + torch.randn(1, device=x.device) * x[_b, :, 1].std() * 0.5
+                        _r = 0.1 + torch.rand(1, device=x.device).item() * 0.3
+                        _cut_mask = ((x[_b, :, 0] - _cx) ** 2 + (x[_b, :, 1] - _cy) ** 2) < _r ** 2
+                        x[_b, _cut_mask, 2:] = 0.0
+                else:  # style_perturb
+                    _C_aug = y.shape[2]
+                    for _b in range(_B_aug):
+                        _sp_scale = 1.0 + 0.05 * torch.randn(1, _C_aug, device=y.device)
+                        _sp_shift = 0.02 * torch.randn(1, _C_aug, device=y.device) * y[_b].std(dim=0, keepdim=True)
+                        y[_b] = y[_b] * _sp_scale + _sp_shift
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
@@ -1546,7 +1824,10 @@ for epoch in range(MAX_EPOCHS):
         )
     if epoch >= cfg.temp_anneal_epoch:
         with torch.no_grad():
-            _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
+            if hasattr(_base_model, 'blocks'):
+                _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
+            elif hasattr(_base_model, 'coarse_block'):
+                _base_model.coarse_block.attn.temperature.data.clamp_(max=0.25)
     if cfg.prog_slices:
         # Progressive slice warmup: ramp active slices from cfg.slice_num → prog_slices_end
         if epoch < cfg.prog_slices_epochs:
@@ -1863,8 +2144,11 @@ if best_metrics:
     elif ema_model is not None:
         vis_model = ema_model
     else:
-        vis_model = model
-    vis_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        vis_model = _base_model  # use uncompiled model for vis (compile can fail on single-sample shapes)
+    _ckpt = torch.load(model_path, map_location=device, weights_only=True)
+    # Strip _orig_mod. prefix from torch.compile'd checkpoints
+    _ckpt = {k.removeprefix("_orig_mod."): v for k, v in _ckpt.items()}
+    vis_model.load_state_dict(_ckpt)
     vis_model.eval()
     plot_dir = Path("plots") / run.id
     n = 1 if cfg.debug else 4
@@ -1877,21 +2161,23 @@ if best_metrics:
                 y_dev = y_true.unsqueeze(0).to(device)
                 is_surf_dev = is_surface.unsqueeze(0).to(device)
                 mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
-                raw_dsdf = x_dev[:, :, 2:10]
-                dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
-                dist_feat = torch.log1p(dist_surf * 10.0)
+                # Compute dist_feat from raw dsdf (before standardization)
+                _vis_raw_dsdf = x_dev[:, :, 2:10]
+                _vis_dist_surf = _vis_raw_dsdf.abs().min(dim=-1, keepdim=True).values
+                _vis_dist_feat = torch.log1p(_vis_dist_surf * 10.0)
                 x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                 curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
-                x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
-                # Fourier PE (must match training loop)
-                raw_xy = x_n[:, :, :2]
-                xy_min = raw_xy.amin(dim=1, keepdim=True)
-                xy_max = raw_xy.amax(dim=1, keepdim=True)
-                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                freqs = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
-                xy_scaled = xy_norm.unsqueeze(-1) * freqs
-                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
-                x_n = torch.cat([x_n, fourier_pe], dim=-1)
+                x_n = torch.cat([x_n, curv, _vis_dist_feat], dim=-1)
+                # Fourier positional encoding (must match training preprocessing)
+                _vis_raw_xy = x_n[:, :, :2]
+                _vis_xy_min = _vis_raw_xy.amin(dim=1, keepdim=True)
+                _vis_xy_max = _vis_raw_xy.amax(dim=1, keepdim=True)
+                _vis_xy_norm = (_vis_raw_xy - _vis_xy_min) / (_vis_xy_max - _vis_xy_min + 1e-8)
+                _vis_bm = vis_model._orig_mod if hasattr(vis_model, '_orig_mod') else vis_model
+                _vis_freqs = torch.cat([_vis_bm.fourier_freqs_fixed.to(device), _vis_bm.fourier_freqs_learned.abs()])
+                _vis_xy_scaled = _vis_xy_norm.unsqueeze(-1) * _vis_freqs
+                _vis_fourier_pe = torch.cat([_vis_xy_scaled.sin().flatten(-2), _vis_xy_scaled.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, _vis_fourier_pe], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 if cfg.raw_targets:
@@ -1910,7 +2196,7 @@ if best_metrics:
                     else:
                         y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
             samples.append((x[:, :2], y_true, y_pred, is_surface))
-        images = visualize(samples, out_dir=plot_dir / split_name)
+        images = _visualize_precomputed(samples, out_dir=plot_dir / split_name)
         if images:
             wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
 
