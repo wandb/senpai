@@ -642,6 +642,120 @@ class Transolver(nn.Module):
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
 
+class LatentNeuralOperator(Transolver):
+    """Encode-Process-Decode architecture with latent bottleneck.
+
+    Replaces TransolverBlocks 0-1 with:
+    - Encoder: cross-attention from M learnable latents to N node features
+    - Processor: self-attention layers on M latents
+    - Decoder: cross-attention from N nodes to M latents
+    Keeps the last TransolverBlock for output refinement with field_decoder.
+    """
+
+    def __init__(self, lno_latents=256, lno_proc_layers=4, **kwargs):
+        kwargs['n_layers'] = 3  # always 3 for LNO (encoder/decoder + output block)
+        super().__init__(**kwargs)
+        H = self.n_hidden
+        self.lno_latents = lno_latents
+
+        # Learnable latent tokens
+        self.latent_tokens = nn.Parameter(torch.randn(1, lno_latents, H) * 0.02)
+
+        # Encoder: cross-attention Q=latents, K/V=nodes
+        self.encoder_attn = nn.MultiheadAttention(H, num_heads=8, batch_first=True, dropout=0.0)
+        self.encoder_norm_q = nn.LayerNorm(H)
+        self.encoder_norm_kv = nn.LayerNorm(H)
+        self.encoder_ffn = nn.Sequential(nn.Linear(H, H * 2), nn.GELU(), nn.Linear(H * 2, H))
+        self.encoder_ffn_norm = nn.LayerNorm(H)
+
+        # Processor: self-attention layers on latents
+        self.proc_layers = nn.ModuleList()
+        for _ in range(lno_proc_layers):
+            self.proc_layers.append(nn.ModuleDict({
+                'attn': nn.MultiheadAttention(H, num_heads=8, batch_first=True, dropout=0.0),
+                'norm1': nn.LayerNorm(H),
+                'ffn': nn.Sequential(nn.Linear(H, H * 2), nn.GELU(), nn.Linear(H * 2, H)),
+                'norm2': nn.LayerNorm(H),
+            }))
+
+        # Decoder: cross-attention Q=nodes, K/V=latents
+        self.decoder_attn = nn.MultiheadAttention(H, num_heads=8, batch_first=True, dropout=0.0)
+        self.decoder_norm_q = nn.LayerNorm(H)
+        self.decoder_norm_kv = nn.LayerNorm(H)
+        self.decoder_ffn = nn.Sequential(nn.Linear(H, H * 2), nn.GELU(), nn.Linear(H * 2, H))
+        self.decoder_ffn_norm = nn.LayerNorm(H)
+
+        # Only keep the last TransolverBlock for output refinement
+        self.blocks = nn.ModuleList([self.blocks[-1]])
+
+    def forward(self, data, pos=None, condition=None):
+        x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
+        if x is None:
+            raise ValueError("Missing required input tensor: x")
+        if condition is not None:
+            raise ValueError("LatentNeuralOperator does not support conditioning inputs")
+
+        # Preprocessing (same as Transolver)
+        use_cond = self.adaln_all_blocks or self.film_cond
+        block_condition = None
+        if use_cond:
+            cond_2 = x[:, 0, 13:15]
+            block_condition = cond_2
+
+        zone_features = None
+        if self.adaln_zone_temp:
+            is_tandem_scalar = (x[:, 0, 21].abs() > 0.01).float()
+            gap_mag = x[:, 0, 21].abs()
+            re_feat = x[:, 0, 13]
+            zone_features = torch.stack([is_tandem_scalar, gap_mag, re_feat], dim=-1)
+
+        x_cross = x * self.feature_cross(x)
+        x = x + 0.1 * x_cross
+        raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)
+        is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
+
+        fx = self.preprocess(x)
+        fx_pre = fx
+        fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
+        B, N, H = fx.shape
+
+        # === Encode: compress N nodes → M latents via cross-attention ===
+        latents = self.latent_tokens.expand(B, -1, -1)  # [B, M, H]
+        q = self.encoder_norm_q(latents)
+        kv = self.encoder_norm_kv(fx)
+        enc_out, _ = self.encoder_attn(q, kv, kv)  # [B, M, H]
+        latents = latents + enc_out
+        latents = latents + self.encoder_ffn(self.encoder_ffn_norm(latents))
+
+        # === Process: self-attention on M latents ===
+        for layer in self.proc_layers:
+            z = layer['norm1'](latents)
+            z, _ = layer['attn'](z, z, z)
+            latents = latents + z
+            latents = latents + layer['ffn'](layer['norm2'](latents))
+
+        # === Decode: expand M latents → N nodes via cross-attention ===
+        q = self.decoder_norm_q(fx)
+        kv = self.decoder_norm_kv(latents)
+        dec_out, _ = self.decoder_attn(q, kv, kv)  # [B, N, H]
+        fx = fx + dec_out
+        fx = fx + self.decoder_ffn(self.decoder_ffn_norm(fx))
+
+        # Auxiliary heads
+        re_pred = self.re_head(fx.mean(dim=1))
+        aoa_pred = self.aoa_head(fx.mean(dim=1))
+
+        # Output refinement: last TransolverBlock with field_decoder
+        last_condition = block_condition if use_cond else (
+            x[:, 0, 13:15] if self.adaln_output else None)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem,
+                             condition=last_condition, zone_features=zone_features)
+        gate = self.skip_gate(fx_pre)
+        fx = fx + gate * self.out_skip(fx_pre)
+        self._validate_output_dims(fx)
+        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+
+
 # ---------------------------------------------------------------------------
 # End Transolver model
 # ---------------------------------------------------------------------------
@@ -751,6 +865,10 @@ class Config:
     # Phase 4: throughput optimization
     val_every: int = 1                  # validate every N epochs (1 = every epoch)
     disable_pcgrad: bool = False        # skip PCGrad dual-backward, use simple combined loss
+    # Phase 4: Latent Neural Operator
+    lno: bool = False                   # use Latent Neural Operator (encode-process-decode)
+    lno_latents: int = 256              # number of latent tokens
+    lno_proc_layers: int = 4            # number of self-attention processor layers
     vol_subsample_frac: float = 1.0     # fraction of volume nodes in loss after vol_ramp (0.8 = 80%)
     compile_mode: str = "default"       # torch.compile mode: "default", "max-autotune", "reduce-overhead"
     num_workers: int = 4                # data loader workers
@@ -905,7 +1023,15 @@ model_config = dict(
     prog_slices=cfg.prog_slices,
 )
 
-model = Transolver(**model_config).to(device)
+if cfg.lno:
+    model = LatentNeuralOperator(
+        lno_latents=cfg.lno_latents, lno_proc_layers=cfg.lno_proc_layers, **model_config
+    ).to(device)
+    model_config["lno"] = True
+    model_config["lno_latents"] = cfg.lno_latents
+    model_config["lno_proc_layers"] = cfg.lno_proc_layers
+else:
+    model = Transolver(**model_config).to(device)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
