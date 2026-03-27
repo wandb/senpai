@@ -748,6 +748,12 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: throughput optimization
+    val_every: int = 1                  # validate every N epochs (1 = every epoch)
+    disable_pcgrad: bool = False        # skip PCGrad dual-backward, use simple combined loss
+    vol_subsample_frac: float = 1.0     # fraction of volume nodes in loss after vol_ramp (0.8 = 80%)
+    compile_mode: str = "default"       # torch.compile mode: "default", "max-autotune", "reduce-overhead"
+    num_workers: int = 4                # data loader workers
 
 
 cfg = sp.parse(Config)
@@ -805,7 +811,7 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
 
-loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
+loader_kwargs = dict(collate_fn=pad_collate, num_workers=cfg.num_workers, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
 
 if cfg.debug:
@@ -901,7 +907,7 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
-model = torch.compile(model, mode="default")
+model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
@@ -1317,6 +1323,14 @@ for epoch in range(MAX_EPOCHS):
             vol_mask_train = torch.zeros_like(vol_mask)
             if n_keep > 0:
                 vol_mask_train[vol_indices[perm, 0], vol_indices[perm, 1]] = True
+        elif cfg.vol_subsample_frac < 1.0:
+            vol_indices = vol_mask.nonzero(as_tuple=False)
+            n_vol = vol_indices.shape[0]
+            n_keep = max(int(n_vol * cfg.vol_subsample_frac), 1)
+            perm = torch.randperm(n_vol, device=vol_mask.device)[:n_keep]
+            vol_mask_train = torch.zeros_like(vol_mask)
+            if n_keep > 0:
+                vol_mask_train[vol_indices[perm, 0], vol_indices[perm, 1]] = True
         else:
             vol_mask_train = vol_mask
 
@@ -1420,7 +1434,7 @@ for epoch in range(MAX_EPOCHS):
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
         is_indist_pcgrad = ~is_ood_pcgrad
-        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
+        use_pcgrad = (not cfg.disable_pcgrad) and is_indist_pcgrad.any() and is_ood_pcgrad.any()
 
         if use_pcgrad:
             n_a = is_indist_pcgrad.float().sum().clamp(min=1)
@@ -1577,6 +1591,19 @@ for epoch in range(MAX_EPOCHS):
                     sa[k].mul_((snapshot_n - 1) / snapshot_n).add_(snap[k].to(device) / snapshot_n)
 
     # --- Validate across all splits ---
+    _do_val = (epoch + 1) % cfg.val_every == 0 or epoch == 0 or epoch == MAX_EPOCHS - 1
+    if not _do_val:
+        dt = time.time() - t0
+        wandb.log({
+            "train/vol_loss": epoch_vol,
+            "train/surf_loss": epoch_surf,
+            "epoch_time_s": dt,
+            "lr": scheduler.get_last_lr()[0],
+            "global_step": global_step,
+        })
+        print(f"Epoch {epoch+1:3d} ({dt:.0f}s)  train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  [val skipped]")
+        continue
+
     if cfg.swa_cyclic and swa_cyclic_model is not None:
         eval_model = swa_cyclic_model
     elif cfg.snapshot_ensemble and snapshot_avg_model is not None:
@@ -1851,6 +1878,7 @@ if best_metrics:
 else:
     print("No completed epochs (timeout too short?).")
 
+wandb.summary.update({"total_epochs": epoch + 1, "total_time_min": total_time})
 if best_metrics:
     wandb.summary.update({"best_" + k: v for k, v in best_metrics.items()})
 
