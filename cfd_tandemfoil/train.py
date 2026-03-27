@@ -34,13 +34,116 @@ from dataclasses import dataclass, asdict
 from einops import rearrange
 from timm.layers import trunc_normal_
 from tqdm import tqdm
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 import simple_parsing as sp
 
 from data.utils import visualize
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
 
 torch.set_float32_matmul_precision('high')
+
+
+# ---------------------------------------------------------------------------
+# Synthetic Data Augmentation (Phase 4)
+# ---------------------------------------------------------------------------
+
+class SyntheticAugmentedDataset(Dataset):
+    """Wraps a base dataset and generates synthetic samples via condition-space interpolation.
+
+    For each base sample, finds its nearest neighbor in condition space
+    (log_Re, AoA0, NACA0_thickness, gap, stagger) and creates a synthetic
+    sample by interpolating features and targets with a random Beta-distributed weight.
+
+    Optionally:
+      - Add small Gaussian noise to interpolated samples (synthetic_noise > 0)
+      - Only augment tandem samples (tandem_only=True)
+    """
+
+    def __init__(self, base_dataset, augment_factor=2, seed=42,
+                 noise_std=0.0, tandem_only=False):
+        self.base = base_dataset
+        self.aug_factor = augment_factor
+        self.noise_std = noise_std
+        self.tandem_only = tandem_only
+        self.rng = torch.Generator().manual_seed(seed)
+        self.n_base = len(base_dataset)
+        self._build_condition_index()
+
+    def _build_condition_index(self):
+        """Extract condition vectors for neighbor matching."""
+        self.conditions = []
+        self.is_tandem_flags = []
+        for i in range(self.n_base):
+            x, y, is_surf = self.base[i]
+            # x layout: [pos(2), saf(2), dsdf(8), is_surface(1), log_Re(1),
+            #            AoA0_rad(1), NACA0(3), AoA1_rad(1), NACA1(3), gap(1), stagger(1)]
+            # Indices: log_Re=13, AoA0_rad=14, NACA0_thickness=15, gap=22, stagger=23
+            cond = torch.tensor([
+                x[0, 13].item(),  # log_Re
+                x[0, 14].item(),  # AoA0_rad
+                x[0, 15].item(),  # NACA0 thickness (3rd NACA digit)
+                x[0, 22].item(),  # gap
+                x[0, 23].item(),  # stagger
+            ])
+            self.conditions.append(cond)
+            self.is_tandem_flags.append(abs(x[0, 22].item()) > 0.01)  # gap != 0 -> tandem
+        self.conditions = torch.stack(self.conditions)  # [N_base, 5]
+        self.is_tandem_flags = torch.tensor(self.is_tandem_flags, dtype=torch.bool)
+        # Normalize for distance computation
+        self.cond_mean = self.conditions.mean(0)
+        self.cond_std = self.conditions.std(0).clamp(min=1e-6)
+        self.cond_norm = (self.conditions - self.cond_mean) / self.cond_std
+
+        # Pre-compute augmentable indices (all or tandem-only)
+        if self.tandem_only:
+            self.aug_indices = self.is_tandem_flags.nonzero(as_tuple=True)[0].tolist()
+        else:
+            self.aug_indices = list(range(self.n_base))
+        self.n_aug = len(self.aug_indices) * self.aug_factor
+
+    def __len__(self):
+        return self.n_base + self.n_aug
+
+    def __getitem__(self, idx):
+        if idx < self.n_base:
+            return self.base[idx]
+
+        # Map synthetic index to a base sample
+        aug_offset = idx - self.n_base
+        aug_list_idx = aug_offset % len(self.aug_indices)
+        base_idx = self.aug_indices[aug_list_idx]
+        x1, y1, is_surf1 = self.base[base_idx]
+
+        # Find nearest neighbor in condition space (excluding self)
+        dists = ((self.cond_norm[base_idx] - self.cond_norm) ** 2).sum(dim=-1)
+        dists[base_idx] = float('inf')
+        # If tandem_only, restrict neighbors to tandem samples too
+        if self.tandem_only:
+            non_tandem_mask = ~self.is_tandem_flags
+            dists[non_tandem_mask] = float('inf')
+        neighbor_idx = dists.argmin().item()
+        x2, y2, is_surf2 = self.base[neighbor_idx]
+
+        # Truncate to min length (different mesh sizes)
+        N = min(x1.shape[0], x2.shape[0])
+
+        # Interpolation weight (Beta distribution for diversity — bimodal)
+        alpha = torch.empty(1).uniform_(0.0, 1.0, generator=self.rng).item()
+        # Use beta-like sampling: transform uniform to beta(0.4,0.4) via inverse CDF approx
+        # Simpler: just use uniform but bias toward extremes
+        alpha = torch.distributions.Beta(0.4, 0.4).sample().item()
+
+        # Interpolate features and targets
+        x_synth = alpha * x1[:N] + (1 - alpha) * x2[:N]
+        y_synth = alpha * y1[:N] + (1 - alpha) * y2[:N]
+        is_surf_synth = is_surf1[:N] | is_surf2[:N]
+
+        # Optional noise injection
+        if self.noise_std > 0:
+            # Add noise to targets only (features should stay consistent)
+            y_synth = y_synth + self.noise_std * torch.randn_like(y_synth)
+
+        return x_synth, y_synth, is_surf_synth
 
 
 # ---------------------------------------------------------------------------
@@ -726,7 +829,7 @@ class Config:
     seed: int = -1                     # random seed (-1 = no seeding)
     n_layers: int = 2                  # number of TransolverBlocks (default 2)
     # Phase 3: data augmentation (training-only)
-    aug: str = "none"  # none|yflip|jitter|featdrop|mixup|scale|flip_jitter|aoa_perturb|cutmix
+    aug: str = "none"  # none|yflip|jitter|featdrop|mixup|scale|flip_jitter|aoa_perturb|cutmix|copy_paste_foil
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
@@ -747,6 +850,11 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: Synthetic data augmentation
+    augment_synthetic: bool = False     # wrap train set with SyntheticAugmentedDataset
+    synthetic_factor: int = 2           # number of synthetic copies per base sample
+    synthetic_noise: float = 0.0        # Gaussian noise std added to synthetic targets
+    synthetic_tandem_only: bool = False  # only augment tandem samples
 
 
 cfg = sp.parse(Config)
@@ -765,6 +873,35 @@ train_ds, val_splits, stats, sample_weights = load_data(
     cfg.manifest, cfg.stats_file, debug=cfg.debug,
 )
 stats = {k: v.to(device) for k, v in stats.items()}
+
+# Phase 4: Wrap training set with synthetic augmentation if enabled
+if cfg.augment_synthetic and not cfg.debug:
+    print(f"Wrapping training set with SyntheticAugmentedDataset "
+          f"(factor={cfg.synthetic_factor}, noise={cfg.synthetic_noise}, "
+          f"tandem_only={cfg.synthetic_tandem_only})")
+    orig_len = len(train_ds)
+    train_ds = SyntheticAugmentedDataset(
+        train_ds,
+        augment_factor=cfg.synthetic_factor,
+        seed=cfg.seed if cfg.seed >= 0 else 42,
+        noise_std=cfg.synthetic_noise,
+        tandem_only=cfg.synthetic_tandem_only,
+    )
+    # Extend sample_weights: base weights stay the same, synthetic get uniform weight
+    # Use mean of original weights for synthetic samples (balanced sampling)
+    synth_weight = sample_weights.mean().item()
+    synth_weights = torch.full((len(train_ds) - orig_len,), synth_weight, dtype=torch.float64)
+    sample_weights = torch.cat([sample_weights, synth_weights])
+    print(f"  Dataset: {orig_len} base + {len(train_ds) - orig_len} synthetic = {len(train_ds)} total")
+    wandb_extra_config = {
+        "synthetic_augmented": True,
+        "synthetic_factor": cfg.synthetic_factor,
+        "synthetic_noise": cfg.synthetic_noise,
+        "synthetic_tandem_only": cfg.synthetic_tandem_only,
+        "synthetic_total_samples": len(train_ds),
+    }
+else:
+    wandb_extra_config = {"synthetic_augmented": False}
 
 
 def _umag_q(y, mask):
@@ -1091,6 +1228,7 @@ run = wandb.init(
         "train_samples": len(train_ds),
         "val_samples": {k: len(v) for k, v in val_splits.items()},
         "split_manifest": cfg.manifest,
+        **wandb_extra_config,
     },
     mode=os.environ.get("WANDB_MODE", "online"),
 )
@@ -1205,6 +1343,44 @@ for epoch in range(MAX_EPOCHS):
                     x[_b, _in_region] = x[_cut_idx[_b], _in_region]
                     y[_b, _in_region] = y[_cut_idx[_b], _in_region]
                     is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
+            if cfg.aug == "copy_paste_foil":
+                # Copy-paste foil augmentation: for tandem samples, swap downstream
+                # surface region (foil 2) between pairs within the batch.
+                # Foil 2 is identified as surface nodes with x > median surface x.
+                _B_aug = x.size(0)
+                _is_tandem_aug = (x[:, 0, 22].abs() > 0.01)  # gap != 0 -> tandem
+                _tandem_ids = _is_tandem_aug.nonzero(as_tuple=True)[0]
+                if _tandem_ids.numel() >= 2:
+                    # Shuffle tandem samples for pairing
+                    _perm = _tandem_ids[torch.randperm(_tandem_ids.numel(), device=x.device)]
+                    for _i in range(0, _tandem_ids.numel() - 1, 2):
+                        _a, _b_idx = _perm[_i], _perm[_i + 1]
+                        # Identify foil-2 surface nodes: surface nodes with x > median(surface_x)
+                        for _src, _dst in [(_a, _b_idx), (_b_idx, _a)]:
+                            _surf_nodes = is_surface[_src] & mask[_src]
+                            if _surf_nodes.sum() < 4:
+                                continue
+                            _surf_x = x[_src, :, 0].clone()
+                            _surf_x[~_surf_nodes] = float('nan')
+                            _med_x = _surf_x.nanmedian()
+                            _foil2_mask = _surf_nodes & (x[_src, :, 0] > _med_x)
+                            _n_foil2 = _foil2_mask.sum().item()
+                            if _n_foil2 < 2:
+                                continue
+                            # Check if donor also has enough foil-2 nodes
+                            _surf_d = is_surface[_dst] & mask[_dst]
+                            _surf_d_x = x[_dst, :, 0].clone()
+                            _surf_d_x[~_surf_d] = float('nan')
+                            _med_d_x = _surf_d_x.nanmedian()
+                            _foil2_d_mask = _surf_d & (x[_dst, :, 0] > _med_d_x)
+                            _n_donor = min(_foil2_d_mask.sum().item(), _n_foil2)
+                            if _n_donor < 2:
+                                continue
+                            # Copy foil-2 features and targets from donor to source
+                            _src_idx = _foil2_mask.nonzero(as_tuple=True)[0][:_n_donor]
+                            _dst_idx = _foil2_d_mask.nonzero(as_tuple=True)[0][:_n_donor]
+                            x[_src, _src_idx] = x[_dst, _dst_idx]
+                            y[_src, _src_idx] = y[_dst, _dst_idx]
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
