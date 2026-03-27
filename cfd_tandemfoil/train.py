@@ -279,11 +279,16 @@ class TransolverBlock(nn.Module):
         dln_zeroinit=False,
         domain_velhead=False,
         prog_slices=False,
+        domain_heads=False,
+        domain_vel_heads=False,
+        domain_heads_wide=False,
     ):
         super().__init__()
         self.last_layer = last_layer
         self.field_decoder = field_decoder
         self.domain_velhead = domain_velhead
+        self.domain_heads = domain_heads
+        self.domain_vel_heads = domain_vel_heads
         self.adaln_output = adaln_output
         self.soft_moe = soft_moe
         self.adaln_all = adaln_all
@@ -353,6 +358,24 @@ class TransolverBlock(nn.Module):
                 self.velhead_tandem = nn.Sequential(
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
+            elif field_decoder and domain_heads:
+                _p_mid = hidden_dim * 3 if domain_heads_wide else hidden_dim * 2
+                self.pres_head_single = nn.Sequential(
+                    nn.Linear(hidden_dim, _p_mid), nn.GELU(), nn.Linear(_p_mid, 1))
+                self.pres_head_tandem = nn.Sequential(
+                    nn.Linear(hidden_dim, _p_mid), nn.GELU(), nn.Linear(_p_mid, 1))
+                self.pres_head_cruise = nn.Sequential(
+                    nn.Linear(hidden_dim, _p_mid), nn.GELU(), nn.Linear(_p_mid, 1))
+                if domain_vel_heads:
+                    self.vel_head_single = nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2))
+                    self.vel_head_tandem = nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2))
+                    self.vel_head_cruise = nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2))
+                else:
+                    self.vel_head = nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2))
             elif field_decoder:
                 self.vel_head = nn.Sequential(
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2)
@@ -370,7 +393,7 @@ class TransolverBlock(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None, domain_mask=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         # DomainLayerNorm helper: pass is_tandem when enabled, else plain call
         dln_it = (tandem_mask.view(-1) > 0.5) if (self.domain_layernorm and tandem_mask is not None) else None
@@ -408,6 +431,30 @@ class TransolverBlock(nn.Module):
                     is_tan = (tandem_mask.view(-1) > 0.5).view(-1, 1, 1)
                     return torch.where(is_tan.expand_as(out_s), out_t, out_s)
                 return out_s
+            elif self.field_decoder and self.domain_heads:
+                # Domain-specific pressure heads with routing
+                p_s = self.pres_head_single(fx_ln)  # [B, N, 1]
+                p_t = self.pres_head_tandem(fx_ln)
+                p_c = self.pres_head_cruise(fx_ln)
+                if domain_mask is not None:
+                    is_single = (domain_mask == 0).view(-1, 1, 1)  # [B, 1, 1]
+                    is_cruise = (domain_mask == 2).view(-1, 1, 1)
+                    p_pred = torch.where(is_single, p_s,
+                             torch.where(is_cruise, p_c, p_t))
+                else:
+                    p_pred = p_s  # fallback to single head
+                if self.domain_vel_heads:
+                    v_s = self.vel_head_single(fx_ln)
+                    v_t = self.vel_head_tandem(fx_ln)
+                    v_c = self.vel_head_cruise(fx_ln)
+                    if domain_mask is not None:
+                        v_pred = torch.where(is_single, v_s,
+                                 torch.where(is_cruise, v_c, v_t))
+                    else:
+                        v_pred = v_s
+                else:
+                    v_pred = self.vel_head(fx_ln)
+                return torch.cat([v_pred, p_pred], dim=-1)
             elif self.field_decoder:
                 return torch.cat([self.vel_head(fx_ln), self.pres_head(fx_ln)], dim=-1)
             elif self.adaln_output and condition is not None:
@@ -453,9 +500,13 @@ class Transolver(nn.Module):
         dln_zeroinit=False,
         domain_velhead=False,
         prog_slices=False,
+        domain_heads=False,
+        domain_vel_heads=False,
+        domain_heads_wide=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
+        self.domain_heads = domain_heads
         self.ref = ref
         self.unified_pos = unified_pos
         self.adaln_output = adaln_output
@@ -519,6 +570,9 @@ class Transolver(nn.Module):
                     dln_zeroinit=dln_zeroinit,
                     domain_velhead=domain_velhead if (idx == n_layers - 1) else False,
                     prog_slices=prog_slices,
+                    domain_heads=domain_heads if (idx == n_layers - 1) else False,
+                    domain_vel_heads=domain_vel_heads if (idx == n_layers - 1) else False,
+                    domain_heads_wide=domain_heads_wide if (idx == n_layers - 1) else False,
                 )
                 for idx in range(n_layers)
             ]
@@ -573,14 +627,15 @@ class Transolver(nn.Module):
         x = data.get("x")
         pos = data.get("pos", pos)
         condition = data.get("condition", condition)
-        return x, pos, condition
+        domain_mask = data.get("domain_mask")
+        return x, pos, condition, domain_mask
 
     def _validate_output_dims(self, preds):
         if sum(self.output_dims) != preds.shape[-1]:
             raise ValueError("Sum of output_dims must match preds last dimension")
 
     def forward(self, data, pos=None, condition=None):
-        x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
+        x, pos, condition, domain_mask = self._unpack_inputs(data, pos=pos, condition=condition)
         if x is None:
             raise ValueError("Missing required input tensor: x")
         if condition is not None:
@@ -635,7 +690,7 @@ class Transolver(nn.Module):
 
         # Last block: use adaln_all condition if enabled, else fallback to adaln_output
         last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features, domain_mask=domain_mask)
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
@@ -748,6 +803,11 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: domain-specific ensemble heads
+    domain_heads: bool = False         # 3 domain-specific pressure heads (single/tandem/cruise)
+    domain_vel_heads: bool = False     # also domain-specific velocity heads
+    domain_heads_wide: bool = False    # wider intermediate dim (hidden*3 vs hidden*2)
+    disable_pcgrad: bool = False       # disable PCGrad gradient projection
 
 
 cfg = sp.parse(Config)
@@ -897,6 +957,9 @@ model_config = dict(
     dln_zeroinit=cfg.dln_zeroinit,
     domain_velhead=cfg.domain_velhead,
     prog_slices=cfg.prog_slices,
+    domain_heads=cfg.domain_heads,
+    domain_vel_heads=cfg.domain_vel_heads,
+    domain_heads_wide=cfg.domain_heads_wide,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1207,6 +1270,18 @@ for epoch in range(MAX_EPOCHS):
                     y[_b, _in_region] = y[_cut_idx[_b], _in_region]
                     is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
 
+        # Domain routing (from raw features, before standardization)
+        if cfg.domain_heads:
+            _raw_gap = x[:, 0, 22]    # gap feature (raw, index 22)
+            _raw_lre = x[:, 0, 13]    # log_Re (raw, index 13)
+            _is_single = _raw_gap.abs() < 0.01
+            _is_cruise = (~_is_single) & (_raw_lre > 14.0)
+            domain_mask = torch.zeros(x.size(0), dtype=torch.long, device=device)
+            domain_mask[~_is_single & ~_is_cruise] = 1  # tandem racecar
+            domain_mask[_is_cruise] = 2  # cruise
+        else:
+            domain_mask = None
+
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
@@ -1283,7 +1358,10 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            _model_input = {"x": x}
+            if domain_mask is not None:
+                _model_input["domain_mask"] = domain_mask
+            out = model(_model_input)
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -1410,7 +1488,7 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x})
+                rdrop_out = model(_model_input)
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -1420,7 +1498,7 @@ for epoch in range(MAX_EPOCHS):
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
         is_indist_pcgrad = ~is_ood_pcgrad
-        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
+        use_pcgrad = (not cfg.disable_pcgrad) and is_indist_pcgrad.any() and is_ood_pcgrad.any()
 
         if use_pcgrad:
             n_a = is_indist_pcgrad.float().sum().clamp(min=1)
@@ -1475,7 +1553,7 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                out2 = model(_model_input)
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -1609,6 +1687,18 @@ for epoch in range(MAX_EPOCHS):
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
 
+                # Domain routing (from raw features)
+                if cfg.domain_heads:
+                    _raw_gap = x[:, 0, 22]
+                    _raw_lre = x[:, 0, 13]
+                    _is_single = _raw_gap.abs() < 0.01
+                    _is_cruise = (~_is_single) & (_raw_lre > 14.0)
+                    domain_mask = torch.zeros(x.size(0), dtype=torch.long, device=device)
+                    domain_mask[~_is_single & ~_is_cruise] = 1
+                    domain_mask[_is_cruise] = 2
+                else:
+                    domain_mask = None
+
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
@@ -1669,7 +1759,10 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    _val_input = {"x": x}
+                    if domain_mask is not None:
+                        _val_input["domain_mask"] = domain_mask
+                    pred = eval_model(_val_input)["preds"]
                 pred = pred.float()
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
@@ -1898,7 +1991,17 @@ if best_metrics:
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
-                    pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
+                    _vis_input = {"x": x_n, "mask": mask}
+                    if cfg.domain_heads:
+                        _vg = x_dev[:, 0, 22]
+                        _vr = x_dev[:, 0, 13]
+                        _vs = _vg.abs() < 0.01
+                        _vc = (~_vs) & (_vr > 14.0)
+                        _vdm = torch.zeros(1, dtype=torch.long, device=device)
+                        _vdm[~_vs & ~_vc] = 1
+                        _vdm[_vc] = 2
+                        _vis_input["domain_mask"] = _vdm
+                    pred = vis_model(_vis_input)["preds"].float()
                     if cfg.raw_targets:
                         y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                     else:
