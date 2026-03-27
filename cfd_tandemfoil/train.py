@@ -726,10 +726,13 @@ class Config:
     seed: int = -1                     # random seed (-1 = no seeding)
     n_layers: int = 2                  # number of TransolverBlocks (default 2)
     # Phase 3: data augmentation (training-only)
-    aug: str = "none"  # none|yflip|jitter|featdrop|mixup|scale|flip_jitter|aoa_perturb|cutmix
+    aug: str = "none"  # none|yflip|jitter|featdrop|mixup|scale|flip_jitter|aoa_perturb|cutmix|random_erase
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    aug_random_erase: bool = False   # compound: apply RandomErasing on top of any --aug
+    aug_random_erase_max: int = 3    # max features to erase per sample (1-3 default, 1 for mild)
+    aug_yflip: bool = False          # compound: apply y-flip on top of any --aug
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1148,7 +1151,8 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         # --- Data augmentation (training-only, applied before normalization) ---
-        if model.training and cfg.aug != "none" and epoch >= cfg.aug_start_epoch:
+        _has_aug = cfg.aug != "none" or cfg.aug_random_erase or cfg.aug_yflip
+        if model.training and _has_aug and epoch >= cfg.aug_start_epoch:
             if cfg.aug in ("yflip", "flip_jitter"):
                 _flip = torch.rand(x.size(0), 1, 1, device=x.device) < 0.5
                 x[:, :, 1:2] = torch.where(_flip, -x[:, :, 1:2], x[:, :, 1:2])
@@ -1205,6 +1209,21 @@ for epoch in range(MAX_EPOCHS):
                     x[_b, _in_region] = x[_cut_idx[_b], _in_region]
                     y[_b, _in_region] = y[_cut_idx[_b], _in_region]
                     is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
+            # Compound y-flip: applied on top of any --aug when --aug_yflip is set
+            if cfg.aug_yflip:
+                _flip = torch.rand(x.size(0), 1, 1, device=x.device) < 0.5
+                x[:, :, 1:2] = torch.where(_flip, -x[:, :, 1:2], x[:, :, 1:2])
+                y[:, :, 1:2] = torch.where(_flip, -y[:, :, 1:2], y[:, :, 1:2])
+                for _idx in [3, 5, 7, 9]:
+                    x[:, :, _idx:_idx+1] = torch.where(_flip, -x[:, :, _idx:_idx+1], x[:, :, _idx:_idx+1])
+            # RandomErasing: zero out random feature channels (skip pos dims 0,1)
+            if cfg.aug == "random_erase" or cfg.aug_random_erase:
+                _B_aug = x.size(0)
+                _re_max = min(cfg.aug_random_erase_max, 3)
+                for _b in range(_B_aug):
+                    _n_erase = torch.randint(1, _re_max + 1, (1,)).item()
+                    _erase_dims = torch.randperm(x.size(2) - 2, device=x.device)[:_n_erase] + 2
+                    x[_b, :, _erase_dims] = 0.0
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
@@ -1820,7 +1839,7 @@ for epoch in range(MAX_EPOCHS):
         elif ema_model is not None:
             save_model = ema_model
         else:
-            save_model = model
+            save_model = _base_model
         torch.save(save_model.state_dict(), model_path)
         tag = f" * -> {model_path}"
 
@@ -1854,46 +1873,50 @@ if best_metrics:
     wandb.summary.update({"best_" + k: v for k, v in best_metrics.items()})
 
     print("\nGenerating flow field plots...")
-    if cfg.swa_cyclic and swa_cyclic_model is not None:
-        vis_model = swa_cyclic_model
-    elif cfg.snapshot_ensemble and snapshot_avg_model is not None:
-        vis_model = snapshot_avg_model
-    elif cfg.swa and swa_model is not None:
-        vis_model = swa_model
-    elif ema_model is not None:
-        vis_model = ema_model
-    else:
-        vis_model = model
-    vis_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-    vis_model.eval()
-    plot_dir = Path("plots") / run.id
-    n = 1 if cfg.debug else 4
-    for split_name, split_ds in val_splits.items():
-        samples = []
-        for i in range(min(n, len(split_ds))):
-            x, y_true, is_surface = split_ds[i]
-            with torch.no_grad():
-                x_dev = x.unsqueeze(0).to(device)
-                y_dev = y_true.unsqueeze(0).to(device)
-                is_surf_dev = is_surface.unsqueeze(0).to(device)
-                mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
-                raw_dsdf = x_dev[:, :, 2:10]
-                dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
-                dist_feat = torch.log1p(dist_surf * 10.0)
-                x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
-                curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
-                x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
-                # Fourier PE (must match training loop)
-                raw_xy = x_n[:, :, :2]
-                xy_min = raw_xy.amin(dim=1, keepdim=True)
-                xy_max = raw_xy.amax(dim=1, keepdim=True)
-                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                freqs = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
-                xy_scaled = xy_norm.unsqueeze(-1) * freqs
-                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
-                x_n = torch.cat([x_n, fourier_pe], dim=-1)
-                Umag, q = _umag_q(y_dev, mask)
-                pred = vis_model({"x": x_n})["preds"].float()
+    try:
+        if cfg.swa_cyclic and swa_cyclic_model is not None:
+            vis_model = swa_cyclic_model
+        elif cfg.snapshot_ensemble and snapshot_avg_model is not None:
+            vis_model = snapshot_avg_model
+        elif cfg.swa and swa_model is not None:
+            vis_model = swa_model
+        elif ema_model is not None:
+            vis_model = ema_model
+        else:
+            vis_model = _base_model
+        _sd = torch.load(model_path, map_location=device, weights_only=True)
+        # Strip _orig_mod. prefix from torch.compile state_dict keys if needed
+        _sd = {k.removeprefix("_orig_mod."): v for k, v in _sd.items()}
+        vis_model.load_state_dict(_sd)
+        vis_model.eval()
+        plot_dir = Path("plots") / run.id
+        n = 1 if cfg.debug else 4
+        for split_name, split_ds in val_splits.items():
+            samples = []
+            for i in range(min(n, len(split_ds))):
+                x, y_true, is_surface = split_ds[i]
+                with torch.no_grad():
+                    x_dev = x.unsqueeze(0).to(device)
+                    y_dev = y_true.unsqueeze(0).to(device)
+                    is_surf_dev = is_surface.unsqueeze(0).to(device)
+                    mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
+                    raw_dsdf = x_dev[:, :, 2:10]
+                    dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+                    dist_feat = torch.log1p(dist_surf * 10.0)
+                    x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
+                    curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
+                    x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                    # Fourier PE (must match training loop)
+                    raw_xy = x_n[:, :, :2]
+                    xy_min = raw_xy.amin(dim=1, keepdim=True)
+                    xy_max = raw_xy.amax(dim=1, keepdim=True)
+                    xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                    freqs = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
+                    xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                    fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                    x_n = torch.cat([x_n, fourier_pe], dim=-1)
+                    Umag, q = _umag_q(y_dev, mask)
+                    pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
                 if cfg.raw_targets:
                     y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                 else:
@@ -1913,5 +1936,8 @@ if best_metrics:
         images = visualize(samples, out_dir=plot_dir / split_name)
         if images:
             wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    except Exception as e:
+        print(f"Warning: flow field visualization failed: {e}")
+        wandb.alert(title="Vis failed", text=str(e)[:200], level="WARN")
 
 wandb.finish()
