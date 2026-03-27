@@ -37,7 +37,11 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import simple_parsing as sp
 
-from data.utils import visualize
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+from data.utils import _scatter_field, _add_quiver, _setup_ax, _get_view_bounds
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
 
 torch.set_float32_matmul_precision('high')
@@ -1914,7 +1918,44 @@ if best_metrics:
                         else:
                             y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
                 samples.append((x[:, :2], y_true, y_pred, is_surface))
-            images = visualize(samples, out_dir=plot_dir / split_name)
+            _plot_dir = plot_dir / split_name
+            _plot_dir.mkdir(parents=True, exist_ok=True)
+            images = []
+            for si, (pos_t, yt, yp, is_surf_t) in enumerate(samples):
+                pos_np, yt_np, yp_np = pos_t.numpy(), yt.numpy(), yp.numpy()
+                is_surf_np = is_surf_t.numpy().astype(bool)
+                surf_pos = pos_np[is_surf_np]
+                x_lo, x_hi, y_lo, y_hi, near = _get_view_bounds(pos_np, surf_pos)
+                px, py = pos_np[near, 0], pos_np[near, 1]
+                gt_vmag = np.sqrt(yt_np[near, 0]**2 + yt_np[near, 1]**2)
+                pr_vmag = np.sqrt(yp_np[near, 0]**2 + yp_np[near, 1]**2)
+                fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+                fig.suptitle(f"{split_name} sample {si}", fontsize=14)
+                vv = (gt_vmag.min(), gt_vmag.max())
+                _scatter_field(axes[0, 0], fig, px, py, gt_vmag, cmap="viridis", vmin=vv[0], vmax=vv[1])
+                axes[0, 0].set_title("|U| GT")
+                _scatter_field(axes[0, 1], fig, px, py, pr_vmag, cmap="viridis", vmin=vv[0], vmax=vv[1])
+                axes[0, 1].set_title("|U| Pred")
+                ev = gt_vmag - pr_vmag
+                evm = max(abs(ev.min()), abs(ev.max()), 1e-6)
+                _scatter_field(axes[0, 2], fig, px, py, ev, cmap="RdBu_r", vmin=-evm, vmax=evm)
+                axes[0, 2].set_title("|U| Error")
+                vp = (yt_np[near, 2].min(), yt_np[near, 2].max())
+                _scatter_field(axes[1, 0], fig, px, py, yt_np[near, 2], cmap="RdBu_r", vmin=vp[0], vmax=vp[1])
+                axes[1, 0].set_title("p GT")
+                _scatter_field(axes[1, 1], fig, px, py, yp_np[near, 2], cmap="RdBu_r", vmin=vp[0], vmax=vp[1])
+                axes[1, 1].set_title("p Pred")
+                ep = yt_np[near, 2] - yp_np[near, 2]
+                epm = max(abs(ep.min()), abs(ep.max()), 1e-6)
+                _scatter_field(axes[1, 2], fig, px, py, ep, cmap="RdBu_r", vmin=-epm, vmax=epm)
+                axes[1, 2].set_title("p Error")
+                for ax in axes.flat:
+                    _setup_ax(ax, x_lo, x_hi, y_lo, y_hi, surf_pos)
+                plt.tight_layout()
+                _path = _plot_dir / f"val_sample_{si}.png"
+                fig.savefig(_path, dpi=200)
+                plt.close(fig)
+                images.append(_path)
             if images:
                 wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
     except Exception as e:
