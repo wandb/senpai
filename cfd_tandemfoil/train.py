@@ -420,6 +420,131 @@ class TransolverBlock(nn.Module):
         return fx
 
 
+class _ManualAttention(nn.Module):
+    """Pure matmul attention without SDPA. Avoids flash/mem_efficient backend bugs."""
+
+    def __init__(self, dim, n_heads=8, dropout=0.0):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        self.scale = self.head_dim ** -0.5
+        self.to_q = nn.Linear(dim, dim)
+        self.to_k = nn.Linear(dim, dim)
+        self.to_v = nn.Linear(dim, dim)
+        self.to_out = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, q, kv):
+        """q: [B, Lq, D], kv: [B, Lkv, D] -> [B, Lq, D]"""
+        B, Lq, D = q.shape
+        Lkv = kv.shape[1]
+        H, HD = self.n_heads, self.head_dim
+
+        q_h = self.to_q(q).reshape(B, Lq, H, HD).permute(0, 2, 1, 3)   # [B, H, Lq, HD]
+        k_h = self.to_k(kv).reshape(B, Lkv, H, HD).permute(0, 2, 1, 3)  # [B, H, Lkv, HD]
+        v_h = self.to_v(kv).reshape(B, Lkv, H, HD).permute(0, 2, 1, 3)  # [B, H, Lkv, HD]
+
+        attn = torch.matmul(q_h, k_h.transpose(-2, -1)) * self.scale  # [B, H, Lq, Lkv]
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+        out = torch.matmul(attn, v_h)  # [B, H, Lq, HD]
+
+        out = out.permute(0, 2, 1, 3).reshape(B, Lq, D)
+        return self.to_out(out)
+
+
+class _LatentSelfAttnLayer(nn.Module):
+    """Pre-norm self-attention + FFN for latent processing. No SDPA."""
+
+    def __init__(self, dim, n_heads=8, ffn_ratio=4, dropout=0.0):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(dim)
+        self.attn = _ManualAttention(dim, n_heads, dropout)
+        self.ln2 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * ffn_ratio),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * ffn_ratio, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        x_norm = self.ln1(x)
+        x = x + self.attn(x_norm, x_norm)
+        x = x + self.ffn(self.ln2(x))
+        return x
+
+
+class PerceiverIOBlock(nn.Module):
+    """Perceiver IO: encode points -> process latents -> decode to points."""
+
+    def __init__(self, input_dim, latent_dim=256, n_latents=256, n_self_attn_layers=6,
+                 n_heads=8, dropout=0.0, iterative_passes=1):
+        super().__init__()
+        self.n_latents = n_latents
+        self.latent_dim = latent_dim
+        self.iterative_passes = iterative_passes
+
+        # Learnable latent array
+        self.latents = nn.Parameter(torch.randn(n_latents, latent_dim) * 0.02)
+
+        # Input projection to latent dim (for K,V in encode cross-attention)
+        self.proj_kv_enc = nn.Linear(input_dim, latent_dim)
+
+        # Cross-attention: input -> latents (encoder)
+        self.cross_attn_encode = _ManualAttention(latent_dim, n_heads, dropout)
+        self.ln_cross_enc_q = nn.LayerNorm(latent_dim)
+        self.ln_cross_enc_kv = nn.LayerNorm(latent_dim)
+
+        # Self-attention layers on latents
+        self.self_attn_layers = nn.ModuleList([
+            _LatentSelfAttnLayer(latent_dim, n_heads, ffn_ratio=4, dropout=dropout)
+            for _ in range(n_self_attn_layers)
+        ])
+
+        # Cross-attention: latents -> output (decoder)
+        self.proj_q_dec = nn.Linear(input_dim, latent_dim)
+        self.cross_attn_decode = _ManualAttention(latent_dim, n_heads, dropout)
+        self.ln_cross_dec_q = nn.LayerNorm(latent_dim)
+        self.ln_cross_dec_kv = nn.LayerNorm(latent_dim)
+
+        # Project decoded output back to input_dim for residual
+        self.proj_out = nn.Linear(latent_dim, input_dim)
+        nn.init.zeros_(self.proj_out.weight)
+        nn.init.zeros_(self.proj_out.bias)
+
+    def forward(self, x):
+        """x: [B, N, D] -> [B, N, D]"""
+        B, N, D = x.shape
+
+        # Project input to latent dim for cross-attention K,V
+        x_proj = self.proj_kv_enc(x)  # [B, N, latent_dim]
+
+        # Expand latents for batch
+        latents = self.latents.unsqueeze(0).expand(B, -1, -1)  # [B, L, latent_dim]
+
+        for _ in range(self.iterative_passes):
+            # Encode: cross-attend from latents (Q) to input (K,V)
+            latents = latents + self.cross_attn_encode(
+                self.ln_cross_enc_q(latents), self.ln_cross_enc_kv(x_proj)
+            )
+
+            # Process latents through self-attention
+            for layer in self.self_attn_layers:
+                latents = layer(latents)
+
+        # Decode: cross-attend from output queries (Q) to latents (K,V)
+        x_query = self.proj_q_dec(x)  # [B, N, latent_dim]
+        decoded = self.cross_attn_decode(
+            self.ln_cross_dec_q(x_query), self.ln_cross_dec_kv(latents)
+        )
+
+        # Project back to input_dim and add residual
+        x_out = x + self.proj_out(decoded)
+        return x_out
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -642,6 +767,162 @@ class Transolver(nn.Module):
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
 
+class PerceiverTransolver(nn.Module):
+    """Perceiver IO variant: preprocess -> PerceiverIOBlock -> final TransolverBlock for output."""
+
+    def __init__(
+        self,
+        space_dim=2,
+        n_hidden=192,
+        dropout=0.0,
+        n_head=3,
+        act="gelu",
+        mlp_ratio=2,
+        fun_dim=1,
+        out_dim=3,
+        slice_num=48,
+        ref=8,
+        unified_pos=False,
+        output_fields=None,
+        output_dims=None,
+        field_decoder=False,
+        adaln_output=False,
+        uncertainty_loss=False,
+        domain_layernorm=False,
+        dln_zeroinit=False,
+        domain_velhead=False,
+        # Perceiver-specific params
+        perceiver_n_latents=256,
+        perceiver_latent_dim=256,
+        perceiver_self_layers=6,
+        perceiver_iterative=1,
+        # Unused but accepted for compatibility with model_config dict
+        **kwargs,
+    ):
+        super().__init__()
+        self.__name__ = "PerceiverTransolver"
+        self.ref = ref
+        self.unified_pos = unified_pos
+        self.adaln_output = adaln_output
+        if output_fields is None or output_dims is None:
+            raise ValueError("output_fields and output_dims must be provided")
+        self.output_fields = output_fields
+        self.output_dims = output_dims
+        if uncertainty_loss:
+            self.log_sigma_vol = nn.Parameter(torch.zeros(1))
+            self.log_sigma_surf_ux = nn.Parameter(torch.zeros(1))
+            self.log_sigma_surf_uy = nn.Parameter(torch.zeros(1))
+            self.log_sigma_surf_p = nn.Parameter(torch.zeros(1))
+
+        # Same preprocessing as Transolver
+        if self.unified_pos:
+            self.preprocess = MLP(
+                fun_dim + self.ref ** 3,
+                n_hidden * 2, n_hidden,
+                n_layers=0, res=False, act=act,
+            )
+        else:
+            self.preprocess = GatedMLP2(fun_dim + space_dim, n_hidden * 2, n_hidden)
+
+        self.n_hidden = n_hidden
+        self.space_dim = space_dim
+        self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
+        nn.init.eye_(self.feature_cross.weight)
+
+        # Perceiver IO block
+        self.perceiver = PerceiverIOBlock(
+            input_dim=n_hidden,
+            latent_dim=perceiver_latent_dim,
+            n_latents=perceiver_n_latents,
+            n_self_attn_layers=perceiver_self_layers,
+            n_heads=max(1, perceiver_latent_dim // 64),
+            dropout=dropout,
+            iterative_passes=perceiver_iterative,
+        )
+
+        # Final TransolverBlock for output head (keeps field_decoder etc.)
+        self.output_block = TransolverBlock(
+            num_heads=n_head,
+            hidden_dim=n_hidden,
+            dropout=dropout,
+            act=act,
+            mlp_ratio=mlp_ratio,
+            out_dim=out_dim,
+            slice_num=slice_num,
+            last_layer=True,
+            field_decoder=field_decoder,
+            adaln_output=adaln_output,
+            domain_layernorm=domain_layernorm,
+            dln_zeroinit=dln_zeroinit,
+            domain_velhead=domain_velhead,
+        )
+
+        self.initialize_weights()
+        self.out_skip = nn.Linear(n_hidden, out_dim)
+        nn.init.zeros_(self.out_skip.weight)
+        nn.init.zeros_(self.out_skip.bias)
+        self.skip_gate = nn.Sequential(nn.Linear(n_hidden, 1), nn.Sigmoid())
+        nn.init.constant_(self.skip_gate[0].bias, -2.0)
+        self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
+        self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
+        self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])
+        self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+
+    def initialize_weights(self):
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            if module.weight.dim() >= 2:
+                nn.init.orthogonal_(module.weight, gain=1.0)
+            else:
+                nn.init.normal_(module.weight, std=0.01)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, (nn.LayerNorm, nn.BatchNorm1d)):
+            nn.init.constant_(module.bias, 0)
+            nn.init.constant_(module.weight, 1.0)
+
+    def _validate_output_dims(self, preds):
+        if sum(self.output_dims) != preds.shape[-1]:
+            raise ValueError("Sum of output_dims must match preds last dimension")
+
+    def forward(self, data, pos=None, condition=None):
+        if not isinstance(data, Mapping):
+            raise TypeError("Model input must be a Mapping with keys: x")
+        x = data.get("x")
+        if x is None:
+            raise ValueError("Missing required input tensor: x")
+
+        x_cross = x * self.feature_cross(x)
+        x = x + 0.1 * x_cross
+        raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)
+
+        is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
+
+        fx = self.preprocess(x)
+        fx_pre = fx
+        fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
+
+        # Perceiver IO: encode -> process -> decode
+        fx = self.perceiver(fx)
+
+        # Auxiliary heads
+        re_pred = self.re_head(fx.mean(dim=1))
+        aoa_pred = self.aoa_head(fx.mean(dim=1))
+
+        # Output block with field_decoder
+        last_condition = x[:, 0, 13:15] if self.adaln_output else None
+        fx = self.output_block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition)
+
+        gate = self.skip_gate(fx_pre)
+        fx = fx + gate * self.out_skip(fx_pre)
+        self._validate_output_dims(fx)
+        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+
+
 # ---------------------------------------------------------------------------
 # End Transolver model
 # ---------------------------------------------------------------------------
@@ -747,6 +1028,12 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: Perceiver IO
+    perceiver_io: bool = False             # use PerceiverTransolver instead of Transolver
+    perceiver_n_latents: int = 256         # number of latent vectors
+    perceiver_latent_dim: int = 256        # latent vector dimension
+    perceiver_self_layers: int = 6         # number of self-attention layers on latents
+    perceiver_iterative: int = 1           # number of encode-process-decode passes
 
 
 cfg = sp.parse(Config)
@@ -898,9 +1185,17 @@ model_config = dict(
     prog_slices=cfg.prog_slices,
 )
 
-model = Transolver(**model_config).to(device)
+if cfg.perceiver_io:
+    model_config["perceiver_n_latents"] = cfg.perceiver_n_latents
+    model_config["perceiver_latent_dim"] = cfg.perceiver_latent_dim
+    model_config["perceiver_self_layers"] = cfg.perceiver_self_layers
+    model_config["perceiver_iterative"] = cfg.perceiver_iterative
+    model = PerceiverTransolver(**model_config).to(device)
+else:
+    model = Transolver(**model_config).to(device)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
-model = torch.compile(model, mode="default")
+if not cfg.perceiver_io:
+    model = torch.compile(model, mode="default")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
@@ -1544,10 +1839,10 @@ for epoch in range(MAX_EPOCHS):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             base_opt, T_max=remaining, eta_min=cfg.cosine_eta_min
         )
-    if epoch >= cfg.temp_anneal_epoch:
+    if epoch >= cfg.temp_anneal_epoch and hasattr(_base_model, 'blocks'):
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
-    if cfg.prog_slices:
+    if cfg.prog_slices and hasattr(_base_model, 'blocks'):
         # Progressive slice warmup: ramp active slices from cfg.slice_num → prog_slices_end
         if epoch < cfg.prog_slices_epochs:
             active = int(cfg.slice_num + (cfg.prog_slices_end - cfg.slice_num) * epoch / cfg.prog_slices_epochs)
@@ -1576,6 +1871,8 @@ for epoch in range(MAX_EPOCHS):
                     sa[k].mul_((snapshot_n - 1) / snapshot_n).add_(snap[k].to(device) / snapshot_n)
 
     # --- Validate across all splits ---
+    if cfg.perceiver_io:
+        torch.cuda.synchronize()  # flush async kernels before switching to eval
     if cfg.swa_cyclic and swa_cyclic_model is not None:
         eval_model = swa_cyclic_model
     elif cfg.snapshot_ensemble and snapshot_avg_model is not None:
@@ -1877,11 +2174,24 @@ if best_metrics:
                 y_dev = y_true.unsqueeze(0).to(device)
                 is_surf_dev = is_surface.unsqueeze(0).to(device)
                 mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
+                raw_dsdf_vis = x_dev[:, :, 2:10]
+                dist_surf = raw_dsdf_vis.abs().min(dim=-1, keepdim=True).values
+                dist_feat = torch.log1p(dist_surf * 10.0)
                 x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                 curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
-                dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
-                dist_feat = torch.log1p(dist_surf * 10.0)
-                x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                if cfg.foil2_dist:
+                    foil2_dist_feat = torch.log1p(raw_dsdf_vis[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                    x_n = torch.cat([x_n, curv, dist_feat, foil2_dist_feat], dim=-1)
+                else:
+                    x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                raw_xy_vis = x_n[:, :, :2]
+                xy_min_v = raw_xy_vis.amin(dim=1, keepdim=True)
+                xy_max_v = raw_xy_vis.amax(dim=1, keepdim=True)
+                xy_norm_v = (raw_xy_vis - xy_min_v) / (xy_max_v - xy_min_v + 1e-8)
+                freqs_v = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                xy_scaled_v = xy_norm_v.unsqueeze(-1) * freqs_v
+                fourier_pe_v = torch.cat([xy_scaled_v.sin().flatten(-2), xy_scaled_v.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, fourier_pe_v], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 if cfg.raw_targets:
@@ -1900,7 +2210,49 @@ if best_metrics:
                     else:
                         y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
             samples.append((x[:, :2], y_true, y_pred, is_surface))
-        images = visualize(samples, out_dir=plot_dir / split_name)
+        # Inline visualization from pre-computed samples
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+        _vis_dir = plot_dir / split_name
+        _vis_dir.mkdir(parents=True, exist_ok=True)
+        images = []
+        for _si, (_pos, _yt, _yp, _is) in enumerate(samples):
+            _pos_np = _pos.numpy()
+            _yt_np = _yt.numpy()
+            _yp_np = _yp.numpy()
+            _is_np = _is.numpy()
+            _sp = _pos_np[_is_np]
+            _near = (_pos_np[:, 0] >= -1) & (_pos_np[:, 0] <= 2) & (_pos_np[:, 1] >= 0)
+            _px, _py = _pos_np[_near, 0], _pos_np[_near, 1]
+            _gt_vmag = np.sqrt(_yt_np[_near, 0]**2 + _yt_np[_near, 1]**2)
+            _pr_vmag = np.sqrt(_yp_np[_near, 0]**2 + _yp_np[_near, 1]**2)
+            _gt_p, _pr_p = _yt_np[_near, 2], _yp_np[_near, 2]
+            fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+            for ax in axes.flat:
+                ax.set_aspect("equal")
+            axes[0, 0].scatter(_px, _py, c=_gt_vmag, s=0.5, cmap="viridis", edgecolors="none")
+            axes[0, 0].set_title("|U| GT")
+            axes[0, 1].scatter(_px, _py, c=_pr_vmag, s=0.5, cmap="viridis", edgecolors="none")
+            axes[0, 1].set_title("|U| Pred")
+            _ev = _gt_vmag - _pr_vmag
+            _evm = max(abs(_ev.min()), abs(_ev.max()), 1e-6)
+            axes[0, 2].scatter(_px, _py, c=_ev, s=0.5, cmap="RdBu_r", vmin=-_evm, vmax=_evm, edgecolors="none")
+            axes[0, 2].set_title("|U| Error")
+            axes[1, 0].scatter(_px, _py, c=_gt_p, s=0.5, cmap="RdBu_r", edgecolors="none")
+            axes[1, 0].set_title("p GT")
+            axes[1, 1].scatter(_px, _py, c=_pr_p, s=0.5, cmap="RdBu_r", edgecolors="none")
+            axes[1, 1].set_title("p Pred")
+            _ep = _gt_p - _pr_p
+            _epm = max(abs(_ep.min()), abs(_ep.max()), 1e-6)
+            axes[1, 2].scatter(_px, _py, c=_ep, s=0.5, cmap="RdBu_r", vmin=-_epm, vmax=_epm, edgecolors="none")
+            axes[1, 2].set_title("p Error")
+            plt.tight_layout()
+            _path = _vis_dir / f"val_sample_{_si}.png"
+            fig.savefig(_path, dpi=150)
+            plt.close(fig)
+            images.append(_path)
         if images:
             wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
 
