@@ -420,6 +420,87 @@ class TransolverBlock(nn.Module):
         return fx
 
 
+class FNOBlock(nn.Module):
+    """Fourier Neural Operator block for irregular meshes via grid projection.
+
+    Projects irregular mesh points onto a regular 2D grid, applies spectral
+    convolution (FFT → learnable complex weights → IFFT), then gathers back
+    to irregular positions. Includes residual MLP path and LayerNorm.
+    """
+
+    def __init__(self, hidden_dim, modes=16, grid_size=64):
+        super().__init__()
+        self.grid_size = grid_size
+        self.modes = modes
+        self.hidden_dim = hidden_dim
+        # Complex spectral weights [hidden_dim, hidden_dim, modes, modes]
+        # Xavier-like initialization: scale ~ 1/sqrt(hidden_dim)
+        scale = 1.0 / (hidden_dim ** 0.5)
+        self.weights_real = nn.Parameter(scale * torch.randn(hidden_dim, hidden_dim, modes, modes))
+        self.weights_imag = nn.Parameter(scale * torch.randn(hidden_dim, hidden_dim, modes, modes))
+        # Residual MLP path
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+        # Learnable residual gate (starts small so FNO contribution ramps in)
+        self.spectral_gate = nn.Parameter(torch.tensor(0.1))
+
+    def _spectral_conv(self, x_ft, weights_real, weights_imag):
+        """Apply spectral convolution: complex weight multiply in Fourier space."""
+        W = torch.complex(weights_real, weights_imag)
+        return torch.einsum('bimn,iomn->bomn', x_ft, W)
+
+    def forward(self, fx, raw_pos):
+        """
+        Args:
+            fx: [B, N, H] hidden features at irregular mesh points
+            raw_pos: [B, N, 2] xy coordinates (standardized ok, normalized internally)
+        Returns:
+            [B, N, H] updated features
+        """
+        B, N, H = fx.shape
+        G = self.grid_size
+        M = self.modes
+        device = fx.device
+
+        # Normalize positions to [0, G-1] grid indices
+        pos_min = raw_pos.amin(dim=1, keepdim=True)
+        pos_max = raw_pos.amax(dim=1, keepdim=True)
+        pos_norm = (raw_pos - pos_min) / (pos_max - pos_min + 1e-8) * (G - 1)
+        grid_idx = pos_norm.long().clamp(0, G - 1)  # [B, N, 2]
+        idx_flat = grid_idx[:, :, 0] * G + grid_idx[:, :, 1]  # [B, N]
+
+        # Scatter to regular grid (mean aggregation)
+        grid = torch.zeros(B, G * G, H, device=device, dtype=fx.dtype)
+        counts = torch.zeros(B, G * G, 1, device=device, dtype=fx.dtype)
+        idx_expand = idx_flat.unsqueeze(-1).expand(-1, -1, H)  # [B, N, H]
+        grid.scatter_add_(1, idx_expand, fx)
+        counts.scatter_add_(1, idx_flat.unsqueeze(-1), torch.ones(B, N, 1, device=device, dtype=fx.dtype))
+        grid = grid / counts.clamp(min=1)
+        grid = grid.reshape(B, G, G, H).permute(0, 3, 1, 2)  # [B, H, G, G]
+
+        # Spectral convolution via rfft2
+        grid_fft = torch.fft.rfft2(grid.float())  # [B, H, G, G//2+1]
+        out_fft = torch.zeros_like(grid_fft)
+        # Apply learnable weights to low-frequency modes
+        out_fft[:, :, :M, :M] = self._spectral_conv(
+            grid_fft[:, :, :M, :M], self.weights_real, self.weights_imag
+        )
+        grid_out = torch.fft.irfft2(out_fft, s=(G, G))  # [B, H, G, G]
+        grid_out = grid_out.to(fx.dtype)
+        grid_out = grid_out.permute(0, 2, 3, 1).reshape(B, G * G, H)  # [B, G*G, H]
+
+        # Gather back to irregular mesh positions
+        fx_spectral = grid_out.gather(1, idx_expand)  # [B, N, H]
+
+        # Combine: residual + gated spectral + MLP
+        fx = self.norm(fx + self.spectral_gate * fx_spectral + self.mlp(fx))
+        return fx
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -642,6 +723,90 @@ class Transolver(nn.Module):
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
 
+class FNOHybridTransolver(Transolver):
+    """Transolver with FNO spectral convolution replacing the middle block.
+
+    Architecture: TransolverBlock → FNOBlock → TransolverBlock (with decoder)
+    The FNO block captures global spectral patterns while the Transolver blocks
+    handle local spatial features and output decoding.
+    """
+
+    def __init__(self, fno_modes=16, fno_grid_size=64, **kwargs):
+        kwargs['n_layers'] = 3  # always 3 layers for hybrid
+        super().__init__(**kwargs)
+        self.fno_modes = fno_modes
+        self.fno_grid_size = fno_grid_size
+        self.fno_block = FNOBlock(self.n_hidden, modes=fno_modes, grid_size=fno_grid_size)
+        # Keep only first and last TransolverBlocks, drop the middle one
+        self.blocks = nn.ModuleList([self.blocks[0], self.blocks[-1]])
+
+    def forward(self, data, pos=None, condition=None):
+        x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
+        if x is None:
+            raise ValueError("Missing required input tensor: x")
+        if condition is not None:
+            raise ValueError("FNOHybridTransolver does not support conditioning inputs")
+
+        # Conditioning (same as Transolver)
+        use_cond = self.adaln_all_blocks or self.film_cond
+        if use_cond:
+            cond_2 = x[:, 0, 13:15]
+            if self.adaln_4cond:
+                gap_feat = x[:, 0, 21:22]
+                surf_frac = (x[:, :, 24].abs() > 0.01).float().mean(dim=1, keepdim=True)
+                block_condition = torch.cat([cond_2, gap_feat, surf_frac], dim=-1)
+            else:
+                block_condition = cond_2
+        else:
+            block_condition = None
+
+        if self.adaln_zone_temp:
+            is_tandem_scalar = (x[:, 0, 21].abs() > 0.01).float()
+            gap_mag = x[:, 0, 21].abs()
+            re_feat = x[:, 0, 13]
+            zone_features = torch.stack([is_tandem_scalar, gap_mag, re_feat], dim=-1)
+        else:
+            zone_features = None
+
+        if self.unified_pos:
+            if pos is None:
+                raise ValueError("Missing required input tensor: pos")
+            new_pos = self.get_grid(pos)
+            x = torch.cat((x, new_pos), dim=-1)
+
+        x_cross = x * self.feature_cross(x)
+        x = x + 0.1 * x_cross
+        raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)
+        raw_pos = x[:, :, :2]  # xy positions for FNO grid projection
+
+        is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
+
+        fx = self.preprocess(x)
+        fx_pre = fx
+        fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
+
+        # Block 0: Standard TransolverBlock (local spatial features)
+        fx = self.blocks[0](fx, raw_xy=raw_xy, tandem_mask=is_tandem,
+                            condition=block_condition, zone_features=zone_features)
+
+        # FNO block: spectral convolution (global patterns)
+        fx = self.fno_block(fx, raw_pos)
+
+        # Auxiliary heads
+        re_pred = self.re_head(fx.mean(dim=1))
+        aoa_pred = self.aoa_head(fx.mean(dim=1))
+
+        # Last block: TransolverBlock with field_decoder
+        last_condition = block_condition if use_cond else (
+            x[:, 0, 13:15] if self.adaln_output else None)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem,
+                             condition=last_condition, zone_features=zone_features)
+        gate = self.skip_gate(fx_pre)
+        fx = fx + gate * self.out_skip(fx_pre)
+        self._validate_output_dims(fx)
+        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+
+
 # ---------------------------------------------------------------------------
 # End Transolver model
 # ---------------------------------------------------------------------------
@@ -747,6 +912,10 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: FNO-Hybrid architecture
+    fno_hybrid: bool = False           # replace middle TransolverBlock with FNO spectral conv
+    fno_modes: int = 16                # number of Fourier modes to keep
+    fno_grid_size: int = 64            # regular grid size for FNO projection
 
 
 cfg = sp.parse(Config)
@@ -898,9 +1067,22 @@ model_config = dict(
     prog_slices=cfg.prog_slices,
 )
 
-model = Transolver(**model_config).to(device)
+if cfg.fno_hybrid:
+    model = FNOHybridTransolver(
+        fno_modes=cfg.fno_modes, fno_grid_size=cfg.fno_grid_size, **model_config
+    ).to(device)
+    model_config["fno_hybrid"] = True
+    model_config["fno_modes"] = cfg.fno_modes
+    model_config["fno_grid_size"] = cfg.fno_grid_size
+else:
+    model = Transolver(**model_config).to(device)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
-model = torch.compile(model, mode="default")
+if cfg.fno_hybrid:
+    # Skip torch.compile for FNO hybrid: scatter/gather + rfft2 causes
+    # dynamo symbolic shape inference issues during recompilation
+    pass
+else:
+    model = torch.compile(model, mode="default")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
@@ -1881,7 +2063,23 @@ if best_metrics:
                 curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                 dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)
-                x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                if cfg.foil2_dist:
+                    raw_dsdf_vis = x_dev[:, :, 2:10]
+                    foil2_dist_feat = torch.log1p(raw_dsdf_vis[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                    x_n = torch.cat([x_n, curv, dist_feat, foil2_dist_feat], dim=-1)
+                else:
+                    x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                # Fourier positional encoding (must match training preprocessing)
+                _vis_xy = x_n[:, :, :2]
+                _vis_xy_min = _vis_xy.amin(dim=1, keepdim=True)
+                _vis_xy_max = _vis_xy.amax(dim=1, keepdim=True)
+                _vis_xy_norm = (_vis_xy - _vis_xy_min) / (_vis_xy_max - _vis_xy_min + 1e-8)
+                _vis_freqs = torch.cat([_base_model.fourier_freqs_fixed.to(device),
+                                        _base_model.fourier_freqs_learned.abs()])
+                _vis_xy_scaled = _vis_xy_norm.unsqueeze(-1) * _vis_freqs
+                _vis_fourier_pe = torch.cat([_vis_xy_scaled.sin().flatten(-2),
+                                             _vis_xy_scaled.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, _vis_fourier_pe], dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 if cfg.raw_targets:
@@ -1900,8 +2098,11 @@ if best_metrics:
                     else:
                         y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
             samples.append((x[:, :2], y_true, y_pred, is_surface))
-        images = visualize(samples, out_dir=plot_dir / split_name)
-        if images:
-            wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+        try:
+            images = visualize(samples, out_dir=plot_dir / split_name)
+            if images:
+                wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+        except TypeError:
+            print(f"  Warning: visualize() call failed for {split_name} (signature mismatch), skipping plots")
 
 wandb.finish()
