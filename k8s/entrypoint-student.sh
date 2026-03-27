@@ -15,55 +15,62 @@ echo "GPUs:   $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | 
 
 # Repo already cloned by the deployment args block
 cd "$WORKDIR"
+
 uv pip install --system -e .
 
 # --- Git identity for commits ---
 git config user.name "senpai-$STUDENT_NAME"
 git config user.email "senpai-$STUDENT_NAME@senpai"
 
-# --- Install Claude Code ---
-curl -fsSL https://claude.ai/install.sh | bash
+# --- Register Weave Claude Code Plugin (tools already baked into Docker image) ---
 export PATH="$HOME/.claude/bin:$PATH"
+source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
 
-# --- Install Weave Claude Code Plugin ---
-source "$WORKDIR/tools/install-weave-cc-plugin.sh"
-
-# --- Install gh CLI ---
-curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli-stable.list > /dev/null
-apt-get update && apt-get install -y gh gettext-base
-# gh uses GITHUB_TOKEN env var automatically, no explicit login needed
-echo "=== gh auth ready (using GITHUB_TOKEN env var) ==="
+# --- Start Hivemind (streams CC session logs to hivemind.wandb.tools) ---
+mkdir -p ~/.claude/projects
+uvx --from wandb-hivemind hivemind run &
+echo "=== Hivemind started (PID=$!) ==="
 
 # --- Install role instructions ---
-cp instructions/CLAUDE-STUDENT.md "$WORKDIR/CLAUDE.md"
+cp "$WORKDIR/system_instructions/CLAUDE-STUDENT.md" "$WORKDIR/CLAUDE.md"
 
 # --- Launch Claude Code in Ralph Loop ---
 export IS_SANDBOX=1
 
-PROMPT="$(envsubst < "$WORKDIR/instructions/prompt-student.md" | sed '/^<!--$/,/^-->$/d')"
+# --- Build prompt ---
+# PROBLEM_DIR comes from ConfigMap (set by launch.py from senpai.yaml)
+PROMPT="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-student.md" | sed '/^<!--$/,/^-->$/d')"
 
+LOGDIR="/workspace/senpai/student_logs"
+mkdir -p "$LOGDIR"
 
 ITERATION=0
 while true; do
     ITERATION=$((ITERATION + 1))
+    LOGFILE="$LOGDIR/iteration_${ITERATION}_$(date +%Y%m%d_%H%M%S).jsonl"
     echo "=== Ralph Loop iteration $ITERATION ($(date)) ==="
+    echo "=== Log: $LOGFILE ==="
 
     # Return to latest advisor branch so student starts from the current baseline
     git checkout "$ADVISOR_BRANCH" 2>/dev/null || true
     git pull origin "$ADVISOR_BRANCH" 2>/dev/null || true
 
+    echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) ==="
+    echo "=== GPU: $(nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null) ==="
+
     # Restore CLAUDE.md — branch checkouts clobber it
-    cp "$WORKDIR/instructions/CLAUDE-STUDENT.md" "$WORKDIR/CLAUDE.md"
+    cp "$WORKDIR/system_instructions/CLAUDE-STUDENT.md" "$WORKDIR/CLAUDE.md"
 
+    START_TS=$(date +%s)
+    EXIT_CODE=0
     if [ "$ITERATION" -eq 1 ]; then
-        claude -p "$PROMPT" --dangerously-skip-permissions || true
+        claude -p "$PROMPT" --output-format stream-json --verbose --dangerously-skip-permissions > "$LOGFILE" 2>&1 || EXIT_CODE=$?
     else
-        claude -c -p "$PROMPT" --dangerously-skip-permissions || \
-        claude -p "$PROMPT" --dangerously-skip-permissions || true
+        claude -c -p "$PROMPT" --output-format stream-json --verbose --dangerously-skip-permissions > "$LOGFILE" 2>&1 || \
+        claude -p "$PROMPT" --output-format stream-json --verbose --dangerously-skip-permissions > "$LOGFILE" 2>&1 || EXIT_CODE=$?
     fi
+    DURATION=$(( $(date +%s) - START_TS ))
 
-    echo "=== Claude exited at $(date), restarting in 5s ==="
+    echo "=== Claude exited code=$EXIT_CODE after ${DURATION}s at $(date), restarting in 5s ==="
     sleep 5
 done

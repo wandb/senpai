@@ -34,29 +34,20 @@ else
 fi
 
 # --- Install role instructions ---
-cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
+cp "$WORKDIR/system_instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
 
-# --- Install Claude Code ---
-curl -fsSL https://claude.ai/install.sh | bash
+# --- Register Weave Claude Plugin (tools already baked into Docker image) ---
 export PATH="$HOME/.claude/bin:$PATH"
+source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
 
-# --- Install Weave Claude Plugin ---
-source "$WORKDIR/tools/install-weave-cc-plugin.sh"
-
-# --- Install kubectl ---
-curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
-chmod +x /usr/local/bin/kubectl
-
-# --- Install gh CLI ---
-curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli-stable.list > /dev/null
-apt-get update && apt-get install -y gh gettext-base
-# gh uses GITHUB_TOKEN env var automatically, no explicit login needed
-echo "=== gh auth ready (using GITHUB_TOKEN env var) ==="
+# --- Start Hivemind (streams CC session logs to hivemind.wandb.tools) ---
+mkdir -p ~/.claude/projects
+uvx --from wandb-hivemind hivemind run &
+echo "=== Hivemind started (PID=$!) ==="
 
 # --- Build prompt ---
-PROMPT="$(envsubst < "$WORKDIR/instructions/prompt-advisor.md" | sed '/^<!--$/,/^-->$/d')"
+# PROBLEM_DIR comes from ConfigMap (set by launch.py from senpai.yaml)
+PROMPT="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-advisor.md" | sed '/^<!--$/,/^-->$/d')"
 
 # --- Append extra startup instructions if provided ---
 if [ -n "${EXTRA_INSTRUCTIONS_B64:-}" ]; then
@@ -76,17 +67,21 @@ while true; do
     LOGFILE="$LOGDIR/iteration_${ITERATION}_$(date +%Y%m%d_%H%M%S).jsonl"
     echo "=== Advisor Loop iteration $ITERATION ($(date)) ==="
     echo "=== Log: $LOGFILE ==="
+    echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) ==="
 
     # Restore CLAUDE.md — branch checkouts clobber it
-    cp "$WORKDIR/instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
+    cp "$WORKDIR/system_instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
 
+    START_TS=$(date +%s)
+    EXIT_CODE=0
     if [ "$ITERATION" -eq 1 ]; then
-        claude -p "$PROMPT" --model "claude-opus-4-6[1m]" --output-format stream-json --verbose --dangerously-skip-permissions > "$LOGFILE" 2>&1 || true
+        claude -p "$PROMPT" --model "claude-opus-4-6[1m]" --output-format stream-json --verbose --dangerously-skip-permissions > "$LOGFILE" 2>&1 || EXIT_CODE=$?
     else
         claude -c -p "$PROMPT" --model "claude-opus-4-6[1m]" --output-format stream-json --verbose --dangerously-skip-permissions > "$LOGFILE" 2>&1 || \
-        claude -p "$PROMPT" --model "claude-opus-4-6[1m]" --output-format stream-json --verbose --dangerously-skip-permissions > "$LOGFILE" 2>&1 || true
+        claude -p "$PROMPT" --model "claude-opus-4-6[1m]" --output-format stream-json --verbose --dangerously-skip-permissions > "$LOGFILE" 2>&1 || EXIT_CODE=$?
     fi
+    DURATION=$(( $(date +%s) - START_TS ))
 
-    echo "=== Advisor exited at $(date), next check in 5 minutes ==="
+    echo "=== Advisor exited code=$EXIT_CODE after ${DURATION}s at $(date), next check in 5 minutes ==="
     sleep 300
 done

@@ -29,7 +29,7 @@ spec:
       serviceAccountName: senpai-orchestrator
       containers:
       - name: advisor
-        image: ghcr.io/tcapelle/dev_box:latest
+        image: ghcr.io/wandb/senpai:latest
         command: ["/bin/bash", "-c"]
         args:
         - |
@@ -57,6 +57,11 @@ spec:
             secretKeyRef:
               name: senpai-secrets
               key: github-token
+        - name: EXA_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: senpai-secrets
+              key: exa-api-key
         resources:
           requests:
             cpu: "4"

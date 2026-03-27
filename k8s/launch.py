@@ -15,6 +15,7 @@ import simple_parsing as sp
 
 STUDENT_TEMPLATE = Path(__file__).parent / "student-deployment.yaml"
 ADVISOR_TEMPLATE = Path(__file__).parent / "advisor-deployment.yaml"
+SENPAI_CONFIG = Path(__file__).parent.parent / "senpai.yaml"
 
 STUDENT_NAMES = [
     "frieren", "fern", "tanjiro", "nezuko", "alphonse", "edward",
@@ -28,11 +29,12 @@ STUDENT_NAMES = [
 class Args:
     """Launch senpai advisor and/or student agents on Kubernetes."""
     tag: str  # research tag (e.g. mar13)
+    problem: str = "cfd_tandemfoil"  # active problem directory (from senpai.yaml)
     names: str = ""  # comma-separated student names (e.g. "frieren,fern")
     n_students: int = 4  # number of students to launch (ignored if --names is provided)
     repo_url: str = "https://github.com/wandb/senpai.git"  # git repo URL
     repo_branch: str = "main"  # git branch to clone
-    image: str = "ghcr.io/tcapelle/dev_box:latest"  # container image for students
+    image: str = "ghcr.io/wandb/senpai:latest"  # container image for students
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
     wandb_project: str = "senpai-v1"  # W&B project name
     advisor_branch: str = "noam"  # branch the advisor works on (PRs target this, not main)
@@ -40,6 +42,7 @@ class Args:
     extra_instructions: str = ""  # extra prompt text for the advisor: a .md file path or a literal string
     timeout_minutes: float = 30.0  # training run wall-clock limit (SENPAI_TIMEOUT_MINUTES)
     max_epochs: int = 50  # maximum training epochs (SENPAI_MAX_EPOCHS)
+    autocompact_pct: int = 40  # context % at which Claude auto-compacts (CLAUDE_AUTOCOMPACT_PCT_OVERRIDE)
     dry_run: bool = False  # print manifests without applying
 
 
@@ -77,6 +80,8 @@ def render_student(template: str, student_name: str, tag: str, args: Args) -> st
             "WANDB_MODE": "online",
             "SENPAI_TIMEOUT_MINUTES": str(args.timeout_minutes),
             "SENPAI_MAX_EPOCHS": str(args.max_epochs),
+            "PROBLEM_DIR": args.problem,
+            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": str(args.autocompact_pct),
         },
     )
     deployment = render_template(template, {
@@ -98,6 +103,7 @@ def render_advisor(template: str, tag: str, student_list: list[str], args: Args)
         "WANDB_ENTITY": args.wandb_entity,
         "WANDB_PROJECT": args.wandb_project,
         "ADVISOR_BRANCH": args.advisor_branch,
+        "PROBLEM_DIR": args.problem,
     }
     if args.extra_instructions:
         p = Path(args.extra_instructions)
@@ -128,7 +134,7 @@ def kubectl_apply(manifest: str, name: str):
 
 
 def main():
-    args = sp.parse(Args)
+    args = sp.parse(Args, config_path=str(SENPAI_CONFIG))
 
     # Resolve student list
     if args.names:
