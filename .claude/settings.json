@@ -1,7 +1,14 @@
 {
   "effortLevel": "high",
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  },
+  "sandbox": {
+    "enabled": false
+  },
   "alwaysThinkingEnabled": true,
   "env": {
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
   }
 }
+

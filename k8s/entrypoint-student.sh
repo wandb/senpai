@@ -64,10 +64,10 @@ while true; do
     START_TS=$(date +%s)
     EXIT_CODE=0
     if [ "$ITERATION" -eq 1 ]; then
-        claude -p "$PROMPT" --output-format stream-json --verbose --dangerously-skip-permissions > "$LOGFILE" 2>&1 || EXIT_CODE=$?
+        claude -p "$PROMPT" --model "claude-opus-4-6[1m]" --output-format stream-json --verbose --dangerously-skip-permissions > "$LOGFILE" 2>&1 || EXIT_CODE=$?
     else
-        claude -c -p "$PROMPT" --output-format stream-json --verbose --dangerously-skip-permissions > "$LOGFILE" 2>&1 || \
-        claude -p "$PROMPT" --output-format stream-json --verbose --dangerously-skip-permissions > "$LOGFILE" 2>&1 || EXIT_CODE=$?
+        claude -c -p "$PROMPT" --model "claude-opus-4-6[1m]" --output-format stream-json --verbose --dangerously-skip-permissions > "$LOGFILE" 2>&1 || \
+        claude -p "$PROMPT" --model "claude-opus-4-6[1m]" --output-format stream-json --verbose --dangerously-skip-permissions > "$LOGFILE" 2>&1 || EXIT_CODE=$?
     fi
     DURATION=$(( $(date +%s) - START_TS ))
 
