@@ -748,6 +748,11 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: Residual prediction
+    residual_prediction: bool = False  # predict residual from freestream prior
+    residual_surface_only: bool = False  # only use residual targets on surface nodes
+    residual_dist_prior: bool = False  # distance-scaled prior (1 at freestream, 0 at surface)
+    disable_pcgrad: bool = False       # disable PCGrad (use simple combined loss)
 
 
 cfg = sp.parse(Config)
@@ -1232,14 +1237,35 @@ for epoch in range(MAX_EPOCHS):
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
         Umag, q = _umag_q(y, mask)
+        prior_phys = None  # freestream prior in Cp space
         if cfg.raw_targets:
             y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
         else:
             y_phys = _phys_norm(y, Umag, q)
+            if cfg.residual_prediction:
+                # Freestream prior in Cp space: Ux/Umag = cos(AoA), Uy/Umag = sin(AoA), p/q = 0
+                # Denormalize AoA from standardized input (index 14)
+                aoa_raw = x[:, 0, 14:15] * stats['x_std'][14] + stats['x_mean'][14]  # [B, 1]
+                prior_ux = torch.cos(aoa_raw).unsqueeze(1).expand_as(y_phys[:, :, 0:1])
+                prior_uy = torch.sin(aoa_raw).unsqueeze(1).expand_as(y_phys[:, :, 1:2])
+                prior_p = torch.zeros_like(y_phys[:, :, 2:3])
+                prior_phys = torch.cat([prior_ux, prior_uy, prior_p], dim=-1)
+                if cfg.residual_dist_prior:
+                    # Scale prior by distance-to-surface: 1 at freestream, 0 at surface
+                    dist_scale = (dist_feat / (dist_feat.max(dim=1, keepdim=True).values + 1e-8)).clamp(0, 1)
+                    prior_phys = prior_phys * dist_scale
+                if cfg.residual_surface_only:
+                    # Only subtract prior on surface nodes
+                    surf_float = is_surface.float().unsqueeze(-1)
+                    y_target = y_phys - prior_phys * surf_float
+                else:
+                    y_target = y_phys - prior_phys
+            else:
+                y_target = y_phys
             if cfg.log_pressure:
-                y_phys = y_phys.clone()
-                y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
-            y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                y_target = y_target.clone()
+                y_target[:, :, 2:3] = y_target[:, :, 2:3].abs().add(1).log() * y_target[:, :, 2:3].sign()
+            y_norm = (y_target - phys_stats["y_mean"]) / phys_stats["y_std"]
         if model.training and not cfg.no_target_noise:
             noise_progress = min(1.0, epoch / max(cfg.noise_anneal_epochs, 1))
             if cfg.half_target_noise:
@@ -1420,7 +1446,7 @@ for epoch in range(MAX_EPOCHS):
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
         is_indist_pcgrad = ~is_ood_pcgrad
-        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
+        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any() and not cfg.disable_pcgrad
 
         if use_pcgrad:
             n_a = is_indist_pcgrad.float().sum().clamp(min=1)
@@ -1635,10 +1661,27 @@ for epoch in range(MAX_EPOCHS):
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
                 else:
                     y_phys = _phys_norm(y, Umag, q)
+                    eval_prior_phys = None
+                    if cfg.residual_prediction:
+                        aoa_raw = x[:, 0, 14:15] * stats['x_std'][14] + stats['x_mean'][14]
+                        ep_ux = torch.cos(aoa_raw).unsqueeze(1).expand_as(y_phys[:, :, 0:1])
+                        ep_uy = torch.sin(aoa_raw).unsqueeze(1).expand_as(y_phys[:, :, 1:2])
+                        ep_p = torch.zeros_like(y_phys[:, :, 2:3])
+                        eval_prior_phys = torch.cat([ep_ux, ep_uy, ep_p], dim=-1)
+                        if cfg.residual_dist_prior:
+                            raw_dsdf_v = x[:, :, 2:10]
+                            dist_v = torch.log1p(raw_dsdf_v.abs().min(dim=-1, keepdim=True).values * 10.0)
+                            dist_scale_v = (dist_v / (dist_v.max(dim=1, keepdim=True).values + 1e-8)).clamp(0, 1)
+                            eval_prior_phys = eval_prior_phys * dist_scale_v
+                        if cfg.residual_surface_only:
+                            eval_prior_phys = eval_prior_phys * is_surface.float().unsqueeze(-1)
+                        y_target = y_phys - eval_prior_phys
+                    else:
+                        y_target = y_phys
                     if cfg.log_pressure:
-                        y_phys = y_phys.clone()
-                        y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
-                    y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                        y_target = y_target.clone()
+                        y_target[:, :, 2:3] = y_target[:, :, 2:3].abs().add(1).log() * y_target[:, :, 2:3].sign()
+                    y_norm = (y_target - phys_stats["y_mean"]) / phys_stats["y_std"]
 
                 # Per-sample std normalization: skip tandem samples
                 raw_gap = x[:, 0, 21]
@@ -1699,6 +1742,8 @@ for epoch in range(MAX_EPOCHS):
                     if cfg.log_pressure:
                         pred_phys = pred_phys.clone()
                         pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
+                    if cfg.residual_prediction and eval_prior_phys is not None:
+                        pred_phys = pred_phys + eval_prior_phys  # add prior back
                     if cfg.tight_denorm_clamps:
                         _pd = pred_phys.clone()
                         _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
