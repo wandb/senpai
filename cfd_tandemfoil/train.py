@@ -139,7 +139,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False,
+                 multi_res_slices=False, gated_attn=False, sigmoid_attn=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -154,14 +155,34 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.decouple_slice = decouple_slice
         self.zone_temp = zone_temp
         self.prog_slices = prog_slices
+        self.multi_res_slices = multi_res_slices
+        self.gated_attn = gated_attn
+        self.sigmoid_attn = sigmoid_attn
         if prog_slices:
             # Buffer for masking inactive slices; updated per-epoch by training loop
             self.register_buffer('slice_mask', torch.zeros(slice_num))
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
-        self.in_project_slice = nn.Linear(dim_head, slice_num)
-        torch.nn.init.orthogonal_(self.in_project_slice.weight)
+        if multi_res_slices:
+            # Multi-resolution: all heads project to max slice_num, but heads with
+            # fewer slices have their extra outputs masked. Compile-friendly (no loops).
+            self.slice_counts = [max(32, slice_num // 2), max(48, slice_num * 2 // 3), slice_num]
+            while len(self.slice_counts) < heads:
+                self.slice_counts.append(slice_num)
+            self.slice_counts = self.slice_counts[:heads]
+            # All heads project to slice_num (max), masked per-head in forward
+            self.in_project_slice = nn.Linear(dim_head, slice_num)
+            torch.nn.init.orthogonal_(self.in_project_slice.weight)
+            # Mask: [1, H, 1, slice_num] — 0 for active slices, -1e9 for inactive
+            _mr_mask = torch.zeros(1, heads, 1, slice_num)
+            for h_idx, sc in enumerate(self.slice_counts):
+                if sc < slice_num:
+                    _mr_mask[0, h_idx, 0, sc:] = -1e9
+            self.register_buffer('multi_res_mask', _mr_mask)
+        else:
+            self.in_project_slice = nn.Linear(dim_head, slice_num)
+            torch.nn.init.orthogonal_(self.in_project_slice.weight)
         if decouple_slice:
             # Separate slice projection for tandem samples
             self.in_project_slice_tandem = nn.Linear(dim_head, slice_num)
@@ -180,6 +201,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout),
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
+        if gated_attn:
+            self.attn_gate = nn.Parameter(torch.zeros(1, heads, 1, 1))
         if learned_kernel:
             self.kernel_mlp = nn.Sequential(
                 nn.Linear(2 * dim_head, dim_head), nn.GELU(),
@@ -219,9 +242,15 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         if spatial_bias is not None:
             slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
         if self.prog_slices:
-            # Apply slice mask: 0 for active slices, -1e9 for inactive (updated each epoch)
             slice_logits = slice_logits + self.slice_mask
-        slice_weights = self.softmax(slice_logits)
+        if self.multi_res_slices:
+            # Apply per-head mask: inactive slices get -1e9 before softmax
+            slice_logits = slice_logits + self.multi_res_mask
+        if self.sigmoid_attn:
+            slice_weights = torch.sigmoid(slice_logits)
+            slice_weights = slice_weights / (slice_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        else:
+            slice_weights = self.softmax(slice_logits)
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
@@ -249,6 +278,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
 
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
+        if self.gated_attn:
+            out_x = torch.sigmoid(self.attn_gate) * out_x
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
         return self.to_out(out_x)
 
@@ -279,6 +310,9 @@ class TransolverBlock(nn.Module):
         dln_zeroinit=False,
         domain_velhead=False,
         prog_slices=False,
+        multi_res_slices=False,
+        gated_attn=False,
+        sigmoid_attn=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -302,6 +336,9 @@ class TransolverBlock(nn.Module):
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
             prog_slices=prog_slices,
+            multi_res_slices=multi_res_slices,
+            gated_attn=gated_attn,
+            sigmoid_attn=sigmoid_attn,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -453,6 +490,9 @@ class Transolver(nn.Module):
         dln_zeroinit=False,
         domain_velhead=False,
         prog_slices=False,
+        multi_res_slices=False,
+        gated_attn=False,
+        sigmoid_attn=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -519,6 +559,9 @@ class Transolver(nn.Module):
                     dln_zeroinit=dln_zeroinit,
                     domain_velhead=domain_velhead if (idx == n_layers - 1) else False,
                     prog_slices=prog_slices,
+                    multi_res_slices=multi_res_slices,
+                    gated_attn=gated_attn,
+                    sigmoid_attn=sigmoid_attn,
                 )
                 for idx in range(n_layers)
             ]
@@ -747,6 +790,10 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: Attention enhancements
+    multi_res_slices: bool = False     # multi-resolution slice counts per head
+    gated_attn: bool = False           # learnable gate on attention output
+    sigmoid_attn: bool = False         # sigmoid attention instead of softmax for slice weights
 
 
 cfg = sp.parse(Config)
@@ -896,6 +943,9 @@ model_config = dict(
     dln_zeroinit=cfg.dln_zeroinit,
     domain_velhead=cfg.domain_velhead,
     prog_slices=cfg.prog_slices,
+    multi_res_slices=cfg.multi_res_slices,
+    gated_attn=cfg.gated_attn,
+    sigmoid_attn=cfg.sigmoid_attn,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1863,8 +1913,11 @@ if best_metrics:
     elif ema_model is not None:
         vis_model = ema_model
     else:
-        vis_model = model
-    vis_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        vis_model = _base_model  # use uncompiled model for visualization (avoids recompilation)
+    _sd = torch.load(model_path, map_location=device, weights_only=True)
+    # Strip _orig_mod. prefix from compiled model state dicts
+    _sd = {k.removeprefix("_orig_mod."): v for k, v in _sd.items()}
+    vis_model.load_state_dict(_sd)
     vis_model.eval()
     plot_dir = Path("plots") / run.id
     n = 1 if cfg.debug else 4
@@ -1910,7 +1963,48 @@ if best_metrics:
                     else:
                         y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
             samples.append((x[:, :2], y_true, y_pred, is_surface))
-        images = visualize(samples, out_dir=plot_dir / split_name)
+        # Inline visualization from pre-computed samples
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+        _vis_dir = plot_dir / split_name
+        _vis_dir.mkdir(parents=True, exist_ok=True)
+        images = []
+        for _si, (_pos, _yt, _yp, _is) in enumerate(samples):
+            _pos_np = _pos.numpy()
+            _yt_np = _yt.numpy()
+            _yp_np = _yp.numpy()
+            _is_np = _is.numpy()
+            _near = (_pos_np[:, 0] >= -1) & (_pos_np[:, 0] <= 2) & (_pos_np[:, 1] >= 0)
+            _px, _py = _pos_np[_near, 0], _pos_np[_near, 1]
+            _gt_vmag = np.sqrt(_yt_np[_near, 0]**2 + _yt_np[_near, 1]**2)
+            _pr_vmag = np.sqrt(_yp_np[_near, 0]**2 + _yp_np[_near, 1]**2)
+            _gt_p, _pr_p = _yt_np[_near, 2], _yp_np[_near, 2]
+            fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+            for ax in axes.flat:
+                ax.set_aspect("equal")
+            axes[0, 0].scatter(_px, _py, c=_gt_vmag, s=0.5, cmap="viridis", edgecolors="none")
+            axes[0, 0].set_title("|U| GT")
+            axes[0, 1].scatter(_px, _py, c=_pr_vmag, s=0.5, cmap="viridis", edgecolors="none")
+            axes[0, 1].set_title("|U| Pred")
+            _ev = _gt_vmag - _pr_vmag
+            _evm = max(abs(_ev.min()), abs(_ev.max()), 1e-6)
+            axes[0, 2].scatter(_px, _py, c=_ev, s=0.5, cmap="RdBu_r", vmin=-_evm, vmax=_evm, edgecolors="none")
+            axes[0, 2].set_title("|U| Error")
+            axes[1, 0].scatter(_px, _py, c=_gt_p, s=0.5, cmap="RdBu_r", edgecolors="none")
+            axes[1, 0].set_title("p GT")
+            axes[1, 1].scatter(_px, _py, c=_pr_p, s=0.5, cmap="RdBu_r", edgecolors="none")
+            axes[1, 1].set_title("p Pred")
+            _ep = _gt_p - _pr_p
+            _epm = max(abs(_ep.min()), abs(_ep.max()), 1e-6)
+            axes[1, 2].scatter(_px, _py, c=_ep, s=0.5, cmap="RdBu_r", vmin=-_epm, vmax=_epm, edgecolors="none")
+            axes[1, 2].set_title("p Error")
+            plt.tight_layout()
+            _path = _vis_dir / f"val_sample_{_si}.png"
+            fig.savefig(_path, dpi=150)
+            plt.close(fig)
+            images.append(_path)
         if images:
             wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
 
