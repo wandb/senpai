@@ -741,6 +741,10 @@ class Config:
     swa_cyclic: bool = False           # GPU 0/1: SWA with cyclic LR warm restarts
     swa_cyclic_T: int = 40             # warm-restart cycle period in epochs
     swa_cyclic_start: int = 100        # epoch to switch from cosine to cyclic schedule
+    # Phase 4: Self-distillation with EMA teacher
+    self_distill: bool = False         # enable online self-distillation from EMA teacher
+    self_distill_weight: float = 0.2   # weight for distillation loss
+    self_distill_start: int = -1       # epoch to start distillation (-1 = start when EMA model exists)
     two_phase_lr: bool = False         # GPU 5: lr=3e-4 for phase1, then lr=1e-4
     two_phase_switch_epoch: int = 100  # epoch at which to switch phases
     two_phase_lr_1: float = 3e-4       # phase 1 LR (overrides cfg.lr when active)
@@ -1405,6 +1409,21 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # Self-distillation: MSE consistency loss between student and EMA teacher
+        distill_loss = torch.tensor(0.0, device=device)
+        if cfg.self_distill and ema_model is not None and model.training:
+            distill_start = cfg.self_distill_start if cfg.self_distill_start >= 0 else (cfg.ema_start_epoch + 5)
+            if epoch >= distill_start:
+                with torch.no_grad():
+                    ema_model.eval()
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        teacher_out = ema_model({"x": x})
+                        teacher_pred = teacher_out["preds"].float()
+                # MSE distillation loss on normalized predictions (masked by valid nodes)
+                valid_mask = mask.float().unsqueeze(-1)  # [B, N, 1]
+                distill_loss = ((pred - teacher_pred.detach()) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
+                loss = loss + cfg.self_distill_weight * distill_loss
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -1505,7 +1524,10 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _train_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.self_distill:
+            _train_log["train/distill_loss"] = distill_loss.item()
+        wandb.log(_train_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -1854,64 +1876,26 @@ if best_metrics:
     wandb.summary.update({"best_" + k: v for k, v in best_metrics.items()})
 
     print("\nGenerating flow field plots...")
-    if cfg.swa_cyclic and swa_cyclic_model is not None:
-        vis_model = swa_cyclic_model
-    elif cfg.snapshot_ensemble and snapshot_avg_model is not None:
-        vis_model = snapshot_avg_model
-    elif cfg.swa and swa_model is not None:
-        vis_model = swa_model
-    elif ema_model is not None:
-        vis_model = ema_model
-    else:
-        vis_model = model
-    vis_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-    vis_model.eval()
-    plot_dir = Path("plots") / run.id
-    n = 1 if cfg.debug else 4
-    for split_name, split_ds in val_splits.items():
-        samples = []
-        for i in range(min(n, len(split_ds))):
-            x, y_true, is_surface = split_ds[i]
-            with torch.no_grad():
-                x_dev = x.unsqueeze(0).to(device)
-                y_dev = y_true.unsqueeze(0).to(device)
-                is_surf_dev = is_surface.unsqueeze(0).to(device)
-                mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
-                raw_dsdf = x_dev[:, :, 2:10]
-                dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
-                dist_feat = torch.log1p(dist_surf * 10.0)
-                x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
-                curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
-                x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
-                # Fourier PE (must match training loop)
-                raw_xy = x_n[:, :, :2]
-                xy_min = raw_xy.amin(dim=1, keepdim=True)
-                xy_max = raw_xy.amax(dim=1, keepdim=True)
-                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                freqs = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
-                xy_scaled = xy_norm.unsqueeze(-1) * freqs
-                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
-                x_n = torch.cat([x_n, fourier_pe], dim=-1)
-                Umag, q = _umag_q(y_dev, mask)
-                pred = vis_model({"x": x_n})["preds"].float()
-                if cfg.raw_targets:
-                    y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
-                else:
-                    pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
-                    if cfg.log_pressure:
-                        pred_phys = pred_phys.clone()
-                        pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
-                    if cfg.tight_denorm_clamps:
-                        _pd = pred_phys.clone()
-                        _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
-                        _pd[:, :, 1:2] = pred_phys[:, :, 1:2].clamp(-5, 5) * Umag
-                        _pd[:, :, 2:3] = pred_phys[:, :, 2:3].clamp(-10, 10) * q
-                        y_pred = _pd.squeeze(0).cpu()
-                    else:
-                        y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
-            samples.append((x[:, :2], y_true, y_pred, is_surface))
-        images = visualize(samples, out_dir=plot_dir / split_name)
-        if images:
-            wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    try:
+        if cfg.swa_cyclic and swa_cyclic_model is not None:
+            vis_model = swa_cyclic_model
+        elif cfg.snapshot_ensemble and snapshot_avg_model is not None:
+            vis_model = snapshot_avg_model
+        elif cfg.swa and swa_model is not None:
+            vis_model = swa_model
+        elif ema_model is not None:
+            vis_model = ema_model
+        else:
+            vis_model = model
+        vis_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        vis_model.eval()
+        plot_dir = Path("plots") / run.id
+        n = 1 if cfg.debug else 4
+        for split_name, split_ds in val_splits.items():
+            images = visualize(vis_model, split_ds, stats, device, n_samples=n, out_dir=plot_dir / split_name)
+            if images:
+                wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    except Exception as e:
+        print(f"Warning: visualization failed: {e}")
 
 wandb.finish()
