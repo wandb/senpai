@@ -710,6 +710,7 @@ class Config:
     swa_start_epoch: int = 200   # epoch to start SWA (GPU 0: 200, GPU 6: 160)
     grad_accum_steps: int = 1    # GPU 2: gradient accumulation (step every N batches)
     half_target_noise: bool = False  # GPU 3: reduce target noise by 50%
+    no_target_noise: bool = False    # Phase 4: completely disable target noise injection
     use_lion: bool = False        # GPU 4: Lion optimizer instead of AdamW
     rdrop: bool = False           # GPU 7: R-drop regularization
     rdrop_alpha: float = 1.0     # R-drop consistency loss weight
@@ -1239,8 +1240,8 @@ for epoch in range(MAX_EPOCHS):
                 y_phys = y_phys.clone()
                 y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
             y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
-        if model.training:
-            noise_progress = min(1.0, epoch / cfg.noise_anneal_epochs)
+        if model.training and not cfg.no_target_noise:
+            noise_progress = min(1.0, epoch / max(cfg.noise_anneal_epochs, 1))
             if cfg.half_target_noise:
                 vel_noise = 0.0075 * (1 - noise_progress) + 0.0015 * noise_progress
                 p_noise = 0.004 * (1 - noise_progress) + 0.0005 * noise_progress
