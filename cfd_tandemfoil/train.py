@@ -1078,6 +1078,148 @@ train_ds, val_splits, stats, sample_weights = load_data(
 )
 stats = {k: v.to(device) for k, v in stats.items()}
 
+# Precompute inviscid Cp for all samples (avoids repeated CPU computation during training)
+_cp_cache = {}
+if cfg.inviscid_prior:
+    print("Precomputing inviscid Cp for all samples...")
+    import time as _time
+    _cp_t0 = _time.time()
+    all_datasets = [("train", train_ds)] + [(k, v) for k, v in val_splits.items()]
+    _n_computed = 0
+    for _ds_name, _ds in all_datasets:
+        for _idx in range(len(_ds)):
+            _x, _y, _is_surf = _ds[_idx]
+            _n = _x.shape[0]
+            _key = (_ds_name, _idx)
+
+            # Extract geometry from raw features
+            _aoa0_rad = _x[0, 14].item()
+            _aoa0_deg = np.degrees(_aoa0_rad)
+            _naca0_enc = _x[0, 15:18].numpy()
+            _naca0_m = int(round(_naca0_enc[0] * 9))
+            _naca0_p = int(round(_naca0_enc[1] * 9))
+            _naca0_t = int(round(_naca0_enc[2] * 24))
+            _naca0_str = f"{_naca0_m}{_naca0_p}{_naca0_t:02d}"
+
+            _gap = _x[0, 22].item()
+            _is_tandem = abs(_gap) > 0.01
+            _pos = _x[:, :2].numpy()
+            _surf_mask = _is_surf.numpy()
+
+            try:
+                _panels = _naca4_geometry(_naca0_str, n_panels=80)
+                if cfg.inviscid_thin_airfoil:
+                    _dx_p = np.diff(_panels[:, 0])
+                    _dy_p = np.diff(_panels[:, 1])
+                    _aoa = np.radians(_aoa0_deg)
+                    _cos_t = _dx_p / np.sqrt(_dx_p**2 + _dy_p**2 + 1e-12)
+                    _sin_t = _dy_p / np.sqrt(_dx_p**2 + _dy_p**2 + 1e-12)
+                    _Vt = np.cos(_aoa) * _cos_t + np.sin(_aoa) * _sin_t
+                    _cp_panels = np.clip(1.0 - _Vt**2, -10.0, 2.0)
+                    _panel_x = 0.5 * (_panels[:-1, 0] + _panels[1:, 0])
+                    _panel_y = 0.5 * (_panels[:-1, 1] + _panels[1:, 1])
+                else:
+                    _panel_x, _panel_y, _cp_panels = _hess_smith_solve(_panels, _aoa0_deg)
+
+                _panel_pts = np.stack([_panel_x, _panel_y], axis=-1)
+
+                # Interpolate to mesh nodes
+                _cp_arr = np.zeros(_n, dtype=np.float32)
+                if cfg.inviscid_surface_only:
+                    _surf_idx = np.where(_surf_mask)[0]
+                    if len(_surf_idx) > 0:
+                        _dists = np.linalg.norm(_pos[_surf_idx, None, :] - _panel_pts[None, :, :], axis=-1)
+                        _nearest = np.argmin(_dists, axis=1)
+                        _cp_arr[_surf_idx] = _cp_panels[_nearest]
+                else:
+                    _dists = np.linalg.norm(_pos[:, None, :] - _panel_pts[None, :, :], axis=-1)
+                    _nearest = np.argmin(_dists, axis=1)
+                    _cp_vals = _cp_panels[_nearest]
+                    _min_dist = _dists[np.arange(_n), _nearest]
+                    _decay = np.exp(-5.0 * _min_dist)
+                    _cp_arr = (_cp_vals * _decay).astype(np.float32)
+
+                # Handle tandem second foil
+                if _is_tandem:
+                    _aoa1_rad = _x[0, 18].item()
+                    _aoa1_deg = np.degrees(_aoa1_rad)
+                    _naca1_enc = _x[0, 19:22].numpy()
+                    _naca1_m = int(round(_naca1_enc[0] * 9))
+                    _naca1_p = int(round(_naca1_enc[1] * 9))
+                    _naca1_t = int(round(_naca1_enc[2] * 24))
+                    _naca1_str = f"{_naca1_m}{_naca1_p}{_naca1_t:02d}"
+                    _stagger = _x[0, 23].item()
+
+                    if _naca1_t > 0:
+                        _panels2 = _naca4_geometry(_naca1_str, n_panels=80)
+                        if cfg.inviscid_thin_airfoil:
+                            _dx2 = np.diff(_panels2[:, 0])
+                            _dy2 = np.diff(_panels2[:, 1])
+                            _aoa2 = np.radians(_aoa1_deg)
+                            _cos2 = _dx2 / np.sqrt(_dx2**2 + _dy2**2 + 1e-12)
+                            _sin2 = _dy2 / np.sqrt(_dx2**2 + _dy2**2 + 1e-12)
+                            _Vt2 = np.cos(_aoa2) * _cos2 + np.sin(_aoa2) * _sin2
+                            _cp2 = np.clip(1.0 - _Vt2**2, -10.0, 2.0)
+                            _p2x = 0.5 * (_panels2[:-1, 0] + _panels2[1:, 0])
+                            _p2y = 0.5 * (_panels2[:-1, 1] + _panels2[1:, 1])
+                        else:
+                            _p2x, _p2y, _cp2 = _hess_smith_solve(_panels2, _aoa1_deg)
+                        _p2_pts = np.stack([_p2x + _gap, _p2y + _stagger], axis=-1)
+
+                        _d2 = np.linalg.norm(_pos[:, None, :] - _p2_pts[None, :, :], axis=-1)
+                        _n2 = np.argmin(_d2, axis=1)
+                        _cp2_vals = _cp2[_n2]
+                        _d2_min = _d2[np.arange(_n), _n2]
+                        _d1_min = np.linalg.norm(_pos[:, None, :] - _panel_pts[None, :, :], axis=-1).min(axis=1)
+
+                        if cfg.inviscid_surface_only:
+                            _surf_idx = np.where(_surf_mask)[0]
+                            _closer2 = _d2_min[_surf_idx] < _d1_min[_surf_idx]
+                            _cp_arr[_surf_idx[_closer2]] = _cp2_vals[_surf_idx[_closer2]]
+                        else:
+                            _decay2 = np.exp(-5.0 * _d2_min)
+                            _cp2_decayed = (_cp2_vals * _decay2).astype(np.float32)
+                            _closer2 = _d2_min < _d1_min
+                            _cp_arr[_closer2] = _cp2_decayed[_closer2]
+
+                _cp_cache[_key] = torch.from_numpy(_cp_arr)
+            except Exception as _e:
+                _cp_cache[_key] = torch.zeros(_n)
+
+            _n_computed += 1
+
+    _cp_elapsed = _time.time() - _cp_t0
+    print(f"  Precomputed Cp for {_n_computed} samples in {_cp_elapsed:.1f}s ({_cp_elapsed/_n_computed*1000:.1f}ms/sample)")
+
+    # Inject Cp into cached dataset samples (augment x from 24→25 dims)
+    # All subsets share the same base MultiFieldDataset
+    _base_ds = train_ds.dataset if hasattr(train_ds, 'dataset') else train_ds
+    # Build a mapping from (ds_name, local_idx) → real_idx in base dataset
+    _injected = set()
+    for _idx in range(len(train_ds)):
+        _real_idx = train_ds.indices[_idx] if hasattr(train_ds, 'indices') else _idx
+        if _real_idx in _injected:
+            continue
+        _cp = _cp_cache.get(("train", _idx), None)
+        if _cp is not None and _real_idx in _base_ds._cache:
+            _x, _y, _is_surf = _base_ds._cache[_real_idx]
+            if _x.shape[1] == 24:
+                _base_ds._cache[_real_idx] = (torch.cat([_x, _cp.unsqueeze(-1)], dim=-1), _y, _is_surf)
+                _injected.add(_real_idx)
+    for _ds_name, _ds in val_splits.items():
+        for _idx in range(len(_ds)):
+            _real_idx = _ds.indices[_idx] if hasattr(_ds, 'indices') else _idx
+            if _real_idx in _injected:
+                continue
+            _cp = _cp_cache.get((_ds_name, _idx), None)
+            if _cp is not None and _real_idx in _base_ds._cache:
+                _x, _y, _is_surf = _base_ds._cache[_real_idx]
+                if _x.shape[1] == 24:
+                    _base_ds._cache[_real_idx] = (torch.cat([_x, _cp.unsqueeze(-1)], dim=-1), _y, _is_surf)
+                    _injected.add(_real_idx)
+    del _cp_cache
+    print(f"  Injected Cp into {len(_injected)} cached samples")
+
 
 def _umag_q(y, mask):
     """Per-sample reference velocity and dynamic pressure from mean velocity.
@@ -1518,15 +1660,20 @@ for epoch in range(MAX_EPOCHS):
                     y[_b, _in_region] = y[_cut_idx[_b], _in_region]
                     is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
 
+        # Extract precomputed Cp if present (appended as 25th feature during data loading)
+        if cfg.inviscid_prior:
+            if x.shape[2] > 24:
+                cp_feat = x[:, :, 24:25]  # (B, N, 1) — precomputed Cp
+                x = x[:, :, :24]  # original 24 features
+            else:
+                # Fallback: compute on-the-fly (slower, used in debug mode)
+                cp_feat = compute_inviscid_cp_for_batch(
+                    x, is_surface, mask, device,
+                    surface_only=cfg.inviscid_surface_only,
+                    thin_airfoil=cfg.inviscid_thin_airfoil)
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
-        # Compute inviscid Cp prior (before standardization, needs raw features)
-        if cfg.inviscid_prior:
-            cp_feat = compute_inviscid_cp_for_batch(
-                x, is_surface, mask, device,
-                surface_only=cfg.inviscid_surface_only,
-                thin_airfoil=cfg.inviscid_thin_airfoil)
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1949,14 +2096,18 @@ for epoch in range(MAX_EPOCHS):
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
 
+                if cfg.inviscid_prior:
+                    if x.shape[2] > 24:
+                        cp_feat = x[:, :, 24:25]
+                        x = x[:, :, :24]
+                    else:
+                        cp_feat = compute_inviscid_cp_for_batch(
+                            x, is_surface, mask, device,
+                            surface_only=cfg.inviscid_surface_only,
+                            thin_airfoil=cfg.inviscid_thin_airfoil)
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
-                if cfg.inviscid_prior:
-                    cp_feat = compute_inviscid_cp_for_batch(
-                        x, is_surface, mask, device,
-                        surface_only=cfg.inviscid_surface_only,
-                        thin_airfoil=cfg.inviscid_thin_airfoil)
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -2230,14 +2381,18 @@ if best_metrics:
                     y_dev = y_true.unsqueeze(0).to(device)
                     is_surf_dev = is_surface.unsqueeze(0).to(device)
                     mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
+                    if cfg.inviscid_prior:
+                        if x_dev.shape[2] > 24:
+                            cp_feat = x_dev[:, :, 24:25]
+                            x_dev = x_dev[:, :, :24]
+                        else:
+                            cp_feat = compute_inviscid_cp_for_batch(
+                                x_dev, is_surf_dev, mask, device,
+                                surface_only=cfg.inviscid_surface_only,
+                                thin_airfoil=cfg.inviscid_thin_airfoil)
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
-                    if cfg.inviscid_prior:
-                        cp_feat = compute_inviscid_cp_for_batch(
-                            x_dev, is_surf_dev, mask, device,
-                            surface_only=cfg.inviscid_surface_only,
-                            thin_airfoil=cfg.inviscid_thin_airfoil)
                     x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                     curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                     if cfg.inviscid_prior:
