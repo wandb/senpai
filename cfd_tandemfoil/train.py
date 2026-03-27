@@ -1406,7 +1406,7 @@ for epoch in range(MAX_EPOCHS):
                 _lo = 1.0 - cfg.aug_scale_range
                 _scale = torch.rand(x.size(0), 1, 1, device=x.device) * (2 * cfg.aug_scale_range) + _lo
                 x[:, :, :2] = x[:, :, :2] * _scale
-            if cfg.aug == "aoa_perturb":
+            if cfg.aug in ("aoa_perturb", "random_erase_aoa", "random_erase_mild_aoa"):
                 _angle_deg = torch.rand(x.size(0), device=x.device) * 2.0 - 1.0
                 _angle_rad = _angle_deg * (torch.pi / 180.0)
                 _cos_a = torch.cos(_angle_rad).view(-1, 1, 1)
@@ -1438,10 +1438,11 @@ for epoch in range(MAX_EPOCHS):
                     y[_b, _in_region] = y[_cut_idx[_b], _in_region]
                     is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
             # Phase 4: RandomErasing — zero out random input feature channels
-            if cfg.aug == "random_erase":
+            if cfg.aug in ("random_erase", "random_erase_mild", "random_erase_aoa", "random_erase_mild_aoa"):
                 _B_aug, _N_aug, _D_aug = x.shape
+                _max_erase = 2 if cfg.aug in ("random_erase_mild", "random_erase_mild_aoa") else 4
                 for _b in range(_B_aug):
-                    _n_erase = torch.randint(1, 4, (1,)).item()
+                    _n_erase = torch.randint(1, _max_erase, (1,)).item()
                     _erase_dims = torch.randperm(_D_aug - 2, device=x.device)[:_n_erase] + 2
                     x[_b, :, _erase_dims] = 0.0
             # Phase 4: Spatial CutOut — zero features in a spatial region
