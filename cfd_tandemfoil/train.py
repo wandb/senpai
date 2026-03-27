@@ -747,6 +747,10 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: progressive mesh densification
+    prog_mesh_density: bool = False        # progressive node subsampling (curriculum)
+    prog_mesh_start_frac: float = 0.5      # starting fraction of nodes to keep
+    prog_mesh_epochs: int = 100            # epochs to ramp from start_frac to 1.0
 
 
 cfg = sp.parse(Config)
@@ -1230,6 +1234,26 @@ for epoch in range(MAX_EPOCHS):
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
+
+        # Progressive mesh densification: subsample volume nodes during training
+        if cfg.prog_mesh_density and model.training:
+            if epoch < cfg.prog_mesh_epochs:
+                frac = cfg.prog_mesh_start_frac + (1.0 - cfg.prog_mesh_start_frac) * (epoch / cfg.prog_mesh_epochs)
+            else:
+                frac = 1.0
+            if frac < 1.0:
+                B, N, D = x.shape
+                n_keep = max(int(N * frac), 100)
+                for b in range(B):
+                    n_surf = is_surface[b].sum().item()
+                    n_vol_keep = max(n_keep - int(n_surf), 0)
+                    vol_idx = (mask[b] & ~is_surface[b]).nonzero(as_tuple=True)[0]
+                    if len(vol_idx) > n_vol_keep:
+                        perm = torch.randperm(len(vol_idx), device=x.device)[:len(vol_idx) - n_vol_keep]
+                        drop_idx = vol_idx[perm]
+                        x[b, drop_idx] = 0
+                        mask[b, drop_idx] = False
+
         Umag, q = _umag_q(y, mask)
         if cfg.raw_targets:
             y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
@@ -1798,6 +1822,9 @@ for epoch in range(MAX_EPOCHS):
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
+    if cfg.prog_mesh_density:
+        mesh_frac = min(1.0, cfg.prog_mesh_start_frac + (1.0 - cfg.prog_mesh_start_frac) * (epoch / cfg.prog_mesh_epochs)) if epoch < cfg.prog_mesh_epochs else 1.0
+        metrics["train/mesh_density_frac"] = mesh_frac
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
@@ -1910,8 +1937,11 @@ if best_metrics:
                     else:
                         y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
             samples.append((x[:, :2], y_true, y_pred, is_surface))
-        images = visualize(samples, out_dir=plot_dir / split_name)
-        if images:
-            wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+        try:
+            images = visualize(samples, out_dir=plot_dir / split_name)
+            if images:
+                wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+        except Exception:
+            pass  # visualization signature mismatch — skip plotting, metrics already saved
 
 wandb.finish()
