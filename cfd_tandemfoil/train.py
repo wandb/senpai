@@ -747,6 +747,9 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: combined best findings
+    disable_pcgrad: bool = False       # disable PCGrad (use single combined loss)
+    val_every: int = 1                 # run validation every N epochs (1 = every epoch)
 
 
 cfg = sp.parse(Config)
@@ -1121,6 +1124,7 @@ prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
+val_metrics_per_split: dict[str, dict] = {}
 
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
@@ -1419,7 +1423,7 @@ for epoch in range(MAX_EPOCHS):
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
         is_indist_pcgrad = ~is_ood_pcgrad
-        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
+        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any() and not cfg.disable_pcgrad
 
         if use_pcgrad:
             n_a = is_indist_pcgrad.float().sum().clamp(min=1)
@@ -1576,6 +1580,7 @@ for epoch in range(MAX_EPOCHS):
                     sa[k].mul_((snapshot_n - 1) / snapshot_n).add_(snap[k].to(device) / snapshot_n)
 
     # --- Validate across all splits ---
+    _do_val = (epoch + 1) % cfg.val_every == 0 or epoch == 0  # always validate first epoch
     if cfg.swa_cyclic and swa_cyclic_model is not None:
         eval_model = swa_cyclic_model
     elif cfg.snapshot_ensemble and snapshot_avg_model is not None:
@@ -1588,10 +1593,14 @@ for epoch in range(MAX_EPOCHS):
         eval_model = model
     eval_model.eval()
     model.eval()
-    val_metrics_per_split: dict[str, dict] = {}
-    val_loss_sum = 0.0
+
+    if _do_val:
+        val_metrics_per_split = {}
+        val_loss_sum = 0.0
 
     for split_name, vloader in val_loaders.items():
+        if not _do_val:
+            break  # skip validation loop entirely
         val_vol = 0.0
         val_surf = 0.0
         mae_surf = torch.zeros(3, device=device)
@@ -1735,6 +1744,20 @@ for epoch in range(MAX_EPOCHS):
             f"{split_name}/mae_surf_p":  mae_surf[2].item(),
         }
         val_loss_sum += split_loss
+
+    if not _do_val:
+        # Skip validation — log train metrics only
+        dt = time.time() - t0
+        peak_mem_gb = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
+        wandb.log({"train/vol_loss": epoch_vol, "train/surf_loss": epoch_surf,
+                    "lr": scheduler.get_last_lr()[0], "epoch_time_s": dt, "global_step": global_step})
+        learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
+        for i, f in enumerate(learned_freqs):
+            wandb.log({f"fourier_freq_{i}": f})
+        print(f"Epoch {epoch+1:3d} ({dt:.0f}s) [{peak_mem_gb:.1f}GB]  "
+              f"train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  val[skipped]")
+        model.train()
+        continue
 
     # 4-split val/loss (all splits) — used for checkpoint selection
     _checkpoint_names = VAL_SPLIT_NAMES  # all 4 splits instead of _3split_names
