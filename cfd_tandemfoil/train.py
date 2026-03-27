@@ -44,6 +44,306 @@ torch.set_float32_matmul_precision('high')
 
 
 # ---------------------------------------------------------------------------
+# Inviscid pressure prior: Hess-Smith panel method
+# ---------------------------------------------------------------------------
+import numpy as np
+
+
+def _naca4_geometry(naca_code_str, n_panels=80):
+    """Generate NACA 4-digit airfoil as closed polygon (upper TE→LE→lower TE).
+
+    Returns (n_pts, 2) array of airfoil coordinates.
+    """
+    m = int(naca_code_str[0]) / 100.0  # max camber
+    p_cam = int(naca_code_str[1]) / 10.0   # camber location
+    t = int(naca_code_str[2:4]) / 100.0    # thickness
+
+    beta = np.linspace(0, np.pi, n_panels // 2 + 1)
+    xc = 0.5 * (1 - np.cos(beta))
+
+    # Thickness distribution (standard NACA formula, closed trailing edge)
+    yt = 5.0 * t * (0.2969 * np.sqrt(xc + 1e-12) - 0.1260 * xc
+                     - 0.3516 * xc**2 + 0.2843 * xc**3 - 0.1015 * xc**4)
+
+    # Camber line and its derivative
+    if p_cam > 0 and m > 0:
+        yc = np.where(xc < p_cam,
+                      m / (p_cam**2) * (2 * p_cam * xc - xc**2),
+                      m / ((1 - p_cam)**2) * (1 - 2 * p_cam + 2 * p_cam * xc - xc**2))
+        dyc = np.where(xc < p_cam,
+                       2 * m / (p_cam**2) * (p_cam - xc),
+                       2 * m / ((1 - p_cam)**2) * (p_cam - xc))
+    else:
+        yc = np.zeros_like(xc)
+        dyc = np.zeros_like(xc)
+
+    theta = np.arctan(dyc)
+    xu = xc - yt * np.sin(theta)
+    yu = yc + yt * np.cos(theta)
+    xl = xc + yt * np.sin(theta)
+    yl = yc - yt * np.cos(theta)
+
+    # Closed polygon: upper surface (TE→LE) then lower (LE→TE)
+    xp = np.concatenate([xu[::-1], xl[1:]])
+    yp = np.concatenate([yu[::-1], yl[1:]])
+    return np.stack([xp, yp], axis=-1)
+
+
+def _hess_smith_solve(panels, aoa_deg):
+    """Vectorized Hess-Smith panel method for source+vortex strengths.
+
+    Args:
+        panels: (n_pts,2) closed airfoil polygon
+        aoa_deg: angle of attack in degrees
+
+    Returns:
+        xm, ym: panel midpoints
+        cp: pressure coefficient at each panel
+    """
+    n = len(panels) - 1  # number of panels
+    xp, yp = panels[:, 0], panels[:, 1]
+
+    # Panel midpoints and geometry
+    xm = 0.5 * (xp[:-1] + xp[1:])
+    ym = 0.5 * (yp[:-1] + yp[1:])
+    dx = xp[1:] - xp[:-1]
+    dy = yp[1:] - yp[:-1]
+    S = np.sqrt(dx**2 + dy**2)
+    S = np.maximum(S, 1e-12)
+    sin_t = dy / S
+    cos_t = dx / S
+    nx = sin_t
+    ny = -cos_t
+
+    aoa = np.radians(aoa_deg)
+    Uinf_x = np.cos(aoa)
+    Uinf_y = np.sin(aoa)
+
+    # Vectorized influence coefficients
+    # dx_ij[i,j] = xm[i] - xp[j], etc.
+    dx_ij = xm[:, None] - xp[None, :n]  # (n, n)
+    dy_ij = ym[:, None] - yp[None, :n]  # (n, n)
+
+    # Rotate to panel j local frame (vectorized)
+    x_loc = dx_ij * cos_t[None, :] + dy_ij * sin_t[None, :]   # (n, n)
+    y_loc = -dx_ij * sin_t[None, :] + dy_ij * cos_t[None, :]  # (n, n)
+
+    Sj = S[None, :]  # (1, n)
+    r1_sq = np.maximum(x_loc**2 + y_loc**2, 1e-20)
+    r2_sq = np.maximum((x_loc - Sj)**2 + y_loc**2, 1e-20)
+
+    theta1 = np.arctan2(y_loc, x_loc)
+    theta2 = np.arctan2(y_loc, x_loc - Sj)
+    dtheta = theta2 - theta1
+    dtheta = (dtheta + np.pi) % (2 * np.pi) - np.pi
+
+    log_r = 0.5 * np.log(r2_sq / r1_sq)
+
+    inv2pi = 1.0 / (2.0 * np.pi)
+    # Source influence in panel j local frame
+    u_s = inv2pi * log_r
+    v_s = inv2pi * dtheta
+    # Vortex influence in panel j local frame
+    u_v = inv2pi * dtheta
+    v_v = -inv2pi * log_r
+
+    # Transform back to global frame
+    u_glob_s = u_s * cos_t[None, :] - v_s * sin_t[None, :]
+    v_glob_s = u_s * sin_t[None, :] + v_s * cos_t[None, :]
+    u_glob_v = u_v * cos_t[None, :] - v_v * sin_t[None, :]
+    v_glob_v = u_v * sin_t[None, :] + v_v * cos_t[None, :]
+
+    # Project onto normal of panel i: An[i,j], Bn[i,j]
+    An = u_glob_s * nx[:, None] + v_glob_s * ny[:, None]  # (n, n)
+    Bn = u_glob_v * nx[:, None] + v_glob_v * ny[:, None]  # (n, n)
+    # Project onto tangent of panel i: At[i,j], Bt[i,j]
+    At = u_glob_s * cos_t[:, None] + v_glob_s * sin_t[:, None]  # (n, n)
+    Bt = u_glob_v * cos_t[:, None] + v_glob_v * sin_t[:, None]  # (n, n)
+
+    # Self-influence (diagonal): source normal=0.5, vortex normal=0, source tangent=0, vortex tangent=0.5
+    np.fill_diagonal(An, 0.5)
+    np.fill_diagonal(Bn, 0.0)
+    np.fill_diagonal(At, 0.0)
+    np.fill_diagonal(Bt, 0.5)
+
+    # Build system: [An | sum(Bn)] [sigma] = [-Vn_inf]
+    #               [At[0]+At[-1] | sum(Bt[0]+Bt[-1])] [gamma]   [-Vt_inf_kutta]
+    A = np.zeros((n + 1, n + 1))
+    A[:n, :n] = An
+    A[:n, n] = Bn.sum(axis=1)
+    A[n, :n] = At[0, :] + At[n - 1, :]
+    A[n, n] = (Bt[0, :] + Bt[n - 1, :]).sum()
+
+    rhs = np.zeros(n + 1)
+    rhs[:n] = -(Uinf_x * nx + Uinf_y * ny)
+    rhs[n] = -(Uinf_x * (cos_t[0] + cos_t[n - 1]) + Uinf_y * (sin_t[0] + sin_t[n - 1]))
+
+    try:
+        sol = np.linalg.solve(A, rhs)
+    except np.linalg.LinAlgError:
+        Vt_inf = Uinf_x * cos_t + Uinf_y * sin_t
+        return xm, ym, 1.0 - Vt_inf**2
+
+    sigma = sol[:n]
+    gamma = sol[n]
+
+    # Tangential velocity at each panel (vectorized)
+    Vt = Uinf_x * cos_t + Uinf_y * sin_t + At.dot(sigma) + gamma * Bt.sum(axis=1)
+
+    cp = np.clip(1.0 - Vt**2, -10.0, 2.0)  # clip extreme values
+    return xm, ym, cp
+
+
+def compute_inviscid_cp_for_batch(x_batch, is_surface_batch, mask_batch, device,
+                                   surface_only=False, thin_airfoil=False):
+    """Compute inviscid Cp feature for a batch of samples.
+
+    Args:
+        x_batch: (B, N, 24) raw features (before standardization)
+        is_surface_batch: (B, N) bool surface mask
+        mask_batch: (B, N) bool padding mask
+        device: torch device
+        surface_only: if True, only surface nodes get Cp, volume gets 0
+        thin_airfoil: if True, use simplified thin-airfoil approximation
+
+    Returns:
+        cp_feat: (B, N, 1) inviscid Cp feature
+    """
+    B, N, _ = x_batch.shape
+    cp_feat = torch.zeros(B, N, 1, device=device)
+
+    for b in range(B):
+        valid = mask_batch[b]
+        n_valid = valid.sum().item()
+        if n_valid == 0:
+            continue
+
+        # Extract geometry info from features
+        pos = x_batch[b, :n_valid, :2].cpu().numpy()  # (n_valid, 2) node positions
+        aoa0_rad = x_batch[b, 0, 14].item()  # AoA foil 0 (radians)
+        aoa0_deg = np.degrees(aoa0_rad)
+
+        # Decode NACA code from normalized features
+        naca0_enc = x_batch[b, 0, 15:18].cpu().numpy()  # (max_camber/9, camber_pos/9, thickness/24)
+        naca0_m = int(round(naca0_enc[0] * 9))
+        naca0_p = int(round(naca0_enc[1] * 9))
+        naca0_t = int(round(naca0_enc[2] * 24))
+        naca0_str = f"{naca0_m}{naca0_p}{naca0_t:02d}"
+
+        # Check for tandem
+        gap = x_batch[b, 0, 22].item()
+        is_tandem = abs(gap) > 0.01
+
+        is_surf = is_surface_batch[b, :n_valid].cpu().numpy()
+
+        try:
+            if thin_airfoil:
+                # Simplified: Cp ≈ 1 - (2*sin(theta))^2 near surface
+                # Just use distance-weighted AoA effect
+                panels = _naca4_geometry(naca0_str, n_panels=80)
+                aoa = np.radians(aoa0_deg)
+                cos_t = np.cos(np.arctan2(np.diff(panels[:, 1]), np.diff(panels[:, 0])))
+                sin_t = np.sin(np.arctan2(np.diff(panels[:, 1]), np.diff(panels[:, 0])))
+                Vt = np.cos(aoa) * cos_t + np.sin(aoa) * sin_t
+                cp_panels = 1.0 - Vt**2
+                panel_x = 0.5 * (panels[:-1, 0] + panels[1:, 0])
+                panel_y = 0.5 * (panels[:-1, 1] + panels[1:, 1])
+            else:
+                # Full Hess-Smith
+                panels = _naca4_geometry(naca0_str, n_panels=80)
+                panel_x, panel_y, cp_panels = _hess_smith_solve(panels, aoa0_deg)
+
+            # Interpolate Cp to mesh nodes using nearest-neighbor
+            panel_pts = np.stack([panel_x, panel_y], axis=-1)  # (n_panels, 2)
+
+            if surface_only:
+                # Only interpolate to surface nodes
+                surf_idx = np.where(is_surf)[0]
+                if len(surf_idx) > 0:
+                    surf_pos = pos[surf_idx]
+                    dists = np.linalg.norm(surf_pos[:, None, :] - panel_pts[None, :, :], axis=-1)
+                    nearest = np.argmin(dists, axis=1)
+                    cp_vals = cp_panels[nearest]
+                    cp_arr = np.zeros(n_valid, dtype=np.float32)
+                    cp_arr[surf_idx] = cp_vals
+                    cp_feat[b, :n_valid, 0] = torch.from_numpy(cp_arr).to(device)
+            else:
+                # Interpolate to ALL nodes using inverse-distance weighting from nearest panels
+                dists = np.linalg.norm(pos[:, None, :] - panel_pts[None, :, :], axis=-1)  # (n_valid, n_panels)
+                nearest = np.argmin(dists, axis=1)
+                cp_vals = cp_panels[nearest]
+                # Decay Cp for volume nodes based on distance to surface
+                min_dist = dists[np.arange(n_valid), nearest]
+                decay = np.exp(-5.0 * min_dist)  # exponential decay away from surface
+                cp_vals = cp_vals * decay
+                cp_feat[b, :n_valid, 0] = torch.from_numpy(cp_vals.astype(np.float32)).to(device)
+
+            # Handle second foil for tandem configurations
+            if is_tandem:
+                aoa1_rad = x_batch[b, 0, 18].item()
+                aoa1_deg = np.degrees(aoa1_rad)
+                naca1_enc = x_batch[b, 0, 19:22].cpu().numpy()
+                naca1_m = int(round(naca1_enc[0] * 9))
+                naca1_p = int(round(naca1_enc[1] * 9))
+                naca1_t = int(round(naca1_enc[2] * 24))
+                naca1_str = f"{naca1_m}{naca1_p}{naca1_t:02d}"
+
+                if naca1_t > 0:  # Valid second foil
+                    stagger = x_batch[b, 0, 23].item()
+
+                    # Compute Cp for second foil
+                    if thin_airfoil:
+                        panels2 = _naca4_geometry(naca1_str, n_panels=80)
+                        aoa2 = np.radians(aoa1_deg)
+                        cos_t2 = np.cos(np.arctan2(np.diff(panels2[:, 1]), np.diff(panels2[:, 0])))
+                        sin_t2 = np.sin(np.arctan2(np.diff(panels2[:, 1]), np.diff(panels2[:, 0])))
+                        Vt2 = np.cos(aoa2) * cos_t2 + np.sin(aoa2) * sin_t2
+                        cp2 = 1.0 - Vt2**2
+                        panel2_x = 0.5 * (panels2[:-1, 0] + panels2[1:, 0])
+                        panel2_y = 0.5 * (panels2[:-1, 1] + panels2[1:, 1])
+                    else:
+                        panels2 = _naca4_geometry(naca1_str, n_panels=80)
+                        panel2_x, panel2_y, cp2 = _hess_smith_solve(panels2, aoa1_deg)
+
+                    # Offset panel positions by gap/stagger
+                    panel2_pts = np.stack([panel2_x + gap, panel2_y + stagger], axis=-1)
+
+                    if surface_only:
+                        surf_idx = np.where(is_surf)[0]
+                        if len(surf_idx) > 0:
+                            surf_pos = pos[surf_idx]
+                            dists2 = np.linalg.norm(surf_pos[:, None, :] - panel2_pts[None, :, :], axis=-1)
+                            nearest2 = np.argmin(dists2, axis=1)
+                            cp2_vals = cp2[nearest2]
+                            # Only apply to nodes closer to foil 2
+                            dists1 = np.linalg.norm(surf_pos[:, None, :] - panel_pts[None, :, :], axis=-1).min(axis=1)
+                            dists2_min = dists2[np.arange(len(surf_idx)), nearest2]
+                            closer_to_2 = dists2_min < dists1
+                            cp_arr = cp_feat[b, :n_valid, 0].cpu().numpy()
+                            cp_arr[surf_idx[closer_to_2]] = cp2_vals[closer_to_2]
+                            cp_feat[b, :n_valid, 0] = torch.from_numpy(cp_arr).to(device)
+                    else:
+                        dists2 = np.linalg.norm(pos[:, None, :] - panel2_pts[None, :, :], axis=-1)
+                        nearest2 = np.argmin(dists2, axis=1)
+                        cp2_vals = cp2[nearest2]
+                        min_dist2 = dists2[np.arange(n_valid), nearest2]
+                        decay2 = np.exp(-5.0 * min_dist2)
+                        cp2_vals = cp2_vals * decay2
+                        # Take the closer foil's Cp
+                        existing_cp = cp_feat[b, :n_valid, 0].cpu().numpy()
+                        min_dist1 = np.linalg.norm(pos[:, None, :] - panel_pts[None, :, :], axis=-1).min(axis=1)
+                        use_foil2 = min_dist2 < min_dist1
+                        existing_cp[use_foil2] = cp2_vals[use_foil2]
+                        cp_feat[b, :n_valid, 0] = torch.from_numpy(existing_cp.astype(np.float32)).to(device)
+
+        except Exception:
+            # If panel method fails, leave Cp as 0
+            pass
+
+    return cp_feat
+
+
+# ---------------------------------------------------------------------------
 # Transolver model (inlined so students can
 # modify architecture and training script in a single file)
 # ---------------------------------------------------------------------------
@@ -754,6 +1054,11 @@ class Config:
     vol_subsample_frac: float = 1.0     # fraction of volume nodes in loss after vol_ramp (0.8 = 80%)
     compile_mode: str = "default"       # torch.compile mode: "default", "max-autotune", "reduce-overhead"
     num_workers: int = 4                # data loader workers
+    # Phase 4: inviscid pressure prior
+    inviscid_prior: bool = False        # add inviscid Cp as input feature
+    inviscid_residual: bool = False     # predict residual (y - y_inviscid) instead of full y
+    inviscid_surface_only: bool = False # only apply Cp to surface nodes (volume gets 0)
+    inviscid_thin_airfoil: bool = False # use simplified thin-airfoil approx instead of Hess-Smith
 
 
 cfg = sp.parse(Config)
@@ -877,7 +1182,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (1 if cfg.inviscid_prior else 0) + 32,  # +curv, +dist, [+foil2dist], [+cp], +32 fourier PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1216,12 +1521,20 @@ for epoch in range(MAX_EPOCHS):
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+        # Compute inviscid Cp prior (before standardization, needs raw features)
+        if cfg.inviscid_prior:
+            cp_feat = compute_inviscid_cp_for_batch(
+                x, is_surface, mask, device,
+                surface_only=cfg.inviscid_surface_only,
+                thin_airfoil=cfg.inviscid_thin_airfoil)
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         if cfg.foil2_dist:
             foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
             x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
+        elif cfg.inviscid_prior:
+            x = torch.cat([x, curv, dist_feat, cp_feat], dim=-1)
         else:
             x = torch.cat([x, curv, dist_feat], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
@@ -1639,12 +1952,19 @@ for epoch in range(MAX_EPOCHS):
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+                if cfg.inviscid_prior:
+                    cp_feat = compute_inviscid_cp_for_batch(
+                        x, is_surface, mask, device,
+                        surface_only=cfg.inviscid_surface_only,
+                        thin_airfoil=cfg.inviscid_thin_airfoil)
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                 if cfg.foil2_dist:
                     foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
                     x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
+                elif cfg.inviscid_prior:
+                    x = torch.cat([x, curv, dist_feat, cp_feat], dim=-1)
                 else:
                     x = torch.cat([x, curv, dist_feat], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
@@ -1913,9 +2233,17 @@ if best_metrics:
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
+                    if cfg.inviscid_prior:
+                        cp_feat = compute_inviscid_cp_for_batch(
+                            x_dev, is_surf_dev, mask, device,
+                            surface_only=cfg.inviscid_surface_only,
+                            thin_airfoil=cfg.inviscid_thin_airfoil)
                     x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                     curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
-                    x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                    if cfg.inviscid_prior:
+                        x_n = torch.cat([x_n, curv, dist_feat, cp_feat], dim=-1)
+                    else:
+                        x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
                     # Fourier PE (must match training loop)
                     raw_xy = x_n[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
