@@ -38,7 +38,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 import simple_parsing as sp
 
 from data.utils import visualize
-from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
+from data.prepare_multi import X_DIM, X_STORED_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
 
 torch.set_float32_matmul_precision('high')
 
@@ -747,6 +747,12 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: advanced feature engineering
+    add_boundary_onehot: bool = False  # one-hot encode boundary type (0-7) → +8 dims
+    add_zone: bool = False             # one-hot encode mesh zone ID (0-2) → +3 dims
+    add_wall_normal: bool = False      # wall-normal direction for surface nodes → +2 dims
+    add_mesh_density: bool = False     # local mesh density proxy → +1 dim
+    add_foil_relative: bool = False    # distance/angle to foil centroids → +4 dims
 
 
 cfg = sp.parse(Config)
@@ -868,9 +874,20 @@ if cfg.raw_targets:
 else:
     raw_stats = None
 
+# Phase 4: compute extra feature dimensions from flags
+extra_feat_dim = sum([
+    8 if cfg.add_boundary_onehot else 0,
+    3 if cfg.add_zone else 0,
+    2 if cfg.add_wall_normal else 0,
+    1 if cfg.add_mesh_density else 0,
+    4 if cfg.add_foil_relative else 0,
+])
+if extra_feat_dim > 0:
+    print(f"Phase 4 extra features: +{extra_feat_dim} dims")
+
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32 + extra_feat_dim,  # +curv, +dist, [+foil2dist], +32 fourier PE, +extra
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1111,6 +1128,50 @@ model_path = model_dir / "checkpoint.pt"
 with open(model_dir / "config.yaml", "w") as f:
     yaml.dump(model_config, f)
 
+def _compute_extra_features(raw_boundary, raw_zone, raw_pos, raw_dsdf, dist_surf, is_surface):
+    """Compute Phase 4 extra input features based on config flags.
+
+    Returns list of (B, N, d_i) tensors to concatenate to x.
+    """
+    extra = []
+    if cfg.add_boundary_onehot:
+        boundary_oh = F.one_hot(raw_boundary.clamp(0, 7), 8).float()
+        extra.append(boundary_oh)
+    if cfg.add_zone:
+        zone_oh = F.one_hot(raw_zone.clamp(0, 2), 3).float()
+        extra.append(zone_oh)
+    if cfg.add_wall_normal:
+        nx = raw_dsdf[:, :, 0:1]
+        ny = raw_dsdf[:, :, 1:2]
+        normal_mag = (nx**2 + ny**2).sqrt().clamp(min=1e-6)
+        wall_normal = torch.cat([nx / normal_mag, ny / normal_mag], dim=-1)
+        wall_normal = wall_normal * is_surface.float().unsqueeze(-1)
+        extra.append(wall_normal)
+    if cfg.add_mesh_density:
+        mesh_density = torch.log1p(1.0 / dist_surf.clamp(min=1e-6))
+        extra.append(mesh_density)
+    if cfg.add_foil_relative:
+        foil1_mask = (raw_boundary == 5) | (raw_boundary == 6)  # [B, N]
+        foil2_mask = (raw_boundary == 7)  # [B, N]
+        f1_sum = (raw_pos * foil1_mask.unsqueeze(-1).float()).sum(dim=1)  # [B, 2]
+        f1_count = foil1_mask.float().sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1]
+        f1_center = f1_sum / f1_count  # [B, 2]
+        f2_sum = (raw_pos * foil2_mask.unsqueeze(-1).float()).sum(dim=1)
+        f2_count = foil2_mask.float().sum(dim=1, keepdim=True).clamp(min=1)
+        f2_center = f2_sum / f2_count
+        has_f2 = (foil2_mask.float().sum(dim=1) > 0).float().unsqueeze(-1)  # [B, 1]
+        f2_center = has_f2 * f2_center + (1 - has_f2) * f1_center
+        d1 = raw_pos - f1_center.unsqueeze(1)  # [B, N, 2]
+        d2 = raw_pos - f2_center.unsqueeze(1)
+        r1 = d1.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        r2 = d2.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        angle1 = torch.atan2(d1[:, :, 1:2], d1[:, :, 0:1])
+        angle2 = torch.atan2(d2[:, :, 1:2], d2[:, :, 0:1])
+        foil_rel = torch.cat([torch.log1p(r1), angle1, torch.log1p(r2), angle2], dim=-1)
+        extra.append(foil_rel)
+    return extra
+
+
 best_val = float("inf")
 ema_val_loss = float("inf")
 ema_decay_val = 0.9
@@ -1146,6 +1207,12 @@ for epoch in range(MAX_EPOCHS):
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
+
+        # Phase 4: extract raw metadata before augmentation/standardization
+        raw_boundary = x[:, :, 24].long()  # (B, N) boundary type 0-7
+        raw_zone = x[:, :, 25].long()      # (B, N) mesh zone 0-2
+        raw_pos_for_feat = x[:, :, :2].clone()  # save raw pos for foil-relative
+        x = x[:, :, :X_DIM]  # trim to core 24 features
 
         # --- Data augmentation (training-only, applied before normalization) ---
         if model.training and cfg.aug != "none" and epoch >= cfg.aug_start_epoch:
@@ -1227,6 +1294,10 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
+        # Phase 4: append extra features
+        _extra = _compute_extra_features(raw_boundary, raw_zone, raw_pos_for_feat, raw_dsdf, dist_surf, is_surface)
+        if _extra:
+            x = torch.cat([x] + _extra, dim=-1)
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -1608,6 +1679,12 @@ for epoch in range(MAX_EPOCHS):
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
 
+                # Phase 4: extract raw metadata
+                raw_boundary = x[:, :, 24].long()
+                raw_zone = x[:, :, 25].long()
+                raw_pos_for_feat = x[:, :, :2].clone()
+                x = x[:, :, :X_DIM]
+
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
@@ -1629,6 +1706,10 @@ for epoch in range(MAX_EPOCHS):
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
+                # Phase 4: append extra features
+                _extra = _compute_extra_features(raw_boundary, raw_zone, raw_pos_for_feat, raw_dsdf, dist_surf, is_surface)
+                if _extra:
+                    x = torch.cat([x] + _extra, dim=-1)
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
@@ -1863,8 +1944,11 @@ if best_metrics:
     elif ema_model is not None:
         vis_model = ema_model
     else:
-        vis_model = model
-    vis_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        vis_model = _base_model  # use uncompiled model to avoid torch.compile shape issues
+    _vis_sd = torch.load(model_path, map_location=device, weights_only=True)
+    # Strip _orig_mod. prefix from compiled model state dict keys
+    _vis_sd = {k.replace("_orig_mod.", ""): v for k, v in _vis_sd.items()}
+    vis_model.load_state_dict(_vis_sd)
     vis_model.eval()
     plot_dir = Path("plots") / run.id
     n = 1 if cfg.debug else 4
@@ -1877,21 +1961,30 @@ if best_metrics:
                 y_dev = y_true.unsqueeze(0).to(device)
                 is_surf_dev = is_surface.unsqueeze(0).to(device)
                 mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
-                raw_dsdf = x_dev[:, :, 2:10]
-                dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+                # Phase 4: extract raw metadata and trim
+                _vis_boundary = x_dev[:, :, 24].long()
+                _vis_zone = x_dev[:, :, 25].long()
+                _vis_raw_pos = x_dev[:, :, :2].clone()
+                x_dev = x_dev[:, :, :X_DIM]
+                raw_dsdf_vis = x_dev[:, :, 2:10]
+                dist_surf = raw_dsdf_vis.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)
                 x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                 curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                 x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
-                # Fourier PE (must match training loop)
-                raw_xy = x_n[:, :, :2]
-                xy_min = raw_xy.amin(dim=1, keepdim=True)
-                xy_max = raw_xy.amax(dim=1, keepdim=True)
-                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                freqs = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
-                xy_scaled = xy_norm.unsqueeze(-1) * freqs
-                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
-                x_n = torch.cat([x_n, fourier_pe], dim=-1)
+                # Fourier PE (match training pipeline)
+                _vis_xy = x_n[:, :, :2]
+                _vis_xy_min = _vis_xy.amin(dim=1, keepdim=True)
+                _vis_xy_max = _vis_xy.amax(dim=1, keepdim=True)
+                _vis_xy_norm = (_vis_xy - _vis_xy_min) / (_vis_xy_max - _vis_xy_min + 1e-8)
+                _vis_freqs = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
+                _vis_xy_scaled = _vis_xy_norm.unsqueeze(-1) * _vis_freqs
+                _vis_fourier = torch.cat([_vis_xy_scaled.sin().flatten(-2), _vis_xy_scaled.cos().flatten(-2)], dim=-1)
+                x_n = torch.cat([x_n, _vis_fourier], dim=-1)
+                # Phase 4: extra features
+                _vis_extra = _compute_extra_features(_vis_boundary, _vis_zone, _vis_raw_pos, raw_dsdf_vis, dist_surf, is_surf_dev)
+                if _vis_extra:
+                    x_n = torch.cat([x_n] + _vis_extra, dim=-1)
                 Umag, q = _umag_q(y_dev, mask)
                 pred = vis_model({"x": x_n})["preds"].float()
                 if cfg.raw_targets:

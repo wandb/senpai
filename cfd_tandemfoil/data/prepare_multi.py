@@ -13,11 +13,16 @@ For single-foil samples: AoA1=0, NACA1=[0,0,0], gap=0, stagger=0.
 The 0-sentinel is distinguishable from real tandem values (cruise gap min ≈ -0.8,
 racecar gap min ≈ 0.4), so the model can learn to attend to it appropriately.
 
-x layout (N, 24):
+x layout (N, X_STORED_DIM=26):
   [pos(2), saf(2), dsdf(8), is_surface(1), log_Re(1),
    AoA0_rad(1), NACA0(3),
-   AoA1_rad(1), NACA1(3), gap(1), stagger(1)]
-   = 2+2+8+1+1+1+3+1+3+1+1 = 24 dimensions
+   AoA1_rad(1), NACA1(3), gap(1), stagger(1),
+   boundary_raw(1), zoneID_raw(1)]
+   = 2+2+8+1+1+1+3+1+3+1+1+1+1 = 26 stored dimensions
+
+The first 24 dims (X_DIM) are the core features used for normalization and model input.
+Dims 24-25 are raw metadata (boundary type, zone ID) carried through for optional
+feature engineering in train.py. They are extracted and stripped before standardization.
 
 Model config: space_dim=2, fun_dim=22  →  preprocess MLP input = 24.
 """
@@ -33,7 +38,8 @@ from data.prepare import load_pickle, DATA_ROOT, parse_naca, pad_collate  # noqa
 # Includes foil 2 surface (ID 7) — fixes the SURFACE_IDS=(5,6) gap in prepare.py
 SURFACE_IDS_MULTI = (5, 6, 7)
 
-X_DIM = 24  # total x feature dimension
+X_DIM = 24  # core x feature dimension (for normalization and model input)
+X_STORED_DIM = 26  # stored dimension (core + boundary_raw + zoneID_raw)
 
 
 def preprocess_sample_multi(sample):
@@ -73,6 +79,11 @@ def preprocess_sample_multi(sample):
     gap = float(gap_val) if gap_val is not None else 0.0
     stagger = float(stagger_val) if stagger_val is not None else 0.0
 
+    # Raw metadata for optional feature engineering in train.py
+    boundary_raw = sample.boundary.float().unsqueeze(1)  # (N, 1) — boundary type 0-7
+    zone_raw = (sample.zoneID.float().unsqueeze(1) if hasattr(sample, 'zoneID')
+                else torch.zeros(n, 1))  # (N, 1) — mesh zone 0-2
+
     x = torch.cat([
         sample.pos.float(),                                        # 2
         sample.saf.float(),                                        # 2
@@ -85,9 +96,11 @@ def preprocess_sample_multi(sample):
         torch.tensor(naca1, dtype=torch.float32).expand(n, 3),     # 3
         torch.full((n, 1), gap),                                   # 1
         torch.full((n, 1), stagger),                               # 1
-    ], dim=1)  # 2+2+8+1+1+1+3+1+3+1+1 = 24
+        boundary_raw,                                               # 1
+        zone_raw,                                                   # 1
+    ], dim=1)  # 2+2+8+1+1+1+3+1+3+1+1+1+1 = 26
 
-    assert x.shape[1] == X_DIM, f"Expected {X_DIM} features, got {x.shape[1]}"
+    assert x.shape[1] == X_STORED_DIM, f"Expected {X_STORED_DIM} features, got {x.shape[1]}"
 
     y = sample.y.float()
     return x, y, is_surface
