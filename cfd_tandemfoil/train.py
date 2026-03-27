@@ -37,7 +37,11 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import simple_parsing as sp
 
-from data.utils import visualize
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+from data.utils import _scatter_field, _add_quiver, _setup_ax, _get_view_bounds
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
 
 torch.set_float32_matmul_precision('high')
@@ -747,9 +751,20 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: Loss formulation experiments
+    loss_type: str = "l1"              # l1, huber, logcosh, focal
+    huber_delta: float = 0.5           # Huber loss delta threshold
+    focal_gamma: float = 2.0           # Focal regression gamma exponent
+    surf_weight_fixed: float = -1      # -1 = use adaptive, >0 = fixed surface weight
+    channel_weights_str: str = ""      # e.g. "1.0,1.0,3.0" for [Ux, Uy, p] weights
 
 
 cfg = sp.parse(Config)
+
+# Parse channel weights
+channel_weights = None
+if cfg.channel_weights_str:
+    channel_weights = torch.tensor([float(w) for w in cfg.channel_weights_str.split(",")])
 
 if cfg.seed >= 0:
     torch.manual_seed(cfg.seed)
@@ -1130,8 +1145,11 @@ for epoch in range(MAX_EPOCHS):
 
     t0 = time.time()
 
-    # Adaptive surface weight: loss-ratio based, clamped [5, 50]
-    surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+    # Surface weight: fixed or adaptive (loss-ratio based, clamped [5, 50])
+    if cfg.surf_weight_fixed > 0:
+        surf_weight = cfg.surf_weight_fixed
+    else:
+        surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
 
     # --- Train ---
     model.train()
@@ -1296,11 +1314,26 @@ for epoch in range(MAX_EPOCHS):
                 pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
+        # Compute loss_err based on loss_type (abs_err kept for hard-node mining)
+        if cfg.loss_type == 'huber':
+            _delta = cfg.huber_delta
+            loss_err = torch.where(abs_err < _delta, 0.5 * sq_err, _delta * (abs_err - 0.5 * _delta))
+        elif cfg.loss_type == 'logcosh':
+            loss_err = torch.log(torch.cosh((pred - y_norm).clamp(-20, 20)))
+        elif cfg.loss_type == 'focal':
+            loss_err = (abs_err ** cfg.focal_gamma) * abs_err
+        else:  # l1 default
+            loss_err = abs_err
+        # Apply channel-specific weights
+        if channel_weights is not None:
+            _cw = channel_weights.to(device).unsqueeze(0).unsqueeze(0)  # [1, 1, 3]
+            loss_err = loss_err * _cw
         if cfg.tandem_ramp:
             pass  # no hard curriculum; tandem_weight applied via tandem_boost below
         elif epoch < cfg.tandem_curriculum_epochs:
             is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
             sample_mask = (~is_tandem_curr).float()[:, None, None]
+            loss_err = loss_err * sample_mask
             abs_err = abs_err * sample_mask
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
@@ -1326,28 +1359,29 @@ for epoch in range(MAX_EPOCHS):
                 threshold = valid_dists.quantile(0.1)
                 near_wall = vol_mask_train & (vol_dist < threshold)
                 node_weight = (1.0 + near_wall.float()).unsqueeze(-1)  # 2x near-wall, 1x else
-                vol_loss = (abs_err * node_weight * vol_mask_train.float().unsqueeze(-1)).sum() / \
+                vol_loss = (loss_err * node_weight * vol_mask_train.float().unsqueeze(-1)).sum() / \
                            (node_weight.squeeze(-1) * vol_mask_train.float()).sum().clamp(min=1)
             else:
-                vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+                vol_loss = (loss_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         else:
-            vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+            vol_loss = (loss_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        surf_per_sample = (loss_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
         running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
         # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
         if epoch >= 30:
-            surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
-            surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
+            surf_pres_abs = abs_err[:, :, 2:3]  # L1 pressure errors for thresholding
+            surf_pres_flat = surf_pres_abs[:, :, 0]  # [B, N]
             surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
             thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
             thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
             hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
-            surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            surf_pres_loss = loss_err[:, :, 2:3]  # use loss_err for actual loss
+            surf_per_sample = (surf_pres_loss * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         if cfg.tandem_ramp:
             tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
@@ -1426,8 +1460,8 @@ for epoch in range(MAX_EPOCHS):
             n_b = is_ood_pcgrad.float().sum().clamp(min=1)
             vol_mask_a = vol_mask_train & is_indist_pcgrad.unsqueeze(1)
             vol_mask_b = vol_mask_train & is_ood_pcgrad.unsqueeze(1)
-            vol_loss_a = (abs_err * vol_mask_a.unsqueeze(-1)).sum() / vol_mask_a.sum().clamp(min=1)
-            vol_loss_b = (abs_err * vol_mask_b.unsqueeze(-1)).sum() / vol_mask_b.sum().clamp(min=1)
+            vol_loss_a = (loss_err * vol_mask_a.unsqueeze(-1)).sum() / vol_mask_a.sum().clamp(min=1)
+            vol_loss_b = (loss_err * vol_mask_b.unsqueeze(-1)).sum() / vol_mask_b.sum().clamp(min=1)
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
@@ -1863,8 +1897,12 @@ if best_metrics:
     elif ema_model is not None:
         vis_model = ema_model
     else:
-        vis_model = model
-    vis_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        vis_model = _base_model  # use uncompiled model to avoid torch.compile shape issues
+    if hasattr(vis_model, '_orig_mod'):
+        vis_model = vis_model._orig_mod
+    _ckpt = torch.load(model_path, map_location=device, weights_only=True)
+    _stripped = {k.replace("_orig_mod.", "", 1) if k.startswith("_orig_mod.") else k: v for k, v in _ckpt.items()}
+    vis_model.load_state_dict(_stripped)
     vis_model.eval()
     plot_dir = Path("plots") / run.id
     n = 1 if cfg.debug else 4
@@ -1888,7 +1926,8 @@ if best_metrics:
                 xy_min = raw_xy.amin(dim=1, keepdim=True)
                 xy_max = raw_xy.amax(dim=1, keepdim=True)
                 xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                freqs = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
+                _vm = vis_model._orig_mod if hasattr(vis_model, '_orig_mod') else vis_model
+                freqs = torch.cat([_vm.fourier_freqs_fixed.to(device), _vm.fourier_freqs_learned.abs()])
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                 x_n = torch.cat([x_n, fourier_pe], dim=-1)
@@ -1910,7 +1949,50 @@ if best_metrics:
                     else:
                         y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
             samples.append((x[:, :2], y_true, y_pred, is_surface))
-        images = visualize(samples, out_dir=plot_dir / split_name)
+        _plot_dir = plot_dir / split_name
+        _plot_dir.mkdir(parents=True, exist_ok=True)
+        images = []
+        for si, (pos_t, yt, yp, is_surf_t) in enumerate(samples):
+            pos_np = pos_t.numpy()
+            yt_np = yt.numpy()
+            yp_np = yp.numpy()
+            is_surf_np = is_surf_t.numpy().astype(bool)
+            surf_pos = pos_np[is_surf_np]
+            x_lo, x_hi, y_lo, y_hi, near = _get_view_bounds(pos_np, surf_pos)
+            px, py = pos_np[near, 0], pos_np[near, 1]
+            gt_ux, gt_uy, gt_p = yt_np[near, 0], yt_np[near, 1], yt_np[near, 2]
+            pr_ux, pr_uy, pr_p = yp_np[near, 0], yp_np[near, 1], yp_np[near, 2]
+            gt_vmag = np.sqrt(gt_ux**2 + gt_uy**2)
+            pr_vmag = np.sqrt(pr_ux**2 + pr_uy**2)
+            err_vmag = gt_vmag - pr_vmag
+            err_p = gt_p - pr_p
+            fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+            fig.suptitle(f"{split_name} sample {si}", fontsize=14)
+            vmin_v, vmax_v = gt_vmag.min(), gt_vmag.max()
+            _scatter_field(axes[0, 0], fig, px, py, gt_vmag, cmap="viridis", vmin=vmin_v, vmax=vmax_v)
+            axes[0, 0].set_title("|U| GT")
+            _add_quiver(axes[0, 0], px, py, gt_ux, gt_uy)
+            _scatter_field(axes[0, 1], fig, px, py, pr_vmag, cmap="viridis", vmin=vmin_v, vmax=vmax_v)
+            axes[0, 1].set_title("|U| Pred")
+            _add_quiver(axes[0, 1], px, py, pr_ux, pr_uy)
+            ev_max = max(abs(err_vmag.min()), abs(err_vmag.max()), 1e-6)
+            _scatter_field(axes[0, 2], fig, px, py, err_vmag, cmap="RdBu_r", vmin=-ev_max, vmax=ev_max)
+            axes[0, 2].set_title("|U| Error")
+            vmin_p, vmax_p = gt_p.min(), gt_p.max()
+            _scatter_field(axes[1, 0], fig, px, py, gt_p, cmap="RdBu_r", vmin=vmin_p, vmax=vmax_p)
+            axes[1, 0].set_title("p GT")
+            _scatter_field(axes[1, 1], fig, px, py, pr_p, cmap="RdBu_r", vmin=vmin_p, vmax=vmax_p)
+            axes[1, 1].set_title("p Pred")
+            ep_max = max(abs(err_p.min()), abs(err_p.max()), 1e-6)
+            _scatter_field(axes[1, 2], fig, px, py, err_p, cmap="RdBu_r", vmin=-ep_max, vmax=ep_max)
+            axes[1, 2].set_title("p Error")
+            for ax in axes.flat:
+                _setup_ax(ax, x_lo, x_hi, y_lo, y_hi, surf_pos)
+            plt.tight_layout()
+            _path = _plot_dir / f"val_sample_{si}.png"
+            fig.savefig(_path, dpi=200)
+            plt.close(fig)
+            images.append(_path)
         if images:
             wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
 
