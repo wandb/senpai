@@ -535,6 +535,15 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        # MAE pre-training: mask token + reconstruction decoder
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, fun_dim + space_dim))
+        nn.init.normal_(self.mask_token, std=0.02)
+        # Reconstruct 15 spatially-varying features (pos:2, saf:2, dsdf:8, is_surf:1, curv:1, dist:1)
+        # or 3 output features (Ux, Uy, p) when pretrain_target="y"
+        self.mae_decoder_x = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden // 2), nn.GELU(), nn.Linear(n_hidden // 2, 15))
+        self.mae_decoder_y = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden // 2), nn.GELU(), nn.Linear(n_hidden // 2, 3))
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -632,6 +641,7 @@ class Transolver(nn.Module):
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
+        fx_hidden = fx  # save hidden state for MAE decoder
 
         # Last block: use adaln_all condition if enabled, else fallback to adaln_output
         last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
@@ -639,7 +649,7 @@ class Transolver(nn.Module):
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred, "hidden": fx_hidden}
 
 
 # ---------------------------------------------------------------------------
@@ -748,6 +758,12 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: masked autoencoder pre-training
+    masked_pretrain: bool = False          # enable MAE pre-training phase
+    pretrain_epochs: int = 30              # number of pre-training epochs
+    mask_ratio: float = 0.5               # fraction of nodes to mask
+    pretrain_target: str = "x"             # "x" = reconstruct input, "y" = reconstruct output
+    disable_pcgrad: bool = False           # disable PCGrad domain splitting
 
 
 cfg = sp.parse(Config)
@@ -1112,6 +1128,125 @@ model_path = model_dir / "checkpoint.pt"
 with open(model_dir / "config.yaml", "w") as f:
     yaml.dump(model_config, f)
 
+# ======================== MAE Pre-Training Phase ========================
+if cfg.masked_pretrain:
+    print(f"\n=== MAE Pre-Training Phase ({cfg.pretrain_epochs} epochs, mask_ratio={cfg.mask_ratio}, target={cfg.pretrain_target}) ===")
+    mae_opt = type(optimizer)(model.parameters(), lr=4e-4 if cfg.use_lion else 3e-3)
+    mae_sched = torch.optim.lr_scheduler.CosineAnnealingLR(mae_opt, T_max=cfg.pretrain_epochs)
+    mae_start = time.time()
+    # Feature indices for reconstruction target (spatially-varying features)
+    # After standardization + curv + dist: indices 0-12 (pos:2, saf:2, dsdf:8, is_surface:1) + 24-25 (curv, dist)
+    recon_x_indices = list(range(13)) + [24, 25]  # 15 features
+
+    for mae_epoch in range(cfg.pretrain_epochs):
+        elapsed_min = (time.time() - mae_start) / 60.0
+        if elapsed_min >= MAX_TIMEOUT * 0.25:  # cap pre-training at 25% of time budget
+            print(f"MAE pre-training timeout at epoch {mae_epoch} ({elapsed_min:.1f} min)")
+            break
+        model.train()
+        mae_loss_sum = 0.0
+        mae_n = 0
+        pbar = tqdm(train_loader, desc=f"MAE Epoch {mae_epoch+1}/{cfg.pretrain_epochs}", leave=False)
+        for x, y, is_surface, mask_pad in pbar:
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            is_surface = is_surface.to(device, non_blocking=True)
+            mask_pad = mask_pad.to(device, non_blocking=True)
+
+            # Feature engineering (same as training loop)
+            raw_dsdf = x[:, :, 2:10]
+            dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+            dist_feat = torch.log1p(dist_surf * 10.0)
+            x = (x - stats["x_mean"]) / stats["x_std"]
+            curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+            x = torch.cat([x, curv, dist_feat], dim=-1)
+            raw_xy = x[:, :, :2]
+            xy_min = raw_xy.amin(dim=1, keepdim=True)
+            xy_max = raw_xy.amax(dim=1, keepdim=True)
+            xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+            freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+            xy_scaled = xy_norm.unsqueeze(-1) * freqs
+            fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+            x = torch.cat([x, fourier_pe], dim=-1)
+
+            B, N, D = x.shape
+            # Save reconstruction targets
+            if cfg.pretrain_target == "y":
+                recon_target = y  # [B, N, 3]
+            else:
+                recon_target = x[:, :, recon_x_indices]  # [B, N, 15]
+
+            # Generate MAE mask: True = masked node
+            rand = torch.rand(B, N, device=device)
+            rand[~mask_pad] = 1.0  # never mask padding
+            mae_mask = rand < cfg.mask_ratio
+
+            # Replace masked node features with mask token (keep pos + fourier PE)
+            mask_token_expanded = model.mask_token.expand(B, N, -1)
+            # Only replace the first fun_dim+space_dim features, keep fourier PE
+            fd = model.mask_token.shape[-1]
+            x_masked = x.clone()
+            x_masked[:, :, :fd] = torch.where(
+                mae_mask.unsqueeze(-1).expand(B, N, fd),
+                mask_token_expanded,
+                x[:, :, :fd],
+            )
+
+            # Forward pass
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out = model({"x": x_masked})
+                hidden = out["hidden"]  # [B, N, n_hidden]
+                if cfg.pretrain_target == "y":
+                    recon_pred = model.mae_decoder_y(hidden)
+                else:
+                    recon_pred = model.mae_decoder_x(hidden)
+
+            recon_pred = recon_pred.float()
+            recon_target = recon_target.float()
+
+            # SCE loss on masked nodes only
+            cos_sim = F.cosine_similarity(recon_pred, recon_target, dim=-1)  # [B, N]
+            sce = (1 - cos_sim).pow(2.0)
+            loss = (sce * mae_mask.float()).sum() / mae_mask.sum().clamp(min=1)
+
+            mae_opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            mae_opt.step()
+
+            mae_loss_sum += loss.item()
+            mae_n += 1
+            pbar.set_postfix(mae_loss=f"{loss.item():.4f}")
+
+        mae_sched.step()
+        avg_mae = mae_loss_sum / max(mae_n, 1)
+        wandb.log({"mae/recon_loss": avg_mae, "mae/epoch": mae_epoch, "mae/lr": mae_sched.get_last_lr()[0]})
+        print(f"  MAE Epoch {mae_epoch+1}: recon_loss={avg_mae:.4f}")
+
+    print(f"MAE pre-training complete ({(time.time()-mae_start)/60:.1f} min)")
+    # Reset optimizer for fine-tuning (fresh momentum state)
+    del mae_opt, mae_sched
+    if cfg.use_lion:
+        optimizer = Lion([
+            {"params": [p for n, p in model.named_parameters() if "fourier_freqs" not in n]},
+            {"params": [model.fourier_freqs_learned], "lr": cfg.lr * 0.1}
+        ], lr=cfg.lr, weight_decay=cfg.weight_decay)
+    else:
+        optimizer = torch.optim.AdamW([
+            {"params": [p for n, p in model.named_parameters() if "fourier_freqs" not in n]},
+            {"params": [model.fourier_freqs_learned], "lr": cfg.lr * 0.1}
+        ], lr=cfg.lr, weight_decay=cfg.weight_decay)
+    # Rebuild scheduler
+    base_opt = optimizer
+    if cfg.use_lookahead:
+        from torch.optim.swa_utils import AveragedModel
+        base_opt = optimizer
+    warmup_sched = torch.optim.lr_scheduler.LinearLR(
+        base_opt, start_factor=cfg.warmup_start_factor, total_iters=cfg.warmup_total_iters)
+    cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        base_opt, T_max=cfg.cosine_T_max, eta_min=cfg.cosine_eta_min)
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        base_opt, schedulers=[warmup_sched, cosine_sched], milestones=[cfg.warmup_total_iters])
+
 best_val = float("inf")
 ema_val_loss = float("inf")
 ema_decay_val = 0.9
@@ -1420,7 +1555,7 @@ for epoch in range(MAX_EPOCHS):
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
         is_indist_pcgrad = ~is_ood_pcgrad
-        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
+        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any() and not cfg.disable_pcgrad
 
         if use_pcgrad:
             n_a = is_indist_pcgrad.float().sum().clamp(min=1)
