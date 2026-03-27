@@ -20,6 +20,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     Tandem surface loss is therefore underweighted.
 """
 
+import gc
 import os
 import time
 from collections.abc import Mapping
@@ -647,6 +648,345 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Mamba/SSM Hybrid Components (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+@torch.compiler.disable
+def z_order_sort(pos, mask=None):
+    """Z-order (Morton code) sorting for 2D spatial locality.
+
+    Args:
+        pos: [B, N, 2] - 2D node positions
+        mask: [B, N] bool or None - True for real (non-padded) nodes
+    Returns:
+        sort_idx: [B, N] - indices sorting nodes by Z-order curve
+    """
+    B, N, _ = pos.shape
+    if mask is not None:
+        big = torch.finfo(pos.dtype).max / 2
+        p_lo = pos.masked_fill(~mask.unsqueeze(-1), big)
+        pos_min = p_lo.amin(dim=1, keepdim=True)
+        p_hi = pos.masked_fill(~mask.unsqueeze(-1), -big)
+        pos_max = p_hi.amax(dim=1, keepdim=True)
+    else:
+        pos_min = pos.amin(dim=1, keepdim=True)
+        pos_max = pos.amax(dim=1, keepdim=True)
+    pos_int = ((pos - pos_min) / (pos_max - pos_min + 1e-8) * 65535).long().clamp(0, 65535)
+    xi, yi = pos_int[:, :, 0], pos_int[:, :, 1]
+    z_idx = torch.zeros(B, N, dtype=torch.long, device=pos.device)
+    for bit in range(16):
+        z_idx |= ((xi >> bit) & 1) << (2 * bit)
+        z_idx |= ((yi >> bit) & 1) << (2 * bit + 1)
+    if mask is not None:
+        z_idx[~mask] = torch.iinfo(torch.long).max
+    return z_idx.argsort(dim=1)
+
+
+@torch.compiler.disable
+def _chunked_parallel_scan(log_dA, dBx, chunk_size=128):
+    """Parallel linear recurrence via chunked cumsum in float32.
+
+    Computes h[t] = exp(log_dA[t]) * h[t-1] + dBx[t] for all t.
+    Uses chunked cumulative sums for O(N) work with numerical stability.
+
+    Args:
+        log_dA: [B, L, D, N] - log of discretized diagonal A (negative)
+        dBx: [B, L, D, N] - discretized B * x input
+    Returns:
+        h: [B, L, D, N] - all hidden states
+    """
+    orig_dtype = log_dA.dtype
+    log_dA = log_dA.float()
+    dBx = dBx.float()
+    B, L, D, N = log_dA.shape
+
+    pad_len = (chunk_size - L % chunk_size) % chunk_size
+    if pad_len > 0:
+        log_dA = F.pad(log_dA, (0, 0, 0, 0, 0, pad_len))
+        dBx = F.pad(dBx, (0, 0, 0, 0, 0, pad_len))
+    L_pad = log_dA.shape[1]
+    n_chunks = L_pad // chunk_size
+
+    log_dA = log_dA.reshape(B, n_chunks, chunk_size, D, N)
+    dBx = dBx.reshape(B, n_chunks, chunk_size, D, N)
+
+    cum_log_dA = torch.cumsum(log_dA, dim=2).clamp(min=-80.0)
+    scaled_dBx = torch.exp((-cum_log_dA).clamp(max=80.0)) * dBx
+    cum_scaled = torch.cumsum(scaled_dBx, dim=2)
+    h_within = torch.exp(cum_log_dA) * cum_scaled
+
+    if n_chunks > 1:
+        chunk_decay = cum_log_dA[:, :, -1]
+        h_end = h_within[:, :, -1]
+        carry_list = [torch.zeros(B, D, N, device=log_dA.device)]
+        for c in range(1, n_chunks):
+            carry_list.append(h_end[:, c - 1] + carry_list[-1] * torch.exp(chunk_decay[:, c - 1]))
+        carries = torch.stack(carry_list, dim=1)
+        h_within = h_within + carries.unsqueeze(2) * torch.exp(cum_log_dA)
+
+    return h_within.reshape(B, L_pad, D, N)[:, :L].to(orig_dtype)
+
+
+class SelectiveSSM(nn.Module):
+    """Selective State-Space Model block with parallel scan.
+
+    Pure PyTorch Mamba-style SSM: input projection + gating, depthwise 1D conv,
+    input-dependent SSM params (selective mechanism), parallel scan, output projection.
+    """
+
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        d_inner = d_model * expand
+        self.d_inner = d_inner
+        self.d_state = d_state
+        self.in_proj = nn.Linear(d_model, d_inner * 2, bias=False)
+        self.conv1d = nn.Conv1d(d_inner, d_inner, d_conv, padding=d_conv - 1, groups=d_inner)
+        self.x_proj = nn.Linear(d_inner, d_state * 2 + 1, bias=False)
+        self.dt_proj = nn.Linear(1, d_inner, bias=True)
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).unsqueeze(0).expand(d_inner, -1)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.D = nn.Parameter(torch.ones(d_inner))
+        self.out_proj = nn.Linear(d_inner, d_model, bias=False)
+        self.norm = nn.LayerNorm(d_model)
+
+    def _forward_impl(self, x):
+        """Core SSM forward: [B, L, D] -> [B, L, D]."""
+        residual = x
+        B, L, D = x.shape
+        xz = self.in_proj(x)
+        x_branch, z = xz.chunk(2, dim=-1)
+        x_branch = self.conv1d(x_branch.transpose(1, 2))[:, :, :L].transpose(1, 2)
+        x_branch = F.silu(x_branch)
+        ssm_params = self.x_proj(x_branch)
+        B_ssm = ssm_params[:, :, :self.d_state]
+        C_ssm = ssm_params[:, :, self.d_state:2 * self.d_state]
+        dt = F.softplus(self.dt_proj(ssm_params[:, :, -1:]))
+        A = -torch.exp(self.A_log)
+        log_dA = dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0)
+        dBx = dt.unsqueeze(-1) * B_ssm.unsqueeze(2) * x_branch.unsqueeze(-1)
+        h = _chunked_parallel_scan(log_dA, dBx)
+        y = (h * C_ssm.unsqueeze(2)).sum(dim=-1) + self.D * x_branch
+        y = y * F.silu(z)
+        y = self.out_proj(y)
+        return self.norm(y + residual)
+
+    def forward(self, x):
+        if self.training:
+            return torch.utils.checkpoint.checkpoint(
+                self._forward_impl, x, use_reentrant=False
+            )
+        return self._forward_impl(x)
+
+
+class MambaTransolver(nn.Module):
+    """Hybrid Mamba-Transolver: SSM for global context + Transolver for physics.
+
+    Architecture:
+        1. GatedMLP2 preprocessing (same as Transolver)
+        2. Z-order sort -> subsample -> SelectiveSSM -> scatter back -> unsort
+        3. TransolverBlock(s) for physics attention
+        4. Output head
+    """
+
+    def __init__(
+        self,
+        space_dim=1, n_layers=5, n_hidden=256, dropout=0.0, n_head=8,
+        act="gelu", mlp_ratio=1, fun_dim=1, out_dim=1, slice_num=32,
+        ref=8, unified_pos=False, output_fields=None, output_dims=None,
+        linear_no_attention=False, learned_kernel=False, field_decoder=False,
+        adaln_output=False, soft_moe=False, uncertainty_loss=False,
+        adaln_all_blocks=False, adaln_4cond=False, adaln_nozero=False,
+        film_cond=False, adaln_decouple=False, adaln_zone_temp=False,
+        domain_layernorm=False, dln_zeroinit=False, domain_velhead=False,
+        prog_slices=False,
+        mamba_d_state=16, mamba_subsample=0, mamba_bidir=False,
+    ):
+        super().__init__()
+        self.__name__ = "MambaTransolver"
+        self.ref = ref
+        self.unified_pos = unified_pos
+        self.adaln_output = adaln_output
+        self.adaln_all_blocks = adaln_all_blocks
+        self.adaln_4cond = adaln_4cond
+        self.film_cond = film_cond
+        self.adaln_zone_temp = adaln_zone_temp
+        self.mamba_subsample = mamba_subsample
+        self.mamba_bidir = mamba_bidir
+        if output_fields is None or output_dims is None:
+            raise ValueError("output_fields and output_dims must be provided")
+        if len(output_fields) != len(output_dims):
+            raise ValueError("output_fields and output_dims must have same length")
+        if out_dim != sum(output_dims):
+            raise ValueError("out_dim must equal sum(output_dims)")
+        self.output_fields = output_fields
+        self.output_dims = output_dims
+        if uncertainty_loss:
+            self.log_sigma_vol = nn.Parameter(torch.zeros(1))
+            self.log_sigma_surf_ux = nn.Parameter(torch.zeros(1))
+            self.log_sigma_surf_uy = nn.Parameter(torch.zeros(1))
+            self.log_sigma_surf_p = nn.Parameter(torch.zeros(1))
+
+        self.preprocess = GatedMLP2(fun_dim + space_dim, n_hidden * 2, n_hidden)
+        self.n_hidden = n_hidden
+        self.space_dim = space_dim
+        self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
+        nn.init.eye_(self.feature_cross.weight)
+
+        self.mamba_fwd = SelectiveSSM(n_hidden, d_state=mamba_d_state, d_conv=4, expand=2)
+        if mamba_bidir:
+            self.mamba_bwd = SelectiveSSM(n_hidden, d_state=mamba_d_state, d_conv=4, expand=2)
+
+        n_tb = max(1, n_layers - 1)
+        self.blocks = nn.ModuleList([
+            TransolverBlock(
+                num_heads=n_head, hidden_dim=n_hidden, dropout=dropout, act=act,
+                mlp_ratio=mlp_ratio, out_dim=out_dim, slice_num=slice_num,
+                last_layer=(i == n_tb - 1),
+                linear_no_attention=linear_no_attention, learned_kernel=learned_kernel,
+                field_decoder=field_decoder if (i == n_tb - 1) else False,
+                adaln_output=adaln_output if (i == n_tb - 1) else False,
+                soft_moe=soft_moe if (i == n_tb - 1) else False,
+                adaln_all=adaln_all_blocks,
+                adaln_cond_dim=4 if adaln_4cond else 2,
+                adaln_zero_init=not adaln_nozero,
+                film_cond=film_cond, decouple_slice=adaln_decouple,
+                zone_temp=adaln_zone_temp, domain_layernorm=domain_layernorm,
+                dln_zeroinit=dln_zeroinit,
+                domain_velhead=domain_velhead if (i == n_tb - 1) else False,
+                prog_slices=prog_slices,
+            )
+            for i in range(n_tb)
+        ])
+
+        self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
+        self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
+        self.out_skip = nn.Linear(n_hidden, out_dim)
+        nn.init.zeros_(self.out_skip.weight)
+        nn.init.zeros_(self.out_skip.bias)
+        self.skip_gate = nn.Sequential(nn.Linear(n_hidden, 1), nn.Sigmoid())
+        nn.init.constant_(self.skip_gate[0].bias, -2.0)
+        self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])
+        self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            if m.weight.dim() >= 2:
+                nn.init.orthogonal_(m.weight, gain=1.0)
+            else:
+                nn.init.normal_(m.weight, std=0.01)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, (nn.LayerNorm, nn.BatchNorm1d)):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def _unpack_inputs(self, data, pos=None, condition=None):
+        if not isinstance(data, Mapping):
+            raise TypeError("Model input must be a Mapping")
+        x = data.get("x")
+        pos = data.get("pos", pos)
+        condition = data.get("condition", condition)
+        mask = data.get("mask")
+        return x, pos, condition, mask
+
+    def _validate_output_dims(self, preds):
+        if sum(self.output_dims) != preds.shape[-1]:
+            raise ValueError("Sum of output_dims must match preds last dimension")
+
+    def forward(self, data, pos=None, condition=None):
+        x, pos, condition, mask = self._unpack_inputs(data, pos=pos, condition=condition)
+        if x is None:
+            raise ValueError("Missing required input tensor: x")
+
+        use_cond = self.adaln_all_blocks or self.film_cond
+        if use_cond:
+            cond_2 = x[:, 0, 13:15]
+            if self.adaln_4cond:
+                gap_feat = x[:, 0, 21:22]
+                surf_frac = (x[:, :, 24].abs() > 0.01).float().mean(dim=1, keepdim=True)
+                block_condition = torch.cat([cond_2, gap_feat, surf_frac], dim=-1)
+            else:
+                block_condition = cond_2
+        else:
+            block_condition = None
+
+        if self.adaln_zone_temp:
+            is_tandem_scalar = (x[:, 0, 21].abs() > 0.01).float()
+            gap_mag = x[:, 0, 21].abs()
+            re_feat = x[:, 0, 13]
+            zone_features = torch.stack([is_tandem_scalar, gap_mag, re_feat], dim=-1)
+        else:
+            zone_features = None
+
+        x_cross = x * self.feature_cross(x)
+        x = x + 0.1 * x_cross
+        raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)
+        is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
+
+        fx = self.preprocess(x)
+        fx_pre = fx
+        fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
+
+        # === Mamba SSM path ===
+        B, N, D = fx.shape
+        pos_2d = x[:, :, :2]
+        sort_idx = z_order_sort(pos_2d, mask=mask)
+        unsort_idx = sort_idx.argsort(dim=1)
+
+        fx_sorted = fx.gather(1, sort_idx.unsqueeze(-1).expand(-1, -1, D))
+
+        n_sub = self.mamba_subsample if self.mamba_subsample > 0 else min(N, 32768)
+
+        if n_sub < N:
+            stride = N / n_sub
+            sub_pos = (torch.arange(n_sub, device=fx.device, dtype=torch.float32) * stride).long().clamp(max=N - 1)
+            fx_sub = fx_sorted[:, sub_pos]
+
+            if self.mamba_bidir:
+                out_fwd = self.mamba_fwd(fx_sub)
+                out_bwd = self.mamba_bwd(fx_sub.flip(1)).flip(1)
+                ssm_out = (out_fwd + out_bwd) / 2
+            else:
+                ssm_out = self.mamba_fwd(fx_sub)
+
+            ssm_delta = ssm_out - fx_sub
+            assign = (torch.arange(N, device=fx.device, dtype=torch.float32) / stride).round().long().clamp(0, n_sub - 1)
+            fx_sorted = fx_sorted + ssm_delta[:, assign]
+        else:
+            if self.mamba_bidir:
+                out_fwd = self.mamba_fwd(fx_sorted)
+                out_bwd = self.mamba_bwd(fx_sorted.flip(1)).flip(1)
+                fx_sorted = (out_fwd + out_bwd) / 2
+            else:
+                fx_sorted = self.mamba_fwd(fx_sorted)
+
+        fx = fx_sorted.gather(1, unsort_idx.unsqueeze(-1).expand(-1, -1, D))
+
+        # === Transolver blocks ===
+        for block in self.blocks[:-1]:
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem,
+                       condition=block_condition, zone_features=zone_features)
+
+        re_pred = self.re_head(fx.mean(dim=1))
+        aoa_pred = self.aoa_head(fx.mean(dim=1))
+
+        last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
+        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem,
+                             condition=last_condition, zone_features=zone_features)
+        gate = self.skip_gate(fx_pre)
+        fx = fx + gate * self.out_skip(fx_pre)
+        self._validate_output_dims(fx)
+        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+
+
 MAX_TIMEOUT = 180.0  # minutes
 MAX_EPOCHS = 500
 
@@ -747,6 +1087,11 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: Mamba/SSM hybrid
+    mamba_hybrid: bool = False        # replace first Transolver block with Mamba SSM
+    mamba_d_state: int = 16           # SSM state dimension
+    mamba_subsample: int = 0          # subsample nodes for SSM (0 = full, capped at 32768)
+    mamba_bidir: bool = False         # bidirectional scan (forward + backward)
 
 
 cfg = sp.parse(Config)
@@ -898,9 +1243,16 @@ model_config = dict(
     prog_slices=cfg.prog_slices,
 )
 
-model = Transolver(**model_config).to(device)
+if cfg.mamba_hybrid:
+    model_config["mamba_d_state"] = cfg.mamba_d_state
+    model_config["mamba_subsample"] = cfg.mamba_subsample
+    model_config["mamba_bidir"] = cfg.mamba_bidir
+    model = MambaTransolver(**model_config).to(device)
+else:
+    model = Transolver(**model_config).to(device)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
-model = torch.compile(model, mode="default")
+if not cfg.mamba_hybrid:
+    model = torch.compile(model, mode="default")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
@@ -1282,7 +1634,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x, "mask": mask})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -1409,7 +1761,7 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x})
+                rdrop_out = model({"x": x, "mask": mask})
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -1419,7 +1771,7 @@ for epoch in range(MAX_EPOCHS):
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
         is_indist_pcgrad = ~is_ood_pcgrad
-        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
+        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any() and not cfg.mamba_hybrid
 
         if use_pcgrad:
             n_a = is_indist_pcgrad.float().sum().clamp(min=1)
@@ -1474,7 +1826,7 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                out2 = model({"x": x, "mask": mask})
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -1505,12 +1857,23 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _loss_val = loss.item()
+        _vol_val = vol_loss.item()
+        _surf_val = surf_loss.item()
+        wandb.log({"train/loss": _loss_val, "train/surf_weight": surf_weight, "global_step": global_step})
 
-        epoch_vol += vol_loss.item()
-        epoch_surf += surf_loss.item()
+        # Free computation graph tensors between batches
+        del out, pred, re_pred, aoa_pred, sq_err, abs_err, loss, vol_loss, surf_loss
+        if '_coarse_loss' in dir() and _coarse_loss is not None:
+            del _coarse_loss
+        if cfg.mamba_hybrid:
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        epoch_vol += _vol_val
+        epoch_surf += _surf_val
         n_batches += 1
-        pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
+        pbar.set_postfix(vol=f"{_vol_val:.3f}", surf=f"{_surf_val:.3f}")
 
     if not step_scheduler_per_batch:
         if cfg.swa_cyclic and epoch >= cfg.swa_cyclic_start:
@@ -1668,7 +2031,7 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    pred = eval_model({"x": x, "mask": mask})["preds"]
                 pred = pred.float()
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
@@ -1820,7 +2183,7 @@ for epoch in range(MAX_EPOCHS):
         elif ema_model is not None:
             save_model = ema_model
         else:
-            save_model = model
+            save_model = _base_model  # use uncompiled model for clean state_dict keys
         torch.save(save_model.state_dict(), model_path)
         tag = f" * -> {model_path}"
 
@@ -1863,44 +2226,17 @@ if best_metrics:
     elif ema_model is not None:
         vis_model = ema_model
     else:
-        vis_model = model
+        vis_model = _base_model  # use uncompiled model to avoid shape recompilation issues
     vis_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     vis_model.eval()
     plot_dir = Path("plots") / run.id
     n = 1 if cfg.debug else 4
     for split_name, split_ds in val_splits.items():
-        samples = []
-        for i in range(min(n, len(split_ds))):
-            x, y_true, is_surface = split_ds[i]
-            with torch.no_grad():
-                x_dev = x.unsqueeze(0).to(device)
-                y_dev = y_true.unsqueeze(0).to(device)
-                is_surf_dev = is_surface.unsqueeze(0).to(device)
-                mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
-                x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
-                curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
-                dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
-                dist_feat = torch.log1p(dist_surf * 10.0)
-                x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
-                Umag, q = _umag_q(y_dev, mask)
-                pred = vis_model({"x": x_n})["preds"].float()
-                if cfg.raw_targets:
-                    y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
-                else:
-                    pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
-                    if cfg.log_pressure:
-                        pred_phys = pred_phys.clone()
-                        pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
-                    if cfg.tight_denorm_clamps:
-                        _pd = pred_phys.clone()
-                        _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
-                        _pd[:, :, 1:2] = pred_phys[:, :, 1:2].clamp(-5, 5) * Umag
-                        _pd[:, :, 2:3] = pred_phys[:, :, 2:3].clamp(-10, 10) * q
-                        y_pred = _pd.squeeze(0).cpu()
-                    else:
-                        y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
-            samples.append((x[:, :2], y_true, y_pred, is_surface))
-        images = visualize(samples, out_dir=plot_dir / split_name)
+        try:
+            images = visualize(vis_model, split_ds, stats, device, n_samples=n, out_dir=plot_dir / split_name)
+        except Exception as e:
+            print(f"  Warning: visualization failed for {split_name}: {e}")
+            images = []
         if images:
             wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
 
