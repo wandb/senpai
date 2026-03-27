@@ -900,8 +900,11 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
-model = torch.compile(model, mode="default")
-_base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+# torch.compile disabled: causes "self must be a matrix" RuntimeError in
+# PyTorch 2.10.0 during the first forward pass (inductor mm kernel bug with
+# re_head/aoa_head sequential modules).  Training runs correctly without it.
+# model = torch.compile(model, mode="default")
+_base_model = model
 
 from copy import deepcopy
 ema_model = None
@@ -1417,9 +1420,11 @@ for epoch in range(MAX_EPOCHS):
 
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
+        # Disabled for batch_size > 4: retain_graph=True in PCGrad doubles VRAM during
+        # backward, causing OOM on 96GB GPUs with larger batches.
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
         is_indist_pcgrad = ~is_ood_pcgrad
-        use_pcgrad = is_indist_pcgrad.any() and is_ood_pcgrad.any()
+        use_pcgrad = cfg.batch_size <= 4 and is_indist_pcgrad.any() and is_ood_pcgrad.any()
 
         if use_pcgrad:
             n_a = is_indist_pcgrad.float().sum().clamp(min=1)
@@ -1868,50 +1873,12 @@ if best_metrics:
     vis_model.eval()
     plot_dir = Path("plots") / run.id
     n = 1 if cfg.debug else 4
-    for split_name, split_ds in val_splits.items():
-        samples = []
-        for i in range(min(n, len(split_ds))):
-            x, y_true, is_surface = split_ds[i]
-            with torch.no_grad():
-                x_dev = x.unsqueeze(0).to(device)
-                y_dev = y_true.unsqueeze(0).to(device)
-                is_surf_dev = is_surface.unsqueeze(0).to(device)
-                mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
-                raw_dsdf = x_dev[:, :, 2:10]
-                dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
-                dist_feat = torch.log1p(dist_surf * 10.0)
-                x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
-                curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
-                x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
-                # Fourier PE (must match training loop)
-                raw_xy = x_n[:, :, :2]
-                xy_min = raw_xy.amin(dim=1, keepdim=True)
-                xy_max = raw_xy.amax(dim=1, keepdim=True)
-                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                freqs = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
-                xy_scaled = xy_norm.unsqueeze(-1) * freqs
-                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
-                x_n = torch.cat([x_n, fourier_pe], dim=-1)
-                Umag, q = _umag_q(y_dev, mask)
-                pred = vis_model({"x": x_n})["preds"].float()
-                if cfg.raw_targets:
-                    y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
-                else:
-                    pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
-                    if cfg.log_pressure:
-                        pred_phys = pred_phys.clone()
-                        pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
-                    if cfg.tight_denorm_clamps:
-                        _pd = pred_phys.clone()
-                        _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
-                        _pd[:, :, 1:2] = pred_phys[:, :, 1:2].clamp(-5, 5) * Umag
-                        _pd[:, :, 2:3] = pred_phys[:, :, 2:3].clamp(-10, 10) * q
-                        y_pred = _pd.squeeze(0).cpu()
-                    else:
-                        y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
-            samples.append((x[:, :2], y_true, y_pred, is_surface))
-        images = visualize(samples, out_dir=plot_dir / split_name)
-        if images:
-            wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    try:
+        for split_name, split_ds in val_splits.items():
+            images = visualize(vis_model, split_ds, stats, device, n_samples=n, out_dir=plot_dir / split_name)
+            if images:
+                wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    except Exception as e:
+        print(f"Warning: visualization failed ({e}), skipping plots.")
 
 wandb.finish()
