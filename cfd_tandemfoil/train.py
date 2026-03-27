@@ -116,6 +116,72 @@ class MLP(nn.Module):
         return x
 
 
+class MoELayer(nn.Module):
+    """Top-k Sparse Mixture of Experts FFN layer."""
+
+    def __init__(self, d_model, d_ff, n_experts=8, top_k=2, act='gelu', aux_loss_coef=0.01):
+        super().__init__()
+        self.n_experts = n_experts
+        self.top_k = top_k
+        self.aux_loss_coef = aux_loss_coef
+
+        # Router: projects hidden dim to expert scores
+        self.router = nn.Linear(d_model, n_experts, bias=False)
+
+        # Expert FFNs
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, d_ff),
+                ACTIVATION[act](),
+                nn.Linear(d_ff, d_model),
+            )
+            for _ in range(n_experts)
+        ])
+
+        self._aux_loss = torch.tensor(0.0)
+
+    def forward(self, x):
+        """x: [B, N, D] → [B, N, D]"""
+        B, N, D = x.shape
+        x_flat = x.reshape(B * N, D)
+
+        # Compute router logits and select top-k experts
+        router_logits = self.router(x_flat)  # [B*N, n_experts]
+        routing_probs = router_logits.softmax(dim=-1)
+        routing_weights, selected_experts = torch.topk(
+            routing_probs, self.top_k, dim=-1
+        )
+        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+
+        # Compute load balancing auxiliary loss
+        expert_mask = torch.zeros_like(router_logits).scatter_(1, selected_experts, 1.0)
+        tokens_per_expert = expert_mask.mean(dim=0)
+        router_prob_per_expert = routing_probs.mean(dim=0)
+        self._aux_loss = (tokens_per_expert * router_prob_per_expert).sum() * self.n_experts
+
+        # Compute expert outputs (loop over experts, batch tokens per expert)
+        output = torch.zeros_like(x_flat)
+        for i, expert in enumerate(self.experts):
+            # Find tokens routed to this expert
+            expert_mask_i = (selected_experts == i).any(dim=-1)
+            if not expert_mask_i.any():
+                continue
+            expert_input = x_flat[expert_mask_i]
+            expert_output = expert(expert_input)
+            # Weight by routing probability
+            weight_mask = torch.where(selected_experts[expert_mask_i] == i,
+                                       routing_weights[expert_mask_i],
+                                       torch.zeros_like(routing_weights[expert_mask_i]))
+            weight = weight_mask.sum(dim=-1, keepdim=True)
+            output[expert_mask_i] += weight * expert_output
+
+        return output.reshape(B, N, D)
+
+    @property
+    def aux_loss(self):
+        return self._aux_loss * self.aux_loss_coef
+
+
 class DomainLayerNorm(nn.Module):
     """Domain-specific LayerNorm: separate weight/bias for single-foil vs tandem (Phase 3 R10)."""
     def __init__(self, dim, zeroinit=False):
@@ -279,6 +345,10 @@ class TransolverBlock(nn.Module):
         dln_zeroinit=False,
         domain_velhead=False,
         prog_slices=False,
+        use_moe=False,
+        moe_n_experts=8,
+        moe_top_k=2,
+        moe_aux_loss=0.01,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -286,6 +356,7 @@ class TransolverBlock(nn.Module):
         self.domain_velhead = domain_velhead
         self.adaln_output = adaln_output
         self.soft_moe = soft_moe
+        self.use_moe = use_moe
         self.adaln_all = adaln_all
         self.film_cond = film_cond
         self.domain_layernorm = domain_layernorm
@@ -321,7 +392,11 @@ class TransolverBlock(nn.Module):
             nn.init.zeros_(self.film_net[-1].weight)
             nn.init.zeros_(self.film_net[-1].bias)
         self.ln_2 = _LN(hidden_dim)
-        self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        if use_moe:
+            self.mlp = MoELayer(hidden_dim, hidden_dim * mlp_ratio, n_experts=moe_n_experts,
+                                top_k=moe_top_k, act=act, aux_loss_coef=moe_aux_loss)
+        else:
+            self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         self.spatial_bias = nn.Sequential(
             nn.Linear(4, 64), nn.GELU(),
             nn.Linear(64, 64), nn.GELU(),
@@ -453,6 +528,10 @@ class Transolver(nn.Module):
         dln_zeroinit=False,
         domain_velhead=False,
         prog_slices=False,
+        use_moe=False,
+        moe_n_experts=8,
+        moe_top_k=2,
+        moe_aux_loss=0.01,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -519,6 +598,10 @@ class Transolver(nn.Module):
                     dln_zeroinit=dln_zeroinit,
                     domain_velhead=domain_velhead if (idx == n_layers - 1) else False,
                     prog_slices=prog_slices,
+                    use_moe=use_moe,
+                    moe_n_experts=moe_n_experts,
+                    moe_top_k=moe_top_k,
+                    moe_aux_loss=moe_aux_loss,
                 )
                 for idx in range(n_layers)
             ]
@@ -737,6 +820,11 @@ class Config:
     prog_slices: bool = False          # progressive slice warmup
     prog_slices_end: int = 128         # max slice count for prog_slices
     prog_slices_epochs: int = 100      # epochs to ramp slice_num → prog_slices_end
+    # Phase 4: Mixture of Experts
+    moe: bool = False                  # replace MLP in TransolverBlocks with MoE
+    moe_n_experts: int = 8             # number of experts
+    moe_top_k: int = 2                 # top-k routing
+    moe_aux_loss: float = 0.01         # load balancing auxiliary loss coefficient
     # Phase 3 R11: SWA / snapshot ensemble / EMA tuning
     swa_cyclic: bool = False           # GPU 0/1: SWA with cyclic LR warm restarts
     swa_cyclic_T: int = 40             # warm-restart cycle period in epochs
@@ -896,6 +984,10 @@ model_config = dict(
     dln_zeroinit=cfg.dln_zeroinit,
     domain_velhead=cfg.domain_velhead,
     prog_slices=cfg.prog_slices,
+    use_moe=cfg.moe,
+    moe_n_experts=cfg.moe_n_experts,
+    moe_top_k=cfg.moe_top_k,
+    moe_aux_loss=cfg.moe_aux_loss,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1405,6 +1497,15 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # MoE auxiliary loss: load balancing across experts
+        moe_aux_loss_val = torch.tensor(0.0, device=device)
+        if cfg.moe:
+            moe_aux_loss_val = sum(
+                block.mlp.aux_loss for block in _base_model.blocks
+                if hasattr(block.mlp, 'aux_loss')
+            )
+            loss = loss + moe_aux_loss_val
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -1505,7 +1606,10 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.moe:
+            _log_dict["train/moe_aux_loss"] = moe_aux_loss_val.item() if isinstance(moe_aux_loss_val, torch.Tensor) else moe_aux_loss_val
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -1868,40 +1972,12 @@ if best_metrics:
     vis_model.eval()
     plot_dir = Path("plots") / run.id
     n = 1 if cfg.debug else 4
-    for split_name, split_ds in val_splits.items():
-        samples = []
-        for i in range(min(n, len(split_ds))):
-            x, y_true, is_surface = split_ds[i]
-            with torch.no_grad():
-                x_dev = x.unsqueeze(0).to(device)
-                y_dev = y_true.unsqueeze(0).to(device)
-                is_surf_dev = is_surface.unsqueeze(0).to(device)
-                mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
-                x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
-                curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
-                dist_surf = x_n[:, :, 2:10].abs().min(dim=-1, keepdim=True).values
-                dist_feat = torch.log1p(dist_surf * 10.0)
-                x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
-                Umag, q = _umag_q(y_dev, mask)
-                pred = vis_model({"x": x_n})["preds"].float()
-                if cfg.raw_targets:
-                    y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
-                else:
-                    pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
-                    if cfg.log_pressure:
-                        pred_phys = pred_phys.clone()
-                        pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
-                    if cfg.tight_denorm_clamps:
-                        _pd = pred_phys.clone()
-                        _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
-                        _pd[:, :, 1:2] = pred_phys[:, :, 1:2].clamp(-5, 5) * Umag
-                        _pd[:, :, 2:3] = pred_phys[:, :, 2:3].clamp(-10, 10) * q
-                        y_pred = _pd.squeeze(0).cpu()
-                    else:
-                        y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
-            samples.append((x[:, :2], y_true, y_pred, is_surface))
-        images = visualize(samples, out_dir=plot_dir / split_name)
-        if images:
-            wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    try:
+        for split_name, split_ds in val_splits.items():
+            images = visualize(vis_model, split_ds, stats, device, n_samples=n, out_dir=plot_dir / split_name)
+            if images:
+                wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    except Exception as e:
+        print(f"Warning: visualization failed ({e}), skipping plots.")
 
 wandb.finish()
