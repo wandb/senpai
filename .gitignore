@@ -19,13 +19,6 @@ venv/
 .vscode/
 .idea/
 
-# Claude Code
-.claude/**
-!.claude/skills/
-!.claude/skills/**
-!.claude/agents/
-!.claude/agents/**
-
 # OS
 .DS_Store
 Thumbs.db
