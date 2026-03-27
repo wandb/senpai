@@ -747,6 +747,10 @@ class Config:
     two_phase_lr_2: float = 1e-4       # phase 2 LR
     snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
     snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: Progressive layer growth
+    prog_layer_growth: bool = False    # start with only layer 1 active, progressively unfreeze
+    prog_layer_epoch_2: int = 50       # epoch to unfreeze layer 2
+    prog_layer_epoch_3: int = 100      # epoch to unfreeze layer 3
 
 
 cfg = sp.parse(Config)
@@ -903,6 +907,16 @@ torch._functorch.config.donated_buffer = False  # required for retain_graph=True
 model = torch.compile(model, mode="default")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
+# Progressive layer growth: freeze deeper layers at start
+if cfg.prog_layer_growth:
+    for i, block in enumerate(_base_model.blocks):
+        if i >= 1:  # freeze layer 2+ (keep only layer 1 active)
+            for p in block.parameters():
+                p.requires_grad = False
+    n_frozen = sum(1 for p in _base_model.parameters() if not p.requires_grad)
+    n_active = sum(1 for p in _base_model.parameters() if p.requires_grad)
+    print(f"Progressive layer growth: {n_active} active params, {n_frozen} frozen")
+
 from copy import deepcopy
 ema_model = None
 swad_initial_val = None
@@ -1026,24 +1040,29 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
-attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
-other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
-_base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
-if cfg.use_lion:
-    base_opt = Lion([
-        {'params': attn_params, 'lr': _base_lr * 0.5},
-        {'params': other_params, 'lr': _base_lr}
-    ], weight_decay=cfg.weight_decay)
-    optimizer = base_opt  # Lion has its own momentum; skip Lookahead
-else:
-    base_opt = torch.optim.AdamW([
-        {'params': attn_params, 'lr': _base_lr * 0.5},
-        {'params': other_params, 'lr': _base_lr}
-    ], weight_decay=cfg.weight_decay)
-    if cfg.use_lookahead:
-        optimizer = Lookahead(base_opt, k=10, alpha=0.8)
+_ATTN_KEYS = ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias']
+
+def _build_optimizer(mdl, lr, wd, use_lion, use_lookahead):
+    """Build optimizer from trainable params only (supports progressive unfreezing)."""
+    attn_p = [p for n, p in mdl.named_parameters() if p.requires_grad and any(k in n for k in _ATTN_KEYS)]
+    other_p = [p for n, p in mdl.named_parameters() if p.requires_grad and not any(k in n for k in _ATTN_KEYS)]
+    if use_lion:
+        opt = Lion([
+            {'params': attn_p, 'lr': lr * 0.5},
+            {'params': other_p, 'lr': lr}
+        ], weight_decay=wd)
+        return opt, opt
     else:
-        optimizer = base_opt
+        opt = torch.optim.AdamW([
+            {'params': attn_p, 'lr': lr * 0.5},
+            {'params': other_p, 'lr': lr}
+        ], weight_decay=wd)
+        if use_lookahead:
+            return Lookahead(opt, k=10, alpha=0.8), opt
+        return opt, opt
+
+_base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
+optimizer, base_opt = _build_optimizer(model, _base_lr, cfg.weight_decay, cfg.use_lion, cfg.use_lookahead)
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
@@ -1129,6 +1148,32 @@ for epoch in range(MAX_EPOCHS):
         break
 
     t0 = time.time()
+
+    # Progressive layer growth: unfreeze deeper layers at specified epochs
+    if cfg.prog_layer_growth:
+        _unfreeze_happened = False
+        if epoch == cfg.prog_layer_epoch_2 and len(_base_model.blocks) > 1:
+            print(f"Progressive growth: unfreezing layer 2 at epoch {epoch}")
+            for p in _base_model.blocks[1].parameters():
+                p.requires_grad = True
+            _unfreeze_happened = True
+        if epoch == cfg.prog_layer_epoch_3 and len(_base_model.blocks) > 2:
+            print(f"Progressive growth: unfreezing layer 3 at epoch {epoch}")
+            for p in _base_model.blocks[2].parameters():
+                p.requires_grad = True
+            _unfreeze_happened = True
+        if _unfreeze_happened:
+            # Rebuild optimizer with newly unfrozen params, use current LR from scheduler
+            _current_lr = scheduler.get_last_lr()[-1]
+            optimizer, base_opt = _build_optimizer(
+                model, _current_lr, cfg.weight_decay, cfg.use_lion, cfg.use_lookahead)
+            # Rebuild scheduler from current position
+            remaining_epochs = max(1, cfg.cosine_T_max - epoch)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                base_opt, T_max=remaining_epochs, eta_min=cfg.cosine_eta_min)
+            n_active = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"  Rebuilt optimizer: {n_active} trainable params, lr={_current_lr:.2e}")
+            wandb.log({"prog_layer_unfreeze": epoch, "global_step": global_step})
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
@@ -1910,8 +1955,11 @@ if best_metrics:
                     else:
                         y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
             samples.append((x[:, :2], y_true, y_pred, is_surface))
-        images = visualize(samples, out_dir=plot_dir / split_name)
-        if images:
-            wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+        try:
+            images = visualize(samples, out_dir=plot_dir / split_name)
+            if images:
+                wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+        except TypeError:
+            print(f"  Warning: visualize() call failed for {split_name} (signature mismatch), skipping plots")
 
 wandb.finish()
