@@ -38,7 +38,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 import simple_parsing as sp
 
 from data.utils import visualize
-from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
+from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES, set_extra_features_mode, get_extra_dim
 
 torch.set_float32_matmul_precision('high')
 
@@ -754,6 +754,10 @@ class Config:
     vol_subsample_frac: float = 1.0     # fraction of volume nodes in loss after vol_ramp (0.8 = 80%)
     compile_mode: str = "default"       # torch.compile mode: "default", "max-autotune", "reduce-overhead"
     num_workers: int = 4                # data loader workers
+    # Phase 5: feature engineering + conditional mixup
+    extra_features: str = "none"        # none|wall_dist|wall_dist_dir|all — extra geometric features
+    conditional_mixup: bool = False     # conditional mixup: mix samples with same geometry, different flow
+    mixup_alpha: float = 0.4           # Beta distribution parameter for conditional mixup
 
 
 cfg = sp.parse(Config)
@@ -767,6 +771,14 @@ if cfg.debug:
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}" + (" [DEBUG MODE]" if cfg.debug else ""))
+
+# Phase 5: set extra features mode before data loading
+if cfg.extra_features != "none":
+    set_extra_features_mode(cfg.extra_features)
+    _extra_feat_dim = get_extra_dim()
+    print(f"Phase 5 extra features: mode={cfg.extra_features}, +{_extra_feat_dim} dims")
+else:
+    _extra_feat_dim = 0
 
 train_ds, val_splits, stats, sample_weights = load_data(
     cfg.manifest, cfg.stats_file, debug=cfg.debug,
@@ -877,7 +889,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32 + _extra_feat_dim,  # +curv, +dist, [+foil2dist], +32 fourier PE, +extra
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1154,6 +1166,12 @@ for epoch in range(MAX_EPOCHS):
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
 
+        # Phase 5: extract extra features before augmentation/standardization
+        _extra_feats = None
+        if _extra_feat_dim > 0:
+            _extra_feats = x[:, :, X_DIM:]  # [B, N, extra_dim]
+            x = x[:, :, :X_DIM]  # trim to core 24 features
+
         # --- Data augmentation (training-only, applied before normalization) ---
         if model.training and cfg.aug != "none" and epoch >= cfg.aug_start_epoch:
             if cfg.aug in ("yflip", "flip_jitter"):
@@ -1213,6 +1231,28 @@ for epoch in range(MAX_EPOCHS):
                     y[_b, _in_region] = y[_cut_idx[_b], _in_region]
                     is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
 
+        # Phase 5: conditional mixup — mix targets of samples with same domain
+        if model.training and cfg.conditional_mixup and x.size(0) >= 2:
+            _B_mix = x.size(0)
+            # Identify domain: single (gap~0) vs tandem (gap!=0)
+            _gap_vals = x[:, 0, 21]  # gap feature (same for all nodes in a sample)
+            _is_tandem_mix = (_gap_vals.abs() > 0.01)  # [B]
+            # Find pairs within same domain
+            _mix_idx = torch.arange(_B_mix, device=x.device)
+            for _b in range(_B_mix):
+                _same_domain = (_is_tandem_mix == _is_tandem_mix[_b])
+                _same_domain[_b] = False  # don't mix with self
+                if _same_domain.any():
+                    _candidates = _same_domain.nonzero(as_tuple=True)[0]
+                    _mix_idx[_b] = _candidates[torch.randint(len(_candidates), (1,))]
+            _lam = torch.distributions.Beta(cfg.mixup_alpha, cfg.mixup_alpha).sample((_B_mix,)).to(x.device).view(_B_mix, 1, 1)
+            # Mix only flow conditions (Re, AoA at indices 11-14) and targets
+            # Keep geometry (pos, saf, dsdf) from original sample
+            x[:, :, 11:15] = _lam * x[:, :, 11:15] + (1 - _lam) * x[_mix_idx, :, 11:15]
+            y = _lam * y + (1 - _lam) * y[_mix_idx]
+            # Also mix mask to handle different padding
+            mask = mask & mask[_mix_idx]
+
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
@@ -1234,6 +1274,9 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
+        # Phase 5: append extra features after standardization/fourier
+        if _extra_feats is not None:
+            x = torch.cat([x, _extra_feats], dim=-1)
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -1636,6 +1679,12 @@ for epoch in range(MAX_EPOCHS):
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
 
+                # Phase 5: extract extra features
+                _val_extra = None
+                if _extra_feat_dim > 0:
+                    _val_extra = x[:, :, X_DIM:]
+                    x = x[:, :, :X_DIM]
+
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
@@ -1657,6 +1706,9 @@ for epoch in range(MAX_EPOCHS):
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
+                # Phase 5: append extra features
+                if _val_extra is not None:
+                    x = torch.cat([x, _val_extra], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
@@ -1910,6 +1962,11 @@ if best_metrics:
                     y_dev = y_true.unsqueeze(0).to(device)
                     is_surf_dev = is_surface.unsqueeze(0).to(device)
                     mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
+                    # Phase 5: extract extra features
+                    _vis_extra = None
+                    if _extra_feat_dim > 0:
+                        _vis_extra = x_dev[:, :, X_DIM:]
+                        x_dev = x_dev[:, :, :X_DIM]
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
@@ -1925,6 +1982,8 @@ if best_metrics:
                     xy_scaled = xy_norm.unsqueeze(-1) * freqs
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
+                    if _vis_extra is not None:
+                        x_n = torch.cat([x_n, _vis_extra], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
                     pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
                     if cfg.raw_targets:
