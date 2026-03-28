@@ -448,6 +448,80 @@ class TransolverBlock(nn.Module):
         return fx
 
 
+class SurfaceAttentionLayer(nn.Module):
+    """Full self-attention over surface nodes only.
+
+    After TransolverBlocks, extract surface node features,
+    apply multi-head self-attention among ALL surface nodes,
+    then scatter the refined features back with a learnable gate.
+    """
+    def __init__(self, dim, heads=4, dim_head=48, gate_init=-2.0):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        inner_dim = heads * dim_head
+        self.heads = heads
+        self.dim_head = dim_head
+        self.q = nn.Linear(dim, inner_dim, bias=False)
+        self.k = nn.Linear(dim, inner_dim, bias=False)
+        self.v = nn.Linear(dim, inner_dim, bias=False)
+        self.out = nn.Linear(inner_dim, dim)
+        self.gate = nn.Sequential(nn.Linear(dim, 1), nn.Sigmoid())
+        nn.init.constant_(self.gate[0].bias, gate_init)  # start nearly closed
+
+    def forward(self, fx, is_surface, mask):
+        """
+        fx: [B, N, D] — hidden features from Transolver
+        is_surface: [B, N] — bool mask for surface nodes
+        mask: [B, N] — padding mask
+
+        Returns: fx with surface nodes updated via attention
+        """
+        B, N, D = fx.shape
+        fx_normed = self.norm(fx)
+
+        max_surf = 600  # safe upper bound for surface nodes per sample
+        device = fx.device
+
+        surf_features = torch.zeros(B, max_surf, D, device=device, dtype=fx.dtype)
+        surf_mask = torch.zeros(B, max_surf, dtype=torch.bool, device=device)
+        surf_indices = torch.zeros(B, max_surf, dtype=torch.long, device=device)
+
+        for b in range(B):
+            surf_idx = (is_surface[b] & mask[b]).nonzero(as_tuple=True)[0]
+            n_surf = min(len(surf_idx), max_surf)
+            if n_surf > 0:
+                surf_features[b, :n_surf] = fx_normed[b, surf_idx[:n_surf]]
+                surf_mask[b, :n_surf] = True
+                surf_indices[b, :n_surf] = surf_idx[:n_surf]
+
+        # Multi-head self-attention among surface nodes
+        q = self.q(surf_features).view(B, max_surf, self.heads, self.dim_head).transpose(1, 2)
+        k = self.k(surf_features).view(B, max_surf, self.heads, self.dim_head).transpose(1, 2)
+        v = self.v(surf_features).view(B, max_surf, self.heads, self.dim_head).transpose(1, 2)
+
+        # Attention mask for padded surface nodes
+        # Shape: (B, 1, 1, max_surf) for key masking
+        key_mask = surf_mask[:, None, None, :]  # (B, 1, 1, max_surf)
+        attn_bias = torch.zeros(B, 1, max_surf, max_surf, device=device, dtype=fx.dtype)
+        attn_bias.masked_fill_(~key_mask, float('-inf'))
+
+        attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
+        attn_out = attn_out.transpose(1, 2).reshape(B, max_surf, -1)
+        attn_out = self.out(attn_out)
+
+        # Gated scatter back to original positions (non-inplace for autograd)
+        gate_val = self.gate(fx)  # [B, N, 1]
+        delta = torch.zeros(B, N, D, device=device, dtype=fx.dtype)
+        for b in range(B):
+            n_surf = surf_mask[b].sum()
+            if n_surf > 0:
+                idx = surf_indices[b, :n_surf]
+                _gated = (gate_val[b, idx] * attn_out[b, :n_surf]).to(fx.dtype)
+                delta[b, idx] = _gated
+
+        return fx + delta
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -484,10 +558,16 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        surface_attn=False,
+        surface_attn_heads=4,
+        surface_attn_dim_head=48,
+        surface_attn_gate_init=-2.0,
+        surface_attn_layers=1,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.pressure_first = pressure_first
+        self.surface_attn = surface_attn
         self.ref = ref
         self.unified_pos = unified_pos
         self.adaln_output = adaln_output
@@ -568,6 +648,14 @@ class Transolver(nn.Module):
             nn.Linear(n_hidden, 1),
         )
         self.initialize_weights()
+        # Surface attention layers (after TransolverBlocks, before output)
+        if surface_attn:
+            self.surface_attn_layers = nn.ModuleList([
+                SurfaceAttentionLayer(
+                    dim=n_hidden, heads=surface_attn_heads,
+                    dim_head=surface_attn_dim_head, gate_init=surface_attn_gate_init)
+                for _ in range(surface_attn_layers)
+            ])
         self.out_skip = nn.Linear(n_hidden, out_dim)
         nn.init.zeros_(self.out_skip.weight)
         nn.init.zeros_(self.out_skip.bias)
@@ -617,14 +705,16 @@ class Transolver(nn.Module):
         x = data.get("x")
         pos = data.get("pos", pos)
         condition = data.get("condition", condition)
-        return x, pos, condition
+        is_surface = data.get("is_surface")
+        mask = data.get("mask")
+        return x, pos, condition, is_surface, mask
 
     def _validate_output_dims(self, preds):
         if sum(self.output_dims) != preds.shape[-1]:
             raise ValueError("Sum of output_dims must match preds last dimension")
 
     def forward(self, data, pos=None, condition=None):
-        x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
+        x, pos, condition, is_surface_input, mask_input = self._unpack_inputs(data, pos=pos, condition=condition)
         if x is None:
             raise ValueError("Missing required input tensor: x")
         if condition is not None:
@@ -679,6 +769,11 @@ class Transolver(nn.Module):
 
         # Last block: use adaln_all condition if enabled, else fallback to adaln_output
         last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
+
+        # Surface attention: all-to-all communication among surface nodes
+        if self.surface_attn and is_surface_input is not None and mask_input is not None:
+            for _sal in self.surface_attn_layers:
+                fx = _sal(fx, is_surface_input, mask_input)
 
         if self._pressure_separate and self.pressure_first:
             # Separate pressure pathway: independent MLP processes pre-last features
@@ -814,6 +909,12 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Surface attention
+    surface_attn: bool = False              # add surface all-to-all attention layer
+    surface_attn_heads: int = 4             # number of attention heads
+    surface_attn_dim_head: int = 48         # dimension per head
+    surface_attn_gate_init: float = -2.0    # gate bias init (negative = nearly closed)
+    surface_attn_layers: int = 1            # number of stacked surface attention layers
 
 
 cfg = sp.parse(Config)
@@ -966,6 +1067,11 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    surface_attn=cfg.surface_attn,
+    surface_attn_heads=cfg.surface_attn_heads,
+    surface_attn_dim_head=cfg.surface_attn_dim_head,
+    surface_attn_gate_init=cfg.surface_attn_gate_init,
+    surface_attn_layers=cfg.surface_attn_layers,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1353,7 +1459,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x, "is_surface": is_surface, "mask": mask})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -1488,7 +1594,7 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x})
+                rdrop_out = model({"x": x, "is_surface": is_surface, "mask": mask})
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -1553,7 +1659,7 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                out2 = model({"x": x, "is_surface": is_surface, "mask": mask})
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -1760,7 +1866,7 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    pred = eval_model({"x": x, "is_surface": is_surface, "mask": mask})["preds"]
                 pred = pred.float()
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
@@ -1990,7 +2096,7 @@ if best_metrics:
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
-                    pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
+                    pred = vis_model({"x": x_n, "is_surface": is_surf_dev, "mask": mask})["preds"].float()
                     if cfg.raw_targets:
                         y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                     else:
