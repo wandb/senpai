@@ -139,11 +139,13 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False,
+                 slice_dropout=0.0):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
         self.heads = heads
+        self.slice_dropout = slice_dropout
         self.scale = dim_head**-0.5
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
@@ -222,6 +224,12 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             # Apply slice mask: 0 for active slices, -1e9 for inactive (updated each epoch)
             slice_logits = slice_logits + self.slice_mask
         slice_weights = self.softmax(slice_logits)
+        # Slice dropout: randomly zero out entire slices during training
+        if self.training and self.slice_dropout > 0:
+            S = slice_weights.shape[-1]  # slice_num dimension
+            drop_mask = (torch.rand(1, 1, 1, S, device=slice_weights.device) > self.slice_dropout).float()
+            slice_weights = slice_weights * drop_mask
+            slice_weights = slice_weights / (slice_weights.sum(dim=-1, keepdim=True) + 1e-8)
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
@@ -282,6 +290,8 @@ class TransolverBlock(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        drop_rate=0.0,
+        slice_dropout=0.0,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -290,6 +300,7 @@ class TransolverBlock(nn.Module):
         self.pressure_first = pressure_first
         self.pressure_no_detach = pressure_no_detach
         self.adaln_output = adaln_output
+        self.drop_rate = drop_rate
         self.soft_moe = soft_moe
         self.adaln_all = adaln_all
         self.film_cond = film_cond
@@ -307,6 +318,7 @@ class TransolverBlock(nn.Module):
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
             prog_slices=prog_slices,
+            slice_dropout=slice_dropout,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -392,6 +404,10 @@ class TransolverBlock(nn.Module):
                 )
 
     def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
+        # Stochastic depth: randomly skip this block during training (not last layer)
+        if self.training and self.drop_rate > 0 and not self.last_layer:
+            if torch.rand(1).item() < self.drop_rate:
+                return fx
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         # DomainLayerNorm helper: pass is_tandem when enabled, else plain call
         dln_it = (tandem_mask.view(-1) > 0.5) if (self.domain_layernorm and tandem_mask is not None) else None
@@ -484,6 +500,8 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        stochastic_depth=0.0,
+        slice_dropout=0.0,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -554,6 +572,8 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
+                    drop_rate=stochastic_depth * (idx + 1) / n_layers,  # linear increase with depth
+                    slice_dropout=slice_dropout,
                 )
                 for idx in range(n_layers)
             ]
@@ -814,6 +834,9 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Stochastic depth + slice dropout regularization
+    stochastic_depth: float = 0.0      # drop rate for stochastic depth (0 = disabled)
+    slice_dropout: float = 0.0         # slice token dropout rate (0 = disabled)
 
 
 cfg = sp.parse(Config)
@@ -966,6 +989,8 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    stochastic_depth=cfg.stochastic_depth,
+    slice_dropout=cfg.slice_dropout,
 )
 
 model = Transolver(**model_config).to(device)
