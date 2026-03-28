@@ -2,15 +2,16 @@
 
 ## Current Baseline (Phase 4 — 2026-03-28, Pressure-First Deep)
 
-| Metric | Mean (4 seeds) | Std | Best single | Worst single |
+| Metric | Mean (8 seeds) | Std | Best single | Worst single |
 |--------|---------------|-----|-------------|--------------|
-| val/loss | 0.401 | 0.005 | 0.395 | 0.406 |
-| p_in | 12.95 | 0.3 | 12.6 | 13.4 |
-| p_oodc | 8.40 | 0.4 | 8.0 | 8.9 |
-| p_tan | 33.8 | 0.5 | 33.3 | 34.4 |
-| p_re | 24.7 | 0.2 | 24.4 | 24.9 |
+| val/loss | 0.404 | 0.004 | 0.400 | 0.410 |
+| p_in | 13.33 | 0.58 | 12.70 | 14.61 |
+| p_oodc | 8.37 | 0.22 | 7.99 | 8.74 |
+| p_tan | 33.57 | 0.44 | 32.97 | 34.15 |
+| p_re | 24.58 | 0.13 | 24.41 | 24.86 |
 
 **Phase 4 improvements merged:** T_max=180 (#1845) + disable_pcgrad (#1846) + pressure_first + pressure_deep (#1867). Memory: ~36.2 GB.
+**8-seed characterization:** PR #1911 (seeds 42-49). W&B group: `phase5-baseline-8seed`.
 
 ### Reproduce
 
