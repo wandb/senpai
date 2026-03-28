@@ -1540,13 +1540,19 @@ for epoch in range(MAX_EPOCHS):
         else:
             if cfg.grad_accum_steps <= 1:
                 optimizer.zero_grad()
-            loss.backward()
+            # Scale loss for gradient accumulation
+            if cfg.grad_accum_steps > 1:
+                (loss / cfg.grad_accum_steps).backward()
+            else:
+                loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         sam_active = sam_optimizer is not None and epoch >= int(MAX_EPOCHS * 0.75)
         _should_step = (cfg.grad_accum_steps <= 1 or
                         (batch_idx + 1) % cfg.grad_accum_steps == 0 or
                         batch_idx == len(train_loader) - 1)
+        # Clip gradients only when stepping
+        if _should_step:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         if sam_active and not use_pcgrad and _should_step:
             # SAM first step: perturb parameters toward gradient direction
             sam_optimizer.perturb()
