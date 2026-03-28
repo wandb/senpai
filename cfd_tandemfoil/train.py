@@ -139,7 +139,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False,
+                 t3_mode=False, t3_gumbel_scale=0.1):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -147,7 +148,17 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.scale = dim_head**-0.5
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
-        self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
+        self.t3_mode = t3_mode
+        self.t3_gumbel_scale = t3_gumbel_scale
+        if t3_mode:
+            # T++ per-point adaptive temperature: MLP on x_mid features
+            self.temp_bias = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
+            self.proj_temperature = nn.Sequential(
+                nn.Linear(dim_head, slice_num), nn.GELU(),
+                nn.Linear(slice_num, 1), nn.GELU(),
+            )
+        else:
+            self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
         self.tandem_temp_offset = nn.Parameter(torch.zeros(1, heads, 1, 1))
         self.linear_no_attention = linear_no_attention
         self.learned_kernel = learned_kernel
@@ -159,7 +170,11 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             self.register_buffer('slice_mask', torch.zeros(slice_num))
 
         self.in_project_x = nn.Linear(dim, inner_dim)
-        self.in_project_fx = nn.Linear(dim, inner_dim)
+        if not t3_mode:
+            self.in_project_fx = nn.Linear(dim, inner_dim)
+        else:
+            # T3: Linear1 applied at M-scale (slice_num) instead of N-scale
+            self.slice_linear1 = nn.Linear(dim, dim_head)
         self.in_project_slice = nn.Linear(dim_head, slice_num)
         torch.nn.init.orthogonal_(self.in_project_slice.weight)
         if decouple_slice:
@@ -189,26 +204,36 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
     def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None):
         bsz, num_points, _ = x.shape
 
-        fx_mid = (
-            self.in_project_fx(x)
-            .reshape(bsz, num_points, self.heads, self.dim_head)
-            .permute(0, 2, 1, 3)
-            .contiguous()
-        )
         x_mid = (
             self.in_project_x(x)
             .reshape(bsz, num_points, self.heads, self.dim_head)
             .permute(0, 2, 1, 3)
             .contiguous()
         )
-        temp = self.temperature
-        if self.zone_temp and zone_features is not None:
-            # zone_features: [B, 3] → per-head offset [B, heads] → [B, heads, 1, 1]
-            zone_offset = self.zone_temp_proj(zone_features).reshape(bsz, self.heads, 1, 1)
-            temp = temp + zone_offset
-        if tandem_mask is not None:
-            temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
-        temp = temp.clamp(min=1e-4)
+
+        # Temperature computation
+        if self.t3_mode:
+            # T++ per-point adaptive temperature: MLP on each point's features
+            temp = self.proj_temperature(x_mid) + self.temp_bias  # [B, H, N, 1]
+            if tandem_mask is not None:
+                temp = temp + self.tandem_temp_offset * tandem_mask
+            temp = temp.clamp(min=0.01)
+        else:
+            fx_mid = (
+                self.in_project_fx(x)
+                .reshape(bsz, num_points, self.heads, self.dim_head)
+                .permute(0, 2, 1, 3)
+                .contiguous()
+            )
+            temp = self.temperature
+            if self.zone_temp and zone_features is not None:
+                zone_offset = self.zone_temp_proj(zone_features).reshape(bsz, self.heads, 1, 1)
+                temp = temp + zone_offset
+            if tandem_mask is not None:
+                temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
+            temp = temp.clamp(min=1e-4)
+
+        # Slice logits
         if self.decouple_slice and tandem_mask is not None:
             std_logits = self.in_project_slice(x_mid) / temp
             tan_logits = self.in_project_slice_tandem(x_mid) / temp
@@ -219,12 +244,31 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         if spatial_bias is not None:
             slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
         if self.prog_slices:
-            # Apply slice mask: 0 for active slices, -1e9 for inactive (updated each epoch)
             slice_logits = slice_logits + self.slice_mask
-        slice_weights = self.softmax(slice_logits)
+
+        # Slice weight computation: Gumbel-Softmax (T3/T++) or standard softmax
+        if self.t3_mode and self.training and self.t3_gumbel_scale > 0:
+            # Gumbel-Softmax: add Gumbel noise for stochastic discrete-like routing
+            u = torch.rand_like(slice_logits).clamp(1e-8, 1 - 1e-8)
+            gumbel_noise = -torch.log(-torch.log(u)) * self.t3_gumbel_scale
+            slice_weights = self.softmax(slice_logits + gumbel_noise)
+        else:
+            slice_weights = self.softmax(slice_logits)
+
         slice_norm = slice_weights.sum(2)
-        slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
-        slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
+
+        # Slice token computation
+        if self.t3_mode:
+            # T3 memory-efficient: aggregate raw x first, then apply Linear1 at M-scale
+            # x: [B, N, C], slice_weights: [B, H, N, M]
+            # Compute w^T @ x at N-scale, then apply linear at M-scale
+            x_expanded = x.unsqueeze(1).expand(-1, self.heads, -1, -1)  # [B, H, N, C]
+            s_raw = torch.einsum("bhng,bhnc->bhgc", slice_weights, x_expanded)  # [B, H, M, C]
+            s_raw = s_raw / ((slice_norm + 1e-5)[:, :, :, None])
+            slice_token = self.slice_linear1(s_raw)  # [B, H, M, D] — Linear1 at M-scale
+        else:
+            slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
+            slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
 
         if self.linear_no_attention:
             out_slice_token = slice_token
@@ -282,6 +326,8 @@ class TransolverBlock(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        t3_mode=False,
+        t3_gumbel_scale=0.1,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -307,6 +353,8 @@ class TransolverBlock(nn.Module):
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
             prog_slices=prog_slices,
+            t3_mode=t3_mode,
+            t3_gumbel_scale=t3_gumbel_scale,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -484,6 +532,8 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        t3_mode=False,
+        t3_gumbel_scale=0.1,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -554,6 +604,8 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
+                    t3_mode=t3_mode,
+                    t3_gumbel_scale=t3_gumbel_scale,
                 )
                 for idx in range(n_layers)
             ]
@@ -814,6 +866,10 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Transolver-3 / T++ features
+    t3_mode: bool = False               # enable T3-inspired improvements
+    t3_gumbel_scale: float = 0.1        # Gumbel noise scale (0 = disable Gumbel)
+    t3_subsample_frac: float = 1.0      # node subsampling fraction (1.0 = no subsampling)
 
 
 cfg = sp.parse(Config)
@@ -966,6 +1022,8 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    t3_mode=cfg.t3_mode,
+    t3_gumbel_scale=cfg.t3_gumbel_scale,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1351,6 +1409,37 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = y_norm * sample_stds
             else:
                 y_norm = y_norm / sample_stds
+
+        # T3 node subsampling: randomly sample nodes per step (keep all surface nodes)
+        _subsample_idx = None
+        if cfg.t3_mode and cfg.t3_subsample_frac < 1.0 and model.training:
+            B, N, C = x.shape
+            keep_n = max(int(N * cfg.t3_subsample_frac), 1)
+            # Always keep surface nodes, randomly sample volume nodes
+            _subsample_idx = []
+            for b in range(B):
+                surf_idx = (is_surface[b] & mask[b]).nonzero(as_tuple=True)[0]
+                vol_idx = (~is_surface[b] & mask[b]).nonzero(as_tuple=True)[0]
+                n_vol_keep = max(keep_n - surf_idx.shape[0], 0)
+                if n_vol_keep < vol_idx.shape[0]:
+                    perm = torch.randperm(vol_idx.shape[0], device=device)[:n_vol_keep]
+                    vol_keep = vol_idx[perm]
+                else:
+                    vol_keep = vol_idx
+                keep = torch.cat([surf_idx, vol_keep])
+                # Pad to fixed size
+                if keep.shape[0] < keep_n:
+                    pad = keep[:1].expand(keep_n - keep.shape[0])
+                    keep = torch.cat([keep, pad])
+                else:
+                    keep = keep[:keep_n]
+                _subsample_idx.append(keep)
+            _subsample_idx = torch.stack(_subsample_idx)  # [B, keep_n]
+            # Subsample all tensors
+            x = torch.gather(x, 1, _subsample_idx.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
+            y_norm = torch.gather(y_norm, 1, _subsample_idx.unsqueeze(-1).expand(-1, -1, y_norm.shape[-1]))
+            mask = torch.gather(mask, 1, _subsample_idx)
+            is_surface = torch.gather(is_surface, 1, _subsample_idx)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model({"x": x})
