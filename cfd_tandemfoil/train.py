@@ -139,7 +139,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False,
+                 gumbel_softmax=False, gumbel_scale=0.1, gumbel_variant="v1"):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -154,6 +155,9 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.decouple_slice = decouple_slice
         self.zone_temp = zone_temp
         self.prog_slices = prog_slices
+        self.gumbel_softmax = gumbel_softmax
+        self.gumbel_scale = gumbel_scale
+        self.gumbel_variant = gumbel_variant
         if prog_slices:
             # Buffer for masking inactive slices; updated per-epoch by training loop
             self.register_buffer('slice_mask', torch.zeros(slice_num))
@@ -221,6 +225,16 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         if self.prog_slices:
             # Apply slice mask: 0 for active slices, -1e9 for inactive (updated each epoch)
             slice_logits = slice_logits + self.slice_mask
+        # Gumbel-Softmax: add Gumbel noise to slice logits for sharper assignment
+        if self.training and self.gumbel_softmax:
+            if self.gumbel_variant == "v1":
+                # askeladd's implementation: uniform → clamp → log → log
+                U = torch.zeros_like(slice_logits).uniform_().clamp(1e-6, 1 - 1e-6)
+                gumbel_noise = -(-U.log()).log()
+            else:
+                # nezuko's implementation: rand → clamp → nested log
+                gumbel_noise = -torch.log(-torch.log(torch.rand_like(slice_logits).clamp(min=1e-10)) + 1e-10)
+            slice_logits = slice_logits + self.gumbel_scale * gumbel_noise
         slice_weights = self.softmax(slice_logits)
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
@@ -282,6 +296,9 @@ class TransolverBlock(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        gumbel_softmax=False,
+        gumbel_scale=0.1,
+        gumbel_variant="v1",
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -307,6 +324,9 @@ class TransolverBlock(nn.Module):
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
             prog_slices=prog_slices,
+            gumbel_softmax=gumbel_softmax,
+            gumbel_scale=gumbel_scale,
+            gumbel_variant=gumbel_variant,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -484,6 +504,9 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        gumbel_softmax=False,
+        gumbel_scale=0.1,
+        gumbel_variant="v1",
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -554,6 +577,9 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
+                    gumbel_softmax=gumbel_softmax,
+                    gumbel_scale=gumbel_scale,
+                    gumbel_variant=gumbel_variant,
                 )
                 for idx in range(n_layers)
             ]
@@ -814,6 +840,10 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Gumbel-Softmax investigation
+    gumbel_softmax: bool = False        # add Gumbel noise to slice logits during training
+    gumbel_scale: float = 0.1           # scale of Gumbel noise
+    gumbel_variant: str = "v1"          # v1=askeladd, v2=nezuko
 
 
 cfg = sp.parse(Config)
@@ -966,6 +996,9 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    gumbel_softmax=cfg.gumbel_softmax,
+    gumbel_scale=cfg.gumbel_scale,
+    gumbel_variant=cfg.gumbel_variant,
 )
 
 model = Transolver(**model_config).to(device)
