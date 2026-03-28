@@ -814,6 +814,9 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Curriculum learning
+    curriculum: str = "none"            # none|domain|loss|anti — curriculum learning strategy
+    curriculum_epochs: int = 60         # epochs over which curriculum ramps (domain: phase transitions)
 
 
 cfg = sp.parse(Config)
@@ -832,6 +835,25 @@ train_ds, val_splits, stats, sample_weights = load_data(
     cfg.manifest, cfg.stats_file, debug=cfg.debug,
 )
 stats = {k: v.to(device) for k, v in stats.items()}
+
+# --- Curriculum learning: per-sample domain labels ---
+import json as _json
+_curriculum_manifest = _json.load(open(cfg.manifest))
+_domain_groups = _curriculum_manifest.get("domain_groups", {})
+_idx_to_domain: dict[int, str] = {}
+for _dname, _didxs in _domain_groups.items():
+    for _di in _didxs:
+        _idx_to_domain[_di] = _dname
+# Per-training-sample domain label (0=racecar_single, 1=racecar_tandem, 2=cruise)
+_domain_order = ["racecar_single", "racecar_tandem", "cruise"]
+_domain_to_id = {d: i for i, d in enumerate(_domain_order)}
+train_domain_ids = torch.tensor(
+    [_domain_to_id.get(_idx_to_domain.get(i, "racecar_single"), 0) for i in train_ds.indices],
+    dtype=torch.long,
+)
+# Per-sample difficulty scores (updated periodically for loss-based curriculum)
+train_difficulty = torch.ones(len(train_ds), dtype=torch.float64)
+base_sample_weights = sample_weights.clone()
 
 
 def _umag_q(y, mask):
@@ -1200,6 +1222,45 @@ for epoch in range(MAX_EPOCHS):
         break
 
     t0 = time.time()
+
+    # --- Curriculum learning: update sampler weights ---
+    if cfg.curriculum != "none" and not cfg.debug:
+        cur_weights = base_sample_weights.clone()
+        if cfg.curriculum == "domain":
+            # Progressive domain introduction:
+            # Phase 1 (0 to 1/3 of curriculum_epochs): only racecar_single
+            # Phase 2 (1/3 to 2/3): + racecar_tandem
+            # Phase 3 (2/3+): all domains (full training set)
+            phase1_end = cfg.curriculum_epochs // 3
+            phase2_end = 2 * cfg.curriculum_epochs // 3
+            if epoch < phase1_end:
+                # Only racecar_single
+                cur_weights[train_domain_ids == 1] = 0.0  # zero tandem
+                cur_weights[train_domain_ids == 2] = 0.0  # zero cruise
+            elif epoch < phase2_end:
+                # racecar_single + racecar_tandem
+                cur_weights[train_domain_ids == 2] = 0.0  # zero cruise
+            # else: all domains active (cur_weights = base_sample_weights)
+        elif cfg.curriculum == "loss":
+            # Loss-based: start uniform, progressively upweight harder samples
+            progress = min(1.0, epoch / max(cfg.curriculum_epochs, 1))
+            centered = train_difficulty - train_difficulty.mean()
+            diff_weight = 1.0 + progress * centered / (centered.abs().max().clamp(min=1e-8))
+            cur_weights = base_sample_weights * diff_weight.clamp(min=0.1)
+        elif cfg.curriculum == "anti":
+            # Anti-curriculum: upweight hard samples from the start
+            progress = max(0.0, 1.0 - epoch / max(cfg.curriculum_epochs, 1))
+            centered = train_difficulty - train_difficulty.mean()
+            diff_weight = 1.0 + progress * centered / (centered.abs().max().clamp(min=1e-8))
+            cur_weights = base_sample_weights * diff_weight.clamp(min=0.1)
+        # Ensure no negative/zero total weight
+        cur_weights = cur_weights.clamp(min=0.0)
+        if cur_weights.sum() < 1e-8:
+            cur_weights = base_sample_weights.clone()
+        sampler.weights = cur_weights
+        if epoch % 20 == 0:
+            n_active = (cur_weights > 1e-8).sum().item()
+            print(f"  Curriculum '{cfg.curriculum}' epoch {epoch}: {n_active}/{len(cur_weights)} active samples")
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
@@ -1641,6 +1702,46 @@ for epoch in range(MAX_EPOCHS):
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
     prev_surf_loss = epoch_surf
+
+    # --- Loss-based curriculum: update per-sample difficulty every 10 epochs ---
+    if cfg.curriculum in ("loss", "anti") and not cfg.debug and epoch % 10 == 0:
+        model.eval()
+        _diff_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
+        _all_losses = []
+        with torch.no_grad():
+            for _cx, _cy, _cis, _cm in _diff_loader:
+                _cx, _cy = _cx.to(device), _cy.to(device)
+                _cm = _cm.to(device)
+                _cis = _cis.to(device)
+                _raw_dsdf = _cx[:, :, 2:10]
+                _dist_surf = _raw_dsdf.abs().min(dim=-1, keepdim=True).values
+                _dist_feat = torch.log1p(_dist_surf * 10.0)
+                _cx_n = (_cx - stats["x_mean"]) / stats["x_std"]
+                _curv = _cx_n[:, :, 2:6].norm(dim=-1, keepdim=True) * _cis.float().unsqueeze(-1)
+                _cx_n = torch.cat([_cx_n, _curv, _dist_feat], dim=-1)
+                _raw_xy = _cx_n[:, :, :2]
+                _xy_min = _raw_xy.amin(dim=1, keepdim=True)
+                _xy_max = _raw_xy.amax(dim=1, keepdim=True)
+                _xy_norm = (_raw_xy - _xy_min) / (_xy_max - _xy_min + 1e-8)
+                _freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                _xy_sc = _xy_norm.unsqueeze(-1) * _freqs
+                _fpe = torch.cat([_xy_sc.sin().flatten(-2), _xy_sc.cos().flatten(-2)], dim=-1)
+                _cx_n = torch.cat([_cx_n, _fpe], dim=-1)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _cpred = model({"x": _cx_n, "mask": _cm})["preds"]
+                _cpred = _cpred.float()
+                _Umag, _cq = _umag_q(_cy, _cm)
+                _cy_phys = _phys_norm(_cy, _Umag, _cq)
+                _cy_norm = (_cy_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                _closs = (_cpred - _cy_norm).abs().mean(dim=(1, 2))  # [B]
+                _all_losses.append(_closs.cpu())
+        train_difficulty = torch.cat(_all_losses).double()
+        # Normalize to [0, 1] range
+        _dmin, _dmax = train_difficulty.min(), train_difficulty.max()
+        if _dmax > _dmin:
+            train_difficulty = (train_difficulty - _dmin) / (_dmax - _dmin)
+        model.train()
+
     # Snapshot ensemble: save running average at specified epochs
     if cfg.snapshot_ensemble and (epoch + 1) in snapshot_epoch_list:
         snap = {k: v.cpu().clone() for k, v in _base_model.state_dict().items()}
