@@ -450,6 +450,7 @@ class ABUPT(nn.Module):
             anc_preds = self.output_head(anc_decoded)
 
         # Scatter anchor predictions back to full mesh (non-anchor nodes get 0)
+        anc_preds = anc_preds.float()  # ensure float32 for scatter (autocast may give bf16)
         preds = torch.zeros(B, N, anc_preds.shape[-1], device=dev)
         anchor_idx = torch.cat([si, vi], dim=1)
         anchor_valid = torch.cat([smask, vmask], dim=1)
