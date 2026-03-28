@@ -25,6 +25,7 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,13 +35,77 @@ from dataclasses import dataclass, asdict
 from einops import rearrange
 from timm.layers import trunc_normal_
 from tqdm import tqdm
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 import simple_parsing as sp
 
 from data.utils import visualize
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
 
 torch.set_float32_matmul_precision('high')
+
+
+# ---------------------------------------------------------------------------
+# Vorticity computation utilities (Phase 5)
+# ---------------------------------------------------------------------------
+
+def compute_vorticity_batch(positions, Ux, Uy, k=12):
+    """Compute vorticity ω = ∂Uy/∂x − ∂Ux/∂y via IDW-weighted FD on a point cloud.
+
+    Args:
+        positions: [N, 2] numpy array of (x, y) coordinates
+        Ux, Uy: [N] numpy arrays of velocity components
+        k: number of nearest neighbors for FD stencil
+    Returns:
+        omega: [N] numpy array of vorticity values
+    """
+    from scipy.spatial import KDTree
+    N = positions.shape[0]
+    tree = KDTree(positions)
+    _, idx = tree.query(positions, k=k + 1)  # +1 for self
+    idx = idx[:, 1:]  # [N, k] exclude self
+
+    dx = positions[idx, 0] - positions[:, None, 0]  # [N, k]
+    dy = positions[idx, 1] - positions[:, None, 1]
+    dUx = Ux[idx] - Ux[:, None]
+    dUy = Uy[idx] - Uy[:, None]
+
+    dist_sq = dx**2 + dy**2 + 1e-10
+    w = 1.0 / dist_sq  # IDW weights
+
+    # Weighted FD estimate of partial derivatives
+    dUy_dx = (w * dUy * dx).sum(axis=1) / (w * dx * dx).sum(axis=1).clip(1e-10)
+    dUx_dy = (w * dUx * dy).sum(axis=1) / (w * dy * dy).sum(axis=1).clip(1e-10)
+
+    return (dUy_dx - dUx_dy).astype(np.float32)
+
+
+def precompute_vorticity(ds, k=12):
+    """Precompute vorticity for all samples in a dataset. Returns list of [N] tensors."""
+    omega_cache = []
+    for i in range(len(ds)):
+        x, y, _ = ds[i]
+        pos = x[:, :2].numpy()
+        Ux = y[:, 0].numpy()
+        Uy = y[:, 1].numpy()
+        omega = compute_vorticity_batch(pos, Ux, Uy, k=k)
+        omega_cache.append(torch.from_numpy(omega))
+    return omega_cache
+
+
+class VorticityDataset(Dataset):
+    """Wraps a dataset to append vorticity as a 4th channel in y."""
+    def __init__(self, ds, omega_cache):
+        self.ds = ds
+        self.omega = omega_cache
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        x, y, is_surface = self.ds[idx]
+        omega = self.omega[idx].unsqueeze(-1)  # [N, 1]
+        y_aug = torch.cat([y, omega], dim=-1)  # [N, 4]: Ux, Uy, p, ω
+        return x, y_aug, is_surface
 
 
 # ---------------------------------------------------------------------------
@@ -363,8 +428,10 @@ class TransolverBlock(nn.Module):
                         nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(), nn.Linear(hidden_dim * 2, 1)
                     )
                 # Velocity head conditioned on predicted pressure: input is hidden_dim + 1
+                # out_dim - 1 non-pressure channels (2 for Ux/Uy, 1 for omega in vorticity mode)
+                _vel_out = out_dim - 1 if out_dim > 1 else 2
                 self.vel_head_conditioned = nn.Sequential(
-                    nn.Linear(hidden_dim + 1, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2)
+                    nn.Linear(hidden_dim + 1, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, _vel_out)
                 )
             elif domain_velhead:
                 # Domain-specific output heads: separate for single-foil vs tandem
@@ -684,15 +751,17 @@ class Transolver(nn.Module):
             # Separate pressure pathway: independent MLP processes pre-last features
             fx_for_pressure = fx  # save for separate pressure branch
             p_sep = self.pressure_sep_mlp(fx_for_pressure)  # [B, N, 1]
-            # Main last block produces vel only (pressure_first still active but p comes from separate branch)
+            # Main last block produces [vel(2), p] (pressure_first is active in block)
             fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
-            # Override: replace the pressure channel from the last block with the separate branch's output
-            fx = torch.cat([fx[:, :, :2], p_sep], dim=-1)
+            # Apply skip to block output (block returns out_dim dims) then override pressure
+            gate = self.skip_gate(fx_pre)
+            fx = fx + gate * self.out_skip(fx_pre)
+            # Override: replace the last pressure channel with the separate branch's output
+            fx = torch.cat([fx[:, :, :-1], p_sep], dim=-1)
         else:
             fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
-
-        gate = self.skip_gate(fx_pre)
-        fx = fx + gate * self.out_skip(fx_pre)
+            gate = self.skip_gate(fx_pre)
+            fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
@@ -814,6 +883,12 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Vorticity prediction
+    vorticity_predict: bool = False     # predict (ω, p) instead of (Ux, Uy, p)
+    vort_k_neighbors: int = 12          # k nearest neighbors for FD vorticity
+    vort_vel_weight: float = 0.3        # weight for velocity recovery loss
+    vort_no_recovery: bool = False      # ablation: no velocity recovery head
+    vort_log_omega: bool = False        # log-scale vorticity transform
 
 
 cfg = sp.parse(Config)
@@ -871,6 +946,35 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
 
+# --- Vorticity precomputation (Phase 5) ---
+if cfg.vorticity_predict:
+    print(f"Precomputing vorticity labels (k={cfg.vort_k_neighbors})...")
+    t_vort = time.time()
+    _train_omega = precompute_vorticity(train_ds, k=cfg.vort_k_neighbors)
+    train_ds = VorticityDataset(train_ds, _train_omega)
+    _val_omega = {}
+    for _vname, _vds in val_splits.items():
+        _vo = precompute_vorticity(_vds, k=cfg.vort_k_neighbors)
+        _val_omega[_vname] = _vo
+        val_splits[_vname] = VorticityDataset(_vds, _vo)
+    # Compute vorticity normalization stats from training set
+    _all_omega = torch.cat([o for o in _train_omega])
+    _omega_mean = _all_omega.mean().item()
+    _omega_std = _all_omega.std().item()
+    if cfg.vort_log_omega:
+        _omega_eps = np.percentile(np.abs(_all_omega.numpy()), 5)
+        _omega_eps = max(_omega_eps, 1e-6)
+        print(f"  Log-omega epsilon: {_omega_eps:.6f}")
+    else:
+        _omega_eps = 0.0
+    print(f"  Vorticity stats: mean={_omega_mean:.4f}, std={_omega_std:.4f}")
+    print(f"  Precomputed in {time.time() - t_vort:.1f}s for {len(_train_omega)} train + {sum(len(v) for v in _val_omega.values())} val samples")
+    del _train_omega, _val_omega
+else:
+    _omega_mean = 0.0
+    _omega_std = 1.0
+    _omega_eps = 1e-6
+
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=cfg.num_workers, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
 
@@ -902,8 +1006,9 @@ _stats_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, *
 with torch.no_grad():
     for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc="Phys stats", leave=False):
         _y, _mask = _y.to(device), _mask.to(device)
-        _Um, _q = _umag_q(_y, _mask)
-        _yp = _phys_norm(_y, _Um, _q)
+        _y_3ch = _y[:, :, :3] if _y.shape[-1] > 3 else _y  # handle 4-ch vorticity mode
+        _Um, _q = _umag_q(_y_3ch, _mask)
+        _yp = _phys_norm(_y_3ch, _Um, _q)
         if cfg.log_pressure:
             _yp = _yp.clone()
             _yp[:, :, 2:3] = _yp[:, :, 2:3].abs().add(1).log() * _yp[:, :, 2:3].sign()
@@ -924,6 +1029,7 @@ if cfg.raw_targets:
     with torch.no_grad():
         for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc="Raw stats", leave=False):
             _y, _mask = _y.to(device), _mask.to(device)
+            _y = _y[:, :, :3] if _y.shape[-1] > 3 else _y
             _m = _mask.float().unsqueeze(-1)
             _raw_sum += (_y * _m).sum(dim=(0, 1))
             _raw_sq_sum += (_y ** 2 * _m).sum(dim=(0, 1))
@@ -935,18 +1041,21 @@ if cfg.raw_targets:
 else:
     raw_stats = None
 
+_vort_out_dim = 2 if cfg.vorticity_predict else 3
+_vort_fields = ["omega", "p"] if cfg.vorticity_predict else ["Ux", "Uy", "p"]
+_vort_dims = [1, 1] if cfg.vorticity_predict else [1, 1, 1]
 model_config = dict(
     space_dim=2,
     fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
-    out_dim=3,
+    out_dim=_vort_out_dim,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
     n_head=3,
     slice_num=cfg.prog_slices_end if cfg.prog_slices else cfg.slice_num,
     mlp_ratio=2,
     dropout=0.05 if cfg.rdrop else 0.0,
-    output_fields=["Ux", "Uy", "p"],
-    output_dims=[1, 1, 1],
+    output_fields=_vort_fields,
+    output_dims=_vort_dims,
     linear_no_attention=cfg.linear_no_attention,
     learned_kernel=cfg.learned_kernel,
     field_decoder=cfg.field_decoder,
@@ -970,6 +1079,18 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 model._pressure_separate = cfg.pressure_separate_last_block
+
+# Velocity recovery MLP for vorticity prediction mode
+vel_recovery_mlp = None
+if cfg.vorticity_predict and not cfg.vort_no_recovery:
+    # Input: (omega_pred, p_pred, x_pos, y_pos, Re_enc, AoA_enc) -> (Ux, Uy)
+    vel_recovery_mlp = nn.Sequential(
+        nn.Linear(6, 128), nn.GELU(),
+        nn.Linear(128, 64), nn.GELU(),
+        nn.Linear(64, 2),
+    ).to(device)
+    vel_recovery_mlp = torch.compile(vel_recovery_mlp, mode=cfg.compile_mode)
+
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
@@ -1099,6 +1220,10 @@ class Lookahead:
 
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+# Add velocity recovery MLP params if present
+if vel_recovery_mlp is not None:
+    _vrm = vel_recovery_mlp._orig_mod if hasattr(vel_recovery_mlp, '_orig_mod') else vel_recovery_mlp
+    other_params = other_params + list(_vrm.parameters())
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
 if cfg.use_lion:
     base_opt = Lion([
@@ -1301,16 +1426,37 @@ for epoch in range(MAX_EPOCHS):
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
-        Umag, q = _umag_q(y, mask)
-        if cfg.raw_targets:
-            y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
+        if cfg.vorticity_predict:
+            # y is [B, N, 4]: Ux, Uy, p, ω
+            y_vel_raw = y[:, :, :3].clone()  # (Ux, Uy, p) for recovery loss + metrics
+            y_omega_raw = y[:, :, 3:4]  # raw vorticity
+            y_3ch = y[:, :, :3]  # standard 3-channel for Umag computation
+            Umag, q = _umag_q(y_3ch, mask)
+            # Normalize pressure as Cp
+            p_cp = y_3ch[:, :, 2:3] / q
+            p_norm = (p_cp - phys_stats["y_mean"][2:3]) / phys_stats["y_std"][2:3]
+            # Normalize vorticity
+            omega_target = y_omega_raw.clone()
+            if cfg.vort_log_omega:
+                omega_target = omega_target.sign() * (omega_target.abs() + _omega_eps).log()
+            omega_norm = (omega_target - _omega_mean) / _omega_std
+            # Model target: [ω_norm, p_norm]
+            y_norm = torch.cat([omega_norm, p_norm], dim=-1)  # [B, N, 2]
+            # Also normalize velocity for recovery loss
+            y_vel_phys = _phys_norm(y_3ch, Umag, q)
+            y_vel_normed = (y_vel_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         else:
-            y_phys = _phys_norm(y, Umag, q)
-            if cfg.log_pressure:
-                y_phys = y_phys.clone()
-                y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
-            y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
-        if model.training and not cfg.no_target_noise:
+            Umag, q = _umag_q(y, mask)
+            if cfg.raw_targets:
+                y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
+            else:
+                y_phys = _phys_norm(y, Umag, q)
+                if cfg.log_pressure:
+                    y_phys = y_phys.clone()
+                    y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
+                y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+        _n_out = y_norm.shape[-1]  # 2 for vorticity mode, 3 for standard
+        if model.training and not cfg.no_target_noise and not cfg.vorticity_predict:
             noise_progress = min(1.0, epoch / max(cfg.noise_anneal_epochs, 1))
             if cfg.half_target_noise:
                 vel_noise = 0.0075 * (1 - noise_progress) + 0.0015 * noise_progress
@@ -1325,9 +1471,13 @@ for epoch in range(MAX_EPOCHS):
         raw_gap = x[:, 0, 21]
         is_tandem = raw_gap.abs() > 0.5
         B = y_norm.shape[0]
-        sample_stds = torch.ones(B, 1, 3, device=device)
+        sample_stds = torch.ones(B, 1, _n_out, device=device)
         if not cfg.no_perstd and not cfg.raw_targets:
-            if cfg.unified_clamps:
+            if cfg.vorticity_predict:
+                # 2 channels: (omega, p) — use omega clamp + pressure clamp
+                channel_clamps = torch.tensor([0.1, 2.0], device=device)
+                tandem_clamps = torch.tensor([0.3, 2.0], device=device)
+            elif cfg.unified_clamps:
                 channel_clamps = tandem_clamps = torch.tensor([0.2, 0.2, 0.7], device=device)
             elif cfg.high_p_clamp:
                 channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
@@ -1412,14 +1562,15 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        _p_ch = _n_out - 1  # pressure is last channel (index 2 for 3-ch, 1 for 2-ch vort mode)
+        surf_per_sample = (abs_err[:, :, _p_ch:_p_ch+1] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
         running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
         # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
         if epoch >= 30:
-            surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
+            surf_pres = abs_err[:, :, _p_ch:_p_ch+1]  # pressure errors [B, N, 1]
             surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
             surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
             thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
@@ -1447,6 +1598,24 @@ for epoch in range(MAX_EPOCHS):
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
         else:
             loss = vol_loss + surf_weight * surf_loss
+
+        # Velocity recovery loss (vorticity mode)
+        _vel_recovery_loss = None
+        if cfg.vorticity_predict and vel_recovery_mlp is not None and model.training:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                # Construct recovery input: (omega_pred, p_pred, x_pos, y_pos, Re, AoA)
+                _omega_p = pred.detach() if not model.training else pred  # [B, N, 2]
+                _xy = x[:, :, :2]  # positions [B, N, 2]
+                _re_feat = x[:, 0:1, 13:14].expand(-1, x.shape[1], -1)  # [B, N, 1]
+                _aoa_feat = x[:, 0:1, 14:15].expand(-1, x.shape[1], -1)  # [B, N, 1]
+                _rec_input = torch.cat([_omega_p, _xy, _re_feat, _aoa_feat], dim=-1)  # [B, N, 6]
+                vel_pred_norm = vel_recovery_mlp(_rec_input).float()  # [B, N, 2]
+            # Loss against normalized velocity targets
+            _vel_target = y_vel_normed[:, :, :2]  # [B, N, 2]
+            _vel_err = (vel_pred_norm - _vel_target).abs()
+            _vel_loss = (_vel_err * mask.unsqueeze(-1)).sum() / mask.sum().clamp(min=1)
+            _vel_recovery_loss = _vel_loss.item()
+            loss = loss + cfg.vort_vel_weight * _vel_loss
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
@@ -1584,7 +1753,10 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if _vel_recovery_loss is not None:
+            _log_dict["train/vel_recovery_loss"] = _vel_recovery_loss
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -1721,23 +1893,39 @@ for epoch in range(MAX_EPOCHS):
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
-                Umag, q = _umag_q(y, mask)
-                if cfg.raw_targets:
-                    y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
+                if cfg.vorticity_predict:
+                    y_3ch = y[:, :, :3]
+                    y_omega_raw = y[:, :, 3:4]
+                    Umag, q = _umag_q(y_3ch, mask)
+                    p_cp = y_3ch[:, :, 2:3] / q
+                    p_norm_v = (p_cp - phys_stats["y_mean"][2:3]) / phys_stats["y_std"][2:3]
+                    omega_target = y_omega_raw.clone()
+                    if cfg.vort_log_omega:
+                        omega_target = omega_target.sign() * (omega_target.abs() + _omega_eps).log()
+                    omega_norm = (omega_target - _omega_mean) / _omega_std
+                    y_norm = torch.cat([omega_norm, p_norm_v], dim=-1)
                 else:
-                    y_phys = _phys_norm(y, Umag, q)
-                    if cfg.log_pressure:
-                        y_phys = y_phys.clone()
-                        y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
-                    y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                    Umag, q = _umag_q(y, mask)
+                    if cfg.raw_targets:
+                        y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
+                    else:
+                        y_phys = _phys_norm(y, Umag, q)
+                        if cfg.log_pressure:
+                            y_phys = y_phys.clone()
+                            y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
+                        y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
                 # Per-sample std normalization: skip tandem samples
+                _v_n_out = y_norm.shape[-1]
                 raw_gap = x[:, 0, 21]
                 is_tandem = raw_gap.abs() > 0.5
                 B = y_norm.shape[0]
-                sample_stds = torch.ones(B, 1, 3, device=device)
+                sample_stds = torch.ones(B, 1, _v_n_out, device=device)
                 if not cfg.no_perstd and not cfg.raw_targets:
-                    if cfg.unified_clamps:
+                    if cfg.vorticity_predict:
+                        channel_clamps = torch.tensor([0.1, 2.0], device=device)
+                        tandem_clamps = torch.tensor([0.3, 2.0], device=device)
+                    elif cfg.unified_clamps:
                         channel_clamps = tandem_clamps = torch.tensor([0.2, 0.2, 0.7], device=device)
                     elif cfg.high_p_clamp:
                         channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
@@ -1776,15 +1964,37 @@ for epoch in range(MAX_EPOCHS):
                     (abs_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item(),
                     1e6
                 )
+                _vp_ch = _v_n_out - 1  # pressure channel
                 val_surf += min(
-                    (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item(),
+                    (abs_err[:, :, _vp_ch:_vp_ch+1] * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item(),
                     1e6
                 )
                 n_vbatches += 1
 
                 # Denormalize: phys_stats → Cp space → original scale
-                if cfg.raw_targets:
+                if cfg.vorticity_predict:
+                    # pred is [B, N, 2]: (ω_norm, p_norm)
+                    # Denormalize pressure: p_norm → Cp → p
+                    p_denorm_cp = pred[:, :, 1:2] * phys_stats["y_std"][2:3] + phys_stats["y_mean"][2:3]
+                    p_denorm = p_denorm_cp.clamp(-20, 20) * q
+                    # Recover velocity via MLP
+                    if vel_recovery_mlp is not None:
+                        _xy_v = x[:, :, :2]
+                        _re_v = x[:, 0:1, 13:14].expand(-1, x.shape[1], -1)
+                        _aoa_v = x[:, 0:1, 14:15].expand(-1, x.shape[1], -1)
+                        _rec_in = torch.cat([pred, _xy_v, _re_v, _aoa_v], dim=-1)
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            vel_rec = vel_recovery_mlp(_rec_in).float()
+                        # Denormalize velocity: vel_rec is in normalized Ux/Umag space
+                        vel_denorm = vel_rec * phys_stats["y_std"][:2] + phys_stats["y_mean"][:2]
+                        vel_denorm = vel_denorm.clamp(-10, 10) * Umag
+                    else:
+                        vel_denorm = torch.zeros_like(y[:, :, :2])  # no recovery = zero velocity
+                    pred_orig = torch.cat([vel_denorm, p_denorm], dim=-1)  # [B, N, 3]
+                    y_clamped = y[:, :, :3].clamp(-1e6, 1e6)  # original (Ux, Uy, p)
+                elif cfg.raw_targets:
                     pred_orig = pred * raw_stats["y_std"] + raw_stats["y_mean"]
+                    y_clamped = y.clamp(-1e6, 1e6)
                 else:
                     pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
                     if cfg.log_pressure:
@@ -1798,7 +2008,7 @@ for epoch in range(MAX_EPOCHS):
                         pred_orig = _pd
                     else:
                         pred_orig = _phys_denorm(pred_phys, Umag, q)
-                y_clamped = y.clamp(-1e6, 1e6)
+                    y_clamped = y.clamp(-1e6, 1e6)
                 err = (pred_orig - y_clamped).abs()
                 finite = err.isfinite()
                 err = err.where(finite, torch.zeros_like(err))
@@ -1989,10 +2199,18 @@ if best_metrics:
                     xy_scaled = xy_norm.unsqueeze(-1) * freqs
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
-                    Umag, q = _umag_q(y_dev, mask)
+                    y_dev_3ch = y_dev[:, :, :3] if y_dev.shape[-1] > 3 else y_dev
+                    Umag, q = _umag_q(y_dev_3ch, mask)
                     pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
                     if cfg.raw_targets:
                         y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
+                    elif cfg.vorticity_predict:
+                        # pred is [B, N, 2] = (omega_norm, p_norm); denorm using vorticity stats + phys pressure stats
+                        pred_omega = pred[:, :, 0:1] * _omega_std + _omega_mean
+                        pred_p_phys = pred[:, :, 1:2] * phys_stats["y_std"][2:3] + phys_stats["y_mean"][2:3]
+                        pred_p = pred_p_phys * q
+                        # Build 3-ch output as (omega, 0, p) for visualization purposes
+                        y_pred = torch.cat([pred_omega, torch.zeros_like(pred_omega), pred_p], dim=-1).squeeze(0).cpu()
                     else:
                         pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
                         if cfg.log_pressure:
@@ -2006,7 +2224,9 @@ if best_metrics:
                             y_pred = _pd.squeeze(0).cpu()
                         else:
                             y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
-                samples.append((x[:, :2], y_true, y_pred, is_surface))
+                # y_true for vis: use first 3 channels (Ux, Uy, p); vorticity mode has 4 channels
+                y_true_vis = y_true[:, :3] if y_true.shape[-1] > 3 else y_true
+                samples.append((x[:, :2], y_true_vis, y_pred, is_surface))
             images = visualize(samples, out_dir=plot_dir / split_name)
             if images:
                 wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
