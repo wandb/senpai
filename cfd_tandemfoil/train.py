@@ -400,12 +400,9 @@ class ABUPT(nn.Module):
         h = self.feat_proj(x)                    # [B, N, hidden_dim]
         rope_pos = self._normalize_pos(raw_pos, mask)
 
-        # Anchor sampling
+        # Anchor sampling (same count for train and eval — eval uses deterministic sampling)
         ns = self.n_surf_anchors
         nv = self.n_vol_anchors
-        if not self.training:
-            ns = min(N, max(ns, 4096))
-            nv = min(N, max(nv, 8192))
         si, vi, smask, vmask = self._sample_anchors(is_surface, mask, ns, nv)
 
         # Gather anchor features and positions
