@@ -647,6 +647,191 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Neural Flow Field (INR) model — SIREN-based implicit neural representation
+# ---------------------------------------------------------------------------
+
+import math as _math
+
+class SIRENLayer(nn.Module):
+    """Sinusoidal activation layer for INR."""
+    def __init__(self, in_features, out_features, omega_0=30.0, is_first=False):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.omega_0 = omega_0
+        self.is_first = is_first
+        with torch.no_grad():
+            if is_first:
+                self.linear.weight.uniform_(-1 / in_features, 1 / in_features)
+            else:
+                self.linear.weight.uniform_(
+                    -_math.sqrt(6 / in_features) / omega_0,
+                    _math.sqrt(6 / in_features) / omega_0
+                )
+
+    def forward(self, x):
+        return torch.sin(self.omega_0 * self.linear(x))
+
+
+class FiLMConditioner(nn.Module):
+    """Generate per-layer scale and shift from global condition."""
+    def __init__(self, cond_dim, hidden_dim, n_film_layers):
+        super().__init__()
+        self.n_film_layers = n_film_layers
+        self.hidden_dim = hidden_dim
+        self.net = nn.Sequential(
+            nn.Linear(cond_dim, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
+        )
+        self.film_params = nn.Linear(hidden_dim, n_film_layers * hidden_dim * 2)
+        # Zero-init so FiLM starts as identity modulation
+        nn.init.zeros_(self.film_params.weight)
+        nn.init.zeros_(self.film_params.bias)
+
+    def forward(self, condition):
+        h = self.net(condition)
+        return self.film_params(h)  # [B, n_layers * hidden * 2]
+
+
+class NeuralFlowField(nn.Module):
+    """SIREN-based INR for flow field prediction.
+
+    Replaces Transolver: encodes global condition once, then evaluates
+    a coordinate-conditioned MLP at each mesh node.
+    """
+    def __init__(self, space_dim=2, fun_dim=34, out_dim=3, n_hidden=256,
+                 n_layers=6, omega_0=30.0, use_residual=False,
+                 use_gelu=False, domain_heads=False,
+                 output_fields=None, output_dims=None, **kwargs):
+        super().__init__()
+        self.__name__ = "NeuralFlowField"
+        self.n_hidden = n_hidden
+        self.n_layers = n_layers
+        self.omega_0 = omega_0
+        self.use_residual = use_residual
+        self.use_gelu = use_gelu
+        self.domain_heads = domain_heads
+
+        input_dim = fun_dim + space_dim  # full feature dimension
+
+        # Condition encoder: extract global flow params from per-node features
+        # Indices in normalized x: Re~13, AoA~14, NACA~15-18, gap~21, stagger~22, etc.
+        self.cond_encoder = nn.Sequential(
+            nn.Linear(input_dim, n_hidden), nn.GELU(),
+            nn.Linear(n_hidden, n_hidden), nn.GELU(),
+            nn.Linear(n_hidden, n_hidden),
+        )
+
+        # FiLM conditioner: n_layers-1 because first SIREN layer is unconditioned
+        n_film = n_layers - 1
+        self.film = FiLMConditioner(n_hidden, n_hidden, n_film)
+
+        # SIREN backbone
+        if use_gelu:
+            # Ablation: GELU instead of sin
+            self.first_layer = nn.Sequential(nn.Linear(input_dim, n_hidden), nn.GELU())
+            self.layers = nn.ModuleList([
+                nn.Sequential(nn.Linear(n_hidden, n_hidden), nn.GELU())
+                for _ in range(n_layers - 1)
+            ])
+        else:
+            self.first_layer = SIRENLayer(input_dim, n_hidden, omega_0, is_first=True)
+            self.layers = nn.ModuleList([
+                SIRENLayer(n_hidden, n_hidden, omega_0) for _ in range(n_layers - 1)
+            ])
+
+        # Layer norms for stability
+        self.layer_norms = nn.ModuleList([nn.LayerNorm(n_hidden) for _ in range(n_layers - 1)])
+
+        # Output heads
+        if domain_heads:
+            # Separate heads for single vs tandem
+            self.vel_head_single = nn.Linear(n_hidden, 2)
+            self.vel_head_tandem = nn.Linear(n_hidden, 2)
+            self.pres_head_single = nn.Linear(n_hidden, 1)
+            self.pres_head_tandem = nn.Linear(n_hidden, 1)
+        else:
+            self.vel_head = nn.Linear(n_hidden, 2)
+            self.pres_head = nn.Linear(n_hidden, 1)
+
+        # Auxiliary heads (match Transolver interface)
+        self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+
+        # Fourier PE (match Transolver interface for training loop compatibility)
+        self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])
+        self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+
+        # Dummy blocks list so training loop guards work
+        self.blocks = nn.ModuleList()
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize non-SIREN weights."""
+        for m in [self.cond_encoder, self.re_head, self.aoa_head]:
+            for sub in m.modules():
+                if isinstance(sub, nn.Linear):
+                    nn.init.xavier_uniform_(sub.weight)
+                    if sub.bias is not None:
+                        nn.init.zeros_(sub.bias)
+
+    def forward(self, data):
+        x = data["x"]  # [B, N, D]
+        B, N, D = x.shape
+
+        # Global condition: mean-pool all features → condition embedding
+        cond_emb = self.cond_encoder(x.mean(dim=1))  # [B, n_hidden]
+
+        # FiLM parameters for all layers
+        film_params = self.film(cond_emb)  # [B, (n_layers-1) * n_hidden * 2]
+        H = self.n_hidden
+
+        # SIREN forward
+        h = self.first_layer(x)  # [B, N, n_hidden]
+
+        for i, (layer, ln) in enumerate(zip(self.layers, self.layer_norms)):
+            # Extract FiLM scale and shift
+            gamma = film_params[:, i*H*2 : i*H*2 + H].unsqueeze(1)  # [B, 1, H]
+            beta = film_params[:, i*H*2 + H : (i+1)*H*2].unsqueeze(1)  # [B, 1, H]
+
+            h_new = layer(ln(h))
+            h_new = h_new * (1 + gamma) + beta  # FiLM modulation
+
+            if self.use_residual:
+                h = h + h_new
+            else:
+                h = h_new
+
+        # Auxiliary predictions from mean-pooled hidden
+        h_mean = h.mean(dim=1)  # [B, H]
+        re_pred = self.re_head(h_mean)
+        aoa_pred = self.aoa_head(h_mean)
+
+        # Output heads
+        if self.domain_heads:
+            # Detect tandem samples via gap feature (index 21)
+            is_tandem = (x[:, 0, 21].abs() > 0.01)  # [B]
+            vel_s = self.vel_head_single(h)
+            vel_t = self.vel_head_tandem(h)
+            pres_s = self.pres_head_single(h)
+            pres_t = self.pres_head_tandem(h)
+            mask_t = is_tandem.float()[:, None, None]
+            vel = vel_s * (1 - mask_t) + vel_t * mask_t
+            pres = pres_s * (1 - mask_t) + pres_t * mask_t
+        else:
+            vel = self.vel_head(h)
+            pres = self.pres_head(h)
+
+        preds = torch.cat([vel, pres], dim=-1)  # [B, N, 3]
+        return {"preds": preds, "re_pred": re_pred, "aoa_pred": aoa_pred}
+
+
+# ---------------------------------------------------------------------------
+# End Neural Flow Field model
+# ---------------------------------------------------------------------------
+
+
 MAX_TIMEOUT = 180.0  # minutes
 MAX_EPOCHS = 500
 
@@ -754,6 +939,12 @@ class Config:
     vol_subsample_frac: float = 1.0     # fraction of volume nodes in loss after vol_ramp (0.8 = 80%)
     compile_mode: str = "default"       # torch.compile mode: "default", "max-autotune", "reduce-overhead"
     num_workers: int = 4                # data loader workers
+    # Phase 5: Neural Flow Field (INR) architecture
+    model_type: str = "transolver"     # "transolver" or "inr"
+    omega_0: float = 30.0              # SIREN frequency parameter
+    inr_residual: bool = False         # residual connections in SIREN layers
+    inr_gelu: bool = False             # use GELU instead of sin (ablation)
+    inr_domain_heads: bool = False     # domain-specific output heads for INR
 
 
 cfg = sp.parse(Config)
@@ -875,37 +1066,55 @@ if cfg.raw_targets:
 else:
     raw_stats = None
 
-model_config = dict(
-    space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
-    out_dim=3,
-    n_hidden=cfg.n_hidden,
-    n_layers=cfg.n_layers,
-    n_head=3,
-    slice_num=cfg.prog_slices_end if cfg.prog_slices else cfg.slice_num,
-    mlp_ratio=2,
-    dropout=0.05 if cfg.rdrop else 0.0,
-    output_fields=["Ux", "Uy", "p"],
-    output_dims=[1, 1, 1],
-    linear_no_attention=cfg.linear_no_attention,
-    learned_kernel=cfg.learned_kernel,
-    field_decoder=cfg.field_decoder,
-    adaln_output=cfg.adaln_output,
-    soft_moe=cfg.soft_moe,
-    uncertainty_loss=cfg.uncertainty_loss,
-    adaln_all_blocks=cfg.adaln_all_blocks,
-    adaln_4cond=cfg.adaln_4cond,
-    adaln_nozero=cfg.adaln_nozero,
-    film_cond=cfg.film_cond,
-    adaln_decouple=cfg.adaln_decouple,
-    adaln_zone_temp=cfg.adaln_zone_temp,
-    domain_layernorm=cfg.domain_layernorm,
-    dln_zeroinit=cfg.dln_zeroinit,
-    domain_velhead=cfg.domain_velhead,
-    prog_slices=cfg.prog_slices,
-)
+_fun_dim = X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32  # +curv, +dist, [+foil2dist], +32 fourier PE
 
-model = Transolver(**model_config).to(device)
+if cfg.model_type == "inr":
+    model_config = dict(
+        space_dim=2,
+        fun_dim=_fun_dim,
+        out_dim=3,
+        n_hidden=cfg.n_hidden,
+        n_layers=cfg.n_layers,
+        omega_0=cfg.omega_0,
+        use_residual=cfg.inr_residual,
+        use_gelu=cfg.inr_gelu,
+        domain_heads=cfg.inr_domain_heads,
+        output_fields=["Ux", "Uy", "p"],
+        output_dims=[1, 1, 1],
+    )
+    model = NeuralFlowField(**model_config).to(device)
+else:
+    model_config = dict(
+        space_dim=2,
+        fun_dim=_fun_dim,
+        out_dim=3,
+        n_hidden=cfg.n_hidden,
+        n_layers=cfg.n_layers,
+        n_head=3,
+        slice_num=cfg.prog_slices_end if cfg.prog_slices else cfg.slice_num,
+        mlp_ratio=2,
+        dropout=0.05 if cfg.rdrop else 0.0,
+        output_fields=["Ux", "Uy", "p"],
+        output_dims=[1, 1, 1],
+        linear_no_attention=cfg.linear_no_attention,
+        learned_kernel=cfg.learned_kernel,
+        field_decoder=cfg.field_decoder,
+        adaln_output=cfg.adaln_output,
+        soft_moe=cfg.soft_moe,
+        uncertainty_loss=cfg.uncertainty_loss,
+        adaln_all_blocks=cfg.adaln_all_blocks,
+        adaln_4cond=cfg.adaln_4cond,
+        adaln_nozero=cfg.adaln_nozero,
+        film_cond=cfg.film_cond,
+        adaln_decouple=cfg.adaln_decouple,
+        adaln_zone_temp=cfg.adaln_zone_temp,
+        domain_layernorm=cfg.domain_layernorm,
+        dln_zeroinit=cfg.dln_zeroinit,
+        domain_velhead=cfg.domain_velhead,
+        prog_slices=cfg.prog_slices,
+    )
+    model = Transolver(**model_config).to(device)
+
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
@@ -1036,7 +1245,16 @@ class Lookahead:
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
-if cfg.use_lion:
+if cfg.model_type == "inr":
+    # INR has no attention params; use single param group
+    all_params = list(model.parameters())
+    if cfg.use_lion:
+        base_opt = Lion([{'params': all_params, 'lr': _base_lr}], weight_decay=cfg.weight_decay)
+        optimizer = base_opt
+    else:
+        base_opt = torch.optim.AdamW([{'params': all_params, 'lr': _base_lr}], weight_decay=cfg.weight_decay)
+        optimizer = base_opt
+elif cfg.use_lion:
     base_opt = Lion([
         {'params': attn_params, 'lr': _base_lr * 0.5},
         {'params': other_params, 'lr': _base_lr}
@@ -1559,7 +1777,7 @@ for epoch in range(MAX_EPOCHS):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             base_opt, T_max=remaining, eta_min=cfg.cosine_eta_min
         )
-    if epoch >= cfg.temp_anneal_epoch:
+    if epoch >= cfg.temp_anneal_epoch and len(_base_model.blocks) > 0 and hasattr(_base_model.blocks[0], 'attn'):
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
     if cfg.prog_slices:
