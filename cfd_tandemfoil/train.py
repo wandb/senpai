@@ -814,6 +814,8 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Foil-2 surface weight boost
+    foil2_surface_weight: float = 1.0  # multiplier for foil-2 (boundary ID 7) surface nodes in loss
 
 
 cfg = sp.parse(Config)
@@ -1412,7 +1414,30 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+
+        # Foil-2 surface weight boost: upweight boundary ID 7 nodes in loss
+        # Identify foil-2 surface nodes geometrically: in tandem samples,
+        # foil-2 is downstream (higher x-coord) with a gap separating the foils
+        N = x.shape[1]
+        if cfg.foil2_surface_weight != 1.0 and is_tandem_batch.any():
+            surf_x_lo = x[:, :, 0].masked_fill(~surf_mask, float('inf'))
+            surf_x_hi = x[:, :, 0].masked_fill(~surf_mask, float('-inf'))
+            x_min = surf_x_lo.min(dim=1).values  # [B]
+            x_max = surf_x_hi.max(dim=1).values  # [B]
+            x_mid = (x_min + x_max) / 2  # [B]
+            foil2_surf_mask = surf_mask & is_tandem_batch[:, None] & (x[:, :, 0] > x_mid[:, None])
+            surf_node_w = torch.ones(B, N, 1, device=device)
+            surf_node_w[foil2_surf_mask] = cfg.foil2_surface_weight
+            # Weighted denominator so foil-2 nodes count proportionally more
+            surf_denom = (surf_node_w[:, :, 0] * surf_mask.float()).sum(dim=1).clamp(min=1).float()
+        else:
+            surf_node_w = None
+            surf_denom = surf_mask.sum(dim=1).clamp(min=1).float()
+
+        if surf_node_w is not None:
+            surf_per_sample = (abs_err[:, :, 2:3] * surf_node_w * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_denom
+        else:
+            surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_denom
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
@@ -1426,7 +1451,10 @@ for epoch in range(MAX_EPOCHS):
             thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
             hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
-            surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            if surf_node_w is not None:
+                surf_per_sample = (surf_pres * hard_weights * surf_node_w * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_denom
+            else:
+                surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         if cfg.tandem_ramp:
             tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
