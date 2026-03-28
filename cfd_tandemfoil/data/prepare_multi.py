@@ -33,7 +33,74 @@ from data.prepare import load_pickle, DATA_ROOT, parse_naca, pad_collate  # noqa
 # Includes foil 2 surface (ID 7) — fixes the SURFACE_IDS=(5,6) gap in prepare.py
 SURFACE_IDS_MULTI = (5, 6, 7)
 
-X_DIM = 24  # total x feature dimension
+X_DIM = 24  # core x feature dimension (for normalization/model)
+
+# Module-level flag set before data loading (avoids threading through constructors)
+_EXTRA_FEATURES_MODE = "none"  # none|wall_dist|wall_dist_dir|all
+
+
+def set_extra_features_mode(mode: str):
+    """Set the extra features mode before loading data."""
+    global _EXTRA_FEATURES_MODE
+    _EXTRA_FEATURES_MODE = mode
+
+
+def get_extra_dim() -> int:
+    """Get number of extra feature dims for current mode."""
+    return {"none": 0, "wall_dist": 1, "wall_dist_dir": 3, "all": 6}[_EXTRA_FEATURES_MODE]
+
+
+def compute_extra_features(pos, boundary, dsdf):
+    """Compute extra geometric features based on current mode.
+
+    Uses efficient DSDF-based wall distance (O(N)) instead of cdist (O(N*S)).
+    Returns tensor of shape (N, extra_dim) or None if mode is 'none'.
+    """
+    mode = _EXTRA_FEATURES_MODE
+    if mode == "none":
+        return None
+
+    n = pos.shape[0]
+    dsdf_f = dsdf.float()  # [N, 8]
+
+    # Wall distance from DSDF: min absolute value across all 8 dsdf channels
+    # This is the same as the existing dist_feat in train.py but precomputed
+    wall_dist_raw = dsdf_f.abs().min(dim=-1, keepdim=True).values  # [N, 1]
+    wall_dist = torch.log1p(wall_dist_raw * 10.0)  # log-scale
+
+    if mode == "wall_dist":
+        return wall_dist  # [N, 1]
+
+    # Wall direction: use first dsdf gradient pair as direction to nearest surface
+    # dsdf pairs are (dx, dy) vectors pointing toward surfaces
+    nx = dsdf_f[:, 0:1]
+    ny = dsdf_f[:, 1:2]
+    dir_norm = (nx**2 + ny**2).sqrt().clamp(min=1e-8)
+    wall_dir = torch.cat([nx / dir_norm, ny / dir_norm], dim=1)  # [N, 2]
+
+    if mode == "wall_dist_dir":
+        return torch.cat([wall_dist, wall_dir], dim=1)  # [N, 3]
+
+    # mode == "all": add local density + curvature divergence + zone encoding
+    # Local density proxy: inverse of min dsdf magnitude (denser mesh = smaller dsdf)
+    local_density = torch.log1p(1.0 / wall_dist_raw.clamp(min=1e-6))  # [N, 1]
+
+    # Curvature proxy: variation in dsdf gradient magnitudes across the 4 pairs
+    g1 = dsdf_f[:, 0:2].norm(dim=1, keepdim=True)
+    g2 = dsdf_f[:, 2:4].norm(dim=1, keepdim=True)
+    g3 = dsdf_f[:, 4:6].norm(dim=1, keepdim=True)
+    g4 = dsdf_f[:, 6:8].norm(dim=1, keepdim=True)
+    all_grads = torch.cat([g1, g2, g3, g4], dim=1)  # [N, 4]
+    curvature_div = all_grads.std(dim=1, keepdim=True)  # [N, 1]
+
+    # Zone encoding: simplified 3-class (interior/boundary/surface)
+    is_surface = (boundary == 5) | (boundary == 6) | (boundary == 7)
+    is_boundary = (boundary == 1) | (boundary == 2) | (boundary == 3)
+    zone = torch.zeros(n, 1, dtype=torch.float32)
+    zone[is_boundary, 0] = 0.5
+    zone[is_surface, 0] = 1.0
+
+    return torch.cat([wall_dist, wall_dir, local_density, curvature_div, zone], dim=1)  # [N, 6]
 
 
 def preprocess_sample_multi(sample):
@@ -88,6 +155,11 @@ def preprocess_sample_multi(sample):
     ], dim=1)  # 2+2+8+1+1+1+3+1+3+1+1 = 24
 
     assert x.shape[1] == X_DIM, f"Expected {X_DIM} features, got {x.shape[1]}"
+
+    # Append extra features if enabled
+    extra = compute_extra_features(sample.pos, sample.boundary, sample.dsdf)
+    if extra is not None:
+        x = torch.cat([x, extra], dim=1)
 
     y = sample.y.float()
     return x, y, is_surface
