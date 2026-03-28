@@ -702,6 +702,232 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# AB-UPT: Anchored-Branched Universal Physics Transformer
+# (arXiv 2502.09692, ELLIS/JKU Linz)
+# Three branches: geometry (anchor pooling), surface, volume
+# ---------------------------------------------------------------------------
+
+class CrossAttentionBlock(nn.Module):
+    """Cross-attention: queries attend to key-value source tokens."""
+    def __init__(self, dim, n_heads=8, dropout=0.0):
+        super().__init__()
+        self.n_heads = n_heads
+        self.dim_head = dim // n_heads
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, q_tokens, kv_tokens, kv_mask=None):
+        """q_tokens: [B, Nq, D], kv_tokens: [B, Nkv, D], kv_mask: [B, Nkv] bool (True=valid)"""
+        B, Nq, D = q_tokens.shape
+        Nkv = kv_tokens.shape[1]
+        H, d = self.n_heads, self.dim_head
+
+        q = self.q_proj(self.norm_q(q_tokens)).view(B, Nq, H, d).permute(0, 2, 1, 3)
+        k = self.k_proj(self.norm_kv(kv_tokens)).view(B, Nkv, H, d).permute(0, 2, 1, 3)
+        v = self.v_proj(self.norm_kv(kv_tokens)).view(B, Nkv, H, d).permute(0, 2, 1, 3)
+
+        # Build attention mask for padding
+        attn_mask = None
+        if kv_mask is not None:
+            # kv_mask [B, Nkv] -> [B, 1, 1, Nkv] for broadcast
+            attn_mask = kv_mask[:, None, None, :].expand(B, H, Nq, Nkv)
+
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        out = out.permute(0, 2, 1, 3).reshape(B, Nq, D)
+        return q_tokens + self.dropout(self.out_proj(out))
+
+
+class SelfAttentionBlock(nn.Module):
+    """Pre-norm self-attention + FFN block."""
+    def __init__(self, dim, n_heads=8, mlp_ratio=2, dropout=0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.n_heads = n_heads
+        self.dim_head = dim // n_heads
+        self.qkv = nn.Linear(dim, 3 * dim)
+        self.out_proj = nn.Linear(dim, dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * mlp_ratio),
+            nn.GELU(),
+            nn.Linear(dim * mlp_ratio, dim),
+            nn.Dropout(dropout),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, N, D = x.shape
+        H, d = self.n_heads, self.dim_head
+        # Self-attention
+        h = self.norm1(x)
+        qkv = self.qkv(h).view(B, N, 3, H, d).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, N, D)
+        x = x + self.dropout(self.out_proj(attn_out))
+        # FFN
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class ABUPT(nn.Module):
+    """Anchored-Branched Universal Physics Transformer.
+
+    Three-branch architecture:
+    1. Geometry branch: pool N mesh nodes -> M anchor supernodes via cross-attention + self-attention
+    2. Surface branch: surface nodes cross-attend to anchors, then predict via surface decoder
+    3. Volume branch: volume nodes cross-attend to anchors, then predict via volume decoder
+    """
+    def __init__(
+        self,
+        fun_dim=1,
+        space_dim=2,
+        n_anchors=256,
+        n_hidden=192,
+        n_layers=4,
+        n_heads=8,
+        out_dim=3,
+        dropout=0.0,
+        output_fields=None,
+        output_dims=None,
+        pressure_first=False,
+        pressure_deep=False,
+        **kwargs,  # accept and ignore Transolver-specific kwargs
+    ):
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.n_anchors = n_anchors
+        self.pressure_first = pressure_first
+        self.output_fields = output_fields or ["Ux", "Uy", "p"]
+        self.output_dims = output_dims or [1, 1, 1]
+        self.space_dim = space_dim
+
+        # Node encoder: project input features -> hidden dim
+        self.node_encoder = GatedMLP2(fun_dim + space_dim, n_hidden * 2, n_hidden)
+
+        # Learnable anchor tokens
+        self.anchors = nn.Parameter(torch.randn(1, n_anchors, n_hidden) * 0.02)
+
+        # Geometry branch: cross-attn (anchors <- all nodes) + self-attn among anchors
+        self.geo_cross = nn.ModuleList([
+            CrossAttentionBlock(n_hidden, n_heads, dropout) for _ in range(n_layers)
+        ])
+        self.geo_self = nn.ModuleList([
+            SelfAttentionBlock(n_hidden, n_heads, mlp_ratio=2, dropout=dropout) for _ in range(n_layers)
+        ])
+
+        # Surface branch: cross-attn (nodes <- anchors) + decoder
+        self.surf_cross = CrossAttentionBlock(n_hidden, n_heads, dropout)
+        if pressure_first:
+            # Predict pressure first, then condition velocity on it
+            if pressure_deep:
+                self.surf_pres_head = nn.Sequential(
+                    nn.LayerNorm(n_hidden), nn.Linear(n_hidden, n_hidden), nn.GELU(),
+                    nn.Linear(n_hidden, n_hidden // 2), nn.GELU(), nn.Linear(n_hidden // 2, 1))
+            else:
+                self.surf_pres_head = nn.Sequential(
+                    nn.LayerNorm(n_hidden), nn.Linear(n_hidden, n_hidden // 2), nn.GELU(),
+                    nn.Linear(n_hidden // 2, 1))
+            self.surf_vel_head = nn.Sequential(
+                nn.LayerNorm(n_hidden + 1),  # +1 for pressure
+                nn.Linear(n_hidden + 1, n_hidden), nn.GELU(),
+                nn.Linear(n_hidden, 2))
+        else:
+            self.surf_decoder = nn.Sequential(
+                nn.LayerNorm(n_hidden),
+                nn.Linear(n_hidden, n_hidden * 2), nn.GELU(),
+                nn.Linear(n_hidden * 2, out_dim))
+
+        # Volume branch: cross-attn (nodes <- anchors) + decoder
+        self.vol_cross = CrossAttentionBlock(n_hidden, n_heads, dropout)
+        self.vol_decoder = nn.Sequential(
+            nn.LayerNorm(n_hidden),
+            nn.Linear(n_hidden, n_hidden * 2), nn.GELU(),
+            nn.Linear(n_hidden * 2, out_dim))
+
+        # Auxiliary heads (Re and AoA prediction from anchor representations)
+        self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+
+        # Fourier PE (same as Transolver for compatibility)
+        self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])
+        self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            if module.weight.dim() >= 2:
+                nn.init.orthogonal_(module.weight, gain=1.0)
+            else:
+                nn.init.normal_(module.weight, std=0.01)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, (nn.LayerNorm,)):
+            nn.init.constant_(module.bias, 0)
+            nn.init.constant_(module.weight, 1.0)
+
+    def forward(self, data, **kwargs):
+        x = data["x"]  # [B, N, D]
+        is_surface = data.get("is_surface")  # [B, N] bool, optional
+        mask = data.get("mask")  # [B, N] bool, optional
+
+        B, N, D = x.shape
+
+        # Encode all nodes
+        h = self.node_encoder(x)  # [B, N, n_hidden]
+
+        # Geometry branch: iteratively refine anchor tokens
+        anchors = self.anchors.expand(B, -1, -1)  # [B, M, n_hidden]
+        for cross, self_attn in zip(self.geo_cross, self.geo_self):
+            anchors = cross(anchors, h, kv_mask=mask)  # anchors attend to nodes
+            anchors = self_attn(anchors)  # self-attention among anchors
+
+        # Auxiliary predictions from anchor representations
+        anchor_pool = anchors.mean(dim=1)  # [B, n_hidden]
+        re_pred = self.re_head(anchor_pool)  # [B, 1]
+        aoa_pred = self.aoa_head(anchor_pool)  # [B, 1]
+
+        # Surface branch: nodes cross-attend to anchors, then decode
+        surf_h = self.surf_cross(h, anchors)  # [B, N, n_hidden]
+
+        if self.pressure_first:
+            p_surf = self.surf_pres_head(surf_h)  # [B, N, 1]
+            vel_input = torch.cat([surf_h, p_surf.detach()], dim=-1)
+            vel_surf = self.surf_vel_head(vel_input)  # [B, N, 2]
+            surf_pred = torch.cat([vel_surf, p_surf], dim=-1)  # [B, N, 3]
+        else:
+            surf_pred = self.surf_decoder(surf_h)  # [B, N, 3]
+
+        # Volume branch: nodes cross-attend to anchors, then decode
+        vol_h = self.vol_cross(h, anchors)  # [B, N, n_hidden]
+        vol_pred = self.vol_decoder(vol_h)  # [B, N, 3]
+
+        # Route predictions: surface nodes get surf_pred, volume nodes get vol_pred
+        if is_surface is not None:
+            surf_sel = is_surface.unsqueeze(-1).float()  # [B, N, 1]
+            preds = surf_pred * surf_sel + vol_pred * (1.0 - surf_sel)
+        else:
+            # Fallback: average both branches
+            preds = (surf_pred + vol_pred) * 0.5
+
+        return {"preds": preds, "re_pred": re_pred, "aoa_pred": aoa_pred}
+
+
+# ---------------------------------------------------------------------------
+# End AB-UPT model
+# ---------------------------------------------------------------------------
+
+
 MAX_TIMEOUT = 180.0  # minutes
 MAX_EPOCHS = 500
 
@@ -814,6 +1040,10 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: AB-UPT model
+    model_type: str = "transolver"  # "transolver" or "abupt"
+    n_anchors: int = 256            # number of anchor supernodes for AB-UPT
+    abupt_pressure_first: bool = False  # pressure-first in AB-UPT surface branch
 
 
 cfg = sp.parse(Config)
@@ -935,43 +1165,67 @@ if cfg.raw_targets:
 else:
     raw_stats = None
 
-model_config = dict(
-    space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
-    out_dim=3,
-    n_hidden=cfg.n_hidden,
-    n_layers=cfg.n_layers,
-    n_head=3,
-    slice_num=cfg.prog_slices_end if cfg.prog_slices else cfg.slice_num,
-    mlp_ratio=2,
-    dropout=0.05 if cfg.rdrop else 0.0,
-    output_fields=["Ux", "Uy", "p"],
-    output_dims=[1, 1, 1],
-    linear_no_attention=cfg.linear_no_attention,
-    learned_kernel=cfg.learned_kernel,
-    field_decoder=cfg.field_decoder,
-    adaln_output=cfg.adaln_output,
-    soft_moe=cfg.soft_moe,
-    uncertainty_loss=cfg.uncertainty_loss,
-    adaln_all_blocks=cfg.adaln_all_blocks,
-    adaln_4cond=cfg.adaln_4cond,
-    adaln_nozero=cfg.adaln_nozero,
-    film_cond=cfg.film_cond,
-    adaln_decouple=cfg.adaln_decouple,
-    adaln_zone_temp=cfg.adaln_zone_temp,
-    domain_layernorm=cfg.domain_layernorm,
-    dln_zeroinit=cfg.dln_zeroinit,
-    domain_velhead=cfg.domain_velhead,
-    prog_slices=cfg.prog_slices,
-    pressure_first=cfg.pressure_first,
-    pressure_no_detach=cfg.pressure_no_detach,
-    pressure_deep=cfg.pressure_deep,
-)
+_fun_dim = X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32  # +curv, +dist, [+foil2dist], +32 fourier PE
 
-model = Transolver(**model_config).to(device)
-model._pressure_separate = cfg.pressure_separate_last_block
+if cfg.model_type == "abupt":
+    model_config = dict(
+        space_dim=2,
+        fun_dim=_fun_dim,
+        out_dim=3,
+        n_hidden=cfg.n_hidden,
+        n_layers=cfg.n_layers,
+        n_heads=8,
+        n_anchors=cfg.n_anchors,
+        dropout=0.05 if cfg.rdrop else 0.0,
+        output_fields=["Ux", "Uy", "p"],
+        output_dims=[1, 1, 1],
+        pressure_first=cfg.abupt_pressure_first,
+        pressure_deep=cfg.pressure_deep,
+    )
+    model = ABUPT(**model_config).to(device)
+    print(f"Using AB-UPT model: n_anchors={cfg.n_anchors}, n_hidden={cfg.n_hidden}, n_layers={cfg.n_layers}")
+else:
+    model_config = dict(
+        space_dim=2,
+        fun_dim=_fun_dim,
+        out_dim=3,
+        n_hidden=cfg.n_hidden,
+        n_layers=cfg.n_layers,
+        n_head=3,
+        slice_num=cfg.prog_slices_end if cfg.prog_slices else cfg.slice_num,
+        mlp_ratio=2,
+        dropout=0.05 if cfg.rdrop else 0.0,
+        output_fields=["Ux", "Uy", "p"],
+        output_dims=[1, 1, 1],
+        linear_no_attention=cfg.linear_no_attention,
+        learned_kernel=cfg.learned_kernel,
+        field_decoder=cfg.field_decoder,
+        adaln_output=cfg.adaln_output,
+        soft_moe=cfg.soft_moe,
+        uncertainty_loss=cfg.uncertainty_loss,
+        adaln_all_blocks=cfg.adaln_all_blocks,
+        adaln_4cond=cfg.adaln_4cond,
+        adaln_nozero=cfg.adaln_nozero,
+        film_cond=cfg.film_cond,
+        adaln_decouple=cfg.adaln_decouple,
+        adaln_zone_temp=cfg.adaln_zone_temp,
+        domain_layernorm=cfg.domain_layernorm,
+        dln_zeroinit=cfg.dln_zeroinit,
+        domain_velhead=cfg.domain_velhead,
+        prog_slices=cfg.prog_slices,
+        pressure_first=cfg.pressure_first,
+        pressure_no_detach=cfg.pressure_no_detach,
+        pressure_deep=cfg.pressure_deep,
+    )
+    model = Transolver(**model_config).to(device)
+    model._pressure_separate = cfg.pressure_separate_last_block
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
-model = torch.compile(model, mode=cfg.compile_mode)
+if cfg.compile_mode != "disable" and cfg.model_type != "abupt":
+    model = torch.compile(model, mode=cfg.compile_mode)
+elif cfg.model_type == "abupt":
+    print("Skipping torch.compile for AB-UPT model (uses eager mode)")
+else:
+    print("torch.compile disabled by config")
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
@@ -1352,8 +1606,9 @@ for epoch in range(MAX_EPOCHS):
             else:
                 y_norm = y_norm / sample_stds
 
+        _model_input = {"x": x, "is_surface": is_surface, "mask": mask}
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model(_model_input)
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -1488,7 +1743,7 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x})
+                rdrop_out = model(_model_input)
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -1553,7 +1808,7 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                out2 = model(_model_input)
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -1759,8 +2014,9 @@ for epoch in range(MAX_EPOCHS):
                 else:
                     y_norm_scaled = y_norm / sample_stds
 
+                _eval_input = {"x": x, "is_surface": is_surface, "mask": mask}
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    pred = eval_model(_eval_input)["preds"]
                 pred = pred.float()
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
@@ -1990,7 +2246,7 @@ if best_metrics:
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
-                    pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
+                    pred = vis_model({"x": x_n, "mask": mask, "is_surface": is_surf_dev})["preds"].float()
                     if cfg.raw_targets:
                         y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                     else:
