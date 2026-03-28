@@ -484,10 +484,12 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        deep_supervision=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.pressure_first = pressure_first
+        self.deep_supervision = deep_supervision
         self.ref = ref
         self.unified_pos = unified_pos
         self.adaln_output = adaln_output
@@ -558,6 +560,16 @@ class Transolver(nn.Module):
                 for idx in range(n_layers)
             ]
         )
+        # Deep supervision: auxiliary pressure heads on non-last blocks
+        if deep_supervision:
+            self.aux_pres_heads = nn.ModuleList([
+                nn.Sequential(
+                    nn.LayerNorm(n_hidden),
+                    nn.Linear(n_hidden, n_hidden), nn.GELU(),
+                    nn.Linear(n_hidden, 1),
+                )
+                for _ in range(n_layers - 1)  # one per non-last block
+            ])
         # Separate pressure pathway (pressure_separate_last_block):
         # Independent MLP + pres_head that processes shared hidden features
         self._pressure_separate = False  # set from Config after construction
@@ -670,8 +682,11 @@ class Transolver(nn.Module):
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
-        for block in self.blocks[:-1]:
+        self._aux_preds = []
+        for block_idx, block in enumerate(self.blocks[:-1]):
             fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+            if self.deep_supervision and self.training:
+                self._aux_preds.append(self.aux_pres_heads[block_idx](fx))
 
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
@@ -814,6 +829,10 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Deep supervision
+    deep_supervision: bool = False  # auxiliary pressure heads on all blocks
+    aux_weight: float = 0.3        # base weight for auxiliary pressure losses
+    aux_anneal: bool = False        # anneal aux weight from 2x to 0.5x over training
 
 
 cfg = sp.parse(Config)
@@ -966,6 +985,7 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    deep_supervision=cfg.deep_supervision,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1448,6 +1468,25 @@ for epoch in range(MAX_EPOCHS):
         else:
             loss = vol_loss + surf_weight * surf_loss
 
+        # Deep supervision: auxiliary pressure loss from intermediate blocks
+        _aux_loss_val = 0.0
+        if cfg.deep_supervision and model.training:
+            _p_idx = 2 if not cfg.pressure_first else 2  # pressure always channel 2 in y_norm (Ux,Uy,p)
+            aux_preds = _base_model._aux_preds
+            for i, aux_p in enumerate(aux_preds):
+                if aux_p is not None:
+                    aux_p = aux_p.float().squeeze(-1)  # [B, N]
+                    aux_err = (aux_p - y_norm[:, :, _p_idx]).abs()
+                    aux_surf = (aux_err * surf_mask.float()).sum() / surf_mask.float().sum().clamp(min=1)
+                    # Exponentially decaying weight: earlier blocks get less
+                    block_weight = cfg.aux_weight * (0.5 ** (len(aux_preds) - 1 - i))
+                    if cfg.aux_anneal:
+                        progress = min(1.0, epoch / 120)
+                        anneal_factor = 2.0 - 1.5 * progress
+                        block_weight *= anneal_factor
+                    _aux_loss_val += block_weight * aux_surf.item()
+                    loss = loss + block_weight * aux_surf
+
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
         coarse_pool_size = 64
@@ -1584,7 +1623,10 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _train_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.deep_supervision and _aux_loss_val > 0:
+            _train_log["train/aux_loss"] = _aux_loss_val
+        wandb.log(_train_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
