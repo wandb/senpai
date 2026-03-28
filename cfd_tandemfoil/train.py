@@ -134,6 +134,51 @@ class DomainLayerNorm(nn.Module):
         return torch.where(mask_t, self.ln_tandem(x), self.ln_single(x))
 
 
+class LandmarkAttention(nn.Module):
+    """FLARE-style landmark cross-attention for irregular meshes.
+    Encode-Process-Decode: M landmarks cross-attend to N nodes, self-attend, then decode back.
+    Uses F.scaled_dot_product_attention for Flash Attention compatibility.
+    """
+    def __init__(self, dim, heads=8, dim_head=24, dropout=0.0, n_landmarks=128):
+        super().__init__()
+        self.heads = heads
+        self.dim_head = dim_head
+        self.n_landmarks = n_landmarks
+        inner_dim = heads * dim_head
+        self.landmark_q = nn.Parameter(torch.randn(1, n_landmarks, inner_dim) * 0.02)
+        self.encode_kv = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, 2 * inner_dim))
+        self.self_q = nn.Linear(inner_dim, inner_dim, bias=False)
+        self.self_k = nn.Linear(inner_dim, inner_dim, bias=False)
+        self.self_v = nn.Linear(inner_dim, inner_dim, bias=False)
+        self.decode_q = nn.Linear(dim, inner_dim)
+        self.decode_kv = nn.Linear(inner_dim, 2 * inner_dim)
+        self.to_out = nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
+
+    def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None):
+        B, N, C = x.shape
+        H, d, M = self.heads, self.dim_head, self.n_landmarks
+        kv = self.encode_kv(x)
+        K_enc, V_enc = kv.chunk(2, dim=-1)
+        K_enc = K_enc.view(B, N, H, d).permute(0, 2, 1, 3).contiguous()
+        V_enc = V_enc.view(B, N, H, d).permute(0, 2, 1, 3).contiguous()
+        Q_enc = self.landmark_q.expand(B, -1, -1).view(B, M, H, d).permute(0, 2, 1, 3).contiguous()
+        Z = F.scaled_dot_product_attention(Q_enc, K_enc, V_enc)
+        Z_flat = Z.permute(0, 2, 1, 3).reshape(B, M, H * d)
+        q_s = self.self_q(Z_flat).view(B, M, H, d).permute(0, 2, 1, 3).contiguous()
+        k_s = self.self_k(Z_flat).view(B, M, H, d).permute(0, 2, 1, 3).contiguous()
+        v_s = self.self_v(Z_flat).view(B, M, H, d).permute(0, 2, 1, 3).contiguous()
+        Z = Z + F.scaled_dot_product_attention(q_s, k_s, v_s)
+        Z_kv = Z.permute(0, 2, 1, 3).reshape(B, M, H * d)
+        kv2 = self.decode_kv(Z_kv)
+        K_dec, V_dec = kv2.chunk(2, dim=-1)
+        K_dec = K_dec.view(B, M, H, d).permute(0, 2, 1, 3).contiguous()
+        V_dec = V_dec.view(B, M, H, d).permute(0, 2, 1, 3).contiguous()
+        Q_dec = self.decode_q(x).view(B, N, H, d).permute(0, 2, 1, 3).contiguous()
+        out = F.scaled_dot_product_attention(Q_dec, K_dec, V_dec)
+        out = out.permute(0, 2, 1, 3).reshape(B, N, H * d)
+        return self.to_out(out)
+
+
 class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
@@ -279,6 +324,8 @@ class TransolverBlock(nn.Module):
         dln_zeroinit=False,
         domain_velhead=False,
         prog_slices=False,
+        landmark_attn=False,
+        n_landmarks=128,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -291,18 +338,23 @@ class TransolverBlock(nn.Module):
         self.domain_layernorm = domain_layernorm
         _LN = (lambda d: DomainLayerNorm(d, zeroinit=dln_zeroinit)) if domain_layernorm else nn.LayerNorm
         self.ln_1 = _LN(hidden_dim)
-        self.attn = Physics_Attention_Irregular_Mesh(
-            hidden_dim,
-            heads=num_heads,
-            dim_head=hidden_dim // num_heads,
-            dropout=dropout,
-            slice_num=slice_num,
-            linear_no_attention=linear_no_attention,
-            learned_kernel=learned_kernel,
-            decouple_slice=decouple_slice,
-            zone_temp=zone_temp,
-            prog_slices=prog_slices,
-        )
+        if landmark_attn:
+            self.attn = LandmarkAttention(
+                hidden_dim, heads=num_heads, dim_head=hidden_dim // num_heads,
+                dropout=dropout, n_landmarks=n_landmarks)
+        else:
+            self.attn = Physics_Attention_Irregular_Mesh(
+                hidden_dim,
+                heads=num_heads,
+                dim_head=hidden_dim // num_heads,
+                dropout=dropout,
+                slice_num=slice_num,
+                linear_no_attention=linear_no_attention,
+                learned_kernel=learned_kernel,
+                decouple_slice=decouple_slice,
+                zone_temp=zone_temp,
+                prog_slices=prog_slices,
+            )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
             self.adaln_net = nn.Sequential(
@@ -453,6 +505,8 @@ class Transolver(nn.Module):
         dln_zeroinit=False,
         domain_velhead=False,
         prog_slices=False,
+        landmark_attn=False,
+        n_landmarks=128,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -519,6 +573,8 @@ class Transolver(nn.Module):
                     dln_zeroinit=dln_zeroinit,
                     domain_velhead=domain_velhead if (idx == n_layers - 1) else False,
                     prog_slices=prog_slices,
+                    landmark_attn=landmark_attn,
+                    n_landmarks=n_landmarks,
                 )
                 for idx in range(n_layers)
             ]
@@ -754,6 +810,9 @@ class Config:
     vol_subsample_frac: float = 1.0     # fraction of volume nodes in loss after vol_ramp (0.8 = 80%)
     compile_mode: str = "default"       # torch.compile mode: "default", "max-autotune", "reduce-overhead"
     num_workers: int = 4                # data loader workers
+    # Phase 5: FactFormer / Landmark attention
+    model_type: str = "transolver"     # "transolver" or "factformer"
+    n_landmarks: int = 128             # number of landmark tokens for factformer
 
 
 cfg = sp.parse(Config)
@@ -903,7 +962,11 @@ model_config = dict(
     dln_zeroinit=cfg.dln_zeroinit,
     domain_velhead=cfg.domain_velhead,
     prog_slices=cfg.prog_slices,
+    landmark_attn=(cfg.model_type == "factformer"),
+    n_landmarks=cfg.n_landmarks,
 )
+if cfg.model_type == "factformer":
+    model_config["n_head"] = 8  # more heads for landmark attention
 
 model = Transolver(**model_config).to(device)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
