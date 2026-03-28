@@ -36,6 +36,7 @@ from timm.layers import trunc_normal_
 from tqdm import tqdm
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import simple_parsing as sp
+## torch_geometric spatial ops reimplemented in pure PyTorch (no torch-cluster needed)
 
 from data.utils import visualize
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
@@ -647,6 +648,369 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Pure PyTorch spatial operations (no torch-cluster dependency)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _fps_batch(pos, batch, ratio, B):
+    """Farthest Point Sampling per batch element. Returns flat indices.
+    Uses random subsampling instead of true FPS for speed on large meshes."""
+    all_idx = []
+    for b in range(B):
+        mask_b = batch == b
+        n = mask_b.sum().item()
+        n_keep = max(int(n * ratio), 1)
+        global_indices = mask_b.nonzero(as_tuple=True)[0]
+        if n_keep >= n:
+            all_idx.append(global_indices)
+        else:
+            # Random subsampling (much faster than FPS for 100K+ nodes)
+            perm = torch.randperm(n, device=pos.device)[:n_keep]
+            all_idx.append(global_indices[perm])
+    return torch.cat(all_idx)
+
+
+def _knn_flat(query_pos, ref_pos, query_batch, ref_batch, k, B):
+    """k-Nearest Neighbors per batch using chunked computation to avoid OOM.
+    Returns (row, col) edge indices."""
+    rows = []
+    cols = []
+    CHUNK = 4096  # process this many query points at a time
+    for b in range(B):
+        q_mask = query_batch == b
+        r_mask = ref_batch == b
+        q_pos = query_pos[q_mask]
+        r_pos = ref_pos[r_mask]
+        q_offset = q_mask.nonzero(as_tuple=True)[0][0].item()
+        r_offset = r_mask.nonzero(as_tuple=True)[0][0].item()
+        nq = q_pos.shape[0]
+        actual_k = min(k, r_pos.shape[0])
+        # Process in chunks to avoid OOM on large meshes
+        for start in range(0, nq, CHUNK):
+            end = min(start + CHUNK, nq)
+            q_chunk = q_pos[start:end]
+            dists = torch.cdist(q_chunk, r_pos)  # [chunk, Nr]
+            _, nn_idx = dists.topk(actual_k, largest=False)  # [chunk, k]
+            chunk_size = end - start
+            row_b = torch.arange(chunk_size, device=query_pos.device).unsqueeze(1).expand(-1, actual_k).reshape(-1) + q_offset + start
+            col_b = nn_idx.reshape(-1) + r_offset
+            rows.append(row_b)
+            cols.append(col_b)
+    return torch.cat(rows), torch.cat(cols)
+
+
+def _knn_interpolate_flat(feat, source_pos, target_pos, source_batch, target_batch, k, B):
+    """Interpolate features from source to target using inverse-distance weighted kNN."""
+    # Chunk size must be small enough so cdist([chunk, Ns]) fits in VRAM.
+    # With Ns~108K per sample, CHUNK=512 → 512*108K*4B ≈ 0.22 GiB (safe).
+    CHUNK = 512
+    n_target = target_pos.shape[0]
+    D = feat.shape[1]
+    out = torch.zeros(n_target, D, device=feat.device, dtype=feat.dtype)
+    for b in range(B):
+        t_mask = target_batch == b
+        s_mask = source_batch == b
+        t_pos = target_pos[t_mask]
+        s_pos = source_pos[s_mask]
+        s_feat = feat[s_mask]
+        t_offset = t_mask.nonzero(as_tuple=True)[0][0].item()
+        nt = t_pos.shape[0]
+        actual_k = min(k, s_pos.shape[0])
+        for start in range(0, nt, CHUNK):
+            end = min(start + CHUNK, nt)
+            t_chunk = t_pos[start:end]
+            dists = torch.cdist(t_chunk, s_pos)  # [chunk, Ns]
+            _, nn_idx = dists.topk(actual_k, largest=False)  # [chunk, k]
+            nn_feats = s_feat[nn_idx]  # [chunk, k, D]
+            nn_dists = dists.gather(1, nn_idx).clamp(min=1e-8)  # [chunk, k]
+            weights = 1.0 / nn_dists
+            weights = weights / weights.sum(dim=-1, keepdim=True)
+            out[t_offset + start:t_offset + end] = (nn_feats * weights.unsqueeze(-1)).sum(dim=1)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical Multi-Scale Point Transformer
+# ---------------------------------------------------------------------------
+
+class LocalAttentionBlock(nn.Module):
+    """Local multi-head attention within kNN neighborhoods."""
+    def __init__(self, dim, heads=8, max_neighbors=32):
+        super().__init__()
+        self.heads = heads
+        self.dim_head = dim // heads
+        self.scale = self.dim_head ** -0.5
+        self.ln = nn.LayerNorm(dim)
+        self.qkv = nn.Linear(dim, 3 * dim)
+        self.out_proj = nn.Linear(dim, dim)
+        self.max_neighbors = max_neighbors
+        self.pos_enc = nn.Sequential(nn.Linear(2, dim), nn.GELU(), nn.Linear(dim, dim))
+
+    def forward(self, x, pos, batch, B):
+        """x: [N_total, D], pos: [N_total, 2], batch: [N_total], B: batch_size"""
+        N, D = x.shape
+        H = self.heads
+        x_ln = self.ln(x)
+
+        # Find k nearest neighbors using pure PyTorch
+        row, col = _knn_flat(pos, pos, batch, batch, self.max_neighbors, B)
+
+        # Relative position encoding
+        rel_pos = pos[col] - pos[row]  # [E, 2]
+        pe = self.pos_enc(rel_pos)  # [E, D]
+
+        # QKV
+        qkv = self.qkv(x_ln)  # [N, 3D]
+        q, k, v = qkv.chunk(3, dim=-1)  # each [N, D]
+
+        # Gather q for targets, k/v for sources
+        q_i = q[row].view(-1, H, self.dim_head)  # [E, H, d]
+        k_j = (k[col] + pe).view(-1, H, self.dim_head)  # [E, H, d]
+        v_j = (v[col] + pe).view(-1, H, self.dim_head)  # [E, H, d]
+
+        # Attention scores
+        attn = (q_i * k_j).sum(dim=-1) * self.scale  # [E, H]
+
+        # Scatter-based softmax: compute per-target node
+        # Max trick for numerical stability
+        attn = attn.float()  # ensure float32 for scatter ops
+        attn_max = torch.full((N, H), -1e9, device=x.device, dtype=torch.float32)
+        attn_max.scatter_reduce_(0, row.unsqueeze(-1).expand_as(attn), attn, reduce='amax', include_self=True)
+        attn = attn - attn_max[row]
+        attn = attn.exp()
+        attn_sum = torch.zeros(N, H, device=x.device, dtype=torch.float32)
+        attn_sum.scatter_add_(0, row.unsqueeze(-1).expand_as(attn), attn)
+        attn = attn / (attn_sum[row] + 1e-8)
+
+        # Weighted sum
+        out = (attn.unsqueeze(-1) * v_j).to(x.dtype)  # [E, H, d]; cast back to x.dtype after float32 attn
+        result = torch.zeros(N, H, self.dim_head, device=x.device, dtype=x.dtype)
+        result.scatter_add_(0, row.unsqueeze(-1).unsqueeze(-1).expand_as(out), out)
+        result = result.reshape(N, D)
+
+        return x + self.out_proj(result)
+
+
+class HierarchicalPointTransformer(nn.Module):
+    """U-Net style hierarchical point transformer for CFD surrogate modeling."""
+
+    def __init__(self, fun_dim, n_hidden=192, n_levels=4, max_neighbors=32,
+                 out_dim=3, n_heads=8, field_decoder=False, domain_velhead=False,
+                 use_local_pe=False):
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.n_levels = n_levels
+        self.out_dim = out_dim
+        self.field_decoder = field_decoder
+        self.domain_velhead = domain_velhead
+        self.use_local_pe = use_local_pe
+        self.downsample_ratio = 0.25  # keep 25% at each level
+
+        # Encoder MLP
+        self.preprocess = nn.Sequential(
+            nn.Linear(fun_dim, n_hidden * 2), nn.GELU(),
+            nn.Linear(n_hidden * 2, n_hidden * 2), nn.GELU(),
+            nn.Linear(n_hidden * 2, n_hidden)
+        )
+
+        # Encoder blocks (one per level)
+        self.encoder_blocks = nn.ModuleList()
+        for i in range(n_levels):
+            self.encoder_blocks.append(nn.ModuleList([
+                LocalAttentionBlock(n_hidden, heads=n_heads, max_neighbors=max_neighbors),
+                nn.Sequential(nn.LayerNorm(n_hidden), nn.Linear(n_hidden, n_hidden * 2),
+                              nn.GELU(), nn.Linear(n_hidden * 2, n_hidden)),
+            ]))
+
+        # Bottleneck: global self-attention at coarsest level
+        self.bottleneck_ln = nn.LayerNorm(n_hidden)
+        self.bottleneck_attn = nn.MultiheadAttention(n_hidden, n_heads, batch_first=True, dropout=0.0)
+        self.bottleneck_ffn = nn.Sequential(
+            nn.LayerNorm(n_hidden), nn.Linear(n_hidden, n_hidden * 2),
+            nn.GELU(), nn.Linear(n_hidden * 2, n_hidden)
+        )
+
+        # Decoder blocks (one per level, with skip connections)
+        self.decoder_blocks = nn.ModuleList()
+        self.skip_projs = nn.ModuleList()
+        for i in range(n_levels):
+            self.skip_projs.append(nn.Linear(n_hidden * 2, n_hidden))
+            self.decoder_blocks.append(nn.ModuleList([
+                LocalAttentionBlock(n_hidden, heads=n_heads, max_neighbors=max_neighbors),
+                nn.Sequential(nn.LayerNorm(n_hidden), nn.Linear(n_hidden, n_hidden * 2),
+                              nn.GELU(), nn.Linear(n_hidden * 2, n_hidden)),
+            ]))
+
+        # Output head
+        if field_decoder:
+            self.vel_head = nn.Sequential(nn.Linear(n_hidden, n_hidden), nn.GELU(), nn.Linear(n_hidden, 2))
+            self.p_head = nn.Sequential(nn.Linear(n_hidden, n_hidden), nn.GELU(), nn.Linear(n_hidden, 1))
+        else:
+            self.out_head = nn.Linear(n_hidden, out_dim)
+
+        # Auxiliary heads (Re and AoA prediction)
+        self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])
+        self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                if m.weight.dim() >= 2:
+                    nn.init.orthogonal_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def _unpack_inputs(self, data, pos=None, condition=None):
+        if not isinstance(data, Mapping):
+            raise TypeError("Model input must be a Mapping with keys: x")
+        x = data.get("x")
+        mask = data.get("mask")
+        return x, mask
+
+    def forward(self, data, pos=None, condition=None):
+        x, mask = self._unpack_inputs(data)
+        B, N, D = x.shape
+
+        # Extract positions (first 2 dims of input)
+        positions = x[:, :, :2].clone()  # [B, N, 2]
+
+        # Preprocess
+        fx = self.preprocess(x)  # [B, N, n_hidden]
+
+        # Convert from [B, N, D] batched format to flat [B*N, D] with batch index
+        # Handle padding via mask
+        if mask is None:
+            mask = torch.ones(B, N, dtype=torch.bool, device=x.device)
+
+        # Build flat tensors for torch_geometric
+        flat_feats_list = []
+        flat_pos_list = []
+        flat_batch_list = []
+        node_counts = []
+        for b in range(B):
+            valid = mask[b]
+            n_valid = valid.sum().item()
+            flat_feats_list.append(fx[b, :n_valid] if valid.all() else fx[b][valid])
+            flat_pos_list.append(positions[b, :n_valid] if valid.all() else positions[b][valid])
+            flat_batch_list.append(torch.full((n_valid,), b, device=x.device, dtype=torch.long))
+            node_counts.append(n_valid)
+
+        flat_feat = torch.cat(flat_feats_list, dim=0)  # [N_total, D]
+        flat_pos = torch.cat(flat_pos_list, dim=0)  # [N_total, 2]
+        flat_batch = torch.cat(flat_batch_list, dim=0)  # [N_total]
+
+        # Encoder: progressive downsampling
+        encoder_feats = []  # skip connections
+        encoder_pos = []
+        encoder_batch = []
+        cur_feat = flat_feat
+        cur_pos = flat_pos
+        cur_batch = flat_batch
+
+        for level in range(self.n_levels):
+            # Local attention + FFN
+            attn_block, ffn_block = self.encoder_blocks[level]
+            cur_feat = attn_block(cur_feat, cur_pos, cur_batch, B)
+            cur_feat = cur_feat + ffn_block(cur_feat)
+
+            # Save for skip connection
+            encoder_feats.append(cur_feat)
+            encoder_pos.append(cur_pos)
+            encoder_batch.append(cur_batch)
+
+            # Downsample (except at last level — that feeds into bottleneck)
+            if level < self.n_levels - 1:
+                ratio = self.downsample_ratio
+                fps_idx = _fps_batch(cur_pos, cur_batch, ratio, B)
+                cur_feat = cur_feat[fps_idx]
+                cur_pos = cur_pos[fps_idx]
+                cur_batch = cur_batch[fps_idx]
+
+        # Bottleneck: global attention at coarsest level
+        # Repack into batched tensor for nn.MultiheadAttention
+        coarse_counts = []
+        for b in range(B):
+            coarse_counts.append((cur_batch == b).sum().item())
+        max_coarse = max(coarse_counts)
+
+        coarse_batched = torch.zeros(B, max_coarse, self.n_hidden, device=x.device, dtype=x.dtype)
+        coarse_mask = torch.ones(B, max_coarse, dtype=torch.bool, device=x.device)  # True = ignored
+        offset = 0
+        for b in range(B):
+            n_c = coarse_counts[b]
+            coarse_batched[b, :n_c] = cur_feat[offset:offset + n_c]
+            coarse_mask[b, :n_c] = False  # not ignored
+            offset += n_c
+
+        # Self-attention
+        q = self.bottleneck_ln(coarse_batched)
+        attn_out, _ = self.bottleneck_attn(q, q, q, key_padding_mask=coarse_mask)
+        coarse_batched = coarse_batched + attn_out
+        coarse_batched = coarse_batched + self.bottleneck_ffn(coarse_batched)
+
+        # Unpack back to flat
+        flat_parts = []
+        for b in range(B):
+            flat_parts.append(coarse_batched[b, :coarse_counts[b]])
+        cur_feat = torch.cat(flat_parts, dim=0)
+
+        # Auxiliary predictions from bottleneck
+        re_pred = self.re_head(coarse_batched.mean(dim=1))  # [B, 1]
+        aoa_pred = self.aoa_head(coarse_batched.mean(dim=1))
+
+        # Decoder: progressive upsampling with skip connections
+        for level in range(self.n_levels - 1, -1, -1):
+            # Upsample to encoder level resolution
+            if level < self.n_levels - 1:
+                # knn interpolate from current (coarse) to encoder level (fine)
+                target_pos = encoder_pos[level]
+                target_batch = encoder_batch[level]
+                cur_feat = _knn_interpolate_flat(cur_feat, cur_pos, target_pos,
+                                                  cur_batch, target_batch, k=3, B=B)
+                cur_pos = target_pos
+                cur_batch = target_batch
+
+            # Skip connection: concat and project
+            skip_feat = encoder_feats[level]
+            cur_feat = self.skip_projs[level](torch.cat([cur_feat, skip_feat], dim=-1))
+
+            # Local attention + FFN
+            attn_block, ffn_block = self.decoder_blocks[level]
+            cur_feat = attn_block(cur_feat, cur_pos, cur_batch, B)
+            cur_feat = cur_feat + ffn_block(cur_feat)
+
+        # Repack flat output to [B, N, D] batched format
+        output = torch.zeros(B, N, self.n_hidden, device=x.device, dtype=x.dtype)
+        offset = 0
+        for b in range(B):
+            n_valid = node_counts[b]
+            if mask[b].all():
+                output[b, :n_valid] = cur_feat[offset:offset + n_valid]
+            else:
+                output[b][mask[b]] = cur_feat[offset:offset + n_valid]
+            offset += n_valid
+
+        # Output head
+        if self.field_decoder:
+            vel = self.vel_head(output)
+            p = self.p_head(output)
+            preds = torch.cat([vel, p], dim=-1)
+        else:
+            preds = self.out_head(output)
+
+        return {"preds": preds, "re_pred": re_pred, "aoa_pred": aoa_pred}
+
+
+# ---------------------------------------------------------------------------
+# End Hierarchical Point Transformer
+# ---------------------------------------------------------------------------
+
+
 MAX_TIMEOUT = 180.0  # minutes
 MAX_EPOCHS = 500
 
@@ -754,6 +1118,11 @@ class Config:
     vol_subsample_frac: float = 1.0     # fraction of volume nodes in loss after vol_ramp (0.8 = 80%)
     compile_mode: str = "default"       # torch.compile mode: "default", "max-autotune", "reduce-overhead"
     num_workers: int = 4                # data loader workers
+    # Phase 5: hierarchical point transformer
+    model_type: str = "transolver"      # "transolver" or "hierarchical"
+    n_levels: int = 4                   # number of hierarchy levels
+    local_k: int = 32                   # max neighbors for local attention
+    use_local_pe: bool = False          # use local positional encoding
 
 
 cfg = sp.parse(Config)
@@ -905,10 +1274,26 @@ model_config = dict(
     prog_slices=cfg.prog_slices,
 )
 
-model = Transolver(**model_config).to(device)
-torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
-model = torch.compile(model, mode=cfg.compile_mode)
-_base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+if cfg.model_type == "hierarchical":
+    fun_dim_hier = X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32  # same as Transolver fun_dim + space_dim
+    model = HierarchicalPointTransformer(
+        fun_dim=fun_dim_hier + 2,  # +2 for space_dim (x,y included in input)
+        n_hidden=cfg.n_hidden,
+        n_levels=cfg.n_levels,
+        max_neighbors=cfg.local_k,
+        out_dim=3,
+        n_heads=3,
+        field_decoder=cfg.field_decoder,
+        domain_velhead=cfg.domain_velhead,
+        use_local_pe=cfg.use_local_pe,
+    ).to(device)
+    # Don't torch.compile hierarchical model — FPS/kNN ops break compilation
+    _base_model = model
+else:
+    model = Transolver(**model_config).to(device)
+    torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
+    model = torch.compile(model, mode=cfg.compile_mode)
+    _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
