@@ -677,6 +677,9 @@ class Transolver(nn.Module):
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
+        # Save hidden state for anchor decoder (before last block's output projection)
+        fx_hidden = fx  # [B, N, n_hidden]
+
         # Last block: use adaln_all condition if enabled, else fallback to adaln_output
         last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
 
@@ -694,11 +697,163 @@ class Transolver(nn.Module):
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred, "hidden": fx_hidden}
 
 
 # ---------------------------------------------------------------------------
 # End Transolver model
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Hybrid Anchor-Decoder: Transolver backbone + anchor attention for surface
+# Pool backbone features to M anchors, surface nodes cross-attend to anchors,
+# then decode via surface-specific MLP. Volume uses existing Transolver head.
+# ---------------------------------------------------------------------------
+
+class AnchorSurfaceDecoder(nn.Module):
+    """Anchor-attention decoder for surface predictions.
+
+    1. Pool all node features to M anchor tokens via cross-attention
+    2. Optional self-attention among anchors
+    3. Surface nodes cross-attend to anchors
+    4. Surface MLP decodes predictions
+    """
+    def __init__(self, n_hidden, n_anchors=128, n_heads=8, n_surf_layers=2,
+                 out_dim=3, pressure_first=False, pressure_deep=False,
+                 domain_anchors=False, dropout=0.0):
+        super().__init__()
+        self.n_anchors = n_anchors
+        self.pressure_first = pressure_first
+        self.domain_anchors = domain_anchors
+
+        # Learned anchor tokens
+        self.anchors = nn.Parameter(torch.randn(1, n_anchors, n_hidden) * 0.02)
+        if domain_anchors:
+            self.anchors_tandem = nn.Parameter(torch.randn(1, n_anchors, n_hidden) * 0.02)
+
+        # Pool: anchors cross-attend to all nodes
+        self.pool_norm_q = nn.LayerNorm(n_hidden)
+        self.pool_norm_kv = nn.LayerNorm(n_hidden)
+        self.pool_q = nn.Linear(n_hidden, n_hidden)
+        self.pool_k = nn.Linear(n_hidden, n_hidden)
+        self.pool_v = nn.Linear(n_hidden, n_hidden)
+        self.pool_out = nn.Linear(n_hidden, n_hidden)
+        self.n_heads = n_heads
+        self.dim_head = n_hidden // n_heads
+
+        # Self-attention among anchors
+        self.anchor_self_norm = nn.LayerNorm(n_hidden)
+        self.anchor_self_qkv = nn.Linear(n_hidden, 3 * n_hidden)
+        self.anchor_self_out = nn.Linear(n_hidden, n_hidden)
+        self.anchor_ffn = nn.Sequential(
+            nn.LayerNorm(n_hidden), nn.Linear(n_hidden, n_hidden * 2),
+            nn.GELU(), nn.Linear(n_hidden * 2, n_hidden))
+
+        # Surface cross-attention: surface nodes attend to anchors
+        self.surf_layers = nn.ModuleList()
+        for _ in range(n_surf_layers):
+            self.surf_layers.append(nn.ModuleDict({
+                'norm_q': nn.LayerNorm(n_hidden),
+                'norm_kv': nn.LayerNorm(n_hidden),
+                'q': nn.Linear(n_hidden, n_hidden),
+                'k': nn.Linear(n_hidden, n_hidden),
+                'v': nn.Linear(n_hidden, n_hidden),
+                'out': nn.Linear(n_hidden, n_hidden),
+                'ffn': nn.Sequential(
+                    nn.LayerNorm(n_hidden), nn.Linear(n_hidden, n_hidden * 2),
+                    nn.GELU(), nn.Linear(n_hidden * 2, n_hidden)),
+            }))
+
+        # Surface output head
+        if pressure_first:
+            if pressure_deep:
+                self.surf_pres_head = nn.Sequential(
+                    nn.LayerNorm(n_hidden), nn.Linear(n_hidden, n_hidden), nn.GELU(),
+                    nn.Linear(n_hidden, n_hidden // 2), nn.GELU(), nn.Linear(n_hidden // 2, 1))
+            else:
+                self.surf_pres_head = nn.Sequential(
+                    nn.LayerNorm(n_hidden), nn.Linear(n_hidden, n_hidden // 2), nn.GELU(),
+                    nn.Linear(n_hidden // 2, 1))
+            self.surf_vel_head = nn.Sequential(
+                nn.LayerNorm(n_hidden + 1),
+                nn.Linear(n_hidden + 1, n_hidden), nn.GELU(),
+                nn.Linear(n_hidden, 2))
+        else:
+            self.surf_out_head = nn.Sequential(
+                nn.LayerNorm(n_hidden),
+                nn.Linear(n_hidden, n_hidden), nn.GELU(),
+                nn.Linear(n_hidden, out_dim))
+
+    def _cross_attn(self, q_tokens, kv_tokens, q_proj, k_proj, v_proj, out_proj,
+                    norm_q, norm_kv, kv_mask=None):
+        B, Nq, D = q_tokens.shape
+        Nkv = kv_tokens.shape[1]
+        H, d = self.n_heads, self.dim_head
+        q = q_proj(norm_q(q_tokens)).view(B, Nq, H, d).permute(0, 2, 1, 3)
+        k = k_proj(norm_kv(kv_tokens)).view(B, Nkv, H, d).permute(0, 2, 1, 3)
+        v = v_proj(norm_kv(kv_tokens)).view(B, Nkv, H, d).permute(0, 2, 1, 3)
+        attn_mask = None
+        if kv_mask is not None:
+            attn_mask = kv_mask[:, None, None, :].expand(B, H, Nq, Nkv)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        out = out.permute(0, 2, 1, 3).reshape(B, Nq, D)
+        return q_tokens + out_proj(out)
+
+    def forward(self, fx, is_surface=None, mask=None, is_tandem=None):
+        """
+        fx: [B, N, n_hidden] — backbone features
+        is_surface: [B, N] bool
+        mask: [B, N] bool (True=valid)
+        is_tandem: [B] bool — for domain-specific anchors
+        """
+        B, N, D = fx.shape
+        H, d = self.n_heads, self.dim_head
+
+        # Select anchors (domain-specific or shared)
+        if self.domain_anchors and is_tandem is not None:
+            anchors = torch.where(
+                is_tandem[:, None, None].expand(B, self.n_anchors, D),
+                self.anchors_tandem.expand(B, -1, -1),
+                self.anchors.expand(B, -1, -1))
+        else:
+            anchors = self.anchors.expand(B, -1, -1)
+
+        # Step 1: Pool — anchors cross-attend to all nodes
+        anchors = self._cross_attn(anchors, fx, self.pool_q, self.pool_k, self.pool_v,
+                                    self.pool_out, self.pool_norm_q, self.pool_norm_kv,
+                                    kv_mask=mask)
+
+        # Self-attention among anchors
+        h = self.anchor_self_norm(anchors)
+        qkv = self.anchor_self_qkv(h).view(B, self.n_anchors, 3, H, d).permute(2, 0, 3, 1, 4)
+        q_a, k_a, v_a = qkv[0], qkv[1], qkv[2]
+        sa_out = F.scaled_dot_product_attention(q_a, k_a, v_a)
+        sa_out = sa_out.permute(0, 2, 1, 3).reshape(B, self.n_anchors, D)
+        anchors = anchors + self.anchor_self_out(sa_out)
+        anchors = anchors + self.anchor_ffn(anchors)
+
+        # Step 2: Surface nodes cross-attend to anchors (multiple layers)
+        surf_h = fx  # start from backbone features
+        for layer in self.surf_layers:
+            surf_h = self._cross_attn(surf_h, anchors, layer['q'], layer['k'], layer['v'],
+                                       layer['out'], layer['norm_q'], layer['norm_kv'])
+            surf_h = surf_h + layer['ffn'](surf_h)
+
+        # Step 3: Surface output head
+        if self.pressure_first:
+            p_surf = self.surf_pres_head(surf_h)  # [B, N, 1]
+            vel_input = torch.cat([surf_h, p_surf.detach()], dim=-1)
+            vel_surf = self.surf_vel_head(vel_input)  # [B, N, 2]
+            surf_pred = torch.cat([vel_surf, p_surf], dim=-1)  # [B, N, 3]
+        else:
+            surf_pred = self.surf_out_head(surf_h)  # [B, N, 3]
+
+        return surf_pred
+
+
+# ---------------------------------------------------------------------------
+# End Hybrid Anchor-Decoder
 # ---------------------------------------------------------------------------
 
 
@@ -814,6 +969,12 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Hybrid anchor-decoder
+    hybrid_anchor: bool = False         # enable anchor-attention surface decoder
+    hybrid_n_anchors: int = 128         # number of anchor tokens
+    hybrid_surf_layers: int = 2         # number of surface cross-attention layers
+    hybrid_pressure_first: bool = False # pressure-first in surface branch
+    hybrid_domain_anchors: bool = False # separate anchors for single vs tandem
 
 
 cfg = sp.parse(Config)
@@ -970,8 +1131,29 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 model._pressure_separate = cfg.pressure_separate_last_block
+
+# Hybrid anchor-decoder: add surface decoder to model
+anchor_decoder = None
+if cfg.hybrid_anchor:
+    anchor_decoder = AnchorSurfaceDecoder(
+        n_hidden=cfg.n_hidden,
+        n_anchors=cfg.hybrid_n_anchors,
+        n_heads=8,
+        n_surf_layers=cfg.hybrid_surf_layers,
+        out_dim=3,
+        pressure_first=cfg.hybrid_pressure_first,
+        pressure_deep=cfg.pressure_deep,
+        domain_anchors=cfg.hybrid_domain_anchors,
+    ).to(device)
+    print(f"Hybrid anchor-decoder: n_anchors={cfg.hybrid_n_anchors}, "
+          f"surf_layers={cfg.hybrid_surf_layers}, "
+          f"pressure_first={cfg.hybrid_pressure_first}, "
+          f"domain_anchors={cfg.hybrid_domain_anchors}")
+
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode=cfg.compile_mode)
+if anchor_decoder is not None:
+    anchor_decoder = torch.compile(anchor_decoder, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
@@ -1097,8 +1279,13 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
-attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
-other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+_all_named = list(model.named_parameters())
+if anchor_decoder is not None:
+    _all_named += [("anchor_decoder." + n, p) for n, p in anchor_decoder.named_parameters()]
+    n_anchor_params = sum(p.numel() for p in anchor_decoder.parameters())
+    print(f"Anchor decoder params: {n_anchor_params:,}")
+attn_params = [p for n, p in _all_named if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+other_params = [p for n, p in _all_named if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
 if cfg.use_lion:
     base_opt = Lion([
@@ -1357,6 +1544,14 @@ for epoch in range(MAX_EPOCHS):
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
+            # Hybrid anchor-decoder: override surface predictions
+            if anchor_decoder is not None:
+                _hidden = out["hidden"]  # [B, N, n_hidden]
+                is_tandem_flag = (x[:, 0, 21].abs() > 0.01) if cfg.hybrid_domain_anchors else None
+                surf_pred = anchor_decoder(_hidden, is_surface=is_surface, mask=mask, is_tandem=is_tandem_flag)
+                # Replace surface node predictions with anchor decoder output
+                surf_sel = is_surface.unsqueeze(-1).float()
+                pred = surf_pred * surf_sel + pred * (1.0 - surf_sel)
         pred = pred.float()
         re_pred = re_pred.float()
         aoa_pred = aoa_pred.float()
@@ -1542,7 +1737,10 @@ for epoch in range(MAX_EPOCHS):
                 optimizer.zero_grad()
             loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        _clip_params = list(model.parameters())
+        if anchor_decoder is not None:
+            _clip_params += list(anchor_decoder.parameters())
+        torch.nn.utils.clip_grad_norm_(_clip_params, max_norm=1.0)
         sam_active = sam_optimizer is not None and epoch >= int(MAX_EPOCHS * 0.75)
         _should_step = (cfg.grad_accum_steps <= 1 or
                         (batch_idx + 1) % cfg.grad_accum_steps == 0 or
@@ -1565,7 +1763,7 @@ for epoch in range(MAX_EPOCHS):
             aoa_loss2 = F.mse_loss(aoa_pred2, aoa_target)
             loss2 = vol_loss2 + surf_weight * surf_loss2 + 0.01 * re_loss2 + 0.01 * aoa_loss2
             loss2.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(_clip_params, max_norm=1.0)
             sam_optimizer.restore()
         if use_pcgrad or _should_step:
             optimizer.step()
@@ -1760,7 +1958,19 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    _eval_out = eval_model({"x": x})
+                    pred = _eval_out["preds"]
+                    # Hybrid anchor-decoder for eval
+                    _eval_decoder = anchor_decoder
+                    if _eval_decoder is not None and ema_model is not None:
+                        # Use EMA anchor decoder if available
+                        pass  # anchor_decoder doesn't have EMA; use as-is
+                    if _eval_decoder is not None:
+                        _hidden = _eval_out["hidden"]
+                        is_tandem_flag = (x[:, 0, 21].abs() > 0.01) if cfg.hybrid_domain_anchors else None
+                        surf_pred = _eval_decoder(_hidden, is_surface=is_surface, mask=mask, is_tandem=is_tandem_flag)
+                        surf_sel = is_surface.unsqueeze(-1).float()
+                        pred = surf_pred * surf_sel + pred * (1.0 - surf_sel)
                 pred = pred.float()
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
