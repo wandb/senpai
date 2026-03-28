@@ -698,6 +698,446 @@ class Transolver(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Transolver++ V2 (from arXiv 2502.02414, ICML 2025)
+# ---------------------------------------------------------------------------
+
+def gumbel_softmax(logits, tau=1.0, hard=False, training=True):
+    """Gumbel-Softmax with per-point adaptive temperature.
+
+    Args:
+        logits: [B, H, N, M] slice logits
+        tau: [B, H, N, 1] or scalar temperature
+        hard: use straight-through estimator (unused in practice)
+        training: add Gumbel noise only during training
+    """
+    if training:
+        u = torch.rand_like(logits)
+        gumbel_noise = -torch.log(-torch.log(u + 1e-8) + 1e-8)
+        y = (logits + gumbel_noise) / tau
+    else:
+        y = logits / tau
+    y = F.softmax(y, dim=-1)
+    if hard:
+        _, y_hard = y.max(dim=-1)
+        y_one_hot = torch.zeros_like(y).scatter_(-1, y_hard.unsqueeze(-1), 1.0)
+        y = (y_one_hot - y).detach() + y
+    return y
+
+
+class Physics_Attention_Eidetic(nn.Module):
+    """Transolver++ eidetic physics attention with per-point adaptive temperature
+    and Gumbel-Softmax slice assignment. Single projection (no separate fx)."""
+
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
+                 gumbel_scale=1.0):
+        super().__init__()
+        inner_dim = dim_head * heads
+        self.dim_head = dim_head
+        self.heads = heads
+        self.slice_num = slice_num
+        self.gumbel_scale = gumbel_scale
+        self.softmax = nn.Softmax(dim=-1)
+        self.dropout = nn.Dropout(dropout)
+
+        # Single projection (Transolver++ removes in_project_fx)
+        self.in_project_x = nn.Linear(dim, inner_dim)
+        self.in_project_slice = nn.Linear(dim_head, slice_num)
+        torch.nn.init.orthogonal_(self.in_project_slice.weight)
+
+        # Per-point adaptive temperature (Ada-Temp from paper)
+        self.proj_temperature = nn.Sequential(
+            nn.Linear(dim_head, slice_num),
+            nn.GELU(),
+            nn.Linear(slice_num, 1),
+            nn.GELU(),
+        )
+        self.temperature_bias = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
+
+        # Slice-to-slice attention (Q/K/V)
+        self.to_q = nn.Linear(dim_head, dim_head, bias=False)
+        self.to_k = nn.Linear(dim_head, dim_head, bias=False)
+        self.to_v = nn.Linear(dim_head, dim_head, bias=False)
+
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        bsz, num_points, _ = x.shape
+
+        # Single projection for both routing and aggregation
+        x_mid = (
+            self.in_project_x(x)
+            .reshape(bsz, num_points, self.heads, self.dim_head)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )  # [B, H, N, D]
+
+        # Per-point adaptive temperature
+        temperature = self.proj_temperature(x_mid) + self.temperature_bias  # [B, H, N, 1]
+        temperature = torch.clamp(temperature, min=0.01)
+
+        # Gumbel-Softmax slice assignment
+        slice_logits = self.in_project_slice(x_mid) * self.gumbel_scale  # [B, H, N, M]
+        slice_weights = gumbel_softmax(
+            slice_logits, tau=temperature, training=self.training
+        )  # [B, H, N, M]
+
+        # Aggregate node features into slice tokens (using x_mid, not separate fx)
+        slice_norm = slice_weights.sum(2)  # [B, H, M]
+        slice_token = torch.einsum("bhnc,bhng->bhgc", x_mid, slice_weights)  # [B, H, M, D]
+        slice_token = slice_token / (slice_norm.unsqueeze(-1) + 1e-5)
+
+        # Slice-to-slice attention via scaled_dot_product_attention (flash-friendly)
+        q = self.to_q(slice_token)  # [B, H, M, D]
+        k = self.to_k(slice_token)
+        v = self.to_v(slice_token)
+        out_slice = F.scaled_dot_product_attention(q, k, v)  # [B, H, M, D]
+
+        # Broadcast back to nodes
+        out_x = torch.einsum("bhgc,bhng->bhnc", out_slice, slice_weights)  # [B, H, N, D]
+        out_x = rearrange(out_x, "b h n d -> b n (h d)")
+        return self.to_out(out_x)
+
+
+class TransolverPPBlock(nn.Module):
+    """Transolver++ block: pre-norm attention + pre-norm FFN with gradient checkpointing."""
+
+    def __init__(
+        self,
+        num_heads: int,
+        hidden_dim: int,
+        dropout: float,
+        act="gelu",
+        mlp_ratio=2,
+        last_layer=False,
+        out_dim=1,
+        slice_num=32,
+        gumbel_scale=1.0,
+        field_decoder=False,
+        adaln_output=False,
+        domain_layernorm=False,
+        dln_zeroinit=False,
+        domain_velhead=False,
+        pressure_first=False,
+        pressure_no_detach=False,
+        pressure_deep=False,
+        use_checkpoint=True,
+    ):
+        super().__init__()
+        self.last_layer = last_layer
+        self.field_decoder = field_decoder
+        self.domain_velhead = domain_velhead
+        self.pressure_first = pressure_first
+        self.pressure_no_detach = pressure_no_detach
+        self.adaln_output = adaln_output
+        self.domain_layernorm = domain_layernorm
+        self.use_checkpoint = use_checkpoint
+
+        _LN = (lambda d: DomainLayerNorm(d, zeroinit=dln_zeroinit)) if domain_layernorm else nn.LayerNorm
+
+        # Pre-norm layers
+        self.ln_1 = _LN(hidden_dim)
+        self.ln_2 = _LN(hidden_dim)
+
+        # Eidetic physics attention
+        self.attn = Physics_Attention_Eidetic(
+            hidden_dim,
+            heads=num_heads,
+            dim_head=hidden_dim // num_heads,
+            dropout=dropout,
+            slice_num=slice_num,
+            gumbel_scale=gumbel_scale,
+        )
+
+        # FFN: Linear → GELU → Linear (no inner residual, matching paper)
+        self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+
+        # Output heads (last layer only)
+        if self.last_layer:
+            self.ln_3 = nn.LayerNorm(hidden_dim)
+            if pressure_first:
+                if pressure_deep:
+                    self.pres_head = nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(),
+                        nn.Linear(hidden_dim * 2, hidden_dim), nn.GELU(),
+                        nn.Linear(hidden_dim, 1),
+                    )
+                else:
+                    self.pres_head = nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(), nn.Linear(hidden_dim * 2, 1)
+                    )
+                self.vel_head_conditioned = nn.Sequential(
+                    nn.Linear(hidden_dim + 1, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2)
+                )
+            elif domain_velhead:
+                self.velhead_single = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+                self.velhead_tandem = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+            elif field_decoder:
+                self.vel_head = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2)
+                )
+                self.pres_head = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(), nn.Linear(hidden_dim * 2, 1)
+                )
+            elif adaln_output:
+                self.cond_net = nn.Sequential(nn.Linear(2, hidden_dim * 2), nn.GELU())
+                self.mlp2 = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+            else:
+                self.mlp2 = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+
+    def _attn_forward(self, x):
+        """Attention forward (for gradient checkpointing)."""
+        return self.attn(x)
+
+    def _mlp_forward(self, x):
+        """MLP forward (for gradient checkpointing)."""
+        return self.mlp(x)
+
+    def forward(self, fx, tandem_mask=None, condition=None):
+        dln_it = (tandem_mask.view(-1) > 0.5) if (self.domain_layernorm and tandem_mask is not None) else None
+        if self.domain_layernorm:
+            def _ln(m, x): return m(x, is_tandem=dln_it)
+        else:
+            def _ln(m, x): return m(x)
+
+        # Pre-norm + attention + residual (with optional gradient checkpointing)
+        if self.training and self.use_checkpoint:
+            fx = torch.utils.checkpoint.checkpoint(
+                self._attn_forward, _ln(self.ln_1, fx), use_reentrant=False
+            ) + fx
+            fx = torch.utils.checkpoint.checkpoint(
+                self._mlp_forward, _ln(self.ln_2, fx), use_reentrant=False
+            ) + fx
+        else:
+            fx = self.attn(_ln(self.ln_1, fx)) + fx
+            fx = self.mlp(_ln(self.ln_2, fx)) + fx
+
+        if self.last_layer:
+            fx_ln = self.ln_3(fx)
+            if self.pressure_first:
+                p_pred = self.pres_head(fx_ln)
+                p_cond = p_pred if self.pressure_no_detach else p_pred.detach()
+                vel_input = torch.cat([fx_ln, p_cond], dim=-1)
+                v_pred = self.vel_head_conditioned(vel_input)
+                return torch.cat([v_pred, p_pred], dim=-1)
+            elif self.domain_velhead:
+                out_s = self.velhead_single(fx_ln)
+                out_t = self.velhead_tandem(fx_ln)
+                if tandem_mask is not None:
+                    is_tan = (tandem_mask.view(-1) > 0.5).view(-1, 1, 1)
+                    return torch.where(is_tan.expand_as(out_s), out_t, out_s)
+                return out_s
+            elif self.field_decoder:
+                return torch.cat([self.vel_head(fx_ln), self.pres_head(fx_ln)], dim=-1)
+            elif self.adaln_output and condition is not None:
+                cond = self.cond_net(condition)
+                scale, shift = cond.chunk(2, dim=-1)
+                fx_ln = fx_ln * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+                return self.mlp2(fx_ln)
+            else:
+                return self.mlp2(fx_ln)
+        return fx
+
+
+class TransolverPP(nn.Module):
+    """Transolver++ V2: complete reimplementation from arXiv 2502.02414.
+
+    Key differences from original Transolver:
+    - Single projection (no in_project_fx) → 50% less attention memory
+    - Per-point adaptive temperature via learned MLP (Ada-Temp)
+    - Gumbel-Softmax slice assignment (soft, with noise during training)
+    - F.scaled_dot_product_attention for flash attention support
+    - Gradient checkpointing during training
+    """
+
+    def __init__(
+        self,
+        space_dim=1,
+        n_layers=5,
+        n_hidden=256,
+        dropout=0.0,
+        n_head=8,
+        act="gelu",
+        mlp_ratio=2,
+        fun_dim=1,
+        out_dim=1,
+        slice_num=32,
+        ref=8,
+        unified_pos=False,
+        output_fields=None,
+        output_dims=None,
+        gumbel_scale=1.0,
+        field_decoder=False,
+        adaln_output=False,
+        domain_layernorm=False,
+        dln_zeroinit=False,
+        domain_velhead=False,
+        pressure_first=False,
+        pressure_no_detach=False,
+        pressure_deep=False,
+        use_checkpoint=True,
+        # Accept but ignore unused original Transolver kwargs for compatibility
+        **kwargs,
+    ):
+        super().__init__()
+        self.__name__ = "TransolverPP_V2"
+        self.pressure_first = pressure_first
+        self.ref = ref
+        self.unified_pos = unified_pos
+        self.adaln_output = adaln_output
+
+        if output_fields is None or output_dims is None:
+            raise ValueError("output_fields and output_dims must be provided")
+        self.output_fields = output_fields
+        self.output_dims = output_dims
+
+        # Preprocessing: same GatedMLP2 as original
+        if self.unified_pos:
+            self.preprocess = MLP(
+                fun_dim + self.ref**3, n_hidden * 2, n_hidden, n_layers=0, res=False, act=act
+            )
+        else:
+            self.preprocess = GatedMLP2(fun_dim + space_dim, n_hidden * 2, n_hidden)
+
+        self.n_hidden = n_hidden
+        self.space_dim = space_dim
+        self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
+        nn.init.eye_(self.feature_cross.weight)
+
+        # Transolver++ blocks
+        self.blocks = nn.ModuleList([
+            TransolverPPBlock(
+                num_heads=n_head,
+                hidden_dim=n_hidden,
+                dropout=dropout,
+                act=act,
+                mlp_ratio=mlp_ratio,
+                out_dim=out_dim,
+                slice_num=slice_num,
+                gumbel_scale=gumbel_scale,
+                last_layer=(idx == n_layers - 1),
+                field_decoder=field_decoder if (idx == n_layers - 1) else False,
+                adaln_output=adaln_output if (idx == n_layers - 1) else False,
+                domain_layernorm=domain_layernorm,
+                dln_zeroinit=dln_zeroinit,
+                domain_velhead=domain_velhead if (idx == n_layers - 1) else False,
+                pressure_first=pressure_first if (idx == n_layers - 1) else False,
+                pressure_no_detach=pressure_no_detach,
+                pressure_deep=pressure_deep,
+                use_checkpoint=use_checkpoint,
+            )
+            for idx in range(n_layers)
+        ])
+
+        self._pressure_separate = False
+        self.pressure_sep_mlp = nn.Sequential(
+            nn.LayerNorm(n_hidden),
+            nn.Linear(n_hidden, n_hidden * 2), nn.GELU(),
+            nn.Linear(n_hidden * 2, n_hidden), nn.GELU(),
+            nn.Linear(n_hidden, 1),
+        )
+
+        self.initialize_weights()
+
+        self.out_skip = nn.Linear(n_hidden, out_dim)
+        nn.init.zeros_(self.out_skip.weight)
+        nn.init.zeros_(self.out_skip.bias)
+        self.skip_gate = nn.Sequential(nn.Linear(n_hidden, 1), nn.Sigmoid())
+        nn.init.constant_(self.skip_gate[0].bias, -2.0)
+        self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
+        self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
+        self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])
+        self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+
+    def initialize_weights(self):
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            if module.weight.dim() >= 2:
+                nn.init.orthogonal_(module.weight, gain=1.0)
+            else:
+                nn.init.normal_(module.weight, std=0.01)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, (nn.LayerNorm, nn.BatchNorm1d)):
+            nn.init.constant_(module.bias, 0)
+            nn.init.constant_(module.weight, 1.0)
+
+    def _unpack_inputs(self, data, pos=None, condition=None):
+        if not isinstance(data, Mapping):
+            raise TypeError("Model input must be a Mapping with keys: x, pos, condition")
+        x = data.get("x")
+        pos = data.get("pos", pos)
+        condition = data.get("condition", condition)
+        return x, pos, condition
+
+    def _validate_output_dims(self, preds):
+        if sum(self.output_dims) != preds.shape[-1]:
+            raise ValueError("Sum of output_dims must match preds last dimension")
+
+    def forward(self, data, pos=None, condition=None):
+        x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
+        if x is None:
+            raise ValueError("Missing required input tensor: x")
+
+        # Detect tandem samples
+        is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
+
+        if self.unified_pos:
+            if pos is None:
+                raise ValueError("Missing required input tensor: pos")
+            new_pos = self.get_grid(pos)
+            x = torch.cat((x, new_pos), dim=-1)
+
+        x_cross = x * self.feature_cross(x)
+        x = x + 0.1 * x_cross
+
+        fx = self.preprocess(x)
+        fx_pre = fx
+        fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
+
+        # adaln_output condition
+        last_condition = x[:, 0, 13:15] if self.adaln_output else None
+
+        for block in self.blocks[:-1]:
+            fx = block(fx, tandem_mask=is_tandem)
+
+        re_pred = self.re_head(fx.mean(dim=1))
+        aoa_pred = self.aoa_head(fx.mean(dim=1))
+
+        if self._pressure_separate and self.pressure_first:
+            fx_for_pressure = fx
+            p_sep = self.pressure_sep_mlp(fx_for_pressure)
+            fx = self.blocks[-1](fx, tandem_mask=is_tandem, condition=last_condition)
+            fx = torch.cat([fx[:, :, :2], p_sep], dim=-1)
+        else:
+            fx = self.blocks[-1](fx, tandem_mask=is_tandem, condition=last_condition)
+
+        gate = self.skip_gate(fx_pre)
+        fx = fx + gate * self.out_skip(fx_pre)
+        self._validate_output_dims(fx)
+        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+
+
+# ---------------------------------------------------------------------------
+# End Transolver++ V2
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
 # End Transolver model
 # ---------------------------------------------------------------------------
 
@@ -814,6 +1254,10 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Transolver++ V2 (arXiv 2502.02414)
+    transolver_pp: bool = False       # use Transolver++ V2 instead of original Transolver
+    gumbel_scale: float = 1.0         # Gumbel-Softmax logit scale (default 1.0, try 0.2 for stronger)
+    pp_checkpoint: bool = True         # gradient checkpointing in T++ blocks
 
 
 cfg = sp.parse(Config)
@@ -968,7 +1412,10 @@ model_config = dict(
     pressure_deep=cfg.pressure_deep,
 )
 
-model = Transolver(**model_config).to(device)
+if cfg.transolver_pp:
+    model = TransolverPP(**model_config, gumbel_scale=cfg.gumbel_scale, use_checkpoint=cfg.pp_checkpoint).to(device)
+else:
+    model = Transolver(**model_config).to(device)
 model._pressure_separate = cfg.pressure_separate_last_block
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode=cfg.compile_mode)
@@ -1623,7 +2070,7 @@ for epoch in range(MAX_EPOCHS):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             base_opt, T_max=remaining, eta_min=cfg.cosine_eta_min
         )
-    if epoch >= cfg.temp_anneal_epoch:
+    if epoch >= cfg.temp_anneal_epoch and hasattr(_base_model.blocks[0].attn, 'temperature'):
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
     if cfg.prog_slices:
