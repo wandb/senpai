@@ -442,42 +442,29 @@ class ABUPT(nn.Module):
         re_pred = self.re_head(pooled)
         aoa_pred = self.aoa_head(pooled)
 
-        if self.training:
-            # Training: predict at anchor locations only (skip decoder for speed/memory)
-            anc_decoded = self.final_norm(anc_h)
-            if self.pressure_first:
-                p = self.pres_head(anc_decoded)
-                v = self.vel_head(torch.cat([anc_decoded, p.detach()], dim=-1))
-                anc_preds = torch.cat([v, p], dim=-1)
-            else:
-                anc_preds = self.output_head(anc_decoded)
-
-            # Scatter anchor predictions back to full mesh (non-anchor nodes get 0)
-            preds = torch.zeros(B, N, anc_preds.shape[-1], device=dev)
-            anchor_idx = torch.cat([si, vi], dim=1)
-            anchor_valid = torch.cat([smask, vmask], dim=1)
-            bi_a = torch.arange(B, device=dev).view(B, 1).expand_as(anchor_idx)
-            preds[bi_a, anchor_idx] = anc_preds
-
-            # pred_mask: True for nodes with valid predictions
-            pred_mask = torch.zeros(B, N, dtype=torch.bool, device=dev)
-            pred_mask[bi_a[anchor_valid], anchor_idx[anchor_valid]] = True
-
-            return {"preds": preds, "pred_mask": pred_mask,
-                    "re_pred": re_pred, "aoa_pred": aoa_pred}
+        # Always predict at anchor locations (fast, no decoder needed)
+        # During eval, we use more anchors (all surface + larger volume sample)
+        anc_decoded = self.final_norm(anc_h)
+        if self.pressure_first:
+            p = self.pres_head(anc_decoded)
+            v = self.vel_head(torch.cat([anc_decoded, p.detach()], dim=-1))
+            anc_preds = torch.cat([v, p], dim=-1)
         else:
-            # Eval: full decoder to reconstruct all nodes
-            anc_pos = torch.cat([raw_pos[bi_s, si], raw_pos[bi_v, vi]], dim=1)
-            decoded = self.decoder(h, raw_pos, anc_h, anc_pos)
-            decoded = self.final_norm(decoded)
-            if self.pressure_first:
-                p = self.pres_head(decoded)
-                v = self.vel_head(torch.cat([decoded, p.detach()], dim=-1))
-                preds = torch.cat([v, p], dim=-1)
-            else:
-                preds = self.output_head(decoded)
+            anc_preds = self.output_head(anc_decoded)
 
-            return {"preds": preds, "re_pred": re_pred, "aoa_pred": aoa_pred}
+        # Scatter anchor predictions back to full mesh (non-anchor nodes get 0)
+        preds = torch.zeros(B, N, anc_preds.shape[-1], device=dev)
+        anchor_idx = torch.cat([si, vi], dim=1)
+        anchor_valid = torch.cat([smask, vmask], dim=1)
+        bi_a = torch.arange(B, device=dev).view(B, 1).expand_as(anchor_idx)
+        preds[bi_a, anchor_idx] = anc_preds
+
+        # pred_mask: True for nodes with valid predictions
+        pred_mask = torch.zeros(B, N, dtype=torch.bool, device=dev)
+        pred_mask[bi_a[anchor_valid], anchor_idx[anchor_valid]] = True
+
+        return {"preds": preds, "pred_mask": pred_mask,
+                "re_pred": re_pred, "aoa_pred": aoa_pred}
 
 
 # ---------------------------------------------------------------------------
@@ -1532,8 +1519,13 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x, "is_surface": is_surface, "mask": mask})["preds"]
+                    _eval_out = eval_model({"x": x, "is_surface": is_surface, "mask": mask})
+                    pred = _eval_out["preds"]
                 pred = pred.float()
+                # AB-UPT: restrict to anchor nodes during eval
+                _eval_pm = _eval_out.get("pred_mask")
+                if _eval_pm is not None:
+                    mask = mask & _eval_pm
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
                 else:
