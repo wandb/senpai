@@ -642,6 +642,155 @@ class Transolver(nn.Module):
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
 
+class DeepONet(nn.Module):
+    """Branch-Trunk Deep Operator Network for CFD flow prediction.
+
+    Branch: encodes global conditions (Re, AoA, shape params) → P basis coefficients
+    Trunk: encodes local spatial features (pos, saf, dsdf) → P basis function values
+    Output: dot product of branch and trunk, per output channel.
+    """
+
+    def __init__(self, cond_dim=13, spatial_dim=58, n_basis=128, n_hidden=256,
+                 branch_layers=4, trunk_layers=4, out_dim=3, domain_heads=False,
+                 residual_nets=False):
+        super().__init__()
+        self.n_basis = n_basis
+        self.out_dim = out_dim
+        self.domain_heads = domain_heads
+        self.residual_nets = residual_nets
+
+        # Branch: global conditions → basis coefficients [3 * n_basis]
+        branch_mods = []
+        in_d = cond_dim
+        for i in range(branch_layers):
+            out_d = n_hidden
+            branch_mods.append(nn.Linear(in_d, out_d))
+            branch_mods.append(nn.GELU())
+            in_d = out_d
+        branch_mods.append(nn.Linear(n_hidden, out_dim * n_basis))
+        self.branch = nn.Sequential(*branch_mods)
+        if residual_nets:
+            self.branch_res = nn.ModuleList([
+                nn.Linear(n_hidden, n_hidden) for _ in range(branch_layers - 1)
+            ])
+
+        # Trunk: spatial features → basis function values [3 * n_basis]
+        trunk_mods = []
+        in_d = spatial_dim
+        for i in range(trunk_layers):
+            out_d = n_hidden
+            trunk_mods.append(nn.Linear(in_d, out_d))
+            trunk_mods.append(nn.GELU())
+            in_d = out_d
+        trunk_mods.append(nn.Linear(n_hidden, out_dim * n_basis))
+        self.trunk = nn.Sequential(*trunk_mods)
+        if residual_nets:
+            self.trunk_res = nn.ModuleList([
+                nn.Linear(n_hidden, n_hidden) for _ in range(trunk_layers - 1)
+            ])
+
+        # Bias per output channel
+        self.bias = nn.Parameter(torch.zeros(out_dim))
+
+        # Domain-specific output refinement
+        if domain_heads:
+            self.refine_single = nn.Sequential(nn.Linear(out_dim, 64), nn.GELU(), nn.Linear(64, out_dim))
+            self.refine_tandem = nn.Sequential(nn.Linear(out_dim, 64), nn.GELU(), nn.Linear(64, out_dim))
+            nn.init.zeros_(self.refine_single[-1].weight)
+            nn.init.zeros_(self.refine_single[-1].bias)
+            nn.init.zeros_(self.refine_tandem[-1].weight)
+            nn.init.zeros_(self.refine_tandem[-1].bias)
+
+        # Auxiliary heads (same interface as Transolver)
+        self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+
+        self._init_weights()
+
+        # Fourier PE compatibility with Transolver training loop
+        self.register_buffer('fourier_freqs_fixed', torch.tensor([0.5, 2.0, 8.0, 32.0]))
+        self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def _branch_forward(self, conditions):
+        """Branch with optional residual connections."""
+        if not self.residual_nets:
+            return self.branch(conditions)
+        x = conditions
+        idx = 0
+        for i, layer in enumerate(self.branch):
+            if isinstance(layer, nn.GELU) and idx < len(self.branch_res):
+                # After GELU, apply residual if dims match
+                res = self.branch_res[idx](x)
+                x = layer(x) + res
+                idx += 1
+            else:
+                x = layer(x)
+        return x
+
+    def _trunk_forward(self, spatial):
+        """Trunk with optional residual connections."""
+        if not self.residual_nets:
+            return self.trunk(spatial)
+        x = spatial
+        idx = 0
+        for i, layer in enumerate(self.trunk):
+            if isinstance(layer, nn.GELU) and idx < len(self.trunk_res):
+                res = self.trunk_res[idx](x)
+                x = layer(x) + res
+                idx += 1
+            else:
+                x = layer(x)
+        return x
+
+    def forward(self, data, pos=None, condition=None):
+        if isinstance(data, dict):
+            x = data["x"]
+        else:
+            x = data
+        B, N, D = x.shape
+
+        # Extract global conditions from first node (same for all nodes)
+        # Indices: 11-23 cover NACA, AoA, Re, gap, stagger etc.
+        conditions = x[:, 0, 11:24]  # [B, 13]
+
+        # Branch: conditions → basis coefficients
+        branch_out = self._branch_forward(conditions)  # [B, 3*P]
+        branch_out = branch_out.view(B, self.out_dim, self.n_basis)  # [B, 3, P]
+
+        # Trunk: spatial features → basis values (using full x as spatial input)
+        trunk_out = self._trunk_forward(x)  # [B, N, 3*P]
+        trunk_out = trunk_out.view(B, N, self.out_dim, self.n_basis)  # [B, N, 3, P]
+
+        # Dot product: sum over basis functions
+        output = torch.einsum("bcp, bncp -> bnc", branch_out, trunk_out) + self.bias  # [B, N, 3]
+
+        # Domain-specific refinement
+        if self.domain_heads:
+            is_tandem = (x[:, 0, 21].abs() > 0.01)  # [B]
+            if is_tandem.any():
+                ref_s = self.refine_single(output)
+                ref_t = self.refine_tandem(output)
+                is_tan = is_tandem.view(-1, 1, 1).expand_as(output)
+                output = output + torch.where(is_tan, ref_t, ref_s)
+
+        # Auxiliary heads from branch hidden (use penultimate branch activation)
+        # Get hidden from branch by running up to second-to-last layer
+        h = conditions
+        for layer in list(self.branch)[:-1]:
+            h = layer(h)
+        re_pred = self.re_head(h)
+        aoa_pred = self.aoa_head(h)
+
+        return {"preds": output, "re_pred": re_pred, "aoa_pred": aoa_pred}
+
+
 # ---------------------------------------------------------------------------
 # End Transolver model
 # ---------------------------------------------------------------------------
@@ -751,6 +900,13 @@ class Config:
     # Phase 4: throughput optimization
     val_every: int = 1                  # validate every N epochs (1 = every epoch)
     disable_pcgrad: bool = False        # skip PCGrad dual-backward, use simple combined loss
+    # Phase 5: DeepONet
+    model_type: str = "transolver"     # "transolver" or "deeponet"
+    n_basis: int = 128                  # number of basis functions for DeepONet
+    branch_layers: int = 4              # depth of branch network
+    trunk_layers: int = 4               # depth of trunk network
+    domain_heads_deeponet: bool = False # domain-specific output refinement
+    residual_deeponet: bool = False     # residual connections in branch/trunk
     vol_subsample_frac: float = 1.0     # fraction of volume nodes in loss after vol_ramp (0.8 = 80%)
     compile_mode: str = "default"       # torch.compile mode: "default", "max-autotune", "reduce-overhead"
     num_workers: int = 4                # data loader workers
@@ -905,7 +1061,22 @@ model_config = dict(
     prog_slices=cfg.prog_slices,
 )
 
-model = Transolver(**model_config).to(device)
+if cfg.model_type == "deeponet":
+    # fun_dim + space_dim = total input features after preprocessing
+    spatial_dim = model_config["fun_dim"] + model_config["space_dim"]
+    model = DeepONet(
+        cond_dim=13, spatial_dim=spatial_dim,
+        n_basis=cfg.n_basis, n_hidden=cfg.n_hidden,
+        branch_layers=cfg.branch_layers, trunk_layers=cfg.trunk_layers,
+        out_dim=3, domain_heads=cfg.domain_heads_deeponet,
+        residual_nets=cfg.residual_deeponet,
+    ).to(device)
+    model_config["model_type"] = "deeponet"
+    model_config["n_basis"] = cfg.n_basis
+    model_config["branch_layers"] = cfg.branch_layers
+    model_config["trunk_layers"] = cfg.trunk_layers
+else:
+    model = Transolver(**model_config).to(device)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
