@@ -139,7 +139,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False,
+                 gumbel_scale=0.0, ada_temp=False, mem_opt=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -154,13 +155,26 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.decouple_slice = decouple_slice
         self.zone_temp = zone_temp
         self.prog_slices = prog_slices
+        self.gumbel_scale = gumbel_scale
+        self.ada_temp = ada_temp
+        self.mem_opt = mem_opt
         if prog_slices:
             # Buffer for masking inactive slices; updated per-epoch by training loop
             self.register_buffer('slice_mask', torch.zeros(slice_num))
 
         self.in_project_x = nn.Linear(dim, inner_dim)
-        self.in_project_fx = nn.Linear(dim, inner_dim)
+        if not mem_opt:
+            self.in_project_fx = nn.Linear(dim, inner_dim)
         self.in_project_slice = nn.Linear(dim_head, slice_num)
+        # Transolver++: per-point adaptive temperature
+        if ada_temp:
+            self.temp_mlp = nn.Sequential(
+                nn.Linear(dim_head, dim_head // 4),
+                nn.GELU(),
+                nn.Linear(dim_head // 4, 1),
+            )
+            nn.init.zeros_(self.temp_mlp[-1].weight)
+            nn.init.zeros_(self.temp_mlp[-1].bias)
         torch.nn.init.orthogonal_(self.in_project_slice.weight)
         if decouple_slice:
             # Separate slice projection for tandem samples
@@ -189,18 +203,23 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
     def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None):
         bsz, num_points, _ = x.shape
 
-        fx_mid = (
-            self.in_project_fx(x)
-            .reshape(bsz, num_points, self.heads, self.dim_head)
-            .permute(0, 2, 1, 3)
-            .contiguous()
-        )
         x_mid = (
             self.in_project_x(x)
             .reshape(bsz, num_points, self.heads, self.dim_head)
             .permute(0, 2, 1, 3)
             .contiguous()
         )
+        if self.mem_opt:
+            # Transolver++ memory optimization: reuse x_mid for both fx and slice computation
+            fx_mid = x_mid
+        else:
+            fx_mid = (
+                self.in_project_fx(x)
+                .reshape(bsz, num_points, self.heads, self.dim_head)
+                .permute(0, 2, 1, 3)
+                .contiguous()
+            )
+
         temp = self.temperature
         if self.zone_temp and zone_features is not None:
             # zone_features: [B, 3] → per-head offset [B, heads] → [B, heads, 1, 1]
@@ -208,6 +227,10 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             temp = temp + zone_offset
         if tandem_mask is not None:
             temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
+        # Transolver++: per-point adaptive temperature
+        if self.ada_temp:
+            ada_t = self.temp_mlp(x_mid)  # [B, H, N, 1]
+            temp = temp + ada_t
         temp = temp.clamp(min=1e-4)
         if self.decouple_slice and tandem_mask is not None:
             std_logits = self.in_project_slice(x_mid) / temp
@@ -221,6 +244,10 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         if self.prog_slices:
             # Apply slice mask: 0 for active slices, -1e9 for inactive (updated each epoch)
             slice_logits = slice_logits + self.slice_mask
+        # Transolver++: Gumbel-Softmax for sharper slice assignment
+        if self.training and self.gumbel_scale > 0:
+            gumbel_noise = -torch.log(-torch.log(torch.rand_like(slice_logits).clamp(min=1e-10)) + 1e-10)
+            slice_logits = slice_logits + self.gumbel_scale * gumbel_noise
         slice_weights = self.softmax(slice_logits)
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
@@ -282,6 +309,7 @@ class TransolverBlock(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        **kwargs,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -307,6 +335,9 @@ class TransolverBlock(nn.Module):
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
             prog_slices=prog_slices,
+            gumbel_scale=kwargs.get('gumbel_scale', 0.0),
+            ada_temp=kwargs.get('ada_temp', False),
+            mem_opt=kwargs.get('mem_opt', False),
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -484,6 +515,9 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        gumbel_scale=0.0,
+        ada_temp=False,
+        mem_opt=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -554,6 +588,9 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
+                    gumbel_scale=gumbel_scale,
+                    ada_temp=ada_temp,
+                    mem_opt=mem_opt,
                 )
                 for idx in range(n_layers)
             ]
@@ -814,6 +851,10 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Transolver++ components
+    gumbel_scale: float = 0.0          # Gumbel-Softmax noise scale for slice assignment (0=disabled)
+    ada_temp: bool = False             # per-point adaptive temperature via MLP
+    mem_opt: bool = False              # memory-efficient: remove in_project_fx, reuse in_project_x
 
 
 cfg = sp.parse(Config)
@@ -966,6 +1007,9 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    gumbel_scale=cfg.gumbel_scale,
+    ada_temp=cfg.ada_temp,
+    mem_opt=cfg.mem_opt,
 )
 
 model = Transolver(**model_config).to(device)
