@@ -814,6 +814,12 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Reynolds scaling augmentation
+    re_scaling_aug: bool = False        # enable Re-scaling data augmentation
+    re_alpha: float = 0.5               # Blasius velocity scaling exponent (u ~ Re^alpha)
+    re_aug_prob: float = 0.3            # probability of applying Re-scaling per sample
+    re_range_lo: float = 0.5           # lower bound of Re multiplier range
+    re_range_hi: float = 3.0           # upper bound of Re multiplier range
 
 
 cfg = sp.parse(Config)
@@ -1276,6 +1282,32 @@ for epoch in range(MAX_EPOCHS):
                     x[_b, _in_region] = x[_cut_idx[_b], _in_region]
                     y[_b, _in_region] = y[_cut_idx[_b], _in_region]
                     is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
+
+        # --- Reynolds scaling augmentation (applied independently of cfg.aug) ---
+        # Physics basis: Cp is Re-independent for attached flow; velocity scales as u ~ Re^alpha
+        # log_Re feature is at x[:, :, 13] (see data/prepare_multi.py)
+        if model.training and cfg.re_scaling_aug:
+            _B_re = x.size(0)
+            # Per-sample apply probability
+            _apply_mask = torch.rand(_B_re, device=x.device) < cfg.re_aug_prob  # [B]
+            if _apply_mask.any():
+                _re_scale = (
+                    torch.empty(_B_re, device=x.device)
+                    .uniform_(cfg.re_range_lo, cfg.re_range_hi)
+                )  # [B] — multiplicative Re factor
+                # Velocity scaling: u_new = u_old * (Re_new/Re_old)^alpha
+                _vel_scale = _re_scale ** cfg.re_alpha  # [B]
+                _vel_scale_bc = _vel_scale.view(_B_re, 1, 1)  # [B, 1, 1]
+                _apply_bc = _apply_mask.view(_B_re, 1, 1)  # [B, 1, 1]
+                # Scale Ux, Uy channels (indices 0, 1) in y — pressure unchanged (Cp is Re-independent)
+                y_aug = y.clone()
+                y_aug[:, :, 0:2] = y[:, :, 0:2] * _vel_scale_bc
+                y = torch.where(_apply_bc.expand_as(y), y_aug, y)
+                # Update log_Re feature in x (index 13, same value for all nodes in a sample)
+                x_aug = x.clone()
+                _log_re_new = x[:, :, 13:14] + _re_scale.log().view(_B_re, 1, 1)
+                x_aug[:, :, 13:14] = _log_re_new
+                x = torch.where(_apply_bc.expand_as(x), x_aug, x)
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
