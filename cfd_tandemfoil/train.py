@@ -647,6 +647,292 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# GNOT: General Neural Operator Transformer
+# (Hao et al., ICML 2023 — latent bottleneck cross-attention architecture)
+# ---------------------------------------------------------------------------
+
+class CrossAttention(nn.Module):
+    """Cross-attention between two sequences (e.g., input nodes <-> latent tokens)."""
+    def __init__(self, dim, heads=8, dim_head=64):
+        super().__init__()
+        inner_dim = heads * dim_head
+        self.heads = heads
+        self.dim_head = dim_head
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+        self.q = nn.Linear(dim, inner_dim, bias=False)
+        self.k = nn.Linear(dim, inner_dim, bias=False)
+        self.v = nn.Linear(dim, inner_dim, bias=False)
+        self.out = nn.Linear(inner_dim, dim)
+
+    def forward(self, x_q, x_kv, mask=None):
+        """
+        x_q: [B, Nq, D], x_kv: [B, Nkv, D]
+        mask: [B, Nkv] bool, True = valid node, False = padded
+        """
+        B, Nq, _ = x_q.shape
+        Nkv = x_kv.shape[1]
+        H, Dh = self.heads, self.dim_head
+
+        q = self.q(self.norm_q(x_q)).reshape(B, Nq, H, Dh).transpose(1, 2)
+        k = self.k(self.norm_kv(x_kv)).reshape(B, Nkv, H, Dh).transpose(1, 2)
+        v = self.v(self.norm_kv(x_kv)).reshape(B, Nkv, H, Dh).transpose(1, 2)
+
+        attn_mask = None
+        if mask is not None:
+            # Float mask: 0 for valid, -1e9 for padded (zeroed after softmax)
+            attn_mask = torch.zeros(B, 1, 1, Nkv, dtype=q.dtype, device=q.device)
+            attn_mask.masked_fill_(~mask[:, None, None, :], -1e9)
+
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        out = out.transpose(1, 2).reshape(B, Nq, H * Dh)
+        return self.out(out)
+
+
+class LatentBlock(nn.Module):
+    """Self-attention + FFN block for latent tokens (fixed-size sequence)."""
+    def __init__(self, dim, heads=8, mlp_ratio=4, domain_layernorm=False,
+                 dln_zeroinit=False, adaln=False):
+        super().__init__()
+        self.domain_layernorm = domain_layernorm
+        self.adaln = adaln
+        _LN = (lambda d: DomainLayerNorm(d, zeroinit=dln_zeroinit)) if domain_layernorm else nn.LayerNorm
+        self.norm1 = _LN(dim)
+        self.norm2 = _LN(dim)
+        self.heads = heads
+        self.dim_per_head = dim // heads
+        self.q = nn.Linear(dim, dim, bias=False)
+        self.k = nn.Linear(dim, dim, bias=False)
+        self.v = nn.Linear(dim, dim, bias=False)
+        self.attn_out = nn.Linear(dim, dim)
+        self.ffn = GatedMLP(dim, dim * mlp_ratio, dim)
+        if adaln:
+            self.adaln_net = nn.Sequential(
+                nn.Linear(2, 128), nn.SiLU(),
+                nn.Linear(128, dim * 4),
+            )
+            nn.init.zeros_(self.adaln_net[-1].weight)
+            nn.init.zeros_(self.adaln_net[-1].bias)
+
+    def _apply_norm(self, norm, x, is_tandem=None):
+        if self.domain_layernorm and is_tandem is not None:
+            return norm(x, is_tandem=is_tandem)
+        return norm(x)
+
+    def forward(self, x, is_tandem=None, condition=None):
+        B, N, D = x.shape
+        H, Dh = self.heads, self.dim_per_head
+
+        x_norm = self._apply_norm(self.norm1, x, is_tandem)
+        if self.adaln and condition is not None:
+            cond_out = self.adaln_net(condition)
+            s1, b1, s2, b2 = cond_out.chunk(4, dim=-1)
+            x_norm = x_norm * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
+
+        q = self.q(x_norm).reshape(B, N, H, Dh).transpose(1, 2)
+        k = self.k(x_norm).reshape(B, N, H, Dh).transpose(1, 2)
+        v = self.v(x_norm).reshape(B, N, H, Dh).transpose(1, 2)
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = attn_out.transpose(1, 2).reshape(B, N, D)
+        x = x + self.attn_out(attn_out)
+
+        x_norm2 = self._apply_norm(self.norm2, x, is_tandem)
+        if self.adaln and condition is not None:
+            x_norm2 = x_norm2 * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
+        x = x + self.ffn(x_norm2)
+        return x
+
+
+class GNOT(nn.Module):
+    """General Neural Operator Transformer.
+
+    1. Input encoder: project features -> n_hidden via GatedMLP2
+    2. Cross-attention: input nodes -> latent tokens (compress ~100K to N_latent)
+    3. L self-attention layers among latent tokens
+    4. Cross-attention: latent tokens -> output positions (expand back)
+    5. Output head: field_decoder with separate pressure/velocity MLPs
+    """
+    def __init__(
+        self,
+        space_dim=2,
+        n_layers=4,
+        n_hidden=192,
+        n_latent=256,
+        heads=8,
+        dim_head=64,
+        fun_dim=56,
+        out_dim=3,
+        field_decoder=False,
+        domain_layernorm=False,
+        dln_zeroinit=False,
+        domain_velhead=False,
+        gnot_adaln=False,
+        output_fields=None,
+        output_dims=None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.__name__ = "GNOT"
+        if output_fields is None or output_dims is None:
+            raise ValueError("output_fields and output_dims must be provided")
+        self.output_fields = output_fields
+        self.output_dims = output_dims
+        self.n_hidden = n_hidden
+        self.n_latent = n_latent
+        self.space_dim = space_dim
+        self.field_decoder = field_decoder
+        self.domain_velhead = domain_velhead
+        self.domain_layernorm = domain_layernorm
+        self.gnot_adaln = gnot_adaln
+
+        # Input encoder (same as Transolver)
+        self.preprocess = GatedMLP2(fun_dim + space_dim, n_hidden * 2, n_hidden)
+        self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
+        nn.init.eye_(self.feature_cross.weight)
+
+        # Fourier PE (must match training loop references to model.fourier_freqs_*)
+        self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])
+        self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+
+        # Learned latent tokens
+        self.latent_tokens = nn.Parameter(torch.randn(1, n_latent, n_hidden) * 0.02)
+
+        # Encode cross-attention: input nodes -> latent tokens
+        self.encode_cross_attn = CrossAttention(n_hidden, heads=heads, dim_head=dim_head)
+
+        # Self-attention layers among latent tokens
+        self.latent_blocks = nn.ModuleList([
+            LatentBlock(n_hidden, heads=heads, mlp_ratio=4,
+                        domain_layernorm=domain_layernorm, dln_zeroinit=dln_zeroinit,
+                        adaln=gnot_adaln)
+            for _ in range(n_layers)
+        ])
+
+        # Decode cross-attention: latent tokens -> output positions
+        self.decode_cross_attn = CrossAttention(n_hidden, heads=heads, dim_head=dim_head)
+
+        # Output normalization
+        self.out_norm = nn.LayerNorm(n_hidden)
+
+        # Output heads (same patterns as Transolver)
+        if domain_velhead:
+            self.velhead_single = nn.Sequential(
+                nn.Linear(n_hidden, n_hidden), nn.GELU(), nn.Linear(n_hidden, out_dim)
+            )
+            self.velhead_tandem = nn.Sequential(
+                nn.Linear(n_hidden, n_hidden), nn.GELU(), nn.Linear(n_hidden, out_dim)
+            )
+        elif field_decoder:
+            self.vel_head = nn.Sequential(
+                nn.Linear(n_hidden, n_hidden), nn.GELU(), nn.Linear(n_hidden, 2)
+            )
+            self.pres_head = nn.Sequential(
+                nn.Linear(n_hidden, n_hidden * 2), nn.GELU(), nn.Linear(n_hidden * 2, 1)
+            )
+        else:
+            self.out_head = nn.Sequential(
+                nn.Linear(n_hidden, n_hidden), nn.GELU(), nn.Linear(n_hidden, out_dim)
+            )
+
+        # Auxiliary heads
+        self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+
+        # Skip connection from encoder output
+        self.out_skip = nn.Linear(n_hidden, out_dim)
+        nn.init.zeros_(self.out_skip.weight)
+        nn.init.zeros_(self.out_skip.bias)
+        self.skip_gate = nn.Sequential(nn.Linear(n_hidden, 1), nn.Sigmoid())
+        nn.init.constant_(self.skip_gate[0].bias, -2.0)
+
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        self.apply(self._init_weights)
+        # Re-init latent tokens after general init
+        nn.init.normal_(self.latent_tokens, std=0.02)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            if module.weight.dim() >= 2:
+                nn.init.orthogonal_(module.weight, gain=1.0)
+            else:
+                nn.init.normal_(module.weight, std=0.01)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, (nn.LayerNorm, nn.BatchNorm1d)):
+            nn.init.constant_(module.bias, 0)
+            nn.init.constant_(module.weight, 1.0)
+
+    def forward(self, data, pos=None, condition=None):
+        x = data.get("x")
+        mask = data.get("mask")  # [B, N] bool, True = valid
+        if x is None:
+            raise ValueError("Missing required input tensor: x")
+
+        B, N, _ = x.shape
+
+        # Extract condition for AdaLN before feature_cross
+        gnot_cond = x[:, 0, 13:15] if self.gnot_adaln else None  # [B, 2] Re, AoA
+
+        # Feature cross (same as Transolver)
+        x_cross = x * self.feature_cross(x)
+        x = x + 0.1 * x_cross
+
+        # Detect tandem
+        is_tandem_1d = (x[:, 0, 21].abs() > 0.01)  # [B] bool
+
+        # Input encoding
+        fx = self.preprocess(x)  # [B, N, n_hidden]
+        fx_pre = fx  # save for skip
+
+        # Expand latent tokens for batch
+        latents = self.latent_tokens.expand(B, -1, -1)  # [B, N_latent, n_hidden]
+
+        # Encode: cross-attention from latent tokens (Q) to input nodes (KV)
+        latents = latents + self.encode_cross_attn(latents, fx, mask=mask)
+
+        # Self-attention among latent tokens
+        for block in self.latent_blocks:
+            latents = block(
+                latents,
+                is_tandem=is_tandem_1d if self.domain_layernorm else None,
+                condition=gnot_cond,
+            )
+
+        # Auxiliary predictions from latent mean
+        latent_mean = latents.mean(dim=1)
+        re_pred = self.re_head(latent_mean)
+        aoa_pred = self.aoa_head(latent_mean)
+
+        # Decode: cross-attention from input nodes (Q) to latent tokens (KV)
+        fx_out = fx + self.decode_cross_attn(fx, latents)
+
+        # Output head
+        fx_ln = self.out_norm(fx_out)
+        if self.domain_velhead:
+            out_s = self.velhead_single(fx_ln)
+            out_t = self.velhead_tandem(fx_ln)
+            is_tan = is_tandem_1d.view(-1, 1, 1)
+            preds = torch.where(is_tan.expand_as(out_s), out_t, out_s)
+        elif self.field_decoder:
+            preds = torch.cat([self.vel_head(fx_ln), self.pres_head(fx_ln)], dim=-1)
+        else:
+            preds = self.out_head(fx_ln)
+
+        # Skip connection
+        gate = self.skip_gate(fx_pre)
+        preds = preds + gate * self.out_skip(fx_pre)
+
+        return {"preds": preds, "re_pred": re_pred, "aoa_pred": aoa_pred}
+
+
+# ---------------------------------------------------------------------------
+# End GNOT model
+# ---------------------------------------------------------------------------
+
+
 MAX_TIMEOUT = 180.0  # minutes
 MAX_EPOCHS = 500
 
@@ -754,6 +1040,10 @@ class Config:
     vol_subsample_frac: float = 1.0     # fraction of volume nodes in loss after vol_ramp (0.8 = 80%)
     compile_mode: str = "default"       # torch.compile mode: "default", "max-autotune", "reduce-overhead"
     num_workers: int = 4                # data loader workers
+    # Phase 5: GNOT architecture
+    model_type: str = "transolver"      # "transolver" or "gnot"
+    n_latent: int = 256                 # GNOT: number of latent tokens
+    gnot_adaln: bool = False            # GNOT: AdaLN conditioning on Re/AoA in latent blocks
 
 
 cfg = sp.parse(Config)
@@ -875,40 +1165,65 @@ if cfg.raw_targets:
 else:
     raw_stats = None
 
-model_config = dict(
-    space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
-    out_dim=3,
-    n_hidden=cfg.n_hidden,
-    n_layers=cfg.n_layers,
-    n_head=3,
-    slice_num=cfg.prog_slices_end if cfg.prog_slices else cfg.slice_num,
-    mlp_ratio=2,
-    dropout=0.05 if cfg.rdrop else 0.0,
-    output_fields=["Ux", "Uy", "p"],
-    output_dims=[1, 1, 1],
-    linear_no_attention=cfg.linear_no_attention,
-    learned_kernel=cfg.learned_kernel,
-    field_decoder=cfg.field_decoder,
-    adaln_output=cfg.adaln_output,
-    soft_moe=cfg.soft_moe,
-    uncertainty_loss=cfg.uncertainty_loss,
-    adaln_all_blocks=cfg.adaln_all_blocks,
-    adaln_4cond=cfg.adaln_4cond,
-    adaln_nozero=cfg.adaln_nozero,
-    film_cond=cfg.film_cond,
-    adaln_decouple=cfg.adaln_decouple,
-    adaln_zone_temp=cfg.adaln_zone_temp,
-    domain_layernorm=cfg.domain_layernorm,
-    dln_zeroinit=cfg.dln_zeroinit,
-    domain_velhead=cfg.domain_velhead,
-    prog_slices=cfg.prog_slices,
-)
+_fun_dim = X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32  # +curv, +dist, [+foil2dist], +32 fourier PE
 
-model = Transolver(**model_config).to(device)
+if cfg.model_type == "gnot":
+    model_config = dict(
+        space_dim=2,
+        fun_dim=_fun_dim,
+        out_dim=3,
+        n_hidden=cfg.n_hidden,
+        n_layers=cfg.n_layers,
+        n_latent=cfg.n_latent,
+        heads=8,
+        dim_head=64,
+        field_decoder=cfg.field_decoder,
+        domain_layernorm=cfg.domain_layernorm,
+        dln_zeroinit=cfg.dln_zeroinit,
+        domain_velhead=cfg.domain_velhead,
+        gnot_adaln=cfg.gnot_adaln,
+        output_fields=["Ux", "Uy", "p"],
+        output_dims=[1, 1, 1],
+    )
+    model = GNOT(**model_config).to(device)
+else:
+    model_config = dict(
+        space_dim=2,
+        fun_dim=_fun_dim,
+        out_dim=3,
+        n_hidden=cfg.n_hidden,
+        n_layers=cfg.n_layers,
+        n_head=3,
+        slice_num=cfg.prog_slices_end if cfg.prog_slices else cfg.slice_num,
+        mlp_ratio=2,
+        dropout=0.05 if cfg.rdrop else 0.0,
+        output_fields=["Ux", "Uy", "p"],
+        output_dims=[1, 1, 1],
+        linear_no_attention=cfg.linear_no_attention,
+        learned_kernel=cfg.learned_kernel,
+        field_decoder=cfg.field_decoder,
+        adaln_output=cfg.adaln_output,
+        soft_moe=cfg.soft_moe,
+        uncertainty_loss=cfg.uncertainty_loss,
+        adaln_all_blocks=cfg.adaln_all_blocks,
+        adaln_4cond=cfg.adaln_4cond,
+        adaln_nozero=cfg.adaln_nozero,
+        film_cond=cfg.film_cond,
+        adaln_decouple=cfg.adaln_decouple,
+        adaln_zone_temp=cfg.adaln_zone_temp,
+        domain_layernorm=cfg.domain_layernorm,
+        dln_zeroinit=cfg.dln_zeroinit,
+        domain_velhead=cfg.domain_velhead,
+        prog_slices=cfg.prog_slices,
+    )
+    model = Transolver(**model_config).to(device)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
-model = torch.compile(model, mode=cfg.compile_mode)
-_base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+if cfg.model_type == "gnot":
+    # Skip torch.compile for GNOT: variable-size cross-attention triggers inductor bugs
+    _base_model = model
+else:
+    model = torch.compile(model, mode=cfg.compile_mode)
+    _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
@@ -1289,7 +1604,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x, "mask": mask})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -1424,7 +1739,7 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x})
+                rdrop_out = model({"x": x, "mask": mask})
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -1489,7 +1804,7 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                out2 = model({"x": x, "mask": mask})
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -1559,10 +1874,10 @@ for epoch in range(MAX_EPOCHS):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             base_opt, T_max=remaining, eta_min=cfg.cosine_eta_min
         )
-    if epoch >= cfg.temp_anneal_epoch:
+    if epoch >= cfg.temp_anneal_epoch and hasattr(_base_model, 'blocks'):
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
-    if cfg.prog_slices:
+    if cfg.prog_slices and hasattr(_base_model, 'blocks'):
         # Progressive slice warmup: ramp active slices from cfg.slice_num → prog_slices_end
         if epoch < cfg.prog_slices_epochs:
             active = int(cfg.slice_num + (cfg.prog_slices_end - cfg.slice_num) * epoch / cfg.prog_slices_epochs)
@@ -1696,7 +2011,7 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    pred = eval_model({"x": x, "mask": mask})["preds"]
                 pred = pred.float()
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
