@@ -814,6 +814,13 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Hard example mining
+    hem_enabled: bool = False           # enable hard example mining
+    hem_alpha: float = 0.9             # EMA decay for per-sample loss
+    hem_beta: float = 1.0             # weight power (higher = stronger reweighting)
+    hem_warmup: int = 0               # uniform sampling for first N epochs
+    hem_surface_only: bool = False    # track surface-only loss for reweighting
+    hem_focal: bool = False           # focal-style weighting: (1 - exp(-loss))^2
 
 
 cfg = sp.parse(Config)
@@ -832,6 +839,22 @@ train_ds, val_splits, stats, sample_weights = load_data(
     cfg.manifest, cfg.stats_file, debug=cfg.debug,
 )
 stats = {k: v.to(device) for k, v in stats.items()}
+
+
+# Wrapper to return sample index alongside data (for hard example mining)
+class IndexedDataset(torch.utils.data.Dataset):
+    def __init__(self, ds):
+        self.ds = ds
+    def __len__(self):
+        return len(self.ds)
+    def __getitem__(self, idx):
+        return (*self.ds[idx], idx)
+
+
+# Per-sample EMA loss tracker for hard example mining
+import numpy as np
+n_train = len(train_ds)
+sample_loss_ema = np.ones(n_train, dtype=np.float32)
 
 
 def _umag_q(y, mask):
@@ -871,12 +894,38 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
 
-loader_kwargs = dict(collate_fn=pad_collate, num_workers=cfg.num_workers, pin_memory=True,
-                     persistent_workers=True, prefetch_factor=2)
+def pad_collate_indexed(batch):
+    """Collate with sample indices for hard example mining."""
+    xs, ys, surfs, idxs = zip(*batch)
+    max_n = max(x.shape[0] for x in xs)
+    B = len(xs)
+    x_pad = torch.zeros(B, max_n, xs[0].shape[1])
+    y_pad = torch.zeros(B, max_n, ys[0].shape[1])
+    surf_pad = torch.zeros(B, max_n, dtype=torch.bool)
+    mask = torch.zeros(B, max_n, dtype=torch.bool)
+    for i, (x, y, sf) in enumerate(zip(xs, ys, surfs)):
+        n = x.shape[0]
+        x_pad[i, :n] = x
+        y_pad[i, :n] = y
+        surf_pad[i, :n] = sf
+        mask[i, :n] = True
+    return x_pad, y_pad, surf_pad, mask, torch.tensor(list(idxs), dtype=torch.long)
+
+
+if cfg.hem_enabled:
+    _hem_ds = IndexedDataset(train_ds)
+    _train_collate = pad_collate_indexed
+else:
+    _hem_ds = train_ds
+    _train_collate = pad_collate
+
+_base_loader_kwargs = dict(num_workers=cfg.num_workers, pin_memory=True,
+                           persistent_workers=True, prefetch_factor=2)
+loader_kwargs = dict(collate_fn=_train_collate, **_base_loader_kwargs)
+_plain_loader_kwargs = dict(collate_fn=pad_collate, **_base_loader_kwargs)
 
 if cfg.debug:
-    # Avoid sampler/length mismatch when train_ds is truncated
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
+    train_loader = DataLoader(_hem_ds, batch_size=cfg.batch_size,
                               shuffle=True, **loader_kwargs)
 else:
     sampler = WeightedRandomSampler(
@@ -884,11 +933,11 @@ else:
         num_samples=len(train_ds),
         replacement=True,
     )
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
+    train_loader = DataLoader(_hem_ds, batch_size=cfg.batch_size,
                               sampler=sampler, **loader_kwargs)
 
 val_loaders = {
-    name: DataLoader(subset, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
+    name: DataLoader(subset, batch_size=cfg.batch_size, shuffle=False, **_plain_loader_kwargs)
     for name, subset in val_splits.items()
 }
 
@@ -898,7 +947,7 @@ print("Computing physics normalization stats...")
 _phys_sum = torch.zeros(3, device=device)
 _phys_sq_sum = torch.zeros(3, device=device)
 _phys_n = 0.0
-_stats_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
+_stats_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, **_plain_loader_kwargs)
 with torch.no_grad():
     for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc="Phys stats", leave=False):
         _y, _mask = _y.to(device), _mask.to(device)
@@ -1213,7 +1262,12 @@ for epoch in range(MAX_EPOCHS):
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     if cfg.grad_accum_steps > 1:
         optimizer.zero_grad()
-    for batch_idx, (x, y, is_surface, mask) in enumerate(pbar):
+    for batch_idx, batch_data in enumerate(pbar):
+        if cfg.hem_enabled:
+            x, y, is_surface, mask, batch_sample_idx = batch_data
+        else:
+            x, y, is_surface, mask = batch_data
+            batch_sample_idx = None
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -1586,10 +1640,42 @@ for epoch in range(MAX_EPOCHS):
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
+        # Hard example mining: track per-sample loss
+        if cfg.hem_enabled and batch_sample_idx is not None:
+            with torch.no_grad():
+                if cfg.hem_surface_only:
+                    per_sample = (abs_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+                else:
+                    per_sample = abs_err.mean(dim=(1, 2))
+                for i, sidx in enumerate(batch_sample_idx):
+                    old = sample_loss_ema[sidx.item()]
+                    sample_loss_ema[sidx.item()] = cfg.hem_alpha * old + (1 - cfg.hem_alpha) * per_sample[i].item()
+
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
         n_batches += 1
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
+
+    # Hard example mining: rebuild sampler weights at epoch end
+    if cfg.hem_enabled and not cfg.debug and epoch >= cfg.hem_warmup:
+        if cfg.hem_focal:
+            hem_weights = (1.0 - np.exp(-sample_loss_ema)) ** 2
+        else:
+            hem_weights = sample_loss_ema ** cfg.hem_beta
+        hem_weights = hem_weights / hem_weights.sum() * len(hem_weights)
+        # Blend with original weights to prevent complete loss of diversity
+        combined_weights = 0.7 * hem_weights + 0.3 * (sample_weights.numpy() if hasattr(sample_weights, 'numpy') else np.array(sample_weights))
+        combined_weights = combined_weights / combined_weights.sum() * len(combined_weights)
+        sampler.weights = torch.from_numpy(combined_weights).double()
+        # Log HEM stats
+        wandb.log({
+            "hem/weight_mean": float(combined_weights.mean()),
+            "hem/weight_max": float(combined_weights.max()),
+            "hem/weight_std": float(combined_weights.std()),
+            "hem/loss_ema_mean": float(sample_loss_ema.mean()),
+            "hem/loss_ema_max": float(sample_loss_ema.max()),
+            "global_step": global_step,
+        })
 
     if not step_scheduler_per_batch:
         if cfg.swa_cyclic and epoch >= cfg.swa_cyclic_start:
