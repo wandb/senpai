@@ -706,6 +706,87 @@ MAX_TIMEOUT = 180.0  # minutes
 MAX_EPOCHS = 500
 
 
+def _compute_pressure_gradients(p_vals, positions, surf_mask, k=4):
+    """Compute surface pressure gradients via weighted least-squares finite differences.
+
+    All computation on GPU. For each surface node, finds k nearest surface neighbors
+    and solves weighted least-squares for dp/dx, dp/dy.
+
+    Args:
+        p_vals: [B, N] pressure values (predicted or ground truth)
+        positions: [B, N, 2] xy coordinates
+        surf_mask: [B, N] bool mask for surface nodes
+        k: number of neighbors
+
+    Returns:
+        dp_dx, dp_dy: [total_surf_nodes] gradient components (flattened across batch)
+        valid_mask: [total_surf_nodes] bool mask for nodes with valid gradients
+    """
+    B, N = p_vals.shape
+    device = p_vals.device
+
+    all_dp_dx = []
+    all_dp_dy = []
+    all_lap = []
+    all_valid = []
+
+    for b in range(B):
+        s_mask = surf_mask[b]  # [N]
+        n_surf = s_mask.sum().item()
+        if n_surf < k + 1:
+            all_dp_dx.append(torch.zeros(n_surf, device=device))
+            all_dp_dy.append(torch.zeros(n_surf, device=device))
+            all_lap.append(torch.zeros(n_surf, device=device))
+            all_valid.append(torch.zeros(n_surf, dtype=torch.bool, device=device))
+            continue
+
+        s_pos = positions[b][s_mask]   # [n_surf, 2]
+        s_p = p_vals[b][s_mask]        # [n_surf]
+
+        # k-nearest neighbors via pairwise distance
+        # For efficiency, compute pairwise distances using broadcasting
+        diff = s_pos.unsqueeze(0) - s_pos.unsqueeze(1)  # [n_surf, n_surf, 2]
+        dist2 = (diff ** 2).sum(dim=-1)  # [n_surf, n_surf]
+        dist2.diagonal().fill_(float('inf'))  # exclude self
+
+        # Get k nearest neighbors
+        _, nn_idx = dist2.topk(k, dim=-1, largest=False)  # [n_surf, k]
+
+        # Compute gradient via weighted least-squares
+        dx = diff[torch.arange(n_surf, device=device).unsqueeze(1), nn_idx, 0]  # [n_surf, k]
+        dy = diff[torch.arange(n_surf, device=device).unsqueeze(1), nn_idx, 1]
+        dp = s_p[nn_idx] - s_p.unsqueeze(1)  # [n_surf, k]
+
+        d2 = dx ** 2 + dy ** 2 + 1e-10
+        w = 1.0 / d2  # inverse-distance weights
+
+        Wdx = w * dx
+        Wdy = w * dy
+        A11 = (Wdx * dx).sum(-1)
+        A12 = (Wdx * dy).sum(-1)
+        A22 = (Wdy * dy).sum(-1)
+        b1 = (Wdx * dp).sum(-1)
+        b2 = (Wdy * dp).sum(-1)
+
+        det = A11 * A22 - A12 * A12 + 1e-10
+        dp_dx = (A22 * b1 - A12 * b2) / det
+        dp_dy = (A11 * b2 - A12 * b1) / det
+
+        # Laplacian: sum of second derivatives (approximate via neighbor values)
+        # lap ≈ (2/k) * sum_j (p_j - p_i) / dist_ij^2
+        lap = (2.0 * (dp / d2).sum(-1))
+
+        all_dp_dx.append(dp_dx)
+        all_dp_dy.append(dp_dy)
+        all_lap.append(lap)
+        all_valid.append(torch.ones(n_surf, dtype=torch.bool, device=device))
+
+    return (torch.cat(all_dp_dx) if all_dp_dx else torch.zeros(0, device=device),
+            torch.cat(all_dp_dy) if all_dp_dy else torch.zeros(0, device=device),
+            torch.cat(all_lap) if all_lap else torch.zeros(0, device=device),
+            torch.cat(all_valid) if all_valid else torch.zeros(0, dtype=torch.bool, device=device))
+
+
 @dataclass
 class Config:
     lr: float = 1.5e-3
@@ -809,6 +890,14 @@ class Config:
     vol_subsample_frac: float = 1.0     # fraction of volume nodes in loss after vol_ramp (0.8 = 80%)
     compile_mode: str = "default"       # torch.compile mode: "default", "max-autotune", "reduce-overhead"
     num_workers: int = 4                # data loader workers
+    # Phase 5: Pressure gradient loss
+    grad_loss: bool = False              # enable surface pressure gradient loss
+    grad_loss_weight: float = 0.3        # lambda_grad multiplier
+    grad_loss_k: int = 4                 # k nearest neighbors for gradient computation
+    grad_loss_vol: bool = False          # also apply gradient loss on volume nodes
+    grad_loss_l2: bool = False           # use L2 (MSE) instead of L1 for gradient loss
+    grad_loss_laplacian: bool = False    # add Laplacian supervision term
+    grad_loss_lap_weight: float = 0.1    # weight for Laplacian term
     # Phase 4: Pressure-first sequential prediction
     pressure_first: bool = False        # predict p first, then condition v on p
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
@@ -1208,6 +1297,7 @@ for epoch in range(MAX_EPOCHS):
     model.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
+    epoch_grad_loss = 0.0
     n_batches = 0
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
@@ -1448,6 +1538,38 @@ for epoch in range(MAX_EPOCHS):
         else:
             loss = vol_loss + surf_weight * surf_loss
 
+        # Pressure gradient loss: supervise dp/dx, dp/dy on surface nodes
+        _grad_loss_val = torch.tensor(0.0, device=device)
+        _lap_loss_val = torch.tensor(0.0, device=device)
+        if cfg.grad_loss and model.training:
+            _grad_mask = (mask & is_surface) if not cfg.grad_loss_vol else mask
+            pred_p = pred[:, :, 2]   # [B, N] predicted pressure
+            gt_p = y_norm[:, :, 2]   # [B, N] ground truth pressure
+            pos_xy = x[:, :, :2]     # [B, N, 2] spatial coordinates
+
+            pred_dp_dx, pred_dp_dy, pred_lap, valid = _compute_pressure_gradients(
+                pred_p, pos_xy, _grad_mask, k=cfg.grad_loss_k)
+            with torch.no_grad():
+                gt_dp_dx, gt_dp_dy, gt_lap, _ = _compute_pressure_gradients(
+                    gt_p, pos_xy, _grad_mask, k=cfg.grad_loss_k)
+
+            if valid.any():
+                pred_dp_dx = pred_dp_dx[valid]
+                pred_dp_dy = pred_dp_dy[valid]
+                gt_dp_dx = gt_dp_dx[valid]
+                gt_dp_dy = gt_dp_dy[valid]
+                if cfg.grad_loss_l2:
+                    _grad_loss_val = F.mse_loss(pred_dp_dx, gt_dp_dx) + F.mse_loss(pred_dp_dy, gt_dp_dy)
+                else:
+                    _grad_loss_val = F.l1_loss(pred_dp_dx, gt_dp_dx) + F.l1_loss(pred_dp_dy, gt_dp_dy)
+                loss = loss + cfg.grad_loss_weight * _grad_loss_val
+
+                if cfg.grad_loss_laplacian:
+                    pred_lap_v = pred_lap[valid]
+                    gt_lap_v = gt_lap[valid]
+                    _lap_loss_val = F.l1_loss(pred_lap_v, gt_lap_v)
+                    loss = loss + cfg.grad_loss_lap_weight * _lap_loss_val
+
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
         coarse_pool_size = 64
@@ -1584,10 +1706,17 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.grad_loss:
+            _log_dict["train/grad_loss"] = _grad_loss_val.item()
+            _log_dict["train/lambda_grad"] = cfg.grad_loss_weight
+            if cfg.grad_loss_laplacian:
+                _log_dict["train/lap_loss"] = _lap_loss_val.item()
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
+        epoch_grad_loss += _grad_loss_val.item() if cfg.grad_loss else 0.0
         n_batches += 1
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
@@ -1881,6 +2010,7 @@ for epoch in range(MAX_EPOCHS):
     metrics = {
         "train/vol_loss": epoch_vol,
         "train/surf_loss": epoch_surf,
+        "train/grad_loss_epoch": epoch_grad_loss / max(n_batches, 1) if cfg.grad_loss else 0.0,
         "val/loss": val_loss_3split,
         "val/loss_3split": val_loss_3split,
         "val/loss_4split": val_loss_4split,
