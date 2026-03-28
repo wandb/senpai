@@ -37,6 +37,8 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import simple_parsing as sp
 
+from torch.optim.swa_utils import AveragedModel, SWALR
+
 from data.utils import visualize
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
 
@@ -814,6 +816,11 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Warm Restarts + SWA
+    warm_restarts: bool = False         # Use CosineAnnealingWarmRestarts instead of default schedule
+    warm_restart_T0: int = 40           # Initial restart period (epochs)
+    warm_restart_Tmult: int = 2         # Multiply period after each restart (1=fixed, 2=doubling)
+    swa_lr: float = 1e-5               # SWA learning rate (used with SWALR scheduler)
 
 
 cfg = sp.parse(Config)
@@ -1117,7 +1124,16 @@ else:
         optimizer = base_opt
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
-if cfg.scheduler_type == "warm_restarts":
+if cfg.warm_restarts:
+    # Phase 5: CosineAnnealingWarmRestarts with warmup
+    _warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
+    _restarts = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        base_opt, T_0=cfg.warm_restart_T0, T_mult=cfg.warm_restart_Tmult, eta_min=1e-7
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        base_opt, schedulers=[_warmup, _restarts], milestones=[10]
+    )
+elif cfg.scheduler_type == "warm_restarts":
     _warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
     _restarts = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         base_opt, T_0=cfg.cosine_T_0, T_mult=cfg.cosine_T_mult, eta_min=cfg.cosine_eta_min
@@ -1148,6 +1164,11 @@ else:  # sequential (default)
     )
 step_scheduler_per_batch = (cfg.scheduler_type == "onecycle")
 
+# Phase 5: SWA setup using PyTorch swa_utils (lazy init for AveragedModel)
+swa_pt_model = None  # Will be AveragedModel, created at swa_start_epoch
+swa_pt_scheduler = None  # Will be SWALR, created at swa_start_epoch
+swa_pt_active = False  # Whether we've switched to SWA phase
+
 # --- wandb ---
 run = wandb.init(
     entity=os.environ.get("WANDB_ENTITY", "wandb-applied-ai-team"),
@@ -1175,6 +1196,12 @@ for _sname in VAL_SPLIT_NAMES:
 wandb.define_metric("lr", step_metric="global_step")
 wandb.define_metric("epoch_time_s", step_metric="global_step")
 wandb.define_metric("val_predictions", step_metric="global_step")
+# SWA-specific metrics
+if cfg.swa:
+    wandb.define_metric("swa/*", step_metric="global_step")
+    wandb.define_metric("swa_val/*", step_metric="global_step")
+    for _sname in VAL_SPLIT_NAMES:
+        wandb.define_metric(f"swa_{_sname}/*", step_metric="global_step")
 
 model_dir = Path(f"models/model-{run.id}")
 model_dir.mkdir(parents=True)
@@ -1576,7 +1603,7 @@ for epoch in range(MAX_EPOCHS):
                 scheduler.step()
             except ValueError:
                 pass
-        if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa and not cfg.swa_cyclic and not cfg.snapshot_ensemble:
+        if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa_cyclic and not cfg.snapshot_ensemble:
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
             else:
@@ -1591,8 +1618,20 @@ for epoch in range(MAX_EPOCHS):
         n_batches += 1
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
+    # Phase 5: SWA model update (using PyTorch AveragedModel)
+    if cfg.swa and epoch >= cfg.swa_start_epoch:
+        if swa_pt_model is None:
+            swa_pt_model = AveragedModel(_base_model)
+            swa_pt_scheduler = SWALR(base_opt, swa_lr=cfg.swa_lr)
+            swa_pt_active = True
+            print(f"  [SWA] Initialized AveragedModel at epoch {epoch+1}, swa_lr={cfg.swa_lr}")
+        swa_pt_model.update_parameters(_base_model)
+        swa_pt_scheduler.step()
+
     if not step_scheduler_per_batch:
-        if cfg.swa_cyclic and epoch >= cfg.swa_cyclic_start:
+        if cfg.swa and swa_pt_active:
+            pass  # SWALR handles scheduling during SWA phase
+        elif cfg.swa_cyclic and epoch >= cfg.swa_cyclic_start:
             if swa_cyclic_scheduler is None:
                 swa_cyclic_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                     base_opt, T_0=cfg.swa_cyclic_T, eta_min=cfg.cosine_eta_min
@@ -1656,13 +1695,14 @@ for epoch in range(MAX_EPOCHS):
 
     # --- Validate across all splits ---
     _do_val = (epoch + 1) % cfg.val_every == 0 or epoch == 0 or epoch == MAX_EPOCHS - 1
+    _current_lr = swa_pt_scheduler.get_last_lr()[0] if (cfg.swa and swa_pt_active and swa_pt_scheduler is not None) else scheduler.get_last_lr()[0]
     if not _do_val:
         dt = time.time() - t0
         wandb.log({
             "train/vol_loss": epoch_vol,
             "train/surf_loss": epoch_surf,
             "epoch_time_s": dt,
-            "lr": scheduler.get_last_lr()[0],
+            "lr": _current_lr,
             "global_step": global_step,
         })
         print(f"Epoch {epoch+1:3d} ({dt:.0f}s)  train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  [val skipped]")
@@ -1672,7 +1712,8 @@ for epoch in range(MAX_EPOCHS):
         eval_model = swa_cyclic_model
     elif cfg.snapshot_ensemble and snapshot_avg_model is not None:
         eval_model = snapshot_avg_model
-    elif cfg.swa and swa_model is not None:
+    elif cfg.swa and not swa_pt_active and swa_model is not None:
+        # Legacy SWA path (Phase 3 manual averaging, not Phase 5 AveragedModel)
         eval_model = swa_model
     elif ema_model is not None:
         eval_model = ema_model
@@ -1875,6 +1916,154 @@ for epoch in range(MAX_EPOCHS):
                               torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isinf())]
     val_loss_4split = sum(_4split_losses) / max(len(_4split_losses), 1)
 
+    # --- Phase 5: Second validation pass for SWA model (AveragedModel) ---
+    swa_val_loss_4split = None
+    swa_val_metrics_per_split: dict[str, dict] = {}
+    if cfg.swa and swa_pt_model is not None and swa_pt_active:
+        swa_pt_model.eval()
+        _swa_loss_sum = 0.0
+        for split_name, vloader in val_loaders.items():
+            swa_val_vol = 0.0
+            swa_val_surf = 0.0
+            swa_mae_surf = torch.zeros(3, device=device)
+            swa_mae_vol = torch.zeros(3, device=device)
+            swa_n_surf = torch.zeros(3, device=device)
+            swa_n_vol = torch.zeros(3, device=device)
+            swa_n_vbatches = 0
+
+            with torch.no_grad():
+                for x, y, is_surface, mask in vloader:
+                    x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                    is_surface = is_surface.to(device, non_blocking=True)
+                    mask = mask.to(device, non_blocking=True)
+
+                    raw_dsdf = x[:, :, 2:10]
+                    dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+                    dist_feat = torch.log1p(dist_surf * 10.0)
+                    x = (x - stats["x_mean"]) / stats["x_std"]
+                    curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                    if cfg.foil2_dist:
+                        foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                        x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
+                    else:
+                        x = torch.cat([x, curv, dist_feat], dim=-1)
+                    raw_xy = x[:, :, :2]
+                    xy_min = raw_xy.amin(dim=1, keepdim=True)
+                    xy_max = raw_xy.amax(dim=1, keepdim=True)
+                    xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                    freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                    xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                    fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                    x = torch.cat([x, fourier_pe], dim=-1)
+                    Umag, q = _umag_q(y, mask)
+                    if cfg.raw_targets:
+                        y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
+                    else:
+                        y_phys = _phys_norm(y, Umag, q)
+                        if cfg.log_pressure:
+                            y_phys = y_phys.clone()
+                            y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
+                        y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+
+                    raw_gap = x[:, 0, 21]
+                    is_tandem = raw_gap.abs() > 0.5
+                    B = y_norm.shape[0]
+                    sample_stds = torch.ones(B, 1, 3, device=device)
+                    if not cfg.no_perstd and not cfg.raw_targets:
+                        if cfg.unified_clamps:
+                            channel_clamps = tandem_clamps = torch.tensor([0.2, 0.2, 0.7], device=device)
+                        elif cfg.high_p_clamp:
+                            channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
+                            tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
+                        else:
+                            channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
+                            tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+                        for b in range(B):
+                            valid = mask[b]
+                            if cfg.no_perstd_p:
+                                vc = (tandem_clamps[:2] if is_tandem[b] else channel_clamps[:2])
+                                sample_stds[b, 0, :2] = y_norm[b, valid, :2].std(dim=0).clamp(min=vc)
+                            elif is_tandem[b]:
+                                sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
+                            else:
+                                sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+                    if cfg.multiply_std:
+                        y_norm_scaled = y_norm * sample_stds
+                    else:
+                        y_norm_scaled = y_norm / sample_stds
+
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        pred = swa_pt_model({"x": x})["preds"]
+                    pred = pred.float()
+                    if cfg.multiply_std:
+                        pred_loss = pred * sample_stds
+                    else:
+                        pred_loss = pred / sample_stds
+                    abs_err = (pred_loss - y_norm_scaled).abs().nan_to_num(0.0)
+
+                    vol_mask = mask & ~is_surface
+                    surf_mask = mask & is_surface
+                    swa_val_vol += min(
+                        (abs_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item(),
+                        1e6
+                    )
+                    swa_val_surf += min(
+                        (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item(),
+                        1e6
+                    )
+                    swa_n_vbatches += 1
+
+                    # Denormalize for physical-space MAE
+                    if cfg.raw_targets:
+                        pred_orig = pred * raw_stats["y_std"] + raw_stats["y_mean"]
+                    else:
+                        pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                        if cfg.log_pressure:
+                            pred_phys = pred_phys.clone()
+                            pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
+                        if cfg.tight_denorm_clamps:
+                            _pd = pred_phys.clone()
+                            _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
+                            _pd[:, :, 1:2] = pred_phys[:, :, 1:2].clamp(-5, 5) * Umag
+                            _pd[:, :, 2:3] = pred_phys[:, :, 2:3].clamp(-10, 10) * q
+                            pred_orig = _pd
+                        else:
+                            pred_orig = _phys_denorm(pred_phys, Umag, q)
+                    y_clamped = y.clamp(-1e6, 1e6)
+                    err = (pred_orig - y_clamped).abs()
+                    finite = err.isfinite()
+                    err = err.where(finite, torch.zeros_like(err))
+                    swa_mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                    swa_mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                    swa_n_surf += (surf_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+                    swa_n_vol += (vol_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+
+            swa_val_vol /= max(swa_n_vbatches, 1)
+            swa_val_surf /= max(swa_n_vbatches, 1)
+            swa_split_loss = swa_val_vol + cfg.surf_weight * swa_val_surf
+            swa_mae_surf /= swa_n_surf.clamp(min=1)
+            swa_mae_vol /= swa_n_vol.clamp(min=1)
+
+            swa_val_metrics_per_split[split_name] = {
+                f"swa_{split_name}/vol_loss":    swa_val_vol,
+                f"swa_{split_name}/surf_loss":   swa_val_surf,
+                f"swa_{split_name}/loss":        swa_split_loss,
+                f"swa_{split_name}/mae_vol_Ux":  swa_mae_vol[0].item(),
+                f"swa_{split_name}/mae_vol_Uy":  swa_mae_vol[1].item(),
+                f"swa_{split_name}/mae_vol_p":   swa_mae_vol[2].item(),
+                f"swa_{split_name}/mae_surf_Ux": swa_mae_surf[0].item(),
+                f"swa_{split_name}/mae_surf_Uy": swa_mae_surf[1].item(),
+                f"swa_{split_name}/mae_surf_p":  swa_mae_surf[2].item(),
+            }
+            _swa_loss_sum += swa_split_loss
+
+        # Compute SWA 4-split val loss
+        _swa_4split_losses = [swa_val_metrics_per_split[n][f"swa_{n}/loss"] for n in VAL_SPLIT_NAMES
+                              if not (torch.tensor(swa_val_metrics_per_split[n][f"swa_{n}/loss"]).isnan() or
+                                      torch.tensor(swa_val_metrics_per_split[n][f"swa_{n}/loss"]).isinf())]
+        swa_val_loss_4split = sum(_swa_4split_losses) / max(len(_swa_4split_losses), 1)
+        print(f"  [SWA] val_loss_4split={swa_val_loss_4split:.4f} (EMA: {val_loss_4split:.4f})")
+
     dt = time.time() - t0
 
     # --- Log to wandb ---
@@ -1884,11 +2073,17 @@ for epoch in range(MAX_EPOCHS):
         "val/loss": val_loss_3split,
         "val/loss_3split": val_loss_3split,
         "val/loss_4split": val_loss_4split,
-        "lr": scheduler.get_last_lr()[0],
+        "lr": _current_lr,
         "epoch_time_s": dt,
     }
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
+    # Phase 5: Log SWA metrics
+    if swa_val_metrics_per_split:
+        for swa_split_metrics in swa_val_metrics_per_split.values():
+            metrics.update(swa_split_metrics)
+        if swa_val_loss_4split is not None:
+            metrics["swa_val/loss_4split"] = swa_val_loss_4split
     metrics["global_step"] = global_step
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
@@ -1903,18 +2098,31 @@ for epoch in range(MAX_EPOCHS):
     tag = ""
     if ema_val_loss < best_val:
         best_val = ema_val_loss
-        best_metrics = {"epoch": epoch + 1, "val_loss": val_loss_3split}
-        for split_metrics in val_metrics_per_split.values():
-            for k, v in split_metrics.items():
-                best_metrics[f"best_{k}"] = v
-        if cfg.swa and swa_model is not None:
-            save_model = swa_model
+        # Phase 5: If SWA model is better than EMA, use SWA metrics and model
+        _use_swa_for_best = (swa_val_loss_4split is not None and swa_val_loss_4split < val_loss_4split)
+        if _use_swa_for_best:
+            best_metrics = {"epoch": epoch + 1, "val_loss": swa_val_loss_4split, "source": "swa"}
+            for swa_split_metrics in swa_val_metrics_per_split.values():
+                for k, v in swa_split_metrics.items():
+                    # Store as best_<split>/metric by stripping swa_ prefix
+                    best_k = k.replace("swa_", "")
+                    best_metrics[f"best_{best_k}"] = v
+        else:
+            best_metrics = {"epoch": epoch + 1, "val_loss": val_loss_3split, "source": "ema"}
+            for split_metrics in val_metrics_per_split.values():
+                for k, v in split_metrics.items():
+                    best_metrics[f"best_{k}"] = v
+        # Choose which model to save
+        if _use_swa_for_best and swa_pt_model is not None:
+            save_model = swa_pt_model.module  # AveragedModel wraps the module
+        elif cfg.swa and not swa_pt_active and swa_model is not None:
+            save_model = swa_model  # Legacy SWA path
         elif ema_model is not None:
             save_model = ema_model
         else:
             save_model = _base_model
         torch.save(save_model.state_dict(), model_path)
-        tag = f" * -> {model_path}"
+        tag = f" * -> {model_path} ({best_metrics.get('source', 'ema')})"
 
     split_summary = "  ".join(
         f"{name}={val_metrics_per_split[name][f'{name}/loss']:.4f}"
@@ -1927,13 +2135,60 @@ for epoch in range(MAX_EPOCHS):
     )
 
 
+# --- Phase 5: Update batch normalization statistics for SWA model ---
+# Note: Our model uses LayerNorm (not BatchNorm), so update_bn is typically a no-op.
+# We still run it for safety in case any BN layers exist, but need a custom wrapper
+# since update_bn expects model(input) but our model expects model({"x": input}).
+if cfg.swa and swa_pt_model is not None:
+    _has_bn = any(isinstance(m, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d))
+                  for m in swa_pt_model.modules())
+    if _has_bn:
+        print("\n[SWA] Updating batch normalization statistics...")
+        try:
+            # Custom BN update: reset running stats then do a forward pass
+            for m in swa_pt_model.modules():
+                if isinstance(m, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)):
+                    m.reset_running_stats()
+                    m.momentum = None  # use cumulative average
+            swa_pt_model.train()
+            with torch.no_grad():
+                for x, y, is_surface, mask in train_loader:
+                    x = x.to(device, non_blocking=True)
+                    is_surface = is_surface.to(device, non_blocking=True)
+                    raw_dsdf = x[:, :, 2:10]
+                    dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+                    dist_feat = torch.log1p(dist_surf * 10.0)
+                    x = (x - stats["x_mean"]) / stats["x_std"]
+                    curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                    if cfg.foil2_dist:
+                        foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                        x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
+                    else:
+                        x = torch.cat([x, curv, dist_feat], dim=-1)
+                    raw_xy = x[:, :, :2]
+                    xy_min = raw_xy.amin(dim=1, keepdim=True)
+                    xy_max = raw_xy.amax(dim=1, keepdim=True)
+                    xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                    freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                    xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                    fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                    x = torch.cat([x, fourier_pe], dim=-1)
+                    swa_pt_model({"x": x})
+            swa_pt_model.eval()
+            print("[SWA] BN statistics updated successfully.")
+        except Exception as e:
+            print(f"[SWA] Warning: update_bn failed: {e}")
+    else:
+        print("\n[SWA] No BatchNorm layers found, skipping BN update.")
+
 # --- Final summary ---
 total_time = (time.time() - train_start) / 60.0
 print("\n" + "=" * 70)
 print(f"TRAINING COMPLETE ({total_time:.1f} min)")
 print("=" * 70)
 if best_metrics:
-    print(f"Best model at epoch {best_metrics['epoch']}  (val/loss={best_metrics['val_loss']:.4f})")
+    _source = best_metrics.get('source', 'unknown')
+    print(f"Best model at epoch {best_metrics['epoch']}  (val/loss={best_metrics['val_loss']:.4f}, source={_source})")
     for split_name in VAL_SPLIT_NAMES:
         k_p = f"best_{split_name}/mae_surf_p"
         k_l = f"best_{split_name}/loss"
@@ -1952,8 +2207,10 @@ if best_metrics:
             vis_model = swa_cyclic_model
         elif cfg.snapshot_ensemble and snapshot_avg_model is not None:
             vis_model = snapshot_avg_model
+        elif cfg.swa and swa_pt_model is not None:
+            vis_model = swa_pt_model.module  # Phase 5: unwrap AveragedModel
         elif cfg.swa and swa_model is not None:
-            vis_model = swa_model
+            vis_model = swa_model  # Legacy SWA
         elif ema_model is not None:
             vis_model = ema_model
         else:
