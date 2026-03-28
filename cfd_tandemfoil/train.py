@@ -733,7 +733,9 @@ model_config = dict(
 
 model = ABUPT(**model_config).to(device)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
-model = torch.compile(model, mode=cfg.compile_mode, dynamic=True)
+# AB-UPT: skip torch.compile — anchor-based forward pass is fast in eager mode
+# and compile causes issues with dynamic batch shapes + kNN operations
+# model = torch.compile(model, mode=cfg.compile_mode, dynamic=True)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
