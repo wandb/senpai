@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-PackageName: senpai
 
-"""Train Transolver with structured benchmark splits.
+"""Train AB-UPT (Anchored-Branched Universal Physics Transformer) with structured benchmark splits.
 
 Reads a split manifest and stats file produced by data/split.py,
 then trains with four separate val tracks:
@@ -44,7 +44,7 @@ torch.set_float32_matmul_precision('high')
 
 
 # ---------------------------------------------------------------------------
-# Transolver model (inlined so students can
+# Model architecture (inlined so students can
 # modify architecture and training script in a single file)
 # ---------------------------------------------------------------------------
 
@@ -116,589 +116,372 @@ class MLP(nn.Module):
         return x
 
 
-class DomainLayerNorm(nn.Module):
-    """Domain-specific LayerNorm: separate weight/bias for single-foil vs tandem (Phase 3 R10)."""
-    def __init__(self, dim, zeroinit=False):
+# ---------------------------------------------------------------------------
+# AB-UPT Model (Anchored-Branched Universal Physics Transformer)
+# Replaces Transolver with anchor-based attention + surface↔volume branching
+# Paper: arXiv:2502.09692
+# ---------------------------------------------------------------------------
+
+
+class RoPE2D(nn.Module):
+    """2D Rotary Position Embeddings for continuous mesh coordinates.
+
+    Splits head dimension into x/y halves and applies 1D RoPE per axis.
+    Positions should be normalized to [0, 1000] for good frequency coverage.
+    """
+    def __init__(self, dim_per_head, theta=10000.0):
         super().__init__()
-        self.ln_single = nn.LayerNorm(dim)
-        self.ln_tandem = nn.LayerNorm(dim)
-        if not zeroinit:
-            self.ln_tandem.weight.data.copy_(self.ln_single.weight.data)
-            self.ln_tandem.bias.data.copy_(self.ln_single.bias.data)
-        # zeroinit: tandem defaults to weight=1, bias=0 (LayerNorm default) — identical to copy
+        half = dim_per_head // 2
+        inv_freq = 1.0 / (theta ** (torch.arange(0, half, 2, dtype=torch.float32) / half))
+        self.register_buffer('inv_freq', inv_freq)
 
-    def forward(self, x, is_tandem=None):
-        if is_tandem is None:
-            return self.ln_single(x)
-        mask_t = is_tandem.view(-1, 1, 1).expand_as(x)
-        return torch.where(mask_t, self.ln_tandem(x), self.ln_single(x))
+    def apply(self, x, pos):
+        """x: [B,H,N,D], pos: [B,N,2] → rotated x."""
+        px = pos[:, :, 0:1] * self.inv_freq  # [B,N,D/4]
+        py = pos[:, :, 1:2] * self.inv_freq  # [B,N,D/4]
+        freqs = torch.cat([px, py], dim=-1)   # [B,N,D/2]
+        cos = freqs.cos().unsqueeze(1)        # [B,1,N,D/2]
+        sin = freqs.sin().unsqueeze(1)
+        d2 = x.shape[-1] // 2
+        x1, x2 = x[..., :d2], x[..., d2:]
+        return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
 
 
-class Physics_Attention_Irregular_Mesh(nn.Module):
-    """Physics attention for irregular meshes in 1D/2D/3D space."""
-
-    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
-                 linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+class ABUPTAttention(nn.Module):
+    """Multi-head attention with 2D RoPE. Supports self and cross attention."""
+    def __init__(self, dim, n_heads, dropout=0.0):
         super().__init__()
-        inner_dim = dim_head * heads
-        self.dim_head = dim_head
-        self.heads = heads
-        self.scale = dim_head**-0.5
-        self.softmax = nn.Softmax(dim=-1)
-        self.dropout = nn.Dropout(dropout)
-        self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
-        self.tandem_temp_offset = nn.Parameter(torch.zeros(1, heads, 1, 1))
-        self.linear_no_attention = linear_no_attention
-        self.learned_kernel = learned_kernel
-        self.decouple_slice = decouple_slice
-        self.zone_temp = zone_temp
-        self.prog_slices = prog_slices
-        if prog_slices:
-            # Buffer for masking inactive slices; updated per-epoch by training loop
-            self.register_buffer('slice_mask', torch.zeros(slice_num))
+        self.n_heads = n_heads
+        self.d_head = dim // n_heads
+        self.wq = nn.Linear(dim, dim, bias=False)
+        self.wk = nn.Linear(dim, dim, bias=False)
+        self.wv = nn.Linear(dim, dim, bias=False)
+        self.wo = nn.Linear(dim, dim)
+        self.rope = RoPE2D(self.d_head)
+        self.drop_p = dropout
 
-        self.in_project_x = nn.Linear(dim, inner_dim)
-        self.in_project_fx = nn.Linear(dim, inner_dim)
-        self.in_project_slice = nn.Linear(dim_head, slice_num)
-        torch.nn.init.orthogonal_(self.in_project_slice.weight)
-        if decouple_slice:
-            # Separate slice projection for tandem samples
-            self.in_project_slice_tandem = nn.Linear(dim_head, slice_num)
-            torch.nn.init.orthogonal_(self.in_project_slice_tandem.weight)
-        if zone_temp:
-            # Zone-aware temperature: learned offset from [is_tandem, gap_mag, re_feat]
-            self.zone_temp_proj = nn.Linear(3, heads)
-            nn.init.zeros_(self.zone_temp_proj.weight)
-            nn.init.zeros_(self.zone_temp_proj.bias)
-        self.to_q = nn.Linear(dim_head, dim_head, bias=False)
-        self.to_k = nn.Linear(dim_head, dim_head, bias=False)
-        self.to_v = nn.Linear(dim_head, dim_head, bias=False)
-        self.slice_residual_scale = nn.Parameter(torch.tensor(0.1))
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, dim),
-            nn.Dropout(dropout),
-        )
-        self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
-        if learned_kernel:
-            self.kernel_mlp = nn.Sequential(
-                nn.Linear(2 * dim_head, dim_head), nn.GELU(),
-                nn.Linear(dim_head, 1),
-            )
-
-    def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None):
-        bsz, num_points, _ = x.shape
-
-        fx_mid = (
-            self.in_project_fx(x)
-            .reshape(bsz, num_points, self.heads, self.dim_head)
-            .permute(0, 2, 1, 3)
-            .contiguous()
-        )
-        x_mid = (
-            self.in_project_x(x)
-            .reshape(bsz, num_points, self.heads, self.dim_head)
-            .permute(0, 2, 1, 3)
-            .contiguous()
-        )
-        temp = self.temperature
-        if self.zone_temp and zone_features is not None:
-            # zone_features: [B, 3] → per-head offset [B, heads] → [B, heads, 1, 1]
-            zone_offset = self.zone_temp_proj(zone_features).reshape(bsz, self.heads, 1, 1)
-            temp = temp + zone_offset
-        if tandem_mask is not None:
-            temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
-        temp = temp.clamp(min=1e-4)
-        if self.decouple_slice and tandem_mask is not None:
-            std_logits = self.in_project_slice(x_mid) / temp
-            tan_logits = self.in_project_slice_tandem(x_mid) / temp
-            is_tan = (tandem_mask > 0.5)  # [B, 1, 1, 1]
-            slice_logits = torch.where(is_tan.expand_as(std_logits), tan_logits, std_logits)
+    def forward(self, x, pos, kv=None, kv_pos=None):
+        """Self-attention: x,pos. Cross-attention: x,pos,kv,kv_pos."""
+        B, N, _ = x.shape
+        q = self.wq(x).reshape(B, N, self.n_heads, self.d_head).transpose(1, 2)
+        if kv is None:
+            kv_src, k_pos = x, pos
         else:
-            slice_logits = self.in_project_slice(x_mid) / temp
-        if spatial_bias is not None:
-            slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
-        if self.prog_slices:
-            # Apply slice mask: 0 for active slices, -1e9 for inactive (updated each epoch)
-            slice_logits = slice_logits + self.slice_mask
-        slice_weights = self.softmax(slice_logits)
-        slice_norm = slice_weights.sum(2)
-        slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
-        slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
-
-        if self.linear_no_attention:
-            out_slice_token = slice_token
-        else:
-            q_slice_token = self.to_q(slice_token)
-            slice_token_kv = slice_token.mean(dim=1, keepdim=True)
-            k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
-            v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
-            if self.learned_kernel:
-                B, H, S, D = q_slice_token.shape
-                q_exp = q_slice_token.unsqueeze(-2).expand(B, H, S, S, D)
-                k_exp = k_slice_token.unsqueeze(-3).expand(B, H, S, S, D)
-                qk_cat = torch.cat([q_exp, k_exp], dim=-1)
-                attn_logits = self.kernel_mlp(qk_cat).squeeze(-1)
-                attn_weights = F.softmax(attn_logits, dim=-1)
-            else:
-                q_norm = F.normalize(q_slice_token, dim=-1)
-                k_norm = F.normalize(k_slice_token, dim=-1)
-                attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
-                attn_weights = F.softmax(attn_logits, dim=-1)
-            out_slice_token = torch.matmul(attn_weights, v_slice_token)
-            out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
-
-        out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
-        out_x = rearrange(out_x, "b h n d -> b n (h d)")
-        return self.to_out(out_x)
+            kv_src, k_pos = kv, kv_pos
+        M = kv_src.shape[1]
+        k = self.wk(kv_src).reshape(B, M, self.n_heads, self.d_head).transpose(1, 2)
+        v = self.wv(kv_src).reshape(B, M, self.n_heads, self.d_head).transpose(1, 2)
+        q = self.rope.apply(q, pos)
+        k = self.rope.apply(k, k_pos)
+        dp = self.drop_p if self.training else 0.0
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dp)
+        return self.wo(out.transpose(1, 2).reshape(B, N, -1))
 
 
-class TransolverBlock(nn.Module):
+class ABUPTBlock(nn.Module):
+    """Pre-norm transformer block: LN → Attn → residual → LN → FFN → residual."""
+    def __init__(self, dim, n_heads, mlp_ratio=4, dropout=0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm1_kv = nn.LayerNorm(dim)
+        self.attn = ABUPTAttention(dim, n_heads, dropout)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * mlp_ratio), nn.GELU(),
+            nn.Linear(dim * mlp_ratio, dim), nn.Dropout(dropout),
+        )
+
+    def forward(self, x, pos, kv=None, kv_pos=None):
+        kv_norm = self.norm1_kv(kv) if kv is not None else None
+        x = x + self.attn(self.norm1(x), pos, kv=kv_norm, kv_pos=kv_pos)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class AnchorDecoder(nn.Module):
+    """Reconstruct full mesh from sparse anchor features via kNN + relative position encoding."""
+    def __init__(self, dim, k=32):
+        super().__init__()
+        self.k = k
+        self.rel_enc = nn.Sequential(nn.Linear(3, 64), nn.GELU(), nn.Linear(64, dim))
+        self.combine = nn.Sequential(
+            nn.LayerNorm(dim * 2),
+            nn.Linear(dim * 2, dim * 4), nn.GELU(),
+            nn.Linear(dim * 4, dim),
+        )
+
+    @torch.compiler.disable
+    def forward(self, node_h, node_pos, anchor_h, anchor_pos):
+        """node_h/pos [B,N,D/2], anchor_h/pos [B,M,D/2] → [B,N,D]."""
+        B, N, D = node_h.shape
+        k = min(self.k, anchor_h.shape[1])
+        parts = []
+        for s in range(0, N, 4096):
+            e = min(s + 4096, N)
+            cp = node_pos[:, s:e]
+            ch = node_h[:, s:e]
+            cs = e - s
+            dists = torch.cdist(cp, anchor_pos)
+            topk_d, topk_i = dists.topk(k, dim=-1, largest=False)
+            del dists
+            bi = torch.arange(B, device=ch.device).view(B, 1, 1).expand(B, cs, k)
+            nn_h = anchor_h[bi, topk_i]
+            nn_p = anchor_pos[bi, topk_i]
+            rel = torch.cat([nn_p - cp.unsqueeze(2), topk_d.unsqueeze(-1)], dim=-1)
+            w = F.softmax(-topk_d * 5.0, dim=-1).unsqueeze(-1)
+            dec = ((nn_h + self.rel_enc(rel)) * w).sum(dim=2)
+            parts.append(self.combine(torch.cat([ch, dec], dim=-1)))
+        return torch.cat(parts, dim=1)
+
+
+class ABUPT(nn.Module):
+    """Anchored-Branched Universal Physics Transformer.
+
+    Architecture:
+      1. Feature projection: input features → hidden_dim
+      2. Geometry branch: kNN pooling to supernodes → self-attention
+      3. Physics trunk: perceiver (anchors ← geometry) + shared self/cross-attn (surface ↔ volume)
+      4. Decoder: kNN-based anchor attention back to full mesh
+      5. Output heads: predict [Ux, Uy, p] per node
+    """
     def __init__(
-        self,
-        num_heads: int,
-        hidden_dim: int,
-        dropout: float,
-        act="gelu",
-        mlp_ratio=4,
-        last_layer=False,
-        out_dim=1,
-        slice_num=32,
-        linear_no_attention=False,
-        learned_kernel=False,
-        field_decoder=False,
-        adaln_output=False,
-        soft_moe=False,
-        adaln_all=False,
-        adaln_cond_dim=2,
-        adaln_zero_init=True,
-        film_cond=False,
-        decouple_slice=False,
-        zone_temp=False,
-        domain_layernorm=False,
-        dln_zeroinit=False,
-        domain_velhead=False,
-        prog_slices=False,
-        pressure_first=False,
-        pressure_no_detach=False,
-        pressure_deep=False,
+        self, input_dim=58, hidden_dim=192, out_dim=3, n_heads=3,
+        n_surf_anchors=2048, n_vol_anchors=4096,
+        n_self_attn=5, n_cross_attn=4,
+        n_supernodes=256, supernode_k=32, decoder_k=32,
+        mlp_ratio=4, dropout=0.0,
+        use_geo_branch=True,
+        pressure_first=False, pressure_deep=False,
+        output_fields=None, output_dims=None,
     ):
         super().__init__()
-        self.last_layer = last_layer
-        self.field_decoder = field_decoder
-        self.domain_velhead = domain_velhead
+        self.__name__ = "ABUPT"
+        self.hidden_dim = hidden_dim
+        self.n_surf_anchors = n_surf_anchors
+        self.n_vol_anchors = n_vol_anchors
+        self.n_self_attn = n_self_attn
+        self.n_cross_attn = n_cross_attn
+        self.n_supernodes = n_supernodes
+        self.supernode_k = supernode_k
+        self.use_geo_branch = use_geo_branch
         self.pressure_first = pressure_first
-        self.pressure_no_detach = pressure_no_detach
-        self.adaln_output = adaln_output
-        self.soft_moe = soft_moe
-        self.adaln_all = adaln_all
-        self.film_cond = film_cond
-        self.domain_layernorm = domain_layernorm
-        _LN = (lambda d: DomainLayerNorm(d, zeroinit=dln_zeroinit)) if domain_layernorm else nn.LayerNorm
-        self.ln_1 = _LN(hidden_dim)
-        self.attn = Physics_Attention_Irregular_Mesh(
-            hidden_dim,
-            heads=num_heads,
-            dim_head=hidden_dim // num_heads,
-            dropout=dropout,
-            slice_num=slice_num,
-            linear_no_attention=linear_no_attention,
-            learned_kernel=learned_kernel,
-            decouple_slice=decouple_slice,
-            zone_temp=zone_temp,
-            prog_slices=prog_slices,
+        self.output_fields = output_fields or ["Ux", "Uy", "p"]
+        self.output_dims = output_dims or [1, 1, 1]
+
+        # Feature projection
+        self.feat_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim * 2), nn.GELU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
         )
-        if adaln_all:
-            # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
-            self.adaln_net = nn.Sequential(
-                nn.Linear(adaln_cond_dim, 128), nn.SiLU(),
-                nn.Linear(128, hidden_dim * 4),
-            )
-            if adaln_zero_init:
-                nn.init.zeros_(self.adaln_net[-1].weight)
-                nn.init.zeros_(self.adaln_net[-1].bias)
-        if film_cond:
-            # FiLM: cond → (gamma, beta) applied after SE layer
-            self.film_net = nn.Sequential(
-                nn.Linear(2, 64), nn.SiLU(),
-                nn.Linear(64, hidden_dim * 2),
-            )
-            nn.init.zeros_(self.film_net[-1].weight)
-            nn.init.zeros_(self.film_net[-1].bias)
-        self.ln_2 = _LN(hidden_dim)
-        self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
-        self.spatial_bias = nn.Sequential(
-            nn.Linear(4, 64), nn.GELU(),
-            nn.Linear(64, 64), nn.GELU(),
-            nn.Linear(64, slice_num),
-        )
-        nn.init.zeros_(self.spatial_bias[-1].weight)
-        nn.init.zeros_(self.spatial_bias[-1].bias)
-        self.ln_1_post = _LN(hidden_dim)
-        self.ln_2_post = _LN(hidden_dim)
-        self.se_fc1 = nn.Linear(hidden_dim, hidden_dim // 4)
-        self.se_fc2 = nn.Linear(hidden_dim // 4, hidden_dim)
-        nn.init.zeros_(self.se_fc2.weight)
-        nn.init.zeros_(self.se_fc2.bias)
-        if self.last_layer:
-            self.ln_3 = nn.LayerNorm(hidden_dim)
-            if soft_moe:
-                self.gate_net = nn.Sequential(nn.Linear(hidden_dim, 2), nn.Softmax(dim=-1))
-                self.expert1 = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
-                )
-                self.expert2 = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
-                )
-            elif pressure_first:
-                # Pressure-first: predict p, then condition v on p (takes priority over domain_velhead/field_decoder)
-                if pressure_deep:
-                    self.pres_head = nn.Sequential(
-                        nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(),
-                        nn.Linear(hidden_dim * 2, hidden_dim), nn.GELU(),
-                        nn.Linear(hidden_dim, 1),
-                    )
-                else:
-                    self.pres_head = nn.Sequential(
-                        nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(), nn.Linear(hidden_dim * 2, 1)
-                    )
-                # Velocity head conditioned on predicted pressure: input is hidden_dim + 1
-                self.vel_head_conditioned = nn.Sequential(
-                    nn.Linear(hidden_dim + 1, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2)
-                )
-            elif domain_velhead:
-                # Domain-specific output heads: separate for single-foil vs tandem
-                self.velhead_single = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
-                )
-                self.velhead_tandem = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
-                )
-            elif field_decoder:
-                self.vel_head = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2)
-                )
+
+        # Geometry branch: kNN pooling → self-attention on supernodes
+        if use_geo_branch:
+            nx = int(n_supernodes ** 0.5)
+            ny = n_supernodes // nx
+            gx = torch.linspace(-1.5, 1.5, nx)
+            gy = torch.linspace(-4.0, 4.0, ny)
+            grid = torch.stack(torch.meshgrid(gx, gy, indexing='ij'), dim=-1).reshape(-1, 2)
+            self.register_buffer('supernode_grid', grid)  # [S, 2]
+            self.geo_proj = nn.Linear(hidden_dim, hidden_dim)
+            self.geo_block = ABUPTBlock(hidden_dim, n_heads, mlp_ratio, dropout)
+
+        # Perceiver: anchors cross-attend to geometry supernodes
+        self.perceiver = ABUPTBlock(hidden_dim, n_heads, mlp_ratio, dropout)
+
+        # Shared-weight physics trunk: self-attn and cross-attn (surface ↔ volume)
+        self.shared_self_attn = ABUPTBlock(hidden_dim, n_heads, mlp_ratio, dropout)
+        self.shared_cross_attn = ABUPTBlock(hidden_dim, n_heads, mlp_ratio, dropout)
+
+        # Decoder: reconstruct all nodes from anchors
+        self.decoder = AnchorDecoder(hidden_dim, k=decoder_k)
+
+        # Final norm + output heads
+        self.final_norm = nn.LayerNorm(hidden_dim)
+        if pressure_first:
+            if pressure_deep:
                 self.pres_head = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(), nn.Linear(hidden_dim * 2, 1)
-                )
-            elif adaln_output:
-                self.cond_net = nn.Sequential(nn.Linear(2, hidden_dim * 2), nn.GELU())
-                self.mlp2 = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                    nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(),
+                    nn.Linear(hidden_dim * 2, hidden_dim), nn.GELU(),
+                    nn.Linear(hidden_dim, 1),
                 )
             else:
-                self.mlp2 = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                self.pres_head = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(),
+                    nn.Linear(hidden_dim * 2, 1),
                 )
-
-    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
-        sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
-        # DomainLayerNorm helper: pass is_tandem when enabled, else plain call
-        dln_it = (tandem_mask.view(-1) > 0.5) if (self.domain_layernorm and tandem_mask is not None) else None
-        if self.domain_layernorm:
-            def _ln(m, x): return m(x, is_tandem=dln_it)
-        else:
-            def _ln(m, x): return m(x)
-        if self.adaln_all and condition is not None:
-            cond_out = self.adaln_net(condition)  # [B, H*4]
-            s1, b1, s2, b2 = cond_out.chunk(4, dim=-1)  # each [B, H]
-            fx_norm = _ln(self.ln_1, fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
-            fx = _ln(self.ln_1_post, self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
-            fx_norm = _ln(self.ln_2, fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
-            fx = _ln(self.ln_2_post, self.mlp(fx_norm) + fx)
-        else:
-            fx = _ln(self.ln_1_post, self.attn(_ln(self.ln_1, fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
-            fx = _ln(self.ln_2_post, self.mlp(_ln(self.ln_2, fx)) + fx)
-        se = fx.mean(dim=1, keepdim=True)
-        se = F.gelu(self.se_fc1(se))
-        se = torch.sigmoid(self.se_fc2(se))
-        fx = fx * se
-        if self.film_cond and condition is not None:
-            film_out = self.film_net(condition)  # [B, H*2]
-            gamma, beta = film_out.chunk(2, dim=-1)  # each [B, H]
-            fx = gamma.unsqueeze(1) * fx + beta.unsqueeze(1)
-        if self.last_layer:
-            fx_ln = self.ln_3(fx)
-            if self.soft_moe:
-                gate = self.gate_net(fx_ln)  # [B, N, 2]
-                return gate[:, :, 0:1] * self.expert1(fx_ln) + gate[:, :, 1:2] * self.expert2(fx_ln)
-            elif self.pressure_first:
-                # Pressure-first: predict p, then condition v on p
-                p_pred = self.pres_head(fx_ln)  # [B, N, 1]
-                p_cond = p_pred if self.pressure_no_detach else p_pred.detach()
-                vel_input = torch.cat([fx_ln, p_cond], dim=-1)  # [B, N, H+1]
-                v_pred = self.vel_head_conditioned(vel_input)  # [B, N, 2]
-                return torch.cat([v_pred, p_pred], dim=-1)
-            elif self.domain_velhead:
-                out_s = self.velhead_single(fx_ln)
-                out_t = self.velhead_tandem(fx_ln)
-                if tandem_mask is not None:
-                    is_tan = (tandem_mask.view(-1) > 0.5).view(-1, 1, 1)
-                    return torch.where(is_tan.expand_as(out_s), out_t, out_s)
-                return out_s
-            elif self.field_decoder:
-                return torch.cat([self.vel_head(fx_ln), self.pres_head(fx_ln)], dim=-1)
-            elif self.adaln_output and condition is not None:
-                cond = self.cond_net(condition)  # [B, 2*H]
-                scale, shift = cond.chunk(2, dim=-1)  # [B, H]
-                fx_ln = fx_ln * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-                return self.mlp2(fx_ln)
-            else:
-                return self.mlp2(fx_ln)
-        return fx
-
-
-class Transolver(nn.Module):
-    def __init__(
-        self,
-        space_dim=1,
-        n_layers=5,
-        n_hidden=256,
-        dropout=0.0,
-        n_head=8,
-        act="gelu",
-        mlp_ratio=1,
-        fun_dim=1,
-        out_dim=1,
-        slice_num=32,
-        ref=8,
-        unified_pos=False,
-        output_fields: list[str] | None = None,
-        output_dims: list[int] | None = None,
-        linear_no_attention=False,
-        learned_kernel=False,
-        field_decoder=False,
-        adaln_output=False,
-        soft_moe=False,
-        uncertainty_loss=False,
-        adaln_all_blocks=False,
-        adaln_4cond=False,
-        adaln_nozero=False,
-        film_cond=False,
-        adaln_decouple=False,
-        adaln_zone_temp=False,
-        domain_layernorm=False,
-        dln_zeroinit=False,
-        domain_velhead=False,
-        prog_slices=False,
-        pressure_first=False,
-        pressure_no_detach=False,
-        pressure_deep=False,
-    ):
-        super().__init__()
-        self.__name__ = "UniPDE_3D"
-        self.pressure_first = pressure_first
-        self.ref = ref
-        self.unified_pos = unified_pos
-        self.adaln_output = adaln_output
-        self.adaln_all_blocks = adaln_all_blocks
-        self.adaln_4cond = adaln_4cond
-        self.film_cond = film_cond
-        self.adaln_zone_temp = adaln_zone_temp
-        if output_fields is None or output_dims is None:
-            raise ValueError("output_fields and output_dims must be provided")
-        if len(output_fields) != len(output_dims):
-            raise ValueError("output_fields and output_dims must have the same length")
-        if out_dim != sum(output_dims):
-            raise ValueError("out_dim must equal sum(output_dims)")
-        self.output_fields = output_fields
-        self.output_dims = output_dims
-        if uncertainty_loss:
-            self.log_sigma_vol = nn.Parameter(torch.zeros(1))
-            self.log_sigma_surf_ux = nn.Parameter(torch.zeros(1))
-            self.log_sigma_surf_uy = nn.Parameter(torch.zeros(1))
-            self.log_sigma_surf_p = nn.Parameter(torch.zeros(1))
-
-        if self.unified_pos:
-            self.preprocess = MLP(
-                fun_dim + self.ref * self.ref * self.ref,
-                n_hidden * 2,
-                n_hidden,
-                n_layers=0,
-                res=False,
-                act=act,
+            self.vel_head = nn.Sequential(
+                nn.Linear(hidden_dim + 1, hidden_dim), nn.GELU(),
+                nn.Linear(hidden_dim, 2),
             )
         else:
-            self.preprocess = GatedMLP2(fun_dim + space_dim, n_hidden * 2, n_hidden)
+            self.output_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
+                nn.Linear(hidden_dim, out_dim),
+            )
 
-        self.n_hidden = n_hidden
-        self.space_dim = space_dim
-        self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
-        nn.init.eye_(self.feature_cross.weight)  # start as identity
-        self.blocks = nn.ModuleList(
-            [
-                TransolverBlock(
-                    num_heads=n_head,
-                    hidden_dim=n_hidden,
-                    dropout=dropout,
-                    act=act,
-                    mlp_ratio=mlp_ratio,
-                    out_dim=out_dim,
-                    slice_num=slice_num,
-                    last_layer=(idx == n_layers - 1),
-                    linear_no_attention=linear_no_attention,
-                    learned_kernel=learned_kernel,
-                    field_decoder=field_decoder if (idx == n_layers - 1) else False,
-                    adaln_output=adaln_output if (idx == n_layers - 1) else False,
-                    soft_moe=soft_moe if (idx == n_layers - 1) else False,
-                    adaln_all=adaln_all_blocks,
-                    adaln_cond_dim=4 if adaln_4cond else 2,
-                    adaln_zero_init=not adaln_nozero,
-                    film_cond=film_cond,
-                    decouple_slice=adaln_decouple,
-                    zone_temp=adaln_zone_temp,
-                    domain_layernorm=domain_layernorm,
-                    dln_zeroinit=dln_zeroinit,
-                    domain_velhead=domain_velhead if (idx == n_layers - 1) else False,
-                    prog_slices=prog_slices,
-                    pressure_first=pressure_first if (idx == n_layers - 1) else False,
-                    pressure_no_detach=pressure_no_detach,
-                    pressure_deep=pressure_deep,
-                )
-                for idx in range(n_layers)
-            ]
-        )
-        # Separate pressure pathway (pressure_separate_last_block):
-        # Independent MLP + pres_head that processes shared hidden features
-        self._pressure_separate = False  # set from Config after construction
-        self.pressure_sep_mlp = nn.Sequential(
-            nn.LayerNorm(n_hidden),
-            nn.Linear(n_hidden, n_hidden * 2), nn.GELU(),
-            nn.Linear(n_hidden * 2, n_hidden), nn.GELU(),
-            nn.Linear(n_hidden, 1),
-        )
-        self.initialize_weights()
-        self.out_skip = nn.Linear(n_hidden, out_dim)
-        nn.init.zeros_(self.out_skip.weight)
-        nn.init.zeros_(self.out_skip.bias)
-        self.skip_gate = nn.Sequential(nn.Linear(n_hidden, 1), nn.Sigmoid())
-        nn.init.constant_(self.skip_gate[0].bias, -2.0)  # starts nearly closed
-        self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
-        self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
-        self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
-        self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
-        self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
+        # Auxiliary heads (Re/AoA prediction for auxiliary loss)
+        self.re_head = nn.Sequential(nn.Linear(hidden_dim, 32), nn.GELU(), nn.Linear(32, 1))
+        self.aoa_head = nn.Sequential(nn.Linear(hidden_dim, 32), nn.GELU(), nn.Linear(32, 1))
+
+        # Fourier PE parameters (used by training loop feature engineering)
+        self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
 
-    def initialize_weights(self):
-        self.apply(self._init_weights)
+        self._init_all_weights()
 
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            if module.weight.dim() >= 2:
-                nn.init.orthogonal_(module.weight, gain=1.0)
-            else:
-                nn.init.normal_(module.weight, std=0.01)
-            if module.bias is not None:
-                nn.init.constant_(module.bias, 0)
-        elif isinstance(module, (nn.LayerNorm, nn.BatchNorm1d)):
-            nn.init.constant_(module.bias, 0)
-            nn.init.constant_(module.weight, 1.0)
+    def _init_all_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
 
-    def get_grid(self, my_pos):
-        batchsize = my_pos.shape[0]
-        device = my_pos.device
-        dtype = my_pos.dtype
+    def _normalize_pos(self, pos, mask):
+        """Normalize positions to [0, 1000] per sample for RoPE."""
+        large = 1e9
+        masked_min = torch.where(mask.unsqueeze(-1), pos, torch.full_like(pos, large))
+        masked_max = torch.where(mask.unsqueeze(-1), pos, torch.full_like(pos, -large))
+        pmin = masked_min.amin(dim=1, keepdim=True)
+        pmax = masked_max.amax(dim=1, keepdim=True)
+        return (pos - pmin) / (pmax - pmin).clamp(min=1e-6) * 1000.0
 
-        gridx = torch.linspace(-1.5, 1.5, self.ref, device=device, dtype=dtype)
-        gridx = gridx.view(1, self.ref, 1, 1, 1).repeat(batchsize, 1, self.ref, self.ref, 1)
-        gridy = torch.linspace(0, 2, self.ref, device=device, dtype=dtype)
-        gridy = gridy.view(1, 1, self.ref, 1, 1).repeat(batchsize, self.ref, 1, self.ref, 1)
-        gridz = torch.linspace(-4, 4, self.ref, device=device, dtype=dtype)
-        gridz = gridz.view(1, 1, 1, self.ref, 1).repeat(batchsize, self.ref, self.ref, 1, 1)
-        grid_ref = torch.cat((gridx, gridy, gridz), dim=-1).reshape(batchsize, self.ref**3, 3)
+    def _sample_anchors(self, is_surface, mask, n_surf, n_vol):
+        """Vectorized anchor sampling via noise + topk."""
+        B, N = mask.shape
+        dev = mask.device
+        sv = is_surface & mask
+        vv = ~is_surface & mask
+        if self.training:
+            ss = torch.rand(B, N, device=dev) * sv.float()
+            vs = torch.rand(B, N, device=dev) * vv.float()
+        else:
+            ss = sv.float() * torch.linspace(1, 0, N, device=dev).unsqueeze(0)
+            vs = vv.float() * torch.linspace(1, 0, N, device=dev).unsqueeze(0)
+        ss.masked_fill_(~sv, -1)
+        vs.masked_fill_(~vv, -1)
+        ns = min(n_surf, N)
+        nv = min(n_vol, N)
+        _, si = ss.topk(ns, dim=-1)
+        _, vi = vs.topk(nv, dim=-1)
+        sm = torch.gather(sv, 1, si)
+        vm = torch.gather(vv, 1, vi)
+        return si, vi, sm, vm
 
-        pos = torch.sqrt(((my_pos[:, :, None, :] - grid_ref[:, None, :, :]) ** 2).sum(dim=-1))
-        return pos.reshape(batchsize, my_pos.shape[1], self.ref * self.ref * self.ref).contiguous()
-
-    def _unpack_inputs(self, data, pos=None, condition=None):
-        if not isinstance(data, Mapping):
-            raise TypeError("Model input must be a Mapping with keys: x, pos, condition")
-        x = data.get("x")
-        pos = data.get("pos", pos)
-        condition = data.get("condition", condition)
-        return x, pos, condition
-
-    def _validate_output_dims(self, preds):
-        if sum(self.output_dims) != preds.shape[-1]:
-            raise ValueError("Sum of output_dims must match preds last dimension")
+    def _knn_pool(self, node_h, node_pos, mask):
+        """kNN pooling to create supernode features from fixed grid."""
+        B, N, D = node_h.shape
+        dev = node_h.device
+        sp = self.supernode_grid.unsqueeze(0).expand(B, -1, -1)  # [B, S, 2]
+        S = sp.shape[1]
+        k = self.supernode_k
+        np_for_dist = torch.where(mask.unsqueeze(-1), node_pos, torch.full_like(node_pos, 1e6))
+        dists = torch.cdist(sp, np_for_dist)
+        _, idx = dists.topk(k, dim=-1, largest=False)
+        bi = torch.arange(B, device=dev).view(B, 1, 1).expand(B, S, k)
+        gathered = node_h[bi, idx].mean(dim=2)
+        return self.geo_proj(gathered), sp
 
     def forward(self, data, pos=None, condition=None):
-        x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
-        if x is None:
-            raise ValueError("Missing required input tensor: x")
-        if condition is not None:
-            raise ValueError("Transolver does not support conditioning inputs")
+        x = data["x"]                           # [B, N, D_in]
+        is_surface = data.get("is_surface")      # [B, N] bool
+        mask = data.get("mask")                  # [B, N] bool
+        B, N, _ = x.shape
+        dev = x.device
 
-        # Compute internal condition before feature_cross (indices are stable here)
-        use_cond = self.adaln_all_blocks or self.film_cond
-        if use_cond:
-            cond_2 = x[:, 0, 13:15]  # Re, AoA [B, 2]
-            if self.adaln_4cond:
-                gap_feat = x[:, 0, 21:22]  # gap feature [B, 1]
-                # surf_frac: fraction of nodes near a surface (curvature at index 24)
-                surf_frac = (x[:, :, 24].abs() > 0.01).float().mean(dim=1, keepdim=True)  # [B, 1]
-                block_condition = torch.cat([cond_2, gap_feat, surf_frac], dim=-1)  # [B, 4]
+        if mask is None:
+            mask = torch.ones(B, N, dtype=torch.bool, device=dev)
+        if is_surface is None:
+            is_surface = x[:, :, 12] > 0
+
+        raw_pos = x[:, :, :2]                   # standardized positions (for kNN distances)
+        h = self.feat_proj(x)                    # [B, N, hidden_dim]
+        rope_pos = self._normalize_pos(raw_pos, mask)
+
+        # Anchor sampling
+        ns = self.n_surf_anchors
+        nv = self.n_vol_anchors
+        if not self.training:
+            ns = min(N, max(ns, 4096))
+            nv = min(N, max(nv, 8192))
+        si, vi, smask, vmask = self._sample_anchors(is_surface, mask, ns, nv)
+
+        # Gather anchor features and positions
+        bi_s = torch.arange(B, device=dev).view(B, 1).expand_as(si)
+        bi_v = torch.arange(B, device=dev).view(B, 1).expand_as(vi)
+        h_s = h[bi_s, si] * smask.unsqueeze(-1).float()
+        h_v = h[bi_v, vi] * vmask.unsqueeze(-1).float()
+        p_s = rope_pos[bi_s, si]
+        p_v = rope_pos[bi_v, vi]
+
+        # Geometry branch: kNN pool → self-attention on supernodes → perceiver
+        if self.use_geo_branch:
+            geo_h, geo_raw = self._knn_pool(h, raw_pos, mask)
+            geo_p = self._normalize_pos(
+                geo_raw, torch.ones(B, geo_h.shape[1], dtype=torch.bool, device=dev)
+            )
+            geo_h = self.geo_block(geo_h, geo_p)
+            h_s = self.perceiver(h_s, p_s, kv=geo_h, kv_pos=geo_p)
+            h_v = self.perceiver(h_v, p_v, kv=geo_h, kv_pos=geo_p)
+
+        # Physics trunk: interleaved self-attention + cross-attention
+        # Pattern: (self, cross) × n_cross + remaining self blocks
+        for i in range(self.n_self_attn):
+            h_s = self.shared_self_attn(h_s, p_s)
+            h_v = self.shared_self_attn(h_v, p_v)
+            if i < self.n_cross_attn:
+                h_s_new = self.shared_cross_attn(h_s, p_s, kv=h_v, kv_pos=p_v)
+                h_v_new = self.shared_cross_attn(h_v, p_v, kv=h_s, kv_pos=p_s)
+                h_s, h_v = h_s_new, h_v_new
+
+        # Auxiliary predictions from pooled anchor features
+        anc_h = torch.cat([h_s, h_v], dim=1)
+        pooled = anc_h.mean(dim=1)
+        re_pred = self.re_head(pooled)
+        aoa_pred = self.aoa_head(pooled)
+
+        if self.training:
+            # Training: predict at anchor locations only (skip decoder for speed/memory)
+            anc_decoded = self.final_norm(anc_h)
+            if self.pressure_first:
+                p = self.pres_head(anc_decoded)
+                v = self.vel_head(torch.cat([anc_decoded, p.detach()], dim=-1))
+                anc_preds = torch.cat([v, p], dim=-1)
             else:
-                block_condition = cond_2  # [B, 2]
+                anc_preds = self.output_head(anc_decoded)
+
+            # Scatter anchor predictions back to full mesh (non-anchor nodes get 0)
+            preds = torch.zeros(B, N, anc_preds.shape[-1], device=dev)
+            anchor_idx = torch.cat([si, vi], dim=1)
+            anchor_valid = torch.cat([smask, vmask], dim=1)
+            bi_a = torch.arange(B, device=dev).view(B, 1).expand_as(anchor_idx)
+            preds[bi_a, anchor_idx] = anc_preds
+
+            # pred_mask: True for nodes with valid predictions
+            pred_mask = torch.zeros(B, N, dtype=torch.bool, device=dev)
+            pred_mask[bi_a[anchor_valid], anchor_idx[anchor_valid]] = True
+
+            return {"preds": preds, "pred_mask": pred_mask,
+                    "re_pred": re_pred, "aoa_pred": aoa_pred}
         else:
-            block_condition = None
+            # Eval: full decoder to reconstruct all nodes
+            anc_pos = torch.cat([raw_pos[bi_s, si], raw_pos[bi_v, vi]], dim=1)
+            decoded = self.decoder(h, raw_pos, anc_h, anc_pos)
+            decoded = self.final_norm(decoded)
+            if self.pressure_first:
+                p = self.pres_head(decoded)
+                v = self.vel_head(torch.cat([decoded, p.detach()], dim=-1))
+                preds = torch.cat([v, p], dim=-1)
+            else:
+                preds = self.output_head(decoded)
 
-        # Compute zone features for zone-aware temperature
-        if self.adaln_zone_temp:
-            is_tandem_scalar = (x[:, 0, 21].abs() > 0.01).float()  # [B]
-            gap_mag = x[:, 0, 21].abs()  # [B]
-            re_feat = x[:, 0, 13]  # [B]
-            zone_features = torch.stack([is_tandem_scalar, gap_mag, re_feat], dim=-1)  # [B, 3]
-        else:
-            zone_features = None
-
-        if self.unified_pos:
-            if pos is None:
-                raise ValueError("Missing required input tensor: pos")
-            new_pos = self.get_grid(pos)
-            x = torch.cat((x, new_pos), dim=-1)
-
-        x_cross = x * self.feature_cross(x)
-        x = x + 0.1 * x_cross  # residual with small scale
-        raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)  # x, y, curvature, dist
-
-        # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
-        is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
-
-        fx = self.preprocess(x)
-        fx_pre = fx  # save for skip
-        fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
-
-        for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
-
-        # Auxiliary Re prediction from pre-output-head hidden representation
-        re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
-        aoa_pred = self.aoa_head(fx.mean(dim=1))
-
-        # Last block: use adaln_all condition if enabled, else fallback to adaln_output
-        last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
-
-        if self._pressure_separate and self.pressure_first:
-            # Separate pressure pathway: independent MLP processes pre-last features
-            fx_for_pressure = fx  # save for separate pressure branch
-            p_sep = self.pressure_sep_mlp(fx_for_pressure)  # [B, N, 1]
-            # Main last block produces vel only (pressure_first still active but p comes from separate branch)
-            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
-            # Override: replace the pressure channel from the last block with the separate branch's output
-            fx = torch.cat([fx[:, :, :2], p_sep], dim=-1)
-        else:
-            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
-
-        gate = self.skip_gate(fx_pre)
-        fx = fx + gate * self.out_skip(fx_pre)
-        self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+            return {"preds": preds, "re_pred": re_pred, "aoa_pred": aoa_pred}
 
 
 # ---------------------------------------------------------------------------
-# End Transolver model
+# End AB-UPT model
 # ---------------------------------------------------------------------------
 
 
@@ -813,7 +596,13 @@ class Config:
     pressure_first: bool = False        # predict p first, then condition v on p
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
-    pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    pressure_separate_last_block: bool = False  # (legacy, unused by ABUPT)
+    # Phase 5: AB-UPT architecture
+    abupt_n_surf_anchors: int = 2048     # surface anchors during training
+    abupt_n_vol_anchors: int = 4096      # volume anchors during training
+    abupt_n_supernodes: int = 256        # supernode count for geometry branch
+    abupt_use_geo_branch: bool = True    # enable geometry branch (kNN → self-attn)
+    abupt_use_adamw: bool = False        # use AdamW instead of Lion
 
 
 cfg = sp.parse(Config)
@@ -935,41 +724,30 @@ if cfg.raw_targets:
 else:
     raw_stats = None
 
+_input_dim = X_DIM + 2 + (1 if cfg.foil2_dist else 0) + 32  # 24 + curv + dist [+foil2dist] + 32 fourier PE = 58
+
 model_config = dict(
-    space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    input_dim=_input_dim,
+    hidden_dim=cfg.n_hidden,
     out_dim=3,
-    n_hidden=cfg.n_hidden,
-    n_layers=cfg.n_layers,
-    n_head=3,
-    slice_num=cfg.prog_slices_end if cfg.prog_slices else cfg.slice_num,
-    mlp_ratio=2,
-    dropout=0.05 if cfg.rdrop else 0.0,
+    n_heads=3,
+    n_surf_anchors=cfg.abupt_n_surf_anchors,
+    n_vol_anchors=cfg.abupt_n_vol_anchors,
+    n_self_attn=5,
+    n_cross_attn=4,
+    n_supernodes=cfg.abupt_n_supernodes,
+    supernode_k=32,
+    decoder_k=32,
+    mlp_ratio=4,
+    dropout=0.0,
+    use_geo_branch=cfg.abupt_use_geo_branch,
+    pressure_first=cfg.pressure_first,
+    pressure_deep=cfg.pressure_deep,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
-    linear_no_attention=cfg.linear_no_attention,
-    learned_kernel=cfg.learned_kernel,
-    field_decoder=cfg.field_decoder,
-    adaln_output=cfg.adaln_output,
-    soft_moe=cfg.soft_moe,
-    uncertainty_loss=cfg.uncertainty_loss,
-    adaln_all_blocks=cfg.adaln_all_blocks,
-    adaln_4cond=cfg.adaln_4cond,
-    adaln_nozero=cfg.adaln_nozero,
-    film_cond=cfg.film_cond,
-    adaln_decouple=cfg.adaln_decouple,
-    adaln_zone_temp=cfg.adaln_zone_temp,
-    domain_layernorm=cfg.domain_layernorm,
-    dln_zeroinit=cfg.dln_zeroinit,
-    domain_velhead=cfg.domain_velhead,
-    prog_slices=cfg.prog_slices,
-    pressure_first=cfg.pressure_first,
-    pressure_no_detach=cfg.pressure_no_detach,
-    pressure_deep=cfg.pressure_deep,
 )
 
-model = Transolver(**model_config).to(device)
-model._pressure_separate = cfg.pressure_separate_last_block
+model = ABUPT(**model_config).to(device)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
@@ -1097,8 +875,9 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
-attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
-other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+_attn_keys = ['.wq.', '.wk.', '.wv.', '.wo.']
+attn_params = [p for n, p in model.named_parameters() if any(k in n for k in _attn_keys)]
+other_params = [p for n, p in model.named_parameters() if not any(k in n for k in _attn_keys)]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
 if cfg.use_lion:
     base_opt = Lion([
@@ -1353,13 +1132,19 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x, "is_surface": is_surface, "mask": mask})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
         pred = pred.float()
         re_pred = re_pred.float()
         aoa_pred = aoa_pred.float()
+
+        # AB-UPT: during training, only anchor nodes have predictions
+        pred_mask = out.get("pred_mask")  # [B, N] bool or None
+        if pred_mask is not None:
+            mask = mask & pred_mask  # restrict all loss masks to anchor nodes
+
         if model.training and not cfg.no_perstd and not cfg.raw_targets:
             if cfg.multiply_std:
                 pred = pred * sample_stds
@@ -1488,7 +1273,7 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x})
+                rdrop_out = model({"x": x, "is_surface": is_surface, "mask": mask})
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -1553,7 +1338,7 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                out2 = model({"x": x, "is_surface": is_surface, "mask": mask})
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -1623,20 +1408,7 @@ for epoch in range(MAX_EPOCHS):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             base_opt, T_max=remaining, eta_min=cfg.cosine_eta_min
         )
-    if epoch >= cfg.temp_anneal_epoch:
-        with torch.no_grad():
-            _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
-    if cfg.prog_slices:
-        # Progressive slice warmup: ramp active slices from cfg.slice_num → prog_slices_end
-        if epoch < cfg.prog_slices_epochs:
-            active = int(cfg.slice_num + (cfg.prog_slices_end - cfg.slice_num) * epoch / cfg.prog_slices_epochs)
-        else:
-            active = cfg.prog_slices_end
-        with torch.no_grad():
-            for _blk in _base_model.blocks:
-                if hasattr(_blk.attn, 'slice_mask'):
-                    _blk.attn.slice_mask.zero_()
-                    _blk.attn.slice_mask[active:].fill_(-1e9)
+    # (Transolver-specific temp_anneal and prog_slices removed for AB-UPT)
     epoch_vol /= n_batches
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
@@ -1760,7 +1532,7 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    pred = eval_model({"x": x, "is_surface": is_surface, "mask": mask})["preds"]
                 pred = pred.float()
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
@@ -1990,7 +1762,7 @@ if best_metrics:
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
-                    pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
+                    pred = vis_model({"x": x_n, "is_surface": is_surf_dev, "mask": mask})["preds"].float()
                     if cfg.raw_targets:
                         y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                     else:
