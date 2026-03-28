@@ -279,11 +279,16 @@ class TransolverBlock(nn.Module):
         dln_zeroinit=False,
         domain_velhead=False,
         prog_slices=False,
+        pressure_first=False,
+        pressure_no_detach=False,
+        pressure_deep=False,
     ):
         super().__init__()
         self.last_layer = last_layer
         self.field_decoder = field_decoder
         self.domain_velhead = domain_velhead
+        self.pressure_first = pressure_first
+        self.pressure_no_detach = pressure_no_detach
         self.adaln_output = adaln_output
         self.soft_moe = soft_moe
         self.adaln_all = adaln_all
@@ -345,6 +350,22 @@ class TransolverBlock(nn.Module):
                 self.expert2 = nn.Sequential(
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
+            elif pressure_first:
+                # Pressure-first: predict p, then condition v on p (takes priority over domain_velhead/field_decoder)
+                if pressure_deep:
+                    self.pres_head = nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(),
+                        nn.Linear(hidden_dim * 2, hidden_dim), nn.GELU(),
+                        nn.Linear(hidden_dim, 1),
+                    )
+                else:
+                    self.pres_head = nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(), nn.Linear(hidden_dim * 2, 1)
+                    )
+                # Velocity head conditioned on predicted pressure: input is hidden_dim + 1
+                self.vel_head_conditioned = nn.Sequential(
+                    nn.Linear(hidden_dim + 1, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2)
+                )
             elif domain_velhead:
                 # Domain-specific output heads: separate for single-foil vs tandem
                 self.velhead_single = nn.Sequential(
@@ -401,6 +422,13 @@ class TransolverBlock(nn.Module):
             if self.soft_moe:
                 gate = self.gate_net(fx_ln)  # [B, N, 2]
                 return gate[:, :, 0:1] * self.expert1(fx_ln) + gate[:, :, 1:2] * self.expert2(fx_ln)
+            elif self.pressure_first:
+                # Pressure-first: predict p, then condition v on p
+                p_pred = self.pres_head(fx_ln)  # [B, N, 1]
+                p_cond = p_pred if self.pressure_no_detach else p_pred.detach()
+                vel_input = torch.cat([fx_ln, p_cond], dim=-1)  # [B, N, H+1]
+                v_pred = self.vel_head_conditioned(vel_input)  # [B, N, 2]
+                return torch.cat([v_pred, p_pred], dim=-1)
             elif self.domain_velhead:
                 out_s = self.velhead_single(fx_ln)
                 out_t = self.velhead_tandem(fx_ln)
@@ -453,9 +481,13 @@ class Transolver(nn.Module):
         dln_zeroinit=False,
         domain_velhead=False,
         prog_slices=False,
+        pressure_first=False,
+        pressure_no_detach=False,
+        pressure_deep=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
+        self.pressure_first = pressure_first
         self.ref = ref
         self.unified_pos = unified_pos
         self.adaln_output = adaln_output
@@ -519,9 +551,21 @@ class Transolver(nn.Module):
                     dln_zeroinit=dln_zeroinit,
                     domain_velhead=domain_velhead if (idx == n_layers - 1) else False,
                     prog_slices=prog_slices,
+                    pressure_first=pressure_first if (idx == n_layers - 1) else False,
+                    pressure_no_detach=pressure_no_detach,
+                    pressure_deep=pressure_deep,
                 )
                 for idx in range(n_layers)
             ]
+        )
+        # Separate pressure pathway (pressure_separate_last_block):
+        # Independent MLP + pres_head that processes shared hidden features
+        self._pressure_separate = False  # set from Config after construction
+        self.pressure_sep_mlp = nn.Sequential(
+            nn.LayerNorm(n_hidden),
+            nn.Linear(n_hidden, n_hidden * 2), nn.GELU(),
+            nn.Linear(n_hidden * 2, n_hidden), nn.GELU(),
+            nn.Linear(n_hidden, 1),
         )
         self.initialize_weights()
         self.out_skip = nn.Linear(n_hidden, out_dim)
@@ -635,7 +679,18 @@ class Transolver(nn.Module):
 
         # Last block: use adaln_all condition if enabled, else fallback to adaln_output
         last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
-        fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+
+        if self._pressure_separate and self.pressure_first:
+            # Separate pressure pathway: independent MLP processes pre-last features
+            fx_for_pressure = fx  # save for separate pressure branch
+            p_sep = self.pressure_sep_mlp(fx_for_pressure)  # [B, N, 1]
+            # Main last block produces vel only (pressure_first still active but p comes from separate branch)
+            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+            # Override: replace the pressure channel from the last block with the separate branch's output
+            fx = torch.cat([fx[:, :, :2], p_sep], dim=-1)
+        else:
+            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
@@ -754,6 +809,11 @@ class Config:
     vol_subsample_frac: float = 1.0     # fraction of volume nodes in loss after vol_ramp (0.8 = 80%)
     compile_mode: str = "default"       # torch.compile mode: "default", "max-autotune", "reduce-overhead"
     num_workers: int = 4                # data loader workers
+    # Phase 4: Pressure-first sequential prediction
+    pressure_first: bool = False        # predict p first, then condition v on p
+    pressure_no_detach: bool = False    # allow gradient from vel back to pres head
+    pressure_deep: bool = False         # 3-layer pressure head instead of 2
+    pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
 
 
 cfg = sp.parse(Config)
@@ -903,9 +963,13 @@ model_config = dict(
     dln_zeroinit=cfg.dln_zeroinit,
     domain_velhead=cfg.domain_velhead,
     prog_slices=cfg.prog_slices,
+    pressure_first=cfg.pressure_first,
+    pressure_no_detach=cfg.pressure_no_detach,
+    pressure_deep=cfg.pressure_deep,
 )
 
 model = Transolver(**model_config).to(device)
+model._pressure_separate = cfg.pressure_separate_last_block
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
