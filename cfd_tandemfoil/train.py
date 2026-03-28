@@ -819,6 +819,10 @@ class Config:
 cfg = sp.parse(Config)
 
 if cfg.seed >= 0:
+    import random as _random
+    import numpy as _np
+    _random.seed(cfg.seed)
+    _np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
     torch.cuda.manual_seed_all(cfg.seed)
 
