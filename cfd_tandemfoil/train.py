@@ -139,7 +139,9 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False,
+                 rbf_routing=False, rbf_bandwidth=1.0, rbf_init_std=0.1,
+                 rbf_per_head=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -154,9 +156,18 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.decouple_slice = decouple_slice
         self.zone_temp = zone_temp
         self.prog_slices = prog_slices
+        self.rbf_routing = rbf_routing
+        self.rbf_per_head = rbf_per_head
         if prog_slices:
             # Buffer for masking inactive slices; updated per-epoch by training loop
             self.register_buffer('slice_mask', torch.zeros(slice_num))
+        if rbf_routing:
+            if rbf_per_head:
+                self.slice_centers = nn.Parameter(torch.randn(heads, slice_num, dim_head) * rbf_init_std)
+            else:
+                self.slice_centers = nn.Parameter(torch.randn(slice_num, dim_head) * rbf_init_std)
+            self.slice_bandwidth = nn.Parameter(torch.ones(slice_num) * rbf_bandwidth)
+            self._rbf_kmeans_pending = False  # set True externally to trigger k-means on first forward
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
@@ -209,19 +220,55 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         if tandem_mask is not None:
             temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
         temp = temp.clamp(min=1e-4)
-        if self.decouple_slice and tandem_mask is not None:
-            std_logits = self.in_project_slice(x_mid) / temp
-            tan_logits = self.in_project_slice_tandem(x_mid) / temp
-            is_tan = (tandem_mask > 0.5)  # [B, 1, 1, 1]
-            slice_logits = torch.where(is_tan.expand_as(std_logits), tan_logits, std_logits)
+        if self.rbf_routing:
+            # RBF kernel routing: exp(-||x - mu||^2 / (2 * sigma^2))
+            x_flat = x_mid.mean(dim=1)  # [B, N, D] — average across heads
+            # K-means init on first forward pass (deferred from __init__)
+            if self._rbf_kmeans_pending:
+                with torch.no_grad():
+                    _feat = x_flat.detach().reshape(-1, self.dim_head)  # [B*N, D]
+                    _S = self.slice_centers.shape[-2]
+                    _idx = torch.randperm(_feat.shape[0], device=_feat.device)[:_S]
+                    _c = _feat[_idx].clone()
+                    for _ in range(10):
+                        _d = torch.cdist(_feat.unsqueeze(0), _c.unsqueeze(0)).squeeze(0)
+                        _a = _d.argmin(dim=-1)
+                        for s in range(_S):
+                            _m = (_a == s)
+                            if _m.any():
+                                _c[s] = _feat[_m].mean(dim=0)
+                    if self.rbf_per_head:
+                        self.slice_centers.data[:] = _c.unsqueeze(0).expand(self.heads, -1, -1)
+                    else:
+                        self.slice_centers.data.copy_(_c)
+                    self._rbf_kmeans_pending = False
+                    print(f"  RBF k-means init: {_S} centers from {_feat.shape[0]} nodes")
+            bandwidth = self.slice_bandwidth.abs().clamp(min=0.1)  # [S]
+            if self.rbf_per_head:
+                # Per-head centers: [H, S, D]
+                # x_mid: [B, H, N, D], centers: [H, S, D]
+                dists = torch.cdist(x_mid, self.slice_centers.unsqueeze(0).expand(bsz, -1, -1, -1))  # [B, H, N, S]
+            else:
+                # Shared centers: [S, D]
+                dists = torch.cdist(x_flat, self.slice_centers.unsqueeze(0).expand(bsz, -1, -1))  # [B, N, S]
+            slice_weights = torch.exp(-dists**2 / (2 * bandwidth**2))  # [B, (H,) N, S]
+            slice_weights = slice_weights / (slice_weights.sum(dim=-1, keepdim=True) + 1e-8)
+            if not self.rbf_per_head:
+                slice_weights = slice_weights.unsqueeze(1).expand(-1, self.heads, -1, -1)  # [B, H, N, S]
         else:
-            slice_logits = self.in_project_slice(x_mid) / temp
-        if spatial_bias is not None:
-            slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
-        if self.prog_slices:
-            # Apply slice mask: 0 for active slices, -1e9 for inactive (updated each epoch)
-            slice_logits = slice_logits + self.slice_mask
-        slice_weights = self.softmax(slice_logits)
+            if self.decouple_slice and tandem_mask is not None:
+                std_logits = self.in_project_slice(x_mid) / temp
+                tan_logits = self.in_project_slice_tandem(x_mid) / temp
+                is_tan = (tandem_mask > 0.5)  # [B, 1, 1, 1]
+                slice_logits = torch.where(is_tan.expand_as(std_logits), tan_logits, std_logits)
+            else:
+                slice_logits = self.in_project_slice(x_mid) / temp
+            if spatial_bias is not None:
+                slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
+            if self.prog_slices:
+                # Apply slice mask: 0 for active slices, -1e9 for inactive (updated each epoch)
+                slice_logits = slice_logits + self.slice_mask
+            slice_weights = self.softmax(slice_logits)
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
@@ -282,6 +329,10 @@ class TransolverBlock(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        rbf_routing=False,
+        rbf_bandwidth=1.0,
+        rbf_init_std=0.1,
+        rbf_per_head=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -307,6 +358,10 @@ class TransolverBlock(nn.Module):
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
             prog_slices=prog_slices,
+            rbf_routing=rbf_routing,
+            rbf_bandwidth=rbf_bandwidth,
+            rbf_init_std=rbf_init_std,
+            rbf_per_head=rbf_per_head,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -484,6 +539,10 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        rbf_routing=False,
+        rbf_bandwidth=1.0,
+        rbf_init_std=0.1,
+        rbf_per_head=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -554,6 +613,10 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
+                    rbf_routing=rbf_routing,
+                    rbf_bandwidth=rbf_bandwidth,
+                    rbf_init_std=rbf_init_std,
+                    rbf_per_head=rbf_per_head,
                 )
                 for idx in range(n_layers)
             ]
@@ -814,6 +877,12 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: RBF kernel slice routing
+    rbf_routing: bool = False           # RBF kernel routing instead of softmax
+    rbf_bandwidth: float = 1.0          # initial RBF bandwidth (sigma)
+    rbf_init_std: float = 0.1           # std for center initialization
+    rbf_per_head: bool = False          # per-head centers (not shared across heads)
+    rbf_kmeans_init: bool = False       # initialize centers via k-means on first batch
 
 
 cfg = sp.parse(Config)
@@ -966,10 +1035,21 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    rbf_routing=cfg.rbf_routing,
+    rbf_bandwidth=cfg.rbf_bandwidth,
+    rbf_init_std=cfg.rbf_init_std,
+    rbf_per_head=cfg.rbf_per_head,
 )
 
 model = Transolver(**model_config).to(device)
 model._pressure_separate = cfg.pressure_separate_last_block
+
+# RBF k-means initialization: set flag to trigger on first forward pass
+if cfg.rbf_routing and cfg.rbf_kmeans_init:
+    for _block in model.blocks:
+        _block.attn._rbf_kmeans_pending = True
+    print("RBF k-means init: will initialize centers from first forward pass")
+
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
