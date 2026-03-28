@@ -139,7 +139,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False,
+                 ada_temp=False, ada_temp_scale=0.1):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -154,6 +155,13 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.decouple_slice = decouple_slice
         self.zone_temp = zone_temp
         self.prog_slices = prog_slices
+        self.ada_temp = ada_temp
+        if ada_temp:
+            # Per-point temperature: mean of heads → per-head offset
+            self.temp_proj = nn.Linear(dim_head, heads)
+            nn.init.zeros_(self.temp_proj.weight)
+            nn.init.zeros_(self.temp_proj.bias)
+            self.temp_scale = nn.Parameter(torch.tensor(ada_temp_scale))
         if prog_slices:
             # Buffer for masking inactive slices; updated per-epoch by training loop
             self.register_buffer('slice_mask', torch.zeros(slice_num))
@@ -201,7 +209,13 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             .permute(0, 2, 1, 3)
             .contiguous()
         )
-        temp = self.temperature
+        temp = self.temperature  # [1, heads, 1, 1]
+        if self.ada_temp:
+            # Per-point adaptive temperature from local features
+            x_mean = x_mid.mean(dim=1)  # [B, N, dim_head] (mean across heads)
+            temp_offset = self.temp_proj(x_mean)  # [B, N, heads]
+            temp_offset = temp_offset.permute(0, 2, 1).unsqueeze(-1)  # [B, heads, N, 1]
+            temp = temp + self.temp_scale * temp_offset.sigmoid()  # [B, heads, N, 1]
         if self.zone_temp and zone_features is not None:
             # zone_features: [B, 3] → per-head offset [B, heads] → [B, heads, 1, 1]
             zone_offset = self.zone_temp_proj(zone_features).reshape(bsz, self.heads, 1, 1)
@@ -282,6 +296,8 @@ class TransolverBlock(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        ada_temp=False,
+        ada_temp_scale=0.1,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -307,6 +323,8 @@ class TransolverBlock(nn.Module):
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
             prog_slices=prog_slices,
+            ada_temp=ada_temp,
+            ada_temp_scale=ada_temp_scale,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -484,6 +502,8 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        ada_temp=False,
+        ada_temp_scale=0.1,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -554,6 +574,8 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
+                    ada_temp=ada_temp,
+                    ada_temp_scale=ada_temp_scale,
                 )
                 for idx in range(n_layers)
             ]
@@ -814,6 +836,9 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Ada-Temp per-point adaptive slice temperature
+    ada_temp: bool = False              # per-point adaptive temperature for slice routing
+    ada_temp_scale: float = 0.1         # initial scale for temperature offset
 
 
 cfg = sp.parse(Config)
@@ -966,6 +991,8 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    ada_temp=cfg.ada_temp,
+    ada_temp_scale=cfg.ada_temp_scale,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1584,7 +1611,13 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.ada_temp:
+            # Log per-block temp_scale and temperature stats
+            for bi, block in enumerate(_base_model.blocks):
+                if hasattr(block.attn, 'temp_scale'):
+                    _log[f"ada_temp/block{bi}_scale"] = block.attn.temp_scale.item()
+        wandb.log(_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
