@@ -814,6 +814,10 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Self-distillation
+    self_distill_online: bool = False  # online distillation from EMA teacher
+    self_distill_2phase: bool = False  # two-phase: train teacher, then distill to student
+    distill_alpha: float = 0.3        # weight of distillation loss (rest is ground truth)
 
 
 cfg = sp.parse(Config)
@@ -1193,6 +1197,11 @@ prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
 
+# Self-distillation teacher setup
+_distill_teacher = None  # will be set to EMA or loaded teacher
+_distill_2phase_saved = False
+_distill_2phase_halfway = MAX_TIMEOUT / 2.0  # minutes
+
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
     if elapsed_min >= MAX_TIMEOUT:
@@ -1484,6 +1493,24 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # Online self-distillation from EMA teacher
+        if (cfg.self_distill_online or cfg.self_distill_2phase) and _distill_teacher is not None:
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    teacher_pred = _distill_teacher({"x": x})["preds"]
+                teacher_pred = teacher_pred.float()
+                if not cfg.no_perstd and not cfg.raw_targets:
+                    if cfg.multiply_std:
+                        teacher_pred = teacher_pred * sample_stds
+                    else:
+                        teacher_pred = teacher_pred / sample_stds
+            distill_err = (pred - teacher_pred) ** 2
+            distill_surf = (distill_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            distill_vol = (distill_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+            distill_loss = distill_vol + surf_weight * distill_surf
+            # Blend: (1-alpha)*gt_loss + alpha*distill_loss
+            loss = (1 - cfg.distill_alpha) * loss + cfg.distill_alpha * distill_loss
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -1583,6 +1610,9 @@ for epoch in range(MAX_EPOCHS):
                 with torch.no_grad():
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+        # Online distillation: use EMA as teacher once available
+        if cfg.self_distill_online and ema_model is not None:
+            _distill_teacher = ema_model
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -1641,6 +1671,45 @@ for epoch in range(MAX_EPOCHS):
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
     prev_surf_loss = epoch_surf
+
+    # Two-phase self-distillation: save teacher and reinit student at halfway
+    if cfg.self_distill_2phase and not _distill_2phase_saved:
+        elapsed_min = (time.time() - train_start) / 60.0
+        if elapsed_min >= _distill_2phase_halfway:
+            print(f"[Distill Phase 2] Saving teacher at epoch {epoch+1} ({elapsed_min:.1f} min)")
+            # Save the EMA model as teacher (or base model if no EMA yet)
+            teacher_src = ema_model if ema_model is not None else _base_model
+            _distill_teacher = deepcopy(teacher_src)
+            _distill_teacher.eval()
+            for p in _distill_teacher.parameters():
+                p.requires_grad = False
+            # Reinit student model with fresh weights
+            fresh_model = Transolver(**model_config).to(device)
+            fresh_model._pressure_separate = cfg.pressure_separate_last_block
+            fresh_model = torch.compile(fresh_model, mode=cfg.compile_mode)
+            _base_model_new = fresh_model._orig_mod if hasattr(fresh_model, '_orig_mod') else fresh_model
+            # Replace model references
+            model = fresh_model
+            _base_model = _base_model_new
+            ema_model = None  # will re-initialize from new model
+            # Fresh optimizer and scheduler for phase 2
+            remaining_min = MAX_TIMEOUT - elapsed_min
+            remaining_epochs = int(remaining_min / (elapsed_min / max(epoch + 1, 1)))
+            p2_T_max = max(remaining_epochs, 30)
+            if cfg.use_lion:
+                base_opt = Lion(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+            else:
+                base_opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+            optimizer = base_opt
+            if cfg.use_lookahead:
+                optimizer = Lookahead(base_opt, alpha=0.5, k=5)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                base_opt, T_max=p2_T_max, eta_min=cfg.cosine_eta_min
+            )
+            step_scheduler_per_batch = False
+            _distill_2phase_saved = True
+            print(f"[Distill Phase 2] Student reinit. Estimated {remaining_epochs} epochs, T_max={p2_T_max}")
+
     # Snapshot ensemble: save running average at specified epochs
     if cfg.snapshot_ensemble and (epoch + 1) in snapshot_epoch_list:
         snap = {k: v.cpu().clone() for k, v in _base_model.state_dict().items()}
