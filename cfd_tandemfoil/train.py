@@ -1730,7 +1730,7 @@ for epoch in range(MAX_EPOCHS):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             base_opt, T_max=remaining, eta_min=cfg.cosine_eta_min
         )
-    if epoch >= cfg.temp_anneal_epoch:
+    if epoch >= cfg.temp_anneal_epoch and hasattr(_base_model, 'blocks'):
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
     if cfg.prog_slices:
