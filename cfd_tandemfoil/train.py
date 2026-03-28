@@ -814,6 +814,10 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Huber loss for surface pressure
+    huber_delta: float = 0.0       # 0 = pure L1 (default), >0 = Huber with this delta for surface loss
+    huber_anneal: bool = False     # anneal delta from 2*huber_delta to huber_delta/4 over training
+    huber_pressure_only: bool = False  # apply Huber only to pressure channel, L1 for velocity
 
 
 cfg = sp.parse(Config)
@@ -1367,6 +1371,20 @@ for epoch in range(MAX_EPOCHS):
                 pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
+        # Huber loss for surface pressure: compute separate surface error tensor
+        if cfg.huber_delta > 0:
+            _huber_delta = cfg.huber_delta
+            if cfg.huber_anneal:
+                _progress = min(1.0, epoch / 120.0)
+                _huber_delta = cfg.huber_delta * (2.0 - 1.75 * _progress)
+            if cfg.huber_pressure_only:
+                surf_err = abs_err.clone()
+                surf_err[:, :, 2:3] = F.smooth_l1_loss(pred[:, :, 2:3], y_norm[:, :, 2:3],
+                                                         beta=_huber_delta, reduction='none')
+            else:
+                surf_err = F.smooth_l1_loss(pred, y_norm, beta=_huber_delta, reduction='none')
+        else:
+            surf_err = abs_err
         if cfg.tandem_ramp:
             pass  # no hard curriculum; tandem_weight applied via tandem_boost below
         elif epoch < cfg.tandem_curriculum_epochs:
@@ -1412,14 +1430,14 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        surf_per_sample = (surf_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
         running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
         # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
         if epoch >= 30:
-            surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
+            surf_pres = surf_err[:, :, 2:3]  # pressure errors [B, N, 1] (Huber or L1)
             surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
             surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
             thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
@@ -1584,7 +1602,13 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.huber_delta > 0:
+            _log_dict["train/huber_delta"] = _huber_delta
+            # Also log L1 surface loss for comparison
+            _l1_surf = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+            _log_dict["train/surf_l1"] = _l1_surf
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
