@@ -647,6 +647,208 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Galerkin Transformer (Phase 5)
+# ---------------------------------------------------------------------------
+
+class GalerkinAttention(nn.Module):
+    """Linear attention via Galerkin projection: Q(K^T V) instead of softmax(QK^T)V.
+
+    Instance-normalizes Q and K along the sequence dimension for stable training.
+    Complexity: O(n * d²) instead of O(n² * d).
+    """
+    def __init__(self, dim, heads=8, dim_head=64):
+        super().__init__()
+        self.heads = heads
+        self.dim_head = dim_head
+        inner_dim = heads * dim_head
+        self.q = nn.Linear(dim, inner_dim)
+        self.k = nn.Linear(dim, inner_dim)
+        self.v = nn.Linear(dim, inner_dim)
+        self.out = nn.Linear(inner_dim, dim)
+
+    def forward(self, x, mask=None):
+        B, N, _ = x.shape
+        H, D = self.heads, self.dim_head
+
+        q = self.q(x).view(B, N, H, D).permute(0, 2, 1, 3)  # [B, H, N, D]
+        k = self.k(x).view(B, N, H, D).permute(0, 2, 1, 3)
+        v = self.v(x).view(B, N, H, D).permute(0, 2, 1, 3)
+
+        # Instance normalize Q and K along sequence dimension
+        q = (q - q.mean(dim=2, keepdim=True)) / (q.std(dim=2, keepdim=True) + 1e-6)
+        k = (k - k.mean(dim=2, keepdim=True)) / (k.std(dim=2, keepdim=True) + 1e-6)
+
+        # Zero out padded nodes in K and V
+        if mask is not None:
+            mask_expand = mask.unsqueeze(1).unsqueeze(-1)  # [B, 1, N, 1]
+            k = k * mask_expand
+            v = v * mask_expand
+
+        # Linear attention: Q(K^T V) — O(n * d²)
+        kv = torch.matmul(k.transpose(-2, -1), v)  # [B, H, D, D]
+        out = torch.matmul(q, kv)  # [B, H, N, D]
+
+        out = out.permute(0, 2, 1, 3).reshape(B, N, -1)
+        return self.out(out)
+
+
+class GalerkinBlock(nn.Module):
+    """Galerkin Transformer block with linear attention + FFN."""
+    def __init__(self, dim, heads=8, dim_head=64, mlp_ratio=4, domain_ln=False):
+        super().__init__()
+        self.domain_ln = domain_ln
+        _LN = (lambda d: DomainLayerNorm(d)) if domain_ln else nn.LayerNorm
+        self.norm1 = _LN(dim)
+        self.attn = GalerkinAttention(dim, heads, dim_head)
+        self.norm2 = _LN(dim)
+        self.ffn = GatedMLP(dim, dim * mlp_ratio, dim)
+
+    def forward(self, x, mask=None, is_tandem=None):
+        if self.domain_ln and is_tandem is not None:
+            x = x + self.attn(self.norm1(x, is_tandem=is_tandem), mask=mask)
+            x = x + self.ffn(self.norm2(x, is_tandem=is_tandem))
+        else:
+            x = x + self.attn(self.norm1(x), mask=mask)
+            x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class GalerkinTransformerCFD(nn.Module):
+    """Full Galerkin Transformer for CFD surrogate prediction.
+
+    1. Input encoder (GatedMLP2 + feature cross + Fourier PE)
+    2. L GalerkinBlocks with linear attention (processes ALL nodes)
+    3. Output head (field_decoder with domain-specific vel + separate pres)
+    """
+    def __init__(self, space_dim=2, n_layers=4, n_hidden=192, n_head=8,
+                 fun_dim=1, out_dim=3, dim_head=64, mlp_ratio=4,
+                 output_fields=None, output_dims=None,
+                 domain_layernorm=False, domain_velhead=False,
+                 **kwargs):
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.output_fields = output_fields or ["Ux", "Uy", "p"]
+        self.output_dims = output_dims or [1, 1, 1]
+
+        # Input encoder
+        self.preprocess = GatedMLP2(fun_dim + space_dim, n_hidden * 2, n_hidden)
+        self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
+        nn.init.eye_(self.feature_cross.weight)
+        self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
+        self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
+
+        # Galerkin blocks
+        self.blocks = nn.ModuleList([
+            GalerkinBlock(n_hidden, heads=n_head, dim_head=dim_head,
+                          mlp_ratio=mlp_ratio, domain_ln=domain_layernorm)
+            for _ in range(n_layers)
+        ])
+
+        # Output heads
+        self.ln_out = nn.LayerNorm(n_hidden)
+        if domain_velhead:
+            self.velhead_single = nn.Sequential(
+                nn.Linear(n_hidden, n_hidden), nn.GELU(), nn.Linear(n_hidden, 2))
+            self.velhead_tandem = nn.Sequential(
+                nn.Linear(n_hidden, n_hidden), nn.GELU(), nn.Linear(n_hidden, 2))
+            self.pres_head = nn.Sequential(
+                nn.Linear(n_hidden, n_hidden * 2), nn.GELU(), nn.Linear(n_hidden * 2, 1))
+            self.domain_velhead = True
+        else:
+            self.vel_head = nn.Sequential(
+                nn.Linear(n_hidden, n_hidden), nn.GELU(), nn.Linear(n_hidden, 2))
+            self.pres_head = nn.Sequential(
+                nn.Linear(n_hidden, n_hidden * 2), nn.GELU(), nn.Linear(n_hidden * 2, 1))
+            self.domain_velhead = False
+
+        # Skip connection
+        self.out_skip = nn.Linear(n_hidden, out_dim)
+        nn.init.zeros_(self.out_skip.weight)
+        nn.init.zeros_(self.out_skip.bias)
+        self.skip_gate = nn.Sequential(nn.Linear(n_hidden, 1), nn.Sigmoid())
+        nn.init.constant_(self.skip_gate[0].bias, -2.0)
+
+        # Auxiliary heads
+        self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+
+        # Fourier frequencies (needed by training loop)
+        self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])
+        self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            if module.weight.dim() >= 2:
+                nn.init.orthogonal_(module.weight, gain=1.0)
+            else:
+                nn.init.normal_(module.weight, std=0.01)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, (nn.LayerNorm, nn.BatchNorm1d)):
+            nn.init.constant_(module.bias, 0)
+            nn.init.constant_(module.weight, 1.0)
+
+    def forward(self, data):
+        from collections.abc import Mapping
+        x = data["x"] if isinstance(data, Mapping) else data
+        mask = data.get("mask") if isinstance(data, Mapping) else None
+        B, N, D = x.shape
+
+        # Feature cross
+        x_cross = x * self.feature_cross(x)
+        x = x + 0.1 * x_cross
+
+        # Detect tandem
+        is_tandem_bool = (x[:, 0, 21].abs() > 0.01)
+        is_tandem = is_tandem_bool.float()[:, None, None, None]
+
+        # Encode
+        fx = self.preprocess(x)
+        fx_pre = fx
+        fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
+
+        # Apply Galerkin blocks
+        mask_float = mask.float() if mask is not None else None
+        for block in self.blocks:
+            fx = block(fx, mask=mask_float, is_tandem=is_tandem_bool if any(
+                hasattr(b, 'domain_ln') and b.domain_ln for b in self.blocks) else None)
+
+        # Auxiliary predictions
+        re_pred = self.re_head(fx.mean(dim=1))
+        aoa_pred = self.aoa_head(fx.mean(dim=1))
+
+        # Output head
+        fx_ln = self.ln_out(fx)
+        if self.domain_velhead:
+            vel_s = self.velhead_single(fx_ln)
+            vel_t = self.velhead_tandem(fx_ln)
+            if is_tandem is not None:
+                is_tan = is_tandem_bool.view(-1, 1, 1)
+                vel = torch.where(is_tan.expand_as(vel_s), vel_t, vel_s)
+            else:
+                vel = vel_s
+            pres = self.pres_head(fx_ln)
+            out = torch.cat([vel, pres], dim=-1)
+        else:
+            out = torch.cat([self.vel_head(fx_ln), self.pres_head(fx_ln)], dim=-1)
+
+        # Skip connection
+        gate = self.skip_gate(fx_pre)
+        out = out + gate * self.out_skip(fx_pre)
+
+        return {"preds": out, "re_pred": re_pred, "aoa_pred": aoa_pred}
+
+# ---------------------------------------------------------------------------
+# End Galerkin Transformer
+# ---------------------------------------------------------------------------
+
+
 MAX_TIMEOUT = 180.0  # minutes
 MAX_EPOCHS = 500
 
@@ -754,6 +956,10 @@ class Config:
     vol_subsample_frac: float = 1.0     # fraction of volume nodes in loss after vol_ramp (0.8 = 80%)
     compile_mode: str = "default"       # torch.compile mode: "default", "max-autotune", "reduce-overhead"
     num_workers: int = 4                # data loader workers
+    # Phase 5: Galerkin Transformer
+    model_type: str = "transolver"      # "transolver" or "galerkin"
+    dim_head: int = 64                  # attention head dimension (for Galerkin)
+    n_head: int = 3                     # number of attention heads (3 for Transolver, 8 for Galerkin)
 
 
 cfg = sp.parse(Config)
@@ -881,7 +1087,7 @@ model_config = dict(
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
-    n_head=3,
+    n_head=cfg.n_head,
     slice_num=cfg.prog_slices_end if cfg.prog_slices else cfg.slice_num,
     mlp_ratio=2,
     dropout=0.05 if cfg.rdrop else 0.0,
@@ -905,7 +1111,23 @@ model_config = dict(
     prog_slices=cfg.prog_slices,
 )
 
-model = Transolver(**model_config).to(device)
+if cfg.model_type == "galerkin":
+    model = GalerkinTransformerCFD(
+        space_dim=2,
+        n_layers=cfg.n_layers,
+        n_hidden=cfg.n_hidden,
+        n_head=cfg.n_head,
+        fun_dim=model_config["fun_dim"],
+        out_dim=3,
+        dim_head=cfg.dim_head,
+        mlp_ratio=2,
+        output_fields=["Ux", "Uy", "p"],
+        output_dims=[1, 1, 1],
+        domain_layernorm=cfg.domain_layernorm,
+        domain_velhead=cfg.domain_velhead,
+    ).to(device)
+else:
+    model = Transolver(**model_config).to(device)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
@@ -1289,7 +1511,10 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            _model_input = {"x": x}
+            if cfg.model_type == "galerkin":
+                _model_input["mask"] = mask
+            out = model(_model_input)
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -1424,7 +1649,7 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x})
+                rdrop_out = model(_model_input)
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -1489,7 +1714,7 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                out2 = model(_model_input)
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -1559,7 +1784,7 @@ for epoch in range(MAX_EPOCHS):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             base_opt, T_max=remaining, eta_min=cfg.cosine_eta_min
         )
-    if epoch >= cfg.temp_anneal_epoch:
+    if epoch >= cfg.temp_anneal_epoch and hasattr(_base_model, 'blocks') and hasattr(getattr(_base_model.blocks[0], 'attn', None), 'temperature'):
         with torch.no_grad():
             _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
     if cfg.prog_slices:
@@ -1696,7 +1921,10 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    _eval_input = {"x": x}
+                    if cfg.model_type == "galerkin":
+                        _eval_input["mask"] = mask
+                    pred = eval_model(_eval_input)["preds"]
                 pred = pred.float()
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
