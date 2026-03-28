@@ -90,6 +90,29 @@ class GatedMLP2(nn.Module):
         return self.down(h)
 
 
+class SurfaceDecoder(nn.Module):
+    """Dedicated deeper MLP for surface node decoding (AB-UPT style)."""
+    def __init__(self, in_dim, hidden_dim, out_dim, n_layers=3):
+        super().__init__()
+        layers = []
+        d = in_dim
+        for i in range(n_layers):
+            out = out_dim if i == n_layers - 1 else hidden_dim
+            layers.append(nn.Linear(d, out * 2 if i < n_layers - 1 else out))
+            d = out
+        self.layers = nn.ModuleList(layers)
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            if i < len(self.layers) - 1:
+                h = layer(x)
+                x, gate = h.chunk(2, dim=-1)
+                x = x * torch.sigmoid(gate)  # gated linear unit
+            else:
+                x = layer(x)
+        return x
+
+
 class MLP(nn.Module):
     def __init__(self, n_input, n_hidden, n_output, n_layers=1, act="gelu", res=True):
         super().__init__()
@@ -391,7 +414,7 @@ class TransolverBlock(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None, return_hidden=False):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         # DomainLayerNorm helper: pass is_tandem when enabled, else plain call
         dln_it = (tandem_mask.view(-1) > 0.5) if (self.domain_layernorm and tandem_mask is not None) else None
@@ -421,30 +444,34 @@ class TransolverBlock(nn.Module):
             fx_ln = self.ln_3(fx)
             if self.soft_moe:
                 gate = self.gate_net(fx_ln)  # [B, N, 2]
-                return gate[:, :, 0:1] * self.expert1(fx_ln) + gate[:, :, 1:2] * self.expert2(fx_ln)
+                out = gate[:, :, 0:1] * self.expert1(fx_ln) + gate[:, :, 1:2] * self.expert2(fx_ln)
             elif self.pressure_first:
                 # Pressure-first: predict p, then condition v on p
                 p_pred = self.pres_head(fx_ln)  # [B, N, 1]
                 p_cond = p_pred if self.pressure_no_detach else p_pred.detach()
                 vel_input = torch.cat([fx_ln, p_cond], dim=-1)  # [B, N, H+1]
                 v_pred = self.vel_head_conditioned(vel_input)  # [B, N, 2]
-                return torch.cat([v_pred, p_pred], dim=-1)
+                out = torch.cat([v_pred, p_pred], dim=-1)
             elif self.domain_velhead:
                 out_s = self.velhead_single(fx_ln)
                 out_t = self.velhead_tandem(fx_ln)
                 if tandem_mask is not None:
                     is_tan = (tandem_mask.view(-1) > 0.5).view(-1, 1, 1)
-                    return torch.where(is_tan.expand_as(out_s), out_t, out_s)
-                return out_s
+                    out = torch.where(is_tan.expand_as(out_s), out_t, out_s)
+                else:
+                    out = out_s
             elif self.field_decoder:
-                return torch.cat([self.vel_head(fx_ln), self.pres_head(fx_ln)], dim=-1)
+                out = torch.cat([self.vel_head(fx_ln), self.pres_head(fx_ln)], dim=-1)
             elif self.adaln_output and condition is not None:
                 cond = self.cond_net(condition)  # [B, 2*H]
                 scale, shift = cond.chunk(2, dim=-1)  # [B, H]
                 fx_ln = fx_ln * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-                return self.mlp2(fx_ln)
+                out = self.mlp2(fx_ln)
             else:
-                return self.mlp2(fx_ln)
+                out = self.mlp2(fx_ln)
+            if return_hidden:
+                return out, fx_ln
+            return out
         return fx
 
 
@@ -484,10 +511,15 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        surface_branch=False,
+        surface_decoder_depth=2,
+        surface_decoder_width=256,
+        surface_shared_head=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.pressure_first = pressure_first
+        self.surface_branch = surface_branch
         self.ref = ref
         self.unified_pos = unified_pos
         self.adaln_output = adaln_output
@@ -567,6 +599,27 @@ class Transolver(nn.Module):
             nn.Linear(n_hidden * 2, n_hidden), nn.GELU(),
             nn.Linear(n_hidden, 1),
         )
+        # AB-UPT surface branch: dedicated decoders for surface nodes
+        if surface_branch:
+            if pressure_first:
+                # Separate surface decoders for p and v
+                self.surface_decoder_p = SurfaceDecoder(
+                    n_hidden, surface_decoder_width, 1, n_layers=surface_decoder_depth
+                )
+                if not surface_shared_head:
+                    self.surface_decoder_v = SurfaceDecoder(
+                        n_hidden, surface_decoder_width, 2, n_layers=surface_decoder_depth
+                    )
+                else:
+                    # Shared: single decoder produces all 3 channels
+                    self.surface_decoder_shared = SurfaceDecoder(
+                        n_hidden, surface_decoder_width, out_dim, n_layers=surface_decoder_depth
+                    )
+            else:
+                # Non-pressure_first: single decoder for all outputs
+                self.surface_decoder_p = SurfaceDecoder(
+                    n_hidden, surface_decoder_width, out_dim, n_layers=surface_decoder_depth
+                )
         self.initialize_weights()
         self.out_skip = nn.Linear(n_hidden, out_dim)
         nn.init.zeros_(self.out_skip.weight)
@@ -617,14 +670,15 @@ class Transolver(nn.Module):
         x = data.get("x")
         pos = data.get("pos", pos)
         condition = data.get("condition", condition)
-        return x, pos, condition
+        is_surface = data.get("is_surface")
+        return x, pos, condition, is_surface
 
     def _validate_output_dims(self, preds):
         if sum(self.output_dims) != preds.shape[-1]:
             raise ValueError("Sum of output_dims must match preds last dimension")
 
     def forward(self, data, pos=None, condition=None):
-        x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
+        x, pos, condition, is_surface = self._unpack_inputs(data, pos=pos, condition=condition)
         if x is None:
             raise ValueError("Missing required input tensor: x")
         if condition is not None:
@@ -680,16 +734,38 @@ class Transolver(nn.Module):
         # Last block: use adaln_all condition if enabled, else fallback to adaln_output
         last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
 
+        _need_hidden = self.surface_branch
         if self._pressure_separate and self.pressure_first:
             # Separate pressure pathway: independent MLP processes pre-last features
             fx_for_pressure = fx  # save for separate pressure branch
             p_sep = self.pressure_sep_mlp(fx_for_pressure)  # [B, N, 1]
             # Main last block produces vel only (pressure_first still active but p comes from separate branch)
-            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+            if _need_hidden:
+                fx, fx_hidden = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features, return_hidden=True)
+            else:
+                fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
             # Override: replace the pressure channel from the last block with the separate branch's output
             fx = torch.cat([fx[:, :, :2], p_sep], dim=-1)
         else:
-            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+            if _need_hidden:
+                fx, fx_hidden = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features, return_hidden=True)
+            else:
+                fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+
+        # AB-UPT surface branch: override surface node predictions with dedicated decoder
+        if _need_hidden and is_surface is not None:
+            surf_expand = is_surface.bool().unsqueeze(-1)  # [B, N, 1]
+            # Run surface decoder on all nodes (torch.where avoids graph breaks from boolean indexing)
+            if self.pressure_first:
+                if hasattr(self, 'surface_decoder_shared'):
+                    surf_out = self.surface_decoder_shared(fx_hidden)  # [B, N, 3]
+                else:
+                    surf_p = self.surface_decoder_p(fx_hidden)  # [B, N, 1]
+                    surf_v = self.surface_decoder_v(fx_hidden)  # [B, N, 2]
+                    surf_out = torch.cat([surf_v, surf_p], dim=-1)  # [B, N, 3]
+            else:
+                surf_out = self.surface_decoder_p(fx_hidden)  # [B, N, out_dim]
+            fx = torch.where(surf_expand, surf_out, fx)
 
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
@@ -814,6 +890,11 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: AB-UPT surface branch
+    surface_branch: bool = False               # dedicated surface decoder (AB-UPT style)
+    surface_decoder_depth: int = 2             # number of GatedMLP layers in surface decoder
+    surface_decoder_width: int = 256           # hidden width of surface decoder
+    surface_shared_head: bool = False          # share single decoder for p and v (else separate)
 
 
 cfg = sp.parse(Config)
@@ -966,6 +1047,10 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    surface_branch=cfg.surface_branch,
+    surface_decoder_depth=cfg.surface_decoder_depth,
+    surface_decoder_width=cfg.surface_decoder_width,
+    surface_shared_head=cfg.surface_shared_head,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1353,7 +1438,10 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            _model_input = {"x": x}
+            if cfg.surface_branch:
+                _model_input["is_surface"] = is_surface
+            out = model(_model_input)
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -1488,7 +1576,10 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x})
+                _rdrop_input = {"x": x}
+                if cfg.surface_branch:
+                    _rdrop_input["is_surface"] = is_surface
+                rdrop_out = model(_rdrop_input)
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -1553,7 +1644,10 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                _sam_input = {"x": x}
+                if cfg.surface_branch:
+                    _sam_input["is_surface"] = is_surface
+                out2 = model(_sam_input)
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -1760,7 +1854,10 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    _eval_input = {"x": x}
+                    if cfg.surface_branch:
+                        _eval_input["is_surface"] = is_surface
+                    pred = eval_model(_eval_input)["preds"]
                 pred = pred.float()
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
@@ -1990,7 +2087,10 @@ if best_metrics:
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
-                    pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
+                    _vis_input = {"x": x_n, "mask": mask}
+                    if cfg.surface_branch:
+                        _vis_input["is_surface"] = is_surf_dev
+                    pred = vis_model(_vis_input)["preds"].float()
                     if cfg.raw_targets:
                         y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                     else:
