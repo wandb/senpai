@@ -139,7 +139,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False,
+                 use_sdpa=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -154,6 +155,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.decouple_slice = decouple_slice
         self.zone_temp = zone_temp
         self.prog_slices = prog_slices
+        self.use_sdpa = use_sdpa
         if prog_slices:
             # Buffer for masking inactive slices; updated per-epoch by training loop
             self.register_buffer('slice_mask', torch.zeros(slice_num))
@@ -228,6 +230,13 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
         if self.linear_no_attention:
             out_slice_token = slice_token
+        elif self.use_sdpa:
+            # SDPA path: use F.scaled_dot_product_attention for flash/memory-efficient attention
+            q_slice_token = self.to_q(slice_token)  # [B, H, M, D]
+            k_slice_token = self.to_k(slice_token)   # [B, H, M, D]
+            v_slice_token = self.to_v(slice_token)   # [B, H, M, D]
+            out_slice_token = F.scaled_dot_product_attention(q_slice_token, k_slice_token, v_slice_token)
+            out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
         else:
             q_slice_token = self.to_q(slice_token)
             slice_token_kv = slice_token.mean(dim=1, keepdim=True)
@@ -282,6 +291,7 @@ class TransolverBlock(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        use_sdpa=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -303,6 +313,7 @@ class TransolverBlock(nn.Module):
             dropout=dropout,
             slice_num=slice_num,
             linear_no_attention=linear_no_attention,
+            use_sdpa=use_sdpa,
             learned_kernel=learned_kernel,
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
@@ -484,6 +495,7 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        use_sdpa=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -554,6 +566,7 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
+                    use_sdpa=use_sdpa,
                 )
                 for idx in range(n_layers)
             ]
@@ -814,6 +827,8 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: SDPA speedup
+    use_sdpa: bool = False             # use F.scaled_dot_product_attention for slice attention
 
 
 cfg = sp.parse(Config)
@@ -966,6 +981,7 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    use_sdpa=cfg.use_sdpa,
 )
 
 model = Transolver(**model_config).to(device)
