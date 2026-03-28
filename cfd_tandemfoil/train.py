@@ -139,7 +139,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False,
+                 tpp_gumbel=False, tpp_gumbel_scale=0.1, tpp_ada_temp=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -154,12 +155,19 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.decouple_slice = decouple_slice
         self.zone_temp = zone_temp
         self.prog_slices = prog_slices
+        self.tpp_gumbel = tpp_gumbel
+        self.tpp_gumbel_scale = tpp_gumbel_scale
+        self.tpp_ada_temp = tpp_ada_temp
         if prog_slices:
             # Buffer for masking inactive slices; updated per-epoch by training loop
             self.register_buffer('slice_mask', torch.zeros(slice_num))
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
+        if tpp_ada_temp:
+            self.temp_proj = nn.Linear(dim_head, 1)
+            nn.init.zeros_(self.temp_proj.weight)
+            nn.init.zeros_(self.temp_proj.bias)
         self.in_project_slice = nn.Linear(dim_head, slice_num)
         torch.nn.init.orthogonal_(self.in_project_slice.weight)
         if decouple_slice:
@@ -202,6 +210,9 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             .contiguous()
         )
         temp = self.temperature
+        if self.tpp_ada_temp:
+            ada_temp_offset = 0.1 * self.temp_proj(x_mid.mean(2, keepdim=True)).sigmoid()
+            temp = temp + ada_temp_offset
         if self.zone_temp and zone_features is not None:
             # zone_features: [B, 3] → per-head offset [B, heads] → [B, heads, 1, 1]
             zone_offset = self.zone_temp_proj(zone_features).reshape(bsz, self.heads, 1, 1)
@@ -221,6 +232,10 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         if self.prog_slices:
             # Apply slice mask: 0 for active slices, -1e9 for inactive (updated each epoch)
             slice_logits = slice_logits + self.slice_mask
+        if self.tpp_gumbel and self.training:
+            U = torch.zeros_like(slice_logits).uniform_().clamp(1e-6, 1 - 1e-6)
+            gumbel_noise = -(-U.log()).log()
+            slice_logits = slice_logits + self.tpp_gumbel_scale * gumbel_noise
         slice_weights = self.softmax(slice_logits)
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
@@ -282,6 +297,9 @@ class TransolverBlock(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        tpp_gumbel=False,
+        tpp_gumbel_scale=0.1,
+        tpp_ada_temp=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -307,6 +325,9 @@ class TransolverBlock(nn.Module):
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
             prog_slices=prog_slices,
+            tpp_gumbel=tpp_gumbel,
+            tpp_gumbel_scale=tpp_gumbel_scale,
+            tpp_ada_temp=tpp_ada_temp,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -484,10 +505,15 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        tpp_gumbel=False,
+        tpp_gumbel_scale=0.1,
+        tpp_ada_temp=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.pressure_first = pressure_first
+        self.tpp_gumbel = tpp_gumbel
+        self.tpp_gumbel_scale = tpp_gumbel_scale
         self.ref = ref
         self.unified_pos = unified_pos
         self.adaln_output = adaln_output
@@ -554,6 +580,9 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
+                    tpp_gumbel=tpp_gumbel,
+                    tpp_gumbel_scale=tpp_gumbel_scale,
+                    tpp_ada_temp=tpp_ada_temp,
                 )
                 for idx in range(n_layers)
             ]
@@ -814,6 +843,11 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Transolver++ features
+    tpp_gumbel: bool = False             # Gumbel-Softmax slice assignment during training
+    tpp_gumbel_scale: float = 0.1        # Gumbel noise scale
+    tpp_gumbel_anneal: bool = False      # anneal gumbel_scale from initial to 0.01 over training
+    tpp_ada_temp: bool = False           # per-point adaptive temperature
 
 
 cfg = sp.parse(Config)
@@ -966,12 +1000,16 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    tpp_gumbel=cfg.tpp_gumbel,
+    tpp_gumbel_scale=cfg.tpp_gumbel_scale,
+    tpp_ada_temp=cfg.tpp_ada_temp,
 )
 
 model = Transolver(**model_config).to(device)
 model._pressure_separate = cfg.pressure_separate_last_block
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
-model = torch.compile(model, mode=cfg.compile_mode)
+if cfg.compile_mode != "disable":
+    model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
@@ -1206,6 +1244,12 @@ for epoch in range(MAX_EPOCHS):
 
     # --- Train ---
     model.train()
+    # Gumbel-Softmax annealing
+    if cfg.tpp_gumbel_anneal and cfg.tpp_gumbel:
+        progress = min(1.0, epoch / max(MAX_EPOCHS - 1, 1))
+        new_scale = cfg.tpp_gumbel_scale * (1.0 - progress) + 0.01 * progress
+        for _blk in _base_model.blocks:
+            _blk.attn.tpp_gumbel_scale = new_scale
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
