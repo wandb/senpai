@@ -48,6 +48,43 @@ torch.set_float32_matmul_precision('high')
 # modify architecture and training script in a single file)
 # ---------------------------------------------------------------------------
 
+import math
+
+
+class FourierFeatureEncoding(nn.Module):
+    """Maps spatial coordinates to sin/cos features at multiple frequencies.
+
+    From Tancik et al. (NeurIPS 2020): Fourier features break spectral bias
+    of MLPs toward low-frequency functions.
+    """
+
+    def __init__(self, coord_dim=2, num_freqs=8, learnable=True, include_input=True):
+        super().__init__()
+        self.include_input = include_input
+        self.coord_dim = coord_dim
+        self.num_freqs = num_freqs
+
+        freqs = 2.0 ** torch.linspace(0, num_freqs - 1, num_freqs)
+        if learnable:
+            self.freqs = nn.Parameter(freqs)
+        else:
+            self.register_buffer('freqs', freqs)
+
+    @property
+    def output_dim(self):
+        return self.coord_dim * self.num_freqs * 2 + (self.coord_dim if self.include_input else 0)
+
+    def forward(self, coords):
+        """coords: [B, N, coord_dim] -> [B, N, output_dim]"""
+        scaled = coords.unsqueeze(-1) * self.freqs * math.pi  # [B, N, coord_dim, num_freqs]
+        sin_feats = scaled.sin().reshape(*coords.shape[:-1], -1)
+        cos_feats = scaled.cos().reshape(*coords.shape[:-1], -1)
+        out = [sin_feats, cos_feats]
+        if self.include_input:
+            out.append(coords)
+        return torch.cat(out, dim=-1)
+
+
 ACTIVATION = {
     "gelu": nn.GELU,
     "tanh": nn.Tanh,
@@ -579,6 +616,7 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        self._fourier_enc = None  # set from Config after construction
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -814,6 +852,11 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Fourier feature encoding
+    fourier_features: bool = False        # add Fourier positional encoding to input
+    fourier_num_freqs: int = 8            # number of frequency bands
+    fourier_learnable: bool = True        # learnable frequencies (vs fixed log-linear)
+    fourier_include_input: bool = True    # concatenate original coords alongside Fourier
 
 
 cfg = sp.parse(Config)
@@ -937,7 +980,10 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (
+        FourierFeatureEncoding(2, cfg.fourier_num_freqs, cfg.fourier_learnable, cfg.fourier_include_input).output_dim
+        if cfg.fourier_features else 32
+    ),  # +curv, +dist, [+foil2dist], +fourier PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -970,6 +1016,11 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 model._pressure_separate = cfg.pressure_separate_last_block
+if cfg.fourier_features:
+    model._fourier_enc = FourierFeatureEncoding(
+        coord_dim=2, num_freqs=cfg.fourier_num_freqs,
+        learnable=cfg.fourier_learnable, include_input=cfg.fourier_include_input,
+    ).to(device)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
@@ -1288,16 +1339,24 @@ for epoch in range(MAX_EPOCHS):
             x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
         else:
             x = torch.cat([x, curv, dist_feat], dim=-1)
-        # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
+        # Fourier positional encoding
         raw_xy = x[:, :, :2]
-        # Normalize xy to [0,1] per-sample for consistent Fourier encoding
-        xy_min = raw_xy.amin(dim=1, keepdim=True)
-        xy_max = raw_xy.amax(dim=1, keepdim=True)
-        xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-        freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-        xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
-        x = torch.cat([x, fourier_pe], dim=-1)
+        if cfg.fourier_features:
+            # Module-based Fourier encoding with configurable frequencies
+            xy_min = raw_xy.amin(dim=1, keepdim=True)
+            xy_max = raw_xy.amax(dim=1, keepdim=True)
+            xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+            fourier_pe = _base_model._fourier_enc(xy_norm)
+            x = torch.cat([x, fourier_pe], dim=-1)
+        else:
+            # Default: 4 fixed + 4 learnable frequencies
+            xy_min = raw_xy.amin(dim=1, keepdim=True)
+            xy_max = raw_xy.amax(dim=1, keepdim=True)
+            xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+            freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+            xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
+            fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+            x = torch.cat([x, fourier_pe], dim=-1)
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -1711,16 +1770,22 @@ for epoch in range(MAX_EPOCHS):
                     x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
                 else:
                     x = torch.cat([x, curv, dist_feat], dim=-1)
-                # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
+                # Fourier positional encoding
                 raw_xy = x[:, :, :2]
-                # Normalize xy to [0,1] per-sample for consistent Fourier encoding
-                xy_min = raw_xy.amin(dim=1, keepdim=True)
-                xy_max = raw_xy.amax(dim=1, keepdim=True)
-                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-                xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
-                x = torch.cat([x, fourier_pe], dim=-1)
+                if cfg.fourier_features:
+                    xy_min = raw_xy.amin(dim=1, keepdim=True)
+                    xy_max = raw_xy.amax(dim=1, keepdim=True)
+                    xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                    fourier_pe = _base_model._fourier_enc(xy_norm)
+                    x = torch.cat([x, fourier_pe], dim=-1)
+                else:
+                    xy_min = raw_xy.amin(dim=1, keepdim=True)
+                    xy_max = raw_xy.amax(dim=1, keepdim=True)
+                    xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                    freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                    xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                    fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                    x = torch.cat([x, fourier_pe], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
@@ -1890,6 +1955,10 @@ for epoch in range(MAX_EPOCHS):
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
+    if cfg.fourier_features and _base_model._fourier_enc is not None:
+        enc_freqs = _base_model._fourier_enc.freqs.abs().detach().cpu().tolist()
+        for i, f in enumerate(enc_freqs):
+            metrics[f"fourier_enc_freq_{i}"] = f
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
@@ -1985,9 +2054,12 @@ if best_metrics:
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
                     xy_max = raw_xy.amax(dim=1, keepdim=True)
                     xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                    freqs = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
-                    xy_scaled = xy_norm.unsqueeze(-1) * freqs
-                    fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                    if cfg.fourier_features and hasattr(vis_model, '_fourier_enc') and vis_model._fourier_enc is not None:
+                        fourier_pe = vis_model._fourier_enc(xy_norm)
+                    else:
+                        freqs = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
+                        xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
                     pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
