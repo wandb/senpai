@@ -807,6 +807,7 @@ class Config:
     val_every: int = 1                  # validate every N epochs (1 = every epoch)
     disable_pcgrad: bool = False        # skip PCGrad dual-backward, use simple combined loss
     vol_subsample_frac: float = 1.0     # fraction of volume nodes in loss after vol_ramp (0.8 = 80%)
+    node_subsample_frac: float = 1.0    # fraction of VOLUME nodes sampled before forward pass (1.0 = all)
     compile_mode: str = "default"       # torch.compile mode: "default", "max-autotune", "reduce-overhead"
     num_workers: int = 4                # data loader workers
     # Phase 4: Pressure-first sequential prediction
@@ -1320,6 +1321,41 @@ for epoch in range(MAX_EPOCHS):
                 p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
             noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
             y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
+
+        # --- Pre-forward-pass node subsampling (amortized training) ---
+        # Keep ALL surface nodes; randomly subsample volume nodes.
+        # Reduces N in forward pass for actual compute/memory savings.
+        if model.training and cfg.node_subsample_frac < 1.0:
+            B_sub = x.shape[0]
+            keep_masks = []
+            for b in range(B_sub):
+                surf_b = is_surface[b] & mask[b]
+                vol_b = (~is_surface[b]) & mask[b]
+                vol_idx = vol_b.nonzero(as_tuple=False).squeeze(1)
+                n_vol = vol_idx.shape[0]
+                n_keep = max(int(n_vol * cfg.node_subsample_frac), 1)
+                perm = torch.randperm(n_vol, device=x.device)[:n_keep]
+                kept_vol = torch.zeros_like(vol_b)
+                kept_vol[vol_idx[perm]] = True
+                keep_masks.append(surf_b | kept_vol)
+            keep_counts = [km.sum().item() for km in keep_masks]
+            max_kept = max(keep_counts)
+            D_x = x.shape[-1]
+            x_sub = torch.zeros(B_sub, max_kept, D_x, device=x.device, dtype=x.dtype)
+            y_sub = torch.zeros(B_sub, max_kept, y_norm.shape[-1], device=y_norm.device, dtype=y_norm.dtype)
+            is_surf_sub = torch.zeros(B_sub, max_kept, device=x.device, dtype=torch.bool)
+            mask_sub = torch.zeros(B_sub, max_kept, device=x.device, dtype=torch.bool)
+            for b in range(B_sub):
+                kc = keep_counts[b]
+                idx = keep_masks[b].nonzero(as_tuple=False).squeeze(1)
+                x_sub[b, :kc] = x[b, idx]
+                y_sub[b, :kc] = y_norm[b, idx]
+                is_surf_sub[b, :kc] = is_surface[b, idx]
+                mask_sub[b, :kc] = True
+            x = x_sub
+            y_norm = y_sub
+            is_surface = is_surf_sub
+            mask = mask_sub
 
         # Per-sample std normalization: skip tandem samples (gap feature index 21)
         raw_gap = x[:, 0, 21]
