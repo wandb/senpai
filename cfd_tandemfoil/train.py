@@ -814,6 +814,9 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Wall distance feature
+    walldist: bool = False           # add wall distance feature (25th input dim)
+    walldist_log: bool = True        # log-transform wall distance (default True)
 
 
 cfg = sp.parse(Config)
@@ -832,6 +835,35 @@ train_ds, val_splits, stats, sample_weights = load_data(
     cfg.manifest, cfg.stats_file, debug=cfg.debug,
 )
 stats = {k: v.to(device) for k, v in stats.items()}
+
+# Inject wall distance as 25th input feature
+if cfg.walldist:
+    base_ds = train_ds.dataset if hasattr(train_ds, 'dataset') else train_ds
+    cache = base_ds._cache
+    print(f"Computing wall distance for {len(cache)} cached samples...")
+    for idx in sorted(cache.keys()):
+        x, y, is_surf = cache[idx]
+        pos = x[:, :2]  # [N, 2]
+        surf_pos = pos[is_surf]  # [N_surf, 2]
+        if surf_pos.shape[0] == 0:
+            wd = torch.zeros(x.shape[0], 1)
+        else:
+            # Compute in chunks to avoid OOM for large meshes
+            n = pos.shape[0]
+            chunk = 4096
+            wd_parts = []
+            for i in range(0, n, chunk):
+                d = torch.cdist(pos[i:i+chunk].unsqueeze(0), surf_pos.unsqueeze(0)).squeeze(0)
+                wd_parts.append(d.min(dim=-1).values)
+            wd = torch.cat(wd_parts).unsqueeze(-1)  # [N, 1]
+        if cfg.walldist_log:
+            wd = torch.log1p(wd)
+        x_new = torch.cat([x, wd], dim=-1)
+        cache[idx] = (x_new, y, is_surf)
+    if cache:
+        print(f"  Wall distance injected (dim {x_new.shape[-1]})")
+    else:
+        print("  Wall distance: debug mode — will compute on-the-fly")
 
 
 def _umag_q(y, mask):
@@ -937,7 +969,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (1 if cfg.walldist else 0) + 32,  # +curv, +dist, [+foil2dist], [+walldist], +32 fourier PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1277,17 +1309,41 @@ for epoch in range(MAX_EPOCHS):
                     y[_b, _in_region] = y[_cut_idx[_b], _in_region]
                     is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
 
+        # Extract or compute walldist
+        _walldist_feat = None
+        if cfg.walldist:
+            if x.shape[-1] > 24:
+                _walldist_feat = x[:, :, 24:25]  # precomputed
+                x = x[:, :, :24]
+            else:
+                # On-the-fly computation (debug/lazy mode)
+                pos = x[:, :, :2]
+                B_wd, N_wd = pos.shape[:2]
+                wd_list = []
+                for b in range(B_wd):
+                    sp = pos[b][is_surface[b] & mask[b]]
+                    if sp.shape[0] == 0:
+                        wd_list.append(torch.zeros(N_wd, 1, device=x.device))
+                    else:
+                        d = torch.cdist(pos[b:b+1], sp.unsqueeze(0)).squeeze(0).min(dim=-1).values
+                        wd = d.unsqueeze(-1)
+                        if cfg.walldist_log:
+                            wd = torch.log1p(wd)
+                        wd_list.append(wd)
+                _walldist_feat = torch.stack(wd_list)
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+        _extra = [curv, dist_feat]
         if cfg.foil2_dist:
             foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
-            x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
-        else:
-            x = torch.cat([x, curv, dist_feat], dim=-1)
+            _extra.append(foil2_dist_feat)
+        if _walldist_feat is not None:
+            _extra.append(_walldist_feat)
+        x = torch.cat([x] + _extra, dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -1700,18 +1756,37 @@ for epoch in range(MAX_EPOCHS):
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
 
+                _walldist_feat_v = None
+                if cfg.walldist:
+                    if x.shape[-1] > 24:
+                        _walldist_feat_v = x[:, :, 24:25]
+                        x = x[:, :, :24]
+                    else:
+                        pos_v = x[:, :, :2]
+                        wd_v = []
+                        for b in range(pos_v.shape[0]):
+                            sp = pos_v[b][is_surface[b] & mask[b]]
+                            if sp.shape[0] == 0:
+                                wd_v.append(torch.zeros(pos_v.shape[1], 1, device=x.device))
+                            else:
+                                d = torch.cdist(pos_v[b:b+1], sp.unsqueeze(0)).squeeze(0).min(dim=-1).values
+                                wd = d.unsqueeze(-1)
+                                if cfg.walldist_log:
+                                    wd = torch.log1p(wd)
+                                wd_v.append(wd)
+                        _walldist_feat_v = torch.stack(wd_v)
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 x = (x - stats["x_mean"]) / stats["x_std"]
-                # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                _extra_v = [curv, dist_feat]
                 if cfg.foil2_dist:
                     foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
-                    x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
-                else:
-                    x = torch.cat([x, curv, dist_feat], dim=-1)
-                # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
+                    _extra_v.append(foil2_dist_feat)
+                if _walldist_feat_v is not None:
+                    _extra_v.append(_walldist_feat_v)
+                x = torch.cat([x] + _extra_v, dim=-1)
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
                 xy_min = raw_xy.amin(dim=1, keepdim=True)
@@ -1974,12 +2049,27 @@ if best_metrics:
                     y_dev = y_true.unsqueeze(0).to(device)
                     is_surf_dev = is_surface.unsqueeze(0).to(device)
                     mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
+                    _walldist_vis = None
+                    if cfg.walldist:
+                        if x_dev.shape[-1] > 24:
+                            _walldist_vis = x_dev[:, :, 24:25]
+                            x_dev = x_dev[:, :, :24]
+                        else:
+                            sp = x_dev[0, :, :2][is_surf_dev[0]]
+                            if sp.shape[0] > 0:
+                                d = torch.cdist(x_dev[:, :, :2], sp.unsqueeze(0)).min(dim=-1).values
+                                _walldist_vis = torch.log1p(d.unsqueeze(-1)) if cfg.walldist_log else d.unsqueeze(-1)
+                            else:
+                                _walldist_vis = torch.zeros(1, x_dev.shape[1], 1, device=device)
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                     curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
-                    x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                    _extra_vis = [curv, dist_feat]
+                    if _walldist_vis is not None:
+                        _extra_vis.append(_walldist_vis)
+                    x_n = torch.cat([x_n] + _extra_vis, dim=-1)
                     # Fourier PE (must match training loop)
                     raw_xy = x_n[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
