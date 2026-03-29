@@ -816,6 +816,10 @@ class Config:
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
     # Phase 5: Residual prediction
     residual_prediction: bool = False   # predict residual from freestream instead of full field
+    residual_mean_sub: bool = False    # subtract per-sample mean instead of freestream
+    residual_renorm: bool = False      # re-normalize residual targets after freestream subtraction
+    residual_progressive: bool = False # progressive residual: freeze base predictions after N epochs
+    residual_progressive_epoch: int = 40  # epoch at which to freeze base predictions
 
 
 cfg = sp.parse(Config)
@@ -978,6 +982,7 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 from copy import deepcopy
 ema_model = None
+_progressive_base_model = None  # frozen model for progressive residual prediction
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -1313,9 +1318,15 @@ for epoch in range(MAX_EPOCHS):
                 y_phys = y_phys.clone()
                 y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
             y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
-        # Residual prediction: subtract freestream from normalized targets
-        _freestream = None
-        if cfg.residual_prediction:
+        # Residual prediction: subtract base solution from normalized targets
+        _residual_base = None
+        if cfg.residual_mean_sub:
+            # Per-sample mean subtraction: base = mean across valid nodes
+            _m = mask.float().unsqueeze(-1)
+            _mean = (y_norm * _m).sum(dim=1, keepdim=True) / _m.sum(dim=1, keepdim=True).clamp(min=1)
+            _residual_base = _mean  # [B, 1, 3]
+            y_norm = y_norm - _residual_base
+        elif cfg.residual_prediction:
             # Freestream in Cp-normalized space: (cos(AoA), sin(AoA), 0)
             # Then apply same z-score normalization
             _aoa = _raw_aoa  # [B, 1]
@@ -1323,8 +1334,13 @@ for epoch in range(MAX_EPOCHS):
             _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))  # Ux/Umag
             _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))  # Uy/Umag
             _fs_phys[:, 0, 2] = 0.0  # p/q
-            _freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]  # [B, 1, 3]
-            y_norm = y_norm - _freestream  # subtract freestream (broadcasts over N)
+            _residual_base = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]  # [B, 1, 3]
+            y_norm = y_norm - _residual_base
+        if cfg.residual_renorm and _residual_base is not None:
+            # Re-normalize residual targets per-sample to O(1)
+            _m = mask.float().unsqueeze(-1)
+            _res_std = ((y_norm ** 2 * _m).sum(dim=1, keepdim=True) / _m.sum(dim=1, keepdim=True).clamp(min=1)).sqrt().clamp(min=0.1)
+            y_norm = y_norm / _res_std
         if model.training and not cfg.no_target_noise:
             noise_progress = min(1.0, epoch / max(cfg.noise_anneal_epochs, 1))
             if cfg.half_target_noise:
@@ -1366,6 +1382,18 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = y_norm * sample_stds
             else:
                 y_norm = y_norm / sample_stds
+
+        # Progressive residual: subtract base model's predictions from targets
+        if cfg.residual_progressive and _progressive_base_model is not None:
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                _base_out = _progressive_base_model({"x": x})
+                _base_pred = _base_out["preds"].float()
+            if not cfg.no_perstd and not cfg.raw_targets:
+                if cfg.multiply_std:
+                    _base_pred = _base_pred * sample_stds
+                else:
+                    _base_pred = _base_pred / sample_stds
+            y_norm = y_norm - _base_pred  # targets become correction to base
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model({"x": x})
@@ -1656,6 +1684,13 @@ for epoch in range(MAX_EPOCHS):
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
     prev_surf_loss = epoch_surf
+    # Progressive residual: freeze base model at specified epoch
+    if cfg.residual_progressive and epoch + 1 == cfg.residual_progressive_epoch and _progressive_base_model is None:
+        _progressive_base_model = deepcopy(_base_model)
+        _progressive_base_model.eval()
+        for p in _progressive_base_model.parameters():
+            p.requires_grad_(False)
+        print(f"Progressive residual: froze base model at epoch {epoch + 1}")
     # Snapshot ensemble: save running average at specified epochs
     if cfg.snapshot_ensemble and (epoch + 1) in snapshot_epoch_list:
         snap = {k: v.cpu().clone() for k, v in _base_model.state_dict().items()}
@@ -1747,15 +1782,25 @@ for epoch in range(MAX_EPOCHS):
                         y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
                     y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
-                # Residual prediction: subtract freestream in val loop
-                _v_freestream = None
-                if cfg.residual_prediction:
+                # Residual prediction: subtract base solution in val loop
+                _v_residual_base = None
+                _v_res_std = None
+                if cfg.residual_mean_sub:
+                    _vm = mask.float().unsqueeze(-1)
+                    _v_mean = (y_norm * _vm).sum(dim=1, keepdim=True) / _vm.sum(dim=1, keepdim=True).clamp(min=1)
+                    _v_residual_base = _v_mean
+                    y_norm = y_norm - _v_residual_base
+                elif cfg.residual_prediction:
                     _aoa = _raw_aoa
                     _fs_phys = torch.zeros(y_norm.shape[0], 1, 3, device=device)
                     _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))
                     _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))
-                    _v_freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
-                    y_norm = y_norm - _v_freestream
+                    _v_residual_base = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                    y_norm = y_norm - _v_residual_base
+                if cfg.residual_renorm and _v_residual_base is not None:
+                    _vm = mask.float().unsqueeze(-1)
+                    _v_res_std = ((y_norm ** 2 * _vm).sum(dim=1, keepdim=True) / _vm.sum(dim=1, keepdim=True).clamp(min=1)).sqrt().clamp(min=0.1)
+                    y_norm = y_norm / _v_res_std
 
                 # Per-sample std normalization: skip tandem samples
                 raw_gap = x[:, 0, 21]
@@ -1808,9 +1853,11 @@ for epoch in range(MAX_EPOCHS):
                 )
                 n_vbatches += 1
 
-                # Add freestream back for residual prediction mode
-                if cfg.residual_prediction and _v_freestream is not None:
-                    pred = pred + _v_freestream  # add freestream back before denorm
+                # Add residual base back before denormalization
+                if cfg.residual_renorm and _v_res_std is not None:
+                    pred = pred * _v_res_std  # undo residual renormalization
+                if _v_residual_base is not None:
+                    pred = pred + _v_residual_base  # add base back before denorm
 
                 # Denormalize: phys_stats → Cp space → original scale
                 if cfg.raw_targets:
