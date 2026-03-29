@@ -816,6 +816,7 @@ class Config:
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
     # Phase 5: Residual prediction
     residual_prediction: bool = False   # predict residual from freestream instead of full field
+    grad_clip: float = 1.0               # max gradient norm for clipping
 
 
 cfg = sp.parse(Config)
@@ -1557,7 +1558,7 @@ for epoch in range(MAX_EPOCHS):
                 optimizer.zero_grad()
             loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip)
         sam_active = sam_optimizer is not None and epoch >= int(MAX_EPOCHS * 0.75)
         _should_step = (cfg.grad_accum_steps <= 1 or
                         (batch_idx + 1) % cfg.grad_accum_steps == 0 or
@@ -1580,7 +1581,7 @@ for epoch in range(MAX_EPOCHS):
             aoa_loss2 = F.mse_loss(aoa_pred2, aoa_target)
             loss2 = vol_loss2 + surf_weight * surf_loss2 + 0.01 * re_loss2 + 0.01 * aoa_loss2
             loss2.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip)
             sam_optimizer.restore()
         if use_pcgrad or _should_step:
             optimizer.step()
