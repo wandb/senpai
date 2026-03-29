@@ -816,6 +816,9 @@ class Config:
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
     # Phase 5: Residual prediction
     residual_prediction: bool = False   # predict residual from freestream instead of full field
+    # Phase 5: Sample reweighting
+    sample_reweight: str = "none"       # "none", "sqrt", "linear", "focal"
+    reweight_start_epoch: int = 30      # start reweighting after this epoch
 
 
 cfg = sp.parse(Config)
@@ -1450,6 +1453,23 @@ for epoch in range(MAX_EPOCHS):
                                        torch.ones(B, device=device))
         else:
             tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
+        # Per-sample reweighting: upweight hard samples
+        _sample_w = None
+        if cfg.sample_reweight != "none" and epoch >= cfg.reweight_start_epoch:
+            with torch.no_grad():
+                per_sample_vol = (abs_err * vol_mask_train.unsqueeze(-1)).sum(dim=(1, 2)) / vol_mask_train.sum(dim=1).clamp(min=1).float()
+                per_sample_total = per_sample_vol + surf_per_sample
+                rel_loss = per_sample_total / per_sample_total.mean().clamp(min=1e-8)
+                if cfg.sample_reweight == "sqrt":
+                    _sample_w = rel_loss.sqrt()
+                elif cfg.sample_reweight == "linear":
+                    _sample_w = rel_loss
+                elif cfg.sample_reweight == "focal":
+                    _sample_w = rel_loss ** 2
+                else:
+                    _sample_w = torch.ones_like(rel_loss)
+                _sample_w = _sample_w / _sample_w.mean()  # normalize to mean=1
+            surf_per_sample = surf_per_sample * _sample_w
         surf_loss = (surf_per_sample * tandem_boost).mean()
         if cfg.uncertainty_loss:
             bm = _base_model
