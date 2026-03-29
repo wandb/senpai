@@ -814,6 +814,12 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Progressive node training
+    progressive_training: bool = False     # enable progressive volume node subsampling
+    progressive_vol_frac: float = 0.5      # fraction of volume nodes during early phase
+    progressive_switch_epoch: int = 80     # epoch to switch from progressive to full mesh
+    progressive_vol_frac_mid: float = -1.0 # if >0, 3-stage: frac→mid→1.0 (mid stage at switch_epoch/2)
+    progressive_ramp: bool = False         # gradual ramp from frac→1.0 instead of hard switch
 
 
 cfg = sp.parse(Config)
@@ -1377,20 +1383,33 @@ for epoch in range(MAX_EPOCHS):
         surf_mask = mask & is_surface
 
         # Progressive resolution: subsample volume nodes in loss early in training
-        # Ramps from 10% → 100% of volume nodes over first 40 epochs
+        # Ramps from 5% → 100% of volume nodes over first vol_ramp_epochs
         if epoch < cfg.vol_ramp_epochs:
             vol_keep_ratio = 0.05 + 0.95 * (epoch / cfg.vol_ramp_epochs)
+        elif cfg.progressive_training and epoch < cfg.progressive_switch_epoch:
+            # Progressive training: hold at progressive_vol_frac until switch epoch
+            if cfg.progressive_vol_frac_mid > 0:
+                # 3-stage: frac → mid → 1.0
+                mid_epoch = cfg.progressive_switch_epoch // 2
+                if epoch < mid_epoch:
+                    vol_keep_ratio = cfg.progressive_vol_frac
+                else:
+                    vol_keep_ratio = cfg.progressive_vol_frac_mid
+            elif cfg.progressive_ramp:
+                # Gradual ramp from frac → 1.0
+                progress = (epoch - cfg.vol_ramp_epochs) / max(1, cfg.progressive_switch_epoch - cfg.vol_ramp_epochs)
+                vol_keep_ratio = cfg.progressive_vol_frac + (1.0 - cfg.progressive_vol_frac) * progress
+            else:
+                vol_keep_ratio = cfg.progressive_vol_frac
+        elif cfg.vol_subsample_frac < 1.0:
+            vol_keep_ratio = cfg.vol_subsample_frac
+        else:
+            vol_keep_ratio = 1.0
+
+        if vol_keep_ratio < 1.0:
             vol_indices = vol_mask.nonzero(as_tuple=False)
             n_vol = vol_indices.shape[0]
             n_keep = max(int(n_vol * vol_keep_ratio), 1)
-            perm = torch.randperm(n_vol, device=vol_mask.device)[:n_keep]
-            vol_mask_train = torch.zeros_like(vol_mask)
-            if n_keep > 0:
-                vol_mask_train[vol_indices[perm, 0], vol_indices[perm, 1]] = True
-        elif cfg.vol_subsample_frac < 1.0:
-            vol_indices = vol_mask.nonzero(as_tuple=False)
-            n_vol = vol_indices.shape[0]
-            n_keep = max(int(n_vol * cfg.vol_subsample_frac), 1)
             perm = torch.randperm(n_vol, device=vol_mask.device)[:n_keep]
             vol_mask_train = torch.zeros_like(vol_mask)
             if n_keep > 0:
