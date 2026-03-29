@@ -1,17 +1,20 @@
 # Baseline Metrics
 
-## Current Baseline (Phase 5 — 2026-03-29, Residual Prediction)
+## Current Baseline (Phase 5 — 2026-03-29, Residual Prediction + Surface Refinement)
 
-| Metric | Mean (4 seeds) | Std | Best single | Worst single |
+| Metric | Mean (8 seeds) | Std | Best single | Worst single |
 |--------|---------------|-----|-------------|--------------|
-| val/loss | 0.396 | 0.003 | 0.392 | 0.399 |
-| p_in | 12.93 | 0.22 | 12.6 | 13.2 |
-| p_oodc | 7.98 | 0.19 | 7.7 | 8.2 |
-| p_tan | 32.93 | 0.29 | 32.5 | 33.3 |
-| p_re | 24.53 | 0.08 | 24.4 | 24.6 |
+| val/loss | 0.383 | 0.003 | 0.378 | 0.389 |
+| p_in | 12.95 | 0.30 | 12.1 | 13.4 |
+| p_oodc | 8.31 | 0.18 | 8.1 | 8.7 |
+| p_tan | 30.01 | 0.52 | 29.2 | 31.0 |
+| p_re | 6.70 | 0.10 | 6.5 | 6.8 |
 
-**Phase 5 improvement merged:** + residual_prediction (#1927). Predicts correction to freestream instead of full field. p_oodc -4.7%, p_tan -1.9%, val/loss -1.8%. Memory: ~36.2 GB.
-**W&B group:** `phase5/residual-prediction` (runs umj5afev, 21pomc9o, arfuy4np, v3f0q6sk).
+**Phase 5 improvements merged:**
+1. residual_prediction (#1927) — predict correction to freestream. p_oodc -4.7%, p_tan -1.9%.
+2. surface_refine (#1935) — dedicated surface-only refinement MLP. p_re -72.7%, p_tan -8.9%, val/loss -3.3%. Manually verified (no target leakage).
+
+Memory: ~38.0 GB. W&B group: `phase5/surface-refine-8seed`.
 
 ### Reproduce
 
@@ -22,13 +25,15 @@ python train.py --agent <name> --wandb_name "<name>/baseline" \
   --n_layers 3 --slice_num 96 --tandem_ramp \
   --domain_layernorm --domain_velhead --ema_decay 0.999 \
   --weight_decay 5e-5 --cosine_T_max 180 --disable_pcgrad \
-  --pressure_first --pressure_deep --residual_prediction
+  --pressure_first --pressure_deep --residual_prediction \
+  --surface_refine --surface_refine_hidden 192 --surface_refine_layers 3
 ```
 
 ### History
 
 | Date | val/loss | p_in | p_oodc | p_tan | p_re | PR | Notes |
 |------|----------|------|--------|-------|------|----|-------|
+| 2026-03-29 | 0.383±0.003 | 12.95±0.30 | 8.31±0.18 | 30.01±0.52 | 6.70±0.10 | #1935 | **Phase 5: + surface_refine** (p_re -72.7%, p_tan -8.9%) |
 | 2026-03-29 | 0.396±0.003 | 12.93±0.22 | 7.98±0.19 | 32.93±0.29 | 24.53±0.08 | #1927 | **Phase 5: + residual_prediction** (p_oodc -4.7%, p_tan -1.9%) |
 | 2026-03-28 | 0.404±0.004 | 13.33±0.58 | 8.37±0.22 | 33.57±0.44 | 24.58±0.13 | #1911 | 8-seed characterization |
 | 2026-03-28 | 0.401±0.005 | 12.95±0.3 | 8.40±0.4 | 33.8±0.5 | 24.7±0.2 | #1867 | **Phase 4: + pressure_first + pressure_deep** (p_in -4.8%) |
