@@ -814,6 +814,10 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Velocity smoothness regularization
+    smoothness_weight: float = 0.0      # weight for velocity smoothness loss (0 = disabled)
+    smoothness_surface_only: bool = False  # only apply smoothness to surface nodes
+    smoothness_anneal: bool = False      # anneal smoothness_weight from 0 to target over first 60 epochs
 
 
 cfg = sp.parse(Config)
@@ -1483,6 +1487,29 @@ for epoch in range(MAX_EPOCHS):
         aoa_target = x[:, 0, 14:15]  # AoA0_rad from normalized input
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
+
+        # Velocity smoothness regularization: penalize rapid spatial variations in predictions
+        if cfg.smoothness_weight > 0 and model.training:
+            sw = cfg.smoothness_weight
+            if cfg.smoothness_anneal:
+                sw = sw * min(1.0, epoch / 60.0)
+            # Sort nodes by x-coordinate, compute FD between adjacent nodes
+            _xy = x[:, :, :2]  # [B, N, 2]
+            _sort_idx = _xy[:, :, 0].argsort(dim=1)  # sort by x
+            _pred_sorted = torch.gather(pred, 1, _sort_idx.unsqueeze(-1).expand_as(pred))  # [B, N, 3]
+            _mask_sorted = torch.gather(mask, 1, _sort_idx)  # [B, N]
+            # FD: difference between consecutive sorted nodes
+            _fd = _pred_sorted[:, 1:] - _pred_sorted[:, :-1]  # [B, N-1, 3]
+            _fd_valid = _mask_sorted[:, 1:] & _mask_sorted[:, :-1]  # [B, N-1]
+            if cfg.smoothness_surface_only:
+                _surf_sorted = torch.gather(is_surface, 1, _sort_idx)
+                _fd_valid = _fd_valid & (_surf_sorted[:, 1:] | _surf_sorted[:, :-1])
+            # Smoothness = mean squared FD (velocity channels only)
+            _fd_vel = _fd[:, :, :2]  # [B, N-1, 2] — only velocity, not pressure
+            smooth_loss = (_fd_vel.pow(2).mean(dim=-1) * _fd_valid.float()).sum() / _fd_valid.float().sum().clamp(min=1)
+            loss = loss + sw * smooth_loss
+            if batch_idx == 0:
+                wandb.log({"train/smooth_loss": smooth_loss.item(), "global_step": global_step})
 
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
