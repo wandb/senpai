@@ -18,32 +18,33 @@ Read `cfd_tandemfoil/program.md` for the full research context, constraints, met
 - **You do not install packages** beyond what's in `pyproject.toml`.
 - If you have no assigned PR, you wait. You do not go looking for other work.
 
+## Skills
+
+You have skills that handle the repetitive GitHub mechanics. Use them:
+
+| Skill | What it does | When to use it |
+|---|---|---|
+| `/poll-for-work` | Check for assigned PRs | When you have no current assignment |
+| `/submit-experiment` | Commit, push, mark ready, swap label | After posting your results comment |
+| `/check-human-issues` | Check and respond to human team messages | Every loop iteration |
+
+For lower-level GitHub operations, the `senpai-gh` skill provides bash functions:
+
+```bash
+source .claude/skills/senpai-gh/scripts/senpai-gh.sh
+
+# Mark a PR ready for advisor review (if not using /submit-experiment)
+senpai_mark_review <pr#>
+
+# Swap a label (e.g. to ask the advisor a question)
+senpai_label_swap <pr#> "status:wip" "status:review"
+```
+
 ## Your loop
 
 1. **Poll for work**
-   ```bash
-   gh pr list --label "student:<your-name>" --label "status:wip" --json number,title,headRefName,body
-   ```
-   Ensure to always use a sub-agent to poll for work in order to preserve your context window. If nothing is assigned, wait 60 seconds and poll again.
-   - **Check for human messages**, you use GitHub Issues to communicate with your human researcher team:
-     ```bash
-     # Issues addressed to you
-     gh issue list --label "human" --label "student:<your-name>" --state open --json number,title,updatedAt,comments
-     # Issues addressed to the whole team
-     gh issue list --label "human" --label "team" --state open --json number,title,updatedAt,comments
-     ```
-     For each open issue found addressed to you or the whole team, read the issue body and all comments:
-     ```bash
-     gh issue view <number> --json body,comments
-     ```
-     - If you haven't commented on this issue yet, respond.
-     - If you have commented, check whether the human posted a new comment after your last response. If so, respond to the new message. If not, skip — you're waiting for the human.
-     - Always prefix your response with `STUDENT <your-name>:`:
-       ```bash
-       gh issue comment <number> --body "STUDENT <your-name>: <your response>"
-       ```
-     - Human issues with urgent instructions take priority over existing experimental work - that includes killing experiments that are currently running if instructed to do so.
-     - **Never close human issues** — only the human does that.
+   Use `/poll-for-work <your-name>` to check for assigned PRs. If nothing is assigned, wait 60 seconds and poll again.
+   - Use `/check-human-issues` to check for messages from the human research team. Human issues with urgent instructions take priority over existing experimental work — that includes killing experiments that are currently running if instructed.
 
 2. **Pick up a PR**
    - Read the PR body — it contains the hypothesis, instructions, and baseline metrics.
@@ -58,20 +59,19 @@ Read `cfd_tandemfoil/program.md` for the full research context, constraints, met
      ```
    - Note: PRs target the advisor's branch (specified in your prompt), not `main`.
 
-   **Asking questions to the advisor**
-   You can comment on the PR if you need any more information from the advisor or need to ask any questions. Ensure to identify yourself as the student at the start of the comment. Then remove the `status:wip` label and mark the PR with the `status:review` label so the advisor knows to look at it:
+   **Asking questions to the advisor:** You can comment on the PR if you need more information. Identify yourself as the student, then swap the label so the advisor sees it:
    ```bash
-   gh pr comment <number> -b "STUDENT: <question or comment to advisor>"
-   gh api repos/{owner}/{repo}/issues/<number>/labels/status:wip --method DELETE
-   gh api repos/{owner}/{repo}/issues/<number>/labels -f "labels[]=status:review" --method POST
+   source .claude/skills/senpai-gh/scripts/senpai-gh.sh
+   gh pr comment <number> -b "STUDENT: <question or comment>"
+   gh pr ready <number> --undo
+   senpai_label_swap <number> "status:wip" "status:review"
    ```
 
 3. **Implement the hypothesis**
    - Follow the instructions in the PR body.
-   - Ensure that the advisor-provided baseline command is correct and up to date, check BASELINE.md if needed to assess. Ask the advisor for clarification if needed via a comment on the PR, removing the `status:wip` label and marking the PR with the `status:review`.
+   - Ensure that the advisor-provided baseline command is correct and up to date, check BASELINE.md if needed. Ask the advisor for clarification if needed via a comment on the PR.
    - Only modify `cfd_tandemfoil/train.py` (see constraints in `cfd_tandemfoil/program.md`).
    - Keep changes focused — one hypothesis per PR. Don't scope-creep.
-   - If the instructions are unclear ask for clarification from the advisor via a comment on the PR, removing the `status:wip` label and marking the PR with the `status:review`.
 
 4. **Run experiments**
    ```bash
@@ -88,12 +88,12 @@ Read `cfd_tandemfoil/program.md` for the full research context, constraints, met
 
 5. **Report results**
    Add a new PR comment with a Results section (template in `cfd_tandemfoil/program.md`):
-   - Start your comment with: 
+   - Start your comment with:
    ```markdown
    STUDENT <your-name>:
 
    ## Results
-   
+
    ```
    - All key metrics: val_loss, Surface MAE (Ux, Uy, p), Volume MAE
    - Comparison against the baseline numbers from the PR body
@@ -103,37 +103,26 @@ Read `cfd_tandemfoil/program.md` for the full research context, constraints, met
    - **What happened** — honest analysis: did it work? why or why not?
    - **Suggested follow-ups** — what would you try next based on what you learned?
 
-   If there are results from a set of follow-up experiments (e.g. if the advisor comments with instructions to try a different variant), add these results to a new results comment, starting with the same format as above.
+   If there are results from follow-up experiments, add them as a new results comment using the same format.
 
 6. **Submit for review**
-   ```bash
-   git add cfd_tandemfoil/train.py
-   git commit -m "<concise description of changes>"
-   git push origin <branch>
-   gh pr ready <number>
-   ```
-   Then swap the status label (keep all other labels intact):
-   ```bash
-   gh api repos/{owner}/{repo}/issues/<number>/labels/status:wip --method DELETE
-   gh api repos/{owner}/{repo}/issues/<number>/labels -f "labels[]=status:review" --method POST
-   ```
-   **IMPORTANT:** Never use `gh pr edit --remove-label --add-label` — it strips other labels. Always use the API calls above to swap status labels individually.
+   Use `/submit-experiment <pr-number>` to commit, push, mark ready, and swap the status label.
 
 7. **Go back to step 1** and poll for the next assignment.
 
 ### Give new experiments the best possible chance of success
 
-Consider that the baseline metrics you are trying to beat is already very well tuned. Ensure that the experiments you run give the best possible chance of success by carefully considering the likely best hyperparameters and training setup. 
+Consider that the baseline metrics you are trying to beat is already very well tuned. Ensure that the experiments you run give the best possible chance of success by carefully considering the likely best hyperparameters and training setup.
 
 #### Handle errors and crashes
 
-Ensure experiments can run successfully. For big codebase changes, consider running 1 tiny debug run first using a sub-agent to check everything is working. If an experiment hits an OOM error, relaunch it with fixes that reduce VRAM usage. If it crashes for any other reason, investigate the cause fix the bug and relaunch the experiment. Comment in the PR with the details of the error, and timestamp so the advisor knows why an experiment might be delayed. If an idea if fundamentally broken, report that in the results.
+Ensure experiments can run successfully. For big codebase changes, consider running 1 tiny debug run first using a sub-agent to check everything is working. If an experiment hits an OOM error, relaunch it with fixes that reduce VRAM usage. If it crashes for any other reason, investigate the cause, fix the bug and relaunch the experiment. Comment in the PR with the details of the error and timestamp so the advisor knows why an experiment might be delayed. If an idea is fundamentally broken, report that in the results.
 
 Note: Don't try to fix errors or failures that arise from our hard, fixed experiment timeout or epoch count limits cutting in.
 
 ### If you find bugs, you fix them
 
-Your are at front line of this code base, if you find bugs in the codebase, including bugs not immediately related to the experiments you are running, it is your responsibility as a dilligent team member to fix them. Ensure you alert the advisor clearly in a separate bug-fix PR comment about any bug fixes you made so that they can review and merge them. Run the bug fixes before you start your experiments.
+You are at the front line of this codebase. If you find bugs, including bugs not immediately related to the experiments you are running, it is your responsibility as a diligent team member to fix them. Ensure you alert the advisor clearly in a separate bug-fix PR comment about any bug fixes you made so that they can review and merge them. Run the bug fixes before you start your experiments.
 
 ### Always have rich wandb logging for every experiment
 
@@ -148,9 +137,9 @@ Installing new packages using `uv` is fine if necessary for an experiment. Ensur
 Your PR may come back as a draft with `status:wip` and review comments. When this happens:
 - Read the review comments carefully.
 - Address the feedback — this might mean tweaking parameters, trying a variation, or fixing an issue.
-- You can comment on the PR if you need any more information from the advisor or need to ask any questions. Ensure to identify yourself as the student at the start of the comment.
+- You can comment on the PR if you need any more information from the advisor.
 - Run new experiments and update the results.
-- Re-submit for review (step 6).
+- Re-submit for review using `/submit-experiment <pr-number>`.
 
 ## Principles
 

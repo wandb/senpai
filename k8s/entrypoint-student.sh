@@ -34,12 +34,19 @@ echo "=== Hivemind started (PID=$!) ==="
 # --- Install role instructions ---
 cp "$WORKDIR/system_instructions/CLAUDE-STUDENT.md" "$WORKDIR/CLAUDE.md"
 
-# --- Launch Claude Code in Ralph Loop ---
-export IS_SANDBOX=1
+# --- Source senpai-gh library for pre-triage ---
+source "$WORKDIR/.claude/skills/senpai-gh/scripts/senpai-gh.sh"
 
-# --- Build prompt ---
+# --- Build prompts ---
 # PROBLEM_DIR comes from ConfigMap (set by launch.py from senpai.yaml)
-PROMPT="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-student.md" | sed '/^<!--$/,/^-->$/d')"
+FULL_PROMPT="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-student.md" | sed '/^<!--$/,/^-->$/d')"
+HEARTBEAT="Continue your student loop. Check for assigned PRs, check for human messages, and resume any in-progress work."
+
+# --- System-level vars (survive compaction via --append-system-prompt) ---
+SYSTEM_VARS="Student: $STUDENT_NAME | Branch: $ADVISOR_BRANCH | W&B: $WANDB_ENTITY/$WANDB_PROJECT"
+
+# --- Launch Claude Code in Heartbeat Loop ---
+export IS_SANDBOX=1
 
 LOGDIR="/workspace/senpai/student_logs"
 mkdir -p "$LOGDIR"
@@ -48,8 +55,7 @@ ITERATION=0
 while true; do
     ITERATION=$((ITERATION + 1))
     LOGFILE="$LOGDIR/iteration_${ITERATION}_$(date +%Y%m%d_%H%M%S).jsonl"
-    echo "=== Ralph Loop iteration $ITERATION ($(date)) ==="
-    echo "=== Log: $LOGFILE ==="
+    echo "=== Student Heartbeat iteration $ITERATION ($(date)) ==="
 
     # Return to latest advisor branch so student starts from the current baseline
     git checkout "$ADVISOR_BRANCH" 2>/dev/null || true
@@ -58,19 +64,63 @@ while true; do
     echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) ==="
     echo "=== GPU: $(nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null) ==="
 
+    # --- Pre-triage: check if there's work before invoking Claude ---
+    ASSIGNED=$(senpai_poll_work "$STUDENT_NAME" 2>/dev/null || echo "[]")
+    ASSIGNED_COUNT=$(echo "$ASSIGNED" | python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))" 2>/dev/null || echo "0")
+    ISSUE_COUNT=$(senpai_check_issues "student:$STUDENT_NAME" 2>/dev/null | python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))" 2>/dev/null || echo "0")
+
+    echo "=== Pre-triage: assigned=$ASSIGNED_COUNT issues=$ISSUE_COUNT ==="
+
+    # --- Skip Claude if nothing to do ---
+    if [ "$ASSIGNED_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ]; then
+        echo "=== No work assigned, sleeping 60s ==="
+        sleep 60
+        continue
+    fi
+
+    # --- Build triaged state summary ---
+    TRIAGE="Pre-triaged state: $ASSIGNED_COUNT assigned PRs | $ISSUE_COUNT human issues"
+
+    # --- Choose prompt weight ---
+    if [ "$ITERATION" -eq 1 ] || [ -f /tmp/student_compacted ]; then
+        PROMPT="$FULL_PROMPT"
+        rm -f /tmp/student_compacted
+        echo "=== Using FULL prompt ==="
+    else
+        PROMPT="$HEARTBEAT"
+        echo "=== Using HEARTBEAT prompt ==="
+    fi
+
     # Restore CLAUDE.md — branch checkouts clobber it
     cp "$WORKDIR/system_instructions/CLAUDE-STUDENT.md" "$WORKDIR/CLAUDE.md"
+
+    echo "=== Log: $LOGFILE ==="
 
     START_TS=$(date +%s)
     EXIT_CODE=0
     if [ "$ITERATION" -eq 1 ]; then
-        claude -p "$PROMPT" --model "claude-opus-4-6[1m]" --output-format stream-json --verbose --dangerously-skip-permissions > "$LOGFILE" 2>&1 || EXIT_CODE=$?
+        claude -p "${PROMPT}"$'\n\n'"${TRIAGE}" \
+            --append-system-prompt "$SYSTEM_VARS" \
+            --max-turns 50 \
+            --model "claude-opus-4-6[1m]" \
+            --output-format stream-json --verbose \
+            --dangerously-skip-permissions > "$LOGFILE" 2>&1 || EXIT_CODE=$?
     else
-        claude -c -p "$PROMPT" --model "claude-opus-4-6[1m]" --output-format stream-json --verbose --dangerously-skip-permissions > "$LOGFILE" 2>&1 || \
-        claude -p "$PROMPT" --model "claude-opus-4-6[1m]" --output-format stream-json --verbose --dangerously-skip-permissions > "$LOGFILE" 2>&1 || EXIT_CODE=$?
+        claude -c -p "${PROMPT}"$'\n\n'"${TRIAGE}" \
+            --append-system-prompt "$SYSTEM_VARS" \
+            --max-turns 50 \
+            --model "claude-opus-4-6[1m]" \
+            --output-format stream-json --verbose \
+            --dangerously-skip-permissions > "$LOGFILE" 2>&1 || \
+        claude -p "${FULL_PROMPT}"$'\n\n'"${TRIAGE}" \
+            --append-system-prompt "$SYSTEM_VARS" \
+            --max-turns 50 \
+            --model "claude-opus-4-6[1m]" \
+            --output-format stream-json --verbose \
+            --dangerously-skip-permissions > "$LOGFILE" 2>&1 || EXIT_CODE=$?
     fi
     DURATION=$(( $(date +%s) - START_TS ))
 
-    echo "=== Claude exited code=$EXIT_CODE after ${DURATION}s at $(date), restarting in 5s ==="
+    echo "=== Claude exited code=$EXIT_CODE after ${DURATION}s at $(date), next check in 5s ==="
     sleep 5
 done

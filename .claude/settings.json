@@ -10,6 +10,18 @@
   "env": {
     "CLAUDE_CODE_SUBAGENT_MODEL": "claude-sonnet-4-6",
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  },
+  "hooks": {
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "touch /tmp/advisor_compacted /tmp/student_compacted && echo 'Compaction detected — next iteration will use full prompt'"
+          }
+        ]
+      }
+    ]
   }
 }
 
