@@ -814,11 +814,18 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: TTA and surface pressure weighting
+    tta_yflip: bool = False              # test-time y-flip augmentation (average normal + flipped)
+    surf_p_weight: float = 1.0           # weight multiplier for surface pressure in loss
 
 
 cfg = sp.parse(Config)
 
 if cfg.seed >= 0:
+    import random as _random
+    import numpy as _np
+    _random.seed(cfg.seed)
+    _np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
     torch.cuda.manual_seed_all(cfg.seed)
 
@@ -1412,14 +1419,15 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        _surf_p_err = abs_err[:, :, 2:3] * cfg.surf_p_weight  # apply surface pressure weight
+        surf_per_sample = (_surf_p_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
         running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
         # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
         if epoch >= 30:
-            surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
+            surf_pres = abs_err[:, :, 2:3] * cfg.surf_p_weight  # pressure errors [B, N, 1]
             surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
             surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
             thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
@@ -1700,6 +1708,9 @@ for epoch in range(MAX_EPOCHS):
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
 
+                # Save raw x for TTA y-flip (before any processing)
+                x_raw = x.clone() if cfg.tta_yflip else None
+
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
@@ -1798,6 +1809,52 @@ for epoch in range(MAX_EPOCHS):
                         pred_orig = _pd
                     else:
                         pred_orig = _phys_denorm(pred_phys, Umag, q)
+
+                # --- TTA y-flip: second pass with flipped input, average predictions ---
+                if cfg.tta_yflip and x_raw is not None:
+                    x_flip = x_raw.clone()
+                    # Match training y-flip augmentation exactly:
+                    # Negate y-coord(1), saf_y(3), dsdf_y(5,7,9)
+                    x_flip[:, :, 1] = -x_flip[:, :, 1]  # y-coordinate
+                    for _fi in [3, 5, 7, 9]:
+                        x_flip[:, :, _fi] = -x_flip[:, :, _fi]
+                    # Process flipped x through the same pipeline
+                    _raw_dsdf_f = x_flip[:, :, 2:10]
+                    _dist_f = torch.log1p(_raw_dsdf_f.abs().min(dim=-1, keepdim=True).values * 10.0)
+                    x_flip = (x_flip - stats["x_mean"]) / stats["x_std"]
+                    _curv_f = x_flip[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                    if cfg.foil2_dist:
+                        _f2d = torch.log1p(_raw_dsdf_f[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                        x_flip = torch.cat([x_flip, _curv_f, _dist_f, _f2d], dim=-1)
+                    else:
+                        x_flip = torch.cat([x_flip, _curv_f, _dist_f], dim=-1)
+                    _rxy_f = x_flip[:, :, :2]
+                    _xymin_f = _rxy_f.amin(dim=1, keepdim=True)
+                    _xymax_f = _rxy_f.amax(dim=1, keepdim=True)
+                    _xyn_f = (_rxy_f - _xymin_f) / (_xymax_f - _xymin_f + 1e-8)
+                    _xys_f = _xyn_f.unsqueeze(-1) * freqs
+                    _fpe_f = torch.cat([_xys_f.sin().flatten(-2), _xys_f.cos().flatten(-2)], dim=-1)
+                    x_flip = torch.cat([x_flip, _fpe_f], dim=-1)
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        pred_flip_raw = eval_model({"x": x_flip})["preds"]
+                    pred_flip_raw = pred_flip_raw.float()
+                    # Denormalize flipped prediction
+                    if cfg.raw_targets:
+                        pred_flip_orig = pred_flip_raw * raw_stats["y_std"] + raw_stats["y_mean"]
+                    else:
+                        _pf_phys = pred_flip_raw * phys_stats["y_std"] + phys_stats["y_mean"]
+                        if cfg.tight_denorm_clamps:
+                            _pfo = _pf_phys.clone()
+                            _pfo[:, :, 0:1] = _pf_phys[:, :, 0:1].clamp(-5, 5) * Umag
+                            _pfo[:, :, 1:2] = _pf_phys[:, :, 1:2].clamp(-5, 5) * Umag
+                            _pfo[:, :, 2:3] = _pf_phys[:, :, 2:3].clamp(-10, 10) * q
+                            pred_flip_orig = _pfo
+                        else:
+                            pred_flip_orig = _phys_denorm(_pf_phys, Umag, q)
+                    # Negate Uy in flipped prediction, then average
+                    pred_flip_orig[:, :, 1] = -pred_flip_orig[:, :, 1]
+                    pred_orig = 0.5 * (pred_orig + pred_flip_orig)
+
                 y_clamped = y.clamp(-1e6, 1e6)
                 err = (pred_orig - y_clamped).abs()
                 finite = err.isfinite()
