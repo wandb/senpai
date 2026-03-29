@@ -816,6 +816,7 @@ class Config:
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
     # Phase 5: Residual prediction
     residual_prediction: bool = False   # predict residual from freestream instead of full field
+    residual_renorm: bool = False      # re-normalize residual targets after freestream subtraction
 
 
 cfg = sp.parse(Config)
@@ -1325,6 +1326,11 @@ for epoch in range(MAX_EPOCHS):
             _fs_phys[:, 0, 2] = 0.0  # p/q
             _freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]  # [B, 1, 3]
             y_norm = y_norm - _freestream  # subtract freestream (broadcasts over N)
+        if cfg.residual_renorm and _freestream is not None:
+            # Re-normalize residual targets per-sample to O(1)
+            _m = mask.float().unsqueeze(-1)
+            _res_std = ((y_norm ** 2 * _m).sum(dim=1, keepdim=True) / _m.sum(dim=1, keepdim=True).clamp(min=1)).sqrt().clamp(min=0.1)
+            y_norm = y_norm / _res_std
         if model.training and not cfg.no_target_noise:
             noise_progress = min(1.0, epoch / max(cfg.noise_anneal_epochs, 1))
             if cfg.half_target_noise:
@@ -1756,6 +1762,11 @@ for epoch in range(MAX_EPOCHS):
                     _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))
                     _v_freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
                     y_norm = y_norm - _v_freestream
+                _v_res_std = None
+                if cfg.residual_renorm and _v_freestream is not None:
+                    _vm = mask.float().unsqueeze(-1)
+                    _v_res_std = ((y_norm ** 2 * _vm).sum(dim=1, keepdim=True) / _vm.sum(dim=1, keepdim=True).clamp(min=1)).sqrt().clamp(min=0.1)
+                    y_norm = y_norm / _v_res_std
 
                 # Per-sample std normalization: skip tandem samples
                 raw_gap = x[:, 0, 21]
@@ -1808,7 +1819,9 @@ for epoch in range(MAX_EPOCHS):
                 )
                 n_vbatches += 1
 
-                # Add freestream back for residual prediction mode
+                # Add residual base back before denormalization
+                if cfg.residual_renorm and _v_res_std is not None:
+                    pred = pred * _v_res_std  # undo residual renormalization
                 if cfg.residual_prediction and _v_freestream is not None:
                     pred = pred + _v_freestream  # add freestream back before denorm
 
