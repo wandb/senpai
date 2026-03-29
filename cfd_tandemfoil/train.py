@@ -816,6 +816,11 @@ class Config:
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
     # Phase 5: Residual prediction
     residual_prediction: bool = False   # predict residual from freestream instead of full field
+    # Phase 5: Surface/volume loss balance
+    surf_weight_init: float = 0.0       # initial surface weight (0 = use adaptive)
+    surf_weight_fixed: float = 0.0      # fixed surface weight, no adaptive (0 = use adaptive)
+    surf_only_epochs: int = 0           # surface-only training for first N epochs
+    vol_only_epochs: int = 0            # volume-only training for first N epochs
 
 
 cfg = sp.parse(Config)
@@ -1203,8 +1208,17 @@ for epoch in range(MAX_EPOCHS):
 
     t0 = time.time()
 
-    # Adaptive surface weight: loss-ratio based, clamped [5, 50]
-    surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+    # Surface weight selection
+    if cfg.surf_weight_fixed > 0:
+        surf_weight = cfg.surf_weight_fixed
+    elif cfg.surf_weight_init > 0 and epoch < 40:
+        # Ramp from surf_weight_init toward adaptive over 40 epochs
+        frac = epoch / 40.0
+        adaptive = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+        surf_weight = cfg.surf_weight_init * (1 - frac) + adaptive * frac
+    else:
+        # Default adaptive surface weight: loss-ratio based, clamped [5, 50]
+        surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
 
     # --- Train ---
     model.train()
@@ -1461,7 +1475,13 @@ for epoch in range(MAX_EPOCHS):
                     surf_uy_loss * torch.exp(-2 * bm.log_sigma_surf_uy) / 2 + bm.log_sigma_surf_uy +
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
         else:
-            loss = vol_loss + surf_weight * surf_loss
+            # Surface/volume curriculum
+            if cfg.surf_only_epochs > 0 and epoch < cfg.surf_only_epochs:
+                loss = surf_weight * surf_loss  # surface only
+            elif cfg.vol_only_epochs > 0 and epoch < cfg.vol_only_epochs:
+                loss = vol_loss  # volume only
+            else:
+                loss = vol_loss + surf_weight * surf_loss
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
