@@ -1226,7 +1226,11 @@ for epoch in range(MAX_EPOCHS):
                 _flip = torch.rand(x.size(0), 1, 1, device=x.device) < 0.5
                 x[:, :, 1:2] = torch.where(_flip, -x[:, :, 1:2], x[:, :, 1:2])
                 y[:, :, 1:2] = torch.where(_flip, -y[:, :, 1:2], y[:, :, 1:2])
-                for _idx in [3, 5, 7, 9]:
+                # Negate y-dependent per-node features: SAF_y(3), DSDF dy(5,7,9,11)
+                for _idx in [3, 5, 7, 9, 11]:
+                    x[:, :, _idx:_idx+1] = torch.where(_flip, -x[:, :, _idx:_idx+1], x[:, :, _idx:_idx+1])
+                # Negate y-dependent global features: AoA0(14), AoA1(18), stagger(23)
+                for _idx in [14, 18, 23]:
                     x[:, :, _idx:_idx+1] = torch.where(_flip, -x[:, :, _idx:_idx+1], x[:, :, _idx:_idx+1])
             if cfg.aug in ("jitter", "flip_jitter"):
                 x[:, :, :2] = x[:, :, :2] + 0.001 * torch.randn_like(x[:, :, :2])
