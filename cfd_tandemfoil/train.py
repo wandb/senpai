@@ -814,6 +814,10 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Uncertainty-weighted multi-task loss
+    uncertainty_weight: bool = False     # learn per-channel uncertainty weights (Kendall et al.)
+    uw_init_p: float = 0.0              # initial log_var for pressure (negative = higher precision)
+    channel_pressure_weight: float = 1.0  # fixed multiplier for pressure channel loss
 
 
 cfg = sp.parse(Config)
@@ -970,6 +974,14 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 model._pressure_separate = cfg.pressure_separate_last_block
+
+# Uncertainty-weighted multi-task loss: learnable log-variance per channel
+uw_log_vars = None
+if cfg.uncertainty_weight:
+    # log(sigma^2) for [Ux, Uy, p] — negative = higher precision
+    uw_log_vars = nn.Parameter(torch.tensor([0.0, 0.0, cfg.uw_init_p], device=device))
+    print(f"Uncertainty weighting: log_vars init = [{0.0:.1f}, {0.0:.1f}, {cfg.uw_init_p:.1f}]")
+
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
@@ -1100,17 +1112,24 @@ class Lookahead:
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
+_extra_params = [uw_log_vars] if uw_log_vars is not None else []
 if cfg.use_lion:
-    base_opt = Lion([
+    _param_groups = [
         {'params': attn_params, 'lr': _base_lr * 0.5},
-        {'params': other_params, 'lr': _base_lr}
-    ], weight_decay=cfg.weight_decay)
+        {'params': other_params, 'lr': _base_lr},
+    ]
+    if _extra_params:
+        _param_groups.append({'params': _extra_params, 'lr': _base_lr, 'weight_decay': 0.0})
+    base_opt = Lion(_param_groups, weight_decay=cfg.weight_decay)
     optimizer = base_opt  # Lion has its own momentum; skip Lookahead
 else:
-    base_opt = torch.optim.AdamW([
+    _param_groups_adam = [
         {'params': attn_params, 'lr': _base_lr * 0.5},
-        {'params': other_params, 'lr': _base_lr}
-    ], weight_decay=cfg.weight_decay)
+        {'params': other_params, 'lr': _base_lr},
+    ]
+    if _extra_params:
+        _param_groups_adam.append({'params': _extra_params, 'lr': _base_lr, 'weight_decay': 0.0})
+    base_opt = torch.optim.AdamW(_param_groups_adam, weight_decay=cfg.weight_decay)
     if cfg.use_lookahead:
         optimizer = Lookahead(base_opt, k=10, alpha=0.8)
     else:
@@ -1436,6 +1455,24 @@ for epoch in range(MAX_EPOCHS):
         else:
             tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
+        # Uncertainty-weighted multi-task loss: per-channel weighting on surface
+        if cfg.uncertainty_weight and uw_log_vars is not None:
+            surf_ux_err = (abs_err[:, :, 0:1] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            surf_uy_err = (abs_err[:, :, 1:2] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            surf_p_err = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            # Kendall uncertainty: L_i / (2*sigma_i^2) + 0.5*log(sigma_i^2)
+            prec_ux = torch.exp(-uw_log_vars[0])
+            prec_uy = torch.exp(-uw_log_vars[1])
+            prec_p = torch.exp(-uw_log_vars[2])
+            surf_loss = (prec_ux * surf_ux_err + 0.5 * uw_log_vars[0] +
+                         prec_uy * surf_uy_err + 0.5 * uw_log_vars[1] +
+                         prec_p * surf_p_err + 0.5 * uw_log_vars[2])
+        elif cfg.channel_pressure_weight != 1.0:
+            # Fixed pressure channel upweight
+            surf_ux_err = (abs_err[:, :, 0:1] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            surf_uy_err = (abs_err[:, :, 1:2] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            surf_p_err = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            surf_loss = (surf_ux_err + surf_uy_err + cfg.channel_pressure_weight * surf_p_err) * tandem_boost.mean()
         if cfg.uncertainty_loss:
             bm = _base_model
             surf_ux_loss = (abs_err[:, :, 0:1] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
@@ -1584,7 +1621,17 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if uw_log_vars is not None:
+            _log_dict["uw/log_var_Ux"] = uw_log_vars[0].item()
+            _log_dict["uw/log_var_Uy"] = uw_log_vars[1].item()
+            _log_dict["uw/log_var_p"] = uw_log_vars[2].item()
+            _log_dict["uw/precision_Ux"] = torch.exp(-uw_log_vars[0]).item()
+            _log_dict["uw/precision_Uy"] = torch.exp(-uw_log_vars[1]).item()
+            _log_dict["uw/precision_p"] = torch.exp(-uw_log_vars[2]).item()
+        if cfg.channel_pressure_weight != 1.0:
+            _log_dict["train/surf_loss"] = surf_loss.item()
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
