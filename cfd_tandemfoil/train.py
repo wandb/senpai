@@ -2171,6 +2171,12 @@ for epoch in range(MAX_EPOCHS):
         else:
             save_model = _base_model
         torch.save(save_model.state_dict(), model_path)
+        # Save refinement head checkpoint alongside main model
+        if refine_head is not None:
+            _refine_save = ema_refine_head if ema_refine_head is not None else (
+                refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
+            )
+            torch.save(_refine_save.state_dict(), model_dir / "refine_head.pt")
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
@@ -2270,5 +2276,232 @@ if best_metrics:
     except Exception as e:
         print(f"Warning: flow field visualization failed: {e}")
         wandb.alert(title="Vis failed", text=str(e)[:200], level="WARN")
+
+# ---------------------------------------------------------------------------
+# Verification: manual denormalization check for surface refinement
+# ---------------------------------------------------------------------------
+if cfg.surface_refine and best_metrics:
+    print("\n" + "=" * 70)
+    print("VERIFICATION: Manual denormalization check on val_ood_re")
+    print("=" * 70)
+    try:
+        # Use the best eval model (EMA if available) + refinement head
+        if ema_model is not None:
+            verify_model = ema_model
+        else:
+            verify_model = _base_model
+        _verify_sd = torch.load(model_path, map_location=device, weights_only=True)
+        _verify_sd = {k.removeprefix("_orig_mod."): v for k, v in _verify_sd.items()}
+        verify_model.load_state_dict(_verify_sd)
+        verify_model.eval()
+
+        # Use EMA refinement head if available, else training head
+        verify_refine = ema_refine_head if ema_refine_head is not None else (
+            refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
+        )
+        verify_refine.eval()
+
+        # Run inference on val_ood_re only
+        _ood_re_loader = val_loaders.get("val_ood_re")
+        if _ood_re_loader is None:
+            print("WARNING: val_ood_re split not found, skipping verification")
+        else:
+            # Collect per-sample results
+            all_manual_surf_p_ae = []  # manual absolute errors for surface pressure
+            all_pipeline_surf_p_ae = []  # pipeline absolute errors (should match W&B)
+            all_correction_magnitudes = []  # refinement correction magnitudes
+            all_re_values = []  # Reynolds numbers for correlation check
+
+            with torch.no_grad():
+                for x, y, is_surface, mask in tqdm(_ood_re_loader, desc="Verify OOD-Re", leave=False):
+                    x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                    is_surface = is_surface.to(device, non_blocking=True)
+                    mask = mask.to(device, non_blocking=True)
+                    B = x.shape[0]
+
+                    # Save Re values (raw, before normalization)
+                    _re_raw = x[:, 0, 13].cpu()  # Re feature
+                    all_re_values.append(_re_raw)
+
+                    # Preprocess (same as val loop)
+                    raw_dsdf = x[:, :, 2:10]
+                    dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+                    dist_feat = torch.log1p(dist_surf * 10.0)
+                    _raw_aoa = x[:, 0, 14:15]
+                    x = (x - stats["x_mean"]) / stats["x_std"]
+                    curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                    if cfg.foil2_dist:
+                        foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                        x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
+                    else:
+                        x = torch.cat([x, curv, dist_feat], dim=-1)
+                    raw_xy = x[:, :, :2]
+                    xy_min = raw_xy.amin(dim=1, keepdim=True)
+                    xy_max = raw_xy.amax(dim=1, keepdim=True)
+                    xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                    freqs = torch.cat([verify_model.fourier_freqs_fixed.to(device), verify_model.fourier_freqs_learned.abs()])
+                    xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                    fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                    x = torch.cat([x, fourier_pe], dim=-1)
+
+                    # Ground truth denormalization reference
+                    Umag, q = _umag_q(y, mask)
+                    y_phys = _phys_norm(y, Umag, q)
+                    y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+
+                    # Residual prediction
+                    _v_freestream = None
+                    if cfg.residual_prediction:
+                        _aoa = _raw_aoa
+                        _fs_phys = torch.zeros(B, 1, 3, device=device)
+                        _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))
+                        _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))
+                        _fs_phys[:, 0, 2] = 0.0
+                        _v_freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                        y_norm = y_norm - _v_freestream
+
+                    # Per-sample std
+                    raw_gap = x[:, 0, 21]
+                    is_tandem_v = raw_gap.abs() > 0.5
+                    sample_stds = torch.ones(B, 1, 3, device=device)
+                    if not cfg.no_perstd and not cfg.raw_targets:
+                        if cfg.high_p_clamp:
+                            channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
+                            tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
+                        else:
+                            channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
+                            tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+                        for b in range(B):
+                            valid = mask[b]
+                            if is_tandem_v[b]:
+                                sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
+                            else:
+                                sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+
+                    # Model forward
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        out = verify_model({"x": x})
+                        pred_raw = out["preds"].float()
+                        hidden = out["hidden"].float()
+
+                    # === PATH A: Pipeline denormalization (same as val loop) ===
+                    pred_loss = pred_raw / sample_stds
+                    # Apply refinement
+                    surf_idx = is_surface.nonzero(as_tuple=False)
+                    correction_full = torch.zeros_like(pred_loss)
+                    if surf_idx.numel() > 0:
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]
+                            surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
+                            correction = verify_refine(surf_hidden, surf_pred).float()
+                        pred_loss_refined = pred_loss.clone()
+                        pred_loss_refined[surf_idx[:, 0], surf_idx[:, 1]] += correction
+                        correction_full[surf_idx[:, 0], surf_idx[:, 1]] = correction
+                    else:
+                        pred_loss_refined = pred_loss
+
+                    # Back-compute pred with refinement
+                    pred_refined = pred_loss_refined * sample_stds
+
+                    # Add freestream back
+                    if cfg.residual_prediction and _v_freestream is not None:
+                        pred_refined = pred_refined + _v_freestream
+
+                    # Z-score denorm
+                    pred_phys_A = pred_refined * phys_stats["y_std"] + phys_stats["y_mean"]
+                    # Physics denorm
+                    pred_orig_A = _phys_denorm(pred_phys_A, Umag, q)
+
+                    # === PATH B: Manual denormalization from scratch ===
+                    # Start from raw model output, apply refinement, denormalize manually
+                    # Step 1: raw model output → divide by sample_stds
+                    pred_manual = pred_raw / sample_stds
+                    # Step 2: add refinement correction (same as above)
+                    if surf_idx.numel() > 0:
+                        pred_manual = pred_manual.clone()
+                        pred_manual[surf_idx[:, 0], surf_idx[:, 1]] += correction
+                    # Step 3: multiply by sample_stds to undo per-sample normalization
+                    pred_manual = pred_manual * sample_stds
+                    # Step 4: add freestream (residual prediction)
+                    if cfg.residual_prediction and _v_freestream is not None:
+                        pred_manual = pred_manual + _v_freestream
+                    # Step 5: undo z-score: pred * std + mean
+                    pred_manual_phys = pred_manual * phys_stats["y_std"] + phys_stats["y_mean"]
+                    # Step 6: undo physics norm: Ux*Umag, Uy*Umag, p*q
+                    pred_manual_orig = torch.zeros_like(pred_manual_phys)
+                    pred_manual_orig[:, :, 0:1] = pred_manual_phys[:, :, 0:1].clamp(-10, 10) * Umag
+                    pred_manual_orig[:, :, 1:2] = pred_manual_phys[:, :, 1:2].clamp(-10, 10) * Umag
+                    pred_manual_orig[:, :, 2:3] = pred_manual_phys[:, :, 2:3].clamp(-20, 20) * q
+
+                    # === PATH C: NO refinement (raw model only) ===
+                    pred_norefine = pred_raw * sample_stds  # undo per-sample std (divides cancel)
+                    # Wait: pred_raw is raw output. For baseline: pred / sample_stds * sample_stds = pred_raw
+                    # So no-refinement path just uses pred_raw directly
+                    pred_norefine = pred_raw.clone()
+                    if cfg.residual_prediction and _v_freestream is not None:
+                        pred_norefine = pred_norefine + _v_freestream
+                    pred_norefine_phys = pred_norefine * phys_stats["y_std"] + phys_stats["y_mean"]
+                    pred_norefine_orig = _phys_denorm(pred_norefine_phys, Umag, q)
+
+                    # Compute surface pressure MAE for all paths
+                    surf_mask = mask & is_surface
+                    y_clamped = y.clamp(-1e6, 1e6)
+
+                    err_A = (pred_orig_A - y_clamped).abs()
+                    err_B = (pred_manual_orig - y_clamped).abs()
+                    err_C = (pred_norefine_orig - y_clamped).abs()
+
+                    for b in range(B):
+                        s = surf_mask[b]
+                        if s.sum() > 0:
+                            all_pipeline_surf_p_ae.append(err_A[b, s, 2].cpu())
+                            all_manual_surf_p_ae.append(err_B[b, s, 2].cpu())
+                            # Correction magnitude per surface node
+                            all_correction_magnitudes.append(correction_full[b, s, 2].abs().cpu())
+
+            # Aggregate results
+            pipeline_mae_p = torch.cat(all_pipeline_surf_p_ae).mean().item()
+            manual_mae_p = torch.cat(all_manual_surf_p_ae).mean().item()
+            corr_mags = torch.cat(all_correction_magnitudes)
+            re_vals = torch.cat(all_re_values)
+
+            print(f"\n--- Verification Results ---")
+            print(f"Pipeline MAE surf_p (should match W&B):  {pipeline_mae_p:.2f}")
+            print(f"Manual denorm MAE surf_p:                {manual_mae_p:.2f}")
+            print(f"Difference (pipeline - manual):          {pipeline_mae_p - manual_mae_p:.4f}")
+            print(f"Match: {'YES' if abs(pipeline_mae_p - manual_mae_p) < 0.1 else 'NO — POTENTIAL BUG'}")
+            print(f"\nRefinement correction magnitude stats:")
+            print(f"  Mean: {corr_mags.mean().item():.6f}")
+            print(f"  Std:  {corr_mags.std().item():.6f}")
+            print(f"  Max:  {corr_mags.max().item():.6f}")
+            print(f"  Min:  {corr_mags.min().item():.6f}")
+
+            # Check Re correlation: compute mean correction magnitude per sample
+            _per_sample_corr = []
+            _idx = 0
+            for _re_batch in all_re_values:
+                for _r in _re_batch:
+                    # Each sample contributes variable number of surface nodes
+                    # Use a simpler per-Re-value check: all OOD-Re should have same Re
+                    _per_sample_corr.append(_r.item())
+            print(f"\nRe values in OOD-Re split (should all be same Re=4.445M):")
+            print(f"  Unique Re values: {set(round(r, 4) for r in _per_sample_corr)}")
+
+            # Log to W&B
+            wandb.summary.update({
+                "verify/pipeline_mae_surf_p": pipeline_mae_p,
+                "verify/manual_mae_surf_p": manual_mae_p,
+                "verify/mae_diff": pipeline_mae_p - manual_mae_p,
+                "verify/correction_mean": corr_mags.mean().item(),
+                "verify/correction_std": corr_mags.std().item(),
+                "verify/correction_max": corr_mags.max().item(),
+                "verify/match": abs(pipeline_mae_p - manual_mae_p) < 0.1,
+            })
+            print("Verification results logged to W&B.")
+
+    except Exception as e:
+        import traceback
+        print(f"WARNING: Verification failed: {e}")
+        traceback.print_exc()
 
 wandb.finish()
