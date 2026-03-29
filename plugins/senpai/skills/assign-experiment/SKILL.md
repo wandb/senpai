@@ -9,10 +9,8 @@ description: >
   Handles branch creation, PR creation with the correct template and
   labels, and ensures the student gets a well-structured assignment.
   Use this skill to: assign an experiment, create a hypothesis PR,
-  give a student work. Triggers for: "assign experiment", "create
-  hypothesis PR", "give student work", "assign PR to student".
+  give a student work.
 argument-hint: "<student-name> <hypothesis-slug>"
-allowed-tools: Bash(git *), Bash(gh *), Bash(source *)
 ---
 
 # assign-experiment
@@ -21,8 +19,8 @@ Create a branch and draft PR that assigns a hypothesis to a student. The student
 
 ## Arguments
 
-- `$0` — Student name (e.g. `frieren`)
-- `$1` — A short kebab-case slug for the hypothesis (e.g. `cosine-annealing-warmup`)
+- `$0` — Student name
+- `$1` — A short kebab-case slug for the hypothesis
 
 The hypothesis details, instructions, and baseline metrics come from your own reasoning — this skill handles the git/GitHub mechanics.
 
@@ -38,7 +36,7 @@ git checkout "$ADVISOR_BRANCH" && git pull origin "$ADVISOR_BRANCH"
 2. **Create the experiment branch:**
 
 ```bash
-BRANCH="${ADVISOR_BRANCH}/$1"
+BRANCH="$0/$1"
 git checkout -b "$BRANCH"
 git push -u origin "$BRANCH"
 ```
@@ -55,13 +53,12 @@ include links to papers or code that support the hypothesis.>
 
 ## Instructions
 <Specific changes to make to cfd_tandemfoil/train.py — be concrete.
-"Try a higher learning rate" is vague.
-"Change lr from 5e-4 to 1e-3 and add cosine annealing with T_max=epochs" is actionable.>
+"Try a higher learning rate" is vague. Change lr from 5e-4 to 1e-3 and add cosine annealing with T_max=epochs" is actionable.>
 
 ## Baseline
 <Current best metrics from BASELINE.md:
 - val/loss: X.XXX
-- Surface MAE: Ux=X.XXXX, Uy=X.XXXX, p=X.XXXX
+- Surface MAE metrics: p_in | p_oodc | p_tan | p_re
 - Baseline W&B run: <run-id> (<wandb-link>)
 - Reproduce command: `cd cfd_tandemfoil && python train.py ...`>
 PREOF
@@ -75,7 +72,7 @@ PREOF
 
 ## Important details
 
-- **Read BASELINE.md** before creating the PR. The student needs concrete metrics to compare against.
+- **Read BASELINE.md** before creating the PR take the most recent metrics from the file. The student needs concrete metrics to compare against.
 - **Be specific in instructions.** The student implements exactly what you write. Vague instructions waste GPU time.
 - **Use `--wandb_group`** in instructions when a hypothesis needs multiple iterations (e.g. "try surface weight 5, 10, 20") so related runs are grouped in W&B.
 - **One hypothesis per PR.** Bundling multiple changes makes it impossible to attribute what worked.

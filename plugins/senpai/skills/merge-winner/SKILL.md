@@ -12,30 +12,33 @@ description: >
   Triggers for: "merge winner", "merge this PR", "update baseline after
   merge", "squash merge".
 argument-hint: "<pr-number>"
-allowed-tools: Bash(git *), Bash(gh *), Bash(source *), Read, Edit
+model: claude-sonnet-4-6
+effort: high
 ---
 
 # merge-winner
 
-A PR beat the baseline — merge it and record the new best.
+A PR beat the baseline — merge it and record the new best metrics in BASELINE.md.
 
 ## Arguments
 
-- `$ARGUMENTS` — The PR number (e.g. `1842`)
+- `$0` — The PR number
+
+Note: $ADVISOR_BRANCH is available as an environment variable.
 
 ## Steps
 
 1. **Squash-merge the PR:**
 
 ```bash
-gh pr merge $ARGUMENTS --squash
+gh pr merge $0 --squash
 ```
 
 If this fails due to merge conflicts, send the PR back for rebase instead:
 
 ```bash
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
-senpai_send_back $ARGUMENTS "ADVISOR: Rebasing needed — the advisor branch was updated after merging a previous winner. Please rebase onto $ADVISOR_BRANCH, re-run the experiment to verify the improvement still holds, and resubmit."
+senpai_send_back $0 "ADVISOR: Rebasing needed — the advisor branch was updated after merging a previous winner. Please rebase onto $ADVISOR_BRANCH, re-run the experiment to verify the improvement still holds, and resubmit."
 ```
 
 Then stop — don't proceed with baseline update.
@@ -46,10 +49,10 @@ Then stop — don't proceed with baseline update.
 git checkout "$ADVISOR_BRANCH" && git pull origin "$ADVISOR_BRANCH"
 ```
 
-3. **Update BASELINE.md** by appending the new baseline entry. Read the winning metrics from the PR comments and/or the W&B run. The entry should include:
+3. **Update BASELINE.md** by appending the new baseline entry. Read the winning metrics from the PR comments and the W&B run metrics. The entry should include:
 
 ```markdown
-## <Date> — PR #<number>: <title>
+## <YYYY-MM-DD HH:MM> — PR #<number>: <title>
 
 - **Surface MAE:** Ux=X.XXXX, Uy=X.XXXX, p=X.XXXX
 - **val/loss:** X.XXX
@@ -61,7 +64,7 @@ git checkout "$ADVISOR_BRANCH" && git pull origin "$ADVISOR_BRANCH"
 
 ```bash
 git add BASELINE.md
-git commit -m "Update baseline: <short description> (PR #$ARGUMENTS)"
+git commit -m "Update baseline: <short description> (PR #$0)"
 git push origin "$ADVISOR_BRANCH"
 ```
 

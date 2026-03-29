@@ -11,9 +11,10 @@ description: >
   messages, respond to human issues, poll for team communications,
   check GitHub issues. Also triggers for: "any human messages?",
   "check issues", "respond to humans".
-argument-hint: "<role-label> <identity-prefix>"
+argument-hint: "<advisor-or-student-name> <advisor-or-student-role-prefix>"
 context: fork
-allowed-tools: Bash(gh *), Bash(source *)
+model: claude-opus-4-6
+effort: high
 ---
 
 # check-human-issues
@@ -22,12 +23,12 @@ Check GitHub Issues tagged `human` for messages from the research team, and resp
 
 ## Arguments
 
-- `$0` — Your role label for issue filtering (e.g. `noam` for the advisor, `student:frieren` for a student)
-- `$1` — Your identity prefix for comments (e.g. `ADVISOR` or `STUDENT frieren`)
+- `$0` — Your name for gh issue filtering by label
+- `$1` — Your role prefix to add at the start of your comments (e.g. `ADVISOR` or `STUDENT <student-name>`)
 
 ## How it works
 
-Human researchers communicate with agents through GitHub Issues. Issues are tagged with `human` plus either your role label or `team` (for broadcast messages). Your job is to check them, respond to new ones, and skip ones you've already handled.
+Human researchers communicate with agents through GitHub Issues. Issues are tagged with `human` plus either your name or `team` (for broadcast messages). Your job is to check them, respond to new ones, and skip ones you've already handled.
 
 ## Steps
 
@@ -50,7 +51,7 @@ gh issue view <number> --json body,comments
    - If you haven't commented on this issue yet → respond.
    - If you have commented, check if the human posted a new comment *after* your last response. If so → respond to the new message. If not → skip, you're waiting for the human.
 
-4. **Respond** with your identity prefix:
+4. **Respond** with your role prefix:
 
 ```bash
 gh issue comment <number> --body "$1: <your response>"
@@ -60,8 +61,8 @@ gh issue comment <number> --body "$1: <your response>"
 
 ## Return format
 
-When you're done, return a one-line summary like:
+When you're done, return a structured summary of the issues you checked and responded to:
 
-> Checked 3 issues. Responded to #45 (new directive about loss weighting). #67, #71 already handled.
+### New research directives from the human researcher team
 
-If there are research directives in the issues, include them in your summary so the parent agent can incorporate them into planning.
+If there are research directives in the issues, include them in detail in your summary so the parent agent can incorporate them into planning.

@@ -3,30 +3,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-PackageName: senpai
 
-name: submit-experiment
+name: submit-experiment-results
 description: >
   Submit experiment results for advisor review. Commits changes, pushes
   the branch, marks the PR as ready, and swaps the status label from
   wip to review. Use this skill when you've finished running experiments
   and posted your results comment. Triggers for: "submit for review",
-  "mark PR ready", "send results to advisor", "submit experiment".
+  "mark PR ready", "send results to advisor", "submit experiment results".
 argument-hint: "<pr-number>"
-allowed-tools: Bash(git *), Bash(gh *), Bash(source *)
+model: claude-sonnet-4-6
+effort: high
 ---
 
-# submit-experiment
+# submit-experiment-results
 
-You've run the experiment, posted a results comment on the PR — now wrap it up and hand it to the advisor.
+You've run the experiment, posted a results comment on the experiment PR — now wrap it up and hand it to the advisor.
 
 ## Arguments
 
-- `$ARGUMENTS` — The PR number (e.g. `1842`)
+- `$ARGUMENTS` — The experiment PR number
 
 ## Before you call this
 
-Make sure you've already:
-1. Posted a results comment on the PR with metrics, W&B run ID, analysis, and suggested follow-ups
-2. Run `/plot-experiment-charts` if applicable
+Make sure you've already posted a results comment on the experiment PR with metrics, W&B run ID, analysis, and suggested follow-ups
 
 ## Steps
 
@@ -44,7 +43,7 @@ git commit -m "<concise description of what you changed>"
 git push origin "$(git branch --show-current)"
 ```
 
-3. **Mark ready and swap labels:**
+3. **Mark the PR as ready for advisor review and swap labels:**
 
 ```bash
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"

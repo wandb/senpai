@@ -5,27 +5,25 @@
 
 name: poll-for-work
 description: >
-  Poll for assigned experiment PRs for a student. Runs in a forked
-  context so idle polling doesn't consume the main context window.
-  Use this skill to: check for assignments, poll for work, see if
-  there's a PR assigned to me. Triggers for: "any work for me?",
-  "check for assignments", "poll for PRs".
+  Poll for assigned experiment PRs for a student. Use this skill to: check for assignments, poll for work, see if
+  there's a PR assigned to me. Triggers for: "any work for me?", "check for assignments", "poll for PRs".
 argument-hint: "<student-name>"
 context: fork
-allowed-tools: Bash(gh *), Bash(source *)
+model: claude-sonnet-4-6
+effort: high
 ---
 
 # poll-for-work
 
-Check whether the advisor has assigned you a PR to work on.
+Check whether the advisor has assigned you an experiment PR to work on.
 
 ## Arguments
 
-- `$ARGUMENTS` — Your student name (e.g. `frieren`)
+- `$ARGUMENTS` — Your student name
 
 ## Steps
 
-1. **Source the library and query:**
+1. **Source the library and query** for assigned experiment PRs:
 
 ```bash
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
@@ -43,12 +41,12 @@ senpai_poll_work "$ARGUMENTS"
 
 If work is available:
 ```
-WORK_AVAILABLE: PR #1842 "Cosine annealing with warm restarts" on branch noam/cosine-annealing-warmup
+WORK_AVAILABLE: PR <pr-number> "<pr-title>" on branch <branch-name>
 ```
 
 If the PR has revision comments from the advisor, include that:
 ```
-WORK_AVAILABLE (REVISION): PR #1842 — advisor requests: "Try lr=1e-3 instead"
+WORK_AVAILABLE (REVISION): PR <pr-number> "<pr-title>" on branch <branch-name> — advisor requests: "<advisor-comment>"
 ```
 
 If nothing:

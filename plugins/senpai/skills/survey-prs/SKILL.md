@@ -10,19 +10,17 @@ description: >
   This is the heartbeat query — use it to understand the current state of
   the research track. Triggers for: "survey state", "check PR status",
   "who's idle", "any PRs ready for review", "what's the current state".
-argument-hint: "<branch> <student-names-csv>"
 context: fork
+model: claude-sonnet-4-6
+effort: high
 allowed-tools: Bash(gh *), Bash(source *), Bash(python3 *)
 ---
 
 # survey-prs
 
-Get a structured snapshot of where things stand — who's working on what, what's ready for review, and who needs an assignment.
+Get a snapshot of the current state of the research track — who's working on what, what's ready for review, and who needs an assignment.
 
-## Arguments
-
-- `$0` — The advisor branch name (e.g. `noam`)
-- `$1` — Comma-separated student names (e.g. `frieren,fern,stark`)
+Uses `$ADVISOR_BRANCH` and `$STUDENT_NAMES` from the environment (set by the k8s ConfigMap).
 
 ## Steps
 
@@ -32,13 +30,13 @@ Get a structured snapshot of where things stand — who's working on what, what'
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 
 # All open PRs on the branch
-senpai_list_all_prs "$0"
+senpai_list_all_prs "$ADVISOR_BRANCH"
 
 # Just the review-ready ones
-senpai_list_review_prs "$0"
+senpai_list_review_prs "$ADVISOR_BRANCH"
 
 # Who's idle
-senpai_idle_students "$1" "$0"
+senpai_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH"
 ```
 
 2. **Categorize** each PR by its status labels:
@@ -49,20 +47,20 @@ senpai_idle_students "$1" "$0"
 3. **Return a structured summary** in this format:
 
 ```markdown
-## PR Survey — <branch>
+## Current Experiment PR State — <branch>
 
 ### Review-ready
-- #1842 "Cosine annealing with warm restarts" (student:frieren)
-- #1855 "Spectral normalization on decoder" (student:fern)
+- <pr-number> "<pr-title>" (student:<student-name>)
+- <pr-number> "<pr-title>" (student:<student-name>)
 
 ### Work in progress
-- #1860 "Gradient-weighted loss" (student:stark) — WIP
+- <pr-number> "<pr-title>" (student:<student-name>) — WIP
 
 ### Idle students (no status:wip PR)
-- fern (last PR #1855 is in review)
+- <student-name> (last PR <pr-number> is in review)
 
 ### Summary
-Review-ready: 2 | WIP: 1 | Idle: 1
+Review-ready: <number-of-review-ready-prs> | WIP: <number-of-wip-prs> | Idle: <number-of-idle-students>
 ```
 
 Keep it compact. The parent agent uses this to decide what to do next.

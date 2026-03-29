@@ -13,7 +13,8 @@ description: >
   student", "close this PR", "mark for review", "check human issues",
   "list review-ready PRs", "idle students".
 user-invocable: false
-allowed-tools: Bash(gh *), Bash(source *), Bash(python3 *)
+model: claude-opus-4-6
+effort: high
 ---
 
 # senpai-gh
@@ -26,32 +27,32 @@ The library lives at `${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh`. Source it bef
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 ```
 
-## Why this exists
-
-GitHub's `gh pr edit --remove-label X --add-label Y` silently strips **all other labels** from the PR. The only safe way to swap a single label is two REST API calls: DELETE the old one, POST the new one. This library wraps that pattern so you never have to remember it.
-
 ## Available functions
 
 ### Label operations
 
 | Function | What it does |
 |---|---|
-| `senpai_label_swap <pr#> <remove> <add>` | Atomically swap one label for another. Safe — won't error if the old label is already gone. |
+| `senpai_label_swap <pr#> <remove-label> <add-label>` | Atomically swap one label for another. Safe — won't error if the old label is already gone. |
 
-### Compound actions (advisor)
+#### The `gh pr edit` footgun
 
-| Function | What it does |
-|---|---|
-| `senpai_send_back <pr#> <comment>` | Comment on the PR, convert back to draft, swap `status:review` → `status:wip`. |
-| `senpai_close_pr <pr#> <reason>` | Comment with reason, close the PR, delete the remote branch. |
+GitHub's `gh pr edit --remove-label X --add-label Y` silently strips **all other labels** from the PR. The only safe way to swap a single label is two REST API calls: DELETE the old one, POST the new one. This library wraps that pattern so you never have to remember it.
 
-### Compound actions (student)
+### Advisor actions
 
 | Function | What it does |
 |---|---|
-| `senpai_mark_review <pr#>` | Mark the PR as ready + swap `status:wip` → `status:review`. |
+| `senpai_send_back <pr#> <comment>` | Send a PR back to the student with feedback. Comment on the PR, convert back to draft, swap `status:review` → `status:wip`. |
+| `senpai_close_pr <pr#> <reason>` | Close a dead-end PR with a comment explaining why. Comment with reason, close the PR, delete the remote branch. |
 
-### Queries
+### Student actions
+
+| Function | What it does |
+|---|---|
+| `senpai_mark_review <pr#>` | Mark a PR as ready for advisor review. Mark the PR as ready + swap `status:wip` → `status:review`. |
+
+### Queries (both roles)
 
 | Function | What it does |
 |---|---|
