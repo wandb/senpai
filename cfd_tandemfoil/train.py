@@ -814,6 +814,9 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Manifold mixup
+    mixup_alpha: float = 0.0            # Beta distribution alpha (0 = disabled)
+    mixup_anneal_epoch: int = 0         # stop mixup after this epoch (0 = never stop)
 
 
 cfg = sp.parse(Config)
@@ -1352,6 +1355,22 @@ for epoch in range(MAX_EPOCHS):
             else:
                 y_norm = y_norm / sample_stds
 
+        # Manifold mixup: interpolate features and targets within the batch
+        mixup_lam = None
+        if (cfg.mixup_alpha > 0 and model.training and B > 1
+                and (cfg.mixup_anneal_epoch == 0 or epoch < cfg.mixup_anneal_epoch)):
+            lam = torch.distributions.Beta(cfg.mixup_alpha, cfg.mixup_alpha).sample().to(device)
+            lam = torch.max(lam, 1 - lam)  # ensure lam >= 0.5 for stability
+            perm = torch.randperm(B, device=device)
+            x = lam * x + (1 - lam) * x[perm]
+            y_norm = lam * y_norm + (1 - lam) * y_norm[perm]
+            # Mix masks: use intersection (both must be valid)
+            mask = mask & mask[perm]
+            is_surface = is_surface & is_surface[perm]
+            if not cfg.no_perstd and not cfg.raw_targets:
+                sample_stds = lam * sample_stds + (1 - lam) * sample_stds[perm]
+            mixup_lam = lam.item()
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model({"x": x})
             pred = out["preds"]
@@ -1584,7 +1603,10 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if mixup_lam is not None:
+            _log_dict["mixup/lambda"] = mixup_lam
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
