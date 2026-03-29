@@ -282,8 +282,12 @@ class TransolverBlock(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        pres_head_layers=0,
+        pres_head_dim=0,
     ):
         super().__init__()
+        self._pres_head_layers = pres_head_layers
+        self._pres_head_dim = pres_head_dim
         self.last_layer = last_layer
         self.field_decoder = field_decoder
         self.domain_velhead = domain_velhead
@@ -352,15 +356,24 @@ class TransolverBlock(nn.Module):
                 )
             elif pressure_first:
                 # Pressure-first: predict p, then condition v on p (takes priority over domain_velhead/field_decoder)
-                if pressure_deep:
+                _ph_dim = getattr(self, '_pres_head_dim', 0) or hidden_dim * 2
+                _ph_layers = getattr(self, '_pres_head_layers', 0)
+                if _ph_layers >= 4:
+                    # 4+ layer pressure head
+                    _layers = [nn.Linear(hidden_dim, _ph_dim), nn.GELU()]
+                    for _ in range(_ph_layers - 2):
+                        _layers.extend([nn.Linear(_ph_dim, _ph_dim), nn.GELU()])
+                    _layers.append(nn.Linear(_ph_dim, 1))
+                    self.pres_head = nn.Sequential(*_layers)
+                elif pressure_deep:
                     self.pres_head = nn.Sequential(
-                        nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(),
-                        nn.Linear(hidden_dim * 2, hidden_dim), nn.GELU(),
+                        nn.Linear(hidden_dim, _ph_dim), nn.GELU(),
+                        nn.Linear(_ph_dim, hidden_dim), nn.GELU(),
                         nn.Linear(hidden_dim, 1),
                     )
                 else:
                     self.pres_head = nn.Sequential(
-                        nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(), nn.Linear(hidden_dim * 2, 1)
+                        nn.Linear(hidden_dim, _ph_dim), nn.GELU(), nn.Linear(_ph_dim, 1)
                     )
                 # Velocity head conditioned on predicted pressure: input is hidden_dim + 1
                 self.vel_head_conditioned = nn.Sequential(
@@ -484,6 +497,8 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        pres_head_layers=0,
+        pres_head_dim=0,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -554,6 +569,8 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
+                    pres_head_layers=pres_head_layers,
+                    pres_head_dim=pres_head_dim,
                 )
                 for idx in range(n_layers)
             ]
@@ -816,6 +833,9 @@ class Config:
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
     # Phase 5: Residual prediction
     residual_prediction: bool = False   # predict residual from freestream instead of full field
+    # Phase 5: Deeper/wider pressure head
+    pres_head_layers: int = 0           # override pressure head depth (0 = use default)
+    pres_head_dim: int = 0              # override pressure head width (0 = use default hidden_dim*2)
 
 
 cfg = sp.parse(Config)
@@ -968,6 +988,8 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    pres_head_layers=cfg.pres_head_layers,
+    pres_head_dim=cfg.pres_head_dim,
 )
 
 model = Transolver(**model_config).to(device)
