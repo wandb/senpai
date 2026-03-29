@@ -816,6 +816,7 @@ class Config:
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
     # Phase 5: Residual prediction
     residual_prediction: bool = False   # predict residual from freestream instead of full field
+    fixed_residual_scale: bool = False  # use dataset-wide residual stats for z-scoring (Re-independent)
 
 
 cfg = sp.parse(Config)
@@ -917,6 +918,34 @@ _pmean = (_phys_sum / _phys_n).float()
 _pstd = ((_phys_sq_sum / _phys_n - _pmean ** 2).clamp(min=0.0).sqrt()).clamp(min=1e-6).float()
 phys_stats = {"y_mean": _pmean, "y_std": _pstd}
 print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
+
+# --- Residual-specific stats (for fixed_residual_scale) ---
+resid_stats = None
+if cfg.fixed_residual_scale and cfg.residual_prediction:
+    print("Computing fixed residual stats...")
+    _res_sum = torch.zeros(3, device=device)
+    _res_sq_sum = torch.zeros(3, device=device)
+    _res_n = 0.0
+    _stats_loader_res = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
+    with torch.no_grad():
+        for _x, _y, _is_surf, _mask in tqdm(_stats_loader_res, desc="Resid stats", leave=False):
+            _y, _mask, _x = _y.to(device), _mask.to(device), _x.to(device)
+            _Um, _q = _umag_q(_y, _mask)
+            _yp = _phys_norm(_y, _Um, _q)
+            # Compute freestream and subtract
+            _aoa = _x[:, 0, 14:15]  # AoA0_rad [B, 1]
+            _fs = torch.zeros(_yp.shape[0], 1, 3, device=device)
+            _fs[:, 0, 0] = torch.cos(_aoa.squeeze(-1))
+            _fs[:, 0, 1] = torch.sin(_aoa.squeeze(-1))
+            _yp_resid = _yp - _fs
+            _m = _mask.float().unsqueeze(-1)
+            _res_sum += (_yp_resid * _m).sum(dim=(0, 1))
+            _res_sq_sum += (_yp_resid ** 2 * _m).sum(dim=(0, 1))
+            _res_n += _mask.float().sum().item()
+    _res_mean = (_res_sum / _res_n).float()
+    _res_std = ((_res_sq_sum / _res_n - _res_mean ** 2).clamp(min=0.0).sqrt()).clamp(min=1e-6).float()
+    resid_stats = {"y_mean": _res_mean, "y_std": _res_std}
+    print(f"  Residual stats — mean: {_res_mean.tolist()}, std: {_res_std.tolist()}")
 
 if cfg.raw_targets:
     print("Computing raw target stats (no physics normalization)...")
@@ -1312,12 +1341,19 @@ for epoch in range(MAX_EPOCHS):
             if cfg.log_pressure:
                 y_phys = y_phys.clone()
                 y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
-            y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
-        # Residual prediction: subtract freestream from normalized targets
+            if cfg.fixed_residual_scale and cfg.residual_prediction:
+                # Fixed residual scaling: subtract freestream in Cp space, then z-score with residual stats
+                _aoa = _raw_aoa  # [B, 1]
+                _fs_phys = torch.zeros(y_phys.shape[0], 1, 3, device=device)
+                _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))
+                _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))
+                y_resid = y_phys - _fs_phys  # residual in Cp space
+                y_norm = (y_resid - resid_stats["y_mean"]) / resid_stats["y_std"]
+            else:
+                y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+        # Residual prediction: subtract freestream from normalized targets (standard path)
         _freestream = None
-        if cfg.residual_prediction:
-            # Freestream in Cp-normalized space: (cos(AoA), sin(AoA), 0)
-            # Then apply same z-score normalization
+        if cfg.residual_prediction and not cfg.fixed_residual_scale:
             _aoa = _raw_aoa  # [B, 1]
             _fs_phys = torch.zeros(y_norm.shape[0], 1, 3, device=device)
             _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))  # Ux/Umag
@@ -1745,11 +1781,19 @@ for epoch in range(MAX_EPOCHS):
                     if cfg.log_pressure:
                         y_phys = y_phys.clone()
                         y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
-                    y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                    if cfg.fixed_residual_scale and cfg.residual_prediction:
+                        _aoa = _raw_aoa
+                        _fs_phys = torch.zeros(y_phys.shape[0], 1, 3, device=device)
+                        _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))
+                        _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))
+                        y_resid = y_phys - _fs_phys
+                        y_norm = (y_resid - resid_stats["y_mean"]) / resid_stats["y_std"]
+                    else:
+                        y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
-                # Residual prediction: subtract freestream in val loop
+                # Residual prediction: subtract freestream in val loop (standard path)
                 _v_freestream = None
-                if cfg.residual_prediction:
+                if cfg.residual_prediction and not cfg.fixed_residual_scale:
                     _aoa = _raw_aoa
                     _fs_phys = torch.zeros(y_norm.shape[0], 1, 3, device=device)
                     _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))
@@ -1808,8 +1852,18 @@ for epoch in range(MAX_EPOCHS):
                 )
                 n_vbatches += 1
 
-                # Add freestream back for residual prediction mode
-                if cfg.residual_prediction and _v_freestream is not None:
+                # Convert predictions back to Cp space
+                if cfg.fixed_residual_scale and cfg.residual_prediction:
+                    # Un-z-score with residual stats, add freestream back
+                    pred_resid = pred * resid_stats["y_std"] + resid_stats["y_mean"]
+                    _aoa = _raw_aoa
+                    _fs = torch.zeros(pred_resid.shape[0], 1, 3, device=device)
+                    _fs[:, 0, 0] = torch.cos(_aoa.squeeze(-1))
+                    _fs[:, 0, 1] = torch.sin(_aoa.squeeze(-1))
+                    pred_cp = pred_resid + _fs  # back to Cp space
+                    # Re-encode as phys_stats-normalized for consistent downstream denorm
+                    pred = (pred_cp - phys_stats["y_mean"]) / phys_stats["y_std"]
+                elif cfg.residual_prediction and _v_freestream is not None:
                     pred = pred + _v_freestream  # add freestream back before denorm
 
                 # Denormalize: phys_stats → Cp space → original scale
