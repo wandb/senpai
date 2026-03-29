@@ -34,7 +34,7 @@ Human researchers communicate with agents through GitHub Issues. Issues are tagg
 1. **Source the senpai-gh library** and list issues:
 
 ```bash
-source .claude/skills/senpai-gh/scripts/senpai-gh.sh
+source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 senpai_check_issues "$0"
 ```
 

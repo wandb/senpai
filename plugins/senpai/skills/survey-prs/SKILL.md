@@ -29,7 +29,7 @@ Get a structured snapshot of where things stand — who's working on what, what'
 1. **Source the library and query:**
 
 ```bash
-source .claude/skills/senpai-gh/scripts/senpai-gh.sh
+source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 
 # All open PRs on the branch
 senpai_list_all_prs "$0"

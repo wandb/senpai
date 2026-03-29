@@ -34,7 +34,7 @@ gh pr merge $ARGUMENTS --squash
 If this fails due to merge conflicts, send the PR back for rebase instead:
 
 ```bash
-source .claude/skills/senpai-gh/scripts/senpai-gh.sh
+source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 senpai_send_back $ARGUMENTS "ADVISOR: Rebasing needed — the advisor branch was updated after merging a previous winner. Please rebase onto $ADVISOR_BRANCH, re-run the experiment to verify the improvement still holds, and resubmit."
 ```
 

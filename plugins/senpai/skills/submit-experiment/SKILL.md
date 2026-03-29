@@ -47,7 +47,7 @@ git push origin "$(git branch --show-current)"
 3. **Mark ready and swap labels:**
 
 ```bash
-source .claude/skills/senpai-gh/scripts/senpai-gh.sh
+source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 senpai_mark_review $ARGUMENTS
 ```
 

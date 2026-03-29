@@ -20,16 +20,10 @@ allowed-tools: Bash(gh *), Bash(source *), Bash(python3 *)
 
 A bash library of GitHub operations shared by both advisor and student agents. Source it once, then call the functions you need.
 
-The library lives at `${CLAUDE_SKILL_DIR}/scripts/senpai-gh.sh`. Source it before using any function:
+The library lives at `${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh`. Source it before using any function:
 
 ```bash
-source "${CLAUDE_SKILL_DIR}/scripts/senpai-gh.sh"
-```
-
-Or from anywhere in the repo:
-
-```bash
-source .claude/skills/senpai-gh/scripts/senpai-gh.sh
+source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 ```
 
 ## Why this exists
@@ -71,7 +65,7 @@ GitHub's `gh pr edit --remove-label X --add-label Y` silently strips **all other
 ## Usage examples
 
 ```bash
-source .claude/skills/senpai-gh/scripts/senpai-gh.sh
+source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 
 # Advisor sends a PR back for revision
 senpai_send_back 1842 "ADVISOR: Promising direction but didn't beat baseline. Try lr=1e-3 with cosine annealing."

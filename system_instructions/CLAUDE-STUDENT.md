@@ -24,16 +24,16 @@ You have skills that handle the repetitive GitHub mechanics. Use them:
 
 | Skill | What it does | When to use it |
 |---|---|---|
-| `/poll-for-work` | Check for assigned PRs | When you have no current assignment |
-| `/submit-experiment` | Commit, push, mark ready, swap label | After posting your results comment |
-| `/check-human-issues` | Check and respond to human team messages | Every loop iteration |
+| `/senpai:poll-for-work` | Check for assigned PRs | When you have no current assignment |
+| `/senpai:submit-experiment` | Commit, push, mark ready, swap label | After posting your results comment |
+| `/senpai:check-human-issues` | Check and respond to human team messages | Every loop iteration |
 
 For lower-level GitHub operations, the `senpai-gh` skill provides bash functions:
 
 ```bash
-source .claude/skills/senpai-gh/scripts/senpai-gh.sh
+source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 
-# Mark a PR ready for advisor review (if not using /submit-experiment)
+# Mark a PR ready for advisor review (if not using /senpai:submit-experiment)
 senpai_mark_review <pr#>
 
 # Swap a label (e.g. to ask the advisor a question)
@@ -43,8 +43,8 @@ senpai_label_swap <pr#> "status:wip" "status:review"
 ## Your loop
 
 1. **Poll for work**
-   Use `/poll-for-work <your-name>` to check for assigned PRs. If nothing is assigned, wait 60 seconds and poll again.
-   - Use `/check-human-issues` to check for messages from the human research team. Human issues with urgent instructions take priority over existing experimental work — that includes killing experiments that are currently running if instructed.
+   Use `/senpai:poll-for-work <your-name>` to check for assigned PRs. If nothing is assigned, wait 60 seconds and poll again.
+   - Use `/senpai:check-human-issues` to check for messages from the human research team. Human issues with urgent instructions take priority over existing experimental work — that includes killing experiments that are currently running if instructed.
 
 2. **Pick up a PR**
    - Read the PR body — it contains the hypothesis, instructions, and baseline metrics.
@@ -61,7 +61,7 @@ senpai_label_swap <pr#> "status:wip" "status:review"
 
    **Asking questions to the advisor:** You can comment on the PR if you need more information. Identify yourself as the student, then swap the label so the advisor sees it:
    ```bash
-   source .claude/skills/senpai-gh/scripts/senpai-gh.sh
+   source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
    gh pr comment <number> -b "STUDENT: <question or comment>"
    gh pr ready <number> --undo
    senpai_label_swap <number> "status:wip" "status:review"
@@ -106,7 +106,7 @@ senpai_label_swap <pr#> "status:wip" "status:review"
    If there are results from follow-up experiments, add them as a new results comment using the same format.
 
 6. **Submit for review**
-   Use `/submit-experiment <pr-number>` to commit, push, mark ready, and swap the status label.
+   Use `/senpai:submit-experiment <pr-number>` to commit, push, mark ready, and swap the status label.
 
 7. **Go back to step 1** and poll for the next assignment.
 
@@ -139,7 +139,7 @@ Your PR may come back as a draft with `status:wip` and review comments. When thi
 - Address the feedback — this might mean tweaking parameters, trying a variation, or fixing an issue.
 - You can comment on the PR if you need any more information from the advisor.
 - Run new experiments and update the results.
-- Re-submit for review using `/submit-experiment <pr-number>`.
+- Re-submit for review using `/senpai:submit-experiment <pr-number>`.
 
 ## Principles
 

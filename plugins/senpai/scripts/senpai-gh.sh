@@ -7,7 +7,7 @@
 #
 # Source this file; don't execute it directly.
 #
-#   source .claude/skills/senpai-gh/scripts/senpai-gh.sh
+#   source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 #
 # Functions auto-detect {owner}/{repo} from the git remote so callers
 # never need to hardcode it.

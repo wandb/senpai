@@ -45,8 +45,9 @@ mkdir -p ~/.claude/projects
 uvx --from wandb-hivemind hivemind run &
 echo "=== Hivemind started (PID=$!) ==="
 
-# --- Source senpai-gh library for pre-triage ---
-source "$WORKDIR/.claude/skills/senpai-gh/scripts/senpai-gh.sh"
+# --- Senpai plugin ---
+SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
+source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
 
 # --- Build prompts ---
 # PROBLEM_DIR comes from ConfigMap (set by launch.py from senpai.yaml)
@@ -116,6 +117,7 @@ while true; do
     if [ "$ITERATION" -eq 1 ]; then
         claude -p "${PROMPT}"$'\n\n'"${TRIAGE}" \
             --append-system-prompt "$SYSTEM_VARS" \
+            --plugin-dir "$SENPAI_PLUGIN" \
             --max-turns 50 \
             --model "claude-opus-4-6[1m]" \
             --output-format stream-json --verbose \
@@ -123,12 +125,14 @@ while true; do
     else
         claude -c -p "${PROMPT}"$'\n\n'"${TRIAGE}" \
             --append-system-prompt "$SYSTEM_VARS" \
+            --plugin-dir "$SENPAI_PLUGIN" \
             --max-turns 50 \
             --model "claude-opus-4-6[1m]" \
             --output-format stream-json --verbose \
             --dangerously-skip-permissions > "$LOGFILE" 2>&1 || \
         claude -p "${FULL_PROMPT}"$'\n\n'"${TRIAGE}" \
             --append-system-prompt "$SYSTEM_VARS" \
+            --plugin-dir "$SENPAI_PLUGIN" \
             --max-turns 50 \
             --model "claude-opus-4-6[1m]" \
             --output-format stream-json --verbose \

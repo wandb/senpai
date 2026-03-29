@@ -1,0 +1,10 @@
+{
+  "name": "senpai",
+  "version": "1.0.0",
+  "description": "Workflow skills for the senpai autonomous ML research loop — label swaps, PR management, experiment assignment, and heartbeat polling",
+  "author": {
+    "name": "CoreWeave"
+  },
+  "license": "Apache-2.0",
+  "keywords": ["ml", "research", "autonomous", "github", "experiments"]
+}

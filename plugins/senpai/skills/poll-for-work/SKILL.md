@@ -28,7 +28,7 @@ Check whether the advisor has assigned you a PR to work on.
 1. **Source the library and query:**
 
 ```bash
-source .claude/skills/senpai-gh/scripts/senpai-gh.sh
+source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 senpai_poll_work "$ARGUMENTS"
 ```
 

@@ -37,17 +37,17 @@ You have access to skills that handle the repetitive GitHub mechanics so you can
 
 | Skill | What it does | When to use it |
 |---|---|---|
-| `/survey-prs` | Survey all PRs on the branch — who's idle, what's in review, what's WIP | Start of every loop iteration |
-| `/check-human-issues` | Check and respond to GitHub Issues from the human team | Every loop iteration |
-| `/assign-experiment` | Create a branch + draft PR to assign a hypothesis to a student | When a student is idle |
-| `/merge-winner` | Squash-merge a winning PR and update BASELINE.md | When a PR beats baseline |
+| `/senpai:survey-prs` | Survey all PRs on the branch — who's idle, what's in review, what's WIP | Start of every loop iteration |
+| `/senpai:check-human-issues` | Check and respond to GitHub Issues from the human team | Every loop iteration |
+| `/senpai:assign-experiment` | Create a branch + draft PR to assign a hypothesis to a student | When a student is idle |
+| `/senpai:merge-winner` | Squash-merge a winning PR and update BASELINE.md | When a PR beats baseline |
 | `/list-experiments` | Fetch full history of all experiments tried | When planning new hypotheses |
 | `/wandb-primary` | Query W&B for run metrics, compare configs | When reviewing experiment results |
 
 For lower-level GitHub operations (label swaps, sending PRs back, closing dead ends), the `senpai-gh` skill provides bash functions. Source the library and call them directly:
 
 ```bash
-source .claude/skills/senpai-gh/scripts/senpai-gh.sh
+source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 
 # Send a PR back to the student with feedback
 senpai_send_back <pr#> "ADVISOR: <feedback>"
@@ -62,8 +62,8 @@ senpai_label_swap <pr#> "status:review" "status:wip"
 ## Your loop
 
 1. **Survey the current state**
-   - Use `/survey-prs` to get a structured snapshot: review-ready PRs, WIP PRs by student, idle students.
-   - Use `/check-human-issues` to check for messages from the human research team. If any contain research directives, incorporate them into your hypothesis planning.
+   - Use `/senpai:survey-prs` to get a structured snapshot: review-ready PRs, WIP PRs by student, idle students.
+   - Use `/senpai:check-human-issues` to check for messages from the human research team. If any contain research directives, incorporate them into your hypothesis planning.
    - Identify priorities: idle students (assign them first), then PRs ready for review, then new hypothesis research.
    - Monitor student pods: `kubectl get deployments -l app=senpai`
 
@@ -77,11 +77,11 @@ senpai_label_swap <pr#> "status:review" "status:wip"
 
    **Checking for comments:** Ensure you check all comments on the PR. If the student has asked a question, answer it as a follow-up comment identifying yourself as the advisor, then send the PR back:
    ```bash
-   source .claude/skills/senpai-gh/scripts/senpai-gh.sh
+   source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
    senpai_send_back <number> "ADVISOR: <comment to student>"
    ```
 
-   **b. Merge winners sequentially, best first.** A PR is a winner if its best surface MAE is lower than the current baseline. Merge aggressively — even small improvements compound over rounds. Use `/merge-winner <number>` for each winner, starting with the best. The skill handles the squash-merge, baseline update, and branch pull.
+   **b. Merge winners sequentially, best first.** A PR is a winner if its best surface MAE is lower than the current baseline. Merge aggressively — even small improvements compound over rounds. Use `/senpai:merge-winner <number>` for each winner, starting with the best. The skill handles the squash-merge, baseline update, and branch pull.
 
    **c. Request changes** on promising PRs that didn't beat baseline but show an interesting direction. Leave specific feedback on what variation to try next, then send back:
    ```bash
@@ -95,7 +95,7 @@ senpai_label_swap <pr#> "status:review" "status:wip"
    Never batch close an entire round without reviewing them individually first.
 
 3. **Create new hypotheses** and assign PRs to idle students
-   Check if any students are idle (no `status:wip` PR) — you MUST assign them a new experiment. This is not optional. Use `/assign-experiment <student> <hypothesis-slug>` for each idle student.
+   Check if any students are idle (no `status:wip` PR) — you MUST assign them a new experiment. This is not optional. Use `/senpai:assign-experiment <student> <hypothesis-slug>` for each idle student.
 
    Use the @researcher-agent to review all previous experiments and research directions and generate fresh new hypotheses. Read student suggestions. The "Suggested follow-ups" section in a student's results reflects what they observed in the data, and often points toward better next experiments than the original hypothesis anticipated. Give the researcher-agent the following instructions plus any additional context you think might be relevant:
 
