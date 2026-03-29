@@ -816,6 +816,8 @@ class Config:
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
     # Phase 5: Residual prediction
     residual_prediction: bool = False   # predict residual from freestream instead of full field
+    # Phase 5: Coordinate jitter augmentation
+    coord_jitter_std: float = 0.0      # std of Gaussian noise added to (x,y) positions during training (0=disabled)
 
 
 cfg = sp.parse(Config)
@@ -1278,6 +1280,10 @@ for epoch in range(MAX_EPOCHS):
                     x[_b, _in_region] = x[_cut_idx[_b], _in_region]
                     y[_b, _in_region] = y[_cut_idx[_b], _in_region]
                     is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
+
+        # Coordinate jitter augmentation: add Gaussian noise to (x,y) positions only
+        if model.training and cfg.coord_jitter_std > 0:
+            x[:, :, :2] = x[:, :, :2] + cfg.coord_jitter_std * torch.randn_like(x[:, :, :2])
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
