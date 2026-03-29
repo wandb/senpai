@@ -816,6 +816,9 @@ class Config:
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
     # Phase 5: Residual prediction
     residual_prediction: bool = False   # predict residual from freestream instead of full field
+    # Phase 5: Lion optimizer tuning
+    lion_beta1: float = 0.9             # Lion beta1 (default 0.9)
+    lion_beta2: float = 0.99            # Lion beta2 (default 0.99)
 
 
 cfg = sp.parse(Config)
@@ -1106,7 +1109,7 @@ if cfg.use_lion:
     base_opt = Lion([
         {'params': attn_params, 'lr': _base_lr * 0.5},
         {'params': other_params, 'lr': _base_lr}
-    ], weight_decay=cfg.weight_decay)
+    ], betas=(cfg.lion_beta1, cfg.lion_beta2), weight_decay=cfg.weight_decay)
     optimizer = base_opt  # Lion has its own momentum; skip Lookahead
 else:
     base_opt = torch.optim.AdamW([
