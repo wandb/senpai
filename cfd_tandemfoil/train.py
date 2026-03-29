@@ -816,6 +816,7 @@ class Config:
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
     # Phase 5: Residual prediction
     residual_prediction: bool = False   # predict residual from freestream instead of full field
+    polar_velocity: bool = False       # predict (speed_residual, angle_residual) instead of (Ux, Uy)
 
 
 cfg = sp.parse(Config)
@@ -936,6 +937,38 @@ if cfg.raw_targets:
     print(f"  Raw stats — mean: {_raw_mean.tolist()}, std: {_raw_std.tolist()}")
 else:
     raw_stats = None
+
+# --- Polar velocity stats (computed over training set if polar_velocity enabled) ---
+polar_stats = None
+if cfg.polar_velocity:
+    print("Computing polar velocity stats...")
+    _pol_sum = torch.zeros(3, device=device)
+    _pol_sq_sum = torch.zeros(3, device=device)
+    _pol_n = 0.0
+    _stats_loader2 = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
+    with torch.no_grad():
+        for _x, _y, _is_surf, _mask in tqdm(_stats_loader2, desc="Polar stats", leave=False):
+            _y, _mask, _x = _y.to(device), _mask.to(device), _x.to(device)
+            _Um, _q = _umag_q(_y, _mask)
+            _yp = _phys_norm(_y, _Um, _q)
+            # Convert to polar: (speed, angle, pressure)
+            _speed = (_yp[:, :, 0:1] ** 2 + _yp[:, :, 1:2] ** 2).sqrt()  # |V|/Umag
+            _angle = torch.atan2(_yp[:, :, 1:2], _yp[:, :, 0:1])  # flow angle
+            # Freestream: speed_fs=1, angle_fs=AoA
+            _aoa = _x[:, 0, 14:15].unsqueeze(1)  # [B, 1, 1]
+            _speed_res = _speed - 1.0
+            _angle_res = _angle - _aoa
+            # Wrap angle residual to [-pi, pi]
+            _angle_res = torch.remainder(_angle_res + torch.pi, 2 * torch.pi) - torch.pi
+            _yp_polar = torch.cat([_speed_res, _angle_res, _yp[:, :, 2:3]], dim=-1)
+            _m = _mask.float().unsqueeze(-1)
+            _pol_sum += (_yp_polar * _m).sum(dim=(0, 1))
+            _pol_sq_sum += (_yp_polar ** 2 * _m).sum(dim=(0, 1))
+            _pol_n += _mask.float().sum().item()
+    _pol_mean = (_pol_sum / _pol_n).float()
+    _pol_std = ((_pol_sq_sum / _pol_n - _pol_mean ** 2).clamp(min=0.0).sqrt()).clamp(min=1e-6).float()
+    polar_stats = {"y_mean": _pol_mean, "y_std": _pol_std}
+    print(f"  Polar stats — mean: {_pol_mean.tolist()}, std: {_pol_std.tolist()}")
 
 model_config = dict(
     space_dim=2,
@@ -1312,10 +1345,21 @@ for epoch in range(MAX_EPOCHS):
             if cfg.log_pressure:
                 y_phys = y_phys.clone()
                 y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
-            y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+            if cfg.polar_velocity:
+                # Polar transform in Cp space: (Ux/Umag, Uy/Umag, Cp) → (speed_res, angle_res, Cp)
+                _speed = (y_phys[:, :, 0:1] ** 2 + y_phys[:, :, 1:2] ** 2).sqrt()
+                _angle = torch.atan2(y_phys[:, :, 1:2], y_phys[:, :, 0:1])
+                _aoa_rad = _raw_aoa.unsqueeze(1)  # [B, 1, 1]
+                _speed_res = _speed - 1.0
+                _angle_res = _angle - _aoa_rad
+                _angle_res = torch.remainder(_angle_res + torch.pi, 2 * torch.pi) - torch.pi
+                y_phys_polar = torch.cat([_speed_res, _angle_res, y_phys[:, :, 2:3]], dim=-1)
+                y_norm = (y_phys_polar - polar_stats["y_mean"]) / polar_stats["y_std"]
+            else:
+                y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         # Residual prediction: subtract freestream from normalized targets
         _freestream = None
-        if cfg.residual_prediction:
+        if cfg.residual_prediction and not cfg.polar_velocity:
             # Freestream in Cp-normalized space: (cos(AoA), sin(AoA), 0)
             # Then apply same z-score normalization
             _aoa = _raw_aoa  # [B, 1]
@@ -1745,11 +1789,21 @@ for epoch in range(MAX_EPOCHS):
                     if cfg.log_pressure:
                         y_phys = y_phys.clone()
                         y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
-                    y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                    if cfg.polar_velocity:
+                        _speed = (y_phys[:, :, 0:1] ** 2 + y_phys[:, :, 1:2] ** 2).sqrt()
+                        _angle = torch.atan2(y_phys[:, :, 1:2], y_phys[:, :, 0:1])
+                        _aoa_rad = _raw_aoa.unsqueeze(1)
+                        _speed_res = _speed - 1.0
+                        _angle_res = _angle - _aoa_rad
+                        _angle_res = torch.remainder(_angle_res + torch.pi, 2 * torch.pi) - torch.pi
+                        y_phys_polar = torch.cat([_speed_res, _angle_res, y_phys[:, :, 2:3]], dim=-1)
+                        y_norm = (y_phys_polar - polar_stats["y_mean"]) / polar_stats["y_std"]
+                    else:
+                        y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
                 # Residual prediction: subtract freestream in val loop
                 _v_freestream = None
-                if cfg.residual_prediction:
+                if cfg.residual_prediction and not cfg.polar_velocity:
                     _aoa = _raw_aoa
                     _fs_phys = torch.zeros(y_norm.shape[0], 1, 3, device=device)
                     _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))
@@ -1808,8 +1862,24 @@ for epoch in range(MAX_EPOCHS):
                 )
                 n_vbatches += 1
 
+                # Convert polar predictions back to Cartesian
+                if cfg.polar_velocity:
+                    # Un-z-score using polar stats → (speed_res, angle_res, Cp)
+                    pred_polar = pred * polar_stats["y_std"] + polar_stats["y_mean"]
+                    # Convert: speed = speed_res + 1.0, angle = angle_res + AoA
+                    _speed = pred_polar[:, :, 0:1] + 1.0
+                    _angle = pred_polar[:, :, 1:2] + _raw_aoa.unsqueeze(1)
+                    # Polar to Cartesian: Ux/Umag = speed*cos(angle), Uy/Umag = speed*sin(angle)
+                    pred_phys_cart = torch.cat([
+                        _speed * torch.cos(_angle),
+                        _speed * torch.sin(_angle),
+                        pred_polar[:, :, 2:3],
+                    ], dim=-1)
+                    # Re-normalize to phys_stats space for consistent loss computation
+                    pred = (pred_phys_cart - phys_stats["y_mean"]) / phys_stats["y_std"]
+
                 # Add freestream back for residual prediction mode
-                if cfg.residual_prediction and _v_freestream is not None:
+                if cfg.residual_prediction and not cfg.polar_velocity and _v_freestream is not None:
                     pred = pred + _v_freestream  # add freestream back before denorm
 
                 # Denormalize: phys_stats → Cp space → original scale
