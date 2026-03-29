@@ -840,22 +840,18 @@ stats = {k: v.to(device) for k, v in stats.items()}
 if cfg.walldist:
     base_ds = train_ds.dataset if hasattr(train_ds, 'dataset') else train_ds
     cache = base_ds._cache
-    print(f"Computing wall distance for {len(cache)} cached samples...")
+    from scipy.spatial import cKDTree
+    print(f"Computing wall distance for {len(cache)} cached samples (KDTree)...")
     for idx in sorted(cache.keys()):
         x, y, is_surf = cache[idx]
-        pos = x[:, :2]  # [N, 2]
-        surf_pos = pos[is_surf]  # [N_surf, 2]
+        pos = x[:, :2].numpy()  # [N, 2]
+        surf_pos = pos[is_surf.numpy()]  # [N_surf, 2]
         if surf_pos.shape[0] == 0:
             wd = torch.zeros(x.shape[0], 1)
         else:
-            # Compute in chunks to avoid OOM for large meshes
-            n = pos.shape[0]
-            chunk = 4096
-            wd_parts = []
-            for i in range(0, n, chunk):
-                d = torch.cdist(pos[i:i+chunk].unsqueeze(0), surf_pos.unsqueeze(0)).squeeze(0)
-                wd_parts.append(d.min(dim=-1).values)
-            wd = torch.cat(wd_parts).unsqueeze(-1)  # [N, 1]
+            tree = cKDTree(surf_pos)
+            dists, _ = tree.query(pos, k=1)
+            wd = torch.tensor(dists, dtype=torch.float32).unsqueeze(-1)  # [N, 1]
         if cfg.walldist_log:
             wd = torch.log1p(wd)
         x_new = torch.cat([x, wd], dim=-1)
