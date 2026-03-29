@@ -786,6 +786,9 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    aug_aoa_range: float = 1.0       # AoA perturbation range in degrees (±range)
+    re_jitter: bool = False           # multiply Re by uniform(1-re_jitter_range, 1+re_jitter_range)
+    re_jitter_range: float = 0.1     # Re jitter half-range (0.1 = ±10%)
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1248,7 +1251,7 @@ for epoch in range(MAX_EPOCHS):
                 _scale = torch.rand(x.size(0), 1, 1, device=x.device) * (2 * cfg.aug_scale_range) + _lo
                 x[:, :, :2] = x[:, :, :2] * _scale
             if cfg.aug == "aoa_perturb":
-                _angle_deg = torch.rand(x.size(0), device=x.device) * 2.0 - 1.0
+                _angle_deg = (torch.rand(x.size(0), device=x.device) * 2.0 - 1.0) * cfg.aug_aoa_range
                 _angle_rad = _angle_deg * (torch.pi / 180.0)
                 _cos_a = torch.cos(_angle_rad).view(-1, 1, 1)
                 _sin_a = torch.sin(_angle_rad).view(-1, 1, 1)
@@ -1265,6 +1268,11 @@ for epoch in range(MAX_EPOCHS):
                         _dy = x[:, :, _yi:_yi+1].clone()
                         x[:, :, _xi:_xi+1] = _cos_a * _dx - _sin_a * _dy
                         x[:, :, _yi:_yi+1] = _sin_a * _dx + _cos_a * _dy
+            # Re jitter: perturb log(Re) feature by small multiplicative factor
+            if cfg.re_jitter:
+                _re_factor = 1.0 + (torch.rand(x.size(0), device=x.device) * 2.0 - 1.0) * cfg.re_jitter_range
+                _log_re_delta = torch.log(_re_factor).view(-1, 1, 1)
+                x[:, :, 13:14] = x[:, :, 13:14] + _log_re_delta  # log(Re * factor) = log(Re) + log(factor)
             if cfg.aug == "cutmix":
                 _B_aug = x.size(0)
                 _cut_idx = torch.randperm(_B_aug, device=x.device)
