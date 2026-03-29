@@ -1,17 +1,17 @@
 # Baseline Metrics
 
-## Current Baseline (Phase 4 — 2026-03-28, Pressure-First Deep)
+## Current Baseline (Phase 5 — 2026-03-29, Residual Prediction)
 
-| Metric | Mean (8 seeds) | Std | Best single | Worst single |
+| Metric | Mean (4 seeds) | Std | Best single | Worst single |
 |--------|---------------|-----|-------------|--------------|
-| val/loss | 0.404 | 0.004 | 0.400 | 0.410 |
-| p_in | 13.33 | 0.58 | 12.70 | 14.61 |
-| p_oodc | 8.37 | 0.22 | 7.99 | 8.74 |
-| p_tan | 33.57 | 0.44 | 32.97 | 34.15 |
-| p_re | 24.58 | 0.13 | 24.41 | 24.86 |
+| val/loss | 0.396 | 0.003 | 0.392 | 0.399 |
+| p_in | 12.93 | 0.22 | 12.6 | 13.2 |
+| p_oodc | 7.98 | 0.19 | 7.7 | 8.2 |
+| p_tan | 32.93 | 0.29 | 32.5 | 33.3 |
+| p_re | 24.53 | 0.08 | 24.4 | 24.6 |
 
-**Phase 4 improvements merged:** T_max=180 (#1845) + disable_pcgrad (#1846) + pressure_first + pressure_deep (#1867). Memory: ~36.2 GB.
-**8-seed characterization:** PR #1911 (seeds 42-49). W&B group: `phase5-baseline-8seed`.
+**Phase 5 improvement merged:** + residual_prediction (#1927). Predicts correction to freestream instead of full field. p_oodc -4.7%, p_tan -1.9%, val/loss -1.8%. Memory: ~36.2 GB.
+**W&B group:** `phase5/residual-prediction` (runs umj5afev, 21pomc9o, arfuy4np, v3f0q6sk).
 
 ### Reproduce
 
@@ -22,13 +22,15 @@ python train.py --agent <name> --wandb_name "<name>/baseline" \
   --n_layers 3 --slice_num 96 --tandem_ramp \
   --domain_layernorm --domain_velhead --ema_decay 0.999 \
   --weight_decay 5e-5 --cosine_T_max 180 --disable_pcgrad \
-  --pressure_first --pressure_deep
+  --pressure_first --pressure_deep --residual_prediction
 ```
 
 ### History
 
 | Date | val/loss | p_in | p_oodc | p_tan | p_re | PR | Notes |
 |------|----------|------|--------|-------|------|----|-------|
+| 2026-03-29 | 0.396±0.003 | 12.93±0.22 | 7.98±0.19 | 32.93±0.29 | 24.53±0.08 | #1927 | **Phase 5: + residual_prediction** (p_oodc -4.7%, p_tan -1.9%) |
+| 2026-03-28 | 0.404±0.004 | 13.33±0.58 | 8.37±0.22 | 33.57±0.44 | 24.58±0.13 | #1911 | 8-seed characterization |
 | 2026-03-28 | 0.401±0.005 | 12.95±0.3 | 8.40±0.4 | 33.8±0.5 | 24.7±0.2 | #1867 | **Phase 4: + pressure_first + pressure_deep** (p_in -4.8%) |
 | 2026-03-27 | 0.403±0.003 | 13.6±0.4 | 8.6±0.1 | 33.1±0.6 | 24.7±0.1 | #1846 | Phase 4: + disable_pcgrad (18% memory reduction) |
 | 2026-03-27 | 0.4016±0.001 | 13.3±0.2 | 8.3±0.2 | 33.1±0.4 | 24.7±0.2 | #1845 | Phase 4: cosine_T_max=180 (4-seed validated) |

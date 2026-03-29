@@ -818,6 +818,8 @@ class Config:
     smoothness_weight: float = 0.0      # weight for velocity smoothness loss (0 = disabled)
     smoothness_surface_only: bool = False  # only apply smoothness to surface nodes
     smoothness_anneal: bool = False      # anneal smoothness_weight from 0 to target over first 60 epochs
+    # Phase 5: Residual prediction
+    residual_prediction: bool = False   # predict residual from freestream instead of full field
 
 
 cfg = sp.parse(Config)
@@ -1284,6 +1286,7 @@ for epoch in range(MAX_EPOCHS):
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+        _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1314,6 +1317,18 @@ for epoch in range(MAX_EPOCHS):
                 y_phys = y_phys.clone()
                 y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
             y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+        # Residual prediction: subtract freestream from normalized targets
+        _freestream = None
+        if cfg.residual_prediction:
+            # Freestream in Cp-normalized space: (cos(AoA), sin(AoA), 0)
+            # Then apply same z-score normalization
+            _aoa = _raw_aoa  # [B, 1]
+            _fs_phys = torch.zeros(y_norm.shape[0], 1, 3, device=device)
+            _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))  # Ux/Umag
+            _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))  # Uy/Umag
+            _fs_phys[:, 0, 2] = 0.0  # p/q
+            _freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]  # [B, 1, 3]
+            y_norm = y_norm - _freestream  # subtract freestream (broadcasts over N)
         if model.training and not cfg.no_target_noise:
             noise_progress = min(1.0, epoch / max(cfg.noise_anneal_epochs, 1))
             if cfg.half_target_noise:
@@ -1730,6 +1745,7 @@ for epoch in range(MAX_EPOCHS):
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+                _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1757,6 +1773,16 @@ for epoch in range(MAX_EPOCHS):
                         y_phys = y_phys.clone()
                         y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
                     y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+
+                # Residual prediction: subtract freestream in val loop
+                _v_freestream = None
+                if cfg.residual_prediction:
+                    _aoa = _raw_aoa
+                    _fs_phys = torch.zeros(y_norm.shape[0], 1, 3, device=device)
+                    _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))
+                    _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))
+                    _v_freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                    y_norm = y_norm - _v_freestream
 
                 # Per-sample std normalization: skip tandem samples
                 raw_gap = x[:, 0, 21]
@@ -1808,6 +1834,10 @@ for epoch in range(MAX_EPOCHS):
                     1e6
                 )
                 n_vbatches += 1
+
+                # Add freestream back for residual prediction mode
+                if cfg.residual_prediction and _v_freestream is not None:
+                    pred = pred + _v_freestream  # add freestream back before denorm
 
                 # Denormalize: phys_stats → Cp space → original scale
                 if cfg.raw_targets:
