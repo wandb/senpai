@@ -816,6 +816,8 @@ class Config:
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
     # Phase 5: Residual prediction
     residual_prediction: bool = False   # predict residual from freestream instead of full field
+    # Phase 5: Input noise augmentation
+    input_noise_std: float = 0.0        # Gaussian noise std on standardized inputs (0 = disabled)
 
 
 cfg = sp.parse(Config)
@@ -1284,6 +1286,12 @@ for epoch in range(MAX_EPOCHS):
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
         x = (x - stats["x_mean"]) / stats["x_std"]
+        # Input noise augmentation: Gaussian noise on standardized features
+        if model.training and cfg.input_noise_std > 0:
+            _inp_noise = torch.randn_like(x)
+            # Coordinates (0:2) get 10% scale to preserve geometry; physics features get full scale
+            _inp_noise[:, :, :2] *= 0.1
+            x = x + cfg.input_noise_std * _inp_noise
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         if cfg.foil2_dist:
