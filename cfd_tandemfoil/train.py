@@ -782,7 +782,7 @@ class Config:
     seed: int = -1                     # random seed (-1 = no seeding)
     n_layers: int = 2                  # number of TransolverBlocks (default 2)
     # Phase 3: data augmentation (training-only)
-    aug: str = "none"  # none|yflip|jitter|featdrop|mixup|scale|flip_jitter|aoa_perturb|cutmix
+    aug: str = "none"  # none|yflip|jitter|featdrop|mixup|scale|flip_jitter|aoa_perturb|yflip_aoa|cutmix
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
@@ -1222,7 +1222,7 @@ for epoch in range(MAX_EPOCHS):
 
         # --- Data augmentation (training-only, applied before normalization) ---
         if model.training and cfg.aug != "none" and epoch >= cfg.aug_start_epoch:
-            if cfg.aug in ("yflip", "flip_jitter"):
+            if cfg.aug in ("yflip", "flip_jitter", "yflip_aoa"):
                 _flip = torch.rand(x.size(0), 1, 1, device=x.device) < 0.5
                 x[:, :, 1:2] = torch.where(_flip, -x[:, :, 1:2], x[:, :, 1:2])
                 y[:, :, 1:2] = torch.where(_flip, -y[:, :, 1:2], y[:, :, 1:2])
@@ -1251,7 +1251,7 @@ for epoch in range(MAX_EPOCHS):
                 _lo = 1.0 - cfg.aug_scale_range
                 _scale = torch.rand(x.size(0), 1, 1, device=x.device) * (2 * cfg.aug_scale_range) + _lo
                 x[:, :, :2] = x[:, :, :2] * _scale
-            if cfg.aug == "aoa_perturb":
+            if cfg.aug in ("aoa_perturb", "yflip_aoa"):
                 _angle_deg = torch.rand(x.size(0), device=x.device) * 2.0 - 1.0
                 _angle_rad = _angle_deg * (torch.pi / 180.0)
                 _cos_a = torch.cos(_angle_rad).view(-1, 1, 1)
