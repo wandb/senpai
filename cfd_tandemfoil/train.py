@@ -60,6 +60,12 @@ ACTIVATION = {
 }
 
 
+def log_cosh_loss(error: torch.Tensor) -> torch.Tensor:
+    """Numerically stable log(cosh(x)) = |x| + softplus(-2|x|) - log(2)."""
+    ax = error.abs()
+    return ax + F.softplus(-2 * ax) - 0.6931471805599453  # log(2)
+
+
 class GatedMLP(nn.Module):
     def __init__(self, n_input, n_hidden, n_output, act='gelu'):
         super().__init__()
@@ -814,6 +820,11 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Loss function and gradient clipping
+    loss_type: str = "l1"              # "l1" or "logcosh"
+    logcosh_scale: float = 1.0         # scale factor for log-cosh loss
+    logcosh_anneal_epoch: int = -1     # anneal from L1 to log-cosh at this epoch (-1 = always log-cosh)
+    max_grad_norm: float = 1.0         # gradient clipping max norm
 
 
 cfg = sp.parse(Config)
@@ -1366,7 +1377,11 @@ for epoch in range(MAX_EPOCHS):
             else:
                 pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
-        abs_err = (pred - y_norm).abs()
+        _raw_err = pred - y_norm
+        if cfg.loss_type == "logcosh" and (cfg.logcosh_anneal_epoch < 0 or epoch >= cfg.logcosh_anneal_epoch):
+            abs_err = log_cosh_loss(_raw_err) * cfg.logcosh_scale
+        else:
+            abs_err = _raw_err.abs()
         if cfg.tandem_ramp:
             pass  # no hard curriculum; tandem_weight applied via tandem_boost below
         elif epoch < cfg.tandem_curriculum_epochs:
@@ -1542,7 +1557,7 @@ for epoch in range(MAX_EPOCHS):
                 optimizer.zero_grad()
             loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.max_grad_norm)
         sam_active = sam_optimizer is not None and epoch >= int(MAX_EPOCHS * 0.75)
         _should_step = (cfg.grad_accum_steps <= 1 or
                         (batch_idx + 1) % cfg.grad_accum_steps == 0 or
@@ -1565,7 +1580,7 @@ for epoch in range(MAX_EPOCHS):
             aoa_loss2 = F.mse_loss(aoa_pred2, aoa_target)
             loss2 = vol_loss2 + surf_weight * surf_loss2 + 0.01 * re_loss2 + 0.01 * aoa_loss2
             loss2.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.max_grad_norm)
             sam_optimizer.restore()
         if use_pcgrad or _should_step:
             optimizer.step()
