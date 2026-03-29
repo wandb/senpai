@@ -725,6 +725,9 @@ class Config:
     cosine_eta_min: float = 1e-5
     ema_start_epoch: int = 140
     ema_decay: float = 0.998
+    ema_ramp: bool = False              # linearly ramp EMA decay over training
+    ema_ramp_start: float = 0.99        # starting EMA decay (lower = faster tracking)
+    ema_ramp_end: float = 0.9999        # ending EMA decay (higher = more averaging)
     temp_anneal_epoch: int = 50
     vol_ramp_epochs: int = 40
     tandem_curriculum_epochs: int = 10
@@ -819,6 +822,10 @@ class Config:
 cfg = sp.parse(Config)
 
 if cfg.seed >= 0:
+    import random as _random
+    import numpy as _np
+    _random.seed(cfg.seed)
+    _np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
     torch.cuda.manual_seed_all(cfg.seed)
 
@@ -1580,11 +1587,21 @@ for epoch in range(MAX_EPOCHS):
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
             else:
+                # Compute effective EMA decay (ramp or fixed)
+                if cfg.ema_ramp:
+                    _ema_progress = min(1.0, epoch / max(MAX_EPOCHS - 1, 1))
+                    _ema_d = cfg.ema_ramp_start + (cfg.ema_ramp_end - cfg.ema_ramp_start) * _ema_progress
+                else:
+                    _ema_d = cfg.ema_decay
                 with torch.no_grad():
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
-                        ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+                        ep.data.mul_(_ema_d).add_(mp.data, alpha=1 - _ema_d)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.ema_ramp and epoch >= cfg.ema_start_epoch:
+            _ema_progress = min(1.0, epoch / max(MAX_EPOCHS - 1, 1))
+            _log_dict["ema_decay_current"] = cfg.ema_ramp_start + (cfg.ema_ramp_end - cfg.ema_ramp_start) * _ema_progress
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
