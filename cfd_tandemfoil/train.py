@@ -816,6 +816,8 @@ class Config:
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
     # Phase 5: Residual prediction
     residual_prediction: bool = False   # predict residual from freestream instead of full field
+    # Phase 5: Distance-dependent volume weighting
+    vol_dist_weight: bool = False       # weight volume loss by inverse distance to surface
 
 
 cfg = sp.parse(Config)
@@ -1413,7 +1415,12 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_mask_train = vol_mask
 
-        if cfg.boundary_aware:
+        if cfg.vol_dist_weight:
+            vol_dist = dist_feat[:, :, 0]  # [B, N], log1p-scaled dist-to-surface
+            node_weight = torch.clamp(1.0 + 2.0 * torch.exp(-vol_dist), max=3.0).unsqueeze(-1)  # [B, N, 1]
+            vol_loss = (abs_err * node_weight * vol_mask_train.float().unsqueeze(-1)).sum() / \
+                       (node_weight.squeeze(-1) * vol_mask_train.float()).sum().clamp(min=1)
+        elif cfg.boundary_aware:
             vol_dist = dist_feat[:, :, 0]  # [B, N], log1p-scaled dist-to-surface
             valid_dists = vol_dist.masked_select(vol_mask_train)
             if valid_dists.numel() > 10:
