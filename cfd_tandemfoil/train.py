@@ -391,7 +391,7 @@ class TransolverBlock(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None, return_hidden=False):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         # DomainLayerNorm helper: pass is_tandem when enabled, else plain call
         dln_it = (tandem_mask.view(-1) > 0.5) if (self.domain_layernorm and tandem_mask is not None) else None
@@ -421,30 +421,34 @@ class TransolverBlock(nn.Module):
             fx_ln = self.ln_3(fx)
             if self.soft_moe:
                 gate = self.gate_net(fx_ln)  # [B, N, 2]
-                return gate[:, :, 0:1] * self.expert1(fx_ln) + gate[:, :, 1:2] * self.expert2(fx_ln)
+                out = gate[:, :, 0:1] * self.expert1(fx_ln) + gate[:, :, 1:2] * self.expert2(fx_ln)
             elif self.pressure_first:
                 # Pressure-first: predict p, then condition v on p
                 p_pred = self.pres_head(fx_ln)  # [B, N, 1]
                 p_cond = p_pred if self.pressure_no_detach else p_pred.detach()
                 vel_input = torch.cat([fx_ln, p_cond], dim=-1)  # [B, N, H+1]
                 v_pred = self.vel_head_conditioned(vel_input)  # [B, N, 2]
-                return torch.cat([v_pred, p_pred], dim=-1)
+                out = torch.cat([v_pred, p_pred], dim=-1)
             elif self.domain_velhead:
                 out_s = self.velhead_single(fx_ln)
                 out_t = self.velhead_tandem(fx_ln)
                 if tandem_mask is not None:
                     is_tan = (tandem_mask.view(-1) > 0.5).view(-1, 1, 1)
-                    return torch.where(is_tan.expand_as(out_s), out_t, out_s)
-                return out_s
+                    out = torch.where(is_tan.expand_as(out_s), out_t, out_s)
+                else:
+                    out = out_s
             elif self.field_decoder:
-                return torch.cat([self.vel_head(fx_ln), self.pres_head(fx_ln)], dim=-1)
+                out = torch.cat([self.vel_head(fx_ln), self.pres_head(fx_ln)], dim=-1)
             elif self.adaln_output and condition is not None:
                 cond = self.cond_net(condition)  # [B, 2*H]
                 scale, shift = cond.chunk(2, dim=-1)  # [B, H]
                 fx_ln = fx_ln * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-                return self.mlp2(fx_ln)
+                out = self.mlp2(fx_ln)
             else:
-                return self.mlp2(fx_ln)
+                out = self.mlp2(fx_ln)
+            if return_hidden:
+                return out, fx_ln
+            return out
         return fx
 
 
@@ -484,10 +488,15 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        dual_head=False,
+        surf_head_dim=192,
+        surf_head_layers=2,
+        surf_head_pressure_only=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.pressure_first = pressure_first
+        self.dual_head = dual_head
         self.ref = ref
         self.unified_pos = unified_pos
         self.adaln_output = adaln_output
@@ -579,6 +588,17 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        # Dual output head: dedicated surface decoder
+        if dual_head:
+            surf_out_dim = 1 if surf_head_pressure_only else out_dim
+            layers = []
+            d = n_hidden
+            for i in range(surf_head_layers):
+                out_d = surf_out_dim if i == surf_head_layers - 1 else surf_head_dim
+                layers.extend([nn.Linear(d, out_d), nn.GELU()] if i < surf_head_layers - 1 else [nn.Linear(d, out_d)])
+                d = out_d
+            self.surf_head = nn.Sequential(*layers)
+            self._surf_head_pressure_only = surf_head_pressure_only
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -685,16 +705,26 @@ class Transolver(nn.Module):
             fx_for_pressure = fx  # save for separate pressure branch
             p_sep = self.pressure_sep_mlp(fx_for_pressure)  # [B, N, 1]
             # Main last block produces vel only (pressure_first still active but p comes from separate branch)
-            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+            if self.dual_head:
+                fx, fx_hidden = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features, return_hidden=True)
+            else:
+                fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
             # Override: replace the pressure channel from the last block with the separate branch's output
             fx = torch.cat([fx[:, :, :2], p_sep], dim=-1)
         else:
-            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+            if self.dual_head:
+                fx, fx_hidden = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features, return_hidden=True)
+            else:
+                fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
 
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+        result = {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred}
+        # Dual head: surface predictions from dedicated head
+        if self.dual_head:
+            result["surf_preds"] = self.surf_head(fx_hidden)  # [B, N, surf_out_dim]
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -816,6 +846,12 @@ class Config:
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
     # Phase 5: Residual prediction
     residual_prediction: bool = False   # predict residual from freestream instead of full field
+    # Phase 5: Dual output head
+    dual_head: bool = False             # add dedicated surface head alongside main head
+    surf_head_dim: int = 192            # hidden dim of surface head MLP
+    surf_head_layers: int = 2           # number of layers in surface head
+    surf_head_pressure_only: bool = False  # surface head predicts only pressure (1 channel)
+    surf_head_weight: float = 5.0       # weight for surface head loss
 
 
 cfg = sp.parse(Config)
@@ -968,6 +1004,10 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    dual_head=cfg.dual_head,
+    surf_head_dim=cfg.surf_head_dim,
+    surf_head_layers=cfg.surf_head_layers,
+    surf_head_pressure_only=cfg.surf_head_pressure_only,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1499,6 +1539,18 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # Dual head: surface-only loss from dedicated surface decoder
+        if cfg.dual_head and "surf_preds" in out:
+            surf_pred_head = out["surf_preds"].float()
+            if cfg.surf_head_pressure_only:
+                # Surface head predicts pressure only — compare against pressure channel
+                surf_head_target = y_norm[:, :, 2:3]
+                surf_head_err = (surf_pred_head - surf_head_target).abs()
+            else:
+                surf_head_err = (surf_pred_head - y_norm).abs()
+            surf_head_loss = (surf_head_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            loss = loss + cfg.surf_head_weight * surf_head_loss
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -1786,7 +1838,18 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = eval_model({"x": x})["preds"]
+                    _eval_out = eval_model({"x": x})
+                    pred = _eval_out["preds"]
+                    # Dual head: use surface head predictions for surface nodes during eval
+                    if cfg.dual_head and "surf_preds" in _eval_out:
+                        _sp = _eval_out["surf_preds"]
+                        _sm = is_surface.bool().unsqueeze(-1)
+                        if cfg.surf_head_pressure_only:
+                            # Replace only pressure channel on surface nodes
+                            pred = pred.clone()
+                            pred[:, :, 2:3] = torch.where(_sm, _sp, pred[:, :, 2:3])
+                        else:
+                            pred = torch.where(_sm, _sp, pred)
                 pred = pred.float()
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
