@@ -926,6 +926,35 @@ _pstd = ((_phys_sq_sum / _phys_n - _pmean ** 2).clamp(min=0.0).sqrt()).clamp(min
 phys_stats = {"y_mean": _pmean, "y_std": _pstd}
 print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
+# Compute fixed residual channel scales from training set (if needed)
+_fixed_residual_ch_scales = None
+if cfg.residual_prediction and cfg.residual_channel_norm:
+    print("Computing fixed residual channel scales from training set...")
+    _res_ch_sum = torch.zeros(3, device=device)
+    _res_ch_n = 0
+    with torch.no_grad():
+        for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc="Residual scales", leave=False):
+            _x, _y, _mask = _x.to(device), _y.to(device), _mask.to(device)
+            _Umag, _q = _umag_q(_y, _mask)
+            _yp = _phys_norm(_y, _Umag, _q)
+            _yn = (_yp - _pmean) / _pstd
+            # Subtract freestream
+            _aoa_idx = 14  # AoA0_rad index
+            _aoa_vals = _x[:, 0, _aoa_idx]  # [B]
+            _fs = torch.zeros(_yn.shape[0], 1, 3, device=device)
+            _fs[:, 0, 0] = torch.cos(_aoa_vals)
+            _fs[:, 0, 1] = torch.sin(_aoa_vals)
+            _fs = (_fs - _pmean) / _pstd
+            _yn_res = _yn - _fs
+            # Compute per-sample std then average
+            for b in range(_yn_res.shape[0]):
+                valid = _mask[b]
+                if valid.any():
+                    _res_ch_sum += _yn_res[b, valid].std(dim=0).clamp(min=0.01)
+                    _res_ch_n += 1
+    _fixed_residual_ch_scales = (_res_ch_sum / max(_res_ch_n, 1)).unsqueeze(0).unsqueeze(0)  # [1, 1, 3]
+    print(f"  Fixed residual channel scales: {_fixed_residual_ch_scales.squeeze().tolist()}")
+
 if cfg.raw_targets:
     print("Computing raw target stats (no physics normalization)...")
     _raw_sum = torch.zeros(3, device=device)
@@ -1334,19 +1363,11 @@ for epoch in range(MAX_EPOCHS):
             _freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]  # [B, 1, 3]
             y_norm = y_norm - _freestream  # subtract freestream (broadcasts over N)
         # Per-channel residual normalization
-        _residual_scales = None
-        if cfg.residual_prediction and cfg.residual_channel_norm:
-            # Normalize each channel by its per-sample std (computed from valid nodes)
-            B_rc = y_norm.shape[0]
-            _residual_scales = torch.ones(B_rc, 1, 3, device=device)
-            for b in range(B_rc):
-                valid = mask[b]
-                _residual_scales[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=0.01)
-            y_norm = y_norm / _residual_scales
+        # Per-channel residual normalization using FIXED scales from training set
+        if cfg.residual_prediction and cfg.residual_channel_norm and _fixed_residual_ch_scales is not None:
+            y_norm = y_norm / _fixed_residual_ch_scales
         elif cfg.residual_prediction and cfg.residual_fixed_scales:
-            # Fixed scales estimated from typical residual magnitudes
-            _residual_scales = torch.tensor([[[0.15, 0.15, 0.5]]], device=device)  # vel ~0.15, p ~0.5
-            y_norm = y_norm / _residual_scales
+            y_norm = y_norm / torch.tensor([[[0.15, 0.15, 0.5]]], device=device)
         if model.training and not cfg.no_target_noise:
             noise_progress = min(1.0, epoch / max(cfg.noise_anneal_epochs, 1))
             if cfg.half_target_noise:
@@ -1784,14 +1805,10 @@ for epoch in range(MAX_EPOCHS):
                     _v_freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
                     y_norm = y_norm - _v_freestream
 
-                # Per-channel residual normalization (validation)
+                # Per-channel residual normalization using FIXED training scales
                 _v_residual_scales = None
-                if cfg.residual_prediction and cfg.residual_channel_norm:
-                    B_rc = y_norm.shape[0]
-                    _v_residual_scales = torch.ones(B_rc, 1, 3, device=device)
-                    for b in range(B_rc):
-                        valid = mask[b]
-                        _v_residual_scales[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=0.01)
+                if cfg.residual_prediction and cfg.residual_channel_norm and _fixed_residual_ch_scales is not None:
+                    _v_residual_scales = _fixed_residual_ch_scales
                     y_norm = y_norm / _v_residual_scales
                 elif cfg.residual_prediction and cfg.residual_fixed_scales:
                     _v_residual_scales = torch.tensor([[[0.15, 0.15, 0.5]]], device=device)
