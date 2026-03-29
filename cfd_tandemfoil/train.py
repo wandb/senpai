@@ -816,11 +816,19 @@ class Config:
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
     # Phase 5: Residual prediction
     residual_prediction: bool = False   # predict residual from freestream instead of full field
+    residual_channel_norm: bool = False  # per-sample per-channel std normalization of residual targets
+    residual_fixed_scales: bool = False  # use fixed channel scales for residual normalization
+    residual_p_weight: float = 1.0      # weight multiplier for pressure channel in residual loss
+    residual_v_weight: float = 1.0      # weight multiplier for velocity channels in residual loss
 
 
 cfg = sp.parse(Config)
 
 if cfg.seed >= 0:
+    import random as _random
+    import numpy as _np
+    _random.seed(cfg.seed)
+    _np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
     torch.cuda.manual_seed_all(cfg.seed)
 
@@ -1325,6 +1333,20 @@ for epoch in range(MAX_EPOCHS):
             _fs_phys[:, 0, 2] = 0.0  # p/q
             _freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]  # [B, 1, 3]
             y_norm = y_norm - _freestream  # subtract freestream (broadcasts over N)
+        # Per-channel residual normalization
+        _residual_scales = None
+        if cfg.residual_prediction and cfg.residual_channel_norm:
+            # Normalize each channel by its per-sample std (computed from valid nodes)
+            B_rc = y_norm.shape[0]
+            _residual_scales = torch.ones(B_rc, 1, 3, device=device)
+            for b in range(B_rc):
+                valid = mask[b]
+                _residual_scales[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=0.01)
+            y_norm = y_norm / _residual_scales
+        elif cfg.residual_prediction and cfg.residual_fixed_scales:
+            # Fixed scales estimated from typical residual magnitudes
+            _residual_scales = torch.tensor([[[0.15, 0.15, 0.5]]], device=device)  # vel ~0.15, p ~0.5
+            y_norm = y_norm / _residual_scales
         if model.training and not cfg.no_target_noise:
             noise_progress = min(1.0, epoch / max(cfg.noise_anneal_epochs, 1))
             if cfg.half_target_noise:
@@ -1382,6 +1404,11 @@ for epoch in range(MAX_EPOCHS):
                 pred = pred / sample_stds
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
+        # Apply per-channel residual loss weighting
+        if cfg.residual_prediction and (cfg.residual_p_weight != 1.0 or cfg.residual_v_weight != 1.0):
+            _ch_weights = torch.tensor([[[cfg.residual_v_weight, cfg.residual_v_weight, cfg.residual_p_weight]]], device=device)
+            abs_err = abs_err * _ch_weights
+            sq_err = sq_err * _ch_weights
         if cfg.tandem_ramp:
             pass  # no hard curriculum; tandem_weight applied via tandem_boost below
         elif epoch < cfg.tandem_curriculum_epochs:
@@ -1757,6 +1784,19 @@ for epoch in range(MAX_EPOCHS):
                     _v_freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
                     y_norm = y_norm - _v_freestream
 
+                # Per-channel residual normalization (validation)
+                _v_residual_scales = None
+                if cfg.residual_prediction and cfg.residual_channel_norm:
+                    B_rc = y_norm.shape[0]
+                    _v_residual_scales = torch.ones(B_rc, 1, 3, device=device)
+                    for b in range(B_rc):
+                        valid = mask[b]
+                        _v_residual_scales[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=0.01)
+                    y_norm = y_norm / _v_residual_scales
+                elif cfg.residual_prediction and cfg.residual_fixed_scales:
+                    _v_residual_scales = torch.tensor([[[0.15, 0.15, 0.5]]], device=device)
+                    y_norm = y_norm / _v_residual_scales
+
                 # Per-sample std normalization: skip tandem samples
                 raw_gap = x[:, 0, 21]
                 is_tandem = raw_gap.abs() > 0.5
@@ -1808,6 +1848,9 @@ for epoch in range(MAX_EPOCHS):
                 )
                 n_vbatches += 1
 
+                # Undo residual channel normalization before denorm
+                if cfg.residual_prediction and _v_residual_scales is not None:
+                    pred = pred * _v_residual_scales
                 # Add freestream back for residual prediction mode
                 if cfg.residual_prediction and _v_freestream is not None:
                     pred = pred + _v_freestream  # add freestream back before denorm
