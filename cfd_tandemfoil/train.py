@@ -816,6 +816,9 @@ class Config:
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
     # Phase 5: Residual prediction
     residual_prediction: bool = False   # predict residual from freestream instead of full field
+    # Phase 5: Multi-scale loss
+    multiscale_frac: float = 0.0        # fraction of nodes for coarse subsample (0 = disabled, e.g. 0.25)
+    multiscale_weight: float = 0.3      # weight for coarse subsample loss
 
 
 cfg = sp.parse(Config)
@@ -1463,34 +1466,19 @@ for epoch in range(MAX_EPOCHS):
         else:
             loss = vol_loss + surf_weight * surf_loss
 
-        # Multi-scale loss: coarse spatial pooling
+        # Multi-scale loss: random node subsample
         _coarse_loss = None
-        coarse_pool_size = 64
-        B, N, C = pred.shape
-        n_groups = N // coarse_pool_size
-        if n_groups > 1:
-            # Sort by x-coordinate for spatially coherent groups
-            raw_x_coord = x[:, :, 0]  # x-coordinate
-            sort_idx = raw_x_coord.argsort(dim=1)
-            pred_sorted = torch.gather(pred, 1, sort_idx.unsqueeze(-1).expand_as(pred))
-            y_sorted = torch.gather(y_norm, 1, sort_idx.unsqueeze(-1).expand_as(y_norm))
-            mask_sorted = torch.gather(mask, 1, sort_idx)
-            # Pool predictions and targets over groups of 64 nodes
-            pred_trunc = pred_sorted[:, :n_groups * coarse_pool_size]
-            y_trunc = y_sorted[:, :n_groups * coarse_pool_size]
-            mask_trunc = mask_sorted[:, :n_groups * coarse_pool_size]
-
-            mask_trunc_f = mask_trunc.float().reshape(B, n_groups, coarse_pool_size).unsqueeze(-1)  # [B, G, P, 1]
-            pred_g = pred_trunc.reshape(B, n_groups, coarse_pool_size, C)
-            y_g = y_trunc.reshape(B, n_groups, coarse_pool_size, C)
-            pred_coarse = (pred_g * mask_trunc_f).sum(dim=2) / mask_trunc_f.sum(dim=2).clamp(min=1)
-            y_coarse = (y_g * mask_trunc_f).sum(dim=2) / mask_trunc_f.sum(dim=2).clamp(min=1)
-            mask_coarse = mask_trunc.reshape(B, n_groups, coarse_pool_size).any(dim=2)
-
-            coarse_err = (pred_coarse - y_coarse).abs()
-            coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
+        if cfg.multiscale_frac > 0:
+            valid_idx = mask.nonzero(as_tuple=False)  # [M, 2] (batch_idx, node_idx)
+            n_valid = valid_idx.shape[0]
+            n_coarse = max(int(n_valid * cfg.multiscale_frac), 1)
+            perm = torch.randperm(n_valid, device=device)[:n_coarse]
+            coarse_sel = valid_idx[perm]  # [n_coarse, 2]
+            coarse_pred = pred[coarse_sel[:, 0], coarse_sel[:, 1]]  # [n_coarse, C]
+            coarse_tgt = y_norm[coarse_sel[:, 0], coarse_sel[:, 1]]  # [n_coarse, C]
+            coarse_loss = (coarse_pred - coarse_tgt).abs().mean()
             _coarse_loss = coarse_loss
-            loss = loss + 1.0 * coarse_loss
+            loss = loss + cfg.multiscale_weight * coarse_loss
 
         log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
         re_loss = F.mse_loss(re_pred, log_re_target)
@@ -1599,7 +1587,10 @@ for epoch in range(MAX_EPOCHS):
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _step_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if _coarse_loss is not None:
+            _step_log["train/multiscale_loss"] = _coarse_loss.item()
+        wandb.log(_step_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
