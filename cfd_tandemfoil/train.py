@@ -48,6 +48,106 @@ torch.set_float32_matmul_precision('high')
 # modify architecture and training script in a single file)
 # ---------------------------------------------------------------------------
 
+def build_knn_graph(pos, k=16, mask=None):
+    """Build k-nearest-neighbor graph from spatial coordinates.
+
+    Args:
+        pos: [B, N, 2] spatial positions
+        k: number of nearest neighbors
+        mask: [B, N] bool, valid nodes (for padded batches)
+    Returns:
+        knn_idx: [B, N, k] neighbor indices
+    """
+    B, N, _ = pos.shape
+    chunk_size = 4096  # Process in chunks to avoid N×N memory
+    knn_list = []
+    for b in range(B):
+        p = pos[b]  # [N, 2]
+        chunks = []
+        for i in range(0, N, chunk_size):
+            chunk = p[i:i + chunk_size]  # [chunk, 2]
+            dists = torch.cdist(chunk, p)  # [chunk, N]
+            if mask is not None:
+                # Mask out padded nodes with large distance
+                dists[:, ~mask[b]] = float('inf')
+            _, idx = dists.topk(k + 1, dim=-1, largest=False)  # [chunk, k+1]
+            chunks.append(idx[:, 1:])  # remove self
+        knn_list.append(torch.cat(chunks, dim=0))  # [N, k]
+    return torch.stack(knn_list)  # [B, N, k]
+
+
+class LocalGraphAttention(nn.Module):
+    """Local graph attention via k-NN message passing.
+
+    Computes attention between each node and its k nearest spatial neighbors,
+    with edge features from relative positions.
+    """
+
+    def __init__(self, hidden_dim, num_heads=4, k=16):
+        super().__init__()
+        self.k = k
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_heads),
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x, pos, knn_idx):
+        """
+        x: [B, N, D] node features
+        pos: [B, N, 2] positions
+        knn_idx: [B, N, k] neighbor indices
+        """
+        B, N, D = x.shape
+        k = knn_idx.shape[2]
+        residual = x
+        x = self.norm(x)
+
+        Q = self.q_proj(x).view(B, N, self.num_heads, self.head_dim)  # [B, N, H, d]
+        K = self.k_proj(x).view(B, N, self.num_heads, self.head_dim)
+        V = self.v_proj(x).view(B, N, self.num_heads, self.head_dim)
+
+        # Gather neighbor K, V using advanced indexing
+        # Flatten knn_idx [B,N,k] -> [B,N*k] so gather dim matches K_flat dims
+        HD = self.num_heads * self.head_dim
+        knn_flat = knn_idx.reshape(B, N * k)                    # [B, N*k]
+        idx_exp = knn_flat.unsqueeze(-1).expand(B, N * k, HD)   # [B, N*k, HD]
+        K_flat = K.reshape(B, N, HD)
+        V_flat = V.reshape(B, N, HD)
+        K_neighbors = K_flat.gather(1, idx_exp).view(B, N, k, self.num_heads, self.head_dim)
+        V_neighbors = V_flat.gather(1, idx_exp).view(B, N, k, self.num_heads, self.head_dim)
+
+        # Attention: Q[i] dot K[j] for j in neighbors(i)
+        attn = (Q.unsqueeze(2) * K_neighbors).sum(-1)  # [B, N, k, H]
+        attn = attn / (self.head_dim ** 0.5)
+
+        # Edge bias from relative positions
+        pos_exp = pos.unsqueeze(2).expand(B, N, k, 2)
+        idx_pos = knn_flat.unsqueeze(-1).expand(B, N * k, 2)   # [B, N*k, 2]
+        neighbor_pos = pos.gather(1, idx_pos).view(B, N, k, 2) # [B, N, k, 2]
+        rel_pos = neighbor_pos - pos_exp  # [B, N, k, 2]
+        dist = rel_pos.norm(dim=-1, keepdim=True)  # [B, N, k, 1]
+        edge_feat = torch.cat([rel_pos, dist], dim=-1)  # [B, N, k, 3]
+        edge_bias = self.edge_mlp(edge_feat)  # [B, N, k, H]
+        attn = attn + edge_bias
+
+        attn = attn.softmax(dim=2)  # softmax over k neighbors
+        out = (attn.unsqueeze(-1) * V_neighbors).sum(2)  # [B, N, H, d]
+        out = out.reshape(B, N, D)
+        out = self.out_proj(out)
+
+        return residual + out
+
+
 ACTIVATION = {
     "gelu": nn.GELU,
     "tanh": nn.Tanh,
@@ -579,6 +679,8 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        self._graph_layers = None  # set from Config after construction
+        self._graph_k = 16
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -669,6 +771,13 @@ class Transolver(nn.Module):
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
+
+        # Local graph attention: k-NN message passing before Transolver blocks
+        if self._graph_layers is not None:
+            pos = x[:, :, :2]  # raw spatial positions [B, N, 2]
+            knn_idx = build_knn_graph(pos, k=self._graph_k)
+            for graph_layer in self._graph_layers:
+                fx = graph_layer(fx, pos, knn_idx)
 
         for block in self.blocks[:-1]:
             fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
@@ -814,6 +923,10 @@ class Config:
     pressure_no_detach: bool = False    # allow gradient from vel back to pres head
     pressure_deep: bool = False         # 3-layer pressure head instead of 2
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Local graph attention
+    graph_attention: bool = False      # add local k-NN graph attention before Transolver blocks
+    graph_k: int = 16                  # number of nearest neighbors
+    graph_num_layers: int = 1          # number of local graph attention layers
 
 
 cfg = sp.parse(Config)
@@ -970,6 +1083,12 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 model._pressure_separate = cfg.pressure_separate_last_block
+if cfg.graph_attention:
+    model._graph_layers = nn.ModuleList([
+        LocalGraphAttention(cfg.n_hidden, num_heads=4, k=cfg.graph_k)
+        for _ in range(cfg.graph_num_layers)
+    ]).to(device)
+    model._graph_k = cfg.graph_k
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
