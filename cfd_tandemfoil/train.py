@@ -942,6 +942,9 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 5: Progressive refinement — backbone first, then add refine head
+    progressive_refine_epoch: int = 0         # epoch to activate surface_refine (0 = disabled)
+    progressive_backbone_lr_mult: float = 0.1 # backbone LR multiplier after refine head activation
 
 
 cfg = sp.parse(Config)
@@ -1103,8 +1106,9 @@ model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 # Surface refinement head (separate module, not compiled with main model)
+# When progressive_refine_epoch > 0, defer creation until that epoch
 refine_head = None
-if cfg.surface_refine:
+if cfg.surface_refine and cfg.progressive_refine_epoch == 0:
     if cfg.surface_refine_context:
         refine_head = SurfaceRefinementContextHead(
             n_hidden=cfg.n_hidden,
@@ -1362,6 +1366,49 @@ for epoch in range(MAX_EPOCHS):
         break
 
     t0 = time.time()
+
+    # Progressive refinement: activate surface_refine head at specified epoch
+    if (cfg.progressive_refine_epoch > 0 and epoch == cfg.progressive_refine_epoch
+            and refine_head is None and cfg.surface_refine):
+        print(f"\n=== Progressive refinement: activating surface_refine head at epoch {epoch} ===")
+        if cfg.surface_refine_context:
+            refine_head = SurfaceRefinementContextHead(
+                n_hidden=cfg.n_hidden, out_dim=3,
+                hidden_dim=cfg.surface_refine_hidden,
+                n_layers=cfg.surface_refine_layers, k_neighbors=8,
+            ).to(device)
+        else:
+            refine_head = SurfaceRefinementHead(
+                n_hidden=cfg.n_hidden, out_dim=3,
+                hidden_dim=cfg.surface_refine_hidden,
+                n_layers=cfg.surface_refine_layers,
+                p_only=cfg.surface_refine_p_only,
+            ).to(device)
+        refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
+        _refine_n_params = sum(p.numel() for p in refine_head.parameters())
+        print(f"  Refinement head: {_refine_n_params:,} params")
+        # Add refine head params to optimizer
+        _refine_params = list(refine_head.parameters())
+        base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
+        print(f"  Added refine head params to optimizer (lr={_base_lr})")
+        # Reduce backbone LR (adjust scheduler base_lrs so scheduler doesn't override)
+        if cfg.progressive_backbone_lr_mult < 1.0:
+            n_backbone_groups = len(base_opt.param_groups) - 1  # exclude just-added refine group
+            for i in range(n_backbone_groups):
+                base_opt.param_groups[i]['lr'] *= cfg.progressive_backbone_lr_mult
+            # Also adjust scheduler base_lrs so future steps respect the reduction
+            if hasattr(scheduler, '_schedulers'):  # SequentialLR
+                for s in scheduler._schedulers:
+                    if hasattr(s, 'base_lrs'):
+                        for i in range(min(n_backbone_groups, len(s.base_lrs))):
+                            s.base_lrs[i] *= cfg.progressive_backbone_lr_mult
+            elif hasattr(scheduler, 'base_lrs'):
+                for i in range(min(n_backbone_groups, len(scheduler.base_lrs))):
+                    scheduler.base_lrs[i] *= cfg.progressive_backbone_lr_mult
+            print(f"  Backbone LR reduced by {cfg.progressive_backbone_lr_mult}x")
+        n_params_total = sum(p.numel() for p in _base_model.parameters()) + _refine_n_params
+        wandb.log({"progressive/refine_activated": 1, "progressive/epoch": epoch,
+                    "progressive/total_params": n_params_total})
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
