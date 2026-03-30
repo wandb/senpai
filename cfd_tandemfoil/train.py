@@ -822,6 +822,44 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def compute_cp_inviscid(x_raw, is_surface, aoa_rad):
+    """Compute approximate inviscid Cp for surface nodes using dsdf-derived normals.
+
+    Args:
+        x_raw: [B, N, 24] raw (unnormalized) input features
+        is_surface: [B, N] bool mask
+        aoa_rad: [B, 1] angle of attack in radians
+
+    Returns:
+        cp_inv: [B, N, 1] inviscid Cp (0 for volume nodes)
+    """
+    B, N, _ = x_raw.shape
+    # dsdf gradient: first 4 channels (indices 2-5) give gradient direction near surface
+    # These are saf(2) + dsdf_first_2. Use first 2 dsdf channels (indices 4-5) as surface normal proxy
+    dsdf_grad = x_raw[:, :, 4:6]  # [B, N, 2] — dsdf gradient (x, y components)
+    grad_norm = dsdf_grad.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    normal = dsdf_grad / grad_norm  # outward surface normal estimate [B, N, 2]
+
+    # Surface tangent is perpendicular to normal: rotate 90 degrees
+    tangent = torch.stack([-normal[:, :, 1], normal[:, :, 0]], dim=-1)  # [B, N, 2]
+
+    # Freestream direction
+    cos_aoa = torch.cos(aoa_rad).unsqueeze(1)  # [B, 1, 1]
+    sin_aoa = torch.sin(aoa_rad).unsqueeze(1)  # [B, 1, 1]
+    freestream = torch.cat([cos_aoa, sin_aoa], dim=-1)  # [B, 1, 2]
+
+    # Dot product: tangent · freestream = cos(angle between tangent and freestream)
+    # Inviscid Cp = 1 - 4*sin²(theta) where theta is the local flow angle
+    # Since sin²(theta) = 1 - cos²(theta) = 1 - (tangent · freestream)²
+    dot = (tangent * freestream).sum(dim=-1, keepdim=True)  # [B, N, 1]
+    cp_inv = 1.0 - 4.0 * (1.0 - dot ** 2)  # = 1 - 4*sin²(theta)
+
+    # Clamp to physical range and zero out volume nodes
+    cp_inv = cp_inv.clamp(-3.0, 1.0)
+    cp_inv = cp_inv * is_surface.float().unsqueeze(-1)
+    return cp_inv
+
+
 MAX_TIMEOUT = 180.0  # minutes
 MAX_EPOCHS = 500
 
@@ -942,6 +980,9 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 5: Inviscid Cp feature
+    cp_inviscid_input: bool = False       # add inviscid Cp as input feature (Mode A)
+    cp_inviscid_residual: bool = False    # use inviscid Cp as residual base for surface pressure (Mode B)
 
 
 cfg = sp.parse(Config)
@@ -1065,7 +1106,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (1 if cfg.cp_inviscid_input else 0) + 32,  # +curv, +dist, [+foil2dist], [+cp_inv], +32 fourier PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1445,6 +1486,10 @@ for epoch in range(MAX_EPOCHS):
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
+        # Inviscid Cp feature (computed before standardization)
+        _cp_inv = None
+        if cfg.cp_inviscid_input or cfg.cp_inviscid_residual:
+            _cp_inv = compute_cp_inviscid(x, is_surface, _raw_aoa)  # [B, N, 1]
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1453,6 +1498,9 @@ for epoch in range(MAX_EPOCHS):
             x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
         else:
             x = torch.cat([x, curv, dist_feat], dim=-1)
+        # Mode A: add inviscid Cp as input feature
+        if cfg.cp_inviscid_input and _cp_inv is not None:
+            x = torch.cat([x, _cp_inv], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -1487,6 +1535,14 @@ for epoch in range(MAX_EPOCHS):
             _fs_phys[:, 0, 2] = 0.0  # p/q
             _freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]  # [B, 1, 3]
             y_norm = y_norm - _freestream  # subtract freestream (broadcasts over N)
+            # Mode B: use inviscid Cp as better residual base for surface pressure
+            if cfg.cp_inviscid_residual and _cp_inv is not None:
+                # _cp_inv is in raw Cp space; normalize same as physics targets
+                _cp_phys = _cp_inv.clone()  # [B, N, 1] — already Cp values
+                _cp_norm = (_cp_phys - phys_stats["y_mean"][2:3]) / phys_stats["y_std"][2:3]
+                # Subtract inviscid Cp from pressure residual (only surface nodes)
+                _cp_residual = _cp_norm * is_surface.float().unsqueeze(-1)
+                y_norm[:, :, 2:3] = y_norm[:, :, 2:3] - _cp_residual
         if model.training and not cfg.no_target_noise:
             noise_progress = min(1.0, epoch / max(cfg.noise_anneal_epochs, 1))
             if cfg.half_target_noise:
@@ -1920,6 +1976,9 @@ for epoch in range(MAX_EPOCHS):
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
+                _cp_inv_v = None
+                if cfg.cp_inviscid_input or cfg.cp_inviscid_residual:
+                    _cp_inv_v = compute_cp_inviscid(x, is_surface, _raw_aoa)
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1928,6 +1987,8 @@ for epoch in range(MAX_EPOCHS):
                     x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
                 else:
                     x = torch.cat([x, curv, dist_feat], dim=-1)
+                if cfg.cp_inviscid_input and _cp_inv_v is not None:
+                    x = torch.cat([x, _cp_inv_v], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -1957,6 +2018,10 @@ for epoch in range(MAX_EPOCHS):
                     _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))
                     _v_freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
                     y_norm = y_norm - _v_freestream
+                    if cfg.cp_inviscid_residual and _cp_inv_v is not None:
+                        _cp_norm_v = (_cp_inv_v - phys_stats["y_mean"][2:3]) / phys_stats["y_std"][2:3]
+                        _cp_res_v = _cp_norm_v * is_surface.float().unsqueeze(-1)
+                        y_norm[:, :, 2:3] = y_norm[:, :, 2:3] - _cp_res_v
 
                 # Per-sample std normalization: skip tandem samples
                 raw_gap = x[:, 0, 21]
