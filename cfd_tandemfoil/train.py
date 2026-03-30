@@ -928,6 +928,7 @@ class Config:
     disable_pcgrad: bool = False        # skip PCGrad dual-backward, use simple combined loss
     vol_subsample_frac: float = 1.0     # fraction of volume nodes in loss after vol_ramp (0.8 = 80%)
     compile_mode: str = "default"       # torch.compile mode: "default", "max-autotune", "reduce-overhead"
+    no_compile: bool = False             # skip torch.compile (for large n_hidden that exceed triton limits)
     num_workers: int = 4                # data loader workers
     # Phase 4: Pressure-first sequential prediction
     pressure_first: bool = False        # predict p first, then condition v on p
@@ -1099,7 +1100,8 @@ model_config = dict(
 model = Transolver(**model_config).to(device)
 model._pressure_separate = cfg.pressure_separate_last_block
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
-model = torch.compile(model, mode=cfg.compile_mode)
+if not cfg.no_compile:
+    model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 # Surface refinement head (separate module, not compiled with main model)
@@ -1121,7 +1123,8 @@ if cfg.surface_refine:
             n_layers=cfg.surface_refine_layers,
             p_only=cfg.surface_refine_p_only,
         ).to(device)
-    refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
+    if not cfg.no_compile:
+        refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
     _refine_n_params = sum(p.numel() for p in refine_head.parameters())
     print(f"Surface refinement head: {_refine_n_params:,} params "
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
