@@ -565,6 +565,33 @@ class SurfaceRefinementContextHead(nn.Module):
         return correction
 
 
+class VelGradHead(nn.Module):
+    """Auxiliary head to predict velocity gradients on surface nodes.
+
+    Predicts 4 gradient components: dUx/dx, dUx/dy, dUy/dx, dUy/dy.
+    Takes hidden features for surface nodes and outputs gradient predictions.
+    """
+
+    def __init__(self, n_hidden: int, hidden_dim: int = 128):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(n_hidden, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 4),  # dUx/dx, dUx/dy, dUy/dx, dUy/dy
+        )
+        # Zero-init last layer
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        """hidden: [M, n_hidden] → [M, 4]"""
+        return self.mlp(hidden)
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -942,6 +969,8 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 5: Auxiliary velocity gradient prediction
+    vel_grad_beta: float = 0.0                # auxiliary gradient loss weight (0 = disabled)
 
 
 cfg = sp.parse(Config)
@@ -1127,6 +1156,14 @@ if cfg.surface_refine:
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
           f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
 
+# Auxiliary velocity gradient prediction head
+vel_grad_head = None
+if cfg.vel_grad_beta > 0:
+    vel_grad_head = VelGradHead(n_hidden=cfg.n_hidden, hidden_dim=128).to(device)
+    vel_grad_head = torch.compile(vel_grad_head, mode=cfg.compile_mode)
+    _vg_n_params = sum(p.numel() for p in vel_grad_head.parameters())
+    print(f"Velocity gradient head: {_vg_n_params:,} params")
+
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
@@ -1277,6 +1314,12 @@ if refine_head is not None:
     _refine_params = list(refine_head.parameters())
     base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
+
+# Add velocity gradient head params to optimizer if enabled
+if vel_grad_head is not None:
+    _vg_params = list(vel_grad_head.parameters())
+    base_opt.add_param_group({'params': _vg_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _vg_params):,} vel gradient head params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
@@ -1683,6 +1726,72 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # Auxiliary velocity gradient prediction on surface nodes
+        _vel_grad_loss = torch.tensor(0.0, device=device)
+        if vel_grad_head is not None and model.training:
+            surf_idx = is_surface.nonzero(as_tuple=False)  # [M, 2]
+            if surf_idx.numel() > 0:
+                # Get hidden features and predict gradients
+                surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]  # [M, n_hidden]
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    grad_pred = vel_grad_head(surf_hidden).float()  # [M, 4]
+
+                # Compute target gradients via sorted finite differences per sample
+                # Use original (non-padded) coordinates and normalized velocity targets
+                surf_xy = x[surf_idx[:, 0], surf_idx[:, 1], :2]  # [M, 2]
+                surf_vel = y_norm[surf_idx[:, 0], surf_idx[:, 1], :2]  # [M, 2] (Ux, Uy)
+                surf_batch = surf_idx[:, 0]  # [M] batch indices
+
+                # Compute FD gradients within each sample
+                grad_targets = []
+                grad_preds = []
+                for b_idx in range(B):
+                    b_mask = surf_batch == b_idx
+                    if b_mask.sum() < 3:
+                        continue
+                    b_xy = surf_xy[b_mask]  # [Mb, 2]
+                    b_vel = surf_vel[b_mask]  # [Mb, 2]
+                    b_gpred = grad_pred[b_mask]  # [Mb, 4]
+
+                    # Sort by x-coordinate
+                    sort_idx_b = b_xy[:, 0].argsort()
+                    b_xy_s = b_xy[sort_idx_b]
+                    b_vel_s = b_vel[sort_idx_b]
+                    b_gpred_s = b_gpred[sort_idx_b]
+
+                    # Finite differences: dU/dx ≈ (U[i+1] - U[i]) / (x[i+1] - x[i])
+                    dx = (b_xy_s[1:, 0] - b_xy_s[:-1, 0]).clamp(min=1e-6)  # [Mb-1]
+                    dy = b_xy_s[1:, 1] - b_xy_s[:-1, 1]  # [Mb-1]
+                    dUx = b_vel_s[1:, 0] - b_vel_s[:-1, 0]
+                    dUy = b_vel_s[1:, 1] - b_vel_s[:-1, 1]
+
+                    ds = (dx**2 + dy**2).sqrt().clamp(min=1e-6)  # arc length
+                    # Gradient components via chain rule: dU/dx = (dU/ds)*(dx/ds), dU/dy = (dU/ds)*(dy/ds)
+                    dx_ds = dx / ds
+                    dy_ds = dy / ds
+                    dUx_ds = dUx / ds
+                    dUy_ds = dUy / ds
+
+                    # Target: [dUx/dx, dUx/dy, dUy/dx, dUy/dy] at midpoints
+                    target = torch.stack([
+                        dUx_ds * dx_ds,  # dUx/dx
+                        dUx_ds * dy_ds,  # dUx/dy
+                        dUy_ds * dx_ds,  # dUy/dx
+                        dUy_ds * dy_ds,  # dUy/dy
+                    ], dim=-1)  # [Mb-1, 4]
+
+                    # Predictions at midpoints (average of consecutive nodes)
+                    pred_mid = 0.5 * (b_gpred_s[:-1] + b_gpred_s[1:])  # [Mb-1, 4]
+
+                    grad_targets.append(target)
+                    grad_preds.append(pred_mid)
+
+                if grad_targets:
+                    all_targets = torch.cat(grad_targets, dim=0)
+                    all_preds = torch.cat(grad_preds, dim=0)
+                    _vel_grad_loss = (all_preds - all_targets).abs().mean()
+                    loss = loss + cfg.vel_grad_beta * _vel_grad_loss
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -1792,7 +1901,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.vel_grad_beta > 0:
+            _log_dict["train/vel_grad_loss"] = _vel_grad_loss.item()
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
