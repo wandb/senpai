@@ -942,6 +942,7 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    surface_refine_lr: float = 0.0            # separate LR for refinement head (0 = use backbone LR)
 
 
 cfg = sp.parse(Config)
@@ -1275,8 +1276,9 @@ else:
 # Add refinement head params to optimizer if enabled
 if refine_head is not None:
     _refine_params = list(refine_head.parameters())
-    base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
-    print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
+    _refine_lr = cfg.surface_refine_lr if cfg.surface_refine_lr > 0 else _base_lr
+    base_opt.add_param_group({'params': _refine_params, 'lr': _refine_lr})
+    print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer (lr={_refine_lr:.2e})")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
@@ -1290,7 +1292,7 @@ if cfg.scheduler_type == "warm_restarts":
 elif cfg.scheduler_type == "onecycle":
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         base_opt,
-        max_lr=[cfg.onecycle_max_lr * 0.5, cfg.onecycle_max_lr],
+        max_lr=[cfg.onecycle_max_lr * 0.5, cfg.onecycle_max_lr] + ([cfg.surface_refine_lr or cfg.onecycle_max_lr] if refine_head is not None else []),
         epochs=cfg.onecycle_epochs,
         steps_per_epoch=len(train_loader),
         pct_start=cfg.onecycle_pct_start,
@@ -1335,6 +1337,7 @@ wandb.define_metric("val/*", step_metric="global_step")
 for _sname in VAL_SPLIT_NAMES:
     wandb.define_metric(f"{_sname}/*", step_metric="global_step")
 wandb.define_metric("lr", step_metric="global_step")
+wandb.define_metric("lr_refine", step_metric="global_step")
 wandb.define_metric("epoch_time_s", step_metric="global_step")
 wandb.define_metric("val_predictions", step_metric="global_step")
 
@@ -1824,6 +1827,9 @@ for epoch in range(MAX_EPOCHS):
     # Two-phase LR: at switch epoch, reset optimizer LR and replace scheduler
     if cfg.two_phase_lr and epoch + 1 == cfg.two_phase_switch_epoch:
         lrs = [cfg.two_phase_lr_2 * 0.5, cfg.two_phase_lr_2]
+        if refine_head is not None:
+            _ratio = (cfg.surface_refine_lr / _base_lr) if cfg.surface_refine_lr > 0 else 1.0
+            lrs.append(cfg.two_phase_lr_2 * _ratio)
         for pg, new_lr in zip(base_opt.param_groups, lrs):
             pg['lr'] = new_lr
             pg['initial_lr'] = new_lr
@@ -1871,6 +1877,7 @@ for epoch in range(MAX_EPOCHS):
             "train/surf_loss": epoch_surf,
             "epoch_time_s": dt,
             "lr": scheduler.get_last_lr()[0],
+            **({"lr_refine": scheduler.get_last_lr()[-1]} if refine_head is not None and cfg.surface_refine_lr > 0 else {}),
             "global_step": global_step,
         })
         print(f"Epoch {epoch+1:3d} ({dt:.0f}s)  train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  [val skipped]")
@@ -2142,6 +2149,7 @@ for epoch in range(MAX_EPOCHS):
         "val/loss_3split": val_loss_3split,
         "val/loss_4split": val_loss_4split,
         "lr": scheduler.get_last_lr()[0],
+        **({"lr_refine": scheduler.get_last_lr()[-1]} if refine_head is not None and cfg.surface_refine_lr > 0 else {}),
         "epoch_time_s": dt,
     }
     for split_metrics in val_metrics_per_split.values():
