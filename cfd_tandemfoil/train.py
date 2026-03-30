@@ -942,6 +942,12 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 5: Offline ensemble distillation (pre-computed soft labels)
+    offline_distill: bool = False              # enable offline distillation
+    offline_distill_alpha: float = 0.3         # distillation weight: (1-alpha)*GT + alpha*distill
+    offline_distill_path: str = ""             # path to pre-computed soft_labels.pt
+    offline_distill_surface_only: bool = False # only distill on surface nodes
+    offline_distill_phase_frac: float = 1.0    # fraction of training with distillation (rest is GT only)
 
 
 cfg = sp.parse(Config)
@@ -999,13 +1005,57 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
 
+# --- Offline distillation: load pre-computed soft labels ---
+_soft_labels = None
+if cfg.offline_distill:
+    assert cfg.offline_distill_path, "Must provide --offline_distill_path"
+    _soft_labels = torch.load(cfg.offline_distill_path, weights_only=False)
+    print(f"Loaded {len(_soft_labels)} soft labels from {cfg.offline_distill_path}")
+
+    class _DistillDataset(torch.utils.data.Dataset):
+        def __init__(self, base_ds, soft_labels):
+            self.base_ds = base_ds
+            self.soft_labels = soft_labels
+        def __len__(self):
+            return len(self.base_ds)
+        def __getitem__(self, idx):
+            x, y, is_surf = self.base_ds[idx]
+            soft = self.soft_labels[idx]
+            return x, y, is_surf, soft
+
+    _train_ds_raw = train_ds  # keep reference to original (unwrapped) dataset for stats
+    train_ds = _DistillDataset(train_ds, _soft_labels)
+
+    def _pad_collate_distill(batch):
+        xs, ys, surfs, softs = zip(*batch)
+        max_n = max(x.shape[0] for x in xs)
+        B = len(xs)
+        x_pad = torch.zeros(B, max_n, xs[0].shape[1])
+        y_pad = torch.zeros(B, max_n, ys[0].shape[1])
+        surf_pad = torch.zeros(B, max_n, dtype=torch.bool)
+        soft_pad = torch.zeros(B, max_n, 3)
+        mask = torch.zeros(B, max_n, dtype=torch.bool)
+        for i, (x, y, sf, so) in enumerate(zip(xs, ys, surfs, softs)):
+            n = x.shape[0]
+            x_pad[i, :n] = x
+            y_pad[i, :n] = y
+            surf_pad[i, :n] = sf
+            soft_pad[i, :n] = so
+            mask[i, :n] = True
+        return x_pad, y_pad, surf_pad, mask, soft_pad
+
+    _distill_loader_kwargs = dict(collate_fn=_pad_collate_distill, num_workers=cfg.num_workers, pin_memory=True,
+                                  persistent_workers=True, prefetch_factor=2)
+
+# Standard loader kwargs for stats computation and validation (always use pad_collate)
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=cfg.num_workers, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
 
+_train_lk = _distill_loader_kwargs if cfg.offline_distill else loader_kwargs
 if cfg.debug:
     # Avoid sampler/length mismatch when train_ds is truncated
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
-                              shuffle=True, **loader_kwargs)
+                              shuffle=True, **_train_lk)
 else:
     sampler = WeightedRandomSampler(
         weights=sample_weights,
@@ -1013,7 +1063,7 @@ else:
         replacement=True,
     )
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
-                              sampler=sampler, **loader_kwargs)
+                              sampler=sampler, **_train_lk)
 
 val_loaders = {
     name: DataLoader(subset, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
@@ -1026,7 +1076,8 @@ print("Computing physics normalization stats...")
 _phys_sum = torch.zeros(3, device=device)
 _phys_sq_sum = torch.zeros(3, device=device)
 _phys_n = 0.0
-_stats_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
+_stats_ds = _train_ds_raw if cfg.offline_distill else train_ds
+_stats_loader = DataLoader(_stats_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
 with torch.no_grad():
     for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc="Phys stats", leave=False):
         _y, _mask = _y.to(device), _mask.to(device)
@@ -1377,7 +1428,13 @@ for epoch in range(MAX_EPOCHS):
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     if cfg.grad_accum_steps > 1:
         optimizer.zero_grad()
-    for batch_idx, (x, y, is_surface, mask) in enumerate(pbar):
+    for batch_idx, batch_data in enumerate(pbar):
+        if cfg.offline_distill:
+            x, y, is_surface, mask, soft_target = batch_data
+            soft_target = soft_target.to(device, non_blocking=True)
+        else:
+            x, y, is_surface, mask = batch_data
+            soft_target = None
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -1564,6 +1621,19 @@ for epoch in range(MAX_EPOCHS):
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
 
+        # --- Offline distillation loss ---
+        _offline_distill_loss = torch.tensor(0.0, device=device)
+        if cfg.offline_distill and soft_target is not None and model.training:
+            # Check if we're in distillation phase
+            _distill_active = (epoch < int(MAX_EPOCHS * cfg.offline_distill_phase_frac))
+            if _distill_active:
+                _d_err = (pred - soft_target).abs()
+                if cfg.offline_distill_surface_only:
+                    _d_surf = mask & is_surface
+                    _offline_distill_loss = (_d_err * _d_surf.unsqueeze(-1)).sum() / _d_surf.sum().clamp(min=1)
+                else:
+                    _offline_distill_loss = (_d_err * mask.unsqueeze(-1)).sum() / mask.sum().clamp(min=1)
+
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         if cfg.tandem_ramp:
@@ -1693,6 +1763,11 @@ for epoch in range(MAX_EPOCHS):
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
 
+        # Offline distillation: mix GT loss with distillation loss
+        if cfg.offline_distill and _offline_distill_loss.item() > 0:
+            gt_loss = loss.clone()
+            loss = (1 - cfg.offline_distill_alpha) * gt_loss + cfg.offline_distill_alpha * _offline_distill_loss
+
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
@@ -1792,7 +1867,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _wlog = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.offline_distill:
+            _wlog["train/offline_distill_loss"] = _offline_distill_loss.item()
+        wandb.log(_wlog)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
