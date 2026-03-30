@@ -565,6 +565,51 @@ class SurfaceRefinementContextHead(nn.Module):
         return correction
 
 
+class GeometryContextBank(nn.Module):
+    """Pool surface + near-surface features into K geometry context tokens.
+
+    Uses cross-attention from learnable query tokens to near-surface hidden
+    features to produce a compact geometric context representation.
+    """
+
+    def __init__(self, n_hidden, n_tokens=16, n_heads=4):
+        super().__init__()
+        self.n_tokens = n_tokens
+        # Learnable query tokens
+        self.queries = nn.Parameter(torch.randn(1, n_tokens, n_hidden) * 0.02)
+        # Cross-attention: queries attend to surface features
+        self.cross_attn = nn.MultiheadAttention(n_hidden, num_heads=n_heads, batch_first=True)
+        self.ln = nn.LayerNorm(n_hidden)
+
+    def forward(self, hidden, is_near_surface):
+        # hidden: [B, N, H], is_near_surface: [B, N] bool
+        B = hidden.shape[0]
+        queries = self.queries.expand(B, -1, -1)  # [B, K, H]
+        # key_padding_mask: True means IGNORE this position (inverted from is_near_surface)
+        ctx = self.cross_attn(queries, hidden, hidden,
+                              key_padding_mask=~is_near_surface)[0]
+        return self.ln(ctx + queries)  # [B, K, H]
+
+
+class GeometryCrossAttention(nn.Module):
+    """Node features cross-attend to geometry context tokens.
+
+    Applied in each TransolverBlock after slice attention, before MLP.
+    Gate parameter starts at 0 so the model initially behaves as baseline.
+    """
+
+    def __init__(self, dim, n_heads=4):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(dim, num_heads=n_heads, batch_first=True)
+        self.ln = nn.LayerNorm(dim)
+        self.gate = nn.Parameter(torch.zeros(1))  # start at 0 = no effect
+
+    def forward(self, node_features, geo_context):
+        # node_features: [B, N, H], geo_context: [B, K, H]
+        cross_out = self.cross_attn(node_features, geo_context, geo_context)[0]
+        return node_features + self.gate * self.ln(cross_out)
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -601,6 +646,8 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        geo_context=False,
+        geo_context_tokens=16,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -612,6 +659,7 @@ class Transolver(nn.Module):
         self.adaln_4cond = adaln_4cond
         self.film_cond = film_cond
         self.adaln_zone_temp = adaln_zone_temp
+        self.geo_context = geo_context
         if output_fields is None or output_dims is None:
             raise ValueError("output_fields and output_dims must be provided")
         if len(output_fields) != len(output_dims):
@@ -675,6 +723,16 @@ class Transolver(nn.Module):
                 for idx in range(n_layers)
             ]
         )
+        # Geometry context bank + per-block cross-attention (GeoTransolver-inspired)
+        if geo_context and geo_context_tokens > 0:
+            self.geo_bank = GeometryContextBank(n_hidden, n_tokens=geo_context_tokens, n_heads=min(4, n_head))
+            self.geo_cross_attns = nn.ModuleList([
+                GeometryCrossAttention(n_hidden, n_heads=min(4, n_head))
+                for _ in range(n_layers)
+            ])
+        else:
+            self.geo_bank = None
+            self.geo_cross_attns = None
         # Separate pressure pathway (pressure_separate_last_block):
         # Independent MLP + pres_head that processes shared hidden features
         self._pressure_separate = False  # set from Config after construction
@@ -734,14 +792,15 @@ class Transolver(nn.Module):
         x = data.get("x")
         pos = data.get("pos", pos)
         condition = data.get("condition", condition)
-        return x, pos, condition
+        near_surface_mask = data.get("near_surface_mask")
+        return x, pos, condition, near_surface_mask
 
     def _validate_output_dims(self, preds):
         if sum(self.output_dims) != preds.shape[-1]:
             raise ValueError("Sum of output_dims must match preds last dimension")
 
     def forward(self, data, pos=None, condition=None):
-        x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
+        x, pos, condition, near_surface_mask = self._unpack_inputs(data, pos=pos, condition=condition)
         if x is None:
             raise ValueError("Missing required input tensor: x")
         if condition is not None:
@@ -787,8 +846,16 @@ class Transolver(nn.Module):
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
-        for block in self.blocks[:-1]:
+        # Compute geometry context bank once before blocks
+        geo_ctx = None
+        if self.geo_context and self.geo_bank is not None and near_surface_mask is not None:
+            geo_ctx = self.geo_bank(fx, near_surface_mask)  # [B, K, H]
+
+        for i, block in enumerate(self.blocks[:-1]):
             fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+            # Apply geometry cross-attention after each non-last block
+            if geo_ctx is not None and self.geo_cross_attns is not None:
+                fx = self.geo_cross_attns[i](fx, geo_ctx)
 
         # Deep hidden representation (post all non-last blocks, pre output head)
         fx_deep = fx  # [B, N, n_hidden]
@@ -806,6 +873,10 @@ class Transolver(nn.Module):
             p_sep = self.pressure_sep_mlp(fx_for_pressure)  # [B, N, 1]
             # Main last block produces vel only (pressure_first still active but p comes from separate branch)
             fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+            # Apply geo cross-attention to last block too
+            if geo_ctx is not None and self.geo_cross_attns is not None:
+                # Note: last block output has out_dim, not n_hidden, so skip cross-attn here
+                pass
             # Override: replace the pressure channel from the last block with the separate branch's output
             fx = torch.cat([fx[:, :, :2], p_sep], dim=-1)
         else:
@@ -942,6 +1013,11 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 5: Geometry Cross-Attention Context (GeoTransolver-inspired)
+    geo_context: bool = False                  # enable geometry context bank + cross-attention
+    geo_context_tokens: int = 16               # number of learnable geometry context tokens
+    geo_context_threshold: float = 0.5         # dist_feat threshold for near-surface nodes
+    geo_context_surface_only: bool = False     # only use actual surface nodes as context (not near-surface)
 
 
 cfg = sp.parse(Config)
@@ -1094,10 +1170,17 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    geo_context=cfg.geo_context,
+    geo_context_tokens=cfg.geo_context_tokens,
 )
 
 model = Transolver(**model_config).to(device)
 model._pressure_separate = cfg.pressure_separate_last_block
+if cfg.geo_context and cfg.geo_context_tokens > 0:
+    _geo_params = sum(p.numel() for m in [model.geo_bank] + list(model.geo_cross_attns) for p in m.parameters())
+    _threshold_desc = "surface_only" if cfg.geo_context_surface_only else f"dist<{cfg.geo_context_threshold}"
+    print(f"Geometry context bank: {_geo_params:,} params "
+          f"(tokens={cfg.geo_context_tokens}, threshold={_threshold_desc})")
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
@@ -1529,8 +1612,16 @@ for epoch in range(MAX_EPOCHS):
             else:
                 y_norm = y_norm / sample_stds
 
+        # Compute near-surface mask for geometry context bank
+        _near_surf_mask = None
+        if cfg.geo_context and cfg.geo_context_tokens > 0:
+            if cfg.geo_context_surface_only:
+                _near_surf_mask = is_surface  # [B, N] bool
+            else:
+                _near_surf_mask = (dist_feat.squeeze(-1) < cfg.geo_context_threshold) & mask  # [B, N]
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x, "near_surface_mask": _near_surf_mask})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -1687,7 +1778,7 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x})
+                rdrop_out = model({"x": x, "near_surface_mask": _near_surf_mask})
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -1752,7 +1843,7 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                out2 = model({"x": x, "near_surface_mask": _near_surf_mask})
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -1986,8 +2077,16 @@ for epoch in range(MAX_EPOCHS):
                 else:
                     y_norm_scaled = y_norm / sample_stds
 
+                # Compute near-surface mask for geometry context bank (val)
+                _val_near_surf_mask = None
+                if cfg.geo_context and cfg.geo_context_tokens > 0:
+                    if cfg.geo_context_surface_only:
+                        _val_near_surf_mask = is_surface
+                    else:
+                        _val_near_surf_mask = (dist_feat.squeeze(-1) < cfg.geo_context_threshold) & mask
+
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    _eval_out = eval_model({"x": x})
+                    _eval_out = eval_model({"x": x, "near_surface_mask": _val_near_surf_mask})
                     pred = _eval_out["preds"]
                     _eval_hidden = _eval_out["hidden"]
                 pred = pred.float()
@@ -2150,6 +2249,10 @@ for epoch in range(MAX_EPOCHS):
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
+    # Log geometry cross-attention gate values
+    if cfg.geo_context and _base_model.geo_cross_attns is not None:
+        for i, gca in enumerate(_base_model.geo_cross_attns):
+            metrics[f"geo_gate_{i}"] = gca.gate.item()
     wandb.log(metrics)
 
     if torch.cuda.is_available():
@@ -2253,7 +2356,14 @@ if best_metrics:
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
-                    pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
+                    # Compute near-surface mask for geometry context bank (vis)
+                    _vis_near_surf_mask = None
+                    if cfg.geo_context and cfg.geo_context_tokens > 0:
+                        if cfg.geo_context_surface_only:
+                            _vis_near_surf_mask = is_surf_dev
+                        else:
+                            _vis_near_surf_mask = (dist_feat.squeeze(-1) < cfg.geo_context_threshold) & mask
+                    pred = vis_model({"x": x_n, "mask": mask, "near_surface_mask": _vis_near_surf_mask})["preds"].float()
                     if cfg.raw_targets:
                         y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                     else:
@@ -2378,9 +2488,17 @@ if cfg.surface_refine and best_metrics:
                             else:
                                 sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
 
+                    # Compute near-surface mask for geometry context bank (verify)
+                    _verify_near_surf_mask = None
+                    if cfg.geo_context and cfg.geo_context_tokens > 0:
+                        if cfg.geo_context_surface_only:
+                            _verify_near_surf_mask = is_surface
+                        else:
+                            _verify_near_surf_mask = (dist_feat.squeeze(-1) < cfg.geo_context_threshold) & mask
+
                     # Model forward
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        out = verify_model({"x": x})
+                        out = verify_model({"x": x, "near_surface_mask": _verify_near_surf_mask})
                         pred_raw = out["preds"].float()
                         hidden = out["hidden"].float()
 
