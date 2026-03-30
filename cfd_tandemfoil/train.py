@@ -457,13 +457,14 @@ class SurfaceRefinementHead(nn.Module):
     """
 
     def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 128,
-                 n_layers: int = 2, p_only: bool = False):
+                 n_layers: int = 2, p_only: bool = False, input_feature_dim: int = 0):
         super().__init__()
         self.p_only = p_only
+        self.input_feature_dim = input_feature_dim
         actual_out = 1 if p_only else out_dim  # 1 for pressure-only, 3 for all fields
         layers: list[nn.Module] = []
-        # Input: hidden features (n_hidden) + base predictions (out_dim)
-        in_dim = n_hidden + out_dim
+        # Input: hidden features (n_hidden) + base predictions (out_dim) [+ raw input features]
+        in_dim = n_hidden + out_dim + input_feature_dim
         for i in range(n_layers):
             layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
             layers.append(nn.LayerNorm(hidden_dim))
@@ -474,15 +475,20 @@ class SurfaceRefinementHead(nn.Module):
         nn.init.zeros_(layers[-1].bias)
         self.mlp = nn.Sequential(*layers)
 
-    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor,
+                input_features: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             hidden: [M, n_hidden] — hidden features for surface nodes only
             base_pred: [M, out_dim] — base predictions for surface nodes only
+            input_features: [M, input_feature_dim] — raw input features (optional)
         Returns:
             correction: [M, out_dim] — additive correction (zero-padded for p_only)
         """
-        inp = torch.cat([hidden, base_pred], dim=-1)
+        parts = [hidden, base_pred]
+        if input_features is not None:
+            parts.append(input_features)
+        inp = torch.cat(parts, dim=-1)
         correction = self.mlp(inp)
         if self.p_only:
             # Pad with zeros for velocity channels: [M, 1] → [M, 3]
@@ -942,6 +948,7 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    surface_refine_input_features: bool = False  # concatenate raw input features to refinement head
 
 
 cfg = sp.parse(Config)
@@ -1114,18 +1121,21 @@ if cfg.surface_refine:
             k_neighbors=8,
         ).to(device)
     else:
+        _input_feat_dim = (model_config['fun_dim'] + model_config['space_dim']) if cfg.surface_refine_input_features else 0
         refine_head = SurfaceRefinementHead(
             n_hidden=cfg.n_hidden,
             out_dim=3,
             hidden_dim=cfg.surface_refine_hidden,
             n_layers=cfg.surface_refine_layers,
             p_only=cfg.surface_refine_p_only,
+            input_feature_dim=_input_feat_dim,
         ).to(device)
     refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
     _refine_n_params = sum(p.numel() for p in refine_head.parameters())
     print(f"Surface refinement head: {_refine_n_params:,} params "
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
-          f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
+          f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context}, "
+          f"input_features={cfg.surface_refine_input_features})")
 
 from copy import deepcopy
 ema_model = None
@@ -1560,7 +1570,8 @@ for epoch in range(MAX_EPOCHS):
                     if surf_idx.numel() > 0:
                         surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]  # [M, n_hidden]
                         surf_pred = pred[surf_idx[:, 0], surf_idx[:, 1]]      # [M, 3]
-                        correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
+                        surf_input = x[surf_idx[:, 0], surf_idx[:, 1]] if cfg.surface_refine_input_features else None
+                        correction = refine_head(surf_hidden, surf_pred, surf_input).float()  # [M, 3]
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
 
@@ -2010,7 +2021,8 @@ for epoch in range(MAX_EPOCHS):
                             if surf_idx.numel() > 0:
                                 surf_hidden = _eval_hidden[surf_idx[:, 0], surf_idx[:, 1]]
                                 surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                                correction = eval_refine_head(surf_hidden, surf_pred).float()
+                                surf_input = x[surf_idx[:, 0], surf_idx[:, 1]] if cfg.surface_refine_input_features else None
+                                correction = eval_refine_head(surf_hidden, surf_pred, surf_input).float()
                                 pred_loss = pred_loss.clone()
                                 pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
@@ -2393,7 +2405,8 @@ if cfg.surface_refine and best_metrics:
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                             surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]
                             surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                            correction = verify_refine(surf_hidden, surf_pred).float()
+                            surf_input = x[surf_idx[:, 0], surf_idx[:, 1]] if cfg.surface_refine_input_features else None
+                            correction = verify_refine(surf_hidden, surf_pred, surf_input).float()
                         pred_loss_refined = pred_loss.clone()
                         pred_loss_refined[surf_idx[:, 0], surf_idx[:, 1]] += correction
                         correction_full[surf_idx[:, 0], surf_idx[:, 1]] = correction
