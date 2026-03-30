@@ -942,6 +942,9 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 5: Surface pressure smoothness loss
+    cp_smooth_beta: float = 0.0               # d²Cp/ds² smoothness penalty weight (0 = disabled)
+    cp_smooth_start_epoch: int = 30           # epoch to start applying smoothness loss
 
 
 cfg = sp.parse(Config)
@@ -1444,6 +1447,7 @@ for epoch in range(MAX_EPOCHS):
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+        _raw_saf = x[:, :, 2:4]  # raw saf features before standardization (for arc-length sorting)
         _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
@@ -1683,6 +1687,42 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # Surface pressure smoothness loss: penalize d²Cp/ds² along arc-length
+        _cp_smooth_loss = torch.tensor(0.0, device=device)
+        if cfg.cp_smooth_beta > 0 and model.training and epoch >= cfg.cp_smooth_start_epoch:
+            # Use raw saf[0] to sort surface nodes by arc-length
+            surf_idx = is_surface.nonzero(as_tuple=False)  # [M, 2]
+            if surf_idx.numel() > 0:
+                surf_saf = _raw_saf[surf_idx[:, 0], surf_idx[:, 1], 0]  # [M] arc-length coord
+                surf_p = pred[surf_idx[:, 0], surf_idx[:, 1], 2]  # [M] predicted pressure
+                surf_batch = surf_idx[:, 0]  # [M] batch indices
+
+                d2p_all = []
+                for b_idx in range(B):
+                    b_mask = surf_batch == b_idx
+                    if b_mask.sum() < 5:
+                        continue
+                    b_saf = surf_saf[b_mask]
+                    b_p = surf_p[b_mask]
+
+                    # Sort by arc-length
+                    sort_idx_b = b_saf.argsort()
+                    b_saf_s = b_saf[sort_idx_b]
+                    b_p_s = b_p[sort_idx_b]
+
+                    # Arc-length spacing
+                    ds = (b_saf_s[1:] - b_saf_s[:-1]).clamp(min=1e-6)
+
+                    # Second-order finite difference: d²p/ds²
+                    ds_avg = 0.5 * (ds[:-1] + ds[1:])  # [N-2]
+                    d2p = (b_p_s[2:] - 2 * b_p_s[1:-1] + b_p_s[:-2]) / (ds_avg ** 2 + 1e-8)
+                    d2p_all.append(d2p)
+
+                if d2p_all:
+                    all_d2p = torch.cat(d2p_all, dim=0)
+                    _cp_smooth_loss = all_d2p.pow(2).mean()
+                    loss = loss + cfg.cp_smooth_beta * _cp_smooth_loss
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -1792,7 +1832,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.cp_smooth_beta > 0:
+            _log_dict["train/cp_smooth_loss"] = _cp_smooth_loss.item()
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
