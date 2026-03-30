@@ -457,22 +457,42 @@ class SurfaceRefinementHead(nn.Module):
     """
 
     def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 128,
-                 n_layers: int = 2, p_only: bool = False):
+                 n_layers: int = 2, p_only: bool = False,
+                 skip: bool = False, act: str = "gelu", no_ln: bool = False):
         super().__init__()
         self.p_only = p_only
+        self.skip = skip
         actual_out = 1 if p_only else out_dim  # 1 for pressure-only, 3 for all fields
-        layers: list[nn.Module] = []
+        act_cls = {"gelu": nn.GELU, "silu": nn.SiLU, "relu": nn.ReLU}[act]
         # Input: hidden features (n_hidden) + base predictions (out_dim)
         in_dim = n_hidden + out_dim
-        for i in range(n_layers):
-            layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
-            layers.append(nn.LayerNorm(hidden_dim))
-            layers.append(nn.GELU())
-        layers.append(nn.Linear(hidden_dim, actual_out))
-        # Zero-init last layer so refinement starts as identity
-        nn.init.zeros_(layers[-1].weight)
-        nn.init.zeros_(layers[-1].bias)
-        self.mlp = nn.Sequential(*layers)
+        if skip:
+            # Skip-connection variant: separate layers for residual connections
+            self.proj_in = nn.Linear(in_dim, hidden_dim)
+            self.blocks = nn.ModuleList()
+            for _ in range(n_layers):
+                block_layers = []
+                block_layers.append(nn.Linear(hidden_dim, hidden_dim))
+                if not no_ln:
+                    block_layers.append(nn.LayerNorm(hidden_dim))
+                block_layers.append(act_cls())
+                self.blocks.append(nn.Sequential(*block_layers))
+            self.proj_out = nn.Linear(hidden_dim, actual_out)
+            nn.init.zeros_(self.proj_out.weight)
+            nn.init.zeros_(self.proj_out.bias)
+            self.mlp = None  # not used in skip mode
+        else:
+            layers: list[nn.Module] = []
+            for i in range(n_layers):
+                layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
+                if not no_ln:
+                    layers.append(nn.LayerNorm(hidden_dim))
+                layers.append(act_cls())
+            layers.append(nn.Linear(hidden_dim, actual_out))
+            # Zero-init last layer so refinement starts as identity
+            nn.init.zeros_(layers[-1].weight)
+            nn.init.zeros_(layers[-1].bias)
+            self.mlp = nn.Sequential(*layers)
 
     def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor) -> torch.Tensor:
         """
@@ -483,7 +503,13 @@ class SurfaceRefinementHead(nn.Module):
             correction: [M, out_dim] — additive correction (zero-padded for p_only)
         """
         inp = torch.cat([hidden, base_pred], dim=-1)
-        correction = self.mlp(inp)
+        if self.skip:
+            h = self.proj_in(inp)
+            for block in self.blocks:
+                h = block(h) + h  # residual connection
+            correction = self.proj_out(h)
+        else:
+            correction = self.mlp(inp)
         if self.p_only:
             # Pad with zeros for velocity channels: [M, 1] → [M, 3]
             zeros = torch.zeros(correction.shape[0], base_pred.shape[-1] - 1,
@@ -942,6 +968,9 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    surface_refine_skip: bool = False         # add residual/skip connections in refine MLP
+    surface_refine_act: str = "gelu"          # activation: gelu, silu, relu
+    surface_refine_no_ln: bool = False        # disable LayerNorm in refine MLP
 
 
 cfg = sp.parse(Config)
@@ -1120,12 +1149,16 @@ if cfg.surface_refine:
             hidden_dim=cfg.surface_refine_hidden,
             n_layers=cfg.surface_refine_layers,
             p_only=cfg.surface_refine_p_only,
+            skip=cfg.surface_refine_skip,
+            act=cfg.surface_refine_act,
+            no_ln=cfg.surface_refine_no_ln,
         ).to(device)
     refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
     _refine_n_params = sum(p.numel() for p in refine_head.parameters())
     print(f"Surface refinement head: {_refine_n_params:,} params "
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
-          f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
+          f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context}, "
+          f"skip={cfg.surface_refine_skip}, act={cfg.surface_refine_act}, no_ln={cfg.surface_refine_no_ln})")
 
 from copy import deepcopy
 ema_model = None
