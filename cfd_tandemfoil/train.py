@@ -942,6 +942,9 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 5: Bernoulli consistency loss — soft physics constraint
+    bernoulli_beta: float = 0.0              # weight for Bernoulli consistency loss (0 = disabled)
+    bernoulli_start_epoch: int = 0           # epoch to start applying Bernoulli loss
 
 
 cfg = sp.parse(Config)
@@ -1693,6 +1696,34 @@ for epoch in range(MAX_EPOCHS):
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
 
+        # Bernoulli consistency loss: soft physics constraint on surface total pressure
+        # H = Cp + (Ux/Umag)^2 + (Uy/Umag)^2 ≈ const on surface (Bernoulli in Cp space)
+        bernoulli_loss = torch.tensor(0.0, device=device)
+        if cfg.bernoulli_beta > 0 and epoch >= cfg.bernoulli_start_epoch:
+            # Recover predictions in Cp space (Ux/Umag, Uy/Umag, Cp)
+            pred_bern = pred * sample_stds  # undo per-sample std → z-scored
+            if cfg.residual_prediction and _freestream is not None:
+                pred_bern = pred_bern + _freestream
+            pred_cp = pred_bern * phys_stats["y_std"] + phys_stats["y_mean"]  # → Cp space
+            if cfg.log_pressure:
+                pred_cp = pred_cp.clone()
+                pred_cp[:, :, 2:3] = pred_cp[:, :, 2:3].sign() * (pred_cp[:, :, 2:3].abs().exp() - 1)
+            b_loss = 0.0
+            n_valid = 0
+            for b in range(B):
+                b_surf = surf_mask[b]
+                if b_surf.sum() < 2:
+                    continue
+                ux_s = pred_cp[b, b_surf, 0]  # Ux/Umag
+                uy_s = pred_cp[b, b_surf, 1]  # Uy/Umag
+                cp_s = pred_cp[b, b_surf, 2]  # Cp
+                H = cp_s + ux_s ** 2 + uy_s ** 2
+                b_loss = b_loss + H.var()
+                n_valid += 1
+            if n_valid > 0:
+                bernoulli_loss = b_loss / n_valid
+            loss = loss + cfg.bernoulli_beta * bernoulli_loss
+
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
@@ -1709,8 +1740,9 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            bernoulli_shared = cfg.bernoulli_beta * bernoulli_loss * 0.5 if cfg.bernoulli_beta > 0 else 0.0
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + bernoulli_shared
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + bernoulli_shared
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -1792,7 +1824,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _train_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.bernoulli_beta > 0:
+            _train_log["train/bernoulli_loss"] = bernoulli_loss.item() if isinstance(bernoulli_loss, torch.Tensor) else bernoulli_loss
+        wandb.log(_train_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
