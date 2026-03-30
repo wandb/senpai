@@ -942,6 +942,9 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 5: Rotation-ensemble TTA
+    tta_rotation: bool = False                 # average predictions from rotated inputs at val time
+    tta_rotation_angles: str = "-0.5,0.5"      # comma-separated rotation angles in degrees
 
 
 cfg = sp.parse(Config)
@@ -1126,6 +1129,12 @@ if cfg.surface_refine:
     print(f"Surface refinement head: {_refine_n_params:,} params "
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
           f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
+
+if cfg.tta_rotation:
+    _tta_angles = [float(a) for a in cfg.tta_rotation_angles.split(",")]
+    print(f"Rotation TTA: {len(_tta_angles)} extra views at angles {_tta_angles}° (val only)")
+else:
+    _tta_angles = []
 
 from copy import deepcopy
 ema_model = None
@@ -1916,6 +1925,10 @@ for epoch in range(MAX_EPOCHS):
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
 
+                # Save raw input for rotation TTA
+                if cfg.tta_rotation:
+                    x_raw_tta = x.clone()
+
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
@@ -1992,6 +2005,61 @@ for epoch in range(MAX_EPOCHS):
                     _eval_hidden = _eval_out["hidden"]
                 pred = pred.float()
                 _eval_hidden = _eval_hidden.float()
+
+                # Rotation TTA: average predictions from rotated inputs
+                if cfg.tta_rotation and _tta_angles:
+                    pred_sum = pred.clone()  # accumulate: starts with original (0°)
+                    n_views = 1
+                    for _tta_deg in _tta_angles:
+                        _tta_rad = _tta_deg * (torch.pi / 180.0)
+                        _cos_r = float(torch.cos(torch.tensor(_tta_rad)))
+                        _sin_r = float(torch.sin(torch.tensor(_tta_rad)))
+                        # Rotate raw input
+                        x_rot = x_raw_tta.clone()
+                        _xc_r = x_rot[:, :, 0:1].clone()
+                        _yc_r = x_rot[:, :, 1:2].clone()
+                        x_rot[:, :, 0:1] = _cos_r * _xc_r - _sin_r * _yc_r
+                        x_rot[:, :, 1:2] = _sin_r * _xc_r + _cos_r * _yc_r
+                        # Rotate DSDF/SAF gradient pairs
+                        for _xi, _yi in [(2, 3), (4, 5), (6, 7), (8, 9)]:
+                            _dx_r = x_rot[:, :, _xi:_xi+1].clone()
+                            _dy_r = x_rot[:, :, _yi:_yi+1].clone()
+                            x_rot[:, :, _xi:_xi+1] = _cos_r * _dx_r - _sin_r * _dy_r
+                            x_rot[:, :, _yi:_yi+1] = _sin_r * _dx_r + _cos_r * _dy_r
+                        # Full preprocessing on rotated input
+                        _rdsdf = x_rot[:, :, 2:10]
+                        _rdist = _rdsdf.abs().min(dim=-1, keepdim=True).values
+                        _rdist_f = torch.log1p(_rdist * 10.0)
+                        x_rot = (x_rot - stats["x_mean"]) / stats["x_std"]
+                        _rcurv = x_rot[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                        if cfg.foil2_dist:
+                            _rf2 = torch.log1p(_rdsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                            x_rot = torch.cat([x_rot, _rcurv, _rdist_f, _rf2], dim=-1)
+                        else:
+                            x_rot = torch.cat([x_rot, _rcurv, _rdist_f], dim=-1)
+                        _rxy = x_rot[:, :, :2]
+                        _rxy_min = _rxy.amin(dim=1, keepdim=True)
+                        _rxy_max = _rxy.amax(dim=1, keepdim=True)
+                        _rxy_n = (_rxy - _rxy_min) / (_rxy_max - _rxy_min + 1e-8)
+                        _rfreqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                        _rxy_sc = _rxy_n.unsqueeze(-1) * _rfreqs
+                        _rfpe = torch.cat([_rxy_sc.sin().flatten(-2), _rxy_sc.cos().flatten(-2)], dim=-1)
+                        x_rot = torch.cat([x_rot, _rfpe], dim=-1)
+                        # Forward pass on rotated input
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            _rout = eval_model({"x": x_rot})
+                            pred_rot = _rout["preds"]
+                        pred_rot = pred_rot.float()
+                        # Un-rotate prediction: apply R(-θ) to (Ux, Uy)
+                        _pUx = pred_rot[:, :, 0:1].clone()
+                        _pUy = pred_rot[:, :, 1:2].clone()
+                        pred_rot[:, :, 0:1] = _cos_r * _pUx + _sin_r * _pUy
+                        pred_rot[:, :, 1:2] = -_sin_r * _pUx + _cos_r * _pUy
+                        # Pressure (index 2) is scalar — no rotation needed
+                        pred_sum = pred_sum + pred_rot
+                        n_views += 1
+                    pred = pred_sum / n_views
+
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
                 else:
