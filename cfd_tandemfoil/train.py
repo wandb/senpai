@@ -942,6 +942,10 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 5: Stacked 2-pass surface refinement — second pass corrects residuals from first
+    stacked_refine: bool = False              # enable second-pass refinement head
+    stacked_refine_hidden: int = 128          # hidden dim for second pass (smaller: corrects residuals)
+    stacked_refine_layers: int = 2            # number of hidden layers in second pass
 
 
 cfg = sp.parse(Config)
@@ -1127,9 +1131,25 @@ if cfg.surface_refine:
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
           f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
 
+# Stacked 2-pass surface refinement: second head corrects residuals from first
+refine_head_2 = None
+if cfg.stacked_refine and cfg.surface_refine:
+    refine_head_2 = SurfaceRefinementHead(
+        n_hidden=cfg.n_hidden,
+        out_dim=3,
+        hidden_dim=cfg.stacked_refine_hidden,
+        n_layers=cfg.stacked_refine_layers,
+        p_only=False,
+    ).to(device)
+    refine_head_2 = torch.compile(refine_head_2, mode=cfg.compile_mode)
+    _refine2_n_params = sum(p.numel() for p in refine_head_2.parameters())
+    print(f"Stacked refinement head (pass 2): {_refine2_n_params:,} params "
+          f"(hidden={cfg.stacked_refine_hidden}, layers={cfg.stacked_refine_layers})")
+
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
+ema_refine_head_2 = None  # EMA copy of stacked refinement head
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -1147,6 +1167,8 @@ snapshot_epoch_list = [int(e) for e in cfg.snapshot_epochs_str.split(",")] if cf
 n_params = sum(p.numel() for p in model.parameters())
 if refine_head is not None:
     n_params += sum(p.numel() for p in refine_head.parameters())
+if refine_head_2 is not None:
+    n_params += sum(p.numel() for p in refine_head_2.parameters())
 
 
 class SAM:
@@ -1277,6 +1299,10 @@ if refine_head is not None:
     _refine_params = list(refine_head.parameters())
     base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
+if refine_head_2 is not None:
+    _refine2_params = list(refine_head_2.parameters())
+    base_opt.add_param_group({'params': _refine2_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _refine2_params):,} stacked refine head params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
@@ -1370,6 +1396,8 @@ for epoch in range(MAX_EPOCHS):
     model.train()
     if refine_head is not None:
         refine_head.train()
+    if refine_head_2 is not None:
+        refine_head_2.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
@@ -1563,6 +1591,17 @@ for epoch in range(MAX_EPOCHS):
                         correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
+
+        # Stacked refinement pass 2: correct residuals from pass 1
+        if refine_head_2 is not None and model.training:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                surf_idx2 = is_surface.nonzero(as_tuple=False)
+                if surf_idx2.numel() > 0:
+                    surf_hidden2 = hidden[surf_idx2[:, 0], surf_idx2[:, 1]]
+                    surf_pred2 = pred[surf_idx2[:, 0], surf_idx2[:, 1]]
+                    correction2 = refine_head_2(surf_hidden2, surf_pred2).float()
+                    pred = pred.clone()
+                    pred[surf_idx2[:, 0], surf_idx2[:, 1]] = pred[surf_idx2[:, 0], surf_idx2[:, 1]] + correction2
 
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
@@ -1791,6 +1830,15 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for stacked refinement head (pass 2)
+            if refine_head_2 is not None:
+                _refine2_base = refine_head_2._orig_mod if hasattr(refine_head_2, '_orig_mod') else refine_head_2
+                if ema_refine_head_2 is None:
+                    ema_refine_head_2 = deepcopy(_refine2_base)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_refine_head_2.parameters(), _refine2_base.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -1896,6 +1944,14 @@ for epoch in range(MAX_EPOCHS):
             eval_refine_head.eval()
         elif refine_head is not None:
             refine_head.eval()
+    # Select stacked refinement head for validation (EMA if available)
+    eval_refine_head_2 = refine_head_2  # default: use training head
+    if refine_head_2 is not None:
+        if ema_refine_head_2 is not None and ema_model is not None and eval_model is ema_model:
+            eval_refine_head_2 = ema_refine_head_2
+            eval_refine_head_2.eval()
+        elif refine_head_2 is not None:
+            refine_head_2.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -2013,6 +2069,16 @@ for epoch in range(MAX_EPOCHS):
                                 correction = eval_refine_head(surf_hidden, surf_pred).float()
                                 pred_loss = pred_loss.clone()
                                 pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
+                # Stacked refinement pass 2 (eval)
+                if eval_refine_head_2 is not None:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        surf_idx2 = is_surface.nonzero(as_tuple=False)
+                        if surf_idx2.numel() > 0:
+                            surf_hidden2 = _eval_hidden[surf_idx2[:, 0], surf_idx2[:, 1]]
+                            surf_pred2 = pred_loss[surf_idx2[:, 0], surf_idx2[:, 1]]
+                            correction2 = eval_refine_head_2(surf_hidden2, surf_pred2).float()
+                            pred_loss = pred_loss.clone()
+                            pred_loss[surf_idx2[:, 0], surf_idx2[:, 1]] = pred_loss[surf_idx2[:, 0], surf_idx2[:, 1]] + correction2
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
                     if cfg.multiply_std:
                         pred = pred_loss / sample_stds
@@ -2177,6 +2243,11 @@ for epoch in range(MAX_EPOCHS):
                 refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
             )
             torch.save(_refine_save.state_dict(), model_dir / "refine_head.pt")
+        if refine_head_2 is not None:
+            _refine2_save = ema_refine_head_2 if ema_refine_head_2 is not None else (
+                refine_head_2._orig_mod if hasattr(refine_head_2, '_orig_mod') else refine_head_2
+            )
+            torch.save(_refine2_save.state_dict(), model_dir / "refine_head_2.pt")
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
@@ -2300,6 +2371,12 @@ if cfg.surface_refine and best_metrics:
             refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
         )
         verify_refine.eval()
+        verify_refine_2 = None
+        if refine_head_2 is not None:
+            verify_refine_2 = ema_refine_head_2 if ema_refine_head_2 is not None else (
+                refine_head_2._orig_mod if hasattr(refine_head_2, '_orig_mod') else refine_head_2
+            )
+            verify_refine_2.eval()
 
         # Run inference on val_ood_re only
         _ood_re_loader = val_loaders.get("val_ood_re")
@@ -2400,6 +2477,17 @@ if cfg.surface_refine and best_metrics:
                     else:
                         pred_loss_refined = pred_loss
 
+                    # Apply stacked refinement pass 2
+                    if verify_refine_2 is not None:
+                        surf_idx2 = is_surface.nonzero(as_tuple=False)
+                        if surf_idx2.numel() > 0:
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                surf_hidden2 = hidden[surf_idx2[:, 0], surf_idx2[:, 1]]
+                                surf_pred2 = pred_loss_refined[surf_idx2[:, 0], surf_idx2[:, 1]]
+                                correction2 = verify_refine_2(surf_hidden2, surf_pred2).float()
+                            pred_loss_refined = pred_loss_refined.clone()
+                            pred_loss_refined[surf_idx2[:, 0], surf_idx2[:, 1]] += correction2
+
                     # Back-compute pred with refinement
                     pred_refined = pred_loss_refined * sample_stds
 
@@ -2420,6 +2508,16 @@ if cfg.surface_refine and best_metrics:
                     if surf_idx.numel() > 0:
                         pred_manual = pred_manual.clone()
                         pred_manual[surf_idx[:, 0], surf_idx[:, 1]] += correction
+                    # Step 2b: stacked refinement pass 2
+                    if verify_refine_2 is not None:
+                        surf_idx2 = is_surface.nonzero(as_tuple=False)
+                        if surf_idx2.numel() > 0:
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                _sh2 = hidden[surf_idx2[:, 0], surf_idx2[:, 1]]
+                                _sp2 = pred_manual[surf_idx2[:, 0], surf_idx2[:, 1]]
+                                _c2 = verify_refine_2(_sh2, _sp2).float()
+                            pred_manual = pred_manual.clone()
+                            pred_manual[surf_idx2[:, 0], surf_idx2[:, 1]] += _c2
                     # Step 3: multiply by sample_stds to undo per-sample normalization
                     pred_manual = pred_manual * sample_stds
                     # Step 4: add freestream (residual prediction)
