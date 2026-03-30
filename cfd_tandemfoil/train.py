@@ -942,6 +942,9 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Error-based curriculum learning
+    error_curriculum: bool = False            # enable error-based curriculum learning
+    error_curriculum_phases: str = "0:0.5,40:0.75,80:1.0"  # epoch:fraction pairs
 
 
 cfg = sp.parse(Config)
@@ -1355,6 +1358,56 @@ prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
 
+# --- Error-based curriculum learning ---
+curriculum_phases: list[tuple[int, float]] = []
+curriculum_sample_losses: torch.Tensor | None = None
+curriculum_current_frac: float = 1.0
+if cfg.error_curriculum:
+    # Parse phases: "0:0.5,40:0.75,80:1.0" -> [(0, 0.5), (40, 0.75), (80, 1.0)]
+    for part in cfg.error_curriculum_phases.split(","):
+        ep_str, frac_str = part.strip().split(":")
+        curriculum_phases.append((int(ep_str), float(frac_str)))
+    curriculum_phases.sort(key=lambda x: x[0])
+    print(f"Error curriculum phases: {curriculum_phases}")
+
+    # Score all training samples with initial model (no grad)
+    print("Scoring training samples for curriculum...")
+    _score_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
+    _sample_losses = []
+    model.eval()
+    with torch.no_grad():
+        for _x, _y, _is_surf, _mask in tqdm(_score_loader, desc="Scoring", leave=False):
+            _x, _y = _x.to(device), _y.to(device)
+            _mask = _mask.to(device)
+            # Quick forward — use raw features without full preprocessing for speed
+            raw_dsdf = _x[:, :, 2:10]
+            dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+            dist_feat = torch.log1p(dist_surf * 10.0)
+            _x = (_x - stats["x_mean"]) / stats["x_std"]
+            curv = _x[:, :, 2:6].norm(dim=-1, keepdim=True) * _is_surf.to(device).float().unsqueeze(-1)
+            _x = torch.cat([_x, curv, dist_feat], dim=-1)
+            raw_xy = _x[:, :, :2]
+            xy_min = raw_xy.amin(dim=1, keepdim=True)
+            xy_max = raw_xy.amax(dim=1, keepdim=True)
+            xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+            freqs = torch.cat([_base_model.fourier_freqs_fixed.to(device), _base_model.fourier_freqs_learned.abs()])
+            xy_scaled = xy_norm.unsqueeze(-1) * freqs
+            fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+            _x = torch.cat([_x, fourier_pe], dim=-1)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                _out = model({"x": _x})
+                _pred = _out["preds"].float()
+            # Per-sample mean absolute error
+            _err = (_pred - _y.to(device)).abs()
+            for b in range(_x.shape[0]):
+                _valid = _mask[b]
+                _sample_losses.append(_err[b, _valid].mean().item())
+    curriculum_sample_losses = torch.tensor(_sample_losses)
+    # Rank: argsort gives indices from easiest to hardest
+    curriculum_rank = curriculum_sample_losses.argsort()
+    print(f"Curriculum scoring done: {len(_sample_losses)} samples, "
+          f"loss range [{curriculum_sample_losses.min():.4f}, {curriculum_sample_losses.max():.4f}]")
+
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
     if elapsed_min >= MAX_TIMEOUT:
@@ -1362,6 +1415,31 @@ for epoch in range(MAX_EPOCHS):
         break
 
     t0 = time.time()
+
+    # Error-based curriculum: update sampler weights if phase changed
+    if cfg.error_curriculum and curriculum_sample_losses is not None and not cfg.debug:
+        # Determine current fraction based on epoch
+        frac = 1.0
+        for phase_epoch, phase_frac in curriculum_phases:
+            if epoch >= phase_epoch:
+                frac = phase_frac
+        if frac != curriculum_current_frac:
+            curriculum_current_frac = frac
+            n_total = len(curriculum_sample_losses)
+            n_keep = max(1, int(n_total * frac))
+            # Easy samples (lowest loss) get weight 1.0, hard samples get weight 0.0
+            new_weights = torch.zeros(n_total, dtype=sample_weights.dtype)
+            keep_idx = curriculum_rank[:n_keep]
+            new_weights[keep_idx] = sample_weights[keep_idx]
+            # Rebuild sampler
+            sampler = WeightedRandomSampler(
+                weights=new_weights,
+                num_samples=n_total,
+                replacement=True,
+            )
+            train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
+                                      sampler=sampler, **loader_kwargs)
+            print(f"  Curriculum: epoch {epoch}, using {frac*100:.0f}% easiest samples ({n_keep}/{n_total})")
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
