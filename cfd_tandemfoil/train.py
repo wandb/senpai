@@ -906,6 +906,7 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    mixup_alpha: float = 0.2        # Beta distribution parameter for mixup: Beta(alpha, alpha)
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1399,7 +1400,7 @@ for epoch in range(MAX_EPOCHS):
                     x[_b, :, _drop] = 0.0
             if cfg.aug == "mixup":
                 _B_aug = x.size(0)
-                _beta_dist = torch.distributions.Beta(torch.tensor(0.2), torch.tensor(0.2))
+                _beta_dist = torch.distributions.Beta(torch.tensor(cfg.mixup_alpha), torch.tensor(cfg.mixup_alpha))
                 _lam = _beta_dist.sample((_B_aug,)).to(x.device).view(_B_aug, 1, 1)
                 _mix_idx = torch.randperm(_B_aug, device=x.device)
                 x = _lam * x + (1 - _lam) * x[_mix_idx]
