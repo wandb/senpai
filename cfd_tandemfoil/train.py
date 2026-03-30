@@ -942,6 +942,10 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 5: Volume refinement head (parallel to surface refine)
+    volume_refine: bool = False               # enable volume refinement head
+    volume_refine_hidden: int = 128           # hidden dimension of volume refinement MLP
+    volume_refine_layers: int = 2             # number of hidden layers in volume refinement MLP
 
 
 cfg = sp.parse(Config)
@@ -1127,9 +1131,25 @@ if cfg.surface_refine:
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
           f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
 
+# Volume refinement head (separate module, parallel to surface refine)
+vol_refine_head = None
+if cfg.volume_refine:
+    vol_refine_head = SurfaceRefinementHead(
+        n_hidden=cfg.n_hidden,
+        out_dim=3,
+        hidden_dim=cfg.volume_refine_hidden,
+        n_layers=cfg.volume_refine_layers,
+        p_only=False,
+    ).to(device)
+    vol_refine_head = torch.compile(vol_refine_head, mode=cfg.compile_mode)
+    _vol_refine_n_params = sum(p.numel() for p in vol_refine_head.parameters())
+    print(f"Volume refinement head: {_vol_refine_n_params:,} params "
+          f"(hidden={cfg.volume_refine_hidden}, layers={cfg.volume_refine_layers})")
+
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
+ema_vol_refine_head = None  # EMA copy of volume refinement head
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -1277,6 +1297,10 @@ if refine_head is not None:
     _refine_params = list(refine_head.parameters())
     base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
+if vol_refine_head is not None:
+    _vol_refine_params = list(vol_refine_head.parameters())
+    base_opt.add_param_group({'params': _vol_refine_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _vol_refine_params):,} volume refinement head params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
@@ -1564,6 +1588,18 @@ for epoch in range(MAX_EPOCHS):
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
 
+        # Volume refinement head: additive correction on volume nodes
+        if vol_refine_head is not None and model.training:
+            vol_mask_refine = mask & ~is_surface
+            vol_idx = vol_mask_refine.nonzero(as_tuple=False)  # [V, 2] (batch, node)
+            if vol_idx.numel() > 0:
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    vol_hidden = hidden[vol_idx[:, 0], vol_idx[:, 1]]  # [V, n_hidden]
+                    vol_pred = pred[vol_idx[:, 0], vol_idx[:, 1]]      # [V, 3]
+                    vol_correction = vol_refine_head(vol_hidden, vol_pred).float()  # [V, 3]
+                pred = pred.clone()
+                pred[vol_idx[:, 0], vol_idx[:, 1]] = pred[vol_idx[:, 0], vol_idx[:, 1]] + vol_correction
+
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         if cfg.tandem_ramp:
@@ -1791,6 +1827,15 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for volume refinement head
+            if vol_refine_head is not None:
+                _vol_refine_base = vol_refine_head._orig_mod if hasattr(vol_refine_head, '_orig_mod') else vol_refine_head
+                if ema_vol_refine_head is None:
+                    ema_vol_refine_head = deepcopy(_vol_refine_base)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_vol_refine_head.parameters(), _vol_refine_base.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -1888,7 +1933,7 @@ for epoch in range(MAX_EPOCHS):
         eval_model = model
     eval_model.eval()
     model.eval()
-    # Select the right refinement head for validation (EMA if available)
+    # Select the right refinement heads for validation (EMA if available)
     eval_refine_head = refine_head  # default: use training head
     if refine_head is not None:
         if ema_refine_head is not None and ema_model is not None and eval_model is ema_model:
@@ -1896,6 +1941,13 @@ for epoch in range(MAX_EPOCHS):
             eval_refine_head.eval()
         elif refine_head is not None:
             refine_head.eval()
+    eval_vol_refine_head = vol_refine_head
+    if vol_refine_head is not None:
+        if ema_vol_refine_head is not None and ema_model is not None and eval_model is ema_model:
+            eval_vol_refine_head = ema_vol_refine_head
+            eval_vol_refine_head.eval()
+        elif vol_refine_head is not None:
+            vol_refine_head.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -2014,6 +2066,23 @@ for epoch in range(MAX_EPOCHS):
                                 pred_loss = pred_loss.clone()
                                 pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
+                    if cfg.multiply_std:
+                        pred = pred_loss / sample_stds
+                    else:
+                        pred = pred_loss * sample_stds
+
+                # Apply volume refinement head during validation
+                if eval_vol_refine_head is not None:
+                    vol_mask_refine = mask & ~is_surface
+                    vol_idx = vol_mask_refine.nonzero(as_tuple=False)
+                    if vol_idx.numel() > 0:
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            vol_hidden = _eval_hidden[vol_idx[:, 0], vol_idx[:, 1]]
+                            vol_pred = pred_loss[vol_idx[:, 0], vol_idx[:, 1]]
+                            vol_correction = eval_vol_refine_head(vol_hidden, vol_pred).float()
+                        pred_loss = pred_loss.clone()
+                        pred_loss[vol_idx[:, 0], vol_idx[:, 1]] = pred_loss[vol_idx[:, 0], vol_idx[:, 1]] + vol_correction
+                    # Back-compute refined pred
                     if cfg.multiply_std:
                         pred = pred_loss / sample_stds
                     else:
@@ -2177,6 +2246,11 @@ for epoch in range(MAX_EPOCHS):
                 refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
             )
             torch.save(_refine_save.state_dict(), model_dir / "refine_head.pt")
+        if vol_refine_head is not None:
+            _vol_refine_save = ema_vol_refine_head if ema_vol_refine_head is not None else (
+                vol_refine_head._orig_mod if hasattr(vol_refine_head, '_orig_mod') else vol_refine_head
+            )
+            torch.save(_vol_refine_save.state_dict(), model_dir / "vol_refine_head.pt")
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
