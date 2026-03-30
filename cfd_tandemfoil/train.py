@@ -457,13 +457,13 @@ class SurfaceRefinementHead(nn.Module):
     """
 
     def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 128,
-                 n_layers: int = 2, p_only: bool = False):
+                 n_layers: int = 2, p_only: bool = False, extra_dim: int = 0):
         super().__init__()
         self.p_only = p_only
         actual_out = 1 if p_only else out_dim  # 1 for pressure-only, 3 for all fields
         layers: list[nn.Module] = []
-        # Input: hidden features (n_hidden) + base predictions (out_dim)
-        in_dim = n_hidden + out_dim
+        # Input: hidden features (n_hidden) + base predictions (out_dim) + optional extra features
+        in_dim = n_hidden + out_dim + extra_dim
         for i in range(n_layers):
             layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
             layers.append(nn.LayerNorm(hidden_dim))
@@ -474,15 +474,20 @@ class SurfaceRefinementHead(nn.Module):
         nn.init.zeros_(layers[-1].bias)
         self.mlp = nn.Sequential(*layers)
 
-    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor,
+                extra: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             hidden: [M, n_hidden] — hidden features for surface nodes only
             base_pred: [M, out_dim] — base predictions for surface nodes only
+            extra: [M, extra_dim] — optional extra features (e.g. surface normals)
         Returns:
             correction: [M, out_dim] — additive correction (zero-padded for p_only)
         """
-        inp = torch.cat([hidden, base_pred], dim=-1)
+        parts = [hidden, base_pred]
+        if extra is not None:
+            parts.append(extra)
+        inp = torch.cat(parts, dim=-1)
         correction = self.mlp(inp)
         if self.p_only:
             # Pad with zeros for velocity channels: [M, 1] → [M, 3]
@@ -942,6 +947,10 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 5: Surface normal features
+    surface_normals: bool = False             # add surface normal (nx, ny) as input features
+    surface_normals_refine_only: bool = False # feed normals to refine head only, not backbone
+    surface_normals_curvature: bool = False   # also add curvature (2nd derivative) feature
 
 
 cfg = sp.parse(Config)
@@ -1065,7 +1074,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32 + (3 if (cfg.surface_normals and cfg.surface_normals_curvature) else (2 if cfg.surface_normals else 0)),  # +curv, +dist, [+foil2dist], +32 fourier PE, [+normals], [+curvature]
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1114,12 +1123,16 @@ if cfg.surface_refine:
             k_neighbors=8,
         ).to(device)
     else:
+        _refine_extra_dim = 0
+        if cfg.surface_normals_refine_only:
+            _refine_extra_dim = 3 if cfg.surface_normals_curvature else 2
         refine_head = SurfaceRefinementHead(
             n_hidden=cfg.n_hidden,
             out_dim=3,
             hidden_dim=cfg.surface_refine_hidden,
             n_layers=cfg.surface_refine_layers,
             p_only=cfg.surface_refine_p_only,
+            extra_dim=_refine_extra_dim,
         ).to(device)
     refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
     _refine_n_params = sum(p.numel() for p in refine_head.parameters())
@@ -1444,6 +1457,21 @@ for epoch in range(MAX_EPOCHS):
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+        # Surface normals from DSDF gradient (foil1: channels 0,1)
+        _surf_normal_feat = None
+        if cfg.surface_normals or cfg.surface_normals_refine_only:
+            dsdf_grad = raw_dsdf[:, :, 0:2]  # (dx, dy) of SDF for foil1
+            grad_norm = dsdf_grad.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            normals = dsdf_grad / grad_norm  # [B, N, 2] normalized
+            surf_f = is_surface.float().unsqueeze(-1)
+            normals = normals * surf_f  # zero for volume nodes
+            if cfg.surface_normals_curvature:
+                # Curvature: difference of DSDF gradients (2nd-order approx)
+                dsdf_grad2 = raw_dsdf[:, :, 2:4]  # next 2 DSDF channels as 2nd derivative proxy
+                curv_mag = dsdf_grad2.norm(dim=-1, keepdim=True) * surf_f
+                _surf_normal_feat = torch.cat([normals, curv_mag], dim=-1)  # [B, N, 3]
+            else:
+                _surf_normal_feat = normals  # [B, N, 2]
         _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
@@ -1453,6 +1481,9 @@ for epoch in range(MAX_EPOCHS):
             x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
         else:
             x = torch.cat([x, curv, dist_feat], dim=-1)
+        # Add surface normals as input features (not for refine-only mode)
+        if cfg.surface_normals and _surf_normal_feat is not None:
+            x = torch.cat([x, _surf_normal_feat], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -1560,7 +1591,10 @@ for epoch in range(MAX_EPOCHS):
                     if surf_idx.numel() > 0:
                         surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]  # [M, n_hidden]
                         surf_pred = pred[surf_idx[:, 0], surf_idx[:, 1]]      # [M, 3]
-                        correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
+                        _refine_extra = None
+                        if cfg.surface_normals_refine_only and _surf_normal_feat is not None:
+                            _refine_extra = _surf_normal_feat[surf_idx[:, 0], surf_idx[:, 1]]
+                        correction = refine_head(surf_hidden, surf_pred, extra=_refine_extra).float()  # [M, 3]
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
 
@@ -1919,6 +1953,19 @@ for epoch in range(MAX_EPOCHS):
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+                _surf_normal_feat = None
+                if cfg.surface_normals or cfg.surface_normals_refine_only:
+                    dsdf_grad = raw_dsdf[:, :, 0:2]
+                    grad_norm = dsdf_grad.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+                    normals = dsdf_grad / grad_norm
+                    surf_f = is_surface.float().unsqueeze(-1)
+                    normals = normals * surf_f
+                    if cfg.surface_normals_curvature:
+                        dsdf_grad2 = raw_dsdf[:, :, 2:4]
+                        curv_mag = dsdf_grad2.norm(dim=-1, keepdim=True) * surf_f
+                        _surf_normal_feat = torch.cat([normals, curv_mag], dim=-1)
+                    else:
+                        _surf_normal_feat = normals
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
@@ -1928,6 +1975,8 @@ for epoch in range(MAX_EPOCHS):
                     x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
                 else:
                     x = torch.cat([x, curv, dist_feat], dim=-1)
+                if cfg.surface_normals and _surf_normal_feat is not None:
+                    x = torch.cat([x, _surf_normal_feat], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2010,7 +2059,10 @@ for epoch in range(MAX_EPOCHS):
                             if surf_idx.numel() > 0:
                                 surf_hidden = _eval_hidden[surf_idx[:, 0], surf_idx[:, 1]]
                                 surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                                correction = eval_refine_head(surf_hidden, surf_pred).float()
+                                _refine_extra = None
+                                if cfg.surface_normals_refine_only and _surf_normal_feat is not None:
+                                    _refine_extra = _surf_normal_feat[surf_idx[:, 0], surf_idx[:, 1]]
+                                correction = eval_refine_head(surf_hidden, surf_pred, extra=_refine_extra).float()
                                 pred_loss = pred_loss.clone()
                                 pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
@@ -2240,9 +2292,24 @@ if best_metrics:
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
+                    _surf_normal_feat = None
+                    if cfg.surface_normals or cfg.surface_normals_refine_only:
+                        dsdf_grad = raw_dsdf[:, :, 0:2]
+                        grad_norm = dsdf_grad.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+                        normals = dsdf_grad / grad_norm
+                        surf_f = is_surf_dev.float().unsqueeze(-1)
+                        normals = normals * surf_f
+                        if cfg.surface_normals_curvature:
+                            dsdf_grad2 = raw_dsdf[:, :, 2:4]
+                            curv_mag = dsdf_grad2.norm(dim=-1, keepdim=True) * surf_f
+                            _surf_normal_feat = torch.cat([normals, curv_mag], dim=-1)
+                        else:
+                            _surf_normal_feat = normals
                     x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                     curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                     x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                    if cfg.surface_normals and _surf_normal_feat is not None:
+                        x_n = torch.cat([x_n, _surf_normal_feat], dim=-1)
                     # Fourier PE (must match training loop)
                     raw_xy = x_n[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
@@ -2327,6 +2394,19 @@ if cfg.surface_refine and best_metrics:
                     raw_dsdf = x[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
+                    _surf_normal_feat = None
+                    if cfg.surface_normals or cfg.surface_normals_refine_only:
+                        dsdf_grad = raw_dsdf[:, :, 0:2]
+                        grad_norm = dsdf_grad.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+                        normals = dsdf_grad / grad_norm
+                        surf_f = is_surface.float().unsqueeze(-1)
+                        normals = normals * surf_f
+                        if cfg.surface_normals_curvature:
+                            dsdf_grad2 = raw_dsdf[:, :, 2:4]
+                            curv_mag = dsdf_grad2.norm(dim=-1, keepdim=True) * surf_f
+                            _surf_normal_feat = torch.cat([normals, curv_mag], dim=-1)
+                        else:
+                            _surf_normal_feat = normals
                     _raw_aoa = x[:, 0, 14:15]
                     x = (x - stats["x_mean"]) / stats["x_std"]
                     curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -2335,6 +2415,8 @@ if cfg.surface_refine and best_metrics:
                         x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
                     else:
                         x = torch.cat([x, curv, dist_feat], dim=-1)
+                    if cfg.surface_normals and _surf_normal_feat is not None:
+                        x = torch.cat([x, _surf_normal_feat], dim=-1)
                     raw_xy = x[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
                     xy_max = raw_xy.amax(dim=1, keepdim=True)
@@ -2393,7 +2475,10 @@ if cfg.surface_refine and best_metrics:
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                             surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]
                             surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                            correction = verify_refine(surf_hidden, surf_pred).float()
+                            _refine_extra = None
+                            if cfg.surface_normals_refine_only and _surf_normal_feat is not None:
+                                _refine_extra = _surf_normal_feat[surf_idx[:, 0], surf_idx[:, 1]]
+                            correction = verify_refine(surf_hidden, surf_pred, extra=_refine_extra).float()
                         pred_loss_refined = pred_loss.clone()
                         pred_loss_refined[surf_idx[:, 0], surf_idx[:, 1]] += correction
                         correction_full[surf_idx[:, 0], surf_idx[:, 1]] = correction
