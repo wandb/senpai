@@ -942,6 +942,10 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 5: Continuity equation loss — div(u)=0 physics constraint
+    continuity_beta: float = 0.0             # weight for continuity loss (0 = disabled)
+    continuity_start_epoch: int = 0          # epoch to start applying continuity loss
+    continuity_k_neighbors: int = 4          # K for KNN finite difference gradient estimation
 
 
 cfg = sp.parse(Config)
@@ -1445,6 +1449,7 @@ for epoch in range(MAX_EPOCHS):
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
+        _raw_xy = x[:, :, :2].clone()  # raw xy coordinates for continuity loss KNN
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1693,6 +1698,88 @@ for epoch in range(MAX_EPOCHS):
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
 
+        # Continuity loss: div(u) = ∂Ux/∂x + ∂Uy/∂y = 0 for incompressible flow
+        # Estimated via KNN least-squares finite differences on volume nodes
+        continuity_loss = torch.tensor(0.0, device=device)
+        if cfg.continuity_beta > 0 and epoch >= cfg.continuity_start_epoch:
+            # Recover predictions in Cp space (Ux/Umag, Uy/Umag, Cp)
+            pred_cont = pred * sample_stds  # undo per-sample std → z-scored
+            if cfg.residual_prediction and _freestream is not None:
+                pred_cont = pred_cont + _freestream
+            pred_cont_cp = pred_cont * phys_stats["y_std"] + phys_stats["y_mean"]  # → Cp space
+            if cfg.log_pressure:
+                pred_cont_cp = pred_cont_cp.clone()
+                pred_cont_cp[:, :, 2:3] = pred_cont_cp[:, :, 2:3].sign() * (pred_cont_cp[:, :, 2:3].abs().exp() - 1)
+
+            K = cfg.continuity_k_neighbors
+            max_query = 2000  # subsample volume nodes if more than this
+            div_loss_accum = 0.0
+            n_valid_div = 0
+            for b in range(B):
+                b_vol = vol_mask[b] & mask[b]
+                vol_idx = b_vol.nonzero(as_tuple=True)[0]
+                if vol_idx.numel() < K + 1:
+                    continue
+
+                # Subsample query nodes if too many
+                query_idx = vol_idx
+                if query_idx.numel() > max_query:
+                    perm = torch.randperm(query_idx.numel(), device=device)[:max_query]
+                    query_idx = query_idx[perm]
+
+                valid_idx = mask[b].nonzero(as_tuple=True)[0]
+                query_coords = _raw_xy[b, query_idx]   # [Q, 2]
+                all_coords = _raw_xy[b, valid_idx]      # [M, 2]
+
+                # KNN: find K nearest neighbors (no grad needed for indices)
+                with torch.no_grad():
+                    dists = torch.cdist(query_coords.unsqueeze(0), all_coords.unsqueeze(0)).squeeze(0)
+                    _, knn_local = dists.topk(K + 1, dim=1, largest=False)
+                    knn_local = knn_local[:, 1:]  # skip self → [Q, K]
+
+                # Map to original node indices
+                knn_orig = valid_idx[knn_local]  # [Q, K]
+                Q = query_idx.numel()
+
+                # Gather neighbor velocities (needs grad) and coordinates
+                pred_b = pred_cont_cp[b]  # [N, 3]
+                q_ux = pred_b[query_idx, 0]         # [Q]
+                q_uy = pred_b[query_idx, 1]         # [Q]
+                nb_ux = pred_b[knn_orig, 0]         # [Q, K]
+                nb_uy = pred_b[knn_orig, 1]         # [Q, K]
+                nb_coords = _raw_xy[b][knn_orig.reshape(-1)].reshape(Q, K, 2)
+
+                # Delta positions and velocities
+                dx = nb_coords - query_coords.unsqueeze(1)  # [Q, K, 2]
+                dux = nb_ux - q_ux.unsqueeze(1)              # [Q, K]
+                duy = nb_uy - q_uy.unsqueeze(1)              # [Q, K]
+
+                # Least-squares normal equations: A^T A grad = A^T b
+                dxc = dx[:, :, 0]  # [Q, K]
+                dyc = dx[:, :, 1]  # [Q, K]
+                M00 = (dxc ** 2).sum(dim=1)
+                M01 = (dxc * dyc).sum(dim=1)
+                M11 = (dyc ** 2).sum(dim=1)
+                det = (M00 * M11 - M01 ** 2).clamp(min=1e-10)
+
+                # ∂Ux/∂x
+                rhs0 = (dxc * dux).sum(dim=1)
+                rhs1 = (dyc * dux).sum(dim=1)
+                dux_dx = (M11 * rhs0 - M01 * rhs1) / det
+
+                # ∂Uy/∂y
+                rhs0 = (dxc * duy).sum(dim=1)
+                rhs1 = (dyc * duy).sum(dim=1)
+                duy_dy = (M00 * rhs1 - M01 * rhs0) / det
+
+                div_u = dux_dx + duy_dy
+                div_loss_accum = div_loss_accum + (div_u ** 2).mean()
+                n_valid_div += 1
+
+            if n_valid_div > 0:
+                continuity_loss = div_loss_accum / n_valid_div
+            loss = loss + cfg.continuity_beta * continuity_loss
+
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
@@ -1709,8 +1796,9 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            cont_shared = cfg.continuity_beta * continuity_loss * 0.5 if cfg.continuity_beta > 0 else 0.0
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + cont_shared
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + cont_shared
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -1792,7 +1880,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _train_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.continuity_beta > 0:
+            _train_log["train/continuity_loss"] = continuity_loss.item() if isinstance(continuity_loss, torch.Tensor) else continuity_loss
+        wandb.log(_train_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
