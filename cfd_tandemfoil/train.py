@@ -902,7 +902,7 @@ class Config:
     seed: int = -1                     # random seed (-1 = no seeding)
     n_layers: int = 2                  # number of TransolverBlocks (default 2)
     # Phase 3: data augmentation (training-only)
-    aug: str = "none"  # none|yflip|jitter|featdrop|mixup|scale|flip_jitter|aoa_perturb|cutmix
+    aug: str = "none"  # none|yflip|jitter|featdrop|mixup|scale|flip_jitter|aoa_perturb|aoa_yflip|cutmix
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
@@ -942,6 +942,8 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 5: Test-time augmentation
+    tta_yflip: bool = False                   # y-flip TTA at validation (average original + y-flipped predictions)
 
 
 cfg = sp.parse(Config)
@@ -1355,6 +1357,30 @@ prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
 
+
+def _prepare_val_features(x_raw, is_surface, model, stats, cfg, device):
+    """Prepare validation features from raw x tensor (feature engineering + Fourier PE)."""
+    raw_dsdf = x_raw[:, :, 2:10]
+    dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+    dist_feat = torch.log1p(dist_surf * 10.0)
+    x = (x_raw - stats["x_mean"]) / stats["x_std"]
+    curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+    if cfg.foil2_dist:
+        foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+        x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
+    else:
+        x = torch.cat([x, curv, dist_feat], dim=-1)
+    raw_xy = x[:, :, :2]
+    xy_min = raw_xy.amin(dim=1, keepdim=True)
+    xy_max = raw_xy.amax(dim=1, keepdim=True)
+    xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+    freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+    xy_scaled = xy_norm.unsqueeze(-1) * freqs
+    fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+    x = torch.cat([x, fourier_pe], dim=-1)
+    return x
+
+
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
     if elapsed_min >= MAX_TIMEOUT:
@@ -1409,7 +1435,15 @@ for epoch in range(MAX_EPOCHS):
                 _lo = 1.0 - cfg.aug_scale_range
                 _scale = torch.rand(x.size(0), 1, 1, device=x.device) * (2 * cfg.aug_scale_range) + _lo
                 x[:, :, :2] = x[:, :, :2] * _scale
-            if cfg.aug == "aoa_perturb":
+            if cfg.aug in ("aoa_perturb", "aoa_yflip"):
+                # Y-flip with 50% probability (aoa_yflip only)
+                if cfg.aug == "aoa_yflip":
+                    _flip = torch.rand(x.size(0), 1, 1, device=x.device) < 0.5
+                    x[:, :, 1:2] = torch.where(_flip, -x[:, :, 1:2], x[:, :, 1:2])
+                    y[:, :, 1:2] = torch.where(_flip, -y[:, :, 1:2], y[:, :, 1:2])
+                    for _idx in [3, 5, 7, 9]:
+                        x[:, :, _idx:_idx+1] = torch.where(_flip, -x[:, :, _idx:_idx+1], x[:, :, _idx:_idx+1])
+                # AoA perturbation ±1°
                 _angle_deg = torch.rand(x.size(0), device=x.device) * 2.0 - 1.0
                 _angle_rad = _angle_deg * (torch.pi / 180.0)
                 _cos_a = torch.cos(_angle_rad).view(-1, 1, 1)
@@ -1916,28 +1950,9 @@ for epoch in range(MAX_EPOCHS):
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
 
-                raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
-                dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
-                dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
-                _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
-                x = (x - stats["x_mean"]) / stats["x_std"]
-                # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
-                curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
-                if cfg.foil2_dist:
-                    foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
-                    x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
-                else:
-                    x = torch.cat([x, curv, dist_feat], dim=-1)
-                # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
-                raw_xy = x[:, :, :2]
-                # Normalize xy to [0,1] per-sample for consistent Fourier encoding
-                xy_min = raw_xy.amin(dim=1, keepdim=True)
-                xy_max = raw_xy.amax(dim=1, keepdim=True)
-                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-                xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
-                x = torch.cat([x, fourier_pe], dim=-1)
+                x_raw = x  # keep raw copy for TTA
+                _raw_aoa = x_raw[:, 0, 14:15]  # AoA0_rad [B, 1]
+                x = _prepare_val_features(x_raw, is_surface, model, stats, cfg, device)
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
@@ -1990,6 +2005,20 @@ for epoch in range(MAX_EPOCHS):
                     _eval_out = eval_model({"x": x})
                     pred = _eval_out["preds"]
                     _eval_hidden = _eval_out["hidden"]
+
+                # TTA: y-flip augmentation at validation
+                if cfg.tta_yflip:
+                    x_flip = x_raw.clone()
+                    x_flip[:, :, 1] = -x_flip[:, :, 1]  # negate pos_y
+                    for _idx in [3, 5, 7, 9]:             # negate DSDF y-gradients
+                        x_flip[:, :, _idx] = -x_flip[:, :, _idx]
+                    x_flip_feat = _prepare_val_features(x_flip, is_surface, model, stats, cfg, device)
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _flip_out = eval_model({"x": x_flip_feat})
+                        pred_flip = _flip_out["preds"]
+                    pred_flip = pred_flip.clone()
+                    pred_flip[:, :, 1] = -pred_flip[:, :, 1]  # un-flip Uy
+                    pred = 0.5 * (pred + pred_flip)
                 pred = pred.float()
                 _eval_hidden = _eval_hidden.float()
                 if cfg.multiply_std:
