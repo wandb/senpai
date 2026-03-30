@@ -942,6 +942,8 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 5: Tandem transfer loss boost
+    tandem_surf_boost: float = 1.0            # extra multiplier on surface loss for tandem samples (1.0 = no boost)
 
 
 cfg = sp.parse(Config)
@@ -1634,6 +1636,10 @@ for epoch in range(MAX_EPOCHS):
                                        torch.ones(B, device=device))
         else:
             tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
+        if cfg.tandem_surf_boost > 1.0:
+            tandem_boost = tandem_boost * torch.where(is_tandem_batch,
+                                                       torch.tensor(cfg.tandem_surf_boost, device=device),
+                                                       torch.ones(B, device=device))
         surf_loss = (surf_per_sample * tandem_boost).mean()
         if cfg.uncertainty_loss:
             bm = _base_model
