@@ -942,6 +942,11 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 5: Ensemble distillation
+    distill: bool = False                      # enable ensemble distillation
+    distill_alpha: float = 0.3                 # weight for distillation loss: (1-alpha)*GT + alpha*distill
+    distill_surface_only: bool = False         # only distill on surface nodes
+    distill_model_dirs: str = ""               # comma-separated model dirs (relative to cwd)
 
 
 cfg = sp.parse(Config)
@@ -1126,6 +1131,49 @@ if cfg.surface_refine:
     print(f"Surface refinement head: {_refine_n_params:,} params "
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
           f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
+
+# --- Ensemble distillation: load teacher models ---
+teacher_models = []
+teacher_refine_heads = []
+if cfg.distill:
+    assert cfg.distill_model_dirs, "Must provide --distill_model_dirs for distillation"
+    _teacher_dirs = [Path(d.strip()) for d in cfg.distill_model_dirs.split(",") if d.strip()]
+    print(f"Loading {len(_teacher_dirs)} teacher models for distillation (alpha={cfg.distill_alpha})...")
+    for ti, tdir in enumerate(_teacher_dirs):
+        assert (tdir / "checkpoint.pt").exists(), f"No checkpoint at {tdir}"
+        assert (tdir / "config.yaml").exists(), f"No config at {tdir}"
+        with open(tdir / "config.yaml") as f:
+            tc = yaml.safe_load(f)
+        tm = Transolver(**tc).to(device)
+        tsd = {k.removeprefix("_orig_mod."): v for k, v in
+               torch.load(tdir / "checkpoint.pt", map_location=device, weights_only=True).items()}
+        tm.load_state_dict(tsd)
+        tm.eval()
+        for p in tm.parameters():
+            p.requires_grad_(False)
+        tm = torch.compile(tm, mode="default")
+        teacher_models.append(tm)
+        # Load refinement head if exists
+        rh_path = tdir / "refine_head.pt"
+        if rh_path.exists():
+            trh = SurfaceRefinementHead(
+                n_hidden=tc['n_hidden'], out_dim=3,
+                hidden_dim=192, n_layers=3,
+            ).to(device)
+            trh_sd = {k.removeprefix("_orig_mod."): v for k, v in
+                      torch.load(rh_path, map_location=device, weights_only=True).items()}
+            trh.load_state_dict(trh_sd)
+            trh.eval()
+            for p in trh.parameters():
+                p.requires_grad_(False)
+            teacher_refine_heads.append(trh)
+        else:
+            teacher_refine_heads.append(None)
+        print(f"  [{ti}] {tdir.name} loaded")
+    print(f"  Distillation: alpha={cfg.distill_alpha}, surface_only={cfg.distill_surface_only}")
+    _distill_wandb_config = {"distill_n_teachers": len(teacher_models),
+                             "distill_alpha": cfg.distill_alpha,
+                             "distill_surface_only": cfg.distill_surface_only}
 
 from copy import deepcopy
 ema_model = None
@@ -1327,6 +1375,10 @@ run = wandb.init(
     },
     mode=os.environ.get("WANDB_MODE", "online"),
 )
+
+# Deferred wandb config updates (distillation info loaded before wandb.init)
+if cfg.distill:
+    wandb.config.update(_distill_wandb_config, allow_val_change=True)
 
 # All metrics use global_step (gradient updates) as the x-axis.
 wandb.define_metric("global_step")
@@ -1564,6 +1616,48 @@ for epoch in range(MAX_EPOCHS):
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
 
+        # --- Ensemble distillation: compute teacher predictions ---
+        distill_loss = torch.tensor(0.0, device=device)
+        if cfg.distill and model.training and len(teacher_models) > 0:
+            with torch.no_grad():
+                teacher_preds = []
+                x_no_fpe = x[:, :, :-32]  # strip student's fourier PE (last 32 dims)
+                for ti, (tm, trh) in enumerate(zip(teacher_models, teacher_refine_heads)):
+                    # Recompute fourier PE with teacher's learned frequencies
+                    t_freqs = torch.cat([tm.fourier_freqs_fixed.to(device), tm.fourier_freqs_learned.abs()])
+                    t_xy_scaled = xy_norm.unsqueeze(-1) * t_freqs
+                    t_fpe = torch.cat([t_xy_scaled.sin().flatten(-2), t_xy_scaled.cos().flatten(-2)], dim=-1)
+                    x_t = torch.cat([x_no_fpe, t_fpe], dim=-1)
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        t_out = tm({"x": x_t})
+                    t_pred = t_out["preds"].float()
+                    t_hidden = t_out["hidden"].float()
+                    # Apply per-sample std normalization (same as student)
+                    if not cfg.no_perstd and not cfg.raw_targets:
+                        if cfg.multiply_std:
+                            t_pred = t_pred * sample_stds
+                        else:
+                            t_pred = t_pred / sample_stds
+                    # Apply teacher's refinement head on surface nodes
+                    if trh is not None:
+                        t_surf_idx = is_surface.nonzero(as_tuple=False)
+                        if t_surf_idx.numel() > 0:
+                            sh = t_hidden[t_surf_idx[:, 0], t_surf_idx[:, 1]]
+                            sp = t_pred[t_surf_idx[:, 0], t_surf_idx[:, 1]]
+                            corr = trh(sh, sp).float()
+                            t_pred = t_pred.clone()
+                            t_pred[t_surf_idx[:, 0], t_surf_idx[:, 1]] += corr
+                    teacher_preds.append(t_pred)
+                # Average teacher predictions in loss space
+                ensemble_target = torch.stack(teacher_preds, dim=0).mean(dim=0)
+            # MSE distillation loss (student pred vs teacher ensemble)
+            _d_err = (pred - ensemble_target) ** 2
+            if cfg.distill_surface_only:
+                _d_surf = mask & is_surface
+                distill_loss = (_d_err * _d_surf.unsqueeze(-1)).sum() / _d_surf.sum().clamp(min=1)
+            else:
+                distill_loss = (_d_err * mask.unsqueeze(-1)).sum() / mask.sum().clamp(min=1)
+
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         if cfg.tandem_ramp:
@@ -1693,6 +1787,11 @@ for epoch in range(MAX_EPOCHS):
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
 
+        # Ensemble distillation loss: (1-alpha)*GT + alpha*distill
+        if cfg.distill and distill_loss.item() > 0:
+            gt_loss = loss.clone()
+            loss = (1 - cfg.distill_alpha) * gt_loss + cfg.distill_alpha * distill_loss
+
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
@@ -1792,7 +1891,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.distill:
+            _log_dict["train/distill_loss"] = distill_loss.item()
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
