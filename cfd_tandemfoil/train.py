@@ -942,6 +942,10 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 5: Offline ensemble distillation
+    distill_alpha: float = 0.0                # distillation loss weight (0 = disabled)
+    distill_phase_frac: float = 1.0           # fraction of training with distillation active
+    distill_labels_path: str = "soft_labels.pt"  # path to pre-computed soft labels
 
 
 cfg = sp.parse(Config)
@@ -999,12 +1003,45 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
 
-loader_kwargs = dict(collate_fn=pad_collate, num_workers=cfg.num_workers, pin_memory=True,
+# --- Distillation: load soft labels and wrap dataset ---
+soft_labels = None
+if cfg.distill_alpha > 0:
+    _sl_path = Path(cfg.distill_labels_path)
+    if not _sl_path.exists():
+        raise FileNotFoundError(f"Soft labels not found at {_sl_path}. Pre-compute them first.")
+    soft_labels = torch.load(_sl_path, map_location="cpu", weights_only=True)
+    print(f"Loaded soft labels: {len(soft_labels)} samples from {_sl_path}")
+
+
+class IndexedDataset(torch.utils.data.Dataset):
+    """Wraps a dataset to also return sample indices."""
+    def __init__(self, dataset):
+        self.dataset = dataset
+    def __len__(self):
+        return len(self.dataset)
+    def __getitem__(self, idx):
+        return (*self.dataset[idx], idx)
+
+
+def pad_collate_with_index(batch):
+    """Collate function that handles the extra index field."""
+    indices = torch.tensor([b[-1] for b in batch], dtype=torch.long)
+    core_batch = [b[:-1] for b in batch]
+    result = pad_collate(core_batch)
+    return (*result, indices)
+
+
+_use_indexed = cfg.distill_alpha > 0
+_train_ds = IndexedDataset(train_ds) if _use_indexed else train_ds
+_train_collate = pad_collate_with_index if _use_indexed else pad_collate
+loader_kwargs = dict(collate_fn=_train_collate, num_workers=cfg.num_workers, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
+val_loader_kwargs = dict(collate_fn=pad_collate, num_workers=cfg.num_workers, pin_memory=True,
+                         persistent_workers=True, prefetch_factor=2)
 
 if cfg.debug:
     # Avoid sampler/length mismatch when train_ds is truncated
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
+    train_loader = DataLoader(_train_ds, batch_size=cfg.batch_size,
                               shuffle=True, **loader_kwargs)
 else:
     sampler = WeightedRandomSampler(
@@ -1012,11 +1049,11 @@ else:
         num_samples=len(train_ds),
         replacement=True,
     )
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
+    train_loader = DataLoader(_train_ds, batch_size=cfg.batch_size,
                               sampler=sampler, **loader_kwargs)
 
 val_loaders = {
-    name: DataLoader(subset, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
+    name: DataLoader(subset, batch_size=cfg.batch_size, shuffle=False, **val_loader_kwargs)
     for name, subset in val_splits.items()
 }
 
@@ -1026,7 +1063,7 @@ print("Computing physics normalization stats...")
 _phys_sum = torch.zeros(3, device=device)
 _phys_sq_sum = torch.zeros(3, device=device)
 _phys_n = 0.0
-_stats_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
+_stats_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, **val_loader_kwargs)
 with torch.no_grad():
     for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc="Phys stats", leave=False):
         _y, _mask = _y.to(device), _mask.to(device)
@@ -1377,7 +1414,12 @@ for epoch in range(MAX_EPOCHS):
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     if cfg.grad_accum_steps > 1:
         optimizer.zero_grad()
-    for batch_idx, (x, y, is_surface, mask) in enumerate(pbar):
+    for batch_idx, batch_data in enumerate(pbar):
+        if _use_indexed:
+            x, y, is_surface, mask, batch_indices = batch_data
+        else:
+            x, y, is_surface, mask = batch_data
+            batch_indices = None
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -1640,12 +1682,44 @@ for epoch in range(MAX_EPOCHS):
             surf_ux_loss = (abs_err[:, :, 0:1] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
             surf_uy_loss = (abs_err[:, :, 1:2] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
             surf_p_loss  = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
-            loss = (vol_loss    * torch.exp(-2 * bm.log_sigma_vol)    / 2 + bm.log_sigma_vol +
+            gt_loss = (vol_loss    * torch.exp(-2 * bm.log_sigma_vol)    / 2 + bm.log_sigma_vol +
                     surf_ux_loss * torch.exp(-2 * bm.log_sigma_surf_ux) / 2 + bm.log_sigma_surf_ux +
                     surf_uy_loss * torch.exp(-2 * bm.log_sigma_surf_uy) / 2 + bm.log_sigma_surf_uy +
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
         else:
-            loss = vol_loss + surf_weight * surf_loss
+            gt_loss = vol_loss + surf_weight * surf_loss
+
+        # Distillation loss: L1 between pred and ensemble soft targets
+        distill_loss = torch.tensor(0.0, device=device)
+        _distill_active = (cfg.distill_alpha > 0 and soft_labels is not None
+                           and batch_indices is not None
+                           and epoch < cfg.distill_phase_frac * MAX_EPOCHS)
+        if _distill_active:
+            # Look up soft labels for this batch, pad to batch max nodes
+            _soft_batch = []
+            for _bi in batch_indices:
+                _sl = soft_labels[_bi.item()].to(device)  # [N_i, 3]
+                _soft_batch.append(_sl)
+            # Pad to match batch tensor size (same padding as pad_collate)
+            _max_n = pred.shape[1]
+            _soft_padded = torch.zeros(len(_soft_batch), _max_n, 3, device=device)
+            for _si, _sl in enumerate(_soft_batch):
+                _n = min(_sl.shape[0], _max_n)
+                _soft_padded[_si, :_n] = _sl[:_n]
+            # Apply same per-sample-std normalization as pred
+            if not cfg.no_perstd and not cfg.raw_targets:
+                if cfg.multiply_std:
+                    _soft_scaled = _soft_padded * sample_stds
+                else:
+                    _soft_scaled = _soft_padded / sample_stds
+            else:
+                _soft_scaled = _soft_padded
+            # L1 distillation loss over all valid nodes
+            _distill_err = (pred - _soft_scaled).abs()
+            distill_loss = (_distill_err * mask.float().unsqueeze(-1)).sum() / mask.float().sum().clamp(min=1)
+            loss = (1 - cfg.distill_alpha) * gt_loss + cfg.distill_alpha * distill_loss
+        else:
+            loss = gt_loss
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
@@ -1792,7 +1866,11 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if _distill_active:
+            _log_dict["train/distill_loss"] = distill_loss.item()
+            _log_dict["train/gt_loss"] = gt_loss.item()
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
