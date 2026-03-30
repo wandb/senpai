@@ -942,6 +942,8 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 5: Test-Time Augmentation
+    tta_yflip: bool = False                    # average predictions from original and y-flipped inputs at val time
 
 
 cfg = sp.parse(Config)
@@ -1126,6 +1128,9 @@ if cfg.surface_refine:
     print(f"Surface refinement head: {_refine_n_params:,} params "
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
           f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
+
+if cfg.tta_yflip:
+    print("Test-Time Augmentation: y-flip averaging enabled (val only)")
 
 from copy import deepcopy
 ema_model = None
@@ -1916,6 +1921,10 @@ for epoch in range(MAX_EPOCHS):
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
 
+                # Save raw input for TTA y-flip second pass
+                if cfg.tta_yflip:
+                    x_raw_tta = x.clone()
+
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
@@ -1992,6 +2001,44 @@ for epoch in range(MAX_EPOCHS):
                     _eval_hidden = _eval_out["hidden"]
                 pred = pred.float()
                 _eval_hidden = _eval_hidden.float()
+
+                # TTA: y-flip averaging (average in normalized pred space before denorm)
+                if cfg.tta_yflip:
+                    pred_orig_saved = pred.clone()  # save for diagnostics
+                    # Create y-flipped copy from raw input
+                    x_flip = x_raw_tta.clone()
+                    x_flip[:, :, 1] = -x_flip[:, :, 1]      # negate y-coordinate
+                    for _fi in [3, 5, 7, 9]:                  # negate DSDF y-gradients
+                        x_flip[:, :, _fi] = -x_flip[:, :, _fi]
+                    # Redo full preprocessing on flipped input
+                    _raw_dsdf_f = x_flip[:, :, 2:10]
+                    _dist_surf_f = _raw_dsdf_f.abs().min(dim=-1, keepdim=True).values
+                    _dist_feat_f = torch.log1p(_dist_surf_f * 10.0)
+                    x_flip = (x_flip - stats["x_mean"]) / stats["x_std"]
+                    _curv_f = x_flip[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                    if cfg.foil2_dist:
+                        _foil2_f = torch.log1p(_raw_dsdf_f[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                        x_flip = torch.cat([x_flip, _curv_f, _dist_feat_f, _foil2_f], dim=-1)
+                    else:
+                        x_flip = torch.cat([x_flip, _curv_f, _dist_feat_f], dim=-1)
+                    _xy_f = x_flip[:, :, :2]
+                    _xy_min_f = _xy_f.amin(dim=1, keepdim=True)
+                    _xy_max_f = _xy_f.amax(dim=1, keepdim=True)
+                    _xy_norm_f = (_xy_f - _xy_min_f) / (_xy_max_f - _xy_min_f + 1e-8)
+                    _freqs_f = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                    _xy_sc_f = _xy_norm_f.unsqueeze(-1) * _freqs_f
+                    _fpe_f = torch.cat([_xy_sc_f.sin().flatten(-2), _xy_sc_f.cos().flatten(-2)], dim=-1)
+                    x_flip = torch.cat([x_flip, _fpe_f], dim=-1)
+                    # Second forward pass on flipped input
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _eval_out_f = eval_model({"x": x_flip})
+                        pred_flip = _eval_out_f["preds"]
+                    pred_flip = pred_flip.float()
+                    # Un-flip Uy channel (index 1)
+                    pred_flip[:, :, 1] = -pred_flip[:, :, 1]
+                    # Average predictions in normalized space
+                    pred = 0.5 * (pred + pred_flip)
+
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
                 else:
