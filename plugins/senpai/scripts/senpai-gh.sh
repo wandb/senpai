@@ -34,6 +34,19 @@ print_gh_repo() {
 }
 
 # ---------------------------------------------------------------------------
+# Retry helper: up to 3 attempts with 5s backoff, then fail loudly.
+# ---------------------------------------------------------------------------
+gh_retry() {
+    local attempt
+    for attempt in 1 2 3 4 5 6; do
+        "$@" && return 0
+        echo "gh_retry: attempt $attempt failed, retrying in 5s..." >&2
+        sleep 15
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # Label operations
 # ---------------------------------------------------------------------------
 
@@ -46,7 +59,7 @@ swap_gh_pr_label() {
     # DELETE may 404 if the label isn't present — that's fine.
     gh api "repos/${repo}/issues/${num}/labels/${remove}" \
         --method DELETE --silent 2>/dev/null || true
-    gh api "repos/${repo}/issues/${num}/labels" \
+    gh_retry gh api "repos/${repo}/issues/${num}/labels" \
         -f "labels[]=${add}" --method POST --silent
 }
 
@@ -58,8 +71,8 @@ swap_gh_pr_label() {
 #   send_pr_back_to_student_with_comment <number> <comment_body>
 send_pr_back_to_student_with_comment() {
     local num="$1" body="$2"
-    gh pr comment "$num" --body "$body"
-    gh pr ready "$num" --undo
+    gh_retry gh pr comment "$num" --body "$body"
+    gh_retry gh pr ready "$num" --undo
     swap_gh_pr_label "$num" "status:review" "status:wip"
 }
 
@@ -67,8 +80,8 @@ send_pr_back_to_student_with_comment() {
 #   close_pr_with_comment <number> <reason>
 close_pr_with_comment() {
     local num="$1" reason="$2"
-    gh pr comment "$num" --body "ADVISOR: Closing PR #${num} because ${reason}."
-    gh pr close "$num" --delete-branch
+    gh_retry gh pr comment "$num" --body "ADVISOR: Closing PR #${num} because ${reason}."
+    gh_retry gh pr close "$num" --delete-branch
 }
 
 # ---------------------------------------------------------------------------
@@ -79,8 +92,8 @@ close_pr_with_comment() {
 #   mark_ready_for_review <number>
 mark_ready_for_review() {
     local num="$1"
-    gh pr ready "$num"
-    swap_gh_pr_label "$num" "status:wip" "status:review"
+    gh_retry gh pr ready "$num"
+    swap_gh_pr_label "$num" "status:wip" "status:review"  # swap_gh_pr_label uses gh_retry internally
 }
 
 # ---------------------------------------------------------------------------
@@ -103,10 +116,10 @@ json_numbers() { python3 -c "import sys,json; print(','.join(f'#{i[\"number\"]}'
 check_gh_issues() {
     local role="$1" since="${2:-}"
     local role_issues team_issues
-    role_issues=$(gh issue list --label "human" --label "$role" --state open \
-        --json number,title,updatedAt,comments 2>/dev/null || echo "[]")
-    team_issues=$(gh issue list --label "human" --label "team" --state open \
-        --json number,title,updatedAt,comments 2>/dev/null || echo "[]")
+    role_issues=$(gh_retry gh issue list --label "human" --label "$role" --state open \
+        --json number,title,updatedAt,comments)
+    team_issues=$(gh_retry gh issue list --label "human" --label "team" --state open \
+        --json number,title,updatedAt,comments)
     printf '[%s,%s]' "$role_issues" "$team_issues" | python3 -c "
 import json, sys
 a, b = json.loads(sys.stdin.read())
@@ -129,7 +142,7 @@ print(json.dumps(merged))
 list_ready_for_review_prs() {
     local branch="$1" since="${2:-}"
     local prs
-    prs=$(gh pr list --label "$branch" --label "status:review" \
+    prs=$(gh_retry gh pr list --label "$branch" --label "status:review" \
         --json number,title,headRefName,labels,updatedAt)
     if [ -z "$since" ]; then
         printf '%s' "$prs"
@@ -147,8 +160,8 @@ print(json.dumps([p for p in prs if p.get('updatedAt', '') > sys.argv[1]]))
 #   list_all_prs <branch>
 list_all_prs() {
     local branch="$1"
-    gh pr list --label "$branch" \
-        --json number,title,state,labels,headRefName,isDraft
+    gh_retry gh pr list --label "$branch" \
+        --json number,title,state,labels,headRefName,updatedAt,isDraft
 }
 
 # List WIP PRs assigned to a specific student.
@@ -156,8 +169,8 @@ list_all_prs() {
 #   student_poll_for_work <student_name>
 student_poll_for_work() {
     local name="$1"
-    gh pr list --label "student:${name}" --label "status:wip" \
-        --json number,title,headRefName,body
+    gh_retry gh pr list --label "student:${name}" --label "status:wip" \
+        --json number,title,headRefName,updatedAt,body
 }
 
 # Compute which students are idle (have no status:wip PR).
@@ -167,8 +180,8 @@ student_poll_for_work() {
 list_idle_students() {
     local students_csv="$1" branch="$2"
     local all_prs
-    all_prs=$(gh pr list --label "$branch" --label "status:wip" \
-        --json labels 2>/dev/null || echo "[]")
+    all_prs=$(gh_retry gh pr list --label "$branch" --label "status:wip" \
+        --json labels)
     printf '%s' "$all_prs" | python3 -c "
 import json, sys
 students = [s.strip() for s in sys.argv[1].split(',') if s.strip()]
