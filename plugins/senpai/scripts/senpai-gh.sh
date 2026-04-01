@@ -25,7 +25,7 @@
 _SENPAI_REPO=""
 
 # Print owner/repo (e.g. "wandb/senpai"), cached after first call.
-senpai_repo() {
+print_gh_repo() {
     if [ -z "$_SENPAI_REPO" ]; then
         _SENPAI_REPO=$(git remote get-url origin 2>/dev/null \
             | sed -E 's|.*github\.com[:/]||; s|\.git$||')
@@ -38,11 +38,11 @@ senpai_repo() {
 # ---------------------------------------------------------------------------
 
 # Atomically swap one label for another on a PR/issue.
-#   senpai_label_swap <number> <remove_label> <add_label>
-senpai_label_swap() {
+#   swap_gh_pr_label <number> <remove_label> <add_label>
+swap_gh_pr_label() {
     local num="$1" remove="$2" add="$3"
     local repo
-    repo=$(senpai_repo)
+    repo=$(print_gh_repo)
     # DELETE may 404 if the label isn't present — that's fine.
     gh api "repos/${repo}/issues/${num}/labels/${remove}" \
         --method DELETE --silent 2>/dev/null || true
@@ -55,17 +55,17 @@ senpai_label_swap() {
 # ---------------------------------------------------------------------------
 
 # Send a PR back to its student: comment, convert to draft, swap review→wip.
-#   senpai_send_back <number> <comment_body>
-senpai_send_back() {
+#   send_pr_back_to_student_with_comment <number> <comment_body>
+send_pr_back_to_student_with_comment() {
     local num="$1" body="$2"
     gh pr comment "$num" --body "$body"
     gh pr ready "$num" --undo
-    senpai_label_swap "$num" "status:review" "status:wip"
+    swap_gh_pr_label "$num" "status:review" "status:wip"
 }
 
 # Close a dead-end PR: comment explaining why, close, delete remote branch.
-#   senpai_close_pr <number> <reason>
-senpai_close_pr() {
+#   close_pr_with_comment <number> <reason>
+close_pr_with_comment() {
     local num="$1" reason="$2"
     gh pr comment "$num" --body "ADVISOR: Closing PR #${num} because ${reason}."
     gh pr close "$num" --delete-branch
@@ -76,11 +76,11 @@ senpai_close_pr() {
 # ---------------------------------------------------------------------------
 
 # Mark a PR as ready for advisor review: mark ready + swap wip→review.
-#   senpai_mark_review <number>
-senpai_mark_review() {
+#   mark_ready_for_review <number>
+mark_ready_for_review() {
     local num="$1"
     gh pr ready "$num"
-    senpai_label_swap "$num" "status:wip" "status:review"
+    swap_gh_pr_label "$num" "status:wip" "status:review"
 }
 
 # ---------------------------------------------------------------------------
@@ -89,9 +89,9 @@ senpai_mark_review() {
 
 # List human-created GitHub Issues addressed to a role (+ team issues).
 # Returns a JSON array, deduplicated by issue number.
-#   senpai_check_issues <role_label>
-#   e.g. senpai_check_issues "noam"  OR  senpai_check_issues "student:frieren"
-senpai_check_issues() {
+#   check_gh_issues <role_label>
+#   e.g. check_gh_issues "noam"  OR  check_gh_issues "student:frieren"
+check_gh_issues() {
     local role="$1"
     local role_issues team_issues
     role_issues=$(gh issue list --label "human" --label "$role" --state open \
@@ -114,8 +114,8 @@ print(json.dumps(merged))
 
 # List PRs that are ready for advisor review on a given branch.
 # Returns a JSON array.
-#   senpai_list_review_prs <branch>
-senpai_list_review_prs() {
+#   list_ready_for_review_prs <branch>
+list_ready_for_review_prs() {
     local branch="$1"
     gh pr list --label "$branch" --label "status:review" \
         --json number,title,headRefName,labels
@@ -123,8 +123,8 @@ senpai_list_review_prs() {
 
 # List all open PRs on a branch (any status).
 # Returns a JSON array.
-#   senpai_list_all_prs <branch>
-senpai_list_all_prs() {
+#   list_all_prs <branch>
+list_all_prs() {
     local branch="$1"
     gh pr list --label "$branch" \
         --json number,title,state,labels,headRefName,isDraft
@@ -132,8 +132,8 @@ senpai_list_all_prs() {
 
 # List WIP PRs assigned to a specific student.
 # Returns a JSON array.
-#   senpai_poll_work <student_name>
-senpai_poll_work() {
+#   student_poll_for_work <student_name>
+student_poll_for_work() {
     local name="$1"
     gh pr list --label "student:${name}" --label "status:wip" \
         --json number,title,headRefName,body
@@ -142,8 +142,8 @@ senpai_poll_work() {
 # Compute which students are idle (have no status:wip PR).
 # Expects a comma-separated student list and the advisor branch.
 # Prints one idle student name per line.
-#   senpai_idle_students <student_names_csv> <branch>
-senpai_idle_students() {
+#   list_idle_students <student_names_csv> <branch>
+list_idle_students() {
     local students_csv="$1" branch="$2"
     local all_prs
     all_prs=$(gh pr list --label "$branch" --label "status:wip" \

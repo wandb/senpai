@@ -33,110 +33,103 @@ else
     git push -u origin "$ADVISOR_BRANCH"
 fi
 
-# --- Install role instructions ---
-cp "$WORKDIR/system_instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
+# --- Create logs directory ---
+LOGDIR="/workspace/senpai/advisor_logs"
+mkdir -p "$LOGDIR"
 
-# --- Register Weave Claude Plugin (tools already baked into Docker image) ---
-export PATH="$HOME/.claude/bin:$PATH"
-source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
-
-# --- Start Hivemind (streams CC session logs to hivemind.wandb.tools) ---
+# --- Start Hivemind logging service (streams CC session logs to hivemind.wandb.tools) ---
 mkdir -p ~/.claude/projects
 uvx --from wandb-hivemind hivemind run &
 echo "=== Hivemind started (PID=$!) ==="
 
-# --- Senpai plugin ---
+# --- Load CC run command helper function ---
+source "$WORKDIR/k8s/run-senpai-claude.sh"
+
+# --- Register Weave CC plugin (tools already baked into Docker image) ---
+export PATH="$HOME/.claude/bin:$PATH"
+source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
+
+# --- Register Senpai CC plugin (skills + tools for common git tasks; CC uses --plugin-dir SENPAI_PLUGIN for tools) ---
 SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
 source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
 
 # --- Build prompts ---
-# PROBLEM_DIR comes from ConfigMap (set by launch.py from senpai.yaml)
-FULL_PROMPT="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-advisor.md" | sed '/^<!--$/,/^-->$/d')"
-HEARTBEAT="Continue your advisor loop. Survey state, review any completed experiments, assign work to idle students, and check for human messages."
+# Advisor prompt (PROBLEM_DIR comes from ConfigMap (set by launch.py from senpai.yaml)
+CLAUDE_DOT_MD="$(cat "$WORKDIR/system_instructions/CLAUDE-ADVISOR.md")"
+TASK_INSTRUCTIONS="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-advisor.md" | sed '/^<!--$/,/^-->$/d')"
+PROMPT="${CLAUDE_DOT_MD}"$'\n\n'"${TASK_INSTRUCTIONS}"
 
-# --- Append extra startup instructions if provided ---
+# Append extra instructions from launch.py if provided
 if [ -n "${EXTRA_INSTRUCTIONS_B64:-}" ]; then
-    FULL_PROMPT="${FULL_PROMPT}"$'\n\n# Finally, some additional instructions\n\n'"$(printf '%s' "$EXTRA_INSTRUCTIONS_B64" | base64 -d)"
+    PROMPT="${PROMPT}"$'\n\n# Finally, some additional instructions\n\n'"$(printf '%s' "$EXTRA_INSTRUCTIONS_B64" | base64 -d)"
 fi
 
-# --- System-level vars (survive compaction via --append-system-prompt) ---
-SYSTEM_VARS="Students: $STUDENT_NAMES | Tag: $RESEARCH_TAG | Branch: $ADVISOR_BRANCH | W&B: $WANDB_ENTITY/$WANDB_PROJECT"
+# Add "$KEY_INFO" (reminder of student names etc) to PROMPT
+KEY_INFO="\n\n Key information:\n\n Students: $STUDENT_NAMES | Tag: $RESEARCH_TAG | Advisor Branch: $ADVISOR_BRANCH | W&B entity/project: $WANDB_ENTITY/$WANDB_PROJECT \n"
+PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
-# --- Launch Claude Code in Heartbeat Loop ---
+# Heartbeat prompt for polling
+HEARTBEAT_PROMPT="Continue your advisor loop. Survey state, review any completed experiment PRs, assign work to all idle students, and check for human gh issues."
+
+# --- Launch Claude Code Loop ---
 export IS_SANDBOX=1
 
-LOGDIR="/workspace/senpai/advisor_logs"
-mkdir -p "$LOGDIR"
+SLEEP_TIME_S=60  # time between loops (in minutes)
+MAX_TURNS=999
 
 ITERATION=0
 while true; do
+    # Set log dir, print loop and git info
     ITERATION=$((ITERATION + 1))
     LOGFILE="$LOGDIR/iteration_${ITERATION}_$(date +%Y%m%d_%H%M%S).jsonl"
     echo "=== Advisor Heartbeat iteration $ITERATION ($(date)) ==="
     echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) ==="
 
-    # --- Pre-triage: check GH state before invoking Claude ---
-    REVIEW_COUNT=$(senpai_list_review_prs "$ADVISOR_BRANCH" 2>/dev/null | python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))" 2>/dev/null || echo "0")
-    ISSUE_COUNT=$(senpai_check_issues "$ADVISOR_BRANCH" 2>/dev/null | python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))" 2>/dev/null || echo "0")
-    IDLE=$(senpai_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH" 2>/dev/null || echo "")
-    IDLE_COUNT=$(echo "$IDLE" | grep -c . 2>/dev/null || echo "0")
+    # --- Check research state before invoking CC ---
+    REVIEW_COUNT=$(list_ready_for_review_prs "$ADVISOR_BRANCH" 2>/dev/null | python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))" 2>/dev/null || echo "0")
+    ISSUE_COUNT=$(check_gh_issues "$ADVISOR_BRANCH" 2>/dev/null | python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))" 2>/dev/null || echo "0")
+    IDLE_STUDENTS=$(list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH" 2>/dev/null || echo "")
+    IDLE_STUDENTS_COUNT=$(echo "$IDLE_STUDENTS" | grep -c . 2>/dev/null || echo "0")
 
-    echo "=== Pre-triage: reviews=$REVIEW_COUNT issues=$ISSUE_COUNT idle=$IDLE_COUNT ==="
+    TRIAGE_INFO="=== Research state: PR's ready for review count=$REVIEW_COUNT | Human issues count=$ISSUE_COUNT | Idle students count=$IDLE_STUDENTS_COUNT ==="
+    echo "$TRIAGE_INFO"
 
-    # --- Skip Claude if nothing to do ---
+    # --- Programmatic skip: skip rest of CC loop if nothing actionable ---
     if [ "$REVIEW_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ] && [ "$IDLE_COUNT" -eq 0 ]; then
-        echo "=== Nothing actionable, sleeping 10 minutes ==="
-        sleep 600
+        echo "=== Nothing actionable, sleeping $SLEEP_TIME_S seconds ==="
+        sleep "$SLEEP_TIME_S"
         continue
     fi
 
-    # --- Build triaged state summary ---
-    TRIAGE="Pre-triaged state: $REVIEW_COUNT PRs ready for review | $ISSUE_COUNT human issues | $IDLE_COUNT idle students"
-    if [ -n "$IDLE" ]; then
-        TRIAGE="$TRIAGE (idle: $(echo "$IDLE" | tr '\n' ',' | sed 's/,$//'))"
+    # --- Continuting CC loop --
+    #  accumulate triage info
+    if [ -n "$IDLE_STUDENTS" ]; then
+        IDLE_INFO="$(idle students: $(echo "$IDLE_STUDENTS" | tr '\n' ',' | sed 's/,$//'))"
+        echo "$IDLE_INFO"
+        TRIAGE_INFO="${TRIAGE_INFO} | ${IDLE_INFO}"
     fi
 
-    # --- Choose prompt weight ---
+    # --- Select prompt ---
     # Full prompt on first iteration or after compaction; heartbeat otherwise
-    if [ "$ITERATION" -eq 1 ] || [ -f /tmp/advisor_compacted ]; then
-        PROMPT="$FULL_PROMPT"
-        rm -f /tmp/advisor_compacted
-        echo "=== Using FULL prompt ==="
+    if [ "$ITERATION" -eq 1 ]; then
+        FINAL_PROMPT="$PROMPT"
+        echo "=== Using full (PROMPT) prompt ==="
     else
-        PROMPT="$HEARTBEAT"
-        echo "=== Using HEARTBEAT prompt ==="
+        FINAL_PROMPT="$HEARTBEAT_PROMPT"
+        echo "=== Using heartbeat (HEARTBEAT_PROMPT) prompt ==="
     fi
-
-    # Restore CLAUDE.md — branch checkouts clobber it
-    cp "$WORKDIR/system_instructions/CLAUDE-ADVISOR.md" "$WORKDIR/CLAUDE.md"
 
     echo "=== Log: $LOGFILE ==="
 
     START_TS=$(date +%s)
     EXIT_CODE=0
+    FINAL_PROMPT="${FINAL_PROMPT}"$'\n\n'"${TRIAGE}"
     if [ "$ITERATION" -eq 1 ]; then
-        claude -p "${PROMPT}"$'\n\n'"${TRIAGE}" \
-            --append-system-prompt "$SYSTEM_VARS" \
-            --plugin-dir "$SENPAI_PLUGIN" \
-            --max-turns 50 \
-            --model "claude-opus-4-6[1m]" \
-            --output-format stream-json --verbose \
-            --dangerously-skip-permissions > "$LOGFILE" 2>&1 || EXIT_CODE=$?
+        # run_senpai_claude args: max_turns, user_prompt, optional extra CC args before -p (e.g. -c)
+        run_senpai_claude MAX_TURNS "$FINAL_PROMPT" || EXIT_CODE=$?
     else
-        claude -c -p "${PROMPT}"$'\n\n'"${TRIAGE}" \
-            --append-system-prompt "$SYSTEM_VARS" \
-            --plugin-dir "$SENPAI_PLUGIN" \
-            --max-turns 50 \
-            --model "claude-opus-4-6[1m]" \
-            --output-format stream-json --verbose \
-            --dangerously-skip-permissions > "$LOGFILE" 2>&1 || \
-        claude -p "${FULL_PROMPT}"$'\n\n'"${TRIAGE}" \
-            --append-system-prompt "$SYSTEM_VARS" \
-            --plugin-dir "$SENPAI_PLUGIN" \
-            --max-turns 50 \
-            --model "claude-opus-4-6[1m]" \
-            --output-format stream-json --verbose \
-            --dangerously-skip-permissions > "$LOGFILE" 2>&1 || EXIT_CODE=$?
+        run_senpai_claude MAX_TURNS "$FINAL_PROMPT" -c || \
+        run_senpai_claude MAX_TURNS "${PROMPT}"$'\n\n'"${TRIAGE}" || EXIT_CODE=$?
     fi
     DURATION=$(( $(date +%s) - START_TS ))
 
