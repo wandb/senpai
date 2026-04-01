@@ -22,35 +22,39 @@ uv pip install --system -e .
 git config user.name "senpai-$STUDENT_NAME"
 git config user.email "senpai-$STUDENT_NAME@senpai"
 
-# --- Register Weave Claude Code Plugin (tools already baked into Docker image) ---
-export PATH="$HOME/.claude/bin:$PATH"
-source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
-
 # --- Start Hivemind (streams CC session logs to hivemind.wandb.tools) ---
 mkdir -p ~/.claude/projects
 uvx --from wandb-hivemind hivemind run &
 echo "=== Hivemind started (PID=$!) ==="
 
-# --- Install role instructions ---
-cp "$WORKDIR/system_instructions/CLAUDE-STUDENT.md" "$WORKDIR/CLAUDE.md"
+# --- Load CC run command helper function ---
+source "$WORKDIR/k8s/run-senpai-claude.sh"
 
-# --- Senpai plugin ---
+# --- Register Weave Claude Code Plugin (tools already baked into Docker image) ---
+export PATH="$HOME/.claude/bin:$PATH"
+source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
+
+# --- Register Senpai CC plugin ---
 SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
 source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
 
 # --- Build prompts ---
-# PROBLEM_DIR comes from ConfigMap (set by launch.py from senpai.yaml)
-FULL_PROMPT="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-student.md" | sed '/^<!--$/,/^-->$/d')"
-HEARTBEAT="Continue your student loop. Check for assigned PRs, check for human messages, and resume any in-progress work."
+CLAUDE_DOT_MD="$(cat "$WORKDIR/system_instructions/CLAUDE-STUDENT.md")"
+TASK_INSTRUCTIONS="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-student.md" | sed '/^<!--$/,/^-->$/d')"
+PROMPT="${CLAUDE_DOT_MD}"$'\n\n'"${TASK_INSTRUCTIONS}"
 
-# --- System-level vars (survive compaction via --append-system-prompt) ---
-SYSTEM_VARS="Student: $STUDENT_NAME | Branch: $ADVISOR_BRANCH | W&B: $WANDB_ENTITY/$WANDB_PROJECT"
+KEY_INFO=$'\n\nKey information:\n\nStudent: '"$STUDENT_NAME"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
+FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
-# --- Launch Claude Code in Heartbeat Loop ---
+HEARTBEAT_PROMPT="Continue your student loop. Check for assigned PRs, check for GitHub issues, and resume any in-progress work."
+
+# --- Launch Claude Code Loop ---
 export IS_SANDBOX=1
 
-LOGDIR="/workspace/senpai/student_logs"
+LOGDIR="$WORKDIR/student_logs"
 mkdir -p "$LOGDIR"
+SLEEP_TIME_S=60
+MAX_TURNS=50
 
 ITERATION=0
 while true; do
@@ -65,66 +69,44 @@ while true; do
     echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) ==="
     echo "=== GPU: $(nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null) ==="
 
-    # --- Pre-triage: check if there's work before invoking Claude ---
-    ASSIGNED=$(senpai_poll_work "$STUDENT_NAME" 2>/dev/null || echo "[]")
-    ASSIGNED_COUNT=$(echo "$ASSIGNED" | python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))" 2>/dev/null || echo "0")
-    ISSUE_COUNT=$(senpai_check_issues "student:$STUDENT_NAME" 2>/dev/null | python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))" 2>/dev/null || echo "0")
+    # --- Check for work before invoking CC ---
+    ASSIGNED_JSON=$(student_poll_for_work "$STUDENT_NAME")
+    ASSIGNED_COUNT=$(printf '%s' "$ASSIGNED_JSON" | json_len)
+    ISSUE_JSON=$(check_gh_issues "student:$STUDENT_NAME")
+    ISSUE_COUNT=$(printf '%s' "$ISSUE_JSON" | json_len)
 
-    echo "=== Pre-triage: assigned=$ASSIGNED_COUNT issues=$ISSUE_COUNT ==="
+    # --- Build triage info ---
+    TRIAGE_INFO="## Student research state"
+    [ "$ASSIGNED_COUNT" -gt 0 ] && TRIAGE_INFO+=$'\n'"- **Assigned PRs ($ASSIGNED_COUNT):** $(printf '%s' "$ASSIGNED_JSON" | json_numbers)"
+    [ "$ISSUE_COUNT" -gt 0 ]    && TRIAGE_INFO+=$'\n'"- **GitHub issues ($ISSUE_COUNT):** $(printf '%s' "$ISSUE_JSON" | json_numbers)"
+    echo "$TRIAGE_INFO"
 
-    # --- Skip Claude if nothing to do ---
+    # --- Skip if nothing to do ---
     if [ "$ASSIGNED_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ]; then
-        echo "=== No work assigned, sleeping 60s ==="
-        sleep 60
+        echo "=== No work assigned, sleeping $SLEEP_TIME_S seconds ==="
+        sleep "$SLEEP_TIME_S"
         continue
     fi
 
-    # --- Build triaged state summary ---
-    TRIAGE="Pre-triaged state: $ASSIGNED_COUNT assigned PRs | $ISSUE_COUNT human issues"
-
-    # --- Choose prompt weight ---
-    if [ "$ITERATION" -eq 1 ] || [ -f /tmp/student_compacted ]; then
-        PROMPT="$FULL_PROMPT"
-        rm -f /tmp/student_compacted
-        echo "=== Using FULL prompt ==="
-    else
-        PROMPT="$HEARTBEAT"
-        echo "=== Using HEARTBEAT prompt ==="
-    fi
-
-    # Restore CLAUDE.md — branch checkouts clobber it
-    cp "$WORKDIR/system_instructions/CLAUDE-STUDENT.md" "$WORKDIR/CLAUDE.md"
-
+    # --- Log triage and invoke CC ---
     echo "=== Log: $LOGFILE ==="
+    echo "$TRIAGE_INFO" > "$LOGFILE"
 
     START_TS=$(date +%s)
     EXIT_CODE=0
     if [ "$ITERATION" -eq 1 ]; then
-        claude -p "${PROMPT}"$'\n\n'"${TRIAGE}" \
-            --append-system-prompt "$SYSTEM_VARS" \
-            --plugin-dir "$SENPAI_PLUGIN" \
-            --max-turns 50 \
-            --model "claude-opus-4-6[1m]" \
-            --output-format stream-json --verbose \
-            --dangerously-skip-permissions > "$LOGFILE" 2>&1 || EXIT_CODE=$?
+        echo "=== Iteration $ITERATION: Using FULL prompt + triage ==="
+        echo "$FULL_PROMPT"
+        echo "$TRIAGE_INFO"
+        run_senpai_claude $MAX_TURNS "${FULL_PROMPT}"$'\n\n'"${TRIAGE_INFO}" || EXIT_CODE=$?
     else
-        claude -c -p "${PROMPT}"$'\n\n'"${TRIAGE}" \
-            --append-system-prompt "$SYSTEM_VARS" \
-            --plugin-dir "$SENPAI_PLUGIN" \
-            --max-turns 50 \
-            --model "claude-opus-4-6[1m]" \
-            --output-format stream-json --verbose \
-            --dangerously-skip-permissions > "$LOGFILE" 2>&1 || \
-        claude -p "${FULL_PROMPT}"$'\n\n'"${TRIAGE}" \
-            --append-system-prompt "$SYSTEM_VARS" \
-            --plugin-dir "$SENPAI_PLUGIN" \
-            --max-turns 50 \
-            --model "claude-opus-4-6[1m]" \
-            --output-format stream-json --verbose \
-            --dangerously-skip-permissions > "$LOGFILE" 2>&1 || EXIT_CODE=$?
+        echo "=== Iteration $ITERATION: Using heartbeat prompt ==="
+        echo "$HEARTBEAT_PROMPT"
+        echo "$TRIAGE_INFO"
+        run_senpai_claude $MAX_TURNS "${HEARTBEAT_PROMPT}"$'\n\n'"${TRIAGE_INFO}" || EXIT_CODE=$?
     fi
     DURATION=$(( $(date +%s) - START_TS ))
 
-    echo "=== Claude exited code=$EXIT_CODE after ${DURATION}s at $(date), next check in 5s ==="
-    sleep 5
+    echo "=== Claude exited code=$EXIT_CODE after ${DURATION}s at $(date), next check in $SLEEP_TIME_S seconds ==="
+    sleep "$SLEEP_TIME_S"
 done
