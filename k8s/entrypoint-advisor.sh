@@ -116,13 +116,11 @@ while true; do
     EXIT_CODE=0
     if [ "$ITERATION" -eq 1 ]; then
         echo "=== Using FULL prompt ($FULL_PROMPT) ==="
-        # run_senpai_claude args: max_turns, user_prompt, optional extra CC args before -p (e.g. -c)
         run_senpai_claude $MAX_TURNS "$FULL_PROMPT" || EXIT_CODE=$?
     else
         echo "=== Using heartbeat (HEARTBEAT_PROMPT) prompt ==="
         CONTINUE_PROMPT="${HEARTBEAT_PROMPT}"$'\n\n'"${TRIAGE_INFO}"
-        run_senpai_claude 50 "$CONTINUE_PROMPT" -c || \
-        run_senpai_claude 50 "${FULL_PROMPT}"$'\n\n'"${CONTINUE_PROMPT}" || EXIT_CODE=$?
+        run_senpai_claude 50 "$CONTINUE_PROMPT" -c || EXIT_CODE=$?
     fi
     DURATION=$(( $(date +%s) - START_TS ))
 
