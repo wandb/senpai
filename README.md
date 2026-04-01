@@ -24,8 +24,6 @@ Training a neural network surrogate for computational fluid dynamics on the [Tan
 
 ## Architecture
 
-![k9s deployments](k9s.png)
-
 ```mermaid
 graph TD
     subgraph K8s["Kubernetes Cluster"]
