@@ -65,7 +65,7 @@ if [ -n "${EXTRA_INSTRUCTIONS_B64:-}" ]; then
 fi
 
 # Add "$KEY_INFO" (reminder of student names etc) to PROMPT
-KEY_INFO="\n\n Key information:\n\n Students: $STUDENT_NAMES | Tag: $RESEARCH_TAG | Advisor Branch: $ADVISOR_BRANCH | W&B entity/project: $WANDB_ENTITY/$WANDB_PROJECT \n"
+KEY_INFO=$'\n\n Key information:\n\n Students: '"$STUDENT_NAMES"' | Tag: '"$RESEARCH_TAG"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
 # Heartbeat prompt for polling
@@ -86,25 +86,25 @@ while true; do
     echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) ==="
 
     # --- Check research state before invoking CC ---
-    REVIEW_COUNT=$(list_ready_for_review_prs "$ADVISOR_BRANCH" 2>/dev/null | python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))" 2>/dev/null || echo "0")
-    ISSUE_COUNT=$(check_gh_issues "$ADVISOR_BRANCH" 2>/dev/null | python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))" 2>/dev/null || echo "0")
-    IDLE_STUDENTS=$(list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH" 2>/dev/null || echo "")
-    IDLE_STUDENTS_COUNT=$(echo "$IDLE_STUDENTS" | grep -c . 2>/dev/null || echo "0")
+    REVIEW_COUNT=$(list_ready_for_review_prs "$ADVISOR_BRANCH" | python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))")
+    ISSUE_COUNT=$(check_gh_issues "$ADVISOR_BRANCH" | python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))")
+    IDLE_JSON=$(list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH")
+    IDLE_STUDENTS_COUNT=$(echo "$IDLE_JSON" | python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))")
 
     TRIAGE_INFO="=== Research state: PR's ready for review count=$REVIEW_COUNT | Human issues count=$ISSUE_COUNT | Idle students count=$IDLE_STUDENTS_COUNT ==="
     echo "$TRIAGE_INFO"
 
     # --- Programmatic skip: skip rest of CC loop if nothing actionable ---
-    if [ "$REVIEW_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ] && [ "$$IDLE_STUDENTS_COUNT" -eq 0 ]; then
+    if [ "$REVIEW_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ] && [ "$IDLE_STUDENTS_COUNT" -eq 0 ]; then
         echo "=== Nothing actionable, sleeping $SLEEP_TIME_S seconds ==="
         sleep "$SLEEP_TIME_S"
         continue
     fi
 
-    # --- Continuting CC loop ---
-    #  accumulate triage info 
-    if [ -n "$IDLE_STUDENTS" ]; then
-        IDLE_INFO="Idle student names: $(echo "$IDLE_STUDENTS" | tr '\n' ',' | sed 's/,$//')"
+    # --- Continuing CC loop ---
+    #  accumulate triage info
+    if [ "$IDLE_STUDENTS_COUNT" -gt 0 ]; then
+        IDLE_INFO="Idle student names: $(echo "$IDLE_JSON" | python3 -c "import sys,json; print(','.join(json.loads(sys.stdin.read())))")"
         echo "$IDLE_INFO"
         TRIAGE_INFO="${TRIAGE_INFO} | ${IDLE_INFO}"
     fi
@@ -124,6 +124,6 @@ while true; do
     fi
     DURATION=$(( $(date +%s) - START_TS ))
 
-    echo "=== Advisor exited code=$EXIT_CODE after ${DURATION}s at $(date), next check in 5 minutes ==="
-    sleep 300
+    echo "=== Advisor exited code=$EXIT_CODE after ${DURATION}s at $(date), next check in $SLEEP_TIME_S seconds ==="
+    sleep "$SLEEP_TIME_S"
 done
