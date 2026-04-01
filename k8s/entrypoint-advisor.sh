@@ -71,11 +71,6 @@ FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 # Heartbeat prompt for polling
 HEARTBEAT_PROMPT="Continue your advisor loop. Attached is the current research state. Review any completed experiment PRs, assign work to all idle students, and check for human gh issues and comments."
 
-# --- JSON helpers ---
-json_len() { python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))"; }
-json_join() { python3 -c "import sys,json; print(','.join(json.loads(sys.stdin.read())))"; }
-json_numbers() { python3 -c "import sys,json; print(','.join(f'#{i[\"number\"]}' for i in json.loads(sys.stdin.read())))"; }
-
 # --- Last-check timestamp state for filtering PRs and issues ---
 LAST_CHECK_FILE="$LOGDIR/.last_check_ts"
 
