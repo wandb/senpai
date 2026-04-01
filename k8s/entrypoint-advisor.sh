@@ -74,7 +74,7 @@ HEARTBEAT_PROMPT="Continue your advisor loop. Survey state, review any completed
 # --- Launch Claude Code Loop ---
 export IS_SANDBOX=1
 
-SLEEP_TIME_S=60  # time between loops (in minutes)
+SLEEP_TIME_S=60  
 MAX_TURNS=999
 
 ITERATION=0
@@ -95,7 +95,7 @@ while true; do
     echo "$TRIAGE_INFO"
 
     # --- Programmatic skip: skip rest of CC loop if nothing actionable ---
-    if [ "$REVIEW_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ] && [ "$IDLE_COUNT" -eq 0 ]; then
+    if [ "$REVIEW_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ] && [ "$$IDLE_STUDENTS_COUNT" -eq 0 ]; then
         echo "=== Nothing actionable, sleeping $SLEEP_TIME_S seconds ==="
         sleep "$SLEEP_TIME_S"
         continue
@@ -104,7 +104,7 @@ while true; do
     # --- Continuting CC loop ---
     #  accumulate triage info 
     if [ -n "$IDLE_STUDENTS" ]; then
-        IDLE_INFO="$(idle students: $(echo "$IDLE_STUDENTS" | tr '\n' ',' | sed 's/,$//'))"
+        IDLE_INFO="Idle student names: $(echo "$IDLE_STUDENTS" | tr '\n' ',' | sed 's/,$//')"
         echo "$IDLE_INFO"
         TRIAGE_INFO="${TRIAGE_INFO} | ${IDLE_INFO}"
     fi
@@ -117,7 +117,7 @@ while true; do
     if [ "$ITERATION" -eq 1 ]; then
         echo "=== Using FULL prompt ($FULL_PROMPT) ==="
         # run_senpai_claude args: max_turns, user_prompt, optional extra CC args before -p (e.g. -c)
-        run_senpai_claude MAX_TURNS "$FULL_PROMPT" || EXIT_CODE=$?
+        run_senpai_claude $MAX_TURNS "$FULL_PROMPT" || EXIT_CODE=$?
     else
         echo "=== Using heartbeat (HEARTBEAT_PROMPT) prompt ==="
         CONTINUE_PROMPT="${HEARTBEAT_PROMPT}"$'\n\n'"${TRIAGE_INFO}"
