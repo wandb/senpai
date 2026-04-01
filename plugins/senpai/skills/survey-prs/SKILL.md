@@ -30,13 +30,13 @@ Uses `$ADVISOR_BRANCH` and `$STUDENT_NAMES` from the environment (set by the k8s
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 
 # All open PRs on the branch
-senpai_list_all_prs "$ADVISOR_BRANCH"
+list_all_prs "$ADVISOR_BRANCH"
 
 # Just the review-ready ones
-senpai_list_review_prs "$ADVISOR_BRANCH"
+list_ready_for_review_prs "$ADVISOR_BRANCH"
 
 # Who's idle
-senpai_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH"
+list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH"
 ```
 
 2. **Categorize** each PR by its status labels:

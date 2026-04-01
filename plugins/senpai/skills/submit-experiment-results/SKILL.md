@@ -47,7 +47,7 @@ git push origin "$(git branch --show-current)"
 
 ```bash
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
-senpai_mark_review $ARGUMENTS
+mark_ready_for_review $ARGUMENTS
 ```
 
 That's it. The advisor will pick it up in their next review cycle.

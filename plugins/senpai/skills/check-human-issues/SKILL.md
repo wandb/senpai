@@ -36,7 +36,7 @@ Human researchers communicate with agents through GitHub Issues. Issues are tagg
 
 ```bash
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
-senpai_check_issues "$0"
+check_gh_issues "$0"
 ```
 
 This returns a deduplicated JSON array of issues addressed to you and the whole team.

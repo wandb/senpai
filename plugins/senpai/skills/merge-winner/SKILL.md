@@ -38,7 +38,7 @@ If this fails due to merge conflicts, send the PR back for rebase instead:
 
 ```bash
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
-senpai_send_back $0 "ADVISOR: Rebasing needed — the advisor branch was updated after merging a previous winner. Please rebase onto $ADVISOR_BRANCH, re-run the experiment to verify the improvement still holds, and resubmit."
+send_pr_back_to_student_with_comment $0 "ADVISOR: Rebasing needed — the advisor branch was updated after merging a previous winner. Please rebase onto $ADVISOR_BRANCH, re-run the experiment to verify the improvement still holds, and resubmit."
 ```
 
 Then stop — don't proceed with baseline update.
