@@ -17,6 +17,7 @@ run_senpai_claude() {
         --output-format stream-json --verbose \
         --settings .claude/settings.json \
         --plugin-dir "$SENPAI_PLUGIN" \
+        --plugin-dir .claude \
         --mcp-config .mcp.json \
         --agents .claude/agents \
         --dangerously-skip-permissions \
