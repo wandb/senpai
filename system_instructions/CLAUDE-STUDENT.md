@@ -25,7 +25,7 @@ You have skills that handle the repetitive GitHub mechanics. Use them:
 | Skill | What it does | When to use it |
 |---|---|---|
 | `/senpai:poll-for-work` | Check for assigned PRs | When you have no current assignment |
-| `/senpai:submit-experiment` | Commit, push, mark ready, swap label | After posting your results comment |
+| `/senpai:submit-experiment-results` | Commit, push, mark ready, swap label | After posting your results comment |
 | `/senpai:check-human-issues` | Check and respond to human team messages | Every loop iteration |
 
 For lower-level GitHub operations, the `senpai-gh` skill provides bash functions:
@@ -33,11 +33,11 @@ For lower-level GitHub operations, the `senpai-gh` skill provides bash functions
 ```bash
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 
-# Mark a PR ready for advisor review (if not using /senpai:submit-experiment)
-senpai_mark_review <pr#>
+# Mark a PR ready for advisor review (if not using /senpai:submit-experiment-results)
+mark_ready_for_review <pr#>
 
 # Swap a label (e.g. to ask the advisor a question)
-senpai_label_swap <pr#> "status:wip" "status:review"
+swap_gh_pr_label <pr#> "status:wip" "status:review"
 ```
 
 ## Your loop
@@ -64,7 +64,7 @@ senpai_label_swap <pr#> "status:wip" "status:review"
    source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
    gh pr comment <number> -b "STUDENT: <question or comment>"
    gh pr ready <number> --undo
-   senpai_label_swap <number> "status:wip" "status:review"
+   swap_gh_pr_label <number> "status:wip" "status:review"
    ```
 
 3. **Implement the hypothesis**
@@ -106,7 +106,7 @@ senpai_label_swap <pr#> "status:wip" "status:review"
    If there are results from follow-up experiments, add them as a new results comment using the same format.
 
 6. **Submit for review**
-   Use `/senpai:submit-experiment <pr-number>` to commit, push, mark ready, and swap the status label.
+   Use `/senpai:submit-experiment-results <pr-number>` to commit, push, mark ready, and swap the status label.
 
 7. **Go back to step 1** and poll for the next assignment.
 
@@ -139,7 +139,7 @@ Your PR may come back as a draft with `status:wip` and review comments. When thi
 - Address the feedback — this might mean tweaking parameters, trying a variation, or fixing an issue.
 - You can comment on the PR if you need any more information from the advisor.
 - Run new experiments and update the results.
-- Re-submit for review using `/senpai:submit-experiment <pr-number>`.
+- Re-submit for review using `/senpai:submit-experiment-results <pr-number>`.
 
 ## Principles
 

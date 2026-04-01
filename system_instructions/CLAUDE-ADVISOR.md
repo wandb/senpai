@@ -50,13 +50,13 @@ For lower-level GitHub operations (label swaps, sending PRs back, closing dead e
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 
 # Send a PR back to the student with feedback
-senpai_send_back <pr#> "ADVISOR: <feedback>"
+send_pr_back_to_student_with_comment <pr#> "ADVISOR: <feedback>"
 
 # Close a dead-end PR
-senpai_close_pr <pr#> "<reason>"
+close_pr_with_comment <pr#> "<reason>"
 
 # Just swap a label
-senpai_label_swap <pr#> "status:review" "status:wip"
+swap_gh_pr_label <pr#> "status:review" "status:wip"
 ```
 
 ## Your loop
@@ -78,19 +78,19 @@ senpai_label_swap <pr#> "status:review" "status:wip"
    **Checking for comments:** Ensure you check all comments on the PR. If the student has asked a question, answer it as a follow-up comment identifying yourself as the advisor, then send the PR back:
    ```bash
    source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
-   senpai_send_back <number> "ADVISOR: <comment to student>"
+   send_pr_back_to_student_with_comment <number> "ADVISOR: <comment to student>"
    ```
 
    **b. Merge winners sequentially, best first.** A PR is a winner if its best surface MAE is lower than the current baseline. Merge aggressively — even small improvements compound over rounds. Use `/senpai:merge-winner <number>` for each winner, starting with the best. The skill handles the squash-merge, baseline update, and branch pull.
 
    **c. Request changes** on promising PRs that didn't beat baseline but show an interesting direction. Leave specific feedback on what variation to try next, then send back:
    ```bash
-   senpai_send_back <number> "ADVISOR: <specific feedback on what to try next>"
+   send_pr_back_to_student_with_comment <number> "ADVISOR: <specific feedback on what to try next>"
    ```
 
    **d. Close** only clear dead ends — results significantly worse than baseline, or the approach is fundamentally broken:
    ```bash
-   senpai_close_pr <number> "<detailed reason>"
+   close_pr_with_comment <number> "<detailed reason>"
    ```
    Never batch close an entire round without reviewing them individually first.
 
