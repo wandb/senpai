@@ -89,36 +89,49 @@ mark_ready_for_review() {
 
 # List human-created GitHub Issues addressed to a role (+ team issues).
 # Returns a JSON array, deduplicated by issue number.
-#   check_gh_issues <role_label>
-#   e.g. check_gh_issues "noam"  OR  check_gh_issues "student:frieren"
+# Optional second arg: ISO timestamp — only return issues updated after it.
+#   check_gh_issues <role_label> [since]
+#   e.g. check_gh_issues "noam" "2026-04-01T12:00:00Z"
 check_gh_issues() {
-    local role="$1"
+    local role="$1" since="${2:-}"
     local role_issues team_issues
     role_issues=$(gh issue list --label "human" --label "$role" --state open \
         --json number,title,updatedAt,comments 2>/dev/null || echo "[]")
     team_issues=$(gh issue list --label "human" --label "team" --state open \
         --json number,title,updatedAt,comments 2>/dev/null || echo "[]")
-    python3 -c "
+    printf '[%s,%s]' "$role_issues" "$team_issues" | python3 -c "
 import json, sys
-a = json.loads('''$role_issues''')
-b = json.loads('''$team_issues''')
+a, b = json.loads(sys.stdin.read())
+since = sys.argv[1]
 seen = set()
 merged = []
 for i in a + b:
     if i['number'] not in seen:
         seen.add(i['number'])
-        merged.append(i)
+        if not since or i.get('updatedAt', '') > since:
+            merged.append(i)
 print(json.dumps(merged))
-"
+" "$since"
 }
 
 # List PRs that are ready for advisor review on a given branch.
 # Returns a JSON array.
-#   list_ready_for_review_prs <branch>
+# Optional second arg: ISO timestamp — only return PRs updated after it.
+#   list_ready_for_review_prs <branch> [since]
 list_ready_for_review_prs() {
-    local branch="$1"
-    gh pr list --label "$branch" --label "status:review" \
-        --json number,title,headRefName,labels
+    local branch="$1" since="${2:-}"
+    local prs
+    prs=$(gh pr list --label "$branch" --label "status:review" \
+        --json number,title,headRefName,labels,updatedAt)
+    if [ -z "$since" ]; then
+        printf '%s' "$prs"
+    else
+        printf '%s' "$prs" | python3 -c "
+import json, sys
+prs = json.loads(sys.stdin.read())
+print(json.dumps([p for p in prs if p.get('updatedAt', '') > sys.argv[1]]))
+" "$since"
+    fi
 }
 
 # List all open PRs on a branch (any status).
@@ -148,10 +161,10 @@ list_idle_students() {
     local all_prs
     all_prs=$(gh pr list --label "$branch" --label "status:wip" \
         --json labels 2>/dev/null || echo "[]")
-    python3 -c "
+    printf '%s' "$all_prs" | python3 -c "
 import json, sys
-students = [s.strip() for s in '''$students_csv'''.split(',') if s.strip()]
-prs = json.loads('''$all_prs''')
+students = [s.strip() for s in sys.argv[1].split(',') if s.strip()]
+prs = json.loads(sys.stdin.read())
 busy = set()
 for pr in prs:
     for label in pr.get('labels', []):
@@ -159,5 +172,5 @@ for pr in prs:
         if name.startswith('student:'):
             busy.add(name.split(':', 1)[1])
 print(json.dumps([s for s in students if s not in busy]))
-"
+" "$students_csv"
 }

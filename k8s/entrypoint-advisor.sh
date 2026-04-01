@@ -69,11 +69,15 @@ KEY_INFO=$'\n\n Key information:\n\n Students: '"$STUDENT_NAMES"' | Tag: '"$RESE
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
 # Heartbeat prompt for polling
-HEARTBEAT_PROMPT="Continue your advisor loop. Survey state, review any completed experiment PRs, assign work to all idle students, and check for human gh issues."
+HEARTBEAT_PROMPT="Continue your advisor loop. Attached is the current research state. Review any completed experiment PRs, assign work to all idle students, and check for human gh issues and comments."
 
 # --- JSON helpers ---
-get_json_len() { python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))"; }
-do_json_join() { python3 -c "import sys,json; print(','.join(json.loads(sys.stdin.read())))"; }
+json_len() { python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))"; }
+json_join() { python3 -c "import sys,json; print(','.join(json.loads(sys.stdin.read())))"; }
+json_numbers() { python3 -c "import sys,json; print(','.join(f'#{i[\"number\"]}' for i in json.loads(sys.stdin.read())))"; }
+
+# --- Last-check timestamp state ---
+LAST_CHECK_FILE="$LOGDIR/.last_check_ts"
 
 # --- Launch Claude Code Loop ---
 export IS_SANDBOX=1
@@ -89,28 +93,30 @@ while true; do
     echo "=== Advisor Heartbeat iteration $ITERATION ($(date)) ==="
     echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) ==="
 
-    # --- Check research state before invoking CC ---
-    REVIEW_COUNT=$(list_ready_for_review_prs "$ADVISOR_BRANCH" | get_json_len)
-    ISSUE_COUNT=$(check_gh_issues "$ADVISOR_BRANCH" | get_json_len)
-    IDLE_STUDENTS_JSON=$(list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH")
-    IDLE_STUDENTS_COUNT=$(echo "$IDLE_STUDENTS_JSON" | get_json_len)
+    # --- Read last-check timestamp (empty on first run = no filtering) ---
+    SINCE=""
+    [ -f "$LAST_CHECK_FILE" ] && SINCE=$(cat "$LAST_CHECK_FILE")
 
-    TRIAGE_INFO="=== Research state: PR's ready for review count=$REVIEW_COUNT | Human issues count=$ISSUE_COUNT | Idle students count=$IDLE_STUDENTS_COUNT ==="
+    # --- Check research state before invoking CC ---
+    REVIEW_JSON=$(list_ready_for_review_prs "$ADVISOR_BRANCH" "$SINCE")
+    REVIEW_COUNT=$(printf '%s' "$REVIEW_JSON" | json_len)
+    ISSUE_JSON=$(check_gh_issues "$ADVISOR_BRANCH" "$SINCE")
+    ISSUE_COUNT=$(printf '%s' "$ISSUE_JSON" | json_len)
+    IDLE_JSON=$(list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH")
+    IDLE_COUNT=$(printf '%s' "$IDLE_JSON" | json_len)
+
+    # --- Build triage info (used in logs, CC prompt, and skip check) ---
+    TRIAGE_INFO="## Research state (since ${SINCE:-boot})"
+    [ "$REVIEW_COUNT" -gt 0 ] && TRIAGE_INFO+=$'\n'"- **PRs to review ($REVIEW_COUNT):** $(printf '%s' "$REVIEW_JSON" | json_numbers)"
+    [ "$ISSUE_COUNT" -gt 0 ]  && TRIAGE_INFO+=$'\n'"- **GH issues ($ISSUE_COUNT):** $(printf '%s' "$ISSUE_JSON" | json_numbers)"
+    [ "$IDLE_COUNT" -gt 0 ]   && TRIAGE_INFO+=$'\n'"- **Idle students ($IDLE_COUNT):** $(printf '%s' "$IDLE_JSON" | json_join)"
     echo "$TRIAGE_INFO"
 
     # --- Programmatic skip: skip rest of CC loop if nothing actionable ---
-    if [ "$REVIEW_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ] && [ "$IDLE_STUDENTS_COUNT" -eq 0 ]; then
+    if [ "$REVIEW_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ] && [ "$IDLE_COUNT" -eq 0 ]; then
         echo "=== Nothing actionable, sleeping $SLEEP_TIME_S seconds ==="
         sleep "$SLEEP_TIME_S"
         continue
-    fi
-
-    # --- Continuing CC loop ---
-    #  accumulate triage info
-    if [ "$IDLE_STUDENTS_COUNT" -gt 0 ]; then
-        IDLE_INFO="Idle student names: $(echo "$IDLE_STUDENTS_JSON" | do_json_join)"
-        echo "$IDLE_INFO"
-        TRIAGE_INFO="${TRIAGE_INFO} | ${IDLE_INFO}"
     fi
 
     # --- Log triage state and select prompt ---
@@ -128,6 +134,11 @@ while true; do
         run_senpai_claude 50 "$CONTINUE_PROMPT" -c || EXIT_CODE=$?
     fi
     DURATION=$(( $(date +%s) - START_TS ))
+
+    # --- Update last-check timestamp (only on success so failed runs retry) ---
+    if [ "$EXIT_CODE" -eq 0 ]; then
+        date -u +%Y-%m-%dT%H:%M:%SZ > "$LAST_CHECK_FILE"
+    fi
 
     echo "=== Advisor exited code=$EXIT_CODE after ${DURATION}s at $(date), next check in $SLEEP_TIME_S seconds ==="
     sleep "$SLEEP_TIME_S"
