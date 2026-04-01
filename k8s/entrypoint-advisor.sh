@@ -34,7 +34,7 @@ else
 fi
 
 # --- Create logs directory ---
-LOGDIR="/workspace/senpai/advisor_logs"
+LOGDIR="$WORKDIR/advisor_logs"
 mkdir -p "$LOGDIR"
 
 # --- Start Hivemind logging service (streams CC session logs to hivemind.wandb.tools) ---
@@ -71,10 +71,14 @@ FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 # Heartbeat prompt for polling
 HEARTBEAT_PROMPT="Continue your advisor loop. Survey state, review any completed experiment PRs, assign work to all idle students, and check for human gh issues."
 
+# --- JSON helpers ---
+get_json_len() { python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))"; }
+do_json_join() { python3 -c "import sys,json; print(','.join(json.loads(sys.stdin.read())))"; }
+
 # --- Launch Claude Code Loop ---
 export IS_SANDBOX=1
 
-SLEEP_TIME_S=60  
+SLEEP_TIME_S=60
 MAX_TURNS=999
 
 ITERATION=0
@@ -86,10 +90,10 @@ while true; do
     echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) ==="
 
     # --- Check research state before invoking CC ---
-    REVIEW_COUNT=$(list_ready_for_review_prs "$ADVISOR_BRANCH" | python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))")
-    ISSUE_COUNT=$(check_gh_issues "$ADVISOR_BRANCH" | python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))")
-    IDLE_JSON=$(list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH")
-    IDLE_STUDENTS_COUNT=$(echo "$IDLE_JSON" | python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))")
+    REVIEW_COUNT=$(list_ready_for_review_prs "$ADVISOR_BRANCH" | get_json_len)
+    ISSUE_COUNT=$(check_gh_issues "$ADVISOR_BRANCH" | get_json_len)
+    IDLE_STUDENTS_JSON=$(list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH")
+    IDLE_STUDENTS_COUNT=$(echo "$IDLE_STUDENTS_JSON" | get_json_len)
 
     TRIAGE_INFO="=== Research state: PR's ready for review count=$REVIEW_COUNT | Human issues count=$ISSUE_COUNT | Idle students count=$IDLE_STUDENTS_COUNT ==="
     echo "$TRIAGE_INFO"
@@ -104,18 +108,19 @@ while true; do
     # --- Continuing CC loop ---
     #  accumulate triage info
     if [ "$IDLE_STUDENTS_COUNT" -gt 0 ]; then
-        IDLE_INFO="Idle student names: $(echo "$IDLE_JSON" | python3 -c "import sys,json; print(','.join(json.loads(sys.stdin.read())))")"
+        IDLE_INFO="Idle student names: $(echo "$IDLE_STUDENTS_JSON" | do_json_join)"
         echo "$IDLE_INFO"
         TRIAGE_INFO="${TRIAGE_INFO} | ${IDLE_INFO}"
     fi
 
-    # --- Select prompt ---
+    # --- Log triage state and select prompt ---
     echo "=== Log: $LOGFILE ==="
+    echo "$TRIAGE_INFO" > "$LOGFILE"
 
     START_TS=$(date +%s)
     EXIT_CODE=0
     if [ "$ITERATION" -eq 1 ]; then
-        echo "=== Using FULL prompt ($FULL_PROMPT) ==="
+        echo "=== Using FULL prompt: ($FULL_PROMPT) ==="
         run_senpai_claude $MAX_TURNS "$FULL_PROMPT" || EXIT_CODE=$?
     else
         echo "=== Using heartbeat (HEARTBEAT_PROMPT) prompt ==="

@@ -20,5 +20,5 @@ run_senpai_claude() {
         --mcp-config .mcp.json \
         --agents .claude/agents \
         --dangerously-skip-permissions \
-        > "$LOGFILE" 2>&1
+        >> "$LOGFILE" 2>&1
 }

@@ -141,7 +141,7 @@ student_poll_for_work() {
 
 # Compute which students are idle (have no status:wip PR).
 # Expects a comma-separated student list and the advisor branch.
-# Prints one idle student name per line.
+# Returns a JSON array of idle student names.
 #   list_idle_students <student_names_csv> <branch>
 list_idle_students() {
     local students_csv="$1" branch="$2"
@@ -158,8 +158,6 @@ for pr in prs:
         name = label.get('name', '')
         if name.startswith('student:'):
             busy.add(name.split(':', 1)[1])
-for s in students:
-    if s not in busy:
-        print(s)
+print(json.dumps([s for s in students if s not in busy]))
 "
 }
