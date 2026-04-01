@@ -100,6 +100,9 @@ while true; do
     IDLE_JSON=$(list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH")
     IDLE_COUNT=$(printf '%s' "$IDLE_JSON" | json_len)
 
+    # --- Derive watermark from the data we actually fetched (no gap, no overlap) ---
+    WATERMARK=$(max_updated_at "$REVIEW_JSON" "$ISSUE_JSON")
+
     # --- Build triage info (used in logs, CC prompt, and skip check) ---
     TRIAGE_INFO="## Research state (since ${SINCE:-boot})"
     [ "$REVIEW_COUNT" -gt 0 ] && TRIAGE_INFO+=$'\n'"- **GitHub PRs to review ($REVIEW_COUNT):** $(printf '%s' "$REVIEW_JSON" | json_numbers)"
@@ -135,9 +138,9 @@ while true; do
     fi
     DURATION=$(( $(date +%s) - START_TS ))
 
-    # --- Update last-check timestamp (only on success so failed runs retry) ---
-    if [ "$EXIT_CODE" -eq 0 ]; then
-        date -u +%Y-%m-%dT%H:%M:%SZ > "$LAST_CHECK_FILE"
+    # --- Advance watermark to max updatedAt of items we fetched (only on success so failed runs retry) ---
+    if [ "$EXIT_CODE" -eq 0 ] && [ -n "$WATERMARK" ]; then
+        echo "$WATERMARK" > "$LAST_CHECK_FILE"
     fi
 
     echo "=== Advisor exited code=$EXIT_CODE after ${DURATION}s at $(date), next check in $SLEEP_TIME_S seconds ==="

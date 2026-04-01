@@ -34,13 +34,13 @@ print_gh_repo() {
 }
 
 # ---------------------------------------------------------------------------
-# Retry helper: up to 3 attempts with 5s backoff, then fail loudly.
+# Retry helper: up to 6 attempts with 15s backoff, then fail loudly.
 # ---------------------------------------------------------------------------
 gh_retry() {
     local attempt
     for attempt in 1 2 3 4 5 6; do
         "$@" && return 0
-        echo "gh_retry: attempt $attempt failed, retrying in 5s..." >&2
+        echo "gh_retry: attempt $attempt failed, retrying in 15s..." >&2
         sleep 15
     done
     return 1
@@ -56,9 +56,19 @@ swap_gh_pr_label() {
     local num="$1" remove="$2" add="$3"
     local repo
     repo=$(print_gh_repo)
-    # DELETE may 404 if the label isn't present — that's fine.
-    gh api "repos/${repo}/issues/${num}/labels/${remove}" \
-        --method DELETE --silent 2>/dev/null || true
+
+    # DELETE the old label — retry transient failures, tolerate 404 (already gone).
+    local attempt err
+    for attempt in 1 2 3 4 5 6; do
+        err=$(gh api "repos/${repo}/issues/${num}/labels/${remove}" \
+            --method DELETE --silent 2>&1) && break
+        echo "$err" | grep -q "404" && break
+        echo "swap_gh_pr_label: DELETE attempt $attempt failed, retrying in 15s..." >&2
+        [ "$attempt" -eq 6 ] && return 1
+        sleep 15
+    done
+
+    # POST the new label (gh_retry gives 6 attempts on transient failure).
     gh_retry gh api "repos/${repo}/issues/${num}/labels" \
         -f "labels[]=${add}" --method POST --silent
 }
@@ -103,6 +113,18 @@ mark_ready_for_review() {
 json_len() { python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))"; }
 json_join() { python3 -c "import sys,json; print(','.join(json.loads(sys.stdin.read())))"; }
 json_numbers() { python3 -c "import sys,json; print(','.join(f'#{i[\"number\"]}' for i in json.loads(sys.stdin.read())))"; }
+
+# Print the maximum updatedAt timestamp from one or more JSON arrays.
+# Returns empty string if all arrays are empty.  Usage:
+#   max_updated_at "$JSON_BLOB1" "$JSON_BLOB2" ...
+max_updated_at() {
+    python3 -c "
+import json, sys
+items = [i for blob in sys.argv[1:] if blob for i in json.loads(blob)]
+ts = [i['updatedAt'] for i in items if 'updatedAt' in i]
+print(max(ts) if ts else '')
+" "$@"
+}
 
 # ---------------------------------------------------------------------------
 # Queries
