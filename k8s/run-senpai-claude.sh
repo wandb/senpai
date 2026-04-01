@@ -11,7 +11,6 @@ run_senpai_claude() {
     local max_turns=$1 user_prompt=$2
     shift 2
     claude "$@" -p "$user_prompt" \
-        --bare \
         --max-turns "$max_turns" \
         --model "claude-opus-4-6[1m]" \
         --output-format stream-json --verbose \
