@@ -84,6 +84,14 @@ mark_ready_for_review() {
 }
 
 # ---------------------------------------------------------------------------
+# JSON helpers
+# ---------------------------------------------------------------------------
+
+json_len() { python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))"; }
+json_join() { python3 -c "import sys,json; print(','.join(json.loads(sys.stdin.read())))"; }
+json_numbers() { python3 -c "import sys,json; print(','.join(f'#{i[\"number\"]}' for i in json.loads(sys.stdin.read())))"; }
+
+# ---------------------------------------------------------------------------
 # Queries
 # ---------------------------------------------------------------------------
 
