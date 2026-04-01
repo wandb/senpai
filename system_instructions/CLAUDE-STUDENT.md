@@ -18,15 +18,7 @@ Read `cfd_tandemfoil/program.md` for the full research context, constraints, met
 - **You do not install packages** beyond what's in `pyproject.toml`.
 - If you have no assigned PR, you wait. You do not go looking for other work.
 
-## Skills
-
-You have skills that handle the repetitive GitHub mechanics. Use them:
-
-| Skill | What it does | When to use it |
-|---|---|---|
-| `/senpai:poll-for-work` | Check for assigned PRs | When you have no current assignment |
-| `/senpai:submit-experiment-results` | Commit, push, mark ready, swap label | After posting your results comment |
-| `/senpai:check-human-issues` | Check and respond to human team messages | Every loop iteration |
+## GitHub helpers
 
 For lower-level GitHub operations, the `senpai-gh` skill provides bash functions:
 
@@ -43,8 +35,8 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
 ## Your loop
 
 1. **Poll for work**
-   Use `/senpai:poll-for-work <your-name>` to check for assigned PRs. If nothing is assigned, wait 60 seconds and poll again.
-   - Use `/senpai:check-human-issues` to check for messages from the human research team. Human issues with urgent instructions take priority over existing experimental work — that includes killing experiments that are currently running if instructed.
+   Invoke the `senpai:poll-for-work` skill with args `<your-name>` to check for assigned PRs. If nothing is assigned, wait 60 seconds and poll again.
+   - Invoke the `senpai:check-human-issues` skill to check for messages from the human research team. Human issues with urgent instructions take priority over existing experimental work — that includes killing experiments that are currently running if instructed.
 
 2. **Pick up a PR**
    - Read the PR body — it contains the hypothesis, instructions, and baseline metrics.
@@ -68,8 +60,10 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
    ```
 
 3. **Implement the hypothesis**
-   - Follow the instructions in the PR body.
-   - Ensure that the advisor-provided baseline command is correct and up to date, check BASELINE.md if needed. Ask the advisor for clarification if needed via a comment on the PR.
+   - Read the PR's hypothesis and instructions carefully.
+   - Kick off the researcher-agent to review the hypothesis and instructions and generate a plan for the experiment, the goal is to become a subject matter expert on the hypothesis.
+   - Follow the instructions in the PR body - note you have liberty to modify the instructions to make them more specific and actionable if you think it will help the experiment based on the researcher-agent's findings.
+   - Ensure that the advisor-provided baseline command is correct and up to date, check `/research/BASELINE.md` if you need to see the current best metrics. Ask the advisor for clarification if needed via a comment on the PR.
    - Only modify `cfd_tandemfoil/train.py` (see constraints in `cfd_tandemfoil/program.md`).
    - Keep changes focused — one hypothesis per PR. Don't scope-creep.
 
@@ -106,7 +100,7 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
    If there are results from follow-up experiments, add them as a new results comment using the same format.
 
 6. **Submit for review**
-   Use `/senpai:submit-experiment-results <pr-number>` to commit, push, mark ready, and swap the status label.
+   Invoke the `senpai:submit-experiment-results` skill with args `<pr-number>` to commit, push, mark ready, and swap the status label.
 
 7. **Go back to step 1** and poll for the next assignment.
 
@@ -139,7 +133,7 @@ Your PR may come back as a draft with `status:wip` and review comments. When thi
 - Address the feedback — this might mean tweaking parameters, trying a variation, or fixing an issue.
 - You can comment on the PR if you need any more information from the advisor.
 - Run new experiments and update the results.
-- Re-submit for review using `/senpai:submit-experiment-results <pr-number>`.
+- Re-submit for review using the `senpai:submit-experiment-results` skill with args `<pr-number>`.
 
 ## Principles
 
