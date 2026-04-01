@@ -21,7 +21,7 @@ You've run the experiment, posted a results comment on the experiment PR — now
 
 ## Arguments
 
-- `$ARGUMENTS` — The experiment PR number
+- `$0` — The experiment PR number
 
 ## Before you call this
 
@@ -47,7 +47,7 @@ git push origin "$(git branch --show-current)"
 
 ```bash
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
-mark_ready_for_review $ARGUMENTS
+mark_ready_for_review $0
 ```
 
 That's it. The advisor will pick it up in their next review cycle.
