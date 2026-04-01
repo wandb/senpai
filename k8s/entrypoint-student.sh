@@ -59,7 +59,7 @@ MAX_TURNS=50
 ITERATION=0
 while true; do
     ITERATION=$((ITERATION + 1))
-    LOGFILE="$LOGDIR/iteration_${ITERATION}_$(date +%Y%m%d_%H%M%S).jsonl"
+    LOGFILE="$LOGDIR/iteration_${ITERATION}_$(date +%Y%m%d_%H%M%S).log"
     echo "=== Student Heartbeat iteration $ITERATION ($(date)) ==="
 
     # Return to latest advisor branch so student starts from the current baseline
@@ -81,13 +81,6 @@ while true; do
     [ "$ISSUE_COUNT" -gt 0 ]    && TRIAGE_INFO+=$'\n'"- **GitHub issues ($ISSUE_COUNT):** $(printf '%s' "$ISSUE_JSON" | json_numbers)"
     echo "$TRIAGE_INFO"
 
-    # --- Skip if nothing to do ---
-    if [ "$ASSIGNED_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ]; then
-        echo "=== No work assigned, sleeping $SLEEP_TIME_S seconds ==="
-        sleep "$SLEEP_TIME_S"
-        continue
-    fi
-
     # --- Log triage and invoke CC ---
     echo "=== Log: $LOGFILE ==="
     echo "$TRIAGE_INFO" > "$LOGFILE"
@@ -100,10 +93,18 @@ while true; do
         echo "$TRIAGE_INFO"
         run_senpai_claude $MAX_TURNS "${FULL_PROMPT}"$'\n\n'"${TRIAGE_INFO}" || EXIT_CODE=$?
     else
+        # --- Skip if nothing to do ---
+        if [ "$ASSIGNED_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ]; then
+            echo "=== No work assigned, sleeping $SLEEP_TIME_S seconds ==="
+            sleep "$SLEEP_TIME_S"
+            continue
+        fi
+        
         echo "=== Iteration $ITERATION: Using heartbeat prompt ==="
         echo "$HEARTBEAT_PROMPT"
         echo "$TRIAGE_INFO"
-        run_senpai_claude $MAX_TURNS "${HEARTBEAT_PROMPT}"$'\n\n'"${TRIAGE_INFO}" || EXIT_CODE=$?
+        # Student should start fresh each iteration (no -c) — experiments are self-contained
+        run_senpai_claude $MAX_TURNS "${FULL_PROMPT}"$'\n\n'"${HEARTBEAT_PROMPT}"$'\n\n'"${TRIAGE_INFO}" || EXIT_CODE=$?
     fi
     DURATION=$(( $(date +%s) - START_TS ))
 

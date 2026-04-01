@@ -84,7 +84,7 @@ ITERATION=0
 while true; do
     # Set log dir, print loop and git info
     ITERATION=$((ITERATION + 1))
-    LOGFILE="$LOGDIR/iteration_${ITERATION}_$(date +%Y%m%d_%H%M%S).jsonl"
+    LOGFILE="$LOGDIR/iteration_${ITERATION}_$(date +%Y%m%d_%H%M%S).log"
     echo "=== Advisor Heartbeat iteration $ITERATION ($(date)) ==="
     echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) ==="
 
