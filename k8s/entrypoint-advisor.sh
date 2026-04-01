@@ -76,7 +76,7 @@ json_len() { python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())
 json_join() { python3 -c "import sys,json; print(','.join(json.loads(sys.stdin.read())))"; }
 json_numbers() { python3 -c "import sys,json; print(','.join(f'#{i[\"number\"]}' for i in json.loads(sys.stdin.read())))"; }
 
-# --- Last-check timestamp state ---
+# --- Last-check timestamp state for filtering PRs and issues ---
 LAST_CHECK_FILE="$LOGDIR/.last_check_ts"
 
 # --- Launch Claude Code Loop ---
@@ -93,7 +93,7 @@ while true; do
     echo "=== Advisor Heartbeat iteration $ITERATION ($(date)) ==="
     echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) ==="
 
-    # --- Read last-check timestamp (empty on first run = no filtering) ---
+    # --- Read last-check timestamp for filtering PRs and issues (empty on first run = no filtering) ---
     SINCE=""
     [ -f "$LAST_CHECK_FILE" ] && SINCE=$(cat "$LAST_CHECK_FILE")
 
@@ -107,17 +107,10 @@ while true; do
 
     # --- Build triage info (used in logs, CC prompt, and skip check) ---
     TRIAGE_INFO="## Research state (since ${SINCE:-boot})"
-    [ "$REVIEW_COUNT" -gt 0 ] && TRIAGE_INFO+=$'\n'"- **PRs to review ($REVIEW_COUNT):** $(printf '%s' "$REVIEW_JSON" | json_numbers)"
-    [ "$ISSUE_COUNT" -gt 0 ]  && TRIAGE_INFO+=$'\n'"- **GH issues ($ISSUE_COUNT):** $(printf '%s' "$ISSUE_JSON" | json_numbers)"
+    [ "$REVIEW_COUNT" -gt 0 ] && TRIAGE_INFO+=$'\n'"- **GitHub PRs to review ($REVIEW_COUNT):** $(printf '%s' "$REVIEW_JSON" | json_numbers)"
+    [ "$ISSUE_COUNT" -gt 0 ]  && TRIAGE_INFO+=$'\n'"- **GitHub issues ($ISSUE_COUNT):** $(printf '%s' "$ISSUE_JSON" | json_numbers)"
     [ "$IDLE_COUNT" -gt 0 ]   && TRIAGE_INFO+=$'\n'"- **Idle students ($IDLE_COUNT):** $(printf '%s' "$IDLE_JSON" | json_join)"
     echo "$TRIAGE_INFO"
-
-    # --- Programmatic skip: skip rest of CC loop if nothing actionable ---
-    if [ "$REVIEW_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ] && [ "$IDLE_COUNT" -eq 0 ]; then
-        echo "=== Nothing actionable, sleeping $SLEEP_TIME_S seconds ==="
-        sleep "$SLEEP_TIME_S"
-        continue
-    fi
 
     # --- Log triage state and select prompt ---
     echo "=== Log: $LOGFILE ==="
@@ -126,10 +119,22 @@ while true; do
     START_TS=$(date +%s)
     EXIT_CODE=0
     if [ "$ITERATION" -eq 1 ]; then
-        echo "=== Using FULL prompt: ($FULL_PROMPT) ==="
-        run_senpai_claude $MAX_TURNS "$FULL_PROMPT" || EXIT_CODE=$?
+        echo "=== Iteration $ITERATION: Using FULL prompt + triage ==="
+        echo "$FULL_PROMPT"
+        echo "$TRIAGE_INFO"
+        run_senpai_claude $MAX_TURNS "${FULL_PROMPT}"$'\n\n'"${TRIAGE_INFO}" || EXIT_CODE=$?
     else
-        echo "=== Using heartbeat (HEARTBEAT_PROMPT) prompt ==="
+        # --- Programmatic skip: skip rest of CC loop if nothing actionable ---
+        if [ "$REVIEW_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ] && [ "$IDLE_COUNT" -eq 0 ]; then
+            echo "=== Iteration $ITERATION: Nothing actionable, sleeping $SLEEP_TIME_S seconds ==="
+            sleep "$SLEEP_TIME_S"
+            continue
+        fi
+
+        echo "=== Iteration $ITERATION: Using heartbeat (HEARTBEAT_PROMPT) prompt ==="
+        echo "$HEARTBEAT_PROMPT"
+        echo "$TRIAGE_INFO"
+        
         CONTINUE_PROMPT="${HEARTBEAT_PROMPT}"$'\n\n'"${TRIAGE_INFO}"
         run_senpai_claude 50 "$CONTINUE_PROMPT" -c || EXIT_CODE=$?
     fi
