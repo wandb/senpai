@@ -66,7 +66,7 @@ fi
 
 # Add "$KEY_INFO" (reminder of student names etc) to PROMPT
 KEY_INFO="\n\n Key information:\n\n Students: $STUDENT_NAMES | Tag: $RESEARCH_TAG | Advisor Branch: $ADVISOR_BRANCH | W&B entity/project: $WANDB_ENTITY/$WANDB_PROJECT \n"
-PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
+FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
 # Heartbeat prompt for polling
 HEARTBEAT_PROMPT="Continue your advisor loop. Survey state, review any completed experiment PRs, assign work to all idle students, and check for human gh issues."
@@ -101,8 +101,8 @@ while true; do
         continue
     fi
 
-    # --- Continuting CC loop --
-    #  accumulate triage info
+    # --- Continuting CC loop ---
+    #  accumulate triage info 
     if [ -n "$IDLE_STUDENTS" ]; then
         IDLE_INFO="$(idle students: $(echo "$IDLE_STUDENTS" | tr '\n' ',' | sed 's/,$//'))"
         echo "$IDLE_INFO"
@@ -110,26 +110,19 @@ while true; do
     fi
 
     # --- Select prompt ---
-    # Full prompt on first iteration or after compaction; heartbeat otherwise
-    if [ "$ITERATION" -eq 1 ]; then
-        FINAL_PROMPT="$PROMPT"
-        echo "=== Using full (PROMPT) prompt ==="
-    else
-        FINAL_PROMPT="$HEARTBEAT_PROMPT"
-        echo "=== Using heartbeat (HEARTBEAT_PROMPT) prompt ==="
-    fi
-
     echo "=== Log: $LOGFILE ==="
 
     START_TS=$(date +%s)
     EXIT_CODE=0
-    FINAL_PROMPT="${FINAL_PROMPT}"$'\n\n'"${TRIAGE}"
     if [ "$ITERATION" -eq 1 ]; then
+        echo "=== Using FULL prompt ($FULL_PROMPT) ==="
         # run_senpai_claude args: max_turns, user_prompt, optional extra CC args before -p (e.g. -c)
-        run_senpai_claude MAX_TURNS "$FINAL_PROMPT" || EXIT_CODE=$?
+        run_senpai_claude MAX_TURNS "$FULL_PROMPT" || EXIT_CODE=$?
     else
-        run_senpai_claude MAX_TURNS "$FINAL_PROMPT" -c || \
-        run_senpai_claude MAX_TURNS "${PROMPT}"$'\n\n'"${TRIAGE}" || EXIT_CODE=$?
+        echo "=== Using heartbeat (HEARTBEAT_PROMPT) prompt ==="
+        CONTINUE_PROMPT="${HEARTBEAT_PROMPT}"$'\n\n'"${TRIAGE_INFO}"
+        run_senpai_claude 50 "$CONTINUE_PROMPT" -c || \
+        run_senpai_claude 50 "${FULL_PROMPT}"$'\n\n'"${CONTINUE_PROMPT}" || EXIT_CODE=$?
     fi
     DURATION=$(( $(date +%s) - START_TS ))
 
