@@ -887,6 +887,7 @@ class Config:
     half_target_noise: bool = False  # GPU 3: reduce target noise by 50%
     no_target_noise: bool = False    # Phase 4: completely disable target noise injection
     use_lion: bool = False        # GPU 4: Lion optimizer instead of AdamW
+    use_soap: bool = False        # Phase 6: SOAP optimizer (heavyball.PaLMForeachSOAP)
     rdrop: bool = False           # GPU 7: R-drop regularization
     rdrop_alpha: float = 1.0     # R-drop consistency loss weight
     # Phase 3 R3: normalization/prediction-space experiments
@@ -1256,7 +1257,19 @@ class Lookahead:
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
-if cfg.use_lion:
+_soap_aux_opt = None  # auxiliary AdamW for SOAP's low-dim params (set below if use_soap)
+if cfg.use_soap:
+    from heavyball import PaLMForeachSOAP
+    # SOAP needs ndim>=2 params; use AdamW for scalars/biases
+    _soap_params = [p for p in model.parameters() if p.ndim >= 2]
+    _adam_params = [p for p in model.parameters() if p.ndim < 2]
+    base_opt = PaLMForeachSOAP(_soap_params, lr=_base_lr, weight_decay=cfg.weight_decay)
+    _soap_aux_opt = torch.optim.AdamW(_adam_params, lr=_base_lr, weight_decay=cfg.weight_decay) if _adam_params else None
+    optimizer = base_opt  # SOAP has built-in preconditioning; skip Lookahead
+    print(f"Using PaLMForeachSOAP optimizer: lr={_base_lr}, wd={cfg.weight_decay}, "
+          f"soap_params={sum(p.numel() for p in _soap_params):,}, "
+          f"adam_aux_params={sum(p.numel() for p in _adam_params):,}")
+elif cfg.use_lion:
     base_opt = Lion([
         {'params': attn_params, 'lr': _base_lr * 0.5},
         {'params': other_params, 'lr': _base_lr}
@@ -1275,7 +1288,19 @@ else:
 # Add refinement head params to optimizer if enabled
 if refine_head is not None:
     _refine_params = list(refine_head.parameters())
-    base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
+    if cfg.use_soap:
+        # Split refinement params: ndim>=2 to SOAP, rest to aux AdamW
+        _refine_soap = [p for p in _refine_params if p.ndim >= 2]
+        _refine_adam = [p for p in _refine_params if p.ndim < 2]
+        if _refine_soap:
+            base_opt.add_param_group({'params': _refine_soap, 'lr': _base_lr})
+        if _refine_adam:
+            if _soap_aux_opt is not None:
+                _soap_aux_opt.add_param_group({'params': _refine_adam, 'lr': _base_lr})
+            else:
+                _soap_aux_opt = torch.optim.AdamW(_refine_adam, lr=_base_lr, weight_decay=cfg.weight_decay)
+    else:
+        base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
@@ -1309,6 +1334,20 @@ else:  # sequential (default)
         milestones=[cfg.warmup_total_iters]
     )
 step_scheduler_per_batch = (cfg.scheduler_type == "onecycle")
+
+# Aux scheduler for SOAP's low-dim params (mirrors main scheduler)
+_soap_aux_scheduler = None
+if cfg.use_soap and _soap_aux_opt is not None:
+    _aux_warmup = torch.optim.lr_scheduler.LinearLR(
+        _soap_aux_opt, start_factor=cfg.warmup_start_factor, total_iters=cfg.warmup_total_iters
+    )
+    _aux_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        _soap_aux_opt, T_max=cfg.cosine_T_max, eta_min=cfg.cosine_eta_min
+    )
+    _soap_aux_scheduler = torch.optim.lr_scheduler.SequentialLR(
+        _soap_aux_opt, schedulers=[_aux_warmup, _aux_cosine],
+        milestones=[cfg.warmup_total_iters]
+    )
 
 # --- wandb ---
 run = wandb.init(
@@ -1377,6 +1416,8 @@ for epoch in range(MAX_EPOCHS):
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     if cfg.grad_accum_steps > 1:
         optimizer.zero_grad()
+        if _soap_aux_opt is not None:
+            _soap_aux_opt.zero_grad()
     for batch_idx, (x, y, is_surface, mask) in enumerate(pbar):
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
@@ -1713,10 +1754,14 @@ for epoch in range(MAX_EPOCHS):
             loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
 
             optimizer.zero_grad()
+            if _soap_aux_opt is not None:
+                _soap_aux_opt.zero_grad()
             loss_a.backward(retain_graph=True)
             grads_a = [p.grad.clone() if p.grad is not None else None
                        for p in model.parameters()]
             optimizer.zero_grad()
+            if _soap_aux_opt is not None:
+                _soap_aux_opt.zero_grad()
             loss_b.backward()
 
             ga_flat = torch.cat([g.view(-1) for g in grads_a if g is not None])
@@ -1739,6 +1784,8 @@ for epoch in range(MAX_EPOCHS):
         else:
             if cfg.grad_accum_steps <= 1:
                 optimizer.zero_grad()
+                if _soap_aux_opt is not None:
+                    _soap_aux_opt.zero_grad()
             loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -1768,11 +1815,17 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.restore()
         if use_pcgrad or _should_step:
             optimizer.step()
+            if _soap_aux_opt is not None:
+                _soap_aux_opt.step()
             if cfg.grad_accum_steps > 1 and not use_pcgrad:
                 optimizer.zero_grad()
+                if _soap_aux_opt is not None:
+                    _soap_aux_opt.zero_grad()
         if step_scheduler_per_batch and (use_pcgrad or _should_step):
             try:
                 scheduler.step()
+                if _soap_aux_scheduler is not None:
+                    _soap_aux_scheduler.step()
             except ValueError:
                 pass
         if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa and not cfg.swa_cyclic and not cfg.snapshot_ensemble:
@@ -1821,6 +1874,8 @@ for epoch in range(MAX_EPOCHS):
                     swa_cyclic_n += 1
         else:
             scheduler.step()
+            if _soap_aux_scheduler is not None:
+                _soap_aux_scheduler.step()
     # Two-phase LR: at switch epoch, reset optimizer LR and replace scheduler
     if cfg.two_phase_lr and epoch + 1 == cfg.two_phase_switch_epoch:
         lrs = [cfg.two_phase_lr_2 * 0.5, cfg.two_phase_lr_2]
