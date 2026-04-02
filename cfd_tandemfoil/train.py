@@ -36,6 +36,7 @@ from timm.layers import trunc_normal_
 from tqdm import tqdm
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import simple_parsing as sp
+import heavyball
 
 from data.utils import visualize
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
@@ -887,6 +888,7 @@ class Config:
     half_target_noise: bool = False  # GPU 3: reduce target noise by 50%
     no_target_noise: bool = False    # Phase 4: completely disable target noise injection
     use_lion: bool = False        # GPU 4: Lion optimizer instead of AdamW
+    use_soap: bool = False        # Phase 6: SOAP optimizer (heavyball PaLMForeachSOAP)
     rdrop: bool = False           # GPU 7: R-drop regularization
     rdrop_alpha: float = 1.0     # R-drop consistency loss weight
     # Phase 3 R3: normalization/prediction-space experiments
@@ -1256,7 +1258,18 @@ class Lookahead:
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
-if cfg.use_lion:
+if cfg.use_soap:
+    # SOAP requires single param group (heavyball bug: only first group updated beyond step 0)
+    _all_params = list(model.parameters())
+    if refine_head is not None:
+        _all_params += list(refine_head.parameters())
+    base_opt = heavyball.PaLMForeachSOAP(
+        _all_params, lr=_base_lr, weight_decay=cfg.weight_decay,
+        precondition_frequency=10, merge_dims=False,
+    )
+    optimizer = base_opt
+    print(f"Optimizer: SOAP (PaLMForeachSOAP, lr={_base_lr}, single param group, {len(_all_params)} tensors)")
+elif cfg.use_lion:
     base_opt = Lion([
         {'params': attn_params, 'lr': _base_lr * 0.5},
         {'params': other_params, 'lr': _base_lr}
@@ -1272,8 +1285,8 @@ else:
     else:
         optimizer = base_opt
 
-# Add refinement head params to optimizer if enabled
-if refine_head is not None:
+# Add refinement head params to optimizer if enabled (skip for SOAP — already included)
+if refine_head is not None and not cfg.use_soap:
     _refine_params = list(refine_head.parameters())
     base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
