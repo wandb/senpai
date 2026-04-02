@@ -1143,6 +1143,7 @@ swa_cyclic_scheduler = None
 snapshot_avg_model = None
 snapshot_n = 0
 snapshot_epoch_list = [int(e) for e in cfg.snapshot_epochs_str.split(",")] if cfg.snapshot_ensemble else []
+snapshot_individual = {}  # epoch -> state_dict (for prediction ensemble)
 
 n_params = sum(p.numel() for p in model.parameters())
 if refine_head is not None:
@@ -1849,9 +1850,15 @@ for epoch in range(MAX_EPOCHS):
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
     prev_surf_loss = epoch_surf
-    # Snapshot ensemble: save running average at specified epochs
+    # Snapshot ensemble: save individual + running average at specified epochs
     if cfg.snapshot_ensemble and (epoch + 1) in snapshot_epoch_list:
         snap = {k: v.cpu().clone() for k, v in _base_model.state_dict().items()}
+        _refine_snap = None
+        if refine_head is not None:
+            _rh = refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
+            _refine_snap = {k: v.cpu().clone() for k, v in _rh.state_dict().items()}
+        snapshot_individual[epoch + 1] = (snap, _refine_snap)
+        print(f"  Snapshot saved at epoch {epoch + 1} ({len(snapshot_individual)}/{len(snapshot_epoch_list)})")
         snapshot_n += 1
         if snapshot_avg_model is None:
             snapshot_avg_model = deepcopy(_base_model)
@@ -2276,6 +2283,207 @@ if best_metrics:
     except Exception as e:
         print(f"Warning: flow field visualization failed: {e}")
         wandb.alert(title="Vis failed", text=str(e)[:200], level="WARN")
+
+# ---------------------------------------------------------------------------
+# Prediction ensemble: average denormalized predictions from multiple snapshots
+# ---------------------------------------------------------------------------
+if cfg.snapshot_ensemble and len(snapshot_individual) >= 2:
+    print("\n" + "=" * 70)
+    print(f"PREDICTION ENSEMBLE ({len(snapshot_individual)} snapshots: {sorted(snapshot_individual.keys())})")
+    print("=" * 70)
+    try:
+        # Use _base_model as the shell to load state_dicts into
+        _ensemble_model = _base_model
+        _ensemble_model.eval()
+        _rh_base = refine_head._orig_mod if (refine_head is not None and hasattr(refine_head, '_orig_mod')) else refine_head
+
+        # Collect per-snapshot predictions for each val split
+        # Structure: {split_name: {epoch: {batch_idx: pred_orig_tensor}}}
+        snap_preds = {sn: {} for sn in VAL_SPLIT_NAMES}
+        snap_targets = {sn: {} for sn in VAL_SPLIT_NAMES}
+        snap_surf_masks = {sn: {} for sn in VAL_SPLIT_NAMES}
+
+        sorted_epochs = sorted(snapshot_individual.keys())
+        for snap_epoch in sorted_epochs:
+            model_sd, refine_sd = snapshot_individual[snap_epoch]
+            # Load model weights (strip _orig_mod prefix if needed)
+            _sd = {k.removeprefix("_orig_mod."): v.to(device) for k, v in model_sd.items()}
+            _ensemble_model.load_state_dict(_sd)
+            _ensemble_model.eval()
+            if _rh_base is not None and refine_sd is not None:
+                _rsd = {k.removeprefix("_orig_mod."): v.to(device) for k, v in refine_sd.items()}
+                _rh_base.load_state_dict(_rsd)
+                _rh_base.eval()
+
+            for split_name, vloader in val_loaders.items():
+                if snap_epoch not in snap_preds[split_name]:
+                    snap_preds[split_name][snap_epoch] = []
+                if snap_epoch == sorted_epochs[0]:
+                    snap_targets[split_name] = []
+                    snap_surf_masks[split_name] = []
+
+                with torch.no_grad():
+                    for x, y, is_surface, mask in vloader:
+                        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                        is_surface = is_surface.to(device, non_blocking=True)
+                        mask = mask.to(device, non_blocking=True)
+
+                        raw_dsdf = x[:, :, 2:10]
+                        dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+                        dist_feat = torch.log1p(dist_surf * 10.0)
+                        _raw_aoa = x[:, 0, 14:15]
+                        x = (x - stats["x_mean"]) / stats["x_std"]
+                        curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                        if cfg.foil2_dist:
+                            foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                            x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
+                        else:
+                            x = torch.cat([x, curv, dist_feat], dim=-1)
+                        raw_xy = x[:, :, :2]
+                        xy_min = raw_xy.amin(dim=1, keepdim=True)
+                        xy_max = raw_xy.amax(dim=1, keepdim=True)
+                        xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                        freqs = torch.cat([_ensemble_model.fourier_freqs_fixed.to(device), _ensemble_model.fourier_freqs_learned.abs()])
+                        xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                        x = torch.cat([x, fourier_pe], dim=-1)
+                        Umag, q = _umag_q(y, mask)
+                        y_phys = _phys_norm(y, Umag, q)
+                        y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+
+                        _v_freestream = None
+                        if cfg.residual_prediction:
+                            _aoa = _raw_aoa
+                            _fs_phys = torch.zeros(y_norm.shape[0], 1, 3, device=device)
+                            _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))
+                            _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))
+                            _v_freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                            y_norm = y_norm - _v_freestream
+
+                        raw_gap = x[:, 0, 21]
+                        is_tandem_e = raw_gap.abs() > 0.5
+                        B = y_norm.shape[0]
+                        sample_stds = torch.ones(B, 1, 3, device=device)
+                        if not cfg.no_perstd and not cfg.raw_targets:
+                            if cfg.high_p_clamp:
+                                channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
+                                tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
+                            else:
+                                channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
+                                tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+                            for b in range(B):
+                                valid = mask[b]
+                                if is_tandem_e[b]:
+                                    sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
+                                else:
+                                    sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            _out = _ensemble_model({"x": x})
+                            pred = _out["preds"].float()
+                            _hidden = _out["hidden"].float()
+                        pred_loss = pred / sample_stds
+
+                        # Apply surface refinement
+                        if _rh_base is not None:
+                            surf_idx = is_surface.nonzero(as_tuple=False)
+                            if surf_idx.numel() > 0:
+                                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                    surf_hidden = _hidden[surf_idx[:, 0], surf_idx[:, 1]]
+                                    surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
+                                    correction = _rh_base(surf_hidden, surf_pred).float()
+                                pred_loss = pred_loss.clone()
+                                pred_loss[surf_idx[:, 0], surf_idx[:, 1]] += correction
+                            pred = pred_loss * sample_stds
+
+                        if cfg.residual_prediction and _v_freestream is not None:
+                            pred = pred + _v_freestream
+                        pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                        pred_orig = _phys_denorm(pred_phys, Umag, q)
+
+                        snap_preds[split_name][snap_epoch].append(pred_orig.cpu())
+                        if snap_epoch == sorted_epochs[0]:
+                            snap_targets[split_name].append(y.cpu())
+                            snap_surf_masks[split_name].append((mask & is_surface).cpu())
+
+            print(f"  Snapshot {snap_epoch}: validation complete")
+
+        # Compute ensemble metrics for different snapshot counts
+        ensemble_configs = {}
+        if len(sorted_epochs) >= 3:
+            # 3-snapshot: middle 3 (130, 140, 155 if available, else last 3)
+            _3snap = sorted_epochs[-3:]
+            ensemble_configs["3-snap"] = _3snap
+        if len(sorted_epochs) >= 5:
+            ensemble_configs["5-snap"] = sorted_epochs
+
+        print(f"\n{'Metric':<35} {'Single-best':<15}", end="")
+        for cfg_name in ensemble_configs:
+            print(f" {cfg_name:<15}", end="")
+        print()
+        print("-" * (35 + 15 + 15 * len(ensemble_configs)))
+
+        ensemble_wandb = {}
+        for split_name in VAL_SPLIT_NAMES:
+            targets = snap_targets[split_name]
+            surf_masks = snap_surf_masks[split_name]
+
+            for ens_name, ens_epochs in ensemble_configs.items():
+                # Average predictions across snapshots
+                n_batches = len(snap_preds[split_name][ens_epochs[0]])
+                mae_surf = torch.zeros(3)
+                n_surf = torch.zeros(3)
+                for bi in range(n_batches):
+                    preds_stack = torch.stack([snap_preds[split_name][ep][bi] for ep in ens_epochs])
+                    avg_pred = preds_stack.mean(0)
+                    y_b = targets[bi].clamp(-1e6, 1e6)
+                    sm = surf_masks[bi]
+                    err = (avg_pred - y_b).abs()
+                    finite = err.isfinite()
+                    err = err.where(finite, torch.zeros_like(err))
+                    mae_surf += (err * sm.unsqueeze(-1)).sum(dim=(0, 1))
+                    n_surf += (sm.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+                mae_surf /= n_surf.clamp(min=1)
+                k = f"ensemble_{ens_name}/{split_name}/mae_surf_p"
+                ensemble_wandb[k] = mae_surf[2].item()
+                k_ux = f"ensemble_{ens_name}/{split_name}/mae_surf_Ux"
+                ensemble_wandb[k_ux] = mae_surf[0].item()
+                k_uy = f"ensemble_{ens_name}/{split_name}/mae_surf_Uy"
+                ensemble_wandb[k_uy] = mae_surf[1].item()
+
+            # Print per-split comparison
+            single_p = best_metrics.get(f"best_{split_name}/mae_surf_p", float("nan"))
+            print(f"  {split_name}/mae_surf_p          {single_p:<15.1f}", end="")
+            for ens_name in ensemble_configs:
+                k = f"ensemble_{ens_name}/{split_name}/mae_surf_p"
+                print(f" {ensemble_wandb[k]:<15.1f}", end="")
+            print()
+
+        # Compute ensemble val/loss equivalent (sum of split losses)
+        for ens_name, ens_epochs in ensemble_configs.items():
+            ens_val_loss = 0.0
+            for split_name in VAL_SPLIT_NAMES:
+                n_batches = len(snap_preds[split_name][ens_epochs[0]])
+                _vol_sum = 0.0
+                _surf_sum = 0.0
+                for bi in range(n_batches):
+                    preds_stack = torch.stack([snap_preds[split_name][ep][bi] for ep in ens_epochs])
+                    avg_pred = preds_stack.mean(0)
+                    y_b = targets[bi] if split_name == VAL_SPLIT_NAMES[-1] else snap_targets[split_name][bi]
+                    # Recompute normalized loss (rough approx: use denormed MAE as proxy)
+                ens_p_in = ensemble_wandb.get(f"ensemble_{ens_name}/val_in_dist/mae_surf_p", 0)
+                ens_p_oodc = ensemble_wandb.get(f"ensemble_{ens_name}/val_ood_cond/mae_surf_p", 0)
+                ens_p_tan = ensemble_wandb.get(f"ensemble_{ens_name}/val_tandem_transfer/mae_surf_p", 0)
+                ens_p_re = ensemble_wandb.get(f"ensemble_{ens_name}/val_ood_re/mae_surf_p", 0)
+            ensemble_wandb[f"ensemble_{ens_name}/summary_p_mean"] = (ens_p_in + ens_p_oodc + ens_p_tan + ens_p_re) / 4
+
+        wandb.summary.update(ensemble_wandb)
+        print(f"\nEnsemble metrics logged to W&B ({len(ensemble_wandb)} metrics)")
+
+    except Exception as e:
+        import traceback
+        print(f"WARNING: Prediction ensemble evaluation failed: {e}")
+        traceback.print_exc()
 
 # ---------------------------------------------------------------------------
 # Verification: manual denormalization check for surface refinement
