@@ -942,6 +942,10 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: Bernoulli Cp estimate
+    bernoulli_cp: bool = False                # add Bernoulli Cp estimate as input feature
+    cp_residual: bool = False                 # predict pressure residual from Bernoulli Cp (instead of raw p)
+    thin_airfoil: bool = False                # use thin airfoil theory Cp instead of simple Bernoulli
 
 
 cfg = sp.parse(Config)
@@ -998,6 +1002,122 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 1:2] = y_p[:, :, 1:2].clamp(-10, 10) * Umag
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
+
+def bernoulli_cp_estimate(raw_xy, raw_dsdf, aoa_rad, is_surface, mask, thin_airfoil=False):
+    """Estimate Cp from Bernoulli equation / thin airfoil theory.
+
+    For incompressible flow, Cp = 1 - (V_local/V_inf)^2. Near surfaces,
+    velocity accelerates → Cp < 0 (suction). Far from surfaces, Cp → 0.
+
+    Args:
+        raw_xy: [B, N, 2] — raw node coordinates (before normalization)
+        raw_dsdf: [B, N, 8] — distance-to-surface fields (4 channels per foil)
+        aoa_rad: [B, 1] — angle of attack in radians
+        is_surface: [B, N] — boolean mask for surface nodes
+        mask: [B, N] — valid node mask
+        thin_airfoil: bool — use thin airfoil theory for surface nodes
+
+    Returns:
+        cp_est: [B, N, 1] — estimated Cp at each node
+    """
+    B, N, _ = raw_xy.shape
+    device = raw_xy.device
+
+    # Distance to nearest surface (from DSDF features)
+    # Foil 1: dsdf[0:4], Foil 2: dsdf[4:8]
+    dist_foil1 = raw_dsdf[:, :, 0:4].abs().min(dim=-1).values  # [B, N]
+    dist_foil2 = raw_dsdf[:, :, 4:8].abs().min(dim=-1).values  # [B, N]
+    dist_surf = torch.min(dist_foil1, dist_foil2)  # [B, N]
+    is_near_foil2 = dist_foil2 < dist_foil1  # [B, N] — node is closer to foil 2
+
+    # Freestream direction
+    cos_a = torch.cos(aoa_rad)  # [B, 1]
+    sin_a = torch.sin(aoa_rad)
+
+    # Project coordinates onto freestream and perpendicular directions
+    x_stream = raw_xy[:, :, 0] * cos_a + raw_xy[:, :, 1] * sin_a  # [B, N]
+    y_perp = -raw_xy[:, :, 0] * sin_a + raw_xy[:, :, 1] * cos_a   # [B, N]
+
+    if thin_airfoil:
+        # Thin airfoil theory: Cp(x/c) ≈ 2*alpha * (1 - 2*x/c) / sqrt(x/c*(1-x/c))
+        # Normalize chord per-foil using surface nodes to avoid tandem x-range bug
+        surf_float = is_surface.float()  # [B, N]
+
+        # Per-foil chord normalization using nearest-foil assignment
+        # For each foil, compute x_min/x_max from surface nodes belonging to that foil
+        foil1_surf = surf_float * (~is_near_foil2).float()  # [B, N]
+        foil2_surf = surf_float * is_near_foil2.float()      # [B, N]
+
+        # Foil 1 chord bounds (use large/small defaults for samples without foil 2)
+        x_vals = raw_xy[:, :, 0]
+        f1_x = x_vals.clone()
+        f1_x[foil1_surf < 0.5] = float('inf')
+        f1_min = f1_x.amin(dim=1, keepdim=True).clamp(min=-10)  # [B, 1]
+        f1_x[foil1_surf < 0.5] = float('-inf')
+        f1_max = f1_x.amax(dim=1, keepdim=True).clamp(max=10)
+
+        # Foil 2 chord bounds (fallback to foil 1 bounds if no foil 2 surface nodes)
+        f2_x = x_vals.clone()
+        f2_x[foil2_surf < 0.5] = float('inf')
+        f2_min = f2_x.amin(dim=1, keepdim=True)
+        f2_x[foil2_surf < 0.5] = float('-inf')
+        f2_max = f2_x.amax(dim=1, keepdim=True)
+        has_foil2 = (foil2_surf.sum(dim=1, keepdim=True) > 0)
+        f2_min = torch.where(has_foil2, f2_min.clamp(min=-10), f1_min)
+        f2_max = torch.where(has_foil2, f2_max.clamp(max=10), f1_max)
+
+        # Assign per-node chord position based on nearest foil
+        x_min = torch.where(is_near_foil2.unsqueeze(-1).squeeze(-1), f2_min, f1_min)
+        x_max = torch.where(is_near_foil2.unsqueeze(-1).squeeze(-1), f2_max, f1_max)
+        x_chord = (x_vals - x_min) / (x_max - x_min + 1e-8)  # [B, N] in ~[0,1]
+
+        x_c = x_chord.clamp(0.01, 0.99)
+        cp_thin = 2.0 * aoa_rad * (1.0 - 2.0 * x_c) / torch.sqrt(x_c * (1.0 - x_c) + 1e-4)
+
+        # Sign flip for upper/lower surface
+        cp_thin = cp_thin * torch.where(y_perp > 0, torch.ones_like(y_perp), -torch.ones_like(y_perp))
+
+        # For surface nodes use thin airfoil, for volume nodes decay with distance
+        decay = torch.exp(-5.0 * dist_surf)
+        cp_est = cp_thin * (is_surface.float() + (~is_surface).float() * decay)
+
+        # Rear foil velocity deficit: reduce Cp magnitude for nodes near foil 2
+        # Wake reduces dynamic pressure → smaller |Cp| on rear foil
+        deficit = 0.15 / (1.0 + dist_foil1.mean(dim=1, keepdim=True).clamp(min=0.1))
+        rear_scale = (1.0 - deficit).pow(2)  # V_eff^2 / V_inf^2
+        cp_est = torch.where(is_near_foil2, cp_est * rear_scale, cp_est)
+    else:
+        # Simple Bernoulli: Cp = 1 - (V/Vinf)^2
+        # Near surfaces V > Vinf (acceleration around body) → Cp < 0
+        # Offset 0.8 gives physically plausible surface Cp in [-3, 1] range
+        k_aoa = (1.0 + 2.0 * aoa_rad.abs())  # [B, 1]
+        accel = k_aoa / (dist_surf + 0.8)     # [B, N] — offset prevents saturation at surface
+
+        # Cp = 1 - (1 + accel)^2
+        cp_est = 1.0 - (1.0 + accel).pow(2)
+        cp_est = cp_est.clamp(-4.0, 1.0)
+
+        # Leading edge factor: use per-foil streamwise min, not batch mean
+        # Compute per-foil leading edge (min x_stream for surface nodes of each foil)
+        surf_x = x_stream.clone()
+        surf_x[~is_surface] = float('inf')
+        f1_le = surf_x.clone()
+        f1_le[is_near_foil2] = float('inf')
+        f1_le_x = f1_le.amin(dim=1, keepdim=True).clamp(min=-10)
+        f2_le = surf_x.clone()
+        f2_le[~is_near_foil2] = float('inf')
+        f2_le_x = f2_le.amin(dim=1, keepdim=True).clamp(min=-10)
+        le_x = torch.where(is_near_foil2, f2_le_x, f1_le_x)
+
+        # Distance from leading edge in streamwise direction
+        x_from_le = x_stream - le_x
+        le_factor = torch.sigmoid(-5.0 * x_from_le)  # higher near leading edge
+        cp_est = cp_est * (0.5 + 0.5 * le_factor)
+
+    # Zero out padded nodes
+    cp_est = cp_est * mask.float()
+    return cp_est.unsqueeze(-1)  # [B, N, 1]
+
 
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=cfg.num_workers, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
@@ -1065,7 +1185,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32 + (1 if cfg.bernoulli_cp else 0),  # +curv, +dist, [+foil2dist], +32 fourier PE, [+bernoulli_cp]
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1445,6 +1565,7 @@ for epoch in range(MAX_EPOCHS):
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
+        _raw_xy = x[:, :, :2].clone()  # save raw xy before normalization (for Bernoulli Cp)
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1463,6 +1584,14 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
+        # Bernoulli Cp estimate as additional input feature
+        _cp_est = None
+        if cfg.bernoulli_cp:
+            _cp_est = bernoulli_cp_estimate(
+                _raw_xy, raw_dsdf, _raw_aoa, is_surface, mask,
+                thin_airfoil=cfg.thin_airfoil,
+            )  # [B, N, 1]
+            x = torch.cat([x, _cp_est], dim=-1)
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -1487,6 +1616,17 @@ for epoch in range(MAX_EPOCHS):
             _fs_phys[:, 0, 2] = 0.0  # p/q
             _freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]  # [B, 1, 3]
             y_norm = y_norm - _freestream  # subtract freestream (broadcasts over N)
+        # Bernoulli Cp residual: subtract Cp estimate from pressure target
+        _cp_base = None
+        if cfg.cp_residual and _cp_est is not None:
+            # _cp_est is in raw Cp space; normalize to match y_norm's pressure channel
+            # y_norm pressure is z-scored Cp, so normalize Cp estimate the same way
+            _cp_normalized = (_cp_est - phys_stats["y_mean"][2:3]) / phys_stats["y_std"][2:3]
+            if cfg.residual_prediction and _freestream is not None:
+                _cp_normalized = _cp_normalized - _freestream[:, :, 2:3]
+            _cp_base = _cp_normalized
+            y_norm = y_norm.clone()
+            y_norm[:, :, 2:3] = y_norm[:, :, 2:3] - _cp_normalized  # predict residual from Cp
         if model.training and not cfg.no_target_noise:
             noise_progress = min(1.0, epoch / max(cfg.noise_anneal_epochs, 1))
             if cfg.half_target_noise:
@@ -1920,6 +2060,7 @@ for epoch in range(MAX_EPOCHS):
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
+                _raw_xy = x[:, :, :2].clone()  # save raw xy before normalization
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1938,6 +2079,14 @@ for epoch in range(MAX_EPOCHS):
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
+                # Bernoulli Cp input feature (validation)
+                _v_cp_est = None
+                if cfg.bernoulli_cp:
+                    _v_cp_est = bernoulli_cp_estimate(
+                        _raw_xy, raw_dsdf, _raw_aoa, is_surface, mask,
+                        thin_airfoil=cfg.thin_airfoil,
+                    )
+                    x = torch.cat([x, _v_cp_est], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
@@ -1957,6 +2106,15 @@ for epoch in range(MAX_EPOCHS):
                     _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))
                     _v_freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
                     y_norm = y_norm - _v_freestream
+                # Bernoulli Cp residual in validation
+                _v_cp_base = None
+                if cfg.cp_residual and _v_cp_est is not None:
+                    _v_cp_normalized = (_v_cp_est - phys_stats["y_mean"][2:3]) / phys_stats["y_std"][2:3]
+                    if cfg.residual_prediction and _v_freestream is not None:
+                        _v_cp_normalized = _v_cp_normalized - _v_freestream[:, :, 2:3]
+                    _v_cp_base = _v_cp_normalized
+                    y_norm = y_norm.clone()
+                    y_norm[:, :, 2:3] = y_norm[:, :, 2:3] - _v_cp_normalized
 
                 # Per-sample std normalization: skip tandem samples
                 raw_gap = x[:, 0, 21]
@@ -2038,6 +2196,10 @@ for epoch in range(MAX_EPOCHS):
                 # Add freestream back for residual prediction mode
                 if cfg.residual_prediction and _v_freestream is not None:
                     pred = pred + _v_freestream  # add freestream back before denorm
+                # Add Bernoulli Cp base back for cp_residual mode
+                if cfg.cp_residual and _v_cp_base is not None:
+                    pred = pred.clone()
+                    pred[:, :, 2:3] = pred[:, :, 2:3] + _v_cp_base
 
                 # Denormalize: phys_stats → Cp space → original scale
                 if cfg.raw_targets:
@@ -2328,6 +2490,7 @@ if cfg.surface_refine and best_metrics:
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
+                    _raw_xy = x[:, :, :2].clone()
                     x = (x - stats["x_mean"]) / stats["x_std"]
                     curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                     if cfg.foil2_dist:
@@ -2343,6 +2506,14 @@ if cfg.surface_refine and best_metrics:
                     xy_scaled = xy_norm.unsqueeze(-1) * freqs
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x = torch.cat([x, fourier_pe], dim=-1)
+                    # Bernoulli Cp input feature (verification)
+                    _v_cp_est = None
+                    if cfg.bernoulli_cp:
+                        _v_cp_est = bernoulli_cp_estimate(
+                            _raw_xy, raw_dsdf, _raw_aoa, is_surface, mask,
+                            thin_airfoil=cfg.thin_airfoil,
+                        )
+                        x = torch.cat([x, _v_cp_est], dim=-1)
 
                     # Ground truth denormalization reference
                     Umag, q = _umag_q(y, mask)
@@ -2359,6 +2530,16 @@ if cfg.surface_refine and best_metrics:
                         _fs_phys[:, 0, 2] = 0.0
                         _v_freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
                         y_norm = y_norm - _v_freestream
+
+                    # Cp residual prediction (verification)
+                    _v_cp_base = None
+                    if cfg.cp_residual and _v_cp_est is not None:
+                        _v_cp_normalized = (_v_cp_est - phys_stats["y_mean"][2:3]) / phys_stats["y_std"][2:3]
+                        if cfg.residual_prediction and _v_freestream is not None:
+                            _v_cp_normalized = _v_cp_normalized - _v_freestream[:, :, 2:3]
+                        _v_cp_base = _v_cp_normalized
+                        y_norm = y_norm.clone()
+                        y_norm[:, :, 2:3] = y_norm[:, :, 2:3] - _v_cp_normalized
 
                     # Per-sample std
                     raw_gap = x[:, 0, 21]
@@ -2406,6 +2587,9 @@ if cfg.surface_refine and best_metrics:
                     # Add freestream back
                     if cfg.residual_prediction and _v_freestream is not None:
                         pred_refined = pred_refined + _v_freestream
+                    if cfg.cp_residual and _v_cp_base is not None:
+                        pred_refined = pred_refined.clone()
+                        pred_refined[:, :, 2:3] = pred_refined[:, :, 2:3] + _v_cp_base
 
                     # Z-score denorm
                     pred_phys_A = pred_refined * phys_stats["y_std"] + phys_stats["y_mean"]
@@ -2425,6 +2609,9 @@ if cfg.surface_refine and best_metrics:
                     # Step 4: add freestream (residual prediction)
                     if cfg.residual_prediction and _v_freestream is not None:
                         pred_manual = pred_manual + _v_freestream
+                    if cfg.cp_residual and _v_cp_base is not None:
+                        pred_manual = pred_manual.clone()
+                        pred_manual[:, :, 2:3] = pred_manual[:, :, 2:3] + _v_cp_base
                     # Step 5: undo z-score: pred * std + mean
                     pred_manual_phys = pred_manual * phys_stats["y_std"] + phys_stats["y_mean"]
                     # Step 6: undo physics norm: Ux*Umag, Uy*Umag, p*q
@@ -2440,6 +2627,8 @@ if cfg.surface_refine and best_metrics:
                     pred_norefine = pred_raw.clone()
                     if cfg.residual_prediction and _v_freestream is not None:
                         pred_norefine = pred_norefine + _v_freestream
+                    if cfg.cp_residual and _v_cp_base is not None:
+                        pred_norefine[:, :, 2:3] = pred_norefine[:, :, 2:3] + _v_cp_base
                     pred_norefine_phys = pred_norefine * phys_stats["y_std"] + phys_stats["y_mean"]
                     pred_norefine_orig = _phys_denorm(pred_norefine_phys, Umag, q)
 
