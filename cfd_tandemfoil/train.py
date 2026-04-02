@@ -565,6 +565,97 @@ class SurfaceRefinementContextHead(nn.Module):
         return correction
 
 
+def compute_divergence_free_loss(
+    pred_vel: torch.Tensor,
+    coords: torch.Tensor,
+    vol_mask: torch.Tensor,
+    k: int = 8,
+    n_sample: int = 512,
+) -> torch.Tensor:
+    """Divergence-free soft penalty: (∂Ux/∂x + ∂Uy/∂y)² ≈ 0 on volume nodes.
+
+    **All kNN/WLS geometry computation is inside torch.no_grad() to prevent
+    the backpropagation instability that occurred in PR #2016.**
+
+    The divergence is computed using detached neighbor indices and weights,
+    then used as a target for the predicted divergence. This means the gradient
+    only flows through the velocity predictions (field values), NOT through
+    the spatial distance/weight computation.
+
+    Args:
+        pred_vel: [B, N, 2] predicted (Ux, Uy) in current space
+        coords: [B, N, 2] node coordinates (detached)
+        vol_mask: [B, N] boolean — True = volume node
+        k: number of kNN neighbors
+        n_sample: number of volume nodes to sample per batch element
+    """
+    B, N, _ = pred_vel.shape
+    device = pred_vel.device
+    losses = []
+
+    for b in range(B):
+        vol_idx = vol_mask[b].nonzero(as_tuple=True)[0]
+        if len(vol_idx) < k + 2:
+            continue
+
+        n = min(n_sample, len(vol_idx))
+        perm = torch.randperm(len(vol_idx), device=device)[:n]
+        query_idx = vol_idx[perm]  # [S]
+        S = len(query_idx)
+
+        # All geometry is detached — no gradient through spatial structure
+        with torch.no_grad():
+            query_c = coords[b, query_idx]   # [S, 2]
+            all_c = coords[b]                 # [N, 2]
+            dists = torch.cdist(query_c, all_c)  # [S, N]
+            dists[torch.arange(S, device=device), query_idx] = float('inf')
+            knn_dist, knn_idx = dists.topk(k, dim=-1, largest=False)  # [S, k]
+
+            # Displacements and IDW weights
+            dx = all_c[knn_idx, 0] - query_c[:, 0:1]  # [S, k]
+            dy = all_c[knn_idx, 1] - query_c[:, 1:2]  # [S, k]
+            w = 1.0 / (knn_dist + 1e-8)               # [S, k]
+
+            # WLS normal equations (analytical 2×2 solve)
+            Adx = dx * w;  Ady = dy * w
+            Axx = (Adx * Adx).sum(-1)  # [S]
+            Axy = (Adx * Ady).sum(-1)
+            Ayy = (Ady * Ady).sum(-1)
+            det = Axx * Ayy - Axy * Axy + 1e-10
+
+            # Pre-compute the WLS solve coefficients for ∂/∂x (per node, per neighbor)
+            # ∂phi/∂x solution: (Ayy * bx - Axy * by) / det
+            # where bx = sum(Adx * dphi * w), by = sum(Ady * dphi * w)
+            # We precompute the per-neighbor weights for bx and by
+            wx_coeff = (Ayy.unsqueeze(1) * Adx - Axy.unsqueeze(1) * Ady) / det.unsqueeze(1)  # [S, k]
+            wy_coeff = (Axx.unsqueeze(1) * Ady - Axy.unsqueeze(1) * Adx) / det.unsqueeze(1)  # [S, k]
+            # These coefficients are fixed (detached); gradient flows through field values only
+
+        # Field values at query and neighbor nodes — these have gradients
+        Ux_q  = pred_vel[b, query_idx, 0]      # [S]
+        Uy_q  = pred_vel[b, query_idx, 1]      # [S]
+        Ux_nb = pred_vel[b][knn_idx][:, :, 0]  # [S, k]
+        Uy_nb = pred_vel[b][knn_idx][:, :, 1]  # [S, k]
+
+        # Velocity differences (gradient flows here)
+        dUx = Ux_nb - Ux_q.unsqueeze(1)  # [S, k]
+        dUy = Uy_nb - Uy_q.unsqueeze(1)  # [S, k]
+
+        # WLS gradient estimates using detached coefficients
+        dUxdx = (wx_coeff * (dUx * w)).sum(-1)   # [S] — ∂Ux/∂x
+        dUydy = (wy_coeff * (dUy * w)).sum(-1)   # [S] — ∂Uy/∂y
+
+        # Divergence: ∂Ux/∂x + ∂Uy/∂y should be ≈ 0 for incompressible flow
+        divergence = dUxdx + dUydy  # [S]
+        # Clamp to prevent numerical overflow in squared loss
+        divergence = divergence.clamp(-100, 100)
+        losses.append(divergence.pow(2).mean())
+
+    if not losses:
+        return pred_vel.sum() * 0.0  # differentiable zero
+    return torch.stack(losses).mean()
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -942,6 +1033,11 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: SOAP optimizer
+    use_soap: bool = False                    # use PaLMForeachSOAP optimizer (heavyball)
+    # Phase 6: Divergence-free loss
+    div_free: bool = False                    # add divergence-free soft penalty
+    div_weight: float = 0.1                   # weight for divergence-free loss
 
 
 cfg = sp.parse(Config)
@@ -1256,13 +1352,51 @@ class Lookahead:
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
-if cfg.use_lion:
+if cfg.use_soap:
+    import heavyball
+    import heavyball.utils as _hb_utils
+    # Monkey-patch: fallback to identity when eigh fails on ill-conditioned GG (rank-1 at init)
+    _orig_get_orth = _hb_utils.get_orthogonal_matrix
+    def _safe_get_orthogonal_matrix(mat, max_eps=1e-3, min_eps=1e-30):
+        try:
+            return _orig_get_orth(mat, max_eps=max_eps, min_eps=min_eps)
+        except (RuntimeError, torch._C._LinAlgError):
+            # Return identity matrices — equivalent to no preconditioning this step
+            result = []
+            for m in mat:
+                if m is None:
+                    result.append(None)
+                else:
+                    result.append(torch.eye(m.shape[0], device=m.device, dtype=m.dtype))
+            return result
+    _hb_utils.get_orthogonal_matrix = _safe_get_orthogonal_matrix
+    # SOAP's Kronecker preconditioning needs ≥2D params; 1D/scalar go to separate AdamW
+    soap_params = [p for p in model.parameters() if p.ndim >= 2]
+    adamw_1d_params = [p for p in model.parameters() if p.ndim < 2]
+    base_opt = heavyball.PaLMForeachSOAP(
+        [{'params': soap_params, 'lr': _base_lr}],
+        lr=_base_lr, weight_decay=cfg.weight_decay,
+        precondition_frequency=10,
+        max_precond_dim=1024,
+        merge_dims=False,
+    )
+    _soap_aux_opt = torch.optim.AdamW(
+        [{'params': adamw_1d_params, 'lr': _base_lr}],
+        weight_decay=cfg.weight_decay
+    ) if adamw_1d_params else None
+    optimizer = base_opt
+    print(f"SOAP: {sum(p.numel() for p in soap_params):,} params (≥2D), "
+          f"{sum(p.numel() for p in adamw_1d_params):,} params (1D→AdamW)")
+    _soap_aux_sched = None  # will be set up with scheduler below
+elif cfg.use_lion:
+    _soap_aux_opt = None
     base_opt = Lion([
         {'params': attn_params, 'lr': _base_lr * 0.5},
         {'params': other_params, 'lr': _base_lr}
     ], weight_decay=cfg.weight_decay)
     optimizer = base_opt  # Lion has its own momentum; skip Lookahead
 else:
+    _soap_aux_opt = None
     base_opt = torch.optim.AdamW([
         {'params': attn_params, 'lr': _base_lr * 0.5},
         {'params': other_params, 'lr': _base_lr}
@@ -1275,7 +1409,16 @@ else:
 # Add refinement head params to optimizer if enabled
 if refine_head is not None:
     _refine_params = list(refine_head.parameters())
-    base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
+    if cfg.use_soap and _soap_aux_opt is not None:
+        # Split: ≥2D to SOAP, 1D to aux AdamW
+        _ref_2d = [p for p in _refine_params if p.ndim >= 2]
+        _ref_1d = [p for p in _refine_params if p.ndim < 2]
+        if _ref_2d:
+            base_opt.add_param_group({'params': _ref_2d, 'lr': _base_lr})
+        if _ref_1d:
+            _soap_aux_opt.add_param_group({'params': _ref_1d, 'lr': _base_lr})
+    else:
+        base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
@@ -1309,6 +1452,21 @@ else:  # sequential (default)
         milestones=[cfg.warmup_total_iters]
     )
 step_scheduler_per_batch = (cfg.scheduler_type == "onecycle")
+
+# Mirror scheduler for SOAP's auxiliary 1D-param AdamW optimizer
+if cfg.use_soap and _soap_aux_opt is not None:
+    _aux_warmup = torch.optim.lr_scheduler.LinearLR(
+        _soap_aux_opt, start_factor=cfg.warmup_start_factor, total_iters=cfg.warmup_total_iters
+    )
+    _aux_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        _soap_aux_opt, T_max=cfg.cosine_T_max, eta_min=cfg.cosine_eta_min
+    )
+    _soap_aux_sched = torch.optim.lr_scheduler.SequentialLR(
+        _soap_aux_opt, schedulers=[_aux_warmup, _aux_cosine],
+        milestones=[cfg.warmup_total_iters]
+    )
+else:
+    _soap_aux_sched = None
 
 # --- wandb ---
 run = wandb.init(
@@ -1377,6 +1535,8 @@ for epoch in range(MAX_EPOCHS):
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     if cfg.grad_accum_steps > 1:
         optimizer.zero_grad()
+        if _soap_aux_opt is not None:
+            _soap_aux_opt.zero_grad()
     for batch_idx, (x, y, is_surface, mask) in enumerate(pbar):
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
@@ -1683,6 +1843,17 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # Divergence-free soft penalty: (∂Ux/∂x + ∂Uy/∂y)² ≈ 0 on volume nodes
+        div_loss = torch.tensor(0.0, device=device)
+        if cfg.div_free and model.training:
+            coords_xy = x[:, :, :2].detach()  # [B, N, 2] xy coordinates
+            # Use normalized predictions — divergence-free holds in any linear scaling
+            div_loss = compute_divergence_free_loss(pred[:, :, :2], coords_xy, vol_mask, k=8, n_sample=512)
+            if torch.isnan(div_loss) or torch.isinf(div_loss):
+                div_loss = torch.tensor(0.0, device=device)
+            else:
+                loss = loss + cfg.div_weight * div_loss
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -1739,6 +1910,8 @@ for epoch in range(MAX_EPOCHS):
         else:
             if cfg.grad_accum_steps <= 1:
                 optimizer.zero_grad()
+                if _soap_aux_opt is not None:
+                    _soap_aux_opt.zero_grad()
             loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -1768,11 +1941,17 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.restore()
         if use_pcgrad or _should_step:
             optimizer.step()
+            if _soap_aux_opt is not None:
+                _soap_aux_opt.step()
             if cfg.grad_accum_steps > 1 and not use_pcgrad:
                 optimizer.zero_grad()
+                if _soap_aux_opt is not None:
+                    _soap_aux_opt.zero_grad()
         if step_scheduler_per_batch and (use_pcgrad or _should_step):
             try:
                 scheduler.step()
+                if _soap_aux_sched is not None:
+                    _soap_aux_sched.step()
             except ValueError:
                 pass
         if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa and not cfg.swa_cyclic and not cfg.snapshot_ensemble:
@@ -1792,7 +1971,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.div_free:
+            _log_dict["train/div_loss"] = div_loss.item()
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -1821,6 +2003,8 @@ for epoch in range(MAX_EPOCHS):
                     swa_cyclic_n += 1
         else:
             scheduler.step()
+            if _soap_aux_sched is not None:
+                _soap_aux_sched.step()
     # Two-phase LR: at switch epoch, reset optimizer LR and replace scheduler
     if cfg.two_phase_lr and epoch + 1 == cfg.two_phase_switch_epoch:
         lrs = [cfg.two_phase_lr_2 * 0.5, cfg.two_phase_lr_2]
