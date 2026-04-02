@@ -21,7 +21,7 @@ Baseline from PR #1935: residual_prediction + surface_refine on Transolver with 
 | Student | Status | PR | Experiment | Phase |
 |---------|--------|----|------------|-------|
 | frieren | WIP | #2008 | **PirateNets (Random Weight Factorization)** | **6** |
-| alphonse | WIP | #2009 | **Geosolver (Geometry-Aware Features)** | **6** |
+| alphonse | WIP | #2011 | **NOBLE (Nonlinear Low-Rank Branches)** | **6** |
 | nezuko | WIP | #2010 | **HeavyBall Optimizers (SOAP, Cauchy, SF)** | **6** |
 | thorfinn | WIP | #2006 | Muon Optimizer + Gram-NS (CRASHED — debugging) | 6 |
 | askeladd | WIP | #2007 | XSA Exclusive Self-Attention (CRASHED — debugging) | 6 |
@@ -39,12 +39,12 @@ None — all students running or debugging.
 - [x] **Muon Optimizer + Gram-NS** → thorfinn (#2006) — CRASHED, debugging
 - [x] **XSA (Exclusive Self-Attention)** → askeladd (#2007) — CRASHED, debugging
 - [x] **PirateNets** → frieren (#2008) — just assigned
-- [x] **Geosolver** → alphonse (#2009) — just assigned
+- [x] ~~**Geosolver**~~ → CLOSED (PR #1989 already tried, failed +9.8%)
+- [x] **NOBLE** → alphonse (#2011) — just assigned (replaced Geosolver)
 - [x] **HeavyBall Optimizers** → nezuko (#2010) — just assigned
-- [ ] NOBLE: Nonlinear Low-Rank Branches (next to assign)
-- [ ] HyperP: Hypersphere Optimization
-- [ ] MSA: Memory Sparse Attention
-- [ ] mHC: Hypernetworks
+- [x] ~~**MSA**~~ — NOT APPLICABLE (wrong problem class, see researcher analysis)
+- [ ] HyperP: Hypersphere Optimization (wait for Muon PR #2006 results)
+- [ ] mHC: Hyper-Connections (DEFER — too complex for 3-layer model)
 
 ### Phase 5 finishing up
 3 experiments still running (fern, tanjiro, edward). Will be reviewed when complete, then students reassigned to Phase 6.
@@ -53,10 +53,16 @@ None — all students running or debugging.
 - Never use raw data files beyond assigned training data (Issue #1834)
 - Each GPU has 96GB VRAM; each student has 8 GPUs
 - Training capped by SENPAI_MAX_EPOCHS and SENPAI_TIMEOUT_MINUTES
+- Throughput is king: >15% step time overhead costs epochs and typically hurts metrics
 
-## Potential Next Research Directions
-1. **NOBLE** — nonlinear low-rank attention branches (for fern/tanjiro/edward when idle)
-2. **HyperP** — hypersphere optimization (complex but potentially impactful)
-3. **MSA** — memory sparse attention for large point clouds
-4. **mHC** — hypernetworks for physics-conditioned weights
-5. **Data augmentation** — physics-aware augmentation, synthetic data from training data only
+## Researcher-Agent Key Findings
+- **Geosolver/MSA ruled out** — Geosolver already failed (PR #1989), MSA wrong problem class
+- **NOBLE is top priority** — cosine nonlinearities match periodic physics patterns
+- **mHC deferred** — too complex for 3-layer model, DomainLayerNorm already handles domain specifics
+- **HyperP only as Muon follow-up** — don't overlap with PR #2006
+- **24-dim input already encodes geometry** — adding more geometry context doesn't help
+
+## Next Assignments (when fern/tanjiro/edward become idle)
+1. Need fresh hypotheses from researcher-agent — current issue #1926 list mostly exhausted
+2. Consider: data augmentation innovations, loss reformulation, ensemble strategies
+3. HyperP only if Muon (#2006) shows promise
