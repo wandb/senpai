@@ -134,6 +134,72 @@ class DomainLayerNorm(nn.Module):
         return torch.where(mask_t, self.ln_tandem(x), self.ln_single(x))
 
 
+class CrossFoilExchange(nn.Module):
+    """Cross-attention between foil-1 and foil-2 surface node features.
+    Pools surface features per-foil, exchanges via cross-attention, injects back."""
+
+    def __init__(self, hidden_dim, n_heads=1):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.n_heads = n_heads
+        # Cross-attention: foil-1 queries foil-2 keys/values and vice versa
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        # Gate for residual injection (starts near-zero)
+        self.gate = nn.Parameter(torch.zeros(1))
+        self.ln = nn.LayerNorm(hidden_dim)
+
+    def _cross_attn(self, q_feats, kv_feats):
+        """q_feats: [B, Nq, H], kv_feats: [B, Nkv, H] -> [B, Nq, H]"""
+        q = self.q_proj(q_feats)  # [B, Nq, H]
+        k = self.k_proj(kv_feats)  # [B, Nkv, H]
+        v = self.v_proj(kv_feats)  # [B, Nkv, H]
+        scale = self.hidden_dim ** -0.5
+        attn = torch.bmm(q, k.transpose(-2, -1)) * scale  # [B, Nq, Nkv]
+        attn = F.softmax(attn, dim=-1)
+        out = torch.bmm(attn, v)  # [B, Nq, H]
+        return self.out_proj(out)
+
+    def forward(self, fx, foil1_mask, foil2_mask, is_tandem):
+        """
+        fx: [B, N, H] — hidden features
+        foil1_mask: [B, N] — bool mask for foil-1 surface nodes
+        foil2_mask: [B, N] — bool mask for foil-2 surface nodes
+        is_tandem: [B] — bool, True for tandem samples
+        Returns: fx with cross-foil info injected into surface nodes
+        """
+        B, N, H = fx.shape
+        # Only process tandem samples (single-foil has no foil-2)
+        if not is_tandem.any():
+            return fx
+
+        fx_out = fx.clone()
+        gate_val = torch.sigmoid(self.gate)
+
+        for b in range(B):
+            if not is_tandem[b]:
+                continue
+            f1_idx = foil1_mask[b].nonzero(as_tuple=True)[0]  # [M1]
+            f2_idx = foil2_mask[b].nonzero(as_tuple=True)[0]  # [M2]
+            if f1_idx.numel() == 0 or f2_idx.numel() == 0:
+                continue
+
+            f1_feats = fx[b, f1_idx].unsqueeze(0)  # [1, M1, H]
+            f2_feats = fx[b, f2_idx].unsqueeze(0)  # [1, M2, H]
+
+            # Foil-1 attends to foil-2, foil-2 attends to foil-1
+            f1_update = self._cross_attn(f1_feats, f2_feats)  # [1, M1, H]
+            f2_update = self._cross_attn(f2_feats, f1_feats)  # [1, M2, H]
+
+            # Gated residual injection
+            fx_out[b, f1_idx] = self.ln(fx[b, f1_idx] + gate_val * f1_update.squeeze(0))
+            fx_out[b, f2_idx] = self.ln(fx[b, f2_idx] + gate_val * f2_update.squeeze(0))
+
+        return fx_out
+
+
 class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
@@ -601,10 +667,14 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        cross_foil=False,
+        cross_foil_last_only=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.pressure_first = pressure_first
+        self.cross_foil = cross_foil
+        self.cross_foil_last_only = cross_foil_last_only
         self.ref = ref
         self.unified_pos = unified_pos
         self.adaln_output = adaln_output
@@ -675,6 +745,14 @@ class Transolver(nn.Module):
                 for idx in range(n_layers)
             ]
         )
+        # Cross-foil exchange modules
+        if cross_foil:
+            if cross_foil_last_only:
+                # Only one module, applied before the last block
+                self.cross_foil_modules = nn.ModuleList([CrossFoilExchange(n_hidden)])
+            else:
+                # One per non-last block (applied after each block)
+                self.cross_foil_modules = nn.ModuleList([CrossFoilExchange(n_hidden) for _ in range(n_layers - 1)])
         # Separate pressure pathway (pressure_separate_last_block):
         # Independent MLP + pres_head that processes shared hidden features
         self._pressure_separate = False  # set from Config after construction
@@ -734,14 +812,16 @@ class Transolver(nn.Module):
         x = data.get("x")
         pos = data.get("pos", pos)
         condition = data.get("condition", condition)
-        return x, pos, condition
+        raw_dsdf = data.get("raw_dsdf")
+        is_surface = data.get("is_surface")
+        return x, pos, condition, raw_dsdf, is_surface
 
     def _validate_output_dims(self, preds):
         if sum(self.output_dims) != preds.shape[-1]:
             raise ValueError("Sum of output_dims must match preds last dimension")
 
     def forward(self, data, pos=None, condition=None):
-        x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
+        x, pos, condition, raw_dsdf, is_surface = self._unpack_inputs(data, pos=pos, condition=condition)
         if x is None:
             raise ValueError("Missing required input tensor: x")
         if condition is not None:
@@ -783,12 +863,30 @@ class Transolver(nn.Module):
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
 
+        # Compute foil-1 / foil-2 masks for cross-foil exchange
+        foil1_mask = foil2_mask = is_tandem_flat = None
+        if self.cross_foil and raw_dsdf is not None and is_surface is not None:
+            # foil-1 surface: is_surface AND closest to foil-1 (dsdf channels 0:4)
+            foil1_dist = raw_dsdf[:, :, 0:4].abs().min(dim=-1).values  # [B, N]
+            foil2_dist = raw_dsdf[:, :, 4:8].abs().min(dim=-1).values  # [B, N]
+            foil1_mask = is_surface & (foil1_dist < foil2_dist)  # [B, N]
+            foil2_mask = is_surface & (foil2_dist <= foil1_dist)  # [B, N]
+            is_tandem_flat = is_tandem.view(-1) > 0.5  # [B]
+
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
-        for block in self.blocks[:-1]:
+        for bi, block in enumerate(self.blocks[:-1]):
             fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+            # Cross-foil exchange after each block (or only before last)
+            if self.cross_foil and foil1_mask is not None:
+                if self.cross_foil_last_only:
+                    # Only apply before the last block (i.e., after the second-to-last non-last block)
+                    if bi == len(self.blocks) - 2:
+                        fx = self.cross_foil_modules[0](fx, foil1_mask, foil2_mask, is_tandem_flat)
+                else:
+                    fx = self.cross_foil_modules[bi](fx, foil1_mask, foil2_mask, is_tandem_flat)
 
         # Deep hidden representation (post all non-last blocks, pre output head)
         fx_deep = fx  # [B, N, n_hidden]
@@ -942,6 +1040,9 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: Cross-foil feature exchange
+    cross_foil: bool = False                   # enable cross-foil attention between foil-1 and foil-2 surfaces
+    cross_foil_last_only: bool = False         # only apply cross-foil exchange before the last block
 
 
 cfg = sp.parse(Config)
@@ -1094,6 +1195,8 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    cross_foil=cfg.cross_foil,
+    cross_foil_last_only=cfg.cross_foil_last_only,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1529,8 +1632,12 @@ for epoch in range(MAX_EPOCHS):
             else:
                 y_norm = y_norm / sample_stds
 
+        _model_input = {"x": x}
+        if cfg.cross_foil:
+            _model_input["raw_dsdf"] = raw_dsdf
+            _model_input["is_surface"] = is_surface
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model(_model_input)
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -1687,7 +1794,7 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x})
+                rdrop_out = model(_model_input)
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -1752,7 +1859,7 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                out2 = model(_model_input)
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -1986,8 +2093,12 @@ for epoch in range(MAX_EPOCHS):
                 else:
                     y_norm_scaled = y_norm / sample_stds
 
+                _eval_input = {"x": x}
+                if cfg.cross_foil:
+                    _eval_input["raw_dsdf"] = raw_dsdf
+                    _eval_input["is_surface"] = is_surface
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    _eval_out = eval_model({"x": x})
+                    _eval_out = eval_model(_eval_input)
                     pred = _eval_out["preds"]
                     _eval_hidden = _eval_out["hidden"]
                 pred = pred.float()
