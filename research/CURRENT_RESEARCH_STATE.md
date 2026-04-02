@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-02 (session start)
+- **Date:** 2026-04-02 (updated after assignments)
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Bold New Architectures & Optimizers
 
@@ -20,51 +20,43 @@ Baseline from PR #1935: residual_prediction + surface_refine on Transolver with 
 
 | Student | Status | PR | Experiment | Phase |
 |---------|--------|----|------------|-------|
-| frieren | WIP | #1998 | Multi-Exit Ensemble (8 parallel) | 5 |
-| fern | WIP | #2004 | Noise Schedule Sweep (8 parallel) | 5 |
-| tanjiro | WIP | #2001 | Learned Loss Weighting — Kendall Uncertainty (8 parallel) | 5 |
-| nezuko | WIP | #2002 | EMA Decay Sweep (8 parallel) | 5 |
-| alphonse | WIP | #2000 | OOD-Focused Hard Mining (8 parallel) | 5 |
-| edward | WIP | #2003 | Warmup & LR Schedule Sweep (8 parallel) | 5 |
-| thorfinn | WIP | #2006 | **Muon Optimizer + Gram-NS** | **6** |
-| askeladd | WIP | #2007 | **XSA Exclusive Self-Attention** | **6** |
+| frieren | WIP | #2008 | **PirateNets (Random Weight Factorization)** | **6** |
+| alphonse | WIP | #2009 | **Geosolver (Geometry-Aware Features)** | **6** |
+| nezuko | WIP | #2010 | **HeavyBall Optimizers (SOAP, Cauchy, SF)** | **6** |
+| thorfinn | WIP | #2006 | Muon Optimizer + Gram-NS (CRASHED — debugging) | 6 |
+| askeladd | WIP | #2007 | XSA Exclusive Self-Attention (CRASHED — debugging) | 6 |
+| fern | WIP | #2004 | Noise Schedule Sweep (running, no metrics yet) | 5 |
+| tanjiro | WIP | #2001 | Learned Loss Weighting (running, no metrics yet) | 5 |
+| edward | WIP | #2003 | Warmup & LR Schedule Sweep (running, no metrics yet) | 5 |
 
 ## PRs Ready for Review
 
-None currently — all students still running.
+None — all students running or debugging.
 
 ## Research Focus
 
-### Phase 6 Direction
-Phase 6 is about bold, fundamentally new approaches. We are executing ideas from human team Issue #1926 and exploring adjacent fields.
-
-**From Issue #1926 — Progress:**
-- [x] **Muon Optimizer + Gram-NS** → thorfinn (#2006) — running
-- [x] **XSA (Exclusive Self-Attention)** → askeladd (#2007) — running
-- [ ] NOBLE: Nonlinear Low-Rank Branches
+### Phase 6 — Active Experiments (from Issue #1926)
+- [x] **Muon Optimizer + Gram-NS** → thorfinn (#2006) — CRASHED, debugging
+- [x] **XSA (Exclusive Self-Attention)** → askeladd (#2007) — CRASHED, debugging
+- [x] **PirateNets** → frieren (#2008) — just assigned
+- [x] **Geosolver** → alphonse (#2009) — just assigned
+- [x] **HeavyBall Optimizers** → nezuko (#2010) — just assigned
+- [ ] NOBLE: Nonlinear Low-Rank Branches (next to assign)
 - [ ] HyperP: Hypersphere Optimization
 - [ ] MSA: Memory Sparse Attention
 - [ ] mHC: Hypernetworks
-- [ ] PirateNets: Physics-informed architecture
-- [ ] Geosolver: Geometry-aware solver
-- [ ] HeavyBall optimizers
 
-**Researcher-agent** investigating remaining Phase 6 ideas with deep literature search — results pending.
-
-### Phase 5 experiments finishing up
-6 incremental experiments (sweeps of noise, LR, EMA, loss weighting, hard mining, multi-exit) are still WIP as of session start. Will be reviewed on completion.
+### Phase 5 finishing up
+3 experiments still running (fern, tanjiro, edward). Will be reviewed when complete, then students reassigned to Phase 6.
 
 ## Key Constraints
 - Never use raw data files beyond assigned training data (Issue #1834)
 - Each GPU has 96GB VRAM; each student has 8 GPUs
 - Training capped by SENPAI_MAX_EPOCHS and SENPAI_TIMEOUT_MINUTES
-- All experiments labeled `phase:6` for Phase 6
 
 ## Potential Next Research Directions
-1. **PirateNets** — physics-informed residual adaptive networks, directly relevant
-2. **NOBLE** — nonlinear low-rank attention branches (architecture improvement)
-3. **HeavyBall** — broad optimizer family, drop-in for Lion
-4. **Geosolver** — geometry-aware solver, relevant to mesh/airfoil encoding
-5. **HyperP** — hypersphere optimization, needs careful LR tuning
-6. **MSA** — memory sparse attention, promising for large point clouds
-7. **mHC** — hypernetworks for physics-conditioned weight generation
+1. **NOBLE** — nonlinear low-rank attention branches (for fern/tanjiro/edward when idle)
+2. **HyperP** — hypersphere optimization (complex but potentially impactful)
+3. **MSA** — memory sparse attention for large point clouds
+4. **mHC** — hypernetworks for physics-conditioned weights
+5. **Data augmentation** — physics-aware augmentation, synthetic data from training data only

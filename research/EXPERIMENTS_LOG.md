@@ -2,51 +2,66 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
-### Assigned — Awaiting Results
+### New Assignments (2026-04-02)
+
+#### 2026-04-02 — PR #2008: Phase 6: PirateNets — Random Weight Factorization
+- Branch: `frieren/pirate-nets`
+- Student: frieren
+- Hypothesis: Apply Random Weight Factorization (RWF) from PirateNets to MLP layers. W = diag(exp(s)) * V where V is fixed random, s is learned. Enables multi-scale frequency learning for better boundary layer / pressure prediction.
+- 8-GPU sweep: baseline × 2, RWF uniform × 2, RWF multiscale × 2, RWF multiscale + higher LR × 2
+- Status: WIP — assigned
+
+#### 2026-04-02 — PR #2009: Phase 6: Geosolver — Geometry-Aware Feature Encoding
+- Branch: `alphonse/geosolver`
+- Student: alphonse
+- Hypothesis: Add explicit geometric features (wall distance, curvature, normals) as inputs + geometry-conditioned attention bias. Physics-geometry coupling directly encoded.
+- 8-GPU sweep: baseline × 2, geo features × 2, geo + attention × 2, geo + attn + higher surf_weight × 2
+- Status: WIP — assigned
+
+#### 2026-04-02 — PR #2010: Phase 6: HeavyBall Optimizers
+- Branch: `nezuko/heavyball-optimizers`
+- Student: nezuko
+- Hypothesis: Sweep modern optimizers (SOAP, CauchyAdamW, Schedule-Free AdamW, PaLM-SOAP) as alternatives to Lion. Different optimizers handle CFD's extreme gradient structure differently.
+- 8-GPU sweep: SOAP × 2 LR, CauchyAdamW × 2 LR, Schedule-Free × 2 LR, PaLM-SOAP, HB-AdamW
+- Status: WIP — assigned
+
+### Previously Assigned
 
 #### 2026-04-01 23:25 — PR #2006: Phase 6: Muon Optimizer + Gram-NS
 - Branch: `phase6/muon-optimizer`
 - Student: thorfinn
-- Hypothesis: Replace Lion optimizer with Muon (Newton-Schulz orthogonalized gradients) for better optimization landscape navigation. Also test Gram-NS faster variant.
-- 8-GPU sweep: Muon at lr=[0.02, 0.01, 0.005], NS steps=[5, 7], Gram-NS variant, + 2 Lion baselines
-- **Status: ALL 8 RUNS CRASHED** — zero metrics logged. Likely code bug (shape mismatch in NS iterations or missing parameter routing). Advisor commented with fix guidance. Sent back for debugging.
+- Hypothesis: Replace Lion with Muon (Newton-Schulz orthogonalized gradients).
+- **Status: ALL 8 RUNS CRASHED** — zero metrics logged. Code bug. Advisor commented with fix guidance.
 
 #### 2026-04-01 23:25 — PR #2007: Phase 6: XSA (Exclusive Self-Attention)
 - Branch: `phase6/xsa-attention`
 - Student: askeladd
-- Hypothesis: Replace standard slice attention with XSA exclusion mechanism to encourage head specialization (different heads → different physical regions).
-- 8-GPU sweep: XSA at temperatures=[0.5, 1.0, 2.0], 4 seeds at t=1.0, + 2 baselines
-- **Status: ALL 8 RUNS CRASHED.** Some logged partial metrics — catastrophically bad (val/loss 3.76-10.6 vs baseline 0.383). Even baseline runs showed broken metrics (~3.83 val/loss), indicating a code regression that breaks training entirely. Advisor commented with fix guidance. Sent back for debugging.
-  
+- Hypothesis: Replace slice attention with XSA exclusion mechanism.
+- **Status: ALL 8 RUNS CRASHED.** Catastrophically bad metrics (val/loss 3.76-10.6 vs baseline 0.383). Code regression. Advisor commented with fix guidance.
+
   | Run | val/loss | p_in | Status |
   |-----|----------|------|--------|
   | xsa-t0.5-s42 | 3.761 | 296.4 | crashed |
   | baseline-s42 | 3.830 | 299.6 | crashed |
-  | xsa-t1.0-s42 | 4.318 | 322.1 | crashed |
-  | xsa-t2.0-s42 | 5.990 | 324.7 | crashed |
 
 ---
 
-## Phase 5 Experiments (Still Running)
+## Phase 5 Experiments
 
-### In Progress
+### Still Running
+- PR #2004: Noise Schedule Sweep (fern) — 8 runs running, no metrics yet
+- PR #2003: Warmup & LR Schedule Sweep (edward) — 8 runs running (earlier 8 crashed), no metrics yet
+- PR #2001: Learned Per-Channel Loss Weighting (tanjiro) — 8 runs running + 1 crashed debug, no metrics yet
 
-- PR #1998: Multi-Exit Ensemble (frieren) — average predictions from intermediate Transolver blocks
-- PR #2004: Noise Schedule Sweep (fern) — re-verify noise schedules on current baseline
-- PR #2003: Warmup & LR Schedule Sweep (edward) — re-tune LR/warmup after architecture changes
-- PR #2002: EMA Decay Sweep (nezuko) — sweep EMA decay values
-- PR #2001: Learned Per-Channel Loss Weighting (tanjiro) — Kendall uncertainty weighting
-- PR #2000: OOD-Focused Training (alphonse) — hard example mining
+### Closed (Dead Ends)
+- PR #1998: Multi-Exit Ensemble (frieren) — **CLOSED.** All 8 crashed, val/loss 4.0-7.5. Auxiliary losses destabilized training.
+- PR #2002: EMA Decay Sweep (nezuko) — **CLOSED.** All 8 crashed, val/loss 1.1. Runs terminated too early.
+- PR #2000: OOD-Focused Training (alphonse) — **CLOSED.** All 8 crashed, val/loss 4.0-11.5. Hard-mining diverged.
 
----
-
-## Phase 5 Experiments (Completed — Summary of Key Results)
-
-### Winners (Merged)
+### Winners (Merged — Phase 5)
 1. **PR #1927: Residual Prediction** — predict correction from freestream. p_oodc -4.7%, p_tan -1.9%
 2. **PR #1935: Surface Refinement Head** — dedicated surface MLP. p_re -72.7%, p_tan -8.9%, val/loss -3.3%
 
-### Key Non-Winners (Closed)
+### Key Non-Winners (Closed — Phase 5)
 - 50+ Phase 5 experiments explored: throughput optimization, data augmentation, architecture variants, loss formulations, ensemble methods, curriculum learning, distillation
-- Most incremental tuning has been exhausted — diminishing returns on Phase 5 approaches
-- This motivates the shift to Phase 6 (radical new ideas)
+- Most incremental tuning exhausted — motivates Phase 6 shift
