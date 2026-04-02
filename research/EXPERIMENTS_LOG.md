@@ -48,10 +48,21 @@
 
 ## Phase 5 Experiments
 
-### Still Running
-- PR #2004: Noise Schedule Sweep (fern) — 8 runs running, no metrics yet
-- PR #2003: Warmup & LR Schedule Sweep (edward) — 8 runs running (earlier 8 crashed), no metrics yet
-- PR #2001: Learned Per-Channel Loss Weighting (tanjiro) — 8 runs running + 1 crashed debug, no metrics yet
+### Completed (2026-04-02)
+
+#### PR #2003: LR Schedule Sweep — **MERGED WINNER**
+- Student: edward | `cosine_T_max=160` beats baseline on ALL metrics
+- val/loss: 0.3761 (−1.8%) | p_in: 12.5 (−3.5%) | p_oodc: 8.2 (−1.3%) | p_tan: 29.8 (−0.7%) | p_re: 6.5 (−3.0%)
+- W&B: `9ysz96ll` | **MERGED** — New baseline. Follow-up: multi-seed (#2012)
+
+#### PR #2001: Learned Per-Channel Loss Weighting — **CLOSED (mixed)**
+- Student: tanjiro | p_tan −1.7% but p_oodc +3.8%, p_re +4.5%
+- Key insight: pressure deserves 1.6x weight (sigma=0.087 vs 0.109-0.111 velocity)
+- **CLOSED** → Follow-up: hybrid learned p-weight (#2013)
+
+#### PR #2004: Noise Schedule Sweep — **CLOSED (dead end)**
+- Student: fern | all stuck at val/loss 0.66-0.68, far above 0.383
+- **CLOSED** → Follow-up: PirateNet surface gate (#2014)
 
 ### Closed (Dead Ends)
 - PR #1998: Multi-Exit Ensemble (frieren) — **CLOSED.** All 8 crashed, val/loss 4.0-7.5. Auxiliary losses destabilized training.
@@ -61,6 +72,7 @@
 ### Winners (Merged — Phase 5)
 1. **PR #1927: Residual Prediction** — predict correction from freestream. p_oodc -4.7%, p_tan -1.9%
 2. **PR #1935: Surface Refinement Head** — dedicated surface MLP. p_re -72.7%, p_tan -8.9%, val/loss -3.3%
+3. **PR #2003: cosine_T_max=160** — faster LR decay. All metrics improved. val/loss -1.8%, p_in -3.5%, p_re -3.0%
 
 ### Key Non-Winners (Closed — Phase 5)
 - 50+ Phase 5 experiments explored: throughput optimization, data augmentation, architecture variants, loss formulations, ensemble methods, curriculum learning, distillation

@@ -1,68 +1,64 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-02 (updated after assignments)
+- **Date:** 2026-04-02 (updated after review round)
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Bold New Architectures & Optimizers
 
-## Current Baseline
+## Current Baseline (PR #2003 MERGED)
 
-| Metric | Mean (8 seeds) | Best single |
-|--------|---------------|-------------|
-| val/loss | 0.383±0.003 | 0.378 |
-| p_in | 12.95±0.30 | 12.1 |
-| p_oodc | 8.31±0.18 | 8.1 |
-| p_tan | 30.01±0.52 | 29.2 |
-| p_re | 6.70±0.10 | 6.5 |
+| Metric | New Best | vs Phase 5 |
+|--------|----------|-----------|
+| val/loss | **0.3761** | -1.8% |
+| p_in | **12.5** | -3.5% |
+| p_oodc | **8.2** | -1.3% |
+| p_tan | **29.8** | -0.7% |
+| p_re | **6.5** | -3.0% |
 
-Baseline from PR #1935: residual_prediction + surface_refine on Transolver with Lion optimizer.
+New change: `--cosine_T_max 160` (was 180). W&B: `9ysz96ll`. Single-seed — needs multi-seed validation.
 
 ## Student Status
 
 | Student | Status | PR | Experiment | Phase |
 |---------|--------|----|------------|-------|
-| frieren | WIP | #2008 | **PirateNets (Random Weight Factorization)** | **6** |
-| alphonse | WIP | #2011 | **NOBLE (Nonlinear Low-Rank Branches)** | **6** |
-| nezuko | WIP | #2010 | **HeavyBall Optimizers (SOAP, Cauchy, SF)** | **6** |
-| thorfinn | WIP | #2006 | Muon Optimizer + Gram-NS (CRASHED — debugging) | 6 |
-| askeladd | WIP | #2007 | XSA Exclusive Self-Attention (CRASHED — debugging) | 6 |
-| fern | WIP | #2004 | Noise Schedule Sweep (running, no metrics yet) | 5 |
-| tanjiro | WIP | #2001 | Learned Loss Weighting (running, no metrics yet) | 5 |
-| edward | WIP | #2003 | Warmup & LR Schedule Sweep (running, no metrics yet) | 5 |
+| edward | WIP | #2012 | T_max=160 multi-seed + fine sweep (140-170) | 6 |
+| tanjiro | WIP | #2013 | Learned pressure weight multiplier (hybrid) | 6 |
+| fern | WIP | #2014 | PirateNet adaptive residual gate on surface refine | 6 |
+| frieren | WIP | #2008 | PirateNets (RWF) | 6 |
+| thorfinn | WIP | #2006 | Muon Optimizer (lower LR sweep after crash fix) | 6 |
+| nezuko | WIP | #2010 | HeavyBall optimizers (all crashed — debugging) | 6 |
+| alphonse | WIP | #2011 | NOBLE (not started yet — pod issue?) | 6 |
+| askeladd | WIP | #2007 | XSA Exclusive Self-Attention (crashed — debugging) | 6 |
 
 ## PRs Ready for Review
 
-None — all students running or debugging.
+None — all students working.
 
 ## Research Focus
 
-### Phase 6 — Active Experiments (from Issue #1926)
-- [x] **Muon Optimizer + Gram-NS** → thorfinn (#2006) — CRASHED, debugging
-- [x] **XSA (Exclusive Self-Attention)** → askeladd (#2007) — CRASHED, debugging
-- [x] **PirateNets** → frieren (#2008) — just assigned
-- [x] ~~**Geosolver**~~ → CLOSED (PR #1989 already tried, failed +9.8%)
-- [x] **NOBLE** → alphonse (#2011) — just assigned (replaced Geosolver)
-- [x] **HeavyBall Optimizers** → nezuko (#2010) — just assigned
-- [x] ~~**MSA**~~ — NOT APPLICABLE (wrong problem class, see researcher analysis)
-- [ ] HyperP: Hypersphere Optimization (wait for Muon PR #2006 results)
-- [ ] mHC: Hyper-Connections (DEFER — too complex for 3-layer model)
+### Completed Phase 6 Loop Items (from Issue #1926)
+- [x] **Muon + Gram-NS** → thorfinn (#2006) — debugging, lower LR needed
+- [x] **XSA** → askeladd (#2007) — debugging code regression
+- [x] **PirateNets (RWF)** → frieren (#2008) — running
+- [x] **NOBLE** → alphonse (#2011) — assigned, not started yet
+- [x] **HeavyBall** → nezuko (#2010) — all crashed, debugging
+- [x] ~~Geosolver~~ → CLOSED (already failed PR #1989)
+- [x] ~~MSA~~ → NOT APPLICABLE (wrong problem class)
+- [ ] HyperP — wait for Muon results
+- [ ] mHC — DEFER (3-layer model too shallow)
 
-### Phase 5 finishing up
-3 experiments still running (fern, tanjiro, edward). Will be reviewed when complete, then students reassigned to Phase 6.
+### Phase 6 Follow-ups (from Phase 5 results)
+- [x] T_max multi-seed validation → edward (#2012)
+- [x] Learned pressure weight → tanjiro (#2013)
+- [x] PirateNet surface gate → fern (#2014)
 
 ## Key Constraints
-- Never use raw data files beyond assigned training data (Issue #1834)
-- Each GPU has 96GB VRAM; each student has 8 GPUs
-- Training capped by SENPAI_MAX_EPOCHS and SENPAI_TIMEOUT_MINUTES
-- Throughput is king: >15% step time overhead costs epochs and typically hurts metrics
+- Never use raw data files beyond training data (Issue #1834)
+- All experiments use `--cosine_T_max 160` (new from PR #2003)
+- Baseline to beat: val/loss 0.3761, p_in 12.5, p_oodc 8.2, p_tan 29.8, p_re 6.5
 
-## Researcher-Agent Key Findings
-- **Geosolver/MSA ruled out** — Geosolver already failed (PR #1989), MSA wrong problem class
-- **NOBLE is top priority** — cosine nonlinearities match periodic physics patterns
-- **mHC deferred** — too complex for 3-layer model, DomainLayerNorm already handles domain specifics
-- **HyperP only as Muon follow-up** — don't overlap with PR #2006
-- **24-dim input already encodes geometry** — adding more geometry context doesn't help
-
-## Next Assignments (when fern/tanjiro/edward become idle)
-1. Need fresh hypotheses from researcher-agent — current issue #1926 list mostly exhausted
-2. Consider: data augmentation innovations, loss reformulation, ensemble strategies
-3. HyperP only if Muon (#2006) shows promise
+## Potential Next Research Directions
+1. If T_max=160 validates → compound with other improvements
+2. T_max=140-150 could be even better (edward #2012 will tell us)
+3. If PirateNet surface gate works → explore wider/deeper surface refine
+4. Muon at very low LR (0.001-0.003) — still running on thorfinn
+5. HyperP as Muon follow-up if Muon shows any promise
