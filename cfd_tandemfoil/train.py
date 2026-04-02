@@ -942,6 +942,11 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 5: Hard example mining — upweight high-loss training samples
+    hard_mining: bool = False                  # enable hard example mining
+    hard_mining_alpha: float = 1.0             # upweighting strength (1.0 = hardest gets 2x weight)
+    hard_mining_start: int = 40                # epoch to start hard mining
+    hard_mining_interval: int = 20             # re-score interval in epochs
 
 
 cfg = sp.parse(Config)
@@ -1019,6 +1024,15 @@ val_loaders = {
     name: DataLoader(subset, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
     for name, subset in val_splits.items()
 }
+
+# Hard mining: sequential eval loader for re-scoring training samples
+hard_mining_eval_loader = None
+hard_mining_base_weights = None
+if cfg.hard_mining and not cfg.debug:
+    hard_mining_eval_loader = DataLoader(
+        train_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs
+    )
+    hard_mining_base_weights = sample_weights.clone()
 
 # --- Physics normalization stats (computed over training set) ---
 # Compute mean/std of Cp-normalized targets so the model sees O(1) values.
@@ -1337,6 +1351,7 @@ for _sname in VAL_SPLIT_NAMES:
 wandb.define_metric("lr", step_metric="global_step")
 wandb.define_metric("epoch_time_s", step_metric="global_step")
 wandb.define_metric("val_predictions", step_metric="global_step")
+wandb.define_metric("hard_mining/*", step_metric="global_step")
 
 model_dir = Path(f"models/model-{run.id}")
 model_dir.mkdir(parents=True)
@@ -1362,6 +1377,105 @@ for epoch in range(MAX_EPOCHS):
         break
 
     t0 = time.time()
+
+    # --- Hard example mining: re-score training samples and update sampler weights ---
+    if (cfg.hard_mining and not cfg.debug and epoch >= cfg.hard_mining_start
+            and epoch % cfg.hard_mining_interval == 0):
+        print(f"  [Hard mining] Re-scoring {len(train_ds)} training samples...")
+        _hm_t0 = time.time()
+        model.eval()
+        if refine_head is not None:
+            refine_head.eval()
+        _hm_losses = []
+        with torch.no_grad():
+            for _hm_x, _hm_y, _hm_is_surf, _hm_mask in tqdm(
+                hard_mining_eval_loader, desc="Hard mining eval", leave=False
+            ):
+                _hm_x = _hm_x.to(device, non_blocking=True)
+                _hm_y = _hm_y.to(device, non_blocking=True)
+                _hm_is_surf = _hm_is_surf.to(device, non_blocking=True)
+                _hm_mask = _hm_mask.to(device, non_blocking=True)
+                _hm_B = _hm_x.shape[0]
+
+                # Preprocessing (same as training loop)
+                _hm_raw_dsdf = _hm_x[:, :, 2:10]
+                _hm_dist_surf = _hm_raw_dsdf.abs().min(dim=-1, keepdim=True).values
+                _hm_dist_feat = torch.log1p(_hm_dist_surf * 10.0)
+                _hm_raw_aoa = _hm_x[:, 0, 14:15]
+                _hm_x = (_hm_x - stats["x_mean"]) / stats["x_std"]
+                _hm_curv = _hm_x[:, :, 2:6].norm(dim=-1, keepdim=True) * _hm_is_surf.float().unsqueeze(-1)
+                if cfg.foil2_dist:
+                    _hm_f2d = torch.log1p(_hm_raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                    _hm_x = torch.cat([_hm_x, _hm_curv, _hm_dist_feat, _hm_f2d], dim=-1)
+                else:
+                    _hm_x = torch.cat([_hm_x, _hm_curv, _hm_dist_feat], dim=-1)
+                _hm_raw_xy = _hm_x[:, :, :2]
+                _hm_xy_min = _hm_raw_xy.amin(dim=1, keepdim=True)
+                _hm_xy_max = _hm_raw_xy.amax(dim=1, keepdim=True)
+                _hm_xy_norm = (_hm_raw_xy - _hm_xy_min) / (_hm_xy_max - _hm_xy_min + 1e-8)
+                _hm_freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                _hm_xy_scaled = _hm_xy_norm.unsqueeze(-1) * _hm_freqs
+                _hm_fpe = torch.cat([_hm_xy_scaled.sin().flatten(-2), _hm_xy_scaled.cos().flatten(-2)], dim=-1)
+                _hm_x = torch.cat([_hm_x, _hm_fpe], dim=-1)
+
+                _hm_Umag, _hm_q = _umag_q(_hm_y, _hm_mask)
+                if cfg.raw_targets:
+                    _hm_y_norm = (_hm_y - raw_stats["y_mean"]) / raw_stats["y_std"]
+                else:
+                    _hm_y_phys = _phys_norm(_hm_y, _hm_Umag, _hm_q)
+                    if cfg.log_pressure:
+                        _hm_y_phys = _hm_y_phys.clone()
+                        _hm_y_phys[:, :, 2:3] = _hm_y_phys[:, :, 2:3].abs().add(1).log() * _hm_y_phys[:, :, 2:3].sign()
+                    _hm_y_norm = (_hm_y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+
+                if cfg.residual_prediction:
+                    _hm_aoa = _hm_raw_aoa
+                    _hm_fs = torch.zeros(_hm_B, 1, 3, device=device)
+                    _hm_fs[:, 0, 0] = torch.cos(_hm_aoa.squeeze(-1))
+                    _hm_fs[:, 0, 1] = torch.sin(_hm_aoa.squeeze(-1))
+                    _hm_freestream = (_hm_fs - phys_stats["y_mean"]) / phys_stats["y_std"]
+                    _hm_y_norm = _hm_y_norm - _hm_freestream
+
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _hm_out = model({"x": _hm_x})
+                    _hm_pred = _hm_out["preds"].float()
+
+                # Per-sample loss: surface MAE (what we care about most)
+                _hm_surf_mask = _hm_mask & _hm_is_surf
+                _hm_abs_err = (_hm_pred - _hm_y_norm).abs()
+                for _b in range(_hm_B):
+                    _s = _hm_surf_mask[_b]
+                    if _s.sum() > 0:
+                        _hm_losses.append(_hm_abs_err[_b, _s].mean().item())
+                    else:
+                        # No surface nodes: use volume loss as proxy
+                        _v = _hm_mask[_b]
+                        _hm_losses.append(_hm_abs_err[_b, _v].mean().item() if _v.sum() > 0 else 0.0)
+
+        _hm_losses = torch.tensor(_hm_losses, dtype=torch.float64)
+        # Soft ranking: weight = base_weight * (1 + alpha * rank/N)
+        _hm_ranks = _hm_losses.argsort().argsort().float() / len(_hm_losses)
+        _hm_new_weights = hard_mining_base_weights * (1.0 + cfg.hard_mining_alpha * _hm_ranks)
+        sampler.weights = _hm_new_weights
+        _hm_dt = time.time() - _hm_t0
+        _hm_top10_pct = _hm_losses.topk(max(1, len(_hm_losses) // 10)).values.mean().item()
+        _hm_bot10_pct = _hm_losses.topk(max(1, len(_hm_losses) // 10), largest=False).values.mean().item()
+        print(f"  [Hard mining] Done in {_hm_dt:.1f}s. "
+              f"Loss range: [{_hm_losses.min():.4f}, {_hm_losses.max():.4f}], "
+              f"top10%={_hm_top10_pct:.4f}, bot10%={_hm_bot10_pct:.4f}")
+        wandb.log({
+            "hard_mining/loss_min": _hm_losses.min().item(),
+            "hard_mining/loss_max": _hm_losses.max().item(),
+            "hard_mining/loss_mean": _hm_losses.mean().item(),
+            "hard_mining/top10pct_loss": _hm_top10_pct,
+            "hard_mining/bot10pct_loss": _hm_bot10_pct,
+            "hard_mining/rescore_time_s": _hm_dt,
+            "hard_mining/alpha": cfg.hard_mining_alpha,
+            "global_step": global_step,
+        })
+        model.train()
+        if refine_head is not None:
+            refine_head.train()
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
