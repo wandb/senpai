@@ -134,6 +134,27 @@ class DomainLayerNorm(nn.Module):
         return torch.where(mask_t, self.ln_tandem(x), self.ln_single(x))
 
 
+class GeometryEncoder(nn.Module):
+    """Encodes DSDF geometry features into a compact per-sample latent code.
+    Inspired by MARIO (arXiv:2505.14704) — geometry-specific modulation."""
+
+    def __init__(self, dsdf_dim=8, latent_dim=8, hidden_dim=64):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(dsdf_dim, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2), nn.GELU(),
+            nn.Linear(hidden_dim // 2, latent_dim),
+        )
+
+    def forward(self, dsdf_features, mask):
+        # dsdf_features: [B, N, dsdf_dim], mask: [B, N]
+        h = self.encoder(dsdf_features)  # [B, N, latent_dim]
+        # Masked mean pooling over valid nodes
+        h_masked = h * mask.unsqueeze(-1).float()
+        z = h_masked.sum(1) / mask.sum(1, keepdim=True).float().clamp(min=1)  # [B, latent_dim]
+        return z
+
+
 class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
@@ -282,6 +303,7 @@ class TransolverBlock(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        mario_latent_dim=0,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -293,6 +315,7 @@ class TransolverBlock(nn.Module):
         self.soft_moe = soft_moe
         self.adaln_all = adaln_all
         self.film_cond = film_cond
+        self.mario_film = mario_latent_dim > 0
         self.domain_layernorm = domain_layernorm
         _LN = (lambda d: DomainLayerNorm(d, zeroinit=dln_zeroinit)) if domain_layernorm else nn.LayerNorm
         self.ln_1 = _LN(hidden_dim)
@@ -325,6 +348,14 @@ class TransolverBlock(nn.Module):
             )
             nn.init.zeros_(self.film_net[-1].weight)
             nn.init.zeros_(self.film_net[-1].bias)
+        if self.mario_film:
+            # MARIO FiLM: geometry latent z → (gamma, beta) for each block
+            self.mario_film_net = nn.Sequential(
+                nn.Linear(mario_latent_dim, hidden_dim), nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim * 2),
+            )
+            nn.init.zeros_(self.mario_film_net[-1].weight)
+            nn.init.zeros_(self.mario_film_net[-1].bias)
         self.ln_2 = _LN(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         self.spatial_bias = nn.Sequential(
@@ -391,7 +422,7 @@ class TransolverBlock(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None, geo_latent=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         # DomainLayerNorm helper: pass is_tandem when enabled, else plain call
         dln_it = (tandem_mask.view(-1) > 0.5) if (self.domain_layernorm and tandem_mask is not None) else None
@@ -417,6 +448,10 @@ class TransolverBlock(nn.Module):
             film_out = self.film_net(condition)  # [B, H*2]
             gamma, beta = film_out.chunk(2, dim=-1)  # each [B, H]
             fx = gamma.unsqueeze(1) * fx + beta.unsqueeze(1)
+        if self.mario_film and geo_latent is not None:
+            mario_out = self.mario_film_net(geo_latent)  # [B, H*2]
+            m_gamma, m_beta = mario_out.chunk(2, dim=-1)  # each [B, H]
+            fx = (1 + m_gamma.unsqueeze(1)) * fx + m_beta.unsqueeze(1)
         if self.last_layer:
             fx_ln = self.ln_3(fx)
             if self.soft_moe:
@@ -601,6 +636,7 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        mario_latent_dim=0,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -612,6 +648,9 @@ class Transolver(nn.Module):
         self.adaln_4cond = adaln_4cond
         self.film_cond = film_cond
         self.adaln_zone_temp = adaln_zone_temp
+        self.mario = mario_latent_dim > 0
+        if self.mario:
+            self.geo_encoder = GeometryEncoder(dsdf_dim=8, latent_dim=mario_latent_dim)
         if output_fields is None or output_dims is None:
             raise ValueError("output_fields and output_dims must be provided")
         if len(output_fields) != len(output_dims):
@@ -671,6 +710,7 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
+                    mario_latent_dim=mario_latent_dim,
                 )
                 for idx in range(n_layers)
             ]
@@ -747,6 +787,14 @@ class Transolver(nn.Module):
         if condition is not None:
             raise ValueError("Transolver does not support conditioning inputs")
 
+        # MARIO: encode geometry from DSDF features
+        geo_latent = None
+        if self.mario:
+            dsdf = x[:, :, 2:10]  # DSDF features [B, N, 8] (standardized)
+            # Derive mask from DSDF: padded nodes have all-zero raw features
+            geo_mask = dsdf.abs().sum(-1) > 1e-6  # [B, N]
+            geo_latent = self.geo_encoder(dsdf, geo_mask)  # [B, latent_dim]
+
         # Compute internal condition before feature_cross (indices are stable here)
         use_cond = self.adaln_all_blocks or self.film_cond
         if use_cond:
@@ -788,7 +836,7 @@ class Transolver(nn.Module):
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features, geo_latent=geo_latent)
 
         # Deep hidden representation (post all non-last blocks, pre output head)
         fx_deep = fx  # [B, N, n_hidden]
@@ -805,16 +853,19 @@ class Transolver(nn.Module):
             fx_for_pressure = fx  # save for separate pressure branch
             p_sep = self.pressure_sep_mlp(fx_for_pressure)  # [B, N, 1]
             # Main last block produces vel only (pressure_first still active but p comes from separate branch)
-            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features, geo_latent=geo_latent)
             # Override: replace the pressure channel from the last block with the separate branch's output
             fx = torch.cat([fx[:, :, :2], p_sep], dim=-1)
         else:
-            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features, geo_latent=geo_latent)
 
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred, "hidden": fx_deep}
+        out = {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred, "hidden": fx_deep}
+        if geo_latent is not None:
+            out["geo_latent"] = geo_latent
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -942,6 +993,9 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: MARIO geometry encoding
+    mario: bool = False                        # enable MARIO-style geometry latent conditioning
+    mario_latent: int = 8                      # geometry latent dimension (paper uses 8)
 
 
 cfg = sp.parse(Config)
@@ -1094,6 +1148,7 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    mario_latent_dim=cfg.mario_latent if cfg.mario else 0,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1792,7 +1847,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _train_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if "geo_latent" in out:
+            _train_log["train/geo_latent_std"] = out["geo_latent"].std().item()
+        wandb.log(_train_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
