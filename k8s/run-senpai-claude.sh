@@ -14,11 +14,7 @@ run_senpai_claude() {
         --max-turns "$max_turns" \
         --model "claude-opus-4-6[1m]" \
         --output-format stream-json --verbose \
-        --settings .claude/settings.json \
         --plugin-dir "$SENPAI_PLUGIN" \
-        --plugin-dir .claude \
-        --mcp-config .mcp.json \
-        --agents .claude/agents \
         --dangerously-skip-permissions \
         >> "$LOGFILE" 2>&1
 }
