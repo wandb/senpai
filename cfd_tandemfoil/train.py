@@ -72,6 +72,24 @@ class GatedMLP(nn.Module):
         return self.down_proj(torch.sigmoid(self.gate_proj(x)) * self.act(self.up_proj(x)))
 
 
+class RandomFourierFeatures(nn.Module):
+    """Maps 2D coordinates to multi-scale Fourier features via random projection.
+
+    Projects [x, y] through a fixed random matrix B ~ N(0, sigma) and returns
+    [sin(Bx), cos(Bx)], producing 2*n_features dimensions.
+    """
+
+    def __init__(self, in_dim=2, n_features=64, sigma=10.0):
+        super().__init__()
+        B = torch.randn(n_features, in_dim) * sigma
+        self.register_buffer('B', B)
+
+    def forward(self, coords):
+        # coords: [B, N, 2] (normalized to [0,1])
+        proj = coords @ self.B.T  # [B, N, n_features]
+        return torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)  # [B, N, 2*n_features]
+
+
 class GatedMLP2(nn.Module):
     """GatedMLP with a residual second gated layer."""
     def __init__(self, n_input, n_hidden, n_output, act='gelu'):
@@ -601,10 +619,13 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        fourier_features=False,
+        fourier_sigma=10.0,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.pressure_first = pressure_first
+        self.fourier_features = fourier_features
         self.ref = ref
         self.unified_pos = unified_pos
         self.adaln_output = adaln_output
@@ -696,6 +717,8 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        if fourier_features:
+            self.rff = RandomFourierFeatures(in_dim=2, n_features=64, sigma=fourier_sigma)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -942,6 +965,9 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: Random Fourier Features
+    fourier_features: bool = False            # append RFF features (128-dim) to input before GatedMLP2
+    fourier_sigma: float = 10.0               # RFF random projection scale (controls spatial frequency)
 
 
 cfg = sp.parse(Config)
@@ -1065,7 +1091,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32 + (128 if cfg.fourier_features else 0),  # +curv, +dist, [+foil2dist], +32 fourier PE, [+128 RFF]
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1094,6 +1120,8 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    fourier_features=cfg.fourier_features,
+    fourier_sigma=cfg.fourier_sigma,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1463,6 +1491,8 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
+        if cfg.fourier_features:
+            x = torch.cat([x, model.rff(xy_norm)], dim=-1)  # +128 RFF features
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -1938,6 +1968,8 @@ for epoch in range(MAX_EPOCHS):
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
+                if cfg.fourier_features:
+                    x = torch.cat([x, eval_model.rff(xy_norm)], dim=-1)  # +128 RFF features
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
@@ -2252,6 +2284,8 @@ if best_metrics:
                     xy_scaled = xy_norm.unsqueeze(-1) * freqs
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
+                    if cfg.fourier_features:
+                        x_n = torch.cat([x_n, vis_model.rff(xy_norm)], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
                     pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
                     if cfg.raw_targets:
@@ -2343,6 +2377,8 @@ if cfg.surface_refine and best_metrics:
                     xy_scaled = xy_norm.unsqueeze(-1) * freqs
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x = torch.cat([x, fourier_pe], dim=-1)
+                    if cfg.fourier_features:
+                        x = torch.cat([x, verify_model.rff(xy_norm)], dim=-1)
 
                     # Ground truth denormalization reference
                     Umag, q = _umag_q(y, mask)
