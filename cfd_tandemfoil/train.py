@@ -139,7 +139,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False,
+                 linear_no=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -150,6 +151,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
         self.tandem_temp_offset = nn.Parameter(torch.zeros(1, heads, 1, 1))
         self.linear_no_attention = linear_no_attention
+        self.linear_no = linear_no
         self.learned_kernel = learned_kernel
         self.decouple_slice = decouple_slice
         self.zone_temp = zone_temp
@@ -180,6 +182,11 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout),
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
+        if linear_no:
+            # LinearNO: project Q/K to slice_num dims, V from raw input
+            self.to_q_linear = nn.Linear(dim_head, slice_num, bias=False)
+            self.to_k_linear = nn.Linear(dim_head, slice_num, bias=False)
+            self.to_v_linear = nn.Linear(dim, inner_dim)
         if learned_kernel:
             self.kernel_mlp = nn.Sequential(
                 nn.Linear(2 * dim_head, dim_head), nn.GELU(),
@@ -188,6 +195,42 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None):
         bsz, num_points, _ = x.shape
+
+        # LinearNO path: asymmetric linear attention with slice-dim projections
+        # (arXiv:2511.06294 — actual implementation uses F.softmax, not F.normalize)
+        if self.linear_no:
+            x_mid = (
+                self.in_project_x(x)
+                .reshape(bsz, num_points, self.heads, self.dim_head)
+                .permute(0, 2, 1, 3)
+                .contiguous()
+            )  # [B, H, N, D]
+            fx_mid = (
+                self.in_project_fx(x)
+                .reshape(bsz, num_points, self.heads, self.dim_head)
+                .permute(0, 2, 1, 3)
+                .contiguous()
+            )  # [B, H, N, D]
+            V = (
+                self.to_v_linear(x)
+                .reshape(bsz, num_points, self.heads, self.dim_head)
+                .permute(0, 2, 1, 3)
+                .contiguous()
+            )  # [B, H, N, D]
+
+            # Project Q/K to slice space: [B, H, N, D] -> [B, H, N, S]
+            q = self.to_q_linear(x_mid)   # deslice weights
+            k = self.to_k_linear(fx_mid)  # slice weights
+
+            # Asymmetric softmax normalization (LinearNO core)
+            q = F.softmax(q, dim=-1)  # row-normalize across slices (each node sums to 1)
+            k = F.softmax(k, dim=-2)  # col-normalize across nodes (each slice sums to 1)
+
+            # Linear attention: O(N*S*D) — slice then deslice
+            kv = torch.einsum('bhns,bhnd->bhsd', k, V)   # [B, H, S, D] aggregate per slice
+            out = torch.einsum('bhns,bhsd->bhnd', q, kv)  # [B, H, N, D] deslice back
+            out = rearrange(out, 'b h n d -> b n (h d)')
+            return self.to_out(out)
 
         fx_mid = (
             self.in_project_fx(x)
@@ -266,6 +309,7 @@ class TransolverBlock(nn.Module):
         slice_num=32,
         linear_no_attention=False,
         learned_kernel=False,
+        linear_no=False,
         field_decoder=False,
         adaln_output=False,
         soft_moe=False,
@@ -307,6 +351,7 @@ class TransolverBlock(nn.Module):
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
             prog_slices=prog_slices,
+            linear_no=linear_no,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -565,6 +610,47 @@ class SurfaceRefinementContextHead(nn.Module):
         return correction
 
 
+class SurfaceCorrectionHead(nn.Module):
+    """Post-hoc residual stacking MLP that corrects the main model's surface predictions.
+
+    Applied AFTER surface refinement. Takes the (already-refined) predictions + hidden
+    features and predicts an additive correction term. Zero-initialized so it starts
+    as identity (no correction).
+    """
+
+    def __init__(self, pred_dim: int = 3, feat_dim: int = 192, hidden: int = 64,
+                 p_only: bool = False):
+        super().__init__()
+        self.p_only = p_only
+        actual_out = 1 if p_only else pred_dim
+        self.net = nn.Sequential(
+            nn.Linear(pred_dim + feat_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, actual_out),
+        )
+        # Zero-init last layer so correction starts at zero (identity)
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, pred: torch.Tensor, hidden_features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred: [M, pred_dim] — current predictions for surface nodes
+            hidden_features: [M, feat_dim] — hidden features for surface nodes
+        Returns:
+            correction: [M, pred_dim] — additive correction (zero-padded for p_only)
+        """
+        correction = self.net(torch.cat([pred, hidden_features], dim=-1))
+        if self.p_only:
+            # Pad with zeros for velocity channels: [M, 1] → [M, pred_dim]
+            zeros = torch.zeros(correction.shape[0], pred.shape[-1] - 1,
+                                device=correction.device, dtype=correction.dtype)
+            correction = torch.cat([zeros, correction], dim=-1)
+        return correction
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -584,6 +670,7 @@ class Transolver(nn.Module):
         output_dims: list[int] | None = None,
         linear_no_attention=False,
         learned_kernel=False,
+        linear_no=False,
         field_decoder=False,
         adaln_output=False,
         soft_moe=False,
@@ -655,6 +742,7 @@ class Transolver(nn.Module):
                     last_layer=(idx == n_layers - 1),
                     linear_no_attention=linear_no_attention,
                     learned_kernel=learned_kernel,
+                    linear_no=linear_no,
                     field_decoder=field_decoder if (idx == n_layers - 1) else False,
                     adaln_output=adaln_output if (idx == n_layers - 1) else False,
                     soft_moe=soft_moe if (idx == n_layers - 1) else False,
@@ -860,6 +948,7 @@ class Config:
     use_lookahead: bool = True
     # Architecture flags (one per GPU)
     linear_no_attention: bool = False  # GPU0: skip Q/K/V in slice attention
+    linear_no: bool = False            # Phase 6: LinearNO asymmetric linear attention (replaces slice/deslice)
     field_decoder: bool = False        # GPU1: separate vel/pres output heads
     learned_kernel: bool = False       # GPU2: MLP attention kernel
     uncertainty_loss: bool = False     # GPU3: Kendall uncertainty weighting
@@ -928,6 +1017,7 @@ class Config:
     disable_pcgrad: bool = False        # skip PCGrad dual-backward, use simple combined loss
     vol_subsample_frac: float = 1.0     # fraction of volume nodes in loss after vol_ramp (0.8 = 80%)
     compile_mode: str = "default"       # torch.compile mode: "default", "max-autotune", "reduce-overhead"
+    no_compile: bool = False             # skip torch.compile entirely (for debugging compile issues)
     num_workers: int = 4                # data loader workers
     # Phase 4: Pressure-first sequential prediction
     pressure_first: bool = False        # predict p first, then condition v on p
@@ -942,6 +1032,11 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: Surface correction head — post-hoc residual stacking on surface nodes
+    surface_correction: bool = False          # enable surface correction head (applied after refinement)
+    sc_hidden: int = 64                       # hidden dimension of correction MLP
+    sc_p_only: bool = False                   # only correct pressure channel
+    sc_detach: bool = False                   # detach hidden features (no gradient to main model via correction)
 
 
 cfg = sp.parse(Config)
@@ -1077,6 +1172,7 @@ model_config = dict(
     output_dims=[1, 1, 1],
     linear_no_attention=cfg.linear_no_attention,
     learned_kernel=cfg.learned_kernel,
+    linear_no=cfg.linear_no,
     field_decoder=cfg.field_decoder,
     adaln_output=cfg.adaln_output,
     soft_moe=cfg.soft_moe,
@@ -1099,7 +1195,8 @@ model_config = dict(
 model = Transolver(**model_config).to(device)
 model._pressure_separate = cfg.pressure_separate_last_block
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
-model = torch.compile(model, mode=cfg.compile_mode)
+if not cfg.no_compile:
+    model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 # Surface refinement head (separate module, not compiled with main model)
@@ -1121,15 +1218,32 @@ if cfg.surface_refine:
             n_layers=cfg.surface_refine_layers,
             p_only=cfg.surface_refine_p_only,
         ).to(device)
-    refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
+    if not cfg.no_compile:
+        refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
     _refine_n_params = sum(p.numel() for p in refine_head.parameters())
     print(f"Surface refinement head: {_refine_n_params:,} params "
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
           f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
 
+# Surface correction head (post-hoc stacking, applied after refinement)
+correction_head = None
+if cfg.surface_correction:
+    correction_head = SurfaceCorrectionHead(
+        pred_dim=3,
+        feat_dim=cfg.n_hidden,
+        hidden=cfg.sc_hidden,
+        p_only=cfg.sc_p_only,
+    ).to(device)
+    if not cfg.no_compile:
+        correction_head = torch.compile(correction_head, mode=cfg.compile_mode)
+    _corr_n_params = sum(p.numel() for p in correction_head.parameters())
+    print(f"Surface correction head: {_corr_n_params:,} params "
+          f"(hidden={cfg.sc_hidden}, p_only={cfg.sc_p_only}, detach={cfg.sc_detach})")
+
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
+ema_correction_head = None  # EMA copy of correction head
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -1147,6 +1261,8 @@ snapshot_epoch_list = [int(e) for e in cfg.snapshot_epochs_str.split(",")] if cf
 n_params = sum(p.numel() for p in model.parameters())
 if refine_head is not None:
     n_params += sum(p.numel() for p in refine_head.parameters())
+if correction_head is not None:
+    n_params += sum(p.numel() for p in correction_head.parameters())
 
 
 class SAM:
@@ -1277,6 +1393,12 @@ if refine_head is not None:
     _refine_params = list(refine_head.parameters())
     base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
+
+# Add correction head params to optimizer if enabled
+if correction_head is not None:
+    _corr_params = list(correction_head.parameters())
+    base_opt.add_param_group({'params': _corr_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _corr_params):,} correction head params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
@@ -1564,6 +1686,19 @@ for epoch in range(MAX_EPOCHS):
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
 
+        # Surface correction head: post-hoc stacking correction on surface nodes
+        if correction_head is not None and model.training:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                surf_idx_c = is_surface.nonzero(as_tuple=False)  # [M, 2]
+                if surf_idx_c.numel() > 0:
+                    c_hidden = hidden[surf_idx_c[:, 0], surf_idx_c[:, 1]]  # [M, n_hidden]
+                    if cfg.sc_detach:
+                        c_hidden = c_hidden.detach()
+                    c_pred = pred[surf_idx_c[:, 0], surf_idx_c[:, 1]]      # [M, 3]
+                    sc_correction = correction_head(c_pred, c_hidden).float()  # [M, 3]
+                    pred = pred.clone()
+                    pred[surf_idx_c[:, 0], surf_idx_c[:, 1]] = pred[surf_idx_c[:, 0], surf_idx_c[:, 1]] + sc_correction
+
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         if cfg.tandem_ramp:
@@ -1791,6 +1926,15 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for correction head
+            if correction_head is not None:
+                _corr_base = correction_head._orig_mod if hasattr(correction_head, '_orig_mod') else correction_head
+                if ema_correction_head is None:
+                    ema_correction_head = deepcopy(_corr_base)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_correction_head.parameters(), _corr_base.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -1896,6 +2040,14 @@ for epoch in range(MAX_EPOCHS):
             eval_refine_head.eval()
         elif refine_head is not None:
             refine_head.eval()
+    # Select the right correction head for validation (EMA if available)
+    eval_correction_head = correction_head  # default: use training head
+    if correction_head is not None:
+        if ema_correction_head is not None and ema_model is not None and eval_model is ema_model:
+            eval_correction_head = ema_correction_head
+            eval_correction_head.eval()
+        elif correction_head is not None:
+            correction_head.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -2014,6 +2166,24 @@ for epoch in range(MAX_EPOCHS):
                                 pred_loss = pred_loss.clone()
                                 pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
+                    if cfg.multiply_std:
+                        pred = pred_loss / sample_stds
+                    else:
+                        pred = pred_loss * sample_stds
+
+                # Apply surface correction head during validation
+                if eval_correction_head is not None:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        surf_idx_c = is_surface.nonzero(as_tuple=False)
+                        if surf_idx_c.numel() > 0:
+                            c_hidden = _eval_hidden[surf_idx_c[:, 0], surf_idx_c[:, 1]]
+                            if cfg.sc_detach:
+                                c_hidden = c_hidden.detach()
+                            c_pred = pred_loss[surf_idx_c[:, 0], surf_idx_c[:, 1]]
+                            sc_correction = eval_correction_head(c_pred, c_hidden).float()
+                            pred_loss = pred_loss.clone()
+                            pred_loss[surf_idx_c[:, 0], surf_idx_c[:, 1]] = pred_loss[surf_idx_c[:, 0], surf_idx_c[:, 1]] + sc_correction
+                    # Back-compute corrected pred for denormalization
                     if cfg.multiply_std:
                         pred = pred_loss / sample_stds
                     else:
@@ -2177,6 +2347,12 @@ for epoch in range(MAX_EPOCHS):
                 refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
             )
             torch.save(_refine_save.state_dict(), model_dir / "refine_head.pt")
+        # Save correction head checkpoint alongside main model
+        if correction_head is not None:
+            _corr_save = ema_correction_head if ema_correction_head is not None else (
+                correction_head._orig_mod if hasattr(correction_head, '_orig_mod') else correction_head
+            )
+            torch.save(_corr_save.state_dict(), model_dir / "correction_head.pt")
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
@@ -2301,6 +2477,14 @@ if cfg.surface_refine and best_metrics:
         )
         verify_refine.eval()
 
+        # Use EMA correction head if available, else training head
+        verify_correction = None
+        if correction_head is not None:
+            verify_correction = ema_correction_head if ema_correction_head is not None else (
+                correction_head._orig_mod if hasattr(correction_head, '_orig_mod') else correction_head
+            )
+            verify_correction.eval()
+
         # Run inference on val_ood_re only
         _ood_re_loader = val_loaders.get("val_ood_re")
         if _ood_re_loader is None:
@@ -2400,6 +2584,17 @@ if cfg.surface_refine and best_metrics:
                     else:
                         pred_loss_refined = pred_loss
 
+                    # Apply correction head
+                    if verify_correction is not None:
+                        surf_idx_c = is_surface.nonzero(as_tuple=False)
+                        if surf_idx_c.numel() > 0:
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                c_hidden = hidden[surf_idx_c[:, 0], surf_idx_c[:, 1]]
+                                c_pred = pred_loss_refined[surf_idx_c[:, 0], surf_idx_c[:, 1]]
+                                sc_correction = verify_correction(c_pred, c_hidden).float()
+                            pred_loss_refined = pred_loss_refined.clone()
+                            pred_loss_refined[surf_idx_c[:, 0], surf_idx_c[:, 1]] += sc_correction
+
                     # Back-compute pred with refinement
                     pred_refined = pred_loss_refined * sample_stds
 
@@ -2420,6 +2615,16 @@ if cfg.surface_refine and best_metrics:
                     if surf_idx.numel() > 0:
                         pred_manual = pred_manual.clone()
                         pred_manual[surf_idx[:, 0], surf_idx[:, 1]] += correction
+                    # Step 2b: add correction head (same as above)
+                    if verify_correction is not None:
+                        surf_idx_c2 = is_surface.nonzero(as_tuple=False)
+                        if surf_idx_c2.numel() > 0:
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                c_hidden2 = hidden[surf_idx_c2[:, 0], surf_idx_c2[:, 1]]
+                                c_pred2 = pred_manual[surf_idx_c2[:, 0], surf_idx_c2[:, 1]]
+                                sc_corr2 = verify_correction(c_pred2, c_hidden2).float()
+                            pred_manual = pred_manual.clone()
+                            pred_manual[surf_idx_c2[:, 0], surf_idx_c2[:, 1]] += sc_corr2
                     # Step 3: multiply by sample_stds to undo per-sample normalization
                     pred_manual = pred_manual * sample_stds
                     # Step 4: add freestream (residual prediction)
