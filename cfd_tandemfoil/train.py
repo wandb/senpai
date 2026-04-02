@@ -942,6 +942,11 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: Asinh pressure transform + gradient-weighted surface loss
+    asinh_pressure: bool = False             # transform pressure targets with asinh for dynamic range compression
+    asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
+    grad_weight_surface: bool = False        # weight surface loss by local pressure gradient magnitude
+    grad_alpha: float = 0.5                  # gradient weight scaling: loss_i *= (1 + alpha * grad_mag_i)
 
 
 cfg = sp.parse(Config)
@@ -1355,6 +1360,35 @@ prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
 
+
+def _surface_grad_weights(y_pressure, raw_xy, surf_mask, alpha, k=4):
+    """Gradient-based weights for surface loss nodes.
+
+    Estimates pressure gradient magnitude at each surface node via kNN,
+    then returns weights: 1 + alpha * normalized_grad_mag.
+    """
+    B, N = y_pressure.shape
+    weights = torch.ones(B, N, device=y_pressure.device)
+    for b in range(B):
+        surf_idx = surf_mask[b].nonzero(as_tuple=True)[0]
+        if surf_idx.numel() < k + 1:
+            continue
+        pos = raw_xy[b, surf_idx]     # [M, 2]
+        pres = y_pressure[b, surf_idx]  # [M]
+        dists = torch.cdist(pos.unsqueeze(0), pos.unsqueeze(0)).squeeze(0)  # [M, M]
+        dists.fill_diagonal_(float('inf'))
+        _, nn_idx = dists.topk(k, largest=False)  # [M, k]
+        nn_dists = dists.gather(1, nn_idx).clamp(min=1e-8)  # [M, k]
+        nn_pres = pres[nn_idx]  # [M, k]
+        dp = (nn_pres - pres.unsqueeze(-1)).abs()  # [M, k]
+        grad_mag = (dp / nn_dists).mean(dim=-1)  # [M]
+        gmax = grad_mag.max()
+        if gmax > 1e-8:
+            grad_mag = grad_mag / gmax
+        weights[b, surf_idx] = 1.0 + alpha * grad_mag
+    return weights
+
+
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
     if elapsed_min >= MAX_TIMEOUT:
@@ -1474,6 +1508,9 @@ for epoch in range(MAX_EPOCHS):
             if cfg.log_pressure:
                 y_phys = y_phys.clone()
                 y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
+            if cfg.asinh_pressure:
+                y_phys = y_phys.clone()
+                y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
             y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         # Residual prediction: subtract freestream from normalized targets
         _freestream = None
@@ -1611,7 +1648,17 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        # Gradient-weighted surface loss: upweight high-gradient regions
+        _grad_w = None
+        if cfg.grad_weight_surface:
+            _grad_w = _surface_grad_weights(
+                y_norm[:, :, 2], raw_xy, surf_mask, alpha=cfg.grad_alpha
+            )  # [B, N]
+            _gw = _grad_w.unsqueeze(-1)  # [B, N, 1]
+            surf_per_sample = (abs_err[:, :, 2:3] * _gw * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / \
+                              (_grad_w * surf_mask.float()).sum(dim=1).clamp(min=1)
+        else:
+            surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
@@ -1625,7 +1672,12 @@ for epoch in range(MAX_EPOCHS):
             thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
             hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
-            surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            if cfg.grad_weight_surface:
+                hard_weights = hard_weights * _gw  # combine with gradient weights
+                surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / \
+                                  (hard_weights.squeeze(-1) * surf_mask.float()).sum(dim=1).clamp(min=1)
+            else:
+                surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         if cfg.tandem_ramp:
             tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
@@ -1946,6 +1998,9 @@ for epoch in range(MAX_EPOCHS):
                     if cfg.log_pressure:
                         y_phys = y_phys.clone()
                         y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
+                    if cfg.asinh_pressure:
+                        y_phys = y_phys.clone()
+                        y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
                     y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
                 # Residual prediction: subtract freestream in val loop
@@ -2047,6 +2102,9 @@ for epoch in range(MAX_EPOCHS):
                     if cfg.log_pressure:
                         pred_phys = pred_phys.clone()
                         pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
+                    if cfg.asinh_pressure:
+                        pred_phys = pred_phys.clone()
+                        pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
                     if cfg.tight_denorm_clamps:
                         _pd = pred_phys.clone()
                         _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
@@ -2261,6 +2319,9 @@ if best_metrics:
                         if cfg.log_pressure:
                             pred_phys = pred_phys.clone()
                             pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
+                        if cfg.asinh_pressure:
+                            pred_phys = pred_phys.clone()
+                            pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
                         if cfg.tight_denorm_clamps:
                             _pd = pred_phys.clone()
                             _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
@@ -2409,6 +2470,9 @@ if cfg.surface_refine and best_metrics:
 
                     # Z-score denorm
                     pred_phys_A = pred_refined * phys_stats["y_std"] + phys_stats["y_mean"]
+                    if cfg.asinh_pressure:
+                        pred_phys_A = pred_phys_A.clone()
+                        pred_phys_A[:, :, 2:3] = torch.sinh(pred_phys_A[:, :, 2:3]) / cfg.asinh_scale
                     # Physics denorm
                     pred_orig_A = _phys_denorm(pred_phys_A, Umag, q)
 
@@ -2427,6 +2491,9 @@ if cfg.surface_refine and best_metrics:
                         pred_manual = pred_manual + _v_freestream
                     # Step 5: undo z-score: pred * std + mean
                     pred_manual_phys = pred_manual * phys_stats["y_std"] + phys_stats["y_mean"]
+                    if cfg.asinh_pressure:
+                        pred_manual_phys = pred_manual_phys.clone()
+                        pred_manual_phys[:, :, 2:3] = torch.sinh(pred_manual_phys[:, :, 2:3]) / cfg.asinh_scale
                     # Step 6: undo physics norm: Ux*Umag, Uy*Umag, p*q
                     pred_manual_orig = torch.zeros_like(pred_manual_phys)
                     pred_manual_orig[:, :, 0:1] = pred_manual_phys[:, :, 0:1].clamp(-10, 10) * Umag
@@ -2441,6 +2508,9 @@ if cfg.surface_refine and best_metrics:
                     if cfg.residual_prediction and _v_freestream is not None:
                         pred_norefine = pred_norefine + _v_freestream
                     pred_norefine_phys = pred_norefine * phys_stats["y_std"] + phys_stats["y_mean"]
+                    if cfg.asinh_pressure:
+                        pred_norefine_phys = pred_norefine_phys.clone()
+                        pred_norefine_phys[:, :, 2:3] = torch.sinh(pred_norefine_phys[:, :, 2:3]) / cfg.asinh_scale
                     pred_norefine_orig = _phys_denorm(pred_norefine_phys, Umag, q)
 
                     # Compute surface pressure MAE for all paths
