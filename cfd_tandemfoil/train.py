@@ -448,6 +448,115 @@ class TransolverBlock(nn.Module):
         return fx
 
 
+class VorticityHead(nn.Module):
+    """Auxiliary head predicting scalar vorticity ω = ∂Uy/∂x - ∂Ux/∂y from hidden states.
+
+    Used as a physics-informed regularizer: the predicted vorticity should be consistent
+    with the curl of the predicted velocity field (vorticity consistency loss).
+    """
+
+    def __init__(self, n_hidden: int):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.LayerNorm(n_hidden),
+            nn.Linear(n_hidden, n_hidden // 2),
+            nn.GELU(),
+            nn.Linear(n_hidden // 2, 1),
+        )
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        return self.head(h)  # [B, N, 1]
+
+
+def compute_vorticity_consistency_loss(
+    pred_vel: torch.Tensor,
+    pred_vort: torch.Tensor,
+    coords: torch.Tensor,
+    vol_mask: torch.Tensor,
+    k: int = 8,
+    n_sample: int = 512,
+) -> torch.Tensor:
+    """Vorticity consistency loss: MSE(pred_vort, curl(pred_vel)) on volume nodes.
+
+    Uses k-NN Weighted Least Squares (IDW weights) to estimate velocity gradients on the
+    unstructured mesh. Excludes surface nodes where high-aspect-ratio cells make WLS
+    gradient estimates unreliable.
+
+    Args:
+        pred_vel: [B, N, 2] predicted velocity (Ux, Uy) in model output space
+        pred_vort: [B, N, 1] predicted vorticity from VorticityHead
+        coords: [B, N, 2] node coordinates (detached, no grad needed)
+        vol_mask: [B, N] boolean mask — True = volume node (include in loss)
+        k: number of neighbors for WLS gradient estimation
+        n_sample: number of volume nodes to sample per batch element
+    """
+    B, N, _ = pred_vel.shape
+    device = pred_vel.device
+    losses = []
+
+    for b in range(B):
+        vol_idx = vol_mask[b].nonzero(as_tuple=True)[0]  # [n_vol]
+        if len(vol_idx) < k + 2:
+            continue
+
+        # Random subsample of volume nodes for efficiency
+        n = min(n_sample, len(vol_idx))
+        perm = torch.randperm(len(vol_idx), device=device)[:n]
+        query_idx = vol_idx[perm]  # [S]
+        S = len(query_idx)
+
+        # Coordinates [S, 2] and [N, 2]
+        query_c = coords[b, query_idx]   # [S, 2]
+        all_c = coords[b]                # [N, 2]
+
+        # Pairwise distances [S, N], exclude self
+        dists = torch.cdist(query_c, all_c)                              # [S, N]
+        dists[torch.arange(S, device=device), query_idx] = float('inf')  # no self-loop
+
+        # k-nearest neighbors
+        knn_dist, knn_idx = dists.topk(k, dim=-1, largest=False)  # [S, k]
+
+        # Displacements from query node to neighbors
+        dx = all_c[knn_idx, 0] - query_c[:, 0:1]  # [S, k]
+        dy = all_c[knn_idx, 1] - query_c[:, 1:2]  # [S, k]
+        w = 1.0 / (knn_dist + 1e-8)               # [S, k] IDW weights
+
+        # WLS normal equations AᵀA (2×2 per node, analytical solve)
+        Adx = dx * w;  Ady = dy * w
+        Axx = (Adx * Adx).sum(-1)  # [S]
+        Axy = (Adx * Ady).sum(-1)
+        Ayy = (Ady * Ady).sum(-1)
+        det = Axx * Ayy - Axy * Axy + 1e-10  # [S]
+
+        # Field values at query and neighbor nodes
+        Ux_q  = pred_vel[b, query_idx, 0]          # [S]
+        Uy_q  = pred_vel[b, query_idx, 1]          # [S]
+        Ux_nb = pred_vel[b][knn_idx][:, :, 0]      # [S, k]
+        Uy_nb = pred_vel[b][knn_idx][:, :, 1]      # [S, k]
+
+        # WLS rhs (weighted residuals)
+        dUx = (Ux_nb - Ux_q.unsqueeze(1)) * w      # [S, k]
+        dUy = (Uy_nb - Uy_q.unsqueeze(1)) * w      # [S, k]
+
+        bx_ux = (Adx * dUx).sum(-1);  by_ux = (Ady * dUx).sum(-1)
+        bx_uy = (Adx * dUy).sum(-1);  by_uy = (Ady * dUy).sum(-1)
+
+        # Solve for gradients (analytical 2×2 inverse)
+        dUxdy = (Axx * by_ux - Axy * bx_ux) / det   # [S] — ∂Ux/∂y
+        dUydx = (Ayy * bx_uy - Axy * by_uy) / det   # [S] — ∂Uy/∂x
+
+        # Curl: ω = ∂Uy/∂x - ∂Ux/∂y
+        curl = dUydx - dUxdy  # [S]
+
+        # Vorticity consistency: MSE between head prediction and computed curl
+        omega_q = pred_vort[b, query_idx, 0]  # [S]
+        losses.append(F.mse_loss(omega_q, curl))
+
+    if not losses:
+        return pred_vel.sum() * 0.0  # differentiable zero
+    return torch.stack(losses).mean()
+
+
 class SurfaceRefinementHead(nn.Module):
     """Lightweight MLP that predicts additive corrections for surface nodes.
 
@@ -942,6 +1051,10 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: Auxiliary vorticity prediction — physics-informed consistency loss
+    aux_vorticity: bool = False              # enable VorticityHead + vorticity consistency loss
+    vort_weight: float = 0.1                 # weight on vorticity consistency loss
+    vort_knn: int = 8                        # number of neighbors for WLS gradient estimation
 
 
 cfg = sp.parse(Config)
@@ -1127,9 +1240,18 @@ if cfg.surface_refine:
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
           f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
 
+# Vorticity head (separate from compiled model, applied on hidden states)
+vort_head = None
+if cfg.aux_vorticity:
+    vort_head = VorticityHead(n_hidden=cfg.n_hidden).to(device)
+    _vort_n_params = sum(p.numel() for p in vort_head.parameters())
+    print(f"Vorticity head: {_vort_n_params:,} params "
+          f"(knn={cfg.vort_knn}, weight={cfg.vort_weight})")
+
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
+ema_vort_head = None    # EMA copy of vorticity head
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -1277,6 +1399,10 @@ if refine_head is not None:
     _refine_params = list(refine_head.parameters())
     base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
+if vort_head is not None:
+    _vort_params = list(vort_head.parameters())
+    base_opt.add_param_group({'params': _vort_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _vort_params):,} vorticity head params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
@@ -1683,6 +1809,27 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # Vorticity consistency loss: enforce curl(predicted_velocity) ≈ predicted_vorticity
+        _vort_loss = torch.tensor(0.0, device=device)
+        if vort_head is not None and model.training:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                vort_pred = vort_head(hidden)  # [B, N, 1]
+            vort_pred = vort_pred.float()
+            # Unnormalize pred to get velocity in consistent normalized coord space
+            # (residual or full — curl is invariant to freestream subtraction)
+            pred_vel_for_vort = pred * sample_stds if not cfg.no_perstd else pred
+            _vort_coords = x[:, :, :2].detach()  # normalized (x,y) coords, no grad needed
+            _vort_vol_mask = vol_mask & mask      # volume nodes within valid mask
+            _vort_loss = compute_vorticity_consistency_loss(
+                pred_vel_for_vort[:, :, :2],  # Ux, Uy only
+                vort_pred,
+                _vort_coords,
+                _vort_vol_mask,
+                k=cfg.vort_knn,
+                n_sample=512,
+            )
+            loss = loss + cfg.vort_weight * _vort_loss
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -1791,8 +1938,19 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for vorticity head
+            if vort_head is not None:
+                if ema_vort_head is None:
+                    ema_vort_head = deepcopy(vort_head)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_vort_head.parameters(), vort_head.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _step_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.aux_vorticity:
+            _step_log["train/vorticity_loss"] = _vort_loss.item()
+        wandb.log(_step_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
