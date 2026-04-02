@@ -66,7 +66,7 @@ while true; do
     git pull origin "$ADVISOR_BRANCH" 2>/dev/null || true
 
     # Overwrite CLAUDE.md with the student role instructions — git checkout/pull clobbers it with the developer copy
-    cp "$WORKDIR/system_instructions/CLAUDE-STUDENT.md" "$WORKDIR/CLAUDE.md"
+    sed '/^<!--$/,/^-->$/d' "$WORKDIR/system_instructions/CLAUDE-STUDENT.md" > "$WORKDIR/CLAUDE.md"
 
     echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) ==="
     echo "=== GPU: $(nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null) ==="
