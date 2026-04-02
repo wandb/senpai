@@ -565,6 +565,39 @@ class SurfaceRefinementContextHead(nn.Module):
         return correction
 
 
+class SurfaceAttention(nn.Module):
+    """Full attention on surface nodes only — encodes elliptic pressure coupling.
+
+    Applied after the last TransolverBlock on the hidden representation.
+    Uses a gated residual starting at 0 so the model initially matches baseline.
+    """
+    def __init__(self, hidden_dim, n_heads=8, no_gate=False):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(hidden_dim, n_heads, batch_first=True)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.no_gate = no_gate
+        if not no_gate:
+            self.gate = nn.Parameter(torch.zeros(1))  # start inactive
+
+    def forward(self, h, surf_mask):
+        """h: [B, N, D], surf_mask: [B, N] boolean."""
+        B, N, D = h.shape
+        h_out = h.clone()
+        # Process each sample independently (surface node counts vary)
+        for b in range(B):
+            s_idx = surf_mask[b].nonzero(as_tuple=True)[0]  # [S]
+            if s_idx.numel() == 0:
+                continue
+            surf_h = h[b, s_idx].unsqueeze(0)  # [1, S, D]
+            attn_out, _ = self.attn(surf_h, surf_h, surf_h)  # [1, S, D]
+            attn_out = self.norm(attn_out.squeeze(0))  # [S, D]
+            if self.no_gate:
+                h_out[b, s_idx] = h[b, s_idx] + attn_out
+            else:
+                h_out[b, s_idx] = h[b, s_idx] + torch.tanh(self.gate) * attn_out
+        return h_out
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -942,6 +975,10 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: Surface attention (all-to-all on surface nodes)
+    surface_attention: bool = False   # full attention on surface nodes for elliptic coupling
+    sa_heads: int = 8                 # number of attention heads
+    sa_no_gate: bool = False          # disable gated residual (full strength from start)
 
 
 cfg = sp.parse(Config)
@@ -1127,6 +1164,17 @@ if cfg.surface_refine:
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
           f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
 
+# Surface attention module (separate from main model)
+surf_attn = None
+ema_surf_attn = None
+if cfg.surface_attention:
+    surf_attn = SurfaceAttention(
+        hidden_dim=cfg.n_hidden, n_heads=cfg.sa_heads, no_gate=cfg.sa_no_gate
+    ).to(device)
+    surf_attn = torch.compile(surf_attn, mode=cfg.compile_mode)
+    _sa_n_params = sum(p.numel() for p in surf_attn.parameters())
+    print(f"Surface attention: {_sa_n_params:,} params (heads={cfg.sa_heads}, no_gate={cfg.sa_no_gate})")
+
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
@@ -1277,6 +1325,12 @@ if refine_head is not None:
     _refine_params = list(refine_head.parameters())
     base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
+
+# Add surface attention params to optimizer if enabled
+if surf_attn is not None:
+    _sa_params = list(surf_attn.parameters())
+    base_opt.add_param_group({'params': _sa_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _sa_params):,} surface attention params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
@@ -1545,6 +1599,11 @@ for epoch in range(MAX_EPOCHS):
             else:
                 pred = pred / sample_stds
 
+        # Surface attention: all-to-all on surface nodes (modifies hidden)
+        if surf_attn is not None and model.training:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                hidden = surf_attn(hidden, is_surface).float()
+
         # Surface refinement head: additive correction on surface nodes
         if refine_head is not None and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -1791,8 +1850,21 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for surface attention
+            if surf_attn is not None:
+                _sa_base = surf_attn._orig_mod if hasattr(surf_attn, '_orig_mod') else surf_attn
+                if ema_surf_attn is None:
+                    ema_surf_attn = deepcopy(_sa_base)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_surf_attn.parameters(), _sa_base.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if surf_attn is not None and not cfg.sa_no_gate:
+            _sa_base = surf_attn._orig_mod if hasattr(surf_attn, '_orig_mod') else surf_attn
+            _log["train/sa_gate"] = torch.tanh(_sa_base.gate).item()
+        wandb.log(_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -1896,6 +1968,14 @@ for epoch in range(MAX_EPOCHS):
             eval_refine_head.eval()
         elif refine_head is not None:
             refine_head.eval()
+    # Select the right surface attention for validation (EMA if available)
+    eval_surf_attn = surf_attn
+    if surf_attn is not None:
+        if ema_surf_attn is not None and ema_model is not None and eval_model is ema_model:
+            eval_surf_attn = ema_surf_attn
+            eval_surf_attn.eval()
+        elif surf_attn is not None:
+            surf_attn.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -1996,6 +2076,11 @@ for epoch in range(MAX_EPOCHS):
                     pred_loss = pred * sample_stds
                 else:
                     pred_loss = pred / sample_stds
+
+                # Apply surface attention during validation
+                if eval_surf_attn is not None:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _eval_hidden = eval_surf_attn(_eval_hidden, is_surface).float()
 
                 # Apply surface refinement head during validation
                 if eval_refine_head is not None:
@@ -2177,6 +2262,12 @@ for epoch in range(MAX_EPOCHS):
                 refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
             )
             torch.save(_refine_save.state_dict(), model_dir / "refine_head.pt")
+        # Save surface attention checkpoint
+        if surf_attn is not None:
+            _sa_save = ema_surf_attn if ema_surf_attn is not None else (
+                surf_attn._orig_mod if hasattr(surf_attn, '_orig_mod') else surf_attn
+            )
+            torch.save(_sa_save.state_dict(), model_dir / "surf_attn.pt")
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
@@ -2301,6 +2392,14 @@ if cfg.surface_refine and best_metrics:
         )
         verify_refine.eval()
 
+        # Use EMA surface attention if available
+        verify_surf_attn = None
+        if surf_attn is not None:
+            verify_surf_attn = ema_surf_attn if ema_surf_attn is not None else (
+                surf_attn._orig_mod if hasattr(surf_attn, '_orig_mod') else surf_attn
+            )
+            verify_surf_attn.eval()
+
         # Run inference on val_ood_re only
         _ood_re_loader = val_loaders.get("val_ood_re")
         if _ood_re_loader is None:
@@ -2385,6 +2484,10 @@ if cfg.surface_refine and best_metrics:
                         hidden = out["hidden"].float()
 
                     # === PATH A: Pipeline denormalization (same as val loop) ===
+                    # Apply surface attention to hidden (if enabled)
+                    if verify_surf_attn is not None:
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            hidden = verify_surf_attn(hidden, is_surface).float()
                     pred_loss = pred_raw / sample_stds
                     # Apply refinement
                     surf_idx = is_surface.nonzero(as_tuple=False)
