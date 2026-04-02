@@ -38,10 +38,9 @@ source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
 SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
 source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
 
-# --- Build prompts ---
-CLAUDE_DOT_MD="$(cat "$WORKDIR/system_instructions/CLAUDE-STUDENT.md")"
+# --- Build prompts (CC auto-discovers CLAUDE.md for role instructions) ---
 TASK_INSTRUCTIONS="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-student.md" | sed '/^<!--$/,/^-->$/d')"
-PROMPT="${CLAUDE_DOT_MD}"$'\n\n'"${TASK_INSTRUCTIONS}"
+PROMPT="${TASK_INSTRUCTIONS}"
 
 KEY_INFO=$'\n\nKey information:\n\nStudent: '"$STUDENT_NAME"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
@@ -65,6 +64,9 @@ while true; do
     # Return to latest advisor branch so student starts from the current baseline
     git checkout "$ADVISOR_BRANCH" 2>/dev/null || true
     git pull origin "$ADVISOR_BRANCH" 2>/dev/null || true
+
+    # Overwrite CLAUDE.md with the student role instructions — git checkout/pull clobbers it with the developer copy
+    cp "$WORKDIR/system_instructions/CLAUDE-STUDENT.md" "$WORKDIR/CLAUDE.md"
 
     echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) ==="
     echo "=== GPU: $(nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null) ==="
