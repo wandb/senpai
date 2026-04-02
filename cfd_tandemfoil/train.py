@@ -139,7 +139,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False,
+                 linear_no=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -150,6 +151,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
         self.tandem_temp_offset = nn.Parameter(torch.zeros(1, heads, 1, 1))
         self.linear_no_attention = linear_no_attention
+        self.linear_no = linear_no
         self.learned_kernel = learned_kernel
         self.decouple_slice = decouple_slice
         self.zone_temp = zone_temp
@@ -174,6 +176,10 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.to_q = nn.Linear(dim_head, dim_head, bias=False)
         self.to_k = nn.Linear(dim_head, dim_head, bias=False)
         self.to_v = nn.Linear(dim_head, dim_head, bias=False)
+        if linear_no:
+            # LinearNO: asymmetric softmax projections (arXiv:2511.06294)
+            self.to_q_linear = nn.Linear(dim_head, slice_num)
+            self.to_k_linear = nn.Linear(dim_head, slice_num)
         self.slice_residual_scale = nn.Parameter(torch.tensor(0.1))
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, dim),
@@ -201,6 +207,17 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             .permute(0, 2, 1, 3)
             .contiguous()
         )
+
+        # LinearNO: asymmetric softmax attention (replaces slice→attn→deslice)
+        if self.linear_no:
+            q = F.softmax(self.to_q_linear(x_mid), dim=-1)   # [B, H, N, S] row-norm
+            k = F.softmax(self.to_k_linear(fx_mid), dim=-2)   # [B, H, N, S] col-norm
+            v = self.to_v(fx_mid)                              # [B, H, N, D]
+            kv = torch.einsum('bhns,bhnd->bhsd', k, v)         # [B, H, S, D]
+            out = torch.einsum('bhns,bhsd->bhnd', q, kv)       # [B, H, N, D]
+            out = rearrange(out, 'b h n d -> b n (h d)')
+            return self.to_out(out)
+
         temp = self.temperature
         if self.zone_temp and zone_features is not None:
             # zone_features: [B, 3] → per-head offset [B, heads] → [B, heads, 1, 1]
@@ -265,6 +282,7 @@ class TransolverBlock(nn.Module):
         out_dim=1,
         slice_num=32,
         linear_no_attention=False,
+        linear_no=False,
         learned_kernel=False,
         field_decoder=False,
         adaln_output=False,
@@ -303,6 +321,7 @@ class TransolverBlock(nn.Module):
             dropout=dropout,
             slice_num=slice_num,
             linear_no_attention=linear_no_attention,
+            linear_no=linear_no,
             learned_kernel=learned_kernel,
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
@@ -565,6 +584,34 @@ class SurfaceRefinementContextHead(nn.Module):
         return correction
 
 
+class SurfaceAttention(nn.Module):
+    """Full self-attention on surface nodes only (elliptic PDE coupling)."""
+
+    def __init__(self, hidden_dim, n_heads=8):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(hidden_dim, n_heads, batch_first=True)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.gate = nn.Parameter(torch.zeros(1))  # start inactive
+
+    def forward(self, h, surf_mask):
+        """
+        h: [B, N, D] — all node hidden features
+        surf_mask: [B, N] — boolean mask for surface nodes
+        """
+        B = h.shape[0]
+        h_out = h.clone()
+        gate_val = torch.tanh(self.gate)
+        for b in range(B):
+            s = surf_mask[b]
+            if s.sum() == 0:
+                continue
+            surf_h = h[b:b+1, s]  # [1, S, D]
+            attn_out, _ = self.attn(surf_h, surf_h, surf_h)  # [1, S, D]
+            attn_out = self.norm(attn_out)
+            h_out[b, s] = h[b, s] + gate_val * attn_out.squeeze(0)
+        return h_out
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -583,6 +630,7 @@ class Transolver(nn.Module):
         output_fields: list[str] | None = None,
         output_dims: list[int] | None = None,
         linear_no_attention=False,
+        linear_no=False,
         learned_kernel=False,
         field_decoder=False,
         adaln_output=False,
@@ -601,10 +649,12 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        surface_attention=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.pressure_first = pressure_first
+        self.surface_attention = surface_attention
         self.ref = ref
         self.unified_pos = unified_pos
         self.adaln_output = adaln_output
@@ -654,6 +704,7 @@ class Transolver(nn.Module):
                     slice_num=slice_num,
                     last_layer=(idx == n_layers - 1),
                     linear_no_attention=linear_no_attention,
+                    linear_no=linear_no,
                     learned_kernel=learned_kernel,
                     field_decoder=field_decoder if (idx == n_layers - 1) else False,
                     adaln_output=adaln_output if (idx == n_layers - 1) else False,
@@ -684,6 +735,8 @@ class Transolver(nn.Module):
             nn.Linear(n_hidden * 2, n_hidden), nn.GELU(),
             nn.Linear(n_hidden, 1),
         )
+        if surface_attention:
+            self.surf_attn = SurfaceAttention(n_hidden, n_heads=8)
         self.initialize_weights()
         self.out_skip = nn.Linear(n_hidden, out_dim)
         nn.init.zeros_(self.out_skip.weight)
@@ -734,14 +787,15 @@ class Transolver(nn.Module):
         x = data.get("x")
         pos = data.get("pos", pos)
         condition = data.get("condition", condition)
-        return x, pos, condition
+        surf_mask = data.get("surf_mask")
+        return x, pos, condition, surf_mask
 
     def _validate_output_dims(self, preds):
         if sum(self.output_dims) != preds.shape[-1]:
             raise ValueError("Sum of output_dims must match preds last dimension")
 
     def forward(self, data, pos=None, condition=None):
-        x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
+        x, pos, condition, surf_mask = self._unpack_inputs(data, pos=pos, condition=condition)
         if x is None:
             raise ValueError("Missing required input tensor: x")
         if condition is not None:
@@ -789,6 +843,10 @@ class Transolver(nn.Module):
 
         for block in self.blocks[:-1]:
             fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+
+        # Surface all-to-all attention on hidden features before output head
+        if self.surface_attention and surf_mask is not None:
+            fx = self.surf_attn(fx, surf_mask)
 
         # Deep hidden representation (post all non-last blocks, pre output head)
         fx_deep = fx  # [B, N, n_hidden]
@@ -942,6 +1000,10 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: LinearNO — asymmetric softmax projections (replaces slice attention)
+    linear_no: bool = False
+    # Phase 6: Surface all-to-all attention on surface nodes after last hidden block
+    surface_attention: bool = False
 
 
 cfg = sp.parse(Config)
@@ -1076,6 +1138,7 @@ model_config = dict(
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
     linear_no_attention=cfg.linear_no_attention,
+    linear_no=cfg.linear_no,
     learned_kernel=cfg.learned_kernel,
     field_decoder=cfg.field_decoder,
     adaln_output=cfg.adaln_output,
@@ -1094,6 +1157,7 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    surface_attention=cfg.surface_attention,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1530,7 +1594,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x, "surf_mask": is_surface})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -1687,7 +1751,7 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x})
+                rdrop_out = model({"x": x, "surf_mask": is_surface})
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -1752,7 +1816,7 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                out2 = model({"x": x, "surf_mask": is_surface})
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -1987,7 +2051,7 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    _eval_out = eval_model({"x": x})
+                    _eval_out = eval_model({"x": x, "surf_mask": is_surface})
                     pred = _eval_out["preds"]
                     _eval_hidden = _eval_out["hidden"]
                 pred = pred.float()
@@ -2253,7 +2317,7 @@ if best_metrics:
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
-                    pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
+                    pred = vis_model({"x": x_n, "mask": mask, "surf_mask": is_surf_dev})["preds"].float()
                     if cfg.raw_targets:
                         y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                     else:
@@ -2380,7 +2444,7 @@ if cfg.surface_refine and best_metrics:
 
                     # Model forward
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        out = verify_model({"x": x})
+                        out = verify_model({"x": x, "surf_mask": is_surface})
                         pred_raw = out["preds"].float()
                         hidden = out["hidden"].float()
 
