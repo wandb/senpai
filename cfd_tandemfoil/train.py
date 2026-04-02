@@ -887,6 +887,8 @@ class Config:
     half_target_noise: bool = False  # GPU 3: reduce target noise by 50%
     no_target_noise: bool = False    # Phase 4: completely disable target noise injection
     use_lion: bool = False        # GPU 4: Lion optimizer instead of AdamW
+    use_soap: bool = False        # Phase 6: SOAP optimizer (PaLMForeachSOAP from heavyball)
+    soap_precond_freq: int = 10   # SOAP precondition frequency
     rdrop: bool = False           # GPU 7: R-drop regularization
     rdrop_alpha: float = 1.0     # R-drop consistency loss weight
     # Phase 3 R3: normalization/prediction-space experiments
@@ -1256,7 +1258,57 @@ class Lookahead:
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
-if cfg.use_lion:
+if cfg.use_soap:
+    import heavyball
+    # CRITICAL: SINGLE param group only! HeavyBall v2.2.1 has a bug where only the
+    # first param group updates beyond step 0 when using multiple param groups.
+    _all_params = list(model.parameters())
+    if refine_head is not None:
+        _refine_params = list(refine_head.parameters())
+        _all_params = _all_params + _refine_params
+        print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to SOAP optimizer")
+    # HeavyBall dim_merger crashes on 0-dim (scalar) parameters — filter them out
+    _soap_params = [p for p in _all_params if p.ndim >= 1]
+    _scalar_params = [p for p in _all_params if p.ndim < 1]
+    base_opt = heavyball.PaLMForeachSOAP(
+        _soap_params,
+        lr=_base_lr,
+        weight_decay=cfg.weight_decay,
+        precondition_frequency=cfg.soap_precond_freq,
+    )
+    # Use a simple AdamW for scalar params that SOAP can't handle
+    if _scalar_params:
+        _scalar_opt = torch.optim.AdamW(_scalar_params, lr=_base_lr, weight_decay=cfg.weight_decay)
+        print(f"  ({len(_scalar_params)} scalar params in separate AdamW)")
+    else:
+        _scalar_opt = None
+
+    class SOAPWithScalars:
+        """Wraps SOAP + a small AdamW for scalar params that HeavyBall can't handle."""
+        def __init__(self, soap_opt, scalar_opt):
+            self.soap_opt = soap_opt
+            self.scalar_opt = scalar_opt
+        def step(self):
+            self.soap_opt.step()
+            if self.scalar_opt is not None:
+                # Sync scalar AdamW lr with SOAP (follows scheduler)
+                soap_lr = self.soap_opt.param_groups[0]['lr']
+                for pg in self.scalar_opt.param_groups:
+                    pg['lr'] = soap_lr
+                self.scalar_opt.step()
+        def zero_grad(self):
+            self.soap_opt.zero_grad()
+            if self.scalar_opt is not None:
+                self.scalar_opt.zero_grad()
+        @property
+        def param_groups(self):
+            return self.soap_opt.param_groups
+
+    optimizer = SOAPWithScalars(base_opt, _scalar_opt)
+    print(f"Using PaLMForeachSOAP optimizer (lr={_base_lr}, wd={cfg.weight_decay}, "
+          f"precond_freq={cfg.soap_precond_freq}, {len(_soap_params)} SOAP params, "
+          f"{len(_scalar_params)} scalar params)")
+elif cfg.use_lion:
     base_opt = Lion([
         {'params': attn_params, 'lr': _base_lr * 0.5},
         {'params': other_params, 'lr': _base_lr}
@@ -1272,8 +1324,8 @@ else:
     else:
         optimizer = base_opt
 
-# Add refinement head params to optimizer if enabled
-if refine_head is not None:
+# Add refinement head params to optimizer if enabled (skip for SOAP — already included above)
+if refine_head is not None and not cfg.use_soap:
     _refine_params = list(refine_head.parameters())
     base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
