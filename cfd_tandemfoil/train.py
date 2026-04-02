@@ -826,6 +826,83 @@ MAX_TIMEOUT = 180.0  # minutes
 MAX_EPOCHS = 500
 
 
+def compute_geo_features(raw_coords, is_surface, mask):
+    """Compute 3 geometric features per node.
+
+    Features:
+      0. Wall distance (log-scaled Euclidean distance to nearest surface node)
+      1. Local mesh density (log count of nodes within radius=0.05)
+      2. Surface normal alignment (y-component of unit vector toward nearest surface node)
+
+    Args:
+        raw_coords: [B, N, 2] xy coordinates (raw, before dataset normalization)
+        is_surface: [B, N] bool surface node indicator
+        mask: [B, N] bool valid (non-padded) node mask
+    Returns:
+        [B, N, 3] float, zeros for padded nodes
+    """
+    B, N, _ = raw_coords.shape
+    device = raw_coords.device
+    dtype = raw_coords.dtype
+    geo_out = torch.zeros(B, N, 3, device=device, dtype=dtype)
+    CHUNK = 4096
+    RADIUS = 0.05
+
+    for b in range(B):
+        valid = mask[b]                      # [N] bool
+        coords_b = raw_coords[b, valid]      # [n_valid, 2]
+        n_valid = coords_b.shape[0]
+        if n_valid == 0:
+            continue
+
+        surf_mask_b = is_surface[b, valid]   # [n_valid] bool
+        surf_coords_b = coords_b[surf_mask_b]  # [S, 2]
+        S = surf_coords_b.shape[0]
+        if S == 0:
+            continue
+
+        # --- Features 0 & 2: wall distance + surface alignment via chunked cdist ---
+        wall_dists = torch.empty(n_valid, device=device, dtype=dtype)
+        nearest_idx = torch.empty(n_valid, device=device, dtype=torch.long)
+        for start in range(0, n_valid, CHUNK):
+            end = min(start + CHUNK, n_valid)
+            d = torch.cdist(coords_b[start:end], surf_coords_b)  # [chunk, S]
+            min_vals, min_ids = d.min(dim=1)
+            wall_dists[start:end] = min_vals
+            nearest_idx[start:end] = min_ids
+        wall_dist_log = torch.log1p(wall_dists * 10.0)
+
+        to_surf = surf_coords_b[nearest_idx] - coords_b       # [n_valid, 2]
+        to_surf_norm = to_surf / (to_surf.norm(dim=1, keepdim=True) + 1e-6)
+        surf_align = to_surf_norm[:, 1]                        # y-component
+
+        # --- Feature 1: local mesh density (grid-based, O(N)) ---
+        c_min = coords_b.min(dim=0).values
+        c_shifted = coords_b - c_min.unsqueeze(0)
+        xi = (c_shifted[:, 0] / RADIUS).long()
+        yi = (c_shifted[:, 1] / RADIUS).long()
+        nx = int(xi.max().item()) + 1
+        ny = int(yi.max().item()) + 1
+        cell_idx = xi * ny + yi
+        counts = torch.zeros(nx * ny, device=device, dtype=dtype)
+        counts.scatter_add_(0, cell_idx, torch.ones(n_valid, device=device, dtype=dtype))
+        density = torch.zeros(n_valid, device=device, dtype=dtype)
+        for dx in range(-1, 2):
+            for dy in range(-1, 2):
+                xi_nb = (xi + dx).clamp(0, nx - 1)
+                yi_nb = (yi + dy).clamp(0, ny - 1)
+                density += counts[xi_nb * ny + yi_nb]
+        density_log = torch.log1p(density)
+
+        # Write to output at valid positions
+        valid_idx = valid.nonzero(as_tuple=False).squeeze(1)
+        geo_out[b, valid_idx, 0] = wall_dist_log
+        geo_out[b, valid_idx, 1] = density_log
+        geo_out[b, valid_idx, 2] = surf_align
+
+    return geo_out
+
+
 @dataclass
 class Config:
     lr: float = 1.5e-3
@@ -942,6 +1019,8 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: Geometry input features
+    geo_input: bool = False   # add wall-dist, mesh-density, surface-alignment as extra input features
 
 
 cfg = sp.parse(Config)
@@ -1063,9 +1142,31 @@ if cfg.raw_targets:
 else:
     raw_stats = None
 
+# --- Geo feature normalization stats (zero-mean, unit-variance over training set) ---
+geo_stats = None
+if cfg.geo_input:
+    print("Computing geo feature stats (wall-dist, density, surf-align)...")
+    _geo_sum = torch.zeros(3, device=device)
+    _geo_sq_sum = torch.zeros(3, device=device)
+    _geo_n = 0.0
+    with torch.no_grad():
+        for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc="Geo stats", leave=False):
+            _x = _x.to(device, non_blocking=True)
+            _is_surf = _is_surf.to(device, non_blocking=True)
+            _mask = _mask.to(device, non_blocking=True)
+            _geo = compute_geo_features(_x[:, :, :2], _is_surf, _mask)
+            _m = _mask.float().unsqueeze(-1)
+            _geo_sum += (_geo * _m).sum(dim=(0, 1))
+            _geo_sq_sum += (_geo ** 2 * _m).sum(dim=(0, 1))
+            _geo_n += _mask.float().sum().item()
+    _geo_mean = (_geo_sum / _geo_n).float()
+    _geo_std = ((_geo_sq_sum / _geo_n - _geo_mean ** 2).clamp(min=0.0).sqrt()).clamp(min=1e-6).float()
+    geo_stats = {"mean": _geo_mean, "std": _geo_std}
+    print(f"  Geo stats — mean: {_geo_mean.tolist()}, std: {_geo_std.tolist()}")
+
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32 + (3 if cfg.geo_input else 0),  # +curv, +dist, [+foil2dist], +32 fourier PE, [+3 geo]
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1324,6 +1425,7 @@ run = wandb.init(
         "train_samples": len(train_ds),
         "val_samples": {k: len(v) for k, v in val_splits.items()},
         "split_manifest": cfg.manifest,
+        **({"geo_stats_mean": geo_stats["mean"].tolist(), "geo_stats_std": geo_stats["std"].tolist()} if geo_stats else {}),
     },
     mode=os.environ.get("WANDB_MODE", "online"),
 )
@@ -1445,6 +1547,7 @@ for epoch in range(MAX_EPOCHS):
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
+        _raw_coords = x[:, :, :2]  # raw xy coords — save before normalization
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1463,6 +1566,10 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
+        if cfg.geo_input:
+            _geo = compute_geo_features(_raw_coords, is_surface, mask)
+            _geo = (_geo - geo_stats["mean"]) / geo_stats["std"]
+            x = torch.cat([x, _geo], dim=-1)
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -1920,6 +2027,7 @@ for epoch in range(MAX_EPOCHS):
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
+                _raw_coords_v = x[:, :, :2]  # raw xy coords before normalization
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1938,6 +2046,10 @@ for epoch in range(MAX_EPOCHS):
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
+                if cfg.geo_input:
+                    _geo = compute_geo_features(_raw_coords_v, is_surface, mask)
+                    _geo = (_geo - geo_stats["mean"]) / geo_stats["std"]
+                    x = torch.cat([x, _geo], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
@@ -2240,6 +2352,7 @@ if best_metrics:
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
+                    _raw_coords_vis = x_dev[:, :, :2]  # raw xy before normalization
                     x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                     curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                     x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
@@ -2252,6 +2365,10 @@ if best_metrics:
                     xy_scaled = xy_norm.unsqueeze(-1) * freqs
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
+                    if cfg.geo_input:
+                        _geo = compute_geo_features(_raw_coords_vis, is_surf_dev, mask)
+                        _geo = (_geo - geo_stats["mean"]) / geo_stats["std"]
+                        x_n = torch.cat([x_n, _geo], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
                     pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
                     if cfg.raw_targets:
@@ -2328,6 +2445,7 @@ if cfg.surface_refine and best_metrics:
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
+                    _raw_coords_vfy = x[:, :, :2]  # raw xy before normalization
                     x = (x - stats["x_mean"]) / stats["x_std"]
                     curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                     if cfg.foil2_dist:
@@ -2343,6 +2461,10 @@ if cfg.surface_refine and best_metrics:
                     xy_scaled = xy_norm.unsqueeze(-1) * freqs
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x = torch.cat([x, fourier_pe], dim=-1)
+                    if cfg.geo_input:
+                        _geo = compute_geo_features(_raw_coords_vfy, is_surface, mask)
+                        _geo = (_geo - geo_stats["mean"]) / geo_stats["std"]
+                        x = torch.cat([x, _geo], dim=-1)
 
                     # Ground truth denormalization reference
                     Umag, q = _umag_q(y, mask)
