@@ -942,6 +942,14 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: Muon optimizer — orthogonalized gradient updates via Newton-Schulz
+    use_muon: bool = False                    # use Muon optimizer for matrix params (>=2D)
+    muon_lr: float = 0.02                     # Muon LR (10-100x higher than Adam due to normalization)
+    muon_momentum: float = 0.95               # Muon momentum coefficient
+    muon_ns_steps: int = 5                    # Newton-Schulz iteration count
+    muon_adamw_lr: float = 3e-4               # AdamW LR for non-matrix params (biases, LN)
+    muon_adamw_wd: float = 0.0                # AdamW weight decay for non-matrix params
+    use_gram_ns: bool = False                 # use Gram-NS variant (faster orthogonalization)
 
 
 cfg = sp.parse(Config)
@@ -1225,6 +1233,136 @@ class Lion(torch.optim.Optimizer):
         return loss
 
 
+class Muon(torch.optim.Optimizer):
+    """Muon optimizer: orthogonalized gradient updates via Newton-Schulz iterations.
+
+    Matrix params (>=2D) get Muon updates (NS-orthogonalized + Nesterov momentum).
+    Vector/scalar params (biases, LayerNorm) get AdamW updates.
+    """
+
+    def __init__(self, muon_params, adamw_params=None, lr=0.02, momentum=0.95,
+                 nesterov=True, ns_steps=5, adamw_lr=3e-4, adamw_betas=(0.9, 0.999),
+                 adamw_wd=0.0, use_gram_ns=False):
+        muon_group = dict(params=list(muon_params), lr=lr, momentum=momentum,
+                          nesterov=nesterov, ns_steps=ns_steps, use_muon=True)
+        groups = [muon_group]
+        if adamw_params:
+            adamw_list = list(adamw_params)
+            if adamw_list:
+                groups.append(dict(params=adamw_list, lr=adamw_lr,
+                                   betas=adamw_betas, weight_decay=adamw_wd, use_muon=False))
+        super().__init__(groups, dict(lr=lr))
+        self.use_gram_ns = use_gram_ns
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            if group.get('use_muon', False):
+                self._muon_step(group)
+            else:
+                self._adamw_step_group(group)
+        return loss
+
+    def _muon_step(self, group):
+        lr = group['lr']
+        mom = group['momentum']
+        nesterov = group['nesterov']
+        ns_steps = group['ns_steps']
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            g = p.grad
+            if g.dim() >= 2:
+                if self.use_gram_ns:
+                    g = self._gram_newton_schulz(g, steps=ns_steps)
+                else:
+                    g = self._newton_schulz(g, steps=ns_steps)
+            state = self.state[p]
+            if 'momentum_buffer' not in state:
+                state['momentum_buffer'] = torch.zeros_like(g)
+            buf = state['momentum_buffer']
+            buf.mul_(mom).add_(g)
+            if nesterov:
+                update = g + mom * buf
+            else:
+                update = buf
+            p.add_(update, alpha=-lr)
+
+    def _adamw_step_group(self, group):
+        lr = group['lr']
+        b1, b2 = group.get('betas', (0.9, 0.999))
+        wd = group.get('weight_decay', 0.0)
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            if wd > 0:
+                p.mul_(1 - lr * wd)
+            g = p.grad
+            state = self.state[p]
+            if 'step' not in state:
+                state.update(step=0, exp_avg=torch.zeros_like(p),
+                             exp_avg_sq=torch.zeros_like(p))
+            state['step'] += 1
+            state['exp_avg'].mul_(b1).add_(g, alpha=1 - b1)
+            state['exp_avg_sq'].mul_(b2).addcmul_(g, g, value=1 - b2)
+            bc1 = 1 - b1 ** state['step']
+            bc2 = 1 - b2 ** state['step']
+            denom = (state['exp_avg_sq'].sqrt() / (bc2 ** 0.5)).add_(1e-8)
+            p.addcdiv_(state['exp_avg'], denom, value=-lr / bc1)
+
+    @staticmethod
+    def _newton_schulz(G, steps=5):
+        """Standard Newton-Schulz orthogonalization of gradient matrix."""
+        orig_shape = G.shape
+        if G.dim() > 2:
+            G = G.reshape(G.shape[0], -1)
+        rows, cols = G.shape
+        transpose = rows < cols
+        if transpose:
+            G = G.T
+        G = G / (G.norm() + 1e-7)
+        # Optimal polynomial coefficients for rapid convergence
+        a, b, c = 3.4445, -4.7750, 2.0315
+        I = torch.eye(G.shape[1], device=G.device, dtype=G.dtype)
+        for _ in range(steps):
+            A = G.T @ G
+            G = G @ (a * I + b * A + c * A @ A)
+        if transpose:
+            G = G.T
+        return G.reshape(orig_shape)
+
+    @staticmethod
+    def _gram_newton_schulz(G, steps=5):
+        """Gram-NS variant: operates on the Gram matrix G^T G directly.
+
+        More numerically stable for ill-conditioned gradients.
+        Uses the same polynomial but applied to the Gram matrix.
+        """
+        orig_shape = G.shape
+        if G.dim() > 2:
+            G = G.reshape(G.shape[0], -1)
+        rows, cols = G.shape
+        transpose = rows < cols
+        if transpose:
+            G = G.T
+        G = G / (G.norm() + 1e-7)
+        a, b, c = 3.4445, -4.7750, 2.0315
+        # Gram-NS: iterate on the Gram matrix S = G^T G
+        S = G.T @ G
+        I = torch.eye(S.shape[0], device=S.device, dtype=S.dtype)
+        for _ in range(steps):
+            T = a * I + b * S + c * S @ S
+            G = G @ T
+            S = T @ S @ T  # update Gram matrix
+        if transpose:
+            G = G.T
+        return G.reshape(orig_shape)
+
+
 class Lookahead:
     def __init__(self, base_optimizer, k=5, alpha=0.5):
         self.base_optimizer = base_optimizer
@@ -1256,7 +1394,20 @@ class Lookahead:
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
-if cfg.use_lion:
+if cfg.use_muon:
+    # Muon: split all model params by dimensionality
+    all_params = list(model.parameters())
+    muon_params = [p for p in all_params if p.requires_grad and p.dim() >= 2]
+    adamw_params = [p for p in all_params if p.requires_grad and p.dim() < 2]
+    _muon_n = sum(p.numel() for p in muon_params)
+    _adamw_n = sum(p.numel() for p in adamw_params)
+    print(f"Muon optimizer: {_muon_n:,} matrix params (Muon), {_adamw_n:,} vector params (AdamW)")
+    base_opt = Muon(muon_params, adamw_params, lr=cfg.muon_lr,
+                    momentum=cfg.muon_momentum, ns_steps=cfg.muon_ns_steps,
+                    adamw_lr=cfg.muon_adamw_lr, adamw_wd=cfg.muon_adamw_wd,
+                    use_gram_ns=cfg.use_gram_ns)
+    optimizer = base_opt  # Muon has its own momentum; skip Lookahead
+elif cfg.use_lion:
     base_opt = Lion([
         {'params': attn_params, 'lr': _base_lr * 0.5},
         {'params': other_params, 'lr': _base_lr}
@@ -1275,7 +1426,20 @@ else:
 # Add refinement head params to optimizer if enabled
 if refine_head is not None:
     _refine_params = list(refine_head.parameters())
-    base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
+    if cfg.use_muon:
+        # Split refinement head params by dimensionality too
+        _refine_muon = [p for p in _refine_params if p.requires_grad and p.dim() >= 2]
+        _refine_adamw = [p for p in _refine_params if p.requires_grad and p.dim() < 2]
+        if _refine_muon:
+            base_opt.add_param_group(dict(params=_refine_muon, lr=cfg.muon_lr,
+                                         momentum=cfg.muon_momentum, nesterov=True,
+                                         ns_steps=cfg.muon_ns_steps, use_muon=True))
+        if _refine_adamw:
+            base_opt.add_param_group(dict(params=_refine_adamw, lr=cfg.muon_adamw_lr,
+                                         betas=(0.9, 0.999), weight_decay=cfg.muon_adamw_wd,
+                                         use_muon=False))
+    else:
+        base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
