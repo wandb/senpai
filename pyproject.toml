@@ -18,6 +18,7 @@ dependencies = [
     "weave",
     "tqdm",
     "matplotlib",
+    "heavyball",
 ]
 
 [tool.setuptools.packages.find]

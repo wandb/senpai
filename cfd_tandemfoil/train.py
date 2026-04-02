@@ -36,6 +36,7 @@ from timm.layers import trunc_normal_
 from tqdm import tqdm
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import simple_parsing as sp
+import heavyball
 
 from data.utils import visualize
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
@@ -822,8 +823,8 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-MAX_TIMEOUT = 180.0  # minutes
-MAX_EPOCHS = 500
+MAX_TIMEOUT = float(os.environ.get("SENPAI_TIMEOUT_MINUTES", "180"))  # minutes
+MAX_EPOCHS = int(os.environ.get("SENPAI_MAX_EPOCHS", "500"))
 
 
 @dataclass
@@ -942,6 +943,8 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: Optimizer selection
+    optimizer: str = "lion"  # lion|soap|cautious_adam|schedule_free|palm_soap|adamw_hb
 
 
 cfg = sp.parse(Config)
@@ -1256,13 +1259,63 @@ class Lookahead:
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
-if cfg.use_lion:
+
+# Resolve effective optimizer name: --use_lion maps to 'lion' for backward compat
+_opt_name = "lion" if cfg.use_lion else cfg.optimizer
+
+# HeavyBall v2.2.1 has a bug: only the first param_group gets updated beyond step 0
+# (the cleanup loop in step() clears gradients of not-yet-processed groups).
+# Workaround: use a single param group for all HeavyBall optimizers.
+_is_heavyball = _opt_name in ("soap", "cautious_adam", "schedule_free", "palm_soap", "adamw_hb")
+if _is_heavyball:
+    _all_params = list(model.parameters())
+    if refine_head is not None:
+        _all_params += list(refine_head.parameters())
+
+if _opt_name == "lion":
     base_opt = Lion([
         {'params': attn_params, 'lr': _base_lr * 0.5},
         {'params': other_params, 'lr': _base_lr}
     ], weight_decay=cfg.weight_decay)
     optimizer = base_opt  # Lion has its own momentum; skip Lookahead
+elif _opt_name == "soap":
+    base_opt = heavyball.PaLMForeachSOAP(
+        _all_params, lr=_base_lr, weight_decay=cfg.weight_decay,
+        precondition_frequency=10, merge_dims=False,
+    )
+    optimizer = base_opt
+elif _opt_name == "cautious_adam":
+    # ForeachCauchyAdamW not in heavyball 2.2.1; ForeachAdamW(caution=True) crashes
+    # with torch.inductor (AssertionError in scheduler.py). Using ForeachLaProp instead:
+    # LaProp separates gradient direction/magnitude and is more robust to outlier gradients.
+    base_opt = heavyball.ForeachLaProp(
+        _all_params, lr=_base_lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.999),
+    )
+    optimizer = base_opt
+elif _opt_name == "schedule_free":
+    base_opt = heavyball.ForeachSFAdamW(
+        _all_params, lr=_base_lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.999),
+    )
+    optimizer = base_opt  # schedule-free handles its own LR; skip Lookahead
+elif _opt_name == "palm_soap":
+    base_opt = heavyball.PaLMForeachSOAP(
+        _all_params, lr=_base_lr, weight_decay=cfg.weight_decay,
+        precondition_frequency=5, merge_dims=False,
+    )
+    optimizer = base_opt
+elif _opt_name == "adamw_hb":
+    base_opt = heavyball.ForeachAdamW(
+        _all_params, lr=_base_lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.999),
+    )
+    optimizer = base_opt
+elif _opt_name == "torch_adamw":
+    base_opt = torch.optim.AdamW([
+        {'params': attn_params, 'lr': _base_lr * 0.5},
+        {'params': other_params, 'lr': _base_lr}
+    ], weight_decay=cfg.weight_decay, betas=(0.9, 0.999))
+    optimizer = base_opt
 else:
+    # Default fallback: standard AdamW
     base_opt = torch.optim.AdamW([
         {'params': attn_params, 'lr': _base_lr * 0.5},
         {'params': other_params, 'lr': _base_lr}
@@ -1272,14 +1325,23 @@ else:
     else:
         optimizer = base_opt
 
-# Add refinement head params to optimizer if enabled
-if refine_head is not None:
+print(f"Optimizer: {_opt_name} (effective class: {type(base_opt).__name__})")
+
+# Add refinement head params to optimizer if enabled (skip for HeavyBall — already included)
+if refine_head is not None and not _is_heavyball:
     _refine_params = list(refine_head.parameters())
     base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
-if cfg.scheduler_type == "warm_restarts":
+# Schedule-free optimizers manage their own LR; disable external scheduler when cosine_T_max==0
+_is_schedule_free = _opt_name == "schedule_free"
+_skip_external_scheduler = _is_schedule_free and cfg.cosine_T_max == 0
+if _skip_external_scheduler:
+    # No-op scheduler: SFAdamW handles LR internally
+    scheduler = torch.optim.lr_scheduler.LambdaLR(base_opt, lr_lambda=lambda epoch: 1.0)
+    print("Schedule-free optimizer: external LR scheduler disabled (cosine_T_max=0)")
+elif cfg.scheduler_type == "warm_restarts":
     _warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
     _restarts = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         base_opt, T_0=cfg.cosine_T_0, T_mult=cfg.cosine_T_mult, eta_min=cfg.cosine_eta_min
@@ -1319,6 +1381,8 @@ run = wandb.init(
     tags=[cfg.agent] if cfg.agent else [],
     config={
         **asdict(cfg),
+        "effective_optimizer": _opt_name,
+        "optimizer_class": type(base_opt).__name__,
         "model_config": model_config,
         "n_params": n_params,
         "train_samples": len(train_ds),
@@ -1368,6 +1432,8 @@ for epoch in range(MAX_EPOCHS):
 
     # --- Train ---
     model.train()
+    if _is_schedule_free:
+        optimizer.train()  # schedule-free: switch optimizer to training mode
     if refine_head is not None:
         refine_head.train()
     epoch_vol = 0.0
@@ -1888,6 +1954,8 @@ for epoch in range(MAX_EPOCHS):
         eval_model = model
     eval_model.eval()
     model.eval()
+    if _is_schedule_free:
+        optimizer.eval()  # schedule-free: switch to eval mode for correct parameter averaging
     # Select the right refinement head for validation (EMA if available)
     eval_refine_head = refine_head  # default: use training head
     if refine_head is not None:
