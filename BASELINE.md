@@ -1,6 +1,35 @@
 # Baseline Metrics
 
-## Current Baseline (Phase 5 — 2026-03-29, Residual Prediction + Surface Refinement)
+## Current Baseline (Phase 5 — 2026-04-02, Faster LR Decay T_max=160)
+
+| Metric | Single seed (s42) | Phase 5 prior | Change |
+|--------|-------------------|---------------|--------|
+| val/loss | **0.3761** | 0.383 | -1.8% |
+| p_in | **12.5** | 12.95 | -3.5% |
+| p_oodc | **8.2** | 8.31 | -1.3% |
+| p_tan | **29.8** | 30.01 | -0.7% |
+| p_re | **6.5** | 6.70 | -3.0% |
+
+**PR #2003** — cosine_T_max 180→160. Single seed, 155 epochs, 38.0 GB VRAM.
+W&B run: `9ysz96ll`
+
+**Reproduce:**
+```bash
+cd cfd_tandemfoil && python train.py --agent edward --wandb_name "baseline" \
+  --field_decoder --adaln_output --use_lion --lr 2e-4 \
+  --aug aoa_perturb --aug_full_dsdf_rot --high_p_clamp \
+  --n_layers 3 --slice_num 96 --tandem_ramp \
+  --domain_layernorm --domain_velhead --ema_decay 0.999 \
+  --weight_decay 5e-5 --cosine_T_max 160 --disable_pcgrad \
+  --pressure_first --pressure_deep --residual_prediction \
+  --surface_refine --surface_refine_hidden 192 --surface_refine_layers 3
+```
+
+⚠️ **Note:** Single-seed result. Multi-seed validation recommended to confirm robustness.
+
+---
+
+## Previous Baseline (Phase 5 — 2026-03-29, Residual Prediction + Surface Refinement)
 
 | Metric | Mean (8 seeds) | Std | Best single | Worst single |
 |--------|---------------|-----|-------------|--------------|
