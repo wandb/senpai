@@ -44,6 +44,145 @@ torch.set_float32_matmul_precision('high')
 
 
 # ---------------------------------------------------------------------------
+# Inviscid Cp computation via NeuralFoil (tandem-aware)
+# ---------------------------------------------------------------------------
+import numpy as np
+
+def _naca4_coords(m, p, t, n=80):
+    """Generate NACA 4-digit airfoil coordinates.
+    Args: m=max camber, p=camber position, t=max thickness (all as fractions, e.g. 0.12)
+    Returns: (N, 2) numpy array of surface points, TE→LE (upper) then LE→TE (lower).
+    """
+    beta = np.linspace(0, np.pi, n)
+    xc = 0.5 * (1 - np.cos(beta))
+    yt = 5 * t * (0.2969 * np.sqrt(xc) - 0.1260 * xc - 0.3516 * xc**2
+                   + 0.2843 * xc**3 - 0.1015 * xc**4)
+    if p > 0 and m > 0:
+        yc = np.where(xc < p, m / p**2 * (2 * p * xc - xc**2),
+                       m / (1 - p)**2 * (1 - 2 * p + 2 * p * xc - xc**2))
+    else:
+        yc = np.zeros_like(xc)
+    xu = xc; yu = yc + yt
+    xl = xc; yl = yc - yt
+    x_coords = np.concatenate([xu[::-1], xl[1:]])
+    y_coords = np.concatenate([yu[::-1], yl[1:]])
+    return np.stack([x_coords, y_coords], axis=1)
+
+
+def _decode_naca(encoded):
+    """Decode NACA 4-digit params from feature encoding: [M/9, P/9, TT/24] → (m, p, t)."""
+    m = float(encoded[0]) * 9.0 / 100.0
+    p = float(encoded[1]) * 9.0 / 10.0
+    t = float(encoded[2]) * 24.0 / 100.0
+    return m, p, t
+
+
+# Cache: (m, p, t, aoa_deg_rounded) -> (bl_x, upper_cp, lower_cp)
+_cp_nf_cache = {}
+
+
+def _get_nf_cp(m, p, t, aoa_deg):
+    """Get NeuralFoil Cp distribution for a single foil. Returns (bl_x, upper_cp, lower_cp) or None."""
+    import neuralfoil as nf
+    if t < 0.001:
+        return None
+    key = (round(m, 5), round(p, 5), round(t, 5), round(aoa_deg, 1))
+    if key not in _cp_nf_cache:
+        try:
+            coords = _naca4_coords(m, p, t, n=80)
+            result = nf.get_aero_from_coordinates(coords, alpha=aoa_deg, Re=1e7)
+            bl_x = nf.bl_x_points  # 32 stations in [0, 1]
+            upper_ue = np.array([float(result[f'upper_bl_ue/vinf_{i}']) for i in range(32)])
+            lower_ue = np.array([float(result[f'lower_bl_ue/vinf_{i}']) for i in range(32)])
+            upper_cp = np.clip(np.nan_to_num(1 - upper_ue**2, nan=0.0, posinf=0.0, neginf=0.0), -5, 1.5)
+            lower_cp = np.clip(np.nan_to_num(1 - lower_ue**2, nan=0.0, posinf=0.0, neginf=0.0), -5, 1.5)
+            _cp_nf_cache[key] = (bl_x, upper_cp, lower_cp)
+        except Exception as e:
+            print(f"Warning: NeuralFoil failed for NACA m={m:.4f} p={p:.4f} t={t:.4f} aoa={aoa_deg:.1f}: {e}")
+            _cp_nf_cache[key] = None
+    return _cp_nf_cache[key]
+
+
+def _interpolate_cp_to_nodes(node_x, node_y, bl_x, upper_cp, lower_cp):
+    """Interpolate NeuralFoil Cp from 32 BL stations to mesh nodes on a single foil."""
+    x_min, x_max = node_x.min(), node_x.max()
+    chord = max(x_max - x_min, 1e-6)
+    x_norm = np.clip((node_x - x_min) / chord, 0, 1)
+    y_median = np.median(node_y)
+    is_upper = node_y > y_median
+    cp_upper = np.interp(x_norm, bl_x, upper_cp)
+    cp_lower = np.interp(x_norm, bl_x, lower_cp)
+    cp_vals = np.where(is_upper, cp_upper, cp_lower)
+    return np.clip(np.nan_to_num(cp_vals, nan=0.0), -5, 1.5)
+
+
+def compute_inviscid_cp_for_sample(x_tensor, is_surface):
+    """Compute inviscid Cp for surface nodes. Tandem-aware: computes Cp per-foil.
+
+    Feature layout (prepare_multi.py):
+      [14] AoA0_rad, [15:18] NACA0, [18] AoA1_rad, [19:22] NACA1,
+      [22] gap, [23] stagger. dsdf at [4:12] (first 4 = foil 1, last 4 = foil 2).
+
+    For tandem: splits surface nodes into foil 1 / foil 2 using dsdf proximity,
+    computes NeuralFoil Cp independently for each foil.
+    Volume nodes get Cp=0.
+    """
+    N = x_tensor.shape[0]
+    cp_feat = torch.zeros(N, 1)
+    surf_idx = is_surface.nonzero(as_tuple=True)[0]
+    if len(surf_idx) == 0:
+        return cp_feat
+
+    # Foil 1 params
+    m0, p0, t0 = _decode_naca(x_tensor[0, 15:18].numpy())
+    aoa0_deg = float(np.degrees(x_tensor[0, 14].item()))
+
+    # Detect tandem: gap at index 22
+    gap = float(x_tensor[0, 22].item())
+    is_tandem = abs(gap) > 0.01
+
+    if is_tandem:
+        # Split surface nodes: foil 1 vs foil 2 using dsdf channels [4:12]
+        dsdf = x_tensor[surf_idx, 4:12].numpy()
+        f1_dist = np.abs(dsdf[:, :4]).min(axis=1)
+        f2_dist = np.abs(dsdf[:, 4:]).min(axis=1)
+        is_f1 = f1_dist <= f2_dist
+        is_f2 = ~is_f1
+
+        # Foil 1 Cp
+        f1_nodes = surf_idx[torch.from_numpy(is_f1)]
+        if len(f1_nodes) > 0:
+            nf_result = _get_nf_cp(m0, p0, t0, aoa0_deg)
+            if nf_result is not None:
+                bl_x, u_cp, l_cp = nf_result
+                pos = x_tensor[f1_nodes].numpy()
+                cp_vals = _interpolate_cp_to_nodes(pos[:, 0], pos[:, 1], bl_x, u_cp, l_cp)
+                cp_feat[f1_nodes, 0] = torch.tensor(cp_vals, dtype=torch.float32)
+
+        # Foil 2 Cp (using foil 2 NACA params at [19:22], AoA at [18])
+        f2_nodes = surf_idx[torch.from_numpy(is_f2)]
+        if len(f2_nodes) > 0:
+            m1, p1, t1 = _decode_naca(x_tensor[0, 19:22].numpy())
+            aoa1_deg = float(np.degrees(x_tensor[0, 18].item()))
+            nf_result = _get_nf_cp(m1, p1, t1, aoa1_deg)
+            if nf_result is not None:
+                bl_x, u_cp, l_cp = nf_result
+                pos = x_tensor[f2_nodes].numpy()
+                cp_vals = _interpolate_cp_to_nodes(pos[:, 0], pos[:, 1], bl_x, u_cp, l_cp)
+                cp_feat[f2_nodes, 0] = torch.tensor(cp_vals, dtype=torch.float32)
+    else:
+        # Single foil: all surface nodes belong to foil 1
+        nf_result = _get_nf_cp(m0, p0, t0, aoa0_deg)
+        if nf_result is not None:
+            bl_x, u_cp, l_cp = nf_result
+            pos = x_tensor[surf_idx].numpy()
+            cp_vals = _interpolate_cp_to_nodes(pos[:, 0], pos[:, 1], bl_x, u_cp, l_cp)
+            cp_feat[surf_idx, 0] = torch.tensor(cp_vals, dtype=torch.float32)
+
+    return cp_feat
+
+
+# ---------------------------------------------------------------------------
 # Transolver model (inlined so students can
 # modify architecture and training script in a single file)
 # ---------------------------------------------------------------------------
@@ -942,6 +1081,9 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: Inviscid Cp input feature
+    inviscid_cp: bool = False                 # add precomputed inviscid Cp as input feature
+    cp_residual: bool = False                 # predict residual from inviscid Cp instead of full pressure
 
 
 cfg = sp.parse(Config)
@@ -960,6 +1102,82 @@ train_ds, val_splits, stats, sample_weights = load_data(
     cfg.manifest, cfg.stats_file, debug=cfg.debug,
 )
 stats = {k: v.to(device) for k, v in stats.items()}
+
+# ---------------------------------------------------------------------------
+# Precompute ALL Cp features at startup (for standardization + fast training)
+# ---------------------------------------------------------------------------
+cp_stats = {"mean": 0.0, "std": 1.0}
+_precomputed_cp = {}  # hash(sample_key) → cp_tensor [N, 1]
+
+def _sample_cp_key(x_tensor):
+    """Content-based key for Cp lookup: NACA0+NACA1+AoA0+AoA1+gap+first_surf_xy."""
+    return (round(float(x_tensor[0, 14]), 4),  # AoA0
+            round(float(x_tensor[0, 15]), 4), round(float(x_tensor[0, 16]), 4), round(float(x_tensor[0, 17]), 4),  # NACA0
+            round(float(x_tensor[0, 18]), 4),  # AoA1
+            round(float(x_tensor[0, 19]), 4), round(float(x_tensor[0, 20]), 4), round(float(x_tensor[0, 21]), 4),  # NACA1
+            round(float(x_tensor[0, 22]), 4),  # gap
+            int(x_tensor.shape[0]))  # node count (distinguishes padded vs unpadded)
+
+if cfg.inviscid_cp:
+    print("Precomputing inviscid Cp for ALL training + validation samples...")
+    _all_datasets = [("train", train_ds)]
+    for vname, vds in val_splits.items():
+        _all_datasets.append((vname, vds))
+    _cp_surface_vals = []
+    _n_total = 0
+    _n_tandem = 0
+    _t0_cp = time.time()
+    for _ds_name, _ds in _all_datasets:
+        for _i in range(len(_ds)):
+            _x_s, _, _is_s = _ds[_i]
+            _cp_s = compute_inviscid_cp_for_sample(_x_s, _is_s)
+            _key = _sample_cp_key(_x_s)
+            _precomputed_cp[_key] = _cp_s
+            _surf_m = _is_s.bool()
+            if _surf_m.any():
+                _cp_surface_vals.append(_cp_s[_surf_m].flatten())
+            if abs(float(_x_s[0, 22])) > 0.01:
+                _n_tandem += 1
+            _n_total += 1
+    if _cp_surface_vals:
+        _all_cp = torch.cat(_cp_surface_vals)
+        cp_stats["mean"] = _all_cp.mean().item()
+        cp_stats["std"] = max(_all_cp.std().item(), 0.1)
+        _nonzero = (_all_cp.abs() > 1e-6).sum().item()
+        print(f"  Cp stats ({_n_total} samples, {_n_tandem} tandem): "
+              f"mean={cp_stats['mean']:.4f}, std={cp_stats['std']:.4f}, "
+              f"min={_all_cp.min().item():.4f}, max={_all_cp.max().item():.4f}, "
+              f"nonzero={_nonzero}/{len(_all_cp)}")
+    print(f"  Precomputed {len(_precomputed_cp)} unique Cp tensors in {time.time()-_t0_cp:.1f}s")
+
+
+def _compute_cp_batch(raw_x_cpu, is_surface_gpu, device):
+    """Look up precomputed Cp features for a batch, with fallback to on-the-fly computation.
+
+    Returns:
+        cp_raw: [B, N, 1] raw Cp values (for cp_residual add-back)
+        cp_input: [B, N, 1] standardized Cp (for model input)
+    """
+    B = raw_x_cpu.shape[0]
+    cp_batch = []
+    for b in range(B):
+        key = _sample_cp_key(raw_x_cpu[b])
+        if key in _precomputed_cp:
+            cp_b = _precomputed_cp[key]
+        else:
+            # Fallback: compute on-the-fly (should be rare after precomputation)
+            is_surf_b = is_surface_gpu[b].detach().cpu()
+            cp_b = compute_inviscid_cp_for_sample(raw_x_cpu[b], is_surf_b)
+        cp_batch.append(cp_b)
+    cp_raw = torch.stack(cp_batch).to(device)  # [B, N, 1]
+    # Standardize: z-score using pre-computed surface-node stats
+    cp_input = (cp_raw - cp_stats["mean"]) / cp_stats["std"]
+    # Clamp standardized values to prevent extreme outliers destabilizing training
+    cp_input = cp_input.clamp(-3, 3)
+    # Zero out volume nodes to preserve surface/volume distinction
+    surf_mask = is_surface_gpu.bool().unsqueeze(-1)
+    cp_input = cp_input * surf_mask.float()
+    return cp_raw, cp_input
 
 
 def _umag_q(y, mask):
@@ -1065,7 +1283,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32 + (1 if cfg.inviscid_cp else 0),  # +curv, +dist, [+foil2dist], +32 fourier PE, [+Cp]
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1324,6 +1542,7 @@ run = wandb.init(
         "train_samples": len(train_ds),
         "val_samples": {k: len(v) for k, v in val_splits.items()},
         "split_manifest": cfg.manifest,
+        "cp_stats": cp_stats if cfg.inviscid_cp else None,
     },
     mode=os.environ.get("WANDB_MODE", "online"),
 )
@@ -1445,6 +1664,8 @@ for epoch in range(MAX_EPOCHS):
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
+        if cfg.inviscid_cp:
+            _raw_x = x.detach().cpu()  # save raw features for Cp computation
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1463,6 +1684,10 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
+        # Inviscid Cp input feature (standardized for model, raw for residual)
+        if cfg.inviscid_cp:
+            cp_feat_raw, cp_feat = _compute_cp_batch(_raw_x, is_surface, device)
+            x = torch.cat([x, cp_feat], dim=-1)
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -1475,6 +1700,11 @@ for epoch in range(MAX_EPOCHS):
                 y_phys = y_phys.clone()
                 y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
             y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+        # Cp residual prediction: subtract inviscid Cp from pressure target (use raw Cp)
+        if cfg.cp_residual and cfg.inviscid_cp:
+            _cp_offset = cp_feat_raw / phys_stats["y_std"][2:3]
+            y_norm = y_norm.clone()
+            y_norm[:, :, 2:3] = y_norm[:, :, 2:3] - _cp_offset
         # Residual prediction: subtract freestream from normalized targets
         _freestream = None
         if cfg.residual_prediction:
@@ -1920,6 +2150,8 @@ for epoch in range(MAX_EPOCHS):
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
+                if cfg.inviscid_cp:
+                    _raw_x_val = x.detach().cpu()
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1938,6 +2170,10 @@ for epoch in range(MAX_EPOCHS):
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
+                # Inviscid Cp input feature (must match training loop)
+                if cfg.inviscid_cp:
+                    cp_feat_raw, cp_feat = _compute_cp_batch(_raw_x_val, is_surface, device)
+                    x = torch.cat([x, cp_feat], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
@@ -1947,6 +2183,12 @@ for epoch in range(MAX_EPOCHS):
                         y_phys = y_phys.clone()
                         y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
                     y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+
+                # Cp residual prediction: subtract inviscid Cp from pressure target (use raw Cp)
+                if cfg.cp_residual and cfg.inviscid_cp:
+                    _cp_offset = cp_feat_raw / phys_stats["y_std"][2:3]
+                    y_norm = y_norm.clone()
+                    y_norm[:, :, 2:3] = y_norm[:, :, 2:3] - _cp_offset
 
                 # Residual prediction: subtract freestream in val loop
                 _v_freestream = None
@@ -2044,6 +2286,10 @@ for epoch in range(MAX_EPOCHS):
                     pred_orig = pred * raw_stats["y_std"] + raw_stats["y_mean"]
                 else:
                     pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                    # Add back inviscid Cp for cp_residual mode (use raw Cp)
+                    if cfg.cp_residual and cfg.inviscid_cp:
+                        pred_phys = pred_phys.clone()
+                        pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3] + cp_feat_raw
                     if cfg.log_pressure:
                         pred_phys = pred_phys.clone()
                         pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
@@ -2252,12 +2498,25 @@ if best_metrics:
                     xy_scaled = xy_norm.unsqueeze(-1) * freqs
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
+                    # Inviscid Cp input feature (standardized for model, raw for residual)
+                    if cfg.inviscid_cp:
+                        _vis_cp = compute_inviscid_cp_for_sample(x, is_surface)
+                        _vis_cp_raw = _vis_cp.unsqueeze(0).to(device)  # [1, N, 1]
+                        # Standardize for model input
+                        _vis_cp_std = (_vis_cp_raw - cp_stats["mean"]) / cp_stats["std"]
+                        _vis_surf_mask = is_surf_dev.bool().unsqueeze(-1)
+                        _vis_cp_std = _vis_cp_std * _vis_surf_mask.float()
+                        x_n = torch.cat([x_n, _vis_cp_std], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
                     pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
                     if cfg.raw_targets:
                         y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                     else:
                         pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                        # Add back inviscid Cp for cp_residual mode (use raw Cp)
+                        if cfg.cp_residual and cfg.inviscid_cp:
+                            pred_phys = pred_phys.clone()
+                            pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3] + _vis_cp_raw
                         if cfg.log_pressure:
                             pred_phys = pred_phys.clone()
                             pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
@@ -2328,6 +2587,8 @@ if cfg.surface_refine and best_metrics:
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
+                    if cfg.inviscid_cp:
+                        _raw_x_verify = x.detach().cpu()
                     x = (x - stats["x_mean"]) / stats["x_std"]
                     curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                     if cfg.foil2_dist:
@@ -2343,11 +2604,21 @@ if cfg.surface_refine and best_metrics:
                     xy_scaled = xy_norm.unsqueeze(-1) * freqs
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x = torch.cat([x, fourier_pe], dim=-1)
+                    # Inviscid Cp input feature (standardized for model, raw for residual)
+                    if cfg.inviscid_cp:
+                        cp_feat_raw, cp_feat = _compute_cp_batch(_raw_x_verify, is_surface, device)
+                        x = torch.cat([x, cp_feat], dim=-1)
 
                     # Ground truth denormalization reference
                     Umag, q = _umag_q(y, mask)
                     y_phys = _phys_norm(y, Umag, q)
                     y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+
+                    # Cp residual prediction
+                    if cfg.cp_residual and cfg.inviscid_cp:
+                        _cp_offset = cp_feat_raw / phys_stats["y_std"][2:3]
+                        y_norm = y_norm.clone()
+                        y_norm[:, :, 2:3] = y_norm[:, :, 2:3] - _cp_offset
 
                     # Residual prediction
                     _v_freestream = None
@@ -2409,6 +2680,10 @@ if cfg.surface_refine and best_metrics:
 
                     # Z-score denorm
                     pred_phys_A = pred_refined * phys_stats["y_std"] + phys_stats["y_mean"]
+                    # Add back inviscid Cp for cp_residual mode
+                    if cfg.cp_residual and cfg.inviscid_cp:
+                        pred_phys_A = pred_phys_A.clone()
+                        pred_phys_A[:, :, 2:3] = pred_phys_A[:, :, 2:3] + cp_feat_raw
                     # Physics denorm
                     pred_orig_A = _phys_denorm(pred_phys_A, Umag, q)
 
@@ -2427,6 +2702,10 @@ if cfg.surface_refine and best_metrics:
                         pred_manual = pred_manual + _v_freestream
                     # Step 5: undo z-score: pred * std + mean
                     pred_manual_phys = pred_manual * phys_stats["y_std"] + phys_stats["y_mean"]
+                    # Add back inviscid Cp for cp_residual mode
+                    if cfg.cp_residual and cfg.inviscid_cp:
+                        pred_manual_phys = pred_manual_phys.clone()
+                        pred_manual_phys[:, :, 2:3] = pred_manual_phys[:, :, 2:3] + cp_feat_raw
                     # Step 6: undo physics norm: Ux*Umag, Uy*Umag, p*q
                     pred_manual_orig = torch.zeros_like(pred_manual_phys)
                     pred_manual_orig[:, :, 0:1] = pred_manual_phys[:, :, 0:1].clamp(-10, 10) * Umag
@@ -2441,6 +2720,10 @@ if cfg.surface_refine and best_metrics:
                     if cfg.residual_prediction and _v_freestream is not None:
                         pred_norefine = pred_norefine + _v_freestream
                     pred_norefine_phys = pred_norefine * phys_stats["y_std"] + phys_stats["y_mean"]
+                    # Add back inviscid Cp for cp_residual mode
+                    if cfg.cp_residual and cfg.inviscid_cp:
+                        pred_norefine_phys = pred_norefine_phys.clone()
+                        pred_norefine_phys[:, :, 2:3] = pred_norefine_phys[:, :, 2:3] + cp_feat_raw
                     pred_norefine_orig = _phys_denorm(pred_norefine_phys, Umag, q)
 
                     # Compute surface pressure MAE for all paths
