@@ -1,64 +1,63 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-02 (updated after review round)
+- **Date:** 2026-04-02 (radical pivot)
 - **Advisor branch:** noam
-- **Phase:** Phase 6 — Bold New Architectures & Optimizers
+- **Phase:** Phase 6 — RADICAL New Architectures & Paradigms
 
-## Current Baseline (PR #2003 MERGED)
+## Current Baseline (PR #2003)
 
-| Metric | New Best | vs Phase 5 |
-|--------|----------|-----------|
-| val/loss | **0.3761** | -1.8% |
-| p_in | **12.5** | -3.5% |
-| p_oodc | **8.2** | -1.3% |
-| p_tan | **29.8** | -0.7% |
-| p_re | **6.5** | -3.0% |
+| Metric | Value |
+|--------|-------|
+| val/loss | 0.3761 |
+| p_in | 12.5 |
+| p_oodc | 8.2 |
+| p_tan | 29.8 |
+| p_re | 6.5 |
 
-New change: `--cosine_T_max 160` (was 180). W&B: `9ysz96ll`. Single-seed — needs multi-seed validation.
+Config: Lion, cosine_T_max=160, 3L Transolver, 192 hidden, 96 slices, residual prediction, surface refine.
 
 ## Student Status
 
-| Student | Status | PR | Experiment | Phase |
-|---------|--------|----|------------|-------|
-| edward | WIP | #2012 | T_max=160 multi-seed + fine sweep (140-170) | 6 |
-| tanjiro | WIP | #2013 | Learned pressure weight multiplier (hybrid) | 6 |
-| fern | WIP | #2014 | PirateNet adaptive residual gate on surface refine | 6 |
-| frieren | WIP | #2008 | PirateNets (RWF) | 6 |
-| thorfinn | WIP | #2006 | Muon Optimizer (lower LR sweep after crash fix) | 6 |
-| nezuko | WIP | #2010 | HeavyBall optimizers (all crashed — debugging) | 6 |
-| alphonse | WIP | #2011 | NOBLE (not started yet — pod issue?) | 6 |
-| askeladd | WIP | #2007 | XSA Exclusive Self-Attention (crashed — debugging) | 6 |
+| Student | PR | Experiment | Type | Status |
+|---------|-----|-----------|------|--------|
+| alphonse | #2033 | **LinearNO** — replace slice attention | RADICAL | 8 runs training |
+| fern | #2034 | **Inviscid Cp** — precomputed physics input | RADICAL | Implementing |
+| tanjiro | #2035 | **All-to-All Surface Attention** | RADICAL | Implementing |
+| nezuko | #2036 | **Conditional Flow Matching** | RADICAL | Implementing |
+| edward | #2037 | **MARIO Latent Geometry** | RADICAL | Implementing |
+| thorfinn | #2026 | Muon v2 (hybrid FFN+Lion) | Per Morgan | 8 runs training |
+| askeladd | #2027 | Geosolver v2 (geometry input features) | Per Morgan | 8 runs training |
+| frieren | #2025 | TTA + SWA | Architecture | 8 runs training |
 
-## PRs Ready for Review
+## Confirmed Dead Ends (Phase 6)
 
-None — all students working.
+| Direction | PRs | Finding |
+|-----------|-----|---------|
+| SOAP/HeavyBall optimizers | #2010,2018,2019,2021,2022,2023 | SOAP 2-6% WORSE than Lion. False 20% claim from NaN MAE. |
+| Muon (full replacement) | #2006 | 30-70% worse. Spectral flattening destroys physics signal. |
+| XSA attention | #2007 | Redundant with orthogonal slices. |
+| PirateNets RWF | #2008 | LayerNorm + Lion attenuate mechanism. |
+| NOBLE | #2011 | Model too small, cosine on hidden features unhelpful. |
+| Fourier features | #2015 | Marginal. Existing PE sufficient. |
+| Deeper model (4-5L) | #2015 | Epoch penalty too large in 180-min timeout. |
+| Multi-scale slices | #2017 | 48≈96 slices. Mechanism adapts to any count. |
+| Physics losses (vorticity, div-free) | #2016,2023 | WLS gradient instability on unstructured mesh. |
+| GeoTransolver cross-attention | #1989 | +9.8% worse, gate near zero. |
+| Learned loss weights | #2013 | Collapsed to zero. |
 
-## Research Focus
+## Key Research Insights
 
-### Completed Phase 6 Loop Items (from Issue #1926)
-- [x] **Muon + Gram-NS** → thorfinn (#2006) — debugging, lower LR needed
-- [x] **XSA** → askeladd (#2007) — debugging code regression
-- [x] **PirateNets (RWF)** → frieren (#2008) — running
-- [x] **NOBLE** → alphonse (#2011) — assigned, not started yet
-- [x] **HeavyBall** → nezuko (#2010) — all crashed, debugging
-- [x] ~~Geosolver~~ → CLOSED (already failed PR #1989)
-- [x] ~~MSA~~ → NOT APPLICABLE (wrong problem class)
-- [ ] HyperP — wait for Muon results
-- [ ] mHC — DEFER (3-layer model too shallow)
+1. **Lion is the optimal optimizer** for this 1.7M-param architecture. All alternatives fail.
+2. **The Transolver is a strong local optimum.** Incremental modifications are absorbed by EMA.
+3. **Throughput matters** — any technique adding >15% step time loses epochs and hurts.
+4. **Physics structure in weights matters** — orthogonalize/flatten at your peril (Muon, SOAP).
+5. **24-dim input already encodes geometry** — adding context banks doesn't help (GeoTransolver).
+6. **48 slices ≈ 96 slices** — the model is over-parameterized in slice dimension.
 
-### Phase 6 Follow-ups (from Phase 5 results)
-- [x] T_max multi-seed validation → edward (#2012)
-- [x] Learned pressure weight → tanjiro (#2013)
-- [x] PirateNet surface gate → fern (#2014)
+## Current Radical Directions (from literature survey)
 
-## Key Constraints
-- Never use raw data files beyond training data (Issue #1834)
-- All experiments use `--cosine_T_max 160` (new from PR #2003)
-- Baseline to beat: val/loss 0.3761, p_in 12.5, p_oodc 8.2, p_tan 29.8, p_re 6.5
-
-## Potential Next Research Directions
-1. If T_max=160 validates → compound with other improvements
-2. T_max=140-150 could be even better (edward #2012 will tell us)
-3. If PirateNet surface gate works → explore wider/deeper surface refine
-4. Muon at very low LR (0.001-0.003) — still running on thorfinn
-5. HyperP as Muon follow-up if Muon shows any promise
+1. **LinearNO** (AAAI 2026) — 60% improvement on AirfRANS. RUNNING.
+2. **Inviscid Cp** — 88% OOD error reduction in B-GNN paper. IMPLEMENTING.
+3. **All-to-All Surface Attention** — elliptic pressure coupling. IMPLEMENTING.
+4. **Conditional Flow Matching** — generative paradigm. IMPLEMENTING.
+5. **MARIO Latent Geometry** — geometry autoencoder + modulated field. IMPLEMENTING.
