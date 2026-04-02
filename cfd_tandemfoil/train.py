@@ -253,6 +253,105 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         return self.to_out(out_x)
 
 
+class XSA_Physics_Attention(nn.Module):
+    """XSA (Exclusive Self-Attention) variant of Physics Attention for irregular meshes.
+
+    Adds an exclusion mechanism to the slice attention so each head focuses on
+    different parts of the input, preventing attention collapse where multiple
+    heads learn redundant patterns. The exclusion gate is zero-initialized so
+    XSA starts as standard attention and gradually learns to specialize.
+    """
+
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
+                 xsa_temperature=1.0):
+        super().__init__()
+        inner_dim = dim_head * heads
+        self.dim_head = dim_head
+        self.heads = heads
+        self.scale = dim_head**-0.5
+        self.softmax = nn.Softmax(dim=-1)
+        self.dropout = nn.Dropout(dropout)
+        self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
+        self.tandem_temp_offset = nn.Parameter(torch.zeros(1, heads, 1, 1))
+        self.xsa_temperature = xsa_temperature
+
+        self.in_project_x = nn.Linear(dim, inner_dim)
+        self.in_project_fx = nn.Linear(dim, inner_dim)
+        self.in_project_slice = nn.Linear(dim_head, slice_num)
+        torch.nn.init.orthogonal_(self.in_project_slice.weight)
+
+        self.to_q = nn.Linear(dim_head, dim_head, bias=False)
+        self.to_k = nn.Linear(dim_head, dim_head, bias=False)
+        self.to_v = nn.Linear(dim_head, dim_head, bias=False)
+
+        # XSA exclusion gate: learned per-head exclusion strength (zero-init → starts as standard attn)
+        self.exclusion_gate = nn.Parameter(torch.zeros(1, heads, 1, 1))
+
+        self.slice_residual_scale = nn.Parameter(torch.tensor(0.1))
+        self.to_out = nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
+        self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
+
+    def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None):
+        bsz, num_points, _ = x.shape
+
+        fx_mid = (
+            self.in_project_fx(x)
+            .reshape(bsz, num_points, self.heads, self.dim_head)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+        x_mid = (
+            self.in_project_x(x)
+            .reshape(bsz, num_points, self.heads, self.dim_head)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+
+        temp = self.temperature
+        if tandem_mask is not None:
+            temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
+        temp = temp.clamp(min=1e-4)
+        slice_logits = self.in_project_slice(x_mid) / temp  # [B, H, N, S]
+
+        if spatial_bias is not None:
+            slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
+
+        # === XSA EXCLUSION MECHANISM ===
+        # Standard softmax attention for all heads
+        all_slice_weights = self.softmax(slice_logits)  # [B, H, N, S]
+
+        # Coverage from OTHER heads: total minus self
+        total_attention = all_slice_weights.sum(dim=1, keepdim=True)  # [B, 1, N, S]
+        other_attention = total_attention - all_slice_weights  # [B, H, N, S]
+
+        # Exclusion: penalize where other heads attend, scaled by learned gate and temperature
+        gate = torch.sigmoid(self.exclusion_gate)  # [0, 1] per head
+        exclusion_penalty = gate * other_attention / self.xsa_temperature
+        slice_weights = all_slice_weights - exclusion_penalty
+        slice_weights = F.relu(slice_weights)  # ensure non-negative
+        slice_weights = slice_weights / (slice_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        # === END XSA ===
+
+        slice_norm = slice_weights.sum(2)
+        slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
+        slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
+
+        q_slice_token = self.to_q(slice_token)
+        slice_token_kv = slice_token.mean(dim=1, keepdim=True)
+        k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
+        v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
+        q_norm = F.normalize(q_slice_token, dim=-1)
+        k_norm = F.normalize(k_slice_token, dim=-1)
+        attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
+        attn_weights = F.softmax(attn_logits, dim=-1)
+        out_slice_token = torch.matmul(attn_weights, v_slice_token)
+        out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
+
+        out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
+        out_x = rearrange(out_x, "b h n d -> b n (h d)")
+        return self.to_out(out_x)
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -282,6 +381,8 @@ class TransolverBlock(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        use_xsa=False,
+        xsa_temperature=1.0,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -296,18 +397,28 @@ class TransolverBlock(nn.Module):
         self.domain_layernorm = domain_layernorm
         _LN = (lambda d: DomainLayerNorm(d, zeroinit=dln_zeroinit)) if domain_layernorm else nn.LayerNorm
         self.ln_1 = _LN(hidden_dim)
-        self.attn = Physics_Attention_Irregular_Mesh(
-            hidden_dim,
-            heads=num_heads,
-            dim_head=hidden_dim // num_heads,
-            dropout=dropout,
-            slice_num=slice_num,
-            linear_no_attention=linear_no_attention,
-            learned_kernel=learned_kernel,
-            decouple_slice=decouple_slice,
-            zone_temp=zone_temp,
-            prog_slices=prog_slices,
-        )
+        if use_xsa:
+            self.attn = XSA_Physics_Attention(
+                hidden_dim,
+                heads=num_heads,
+                dim_head=hidden_dim // num_heads,
+                dropout=dropout,
+                slice_num=slice_num,
+                xsa_temperature=xsa_temperature,
+            )
+        else:
+            self.attn = Physics_Attention_Irregular_Mesh(
+                hidden_dim,
+                heads=num_heads,
+                dim_head=hidden_dim // num_heads,
+                dropout=dropout,
+                slice_num=slice_num,
+                linear_no_attention=linear_no_attention,
+                learned_kernel=learned_kernel,
+                decouple_slice=decouple_slice,
+                zone_temp=zone_temp,
+                prog_slices=prog_slices,
+            )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
             self.adaln_net = nn.Sequential(
@@ -601,6 +712,8 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        use_xsa=False,
+        xsa_temperature=1.0,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -671,6 +784,8 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
+                    use_xsa=use_xsa,
+                    xsa_temperature=xsa_temperature,
                 )
                 for idx in range(n_layers)
             ]
@@ -942,6 +1057,9 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: XSA (Exclusive Self-Attention)
+    use_xsa: bool = False                     # replace Physics_Attention with XSA variant
+    xsa_temperature: float = 1.0              # exclusion temperature (lower = sharper exclusion)
 
 
 cfg = sp.parse(Config)
@@ -1094,6 +1212,8 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    use_xsa=cfg.use_xsa,
+    xsa_temperature=cfg.xsa_temperature,
 )
 
 model = Transolver(**model_config).to(device)
@@ -2150,6 +2270,14 @@ for epoch in range(MAX_EPOCHS):
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
+    # Log XSA exclusion gate values per head if enabled
+    if cfg.use_xsa:
+        for blk_idx, blk in enumerate(_base_model.blocks):
+            gate_vals = torch.sigmoid(blk.attn.exclusion_gate).squeeze().detach().cpu().tolist()
+            if isinstance(gate_vals, float):
+                gate_vals = [gate_vals]
+            for h_idx, gv in enumerate(gate_vals):
+                metrics[f"xsa/block{blk_idx}_head{h_idx}_gate"] = gv
     wandb.log(metrics)
 
     if torch.cuda.is_available():
