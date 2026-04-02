@@ -20,6 +20,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     Tandem surface loss is therefore underweighted.
 """
 
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -74,14 +75,16 @@ class GatedMLP(nn.Module):
 
 class GatedMLP2(nn.Module):
     """GatedMLP with a residual second gated layer."""
-    def __init__(self, n_input, n_hidden, n_output, act='gelu'):
+    def __init__(self, n_input, n_hidden, n_output, act='gelu',
+                 use_rwf: bool = False, multiscale: bool = False):
         super().__init__()
         act_fn = ACTIVATION[act]
-        self.gate1 = nn.Linear(n_input, n_hidden)
-        self.up1 = nn.Linear(n_input, n_hidden)
-        self.gate2 = nn.Linear(n_hidden, n_hidden)
-        self.up2 = nn.Linear(n_hidden, n_hidden)
-        self.down = nn.Linear(n_hidden, n_output)
+        L = lambda i, o: _make_linear(i, o, use_rwf=use_rwf, multiscale=multiscale)
+        self.gate1 = L(n_input, n_hidden)
+        self.up1 = L(n_input, n_hidden)
+        self.gate2 = L(n_hidden, n_hidden)
+        self.up2 = L(n_hidden, n_hidden)
+        self.down = L(n_hidden, n_output)
         self.act = act_fn()
 
     def forward(self, x):
@@ -91,7 +94,8 @@ class GatedMLP2(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, n_input, n_hidden, n_output, n_layers=1, act="gelu", res=True):
+    def __init__(self, n_input, n_hidden, n_output, n_layers=1, act="gelu", res=True,
+                 use_rwf: bool = False, multiscale: bool = False):
         super().__init__()
         if act not in ACTIVATION:
             raise NotImplementedError
@@ -101,9 +105,10 @@ class MLP(nn.Module):
         self.n_output = n_output
         self.n_layers = n_layers
         self.res = res
-        self.linear_pre = nn.Sequential(nn.Linear(n_input, n_hidden), act_fn())
-        self.linear_post = nn.Linear(n_hidden, n_output)
-        self.linears = nn.ModuleList([nn.Sequential(nn.Linear(n_hidden, n_hidden), act_fn()) for _ in range(n_layers)])
+        L = lambda i, o: _make_linear(i, o, use_rwf=use_rwf, multiscale=multiscale)
+        self.linear_pre = nn.Sequential(L(n_input, n_hidden), act_fn())
+        self.linear_post = L(n_hidden, n_output)
+        self.linears = nn.ModuleList([nn.Sequential(L(n_hidden, n_hidden), act_fn()) for _ in range(n_layers)])
 
     def forward(self, x):
         x = self.linear_pre(x)
@@ -114,6 +119,55 @@ class MLP(nn.Module):
                 x = self.linears[i](x)
         x = self.linear_post(x)
         return x
+
+
+class RWFLinear(nn.Module):
+    """Random Weight Factorization linear layer (Wang et al., arXiv:2210.01274, ICLR 2023).
+
+    W_eff = diag(exp(log_g)) @ V  — both log_g and V are trainable parameters.
+    V is initialized as W_glorot / exp(log_g), so W_eff == W_glorot at step 0.
+
+    The factorization gives neurons different effective learning rates, helping the
+    network simultaneously learn multi-scale features (boundary layers + freestream).
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True,
+                 mean: float = 0.5, stddev: float = 0.1, multiscale: bool = False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.log_g = nn.Parameter(torch.empty(out_features))
+        self.V = nn.Parameter(torch.empty(out_features, in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.register_parameter('bias', None)
+        self._reset_rwf(mean, stddev, multiscale)
+
+    def _reset_rwf(self, mean: float, stddev: float, multiscale: bool):
+        if multiscale:
+            # Deterministic spectrum across [log(0.2), log(5.0)] — shuffled for diversity
+            log_g_vals = torch.linspace(math.log(0.2), math.log(5.0), self.out_features)
+            self.log_g.data.copy_(log_g_vals[torch.randperm(self.out_features)])
+        else:
+            nn.init.normal_(self.log_g, mean=mean, std=stddev)
+        # V = W_glorot / exp(log_g): preserves Glorot statistics at init (W_eff == W_glorot)
+        W = torch.empty(self.out_features, self.in_features)
+        nn.init.xavier_normal_(W)
+        with torch.no_grad():
+            self.V.data.copy_(W / torch.exp(self.log_g).unsqueeze(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        W_eff = torch.exp(self.log_g).unsqueeze(1) * self.V  # [out, in]
+        return F.linear(x, W_eff, self.bias)
+
+
+def _make_linear(in_f: int, out_f: int, bias: bool = True,
+                 use_rwf: bool = False, multiscale: bool = False) -> nn.Module:
+    """Helper: returns RWFLinear when use_rwf=True, else nn.Linear."""
+    if use_rwf:
+        return RWFLinear(in_f, out_f, bias=bias, mean=0.5, stddev=0.1, multiscale=multiscale)
+    return nn.Linear(in_f, out_f, bias=bias)
 
 
 class DomainLayerNorm(nn.Module):
@@ -282,6 +336,8 @@ class TransolverBlock(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        pirate_rwf=False,
+        pirate_multiscale=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -326,7 +382,8 @@ class TransolverBlock(nn.Module):
             nn.init.zeros_(self.film_net[-1].weight)
             nn.init.zeros_(self.film_net[-1].bias)
         self.ln_2 = _LN(hidden_dim)
-        self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act,
+                       use_rwf=pirate_rwf, multiscale=pirate_multiscale)
         self.spatial_bias = nn.Sequential(
             nn.Linear(4, 64), nn.GELU(),
             nn.Linear(64, 64), nn.GELU(),
@@ -601,6 +658,8 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        pirate_rwf=False,
+        pirate_multiscale=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -636,7 +695,10 @@ class Transolver(nn.Module):
                 act=act,
             )
         else:
-            self.preprocess = GatedMLP2(fun_dim + space_dim, n_hidden * 2, n_hidden)
+            self.preprocess = GatedMLP2(
+                fun_dim + space_dim, n_hidden * 2, n_hidden,
+                use_rwf=pirate_rwf, multiscale=pirate_multiscale,
+            )
 
         self.n_hidden = n_hidden
         self.space_dim = space_dim
@@ -671,6 +733,8 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
+                    pirate_rwf=pirate_rwf,
+                    pirate_multiscale=pirate_multiscale,
                 )
                 for idx in range(n_layers)
             ]
@@ -936,6 +1000,9 @@ class Config:
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
     # Phase 5: Residual prediction
     residual_prediction: bool = False   # predict residual from freestream instead of full field
+    # Phase 6: PirateNets — Random Weight Factorization
+    pirate_rwf: bool = False            # RWF on MLP and GatedMLP2 layers (W = diag(exp(log_g)) * V)
+    pirate_multiscale: bool = False     # multiscale init for log_g: linspace(log(0.2), log(5.0))
     # Phase 5: Surface refinement head — additive correction MLP on surface nodes
     surface_refine: bool = False              # enable surface refinement head
     surface_refine_hidden: int = 128          # hidden dimension of refinement MLP
@@ -1094,6 +1161,8 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    pirate_rwf=cfg.pirate_rwf,
+    pirate_multiscale=cfg.pirate_multiscale,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1147,6 +1216,11 @@ snapshot_epoch_list = [int(e) for e in cfg.snapshot_epochs_str.split(",")] if cf
 n_params = sum(p.numel() for p in model.parameters())
 if refine_head is not None:
     n_params += sum(p.numel() for p in refine_head.parameters())
+if cfg.pirate_rwf:
+    _rwf_count = sum(1 for m in _base_model.modules() if isinstance(m, RWFLinear))
+    _rwf_log_g_params = sum(m.log_g.numel() for m in _base_model.modules() if isinstance(m, RWFLinear))
+    print(f"PirateNets RWF: {_rwf_count} RWFLinear layers, {_rwf_log_g_params:,} log_g params "
+          f"(multiscale={cfg.pirate_multiscale})")
 
 
 class SAM:
@@ -1253,20 +1327,35 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
-attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
-other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+_ATTN_KEYS = ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias']
+attn_params = [p for n, p in model.named_parameters() if any(k in n for k in _ATTN_KEYS)]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
-if cfg.use_lion:
-    base_opt = Lion([
+if cfg.pirate_rwf:
+    # Separate log_g params — reduce LR 10x to prevent runaway drift under Lion sign updates
+    log_g_params = [p for n, p in model.named_parameters()
+                    if 'log_g' in n and not any(k in n for k in _ATTN_KEYS)]
+    _log_g_names = {id(p) for p in log_g_params}
+    other_params = [p for n, p in model.named_parameters()
+                    if not any(k in n for k in _ATTN_KEYS) and id(p) not in _log_g_names]
+    _rwf_param_groups = [
+        {'params': attn_params, 'lr': _base_lr * 0.5, 'weight_decay': cfg.weight_decay},
+        {'params': log_g_params, 'lr': _base_lr * 0.1, 'weight_decay': 0.0},
+        {'params': other_params, 'lr': _base_lr, 'weight_decay': cfg.weight_decay},
+    ]
+    _n_log_g = sum(p.numel() for p in log_g_params)
+    print(f"RWF optimizer: {_n_log_g:,} log_g params at lr={_base_lr * 0.1:.2e}, "
+          f"others at lr={_base_lr:.2e}")
+else:
+    other_params = [p for n, p in model.named_parameters() if not any(k in n for k in _ATTN_KEYS)]
+    _rwf_param_groups = [
         {'params': attn_params, 'lr': _base_lr * 0.5},
-        {'params': other_params, 'lr': _base_lr}
-    ], weight_decay=cfg.weight_decay)
+        {'params': other_params, 'lr': _base_lr},
+    ]
+if cfg.use_lion:
+    base_opt = Lion(_rwf_param_groups, weight_decay=cfg.weight_decay)
     optimizer = base_opt  # Lion has its own momentum; skip Lookahead
 else:
-    base_opt = torch.optim.AdamW([
-        {'params': attn_params, 'lr': _base_lr * 0.5},
-        {'params': other_params, 'lr': _base_lr}
-    ], weight_decay=cfg.weight_decay)
+    base_opt = torch.optim.AdamW(_rwf_param_groups, weight_decay=cfg.weight_decay)
     if cfg.use_lookahead:
         optimizer = Lookahead(base_opt, k=10, alpha=0.8)
     else:
@@ -1768,6 +1857,11 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.restore()
         if use_pcgrad or _should_step:
             optimizer.step()
+            # Clamp RWF log_g to prevent runaway drift (g stays in [e^-2, e^2] ≈ [0.14, 7.4])
+            if cfg.pirate_rwf:
+                for module in _base_model.modules():
+                    if isinstance(module, RWFLinear):
+                        module.log_g.data.clamp_(-2.0, 2.0)
             if cfg.grad_accum_steps > 1 and not use_pcgrad:
                 optimizer.zero_grad()
         if step_scheduler_per_batch and (use_pcgrad or _should_step):
@@ -2150,6 +2244,20 @@ for epoch in range(MAX_EPOCHS):
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
+    # RWF scale statistics per epoch
+    if cfg.pirate_rwf:
+        _rwf_g_all = []
+        for _rwf_name, _rwf_mod in _base_model.named_modules():
+            if isinstance(_rwf_mod, RWFLinear):
+                _g = _rwf_mod.log_g.exp().detach()
+                _rwf_g_all.append(_g)
+        if _rwf_g_all:
+            _g_cat = torch.cat(_rwf_g_all)
+            metrics["rwf/g_mean"] = _g_cat.mean().item()
+            metrics["rwf/g_std"] = _g_cat.std().item()
+            metrics["rwf/g_max"] = _g_cat.max().item()
+            metrics["rwf/g_min"] = _g_cat.min().item()
+            metrics["rwf/log_g_mean"] = _g_cat.log().mean().item()
     wandb.log(metrics)
 
     if torch.cuda.is_available():
