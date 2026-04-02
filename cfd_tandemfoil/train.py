@@ -942,6 +942,8 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: SOAP optimizer
+    use_soap: bool = False        # use PaLMForeachSOAP optimizer (heavyball) instead of Lion/AdamW
 
 
 cfg = sp.parse(Config)
@@ -1256,7 +1258,45 @@ class Lookahead:
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
-if cfg.use_lion:
+if cfg.use_soap:
+    import heavyball
+    # SOAP preconditioning only benefits 2D+ params; 1D/scalar params go to AdamW
+    _all_params = list(model.named_parameters())
+    if refine_head is not None:
+        _all_params += [(f"refine.{n}", p) for n, p in refine_head.named_parameters()]
+        print(f"Added {sum(p.numel() for p in refine_head.parameters()):,} refinement head params to SOAP optimizer")
+    _soap_params = [p for _, p in _all_params if p.ndim >= 2]
+    _adamw_params = [p for _, p in _all_params if p.ndim < 2]
+    # SOAP for matrix params (single param group — HeavyBall multi-group bug)
+    _soap_opt = heavyball.PaLMForeachSOAP(
+        _soap_params,
+        lr=_base_lr,
+        weight_decay=cfg.weight_decay,
+        precondition_frequency=10,
+    )
+    # AdamW for bias/scalar/1D params
+    _adamw_opt = torch.optim.AdamW(_adamw_params, lr=_base_lr, weight_decay=cfg.weight_decay)
+
+    class DualOptimizer:
+        """Wraps SOAP (2D+ params) + AdamW (1D/scalar params) as one optimizer."""
+        def __init__(self, soap, adamw):
+            self.soap = soap
+            self.adamw = adamw
+        def step(self):
+            self.soap.step()
+            self.adamw.step()
+        def zero_grad(self):
+            self.soap.zero_grad()
+            self.adamw.zero_grad()
+        @property
+        def param_groups(self):
+            return self.soap.param_groups + self.adamw.param_groups
+
+    base_opt = _soap_opt  # scheduler wraps SOAP (the primary optimizer)
+    optimizer = DualOptimizer(_soap_opt, _adamw_opt)
+    print(f"Using SOAP optimizer: lr={_base_lr}, wd={cfg.weight_decay}, precond_freq=10, "
+          f"soap_params={len(_soap_params)}, adamw_params={len(_adamw_params)}")
+elif cfg.use_lion:
     base_opt = Lion([
         {'params': attn_params, 'lr': _base_lr * 0.5},
         {'params': other_params, 'lr': _base_lr}
@@ -1272,8 +1312,8 @@ else:
     else:
         optimizer = base_opt
 
-# Add refinement head params to optimizer if enabled
-if refine_head is not None:
+# Add refinement head params to optimizer if enabled (skip for SOAP — already included)
+if refine_head is not None and not cfg.use_soap:
     _refine_params = list(refine_head.parameters())
     base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
@@ -1309,6 +1349,33 @@ else:  # sequential (default)
         milestones=[cfg.warmup_total_iters]
     )
 step_scheduler_per_batch = (cfg.scheduler_type == "onecycle")
+
+# Mirror the LR schedule for AdamW bias/scalar params when using SOAP
+if cfg.use_soap:
+    if cfg.scheduler_type == "sequential":
+        _aw_warmup = torch.optim.lr_scheduler.LinearLR(
+            _adamw_opt, start_factor=cfg.warmup_start_factor, total_iters=cfg.warmup_total_iters)
+        _aw_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            _adamw_opt, T_max=cfg.cosine_T_max, eta_min=cfg.cosine_eta_min)
+        _adamw_scheduler = torch.optim.lr_scheduler.SequentialLR(
+            _adamw_opt, schedulers=[_aw_warmup, _aw_cosine], milestones=[cfg.warmup_total_iters])
+    else:
+        _adamw_scheduler = None  # other scheduler types not used with SOAP
+    _soap_scheduler = scheduler
+
+    class DualScheduler:
+        """Steps both SOAP and AdamW schedulers together."""
+        def __init__(self, primary, secondary):
+            self.primary = primary
+            self.secondary = secondary
+        def step(self):
+            self.primary.step()
+            if self.secondary is not None:
+                self.secondary.step()
+        def get_last_lr(self):
+            return self.primary.get_last_lr()
+
+    scheduler = DualScheduler(_soap_scheduler, _adamw_scheduler)
 
 # --- wandb ---
 run = wandb.init(
