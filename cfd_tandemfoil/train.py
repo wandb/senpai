@@ -60,6 +60,45 @@ ACTIVATION = {
 }
 
 
+class CosNet(nn.Module):
+    """Two cosine activations with learnable frequency/phase + mixing matrix.
+    Maps R^r -> R^r with bounded output [-1, 1]. (NOBLE paper, arXiv 2603.06492)
+    """
+    def __init__(self, rank):
+        super().__init__()
+        self.freq1 = nn.Parameter(torch.ones(rank))
+        self.phase1 = nn.Parameter(torch.zeros(rank))
+        self.mix = nn.Linear(rank, rank, bias=False)
+        self.freq2 = nn.Parameter(torch.ones(rank))
+        self.phase2 = nn.Parameter(torch.zeros(rank))
+        nn.init.orthogonal_(self.mix.weight)
+
+    def forward(self, x):
+        x = torch.cos(self.freq1 * x + self.phase1)
+        x = self.mix(x)
+        x = torch.cos(self.freq2 * x + self.phase2)
+        return x
+
+
+class NOBLELinear(nn.Module):
+    """Linear layer + nonlinear low-rank branch (NOBLE).
+    output = x @ W.T + b + CosNet(x @ W_down.T) @ W_up.T
+    Branch starts silent (W_up zero-init) and gradually activates.
+    """
+    def __init__(self, in_features, out_features, bias=True, rank=32):
+        super().__init__()
+        self.main = nn.Linear(in_features, out_features, bias=bias)
+        with torch.no_grad():
+            self.main.weight.mul_(0.5)
+        self.W_down = nn.Linear(in_features, rank, bias=False)
+        self.cosnet = CosNet(rank)
+        self.W_up = nn.Linear(rank, out_features, bias=False)
+        nn.init.zeros_(self.W_up.weight)
+
+    def forward(self, x):
+        return self.main(x) + self.W_up(self.cosnet(self.W_down(x)))
+
+
 class GatedMLP(nn.Module):
     def __init__(self, n_input, n_hidden, n_output, act='gelu'):
         super().__init__()
@@ -942,6 +981,9 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: NOBLE — Nonlinear Low-Rank Branches in Attention Layers
+    noble: bool = False                        # enable NOBLE branches on attention projections
+    noble_rank: int = 32                       # bottleneck rank for NOBLE branches
 
 
 cfg = sp.parse(Config)
@@ -1098,6 +1140,42 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 model._pressure_separate = cfg.pressure_separate_last_block
+
+# NOBLE: replace attention projections with NOBLELinear
+if cfg.noble:
+    _noble_replaced = 0
+    _noble_target_names = {'in_project_x', 'in_project_fx', 'to_q', 'to_k', 'to_v'}
+    for block in model.blocks:
+        attn = block.attn
+        for name in _noble_target_names:
+            old = getattr(attn, name)
+            noble_layer = NOBLELinear(
+                old.in_features, old.out_features,
+                bias=old.bias is not None, rank=cfg.noble_rank,
+            ).to(device)
+            # Copy existing weights into the main linear
+            with torch.no_grad():
+                noble_layer.main.weight.copy_(old.weight * 0.5)
+                if old.bias is not None:
+                    noble_layer.main.bias.copy_(old.bias)
+            setattr(attn, name, noble_layer)
+            _noble_replaced += 1
+        # Replace to_out[0] (the Linear inside the Sequential)
+        old_out = attn.to_out[0]
+        noble_out = NOBLELinear(
+            old_out.in_features, old_out.out_features,
+            bias=old_out.bias is not None, rank=cfg.noble_rank,
+        ).to(device)
+        with torch.no_grad():
+            noble_out.main.weight.copy_(old_out.weight * 0.5)
+            if old_out.bias is not None:
+                noble_out.main.bias.copy_(old_out.bias)
+        attn.to_out[0] = noble_out
+        _noble_replaced += 1
+    _noble_n_params = sum(p.numel() for p in model.parameters())
+    print(f"NOBLE: replaced {_noble_replaced} layers (rank={cfg.noble_rank}), "
+          f"total params: {_noble_n_params:,}")
+
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
@@ -1253,20 +1331,30 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
-attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
-other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
+_noble_branch_names = {'cosnet', 'W_down', 'W_up'}
+attn_params = [p for n, p in model.named_parameters()
+               if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])
+               and not any(k in n for k in _noble_branch_names)]
+noble_params = [p for n, p in model.named_parameters()
+                if any(k in n for k in _noble_branch_names)] if cfg.noble else []
+other_params = [p for n, p in model.named_parameters()
+                if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])
+                and not any(k in n for k in _noble_branch_names)]
+_param_groups = [
+    {'params': attn_params, 'lr': _base_lr * 0.5},
+    {'params': other_params, 'lr': _base_lr},
+]
+if cfg.noble and noble_params:
+    _noble_lr_mult = (cfg.n_hidden / cfg.noble_rank) ** 0.6
+    _param_groups.append({'params': noble_params, 'lr': _base_lr * _noble_lr_mult})
+    print(f"NOBLE LR: base={_base_lr:.1e}, branch={_base_lr * _noble_lr_mult:.1e} "
+          f"(mult={_noble_lr_mult:.2f}), {len(noble_params)} param tensors")
 if cfg.use_lion:
-    base_opt = Lion([
-        {'params': attn_params, 'lr': _base_lr * 0.5},
-        {'params': other_params, 'lr': _base_lr}
-    ], weight_decay=cfg.weight_decay)
+    base_opt = Lion(_param_groups, weight_decay=cfg.weight_decay)
     optimizer = base_opt  # Lion has its own momentum; skip Lookahead
 else:
-    base_opt = torch.optim.AdamW([
-        {'params': attn_params, 'lr': _base_lr * 0.5},
-        {'params': other_params, 'lr': _base_lr}
-    ], weight_decay=cfg.weight_decay)
+    base_opt = torch.optim.AdamW(_param_groups, weight_decay=cfg.weight_decay)
     if cfg.use_lookahead:
         optimizer = Lookahead(base_opt, k=10, alpha=0.8)
     else:
@@ -1849,6 +1937,22 @@ for epoch in range(MAX_EPOCHS):
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
     prev_surf_loss = epoch_surf
+    # NOBLE branch activation logging
+    if cfg.noble and epoch % 10 == 0:
+        _wup_norms = []
+        for _blk in _base_model.blocks:
+            for _name in ['in_project_x', 'in_project_fx', 'to_q', 'to_k', 'to_v']:
+                _layer = getattr(_blk.attn, _name, None)
+                if isinstance(_layer, NOBLELinear):
+                    _wup_norms.append(_layer.W_up.weight.data.norm().item())
+            if isinstance(_blk.attn.to_out[0], NOBLELinear):
+                _wup_norms.append(_blk.attn.to_out[0].W_up.weight.data.norm().item())
+        if _wup_norms:
+            wandb.log({
+                "noble/W_up_norm_mean": sum(_wup_norms) / len(_wup_norms),
+                "noble/W_up_norm_max": max(_wup_norms),
+                "global_step": global_step,
+            })
     # Snapshot ensemble: save running average at specified epochs
     if cfg.snapshot_ensemble and (epoch + 1) in snapshot_epoch_list:
         snap = {k: v.cpu().clone() for k, v in _base_model.state_dict().items()}
