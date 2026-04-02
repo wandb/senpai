@@ -36,6 +36,7 @@ from timm.layers import trunc_normal_
 from tqdm import tqdm
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import simple_parsing as sp
+import heavyball
 
 from data.utils import visualize
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
@@ -887,6 +888,12 @@ class Config:
     half_target_noise: bool = False  # GPU 3: reduce target noise by 50%
     no_target_noise: bool = False    # Phase 4: completely disable target noise injection
     use_lion: bool = False        # GPU 4: Lion optimizer instead of AdamW
+    use_soap: bool = False        # Phase 6: SOAP optimizer (PaLMForeachSOAP from heavyball)
+    use_muon: bool = False        # Phase 6: Full Muon optimizer (replaces Lion/AdamW entirely)
+    hybrid_muon: bool = False     # Phase 6: Hybrid Muon (FFN) + Lion (attention) optimizer
+    muon_lr: float = 0.001        # Muon learning rate (for use_muon or hybrid_muon)
+    muon_ns_steps: int = 5        # Newton-Schulz iteration steps for Muon
+    muon_clip: float = 0.0        # Gradient clipping max_norm for Muon (0 = disabled)
     rdrop: bool = False           # GPU 7: R-drop regularization
     rdrop_alpha: float = 1.0     # R-drop consistency loss weight
     # Phase 3 R3: normalization/prediction-space experiments
@@ -1225,6 +1232,84 @@ class Lion(torch.optim.Optimizer):
         return loss
 
 
+class Muon(torch.optim.Optimizer):
+    """Muon optimizer — Momentum + Newton-Schulz orthogonalization.
+
+    For weight matrices (ndim >= 2), applies Newton-Schulz iterations to
+    approximate the matrix sign / polar decomposition of the gradient,
+    producing spectrally flat updates. For 1D params (biases, norms),
+    falls back to standard SGD with momentum.
+
+    Reference: https://github.com/KellerJordan/Muon (Keller Jordan, 2024)
+    """
+    def __init__(self, params, lr=0.02, momentum=0.95, ns_steps=5,
+                 weight_decay=0.0, max_grad_norm=0.0):
+        defaults = dict(lr=lr, momentum=momentum, ns_steps=ns_steps,
+                        weight_decay=weight_decay, max_grad_norm=max_grad_norm)
+        super().__init__(params, defaults)
+
+    @staticmethod
+    def _newton_schulz(G, steps=5):
+        """Approximate matrix sign via Newton-Schulz iteration.
+        Operates on 2D matrices. Returns orthogonalized gradient."""
+        assert G.ndim == 2
+        a, b, c = (3.4445, -4.7750, 2.0315)  # coefficients for NS5
+        X = G.float()
+        X = X / (X.norm() + 1e-7)
+        for _ in range(steps):
+            A = X @ X.T
+            B = b * A + c * A @ A
+            X = a * X + B @ X
+        return X.to(G.dtype)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            lr = group['lr']
+            mu = group['momentum']
+            ns_steps = group['ns_steps']
+            wd = group['weight_decay']
+            max_gn = group['max_grad_norm']
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                # Optional gradient clipping before NS
+                if max_gn > 0 and g.ndim >= 2:
+                    gn = g.norm()
+                    if gn > max_gn:
+                        g = g * (max_gn / (gn + 1e-6))
+                state = self.state[p]
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(p.data)
+                buf = state['momentum_buffer']
+                buf.mul_(mu).add_(g)
+                if p.ndim >= 2:
+                    # Newton-Schulz orthogonalization for weight matrices
+                    # Reshape to 2D if needed (e.g. conv weights)
+                    orig_shape = buf.shape
+                    if buf.ndim > 2:
+                        buf_2d = buf.reshape(buf.shape[0], -1)
+                    else:
+                        buf_2d = buf
+                    update = self._newton_schulz(buf_2d, steps=ns_steps)
+                    if buf.ndim > 2:
+                        update = update.reshape(orig_shape)
+                    # Scale by sqrt(fan_in * fan_out) / fan_in for proper scaling
+                    scale = max(1, update.shape[0] / update.shape[-1]) ** 0.5
+                    p.data.add_(update, alpha=-lr * scale)
+                else:
+                    # 1D params: standard SGD with momentum
+                    p.data.add_(buf, alpha=-lr)
+                if wd > 0:
+                    p.data.mul_(1 - lr * wd)
+        return loss
+
+
 class Lookahead:
     def __init__(self, base_optimizer, k=5, alpha=0.5):
         self.base_optimizer = base_optimizer
@@ -1256,7 +1341,65 @@ class Lookahead:
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
-if cfg.use_lion:
+_is_soap = cfg.use_soap
+_is_hybrid_muon = cfg.hybrid_muon
+_is_full_muon = cfg.use_muon
+muon_optimizer = None  # secondary optimizer for hybrid mode
+
+if _is_hybrid_muon:
+    # Hybrid: Muon for FFN weight matrices, Lion for attention + everything else
+    # Split parameters: FFN weight matrices (ndim >= 2, in MLP/GatedMLP/preprocess layers) → Muon
+    _muon_names = {'mlp', 'GatedMLP', 'gated_mlp', 'gate_proj', 'up_proj', 'down_proj',
+                   'gate1', 'up1', 'gate2', 'up2', 'down', 'preprocess',
+                   'linear_pre', 'linear_post', 'linears',
+                   'se_fc1', 'se_fc2'}
+    _muon_params = []
+    _lion_params = []
+    for name, param in model.named_parameters():
+        name_parts = name.split('.')
+        is_ffn = any(k in name for k in _muon_names) and param.ndim >= 2
+        if is_ffn:
+            _muon_params.append(param)
+        else:
+            _lion_params.append(param)
+    # Lion for attention + non-FFN params (with attn at half LR)
+    # Use id() for tensor identity checks to avoid ambiguous boolean comparison
+    _muon_param_ids = {id(p) for p in _muon_params}
+    _lion_attn = [p for n, p in model.named_parameters()
+                  if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])
+                  and id(p) not in _muon_param_ids]
+    _lion_attn_ids = {id(p) for p in _lion_attn}
+    _lion_other = [p for p in _lion_params if id(p) not in _lion_attn_ids]
+    base_opt = Lion([
+        {'params': _lion_attn, 'lr': _base_lr * 0.5},
+        {'params': _lion_other, 'lr': _base_lr}
+    ], weight_decay=cfg.weight_decay)
+    optimizer = base_opt
+    muon_optimizer = Muon(_muon_params, lr=cfg.muon_lr, ns_steps=cfg.muon_ns_steps,
+                          weight_decay=cfg.weight_decay, max_grad_norm=cfg.muon_clip)
+    print(f"Hybrid optimizer: Lion ({sum(p.numel() for p in _lion_params):,} params) "
+          f"+ Muon ({sum(p.numel() for p in _muon_params):,} params, lr={cfg.muon_lr}, ns={cfg.muon_ns_steps})")
+elif _is_full_muon:
+    # Full Muon: all params through Muon
+    _all_params = list(model.parameters())
+    base_opt = Muon(_all_params, lr=cfg.muon_lr, ns_steps=cfg.muon_ns_steps,
+                    weight_decay=cfg.weight_decay, max_grad_norm=cfg.muon_clip)
+    optimizer = base_opt
+    print(f"Full Muon optimizer: {sum(p.numel() for p in _all_params):,} params, "
+          f"lr={cfg.muon_lr}, ns={cfg.muon_ns_steps}, clip={cfg.muon_clip}")
+elif _is_soap:
+    # SOAP (PaLMForeachSOAP) requires a single param group — heavyball v2.2.1 bug
+    # where only the first param_group gets updated beyond step 0.
+    _all_params = list(model.parameters())
+    if refine_head is not None:
+        _all_params += list(refine_head.parameters())
+    base_opt = heavyball.PaLMForeachSOAP(
+        _all_params, lr=_base_lr, weight_decay=cfg.weight_decay,
+        precondition_frequency=10, merge_dims=False,
+    )
+    optimizer = base_opt
+    print(f"SOAP optimizer: {sum(p.numel() for p in _all_params):,} params in single group")
+elif cfg.use_lion:
     base_opt = Lion([
         {'params': attn_params, 'lr': _base_lr * 0.5},
         {'params': other_params, 'lr': _base_lr}
@@ -1272,10 +1415,14 @@ else:
     else:
         optimizer = base_opt
 
-# Add refinement head params to optimizer if enabled
-if refine_head is not None:
+# Add refinement head params to optimizer if enabled (skip for SOAP — already included)
+if refine_head is not None and not _is_soap:
     _refine_params = list(refine_head.parameters())
-    base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
+    if _is_hybrid_muon:
+        # Add refine head to Lion side (not Muon)
+        base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
+    else:
+        base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
@@ -1310,6 +1457,20 @@ else:  # sequential (default)
     )
 step_scheduler_per_batch = (cfg.scheduler_type == "onecycle")
 
+# Muon scheduler (mirrors the main scheduler for the Muon optimizer in hybrid mode)
+muon_scheduler = None
+if muon_optimizer is not None and not step_scheduler_per_batch:
+    _muon_warmup = torch.optim.lr_scheduler.LinearLR(
+        muon_optimizer, start_factor=cfg.warmup_start_factor, total_iters=cfg.warmup_total_iters
+    )
+    _muon_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        muon_optimizer, T_max=cfg.cosine_T_max, eta_min=cfg.cosine_eta_min * (cfg.muon_lr / max(_base_lr, 1e-8))
+    )
+    muon_scheduler = torch.optim.lr_scheduler.SequentialLR(
+        muon_optimizer, schedulers=[_muon_warmup, _muon_cosine],
+        milestones=[cfg.warmup_total_iters]
+    )
+
 # --- wandb ---
 run = wandb.init(
     entity=os.environ.get("WANDB_ENTITY", "wandb-applied-ai-team"),
@@ -1324,6 +1485,8 @@ run = wandb.init(
         "train_samples": len(train_ds),
         "val_samples": {k: len(v) for k, v in val_splits.items()},
         "split_manifest": cfg.manifest,
+        "optimizer_type": "hybrid_muon" if _is_hybrid_muon else "full_muon" if _is_full_muon else "soap" if _is_soap else "lion" if cfg.use_lion else "adamw",
+        "muon_params_count": sum(p.numel() for p in muon_optimizer.param_groups[0]['params']) if muon_optimizer is not None else 0,
     },
     mode=os.environ.get("WANDB_MODE", "online"),
 )
@@ -1335,6 +1498,7 @@ wandb.define_metric("val/*", step_metric="global_step")
 for _sname in VAL_SPLIT_NAMES:
     wandb.define_metric(f"{_sname}/*", step_metric="global_step")
 wandb.define_metric("lr", step_metric="global_step")
+wandb.define_metric("muon_lr", step_metric="global_step")
 wandb.define_metric("epoch_time_s", step_metric="global_step")
 wandb.define_metric("val_predictions", step_metric="global_step")
 
@@ -1377,6 +1541,8 @@ for epoch in range(MAX_EPOCHS):
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     if cfg.grad_accum_steps > 1:
         optimizer.zero_grad()
+        if muon_optimizer is not None:
+            muon_optimizer.zero_grad()
     for batch_idx, (x, y, is_surface, mask) in enumerate(pbar):
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
@@ -1713,10 +1879,14 @@ for epoch in range(MAX_EPOCHS):
             loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
 
             optimizer.zero_grad()
+            if muon_optimizer is not None:
+                muon_optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
             grads_a = [p.grad.clone() if p.grad is not None else None
                        for p in model.parameters()]
             optimizer.zero_grad()
+            if muon_optimizer is not None:
+                muon_optimizer.zero_grad()
             loss_b.backward()
 
             ga_flat = torch.cat([g.view(-1) for g in grads_a if g is not None])
@@ -1739,6 +1909,8 @@ for epoch in range(MAX_EPOCHS):
         else:
             if cfg.grad_accum_steps <= 1:
                 optimizer.zero_grad()
+                if muon_optimizer is not None:
+                    muon_optimizer.zero_grad()
             loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -1768,11 +1940,17 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.restore()
         if use_pcgrad or _should_step:
             optimizer.step()
+            if muon_optimizer is not None:
+                muon_optimizer.step()
             if cfg.grad_accum_steps > 1 and not use_pcgrad:
                 optimizer.zero_grad()
+                if muon_optimizer is not None:
+                    muon_optimizer.zero_grad()
         if step_scheduler_per_batch and (use_pcgrad or _should_step):
             try:
                 scheduler.step()
+                if muon_scheduler is not None:
+                    muon_scheduler.step()
             except ValueError:
                 pass
         if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa and not cfg.swa_cyclic and not cfg.snapshot_ensemble:
@@ -1821,6 +1999,8 @@ for epoch in range(MAX_EPOCHS):
                     swa_cyclic_n += 1
         else:
             scheduler.step()
+            if muon_scheduler is not None:
+                muon_scheduler.step()
     # Two-phase LR: at switch epoch, reset optimizer LR and replace scheduler
     if cfg.two_phase_lr and epoch + 1 == cfg.two_phase_switch_epoch:
         lrs = [cfg.two_phase_lr_2 * 0.5, cfg.two_phase_lr_2]
@@ -1866,13 +2046,16 @@ for epoch in range(MAX_EPOCHS):
     _do_val = (epoch + 1) % cfg.val_every == 0 or epoch == 0 or epoch == MAX_EPOCHS - 1
     if not _do_val:
         dt = time.time() - t0
-        wandb.log({
+        _log_dict = {
             "train/vol_loss": epoch_vol,
             "train/surf_loss": epoch_surf,
             "epoch_time_s": dt,
             "lr": scheduler.get_last_lr()[0],
             "global_step": global_step,
-        })
+        }
+        if muon_scheduler is not None:
+            _log_dict["muon_lr"] = muon_scheduler.get_last_lr()[0]
+        wandb.log(_log_dict)
         print(f"Epoch {epoch+1:3d} ({dt:.0f}s)  train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  [val skipped]")
         continue
 
@@ -2144,6 +2327,8 @@ for epoch in range(MAX_EPOCHS):
         "lr": scheduler.get_last_lr()[0],
         "epoch_time_s": dt,
     }
+    if muon_scheduler is not None:
+        metrics["muon_lr"] = muon_scheduler.get_last_lr()[0]
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
