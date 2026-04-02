@@ -898,6 +898,10 @@ class Config:
     raw_targets: bool = False         # GPU 5: skip physics norm, raw target space
     tight_denorm_clamps: bool = False  # GPU 6: tighter denorm clamps [-5,5]/[-10,10]
     log_pressure: bool = False        # GPU 7: log-transform Cp pressure channel
+    # Phase 6: Target normalization experiments
+    adaptive_norm: bool = False       # per-channel running stats (skip physics normalization)
+    log1p_pressure: bool = False      # apply log1p to raw pressure before z-score
+    sep_surf_vol_norm: bool = False   # separate mean/std for surface vs volume nodes
     # Phase 3: compound experiments
     seed: int = -1                     # random seed (-1 = no seeding)
     n_layers: int = 2                  # number of TransolverBlocks (default 2)
@@ -1044,24 +1048,55 @@ _pstd = ((_phys_sq_sum / _phys_n - _pmean ** 2).clamp(min=0.0).sqrt()).clamp(min
 phys_stats = {"y_mean": _pmean, "y_std": _pstd}
 print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
 
-if cfg.raw_targets:
-    print("Computing raw target stats (no physics normalization)...")
+if cfg.raw_targets or cfg.adaptive_norm or cfg.log1p_pressure:
+    print("Computing raw/adaptive target stats...")
     _raw_sum = torch.zeros(3, device=device)
     _raw_sq_sum = torch.zeros(3, device=device)
     _raw_n = 0.0
     with torch.no_grad():
         for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc="Raw stats", leave=False):
             _y, _mask = _y.to(device), _mask.to(device)
+            _yt = _y.clone()
+            if cfg.log1p_pressure:
+                # Apply log1p to raw pressure before computing stats
+                _yt[:, :, 2:3] = _yt[:, :, 2:3].sign() * torch.log1p(_yt[:, :, 2:3].abs())
             _m = _mask.float().unsqueeze(-1)
-            _raw_sum += (_y * _m).sum(dim=(0, 1))
-            _raw_sq_sum += (_y ** 2 * _m).sum(dim=(0, 1))
+            _raw_sum += (_yt * _m).sum(dim=(0, 1))
+            _raw_sq_sum += (_yt ** 2 * _m).sum(dim=(0, 1))
             _raw_n += _mask.float().sum().item()
     _raw_mean = (_raw_sum / _raw_n).float()
     _raw_std = ((_raw_sq_sum / _raw_n - _raw_mean ** 2).clamp(min=0.0).sqrt()).clamp(min=1e-6).float()
     raw_stats = {"y_mean": _raw_mean, "y_std": _raw_std}
-    print(f"  Raw stats — mean: {_raw_mean.tolist()}, std: {_raw_std.tolist()}")
+    print(f"  Raw/adaptive stats — mean: {_raw_mean.tolist()}, std: {_raw_std.tolist()}")
 else:
     raw_stats = None
+
+# Separate surface/volume normalization stats
+surf_vol_stats = None
+if cfg.sep_surf_vol_norm:
+    print("Computing separate surface/volume stats...")
+    _sv_sum = {"surf": torch.zeros(3, device=device), "vol": torch.zeros(3, device=device)}
+    _sv_sq = {"surf": torch.zeros(3, device=device), "vol": torch.zeros(3, device=device)}
+    _sv_n = {"surf": 0.0, "vol": 0.0}
+    with torch.no_grad():
+        for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc="Surf/vol stats", leave=False):
+            _y, _mask, _is_surf = _y.to(device), _mask.to(device), _is_surf.to(device)
+            _Um, _q = _umag_q(_y, _mask)
+            _yp = _phys_norm(_y, _Um, _q)
+            _sm = (_is_surf & _mask).float().unsqueeze(-1)
+            _vm = ((~_is_surf) & _mask).float().unsqueeze(-1)
+            _sv_sum["surf"] += (_yp * _sm).sum(dim=(0, 1))
+            _sv_sq["surf"] += (_yp ** 2 * _sm).sum(dim=(0, 1))
+            _sv_n["surf"] += _sm.sum().item()
+            _sv_sum["vol"] += (_yp * _vm).sum(dim=(0, 1))
+            _sv_sq["vol"] += (_yp ** 2 * _vm).sum(dim=(0, 1))
+            _sv_n["vol"] += _vm.sum().item()
+    surf_vol_stats = {}
+    for key in ["surf", "vol"]:
+        _m = (_sv_sum[key] / _sv_n[key]).float()
+        _s = ((_sv_sq[key] / _sv_n[key] - _m ** 2).clamp(min=0.0).sqrt()).clamp(min=1e-6).float()
+        surf_vol_stats[key] = {"y_mean": _m, "y_std": _s}
+        print(f"  {key} stats — mean: {_m.tolist()}, std: {_s.tolist()}")
 
 model_config = dict(
     space_dim=2,
@@ -1467,8 +1502,22 @@ for epoch in range(MAX_EPOCHS):
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
         Umag, q = _umag_q(y, mask)
-        if cfg.raw_targets:
-            y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
+        if cfg.raw_targets or cfg.adaptive_norm:
+            _yt = y.clone()
+            if cfg.log1p_pressure:
+                _yt[:, :, 2:3] = _yt[:, :, 2:3].sign() * torch.log1p(_yt[:, :, 2:3].abs())
+            y_norm = (_yt - raw_stats["y_mean"]) / raw_stats["y_std"]
+        elif cfg.sep_surf_vol_norm:
+            y_phys = _phys_norm(y, Umag, q)
+            # Normalize surface and volume nodes with separate statistics
+            y_norm = torch.zeros_like(y_phys)
+            _s_mask = is_surface.unsqueeze(-1).expand_as(y_phys)
+            _v_mask = (~is_surface & mask).unsqueeze(-1).expand_as(y_phys)
+            y_norm = torch.where(_s_mask,
+                (y_phys - surf_vol_stats["surf"]["y_mean"]) / surf_vol_stats["surf"]["y_std"],
+                torch.where(_v_mask,
+                    (y_phys - surf_vol_stats["vol"]["y_mean"]) / surf_vol_stats["vol"]["y_std"],
+                    y_phys))
         else:
             y_phys = _phys_norm(y, Umag, q)
             if cfg.log_pressure:
@@ -1939,8 +1988,21 @@ for epoch in range(MAX_EPOCHS):
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
                 Umag, q = _umag_q(y, mask)
-                if cfg.raw_targets:
-                    y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
+                if cfg.raw_targets or cfg.adaptive_norm:
+                    _yt = y.clone()
+                    if cfg.log1p_pressure:
+                        _yt[:, :, 2:3] = _yt[:, :, 2:3].sign() * torch.log1p(_yt[:, :, 2:3].abs())
+                    y_norm = (_yt - raw_stats["y_mean"]) / raw_stats["y_std"]
+                elif cfg.sep_surf_vol_norm:
+                    y_phys = _phys_norm(y, Umag, q)
+                    y_norm = torch.zeros_like(y_phys)
+                    _s_mask = is_surface.unsqueeze(-1).expand_as(y_phys)
+                    _v_mask = (~is_surface & mask).unsqueeze(-1).expand_as(y_phys)
+                    y_norm = torch.where(_s_mask,
+                        (y_phys - surf_vol_stats["surf"]["y_mean"]) / surf_vol_stats["surf"]["y_std"],
+                        torch.where(_v_mask,
+                            (y_phys - surf_vol_stats["vol"]["y_mean"]) / surf_vol_stats["vol"]["y_std"],
+                            y_phys))
                 else:
                     y_phys = _phys_norm(y, Umag, q)
                     if cfg.log_pressure:
@@ -2040,8 +2102,24 @@ for epoch in range(MAX_EPOCHS):
                     pred = pred + _v_freestream  # add freestream back before denorm
 
                 # Denormalize: phys_stats → Cp space → original scale
-                if cfg.raw_targets:
-                    pred_orig = pred * raw_stats["y_std"] + raw_stats["y_mean"]
+                if cfg.raw_targets or cfg.adaptive_norm:
+                    pred_raw = pred * raw_stats["y_std"] + raw_stats["y_mean"]
+                    if cfg.log1p_pressure:
+                        # Inverse log1p: sign(x) * (exp(|x|) - 1)
+                        pred_raw = pred_raw.clone()
+                        pred_raw[:, :, 2:3] = pred_raw[:, :, 2:3].sign() * (pred_raw[:, :, 2:3].abs().exp() - 1)
+                    pred_orig = pred_raw
+                elif cfg.sep_surf_vol_norm:
+                    # Denormalize surface and volume nodes separately
+                    pred_phys = torch.zeros_like(pred)
+                    _s_mask = is_surface.unsqueeze(-1).expand_as(pred)
+                    _v_mask = (~is_surface & mask).unsqueeze(-1).expand_as(pred)
+                    pred_phys = torch.where(_s_mask,
+                        pred * surf_vol_stats["surf"]["y_std"] + surf_vol_stats["surf"]["y_mean"],
+                        torch.where(_v_mask,
+                            pred * surf_vol_stats["vol"]["y_std"] + surf_vol_stats["vol"]["y_mean"],
+                            pred))
+                    pred_orig = _phys_denorm(pred_phys, Umag, q)
                 else:
                     pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
                     if cfg.log_pressure:
