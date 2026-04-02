@@ -942,6 +942,10 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: Learnable pressure weight
+    learned_p_weight: bool = False            # learn a scalar multiplier on surface pressure loss
+    log_p_init: float = 0.0                   # log-space init for learned p weight (0.0 → 1x, 0.47 → 1.6x)
+    fixed_p_weight: float = 0.0               # fixed multiplier on surface pressure loss (0 = disabled)
 
 
 cfg = sp.parse(Config)
@@ -1098,6 +1102,8 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 model._pressure_separate = cfg.pressure_separate_last_block
+if cfg.learned_p_weight:
+    model.log_p_weight = nn.Parameter(torch.tensor(cfg.log_p_init))
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
@@ -1635,6 +1641,11 @@ for epoch in range(MAX_EPOCHS):
         else:
             tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
+        # Learnable or fixed pressure weight multiplier on surface loss
+        if cfg.learned_p_weight:
+            surf_loss = surf_loss * torch.exp(_base_model.log_p_weight)
+        elif cfg.fixed_p_weight > 0:
+            surf_loss = surf_loss * cfg.fixed_p_weight
         if cfg.uncertainty_loss:
             bm = _base_model
             surf_ux_loss = (abs_err[:, :, 0:1] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
@@ -1792,7 +1803,12 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.learned_p_weight:
+            _log_dict["train/p_weight"] = torch.exp(_base_model.log_p_weight).item()
+        elif cfg.fixed_p_weight > 0:
+            _log_dict["train/p_weight"] = cfg.fixed_p_weight
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
