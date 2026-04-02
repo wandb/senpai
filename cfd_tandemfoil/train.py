@@ -1792,7 +1792,13 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        step_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.uncertainty_loss:
+            step_log["train/log_sigma_vol"] = _base_model.log_sigma_vol.item()
+            step_log["train/log_sigma_surf_ux"] = _base_model.log_sigma_surf_ux.item()
+            step_log["train/log_sigma_surf_uy"] = _base_model.log_sigma_surf_uy.item()
+            step_log["train/log_sigma_surf_p"] = _base_model.log_sigma_surf_p.item()
+        wandb.log(step_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -2150,6 +2156,16 @@ for epoch in range(MAX_EPOCHS):
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
+    if cfg.uncertainty_loss:
+        bm = _base_model
+        metrics["learned/log_sigma_vol"] = bm.log_sigma_vol.item()
+        metrics["learned/log_sigma_surf_ux"] = bm.log_sigma_surf_ux.item()
+        metrics["learned/log_sigma_surf_uy"] = bm.log_sigma_surf_uy.item()
+        metrics["learned/log_sigma_surf_p"] = bm.log_sigma_surf_p.item()
+        metrics["learned/sigma_vol"] = torch.exp(bm.log_sigma_vol).item()
+        metrics["learned/sigma_surf_ux"] = torch.exp(bm.log_sigma_surf_ux).item()
+        metrics["learned/sigma_surf_uy"] = torch.exp(bm.log_sigma_surf_uy).item()
+        metrics["learned/sigma_surf_p"] = torch.exp(bm.log_sigma_surf_p).item()
     wandb.log(metrics)
 
     if torch.cuda.is_available():
