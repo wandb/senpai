@@ -134,12 +134,74 @@ class DomainLayerNorm(nn.Module):
         return torch.where(mask_t, self.ln_tandem(x), self.ln_single(x))
 
 
+def apply_rope_2d(q, k, coords, slice_weights):
+    """Apply 2D Rotary Position Embeddings to slice-level Q and K.
+
+    Computes slice positions as weighted average of node positions, then
+    applies separate x/y rotations to halves of the head dimension.
+
+    Args:
+        q, k: [B, H, S, D] slice-level query/key
+        coords: [B, N, 2] node xy coordinates (normalized to [0,1])
+        slice_weights: [B, H, N, S] soft assignment weights
+    Returns:
+        q_rot, k_rot: [B, H, S, D] rotated Q and K
+    """
+    B, H, S, D = q.shape
+    # Ensure even splits: use pairs of dims for rotation, pass through remainder
+    half_D = D // 2
+    # Number of rotation pairs per axis (must be even for paired rotation)
+    n_rot_x = (half_D // 2) * 2  # even number of dims for x-rotation
+    n_rot_y = ((D - half_D) // 2) * 2  # even number of dims for y-rotation
+    n_freq_x = n_rot_x // 2
+    n_freq_y = n_rot_y // 2
+    device = q.device
+
+    # Compute slice positions as weighted average of node coordinates
+    # slice_weights: [B, H, N, S], coords: [B, N, 2]
+    w_norm = slice_weights / (slice_weights.sum(dim=2, keepdim=True) + 1e-8)  # [B, H, N, S]
+    # [B, H, S, 2]: contract over N; w_norm [B,H,N,S], coords [B,N,2] -> [B,H,S,2]
+    slice_pos = torch.einsum('bhns,bnd->bhsd', w_norm, coords)
+
+    # RoPE frequency schedule — base=100 for [0,1] coord range
+    freqs_x = 1.0 / (100.0 ** (torch.arange(0, n_freq_x, device=device).float() / max(n_freq_x, 1)))
+    freqs_y = 1.0 / (100.0 ** (torch.arange(0, n_freq_y, device=device).float() / max(n_freq_y, 1)))
+
+    # X rotations
+    x_angles = slice_pos[..., 0:1] * freqs_x  # [B, H, S, n_freq_x]
+    cos_x, sin_x = torch.cos(x_angles), torch.sin(x_angles)
+
+    # Y rotations
+    y_angles = slice_pos[..., 1:2] * freqs_y  # [B, H, S, n_freq_y]
+    cos_y, sin_y = torch.cos(y_angles), torch.sin(y_angles)
+
+    def _rotate_pairs(t, cos_val, sin_val, n_rot):
+        """Rotate first n_rot dims as pairs, pass through remainder."""
+        t_rot = t[..., :n_rot]
+        t_pass = t[..., n_rot:]
+        t1, t2 = t_rot[..., :n_rot // 2], t_rot[..., n_rot // 2:]
+        rotated = torch.cat([t1 * cos_val - t2 * sin_val, t1 * sin_val + t2 * cos_val], dim=-1)
+        return torch.cat([rotated, t_pass], dim=-1) if t_pass.shape[-1] > 0 else rotated
+
+    # Apply rotations to Q and K
+    q_x, q_y = q[..., :half_D], q[..., half_D:]
+    k_x, k_y = k[..., :half_D], k[..., half_D:]
+
+    q_rot = torch.cat([_rotate_pairs(q_x, cos_x, sin_x, n_rot_x),
+                        _rotate_pairs(q_y, cos_y, sin_y, n_rot_y)], dim=-1)
+    k_rot = torch.cat([_rotate_pairs(k_x, cos_x, sin_x, n_rot_x),
+                        _rotate_pairs(k_y, cos_y, sin_y, n_rot_y)], dim=-1)
+
+    return q_rot, k_rot
+
+
 class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False,
+                 rope_2d=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -152,6 +214,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.linear_no_attention = linear_no_attention
         self.learned_kernel = learned_kernel
         self.decouple_slice = decouple_slice
+        self.rope_2d = rope_2d
         self.zone_temp = zone_temp
         self.prog_slices = prog_slices
         if prog_slices:
@@ -186,7 +249,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
                 nn.Linear(dim_head, 1),
             )
 
-    def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None):
+    def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None, coords=None):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -233,6 +296,9 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             slice_token_kv = slice_token.mean(dim=1, keepdim=True)
             k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
             v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
+            if self.rope_2d and coords is not None:
+                q_slice_token, k_slice_token = apply_rope_2d(
+                    q_slice_token, k_slice_token, coords, slice_weights)
             if self.learned_kernel:
                 B, H, S, D = q_slice_token.shape
                 q_exp = q_slice_token.unsqueeze(-2).expand(B, H, S, S, D)
@@ -282,6 +348,7 @@ class TransolverBlock(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        rope_2d=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -307,6 +374,7 @@ class TransolverBlock(nn.Module):
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
             prog_slices=prog_slices,
+            rope_2d=rope_2d,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -391,7 +459,7 @@ class TransolverBlock(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None, coords=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         # DomainLayerNorm helper: pass is_tandem when enabled, else plain call
         dln_it = (tandem_mask.view(-1) > 0.5) if (self.domain_layernorm and tandem_mask is not None) else None
@@ -403,11 +471,11 @@ class TransolverBlock(nn.Module):
             cond_out = self.adaln_net(condition)  # [B, H*4]
             s1, b1, s2, b2 = cond_out.chunk(4, dim=-1)  # each [B, H]
             fx_norm = _ln(self.ln_1, fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
-            fx = _ln(self.ln_1_post, self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            fx = _ln(self.ln_1_post, self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features, coords=coords) + fx)
             fx_norm = _ln(self.ln_2, fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
             fx = _ln(self.ln_2_post, self.mlp(fx_norm) + fx)
         else:
-            fx = _ln(self.ln_1_post, self.attn(_ln(self.ln_1, fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            fx = _ln(self.ln_1_post, self.attn(_ln(self.ln_1, fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features, coords=coords) + fx)
             fx = _ln(self.ln_2_post, self.mlp(_ln(self.ln_2, fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
@@ -601,10 +669,14 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        rope_2d=False,
+        no_spatial_bias=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.pressure_first = pressure_first
+        self.rope_2d = rope_2d
+        self.no_spatial_bias = no_spatial_bias
         self.ref = ref
         self.unified_pos = unified_pos
         self.adaln_output = adaln_output
@@ -671,6 +743,7 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
+                    rope_2d=rope_2d,
                 )
                 for idx in range(n_layers)
             ]
@@ -779,6 +852,16 @@ class Transolver(nn.Module):
         x_cross = x * self.feature_cross(x)
         x = x + 0.1 * x_cross  # residual with small scale
         raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)  # x, y, curvature, dist
+        if self.no_spatial_bias:
+            raw_xy = None  # disable spatial_bias MLP
+
+        # Normalized coords for RoPE: [0,1] per sample
+        _rope_coords = None
+        if self.rope_2d:
+            _xy = x[:, :, :2]
+            _xy_min = _xy.amin(dim=1, keepdim=True)
+            _xy_max = _xy.amax(dim=1, keepdim=True)
+            _rope_coords = (_xy - _xy_min) / (_xy_max - _xy_min + 1e-8)
 
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
@@ -788,7 +871,7 @@ class Transolver(nn.Module):
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features, coords=_rope_coords)
 
         # Deep hidden representation (post all non-last blocks, pre output head)
         fx_deep = fx  # [B, N, n_hidden]
@@ -805,11 +888,11 @@ class Transolver(nn.Module):
             fx_for_pressure = fx  # save for separate pressure branch
             p_sep = self.pressure_sep_mlp(fx_for_pressure)  # [B, N, 1]
             # Main last block produces vel only (pressure_first still active but p comes from separate branch)
-            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features, coords=_rope_coords)
             # Override: replace the pressure channel from the last block with the separate branch's output
             fx = torch.cat([fx[:, :, :2], p_sep], dim=-1)
         else:
-            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features, coords=_rope_coords)
 
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
@@ -942,6 +1025,9 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: 2D RoPE position encoding
+    rope_2d: bool = False             # apply 2D Rotary Position Embeddings to slice-level Q/K
+    no_spatial_bias: bool = False     # disable the spatial_bias MLP (for RoPE-only ablation)
 
 
 cfg = sp.parse(Config)
@@ -1094,6 +1180,8 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    rope_2d=cfg.rope_2d,
+    no_spatial_bias=cfg.no_spatial_bias,
 )
 
 model = Transolver(**model_config).to(device)
