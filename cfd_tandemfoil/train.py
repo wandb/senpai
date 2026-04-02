@@ -20,6 +20,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     Tandem surface loss is therefore underweighted.
 """
 
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -132,6 +133,22 @@ class DomainLayerNorm(nn.Module):
             return self.ln_single(x)
         mask_t = is_tandem.view(-1, 1, 1).expand_as(x)
         return torch.where(mask_t, self.ln_tandem(x), self.ln_single(x))
+
+
+class SinusoidalTimeEmbedding(nn.Module):
+    """Sinusoidal positional encoding for diffusion timestep t ∈ [0, 1]."""
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t):
+        # t: [B] or [B, 1] → [B, dim]
+        if t.dim() == 2:
+            t = t.squeeze(-1)
+        half = self.dim // 2
+        freqs = torch.exp(-math.log(10000.0) * torch.arange(half, device=t.device, dtype=t.dtype) / half)
+        args = t.unsqueeze(-1) * freqs.unsqueeze(0)
+        return torch.cat([args.sin(), args.cos()], dim=-1)
 
 
 class Physics_Attention_Irregular_Mesh(nn.Module):
@@ -282,6 +299,8 @@ class TransolverBlock(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        flow_matching=False,
+        time_emb_dim=128,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -294,6 +313,15 @@ class TransolverBlock(nn.Module):
         self.adaln_all = adaln_all
         self.film_cond = film_cond
         self.domain_layernorm = domain_layernorm
+        self.flow_matching = flow_matching
+        if flow_matching:
+            # FiLM conditioning for diffusion timestep
+            self.time_film_net = nn.Sequential(
+                nn.Linear(time_emb_dim, 128), nn.SiLU(),
+                nn.Linear(128, hidden_dim * 2),
+            )
+            nn.init.zeros_(self.time_film_net[-1].weight)
+            nn.init.zeros_(self.time_film_net[-1].bias)
         _LN = (lambda d: DomainLayerNorm(d, zeroinit=dln_zeroinit)) if domain_layernorm else nn.LayerNorm
         self.ln_1 = _LN(hidden_dim)
         self.attn = Physics_Attention_Irregular_Mesh(
@@ -391,7 +419,7 @@ class TransolverBlock(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None, time_emb=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         # DomainLayerNorm helper: pass is_tandem when enabled, else plain call
         dln_it = (tandem_mask.view(-1) > 0.5) if (self.domain_layernorm and tandem_mask is not None) else None
@@ -417,6 +445,10 @@ class TransolverBlock(nn.Module):
             film_out = self.film_net(condition)  # [B, H*2]
             gamma, beta = film_out.chunk(2, dim=-1)  # each [B, H]
             fx = gamma.unsqueeze(1) * fx + beta.unsqueeze(1)
+        if self.flow_matching and time_emb is not None:
+            t_film = self.time_film_net(time_emb)  # [B, H*2]
+            t_gamma, t_beta = t_film.chunk(2, dim=-1)  # each [B, H]
+            fx = (1 + t_gamma.unsqueeze(1)) * fx + t_beta.unsqueeze(1)
         if self.last_layer:
             fx_ln = self.ln_3(fx)
             if self.soft_moe:
@@ -579,6 +611,7 @@ class Transolver(nn.Module):
         out_dim=1,
         slice_num=32,
         ref=8,
+        flow_matching=False,
         unified_pos=False,
         output_fields: list[str] | None = None,
         output_dims: list[int] | None = None,
@@ -612,6 +645,14 @@ class Transolver(nn.Module):
         self.adaln_4cond = adaln_4cond
         self.film_cond = film_cond
         self.adaln_zone_temp = adaln_zone_temp
+        self.flow_matching = flow_matching
+        if flow_matching:
+            _time_sinusoidal_dim = 128
+            self.time_embed = nn.Sequential(
+                SinusoidalTimeEmbedding(_time_sinusoidal_dim),
+                nn.Linear(_time_sinusoidal_dim, n_hidden), nn.SiLU(),
+                nn.Linear(n_hidden, _time_sinusoidal_dim),
+            )
         if output_fields is None or output_dims is None:
             raise ValueError("output_fields and output_dims must be provided")
         if len(output_fields) != len(output_dims):
@@ -671,6 +712,8 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
+                    flow_matching=flow_matching,
+                    time_emb_dim=128 if flow_matching else 0,
                 )
                 for idx in range(n_layers)
             ]
@@ -734,18 +777,24 @@ class Transolver(nn.Module):
         x = data.get("x")
         pos = data.get("pos", pos)
         condition = data.get("condition", condition)
-        return x, pos, condition
+        t = data.get("t", None)  # flow matching timestep [B, 1] or [B]
+        return x, pos, condition, t
 
     def _validate_output_dims(self, preds):
         if sum(self.output_dims) != preds.shape[-1]:
             raise ValueError("Sum of output_dims must match preds last dimension")
 
     def forward(self, data, pos=None, condition=None):
-        x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
+        x, pos, condition, t = self._unpack_inputs(data, pos=pos, condition=condition)
         if x is None:
             raise ValueError("Missing required input tensor: x")
         if condition is not None:
             raise ValueError("Transolver does not support conditioning inputs")
+
+        # Flow matching: compute time embedding
+        time_emb = None
+        if self.flow_matching and t is not None:
+            time_emb = self.time_embed(t)  # [B, 128]
 
         # Compute internal condition before feature_cross (indices are stable here)
         use_cond = self.adaln_all_blocks or self.film_cond
@@ -788,7 +837,7 @@ class Transolver(nn.Module):
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features, time_emb=time_emb)
 
         # Deep hidden representation (post all non-last blocks, pre output head)
         fx_deep = fx  # [B, N, n_hidden]
@@ -805,11 +854,11 @@ class Transolver(nn.Module):
             fx_for_pressure = fx  # save for separate pressure branch
             p_sep = self.pressure_sep_mlp(fx_for_pressure)  # [B, N, 1]
             # Main last block produces vel only (pressure_first still active but p comes from separate branch)
-            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features, time_emb=time_emb)
             # Override: replace the pressure channel from the last block with the separate branch's output
             fx = torch.cat([fx[:, :, :2], p_sep], dim=-1)
         else:
-            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features, time_emb=time_emb)
 
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
@@ -942,6 +991,10 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: Conditional Flow Matching (rectified flow)
+    flow_matching: bool = False               # enable conditional flow matching mode
+    fm_steps: int = 8                         # number of ODE integration steps at inference
+    fm_samples: int = 1                       # number of trajectories to average at inference
 
 
 cfg = sp.parse(Config)
@@ -1065,7 +1118,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32 + (3 if cfg.flow_matching else 0),  # +curv, +dist, [+foil2dist], +32 fourier PE, [+3 x_t for flow matching]
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1094,6 +1147,7 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    flow_matching=cfg.flow_matching,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1529,8 +1583,20 @@ for epoch in range(MAX_EPOCHS):
             else:
                 y_norm = y_norm / sample_stds
 
+        # Flow matching: sample time, create noisy interpolation, predict velocity
+        _fm_v_target = None
+        if cfg.flow_matching and model.training:
+            _fm_t = torch.rand(B, 1, 1, device=device)  # [B, 1, 1]
+            _fm_noise = torch.randn_like(y_norm)
+            _fm_x_t = (1 - _fm_t) * _fm_noise + _fm_t * y_norm  # interpolated state
+            _fm_v_target = y_norm - _fm_noise  # target velocity field
+            x = torch.cat([x, _fm_x_t], dim=-1)  # append x_t to input features
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            _model_input = {"x": x}
+            if cfg.flow_matching and model.training:
+                _model_input["t"] = _fm_t[:, 0, :]  # [B, 1]
+            out = model(_model_input)
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -1539,14 +1605,18 @@ for epoch in range(MAX_EPOCHS):
         re_pred = re_pred.float()
         aoa_pred = aoa_pred.float()
         hidden = hidden.float()
-        if model.training and not cfg.no_perstd and not cfg.raw_targets:
+
+        # Flow matching: model output IS the velocity prediction, target is v_target
+        if cfg.flow_matching and _fm_v_target is not None:
+            y_norm = _fm_v_target  # replace target with velocity target for loss computation
+        elif model.training and not cfg.no_perstd and not cfg.raw_targets:
             if cfg.multiply_std:
                 pred = pred * sample_stds
             else:
                 pred = pred / sample_stds
 
-        # Surface refinement head: additive correction on surface nodes
-        if refine_head is not None and model.training:
+        # Surface refinement head: additive correction on surface nodes (skip during flow matching training)
+        if refine_head is not None and model.training and not cfg.flow_matching:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 if cfg.surface_refine_context:
                     # Context-aware: needs all nodes, coords, masks
@@ -1986,16 +2056,38 @@ for epoch in range(MAX_EPOCHS):
                 else:
                     y_norm_scaled = y_norm / sample_stds
 
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    _eval_out = eval_model({"x": x})
-                    pred = _eval_out["preds"]
-                    _eval_hidden = _eval_out["hidden"]
-                pred = pred.float()
-                _eval_hidden = _eval_hidden.float()
-                if cfg.multiply_std:
-                    pred_loss = pred * sample_stds
+                if cfg.flow_matching:
+                    # ODE integration: start from noise, integrate velocity field
+                    N = x.shape[1]
+                    _fm_dt = 1.0 / cfg.fm_steps
+                    _fm_preds = []
+                    for _s in range(cfg.fm_samples):
+                        x_t = torch.randn(B, N, 3, device=device, dtype=torch.float32)
+                        for _step in range(cfg.fm_steps):
+                            _t_val = torch.full((B, 1), _step * _fm_dt, device=device)
+                            x_fm = torch.cat([x, x_t], dim=-1)
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                _eval_out = eval_model({"x": x_fm, "t": _t_val})
+                            x_t = x_t + _eval_out["preds"].float() * _fm_dt
+                        _fm_preds.append(x_t)
+                    pred_loss = torch.stack(_fm_preds).mean(dim=0) if len(_fm_preds) > 1 else _fm_preds[0]
+                    _eval_hidden = _eval_out["hidden"].float()
+                    # Back-compute pred for denormalization path
+                    if cfg.multiply_std:
+                        pred = pred_loss / sample_stds
+                    else:
+                        pred = pred_loss * sample_stds
                 else:
-                    pred_loss = pred / sample_stds
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _eval_out = eval_model({"x": x})
+                        pred = _eval_out["preds"]
+                        _eval_hidden = _eval_out["hidden"]
+                    pred = pred.float()
+                    _eval_hidden = _eval_hidden.float()
+                    if cfg.multiply_std:
+                        pred_loss = pred * sample_stds
+                    else:
+                        pred_loss = pred / sample_stds
 
                 # Apply surface refinement head during validation
                 if eval_refine_head is not None:
@@ -2454,14 +2546,22 @@ if cfg.surface_refine and best_metrics:
                     for b in range(B):
                         s = surf_mask[b]
                         if s.sum() > 0:
-                            all_pipeline_surf_p_ae.append(err_A[b, s, 2].cpu())
-                            all_manual_surf_p_ae.append(err_B[b, s, 2].cpu())
-                            # Correction magnitude per surface node
-                            all_correction_magnitudes.append(correction_full[b, s, 2].abs().cpu())
+                            _ea = err_A[b, s, 2].cpu()
+                            _eb = err_B[b, s, 2].cpu()
+                            _ec = correction_full[b, s, 2].abs().cpu()
+                            if _ea.isnan().any():
+                                continue  # skip samples with NaN (bfloat16 overflow)
+                            all_pipeline_surf_p_ae.append(_ea)
+                            all_manual_surf_p_ae.append(_eb)
+                            all_correction_magnitudes.append(_ec)
 
             # Aggregate results
-            pipeline_mae_p = torch.cat(all_pipeline_surf_p_ae).mean().item()
-            manual_mae_p = torch.cat(all_manual_surf_p_ae).mean().item()
+            if not all_pipeline_surf_p_ae:
+                pipeline_mae_p = float('nan')
+                manual_mae_p = float('nan')
+            else:
+                pipeline_mae_p = torch.cat(all_pipeline_surf_p_ae).mean().item()
+                manual_mae_p = torch.cat(all_manual_surf_p_ae).mean().item()
             corr_mags = torch.cat(all_correction_magnitudes)
             re_vals = torch.cat(all_re_values)
 
