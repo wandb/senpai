@@ -578,6 +578,7 @@ class Transolver(nn.Module):
         fun_dim=1,
         out_dim=1,
         slice_num=32,
+        slice_counts: list[int] | None = None,  # per-block slice counts; overrides slice_num if set
         ref=8,
         unified_pos=False,
         output_fields: list[str] | None = None,
@@ -642,6 +643,7 @@ class Transolver(nn.Module):
         self.space_dim = space_dim
         self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
         nn.init.eye_(self.feature_cross.weight)  # start as identity
+        _slice_counts = slice_counts if slice_counts is not None else [slice_num] * n_layers
         self.blocks = nn.ModuleList(
             [
                 TransolverBlock(
@@ -651,7 +653,7 @@ class Transolver(nn.Module):
                     act=act,
                     mlp_ratio=mlp_ratio,
                     out_dim=out_dim,
-                    slice_num=slice_num,
+                    slice_num=_slice_counts[idx],
                     last_layer=(idx == n_layers - 1),
                     linear_no_attention=linear_no_attention,
                     learned_kernel=learned_kernel,
@@ -942,6 +944,8 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: Multi-scale slice counts per block (coarse-to-fine or fine-to-coarse)
+    multiscale_slices: str = ""               # e.g. "32,64,96" — one per block. Empty = use --slice_num for all.
 
 
 cfg = sp.parse(Config)
@@ -1094,8 +1098,11 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    slice_counts=[int(x) for x in cfg.multiscale_slices.split(",")] if cfg.multiscale_slices else None,
 )
 
+_slice_counts_actual = [int(x) for x in cfg.multiscale_slices.split(",")] if cfg.multiscale_slices else [cfg.slice_num] * cfg.n_layers
+print(f"Slice counts per block: {_slice_counts_actual}")
 model = Transolver(**model_config).to(device)
 model._pressure_separate = cfg.pressure_separate_last_block
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
