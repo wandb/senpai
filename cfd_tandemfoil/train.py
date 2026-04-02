@@ -2353,20 +2353,25 @@ if cfg.surface_refine and best_metrics:
     print("VERIFICATION: Manual denormalization check on val_ood_re")
     print("=" * 70)
     try:
-        # Use the best eval model (EMA if available) + refinement head
-        if ema_model is not None:
-            verify_model = ema_model
-        else:
-            verify_model = _base_model
+        # Load best checkpoint into a FRESH model (avoids optimizer state contamination
+        # from HeavyBall optimizers which can leave non-standard parameter metadata)
+        from copy import deepcopy
+        verify_model = deepcopy(_base_model)
         _verify_sd = torch.load(model_path, map_location=device, weights_only=True)
         _verify_sd = {k.removeprefix("_orig_mod."): v for k, v in _verify_sd.items()}
         verify_model.load_state_dict(_verify_sd)
         verify_model.eval()
 
-        # Use EMA refinement head if available, else training head
-        verify_refine = ema_refine_head if ema_refine_head is not None else (
-            refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
-        )
+        # Load best refinement head checkpoint into a fresh copy
+        _refine_path = model_dir / "refine_head.pt"
+        if _refine_path.exists():
+            _refine_base = refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
+            verify_refine = deepcopy(_refine_base)
+            verify_refine.load_state_dict(torch.load(_refine_path, map_location=device, weights_only=True))
+        else:
+            verify_refine = ema_refine_head if ema_refine_head is not None else (
+                refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
+            )
         verify_refine.eval()
 
         # Run inference on val_ood_re only
@@ -2452,6 +2457,7 @@ if cfg.surface_refine and best_metrics:
                         pred_raw = out["preds"].float()
                         hidden = out["hidden"].float()
 
+
                     # === PATH A: Pipeline denormalization (same as val loop) ===
                     pred_loss = pred_raw / sample_stds
                     # Apply refinement
@@ -2522,14 +2528,29 @@ if cfg.surface_refine and best_metrics:
                     for b in range(B):
                         s = surf_mask[b]
                         if s.sum() > 0:
-                            all_pipeline_surf_p_ae.append(err_A[b, s, 2].cpu())
-                            all_manual_surf_p_ae.append(err_B[b, s, 2].cpu())
-                            # Correction magnitude per surface node
-                            all_correction_magnitudes.append(correction_full[b, s, 2].abs().cpu())
+                            _ea = err_A[b, s, 2].cpu()
+                            _eb = err_B[b, s, 2].cpu()
+                            _ec = correction_full[b, s, 2].abs().cpu()
+                            # Skip samples where denorm produced NaN (e.g. Umag=0)
+                            if _ea.isnan().any():
+                                _umag_b = Umag[b].item() if Umag.dim() > 1 else Umag[b].item()
+                                _q_b = q[b].item() if q.dim() > 1 else q[b].item()
+                                print(f"  [VERIFY WARN] Sample has NaN surf_p MAE: Umag={_umag_b:.4f}, q={_q_b:.4f}, "
+                                      f"pred_phys_A NaN={pred_phys_A[b].isnan().sum().item()}, "
+                                      f"y NaN={y[b].isnan().sum().item()}")
+                                continue  # skip this sample
+                            all_pipeline_surf_p_ae.append(_ea)
+                            all_manual_surf_p_ae.append(_eb)
+                            all_correction_magnitudes.append(_ec)
 
             # Aggregate results
-            pipeline_mae_p = torch.cat(all_pipeline_surf_p_ae).mean().item()
-            manual_mae_p = torch.cat(all_manual_surf_p_ae).mean().item()
+            if not all_pipeline_surf_p_ae:
+                print("WARNING: No valid surface pressure samples for verification!")
+                pipeline_mae_p = float('nan')
+                manual_mae_p = float('nan')
+            else:
+                pipeline_mae_p = torch.cat(all_pipeline_surf_p_ae).mean().item()
+                manual_mae_p = torch.cat(all_manual_surf_p_ae).mean().item()
             corr_mags = torch.cat(all_correction_magnitudes)
             re_vals = torch.cat(all_re_values)
 
