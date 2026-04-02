@@ -942,6 +942,9 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: Tandem-focused training
+    tandem_oversample: float = 1.0            # tandem sampling weight multiplier (>1 oversamples)
+    tandem_loss_mult: float = 1.0             # additional tandem surface loss multiplier
 
 
 cfg = sp.parse(Config)
@@ -1001,6 +1004,15 @@ def _phys_denorm(y_p, Umag, q):
 
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=cfg.num_workers, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
+
+if cfg.tandem_oversample > 1.0:
+    n_boosted = 0
+    for i in range(len(train_ds)):
+        x_i = train_ds[i][0]
+        if abs(x_i[0, 21].item()) > 0.01:  # gap feature → tandem
+            sample_weights[i] *= cfg.tandem_oversample
+            n_boosted += 1
+    print(f"Tandem oversampling: boosted {n_boosted}/{len(train_ds)} samples by {cfg.tandem_oversample}x")
 
 if cfg.debug:
     # Avoid sampler/length mismatch when train_ds is truncated
@@ -1630,10 +1642,10 @@ for epoch in range(MAX_EPOCHS):
         if cfg.tandem_ramp:
             tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
             tandem_boost = torch.where(is_tandem_batch,
-                                       torch.tensor(adaptive_boost * tandem_weight, device=device),
+                                       torch.tensor(adaptive_boost * tandem_weight * cfg.tandem_loss_mult, device=device),
                                        torch.ones(B, device=device))
         else:
-            tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
+            tandem_boost = torch.where(is_tandem_batch, adaptive_boost * cfg.tandem_loss_mult, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
         if cfg.uncertainty_loss:
             bm = _base_model
