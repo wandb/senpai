@@ -448,6 +448,29 @@ class TransolverBlock(nn.Module):
         return fx
 
 
+class GatedSurfaceRefineLayer(nn.Module):
+    """PirateNet-style adaptive residual gate for surface refinement MLP.
+
+    Each layer has a learnable gate alpha (initialized to 0) that controls
+    how much of the transformed signal vs identity is passed through:
+        x_out = tanh(alpha) * F(x_in) + (1 - tanh(alpha)) * x_in
+    At init, tanh(0)=0 so all layers start as identity maps.
+    """
+
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.linear1 = nn.Linear(hidden_dim, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.gate = nn.Parameter(torch.zeros(1))  # init at 0 → identity
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.act(self.linear1(x))
+        h = self.linear2(h)
+        g = torch.tanh(self.gate)
+        return g * h + (1 - g) * x
+
+
 class SurfaceRefinementHead(nn.Module):
     """Lightweight MLP that predicts additive corrections for surface nodes.
 
@@ -457,22 +480,37 @@ class SurfaceRefinementHead(nn.Module):
     """
 
     def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 128,
-                 n_layers: int = 2, p_only: bool = False):
+                 n_layers: int = 2, p_only: bool = False, gated: bool = False):
         super().__init__()
         self.p_only = p_only
         actual_out = 1 if p_only else out_dim  # 1 for pressure-only, 3 for all fields
-        layers: list[nn.Module] = []
-        # Input: hidden features (n_hidden) + base predictions (out_dim)
         in_dim = n_hidden + out_dim
-        for i in range(n_layers):
-            layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
-            layers.append(nn.LayerNorm(hidden_dim))
-            layers.append(nn.GELU())
-        layers.append(nn.Linear(hidden_dim, actual_out))
-        # Zero-init last layer so refinement starts as identity
-        nn.init.zeros_(layers[-1].weight)
-        nn.init.zeros_(layers[-1].bias)
-        self.mlp = nn.Sequential(*layers)
+        if gated:
+            # Input projection + gated hidden layers + output projection
+            self.input_proj = nn.Sequential(
+                nn.Linear(in_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+            )
+            self.gated_layers = nn.Sequential(
+                *[GatedSurfaceRefineLayer(hidden_dim) for _ in range(n_layers - 1)]
+            ) if n_layers > 1 else nn.Identity()
+            self.output_proj = nn.Linear(hidden_dim, actual_out)
+            nn.init.zeros_(self.output_proj.weight)
+            nn.init.zeros_(self.output_proj.bias)
+            self.mlp = None
+        else:
+            # Original sequential MLP
+            layers: list[nn.Module] = []
+            for i in range(n_layers):
+                layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
+                layers.append(nn.LayerNorm(hidden_dim))
+                layers.append(nn.GELU())
+            layers.append(nn.Linear(hidden_dim, actual_out))
+            # Zero-init last layer so refinement starts as identity
+            nn.init.zeros_(layers[-1].weight)
+            nn.init.zeros_(layers[-1].bias)
+            self.mlp = nn.Sequential(*layers)
 
     def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor) -> torch.Tensor:
         """
@@ -483,7 +521,12 @@ class SurfaceRefinementHead(nn.Module):
             correction: [M, out_dim] — additive correction (zero-padded for p_only)
         """
         inp = torch.cat([hidden, base_pred], dim=-1)
-        correction = self.mlp(inp)
+        if self.mlp is not None:
+            correction = self.mlp(inp)
+        else:
+            h = self.input_proj(inp)
+            h = self.gated_layers(h)
+            correction = self.output_proj(h)
         if self.p_only:
             # Pad with zeros for velocity channels: [M, 1] → [M, 3]
             zeros = torch.zeros(correction.shape[0], base_pred.shape[-1] - 1,
@@ -501,20 +544,34 @@ class SurfaceRefinementContextHead(nn.Module):
     """
 
     def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 128,
-                 n_layers: int = 2, k_neighbors: int = 8):
+                 n_layers: int = 2, k_neighbors: int = 8, gated: bool = False):
         super().__init__()
         self.k_neighbors = k_neighbors
         # Input: surface hidden (n_hidden) + volume context (n_hidden) + base pred (out_dim)
         in_dim = n_hidden * 2 + out_dim
-        layers: list[nn.Module] = []
-        for i in range(n_layers):
-            layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
-            layers.append(nn.LayerNorm(hidden_dim))
-            layers.append(nn.GELU())
-        layers.append(nn.Linear(hidden_dim, out_dim))
-        nn.init.zeros_(layers[-1].weight)
-        nn.init.zeros_(layers[-1].bias)
-        self.mlp = nn.Sequential(*layers)
+        if gated:
+            self.input_proj = nn.Sequential(
+                nn.Linear(in_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+            )
+            self.gated_layers = nn.Sequential(
+                *[GatedSurfaceRefineLayer(hidden_dim) for _ in range(n_layers - 1)]
+            ) if n_layers > 1 else nn.Identity()
+            self.output_proj = nn.Linear(hidden_dim, out_dim)
+            nn.init.zeros_(self.output_proj.weight)
+            nn.init.zeros_(self.output_proj.bias)
+            self.mlp = None
+        else:
+            layers: list[nn.Module] = []
+            for i in range(n_layers):
+                layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
+                layers.append(nn.LayerNorm(hidden_dim))
+                layers.append(nn.GELU())
+            layers.append(nn.Linear(hidden_dim, out_dim))
+            nn.init.zeros_(layers[-1].weight)
+            nn.init.zeros_(layers[-1].bias)
+            self.mlp = nn.Sequential(*layers)
 
     def forward(self, hidden_all: torch.Tensor, base_pred_surf: torch.Tensor,
                 is_surface: torch.Tensor, mask: torch.Tensor,
@@ -559,7 +616,12 @@ class SurfaceRefinementContextHead(nn.Module):
             surf_pred = base_pred_surf[b, surf_idx]  # [M_s, out_dim]
 
             inp = torch.cat([surf_hidden, vol_context, surf_pred], dim=-1)
-            corr = self.mlp(inp).to(correction.dtype)  # [M_s, out_dim]
+            if self.mlp is not None:
+                corr = self.mlp(inp).to(correction.dtype)  # [M_s, out_dim]
+            else:
+                h = self.input_proj(inp)
+                h = self.gated_layers(h)
+                corr = self.output_proj(h).to(correction.dtype)
             correction[b, surf_idx] = corr
 
         return correction
@@ -942,6 +1004,7 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    surface_refine_gate: bool = False         # PirateNet-style adaptive residual gates in refinement MLP
 
 
 cfg = sp.parse(Config)
@@ -1112,6 +1175,7 @@ if cfg.surface_refine:
             hidden_dim=cfg.surface_refine_hidden,
             n_layers=cfg.surface_refine_layers,
             k_neighbors=8,
+            gated=cfg.surface_refine_gate,
         ).to(device)
     else:
         refine_head = SurfaceRefinementHead(
@@ -1120,12 +1184,14 @@ if cfg.surface_refine:
             hidden_dim=cfg.surface_refine_hidden,
             n_layers=cfg.surface_refine_layers,
             p_only=cfg.surface_refine_p_only,
+            gated=cfg.surface_refine_gate,
         ).to(device)
     refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
     _refine_n_params = sum(p.numel() for p in refine_head.parameters())
     print(f"Surface refinement head: {_refine_n_params:,} params "
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
-          f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
+          f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context}, "
+          f"gated={cfg.surface_refine_gate})")
 
 from copy import deepcopy
 ema_model = None
