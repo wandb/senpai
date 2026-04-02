@@ -917,6 +917,10 @@ class Config:
     swa_cyclic: bool = False           # GPU 0/1: SWA with cyclic LR warm restarts
     swa_cyclic_T: int = 40             # warm-restart cycle period in epochs
     swa_cyclic_start: int = 100        # epoch to switch from cosine to cyclic schedule
+    # Phase 6: Test-Time Augmentation + SWA-final
+    tta_k: int = 0                     # TTA copies per validation batch (0=disabled)
+    tta_scale_deg: float = 0.5         # ±degrees for TTA AoA rotation (half-range)
+    swa_final: bool = False            # SWA over last 30 epochs with cyclic LR (T=10)
     two_phase_lr: bool = False         # GPU 5: lr=3e-4 for phase1, then lr=1e-4
     two_phase_switch_epoch: int = 100  # epoch at which to switch phases
     two_phase_lr_1: float = 3e-4       # phase 1 LR (overrides cfg.lr when active)
@@ -945,6 +949,13 @@ class Config:
 
 
 cfg = sp.parse(Config)
+
+# swa_final: auto-configure swa_cyclic for the last 30 epochs
+if cfg.swa_final:
+    cfg.swa_cyclic = True
+    cfg.swa_cyclic_start = max(0, cfg.cosine_T_max - 30)
+    cfg.swa_cyclic_T = 10
+    print(f"SWA-final enabled: swa_cyclic_start={cfg.swa_cyclic_start}, T={cfg.swa_cyclic_T}")
 
 if cfg.seed >= 0:
     torch.manual_seed(cfg.seed)
@@ -1928,6 +1939,8 @@ for epoch in range(MAX_EPOCHS):
                     x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
                 else:
                     x = torch.cat([x, curv, dist_feat], dim=-1)
+                # Save x before Fourier PE for TTA
+                x_pre_fourier = x  # [B, N, D] — no clone needed, Fourier PE just appends
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2014,6 +2027,76 @@ for epoch in range(MAX_EPOCHS):
                                 pred_loss = pred_loss.clone()
                                 pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
+                    if cfg.multiply_std:
+                        pred = pred_loss / sample_stds
+                    else:
+                        pred = pred_loss * sample_stds
+
+                # Test-Time Augmentation: average predictions over k random AoA rotations
+                if cfg.tta_k > 0:
+                    tta_preds = [pred_loss]  # include the original prediction
+                    B_tta = pred_loss.shape[0]
+                    for _tta_i in range(cfg.tta_k):
+                        x_tta = x_pre_fourier.clone()
+                        # Small random rotation (smaller than training ±1°)
+                        _a_deg = (torch.rand(B_tta, device=device) - 0.5) * 2.0 * cfg.tta_scale_deg
+                        _a_rad = _a_deg * (torch.pi / 180.0)
+                        _c_tta = torch.cos(_a_rad).view(-1, 1, 1)
+                        _s_tta = torch.sin(_a_rad).view(-1, 1, 1)
+                        # Rotate normalized xy coordinates
+                        _x0 = x_tta[:, :, 0:1].clone()
+                        _y0 = x_tta[:, :, 1:2].clone()
+                        x_tta[:, :, 0:1] = _c_tta * _x0 - _s_tta * _y0
+                        x_tta[:, :, 1:2] = _s_tta * _x0 + _c_tta * _y0
+                        # Also rotate DSDF gradient pairs if enabled
+                        if cfg.aug_full_dsdf_rot:
+                            for _xi, _yi in [(2, 3), (4, 5), (6, 7), (8, 9)]:
+                                _dx = x_tta[:, :, _xi:_xi+1].clone()
+                                _dy = x_tta[:, :, _yi:_yi+1].clone()
+                                x_tta[:, :, _xi:_xi+1] = _c_tta * _dx - _s_tta * _dy
+                                x_tta[:, :, _yi:_yi+1] = _s_tta * _dx + _c_tta * _dy
+                        # Recompute Fourier PE for rotated coordinates
+                        _rxy = x_tta[:, :, :2]
+                        _rxy_min = _rxy.amin(dim=1, keepdim=True)
+                        _rxy_max = _rxy.amax(dim=1, keepdim=True)
+                        _rxy_n = (_rxy - _rxy_min) / (_rxy_max - _rxy_min + 1e-8)
+                        _rxy_s = _rxy_n.unsqueeze(-1) * freqs
+                        _fpe = torch.cat([_rxy_s.sin().flatten(-2), _rxy_s.cos().flatten(-2)], dim=-1)
+                        x_tta = torch.cat([x_tta, _fpe], dim=-1)
+                        # Forward pass
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            _tta_out = eval_model({"x": x_tta})
+                            _tta_pred = _tta_out["preds"].float()
+                            _tta_hidden = _tta_out["hidden"].float()
+                        if cfg.multiply_std:
+                            _tta_pl = _tta_pred * sample_stds
+                        else:
+                            _tta_pl = _tta_pred / sample_stds
+                        # Apply refinement head
+                        if eval_refine_head is not None:
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                if cfg.surface_refine_context:
+                                    _rc = eval_refine_head(
+                                        _tta_hidden, _tta_pl, is_surface, mask, x_tta[:, :, :2]
+                                    ).float()
+                                    _tta_pl = _tta_pl + _rc
+                                else:
+                                    _sidx = is_surface.nonzero(as_tuple=False)
+                                    if _sidx.numel() > 0:
+                                        _sh = _tta_hidden[_sidx[:, 0], _sidx[:, 1]]
+                                        _sp = _tta_pl[_sidx[:, 0], _sidx[:, 1]]
+                                        _corr = eval_refine_head(_sh, _sp).float()
+                                        _tta_pl = _tta_pl.clone()
+                                        _tta_pl[_sidx[:, 0], _sidx[:, 1]] += _corr
+                        # Rotate velocity predictions BACK (inverse rotation: transpose = negate angle)
+                        _Ux_tta = _tta_pl[:, :, 0:1].clone()
+                        _Uy_tta = _tta_pl[:, :, 1:2].clone()
+                        _tta_pl[:, :, 0:1] = _c_tta * _Ux_tta + _s_tta * _Uy_tta
+                        _tta_pl[:, :, 1:2] = -_s_tta * _Ux_tta + _c_tta * _Uy_tta
+                        tta_preds.append(_tta_pl)
+                    # Average all TTA predictions (original + k augmented)
+                    pred_loss = torch.stack(tta_preds).mean(0)
+                    # Recompute pred from averaged pred_loss
                     if cfg.multiply_std:
                         pred = pred_loss / sample_stds
                     else:
