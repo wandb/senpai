@@ -936,6 +936,9 @@ class Config:
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
     # Phase 5: Residual prediction
     residual_prediction: bool = False   # predict residual from freestream instead of full field
+    # Phase 6: Feature-space mixup
+    feature_mixup: bool = False       # interpolate training samples in normalized feature space
+    mixup_alpha: float = 0.2          # Beta distribution alpha for mixup lambda
     # Phase 5: Surface refinement head — additive correction MLP on surface nodes
     surface_refine: bool = False              # enable surface refinement head
     surface_refine_hidden: int = 128          # hidden dimension of refinement MLP
@@ -1529,6 +1532,25 @@ for epoch in range(MAX_EPOCHS):
             else:
                 y_norm = y_norm / sample_stds
 
+        # Feature-space mixup: interpolate in fully-normalized feature/target space
+        # Applied after all normalization so mixing is in a consistent representation.
+        # Uses mask intersection to only supervise nodes valid in both samples.
+        _mixup_lam = None
+        if model.training and cfg.feature_mixup:
+            _B_mix = x.size(0)
+            _mix_dist = torch.distributions.Beta(
+                torch.tensor(cfg.mixup_alpha, device=device),
+                torch.tensor(cfg.mixup_alpha, device=device)
+            )
+            _mixup_lam = _mix_dist.sample((_B_mix,)).to(device).view(_B_mix, 1, 1)
+            _mix_idx = torch.randperm(_B_mix, device=device)
+            x = _mixup_lam * x + (1 - _mixup_lam) * x[_mix_idx]
+            y_norm = _mixup_lam * y_norm + (1 - _mixup_lam) * y_norm[_mix_idx]
+            mask = mask & mask[_mix_idx]
+            is_surface = is_surface & is_surface[_mix_idx]
+            # sample_stds is already computed; mix them too for consistent denorm
+            sample_stds = _mixup_lam * sample_stds + (1 - _mixup_lam) * sample_stds[_mix_idx]
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model({"x": x})
             pred = out["preds"]
@@ -1792,7 +1814,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if _mixup_lam is not None:
+            _log["train/mixup_lambda_mean"] = _mixup_lam.mean().item()
+        wandb.log(_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
