@@ -1,6 +1,42 @@
 # Baseline Metrics
 
-## Current Baseline (Phase 6 — 2026-04-03, 8-Seed Prediction Ensemble)
+## Current Baseline (Phase 6 — 2026-04-03, 8-Seed Ensemble from Seeds 66-73)
+
+| Metric | 8-Ensemble (66-73) | vs prior 8-ensemble (42-49) | vs Asinh-only |
+|--------|-------------------|-----------------------------|---------------|
+| p_in | **12.2** | **-1.6%** | -6.4% |
+| p_oodc | **6.7** | 0% | **-14.4%** |
+| p_tan | **29.1** | **-1.0%** | -3.9% |
+| p_re | **5.8** | 0% | **-10.1%** |
+
+**PR #2080** — 8-seed ensemble from fresh seeds 66-73 (standard 3L config with asinh s=0.75). Slightly outperforms the original 8-seed ensemble (seeds 42-49) on p_in and p_tan. W&B run IDs: j9w7d1r7, mc4jvgqj, cbbvhl62, bigqfn3k, bqhg6lq8, 5ukk7wv6, xlnhwuqc, ii1tz4vv
+
+**Reproduce:**
+```bash
+# Train 8 seeds
+for seed in 66 67 68 69 70 71 72 73; do
+  python train.py --agent <name> --wandb_name "<name>/ensemble-seed-${seed}" \
+    --wandb_group phase6/ensemble-more-seeds \
+    --asinh_pressure --asinh_scale 0.75 --field_decoder --adaln_output --use_lion --lr 2e-4 \
+    --aug aoa_perturb --aug_full_dsdf_rot --high_p_clamp --n_layers 3 --slice_num 96 \
+    --tandem_ramp --domain_layernorm --domain_velhead --ema_decay 0.999 --weight_decay 5e-5 \
+    --cosine_T_max 160 --disable_pcgrad --pressure_first --pressure_deep \
+    --residual_prediction --surface_refine --surface_refine_hidden 192 --surface_refine_layers 3 \
+    --seed ${seed} &
+done
+wait
+
+# Evaluate ensemble
+python eval_ensemble.py \
+  --run_ids j9w7d1r7 mc4jvgqj cbbvhl62 bigqfn3k bqhg6lq8 5ukk7wv6 xlnhwuqc ii1tz4vv \
+  --asinh_scale 0.75
+```
+
+⚠️ **Note:** Requires 8x inference cost. Each model uses 38GB VRAM. Can run serially or on 8 GPUs in parallel.
+
+---
+
+## Prior Baseline (Phase 6 — 2026-04-03, 8-Seed Prediction Ensemble, Seeds 42-49)
 
 | Metric | 8-Ensemble | vs Asinh-only baseline |
 |--------|-----------|----------------------|
@@ -9,24 +45,7 @@
 | p_tan | **29.4** | -2.9% |
 | p_re | **5.8** | **-10.1%** |
 
-**PR #2076** — Post-hoc 8-seed ensemble (average predictions from 8 independently-trained models at inference time). No training changes. W&B run IDs: rboyvjeo, h0uog211, kwt8tw52, 5j26p5v1, rmump7ke, ujt9cu0l, 7fw8ksxq, 0lsry8km.
-
-**Reproduce:**
-```bash
-# Train 8 seeds
-for seed in 42 43 44 45 46 47 48 49; do
-  python train.py --agent <name> --wandb_name "<name>/asinh-bl-s${seed}" \
-    --asinh_pressure --asinh_scale 0.75 \
-    [all baseline flags] --seed ${seed}
-done
-
-# Evaluate ensemble
-python eval_ensemble.py \
-  --run_ids rboyvjeo h0uog211 kwt8tw52 5j26p5v1 rmump7ke ujt9cu0l 7fw8ksxq 0lsry8km \
-  --asinh_scale 0.75
-```
-
-⚠️ **Note:** Requires 8x inference cost. Each model uses 38GB VRAM. Can run serially or on 8 GPUs in parallel.
+**PR #2076** — Post-hoc 8-seed ensemble. W&B run IDs: rboyvjeo, h0uog211, kwt8tw52, 5j26p5v1, rmump7ke, ujt9cu0l, 7fw8ksxq, 0lsry8km.
 
 ---
 
