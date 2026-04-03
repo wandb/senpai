@@ -100,6 +100,16 @@ n_students: 4
 
 `launch.py` reads this via `simple_parsing` — every field can be overridden on the CLI.
 
+### API Key
+
+Due to the high cost of running CC with ANTHROPIC_API_KEY, instead use CLAUDE_CODE_OAUTH_TOKEN. Create this token as follows:
+
+```
+claude setup-token
+```
+
+and push the key to the k8s secrets.
+
 ## Running
 
 ```bash
