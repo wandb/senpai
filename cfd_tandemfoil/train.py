@@ -947,6 +947,8 @@ class Config:
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
+    # Phase 6: Per-sample pressure range scaling
+    per_sample_pscale: bool = False          # normalize pressure by per-sample range (p_max - p_min)
 
 
 cfg = sp.parse(Config)
@@ -1495,6 +1497,15 @@ for epoch in range(MAX_EPOCHS):
                 y_phys = y_phys.clone()
                 y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
             y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+        # Per-sample pressure range scaling
+        _pscale = None
+        if cfg.per_sample_pscale:
+            _p_masked = y_norm[:, :, 2:3].clone()
+            _p_masked[~mask.unsqueeze(-1).expand_as(_p_masked)] = float('nan')
+            _p_max = torch.nanquantile(_p_masked.squeeze(-1), 1.0, dim=1, keepdim=True).unsqueeze(-1)  # [B,1,1]
+            _p_min = torch.nanquantile(_p_masked.squeeze(-1), 0.0, dim=1, keepdim=True).unsqueeze(-1)  # [B,1,1]
+            _pscale = (_p_max - _p_min).clamp(min=1e-6)
+            y_norm[:, :, 2:3] = y_norm[:, :, 2:3] / _pscale
         # Residual prediction: subtract freestream from normalized targets
         _freestream = None
         if cfg.residual_prediction:
@@ -1983,6 +1994,16 @@ for epoch in range(MAX_EPOCHS):
                         y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
                     y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
+                # Per-sample pressure range scaling (val)
+                _v_pscale = None
+                if cfg.per_sample_pscale:
+                    _vp = y_norm[:, :, 2:3].clone()
+                    _vp[~mask.unsqueeze(-1).expand_as(_vp)] = float('nan')
+                    _vp_max = torch.nanquantile(_vp.squeeze(-1), 1.0, dim=1, keepdim=True).unsqueeze(-1)
+                    _vp_min = torch.nanquantile(_vp.squeeze(-1), 0.0, dim=1, keepdim=True).unsqueeze(-1)
+                    _v_pscale = (_vp_max - _vp_min).clamp(min=1e-6)
+                    y_norm[:, :, 2:3] = y_norm[:, :, 2:3] / _v_pscale
+
                 # Residual prediction: subtract freestream in val loop
                 _v_freestream = None
                 if cfg.residual_prediction:
@@ -2080,6 +2101,11 @@ for epoch in range(MAX_EPOCHS):
                 # Add freestream back for residual prediction mode
                 if cfg.residual_prediction and _v_freestream is not None:
                     pred = pred + _v_freestream  # add freestream back before denorm
+
+                # Undo per-sample pressure scaling before denorm
+                if cfg.per_sample_pscale and _v_pscale is not None:
+                    pred = pred.clone()
+                    pred[:, :, 2:3] = pred[:, :, 2:3] * _v_pscale
 
                 # Denormalize: phys_stats → Cp space → original scale
                 if cfg.raw_targets:
@@ -2305,6 +2331,20 @@ if best_metrics:
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
                     pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
+                    # Undo per-sample pscale for vis
+                    if cfg.per_sample_pscale:
+                        y_phys_vis = _phys_norm(y_dev, Umag, q)
+                        if cfg.asinh_pressure:
+                            y_phys_vis = y_phys_vis.clone()
+                            y_phys_vis[:, :, 2:3] = torch.asinh(y_phys_vis[:, :, 2:3] * cfg.asinh_scale)
+                        y_norm_vis = (y_phys_vis - phys_stats["y_mean"]) / phys_stats["y_std"]
+                        _vp_vis = y_norm_vis[:, :, 2:3].clone()
+                        _vp_vis[~mask.unsqueeze(-1).expand_as(_vp_vis)] = float('nan')
+                        _vis_pmax = torch.nanquantile(_vp_vis.squeeze(-1), 1.0, dim=1, keepdim=True).unsqueeze(-1)
+                        _vis_pmin = torch.nanquantile(_vp_vis.squeeze(-1), 0.0, dim=1, keepdim=True).unsqueeze(-1)
+                        _vis_pscale = (_vis_pmax - _vis_pmin).clamp(min=1e-6)
+                        pred = pred.clone()
+                        pred[:, :, 2:3] = pred[:, :, 2:3] * _vis_pscale
                     if cfg.raw_targets:
                         y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                     elif cfg.adaptive_norm:
@@ -2415,6 +2455,16 @@ if cfg.surface_refine and best_metrics:
                         y_phys = _phys_norm(y, Umag, q)
                         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
+                    # Per-sample pressure scaling (verification)
+                    _ver_pscale = None
+                    if cfg.per_sample_pscale:
+                        _ver_p = y_norm[:, :, 2:3].clone()
+                        _ver_p[~mask.unsqueeze(-1).expand_as(_ver_p)] = float('nan')
+                        _ver_pmax = torch.nanquantile(_ver_p.squeeze(-1), 1.0, dim=1, keepdim=True).unsqueeze(-1)
+                        _ver_pmin = torch.nanquantile(_ver_p.squeeze(-1), 0.0, dim=1, keepdim=True).unsqueeze(-1)
+                        _ver_pscale = (_ver_pmax - _ver_pmin).clamp(min=1e-6)
+                        y_norm[:, :, 2:3] = y_norm[:, :, 2:3] / _ver_pscale
+
                     # Residual prediction
                     _v_freestream = None
                     if cfg.residual_prediction:
@@ -2480,6 +2530,11 @@ if cfg.surface_refine and best_metrics:
                     if cfg.residual_prediction and _v_freestream is not None:
                         pred_refined = pred_refined + _v_freestream
 
+                    # Undo per-sample pscale before denorm
+                    if cfg.per_sample_pscale and _ver_pscale is not None:
+                        pred_refined = pred_refined.clone()
+                        pred_refined[:, :, 2:3] = pred_refined[:, :, 2:3] * _ver_pscale
+
                     # Z-score denorm
                     _zs = raw_stats if cfg.adaptive_norm else phys_stats
                     pred_phys_A = pred_refined * _zs["y_std"] + _zs["y_mean"]
@@ -2502,7 +2557,11 @@ if cfg.surface_refine and best_metrics:
                     # Step 4: add freestream (residual prediction)
                     if cfg.residual_prediction and _v_freestream is not None:
                         pred_manual = pred_manual + _v_freestream
-                    # Step 5: undo z-score: pred * std + mean
+                    # Step 5a: undo per-sample pscale
+                    if cfg.per_sample_pscale and _ver_pscale is not None:
+                        pred_manual = pred_manual.clone()
+                        pred_manual[:, :, 2:3] = pred_manual[:, :, 2:3] * _ver_pscale
+                    # Step 5b: undo z-score: pred * std + mean
                     pred_manual_phys = pred_manual * _zs["y_std"] + _zs["y_mean"]
                     if cfg.asinh_pressure:
                         pred_manual_phys = pred_manual_phys.clone()
@@ -2523,6 +2582,9 @@ if cfg.surface_refine and best_metrics:
                     pred_norefine = pred_raw.clone()
                     if cfg.residual_prediction and _v_freestream is not None:
                         pred_norefine = pred_norefine + _v_freestream
+                    if cfg.per_sample_pscale and _ver_pscale is not None:
+                        pred_norefine = pred_norefine.clone()
+                        pred_norefine[:, :, 2:3] = pred_norefine[:, :, 2:3] * _ver_pscale
                     pred_norefine_phys = pred_norefine * _zs["y_std"] + _zs["y_mean"]
                     if cfg.asinh_pressure:
                         pred_norefine_phys = pred_norefine_phys.clone()
