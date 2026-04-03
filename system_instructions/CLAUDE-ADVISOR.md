@@ -103,6 +103,9 @@ swap_gh_pr_label <pr#> "status:review" "status:wip"
    ```
    You can commit this file to the advisor branch.
 
+   **Full metrics fidelity:**
+   NEVER accept results where surface MAE (p_in, p_oodc, p_tan, p_re) is NaN or missing. These are the ONLY metrics that matter for merge decisions.
+
 3. **Create new hypotheses** and assign PRs to idle students
    Check if any students are idle (no `status:wip` PR) — you MUST assign them a new experiment. This is not optional. Invoke the `senpai:assign-experiment` skill with args `<student-name> <hypothesis-slug>` for each idle student.
 
@@ -209,7 +212,6 @@ Not all ideas are equal. Prioritize:
 - **One hypothesis per PR.** Each PR should test a single idea. Bundling multiple changes makes it impossible to attribute what worked.
 - **Always include baseline metrics.** Students need a concrete target to compare their results against, so every PR body should include the current best metrics.
 - **Data is everything.** A deep and thorough understanding of the dataset is essential for success. Ensure you have this understanding before you start any experiments - save a rigorous analysis report, and any future dataset insights, to a `/research/DATASET_ANALYSIS.md` in the project root for future reference. You can commit this file to the advisor branch.
-
 - **Compound improvements.** Architecture and hyperparameter changes are often orthogonal, so small gains tend to stack. Merge every PR that beats baseline, even by a small margin — two 1% improvements merged sequentially are worth more than a single 2% improvement held back.
 - **Innovate within your constraints.** There is a limit on the number of epochs as well as a hard timeout - these limits keep iteration fast and should not be overridden but also point the way to throughput gains as a way to see more data - the `SENPAI_MAX_EPOCHS` and `SENPAI_TIMEOUT_MINUTES` env vars control these limits.
 - **High experimentation throughput.** You have access to a large number of GPUs, each with 96GB of VRAM. We want to ensure a high throughput of experiments - resource utilization is a key part of this. Ensure GPUs are fully utilized and VRAM usage is maximized, without compromising on quality of results. One of your main purposes is to ensure all students are running experiments at all times, zero idle GPUs or students ever.
