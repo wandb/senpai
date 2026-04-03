@@ -52,7 +52,7 @@ swap_gh_pr_label <pr#> "status:review" "status:wip"
 
 1. **Survey the current state**
    - Invoke the `senpai:survey-prs` skill to get a structured snapshot: review-ready PRs, WIP PRs by student, idle students.
-   - Invoke the `senpai:check-human-issues` skill to check for messages from the human research team. If any contain research directives, incorporate them into your hypothesis planning.
+   - Invoke the `senpai:check-human-issues` skill with args `<advisor-branch> ADVISOR` (e.g. `noam ADVISOR`) to check for messages from the human research team. If any contain research directives, incorporate them into your hypothesis planning.
    - Identify priorities: PRs ready for review, then new hypothesis research, then assigning new work to idle students (including students that have just become idle if you just closed their PRs after reviewing them)
    - Monitor student pods: `kubectl get deployments -l app=senpai`
    - Use sub-agents or teams of sub-agents as much as you can in order to preserve your context window. 

@@ -11,7 +11,7 @@ description: >
   messages, respond to human issues, poll for team communications,
   check GitHub issues. Also triggers for: "any human messages?",
   "check issues", "respond to humans".
-argument-hint: "<advisor-or-student-name> <advisor-or-student-role-prefix>"
+argument-hint: "<name> <ADVISOR|STUDENT>"
 context: fork
 model: claude-opus-4-6
 effort: high
@@ -23,8 +23,12 @@ Check GitHub Issues tagged `human` for messages from the research team, and resp
 
 ## Arguments
 
-- `$0` — Your name for gh issue filtering by label
-- `$1` — Your role prefix to add at the start of your comments (e.g. `ADVISOR` or `STUDENT <student-name>`)
+`$ARGUMENTS` is `<name> <role>`, e.g. `noam ADVISOR` or `fern STUDENT`.
+
+- **name** (first word) — Your name/label for gh issue filtering (e.g. `noam`, `fern`)
+- **role** (second word) — Either `ADVISOR` or `STUDENT`
+
+The comment prefix is: if role is `ADVISOR` → `ADVISOR:`, if role is `STUDENT` → `STUDENT <name>:`.
 
 ## How it works
 
@@ -32,11 +36,13 @@ Human researchers communicate with agents through GitHub Issues. Issues are tagg
 
 ## Steps
 
-1. **Source the senpai-gh library** and list issues:
+Parse `$ARGUMENTS`: split on space — first word is **name**, second word is **role**.
+
+1. **Source the senpai-gh library** and list issues using **name** as the label filter:
 
 ```bash
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
-check_gh_issues "$0"
+check_gh_issues "<name>"
 ```
 
 This returns a deduplicated JSON array of issues addressed to you and the whole team.
@@ -54,7 +60,10 @@ gh issue view <number> --json body,comments
 4. **Respond** with your role prefix:
 
 ```bash
-gh issue comment <number> --body "$1: <your response>"
+# ADVISOR example:
+gh issue comment <number> --body "ADVISOR: <your response>"
+# STUDENT example:
+gh issue comment <number> --body "STUDENT <name>: <your response>"
 ```
 
 5. **Never close human issues.** Only the human does that.

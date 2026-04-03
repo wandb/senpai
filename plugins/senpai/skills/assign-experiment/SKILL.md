@@ -19,12 +19,16 @@ Create a branch and draft PR that assigns a hypothesis to a student. The student
 
 ## Arguments
 
-- `$0` — Student name
-- `$1` — A short kebab-case slug for the hypothesis
+`$ARGUMENTS` is `<student-name> <hypothesis-slug>`, e.g. `fern cosine-annealing`.
+
+- **student-name** (first word) — The student to assign
+- **hypothesis-slug** (second word) — A short kebab-case slug for the hypothesis
 
 The hypothesis details, instructions, and baseline metrics come from your own reasoning — this skill handles the git/GitHub mechanics.
 
 ## Steps
+
+Parse `$ARGUMENTS`: split on first space — first word is **student-name**, second word is **hypothesis-slug**.
 
 1. **Start from the latest advisor branch:**
 
@@ -36,7 +40,7 @@ git checkout "$ADVISOR_BRANCH" && git pull origin "$ADVISOR_BRANCH"
 2. **Create the experiment branch:**
 
 ```bash
-BRANCH="$0/$1"
+BRANCH="<student-name>/<hypothesis-slug>"
 git checkout -b "$BRANCH"
 git push -u origin "$BRANCH"
 ```
@@ -64,7 +68,7 @@ include links to papers or code that support the hypothesis.>
 PREOF
 )" \
     --label "$ADVISOR_BRANCH" \
-    --label "student:$0" \
+    --label "student:<student-name>" \
     --label "status:wip" \
     --base "$ADVISOR_BRANCH" \
     --head "$BRANCH"

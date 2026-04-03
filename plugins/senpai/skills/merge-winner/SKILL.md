@@ -22,23 +22,23 @@ A PR beat the baseline — merge it and record the new best metrics in BASELINE.
 
 ## Arguments
 
-- `$0` — The PR number
+`$ARGUMENTS` is the PR number, e.g. `1842`.
 
-Note: $ADVISOR_BRANCH is available as an environment variable.
+Note: `$ADVISOR_BRANCH` is available as an environment variable.
 
 ## Steps
 
 1. **Squash-merge the PR:**
 
 ```bash
-gh pr merge $0 --squash
+gh pr merge $ARGUMENTS --squash
 ```
 
 If this fails due to merge conflicts, send the PR back for rebase instead:
 
 ```bash
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
-send_pr_back_to_student_with_comment $0 "ADVISOR: Rebasing needed — the advisor branch was updated after merging a previous winner. Please rebase onto $ADVISOR_BRANCH, re-run the experiment to verify the improvement still holds, and resubmit."
+send_pr_back_to_student_with_comment $ARGUMENTS "ADVISOR: Rebasing needed — the advisor branch was updated after merging a previous winner. Please rebase onto $ADVISOR_BRANCH, re-run the experiment to verify the improvement still holds, and resubmit."
 ```
 
 Then stop — don't proceed with baseline update.
@@ -64,7 +64,7 @@ git checkout "$ADVISOR_BRANCH" && git pull origin "$ADVISOR_BRANCH"
 
 ```bash
 git add BASELINE.md
-git commit -m "Update baseline: <short description> (PR #$0)"
+git commit -m "Update baseline: <short description> (PR #$ARGUMENTS)"
 git push origin "$ADVISOR_BRANCH"
 ```
 
