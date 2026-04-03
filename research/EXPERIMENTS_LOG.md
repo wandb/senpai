@@ -4,6 +4,22 @@
 
 ### New Assignments (2026-04-03)
 
+#### 2026-04-03 — PR #2092: Phase 6: Ensemble Seeds 82-89 — thorfinn — NEW
+- Branch: `thorfinn/ensemble-seeds-82-89`
+- Hypothesis: More standard 3L seeds for ensemble expansion (total pool: 42-49, 66-73, 74-81, 82-89, 90-95)
+- Status: WIP — just assigned
+
+#### 2026-04-03 — PR #2080: Phase 6: Ensemble Seeds 66-73 — tanjiro — **MERGED WINNER**
+- Branch: `tanjiro/ensemble-more-seeds`
+- W&B group: phase6/ensemble-more-seeds (8 runs finished)
+- Results: **NEW BEST.** 8-seed ensemble (66-73) beats prior best (42-49):
+  - p_in: 12.2 (was 12.4, **-1.6%**)
+  - p_oodc: 6.7 (flat)
+  - p_tan: 29.1 (was 29.4, **-1.0%**)
+  - p_re: 5.8 (flat)
+- Run IDs: j9w7d1r7, mc4jvgqj, cbbvhl62, bigqfn3k, bqhg6lq8, 5ukk7wv6, xlnhwuqc, ii1tz4vv
+- **MERGED** — Updated baseline. Next: 16-seed combined evaluation.
+
 #### 2026-04-03 — PR #2082: Phase 6: Packed Ensemble — thorfinn — CLOSED
 - Branch: `thorfinn/packed-ensemble`
 - W&B group: phase6/packed-ensemble (8 runs finished)
