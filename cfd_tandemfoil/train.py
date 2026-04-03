@@ -874,6 +874,8 @@ class Config:
     adaln_decouple: bool = False       # decoupled slice assignment for tandem
     adaln_nozero: bool = False         # ablation: no zero-init on adaln projection
     adaln_sam: bool = False            # SAM optimizer in last 25% of training
+    sam_rho: float = 0.05              # SAM perturbation radius
+    sam_start_epoch: int = 0           # epoch to activate SAM (0 = from the start)
     film_cond: bool = False            # FiLM conditioning (simpler alternative to AdaLN)
     adaln_zone_temp: bool = False      # zone-aware temperature modulation
     # Phase 2 R5: tandem warm-in combinations
@@ -1290,7 +1292,7 @@ if refine_head is not None:
     base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
 
-sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
+sam_optimizer = SAM(base_opt, rho=cfg.sam_rho) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
     _warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
     _restarts = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -1769,7 +1771,7 @@ for epoch in range(MAX_EPOCHS):
             loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        sam_active = sam_optimizer is not None and epoch >= int(MAX_EPOCHS * 0.75)
+        sam_active = sam_optimizer is not None and epoch >= cfg.sam_start_epoch
         _should_step = (cfg.grad_accum_steps <= 1 or
                         (batch_idx + 1) % cfg.grad_accum_steps == 0 or
                         batch_idx == len(train_loader) - 1)
@@ -1778,17 +1780,27 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.perturb()
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
+            # Detach all tensors from the first forward pass graph to avoid
+            # "backward through the graph a second time" errors.
+            _x2 = x.detach()
+            _sample_stds2 = sample_stds.detach()
+            _y_norm2 = y_norm.detach()
+            _vol_mask_train2 = vol_mask_train.detach()
+            _surf_mask2 = surf_mask.detach()
+            _tandem_boost2 = tandem_boost.detach()
+            _log_re_target2 = log_re_target.detach()
+            _aoa_target2 = aoa_target.detach()
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
-                pred2 = out2["preds"].float() / sample_stds
+                out2 = model({"x": _x2})
+                pred2 = out2["preds"].float() / _sample_stds2
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
-            abs_err2 = (pred2 - y_norm).abs()
-            vol_loss2 = (abs_err2 * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
-            surf_ps2 = (abs_err2[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
-            surf_loss2 = (surf_ps2 * tandem_boost).mean()
-            re_loss2 = F.mse_loss(re_pred2, log_re_target)
-            aoa_loss2 = F.mse_loss(aoa_pred2, aoa_target)
+            abs_err2 = (pred2 - _y_norm2).abs()
+            vol_loss2 = (abs_err2 * _vol_mask_train2.unsqueeze(-1)).sum() / _vol_mask_train2.sum().clamp(min=1)
+            surf_ps2 = (abs_err2[:, :, 2:3] * _surf_mask2.unsqueeze(-1)).sum(dim=(1, 2)) / _surf_mask2.sum(dim=1).clamp(min=1).float()
+            surf_loss2 = (surf_ps2 * _tandem_boost2).mean()
+            re_loss2 = F.mse_loss(re_pred2, _log_re_target2)
+            aoa_loss2 = F.mse_loss(aoa_pred2, _aoa_target2)
             loss2 = vol_loss2 + surf_weight * surf_loss2 + 0.01 * re_loss2 + 0.01 * aoa_loss2
             loss2.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
