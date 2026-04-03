@@ -1,40 +1,48 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-02 (radical pivot)
+- **Date:** 2026-04-03 ~19:40 UTC
 - **Advisor branch:** noam
-- **Phase:** Phase 6 — RADICAL New Architectures & Paradigms
+- **Phase:** Phase 6 — Ensemble Expansion + Architectural Exploration
 
-## Current Baseline (PR #2003)
+## Current Baseline (PR #2076)
 
-| Metric | Value |
-|--------|-------|
-| val/loss | 0.3761 |
-| p_in | 12.5 |
-| p_oodc | 8.2 |
-| p_tan | 29.8 |
-| p_re | 6.5 |
+| Metric | 8-Seed Ensemble | Single-model Mean (8 seeds) | Std |
+|--------|----------------|-----------------------------|-----|
+| p_in | **12.4** | 13.03 | ±0.39 |
+| p_oodc | **6.7** | 7.83 | ±0.19 |
+| p_tan | **29.4** | 30.29 | ±0.47 |
+| p_re | **5.8** | 6.45 | ±0.05 |
 
-Config: Lion, cosine_T_max=160, 3L Transolver, 192 hidden, 96 slices, residual prediction, surface refine.
+Config: Lion lr=2e-4, cosine_T_max=160, 3L Transolver, surface_refine 192/3, asinh s=0.75, residual_prediction, pressure_first.
 
-## Student Status
+**Phase 6 wins so far:** T_max=160 (PR #2003), Asinh s=0.75 (PR #2054), 8-Seed Ensemble (PR #2076).
 
-| Student | PR | Experiment | Type | Status |
-|---------|-----|-----------|------|--------|
-| alphonse | #2033 | **LinearNO** — replace slice attention | RADICAL | 8 runs training |
-| fern | #2034 | **Inviscid Cp** — precomputed physics input | RADICAL | Implementing |
-| tanjiro | #2035 | **All-to-All Surface Attention** | RADICAL | Implementing |
-| nezuko | #2036 | **Conditional Flow Matching** | RADICAL | Implementing |
-| edward | #2037 | **MARIO Latent Geometry** | RADICAL | Implementing |
-| thorfinn | #2026 | Muon v2 (hybrid FFN+Lion) | Per Morgan | 8 runs training |
-| askeladd | #2027 | Geosolver v2 (geometry input features) | Per Morgan | 8 runs training |
-| frieren | #2025 | TTA + SWA | Architecture | 8 runs training |
+## Student Status (2026-04-03 ~19:40 UTC)
 
-## Confirmed Dead Ends (Phase 6)
+| Student | PR | Experiment | Status |
+|---------|-----|-----------|--------|
+| frieren | #2086 | SAM Phase-Only (rho sweep: 0.05/0.1/0.2) | **NEW — just assigned** |
+| fern | #2083 | srf4L Ensemble Seeds 50-57 | Running (8/8) |
+| thorfinn | #2082 | Packed Ensemble M=2/4/8 | Running (8/8) |
+| edward | #2081 | srf4L Ensemble Seeds 42-49 | Running (8/8, first batch crashed) |
+| tanjiro | #2080 | Ensemble Seeds 66-73 | Running (8/8, first batch crashed) |
+| askeladd | #2079 | srf4L Multi-Seed Validation | Running (8/8, initial group crashed) |
+| alphonse | #2068 | Asymmetric/Magnitude-Weighted Surface Loss | Running (8/8) |
+| nezuko | #2085 | srf4L Ensemble Seeds 58-65 | Running (8/8) |
+
+## Recent Closed PRs
+- #2066 (frieren) — Synthetic data mesh interpolation — **DEAD END** (all metrics 3-10x worse, physically invalid)
+
+## Idle Students
+None — all 8 students working.
+
+## Confirmed Dead Ends (Phase 6, cumulative)
 
 | Direction | PRs | Finding |
 |-----------|-----|---------|
-| SOAP/HeavyBall optimizers | #2010,2018,2019,2021,2022,2023 | SOAP 2-6% WORSE than Lion. False 20% claim from NaN MAE. |
-| Muon (full replacement) | #2006 | 30-70% worse. Spectral flattening destroys physics signal. |
+| Mesh interpolation (synthetic data) | #2066 | Physically invalid for unstructured CFD meshes. All metrics 3-10x worse. |
+| SOAP/HeavyBall optimizers | #2010,2018-2023 | SOAP 2-6% WORSE than Lion. False 20% claim from NaN MAE. |
+| Muon (full+hybrid) | #2006 | 30-70% worse. Spectral flattening destroys physics signal. |
 | XSA attention | #2007 | Redundant with orthogonal slices. |
 | PirateNets RWF | #2008 | LayerNorm + Lion attenuate mechanism. |
 | NOBLE | #2011 | Model too small, cosine on hidden features unhelpful. |
@@ -44,20 +52,45 @@ Config: Lion, cosine_T_max=160, 3L Transolver, 192 hidden, 96 slices, residual p
 | Physics losses (vorticity, div-free) | #2016,2023 | WLS gradient instability on unstructured mesh. |
 | GeoTransolver cross-attention | #1989 | +9.8% worse, gate near zero. |
 | Learned loss weights | #2013 | Collapsed to zero. |
+| LinearNO | #2033-2038 | All failed (AAAI paper doesn't transfer). |
+| Flow matching/generative | #2036 | 60% worse. Problem is deterministic, not multi-modal. |
+| MARIO latent geometry | #2037 | Redundant geometry encoding. |
+| Inviscid Cp precomputed | #2034 | Single-foil NeuralFoil wrong for tandem interaction. |
+| All-to-all surface attention | #2035 | +8% worse — elliptic coupling handled by existing slices. |
+| Asymmetric loss variants | In progress | TBD (alphonse #2068) |
 
-## Key Research Insights
+## Current Research Strategy
 
-1. **Lion is the optimal optimizer** for this 1.7M-param architecture. All alternatives fail.
-2. **The Transolver is a strong local optimum.** Incremental modifications are absorbed by EMA.
-3. **Throughput matters** — any technique adding >15% step time loses epochs and hurts.
-4. **Physics structure in weights matters** — orthogonalize/flatten at your peril (Muon, SOAP).
-5. **24-dim input already encodes geometry** — adding context banks doesn't help (GeoTransolver).
-6. **48 slices ≈ 96 slices** — the model is over-parameterized in slice dimension.
+**Primary direction: Ensemble expansion + quality improvement**
+The 8-seed ensemble gave the biggest gains of the programme (-14.4% p_oodc, -10.1% p_re). We are:
+1. Building a larger seed pool (16 srf4L seeds training: edward, fern, nezuko)
+2. Testing if srf4L (4-layer surface refine) produces better individual models (askeladd #2079)
+3. Testing packed ensembles for lower inference cost (thorfinn #2082)
+4. Growing the ensemble to 24 seeds (tanjiro #2080)
 
-## Current Radical Directions (from literature survey)
+**Secondary direction: Loss/optimizer improvements**
+- SAM phase-only (frieren #2086) — seeks flatter minima for better OOD generalization
+- Asymmetric loss (alphonse #2068) — magnitude-weighted L1, pinball loss
 
-1. **LinearNO** (AAAI 2026) — 60% improvement on AirfRANS. RUNNING.
-2. **Inviscid Cp** — 88% OOD error reduction in B-GNN paper. IMPLEMENTING.
-3. **All-to-All Surface Attention** — elliptic pressure coupling. IMPLEMENTING.
-4. **Conditional Flow Matching** — generative paradigm. IMPLEMENTING.
-5. **MARIO Latent Geometry** — geometry autoencoder + modulated field. IMPLEMENTING.
+## Potential Next Research Directions
+
+1. **Knowledge distillation from ensemble** — distill the 8-seed ensemble into a single model with soft targets. Could improve single-model baseline, making ensembles even better.
+2. **MC Dropout in surface refine head** — stochastic inference via K=8 forward passes. Near-zero training overhead, approximates Bayesian model averaging.
+3. **HyperP** (from human issue #1926) — Transferable Hypersphere Optimization. Not yet tested.
+4. **Larger ensemble evaluation** — if srf4L seeds are better, a 24-seed srf4L ensemble could push metrics significantly lower.
+5. **Diverse model ensemble** — ensemble models with different architectures/configs rather than just seeds.
+6. **Feature engineering** — local mesh quality metrics, curvature-weighted features.
+
+## Most Recent Human Research Team Directives (from issues)
+- Issue #1860: "Think bigger, radical changes" — addressed. Phase 6 trialed all major radical ideas. Only ensemble and target-space tricks worked.
+- Issue #1834: "Never use held-out data" — acknowledged and adhered to.
+- Issue #1926: All listed ideas tried. HyperP, MSA, mHC not yet attempted.
+
+## Key Research Insights (accumulated)
+
+1. **Lion is the optimal optimizer** — all alternatives (SOAP, Muon, HeavyBall) fail.
+2. **Transolver is a strong local optimum** — architecture modifications absorbed by EMA.
+3. **Target-space compression helps** — asinh(p, s=0.75) improved OOD metrics.
+4. **Ensemble variance reduction is the biggest lever** — 8-seed ensemble: -3% to -14%.
+5. **Throughput matters** — any technique adding >15% step time loses epochs and hurts.
+6. **Mesh-level operations don't transfer** — unstructured CFD meshes have no spatial correspondence across samples.

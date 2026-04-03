@@ -2,6 +2,60 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### New Assignments (2026-04-03)
+
+#### 2026-04-03 — PR #2086: Phase 6: SAM Phase-Only — Flat Minima for OOD Generalization
+- Branch: `frieren/sam-phase-only`
+- Student: frieren
+- Hypothesis: SAM (already in train.py) applied only in last 25% of training (epoch≥120) finds flatter minima. Sweep rho={0.05, 0.1, 0.2} since Lion's sign updates may need different scaling than Adam. Target: reduce seed variance AND improve p_oodc/p_re.
+- 8-GPU: 2 baselines (s42/s43) + 3 rho values × 2 seeds = 8 runs
+- Status: WIP — assigned
+
+#### 2026-04-03 — PR #2085: Phase 6: srf4L Ensemble Seeds 58-65 (3rd Batch) — nezuko
+- Branch: `nezuko/srf4L-ensemble-v3`
+- Hypothesis: More srf4L seeds (58-65) to build toward larger ensemble pool
+- Status: WIP, 8 runs running
+
+#### 2026-04-03 — PR #2083: Phase 6: srf4L Ensemble Seeds 50-57 — fern
+- Branch: `fern/srf4L-ensemble-v2`
+- Hypothesis: srf4L seeds 50-57 to complement edward's seeds 42-49
+- Status: WIP, 8 runs running
+
+#### 2026-04-03 — PR #2082: Phase 6: Packed Ensemble — thorfinn
+- Branch: `thorfinn/packed-ensemble`
+- Hypothesis: M sub-models packed into one forward pass via grouped linear ops. Test M=2,4,8. From Laurent et al. 2023, AirfRANS shows 25% training speedup over deep ensembles.
+- 8 GPUs: 2 baseline + 2×M=2 + 2×M=4 + 2×M=8
+- Status: WIP, 8 runs running
+
+#### 2026-04-03 — PR #2081: Phase 6: srf4L + 8-Seed Ensemble (Compound) — edward
+- Branch: `edward/srf4L-ensemble`
+- Hypothesis: If srf4L improves individual model quality, ensembling srf4L models should beat the existing ensemble
+- 8 GPUs: seeds 42-49 with --surface_refine_layers 4
+- Status: WIP, 8 crashed + 8 running (relaunched)
+
+#### 2026-04-03 — PR #2080: Phase 6: Ensemble Seeds 66-73 (Building Toward 24-Model) — tanjiro
+- Branch: `tanjiro/ensemble-more-seeds`
+- Hypothesis: Extend ensemble to 24 models (seeds 42-73). If ensemble variance reduction scales with N, 24-model could give another step down.
+- Status: WIP, 8 crashed + 8 running (relaunched)
+
+#### 2026-04-03 — PR #2079: Phase 6: srf4L on Asinh Baseline (Multi-Seed) — askeladd
+- Branch: `askeladd/srf4L-asinh`
+- Hypothesis: Test srf4L (surface_refine_layers=4 vs 3) as a standalone improvement. 4 seeds each config.
+- Status: WIP, 8 crashed + 8 running (srf4L-multiseed group)
+
+#### 2026-04-03 — PR #2068: Phase 6: Asymmetric/Magnitude-Weighted Surface Loss — alphonse
+- Branch: `alphonse/asymmetric-loss`
+- Hypothesis: Replace symmetric L1 with magnitude-weighted L1 (overweight stagnation/suction peaks) and pinball tau=0.45 (penalize underprediction)
+- 8 GPUs: 2 baseline + magnitude-weighted α=0.5 + α=1.0 + pinball τ=0.45 × 2 seeds each
+- Status: WIP, 8 runs running
+
+#### 2026-04-03 — PR #2066: Phase 6: Synthetic Data Generation via Physics-Consistent Interpolation — frieren
+- Branch: `frieren/data-gen-interpolation` (CLOSED)
+- Hypothesis: Interpolate between same-condition CFD samples to create synthetic training data
+- Results: DEAD END. All metrics 3-10x worse than baseline. Root cause: mesh-level interpolation is physically meaningless for unstructured CFD (no spatial correspondence between node indices across different meshes)
+- W&B runs: xjo7mj7s, 5dggj8av, ysg5zqr4, nandekgh, jr5qg1i1, s3lt4tjd, 5d828zol, 1n8k5m0g
+- Status: CLOSED
+
 ### New Assignments (2026-04-02)
 
 #### 2026-04-02 — PR #2008: Phase 6: PirateNets — Random Weight Factorization
