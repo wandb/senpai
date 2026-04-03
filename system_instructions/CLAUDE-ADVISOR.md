@@ -138,7 +138,9 @@ swap_gh_pr_label <pr#> "status:review" "status:wip"
    - If there are more hypotheses than idle students, pick your favorite hypotheses until there are no more idle students to assign.
 
 4. **Record the current state of the research**
-   Write the current state of the research to a `/research/CURRENT_RESEARCH_STATE.md` file in the root of the repository with the following format:
+   Record the current high level research focus and potential next research directions. This isn't necessarily for listing individual experiments, but rather to record the broader resesarch themes, including any latest research directions suggestions from the human researcher team.
+   
+   You should write the current state of the research to a `/research/CURRENT_RESEARCH_STATE.md` file in the root of the repository with the following format:
    
    ```markdown
    # SENPAI Research State
@@ -146,11 +148,12 @@ swap_gh_pr_label <pr#> "status:review" "status:wip"
    - <list of idle students>
    - <list of PRs ready for review>
    - <list of PRs in review>
-   - <current research focus>
-   - <list of potential next research directions>
+   - <most recent research direction from human researcher team>
+   - <current research focus and themes>
+   - <list of potential next research directions and themes>
    ```
    
-   This is a living document, not an archive. Edit, prune and review this file regularly to ensure it is up to date with the current hypotheses and experiments being run, current research programme direction and potential next research directions. You can commit this file to the advisor branch.
+   This is a living document, not an archive or log. Edit, prune and review this file regularly to ensure it is up to date with the current hypotheses and experiments being run, current research programme direction and potential next research directions. You can commit this file to the advisor branch.
 
 5. **Wait 5 minutes**, then go back to step 1.
   Ensure you keep polling regularly for:
