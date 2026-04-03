@@ -942,6 +942,12 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: Asinh pressure transform
+    asinh_pressure: bool = False             # transform pressure targets with asinh for dynamic range compression
+    asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
+    # Phase 6: Tandem oversampling + loss multiplier
+    tandem_oversample: int = 1               # oversample tandem configs in sampler (1 = no change)
+    tandem_loss_mult: float = 1.0            # multiply surface loss for tandem samples
 
 
 cfg = sp.parse(Config)
@@ -960,6 +966,18 @@ train_ds, val_splits, stats, sample_weights = load_data(
     cfg.manifest, cfg.stats_file, debug=cfg.debug,
 )
 stats = {k: v.to(device) for k, v in stats.items()}
+
+# Phase 6: Tandem oversampling — boost tandem sample weights in sampler
+if cfg.tandem_oversample > 1:
+    import json as _json
+    with open(cfg.manifest) as _mf:
+        _manifest = _json.load(_mf)
+    _tandem_set = set(_manifest["domain_groups"].get("racecar_tandem", []))
+    _train_indices = train_ds.indices
+    for _i, _global_idx in enumerate(_train_indices):
+        if _global_idx in _tandem_set:
+            sample_weights[_i] *= cfg.tandem_oversample
+    print(f"Tandem oversampling: {cfg.tandem_oversample}x weight boost for tandem samples")
 
 
 def _umag_q(y, mask):
@@ -1035,6 +1053,9 @@ with torch.no_grad():
         if cfg.log_pressure:
             _yp = _yp.clone()
             _yp[:, :, 2:3] = _yp[:, :, 2:3].abs().add(1).log() * _yp[:, :, 2:3].sign()
+        if cfg.asinh_pressure:
+            _yp = _yp.clone()
+            _yp[:, :, 2:3] = torch.asinh(_yp[:, :, 2:3] * cfg.asinh_scale)
         _m = _mask.float().unsqueeze(-1)  # [B, N, 1]
         _phys_sum += (_yp * _m).sum(dim=(0, 1))
         _phys_sq_sum += (_yp ** 2 * _m).sum(dim=(0, 1))
@@ -1474,6 +1495,9 @@ for epoch in range(MAX_EPOCHS):
             if cfg.log_pressure:
                 y_phys = y_phys.clone()
                 y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
+            if cfg.asinh_pressure:
+                y_phys = y_phys.clone()
+                y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
             y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         # Residual prediction: subtract freestream from normalized targets
         _freestream = None
@@ -1634,6 +1658,9 @@ for epoch in range(MAX_EPOCHS):
                                        torch.ones(B, device=device))
         else:
             tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
+        # Phase 6: tandem loss multiplier (on top of adaptive boost)
+        if cfg.tandem_loss_mult != 1.0:
+            tandem_boost = torch.where(is_tandem_batch, tandem_boost * cfg.tandem_loss_mult, tandem_boost)
         surf_loss = (surf_per_sample * tandem_boost).mean()
         if cfg.uncertainty_loss:
             bm = _base_model
@@ -1946,6 +1973,9 @@ for epoch in range(MAX_EPOCHS):
                     if cfg.log_pressure:
                         y_phys = y_phys.clone()
                         y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
+                    if cfg.asinh_pressure:
+                        y_phys = y_phys.clone()
+                        y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
                     y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
                 # Residual prediction: subtract freestream in val loop
@@ -2047,6 +2077,9 @@ for epoch in range(MAX_EPOCHS):
                     if cfg.log_pressure:
                         pred_phys = pred_phys.clone()
                         pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
+                    if cfg.asinh_pressure:
+                        pred_phys = pred_phys.clone()
+                        pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
                     if cfg.tight_denorm_clamps:
                         _pd = pred_phys.clone()
                         _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
@@ -2261,6 +2294,9 @@ if best_metrics:
                         if cfg.log_pressure:
                             pred_phys = pred_phys.clone()
                             pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
+                        if cfg.asinh_pressure:
+                            pred_phys = pred_phys.clone()
+                            pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
                         if cfg.tight_denorm_clamps:
                             _pd = pred_phys.clone()
                             _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
@@ -2409,6 +2445,9 @@ if cfg.surface_refine and best_metrics:
 
                     # Z-score denorm
                     pred_phys_A = pred_refined * phys_stats["y_std"] + phys_stats["y_mean"]
+                    if cfg.asinh_pressure:
+                        pred_phys_A = pred_phys_A.clone()
+                        pred_phys_A[:, :, 2:3] = torch.sinh(pred_phys_A[:, :, 2:3]) / cfg.asinh_scale
                     # Physics denorm
                     pred_orig_A = _phys_denorm(pred_phys_A, Umag, q)
 
@@ -2427,6 +2466,9 @@ if cfg.surface_refine and best_metrics:
                         pred_manual = pred_manual + _v_freestream
                     # Step 5: undo z-score: pred * std + mean
                     pred_manual_phys = pred_manual * phys_stats["y_std"] + phys_stats["y_mean"]
+                    if cfg.asinh_pressure:
+                        pred_manual_phys = pred_manual_phys.clone()
+                        pred_manual_phys[:, :, 2:3] = torch.sinh(pred_manual_phys[:, :, 2:3]) / cfg.asinh_scale
                     # Step 6: undo physics norm: Ux*Umag, Uy*Umag, p*q
                     pred_manual_orig = torch.zeros_like(pred_manual_phys)
                     pred_manual_orig[:, :, 0:1] = pred_manual_phys[:, :, 0:1].clamp(-10, 10) * Umag
@@ -2441,6 +2483,9 @@ if cfg.surface_refine and best_metrics:
                     if cfg.residual_prediction and _v_freestream is not None:
                         pred_norefine = pred_norefine + _v_freestream
                     pred_norefine_phys = pred_norefine * phys_stats["y_std"] + phys_stats["y_mean"]
+                    if cfg.asinh_pressure:
+                        pred_norefine_phys = pred_norefine_phys.clone()
+                        pred_norefine_phys[:, :, 2:3] = torch.sinh(pred_norefine_phys[:, :, 2:3]) / cfg.asinh_scale
                     pred_norefine_orig = _phys_denorm(pred_norefine_phys, Umag, q)
 
                     # Compute surface pressure MAE for all paths
