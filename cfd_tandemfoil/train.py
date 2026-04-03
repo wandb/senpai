@@ -822,8 +822,8 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-MAX_TIMEOUT = 180.0  # minutes
-MAX_EPOCHS = 500
+MAX_TIMEOUT = float(os.environ.get("SENPAI_TIMEOUT_MINUTES", 180.0))  # minutes
+MAX_EPOCHS = int(os.environ.get("SENPAI_MAX_EPOCHS", 500))
 
 
 @dataclass
