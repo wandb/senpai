@@ -1,6 +1,32 @@
 # Baseline Metrics
 
-## Current Baseline (Phase 6 — 2026-04-03, T_max=160, 8-seed characterization)
+## Current Baseline (Phase 6 — 2026-04-03, Asinh Pressure s=0.75)
+
+| Metric | 8-seed Mean | Std | Best | Improvement |
+|--------|------------|-----|------|-------------|
+| p_in | **13.03** | 0.39 | 12.2 | ~0% vs prior |
+| p_oodc | **7.83** | 0.19 | 7.6 | **-6.1%** |
+| p_tan | **30.29** | 0.47 | 29.8 | ~0% vs prior |
+| p_re | **6.45** | 0.05 | 6.4 | **-3.9%** |
+
+**PR #2054** — `--asinh_pressure --asinh_scale 0.75`. Validated 8 seeds. W&B group: `phase6/asinh-075-multiseed`.
+
+**Reproduce:**
+```bash
+cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "baseline" \
+  --asinh_pressure --asinh_scale 0.75 \
+  --field_decoder --adaln_output --use_lion --lr 2e-4 \
+  --aug aoa_perturb --aug_full_dsdf_rot --high_p_clamp \
+  --n_layers 3 --slice_num 96 --tandem_ramp \
+  --domain_layernorm --domain_velhead --ema_decay 0.999 \
+  --weight_decay 5e-5 --cosine_T_max 160 --disable_pcgrad \
+  --pressure_first --pressure_deep --residual_prediction \
+  --surface_refine --surface_refine_hidden 192 --surface_refine_layers 3
+```
+
+---
+
+## Prior Baseline (Phase 6 — 2026-04-03, T_max=160, 8-seed characterization)
 
 | Metric | 8-seed Mean | Std | Best | Worst | 95% CI (±1.96σ) |
 |--------|------------|-----|------|-------|------------------|
