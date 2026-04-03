@@ -1,6 +1,36 @@
 # Baseline Metrics
 
-## Current Baseline (Phase 6 — 2026-04-03, Asinh Pressure s=0.75)
+## Current Baseline (Phase 6 — 2026-04-03, 8-Seed Prediction Ensemble)
+
+| Metric | 8-Ensemble | vs Asinh-only baseline |
+|--------|-----------|----------------------|
+| p_in | **12.4** | -4.8% |
+| p_oodc | **6.7** | **-14.4%** |
+| p_tan | **29.4** | -2.9% |
+| p_re | **5.8** | **-10.1%** |
+
+**PR #2076** — Post-hoc 8-seed ensemble (average predictions from 8 independently-trained models at inference time). No training changes. W&B run IDs: rboyvjeo, h0uog211, kwt8tw52, 5j26p5v1, rmump7ke, ujt9cu0l, 7fw8ksxq, 0lsry8km.
+
+**Reproduce:**
+```bash
+# Train 8 seeds
+for seed in 42 43 44 45 46 47 48 49; do
+  python train.py --agent <name> --wandb_name "<name>/asinh-bl-s${seed}" \
+    --asinh_pressure --asinh_scale 0.75 \
+    [all baseline flags] --seed ${seed}
+done
+
+# Evaluate ensemble
+python eval_ensemble.py \
+  --run_ids rboyvjeo h0uog211 kwt8tw52 5j26p5v1 rmump7ke ujt9cu0l 7fw8ksxq 0lsry8km \
+  --asinh_scale 0.75
+```
+
+⚠️ **Note:** Requires 8x inference cost. Each model uses 38GB VRAM. Can run serially or on 8 GPUs in parallel.
+
+---
+
+## Prior Baseline (Phase 6 — 2026-04-03, Asinh Pressure s=0.75)
 
 | Metric | 8-seed Mean | Std | Best | Improvement |
 |--------|------------|-----|------|-------------|
