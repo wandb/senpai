@@ -20,6 +20,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     Tandem surface loss is therefore underweighted.
 """
 
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -114,6 +115,43 @@ class MLP(nn.Module):
                 x = self.linears[i](x)
         x = self.linear_post(x)
         return x
+
+
+class PackedLinear(nn.Module):
+    """Grouped linear for Packed Ensembles (Laurent et al., ICLR 2023).
+
+    Embeds M independent sub-networks via block-diagonal weight matrix.
+    Each group processes in_features/M -> out_features/M independently.
+    Diversity comes from independent random init per group.
+    """
+
+    def __init__(self, in_features, out_features, num_groups, bias=True):
+        super().__init__()
+        assert in_features % num_groups == 0, (
+            f"in_features={in_features} not divisible by num_groups={num_groups}")
+        assert out_features % num_groups == 0, (
+            f"out_features={out_features} not divisible by num_groups={num_groups}")
+        self.num_groups = num_groups
+        self.in_per_group = in_features // num_groups
+        self.out_per_group = out_features // num_groups
+        self.weight = nn.Parameter(
+            torch.empty(num_groups, self.out_per_group, self.in_per_group))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.register_parameter("bias", None)
+        # Independent Kaiming init per group → each sub-model diverges from step 0
+        for g in range(num_groups):
+            nn.init.kaiming_uniform_(self.weight[g], a=math.sqrt(5))
+
+    def forward(self, x):
+        shape = x.shape[:-1]
+        x_g = x.reshape(*shape, self.num_groups, self.in_per_group)
+        out = torch.einsum("...gi,goi->...go", x_g, self.weight)
+        out = out.reshape(*shape, self.num_groups * self.out_per_group)
+        if self.bias is not None:
+            out = out + self.bias
+        return out
 
 
 class DomainLayerNorm(nn.Module):
@@ -282,8 +320,10 @@ class TransolverBlock(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        packed_M=1,
     ):
         super().__init__()
+        self.packed_M = packed_M
         self.last_layer = last_layer
         self.field_decoder = field_decoder
         self.domain_velhead = domain_velhead
@@ -326,7 +366,15 @@ class TransolverBlock(nn.Module):
             nn.init.zeros_(self.film_net[-1].weight)
             nn.init.zeros_(self.film_net[-1].bias)
         self.ln_2 = _LN(hidden_dim)
-        self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        if packed_M > 1:
+            act_fn = ACTIVATION[act]
+            self.mlp = nn.Sequential(
+                PackedLinear(hidden_dim, hidden_dim * mlp_ratio, packed_M),
+                act_fn(),
+                PackedLinear(hidden_dim * mlp_ratio, hidden_dim, packed_M),
+            )
+        else:
+            self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         self.spatial_bias = nn.Sequential(
             nn.Linear(4, 64), nn.GELU(),
             nn.Linear(64, 64), nn.GELU(),
@@ -336,10 +384,18 @@ class TransolverBlock(nn.Module):
         nn.init.zeros_(self.spatial_bias[-1].bias)
         self.ln_1_post = _LN(hidden_dim)
         self.ln_2_post = _LN(hidden_dim)
-        self.se_fc1 = nn.Linear(hidden_dim, hidden_dim // 4)
-        self.se_fc2 = nn.Linear(hidden_dim // 4, hidden_dim)
-        nn.init.zeros_(self.se_fc2.weight)
-        nn.init.zeros_(self.se_fc2.bias)
+        if packed_M > 1:
+            self.se_fc1 = PackedLinear(hidden_dim, hidden_dim // 4, packed_M)
+            self.se_fc2 = PackedLinear(hidden_dim // 4, hidden_dim, packed_M)
+            # Zero-init the last group weights for each sub-model
+            with torch.no_grad():
+                self.se_fc2.weight.zero_()
+                self.se_fc2.bias.zero_()
+        else:
+            self.se_fc1 = nn.Linear(hidden_dim, hidden_dim // 4)
+            self.se_fc2 = nn.Linear(hidden_dim // 4, hidden_dim)
+            nn.init.zeros_(self.se_fc2.weight)
+            nn.init.zeros_(self.se_fc2.bias)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
             if soft_moe:
@@ -419,6 +475,8 @@ class TransolverBlock(nn.Module):
             fx = gamma.unsqueeze(1) * fx + beta.unsqueeze(1)
         if self.last_layer:
             fx_ln = self.ln_3(fx)
+            if self.packed_M > 1:
+                return fx_ln  # Return features for PackedOutputHead
             if self.soft_moe:
                 gate = self.gate_net(fx_ln)  # [B, N, 2]
                 return gate[:, :, 0:1] * self.expert1(fx_ln) + gate[:, :, 1:2] * self.expert2(fx_ln)
@@ -565,6 +623,67 @@ class SurfaceRefinementContextHead(nn.Module):
         return correction
 
 
+class PackedOutputHead(nn.Module):
+    """M independent output heads for packed ensemble.
+
+    Splits hidden features into M groups; each head processes hidden_dim/M
+    features and produces a full out_dim prediction. Results are averaged.
+    """
+
+    def __init__(self, hidden_dim, out_dim, packed_M,
+                 pressure_first=False, pressure_no_detach=False,
+                 pressure_deep=False):
+        super().__init__()
+        self.packed_M = packed_M
+        self.pressure_first = pressure_first
+        self.pressure_no_detach = pressure_no_detach
+        head_dim = hidden_dim // packed_M
+
+        self.heads = nn.ModuleList()
+        for _ in range(packed_M):
+            if pressure_first:
+                if pressure_deep:
+                    pres = nn.Sequential(
+                        nn.Linear(head_dim, head_dim * 2), nn.GELU(),
+                        nn.Linear(head_dim * 2, head_dim), nn.GELU(),
+                        nn.Linear(head_dim, 1),
+                    )
+                else:
+                    pres = nn.Sequential(
+                        nn.Linear(head_dim, head_dim * 2), nn.GELU(),
+                        nn.Linear(head_dim * 2, 1),
+                    )
+                vel = nn.Sequential(
+                    nn.Linear(head_dim + 1, head_dim), nn.GELU(),
+                    nn.Linear(head_dim, 2),
+                )
+                self.heads.append(nn.ModuleDict({"pres": pres, "vel": vel}))
+            else:
+                self.heads.append(nn.Sequential(
+                    nn.Linear(head_dim, head_dim), nn.GELU(),
+                    nn.Linear(head_dim, out_dim),
+                ))
+
+    def forward(self, fx_ln):
+        B, N, _ = fx_ln.shape
+        head_dim = fx_ln.shape[-1] // self.packed_M
+        fx_groups = fx_ln.reshape(B, N, self.packed_M, head_dim)
+
+        preds = []
+        for i, head in enumerate(self.heads):
+            fx_i = fx_groups[:, :, i, :]
+            if self.pressure_first:
+                p_pred = head["pres"](fx_i)
+                p_cond = p_pred if self.pressure_no_detach else p_pred.detach()
+                vel_in = torch.cat([fx_i, p_cond], dim=-1)
+                v_pred = head["vel"](vel_in)
+                preds.append(torch.cat([v_pred, p_pred], dim=-1))
+            else:
+                preds.append(head(fx_i))
+
+        return torch.stack(preds, dim=2).mean(dim=2)
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -601,9 +720,11 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        packed_M=1,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
+        self.packed_M = packed_M
         self.pressure_first = pressure_first
         self.ref = ref
         self.unified_pos = unified_pos
@@ -671,10 +792,19 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
+                    packed_M=packed_M,
                 )
                 for idx in range(n_layers)
             ]
         )
+        # Packed ensemble output head
+        if packed_M > 1:
+            self.packed_output = PackedOutputHead(
+                n_hidden, out_dim, packed_M,
+                pressure_first=pressure_first,
+                pressure_no_detach=pressure_no_detach,
+                pressure_deep=pressure_deep,
+            )
         # Separate pressure pathway (pressure_separate_last_block):
         # Independent MLP + pres_head that processes shared hidden features
         self._pressure_separate = False  # set from Config after construction
@@ -810,6 +940,10 @@ class Transolver(nn.Module):
             fx = torch.cat([fx[:, :, :2], p_sep], dim=-1)
         else:
             fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+
+        if self.packed_M > 1:
+            # fx is [B, N, hidden_dim] from last block; apply packed output heads
+            fx = self.packed_output(fx)  # [B, N, out_dim] (averaged over M sub-models)
 
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
@@ -947,6 +1081,8 @@ class Config:
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
+    # Phase 6: Packed Ensemble — M sub-models via grouped linear ops
+    packed_M: int = 1                        # number of packed sub-models (1 = disabled)
 
 
 cfg = sp.parse(Config)
@@ -1106,6 +1242,7 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    packed_M=cfg.packed_M,
 )
 
 model = Transolver(**model_config).to(device)
