@@ -822,8 +822,8 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-MAX_TIMEOUT = float(os.environ.get("SENPAI_TIMEOUT_MINUTES", 180.0))
-MAX_EPOCHS = int(os.environ.get("SENPAI_MAX_EPOCHS", 500))
+MAX_TIMEOUT = 180.0  # minutes
+MAX_EPOCHS = 500
 
 
 @dataclass
@@ -1771,7 +1771,7 @@ for epoch in range(MAX_EPOCHS):
             loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        sam_active = sam_optimizer is not None and epoch >= int(MAX_EPOCHS * cfg.sam_start_frac)
+        sam_active = sam_optimizer is not None and epoch >= int(cfg.cosine_T_max * cfg.sam_start_frac)
         _should_step = (cfg.grad_accum_steps <= 1 or
                         (batch_idx + 1) % cfg.grad_accum_steps == 0 or
                         batch_idx == len(train_loader) - 1)
