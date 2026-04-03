@@ -42,7 +42,6 @@ class Args:
     extra_instructions: str = ""  # extra prompt text for the advisor: a .md file path or a literal string
     timeout_minutes: float = 30.0  # training run wall-clock limit (SENPAI_TIMEOUT_MINUTES)
     max_epochs: int = 50  # maximum training epochs (SENPAI_MAX_EPOCHS)
-    autocompact_pct: int = 40  # context % at which Claude auto-compacts (CLAUDE_AUTOCOMPACT_PCT_OVERRIDE)
     dry_run: bool = False  # print manifests without applying
 
 
@@ -81,7 +80,6 @@ def render_student(template: str, student_name: str, tag: str, args: Args) -> st
             "SENPAI_TIMEOUT_MINUTES": str(args.timeout_minutes),
             "SENPAI_MAX_EPOCHS": str(args.max_epochs),
             "PROBLEM_DIR": args.problem,
-            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": str(args.autocompact_pct),
         },
     )
     deployment = render_template(template, {
