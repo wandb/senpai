@@ -4,6 +4,32 @@
 
 ### New Assignments (2026-04-03)
 
+#### 2026-04-03 — PR #2068: Phase 6: Asymmetric/Magnitude-Weighted Surface Loss — alphonse — SENT BACK
+- Branch: `alphonse/asymmetric-loss`
+- W&B group: phase6/asymmetric-loss (8 runs finished)
+- Results: Mixed tradeoff. magweight α=1.0 improves p_tan -4.3% but worsens p_in +3.7%, p_oodc +3.8%.
+  - α=0.5: p_tan -2.0%, other metrics +0.5-1.5% worse
+  - α=1.0: p_tan -4.3%, p_in +3.7%, p_oodc +3.8% (tradeoff too steep)
+  - pinball τ=0.45: p_tan -2.1%, p_in +2.0%, p_oodc +3.7% (worse)
+- Conclusion: Magnitude weighting shifts gradient from OOD to tandem transfer. SENT BACK for milder α sweep (0.1-0.3).
+
+#### 2026-04-03 — PR #2088: Phase 6: MC Dropout in Surface Refine Head — nezuko — CLOSED
+- Branch: `nezuko/mc-dropout-surface-refine`
+- W&B group: phase6/mc-dropout (8 runs finished)
+- Results: NULL RESULT. No consistent improvement across configs.
+  - p=0.05 K=16: flat vs baseline (within noise)
+  - p=0.05 K=8: mixed (p_in +2.8%, p_re -2.3%)
+  - p=0.10 K=8: tradeoff (p_oodc -3.1%, p_re -3.5% BUT p_tan +3.5%)
+- Conclusion: MC Dropout stochasticity insufficient for meaningful variance reduction. EMA already provides implicit regularization. CLOSED.
+
+#### 2026-04-03 — PR #2080: Phase 6: Ensemble Seeds 66-73 — tanjiro — RESULTS IN
+- Branch: `tanjiro/ensemble-more-seeds`
+- W&B group: phase6/ensemble-more-seeds (8 runs finished)
+- Individual model metrics consistent with 8-seed baseline:
+  - p_in=13.06±0.34, p_oodc=7.88±0.17, p_tan=30.29±0.63, p_re=6.42±0.09
+- Pending: 16-seed ensemble evaluation (combining seeds 42-49 + 66-73)
+- Status: Awaiting ensemble eval from student
+
 #### 2026-04-03 — PR #2086: Phase 6: SAM Phase-Only — Flat Minima for OOD Generalization
 - Branch: `frieren/sam-phase-only`
 - Student: frieren
