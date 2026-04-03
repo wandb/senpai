@@ -34,7 +34,7 @@ from dataclasses import dataclass, asdict
 from einops import rearrange
 from timm.layers import trunc_normal_
 from tqdm import tqdm
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, WeightedRandomSampler, ConcatDataset, Dataset as TorchDataset
 import simple_parsing as sp
 
 from data.utils import visualize
@@ -822,8 +822,8 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-MAX_TIMEOUT = 180.0  # minutes
-MAX_EPOCHS = 500
+MAX_TIMEOUT = float(os.environ.get("SENPAI_TIMEOUT_MINUTES", 180.0))
+MAX_EPOCHS = int(os.environ.get("SENPAI_MAX_EPOCHS", 500))
 
 
 @dataclass
@@ -947,6 +947,12 @@ class Config:
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
+    # Phase 6: Synthetic data generation via interpolation
+    synth_ratio: float = 0.0                 # ratio of synthetic to real samples (0=none, 0.5=50% more, 1.0=double, 2.0=triple)
+    synth_beta_alpha: float = 0.4            # Beta distribution alpha (bimodal favoring near-original)
+    synth_beta_beta: float = 0.4             # Beta distribution beta
+    synth_aoa_tol_deg: float = 2.0           # AoA matching tolerance in degrees
+    synth_re_tol_frac: float = 0.05          # Re matching tolerance as fraction (5%)
 
 
 cfg = sp.parse(Config)
@@ -964,6 +970,97 @@ print(f"Device: {device}" + (" [DEBUG MODE]" if cfg.debug else ""))
 train_ds, val_splits, stats, sample_weights = load_data(
     cfg.manifest, cfg.stats_file, debug=cfg.debug,
 )
+
+
+# ---------------------------------------------------------------------------
+# Synthetic data generation via condition-matched interpolation
+# ---------------------------------------------------------------------------
+class SyntheticInterpolationDataset(TorchDataset):
+    """Generate synthetic training samples by interpolating condition-matched pairs.
+
+    For each synthetic sample, picks two training samples with similar AoA and Re,
+    then interpolates their features and targets using a Beta-distributed weight.
+    Handles variable-length meshes by truncating to the shorter sample's length.
+    """
+
+    def __init__(self, base_ds, n_synthetic, beta_alpha=0.4, beta_beta=0.4,
+                 aoa_tol_deg=2.0, re_tol_frac=0.05, seed=42):
+        self.base_ds = base_ds
+        self.n_synthetic = n_synthetic
+        self.beta_alpha = beta_alpha
+        self.beta_beta = beta_beta
+        self.rng = torch.Generator().manual_seed(seed)
+
+        # Extract conditions for all training samples
+        n_train = len(base_ds)
+        aoa_vals = torch.zeros(n_train)
+        re_vals = torch.zeros(n_train)
+        gap_vals = torch.zeros(n_train)
+        for i in range(n_train):
+            x, _, _ = base_ds[i]
+            aoa_vals[i] = x[0, 14]   # AoA0_rad
+            re_vals[i] = x[0, 13]    # log_Re
+            gap_vals[i] = x[0, 21]   # gap (tandem indicator)
+
+        # Build pair index: for each sample, list of compatible partner indices
+        import math as _math
+        aoa_tol_rad = aoa_tol_deg * (_math.pi / 180.0)
+        self.pair_map = {}  # sample_idx -> list of partner indices
+        n_pairs = 0
+        for i in range(n_train):
+            # Only pair within same domain type (tandem with tandem, single with single)
+            is_tandem_i = abs(gap_vals[i].item()) > 0.01
+            partners = []
+            for j in range(n_train):
+                if i == j:
+                    continue
+                is_tandem_j = abs(gap_vals[j].item()) > 0.01
+                if is_tandem_i != is_tandem_j:
+                    continue
+                aoa_diff = abs(aoa_vals[i].item() - aoa_vals[j].item())
+                re_diff = abs(re_vals[i].item() - re_vals[j].item()) / max(abs(re_vals[i].item()), 1e-8)
+                if aoa_diff <= aoa_tol_rad and re_diff <= re_tol_frac:
+                    partners.append(j)
+            if partners:
+                self.pair_map[i] = partners
+                n_pairs += len(partners)
+
+        self.valid_sources = list(self.pair_map.keys())
+        if not self.valid_sources:
+            print("WARNING: No valid interpolation pairs found! Synthetic dataset will be empty.")
+            self.n_synthetic = 0
+        else:
+            avg_partners = n_pairs / len(self.valid_sources)
+            print(f"Synthetic data: {len(self.valid_sources)}/{n_train} samples have partners "
+                  f"(avg {avg_partners:.1f} partners each), generating {self.n_synthetic} synthetic samples")
+
+    def __len__(self):
+        return self.n_synthetic
+
+    def __getitem__(self, idx):
+        # Pick a random source sample and one of its partners
+        src_idx = self.valid_sources[idx % len(self.valid_sources)]
+        partners = self.pair_map[src_idx]
+        partner_idx = partners[torch.randint(len(partners), (1,), generator=self.rng).item()]
+
+        x_a, y_a, surf_a = self.base_ds[src_idx]
+        x_b, y_b, surf_b = self.base_ds[partner_idx]
+
+        # Sample interpolation weight from Beta distribution
+        lam = torch.distributions.Beta(self.beta_alpha, self.beta_beta).sample().item()
+
+        # Truncate to minimum length so all nodes are valid in both
+        n_min = min(x_a.shape[0], x_b.shape[0])
+        x_a, y_a, surf_a = x_a[:n_min], y_a[:n_min], surf_a[:n_min]
+        x_b, y_b, surf_b = x_b[:n_min], y_b[:n_min], surf_b[:n_min]
+
+        # Interpolate features and targets
+        x_synth = lam * x_a + (1 - lam) * x_b
+        y_synth = lam * y_a + (1 - lam) * y_b
+        # Surface flag: conservative — only mark as surface if both parents agree
+        surf_synth = surf_a & surf_b
+
+        return x_synth, y_synth, surf_synth
 stats = {k: v.to(device) for k, v in stats.items()}
 
 
@@ -1007,17 +1104,37 @@ def _phys_denorm(y_p, Umag, q):
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=cfg.num_workers, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
 
+synth_ds = None
+effective_train_ds = train_ds
+if cfg.synth_ratio > 0 and not cfg.debug:
+    n_synthetic = int(len(train_ds) * cfg.synth_ratio)
+    synth_ds = SyntheticInterpolationDataset(
+        base_ds=train_ds,
+        n_synthetic=n_synthetic,
+        beta_alpha=cfg.synth_beta_alpha,
+        beta_beta=cfg.synth_beta_beta,
+        aoa_tol_deg=cfg.synth_aoa_tol_deg,
+        re_tol_frac=cfg.synth_re_tol_frac,
+        seed=cfg.seed if cfg.seed >= 0 else 42,
+    )
+    if len(synth_ds) > 0:
+        effective_train_ds = ConcatDataset([train_ds, synth_ds])
+        # Extend sample weights: synthetic samples get uniform weight
+        synth_weights = torch.ones(len(synth_ds), dtype=torch.float64) * sample_weights.mean().item()
+        sample_weights = torch.cat([sample_weights, synth_weights])
+        print(f"Training with {len(train_ds)} real + {len(synth_ds)} synthetic = {len(effective_train_ds)} total samples")
+
 if cfg.debug:
     # Avoid sampler/length mismatch when train_ds is truncated
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
+    train_loader = DataLoader(effective_train_ds, batch_size=cfg.batch_size,
                               shuffle=True, **loader_kwargs)
 else:
     sampler = WeightedRandomSampler(
         weights=sample_weights,
-        num_samples=len(train_ds),
+        num_samples=len(effective_train_ds),
         replacement=True,
     )
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
+    train_loader = DataLoader(effective_train_ds, batch_size=cfg.batch_size,
                               sampler=sampler, **loader_kwargs)
 
 val_loaders = {
@@ -1334,6 +1451,8 @@ run = wandb.init(
         "model_config": model_config,
         "n_params": n_params,
         "train_samples": len(train_ds),
+        "train_samples_effective": len(effective_train_ds),
+        "synth_samples": len(synth_ds) if synth_ds is not None else 0,
         "val_samples": {k: len(v) for k, v in val_splits.items()},
         "split_manifest": cfg.manifest,
     },
