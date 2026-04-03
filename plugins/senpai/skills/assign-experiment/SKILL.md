@@ -11,6 +11,8 @@ description: >
   Use this skill to: assign an experiment, create a hypothesis PR,
   give a student work.
 argument-hint: "<student-name> <hypothesis-slug>"
+model: claude-sonnet-4-6
+effort: high
 ---
 
 # assign-experiment
@@ -19,16 +21,12 @@ Create a branch and draft PR that assigns a hypothesis to a student. The student
 
 ## Arguments
 
-`$ARGUMENTS` is `<student-name> <hypothesis-slug>`, e.g. `fern cosine-annealing`.
-
-- **student-name** (first word) — The student to assign
-- **hypothesis-slug** (second word) — A short kebab-case slug for the hypothesis
+- **$0** — The student to assign (e.g. `fern`)
+- **$1** — A short kebab-case slug for the hypothesis (e.g. `cosine-annealing`)
 
 The hypothesis details, instructions, and baseline metrics come from your own reasoning — this skill handles the git/GitHub mechanics.
 
 ## Steps
-
-Parse `$ARGUMENTS`: split on first space — first word is **student-name**, second word is **hypothesis-slug**.
 
 1. **Start from the latest advisor branch:**
 
@@ -40,7 +38,7 @@ git checkout "$ADVISOR_BRANCH" && git pull origin "$ADVISOR_BRANCH"
 2. **Create the experiment branch:**
 
 ```bash
-BRANCH="<student-name>/<hypothesis-slug>"
+BRANCH="$0/$1"
 git checkout -b "$BRANCH"
 git push -u origin "$BRANCH"
 ```
@@ -68,7 +66,7 @@ include links to papers or code that support the hypothesis.>
 PREOF
 )" \
     --label "$ADVISOR_BRANCH" \
-    --label "student:<student-name>" \
+    --label "student:$0" \
     --label "status:wip" \
     --base "$ADVISOR_BRANCH" \
     --head "$BRANCH"

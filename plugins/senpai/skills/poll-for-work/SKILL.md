@@ -19,7 +19,7 @@ Check whether the advisor has assigned you an experiment PR to work on.
 
 ## Arguments
 
-`$ARGUMENTS` is your student name, e.g. `fern`.
+- **$0** — Your student name (e.g. `fern`)
 
 ## Steps
 
@@ -27,7 +27,7 @@ Check whether the advisor has assigned you an experiment PR to work on.
 
 ```bash
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
-student_poll_for_work "$ARGUMENTS"
+student_poll_for_work "$0"
 ```
 
 2. **If PRs are returned**, for each one:
