@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-03 ~20:45 UTC
+- **Date:** 2026-04-03 ~21:15 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Ensemble Expansion + Diverse Methods
 
@@ -21,31 +21,65 @@ Seeds: j9w7d1r7, mc4jvgqj, cbbvhl62, bigqfn3k, bqhg6lq8, 5ukk7wv6, xlnhwuqc, ii1
 3. 8-seed ensemble (PR #2076) — ALL metrics -3% to -14%
 4. Seeds 66-73 ensemble (PR #2080) — p_in -1.6%, p_tan -1.0%
 
-## Student Status (2026-04-03 ~20:45 UTC)
+## Student Status (2026-04-03 ~21:15 UTC)
 
-| Student | PR | Experiment | Status |
-|---------|-----|-----------|--------|
-| tanjiro | #2093 | 16-Seed Combined Ensemble Eval + seeds 100-106 | New |
-| thorfinn | #2092 | Standard 3L Seeds 82-89 | New — awaiting pickup |
-| nezuko | #2091 | Diverse Hyperparameter Ensemble (lr/T_max/wd sweep) | Running |
-| fern | #2090 | Knowledge Distillation from Ensemble | Awaiting pickup |
-| askeladd | #2089 | Ensemble Weight Opt + Seeds 90-95 | Running (6/8 seeds) |
-| edward | #2087 | Standard 3L Seeds 74-81 | Running (8/8) |
-| frieren | #2086 | SAM Phase-Only (rho sweep) | Running (8/8) |
-| alphonse | #2068 | Asymmetric Loss v2 (milder α=0.1-0.3) | Sent back, awaiting v2 |
+| Student | PR | Experiment | Status | ETA |
+|---------|-----|-----------|--------|-----|
+| frieren | #2086 | SAM Phase-Only (rho sweep) | Running ~110 min | ~70 min |
+| askeladd | #2089 | Seeds 90-95 + Ensemble Weight Opt | Running ~98 min (6/6 seeds) | ~80 min |
+| edward | #2087 | Standard 3L Seeds 74-81 | Running ~91 min (8/8) | ~90 min |
+| nezuko | #2091 | Diverse Hyperparameter Ensemble | Running ~67 min (8/8) | ~110 min |
+| thorfinn | #2092 | Standard 3L Seeds 82-89 | Running ~58 min (8/8) | ~120 min |
+| alphonse | #2068 | Asymmetric Loss v2 (α=0.1-0.3) | Running ~37 min (1 crash/retry) | ~140 min |
+| fern | #2090 | Knowledge Distillation | Re-training teachers (seeds 60-67) | ~3h total |
+| tanjiro | #2093 | 16-Seed Eval + Seeds 100-106 | Re-training seeds 42-49 first | ~3h total |
+
+**Note:** fern and tanjiro both encountered checkpoint unavailability (prior pod sessions cleaned up).
+- fern: re-training seeds 60-67 as teacher ensemble (~3h), then distilling
+- tanjiro: re-training seeds 42-49 (~3h), then 16-seed eval on GPU 0 + seeds 100-106 on GPUs 1-7
 
 ## Current Ensemble Seed Pool
 
 | Batch | Seeds | Status | Notes |
 |-------|-------|--------|-------|
-| Batch 1 | 42-49 | Done | Original 8-seed ensemble (p_in=12.4) |
+| Batch 1 | 42-49 | Done (re-training by tanjiro) | Original 8-seed ensemble (p_in=12.4) |
 | Batch 2 | 66-73 | Done ✓ MERGED | **New best** (p_in=12.2) |
-| Batch 3 | 74-81 | Training (edward) | ~1h remaining |
-| Batch 4 | 82-89 | New (thorfinn) | Just assigned |
-| Batch 5 | 90-95 | Training (askeladd) | ~1h remaining |
-| Batch 6 | 100-106 | New (tanjiro) | Just assigned |
+| Batch 3 | 74-81 | Training (edward) | ~90 min remaining |
+| Batch 4 | 82-89 | Training (thorfinn) | ~120 min remaining |
+| Batch 5 | 90-95 | Training (askeladd) | ~80 min remaining |
+| Batch 6 | 100-106 | Pending (tanjiro, after re-train) | ~4h |
 
-**Total seed pool when complete: 48 seeds** (6 batches × 8 seeds)
+**Total seed pool when complete: 48+ seeds**
+
+## Next Research Directions (researcher-agent output 2026-04-03 20:50)
+
+Ranked by priority — to be assigned as current experiments complete:
+
+### Priority 1: SWAD (Stochastic Weight Averaging Densely)
+- **Code change:** Flag flip `--swad True` (fully implemented in train.py)
+- **Evidence:** NeurIPS 2021 (Cha et al.) — flat basin averaging, strong OOD generalization
+- **Why now:** Ensemble variance reduction is our biggest lever. SWAD gives a single model parameter-space averaging without separate seeds. Orthogonal to Lion/EMA.
+- **Experiment:** Compare --swad True vs baseline, 8 seeds, seed=42 comparison + sweep
+
+### Priority 2: SGDR Warm Restarts (T_0=40, T_mult=2)
+- **Code change:** Flag flip `--scheduler_type warm_restarts --cosine_T_0 40 --cosine_T_mult 2`
+- **Evidence:** ICLR 2017 (Loshchilov & Hutter), widely validated
+- **Why:** p_tan=29.1 is notably worse than p_in=12.2 — suggests overfitting to single-foil geometry. Warm restarts escape local minima, especially for OOD splits.
+- **Experiment:** Compare standard cosine vs warm_restarts at T_0=40/T_mult=2, 8 seeds
+
+### Priority 3: Learnable Asinh Scale
+- **Code change:** ~5 lines — `self.asinh_scale = nn.Parameter(torch.tensor(0.75))`
+- **Why:** Fixed s=0.75 chosen by grid search. Learnable scale adapts per run to actual pressure distribution. Especially could help p_tan.
+- **Extension:** Asymmetric asinh (separate scale for positive/negative pressure)
+
+### Priority 4: Multi-Scale Output Supervision
+- **Code change:** ~15 lines — auxiliary head on `fx_deep` (pre-final block features)
+- **Evidence:** Deep supervision standard in nnUNet, HED, FNO variants
+- **Why:** 3-block Transolver is shallow. Aux loss forces earlier blocks to learn better physics representations.
+
+### Priority 5: Asinh on Velocity Channels
+- **Code change:** ~10 lines — apply asinh to Ux/Uy channels with separate scale
+- **Why:** Same motivation as pressure asinh — velocity has steep boundary-layer gradients dominating L1 loss
 
 ## Dead Ends This Session (2026-04-03)
 
@@ -85,14 +119,7 @@ Seeds: j9w7d1r7, mc4jvgqj, cbbvhl62, bigqfn3k, bqhg6lq8, 5ukk7wv6, xlnhwuqc, ii1
 4. **srf4L is a confirmed dead end** — extra surface refine layers hurt tandem transfer
 5. **Model too small for packed ensembles** — separate training + averaging strictly better
 6. **Architecture modifications absorbed by EMA+Lion** — incremental changes don't stick
-
-## Next Research Priorities
-
-1. **16-seed combined evaluation** (tanjiro #2093) — immediate priority
-2. **Knowledge distillation** (fern #2090) — could improve single-model quality
-3. **SAM phase-only** (frieren #2086) — could reduce seed variance
-4. **Diverse hyperparameter ensemble** (nezuko #2091) — test diversity beyond seed variation
-5. **Ensemble weight optimization** (askeladd #2089) — optimize per-model weights post-hoc
+7. **Checkpoint persistence** — student pods don't retain checkpoints across sessions; W&B artifacts needed for cross-node ensemble eval
 
 ## Human Team Directives (from issues #1860, #1834, #1926)
 - All ideas from issue #1926 tested (HyperP, MSA, mHC — deprioritized as most exploratory)
