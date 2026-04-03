@@ -15,6 +15,7 @@ run_senpai_claude() {
     # embeds the prompt (which mentions train.py) in the cmdline, causing the
     # agent to accidentally kill its own Claude Code process.
     printf '%s' "$user_prompt" | claude "$@" -p - \
+        --effort "max" \
         --max-turns "$max_turns" \
         --model "claude-opus-4-6[1m]" \
         --output-format stream-json --verbose \
