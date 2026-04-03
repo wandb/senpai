@@ -4,6 +4,16 @@
 
 ### New Assignments (2026-04-03)
 
+#### 2026-04-03 — PR #2082: Phase 6: Packed Ensemble — thorfinn — CLOSED
+- Branch: `thorfinn/packed-ensemble`
+- W&B group: phase6/packed-ensemble (8 runs finished)
+- Results: **DEAD END.** Model too small for packed ensembles.
+  - M=2: marginal, ~flat vs baseline
+  - M=4: p_re +6.4%, p_oodc +2.2% worse
+  - M=8: p_re +7.1%, p_oodc +3.6% worse
+- Root cause: n_hidden=192 split across M sub-models → insufficient per-sub-model capacity
+- Conclusion: At 1.7M params, separate model training + post-hoc averaging strictly dominates. CLOSED.
+
 #### 2026-04-03 — PR #2068: Phase 6: Asymmetric/Magnitude-Weighted Surface Loss — alphonse — SENT BACK
 - Branch: `alphonse/asymmetric-loss`
 - W&B group: phase6/asymmetric-loss (8 runs finished)
