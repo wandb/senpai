@@ -53,7 +53,7 @@ export IS_SANDBOX=1
 LOGDIR="$WORKDIR/student_logs"
 mkdir -p "$LOGDIR"
 SLEEP_TIME_S=60
-MAX_TURNS=50
+MAX_TURNS=10000
 
 ITERATION=0
 while true; do
