@@ -906,6 +906,8 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    yflip_aug: bool = False          # independent y-flip augmentation (can combine with aoa_perturb)
+    yflip_prob: float = 0.5          # probability of y-flip per sample (1.0 = always flip)
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1452,6 +1454,14 @@ for epoch in range(MAX_EPOCHS):
                     x[_b, _in_region] = x[_cut_idx[_b], _in_region]
                     y[_b, _in_region] = y[_cut_idx[_b], _in_region]
                     is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
+
+        # --- Independent y-flip augmentation (can combine with aoa_perturb) ---
+        if model.training and cfg.yflip_aug:
+            _yflip = torch.rand(x.size(0), 1, 1, device=x.device) < cfg.yflip_prob
+            x[:, :, 1:2] = torch.where(_yflip, -x[:, :, 1:2], x[:, :, 1:2])
+            y[:, :, 1:2] = torch.where(_yflip, -y[:, :, 1:2], y[:, :, 1:2])
+            for _idx in [3, 5, 7, 9]:
+                x[:, :, _idx:_idx+1] = torch.where(_yflip, -x[:, :, _idx:_idx+1], x[:, :, _idx:_idx+1])
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
