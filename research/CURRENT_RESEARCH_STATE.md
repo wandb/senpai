@@ -21,22 +21,22 @@ Seeds: j9w7d1r7, mc4jvgqj, cbbvhl62, bigqfn3k, bqhg6lq8, 5ukk7wv6, xlnhwuqc, ii1
 3. 8-seed ensemble (PR #2076) — ALL metrics -3% to -14%
 4. Seeds 66-73 ensemble (PR #2080) — p_in -1.6%, p_tan -1.0%
 
-## Student Status (2026-04-03 ~21:15 UTC)
+## Student Status (2026-04-03 ~23:20 UTC)
 
 | Student | PR | Experiment | Status | ETA |
 |---------|-----|-----------|--------|-----|
-| frieren | #2086 | SAM Phase-Only (rho sweep) | Running ~110 min | ~70 min |
-| askeladd | #2089 | Seeds 90-95 + Ensemble Weight Opt | Running ~98 min (6/6 seeds) | ~80 min |
-| edward | #2087 | Standard 3L Seeds 74-81 | Running ~91 min (8/8) | ~90 min |
-| nezuko | #2091 | Diverse Hyperparameter Ensemble | Running ~67 min (8/8) | ~110 min |
-| thorfinn | #2092 | Standard 3L Seeds 82-89 | Running ~58 min (8/8) | ~120 min |
-| alphonse | #2068 | Asymmetric Loss v2 (α=0.1-0.3) | Running ~37 min (1 crash/retry) | ~140 min |
-| fern | #2090 | Knowledge Distillation | Re-training teachers (seeds 60-67) | ~3h total |
-| tanjiro | #2093 | 16-Seed Eval + Seeds 100-106 | Re-training seeds 42-49 first | ~3h total |
+| edward | #2094 | SWAD Dense Weight Averaging | New — just assigned | ~3h |
+| askeladd | #2095 | SGDR Warm Restarts (T_0 sweep) | New — just assigned | ~3h |
+| nezuko | #2091 | Diverse Hyperparameter Ensemble | Running ~160 min | ~20 min |
+| thorfinn | #2092 | Standard 3L Seeds 82-89 | Running ~151 min | ~30 min |
+| fern | #2090 | Knowledge Distillation (teachers) | Running ~158 min | ~22 min |
+| tanjiro | #2093 | Re-train seeds 42-49, then eval+100-106 | Running ~145 min | ~35 min |
+| alphonse | #2068 | Asymmetric Loss v2 (α=0.1-0.3) | Running ~130 min | ~50 min |
+| frieren | #2086 | SAM Phase-Only v3 (restarted) | Running ~21 min | ~159 min |
 
-**Note:** fern and tanjiro both encountered checkpoint unavailability (prior pod sessions cleaned up).
-- fern: re-training seeds 60-67 as teacher ensemble (~3h), then distilling
-- tanjiro: re-training seeds 42-49 (~3h), then 16-seed eval on GPU 0 + seeds 100-106 on GPUs 1-7
+**Completed this round:**
+- edward #2087: Seeds 74-81 trained ✓ (CLOSED — models available for ensemble)
+- askeladd #2089: Weight optimization NULL RESULT ✓ (CLOSED — equal weights, need method diversity)
 
 ## Current Ensemble Seed Pool
 
@@ -44,9 +44,9 @@ Seeds: j9w7d1r7, mc4jvgqj, cbbvhl62, bigqfn3k, bqhg6lq8, 5ukk7wv6, xlnhwuqc, ii1
 |-------|-------|--------|-------|
 | Batch 1 | 42-49 | Done (re-training by tanjiro) | Original 8-seed ensemble (p_in=12.4) |
 | Batch 2 | 66-73 | Done ✓ MERGED | **New best** (p_in=12.2) |
-| Batch 3 | 74-81 | Training (edward) | ~90 min remaining |
+| Batch 3 | 74-81 | Done ✓ (edward) | 8 models trained |
 | Batch 4 | 82-89 | Training (thorfinn) | ~120 min remaining |
-| Batch 5 | 90-95 | Training (askeladd) | ~80 min remaining |
+| Batch 5 | 90-95 | Done ✓ (askeladd) | 6 models trained |
 | Batch 6 | 100-106 | Pending (tanjiro, after re-train) | ~4h |
 
 **Total seed pool when complete: 48+ seeds**
@@ -110,6 +110,7 @@ Ranked by priority — to be assigned as current experiments complete:
 | Physics losses | #2016,2023 | WLS instability |
 | MC Dropout | #2088 | Null result |
 | Packed Ensemble | #2082 | Model too small |
+| Ensemble Weight Opt | #2089 | Equal weights — no benefit from non-uniform weighting |
 
 ## Key Research Insights
 

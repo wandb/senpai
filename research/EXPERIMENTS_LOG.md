@@ -2,9 +2,43 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
-### New Assignments (2026-04-03)
+### New Assignments (2026-04-03 ~23:20 UTC)
 
-#### 2026-04-03 — PR #2092: Phase 6: Ensemble Seeds 82-89 — thorfinn — NEW
+#### 2026-04-03 — PR #2095: Phase 6: SGDR Warm Restarts — askeladd — NEW
+- Branch: `askeladd/sgdr-warm-restarts`
+- Hypothesis: Cosine annealing with warm restarts (T_0={20,40,60}, T_mult=2) for better OOD generalization
+- Status: WIP — just assigned (askeladd idle after #2089 closed)
+
+#### 2026-04-03 — PR #2094: Phase 6: SWAD Dense Weight Averaging — edward — NEW
+- Branch: `edward/swad-averaging`
+- Hypothesis: SWAD (NeurIPS 2021) averages checkpoints from validation-stable window for flatter minima
+- Status: WIP — just assigned (edward idle after #2087 closed)
+- Note: Requires refine_head bug fix (SWAD doesn't average surface refine head)
+
+### Completed (2026-04-03 ~23:00 UTC)
+
+#### 2026-04-03 — PR #2089: Phase 6: Ensemble Weight Optimization — askeladd — CLOSED (null result)
+- Branch: `askeladd/ensemble-weight-opt`
+- W&B group: phase6/ensemble-weight-opt (6 runs finished: seeds 90-95)
+- Results: **WEIGHT OPTIMIZATION NULL RESULT.** SLSQP converged to equal weights (~0.1 each).
+  - 10-model equal-weight ensemble: p_in=12.27, p_oodc=6.67, p_tan=29.08, p_re=5.83
+  - Best 6-of-10 selective: p_in=12.07, p_oodc=6.76, p_tan=29.18, p_re=5.80
+  - vs current baseline (8-seed, p_in=12.2): FLAT — no improvement
+- Key insight: Same-architecture models don't benefit from non-uniform weighting. Need method diversity.
+- Run IDs (seeds 90-95): ici6bxi1, 6chuzqal, xcsqiwdv, sxisuynb, q8m1w63d, ggn5mioe
+- CLOSED — documented, seeds available for future ensemble expansion
+
+#### 2026-04-03 — PR #2087: Phase 6: Ensemble Seeds 74-81 — edward — CLOSED (complete)
+- Branch: `edward/ensemble-seeds-74-81`
+- W&B group: phase6/ensemble-seeds-74-81 (8 runs finished)
+- Results: Individual model metrics consistent with baseline:
+  - Mean: p_in=13.11±0.45, p_oodc=7.97±0.17, p_tan=30.52±0.53, p_re=6.50±0.11
+- Run IDs: 2sre8vzp, ue8pmbbr, hgyim25m, e2obsfn1, 555102xo, 2lpzf6go, ibsrx1t8, a6e89sx4
+- CLOSED — seeds trained, available for combined ensemble evaluation
+
+### Prior Assignments (2026-04-03)
+
+#### 2026-04-03 — PR #2092: Phase 6: Ensemble Seeds 82-89 — thorfinn — RUNNING
 - Branch: `thorfinn/ensemble-seeds-82-89`
 - Hypothesis: More standard 3L seeds for ensemble expansion (total pool: 42-49, 66-73, 74-81, 82-89, 90-95)
 - Status: WIP — just assigned
