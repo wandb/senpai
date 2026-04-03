@@ -457,7 +457,7 @@ class SurfaceRefinementHead(nn.Module):
     """
 
     def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 128,
-                 n_layers: int = 2, p_only: bool = False):
+                 n_layers: int = 2, p_only: bool = False, dropout: float = 0.0):
         super().__init__()
         self.p_only = p_only
         actual_out = 1 if p_only else out_dim  # 1 for pressure-only, 3 for all fields
@@ -468,6 +468,8 @@ class SurfaceRefinementHead(nn.Module):
             layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
             layers.append(nn.LayerNorm(hidden_dim))
             layers.append(nn.GELU())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
         layers.append(nn.Linear(hidden_dim, actual_out))
         # Zero-init last layer so refinement starts as identity
         nn.init.zeros_(layers[-1].weight)
@@ -942,6 +944,8 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    mc_dropout: float = 0.0                   # dropout rate in surface refine MLP (0 = off)
+    mc_samples: int = 1                       # MC dropout passes at inference (>1 = ensemble avg)
     # Phase 6: Asinh pressure transform
     asinh_pressure: bool = False             # transform pressure targets with asinh for dynamic range compression
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
@@ -1132,6 +1136,7 @@ if cfg.surface_refine:
             hidden_dim=cfg.surface_refine_hidden,
             n_layers=cfg.surface_refine_layers,
             p_only=cfg.surface_refine_p_only,
+            dropout=cfg.mc_dropout,
         ).to(device)
     refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
     _refine_n_params = sum(p.numel() for p in refine_head.parameters())
@@ -2041,18 +2046,37 @@ for epoch in range(MAX_EPOCHS):
 
                 # Apply surface refinement head during validation
                 if eval_refine_head is not None:
+                    _mc_k = cfg.mc_samples if cfg.mc_dropout > 0 else 1
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                         if cfg.surface_refine_context:
-                            refine_correction = eval_refine_head(
-                                _eval_hidden, pred_loss, is_surface, mask, x[:, :, :2]
-                            ).float()
-                            pred_loss = pred_loss + refine_correction
+                            if _mc_k > 1:
+                                eval_refine_head.train()  # enable dropout
+                                corr_sum = torch.zeros_like(pred_loss)
+                                for _ in range(_mc_k):
+                                    corr_sum += eval_refine_head(
+                                        _eval_hidden, pred_loss, is_surface, mask, x[:, :, :2]
+                                    ).float()
+                                eval_refine_head.eval()
+                                pred_loss = pred_loss + corr_sum / _mc_k
+                            else:
+                                refine_correction = eval_refine_head(
+                                    _eval_hidden, pred_loss, is_surface, mask, x[:, :, :2]
+                                ).float()
+                                pred_loss = pred_loss + refine_correction
                         else:
                             surf_idx = is_surface.nonzero(as_tuple=False)
                             if surf_idx.numel() > 0:
                                 surf_hidden = _eval_hidden[surf_idx[:, 0], surf_idx[:, 1]]
                                 surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                                correction = eval_refine_head(surf_hidden, surf_pred).float()
+                                if _mc_k > 1:
+                                    eval_refine_head.train()  # enable dropout
+                                    corr_sum = torch.zeros_like(surf_pred)
+                                    for _ in range(_mc_k):
+                                        corr_sum += eval_refine_head(surf_hidden, surf_pred).float()
+                                    eval_refine_head.eval()
+                                    correction = corr_sum / _mc_k
+                                else:
+                                    correction = eval_refine_head(surf_hidden, surf_pred).float()
                                 pred_loss = pred_loss.clone()
                                 pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
@@ -2466,7 +2490,16 @@ if cfg.surface_refine and best_metrics:
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                             surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]
                             surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                            correction = verify_refine(surf_hidden, surf_pred).float()
+                            _mc_k = cfg.mc_samples if cfg.mc_dropout > 0 else 1
+                            if _mc_k > 1:
+                                verify_refine.train()
+                                corr_sum = torch.zeros_like(surf_pred)
+                                for _ in range(_mc_k):
+                                    corr_sum += verify_refine(surf_hidden, surf_pred).float()
+                                verify_refine.eval()
+                                correction = corr_sum / _mc_k
+                            else:
+                                correction = verify_refine(surf_hidden, surf_pred).float()
                         pred_loss_refined = pred_loss.clone()
                         pred_loss_refined[surf_idx[:, 0], surf_idx[:, 1]] += correction
                         correction_full[surf_idx[:, 0], surf_idx[:, 1]] = correction
