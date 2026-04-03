@@ -332,9 +332,21 @@ def main():
 
     # 8-seed ensemble
     if len(args.run_ids) >= 8:
-        print("\n--- 8-Seed Ensemble (42-49) ---")
+        print("\n--- 8-Seed Ensemble (first 8) ---")
         r8 = evaluate_ensemble(models_and_heads[:8], **kw)
         print_results("8-Seed Ensemble", r8)
+
+    # 16-seed ensemble
+    if len(args.run_ids) >= 16:
+        print("\n--- 16-Seed Ensemble (all 16) ---")
+        r16 = evaluate_ensemble(models_and_heads[:16], **kw)
+        print_results("16-Seed Ensemble", r16)
+
+    # Also eval second batch of 8 if 16 models available
+    if len(args.run_ids) >= 16:
+        print("\n--- 8-Seed Ensemble (second 8 only) ---")
+        r8b = evaluate_ensemble(models_and_heads[8:16], **kw)
+        print_results("8-Seed Ensemble (seeds 50-57)", r8b)
 
 
 if __name__ == "__main__":
