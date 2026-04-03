@@ -1,21 +1,25 @@
 # Baseline Metrics
 
-## Current Baseline (Phase 5 — 2026-04-02, Faster LR Decay T_max=160)
+## Current Baseline (Phase 6 — 2026-04-03, T_max=160, 8-seed characterization)
 
-| Metric | Single seed (s42) | Phase 5 prior | Change |
-|--------|-------------------|---------------|--------|
-| val/loss | **0.3761** | 0.383 | -1.8% |
-| p_in | **12.5** | 12.95 | -3.5% |
-| p_oodc | **8.2** | 8.31 | -1.3% |
-| p_tan | **29.8** | 30.01 | -0.7% |
-| p_re | **6.5** | 6.70 | -3.0% |
+| Metric | 8-seed Mean | Std | Best | Worst | 95% CI (±1.96σ) |
+|--------|------------|-----|------|-------|------------------|
+| val/loss | **0.3829** | 0.003 | 0.377 | 0.392 | ±0.006 |
+| p_in | **12.99** | 0.22 | 12.7 | 13.4 | ±0.43 |
+| p_oodc | **8.34** | 0.26 | 8.0 | 8.8 | ±0.51 |
+| p_tan | **30.13** | 0.45 | 29.5 | 30.9 | ±0.88 |
+| p_re | **6.71** | 0.08 | 6.6 | 6.9 | ±0.16 |
 
-**PR #2003** — cosine_T_max 180→160. Single seed, 155 epochs, 38.0 GB VRAM.
-W&B run: `9ysz96ll`
+**Significance thresholds** (must beat 8-seed mean - 2σ for confident improvement):
+- p_in < 12.56, p_oodc < 7.83, p_tan < 29.25, p_re < 6.55
+
+**PR #2003** — cosine_T_max 180→160. W&B group: `phase6/baseline-8seed` (PR #2052).
+
+**Note:** The original single-seed (PR #2003, val/loss=0.3761, p_in=12.5) was a lucky seed. Use the 8-seed mean as the TRUE baseline for merge decisions.
 
 **Reproduce:**
 ```bash
-cd cfd_tandemfoil && python train.py --agent edward --wandb_name "baseline" \
+cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "baseline" \
   --field_decoder --adaln_output --use_lion --lr 2e-4 \
   --aug aoa_perturb --aug_full_dsdf_rot --high_p_clamp \
   --n_layers 3 --slice_num 96 --tandem_ramp \
@@ -24,8 +28,6 @@ cd cfd_tandemfoil && python train.py --agent edward --wandb_name "baseline" \
   --pressure_first --pressure_deep --residual_prediction \
   --surface_refine --surface_refine_hidden 192 --surface_refine_layers 3
 ```
-
-⚠️ **Note:** Single-seed result. Multi-seed validation recommended to confirm robustness.
 
 ---
 
