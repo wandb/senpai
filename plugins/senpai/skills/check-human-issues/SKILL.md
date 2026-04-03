@@ -6,12 +6,11 @@
 name: check-human-issues
 description: >
   Check and respond to GitHub Issues from the human researcher team.
-  Runs in a forked context to keep issue content out of the main
-  conversation. Use this skill whenever you need to: check for human
+  Runs in a forked context (no access to main conversation). Use this skill whenever you need to: check for human
   messages, respond to human issues, poll for team communications,
   check GitHub issues. Also triggers for: "any human messages?",
   "check issues", "respond to humans".
-argument-hint: "<advisor-or-student-name> <advisor-or-student-role-prefix>"
+argument-hint: "<name> <ADVISOR|STUDENT>"
 context: fork
 model: claude-opus-4-6
 effort: high
@@ -23,8 +22,10 @@ Check GitHub Issues tagged `human` for messages from the research team, and resp
 
 ## Arguments
 
-- `$0` — Your name for gh issue filtering by label
-- `$1` — Your role prefix to add at the start of your comments (e.g. `ADVISOR` or `STUDENT <student-name>`)
+- **$0** — Your name/label for gh issue filtering (e.g. `noam`, `fern`)
+- **$1** — Either `ADVISOR` or `STUDENT`
+
+The comment prefix is: if role is `ADVISOR` → `ADVISOR:`, if role is `STUDENT` → `STUDENT $0:`.
 
 ## How it works
 
@@ -32,7 +33,7 @@ Human researchers communicate with agents through GitHub Issues. Issues are tagg
 
 ## Steps
 
-1. **Source the senpai-gh library** and list issues:
+1. **Source the senpai-gh library** and list issues using **name** as the label filter:
 
 ```bash
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
@@ -54,7 +55,10 @@ gh issue view <number> --json body,comments
 4. **Respond** with your role prefix:
 
 ```bash
-gh issue comment <number> --body "$1: <your response>"
+# ADVISOR example:
+gh issue comment <number> --body "ADVISOR: <your response>"
+# STUDENT example:
+gh issue comment <number> --body "STUDENT $0: <your response>"
 ```
 
 5. **Never close human issues.** Only the human does that.

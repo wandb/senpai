@@ -21,7 +21,7 @@ You've run the experiment, posted a results comment on the experiment PR — now
 
 ## Arguments
 
-- `$0` — The experiment PR number
+- **$0** — The experiment PR number (e.g. `1842`)
 
 ## Before you call this
 

@@ -21,7 +21,6 @@ advisor_branch: noam
 # training limits
 timeout_minutes: 30.0
 max_epochs: 50
-autocompact_pct: 40
 
 # students
 n_students: 4

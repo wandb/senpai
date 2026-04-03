@@ -11,6 +11,8 @@ description: >
   Use this skill to: assign an experiment, create a hypothesis PR,
   give a student work.
 argument-hint: "<student-name> <hypothesis-slug>"
+model: claude-sonnet-4-6
+effort: high
 ---
 
 # assign-experiment
@@ -19,8 +21,8 @@ Create a branch and draft PR that assigns a hypothesis to a student. The student
 
 ## Arguments
 
-- `$0` — Student name
-- `$1` — A short kebab-case slug for the hypothesis
+- **$0** — The student to assign (e.g. `fern`)
+- **$1** — A short kebab-case slug for the hypothesis (e.g. `cosine-annealing`)
 
 The hypothesis details, instructions, and baseline metrics come from your own reasoning — this skill handles the git/GitHub mechanics.
 

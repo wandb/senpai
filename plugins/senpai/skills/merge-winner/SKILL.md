@@ -18,13 +18,13 @@ effort: high
 
 # merge-winner
 
-A PR beat the baseline — merge it and record the new best metrics in BASELINE.md.
+A PR beat the baseline — merge it and record the new best metrics in BASELINE.md. Comment on the PR saying your are merging it and why if there isn't already a comment.
 
 ## Arguments
 
-- `$0` — The PR number
+- **$0** — The PR number (e.g. `1842`)
 
-Note: $ADVISOR_BRANCH is available as an environment variable.
+Note: `$ADVISOR_BRANCH` is available as an environment variable.
 
 ## Steps
 

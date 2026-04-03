@@ -19,7 +19,7 @@ Check whether the advisor has assigned you an experiment PR to work on.
 
 ## Arguments
 
-- `$0` — Your student name
+- **$0** — Your student name (e.g. `fern`)
 
 ## Steps
 

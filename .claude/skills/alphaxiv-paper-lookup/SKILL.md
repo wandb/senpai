@@ -1,6 +1,8 @@
 ---
 name: alphaxiv-paper-lookup
 description: Look up any arxiv paper on alphaxiv.org to get a structured AI-generated overview. This is faster and more reliable than trying to read a raw PDF.
+model: claude-opus-4-6
+effort: high
 ---
 
 # AlphaXiv Paper Lookup
