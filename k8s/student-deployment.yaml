@@ -49,11 +49,6 @@ spec:
             secretKeyRef:
               name: senpai-secrets
               key: wandb-api-key
-        - name: ANTHROPIC_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: senpai-secrets
-              key: anthropic-api-key
         - name: GITHUB_TOKEN
           valueFrom:
             secretKeyRef:
