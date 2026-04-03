@@ -945,6 +945,9 @@ class Config:
     # Phase 6: Asinh pressure transform
     asinh_pressure: bool = False             # transform pressure targets with asinh for dynamic range compression
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
+    # Phase 6: Asinh velocity transform
+    asinh_velocity: bool = False             # transform velocity targets (Ux, Uy) with asinh
+    asinh_vel_scale: float = 1.0             # scale factor for velocity asinh: asinh(v * vel_scale)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
 
@@ -1043,6 +1046,9 @@ with torch.no_grad():
         if cfg.asinh_pressure:
             _yp = _yp.clone()
             _yp[:, :, 2:3] = torch.asinh(_yp[:, :, 2:3] * cfg.asinh_scale)
+        if cfg.asinh_velocity:
+            _yp = _yp.clone()
+            _yp[:, :, 0:2] = torch.asinh(_yp[:, :, 0:2] * cfg.asinh_vel_scale)
         _m = _mask.float().unsqueeze(-1)  # [B, N, 1]
         _phys_sum += (_yp * _m).sum(dim=(0, 1))
         _phys_sq_sum += (_yp ** 2 * _m).sum(dim=(0, 1))
@@ -1064,6 +1070,8 @@ if cfg.raw_targets or cfg.adaptive_norm:
             _yt = _y.clone()
             if cfg.adaptive_norm and cfg.asinh_pressure:
                 _yt[:, :, 2:3] = torch.asinh(_yt[:, :, 2:3] * cfg.asinh_scale)
+            if cfg.adaptive_norm and cfg.asinh_velocity:
+                _yt[:, :, 0:2] = torch.asinh(_yt[:, :, 0:2] * cfg.asinh_vel_scale)
             _m = _mask.float().unsqueeze(-1)
             _raw_sum += (_yt * _m).sum(dim=(0, 1))
             _raw_sq_sum += (_yt ** 2 * _m).sum(dim=(0, 1))
@@ -1485,6 +1493,8 @@ for epoch in range(MAX_EPOCHS):
             y_adapt = y.clone()
             if cfg.asinh_pressure:
                 y_adapt[:, :, 2:3] = torch.asinh(y_adapt[:, :, 2:3] * cfg.asinh_scale)
+            if cfg.asinh_velocity:
+                y_adapt[:, :, 0:2] = torch.asinh(y_adapt[:, :, 0:2] * cfg.asinh_vel_scale)
             y_norm = (y_adapt - raw_stats["y_mean"]) / raw_stats["y_std"]
         else:
             y_phys = _phys_norm(y, Umag, q)
@@ -1494,6 +1504,9 @@ for epoch in range(MAX_EPOCHS):
             if cfg.asinh_pressure:
                 y_phys = y_phys.clone()
                 y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
+            if cfg.asinh_velocity:
+                y_phys = y_phys.clone()
+                y_phys[:, :, 0:2] = torch.asinh(y_phys[:, :, 0:2] * cfg.asinh_vel_scale)
             y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         # Residual prediction: subtract freestream from normalized targets
         _freestream = None
@@ -1972,6 +1985,8 @@ for epoch in range(MAX_EPOCHS):
                     y_adapt = y.clone()
                     if cfg.asinh_pressure:
                         y_adapt[:, :, 2:3] = torch.asinh(y_adapt[:, :, 2:3] * cfg.asinh_scale)
+                    if cfg.asinh_velocity:
+                        y_adapt[:, :, 0:2] = torch.asinh(y_adapt[:, :, 0:2] * cfg.asinh_vel_scale)
                     y_norm = (y_adapt - raw_stats["y_mean"]) / raw_stats["y_std"]
                 else:
                     y_phys = _phys_norm(y, Umag, q)
@@ -1981,6 +1996,9 @@ for epoch in range(MAX_EPOCHS):
                     if cfg.asinh_pressure:
                         y_phys = y_phys.clone()
                         y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
+                    if cfg.asinh_velocity:
+                        y_phys = y_phys.clone()
+                        y_phys[:, :, 0:2] = torch.asinh(y_phys[:, :, 0:2] * cfg.asinh_vel_scale)
                     y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
                 # Residual prediction: subtract freestream in val loop
@@ -2089,6 +2107,9 @@ for epoch in range(MAX_EPOCHS):
                     if cfg.asinh_pressure:
                         pred_adapt = pred_adapt.clone()
                         pred_adapt[:, :, 2:3] = torch.sinh(pred_adapt[:, :, 2:3]) / cfg.asinh_scale
+                    if cfg.asinh_velocity:
+                        pred_adapt = pred_adapt.clone()
+                        pred_adapt[:, :, 0:2] = torch.sinh(pred_adapt[:, :, 0:2]) / cfg.asinh_vel_scale
                     pred_orig = pred_adapt
                 else:
                     pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
@@ -2098,6 +2119,9 @@ for epoch in range(MAX_EPOCHS):
                     if cfg.asinh_pressure:
                         pred_phys = pred_phys.clone()
                         pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
+                    if cfg.asinh_velocity:
+                        pred_phys = pred_phys.clone()
+                        pred_phys[:, :, 0:2] = torch.sinh(pred_phys[:, :, 0:2]) / cfg.asinh_vel_scale
                     if cfg.tight_denorm_clamps:
                         _pd = pred_phys.clone()
                         _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
@@ -2312,6 +2336,9 @@ if best_metrics:
                         if cfg.asinh_pressure:
                             pred_adapt = pred_adapt.clone()
                             pred_adapt[:, :, 2:3] = torch.sinh(pred_adapt[:, :, 2:3]) / cfg.asinh_scale
+                        if cfg.asinh_velocity:
+                            pred_adapt = pred_adapt.clone()
+                            pred_adapt[:, :, 0:2] = torch.sinh(pred_adapt[:, :, 0:2]) / cfg.asinh_vel_scale
                         y_pred = pred_adapt.squeeze(0).cpu()
                     else:
                         pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
@@ -2321,6 +2348,9 @@ if best_metrics:
                         if cfg.asinh_pressure:
                             pred_phys = pred_phys.clone()
                             pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
+                        if cfg.asinh_velocity:
+                            pred_phys = pred_phys.clone()
+                            pred_phys[:, :, 0:2] = torch.sinh(pred_phys[:, :, 0:2]) / cfg.asinh_vel_scale
                         if cfg.tight_denorm_clamps:
                             _pd = pred_phys.clone()
                             _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
@@ -2410,6 +2440,8 @@ if cfg.surface_refine and best_metrics:
                         y_adapt = y.clone()
                         if cfg.asinh_pressure:
                             y_adapt[:, :, 2:3] = torch.asinh(y_adapt[:, :, 2:3] * cfg.asinh_scale)
+                        if cfg.asinh_velocity:
+                            y_adapt[:, :, 0:2] = torch.asinh(y_adapt[:, :, 0:2] * cfg.asinh_vel_scale)
                         y_norm = (y_adapt - raw_stats["y_mean"]) / raw_stats["y_std"]
                     else:
                         y_phys = _phys_norm(y, Umag, q)
@@ -2486,6 +2518,9 @@ if cfg.surface_refine and best_metrics:
                     if cfg.asinh_pressure:
                         pred_phys_A = pred_phys_A.clone()
                         pred_phys_A[:, :, 2:3] = torch.sinh(pred_phys_A[:, :, 2:3]) / cfg.asinh_scale
+                    if cfg.asinh_velocity:
+                        pred_phys_A = pred_phys_A.clone()
+                        pred_phys_A[:, :, 0:2] = torch.sinh(pred_phys_A[:, :, 0:2]) / cfg.asinh_vel_scale
                     # Physics denorm (skip for adaptive_norm — already in raw space)
                     pred_orig_A = pred_phys_A if cfg.adaptive_norm else _phys_denorm(pred_phys_A, Umag, q)
 
@@ -2507,6 +2542,9 @@ if cfg.surface_refine and best_metrics:
                     if cfg.asinh_pressure:
                         pred_manual_phys = pred_manual_phys.clone()
                         pred_manual_phys[:, :, 2:3] = torch.sinh(pred_manual_phys[:, :, 2:3]) / cfg.asinh_scale
+                    if cfg.asinh_velocity:
+                        pred_manual_phys = pred_manual_phys.clone()
+                        pred_manual_phys[:, :, 0:2] = torch.sinh(pred_manual_phys[:, :, 0:2]) / cfg.asinh_vel_scale
                     # Step 6: undo physics norm: Ux*Umag, Uy*Umag, p*q
                     if cfg.adaptive_norm:
                         pred_manual_orig = pred_manual_phys
@@ -2527,6 +2565,9 @@ if cfg.surface_refine and best_metrics:
                     if cfg.asinh_pressure:
                         pred_norefine_phys = pred_norefine_phys.clone()
                         pred_norefine_phys[:, :, 2:3] = torch.sinh(pred_norefine_phys[:, :, 2:3]) / cfg.asinh_scale
+                    if cfg.asinh_velocity:
+                        pred_norefine_phys = pred_norefine_phys.clone()
+                        pred_norefine_phys[:, :, 0:2] = torch.sinh(pred_norefine_phys[:, :, 0:2]) / cfg.asinh_vel_scale
                     pred_norefine_orig = pred_norefine_phys if cfg.adaptive_norm else _phys_denorm(pred_norefine_phys, Umag, q)
 
                     # Compute surface pressure MAE for all paths
