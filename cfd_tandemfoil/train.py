@@ -826,6 +826,56 @@ MAX_TIMEOUT = 180.0  # minutes
 MAX_EPOCHS = 500
 
 
+def compute_potential_flow(coords, aoa_rad, mask, with_kutta=False):
+    """Compute analytic potential flow velocity at each node.
+
+    Potential flow = uniform freestream + optional Kutta-Joukowski circulation
+    from a point vortex (per-foil).
+
+    Args:
+        coords: [B, N, 2] node xy coordinates (raw, not normalized)
+        aoa_rad: [B, 1] angle of attack in radians
+        mask: [B, N] bool valid node mask
+        with_kutta: if True, add Kutta-Joukowski circulation term
+    Returns:
+        [B, N, 2] potential flow velocity (Vx, Vy) in freestream-normalized units
+    """
+    B, N, _ = coords.shape
+    device = coords.device
+
+    cos_a = torch.cos(aoa_rad)  # [B, 1]
+    sin_a = torch.sin(aoa_rad)  # [B, 1]
+
+    # Freestream (V_inf = 1.0 normalized)
+    vx_pot = cos_a.unsqueeze(-1).expand(B, N, 1)  # [B, N, 1]
+    vy_pot = sin_a.unsqueeze(-1).expand(B, N, 1)  # [B, N, 1]
+
+    if with_kutta:
+        # Kutta-Joukowski: Γ = 2π * sin(AoA) * chord (thin airfoil, chord=1)
+        # Point vortex at foil centroid (estimated from coords centroid)
+        # Vx = -Γ*(y-yc)/(2π*r²), Vy = +Γ*(x-xc)/(2π*r²)
+        gamma = 2.0 * torch.pi * torch.sin(aoa_rad)  # [B, 1] circulation strength
+
+        # Foil centroid: estimate as centroid of nodes near the domain center
+        # Use masked average of all valid nodes as a proxy
+        n_valid = mask.float().sum(dim=1, keepdim=True).clamp(min=1.0)  # [B, 1]
+        xc = (coords[:, :, 0] * mask.float()).sum(dim=1, keepdim=True) / n_valid  # [B, 1]
+        yc = (coords[:, :, 1] * mask.float()).sum(dim=1, keepdim=True) / n_valid  # [B, 1]
+
+        dx = coords[:, :, 0] - xc  # [B, N]
+        dy = coords[:, :, 1] - yc  # [B, N]
+        r2 = (dx ** 2 + dy ** 2).clamp(min=0.01)  # [B, N], clamp to avoid singularity
+
+        # Point vortex induced velocities
+        vx_kutta = -(gamma / (2.0 * torch.pi)) * dy / r2  # [B, N]
+        vy_kutta = +(gamma / (2.0 * torch.pi)) * dx / r2  # [B, N]
+
+        vx_pot = vx_pot + vx_kutta.unsqueeze(-1)
+        vy_pot = vy_pot + vy_kutta.unsqueeze(-1)
+
+    return torch.cat([vx_pot, vy_pot], dim=-1)  # [B, N, 2]
+
+
 @dataclass
 class Config:
     lr: float = 1.5e-3
@@ -942,6 +992,10 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: Potential flow features
+    potential_flow: bool = False     # add analytic potential flow velocity as 2 extra input features
+    pf_kutta: bool = False           # include Kutta-Joukowski circulation correction
+    pf_residual: bool = False        # subtract potential flow from targets (instead of freestream)
 
 
 cfg = sp.parse(Config)
@@ -1065,7 +1119,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32 + (2 if cfg.potential_flow else 0),  # +curv, +dist, [+foil2dist], +32 fourier PE, [+2 potential flow]
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1445,6 +1499,7 @@ for epoch in range(MAX_EPOCHS):
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
+        _raw_coords = x[:, :, :2]  # raw xy coords before normalization (for potential flow)
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1463,6 +1518,16 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
+        # Potential flow features: append Vx_pot, Vy_pot in Cp-normalized space
+        _pf_vel = None
+        if cfg.potential_flow:
+            _pf_vel = compute_potential_flow(
+                _raw_coords, _raw_aoa, mask, with_kutta=cfg.pf_kutta
+            )  # [B, N, 2] in freestream-normalized units (Vx/Vinf, Vy/Vinf)
+            # Convert to Cp-normalized space: divide by phys_stats std, center by mean
+            _pf_phys = torch.cat([_pf_vel, torch.zeros_like(_pf_vel[:, :, :1])], dim=-1)  # [B, N, 3]
+            _pf_norm = (_pf_phys - phys_stats["y_mean"]) / phys_stats["y_std"]  # [B, N, 3]
+            x = torch.cat([x, _pf_norm[:, :, :2]], dim=-1)  # append Vx, Vy features only
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -1475,7 +1540,7 @@ for epoch in range(MAX_EPOCHS):
                 y_phys = y_phys.clone()
                 y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
             y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
-        # Residual prediction: subtract freestream from normalized targets
+        # Residual prediction: subtract freestream (or potential flow) from normalized targets
         _freestream = None
         if cfg.residual_prediction:
             # Freestream in Cp-normalized space: (cos(AoA), sin(AoA), 0)
@@ -1487,6 +1552,18 @@ for epoch in range(MAX_EPOCHS):
             _fs_phys[:, 0, 2] = 0.0  # p/q
             _freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]  # [B, 1, 3]
             y_norm = y_norm - _freestream  # subtract freestream (broadcasts over N)
+        if cfg.pf_residual and _pf_vel is not None:
+            # Additionally subtract node-wise potential flow correction (over freestream)
+            _aoa = _raw_aoa
+            _pf_full = torch.cat([_pf_vel, torch.zeros(_pf_vel.shape[0], _pf_vel.shape[1], 1, device=device)], dim=-1)
+            _pf_full_norm = (_pf_full - phys_stats["y_mean"]) / phys_stats["y_std"]  # [B, N, 3]
+            # freestream contribution already subtracted (if residual_prediction); subtract residual
+            if cfg.residual_prediction:
+                # Subtract the per-node deviation from uniform freestream
+                _fs_uniform = _freestream.expand_as(_pf_full_norm)
+                y_norm = y_norm - (_pf_full_norm - _fs_uniform)
+            else:
+                y_norm = y_norm - _pf_full_norm
         if model.training and not cfg.no_target_noise:
             noise_progress = min(1.0, epoch / max(cfg.noise_anneal_epochs, 1))
             if cfg.half_target_noise:
@@ -1920,6 +1997,7 @@ for epoch in range(MAX_EPOCHS):
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
+                _raw_coords_v = x[:, :, :2]  # raw xy before normalization
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1938,6 +2016,14 @@ for epoch in range(MAX_EPOCHS):
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
+                _v_pf_vel = None
+                if cfg.potential_flow:
+                    _v_pf_vel = compute_potential_flow(
+                        _raw_coords_v, _raw_aoa, mask, with_kutta=cfg.pf_kutta
+                    )
+                    _v_pf_phys = torch.cat([_v_pf_vel, torch.zeros_like(_v_pf_vel[:, :, :1])], dim=-1)
+                    _v_pf_norm = (_v_pf_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                    x = torch.cat([x, _v_pf_norm[:, :, :2]], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
@@ -1957,6 +2043,14 @@ for epoch in range(MAX_EPOCHS):
                     _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))
                     _v_freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
                     y_norm = y_norm - _v_freestream
+                if cfg.pf_residual and _v_pf_vel is not None:
+                    _v_pf_full = torch.cat([_v_pf_vel, torch.zeros(_v_pf_vel.shape[0], _v_pf_vel.shape[1], 1, device=device)], dim=-1)
+                    _v_pf_full_norm = (_v_pf_full - phys_stats["y_mean"]) / phys_stats["y_std"]
+                    if cfg.residual_prediction:
+                        _fs_uni = _v_freestream.expand_as(_v_pf_full_norm)
+                        y_norm = y_norm - (_v_pf_full_norm - _fs_uni)
+                    else:
+                        y_norm = y_norm - _v_pf_full_norm
 
                 # Per-sample std normalization: skip tandem samples
                 raw_gap = x[:, 0, 21]
@@ -2038,6 +2132,14 @@ for epoch in range(MAX_EPOCHS):
                 # Add freestream back for residual prediction mode
                 if cfg.residual_prediction and _v_freestream is not None:
                     pred = pred + _v_freestream  # add freestream back before denorm
+                # Add potential flow residual back
+                if cfg.pf_residual and _v_pf_vel is not None:
+                    _v_pf_full = torch.cat([_v_pf_vel, torch.zeros(_v_pf_vel.shape[0], _v_pf_vel.shape[1], 1, device=device)], dim=-1)
+                    _v_pf_full_norm = (_v_pf_full - phys_stats["y_mean"]) / phys_stats["y_std"]
+                    if cfg.residual_prediction:
+                        pred = pred + (_v_pf_full_norm - _v_freestream.expand_as(_v_pf_full_norm))
+                    else:
+                        pred = pred + _v_pf_full_norm
 
                 # Denormalize: phys_stats → Cp space → original scale
                 if cfg.raw_targets:
@@ -2240,6 +2342,8 @@ if best_metrics:
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
+                    _vis_raw_aoa = x_dev[:, 0, 14:15]  # AoA0_rad before normalization
+                    _vis_raw_coords = x_dev[:, :, :2]   # raw xy before normalization
                     x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                     curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                     x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
@@ -2252,8 +2356,30 @@ if best_metrics:
                     xy_scaled = xy_norm.unsqueeze(-1) * freqs
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
+                    # Potential flow features (must match training loop)
+                    if cfg.potential_flow:
+                        _vis_pf_vel = compute_potential_flow(
+                            _vis_raw_coords, _vis_raw_aoa, mask, with_kutta=cfg.pf_kutta
+                        )
+                        _vis_pf_phys = torch.cat([_vis_pf_vel, torch.zeros_like(_vis_pf_vel[:, :, :1])], dim=-1)
+                        _vis_pf_norm = (_vis_pf_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                        x_n = torch.cat([x_n, _vis_pf_norm[:, :, :2]], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
                     pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
+                    # Add back residual/potential flow before denormalization
+                    if cfg.residual_prediction:
+                        _vis_fs = torch.zeros(1, 1, 3, device=device)
+                        _vis_fs[0, 0, 0] = torch.cos(_vis_raw_aoa.squeeze())
+                        _vis_fs[0, 0, 1] = torch.sin(_vis_raw_aoa.squeeze())
+                        _vis_freestream = (_vis_fs - phys_stats["y_mean"]) / phys_stats["y_std"]
+                        pred = pred + _vis_freestream
+                    if cfg.pf_residual and cfg.potential_flow:
+                        _vis_pf_full = torch.cat([_vis_pf_vel, torch.zeros_like(_vis_pf_vel[:, :, :1])], dim=-1)
+                        _vis_pf_full_norm = (_vis_pf_full - phys_stats["y_mean"]) / phys_stats["y_std"]
+                        if cfg.residual_prediction:
+                            pred = pred + (_vis_pf_full_norm - _vis_freestream.expand_as(_vis_pf_full_norm))
+                        else:
+                            pred = pred + _vis_pf_full_norm
                     if cfg.raw_targets:
                         y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                     else:
@@ -2328,6 +2454,7 @@ if cfg.surface_refine and best_metrics:
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
+                    _raw_coords_vfy = x[:, :, :2]
                     x = (x - stats["x_mean"]) / stats["x_std"]
                     curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                     if cfg.foil2_dist:
@@ -2343,6 +2470,13 @@ if cfg.surface_refine and best_metrics:
                     xy_scaled = xy_norm.unsqueeze(-1) * freqs
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x = torch.cat([x, fourier_pe], dim=-1)
+                    if cfg.potential_flow:
+                        _vfy_pf_vel = compute_potential_flow(
+                            _raw_coords_vfy, _raw_aoa, mask, with_kutta=cfg.pf_kutta
+                        )
+                        _vfy_pf_phys = torch.cat([_vfy_pf_vel, torch.zeros_like(_vfy_pf_vel[:, :, :1])], dim=-1)
+                        _vfy_pf_norm = (_vfy_pf_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                        x = torch.cat([x, _vfy_pf_norm[:, :, :2]], dim=-1)
 
                     # Ground truth denormalization reference
                     Umag, q = _umag_q(y, mask)
