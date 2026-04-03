@@ -2413,6 +2413,9 @@ if cfg.surface_refine and best_metrics:
                         y_norm = (y_adapt - raw_stats["y_mean"]) / raw_stats["y_std"]
                     else:
                         y_phys = _phys_norm(y, Umag, q)
+                        if cfg.asinh_pressure:
+                            y_phys = y_phys.clone()
+                            y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
                         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
                     # Residual prediction
