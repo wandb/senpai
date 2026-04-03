@@ -947,6 +947,10 @@ class Config:
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
+    # Phase 6: Asymmetric / magnitude-weighted surface loss
+    surface_loss_type: str = "l1"            # "l1" (default), "magnitude_weighted", "pinball"
+    magnitude_alpha: float = 0.5             # alpha for magnitude-weighted: w_i = 1 + alpha * |p_i| / mean|p|
+    pinball_tau: float = 0.45                # tau for pinball loss (< 0.5 penalizes overprediction more)
 
 
 cfg = sp.parse(Config)
@@ -1638,14 +1642,29 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        # --- Asymmetric / magnitude-weighted surface pressure error ---
+        if cfg.surface_loss_type == "magnitude_weighted":
+            # Weight by original (pre-transform) pressure magnitude
+            orig_p_abs = y[:, :, 2:3].abs()  # [B, N, 1] in original units
+            surf_count = surf_mask.sum(dim=1, keepdim=True).clamp(min=1).float()  # [B, 1]
+            mean_p = (orig_p_abs.squeeze(-1) * surf_mask.float()).sum(dim=1, keepdim=True) / surf_count  # [B, 1]
+            mag_weight = 1.0 + cfg.magnitude_alpha * orig_p_abs.squeeze(-1) / mean_p.clamp(min=1e-8)  # [B, N]
+            surf_p_err = abs_err[:, :, 2:3] * mag_weight.unsqueeze(-1)  # [B, N, 1]
+        elif cfg.surface_loss_type == "pinball":
+            # Pinball / quantile loss: asymmetric penalty for under vs over prediction
+            residual = y_norm[:, :, 2:3] - pred[:, :, 2:3]  # positive = underprediction
+            tau = cfg.pinball_tau
+            surf_p_err = torch.where(residual >= 0, tau * residual, (tau - 1.0) * residual)  # [B, N, 1]
+        else:
+            surf_p_err = abs_err[:, :, 2:3]  # standard L1
+        surf_per_sample = (surf_p_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
         running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
         # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
         if epoch >= 30:
-            surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
+            surf_pres = surf_p_err  # use asymmetric error for hard-node mining
             surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
             surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
             thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
@@ -1666,7 +1685,7 @@ for epoch in range(MAX_EPOCHS):
             bm = _base_model
             surf_ux_loss = (abs_err[:, :, 0:1] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
             surf_uy_loss = (abs_err[:, :, 1:2] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
-            surf_p_loss  = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            surf_p_loss  = (surf_p_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
             loss = (vol_loss    * torch.exp(-2 * bm.log_sigma_vol)    / 2 + bm.log_sigma_vol +
                     surf_ux_loss * torch.exp(-2 * bm.log_sigma_surf_ux) / 2 + bm.log_sigma_surf_ux +
                     surf_uy_loss * torch.exp(-2 * bm.log_sigma_surf_uy) / 2 + bm.log_sigma_surf_uy +
