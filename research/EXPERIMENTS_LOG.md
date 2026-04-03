@@ -11,15 +11,18 @@
 - 8-GPU: 2 baselines (s42/s43) + 3 rho values × 2 seeds = 8 runs
 - Status: WIP — assigned
 
-#### 2026-04-03 — PR #2085: Phase 6: srf4L Ensemble Seeds 58-65 (3rd Batch) — nezuko
+#### 2026-04-03 — PR #2085: Phase 6: srf4L Ensemble Seeds 58-65 (3rd Batch) — nezuko — CLOSED
 - Branch: `nezuko/srf4L-ensemble-v3`
-- Hypothesis: More srf4L seeds (58-65) to build toward larger ensemble pool
-- Status: WIP, 8 runs running
+- Hypothesis: More srf4L seeds for ensemble
+- CLOSED — srf4L hypothesis invalidated (p_tan +5-7% worse per #2079, #2083)
 
-#### 2026-04-03 — PR #2083: Phase 6: srf4L Ensemble Seeds 50-57 — fern
+#### 2026-04-03 — PR #2083: Phase 6: srf4L Ensemble Seeds 50-57 — fern — CLOSED
 - Branch: `fern/srf4L-ensemble-v2`
-- Hypothesis: srf4L seeds 50-57 to complement edward's seeds 42-49
-- Status: WIP, 8 runs running
+- Hypothesis: srf4L seeds 50-57 for ensemble expansion
+- W&B group: phase6/srf4L-ensemble-v2 (8 runs finished)
+- Results: **DEAD END.** Confirms srf4L regression:
+  - p_in: 13.20 (+1.3%), p_oodc: 8.06 (+2.9%), p_tan: **32.43 (+7.0% WORSE)**, p_re: 6.43 (-0.3%)
+- CLOSED — srf4L hypothesis invalidated
 
 #### 2026-04-03 — PR #2082: Phase 6: Packed Ensemble — thorfinn
 - Branch: `thorfinn/packed-ensemble`
@@ -27,21 +30,26 @@
 - 8 GPUs: 2 baseline + 2×M=2 + 2×M=4 + 2×M=8
 - Status: WIP, 8 runs running
 
-#### 2026-04-03 — PR #2081: Phase 6: srf4L + 8-Seed Ensemble (Compound) — edward
+#### 2026-04-03 — PR #2081: Phase 6: srf4L + 8-Seed Ensemble (Compound) — edward — CLOSED
 - Branch: `edward/srf4L-ensemble`
-- Hypothesis: If srf4L improves individual model quality, ensembling srf4L models should beat the existing ensemble
-- 8 GPUs: seeds 42-49 with --surface_refine_layers 4
-- Status: WIP, 8 crashed + 8 running (relaunched)
+- Hypothesis: srf4L ensemble should beat 3L ensemble
+- CLOSED — srf4L hypothesis invalidated (p_tan +5-7% worse per #2079, #2083)
 
 #### 2026-04-03 — PR #2080: Phase 6: Ensemble Seeds 66-73 (Building Toward 24-Model) — tanjiro
 - Branch: `tanjiro/ensemble-more-seeds`
 - Hypothesis: Extend ensemble to 24 models (seeds 42-73). If ensemble variance reduction scales with N, 24-model could give another step down.
 - Status: WIP, 8 crashed + 8 running (relaunched)
 
-#### 2026-04-03 — PR #2079: Phase 6: srf4L on Asinh Baseline (Multi-Seed) — askeladd
+#### 2026-04-03 — PR #2079: Phase 6: srf4L on Asinh Baseline (Multi-Seed) — askeladd — CLOSED
 - Branch: `askeladd/srf4L-asinh`
-- Hypothesis: Test srf4L (surface_refine_layers=4 vs 3) as a standalone improvement. 4 seeds each config.
-- Status: WIP, 8 crashed + 8 running (srf4L-multiseed group)
+- Hypothesis: Test srf4L (surface_refine_layers=4 vs 3) as a standalone improvement
+- W&B group: phase6/srf4L-multiseed (8 runs finished)
+- Results: **DEAD END.** srf4L consistently WORSE than 3L baseline:
+  - p_in: 13.29 vs 13.30 (flat)
+  - p_oodc: 7.83 vs 7.78 (+0.7%)
+  - p_tan: **32.01 vs 30.33 (+5.5% WORSE)**
+  - p_re: 6.53 vs 6.46 (+1.1%)
+- Conclusion: 4th surface refine layer overfits, damages tandem transfer. CLOSED
 
 #### 2026-04-03 — PR #2068: Phase 6: Asymmetric/Magnitude-Weighted Surface Loss — alphonse
 - Branch: `alphonse/asymmetric-loss`
