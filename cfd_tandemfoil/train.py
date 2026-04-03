@@ -945,6 +945,11 @@ class Config:
     # Phase 6: Asinh pressure transform
     asinh_pressure: bool = False             # transform pressure targets with asinh for dynamic range compression
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
+    # Phase 6: AoA interpolation augmentation
+    aoa_interp: bool = False                 # interpolate between same-geometry different-AoA samples
+    aoa_interp_max_deg: float = 2.0          # max AoA difference in degrees for pairing
+    aoa_interp_prob: float = 0.5             # probability of applying interp to a matched pair
+    aoa_interp_strong_aug: bool = False       # combine with stronger aoa_perturb (±2° instead of ±1°)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
 
@@ -1422,7 +1427,8 @@ for epoch in range(MAX_EPOCHS):
                 _scale = torch.rand(x.size(0), 1, 1, device=x.device) * (2 * cfg.aug_scale_range) + _lo
                 x[:, :, :2] = x[:, :, :2] * _scale
             if cfg.aug == "aoa_perturb":
-                _angle_deg = torch.rand(x.size(0), device=x.device) * 2.0 - 1.0
+                _aoa_range = 2.0 if cfg.aoa_interp_strong_aug else 1.0
+                _angle_deg = torch.rand(x.size(0), device=x.device) * (2 * _aoa_range) - _aoa_range
                 _angle_rad = _angle_deg * (torch.pi / 180.0)
                 _cos_a = torch.cos(_angle_rad).view(-1, 1, 1)
                 _sin_a = torch.sin(_angle_rad).view(-1, 1, 1)
@@ -1452,6 +1458,55 @@ for epoch in range(MAX_EPOCHS):
                     x[_b, _in_region] = x[_cut_idx[_b], _in_region]
                     y[_b, _in_region] = y[_cut_idx[_b], _in_region]
                     is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
+
+        # --- AoA interpolation augmentation ---
+        # Pair samples with same NACA+Re+gap but different AoA, then interpolate flow fields
+        if model.training and cfg.aoa_interp and epoch >= cfg.aug_start_epoch:
+            B_interp = x.size(0)
+            # Extract global condition features (constant per node, take node 0)
+            _naca0 = x[:, 0, 15:18]     # [B, 3] NACA0 digits
+            _re = x[:, 0, 13:14]         # [B, 1] log_Re
+            _gap = x[:, 0, 22:23]        # [B, 1] gap (0 for single)
+            _aoa = x[:, 0, 14:15]        # [B, 1] AoA0_rad
+            _n_valid = mask.sum(dim=1)   # [B] node counts per sample
+
+            # Build geometry fingerprint: NACA0 + Re + gap + n_valid (same mesh requirement)
+            _geo_key = torch.cat([_naca0, _re, _gap, _n_valid.float().unsqueeze(1)], dim=1)  # [B, 6]
+
+            # Find pairs: for each sample, find another with same geometry but different AoA
+            _max_rad = cfg.aoa_interp_max_deg * (torch.pi / 180.0)
+            _paired = torch.full((B_interp,), -1, dtype=torch.long, device=x.device)
+            for _i in range(B_interp):
+                # Match on geometry (NACA+Re+gap+n_valid within tolerance)
+                _geo_dist = (_geo_key[_i:_i+1] - _geo_key).abs().sum(dim=1)  # [B]
+                _aoa_diff = (_aoa[_i] - _aoa[:, 0]).abs()  # [B]
+                # Same geometry (very close), different AoA (>0.001 rad ≈ 0.06°), within max range
+                _candidates = (_geo_dist < 0.01) & (_aoa_diff > 0.001) & (_aoa_diff <= _max_rad)
+                _candidates[_i] = False  # don't pair with self
+                _cand_idx = _candidates.nonzero(as_tuple=True)[0]
+                if _cand_idx.numel() > 0:
+                    _pick = _cand_idx[torch.randint(_cand_idx.numel(), (1,), device=x.device)]
+                    _paired[_i] = _pick
+
+            # Apply interpolation to matched pairs with probability aoa_interp_prob
+            _do_interp = (_paired >= 0) & (torch.rand(B_interp, device=x.device) < cfg.aoa_interp_prob)
+            if _do_interp.any():
+                _lam = torch.rand(_do_interp.sum().item(), 1, 1, device=x.device)  # [K, 1, 1]
+                _src = _do_interp.nonzero(as_tuple=True)[0]  # indices to interpolate
+                _tgt = _paired[_src]  # their partners
+                # Interpolate flow field targets
+                y[_src] = (1 - _lam) * y[_src] + _lam * y[_tgt]
+                # Interpolate AoA in features (index 14 and 18 for dual foil)
+                _lam_1d = _lam[:, 0, 0]  # [K]
+                x[_src, :, 14] = (1 - _lam_1d).unsqueeze(1) * x[_src, :, 14] + _lam_1d.unsqueeze(1) * x[_tgt, :, 14]
+                x[_src, :, 18] = (1 - _lam_1d).unsqueeze(1) * x[_src, :, 18] + _lam_1d.unsqueeze(1) * x[_tgt, :, 18]
+                # Interpolate coordinates (pos) to handle slight mesh differences at surface
+                x[_src, :, :2] = (1 - _lam) * x[_src, :, :2] + _lam * x[_tgt, :, :2]
+                # Also interpolate surface-distance fields (saf, dsdf) which are geometry-dependent
+                x[_src, :, 2:12] = (1 - _lam) * x[_src, :, 2:12] + _lam * x[_tgt, :, 2:12]
+                # Interpolate is_surface (union of both masks)
+                is_surface[_src] = is_surface[_src] | is_surface[_tgt]
+                wandb.log({"train/aoa_interp_pairs": _src.numel()}, commit=False)
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
