@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-04 ~23:30 UTC
+- **Date:** 2026-04-04 ~23:45 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -47,7 +47,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | fern | #2130 | Gap/Stagger-Conditioned Spatial Bias — Tandem-Geometry-Aware Slice Routing | WIP |
 | alphonse | #2131 | Tandem-Slice Carve-Out — Reserved Physics Slices for Tandem Samples | WIP |
 | nezuko | #2129 | Supervised Surface Pressure Gradient Aux Loss — **v2** (per-foil fix + aft_srf_context rebase) | WIP — sent back for revision |
-| askeladd | #2119 | PCGrad 2-Way Validation — 8-seed validation | WIP |
+| askeladd | #2119 | PCGrad 2-Way — rebased 2-seed validation (p_tan -1.9% in 8-seed) | WIP — sent back for rebase |
 | thorfinn | #2132 | Tandem DSDF Channel Mixup — Synthetic Foil-Shape Interpolation | WIP |
 | frieren | #2134 | Fore-Foil TE Relative Coords — Inter-Foil Jet Frame for AftSRF Context | WIP — just assigned |
 | edward | #2135 | Tandem Self-Distillation — EMA Teacher for Tandem Samples | WIP — just assigned |

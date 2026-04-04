@@ -2,6 +2,36 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 ~23:45 — PR #2119: PCGrad 2-Way Validation (8-seed) — askeladd — **SENT BACK** (rebase + 2-seed validation)
+
+- Branch: `askeladd/pcgrad-3way`
+- Hypothesis: 3-way PCGrad (single-foil / tandem-normal / tandem-extreme-Re) to resolve gradient conflicts. Due to batch_size=4 confound, effectively tested **2-way PCGrad** (single-foil vs all-tandem). 8-seed validation (seeds 42-49).
+
+| Seed | p_in | p_oodc | p_tan | p_re | W&B ID |
+|------|------|--------|-------|------|--------|
+| 42 | 13.463 | 7.685 | 30.021 | 6.445 | tmqq1xlo |
+| 43 | 13.550 | 7.972 | 28.678 | 6.456 | 84aff7cq |
+| 44 | 12.880 | 7.758 | 29.221 | 6.656 | 23y1pfj5 |
+| 45 | 12.816 | 7.780 | 29.357 | 6.277 | yw2djp6d |
+| 46 | 13.158 | 8.004 | 29.691 | 6.635 | afis6090 |
+| 47 | 13.482 | 8.218 | 29.206 | 6.605 | c80t1a69 |
+| 48 | 13.219 | 7.993 | 30.016 | 6.566 | xcmpfkqs |
+| 49 | 13.051 | 7.899 | 29.671 | 6.391 | 75d4hhzm |
+| **8-seed mean** | **13.202 ± 0.261** | **7.913 ± 0.160** | **29.483 ± 0.427** | **6.504 ± 0.125** | — |
+| **Old baseline** | **13.19 ± 0.33** | **7.92 ± 0.17** | **30.05 ± 0.36** | **6.45 ± 0.07** | — |
+
+W&B group: `phase6/pcgrad-2way-validation`
+
+**Results commentary:**
+- **p_tan -1.9% (29.48 vs 30.05)** — real and consistent. 7/8 seeds below baseline. Best: seed 43 (28.68).
+- p_oodc flat (+0.1%), p_in flat (+0.1%), p_re slight regression (+0.8%).
+- **Confound:** 3-way split never fires with batch_size=4 (identical metrics for pct=0.10 and pct=0.15 on seed 42). Effectively 2-way PCGrad.
+- **Missing features:** Runs lacked `--aft_foil_srf_context` and `--aug_gap_stagger_sigma 0.02` from current baseline.
+- **VRAM:** 45-46 GB per run (+22% from 3 backward passes). Unknown if compatible with aft_foil_srf_context (69-95 GB).
+- **Sent back** for rebased 2-seed validation with full current baseline flags. If p_tan < 29.91, merge immediately.
+
+---
+
 ### 2026-04-04 ~23:30 — PR #2129: Supervised Surface Pressure Gradient Aux Loss — nezuko — **SENT BACK** (revision requested)
 
 - Branch: `nezuko/surf-pressure-gradient-aux`
