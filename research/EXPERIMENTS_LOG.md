@@ -2,6 +2,30 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 ~16:30 — PR #2118: Phase 6: Boundary-ID One-Hot Feature — Explicit Surface-Type Conditioning — thorfinn — CLOSED
+
+- Branch: `thorfinn/boundary-id-onehot`
+- Hypothesis: Append a 3-dim one-hot vector encoding boundary type (single-foil ID=5, fore-foil ID=6, aft-foil ID=7) as explicit input feature to all mesh nodes. Non-surface nodes get zero vector. Goal: let Transolver route computation differently by boundary type from the first layer.
+
+| Seed | p_in | p_oodc | p_tan | p_re | val/loss | W&B Run ID |
+|------|------|--------|-------|------|----------|------------|
+| 42 | 13.05 | 7.72 | 30.37 | 6.58 | 0.3899 | txl1svzm |
+| 43 | 13.16 | 7.61 | 30.97 | 6.51 | 0.3917 | 12uns5n9 |
+| **2-seed avg** | **13.10** | **7.66** | **30.67** | **6.55** | | |
+| Baseline | 13.19 | 7.92 | 30.05 | 6.45 | | |
+| **Δ** | **-0.7%** | **-3.3%** | **+2.1%** | **+1.5%** | | |
+
+W&B group: `phase6/boundary-id-onehot`
+
+**Results commentary:**
+- p_in and p_oodc show modest improvements on both seeds, but the PRIMARY target p_tan regresses +2.0% (s42) and +5.8% (s43). p_re also regresses on both seeds.
+- Student's analysis (correct): sparse 3-dim one-hot firing on only ~0.4% of nodes (surface nodes) disrupts Transolver's physics-aware slice assignment for the 99.6% volume nodes that receive the zero vector.
+- Boundary-ID detection confirmed working via sanity logs (bid/frac_single ~0.004, bid/frac_fore ~0.002, bid/frac_aft ~0.002).
+- **Conclusion:** Sparse surface-only features appended to the full node set are the wrong delivery mechanism for boundary-type identity. Rules out this approach. The aft-foil SRF head (#2104) works because it's a dedicated output correction, not an input feature.
+- **Adds to dead-end knowledge:** boundary-type information must be delivered through architecture (dedicated heads) not through sparse input features.
+
+---
+
 ### 2026-04-04 15:20 — PR #2117: Phase 6: Fore-Foil Dedicated SRF Head (ID=6) — Split from Single-Foil — fern — CLOSED
 
 - Branch: `fern/fore-foil-srf-split`

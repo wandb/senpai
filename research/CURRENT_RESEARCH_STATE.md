@@ -26,18 +26,18 @@
 | p_tan | **29.1** |
 | p_re | **5.8** |
 
-## Student Status (~15:30 UTC)
+## Student Status (~16:30 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | nezuko | #2122 | Fore-Foil Loss Upweighting (ID=6) — Symmetric to Aft-Foil Weight | WIP |
-| fern | #2124 | Fore-Foil Stacked SRF Head (ID=6) — Additive, Not Split | WIP — just assigned |
+| fern | #2124 | Fore-Foil Stacked SRF Head (ID=6) — Additive, Not Split | WIP |
 | tanjiro | #2121 | Aft-Foil Loss Upweighting — Stronger Gradient for Wake Nodes (weight 1.5–2.0×) | WIP |
 | edward | #2120 | Langevin Gradient Noise (SGLD) — Stochastic Exploration for Lion | WIP |
 | askeladd | #2119 | PCGrad 3-Way Task Split — Gradient Surgery (single/tandem-normal/tandem-extreme) | WIP |
 | frieren | #2107 | Aft-Foil Coordinate Frame Normalization (dual-frame v2) — VRAM fix + 2 more seeds | WIP — sent back |
 | alphonse | #2123 | Combined Baseline 8-Seed Validation (aft_foil_srf + gap/stagger aug, seeds 42-49) | WIP |
-| thorfinn | #2118 | Boundary-ID One-Hot Feature — Explicit Surface-Type Conditioning | WIP |
+| thorfinn | #2125 | Reynolds Number Perturbation Augmentation — OOD-Re Robustness | WIP — just assigned |
 
 **All 8 students active. Zero idle GPUs.**
 
@@ -45,6 +45,7 @@
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
+| #2118 | thorfinn | Boundary-ID One-Hot Feature — Sparse 3-dim input feature | CLOSED | p_tan +2.1% (avg), p_re +1.5%. Sparse features on 0.4% of nodes disrupt Transolver slice assignment for 99.6% volume nodes. Rules out sparse input features for boundary type. |
 | #2117 | fern | Fore-Foil Dedicated SRF Head (ID=6) — Split approach | CLOSED | **+9–11% p_tan regression**. Splitting shared srf_head removes tandem transfer learning. Next: stacked additive approach (#2124) |
 | #2115 | nezuko | Gap/Stagger Perturbation Aug (σ=0.02) | **MERGED** | p_oodc -4.9% (7.446 vs 7.83); p_re -1.5%; p_tan flat; largest p_oodc gain since pressure_first |
 | #2114 | tanjiro | Gradient Centralization (GC-Lion) | CLOSED | p_in +12-17%, p_oodc +15-38%. GC incompatible with Lion sign operation |
@@ -69,7 +70,7 @@
 2. **Fore-Foil Stacked SRF Head (ID=6)** (fern #2124) — additive fore_srf_head on top of shared srf_head WITHOUT narrowing; parallel to aft_srf_head design; direct fix for #2117's split failure
 3. **Aft-Foil Loss Upweighting (ID=7)** (tanjiro #2121) — upweight aft-foil nodes 1.5–2.0× in main surface loss
 4. **Dual-Frame Coordinate Features** (frieren #2107) — VRAM bug fix + 2 more seeds; high confidence in improvement once variance resolved
-5. **Boundary-ID One-Hot Feature** (thorfinn #2118) — append 3-dim one-hot (ID=5/6/7) to all nodes
+5. **Reynolds Number Perturbation Augmentation** (thorfinn #2125) — add Gaussian noise to log_Re (feature idx 13) during training; σ sweep {0.05, 0.1, 0.2}; direct extension of gap/stagger aug success; targets p_re < 6.45
 6. **PCGrad 3-Way Task Split** (askeladd #2119) — gradient surgery across single/tandem-normal/tandem-extreme-Re
 7. **Langevin Gradient Noise / SGLD** (edward #2120) — Gaussian noise after Lion step; sweep {5e-5, 1e-4, 3e-4}
 8. **Combined Baseline 8-Seed Validation** (alphonse #2123) — runs seeds 42-49 with aft_foil_srf + aug_gap_stagger_sigma=0.02 combined; gives accurate merge targets for 7 incoming WIP results
@@ -81,10 +82,12 @@
 - NOT progressive surface weight scheduling (#2110)
 - NOT gradient centralization (GC-Lion incompatible: #2114)
 - NOT fore-foil splitting (loses tandem transfer learning: #2117 → +9–11% p_tan regression)
+- NOT sparse input features for boundary type (one-hot: #2118 → p_tan +2.1%, disrupts slice assignment)
 - HAS coordinate-frame component (dual-frame #2107: s73 beats all 4 metrics; pending VRAM fix)
 - HAS dedicated-head component (aft-foil SRF #2104: p_tan -0.8%)
 - HAS OOD domain randomization benefit (gap/stagger aug #2115: p_oodc -4.9%)
 - DESIGN LESSON: SRF specialization must be ADDITIVE (stack on shared head), not REPLACING (split from shared head)
+- DESIGN LESSON: Boundary-type information must be delivered through architecture (dedicated heads), not sparse input features on the full node set
 
 ## Potential Next Research Directions (not yet assigned)
 
@@ -93,7 +96,9 @@
 2. **Fixed per-boundary asinh scale** — different fixed scales for each boundary type (ID=5/6/7); aft-foil wake pressure sharper gradients may need different compression; build on gap/stagger aug OOD insight
 3. **MC Dropout on SRF head** — `nn.Dropout(p=0.05)` in SurfaceRefinementHead only, K=8 forward passes at inference, average predictions; cheap variance reduction without training extra models
 4. **AoA-consistent augmentation fix** — current `aoa_perturb` perturbs x but not y (inconsistent); scale y-targets proportionally with AoA delta; may improve p_oodc
-5. ~~8-seed combined baseline validation~~ — **ASSIGNED to alphonse #2123**
+5. **Velocity channel asinh transform** — extend asinh from pressure-only to velocity channels (Ux, Uy) with separate scale; same motivation as pressure asinh but for velocity dynamic range
+6. ~~Reynolds number perturbation aug~~ — **ASSIGNED to thorfinn #2125**
+7. ~~8-seed combined baseline validation~~ — **ASSIGNED to alphonse #2123**
 
 **Deferred pending current results:**
 - Expand ensemble to 23 seeds (seeds 100-106 already trained) — do after single-model improvements land
@@ -156,6 +161,7 @@
 | Smooth L1 / Huber Loss | #2113 | Catastrophic: gradient attenuation for small errors incompatible with residual-prediction+asinh; L1 constant gradient is optimal |
 | Charbonnier Loss (smooth L1 variant) | #2116 | Dead end: all eps values degrade all metrics; p_oodc +12-24%; smooth loss family fully exhausted |
 | Fore-Foil SRF Split (narrowing shared head) | #2117 | +9–11% p_tan regression; loses transfer learning from tandem data; additive stack (#2124) is the correct formulation |
+| Boundary-ID One-Hot (sparse 3-dim input) | #2118 | p_tan +2.1%, p_re +1.5%; sparse features on 0.4% of surface nodes disrupt slice assignment for 99.6% volume nodes; boundary type must be architectural (dedicated heads), not input features |
 | FiLM on gap/stagger | #2104 | p_oodc catastrophe (+41.6%) |
 | Foil-2 Loss Upweighting | #1893 | Marginal (still shared head); retesting as #2121 WITH aft-foil SRF head in baseline |
 | Ada-Temp (per-node) | #1879,#1793,#1615 | Null across multiple phases |
