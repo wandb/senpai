@@ -16,10 +16,25 @@
 
 ### Assignments (2026-04-03 ~23:20 UTC)
 
-#### 2026-04-03 — PR #2095: Phase 6: SGDR Warm Restarts — askeladd — RUNNING
+#### 2026-04-04 — PR #2099: Phase 6: Stochastic Depth (DropPath) — askeladd — NEW
+- Branch: `askeladd/stochastic-depth-droppath`
+- Hypothesis: DropPath randomly skips Transolver block residuals during training, creating implicit ensemble of subnetworks. Proven OOD regularizer in ViT/DeiT. Target: p_tan improvement.
+- Experiment: drop_path_rate={0.1, 0.2} × seeds {42, 73} = 4 runs
+
+#### 2026-04-04 — PR #2095: Phase 6: SGDR Warm Restarts — askeladd — CLOSED (dead end)
 - Branch: `askeladd/sgdr-warm-restarts`
 - Hypothesis: Cosine annealing with warm restarts (T_0={20,40,60}, T_mult=2) for better OOD generalization
-- Status: WIP — just assigned (askeladd idle after #2089 closed)
+- Results: **ALL 8 RUNS WORSE THAN BASELINE.** SGDR warm restarts hurt OOD generalization.
+
+| Config | p_in seed42 | p_oodc seed42 | p_in seed73 | p_oodc seed73 |
+|--------|------------|---------------|------------|---------------|
+| Baseline (cosine) | 12.71 | 8.13 | 13.33 | 7.59 |
+| T_0=20 | 13.62 | 8.32 | 14.02 | 8.26 |
+| T_0=40 | 13.89 | 8.47 | 13.34 | 8.35 |
+| T_0=60 | 13.51 | 8.19 | 13.61 | 8.30 |
+
+- Conclusion: LR restarts disrupt the stable descent into the flat basin that Lion+cosine finds naturally. SGDR is a confirmed dead end for this architecture.
+- CLOSED
 
 #### 2026-04-03 — PR #2094: Phase 6: SWAD Dense Weight Averaging — edward — NEW
 - Branch: `edward/swad-averaging`

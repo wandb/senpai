@@ -1,30 +1,30 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-04 ~00:15 UTC
+- **Date:** 2026-04-04 ~01:30 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
 ## Current Baseline (PR #2080 — MERGED 2026-04-03)
 
-| Metric | 8-Seed Ensemble (66-73) | vs prior best (42-49) |
-|--------|------------------------|-----------------------|
-| p_in | **12.2** | **-1.6%** |
-| p_oodc | **6.7** | 0% |
-| p_tan | **29.1** | **-1.0%** |
-| p_re | **5.8** | 0% |
+| Metric | 8-Seed Ensemble (66-73) | Single-model mean (8 seeds) |
+|--------|------------------------|-----------------------------|
+| p_in | **12.2** | 13.03 |
+| p_oodc | **6.7** | 7.83 |
+| p_tan | **29.1** | 30.29 |
+| p_re | **5.8** | 6.45 |
 
-## Student Status (2026-04-04 ~00:15 UTC)
+## Student Status (2026-04-04 ~01:30 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| edward | #2094 | SWAD Dense Weight Averaging | Running (1 run, ~20 min) |
-| askeladd | #2095 | SGDR Warm Restarts (T_0 sweep) | Running (8 runs, ~43 min) |
-| thorfinn | #2096 | Learnable Asinh Scale | New — just assigned |
-| nezuko | #2097 | Multi-Scale Deep Supervision | New — just assigned |
-| alphonse | #2098 | Asinh Velocity Transform | New — just assigned |
-| frieren | #2086 | SAM Phase-Only (sent back for timeout fix) | WIP — awaiting rerun |
-| fern | #2090 | Knowledge Distillation | Teachers done, distillation pending |
-| tanjiro | #2093 | 16-Seed Eval + Seeds 100-106 | Retrain done, next phase pending |
+| edward | #2094 | SWAD Dense Weight Averaging | WIP (1 run, ~180+ min — may be stuck on refine_head fix) |
+| askeladd | #2099 | Stochastic Depth (DropPath) | NEW — just assigned |
+| thorfinn | #2096 | Learnable Asinh Scale | WIP (~120+ min) |
+| nezuko | #2097 | Multi-Scale Deep Supervision | WIP (~130+ min) |
+| alphonse | #2098 | Asinh Velocity Transform | WIP (~115+ min) |
+| frieren | #2086 | SAM Phase-Only | WIP (~170+ min) |
+| fern | #2090 | Knowledge Distillation v2 | WIP (~65+ min) |
+| tanjiro | #2093 | 16-Seed Eval + Seeds 100-106 | WIP (~155+ min) |
 
 ## Current Research Direction: Training Improvements
 
@@ -33,36 +33,25 @@ After confirming that:
 2. **Ensemble weight optimization = null result** (askeladd #2089)
 3. **Magnitude-weighted loss = dead end** (alphonse #2068)
 4. **srf4L = dead end** (4 PRs)
+5. **SGDR warm restarts = dead end** (askeladd #2095 — ALL T_0 values worse)
 
-We are now pivoting to **training procedure improvements** that could improve individual model quality:
+We are now focused on **training procedure improvements** that alter optimization dynamics:
 
 ### Active Experiments (Priority Order)
-1. **SWAD** (edward #2094) — flat-basin checkpoint averaging, NeurIPS 2021
-2. **SGDR Warm Restarts** (askeladd #2095) — cosine restarts for OOD generalization
+1. **SWAD** (edward #2094) — flat-basin checkpoint averaging, NeurIPS 2021 (concern: only 1 run after 180 min)
+2. **Stochastic Depth** (askeladd #2099) — DropPath for implicit ensemble regularization, targets p_tan
 3. **Learnable Asinh Scale** (thorfinn #2096) — adaptive pressure compression
 4. **Deep Supervision** (nezuko #2097) — auxiliary loss on intermediate features
 5. **Asinh Velocity** (alphonse #2098) — compression on Ux/Uy channels
-6. **SAM Phase-Only** (frieren #2086) — flat minima via SAM (pending timeout fix)
-7. **Knowledge Distillation** (fern #2090) — ensemble → single model
+6. **SAM Phase-Only** (frieren #2086) — flat minima via SAM
+7. **Knowledge Distillation** (fern #2090) — ensemble → single model distillation
 8. **16-Seed Combined Eval** (tanjiro #2093) — quantify N-model scaling
 
-## Ensemble Seed Pool (Complete)
-
-| Batch | Seeds | Status | Run IDs |
-|-------|-------|--------|---------|
-| Batch 2 | 66-73 | ✓ BASELINE | j9w7d1r7, mc4jvgqj, cbbvhl62, bigqfn3k, bqhg6lq8, 5ukk7wv6, xlnhwuqc, ii1tz4vv |
-| Batch 3 | 74-81 | ✓ Trained | 2sre8vzp, ue8pmbbr, hgyim25m, e2obsfn1, 555102xo, 2lpzf6go, ibsrx1t8, a6e89sx4 |
-| Batch 4 | 82-89 | ✓ Trained | u0eapina, fmhetijo, yp7dlkmk, 30hxo8a1, 4e74gtuc, wc8x0v49, qvn871e1, nb6poqj2 |
-| Batch 5 | 90-95 | ✓ Trained | ici6bxi1, 6chuzqal, xcsqiwdv, sxisuynb, q8m1w63d, ggn5mioe |
-| Batch 1 | 42-49 | Re-trained (tanjiro) | Pending new run IDs |
-| Batch 6 | 100-106 | Pending (tanjiro) | Not started |
-
-**Total trained: 30 models** (8+8+8+6). When tanjiro completes: 45 models.
-
-## Confirmed Dead Ends (Phase 6, all time)
+## Confirmed Dead Ends (all time)
 
 | Direction | PRs | Finding |
 |-----------|-----|---------|
+| SGDR warm restarts | #2095 | All T_0 values (20/40/60) worse — restarts disrupt Lion+cosine stable descent |
 | srf4L (4-layer surface refine) | #2079,2081,2083,2085 | p_tan +5-7% WORSE |
 | Mesh interpolation | #2066 | Physically invalid for unstructured CFD |
 | SOAP/HeavyBall | #2010,2018-2023 | 2-6% WORSE than Lion |
@@ -82,15 +71,35 @@ We are now pivoting to **training procedure improvements** that could improve in
 | Diverse Hparam Ensemble | #2091 | Seed diversity strictly better |
 | Magnitude-Weighted Loss | #2068 | No sweet spot at any alpha |
 
+## Ensemble Seed Pool (Complete)
+
+| Batch | Seeds | Status | Run IDs |
+|-------|-------|--------|---------|
+| Batch 2 | 66-73 | ✓ BASELINE | j9w7d1r7, mc4jvgqj, cbbvhl62, bigqfn3k, bqhg6lq8, 5ukk7wv6, xlnhwuqc, ii1tz4vv |
+| Batch 3 | 74-81 | ✓ Trained | 2sre8vzp, ue8pmbbr, hgyim25m, e2obsfn1, 555102xo, 2lpzf6go, ibsrx1t8, a6e89sx4 |
+| Batch 4 | 82-89 | ✓ Trained | u0eapina, fmhetijo, yp7dlkmk, 30hxo8a1, 4e74gtuc, wc8x0v49, qvn871e1, nb6poqj2 |
+| Batch 5 | 90-95 | ✓ Trained | ici6bxi1, 6chuzqal, xcsqiwdv, sxisuynb, q8m1w63d, ggn5mioe |
+| Batch 1 | 42-49 | Pending re-train (tanjiro) | Pending new run IDs |
+| Batch 6 | 100-106 | Pending (tanjiro) | Not started |
+
+**Total trained: 30 models** (8+8+8+6). When tanjiro completes: 45 models.
+
 ## Key Research Insights
 
 1. **Ensemble variance reduction is the biggest lever** — 30 models trained, pending combined evaluation
 2. **Seed diversity > hyperparameter diversity > weight optimization** (confirmed experimentally)
 3. **Architecture modifications absorbed by EMA+Lion** — incremental changes don't stick
-4. **Next frontier: training procedure changes** (SWAD, SGDR, deep supervision) that alter optimization dynamics rather than model structure
-5. **Asinh transform was a big win for pressure** — testing on velocity channels now
+4. **SGDR restarts HURT** — Lion+cosine already finds a good basin; restarts disrupt this
+5. **Training regularization untested** — Stochastic Depth (DropPath) is a fresh angle targeting p_tan
+6. **Asinh transform big win for pressure** — testing on velocity channels now
+7. **Next frontier: training procedure changes** (SWAD, DropPath, deep supervision)
 
-## Human Team Directives (from issues #1860, #1834, #1926)
-- All ideas from issue #1926 tested (HyperP, MSA, mHC — deprioritized as most exploratory)
-- Data constraint from #1834 respected
-- Bold architectures tried and failed — training improvements now dominant strategy
+## Potential Next Research Directions
+
+If current batch produces no winners:
+- TTA via AoA perturbation (inference-only, zero training cost)
+- R-Drop / consistency regularization
+- Larger model (more slices, more layers) — haven't tried scale-up
+- Fourier feature augmentation for geometry encoding
+- HyperP (hypernetwork-conditioned weights, from issue #1926)
+- Gradient accumulation for effectively larger batch sizes
