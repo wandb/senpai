@@ -91,14 +91,22 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 ## Potential Next Research Directions (not yet assigned)
 
-1. **Combined DSDF1+DSDF2 aug at lower σ** — Simultaneous augmentation of both foil DSDF channels at σ=0.02-0.03 each; may compound improvements
-2. **Gap/stagger sigma reduction** (0.02→0.01) — reduce the p_tan hurt from gap_stagger while keeping partial p_oodc benefit
-3. **Tandem-Aware Temperature Annealing** — softer attention for tandem, sharper for single-foil; check if tandem_temp_offset is already wired
-4. **EMA Stochastic Weight Perturbation** — inject small noise at EMA start epoch (σ sweep {5e-4, 1e-3, 3e-3}); flat-minima seeking; ~12 LoC
-5. **Foil-2 AoA Rotation Aug** — Independent AoA perturbation for aft-foil nodes; increases (fore_AoA, aft_AoA) diversity
-6. **Aft-Foil TV Loss** — chord-wise total variation regularization on aft-foil predictions; wait for nezuko #2129 first
+### Top Priority (researcher-agent, 2026-04-04, see RESEARCH_IDEAS_2026-04-04_TANJIRO.md)
 
-**Strategic consideration:** The DSDF augmentation family is showing consistent wins. The pattern: domain randomization in geometric feature space forces generalization. If DSDF1 aug also succeeds, the next step is combined/joint DSDF1+DSDF2 augmentation.
+1. **foil1-relative-coords** — Add 2 input features for aft-foil nodes: (x,y) relative to fore-foil trailing edge. Physically motivated: wake pressure is controlled by inter-foil jet geometry. ~20 LoC. **Expected p_tan -3% to -7%.** Synergistic with aft_srf head. HIGH PRIORITY.
+2. **tandem-selfdistill** — Use EMA model as online teacher for tandem samples only (KD loss after epoch 40). EMA is already on device; adds second, cleaner training signal at near-zero cost. ~25 LoC. **Expected p_tan -2% to -5%.**
+3. **foil-shape-ae (stats variant first)** — Inject 16 global shape statistics (mean/std/skew/kurtosis of each DSDF channel over surface nodes) as AdaLN conditioning. ~10 LoC for stats variant. Gives trunk a global shape fingerprint that may interpolate to OOD NACA6416. **Expected p_tan -2% to -6%.**
+4. **interfoil-channel-aug** — Morph mesh coordinates between tandem samples (not just scalar gap/stagger). Physically consistent augmentation unlike scalar gap/stagger perturb. ~35 LoC.
+5. **surf-node-dropout** — Randomly drop surface nodes during training to force robust volume-to-surface info routing. ~15 LoC, low risk.
+
+### Existing Queue
+
+6. **Combined DSDF1+DSDF2 aug at lower σ** — Simultaneous aug of both foil DSDF channels at σ=0.02-0.03 each; may compound improvements
+7. **Gap/stagger sigma reduction** (0.02→0.01) — reduce p_tan hurt while keeping p_oodc benefit
+8. **EMA Stochastic Weight Perturbation** — flat-minima seeking; ~12 LoC
+9. **Aft-Foil TV Loss** — chord-wise TV regularization on aft-foil predictions; wait for nezuko #2129 first
+
+**Strategic theme:** The research is now attacking the core bottleneck (OOD shape generalization for val_tandem_transfer) from multiple angles: geometric augmentation (DSDF family), coordinate-frame inductive biases (foil1-relative-coords), and training signal quality (self-distillation). If DSDF1 aug succeeds, the next wave should focus on foil1-relative-coords and tandem-selfdistill as complementary, orthogonal levers.
 
 ## Confirmed Dead Ends (Phase 6)
 
