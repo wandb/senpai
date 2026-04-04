@@ -2,6 +2,20 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 07:25 — PR #2102: Phase 6: Sin Activation in SRF Head — alphonse — CLOSED (dead end)
+- Branch: `alphonse/sin-activation-srf-head`
+- Hypothesis: SIREN (sinusoidal activation) in the surface refinement head should capture oscillatory Cp distributions better than GELU.
+- W&B group: `siren-surf-head`
+
+| Config | p_in | p_oodc | p_tan | p_re | W&B Runs |
+|--------|------|--------|-------|------|----------|
+| Baseline (2-seed) | 13.2 | 7.95 | 30.1 | 6.4 | jijyca9m, 6vf7ts82 |
+| SIREN w=1.0 | 13.1 | 7.9 | 30.25 | 6.45 | tl6loy2k, 5x24h9o2 |
+| SIREN w=10.0 | 13.3 | 7.95 | 31.25 | 6.35 | h9dsjz11, meqkfczf |
+| SIREN w=30.0 | 13.05 | 8.2 | 32.75 | 6.5 | hz86txm2, smw15svc |
+
+**Analysis:** Monotonic degradation with omega — higher SIREN frequency → worse p_tan (30.25 → 31.25 → 32.75). Even w=1.0 (mildest) shows no improvement anywhere. The srf_head's residual corrections don't have the oscillatory structure that SIREN is optimized for — GELU is well-calibrated for this task. **Confirmed dead end: sinusoidal activations don't help surface refinement.**
+
 ### 2026-04-04 07:00 — PR #2097: Phase 6: Deep Supervision — nezuko — CLOSED (mixed: p_in improved, p_tan regressed)
 - Branch: `nezuko/deep-supervision`
 - Hypothesis: Auxiliary loss on pre-final-block hidden features provides direct gradient flow to intermediate blocks, improving representation quality and OOD generalization.

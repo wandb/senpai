@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-04 ~07:05 UTC
+- **Date:** 2026-04-04 ~07:30 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -25,7 +25,7 @@
 | frieren | #2107 | Aft-Foil Coordinate Frame Normalization | WIP — just assigned |
 | fern | #2104 | Dedicated Aft-Foil SRF Branch (ID=7) | WIP |
 | nezuko | #2110 | Progressive Surface Focus Schedule (curriculum) | WIP — just assigned |
-| alphonse | #2102 | Sin Activation in Surface Refinement Head | WIP |
+| alphonse | #2111 | TTA via AoA Perturbation (inference-only) | WIP — just assigned |
 | thorfinn | #2103 | Iterative Weight-Tied Transolver (K=2,3,4) | WIP |
 
 **All 8 students active. Zero idle GPUs.**
@@ -56,7 +56,7 @@ Active experiments attacking p_tan from multiple angles:
 
 ### Representation and signal quality:
 6. **Fourier Feature Position Encoding** (askeladd #2106) — Random Fourier Features for spatial coordinates (Tancik et al., NeurIPS 2020), addressing spectral bias and helping model capture high-frequency suction peaks
-7. **Sin Activation in srf_head** (alphonse #2102) — periodic activation for oscillatory pressure distributions
+7. **TTA via AoA Perturbation** (alphonse #2111) — inference-only: average predictions at AoA ± δ for variance reduction; zero training cost
 8. **Aft-Foil Coordinate Frame Normalization** (frieren #2107) — normalize aft foil coords to local centroid frame; equivariance for tandem geometry; directly targets p_tan
 
 ### Target-space representation:
@@ -79,6 +79,7 @@ Active experiments attacking p_tan from multiple angles:
 
 | Direction | PRs | Finding |
 |-----------|-----|---------|
+| SIREN Activation in SRF Head | #2102 | Monotonic degradation with omega; w=30 → p_tan +8.8%; GELU is well-calibrated for srf corrections |
 | Deep Supervision (aux loss) | #2097 | p_in -1.7% but p_tan +2.7% at 8-seed scale — constrains representational flexibility for tandem transfer |
 | OHEM (hard example mining) | #2101 | No improvement; stronger weight hurts; compounds with existing tandem_ramp — sample reweighting is not the bottleneck |
 | Model Scale-Up (5L, 160s, 4L/128s) | #2100 | No config beats 3L/96s; p_tan similar across all scales — NOT capacity-limited |
@@ -126,7 +127,7 @@ Active experiments attacking p_tan from multiple angles:
 ## Potential Next Research Directions
 
 **Available (not yet assigned), in priority order:**
-1. **TTA via AoA Perturbation** — inference-only: average predictions at AoA ± δ; zero training cost; ~25 eval-only lines; targets p_oodc/p_tan
+1. **Precomputed Pressure-Poisson Soft Constraint** — baked finite-diff Laplacian stencil; distinct from failed WLS; targets p_tan/p_oodc; complex (~65 lines)
 4. **Precomputed Pressure-Poisson Soft Constraint** — baked finite-diff Laplacian stencil; distinct from failed WLS; targets p_tan/p_oodc; complex (~65 lines)
 5. **Mesh-Density Weighted L1 Loss** — upweight fine-mesh nodes proportional to 1/local_spacing; targets p_in, p_tan; ~15 lines
 6. **Geometry-Conditioned AoA Interpolation** — physics-space interpolation (distinct from failed feature-space Mixup); targets p_oodc; moderate complexity
