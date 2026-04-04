@@ -959,6 +959,7 @@ class Config:
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
+    aug_re_sigma: float = 0.0           # std of Gaussian noise on log_Re feature (index 13) during training
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1553,6 +1554,12 @@ for epoch in range(MAX_EPOCHS):
                     x[:, :, 22] = x[:, :, 22] + _gap_noise.unsqueeze(1)
                     x[:, :, 23] = x[:, :, 23] + _stag_noise.unsqueeze(1)
 
+        # Reynolds number perturbation augmentation (all samples, training only)
+        if cfg.aug_re_sigma > 0.0:
+            _B = x.size(0)
+            _re_noise = torch.randn(_B, device=x.device) * cfg.aug_re_sigma  # [B]
+            x[:, :, 13] = x[:, :, 13] + _re_noise.unsqueeze(1)  # broadcast to all N nodes
+
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
@@ -1951,7 +1958,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _aft_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _step_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.aug_re_sigma > 0.0:
+            _step_log["aug/re_sigma"] = cfg.aug_re_sigma
+        wandb.log(_step_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
