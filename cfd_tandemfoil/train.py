@@ -985,24 +985,27 @@ stats = {k: v.to(device) for k, v in stats.items()}
 
 
 def _apply_aft_local_frame(x):
-    """Strip is_aft_surface sideband (idx 24), normalize aft foil coords to local centroid frame.
+    """Strip is_aft_surface sideband (idx 24), compute local-frame coords for aft foil.
 
-    The sideband feature was injected by the monkey-patched preprocess_sample_multi.
-    After stripping, x returns to its standard 24-dim shape for stats compatibility.
+    Dual-frame approach: global coords are preserved, local-frame coords returned separately.
+    For non-aft nodes and single-foil samples, local coords equal global coords.
+
+    Returns:
+        x: [B, N, 24] — original features with sideband stripped (global coords intact)
+        local_xy: [B, N, 2] — local-frame (x, y) coords
     """
     aft_mask = x[:, :, 24] > 0.5  # [B, N] — True for boundary_id==7 nodes
     x = x[:, :, :24]  # strip sideband → [B, N, 24]
     is_tandem_b = (x[:, 0, 21].abs() > 0.01)  # [B] — NACA1[2] tandem sentinel
     aft_mask_tandem = aft_mask & is_tandem_b.unsqueeze(1)  # [B, N]
-    if aft_mask_tandem.any():
-        aft_float = aft_mask_tandem.float()  # [B, N]
-        aft_count = aft_float.sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1]
-        cx = (x[:, :, 0] * aft_float).sum(dim=1, keepdim=True) / aft_count  # [B, 1]
-        cy = (x[:, :, 1] * aft_float).sum(dim=1, keepdim=True) / aft_count  # [B, 1]
-        x = x.clone()  # avoid in-place modification of DataLoader output
-        x[:, :, 0] = x[:, :, 0] - cx * aft_float
-        x[:, :, 1] = x[:, :, 1] - cy * aft_float
-    return x
+    aft_float = aft_mask_tandem.float()  # [B, N]
+    aft_count = aft_float.sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1]
+    cx = (x[:, :, 0] * aft_float).sum(dim=1, keepdim=True) / aft_count  # [B, 1]
+    cy = (x[:, :, 1] * aft_float).sum(dim=1, keepdim=True) / aft_count  # [B, 1]
+    local_x = x[:, :, 0] - cx * aft_float  # [B, N]
+    local_y = x[:, :, 1] - cy * aft_float  # [B, N]
+    local_xy = torch.stack([local_x, local_y], dim=-1)  # [B, N, 2]
+    return x, local_xy
 
 
 def _umag_q(y, mask):
@@ -1115,7 +1118,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32 + (2 if cfg.aft_foil_local_frame else 0),  # +curv, +dist, [+foil2dist], +32 fourier PE, [+2 local_xy]
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1492,9 +1495,10 @@ for epoch in range(MAX_EPOCHS):
                     y[_b, _in_region] = y[_cut_idx[_b], _in_region]
                     is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
 
-        # Aft-foil local frame: strip sideband and normalize coords before stats
+        # Aft-foil local frame: strip sideband, compute local-frame coords
+        _local_xy = None
         if cfg.aft_foil_local_frame:
-            x = _apply_aft_local_frame(x)
+            x, _local_xy = _apply_aft_local_frame(x)
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
@@ -1518,6 +1522,9 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
+        if _local_xy is not None:
+            _local_xy = (_local_xy - stats["x_mean"][:2]) / stats["x_std"][:2]
+            x = torch.cat([x, _local_xy], dim=-1)
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -1986,9 +1993,10 @@ for epoch in range(MAX_EPOCHS):
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
 
-                # Aft-foil local frame: strip sideband and normalize coords before stats
+                # Aft-foil local frame: strip sideband, compute local-frame coords
+                _local_xy = None
                 if cfg.aft_foil_local_frame:
-                    x = _apply_aft_local_frame(x)
+                    x, _local_xy = _apply_aft_local_frame(x)
 
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
@@ -2012,6 +2020,9 @@ for epoch in range(MAX_EPOCHS):
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
+                if _local_xy is not None:
+                    _local_xy = (_local_xy - stats["x_mean"][:2]) / stats["x_std"][:2]
+                    x = torch.cat([x, _local_xy], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
@@ -2336,8 +2347,9 @@ if best_metrics:
                     is_surf_dev = is_surface.unsqueeze(0).to(device)
                     mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
                     # Aft-foil local frame
+                    _local_xy = None
                     if cfg.aft_foil_local_frame:
-                        x_dev = _apply_aft_local_frame(x_dev)
+                        x_dev, _local_xy = _apply_aft_local_frame(x_dev)
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
@@ -2353,6 +2365,9 @@ if best_metrics:
                     xy_scaled = xy_norm.unsqueeze(-1) * freqs
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
+                    if _local_xy is not None:
+                        _local_xy = (_local_xy - stats["x_mean"][:2]) / stats["x_std"][:2]
+                        x_n = torch.cat([x_n, _local_xy], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
                     pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
                     if cfg.raw_targets:
@@ -2434,8 +2449,9 @@ if cfg.surface_refine and best_metrics:
                     all_re_values.append(_re_raw)
 
                     # Preprocess (same as val loop)
+                    _local_xy = None
                     if cfg.aft_foil_local_frame:
-                        x = _apply_aft_local_frame(x)
+                        x, _local_xy = _apply_aft_local_frame(x)
                     raw_dsdf = x[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
@@ -2455,6 +2471,9 @@ if cfg.surface_refine and best_metrics:
                     xy_scaled = xy_norm.unsqueeze(-1) * freqs
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x = torch.cat([x, fourier_pe], dim=-1)
+                    if _local_xy is not None:
+                        _local_xy = (_local_xy - stats["x_mean"][:2]) / stats["x_std"][:2]
+                        x = torch.cat([x, _local_xy], dim=-1)
 
                     # Ground truth denormalization reference
                     Umag, q = _umag_q(y, mask)
