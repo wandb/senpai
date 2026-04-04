@@ -822,8 +822,46 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-MAX_TIMEOUT = 180.0  # minutes
-MAX_EPOCHS = 500
+MAX_TIMEOUT = float(os.environ.get("SENPAI_TIMEOUT_MINUTES", 180.0))  # minutes
+MAX_EPOCHS = int(os.environ.get("SENPAI_MAX_EPOCHS", 500))
+
+
+# ---------------------------------------------------------------------------
+# IndexedDataset: wraps a dataset to also return the sample index,
+# enabling offline distillation soft-target lookup.
+# ---------------------------------------------------------------------------
+class _IndexedDS(torch.utils.data.Dataset):
+    def __init__(self, ds):
+        self.ds = ds
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        x, y, s = self.ds[idx]
+        return x, y, s, idx
+
+
+def _make_indexed_collate(soft_targets_cpu):
+    """Returns a collate_fn that pads x/y/surface and also pads the soft target."""
+    import torch.nn.functional as _Fpad
+
+    def _collate(batch):
+        xb, yb, sb, idxb = zip(*batch)
+        x_pad, y_pad, s_pad, mask = pad_collate(list(zip(xb, yb, sb)))
+        N_max = x_pad.shape[1]
+        st_list = []
+        for idx in idxb:
+            st = soft_targets_cpu[idx]  # [N_i, 3]
+            n = st.shape[0]
+            if n < N_max:
+                st = _Fpad.pad(st, (0, 0, 0, N_max - n))
+            elif n > N_max:
+                st = st[:N_max]
+            st_list.append(st)
+        return x_pad, y_pad, s_pad, mask, torch.stack(st_list)
+
+    return _collate
 
 
 @dataclass
@@ -947,6 +985,11 @@ class Config:
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
+    # Phase 6: Knowledge distillation from pre-trained ensemble
+    distill_targets: str = ""              # path to pre-computed soft targets (list of [N_i,3] tensors)
+    distill_alpha: float = 0.5             # hard-target loss weight; (1-alpha) weights soft-target loss
+    gen_soft_targets: str = ""             # if set, generate soft targets and save to this path
+    gen_soft_teacher_ids: str = ""         # comma-separated W&B run IDs of teacher models
 
 
 cfg = sp.parse(Config)
@@ -1367,6 +1410,178 @@ prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
 
+# ---------------------------------------------------------------------------
+# Soft target generation mode: compute teacher ensemble predictions on the
+# training set, average in prediction space, and save to disk.
+# Run with --gen_soft_targets <output_path> --gen_soft_teacher_ids <ids>
+# ---------------------------------------------------------------------------
+if cfg.gen_soft_targets:
+    _teacher_ids = [tid.strip() for tid in cfg.gen_soft_teacher_ids.split(",") if tid.strip()]
+    if not _teacher_ids:
+        raise ValueError("--gen_soft_teacher_ids must be set when using --gen_soft_targets")
+    print(f"Generating soft targets from {len(_teacher_ids)} teachers → {cfg.gen_soft_targets}")
+
+    # Load teacher models
+    _teachers, _t_refines = [], []
+    for _tid in _teacher_ids:
+        _ckpt_dir = Path(f"models/model-{_tid}")
+        _tcfg = yaml.safe_load((_ckpt_dir / "config.yaml").read_text())
+        _tmodel = Transolver(**_tcfg).to(device)
+        _tsd = torch.load(_ckpt_dir / "checkpoint.pt", map_location=device, weights_only=True)
+        _tsd = {k.removeprefix("_orig_mod."): v for k, v in _tsd.items()}
+        _tmodel.load_state_dict(_tsd)
+        _tmodel.eval()
+        _teachers.append(_tmodel)
+        _tr = None
+        _trp = _ckpt_dir / "refine_head.pt"
+        if _trp.exists():
+            _trsd = torch.load(_trp, map_location=device, weights_only=True)
+            _trsd = {k.removeprefix("_orig_mod."): v for k, v in _trsd.items()}
+            _n_hid = _tcfg["n_hidden"]
+            _hd = _trsd["mlp.0.weight"].shape[0]
+            _lk = sorted([k for k in _trsd if k.endswith(".weight") and _trsd[k].dim() == 2])
+            _nl = len(_lk) - 1
+            _po = (_trsd[_lk[-1]].shape[0] == 1)
+            _tr = SurfaceRefinementHead(n_hidden=_n_hid, out_dim=3, hidden_dim=_hd,
+                                        n_layers=_nl, p_only=_po).to(device)
+            _tr.load_state_dict(_trsd)
+            _tr.eval()
+        _t_refines.append(_tr)
+    print(f"  Loaded {len(_teachers)} teachers")
+
+    _seq_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False,
+                             collate_fn=pad_collate, num_workers=cfg.num_workers,
+                             pin_memory=True, persistent_workers=False)
+    _all_soft: list = []
+    with torch.no_grad():
+        for _x, _y, _is_surf, _mask in tqdm(_seq_loader, desc="Soft-target gen"):
+            _x, _y = _x.to(device), _y.to(device)
+            _is_surf = _is_surf.to(device)
+            _mask = _mask.to(device)
+            _Umag, _q = _umag_q(_y, _mask)
+            # Compute y_norm in same way as training
+            _aoa2 = _x[:, 0, 14:15]  # save raw AoA before normalization
+            if cfg.raw_targets:
+                _yn = (_y - raw_stats["y_mean"]) / raw_stats["y_std"]
+            elif cfg.adaptive_norm:
+                _ya = _y.clone()
+                if cfg.asinh_pressure:
+                    _ya[:, :, 2:3] = torch.asinh(_ya[:, :, 2:3] * cfg.asinh_scale)
+                _yn = (_ya - raw_stats["y_mean"]) / raw_stats["y_std"]
+            else:
+                _yp2 = _phys_norm(_y, _Umag, _q)
+                if cfg.asinh_pressure:
+                    _yp2 = _yp2.clone()
+                    _yp2[:, :, 2:3] = torch.asinh(_yp2[:, :, 2:3] * cfg.asinh_scale)
+                _yn = (_yp2 - phys_stats["y_mean"]) / phys_stats["y_std"]
+            if cfg.residual_prediction:
+                if cfg.adaptive_norm:
+                    _fs2 = torch.zeros(_yn.shape[0], 1, 3, device=device)
+                    _fs2[:, 0, 0] = _Umag.squeeze() * torch.cos(_aoa2.squeeze(-1))
+                    _fs2[:, 0, 1] = _Umag.squeeze() * torch.sin(_aoa2.squeeze(-1))
+                    _fsn = (_fs2 - raw_stats["y_mean"]) / raw_stats["y_std"]
+                else:
+                    _fs2 = torch.zeros(_yn.shape[0], 1, 3, device=device)
+                    _fs2[:, 0, 0] = torch.cos(_aoa2.squeeze(-1))
+                    _fs2[:, 0, 1] = torch.sin(_aoa2.squeeze(-1))
+                    _fsn = (_fs2 - phys_stats["y_mean"]) / phys_stats["y_std"]
+                _yn = _yn - _fsn
+            # Normalize x (needed for per-sample std gap detection and model input)
+            _x_norm = (_x - stats["x_mean"]) / stats["x_std"]
+            # Compute per-sample std (training formula) — use normalized x for gap
+            _gap = _x_norm[:, 0, 21]
+            _is_tan = _gap.abs() > 0.5
+            _B2 = _yn.shape[0]
+            _ss = torch.ones(_B2, 1, 3, device=device)
+            if not cfg.no_perstd and not cfg.raw_targets and not cfg.adaptive_norm:
+                if cfg.high_p_clamp:
+                    _cc = torch.tensor([0.1, 0.1, 2.0], device=device)
+                    _tc = torch.tensor([0.3, 0.3, 2.0], device=device)
+                elif cfg.unified_clamps:
+                    _cc = _tc = torch.tensor([0.2, 0.2, 0.7], device=device)
+                else:
+                    _cc = torch.tensor([0.1, 0.1, 0.5], device=device)
+                    _tc = torch.tensor([0.3, 0.3, 1.0], device=device)
+                for _b2 in range(_B2):
+                    _vm = _mask[_b2]
+                    if cfg.no_perstd_p:
+                        _vc = (_tc[:2] if _is_tan[_b2] else _cc[:2])
+                        _ss[_b2, 0, :2] = _yn[_b2, _vm, :2].std(dim=0).clamp(min=_vc)
+                    elif _is_tan[_b2]:
+                        _ss[_b2, 0] = _yn[_b2, _vm].std(dim=0).clamp(min=_tc)
+                    else:
+                        _ss[_b2, 0] = _yn[_b2, _vm].std(dim=0).clamp(min=_cc)
+            # Preprocess x: curvature + dist_feat (x_norm already computed above)
+            _raw_dsdf = _x[:, :, 2:10]
+            _dist_surf = _raw_dsdf.abs().min(dim=-1, keepdim=True).values
+            _dist_feat = torch.log1p(_dist_surf * 10.0)
+            _curv = _x_norm[:, :, 2:6].norm(dim=-1, keepdim=True) * _is_surf.float().unsqueeze(-1)
+            _x_base = torch.cat([_x_norm, _curv, _dist_feat], dim=-1)  # [B, N, X_DIM+2]
+            # Raw xy for Fourier PE (same base for all teachers, normalized per-sample)
+            _raw_xy = _x_norm[:, :, :2]
+            _xy_min = _raw_xy.amin(dim=1, keepdim=True)
+            _xy_max = _raw_xy.amax(dim=1, keepdim=True)
+            _xy_norm2 = (_raw_xy - _xy_min) / (_xy_max - _xy_min + 1e-8)
+
+            # Average teacher predictions
+            _sum_pred = torch.zeros_like(_yn)
+            for _tm, _tr in zip(_teachers, _t_refines):
+                # Compute Fourier PE using THIS teacher's learned frequencies
+                _freqs = torch.cat([_tm.fourier_freqs_fixed.to(device), _tm.fourier_freqs_learned.abs()])
+                _xy_scaled = _xy_norm2.unsqueeze(-1) * _freqs
+                _fpe = torch.cat([_xy_scaled.sin().flatten(-2), _xy_scaled.cos().flatten(-2)], dim=-1)
+                _x_full = torch.cat([_x_base, _fpe], dim=-1)  # [B, N, fun_dim+space_dim]
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _tout = _tm({"x": _x_full})
+                _tp = _tout["preds"].float()
+                _th = _tout["hidden"].float()
+                if _tr is not None:
+                    _si = _is_surf.nonzero(as_tuple=False)
+                    if _si.numel() > 0:
+                        _sh = _th[_si[:, 0], _si[:, 1]]
+                        _sp = _tp[_si[:, 0], _si[:, 1]]
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            _corr = _tr(_sh, _sp).float()
+                        _tp = _tp.clone()
+                        _tp[_si[:, 0], _si[:, 1]] += _corr
+                if not cfg.no_perstd and not cfg.raw_targets and not cfg.adaptive_norm:
+                    _tp = _tp / _ss if not cfg.multiply_std else _tp * _ss
+                _sum_pred += _tp
+            _avg = _sum_pred / len(_teachers)
+            # Store per sample (trim to valid nodes)
+            for _b2 in range(_B2):
+                _n_valid = int(_mask[_b2].sum().item())
+                _all_soft.append(_avg[_b2, :_n_valid].cpu())
+
+    torch.save(_all_soft, cfg.gen_soft_targets)
+    print(f"  Saved {len(_all_soft)} soft targets to {cfg.gen_soft_targets}")
+    wandb.finish()
+    import sys; sys.exit(0)
+
+# ---------------------------------------------------------------------------
+# Distillation: if distill_targets is set, swap the train_loader for an
+# indexed version that also returns pre-computed soft targets per batch.
+# ---------------------------------------------------------------------------
+_use_distill = bool(cfg.distill_targets) and os.path.exists(cfg.distill_targets)
+_soft_targets_cpu: list | None = None
+if _use_distill:
+    _soft_targets_cpu = torch.load(cfg.distill_targets, map_location="cpu", weights_only=False)
+    assert len(_soft_targets_cpu) == len(train_ds), (
+        f"Soft targets length {len(_soft_targets_cpu)} != train_ds length {len(train_ds)}"
+    )
+    print(f"Loaded soft targets from {cfg.distill_targets} "
+          f"({len(_soft_targets_cpu)} samples, alpha={cfg.distill_alpha:.2f})")
+    _indexed_ds = _IndexedDS(train_ds)
+    _distill_collate = _make_indexed_collate(_soft_targets_cpu)
+    _distill_loader_kwargs = dict(collate_fn=_distill_collate, num_workers=cfg.num_workers,
+                                  pin_memory=True, persistent_workers=True, prefetch_factor=2)
+    if cfg.debug:
+        train_loader = DataLoader(_indexed_ds, batch_size=cfg.batch_size,
+                                  shuffle=True, **_distill_loader_kwargs)
+    else:
+        train_loader = DataLoader(_indexed_ds, batch_size=cfg.batch_size,
+                                  sampler=sampler, **_distill_loader_kwargs)
+
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
     if elapsed_min >= MAX_TIMEOUT:
@@ -1389,7 +1604,13 @@ for epoch in range(MAX_EPOCHS):
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     if cfg.grad_accum_steps > 1:
         optimizer.zero_grad()
-    for batch_idx, (x, y, is_surface, mask) in enumerate(pbar):
+    for batch_idx, _batch in enumerate(pbar):
+        if _use_distill:
+            x, y, is_surface, mask, _soft_tgt_batch = _batch
+            _soft_tgt_batch = _soft_tgt_batch.to(device, non_blocking=True)
+        else:
+            x, y, is_surface, mask = _batch
+            _soft_tgt_batch = None
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -1710,6 +1931,17 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # Knowledge distillation: blend hard-target loss with soft-target loss
+        if _use_distill and _soft_tgt_batch is not None:
+            _st = _soft_tgt_batch  # [B, N_max, 3], same space as pred
+            _st_err = (pred - _st).abs()
+            _st_vol = (_st_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+            _st_surf_per = (_st_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / \
+                           surf_mask.sum(dim=1).clamp(min=1).float()
+            _st_surf = (_st_surf_per * tandem_boost).mean()
+            soft_loss = _st_vol + surf_weight * _st_surf
+            loss = cfg.distill_alpha * loss + (1.0 - cfg.distill_alpha) * soft_loss
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -1819,7 +2051,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if _use_distill and _soft_tgt_batch is not None:
+            _log_dict["train/soft_loss"] = soft_loss.item()
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
