@@ -2,6 +2,38 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 11:30 — PR #2111: Phase 6: TTA via AoA Perturbation — alphonse — CLOSED (marginal at matching epochs; self-defeating under timeout)
+- Branch: `alphonse/tta-aoa-perturbation`
+- Hypothesis: Average model predictions over 3 AoA perturbations (−δ, 0, +δ) at inference time. Physical motivation: CFD solutions are smooth in AoA; averaging cancels model-artifact error components that vary rapidly with AoA while preserving true signal.
+- W&B group: `phase6/tta-aoa`
+
+**Raw final metrics (confounded by epoch count):**
+
+| Run | W&B ID | Seed | Best Epoch | p_in | p_tan | p_oodc | p_re |
+|-----|--------|------|-----------|------|-------|--------|------|
+| baseline | m6p2jskq | 42 | 157 | 12.9 | 30.4 | 7.9 | 6.5 |
+| baseline | u24b9oh9 | 43 | 157 | 12.9 | 29.8 | 7.8 | 6.4 |
+| tta-d0.5 | 6biat14l | 42 | 130 | 16.3 | 30.5 | 8.8 | 7.0 |
+| tta-d0.5 | j604eyv0 | 43 | 132 | 14.1 | 29.8 | 8.7 | 6.9 |
+| tta-d1.0 | j7n5d3wf | 42 | 132 | 13.7 | 31.4 | 8.5 | 7.1 |
+| tta-d1.0 | z4kv5ghh | 43 | 131 | 14.3 | 31.2 | 8.5 | 6.9 |
+| tta-d2.0 | b6uyjpm6 | 42 | 131 | 16.2 | 30.6 | 8.8 | 7.4 |
+| tta-d2.0 | n7bs7408 | 43 | 131 | 14.5 | 31.3 | 8.6 | 7.0 |
+
+**Epoch-matched W&B comparison (epoch 130, equal training length):**
+
+| Group | p_in | p_tan | p_oodc | p_re |
+|-------|------|-------|--------|------|
+| Baseline (2-seed avg) | 15.71 | 31.43 | 8.88 | 7.20 |
+| TTA d=0.5 (2-seed avg) | 15.71 | 31.30 | 8.81 | 7.15 |
+| TTA d=1.0 (2-seed avg) | 15.88 | 31.29 | 8.80 | 7.13 |
+
+**Delta vs baseline at epoch 130:**
+- TTA d=0.5: p_in ≈ -0.0%, p_tan -0.4%, p_oodc -0.8%, p_re -0.8%
+- TTA d=1.0: p_in +1.1%, p_tan -0.4%, p_oodc -0.9%, p_re -1.0%
+
+**Analysis:** Student correctly diagnosed the confound: TTA validation adds ~14s/epoch (+21% overhead), causing TTA runs to terminate ~25 epochs earlier than baseline. Training is verified identical at matching epochs (bit-for-bit val/loss match). W&B epoch-matched analysis confirms: at equal training length, TTA provides marginal benefit (~0.4-1.0% on p_tan/p_oodc/p_re, neutral to slightly worse on p_in) — insufficient to justify 3x inference overhead, and self-defeating because the overhead consumes ~25 training epochs worth ~18% p_in improvement. **Closed: TTA as a training-loop validation technique is self-defeating under our timeout constraint. Per-model TTA gain (~0.8%) is too small to justify cost vs training more epochs.**
+
 ### 2026-04-04 10:45 — PR #2110: Phase 6: Progressive Surface Focus Schedule — nezuko — CLOSED (negative, p_in regresses)
 - Branch: `nezuko/progressive-surface-focus`
 - Hypothesis: Starting with surf_weight=1.0 and ramping to dynamic target over a warm-in period lets the model build a coherent bulk-flow backbone before amplifying surface loss, improving surface MAE.
