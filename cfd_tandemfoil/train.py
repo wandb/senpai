@@ -454,12 +454,15 @@ class SurfaceRefinementHead(nn.Module):
     Takes the Transolver hidden features (and optionally the base predictions)
     for surface nodes only, and outputs a residual correction that is added
     to the main model's predictions at surface locations.
+
+    Optionally applies FiLM conditioning on (Re, AoA) after the first hidden layer.
     """
 
     def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 128,
-                 n_layers: int = 2, p_only: bool = False):
+                 n_layers: int = 2, p_only: bool = False, film: bool = False):
         super().__init__()
         self.p_only = p_only
+        self.film = film
         actual_out = 1 if p_only else out_dim  # 1 for pressure-only, 3 for all fields
         layers: list[nn.Module] = []
         # Input: hidden features (n_hidden) + base predictions (out_dim)
@@ -473,17 +476,34 @@ class SurfaceRefinementHead(nn.Module):
         nn.init.zeros_(layers[-1].weight)
         nn.init.zeros_(layers[-1].bias)
         self.mlp = nn.Sequential(*layers)
+        # FiLM modulation from (Re, AoA) — 2-dim condition, zero-initialized
+        if film:
+            self.film_scale = nn.Linear(2, hidden_dim, bias=False)
+            self.film_shift = nn.Linear(2, hidden_dim)
+            nn.init.zeros_(self.film_scale.weight)
+            nn.init.zeros_(self.film_shift.weight)
+            nn.init.zeros_(self.film_shift.bias)
 
-    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor,
+                cond: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             hidden: [M, n_hidden] — hidden features for surface nodes only
             base_pred: [M, out_dim] — base predictions for surface nodes only
+            cond: [M, 2] — per-node (Re, AoA) condition (only used if film=True)
         Returns:
             correction: [M, out_dim] — additive correction (zero-padded for p_only)
         """
         inp = torch.cat([hidden, base_pred], dim=-1)
-        correction = self.mlp(inp)
+        # Run through layers, applying FiLM after first hidden activation (index 2)
+        x = inp
+        for i, layer in enumerate(self.mlp):
+            x = layer(x)
+            if self.film and cond is not None and i == 2:
+                gamma = self.film_scale(cond)   # [M, hidden_dim]
+                beta = self.film_shift(cond)    # [M, hidden_dim]
+                x = x * (1.0 + gamma) + beta
+        correction = x
         if self.p_only:
             # Pad with zeros for velocity channels: [M, 1] → [M, 3]
             zeros = torch.zeros(correction.shape[0], base_pred.shape[-1] - 1,
@@ -995,6 +1015,7 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    surface_refine_film: bool = False         # FiLM conditioning on (Re, AoA) for SRF head
     # Phase 6: Asinh pressure transform
     asinh_pressure: bool = False             # transform pressure targets with asinh for dynamic range compression
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
@@ -1190,6 +1211,7 @@ if cfg.surface_refine:
             hidden_dim=cfg.surface_refine_hidden,
             n_layers=cfg.surface_refine_layers,
             p_only=cfg.surface_refine_p_only,
+            film=cfg.surface_refine_film,
         ).to(device)
     refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
     _refine_n_params = sum(p.numel() for p in refine_head.parameters())
@@ -1695,7 +1717,11 @@ for epoch in range(MAX_EPOCHS):
                     if surf_idx.numel() > 0:
                         surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]  # [M, n_hidden]
                         surf_pred = pred[surf_idx[:, 0], surf_idx[:, 1]]      # [M, 3]
-                        correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
+                        # FiLM condition: (Re, AoA) per surface node — from x[:, 0, 13:15]
+                        _srf_cond = None
+                        if cfg.surface_refine_film:
+                            _srf_cond = x[surf_idx[:, 0], 0, 13:15]  # [M, 2]
+                        correction = refine_head(surf_hidden, surf_pred, _srf_cond).float()  # [M, 3]
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
 
@@ -2199,7 +2225,10 @@ for epoch in range(MAX_EPOCHS):
                             if surf_idx.numel() > 0:
                                 surf_hidden = _eval_hidden[surf_idx[:, 0], surf_idx[:, 1]]
                                 surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                                correction = eval_refine_head(surf_hidden, surf_pred).float()
+                                _srf_cond_val = None
+                                if cfg.surface_refine_film:
+                                    _srf_cond_val = x[surf_idx[:, 0], 0, 13:15]  # [M, 2]
+                                correction = eval_refine_head(surf_hidden, surf_pred, _srf_cond_val).float()
                                 pred_loss = pred_loss.clone()
                                 pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
