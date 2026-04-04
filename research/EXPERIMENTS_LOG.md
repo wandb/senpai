@@ -2,6 +2,33 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 ~19:00 — PR #2119: Phase 6: PCGrad 3-Way Task Split — Gradient Surgery — askeladd — SENT BACK (8-seed validation)
+
+- Branch: `askeladd/pcgrad-3way`
+- Hypothesis: 3-way PCGrad splitting samples into single-foil / tandem-normal / tandem-extreme-Re for gradient surgery to reduce gradient conflicts between tasks.
+- **Critical confound:** batch_size=4 gives ~2 tandem samples per batch; the ≥4 threshold for extreme-Re quantile detection almost never triggers. Runs pct=0.15/s42 and pct=0.10/s42 are **identical** (confirmed via W&B). The experiment effectively tested **2-way PCGrad** (single-foil vs all-tandem).
+
+| Run | W&B ID | Config | Seed | p_in | p_oodc | p_tan | p_re |
+|-----|--------|--------|------|------|--------|-------|------|
+| 1 | p9oupnt2 | pct=0.15 | 42 | 13.49 | 7.64 | 30.04 | 6.43 |
+| 2 | 6sp2uazt | pct=0.15 | 73 | 12.94 | 7.49 | 29.37 | 6.45 |
+| 3 | kov6n0rs | pct=0.10 | 42 | 13.49 | 7.64 | 30.04 | 6.43 |
+| 4 | l308y9lx | pct=0.10 | 73 | 13.41 | 7.82 | 29.03 | 6.43 |
+| Baseline (8-seed mean) | | | | 13.19 | 7.92 | 30.05 | 6.45 |
+
+W&B group: `phase6/pcgrad-3way`
+
+**Results commentary:**
+- **p_oodc improves in ALL 4 runs** (7.49–7.82 vs 7.92, -1.3% to -5.4%). This is the most consistent signal.
+- p_tan improves substantially for seed 73 (29.03, 29.37 vs 30.05) but is flat for seed 42 (30.04). High seed variance.
+- p_in inconsistent: 12.94 (good) vs 13.41/13.49 (worse).
+- p_re marginally better across the board.
+- VRAM overhead: ~45-46 GB (up from ~38 GB, +22% for 3 backward passes).
+- **Key insight:** 2-way PCGrad (single-foil vs all-tandem) produces a reliable p_oodc improvement. The original PCGrad (disabled with `--disable_pcgrad`) split differently (indist vs all-OOD). The new single/tandem boundary is a cleaner split.
+- **Decision:** Sent back for 8-seed validation (seeds 42-49) with `--aug_gap_stagger_sigma 0.02` added. If 8-seed mean p_oodc < 7.92, merge.
+
+---
+
 ### 2026-04-04 ~17:30 — PR #2121: Phase 6: Aft-Foil Loss Upweighting — Stronger Gradient for Wake Nodes — tanjiro — CLOSED
 
 - Branch: `tanjiro/aft-foil-loss-weight`

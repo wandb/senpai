@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-04 ~18:00 UTC
+- **Date:** 2026-04-04 ~19:00 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -35,16 +35,17 @@
 | nezuko | #2122 | Fore-Foil Loss Upweighting (ID=6) — Symmetric to Aft-Foil Weight | WIP |
 | fern | #2124 | Fore-Foil Stacked SRF Head (ID=6) — Additive, Not Split | WIP |
 | edward | #2120 | Langevin Gradient Noise (SGLD) — Stochastic Exploration for Lion | WIP |
-| askeladd | #2119 | PCGrad 3-Way Task Split — Gradient Surgery (single/tandem-normal/tandem-extreme) | WIP |
+| askeladd | #2119 | PCGrad 2-Way Validation — 8-seed (seeds 42-49) with gap_stagger aug | WIP (sent back for validation) |
 | alphonse | #2123 | Combined Baseline 8-Seed Validation (aft_foil_srf + gap/stagger aug, seeds 42-49) | WIP |
 | thorfinn | #2125 | Reynolds Number Perturbation Augmentation — OOD-Re Robustness | WIP |
 
 **All 8 students active. Zero idle GPUs.**
 
-## Recently Reviewed (2026-04-04 ~17:30)
+## Recently Reviewed (2026-04-04 ~19:00)
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
+| #2119 | askeladd | PCGrad 3-Way (effectively 2-way due to batch-size confound) | **SENT BACK** | p_oodc beats baseline in ALL 4 runs (-1.3% to -5.4%). 3-way never fires (batch_size=4). Sent back for 8-seed 2-way validation. |
 | #2121 | tanjiro | Aft-Foil Loss Upweighting (w=1.5, w=2.0) | **CLOSED** | p_oodc consistently beats baseline (-2%) but p_tan regresses +1.5-1.7%. Loss weighting helps OOD-C but trades off tandem. |
 | #2107 | frieren | Aft-Foil Coordinate Frame (dual-frame v2, 4-seed final) | **CLOSED** | After 3 iterations and 8 runs: 4-seed mean p_in +3.0%, p_tan +0.6%. High p_tan variance (range 1.55). Approach explored. |
 
@@ -63,7 +64,7 @@
 3. **Fore-Foil Loss Upweighting (ID=6)** (nezuko #2122) — upweight fore-foil nodes 1.5–2.0× in surface loss
 4. **Fore-Foil Stacked SRF Head (ID=6)** (fern #2124) — additive fore_srf_head on top of shared srf_head
 5. **Reynolds Number Perturbation Augmentation** (thorfinn #2125) — add Gaussian noise to log_Re during training; σ sweep {0.05, 0.1, 0.2}; targets p_re < 6.45
-6. **PCGrad 3-Way Task Split** (askeladd #2119) — gradient surgery across single/tandem-normal/tandem-extreme-Re
+6. **PCGrad 2-Way Validation** (askeladd #2119) — 8-seed validation of 2-way PCGrad (single-foil vs all-tandem); p_oodc signal -1.3% to -5.4% in initial 4 runs
 7. **Langevin Gradient Noise / SGLD** (edward #2120) — Gaussian noise after Lion step; sweep {5e-5, 1e-4, 3e-4}
 8. **Combined Baseline 8-Seed Validation** (alphonse #2123) — runs seeds 42-49 with aft_foil_srf + aug_gap_stagger_sigma=0.02 combined; gives accurate merge targets
 
@@ -72,6 +73,7 @@
 - **What doesn't work:** Loss reweighting by surface region (p_oodc improves but p_tan regresses), input feature engineering (boundary-ID one-hot, coordinate frames), loss function changes (Charbonnier, Huber, GC)
 - **Design principle:** SRF specialization must be ADDITIVE (stack on shared head), not REPLACING
 - **Design principle:** Boundary-type information must be delivered architecturally (dedicated heads), not as sparse input features
+- **Emerging signal:** 2-way PCGrad (single-foil vs tandem) produces consistent p_oodc improvement; awaiting 8-seed validation
 
 ## Potential Next Research Directions (not yet assigned)
 
