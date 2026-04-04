@@ -906,6 +906,7 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1452,6 +1453,21 @@ for epoch in range(MAX_EPOCHS):
                     x[_b, _in_region] = x[_cut_idx[_b], _in_region]
                     y[_b, _in_region] = y[_cut_idx[_b], _in_region]
                     is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
+
+            # Gap/stagger perturbation augmentation (tandem samples only)
+            if cfg.aug_gap_stagger_sigma > 0.0:
+                _is_tandem_aug = (x[:, 0, 21].abs() > 0.01)  # [B] — matches existing tandem detection
+                if _is_tandem_aug.any():
+                    _B = x.size(0)
+                    # Per-sample Gaussian noise, broadcast to all N nodes
+                    _gap_noise  = torch.randn(_B, device=x.device) * cfg.aug_gap_stagger_sigma
+                    _stag_noise = torch.randn(_B, device=x.device) * cfg.aug_gap_stagger_sigma
+                    # Zero out noise for non-tandem samples (preserve single-foil sentinel exactly)
+                    _gap_noise  = _gap_noise  * _is_tandem_aug.float()
+                    _stag_noise = _stag_noise * _is_tandem_aug.float()
+                    # Apply: broadcast [B] → [B, 1] → adds to [B, N]
+                    x[:, :, 22] = x[:, :, 22] + _gap_noise.unsqueeze(1)
+                    x[:, :, 23] = x[:, :, 23] + _stag_noise.unsqueeze(1)
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
