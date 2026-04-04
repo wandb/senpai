@@ -544,6 +544,51 @@ class AftFoilRefinementHead(nn.Module):
         return x
 
 
+class AftFoilRefinementContextHead(nn.Module):
+    """Aft-foil refinement head with KNN volume context for wake pressure recovery.
+
+    For each aft-foil surface node, aggregates hidden states from K nearest
+    volume neighbors, giving the correction head access to upstream wake
+    information. Zero-initialized output for safe initialization.
+    """
+
+    def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 192,
+                 n_layers: int = 3, k_neighbors: int = 8):
+        super().__init__()
+        self.k = k_neighbors
+        # Input: aft surface hidden + volume KNN context + base pred
+        in_dim = n_hidden + n_hidden + out_dim
+        layers: list[nn.Module] = []
+        for i in range(n_layers):
+            layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
+            layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.GELU())
+        layers.append(nn.Linear(hidden_dim, out_dim))
+        nn.init.zeros_(layers[-1].weight)
+        nn.init.zeros_(layers[-1].bias)
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, aft_hidden: torch.Tensor, aft_positions: torch.Tensor,
+                vol_hidden: torch.Tensor, vol_positions: torch.Tensor,
+                aft_base_pred: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            aft_hidden: [A, n_hidden] — hidden features for aft-foil surface nodes
+            aft_positions: [A, 2] — xy coords of aft-foil surface nodes
+            vol_hidden: [V, n_hidden] — hidden features of volume (non-surface) nodes
+            vol_positions: [V, 2] — xy coords of volume nodes
+            aft_base_pred: [A, out_dim] — base predictions for aft-foil nodes
+        Returns:
+            correction: [A, out_dim] — additive correction
+        """
+        k = min(self.k, vol_hidden.shape[0])
+        dists = torch.cdist(aft_positions, vol_positions)  # [A, V]
+        _, nn_idx = dists.topk(k, dim=-1, largest=False)  # [A, k]
+        vol_context = vol_hidden[nn_idx].mean(dim=1)  # [A, n_hidden]
+        inp = torch.cat([aft_hidden, vol_context, aft_base_pred], dim=-1)
+        return self.mlp(inp)
+
+
 class SurfaceRefinementContextHead(nn.Module):
     """Surface refinement head that incorporates nearest-volume context.
 
@@ -959,6 +1004,7 @@ class Config:
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
+    aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1005,6 +1051,7 @@ class Config:
     aft_foil_srf_film: bool = False          # FiLM conditioning on gap/stagger for aft-foil head
     aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
     aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
+    aft_foil_srf_context: bool = False       # KNN volume context for aft-foil SRF (wake pressure recovery)
     # Phase 6: Supervised surface pressure gradient auxiliary loss
     surf_grad_aux: bool = False              # supervised pressure gradient auxiliary loss
     surf_grad_weight: float = 0.05           # weight relative to main surface loss
@@ -1202,19 +1249,33 @@ if cfg.surface_refine:
 
 # Aft-foil (boundary ID=7) dedicated refinement head
 aft_srf_head = None
+aft_srf_ctx_head = None
 if cfg.aft_foil_srf:
-    aft_srf_head = AftFoilRefinementHead(
-        n_hidden=cfg.n_hidden,
-        out_dim=3,
-        hidden_dim=cfg.aft_foil_srf_hidden,
-        n_layers=cfg.aft_foil_srf_layers,
-        film=cfg.aft_foil_srf_film,
-    ).to(device)
-    aft_srf_head = torch.compile(aft_srf_head, mode=cfg.compile_mode)
-    _aft_n_params = sum(p.numel() for p in aft_srf_head.parameters())
-    print(f"Aft-foil SRF head: {_aft_n_params:,} params "
-          f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, "
-          f"film={cfg.aft_foil_srf_film})")
+    if cfg.aft_foil_srf_context:
+        aft_srf_ctx_head = AftFoilRefinementContextHead(
+            n_hidden=cfg.n_hidden,
+            out_dim=3,
+            hidden_dim=cfg.aft_foil_srf_hidden,
+            n_layers=cfg.aft_foil_srf_layers,
+            k_neighbors=8,
+        ).to(device)
+        aft_srf_ctx_head = torch.compile(aft_srf_ctx_head, mode=cfg.compile_mode)
+        _aft_n_params = sum(p.numel() for p in aft_srf_ctx_head.parameters())
+        print(f"Aft-foil SRF context head: {_aft_n_params:,} params "
+              f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, k=8)")
+    else:
+        aft_srf_head = AftFoilRefinementHead(
+            n_hidden=cfg.n_hidden,
+            out_dim=3,
+            hidden_dim=cfg.aft_foil_srf_hidden,
+            n_layers=cfg.aft_foil_srf_layers,
+            film=cfg.aft_foil_srf_film,
+        ).to(device)
+        aft_srf_head = torch.compile(aft_srf_head, mode=cfg.compile_mode)
+        _aft_n_params = sum(p.numel() for p in aft_srf_head.parameters())
+        print(f"Aft-foil SRF head: {_aft_n_params:,} params "
+              f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, "
+              f"film={cfg.aft_foil_srf_film})")
 
 from copy import deepcopy
 ema_model = None
@@ -1239,6 +1300,8 @@ if refine_head is not None:
     n_params += sum(p.numel() for p in refine_head.parameters())
 if aft_srf_head is not None:
     n_params += sum(p.numel() for p in aft_srf_head.parameters())
+if aft_srf_ctx_head is not None:
+    n_params += sum(p.numel() for p in aft_srf_ctx_head.parameters())
 
 
 class SAM:
@@ -1375,6 +1438,10 @@ if aft_srf_head is not None:
     _aft_params = list(aft_srf_head.parameters())
     base_opt.add_param_group({'params': _aft_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _aft_params):,} aft-foil SRF head params to optimizer")
+if aft_srf_ctx_head is not None:
+    _ctx_params = list(aft_srf_ctx_head.parameters())
+    base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
@@ -1470,6 +1537,8 @@ for epoch in range(MAX_EPOCHS):
         refine_head.train()
     if aft_srf_head is not None:
         aft_srf_head.train()
+    if aft_srf_ctx_head is not None:
+        aft_srf_ctx_head.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
@@ -1555,6 +1624,19 @@ for epoch in range(MAX_EPOCHS):
                     # Apply: broadcast [B] → [B, 1] → adds to [B, N]
                     x[:, :, 22] = x[:, :, 22] + _gap_noise.unsqueeze(1)
                     x[:, :, 23] = x[:, :, 23] + _stag_noise.unsqueeze(1)
+
+        # Foil-2 DSDF magnitude augmentation (tandem samples only, training only)
+        # x layout: [pos(2), saf(2), dsdf(8), ...]; foil-2 SDF = dsdf[4:8] = x[:, :, 6:10]
+        # Scaling is log-normal (preserves gradient directions, adjusts magnitude only)
+        if model.training and cfg.aug_dsdf2_sigma > 0.0:
+            _is_tandem_aug2 = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero → tandem
+            if _is_tandem_aug2.any():
+                _dsdf2_scale = torch.exp(
+                    torch.randn(x.size(0), device=x.device) * cfg.aug_dsdf2_sigma
+                )
+                # Identity for non-tandem samples
+                _dsdf2_scale = _dsdf2_scale * _is_tandem_aug2.float() + (~_is_tandem_aug2).float()
+                x[:, :, 6:10] = x[:, :, 6:10] * _dsdf2_scale.view(-1, 1, 1)
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
@@ -1703,7 +1785,26 @@ for epoch in range(MAX_EPOCHS):
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
 
         # Aft-foil dedicated refinement head: additive correction on boundary ID=7 nodes only
-        if aft_srf_head is not None and model.training and _aft_foil_mask is not None:
+        if aft_srf_ctx_head is not None and model.training and _aft_foil_mask is not None:
+            # Context-aware version: KNN volume context for wake pressure
+            _vol_mask = mask & ~is_surface  # [B, N] — volume (non-surface) nodes
+            _coords = x[:, :, :2]  # standardized (x, y) positions
+            pred = pred.clone()
+            for b in range(x.shape[0]):
+                _aft_b = _aft_foil_mask[b].nonzero(as_tuple=True)[0]
+                _vol_b = _vol_mask[b].nonzero(as_tuple=True)[0]
+                if _aft_b.numel() == 0 or _vol_b.numel() == 0:
+                    continue
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _corr = aft_srf_ctx_head(
+                        hidden[b, _aft_b],     # aft surface hidden
+                        _coords[b, _aft_b],    # aft surface positions
+                        hidden[b, _vol_b],     # volume hidden
+                        _coords[b, _vol_b],    # volume positions
+                        pred[b, _aft_b],       # aft base prediction
+                    ).float()
+                pred[b, _aft_b] = pred[b, _aft_b] + _corr
+        elif aft_srf_head is not None and model.training and _aft_foil_mask is not None:
             aft_idx = _aft_foil_mask.nonzero(as_tuple=False)  # [A, 2] (batch, node)
             if aft_idx.numel() > 0:
                 aft_hidden = hidden[aft_idx[:, 0], aft_idx[:, 1]]  # [A, n_hidden]
@@ -1996,6 +2097,14 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _aft_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            if aft_srf_ctx_head is not None:
+                _ctx_base = aft_srf_ctx_head._orig_mod if hasattr(aft_srf_ctx_head, '_orig_mod') else aft_srf_ctx_head
+                if ema_aft_srf_head is None:
+                    ema_aft_srf_head = deepcopy(_ctx_base)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -2103,12 +2212,19 @@ for epoch in range(MAX_EPOCHS):
             refine_head.eval()
     # Select aft-foil SRF head for eval (EMA if available)
     eval_aft_srf_head = aft_srf_head
+    eval_aft_srf_ctx_head = aft_srf_ctx_head
     if aft_srf_head is not None:
         if ema_aft_srf_head is not None and ema_model is not None and eval_model is ema_model:
             eval_aft_srf_head = ema_aft_srf_head
             eval_aft_srf_head.eval()
         elif aft_srf_head is not None:
             aft_srf_head.eval()
+    if aft_srf_ctx_head is not None:
+        if ema_aft_srf_head is not None and ema_model is not None and eval_model is ema_model:
+            eval_aft_srf_ctx_head = ema_aft_srf_head
+            eval_aft_srf_ctx_head.eval()
+        else:
+            aft_srf_ctx_head.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -2255,7 +2371,27 @@ for epoch in range(MAX_EPOCHS):
                         pred = pred_loss * sample_stds
 
                 # Apply aft-foil SRF head during validation
-                if eval_aft_srf_head is not None and _eval_aft_mask is not None:
+                if eval_aft_srf_ctx_head is not None and _eval_aft_mask is not None:
+                    _vol_mask_v = mask & ~is_surface
+                    _coords_v = x[:, :, :2]
+                    pred_loss = pred_loss.clone()
+                    for b in range(x.shape[0]):
+                        _aft_b = _eval_aft_mask[b].nonzero(as_tuple=True)[0]
+                        _vol_b = _vol_mask_v[b].nonzero(as_tuple=True)[0]
+                        if _aft_b.numel() == 0 or _vol_b.numel() == 0:
+                            continue
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            _corr = eval_aft_srf_ctx_head(
+                                _eval_hidden[b, _aft_b], _coords_v[b, _aft_b],
+                                _eval_hidden[b, _vol_b], _coords_v[b, _vol_b],
+                                pred_loss[b, _aft_b],
+                            ).float()
+                        pred_loss[b, _aft_b] += _corr
+                    if cfg.multiply_std:
+                        pred = pred_loss / sample_stds
+                    else:
+                        pred = pred_loss * sample_stds
+                elif eval_aft_srf_head is not None and _eval_aft_mask is not None:
                     aft_idx = _eval_aft_mask.nonzero(as_tuple=False)
                     if aft_idx.numel() > 0:
                         _ah = _eval_hidden[aft_idx[:, 0], aft_idx[:, 1]]
@@ -2443,6 +2579,11 @@ for epoch in range(MAX_EPOCHS):
                 aft_srf_head._orig_mod if hasattr(aft_srf_head, '_orig_mod') else aft_srf_head
             )
             torch.save(_aft_save.state_dict(), model_dir / "aft_srf_head.pt")
+        if aft_srf_ctx_head is not None:
+            _ctx_save = ema_aft_srf_head if ema_aft_srf_head is not None else (
+                aft_srf_ctx_head._orig_mod if hasattr(aft_srf_ctx_head, '_orig_mod') else aft_srf_ctx_head
+            )
+            torch.save(_ctx_save.state_dict(), model_dir / "aft_srf_ctx_head.pt")
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(

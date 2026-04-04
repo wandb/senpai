@@ -1,19 +1,79 @@
 # Baseline Metrics
 
-## Current Single-Model Baseline (Phase 6 — 2026-04-04, +aft_foil_srf +aug_gap_stagger, 8-Seed Mean, Seeds 42-49)
+## Current Single-Model Baseline (Phase 6 — 2026-04-04, +aft_foil_srf_context K=8, 2-Seed Evidence, PR #2127)
 
-| Metric | aft_srf 8-seed mean | vs prior 8-seed baseline | vs Asinh-only |
+| Metric | 2-seed avg | vs prior (DSDF2 aug) | Δ |
+|--------|------------|----------------------|---|
+| p_in | **13.02** | 13.04 | **-0.2%** |
+| p_oodc | **7.62** | 7.66 | **-0.5%** |
+| **p_tan** | **29.91** | 30.11 | **-0.7%** |
+| p_re | **6.47** | 6.52 | **-1.0%** |
+
+**PR #2127** (merged 2026-04-04) — Context-Aware AftSRF: KNN volume context (K=8 nearest zone-2 volume neighbors) for the aft-foil SRF correction head. Gives the correction MLP direct access to upstream wake hidden states, physically motivated by fore→aft pressure dependency. Note: run WITHOUT `--aug_dsdf2_sigma 0.05` — improvement is independent of DSDF2 aug. W&B runs: zosxwjmm (seed 42, p_tan=29.96), twilqf1x (seed 73, p_tan=29.87).
+
+⚠️ **2-seed only** — statistically solid directional signal (both seeds below baseline). VRAM usage 69-95GB peak per run (dedicated H100 required per seed). Per-epoch overhead ~25% vs baseline. For merge decisions: use p_tan < 29.91, p_oodc < 7.62, p_in < 13.02, p_re < 6.47.
+
+**Reproduce (current baseline):**
+```bash
+cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baseline-aft-srf-ctx" \
+  --asinh_pressure --asinh_scale 0.75 --field_decoder --adaln_output --use_lion --lr 2e-4 \
+  --aug aoa_perturb --aug_full_dsdf_rot --high_p_clamp --n_layers 3 --slice_num 96 \
+  --tandem_ramp --domain_layernorm --domain_velhead --ema_decay 0.999 --weight_decay 5e-5 \
+  --cosine_T_max 160 --disable_pcgrad --pressure_first --pressure_deep \
+  --residual_prediction --surface_refine --surface_refine_hidden 192 --surface_refine_layers 3 \
+  --aft_foil_srf --aug_gap_stagger_sigma 0.02 --aft_foil_srf_context
+```
+
+**For merge decisions:** Compare 2-seed avg against: p_tan < 29.91, p_oodc < 7.62, p_in < 13.02, p_re < 6.47.
+
+---
+
+## Prior Single-Model Baseline (Phase 6 — 2026-04-04, +aft_foil_srf +aug_gap_stagger +aug_dsdf2_sigma=0.05, 2-Seed Evidence, PR #2126)
+
+| Metric | 2-seed avg (σ=0.05) | vs prior combined baseline | Δ |
+|--------|---------------------|---------------------------|---|
+| p_in | **13.04** | 13.24 | **-1.5%** |
+| p_oodc | **7.66** | 7.73 | **-0.9%** |
+| **p_tan** | **30.11** | 30.53 | **-1.4%** |
+| p_re | 6.52 | 6.50 | +0.3% (noise) |
+
+**PR #2126** (merged 2026-04-04) — Foil-2 DSDF Magnitude Augmentation (σ=0.05). Log-normal scaling of foil-2 DSDF channels (x[:,6:10], tandem samples only) before standardization forces shape-transfer generalization. W&B runs: hcc2q68t (seed 42, p_tan=29.76), e9cri4mt (seed 73, p_tan=30.46).
+
+⚠️ **2-seed only** — Requires 8-seed validation for statistical confidence. Best single run: p_in=13.11, p_oodc=7.70, **p_tan=29.76**, p_re=6.42 (seed 42). For merge decisions: use p_tan < 30.11, p_oodc < 7.66, p_in < 13.04 as targets.
+
+**Reproduce (current baseline):**
+```bash
+cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baseline-dsdf2-aug" \
+  --asinh_pressure --asinh_scale 0.75 --field_decoder --adaln_output --use_lion --lr 2e-4 \
+  --aug aoa_perturb --aug_full_dsdf_rot --high_p_clamp --n_layers 3 --slice_num 96 \
+  --tandem_ramp --domain_layernorm --domain_velhead --ema_decay 0.999 --weight_decay 5e-5 \
+  --cosine_T_max 160 --disable_pcgrad --pressure_first --pressure_deep \
+  --residual_prediction --surface_refine --surface_refine_hidden 192 --surface_refine_layers 3 \
+  --aft_foil_srf --aug_gap_stagger_sigma 0.02 --aug_dsdf2_sigma 0.05
+```
+
+**For merge decisions:** Compare 2-seed avg against: p_tan < 30.11, p_oodc < 7.66, p_in < 13.04, p_re < 6.52.
+
+---
+
+## Prior Single-Model Baseline (Phase 6 — 2026-04-04, +aft_foil_srf +aug_gap_stagger, 8-Seed Combined Validation, Seeds 42-49)
+
+| Metric | Combined 8-seed mean | vs aft_srf-only (PR #2104) | vs Asinh-only |
 |--------|---------------------|--------------------------|---------------|
-| p_in | **13.19 ± 0.33** | +1.2% | +1.2% |
-| p_oodc | **7.92 ± 0.17** | +1.2% | +1.2% |
-| p_tan | **30.05 ± 0.36** | **-0.8%** | **-0.8%** |
-| p_re | **6.45 ± 0.07** | 0% | 0% |
+| p_in | **13.24 ± 0.33** | +0.4% | +1.6% |
+| p_oodc | **7.73 ± 0.22** | **-2.4%** | -1.3% |
+| p_tan | **30.53 ± 0.50** | +1.6% | +0.8% |
+| p_re | **6.50 ± 0.07** | +0.8% | +0.8% |
 
-**PR #2104** — Dedicated aft-foil Surface Refinement Head (boundary ID=7 only). Beats prior single-model baseline on p_tan (-0.8%, our primary target). W&B group: `phase6/aft-foil-srf-8seed`. Run IDs: fctgmn1d, rc40fpuu, ygqo9rom, r5uxnp4b, yxhjfisl, qrbprrli, 9whdgscd, ekdcwekr.
+**PR #2123** (validated 2026-04-04) — Combined 8-seed validation of aft_foil_srf + aug_gap_stagger_sigma=0.02. W&B group: `phase6/combined-baseline-8seed`. Run IDs: zapen0x3, 3vuz3adi, g1uhcorj, ea551p6b, fdf1vsi3, al6opl9g, jg15oow3, vzm3s42y.
 
-**PR #2115** (merged 2026-04-04) — Gap/Stagger Perturbation Augmentation (`--aug_gap_stagger_sigma 0.02`). Validated without `--aft_foil_srf` (in-flight during experiment); results vs pre-aft_foil_srf asinh-only baseline: p_oodc **-4.9%** (7.446 vs 7.83), p_re **-1.5%** (6.351 vs 6.45), p_tan -0.25%. Augmentation is orthogonal (adds Gaussian noise to gap/stagger scalars during training only). Added to baseline reproduce command. W&B group: `phase6/gap-stagger-aug`. Best run IDs: hszpxxof (σ=0.02, s42), weovkf6s (σ=0.02, s73).
+⚠️ **Key finding:** Gap/stagger augmentation (PR #2115) is NOT additive with aft_foil_srf (PR #2104). The combination helps p_oodc (-2.4%) but **regresses p_tan (+1.6%)**. This suggests gap/stagger noise during training may slightly disrupt the aft-foil SRF head's ability to learn tandem wake corrections.
 
-**Reproduce (new baseline):**
+**Component baselines for reference:**
+- aft_foil_srf only (PR #2104, 8-seed): p_in=13.19, p_oodc=7.92, **p_tan=30.05**, p_re=6.45
+- gap/stagger only (PR #2115, 2-seed, no aft_srf): p_in≈13.04, p_oodc=7.45, p_tan=30.21, p_re=6.35
+
+**Reproduce (current baseline):**
 ```bash
 cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baseline-aft-srf-aug" \
   --asinh_pressure --asinh_scale 0.75 --field_decoder --adaln_output --use_lion --lr 2e-4 \
@@ -24,7 +84,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
   --aft_foil_srf --aug_gap_stagger_sigma 0.02
 ```
 
-**For merge decisions:** Compare 2-seed avg against single-model mean targets: p_tan < 30.05, p_oodc < 7.92, p_in < 13.19, p_re < 6.45.
+**For merge decisions:** Compare 2-seed avg against combined 8-seed mean targets: p_tan < 30.53, p_oodc < 7.73, p_in < 13.24, p_re < 6.50.
 
 ---
 

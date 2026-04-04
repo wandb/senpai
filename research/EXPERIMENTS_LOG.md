@@ -2,6 +2,203 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 ~23:30 — PR #2129: Supervised Surface Pressure Gradient Aux Loss — nezuko — **SENT BACK** (revision requested)
+
+- Branch: `nezuko/surf-pressure-gradient-aux`
+- Hypothesis: Add an auxiliary L1 loss on the chord-wise first-order pressure gradient (finite differences between consecutive surface nodes sorted by x-coordinate). Forces the model to reproduce the spatial structure of the Cp distribution, not just point-wise accuracy. Tested at weight=0.05 and weight=0.10.
+
+| Run | W&B ID | Weight | Seed | p_in | p_oodc | p_tan | p_re |
+|-----|--------|--------|------|------|--------|-------|------|
+| surfgrad-w05-s42 | bnskf03a | 0.05 | 42 | 13.518 | 7.574 | 30.387 | 6.451 |
+| surfgrad-w05-s73 | yfy3efjq | 0.05 | 73 | 13.644 | 7.854 | 30.826 | 6.650 |
+| surfgrad-w10-s42 | s2txmpe9 | 0.10 | 42 | 13.113 | 7.836 | 30.311 | 6.475 |
+| surfgrad-w10-s73 | 3is100bp | 0.10 | 73 | 13.185 | 7.631 | 30.428 | 6.393 |
+| **w=0.05 avg** | — | 0.05 | — | **13.581** | **7.714** | **30.607** | **6.551** |
+| **w=0.10 avg** | — | 0.10 | — | **13.149** | **7.734** | **30.370** | **6.434** |
+| **Current baseline** | — | — | — | **13.02** | **7.62** | **29.91** | **6.47** |
+
+W&B group: `phase6/surf-grad-aux`
+
+**Results commentary:**
+- **DOES NOT BEAT BASELINE.** Against the current baseline (PR #2127, +aft_foil_srf_context), all metrics except p_re regress.
+- **w=0.10 > w=0.05** across the board. Weight=0.10 is clearly the better setting.
+- **Known bug:** Runs used stale baseline (missing `--aft_foil_srf_context`). More importantly, chord-wise sorting over ALL surface nodes creates spurious gradients between fore-foil TE and aft-foil LE in tandem samples. These cross-foil gradients are physically meaningless and likely suppress the p_tan signal.
+- **Sent back** with instructions to: (1) split gradient computation per-foil to eliminate cross-foil artifacts, (2) add `--aft_foil_srf_context` to match current baseline, (3) re-run w=0.10 only (2 seeds). Final iteration — close if no improvement.
+
+---
+
+### 2026-04-04 ~22:00 — PR #2127: Context-Aware AftSRF — KNN Volume Context — frieren — **MERGED** (winner)
+
+- Branch: `frieren/aft-srf-knn-context`
+- Hypothesis: AftFoilRefinementHead receives no non-local context. Aft-foil surface pressure depends on upstream wake state arriving from the fore-foil. Augmenting each aft-foil surface node's hidden state with the averaged hidden states of K=8 nearest zone-2 volume neighbors gives the correction head direct access to wake-state information.
+
+| Metric | Seed 42 (zosxwjmm) | Seed 73 (twilqf1x) | 2-Seed Avg | Baseline | Δ |
+|--------|--------------------|--------------------|------------|----------|---|
+| p_in | 12.87 | 13.18 | **13.02** | 13.04 | -0.2% |
+| p_oodc | 7.47 | 7.76 | **7.62** | 7.66 | -0.5% |
+| **p_tan** | 29.96 | 29.87 | **29.91** | 30.11 | **-0.7%** |
+| p_re | 6.56 | 6.37 | **6.47** | 6.52 | -1.0% |
+| val/loss | 0.388 | 0.386 | 0.387 | — | — |
+
+W&B group: `phase6/aft-srf-knn-context`
+
+**Results commentary:**
+- **MERGE DECISION:** All 4 metrics beat baseline. Primary target p_tan: 29.91 < 30.11 (-0.7%). Physical intuition holds: giving the aft-foil correction head access to upstream wake flow information improves aft-foil surface pressure.
+- **Note:** Run WITHOUT `--aug_dsdf2_sigma 0.05`. KNN context alone beats the baseline that INCLUDES dsdf2 aug. This suggests the two improvements are orthogonal and may compound.
+- **VRAM:** 69-95GB peak per seed — dedicated H100 required per seed. +25% per-epoch overhead vs non-context baseline.
+- **New baseline flag:** `--aft_foil_srf_context` added to all future baseline runs.
+
+---
+
+### 2026-04-04 ~22:00 — PR #2128: Reynolds-Conditional SRF FiLM — edward — **CLOSED** (null result)
+
+- Branch: `edward/re-conditional-srf`
+- Hypothesis: Conditioning the SRF head on (Re, AoA) via FiLM modulation allows the correction MLP to adapt its strategy to the flow regime, targeting p_re and p_oodc.
+
+| Run | p_in | p_oodc | p_tan | p_re | W&B ID |
+|-----|------|--------|-------|------|--------|
+| FiLM s42 | 13.34 | 7.96 | 30.57 | 6.60 | 7bnlke5o |
+| FiLM s73 | 12.72 | 7.73 | 29.73 | 6.52 | yh5ixlx8 |
+| **FiLM avg** | **13.03** | **7.84** | **30.15** | **6.56** | — |
+| Control s42 | 12.81 | 7.79 | 29.70 | 6.83 | np3anmah |
+| Control s73 | 14.16 | 7.31 | 29.86 | 6.49 | fcri663y |
+| **Control avg** | **13.49** | **7.55** | **29.78** | **6.66** | — |
+| **Baseline** | **13.04** | **7.66** | **30.11** | **6.52** | — |
+
+**Results commentary:**
+- **CLOSE DECISION:** FiLM conditioning on (Re, AoA) shows no improvement. FiLM avg vs baseline: p_oodc +2.4%, p_tan +0.1%, p_re +0.8%. FiLM is also worse than its own control on p_oodc and p_tan.
+- **Why it fails:** The SRF head already receives Re/AoA conditioning implicitly through the Transolver backbone's AdaLN at every block. Adding explicit FiLM modulation is redundant — 960 extra parameters cannot learn anything new beyond what AdaLN already encodes.
+- **Mechanism confirmed dead:** Explicit Re/AoA conditioning on the SRF head via FiLM is a dead end. Alternative: condition on local flow features rather than global scalars.
+
+---
+
+### 2026-04-04 ~20:30 — PR #2126: Foil-2 DSDF Magnitude Augmentation — tanjiro — **MERGED** (winner)
+
+- Branch: `tanjiro/dsdf2-mag-aug`
+- Hypothesis: Log-normal multiplicative scaling of foil-2 DSDF channels (x[:,6:10], tandem samples only) before standardization forces the model to be less reliant on memorizing exact DSDF patterns for seen foil shapes. This targets the geometric transfer gap that val_tandem_transfer probes (NACA6416 front foil, never seen in training). Analogous to gap/stagger aug but in the geometric feature space.
+
+| Run | W&B ID | σ | Seed | p_in | p_oodc | p_tan | p_re | val_loss |
+|-----|--------|---|------|------|--------|-------|------|----------|
+| dsdf2-σ=0.05-s42 | hcc2q68t | 0.05 | 42 | 13.11 | 7.70 | **29.76** | 6.42 | 0.385 |
+| dsdf2-σ=0.05-s73 | e9cri4mt | 0.05 | 73 | 12.96 | 7.62 | 30.46 | 6.61 | 0.388 |
+| dsdf2-σ=0.10-s42 | d50erbko | 0.10 | 42 | 13.16 | 7.47 | 30.43 | 6.65 | 0.390 |
+| dsdf2-σ=0.10-s73 | snai0bmf | 0.10 | 73 | 13.39 | 7.67 | 30.11 | 6.34 | 0.388 |
+| dsdf2-σ=0.15-s42 | el1jybsu | 0.15 | 42 | 13.04 | 7.47 | 30.74 | 6.47 | 0.387 |
+| dsdf2-σ=0.15-s73 | 3usr74hv | 0.15 | 73 | 13.09 | 7.47 | 31.71 | 6.21 | 0.391 |
+| **σ=0.05 2-seed avg** | | | | **13.04** | **7.66** | **30.11** | **6.52** | |
+| **Baseline (combined 8-seed)** | | | | 13.24 | 7.73 | 30.53 | 6.50 | |
+
+**Results commentary:**
+
+- **MERGE DECISION:** σ=0.05 beats combined baseline on primary target p_tan (-1.4%, 30.11 vs 30.53) and on p_in (-1.5%) and p_oodc (-0.9%). p_re is +0.02 (noise). **Clear merge.**
+
+- **σ=0.05 is the sweet spot:** Larger σ (0.10, 0.15) hurts p_tan. The model needs enough DSDF perturbation to generalize but not so much that it loses geometric detail for accurate prediction.
+
+- **Implementation detail confirmed:** Foil-2 DSDF indices are x[:,6:10] (4 channels: sdf value + gradient x/y + second foil distance). Applied BEFORE standardization, tandem detection via `x[:, 0, 22].abs() > 0.01` (gap feature in raw space).
+
+- **Best single run (s42, σ=0.05):** p_in=13.11, p_oodc=7.70, **p_tan=29.76**, p_re=6.42 — all metrics beat the combined baseline.
+
+- **High seed variance:** 2-seed spread on p_tan is 0.7 (29.76 vs 30.46). 8-seed validation would give more statistical confidence, but the directional signal is clear given the combined baseline std of 0.50.
+
+- **New config flag:** `--aug_dsdf2_sigma 0.05` added to baseline.
+
+### 2026-04-04 ~19:20 — PR #2125: Reynolds Number Perturbation Augmentation — thorfinn — CLOSED (dead end)
+
+- Branch: `thorfinn/re-perturb-aug`
+- Hypothesis: Add Gaussian noise σ=0.05 to log_Re feature (index 13) during training to improve OOD-Re robustness by domain randomization. Target: p_re < 6.50.
+
+| Run | W&B ID | Seed | σ | p_in | p_oodc | p_tan | p_re |
+|-----|--------|------|---|------|--------|-------|------|
+| 1 | ecxe1ti3 | 42 | 0.05 | 13.38 | 7.82 | 30.24 | 6.51 |
+| 2 | 29xvq9bz | 43 | 0.05 | 13.08 | 7.72 | 30.79 | 6.49 |
+| **2-seed avg** | | | | **13.23** | **7.77** | **30.52** | **6.50** |
+| **Baseline** | | | | **13.24** | **7.73** | **30.53** | **6.50** |
+
+**Commentary:** Clear null result. All metrics within noise of baseline. Seed 43 showed a significant p_tan regression (+1.5 to 30.8), indicating Re noise interferes with tandem pressure learning. The OOD-Re split (Re=4.445M, log(Re)≈15.3) is not far enough in log-space from training Re values to benefit from domain randomization. p_re showed no improvement at all (+0.01 avg). Adding Re perturbation augmentation to confirmed dead-ends list.
+
+### 2026-04-04 ~22:00 — PR #2123: Combined Baseline 8-Seed Validation (aft_foil_srf + gap/stagger aug) — alphonse — CLOSED (validation complete)
+
+- Branch: `alphonse/combined-baseline-8seed`
+- Hypothesis: Pure validation run — measure the TRUE combined baseline with both `--aft_foil_srf` and `--aug_gap_stagger_sigma 0.02` over 8 seeds (42-49). No code changes.
+
+| Seed | W&B ID | p_in | p_oodc | p_tan | p_re | val/loss |
+|------|--------|------|--------|-------|------|----------|
+| 42 | zapen0x3 | 12.49 | 7.4 | 30.7 | 6.5 | 0.3878 |
+| 43 | 3vuz3adi | 13.33 | 7.9 | 30.9 | 6.5 | 0.3918 |
+| 44 | g1uhcorj | 13.57 | 7.9 | 30.8 | 6.6 | 0.3945 |
+| 45 | ea551p6b | 13.21 | 7.7 | 30.4 | 6.4 | 0.3891 |
+| 46 | fdf1vsi3 | 13.38 | 8.0 | 31.0 | 6.4 | 0.3944 |
+| 47 | al6opl9g | 13.09 | 7.8 | 29.6 | 6.6 | 0.3850 |
+| 48 | jg15oow3 | 13.49 | 7.4 | 29.9 | 6.5 | 0.3859 |
+| 49 | vzm3s42y | 13.33 | 7.7 | 30.9 | 6.5 | 0.3897 |
+| **Mean** | | **13.24** | **7.73** | **30.53** | **6.50** | **0.3898** |
+| **Std** | | **0.33** | **0.22** | **0.50** | **0.07** | **0.0034** |
+
+W&B group: `phase6/combined-baseline-8seed`
+
+**Results commentary:**
+- **CRITICAL FINDING:** The combination is NOT simply additive. Gap/stagger augmentation helps p_oodc (-2.4% vs aft_srf-only 7.92) but REGRESSES p_tan (+1.6% vs aft_srf-only 30.05).
+- p_in and p_re are approximately neutral.
+- **Implication:** Merge decision targets updated from aft_srf-only numbers to these combined numbers. All in-flight experiments running with both flags should compare against p_tan=30.53, not 30.05.
+- **Follow-up consideration:** Gap/stagger augmentation may be worth dropping from the baseline in a future round if p_tan improvements stall, since it costs +0.48 on our primary metric.
+
+---
+
+### 2026-04-04 ~22:00 — PR #2124: Fore-Foil Stacked SRF Head (ID=6) — fern — CLOSED (dead end)
+
+- Branch: `fern/fore-foil-srf-stacked`
+- Hypothesis: Add a stacked (additive) fore_srf_head on top of the shared srf_head for fore-foil (ID=6) nodes, mirroring how aft_foil_srf works for ID=7. Unlike PR #2117 which split the shared head, this keeps the shared head untouched and adds a pure correction.
+
+| Config | Seed | W&B ID | p_in | p_oodc | p_tan | p_re | val/loss |
+|--------|------|--------|------|--------|-------|------|----------|
+| Baseline (aft_srf only) | 42 | 4e65pcn2 | 13.1 | 7.5 | 29.8 | 6.5 | 0.3856 |
+| Baseline (aft_srf only) | 43 | ic3133oe | 13.1 | 7.8 | 30.2 | 6.6 | 0.3888 |
+| fore_srf 192/3L | 42 | 5er3uk4r | 13.4 | 8.1 | 30.7 | 6.6 | 0.3955 |
+| fore_srf 192/3L | 43 | 819huufp | 13.3 | 8.1 | 29.9 | 6.6 | 0.3874 |
+| fore_srf 128/2L | 42 | abpealjg | 13.1 | 7.9 | 29.6 | 6.4 | 0.3835 |
+| fore_srf 128/2L | 43 | mmovvvih | 13.7 | 8.1 | 32.8 | 6.6 | 0.4005 |
+
+W&B group: `phase6/fore-foil-srf-stacked`
+
+2-seed means vs baseline:
+- **192/3L:** p_in=13.35, p_oodc=8.1, p_tan=30.3, p_re=6.6 — worse across the board
+- **128/2L:** p_in=13.4, p_oodc=8.0, p_tan=31.2, p_re=6.5 — worse, high variance (s43 p_tan=32.8)
+- **Control:** p_in=13.1, p_oodc=7.65, p_tan=30.0, p_re=6.55
+
+**Results commentary:**
+- Both formulations degrade p_oodc by ~0.4 (8.0-8.1 vs 7.65 control), suggesting optimizer interference.
+- 128/2L s43 is catastrophic (p_tan=32.8), indicating the small head is unstable.
+- Combined with PR #2117 (split formulation, +9-11% p_tan regression), this definitively closes fore-foil SRF.
+- **Root cause:** Fore-foil (ID=6) sees channel-accelerated flow that the shared srf_head already handles well. Unlike aft-foil wake flow (ID=7), there is no qualitatively distinct correction signal for a dedicated head to learn.
+- **Conclusion:** Fore-foil SRF is a dead end in all formulations. Boundary-type improvements for ID=6 must come through other mechanisms (e.g., spatial bias conditioning, trunk-level awareness).
+
+---
+
+### 2026-04-04 ~20:30 — PR #2122: Phase 6: Fore-Foil Loss Upweighting (ID=6) — nezuko — CLOSED (dead end)
+
+- Branch: `nezuko/fore-foil-loss-weight`
+- Hypothesis: Upweighting fore-foil (ID=6) surface nodes in the main surface pressure L1 loss by 1.5–2.0× would improve fore-foil pressure predictions, propagating downstream benefits via better wake representation. Symmetric to the aft-foil loss upweighting idea (PR #2121).
+
+| Run | W&B ID | Weight | Seed | p_in | p_oodc | p_tan | p_re |
+|-----|--------|--------|------|------|--------|-------|------|
+| forefoil-lw15-s42 | swgrtft1 | 1.5 | 42 | 12.761 | 7.839 | 30.189 | 6.556 |
+| forefoil-lw15-s73 | mhihrtht | 1.5 | 73 | 14.152 | 7.715 | 30.833 | 6.277 |
+| forefoil-lw20-s42 | rn1v2g8z | 2.0 | 42 | 12.946 | 7.730 | 30.372 | 6.797 |
+| forefoil-lw20-s73 | jab8a2yz | 2.0 | 73 | 13.396 | 7.837 | 30.869 | 6.418 |
+
+W&B group: `phase6/fore-foil-loss-weight`
+
+2-seed means vs baseline (p_in=13.19, p_oodc=7.92, p_tan=30.05, p_re=6.45):
+- weight=1.5: p_in=13.457 (+2.0%), p_oodc=7.777 (-1.8%), p_tan=30.511 (+1.5%), p_re=6.417 (-0.5%)
+- weight=2.0: p_in=13.171 (-0.1%), p_oodc=7.784 (-1.7%), p_tan=30.621 (+1.9%), p_re=6.608 (+2.4%)
+
+**Results commentary:**
+- p_oodc improves consistently (-1.7% to -1.8%) across both weight settings.
+- **p_tan regresses in ALL configurations** (+1.5% to +1.9%) — this is the critical failure since p_tan is our primary target.
+- Root cause: upweighting fore-foil nodes steals gradient from aft-foil nodes, directly hurting tandem transfer predictions.
+- Combined with PR #2121 (aft-foil loss upweighting, same pattern: p_oodc improves but p_tan regresses), this definitively closes the entire loss-region-upweighting approach.
+- **Conclusion:** Surface loss reweighting by boundary region is a dead end. The p_oodc benefit comes at the cost of p_tan. Boundary-specific improvements must be delivered architecturally (dedicated heads), not through loss weighting.
+
 ### 2026-04-04 ~20:10 — PR #2120: Phase 6: Langevin Gradient Noise (SGLD) — edward — CLOSED (dead end)
 
 - Branch: `edward/langevin-noise`
