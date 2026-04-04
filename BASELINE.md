@@ -1,6 +1,34 @@
 # Baseline Metrics
 
-## Current Single-Model Baseline (Phase 6 — 2026-04-04, +aft_foil_srf +aug_gap_stagger +aug_dsdf2_sigma=0.05, 2-Seed Evidence, PR #2126)
+## Current Single-Model Baseline (Phase 6 — 2026-04-04, +aft_foil_srf_context K=8, 2-Seed Evidence, PR #2127)
+
+| Metric | 2-seed avg | vs prior (DSDF2 aug) | Δ |
+|--------|------------|----------------------|---|
+| p_in | **13.02** | 13.04 | **-0.2%** |
+| p_oodc | **7.62** | 7.66 | **-0.5%** |
+| **p_tan** | **29.91** | 30.11 | **-0.7%** |
+| p_re | **6.47** | 6.52 | **-1.0%** |
+
+**PR #2127** (merged 2026-04-04) — Context-Aware AftSRF: KNN volume context (K=8 nearest zone-2 volume neighbors) for the aft-foil SRF correction head. Gives the correction MLP direct access to upstream wake hidden states, physically motivated by fore→aft pressure dependency. Note: run WITHOUT `--aug_dsdf2_sigma 0.05` — improvement is independent of DSDF2 aug. W&B runs: zosxwjmm (seed 42, p_tan=29.96), twilqf1x (seed 73, p_tan=29.87).
+
+⚠️ **2-seed only** — statistically solid directional signal (both seeds below baseline). VRAM usage 69-95GB peak per run (dedicated H100 required per seed). Per-epoch overhead ~25% vs baseline. For merge decisions: use p_tan < 29.91, p_oodc < 7.62, p_in < 13.02, p_re < 6.47.
+
+**Reproduce (current baseline):**
+```bash
+cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baseline-aft-srf-ctx" \
+  --asinh_pressure --asinh_scale 0.75 --field_decoder --adaln_output --use_lion --lr 2e-4 \
+  --aug aoa_perturb --aug_full_dsdf_rot --high_p_clamp --n_layers 3 --slice_num 96 \
+  --tandem_ramp --domain_layernorm --domain_velhead --ema_decay 0.999 --weight_decay 5e-5 \
+  --cosine_T_max 160 --disable_pcgrad --pressure_first --pressure_deep \
+  --residual_prediction --surface_refine --surface_refine_hidden 192 --surface_refine_layers 3 \
+  --aft_foil_srf --aug_gap_stagger_sigma 0.02 --aft_foil_srf_context
+```
+
+**For merge decisions:** Compare 2-seed avg against: p_tan < 29.91, p_oodc < 7.62, p_in < 13.02, p_re < 6.47.
+
+---
+
+## Prior Single-Model Baseline (Phase 6 — 2026-04-04, +aft_foil_srf +aug_gap_stagger +aug_dsdf2_sigma=0.05, 2-Seed Evidence, PR #2126)
 
 | Metric | 2-seed avg (σ=0.05) | vs prior combined baseline | Δ |
 |--------|---------------------|---------------------------|---|
