@@ -1005,6 +1005,9 @@ class Config:
     aft_foil_srf_film: bool = False          # FiLM conditioning on gap/stagger for aft-foil head
     aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
     aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
+    # Phase 6: Supervised surface pressure gradient auxiliary loss
+    surf_grad_aux: bool = False              # supervised pressure gradient auxiliary loss
+    surf_grad_weight: float = 0.05           # weight relative to main surface loss
 
 
 cfg = sp.parse(Config)
@@ -1785,6 +1788,31 @@ for epoch in range(MAX_EPOCHS):
         else:
             tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
+        # Supervised surface pressure gradient auxiliary loss
+        grad_aux_loss = torch.tensor(0.0, device=device)
+        if cfg.surf_grad_aux:
+            for b in range(B):
+                if not is_surface[b].any():
+                    continue
+                surf_idx_b = is_surface[b].nonzero(as_tuple=True)[0]  # [M]
+                if surf_idx_b.numel() < 4:
+                    continue
+                # Sort surface nodes by x-coordinate for chord-wise ordering
+                x_coords = x[b, surf_idx_b, 0]
+                sort_order = x_coords.argsort()
+                sorted_idx = surf_idx_b[sort_order]
+                # Predicted and true pressure (normalized)
+                pred_p = pred[b, sorted_idx, 2]
+                true_p = y_norm[b, sorted_idx, 2]
+                # First-order finite differences (chord-wise pressure gradient)
+                pred_grad = pred_p[1:] - pred_p[:-1]
+                true_grad = true_p[1:] - true_p[:-1]
+                grad_aux_loss = grad_aux_loss + (pred_grad - true_grad).abs().mean()
+            grad_aux_loss = grad_aux_loss / B
+            if epoch == 0 and batch_idx == 0:
+                print(f"[Grad aux] surf_loss={surf_loss.item():.4f}, "
+                      f"grad_aux={grad_aux_loss.item():.4f}, "
+                      f"ratio={grad_aux_loss.item()/(surf_loss.item()+1e-8):.3f}")
         if cfg.uncertainty_loss:
             bm = _base_model
             surf_ux_loss = (abs_err[:, :, 0:1] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
@@ -1796,6 +1824,8 @@ for epoch in range(MAX_EPOCHS):
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
         else:
             loss = vol_loss + surf_weight * surf_loss
+        if cfg.surf_grad_aux:
+            loss = loss + cfg.surf_grad_weight * grad_aux_loss
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
