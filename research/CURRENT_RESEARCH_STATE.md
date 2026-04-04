@@ -1,26 +1,34 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-04 ~19:30 UTC
+- **Date:** 2026-04-04 ~20:45 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
 ## Current Baseline
 
-### Single-Model Baseline (PRs #2104 + #2115 merged — combined 8-seed validation PR #2123)
+### Single-Model Baseline (PRs #2104 + #2115 + #2126 merged — 2-seed evidence)
 
-| Metric | Combined 8-seed mean | Target to beat |
-|--------|---------------------|----------------|
-| p_in | 13.24 ± 0.33 | < 13.24 |
-| p_oodc | 7.73 ± 0.22 | < 7.73 |
-| **p_tan** | **30.53 ± 0.50** | **< 30.53** |
-| p_re | 6.50 ± 0.07 | < 6.50 |
+| Metric | Current Baseline | vs Prior (combined 8-seed) |
+|--------|-----------------|---------------------------|
+| p_in | **13.04** | -1.5% |
+| p_oodc | **7.66** | -0.9% |
+| **p_tan** | **30.11** | **-1.4%** |
+| p_re | 6.52 | +0.3% (noise) |
 
-⚠️ **Key interaction finding (PR #2123):** Gap/stagger augmentation + aft_foil_srf is NOT additive.
-- p_oodc improves (-2.4% vs aft_srf-only 7.92 ✓)
-- p_tan regresses (+1.6% vs aft_srf-only 30.05 ✗ — PRIMARY metric hurt)
-- aft_foil_srf-only gave p_tan=30.05; combined gives 30.53
+**Latest merge:** PR #2126 (tanjiro) — DSDF2 magnitude aug σ=0.05. W&B: hcc2q68t (s42, p_tan=29.76), e9cri4mt (s73, p_tan=30.46). Metrics fully W&B-verified.
 
-This suggests gap/stagger noise disrupts aft-foil SRF training. All in-flight students run with both flags, so compare against 30.53.
+⚠️ **Important:** Current baseline is 2-seed only. Previous combined 8-seed mean was p_tan=30.53. All in-flight experiments should target p_tan < 30.11.
+
+**Reproduce current baseline:**
+```bash
+cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baseline-dsdf2-aug" \
+  --asinh_pressure --asinh_scale 0.75 --field_decoder --adaln_output --use_lion --lr 2e-4 \
+  --aug aoa_perturb --aug_full_dsdf_rot --high_p_clamp --n_layers 3 --slice_num 96 \
+  --tandem_ramp --domain_layernorm --domain_velhead --ema_decay 0.999 --weight_decay 5e-5 \
+  --cosine_T_max 160 --disable_pcgrad --pressure_first --pressure_deep \
+  --residual_prediction --surface_refine --surface_refine_hidden 192 --surface_refine_layers 3 \
+  --aft_foil_srf --aug_gap_stagger_sigma 0.02 --aug_dsdf2_sigma 0.05
+```
 
 ### Ensemble Baseline (PR #2093 — 16-Seed Ensemble, Seeds 42-49 + 66-73)
 
@@ -31,83 +39,82 @@ This suggests gap/stagger noise disrupts aft-foil SRF training. All in-flight st
 | p_tan | **29.1** |
 | p_re | **5.8** |
 
-## Student Status (~22:00 UTC)
+## Student Status (~20:45 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| fern | #2130 | Gap/Stagger-Conditioned Spatial Bias — Tandem-Geometry-Aware Slice Routing | WIP — just assigned |
-| alphonse | #2131 | Tandem-Slice Carve-Out — Reserved Physics Slices for Tandem Samples | WIP — just assigned |
-| tanjiro | #2126 | Foil-2 DSDF Magnitude Augmentation (σ sweep: 0.05/0.10/0.15) | WIP |
+| tanjiro | #2133 | Foil-1 DSDF Magnitude Aug — Front Foil Shape Transfer | WIP — just assigned |
+| fern | #2130 | Gap/Stagger-Conditioned Spatial Bias — Tandem-Geometry-Aware Slice Routing | WIP |
+| alphonse | #2131 | Tandem-Slice Carve-Out — Reserved Physics Slices for Tandem Samples | WIP |
 | frieren | #2127 | Context-Aware AftSRF — KNN Volume Context for Wake Pressure (K=8) | WIP |
-| nezuko | #2129 | Supervised Surface Pressure Gradient Aux Loss (w=0.05/0.10, seeds 42/73) | WIP |
+| nezuko | #2129 | Supervised Surface Pressure Gradient Aux Loss (w=0.05/0.10) | WIP |
 | edward | #2128 | Reynolds-Conditional SRF — FiLM on (Re, AoA) for surface_refine head | WIP |
-| askeladd | #2119 | PCGrad 2-Way Validation — 8-seed (seeds 42-49) with gap_stagger aug | WIP (sent back 2x for validation) |
-| thorfinn | #2132 | Tandem DSDF Channel Mixup — Synthetic Foil-Shape Interpolation | WIP — just assigned |
+| askeladd | #2119 | PCGrad 2-Way Validation — 8-seed validation | WIP |
+| thorfinn | #2132 | Tandem DSDF Channel Mixup — Synthetic Foil-Shape Interpolation | WIP |
 
 **All 8 students active. Zero idle GPUs.**
 
-## Recently Reviewed (2026-04-04 ~19:30)
+## Recently Reviewed (2026-04-04 ~20:30)
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
-| #2125 | thorfinn | Reynolds Number Perturbation Augmentation — σ=0.05 | **CLOSED** | Null result — all metrics within noise of baseline. p_re unchanged (6.50 avg), p_tan regressed seed 43 (+1.5). OOD-Re gap too small in log-space for domain randomization to help. |
-| #2124 | fern | Fore-Foil Stacked SRF Head (ID=6) — Additive | **CLOSED** | Both 192/3L and 128/2L stacked heads degrade p_oodc by ~0.4; 128/2L s43 catastrophic (p_tan=32.8). Combined with #2117 (split), fore-foil SRF exhausted in all formulations. |
-| #2123 | alphonse | Combined Baseline 8-Seed Validation | **CLOSED** | Validation complete. Critical finding: gap_stagger aug + aft_foil_srf not additive — p_tan regresses +1.6%. Baseline updated to combined numbers. |
+| #2126 | tanjiro | Foil-2 DSDF Magnitude Augmentation — σ sweep | **MERGED** | σ=0.05 best: p_tan 30.53→30.11 (-1.4%), p_in -1.5%, p_oodc -0.9%. W&B verified all 6 runs. |
+| #2125 | thorfinn | Reynolds Number Perturbation Augmentation — σ=0.05 | **CLOSED** | Null result — all metrics within noise of baseline. Re perturbation dead end. |
+| #2124 | fern | Fore-Foil Stacked SRF Head (ID=6) — Additive | **CLOSED** | Both 192/3L and 128/2L degrade p_oodc; fore-foil SRF exhausted in all formulations. |
+| #2123 | alphonse | Combined Baseline 8-Seed Validation | **CLOSED** | Validation: gap_stagger aug + aft_foil_srf not additive — p_tan regresses +1.6%. |
 
 ## Current Research Focus
 
-### Primary target: p_tan = 30.53 → push toward 29.1 (ensemble floor)
+### Primary target: p_tan = 30.11 → push toward 29.1 (ensemble floor)
 
 **Confirmed wins (merged):**
-1. `--aft_foil_srf`: dedicated aft-foil SRF head (ID=7) — p_tan -0.8%
-2. `--aug_gap_stagger_sigma 0.02`: domain randomization on tandem scalars — p_oodc -2.4% (vs combined baseline)
-3. `--surface_refine`, `--residual_prediction`, `--pressure_first`, `--pressure_deep`, `--asinh_pressure 0.75`, etc.
+1. `--aft_foil_srf`: dedicated aft-foil SRF head (ID=7)
+2. `--aug_gap_stagger_sigma 0.02`: tandem scalar domain randomization — helps p_oodc, slightly hurts p_tan
+3. `--aug_dsdf2_sigma 0.05`: foil-2 DSDF magnitude aug — p_tan -1.4% (PR #2126, just merged)
+4. `--surface_refine`, `--residual_prediction`, `--pressure_first`, `--pressure_deep`, `--asinh_pressure 0.75`, etc.
 
 **Active experiments (8 students):**
-1. **Gap/Stagger-Conditioned Spatial Bias** (fern #2130) — Extend raw_xy in TransolverBlock spatial_bias from 4→6 dims by appending gap+stagger; makes slice routing tandem-geometry-aware; zero effect on single-foil by design; ~18 LoC; expected -3 to -7% p_tan; **TOP PRIORITY IDEA**
-2. **Tandem-Slice Carve-Out** (alphonse #2131) — Reserve K dedicated physics slices exclusively for tandem samples via large negative bias on reserved slice logits for single-foil; K sweep {4, 8}; ~20 LoC; targets tandem representational capacity
-3. **Foil-2 DSDF Magnitude Aug** (tanjiro #2126) — log-normal scale of foil-2 DSDF channels (tandem only); σ sweep {0.05, 0.10, 0.15}; 6 runs total
-4. **Context-Aware AftSRF** (frieren #2127) — KNN volume context (K=8, zone_id=2 nodes) for aft-foil SRF head; physically motivated by non-local fore→aft wake dependency
-5. **Supervised Surface Pressure Gradient Aux Loss** (nezuko #2129) — L1 on chord-wise pressure gradient finite differences; targets spatial structure of Cp; w=0.05/0.10 sweep
-6. **Tandem DSDF Channel Mixup** (thorfinn #2132) — interpolate DSDF channels (x[:,2:10]) between pairs of tandem training samples using Beta(0.7/0.5, 0.4); creates synthetic intermediate foil geometries; α sweep {0.7, 0.5}; targets p_tan via foil-shape generalization
-7. **PCGrad 2-Way Validation** (askeladd #2119) — 8-seed validation of 2-way PCGrad (single-foil vs all-tandem); p_oodc signal -1.3% to -5.4% in initial 4 runs
+1. **Foil-1 DSDF Magnitude Aug** (tanjiro #2133) — Mirror of DSDF2 aug for front foil. val_tandem_transfer tests NACA6416 as FRONT foil → foil-1 DSDF channels directly encode this. σ sweep {0.05, 0.10, 0.15}; **HIGH PRIORITY**
+2. **Gap/Stagger-Conditioned Spatial Bias** (fern #2130) — Extend spatial_bias 4→6 dims by appending gap+stagger; tandem-geometry-aware slice routing; **TOP ARCHITECTURE IDEA**
+3. **Tandem-Slice Carve-Out** (alphonse #2131) — Reserve K dedicated physics slices for tandem via large negative bias on single-foil; K sweep {4, 8}
+4. **Context-Aware AftSRF** (frieren #2127) — KNN volume context (K=8) for aft-foil SRF head; non-local fore→aft wake dependency
+5. **Supervised Surface Pressure Gradient Aux Loss** (nezuko #2129) — L1 on chord-wise pressure gradient finite differences; w=0.05/0.10 sweep
+6. **Tandem DSDF Channel Mixup** (thorfinn #2132) — interpolate DSDF channels between tandem training samples; creates synthetic intermediate foil geometries; α sweep {0.7, 0.5}
+7. **PCGrad 2-Way Validation** (askeladd #2119) — 8-seed validation of 2-way PCGrad; prior 4-seed showed p_oodc -1.3% to -5.4%
 8. **Reynolds-Conditional SRF** (edward #2128) — FiLM conditioning on (Re, AoA) for surface_refine head; targets p_re and p_oodc
 
-**Key research patterns from recent experiments:**
-- **What works:** Additive specialized heads (aft_srf), target transforms (asinh), data augmentation (gap/stagger helps p_oodc but not p_tan)
-- **What doesn't work:** Fore-foil SRF in any formulation (split or stacked), loss reweighting by surface region, fore-foil coordinate frames, sparse boundary-type features
-- **Design principle:** SRF specialization must be ADDITIVE (stack on shared head), not REPLACING
-- **Design principle:** Boundary-type information must be delivered architecturally (dedicated heads), not as sparse input features
-- **New finding:** Gap/stagger augmentation and aft_foil_srf interact negatively on p_tan — future experiments should consider these carefully
-- **Emerging signal:** 2-way PCGrad (single-foil vs tandem) produces consistent p_oodc improvement; awaiting 8-seed validation
+**Key research patterns:**
+- **What works:** DSDF magnitude augmentation (foil-2 confirmed, foil-1 being tested), additive specialized heads (aft_srf), target transforms (asinh)
+- **What doesn't work:** Fore-foil SRF (all formulations), loss reweighting, Re perturbation aug, Charbonnier/Smooth-L1 loss families
+- **Critical interaction:** gap_stagger aug + aft_foil_srf NOT additive — helps p_oodc but hurts p_tan by +1.6%
+- **Emerging mechanism:** Log-normal DSDF magnitude aug forces geometric generalization without disrupting gradient directions. σ=0.05 is the sweet spot.
 
 ## Potential Next Research Directions (not yet assigned)
 
-**From existing queue (DSDF Mixup now assigned to thorfinn #2132):**
-1. **Tandem-Aware Temperature Annealing** (Idea 6 ROUND2) — Check if tandem_temp_offset is already wired in Physics_Attention; if not, enable it (softer attention for tandem, sharper for single-foil)
-2. **Foil-2 AoA Rotation Aug** (Idea 7 ROUND2, bold) — Independent AoA perturbation for aft-foil nodes; increases (fore_AoA, aft_AoA) diversity; high implementation complexity
-3. **Aft-Foil TV Loss** (Idea 5 from 22:00 file) — unsupervised chord-wise total variation regularization on aft-foil predictions; wait for nezuko #2129 results first
-4. **EMA Stochastic Weight Perturbation** (Idea 2 from 22:00 file) — inject small noise at EMA start epoch, flat-minima seeking; ~12 LoC; σ sweep {5e-4, 1e-3, 3e-3}
-5. **Drop gap_stagger aug from baseline** — Combined validation showed p_tan regresses +1.6% with gap_stagger. Consider testing aft_srf-only to recover the p_tan=30.05 target. (Trade: lose p_oodc=7.73, recover p_tan=30.05)
+1. **Combined DSDF1+DSDF2 aug at lower σ** — Simultaneous augmentation of both foil DSDF channels at σ=0.02-0.03 each; may compound improvements
+2. **Gap/stagger sigma reduction** (0.02→0.01) — reduce the p_tan hurt from gap_stagger while keeping partial p_oodc benefit
+3. **Tandem-Aware Temperature Annealing** — softer attention for tandem, sharper for single-foil; check if tandem_temp_offset is already wired
+4. **EMA Stochastic Weight Perturbation** — inject small noise at EMA start epoch (σ sweep {5e-4, 1e-3, 3e-3}); flat-minima seeking; ~12 LoC
+5. **Foil-2 AoA Rotation Aug** — Independent AoA perturbation for aft-foil nodes; increases (fore_AoA, aft_AoA) diversity
+6. **Aft-Foil TV Loss** — chord-wise total variation regularization on aft-foil predictions; wait for nezuko #2129 first
 
-**Strategic consideration:** Gap/stagger augmentation hurts p_tan but helps p_oodc. If upcoming experiments improve p_tan, gap_stagger may need to be revisited. Alternatively, new ideas that improve p_tan without gap_stagger could use the aft_srf-only baseline (p_tan=30.05) as a starting point.
+**Strategic consideration:** The DSDF augmentation family is showing consistent wins. The pattern: domain randomization in geometric feature space forces generalization. If DSDF1 aug also succeeds, the next step is combined/joint DSDF1+DSDF2 augmentation.
 
 ## Confirmed Dead Ends (Phase 6)
 
 | Direction | PRs | Finding |
 |-----------|-----|---------|
-| Fore-Foil SRF (all formulations) | #2117, #2124 | Split: +9-11% p_tan. Stacked: +1-4% p_tan, p_oodc degrades. Fore-foil channel flow is already well-handled by shared srf_head. |
-| Aft-Foil Loss Upweighting | #2121 | p_oodc improves -2% but p_tan regresses +1.5%; loss weighting benefits OOD-C not tandem |
-| Fore-Foil Loss Upweighting | #2122 | p_oodc improves -1.8% but p_tan regresses +1.5-1.9%; confirms loss-region-weighting is dead |
-| Aft-Foil Coordinate Frame (dual-frame) | #2107 | 3 iterations, 8 runs, p_in +3%, p_tan barely moves; high variance |
-| Fore-Foil SRF Split (narrowing shared head) | #2117 | +9–11% p_tan regression; loses tandem transfer learning |
+| Fore-Foil SRF (all formulations) | #2117, #2124 | Split: +9-11% p_tan. Stacked: +1-4% p_tan, p_oodc degrades. |
+| Aft-Foil Loss Upweighting | #2121 | p_oodc improves -2% but p_tan regresses +1.5% |
+| Fore-Foil Loss Upweighting | #2122 | p_oodc improves -1.8% but p_tan regresses +1.5-1.9% |
+| Aft-Foil Coordinate Frame (dual-frame) | #2107 | 3 iterations, 8 runs, p_in +3%, p_tan barely moves |
 | Boundary-ID One-Hot (sparse 3-dim input) | #2118 | p_tan +2.1%; sparse features disrupt slice assignment |
-| Charbonnier Loss | #2116 | All eps values degrade all metrics; smooth loss family exhausted |
+| Charbonnier Loss | #2116 | All eps values degrade all metrics |
 | Mesh-Density Weighted L1 | #2112 | All metrics regressed 5–16% |
 | Smooth L1 / Huber Loss | #2113 | Catastrophic |
 | Gradient Centralization (GC-Lion) | #2114 | Incompatible with Lion sign operation |
-| Reynolds Number Perturbation Augmentation | #2125 | Null result + p_tan regression (seed 43 +1.5). OOD-Re gap too small in log-space for domain randomization. |
-| Langevin Gradient Noise (SGLD) | #2120 | No improvement; Lion sign-based updates already provide implicit gradient noise |
+| Reynolds Number Perturbation Augmentation | #2125 | Null result + p_tan regression. OOD-Re gap too small in log-space. |
+| Langevin Gradient Noise (SGLD) | #2120 | No improvement; Lion already provides implicit gradient noise |
 | Fourier Feature Position Encoding | #2106 | p_oodc +4.8%, p_re +6.2% regression |
 | Deep Supervision (aux loss) | #2097 | p_tan +2.7% regression |
 | SWAD | #2094 | Catastrophic |
@@ -127,7 +134,7 @@ This suggests gap/stagger noise disrupts aft-foil SRF training. All in-flight st
 
 ## Human Researcher Directives
 
-- **#1860 (2026-03-27):** Think bigger — radical new full model changes and data aug. Phase 5 tested 6 new architectures (all failed); current focus on routing/capacity, loss reformulation, novel data augmentation.
+- **#1860 (2026-03-27):** Think bigger — radical new full model changes and data aug. Current phase focuses on geometric augmentation (DSDF family) and routing modifications.
 - **#1834 (2026-03-27):** Never use raw data files outside assigned training split. Confirmed.
 
 ## Ensemble Seed Pool (Complete)
@@ -141,4 +148,4 @@ This suggests gap/stagger noise disrupts aft-foil SRF training. All in-flight st
 | Batch 5 | 90-95 | ✓ Trained |
 | Batch 6 | 100-106 | ✓ Trained (available for 23-seed ensemble) |
 
-**Total trained: 45 models.** 23-seed evaluation (42-49 + 66-73 + 100-106) available; defer until single-model improvements land.
+**Total trained: 45 models.** 23-seed evaluation available; defer until single-model improvements land.
