@@ -2,9 +2,21 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
-### New Assignments (2026-04-03 ~23:20 UTC)
+### New Assignments (2026-04-04 ~00:00 UTC)
 
-#### 2026-04-03 — PR #2095: Phase 6: SGDR Warm Restarts — askeladd — NEW
+#### 2026-04-04 — PR #2097: Phase 6: Multi-Scale Deep Supervision — nezuko — NEW
+- Branch: `nezuko/deep-supervision`
+- Hypothesis: Auxiliary loss on intermediate features (fx_deep) forces better representations in earlier blocks
+- aux_loss_weight sweep: 0.05, 0.1, 0.2
+
+#### 2026-04-04 — PR #2096: Phase 6: Learnable Asinh Scale — thorfinn — NEW
+- Branch: `thorfinn/learnable-asinh-scale`
+- Hypothesis: Learnable nn.Parameter asinh_scale (init 0.75) adapts compression per run
+- Includes asymmetric variant (separate pos/neg scales)
+
+### Assignments (2026-04-03 ~23:20 UTC)
+
+#### 2026-04-03 — PR #2095: Phase 6: SGDR Warm Restarts — askeladd — RUNNING
 - Branch: `askeladd/sgdr-warm-restarts`
 - Hypothesis: Cosine annealing with warm restarts (T_0={20,40,60}, T_mult=2) for better OOD generalization
 - Status: WIP — just assigned (askeladd idle after #2089 closed)
@@ -27,6 +39,32 @@
 - Key insight: Same-architecture models don't benefit from non-uniform weighting. Need method diversity.
 - Run IDs (seeds 90-95): ici6bxi1, 6chuzqal, xcsqiwdv, sxisuynb, q8m1w63d, ggn5mioe
 - CLOSED — documented, seeds available for future ensemble expansion
+
+#### 2026-04-03 — PR #2091: Phase 6: Diverse Hyperparameter Ensemble — nezuko — CLOSED (informative negative)
+- Branch: `nezuko/diverse-hparam-ensemble`
+- W&B group: phase6/diverse-hparam-ensemble (8 runs finished)
+- Results: **Hyperparameter diversity LOSES to seed diversity.**
+  - Diverse 8-model ensemble: p_in=12.3, p_oodc=7.0, p_tan=29.8, p_re=5.9
+  - Same-config 8-seed baseline: p_in=12.4, p_oodc=6.7, p_tan=29.4, p_re=5.8
+  - p_oodc +4.5%, p_tan +1.4%, p_re +1.7% ALL WORSE
+- Key insight: Different hyperparams make systematic tradeoffs, not complementary errors. Seed diversity strictly better.
+- Run IDs: 369n5uv8, i8xwj9zn, 2bht89ay, wrbmgygu, qmsobmzv, cofd0trk, 80aq4s2f, o4dh75fa
+- CLOSED
+
+#### 2026-04-03 — PR #2092: Phase 6: Ensemble Seeds 82-89 — thorfinn — CLOSED (complete)
+- Branch: `thorfinn/ensemble-seeds-82-89`
+- W&B group: phase6/ensemble-seeds-82-89 (8 runs finished)
+- Results: Individual model metrics consistent with baseline:
+  - Mean: p_in=13.05±0.29, p_oodc=7.89±0.28, p_tan=30.30±0.42, p_re=6.44±0.10
+  - Notable: s86 p_oodc=7.44, s88 p_re=6.18
+- Run IDs: u0eapina, fmhetijo, yp7dlkmk, 30hxo8a1, 4e74gtuc, wc8x0v49, qvn871e1, nb6poqj2
+- CLOSED — seeds trained, available for combined ensemble evaluation
+
+#### 2026-04-03 — PR #2086: Phase 6: SAM Phase-Only — frieren — SENT BACK
+- 3 rounds of failures: (1) infrastructure crash at 127min, (2) code crash at 4min, (3) timeout at 30min
+- Root cause: student applied SENPAI_TIMEOUT_MINUTES to train.py MAX_TIMEOUT
+- Bug fixes preserved: SAM backward graph fix, configurable sam_rho, sam_start_frac
+- SENT BACK — must revert MAX_TIMEOUT override and rerun at full 180 min
 
 #### 2026-04-03 — PR #2087: Phase 6: Ensemble Seeds 74-81 — edward — CLOSED (complete)
 - Branch: `edward/ensemble-seeds-74-81`
