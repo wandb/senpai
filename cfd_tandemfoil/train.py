@@ -1005,6 +1005,8 @@ class Config:
     aft_foil_srf_film: bool = False          # FiLM conditioning on gap/stagger for aft-foil head
     aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
     aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
+    # Phase 6: Fore-foil loss upweighting
+    fore_foil_loss_weight: float = 1.0       # loss weight multiplier for fore-foil (ID=6) surface nodes (1.0=baseline)
 
 
 cfg = sp.parse(Config)
@@ -1557,14 +1559,20 @@ for epoch in range(MAX_EPOCHS):
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
-        # Aft-foil mask: boundary ID=7 nodes identified by saf norm > 0.005
+        # SAF norm and tandem detection (needed for aft-foil SRF and fore-foil loss weight)
         # saf is at raw x[:,:,2:4]; foil-1 surface has saf≈0, foil-2 has saf>>0
+        _raw_saf_norm = x[:, :, 2:4].norm(dim=-1)  # [B, N]
+        _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
         _aft_foil_mask = None
         if aft_srf_head is not None:
-            _raw_saf_norm = x[:, :, 2:4].norm(dim=-1)  # [B, N]
-            _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
+        # Fore-foil mask: tandem surface nodes that are NOT aft-foil (SAF norm <= 0.005)
+        node_w = None
+        if cfg.fore_foil_loss_weight != 1.0:
+            _fore_foil_mask = is_surface & (_raw_saf_norm <= 0.005) & _is_tandem.unsqueeze(1)
+            node_w = torch.ones(x.size(0), x.size(1), device=x.device)
+            node_w[_fore_foil_mask] = cfg.fore_foil_loss_weight
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1761,7 +1769,12 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        # Weighted surface loss (fore-foil nodes get extra weight when enabled)
+        if node_w is not None:
+            _wt_surf = surf_mask.float() * node_w  # [B, N]
+            surf_per_sample = (abs_err[:, :, 2:3] * _wt_surf.unsqueeze(-1)).sum(dim=(1, 2)) / _wt_surf.sum(dim=1).clamp(min=1).float()
+        else:
+            surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
@@ -1774,8 +1787,12 @@ for epoch in range(MAX_EPOCHS):
             thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
             thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
             hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
-            hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
-            surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            hard_w = (hard_mask.float() * 0.5 + 1.0)  # [B, N] — 1.5 hard, 1.0 else
+            if node_w is not None:
+                combined_w = hard_w * node_w  # [B, N]
+                surf_per_sample = (surf_pres * combined_w.unsqueeze(-1) * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / (surf_mask.float() * combined_w).sum(dim=1).clamp(min=1).float()
+            else:
+                surf_per_sample = (surf_pres * hard_w.unsqueeze(-1) * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         if cfg.tandem_ramp:
             tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
