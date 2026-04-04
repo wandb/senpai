@@ -947,6 +947,10 @@ class Config:
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
+    # Phase 6: Online Hard Example Mining
+    ohem: bool = False              # enable per-sample EMA loss tracking and soft upweighting
+    ohem_weight: float = 1.5       # weight multiplier for hard samples (above threshold)
+    ohem_threshold_pct: int = 75   # percentile threshold for hard sample classification
 
 
 cfg = sp.parse(Config)
@@ -1006,6 +1010,18 @@ def _phys_denorm(y_p, Umag, q):
 
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=cfg.num_workers, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
+
+
+class IndexedDataset(torch.utils.data.Dataset):
+    """Wraps a dataset to return (item, dataset_index) for OHEM index tracking."""
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __getitem__(self, idx):
+        return self.dataset[idx], idx
+
+    def __len__(self):
+        return len(self.dataset)
 
 if cfg.debug:
     # Avoid sampler/length mismatch when train_ds is truncated
@@ -1074,6 +1090,31 @@ if cfg.raw_targets or cfg.adaptive_norm:
     print(f"  {_label} stats — mean: {_raw_mean.tolist()}, std: {_raw_std.tolist()}")
 else:
     raw_stats = None
+
+# OHEM: per-sample EMA loss buffer and indexed train loader (rebuilt after stats computation)
+if cfg.ohem:
+    n_train_samples = len(train_ds)
+    sample_ema_loss = torch.ones(n_train_samples) * 0.5  # CPU buffer, init to 0.5
+    OHEM_DECAY = 0.9
+
+    def _indexed_collate(batch):
+        data = [item[0] for item in batch]
+        indices = torch.tensor([item[1] for item in batch], dtype=torch.long)
+        return (*pad_collate(data), indices)
+
+    _ohem_loader_kwargs = {**loader_kwargs, 'collate_fn': _indexed_collate}
+    _indexed_ds = IndexedDataset(train_ds)
+    if cfg.debug:
+        train_loader = DataLoader(_indexed_ds, batch_size=cfg.batch_size,
+                                  shuffle=True, **_ohem_loader_kwargs)
+    else:
+        train_loader = DataLoader(_indexed_ds, batch_size=cfg.batch_size,
+                                  sampler=sampler, **_ohem_loader_kwargs)
+    print(f"OHEM enabled: weight={cfg.ohem_weight}, threshold_pct={cfg.ohem_threshold_pct}, "
+          f"EMA_decay={OHEM_DECAY}, n_samples={n_train_samples}")
+else:
+    sample_ema_loss = None
+    OHEM_DECAY = None
 
 model_config = dict(
     space_dim=2,
@@ -1389,7 +1430,12 @@ for epoch in range(MAX_EPOCHS):
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     if cfg.grad_accum_steps > 1:
         optimizer.zero_grad()
-    for batch_idx, (x, y, is_surface, mask) in enumerate(pbar):
+    for batch_idx, _batch in enumerate(pbar):
+        if cfg.ohem:
+            x, y, is_surface, mask, batch_indices = _batch
+        else:
+            x, y, is_surface, mask = _batch
+            batch_indices = None
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -1643,6 +1689,8 @@ for epoch in range(MAX_EPOCHS):
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
         running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
+        # Save raw surf_per_sample for OHEM EMA tracking (before hard-node mining modifies it)
+        surf_per_sample_raw = surf_per_sample.detach()
         # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
         if epoch >= 30:
             surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
@@ -1661,7 +1709,25 @@ for epoch in range(MAX_EPOCHS):
                                        torch.ones(B, device=device))
         else:
             tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
-        surf_loss = (surf_per_sample * tandem_boost).mean()
+        # OHEM: update per-sample EMA and compute normalized soft weights
+        if cfg.ohem and batch_indices is not None:
+            with torch.no_grad():
+                sample_ema_loss[batch_indices] = (
+                    OHEM_DECAY * sample_ema_loss[batch_indices] +
+                    (1 - OHEM_DECAY) * surf_per_sample_raw.cpu()
+                )
+            batch_ema = sample_ema_loss[batch_indices].to(device)
+            ohem_threshold = torch.quantile(batch_ema, cfg.ohem_threshold_pct / 100.0)
+            ohem_weights = torch.where(
+                batch_ema > ohem_threshold,
+                torch.full((len(batch_indices),), cfg.ohem_weight, device=device),
+                torch.ones(len(batch_indices), device=device),
+            )
+            # Normalize to unit mean so effective LR is unchanged
+            ohem_weights = ohem_weights / ohem_weights.mean().clamp(min=1e-8)
+            surf_loss = (surf_per_sample * tandem_boost * ohem_weights).mean()
+        else:
+            surf_loss = (surf_per_sample * tandem_boost).mean()
         if cfg.uncertainty_loss:
             bm = _base_model
             surf_ux_loss = (abs_err[:, :, 0:1] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
@@ -1888,6 +1954,17 @@ for epoch in range(MAX_EPOCHS):
                 sa = snapshot_avg_model.state_dict()
                 for k in snap:
                     sa[k].mul_((snapshot_n - 1) / snapshot_n).add_(snap[k].to(device) / snapshot_n)
+
+    # OHEM epoch-level stats logging
+    if cfg.ohem and sample_ema_loss is not None:
+        _ohem_thresh = sample_ema_loss.quantile(cfg.ohem_threshold_pct / 100.0)
+        _hard_mask_epoch = sample_ema_loss > _ohem_thresh
+        wandb.log({
+            "ohem/hard_mean_loss": sample_ema_loss[_hard_mask_epoch].mean().item(),
+            "ohem/easy_mean_loss": sample_ema_loss[~_hard_mask_epoch].mean().item(),
+            "ohem/hard_count": int(_hard_mask_epoch.sum().item()),
+            "global_step": global_step,
+        }, commit=False)
 
     # --- Validate across all splits ---
     _do_val = (epoch + 1) % cfg.val_every == 0 or epoch == 0 or epoch == MAX_EPOCHS - 1
