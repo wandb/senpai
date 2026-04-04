@@ -139,7 +139,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False,
+                 per_node_temp=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -148,6 +149,10 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
         self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
+        self.per_node_temp = per_node_temp
+        if per_node_temp:
+            self.temp_proj = nn.Linear(dim, heads, bias=False)
+            nn.init.zeros_(self.temp_proj.weight)  # zero-init: starts as global temp
         self.tandem_temp_offset = nn.Parameter(torch.zeros(1, heads, 1, 1))
         self.linear_no_attention = linear_no_attention
         self.learned_kernel = learned_kernel
@@ -208,6 +213,11 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             temp = temp + zone_offset
         if tandem_mask is not None:
             temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
+        if self.per_node_temp:
+            # Per-node adaptive temperature: x is [B, N, dim] → [B, N, heads] → [B, heads, N, 1]
+            tau_delta = self.temp_proj(x)                       # [B, N, heads]
+            tau_delta = tau_delta.permute(0, 2, 1).unsqueeze(3) # [B, heads, N, 1]
+            temp = temp + tau_delta                             # broadcast: [B, heads, N, 1]
         temp = temp.clamp(min=1e-4)
         if self.decouple_slice and tandem_mask is not None:
             std_logits = self.in_project_slice(x_mid) / temp
@@ -282,6 +292,7 @@ class TransolverBlock(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        per_node_temp=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -307,6 +318,7 @@ class TransolverBlock(nn.Module):
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
             prog_slices=prog_slices,
+            per_node_temp=per_node_temp,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -601,6 +613,7 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        per_node_temp=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -671,6 +684,7 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
+                    per_node_temp=per_node_temp,
                 )
                 for idx in range(n_layers)
             ]
@@ -947,6 +961,8 @@ class Config:
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
+    # Phase 6: Per-node adaptive temperature (Transolver++ Eidetic States)
+    per_node_temp: bool = False             # per-node adaptive routing temperature
 
 
 cfg = sp.parse(Config)
@@ -1106,6 +1122,7 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    per_node_temp=cfg.per_node_temp,
 )
 
 model = Transolver(**model_config).to(device)
