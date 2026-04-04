@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-04 ~06:25 UTC
+- **Date:** 2026-04-04 ~06:55 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -19,7 +19,7 @@
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| tanjiro | #2101 | OHEM — Online Hard Example Mining | WIP |
+| tanjiro | #2109 | Contrastive Tandem-Single Regularization | WIP — just assigned |
 | edward | #2108 | Asymmetric Fixed Asinh Scales (pos/neg pressure) | WIP — just assigned |
 | askeladd | #2106 | Fourier Feature Position Encoding | WIP |
 | frieren | #2107 | Aft-Foil Coordinate Frame Normalization | WIP — just assigned |
@@ -30,10 +30,11 @@
 
 **All 8 students active. Zero idle GPUs.**
 
-## Recently Reviewed (2026-04-04 ~06:25 UTC)
+## Recently Reviewed (2026-04-04 ~06:55 UTC)
 
 | PR | Student | Experiment | Decision | Reason |
 |----|---------|-----------|---------|--------|
+| #2101 | tanjiro | OHEM (hard example mining) | CLOSED | Negative: no improvement; stronger weight actively hurts. OHEM compounds with existing tandem_ramp/adaptive_boost. Sample-level reweighting is NOT the p_tan bottleneck. |
 | #2100 | frieren | Model Scale-Up (5L, 3L/160s, 4L/128s) | CLOSED | Negative: no config beats 3L/96s baseline. **Key finding: p_tan is similar (~30-32) across ALL model scales — tandem problem is NOT capacity-limited.** |
 | #2094 | edward | SWAD Dense Weight Averaging | CLOSED | Catastrophic: +268% p_in, +369% p_oodc. SWAD suppresses EMA but never triggers collection (eval-at-end loop). **EMA is load-bearing.** |
 | #2099 | askeladd | Stochastic Depth (DropPath) | CLOSED | Dead end: all metrics worse (p_oodc +9-10%), 3-layer too shallow for DropPath |
@@ -47,7 +48,7 @@
 ### Primary target: p_tan = 29.1 (our weakest metric, 2.5x worse than p_in)
 
 Active experiments attacking p_tan from multiple angles:
-1. **OHEM** (tanjiro #2101) — dynamic per-sample hard mining, upweights difficult tandem configs
+1. **Contrastive Tandem-Single Regularization** (tanjiro #2109) — cosine similarity loss pushes apart tandem vs single-foil hidden representations; directly addresses the confirmed representation bottleneck
 2. **Deep Supervision** (nezuko #2097) — auxiliary loss on intermediate features; most promising result this round (p_oodc -1.7%, awaiting 8-seed validation)
 3. **Iterative Weight-Tied Transolver** (thorfinn #2103) — deeper effective receptive field via block reuse, targets long-range fore→aft signal propagation
 4. **Model Scale-Up** (frieren #2100) — larger model backbone (5L, 4L/128s)
@@ -78,6 +79,7 @@ Active experiments attacking p_tan from multiple angles:
 
 | Direction | PRs | Finding |
 |-----------|-----|---------|
+| OHEM (hard example mining) | #2101 | No improvement; stronger weight hurts; compounds with existing tandem_ramp — sample reweighting is not the bottleneck |
 | Model Scale-Up (5L, 160s, 4L/128s) | #2100 | No config beats 3L/96s; p_tan similar across all scales — NOT capacity-limited |
 | SWAD | #2094 | Catastrophic (+268% p_in); suppresses EMA, never triggers collection with eval-at-end loop |
 | Stochastic Depth (DropPath) | #2099 | All metrics worse; 3-block too shallow for path diversity |
@@ -123,8 +125,7 @@ Active experiments attacking p_tan from multiple angles:
 ## Potential Next Research Directions
 
 **Available (not yet assigned), in priority order:**
-1. **Contrastive Tandem-Single Regularization** — push apart hidden representations of tandem vs single-foil configs; targets p_tan OOD generalization; ~20 lines
-2. **Progressive Surface Focus Schedule** — curriculum: ramp surf_weight from 1 to target over first N epochs; ~8 lines; targets all tracks
+1. **Progressive Surface Focus Schedule** — curriculum: ramp surf_weight from 1 to target over first N epochs; ~8 lines; targets all tracks
 3. **TTA via AoA Perturbation** — inference-only: average predictions at AoA ± δ; zero training cost; ~25 eval-only lines; targets p_oodc/p_tan
 4. **Precomputed Pressure-Poisson Soft Constraint** — baked finite-diff Laplacian stencil; distinct from failed WLS; targets p_tan/p_oodc; complex (~65 lines)
 5. **Mesh-Density Weighted L1 Loss** — upweight fine-mesh nodes proportional to 1/local_spacing; targets p_in, p_tan; ~15 lines

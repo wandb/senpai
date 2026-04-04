@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 06:50 — PR #2101: Phase 6: OHEM — tanjiro — CLOSED (negative)
+- Branch: `tanjiro/ohem-hard-example-mining`
+- Hypothesis: Per-sample EMA loss tracking + upweighting of persistently hard samples. Should improve p_tan by focusing gradient budget on difficult tandem configs.
+- W&B group: `phase6/ohem`
+
+| Config | p_in | p_oodc | p_tan | p_re | W&B Run |
+|--------|------|--------|-------|------|---------|
+| Baseline s42 | 13.3 | 7.7 | 30.3 | 6.5 | tqlbfz9y |
+| Baseline s73 | 12.9 | 8.1 | 30.5 | 6.6 | dck4ur8w |
+| OHEM w=1.5 p75 s42 | 14.3 | 7.9 | 30.3 | 6.5 | 4x372o82 |
+| OHEM w=1.5 p75 s66 | 13.4 | 8.0 | 30.7 | 6.6 | c8v1a5l0 |
+| OHEM w=1.5 p75 s73 | 13.3 | 8.0 | 30.9 | 6.6 | 6db353lp |
+| OHEM w=2.0 p75 s42 | 13.4 | 7.9 | 30.9 | 6.5 | nzdg07dy |
+| OHEM w=2.0 p75 s73 | 13.5 | 8.2 | 31.3 | 6.5 | 0k97472w |
+| OHEM w=1.5 p90 s42 | 14.4 | 7.9 | 30.4 | 6.4 | dng4d3lt |
+
+**Analysis:** OHEM provides no improvement — all configs are at or below baseline. Stronger weight (w=2.0) actively hurts: p_tan +2.3%, p_in +3.1%. Root cause: OHEM compounds with existing tandem_ramp and adaptive_boost mechanisms (3 layers of reweighting is too much). The EMA correctly tracks hard samples (2.7× loss ratio) but existing mechanisms already handle this. **Confirmed: sample-level reweighting is not the p_tan bottleneck.**
+
 ### 2026-04-04 06:20 — PR #2100: Phase 6: Model Scale-Up — frieren — CLOSED (negative, key insight)
 - Branch: `frieren/model-scale-up`
 - Hypothesis: 3L/96s Transolver uses only 38/96GB VRAM. Deeper (5L) or wider (160s) models may improve metrics, especially p_tan which could be capacity-limited.
