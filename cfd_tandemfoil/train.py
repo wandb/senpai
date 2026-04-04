@@ -1004,6 +1004,8 @@ class Config:
     aft_foil_srf_film: bool = False          # FiLM conditioning on gap/stagger for aft-foil head
     aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
     aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
+    # Phase 6: Aft-foil loss upweighting
+    aft_foil_loss_weight: float = 1.0        # loss weight multiplier for aft-foil (ID=7) surface nodes (1.0=baseline)
 
 
 cfg = sp.parse(Config)
@@ -1544,7 +1546,7 @@ for epoch in range(MAX_EPOCHS):
         # Aft-foil mask: boundary ID=7 nodes identified by saf norm > 0.005
         # saf is at raw x[:,:,2:4]; foil-1 surface has saf≈0, foil-2 has saf>>0
         _aft_foil_mask = None
-        if aft_srf_head is not None:
+        if aft_srf_head is not None or cfg.aft_foil_loss_weight != 1.0:
             _raw_saf_norm = x[:, :, 2:4].norm(dim=-1)  # [B, N]
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
@@ -1750,6 +1752,12 @@ for epoch in range(MAX_EPOCHS):
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
         running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
+        # Build aft-foil per-node weight tensor for loss (1.0 for all non-aft nodes)
+        if cfg.aft_foil_loss_weight != 1.0 and _aft_foil_mask is not None and _aft_foil_mask.any():
+            _aft_w = torch.ones_like(surf_mask, dtype=torch.float32).unsqueeze(-1)  # [B, N, 1]
+            _aft_w[_aft_foil_mask] = cfg.aft_foil_loss_weight
+        else:
+            _aft_w = None
         # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
         if epoch >= 30:
             surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
@@ -1759,7 +1767,15 @@ for epoch in range(MAX_EPOCHS):
             thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
             hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
-            surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            # Combine hard-node weights with aft-foil upweighting if enabled
+            combined_w = hard_weights * _aft_w if _aft_w is not None else hard_weights
+            surf_per_sample = (surf_pres * combined_w * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / \
+                              (combined_w.squeeze(-1) * surf_mask.float()).sum(dim=1).clamp(min=1)
+        elif _aft_w is not None:
+            # Aft-foil upweighting without hard-node mining
+            surf_pres = abs_err[:, :, 2:3]
+            surf_per_sample = (surf_pres * _aft_w * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / \
+                              (_aft_w.squeeze(-1) * surf_mask.float()).sum(dim=1).clamp(min=1)
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         if cfg.tandem_ramp:
             tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
