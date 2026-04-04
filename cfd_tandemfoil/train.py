@@ -492,6 +492,58 @@ class SurfaceRefinementHead(nn.Module):
         return correction
 
 
+class AftFoilRefinementHead(nn.Module):
+    """Dedicated refinement head for aft-foil (boundary ID=7) surface nodes.
+
+    Optionally applies FiLM conditioning from gap/stagger geometry features.
+    Zero-initialized output layer for safe initialization (identity at start).
+    """
+
+    def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 192,
+                 n_layers: int = 3, film: bool = False):
+        super().__init__()
+        self.film = film
+        in_dim = n_hidden + out_dim
+        layers: list[nn.Module] = []
+        for i in range(n_layers):
+            layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
+            layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.GELU())
+        layers.append(nn.Linear(hidden_dim, out_dim))
+        nn.init.zeros_(layers[-1].weight)
+        nn.init.zeros_(layers[-1].bias)
+        self.mlp = nn.Sequential(*layers)
+        # FiLM modulation from gap/stagger (2-dim condition)
+        if film:
+            self.film_scale = nn.Linear(2, hidden_dim, bias=False)
+            self.film_shift = nn.Linear(2, hidden_dim)
+            nn.init.zeros_(self.film_scale.weight)
+            nn.init.zeros_(self.film_shift.weight)
+            nn.init.zeros_(self.film_shift.bias)
+
+    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor,
+                cond: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Args:
+            hidden: [A, n_hidden] — hidden features for aft-foil nodes
+            base_pred: [A, out_dim] — base predictions for aft-foil nodes
+            cond: [A, 2] — (gap, stagger) per node (only used if film=True)
+        Returns:
+            correction: [A, out_dim] — additive correction
+        """
+        inp = torch.cat([hidden, base_pred], dim=-1)
+        # Run through layers, applying FiLM after first hidden activation
+        x = inp
+        for i, layer in enumerate(self.mlp):
+            x = layer(x)
+            # Apply FiLM after first LayerNorm+GELU (i.e., after index 2)
+            if self.film and cond is not None and i == 2:
+                gamma = self.film_scale(cond)   # [A, hidden_dim]
+                beta = self.film_shift(cond)    # [A, hidden_dim]
+                x = x * (1.0 + gamma) + beta
+        return x
+
+
 class SurfaceRefinementContextHead(nn.Module):
     """Surface refinement head that incorporates nearest-volume context.
 
@@ -947,6 +999,11 @@ class Config:
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
+    # Phase 6: Dedicated aft-foil surface refinement head (boundary ID=7 nodes only)
+    aft_foil_srf: bool = False               # enable second SRF head for aft-foil (ID=7) nodes
+    aft_foil_srf_film: bool = False          # FiLM conditioning on gap/stagger for aft-foil head
+    aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
+    aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
 
 
 cfg = sp.parse(Config)
@@ -1139,9 +1196,26 @@ if cfg.surface_refine:
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
           f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
 
+# Aft-foil (boundary ID=7) dedicated refinement head
+aft_srf_head = None
+if cfg.aft_foil_srf:
+    aft_srf_head = AftFoilRefinementHead(
+        n_hidden=cfg.n_hidden,
+        out_dim=3,
+        hidden_dim=cfg.aft_foil_srf_hidden,
+        n_layers=cfg.aft_foil_srf_layers,
+        film=cfg.aft_foil_srf_film,
+    ).to(device)
+    aft_srf_head = torch.compile(aft_srf_head, mode=cfg.compile_mode)
+    _aft_n_params = sum(p.numel() for p in aft_srf_head.parameters())
+    print(f"Aft-foil SRF head: {_aft_n_params:,} params "
+          f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, "
+          f"film={cfg.aft_foil_srf_film})")
+
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
+ema_aft_srf_head = None  # EMA copy of aft-foil SRF head
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -1159,6 +1233,8 @@ snapshot_epoch_list = [int(e) for e in cfg.snapshot_epochs_str.split(",")] if cf
 n_params = sum(p.numel() for p in model.parameters())
 if refine_head is not None:
     n_params += sum(p.numel() for p in refine_head.parameters())
+if aft_srf_head is not None:
+    n_params += sum(p.numel() for p in aft_srf_head.parameters())
 
 
 class SAM:
@@ -1290,6 +1366,12 @@ if refine_head is not None:
     base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
 
+# Add aft-foil SRF head params to optimizer if enabled
+if aft_srf_head is not None:
+    _aft_params = list(aft_srf_head.parameters())
+    base_opt.add_param_group({'params': _aft_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _aft_params):,} aft-foil SRF head params to optimizer")
+
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
     _warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
@@ -1382,6 +1464,8 @@ for epoch in range(MAX_EPOCHS):
     model.train()
     if refine_head is not None:
         refine_head.train()
+    if aft_srf_head is not None:
+        aft_srf_head.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
@@ -1457,6 +1541,14 @@ for epoch in range(MAX_EPOCHS):
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
+        # Aft-foil mask: boundary ID=7 nodes identified by saf norm > 0.005
+        # saf is at raw x[:,:,2:4]; foil-1 surface has saf≈0, foil-2 has saf>>0
+        _aft_foil_mask = None
+        if aft_srf_head is not None:
+            _raw_saf_norm = x[:, :, 2:4].norm(dim=-1)  # [B, N]
+            _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
+            _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
+            _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1590,6 +1682,21 @@ for epoch in range(MAX_EPOCHS):
                         correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
+
+        # Aft-foil dedicated refinement head: additive correction on boundary ID=7 nodes only
+        if aft_srf_head is not None and model.training and _aft_foil_mask is not None:
+            aft_idx = _aft_foil_mask.nonzero(as_tuple=False)  # [A, 2] (batch, node)
+            if aft_idx.numel() > 0:
+                aft_hidden = hidden[aft_idx[:, 0], aft_idx[:, 1]]  # [A, n_hidden]
+                aft_pred = pred[aft_idx[:, 0], aft_idx[:, 1]]      # [A, 3]
+                # FiLM conditioning: expand gap/stagger per aft-foil node
+                _aft_cond = None
+                if cfg.aft_foil_srf_film:
+                    _aft_cond = _raw_gap_stagger[aft_idx[:, 0]]  # [A, 2]
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    aft_correction = aft_srf_head(aft_hidden, aft_pred, _aft_cond).float()
+                pred = pred.clone()
+                pred[aft_idx[:, 0], aft_idx[:, 1]] = pred[aft_idx[:, 0], aft_idx[:, 1]] + aft_correction
 
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
@@ -1818,6 +1925,15 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for aft-foil SRF head
+            if aft_srf_head is not None:
+                _aft_base = aft_srf_head._orig_mod if hasattr(aft_srf_head, '_orig_mod') else aft_srf_head
+                if ema_aft_srf_head is None:
+                    ema_aft_srf_head = deepcopy(_aft_base)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_aft_srf_head.parameters(), _aft_base.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -1923,6 +2039,14 @@ for epoch in range(MAX_EPOCHS):
             eval_refine_head.eval()
         elif refine_head is not None:
             refine_head.eval()
+    # Select aft-foil SRF head for eval (EMA if available)
+    eval_aft_srf_head = aft_srf_head
+    if aft_srf_head is not None:
+        if ema_aft_srf_head is not None and ema_model is not None and eval_model is ema_model:
+            eval_aft_srf_head = ema_aft_srf_head
+            eval_aft_srf_head.eval()
+        elif aft_srf_head is not None:
+            aft_srf_head.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -1947,6 +2071,13 @@ for epoch in range(MAX_EPOCHS):
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
+                # Aft-foil mask for eval (same logic as training)
+                _eval_aft_mask = None
+                if eval_aft_srf_head is not None:
+                    _v_saf_norm = x[:, :, 2:4].norm(dim=-1)
+                    _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
+                    _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
+                    _v_gap_stagger = x[:, 0, 22:24]  # [B, 2]
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -2060,6 +2191,23 @@ for epoch in range(MAX_EPOCHS):
                         pred = pred_loss / sample_stds
                     else:
                         pred = pred_loss * sample_stds
+
+                # Apply aft-foil SRF head during validation
+                if eval_aft_srf_head is not None and _eval_aft_mask is not None:
+                    aft_idx = _eval_aft_mask.nonzero(as_tuple=False)
+                    if aft_idx.numel() > 0:
+                        _ah = _eval_hidden[aft_idx[:, 0], aft_idx[:, 1]]
+                        _ap = pred_loss[aft_idx[:, 0], aft_idx[:, 1]]
+                        _ac = _v_gap_stagger[aft_idx[:, 0]] if cfg.aft_foil_srf_film else None
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            _aft_corr = eval_aft_srf_head(_ah, _ap, _ac).float()
+                        pred_loss = pred_loss.clone()
+                        pred_loss[aft_idx[:, 0], aft_idx[:, 1]] += _aft_corr
+                        # Back-compute pred for denormalization
+                        if cfg.multiply_std:
+                            pred = pred_loss / sample_stds
+                        else:
+                            pred = pred_loss * sample_stds
 
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
@@ -2228,6 +2376,11 @@ for epoch in range(MAX_EPOCHS):
                 refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
             )
             torch.save(_refine_save.state_dict(), model_dir / "refine_head.pt")
+        if aft_srf_head is not None:
+            _aft_save = ema_aft_srf_head if ema_aft_srf_head is not None else (
+                aft_srf_head._orig_mod if hasattr(aft_srf_head, '_orig_mod') else aft_srf_head
+            )
+            torch.save(_aft_save.state_dict(), model_dir / "aft_srf_head.pt")
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
