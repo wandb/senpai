@@ -253,6 +253,22 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         return self.to_out(out_x)
 
 
+class DropPath(nn.Module):
+    """Stochastic Depth (Huang et al., ECCV 2016). Drops entire residual paths."""
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if not self.training or self.drop_prob == 0.0:
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        rand_t = torch.rand(shape, dtype=x.dtype, device=x.device)
+        rand_t = torch.floor(rand_t + keep_prob)
+        return x * rand_t / keep_prob
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -282,6 +298,7 @@ class TransolverBlock(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        drop_prob=0.0,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -334,6 +351,7 @@ class TransolverBlock(nn.Module):
         )
         nn.init.zeros_(self.spatial_bias[-1].weight)
         nn.init.zeros_(self.spatial_bias[-1].bias)
+        self.drop_path = DropPath(drop_prob) if drop_prob > 0.0 else nn.Identity()
         self.ln_1_post = _LN(hidden_dim)
         self.ln_2_post = _LN(hidden_dim)
         self.se_fc1 = nn.Linear(hidden_dim, hidden_dim // 4)
@@ -403,12 +421,12 @@ class TransolverBlock(nn.Module):
             cond_out = self.adaln_net(condition)  # [B, H*4]
             s1, b1, s2, b2 = cond_out.chunk(4, dim=-1)  # each [B, H]
             fx_norm = _ln(self.ln_1, fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
-            fx = _ln(self.ln_1_post, self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            fx = _ln(self.ln_1_post, self.drop_path(self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features)) + fx)
             fx_norm = _ln(self.ln_2, fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
-            fx = _ln(self.ln_2_post, self.mlp(fx_norm) + fx)
+            fx = _ln(self.ln_2_post, self.drop_path(self.mlp(fx_norm)) + fx)
         else:
-            fx = _ln(self.ln_1_post, self.attn(_ln(self.ln_1, fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
-            fx = _ln(self.ln_2_post, self.mlp(_ln(self.ln_2, fx)) + fx)
+            fx = _ln(self.ln_1_post, self.drop_path(self.attn(_ln(self.ln_1, fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features)) + fx)
+            fx = _ln(self.ln_2_post, self.drop_path(self.mlp(_ln(self.ln_2, fx))) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
@@ -601,6 +619,7 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        drop_path_rate=0.0,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -642,6 +661,8 @@ class Transolver(nn.Module):
         self.space_dim = space_dim
         self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
         nn.init.eye_(self.feature_cross.weight)  # start as identity
+        # Linear stochastic depth schedule: layer 0 gets 0, last layer gets drop_path_rate
+        _dpr = [drop_path_rate * i / max(n_layers - 1, 1) for i in range(n_layers)]
         self.blocks = nn.ModuleList(
             [
                 TransolverBlock(
@@ -671,6 +692,7 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
+                    drop_prob=_dpr[idx],
                 )
                 for idx in range(n_layers)
             ]
@@ -947,6 +969,8 @@ class Config:
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
+    # Phase 6: Stochastic Depth
+    drop_path_rate: float = 0.0             # stochastic depth max drop rate (0=disabled, linear schedule across layers)
 
 
 cfg = sp.parse(Config)
@@ -1106,6 +1130,7 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    drop_path_rate=cfg.drop_path_rate,
 )
 
 model = Transolver(**model_config).to(device)
