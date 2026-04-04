@@ -947,6 +947,16 @@ class Config:
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
+    # Phase 6: Gradient Centralization (GC-Lion)
+    gradient_centralization: bool = False    # remove gradient DC offset before optimizer step (Yong et al. ECCV 2020)
+
+
+def apply_gradient_centralization(model: nn.Module) -> None:
+    """Subtract gradient mean over input dims (GC, Yong et al. ECCV 2020)."""
+    for p in model.parameters():
+        if p.grad is not None and p.grad.dim() > 1:
+            axes = tuple(range(1, p.grad.dim()))
+            p.grad.data -= p.grad.data.mean(dim=axes, keepdim=True)
 
 
 cfg = sp.parse(Config)
@@ -1768,6 +1778,8 @@ for epoch in range(MAX_EPOCHS):
                 optimizer.zero_grad()
             loss.backward()
 
+        if cfg.gradient_centralization:
+            apply_gradient_centralization(model)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         sam_active = sam_optimizer is not None and epoch >= int(MAX_EPOCHS * 0.75)
         _should_step = (cfg.grad_accum_steps <= 1 or
