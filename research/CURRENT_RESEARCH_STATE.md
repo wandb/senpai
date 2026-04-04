@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-04 ~15:20 UTC
+- **Date:** 2026-04-04 ~15:30 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -26,17 +26,17 @@
 | p_tan | **29.1** |
 | p_re | **5.8** |
 
-## Student Status (~14:55 UTC)
+## Student Status (~15:30 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| nezuko | #2122 | Fore-Foil Loss Upweighting (ID=6) — Symmetric to Aft-Foil Weight | WIP — just assigned |
-| fern | #2117 | Fore-Foil Dedicated SRF Head (ID=6) — Split from Single-Foil | WIP |
+| nezuko | #2122 | Fore-Foil Loss Upweighting (ID=6) — Symmetric to Aft-Foil Weight | WIP |
+| fern | #2124 | Fore-Foil Stacked SRF Head (ID=6) — Additive, Not Split | WIP — just assigned |
 | tanjiro | #2121 | Aft-Foil Loss Upweighting — Stronger Gradient for Wake Nodes (weight 1.5–2.0×) | WIP |
 | edward | #2120 | Langevin Gradient Noise (SGLD) — Stochastic Exploration for Lion | WIP |
 | askeladd | #2119 | PCGrad 3-Way Task Split — Gradient Surgery (single/tandem-normal/tandem-extreme) | WIP |
 | frieren | #2107 | Aft-Foil Coordinate Frame Normalization (dual-frame v2) — VRAM fix + 2 more seeds | WIP — sent back |
-| alphonse | #2123 | Combined Baseline 8-Seed Validation (aft_foil_srf + gap/stagger aug, seeds 42-49) | WIP — just assigned |
+| alphonse | #2123 | Combined Baseline 8-Seed Validation (aft_foil_srf + gap/stagger aug, seeds 42-49) | WIP |
 | thorfinn | #2118 | Boundary-ID One-Hot Feature — Explicit Surface-Type Conditioning | WIP |
 
 **All 8 students active. Zero idle GPUs.**
@@ -45,6 +45,7 @@
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
+| #2117 | fern | Fore-Foil Dedicated SRF Head (ID=6) — Split approach | CLOSED | **+9–11% p_tan regression**. Splitting shared srf_head removes tandem transfer learning. Next: stacked additive approach (#2124) |
 | #2115 | nezuko | Gap/Stagger Perturbation Aug (σ=0.02) | **MERGED** | p_oodc -4.9% (7.446 vs 7.83); p_re -1.5%; p_tan flat; largest p_oodc gain since pressure_first |
 | #2114 | tanjiro | Gradient Centralization (GC-Lion) | CLOSED | p_in +12-17%, p_oodc +15-38%. GC incompatible with Lion sign operation |
 | #2107 | frieren | Aft-Foil Local Frame (dual-frame v2) | SENT BACK | s73 beats all 4 metrics (p_tan -1.8%) but 2-seed avg fails; VRAM bug; needs fix + 2 more seeds |
@@ -64,8 +65,8 @@
 3. `--surface_refine`, `--residual_prediction`, `--pressure_first`, `--pressure_deep`, `--asinh_pressure 0.75`, etc.
 
 **Active experiments (8 students):**
-1. **Fore-Foil Loss Upweighting (ID=6)** (nezuko #2122) — upweight fore-foil nodes 1.5–2.0× in surface loss; symmetric to tanjiro's aft-foil upweighting; orthogonal to fern's SRF head
-2. **Fore-Foil SRF Head (ID=6)** (fern #2117) — dedicated SRF head for fore-foil; natural extension of aft-foil SRF
+1. **Fore-Foil Loss Upweighting (ID=6)** (nezuko #2122) — upweight fore-foil nodes 1.5–2.0× in surface loss; orthogonal to fern's SRF stack
+2. **Fore-Foil Stacked SRF Head (ID=6)** (fern #2124) — additive fore_srf_head on top of shared srf_head WITHOUT narrowing; parallel to aft_srf_head design; direct fix for #2117's split failure
 3. **Aft-Foil Loss Upweighting (ID=7)** (tanjiro #2121) — upweight aft-foil nodes 1.5–2.0× in main surface loss
 4. **Dual-Frame Coordinate Features** (frieren #2107) — VRAM bug fix + 2 more seeds; high confidence in improvement once variance resolved
 5. **Boundary-ID One-Hot Feature** (thorfinn #2118) — append 3-dim one-hot (ID=5/6/7) to all nodes
@@ -79,9 +80,11 @@
 - NOT representational entanglement (contrastive #2109)
 - NOT progressive surface weight scheduling (#2110)
 - NOT gradient centralization (GC-Lion incompatible: #2114)
+- NOT fore-foil splitting (loses tandem transfer learning: #2117 → +9–11% p_tan regression)
 - HAS coordinate-frame component (dual-frame #2107: s73 beats all 4 metrics; pending VRAM fix)
 - HAS dedicated-head component (aft-foil SRF #2104: p_tan -0.8%)
 - HAS OOD domain randomization benefit (gap/stagger aug #2115: p_oodc -4.9%)
+- DESIGN LESSON: SRF specialization must be ADDITIVE (stack on shared head), not REPLACING (split from shared head)
 
 ## Potential Next Research Directions (not yet assigned)
 
@@ -152,6 +155,7 @@
 | Gradient Centralization (GC-Lion) | #2114 | p_in +12-17%, p_oodc +15-38%; GC changes direction which Lion's sign-op treats as noise; incompatible |
 | Smooth L1 / Huber Loss | #2113 | Catastrophic: gradient attenuation for small errors incompatible with residual-prediction+asinh; L1 constant gradient is optimal |
 | Charbonnier Loss (smooth L1 variant) | #2116 | Dead end: all eps values degrade all metrics; p_oodc +12-24%; smooth loss family fully exhausted |
+| Fore-Foil SRF Split (narrowing shared head) | #2117 | +9–11% p_tan regression; loses transfer learning from tandem data; additive stack (#2124) is the correct formulation |
 | FiLM on gap/stagger | #2104 | p_oodc catastrophe (+41.6%) |
 | Foil-2 Loss Upweighting | #1893 | Marginal (still shared head); retesting as #2121 WITH aft-foil SRF head in baseline |
 | Ada-Temp (per-node) | #1879,#1793,#1615 | Null across multiple phases |

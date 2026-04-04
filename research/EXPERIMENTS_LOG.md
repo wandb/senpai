@@ -2,6 +2,27 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 15:20 — PR #2117: Phase 6: Fore-Foil Dedicated SRF Head (ID=6) — Split from Single-Foil — fern — CLOSED
+
+- Branch: `fern/fore-foil-srf-split`
+- Hypothesis: Give the fore-foil (boundary ID=6) its own dedicated Surface Refinement Head, split away from the shared `srf_head` (which previously served both single-foil ID=5 and fore-foil ID=6 nodes). Motivated by the successful aft-foil SRF (#2104).
+
+| Config | Seeds | p_in | p_oodc | p_tan | p_re | W&B Runs |
+|--------|-------|------|--------|-------|------|----------|
+| Control (aft_srf only) | 42,43 | 13.30 | 7.70 | **29.45** | 6.40 | sqfe4eih, 69va7w4w |
+| +fore_srf 192/3L | 42,43 | 13.20 | 7.75 | 32.15 | 6.45 | oiygmwit, o3ziow82 |
+| +fore_srf_lg 256/4L | 42,43 | 13.45 | 8.00 | 32.75 | 6.60 | qkp9400n, w62a6akm |
+
+W&B group: `phase6/fore-foil-srf`
+
+**Results commentary:**
+- **Clear dead end — both configs regress p_tan by +9–11%** vs. control. Larger capacity is strictly worse.
+- Root cause identified by fern: when `--fore_foil_srf` is active, the shared `srf_head` was narrowed to single-foil nodes only, losing transfer learning from tandem data. The fore-foil head sees only ~200 nodes in ~40% of training samples — insufficient signal.
+- Key contrast: aft-foil SRF (#2104) ADDED an extra head on top of the shared head without narrowing it. The fore-foil splitting approach inverts this design.
+- **Action:** Stacked fore-foil refinement (additive on top of shared srf_head, no narrowing) assigned to fern as the natural follow-up.
+
+---
+
 ### 2026-04-04 15:15 — PR #2116: Phase 6: Charbonnier Loss — Fully Smooth L1 — alphonse — CLOSED
 
 - Branch: `alphonse/charbonnier-loss`
