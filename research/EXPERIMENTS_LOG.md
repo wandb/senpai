@@ -2,6 +2,31 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~00:00 — PR #2130: Gap/Stagger-Conditioned Spatial Bias — fern — **SENT BACK** (rebase + 2-seed validation)
+
+- Branch: `fern/gap-stagger-spatial-bias`
+- Hypothesis: Extend Transolver's spatial_bias MLP from 4→6 inputs by appending (gap, stagger) scalars. Makes slice routing tandem-geometry-aware. Zero effect on single-foil (gap=0, stagger=0). Zero-init on new weights ensures identical routing at epoch 0.
+
+| Config | p_in | p_oodc | p_tan | p_re | W&B ID |
+|--------|------|--------|-------|------|--------|
+| Control s42 | 13.103 | 7.464 | 29.843 | 6.522 | yrckevun |
+| Control s43 | 13.136 | 7.773 | 30.249 | 6.551 | fwof1f72 |
+| **Control avg** | **13.120** | **7.618** | **30.046** | **6.537** | — |
+| GSB s42 | 12.819 | 7.394 | 29.739 | 6.529 | mh5sy993 |
+| GSB s43 | 13.275 | 7.778 | 29.898 | 6.469 | agndk2w9 |
+| **GSB avg** | **13.047** | **7.586** | **29.819** | **6.499** | — |
+
+W&B group: `phase6/gap-stagger-spatial-bias`
+
+**Results commentary:**
+- **GSB beats control on ALL 4 metrics:** p_in -0.6%, p_oodc -0.4%, p_tan **-0.8%**, p_re -0.6%.
+- GSB avg p_tan=29.82 already beats the current baseline (29.91) WITHOUT `--aft_foil_srf_context`.
+- Feature index correction: gap=22, stagger=23 (not 21, 22 as in PR instructions). Student caught this.
+- VRAM: 38.4 GB — identical to baseline (negligible parameter overhead).
+- **Sent back** for rebased 2-seed validation with `--aft_foil_srf_context`. Expect compounding — merge if p_tan < 29.91.
+
+---
+
 ### 2026-04-04 ~23:45 — PR #2119: PCGrad 2-Way Validation (8-seed) — askeladd — **SENT BACK** (rebase + 2-seed validation)
 
 - Branch: `askeladd/pcgrad-3way`
