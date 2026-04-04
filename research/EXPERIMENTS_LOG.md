@@ -2,6 +2,33 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 07:00 — PR #2097: Phase 6: Deep Supervision — nezuko — CLOSED (mixed: p_in improved, p_tan regressed)
+- Branch: `nezuko/deep-supervision`
+- Hypothesis: Auxiliary loss on pre-final-block hidden features provides direct gradient flow to intermediate blocks, improving representation quality and OOD generalization.
+- W&B group: `phase6/deep-supervision-8seed`
+
+**8-seed validation (aux_w=0.2, seeds 42-49):**
+
+| Seed | p_in | p_oodc | p_tan | p_re | W&B Run |
+|------|------|--------|-------|------|---------|
+| 42 | 12.3 | 7.9 | 31.8 | 6.4 | k1v8bvum |
+| 43 | 12.8 | 7.7 | 30.2 | 6.4 | 11yf2z5i |
+| 44 | 12.9 | 8.1 | 31.1 | 6.5 | 2qwd1irz |
+| 45 | 12.5 | 7.8 | 31.9 | 6.6 | x97wrsdz |
+| 46 | 12.8 | 7.7 | 30.7 | 6.3 | e1l5eokg |
+| 47 | 13.2 | 8.3 | 31.9 | 6.6 | xpfnr80l |
+| 48 | 13.1 | 7.7 | 30.4 | 6.7 | ds46hwpq |
+| 49 | 12.9 | 8.1 | 30.8 | 6.4 | ocxi1i4c |
+
+| Metric | Deep Sup (8-seed) | Baseline (8-seed) | Delta |
+|--------|------------------|-------------------|-------|
+| p_in | **12.81 ± 0.29** | 13.03 ± 0.39 | **-1.7%** |
+| p_oodc | 7.91 ± 0.23 | **7.83 ± 0.19** | +1.1% |
+| p_tan | 31.10 ± 0.69 | **30.29 ± 0.47** | **+2.7%** |
+| p_re | 6.49 ± 0.14 | **6.45 ± 0.05** | +0.6% |
+
+**Analysis:** Initial 2-seed result (p_oodc -3.1%) was optimistic — 8-seed shows p_oodc +1.1%. **p_in genuinely improves -1.7%** (the auxiliary gradient signal helps in-distribution feature quality). But **p_tan regresses +2.7%** — the auxiliary loss constrains representational flexibility needed for tandem geometry transfer. Since p_tan is our primary target, this tradeoff is unacceptable. Demonstrates the tension between in-distribution fitting and OOD generalization in this architecture. **Closed: p_tan regression overrides p_in improvement.**
+
 ### 2026-04-04 06:50 — PR #2101: Phase 6: OHEM — tanjiro — CLOSED (negative)
 - Branch: `tanjiro/ohem-hard-example-mining`
 - Hypothesis: Per-sample EMA loss tracking + upweighting of persistently hard samples. Should improve p_tan by focusing gradient budget on difficult tandem configs.

@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-04 ~06:55 UTC
+- **Date:** 2026-04-04 ~07:05 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -24,7 +24,7 @@
 | askeladd | #2106 | Fourier Feature Position Encoding | WIP |
 | frieren | #2107 | Aft-Foil Coordinate Frame Normalization | WIP — just assigned |
 | fern | #2104 | Dedicated Aft-Foil SRF Branch (ID=7) | WIP |
-| nezuko | #2097 | Deep Supervision (aux_w=0.2) — 8-seed validation | WIP (sent back) |
+| nezuko | #2110 | Progressive Surface Focus Schedule (curriculum) | WIP — just assigned |
 | alphonse | #2102 | Sin Activation in Surface Refinement Head | WIP |
 | thorfinn | #2103 | Iterative Weight-Tied Transolver (K=2,3,4) | WIP |
 
@@ -49,7 +49,7 @@
 
 Active experiments attacking p_tan from multiple angles:
 1. **Contrastive Tandem-Single Regularization** (tanjiro #2109) — cosine similarity loss pushes apart tandem vs single-foil hidden representations; directly addresses the confirmed representation bottleneck
-2. **Deep Supervision** (nezuko #2097) — auxiliary loss on intermediate features; most promising result this round (p_oodc -1.7%, awaiting 8-seed validation)
+2. **Progressive Surface Focus Schedule** (nezuko #2110) — curriculum learning: ramp surf_weight from 1→target over first N epochs; builds solid backbone before amplifying surface loss
 3. **Iterative Weight-Tied Transolver** (thorfinn #2103) — deeper effective receptive field via block reuse, targets long-range fore→aft signal propagation
 4. **Model Scale-Up** (frieren #2100) — larger model backbone (5L, 4L/128s)
 5. **Dedicated Aft-Foil SRF Branch** (fern #2104) — separate refinement MLP exclusively for boundary ID=7 (aft foil tandem nodes), with optional FiLM conditioning on gap/stagger
@@ -68,7 +68,7 @@ Active experiments attacking p_tan from multiple angles:
 2. **Target-space transforms cannot be learnable** — Learnable asinh scale (#2096) confirms: joint optimization creates trivial shortcuts
 3. **Velocity doesn't need compression** — Asinh velocity (#2098) confirms: velocity channels are well-behaved, pressure asymmetry is the unique bottleneck
 4. **Ensembling is near-saturating** — 16→23 seeds gains diminish; single-model improvements are the priority
-5. **Deep supervision is promising** — The only bright result this round: auxiliary loss on intermediate features shows consistent improvements across all 4 metrics at aux_w=0.2
+5. **Deep supervision improves p_in but hurts p_tan** — (#2097) 8-seed validation: p_in -1.7% but p_tan +2.7%. Auxiliary loss constrains intermediate representations, helping in-distribution but hurting tandem transfer
 6. **Offline regression KD doesn't work** — (#2090) confirms: the ensemble's single-model gap is too small for soft-target distillation to reliably capture at convergence
 7. **Stochastic depth requires depth** — DropPath (#2099) is ineffective for 3-block architectures; requires 6+ layers for meaningful path diversity
 8. **Per-node adaptive temperature is a known null** — Ada-Temp tried in PRs #1879, #1793, #1615 — all null results; do NOT reassign
@@ -79,6 +79,7 @@ Active experiments attacking p_tan from multiple angles:
 
 | Direction | PRs | Finding |
 |-----------|-----|---------|
+| Deep Supervision (aux loss) | #2097 | p_in -1.7% but p_tan +2.7% at 8-seed scale — constrains representational flexibility for tandem transfer |
 | OHEM (hard example mining) | #2101 | No improvement; stronger weight hurts; compounds with existing tandem_ramp — sample reweighting is not the bottleneck |
 | Model Scale-Up (5L, 160s, 4L/128s) | #2100 | No config beats 3L/96s; p_tan similar across all scales — NOT capacity-limited |
 | SWAD | #2094 | Catastrophic (+268% p_in); suppresses EMA, never triggers collection with eval-at-end loop |
@@ -125,8 +126,7 @@ Active experiments attacking p_tan from multiple angles:
 ## Potential Next Research Directions
 
 **Available (not yet assigned), in priority order:**
-1. **Progressive Surface Focus Schedule** — curriculum: ramp surf_weight from 1 to target over first N epochs; ~8 lines; targets all tracks
-3. **TTA via AoA Perturbation** — inference-only: average predictions at AoA ± δ; zero training cost; ~25 eval-only lines; targets p_oodc/p_tan
+1. **TTA via AoA Perturbation** — inference-only: average predictions at AoA ± δ; zero training cost; ~25 eval-only lines; targets p_oodc/p_tan
 4. **Precomputed Pressure-Poisson Soft Constraint** — baked finite-diff Laplacian stencil; distinct from failed WLS; targets p_tan/p_oodc; complex (~65 lines)
 5. **Mesh-Density Weighted L1 Loss** — upweight fine-mesh nodes proportional to 1/local_spacing; targets p_in, p_tan; ~15 lines
 6. **Geometry-Conditioned AoA Interpolation** — physics-space interpolation (distinct from failed feature-space Mixup); targets p_oodc; moderate complexity
