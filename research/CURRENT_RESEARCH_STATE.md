@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-04 ~20:10 UTC
+- **Date:** 2026-04-04 ~20:30 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -32,7 +32,7 @@
 |---------|-----|-----------|--------|
 | tanjiro | #2126 | Foil-2 DSDF Magnitude Augmentation (σ sweep: 0.05/0.10/0.15) | WIP — just assigned |
 | frieren | #2127 | Context-Aware AftSRF — KNN Volume Context for Wake Pressure (K=8) | WIP — just assigned |
-| nezuko | #2122 | Fore-Foil Loss Upweighting (ID=6) — Symmetric to Aft-Foil Weight | WIP |
+| nezuko | #2129 | Supervised Surface Pressure Gradient Aux Loss (w=0.05/0.10, seeds 42/73) | WIP — just assigned |
 | fern | #2124 | Fore-Foil Stacked SRF Head (ID=6) — Additive, Not Split | WIP |
 | edward | #2128 | Reynolds-Conditional SRF — FiLM on (Re, AoA) for surface_refine head | WIP — just assigned |
 | askeladd | #2119 | PCGrad 2-Way Validation — 8-seed (seeds 42-49) with gap_stagger aug | WIP (sent back for validation) |
@@ -41,13 +41,14 @@
 
 **All 8 students active. Zero idle GPUs.**
 
-## Recently Reviewed (2026-04-04 ~19:00)
+## Recently Reviewed (2026-04-04 ~20:30)
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
-| #2119 | askeladd | PCGrad 3-Way (effectively 2-way due to batch-size confound) | **SENT BACK** | p_oodc beats baseline in ALL 4 runs (-1.3% to -5.4%). 3-way never fires (batch_size=4). Sent back for 8-seed 2-way validation. |
-| #2121 | tanjiro | Aft-Foil Loss Upweighting (w=1.5, w=2.0) | **CLOSED** | p_oodc consistently beats baseline (-2%) but p_tan regresses +1.5-1.7%. Loss weighting helps OOD-C but trades off tandem. |
-| #2107 | frieren | Aft-Foil Coordinate Frame (dual-frame v2, 4-seed final) | **CLOSED** | After 3 iterations and 8 runs: 4-seed mean p_in +3.0%, p_tan +0.6%. High p_tan variance (range 1.55). Approach explored. |
+| #2122 | nezuko | Fore-Foil Loss Upweighting (w=1.5, w=2.0) | **CLOSED** | p_oodc -1.8% but p_tan +1.5-1.9% in all configs. Confirms loss-region-weighting dead end (symmetric to #2121). |
+| #2119 | askeladd | PCGrad 2-Way Validation | **SENT BACK (again)** | 8-seed validation never ran. Re-sent with explicit commands. 2-seed mean p_oodc -4.5%, p_tan -1.2%. |
+| #2121 | tanjiro | Aft-Foil Loss Upweighting (w=1.5, w=2.0) | **CLOSED** | p_oodc -2% but p_tan +1.5-1.7%. Loss weighting helps OOD-C but trades off tandem. |
+| #2107 | frieren | Aft-Foil Coordinate Frame (dual-frame v2, 4-seed final) | **CLOSED** | After 3 iterations and 8 runs: p_in +3.0%, p_tan +0.6%. Approach explored. |
 
 ## Current Research Focus
 
@@ -61,7 +62,7 @@
 **Active experiments (8 students):**
 1. **Foil-2 DSDF Magnitude Aug** (tanjiro #2126) — log-normal scale of foil-2 DSDF channels (tandem only); σ sweep {0.05, 0.10, 0.15}; 6 runs total; direct geometric extension of gap/stagger aug; targets p_tan by forcing shape-independent representations
 2. **Context-Aware AftSRF** (frieren #2127) — KNN volume context (K=8, zone_id=2 nodes) for aft-foil SRF head; gives wake-state information to the correction head; physically motivated by non-local fore→aft wake dependency
-3. **Fore-Foil Loss Upweighting (ID=6)** (nezuko #2122) — upweight fore-foil nodes 1.5–2.0× in surface loss
+3. **Supervised Surface Pressure Gradient Aux Loss** (nezuko #2129) — L1 on chord-wise pressure gradient finite differences; targets spatial structure of Cp not just per-node; w=0.05/0.10 sweep
 4. **Fore-Foil Stacked SRF Head (ID=6)** (fern #2124) — additive fore_srf_head on top of shared srf_head
 5. **Reynolds Number Perturbation Augmentation** (thorfinn #2125) — add Gaussian noise to log_Re during training; σ sweep {0.05, 0.1, 0.2}; targets p_re < 6.45
 6. **PCGrad 2-Way Validation** (askeladd #2119) — 8-seed validation of 2-way PCGrad (single-foil vs all-tandem); p_oodc signal -1.3% to -5.4% in initial 4 runs
@@ -99,6 +100,7 @@
 | Direction | PRs | Finding |
 |-----------|-----|---------|
 | Aft-Foil Loss Upweighting | #2121 | p_oodc improves -2% but p_tan regresses +1.5%; loss weighting benefits OOD-C not tandem |
+| Fore-Foil Loss Upweighting | #2122 | p_oodc improves -1.8% but p_tan regresses +1.5-1.9%; confirms loss-region-weighting is dead |
 | Aft-Foil Coordinate Frame (dual-frame) | #2107 | 3 iterations, 8 runs, p_in +3%, p_tan barely moves; high variance |
 | Fore-Foil SRF Split (narrowing shared head) | #2117 | +9–11% p_tan regression; loses tandem transfer learning |
 | Boundary-ID One-Hot (sparse 3-dim input) | #2118 | p_tan +2.1%; sparse features disrupt slice assignment |

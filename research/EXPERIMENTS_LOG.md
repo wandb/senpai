@@ -2,6 +2,31 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 ~20:30 — PR #2122: Phase 6: Fore-Foil Loss Upweighting (ID=6) — nezuko — CLOSED (dead end)
+
+- Branch: `nezuko/fore-foil-loss-weight`
+- Hypothesis: Upweighting fore-foil (ID=6) surface nodes in the main surface pressure L1 loss by 1.5–2.0× would improve fore-foil pressure predictions, propagating downstream benefits via better wake representation. Symmetric to the aft-foil loss upweighting idea (PR #2121).
+
+| Run | W&B ID | Weight | Seed | p_in | p_oodc | p_tan | p_re |
+|-----|--------|--------|------|------|--------|-------|------|
+| forefoil-lw15-s42 | swgrtft1 | 1.5 | 42 | 12.761 | 7.839 | 30.189 | 6.556 |
+| forefoil-lw15-s73 | mhihrtht | 1.5 | 73 | 14.152 | 7.715 | 30.833 | 6.277 |
+| forefoil-lw20-s42 | rn1v2g8z | 2.0 | 42 | 12.946 | 7.730 | 30.372 | 6.797 |
+| forefoil-lw20-s73 | jab8a2yz | 2.0 | 73 | 13.396 | 7.837 | 30.869 | 6.418 |
+
+W&B group: `phase6/fore-foil-loss-weight`
+
+2-seed means vs baseline (p_in=13.19, p_oodc=7.92, p_tan=30.05, p_re=6.45):
+- weight=1.5: p_in=13.457 (+2.0%), p_oodc=7.777 (-1.8%), p_tan=30.511 (+1.5%), p_re=6.417 (-0.5%)
+- weight=2.0: p_in=13.171 (-0.1%), p_oodc=7.784 (-1.7%), p_tan=30.621 (+1.9%), p_re=6.608 (+2.4%)
+
+**Results commentary:**
+- p_oodc improves consistently (-1.7% to -1.8%) across both weight settings.
+- **p_tan regresses in ALL configurations** (+1.5% to +1.9%) — this is the critical failure since p_tan is our primary target.
+- Root cause: upweighting fore-foil nodes steals gradient from aft-foil nodes, directly hurting tandem transfer predictions.
+- Combined with PR #2121 (aft-foil loss upweighting, same pattern: p_oodc improves but p_tan regresses), this definitively closes the entire loss-region-upweighting approach.
+- **Conclusion:** Surface loss reweighting by boundary region is a dead end. The p_oodc benefit comes at the cost of p_tan. Boundary-specific improvements must be delivered architecturally (dedicated heads), not through loss weighting.
+
 ### 2026-04-04 ~20:10 — PR #2120: Phase 6: Langevin Gradient Noise (SGLD) — edward — CLOSED (dead end)
 
 - Branch: `edward/langevin-noise`
