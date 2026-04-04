@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-04 ~13:15 UTC
+- **Date:** 2026-04-04 ~13:35 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -30,21 +30,22 @@ Baseline config now includes `--aft_foil_srf`. All new experiments must use it.
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| fern | #2117 | Fore-Foil Dedicated SRF Head (ID=6) — Split from Single-Foil | WIP — just assigned |
+| fern | #2117 | Fore-Foil Dedicated SRF Head (ID=6) — Split from Single-Foil | WIP |
 | tanjiro | #2114 | Gradient Centralization — Zero-Mean Gradient Updates with Lion | WIP |
 | edward | #2113 | Smooth L1 (Huber) Loss — Node-Level Gradient Emphasis | WIP |
-| askeladd | #2106 | Fourier Feature Position Encoding — Spectral Bias Correction | WIP |
-| frieren | #2107 | Aft-Foil Coordinate Frame Normalization (dual-frame iteration) | WIP — sent back |
+| askeladd | #2119 | PCGrad 3-Way Task Split — Gradient Surgery (single/tandem-normal/tandem-extreme) | WIP — just assigned |
+| frieren | #2107 | Aft-Foil Coordinate Frame Normalization (dual-frame iteration) | WIP |
 | nezuko | #2115 | Gap/Stagger Perturbation Augmentation — Tandem OOD Robustness | WIP |
 | alphonse | #2116 | Charbonnier Loss — Fully Smooth L1 (eps sweep: 0.05, 0.1, 0.2) | WIP |
-| thorfinn | #2118 | Boundary-ID One-Hot Feature — Explicit Surface-Type Conditioning | WIP — just assigned |
+| thorfinn | #2118 | Boundary-ID One-Hot Feature — Explicit Surface-Type Conditioning | WIP |
 
-**All 8 students active. Zero idle GPUs.** (thorfinn reassigned after #2112 closed → #2118)
+**All 8 students active. Zero idle GPUs.** (askeladd: #2106 Fourier PE → closed → #2119 PCGrad 3-way)
 
 ## Recently Reviewed / Merged (2026-04-04)
 
 | PR | Student | Experiment | Decision | p_tan result |
 |----|---------|-----------|---------|--------------|
+| #2106 | askeladd | Fourier Feature Position Encoding | CLOSED | p_tan -1.3% (FF=32) but p_oodc +4.8%, p_re +6.2%; hidden-space RFF redundant with existing input PE |
 | #2112 | thorfinn | Mesh-Density Weighted L1 | CLOSED | All metrics regressed 5–16%; train/eval distribution shift + double-upweighting with hard-node mining |
 | #2104 | fern | Dedicated Aft-Foil SRF Head (ID=7) | **MERGED** | 30.05 ± 0.36 (-0.8% vs 30.29 baseline) |
 | #2111 | alphonse | TTA via AoA Perturbation | CLOSED | Self-defeating under timeout; marginal at matching epochs |
@@ -67,7 +68,7 @@ Baseline config now includes `--aft_foil_srf`. All new experiments must use it.
 2. **Dual-Frame Coordinate Features** (frieren #2107) — add local-frame coords as ADDITIONAL features; p_tan -2.6% previously but p_in regressed with in-place replacement; non-destructive version being tested
 3. **Gap/Stagger Perturbation Aug** (nezuko #2115) — domain randomization on tandem geometry features; targets p_tan OOD axis
 4. **Boundary-ID One-Hot Feature** (thorfinn #2118) — append 3-dim one-hot (ID=5/6/7) to input before all attention blocks; expected -3 to -8% p_tan; complements SRF heads
-5. **Fourier Feature Position Encoding** (askeladd #2106) — spectral bias correction via RFF
+5. **PCGrad 3-Way Task Split** (askeladd #2119) — gradient surgery across 3 groups (single/tandem-normal/tandem-extreme-Re); sweep pcgrad_extreme_pct={0.10, 0.15}; expected -2 to -5% p_tan
 6. **Smooth L1 (Huber) Loss** (edward #2113) — sweep beta={0.5, 1.0, 2.0}
 7. **Gradient Centralization** (tanjiro #2114) — remove DC gradient component before Lion sign
 8. **Charbonnier Loss** (alphonse #2116) — fully smooth L1; sweep eps={0.05, 0.1, 0.2}
@@ -83,9 +84,9 @@ Baseline config now includes `--aft_foil_srf`. All new experiments must use it.
 ## Potential Next Research Directions (not yet assigned)
 
 **Priority queue (assign to next idle students):**
-1. **Tandem-Specific PCGrad 3-Way Split** — split Group B further into tandem vs. extreme-Re/AoA; expected -2 to -5% p_tan; ~15 LoC; MEDIUM risk
-2. **Langevin Gradient Noise (SGLD-style)** — Gaussian noise to gradients after Lion update; expected -1 to -3% p_in; ~10 LoC; LOW-MEDIUM risk
-3. **Precomputed Pressure-Poisson Soft Constraint** — finite-diff Laplacian stencil as auxiliary loss; targets p_tan/p_oodc
+1. **Langevin Gradient Noise (SGLD-style)** — Gaussian noise to gradients after Lion update; expected -1 to -3% p_in; ~10 LoC; LOW-MEDIUM risk
+2. **Precomputed Pressure-Poisson Soft Constraint** — finite-diff Laplacian stencil as auxiliary loss; targets p_tan/p_oodc
+3. **Aft-Foil Loss Upweighting** — apply separate loss weight (1.5-2.0x) to aft-foil (ID=7) surface nodes; complements existing SRF head
 
 **Deferred pending current results:**
 - Expand ensemble to 23 seeds (seeds 100-106 already trained) — do after single-model improvements land
@@ -125,6 +126,7 @@ Baseline config now includes `--aft_foil_srf`. All new experiments must use it.
 
 | Direction | PRs | Finding |
 |-----------|-----|---------|
+| Fourier Feature Position Encoding (hidden-space) | #2106 | p_tan -1.3% (FF=32) but p_oodc +4.8%, p_re +6.2%; input-level PE already sufficient |
 | Mesh-Density Weighted L1 | #2112 | All metrics regressed 5–16%; train/eval distribution shift; compounds with hard-node mining |
 | TTA via AoA Perturbation (training-loop) | #2111 | Self-defeating under timeout; marginal at matching epochs |
 | Progressive surface focus (curriculum ramp) | #2110 | p_in regresses +0.7%; dynamic surf_weight already optimal |

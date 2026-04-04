@@ -2,6 +2,31 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 13:30 — PR #2106: Phase 6: Fourier Feature Position Encoding — Spectral Bias Correction — askeladd — CLOSED
+
+- Branch: `askeladd/fourier-feature-position-encoding`
+- Hypothesis: Hidden-space Random Fourier Features (RFF) lift positional coordinates into a higher-frequency basis, correcting the neural network's spectral bias. Expected to help sharp pressure peaks at leading edges (p_in) and aft-foil suction peaks (p_tan).
+
+| Config | Seed | val/loss | p_in | p_oodc | p_tan | p_re | W&B Run |
+|--------|------|----------|------|--------|-------|------|---------| 
+| FF=16, σ=10 | 42 | 0.3939 | 13.6 | 8.1 | 29.8 | 6.9 | i36jee3d |
+| FF=16, σ=10 | 73 | 0.4002 | 14.1 | 8.2 | 31.1 | 6.6 | 28jblql6 |
+| FF=32, σ=10 | 42 | 0.3921 | 12.9 | 8.1 | 30.0 | 6.8 | bkktfeu6 |
+| FF=32, σ=10 | 73 | 0.3942 | 13.2 | 8.5 | 29.3 | 6.9 | snipvwml |
+
+W&B group: `phase6/fourier-features`
+
+**Results commentary (vs current 8-seed baseline: p_in=13.19, p_oodc=7.92, p_tan=30.05, p_re=6.45):**
+- FF=32 2-seed mean: p_in=13.05 (-1.1% ✓), p_oodc=8.30 (+4.8% ✗), p_tan=29.65 (-1.3% ✓), p_re=6.85 (+6.2% ✗)
+- FF=16 strictly worse across all metrics
+- p_tan improvement is real (seed 73 hits 29.3, well below baseline) but p_oodc and p_re regress >5%
+- Root cause: the model already has 8-frequency Fourier PE in the input (4 fixed + 4 learnable); hidden-space addition duplicates coverage without generalizing well to OOD/Re splits
+- The fixed random frequencies introduce position-dependent biases that are geometry-specific rather than physics-general
+
+**Conclusion:** Closes the hidden-space Fourier PE direction. Input-level PE is already sufficient; adding more in hidden space hurts OOD generalization.
+
+---
+
 ### 2026-04-04 13:10 — PR #2112: Phase 6: Mesh-Density Weighted L1 — Upweight Fine-Mesh Regions — thorfinn — CLOSED
 
 - Branch: `thorfinn/mesh-density-weighted-loss`
