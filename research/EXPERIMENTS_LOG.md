@@ -2,6 +2,29 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 13:10 — PR #2112: Phase 6: Mesh-Density Weighted L1 — Upweight Fine-Mesh Regions — thorfinn — CLOSED
+
+- Branch: `thorfinn/mesh-density-weighted-loss`
+- Hypothesis: Weight each node's loss by `1 / local_mesh_spacing` (inverse mean k-NN distance) to upweight fine-mesh regions (leading/trailing edges, suction peaks) that drive surface MAE but contribute equally to unweighted L1.
+
+| Run | p_in | p_oodc | p_tan | p_re | W&B run |
+|-----|------|--------|-------|------|---------|
+| density-w-s42 (clip=10) | 13.35 | 8.9 | 30.9 | 7.1 | rta5eea7 |
+| density-w-s73 (clip=10) | 12.94 | 8.8 | 31.1 | 6.9 | xb0ittvc |
+| density-w-clip20-s42 | 13.94 | 8.6 | 30.8 | 6.9 | kgkllnwg |
+| density-w-clip20-s73 | 13.15 | 8.8 | 30.8 | 7.1 | qzmaub2r |
+
+W&B group: `phase6/mesh-density-loss`
+
+**Results commentary:** Clear negative result — all 4 variants regress 5–16% across all metrics vs baseline (single-model targets: p_in < 13.19, p_oodc < 7.92, p_tan < 30.05, p_re < 6.45). Three failure modes identified by student:
+1. **Train/eval distribution shift:** Density-weighted training loss ≠ unweighted evaluation MAE, creating a systematic bias toward fitting leading-edge nodes at the expense of mid-chord nodes that dominate the metric.
+2. **Double-upweighting with hard-node mining:** Leading-edge nodes are both high-density AND high-error → compound 2× upweighting that destabilizes the gradient landscape.
+3. **Geometric ≠ physical priority:** Mesh density encodes CFD mesher decisions (geometric refinement), not directly what drives surface MAE.
+
+Clip=10 vs clip=20 makes no consistent difference. Implementation was sound; the hypothesis itself is flawed. Closes the mesh-density-weighting direction.
+
+---
+
 ### 2026-04-04 11:50 — PR #2104: Phase 6: Dedicated Aft-Foil Surface Refinement Head (ID=7) — fern — MERGED
 
 - Branch: `fern/aft-foil-srf-branch`

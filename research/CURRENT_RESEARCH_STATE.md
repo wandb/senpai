@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-04 ~12:00 UTC
+- **Date:** 2026-04-04 ~13:15 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -37,14 +37,15 @@ Baseline config now includes `--aft_foil_srf`. All new experiments must use it.
 | frieren | #2107 | Aft-Foil Coordinate Frame Normalization (dual-frame iteration) | WIP — sent back |
 | nezuko | #2115 | Gap/Stagger Perturbation Augmentation — Tandem OOD Robustness | WIP |
 | alphonse | #2116 | Charbonnier Loss — Fully Smooth L1 (eps sweep: 0.05, 0.1, 0.2) | WIP |
-| thorfinn | #2112 | Mesh-Density Weighted L1 — Upweight Fine-Mesh Regions | WIP |
+| thorfinn | #2118 | Boundary-ID One-Hot Feature — Explicit Surface-Type Conditioning | WIP — just assigned |
 
-**All 8 students active. Zero idle GPUs.**
+**All 8 students active. Zero idle GPUs.** (thorfinn reassigned after #2112 closed → #2118)
 
 ## Recently Reviewed / Merged (2026-04-04)
 
 | PR | Student | Experiment | Decision | p_tan result |
 |----|---------|-----------|---------|--------------|
+| #2112 | thorfinn | Mesh-Density Weighted L1 | CLOSED | All metrics regressed 5–16%; train/eval distribution shift + double-upweighting with hard-node mining |
 | #2104 | fern | Dedicated Aft-Foil SRF Head (ID=7) | **MERGED** | 30.05 ± 0.36 (-0.8% vs 30.29 baseline) |
 | #2111 | alphonse | TTA via AoA Perturbation | CLOSED | Self-defeating under timeout; marginal at matching epochs |
 | #2110 | nezuko | Progressive Surface Focus Schedule | CLOSED | p_in regresses +0.7%; dynamic surf_weight already optimal |
@@ -65,7 +66,7 @@ Baseline config now includes `--aft_foil_srf`. All new experiments must use it.
 1. **Fore-Foil SRF Head (ID=6)** (fern #2117) — natural extension of aft-foil SRF; expected -3 to -6% p_tan; LOW RISK; zero-init
 2. **Dual-Frame Coordinate Features** (frieren #2107) — add local-frame coords as ADDITIONAL features; p_tan -2.6% previously but p_in regressed with in-place replacement; non-destructive version being tested
 3. **Gap/Stagger Perturbation Aug** (nezuko #2115) — domain randomization on tandem geometry features; targets p_tan OOD axis
-4. **Mesh-Density Weighted L1** (thorfinn #2112) — upweight fine-mesh nodes (leading edge, suction peaks)
+4. **Boundary-ID One-Hot Feature** (thorfinn #2118) — append 3-dim one-hot (ID=5/6/7) to input before all attention blocks; expected -3 to -8% p_tan; complements SRF heads
 5. **Fourier Feature Position Encoding** (askeladd #2106) — spectral bias correction via RFF
 6. **Smooth L1 (Huber) Loss** (edward #2113) — sweep beta={0.5, 1.0, 2.0}
 7. **Gradient Centralization** (tanjiro #2114) — remove DC gradient component before Lion sign
@@ -82,10 +83,9 @@ Baseline config now includes `--aft_foil_srf`. All new experiments must use it.
 ## Potential Next Research Directions (not yet assigned)
 
 **Priority queue (assign to next idle students):**
-1. **Boundary-ID One-Hot as Sideband Feature** — explicit per-node surface-type conditioning (ID=5/6/7 as 3-dim one-hot input feature); expected -3 to -8% p_tan; ~10 LoC; MEDIUM risk
-2. **Tandem-Specific PCGrad 3-Way Split** — split Group B further into tandem vs. extreme-Re/AoA; expected -2 to -5% p_tan; ~15 LoC; MEDIUM risk
-3. **Langevin Gradient Noise (SGLD-style)** — Gaussian noise to gradients after Lion update; expected -1 to -3% p_in; ~10 LoC; LOW-MEDIUM risk
-4. **Precomputed Pressure-Poisson Soft Constraint** — finite-diff Laplacian stencil as auxiliary loss; targets p_tan/p_oodc
+1. **Tandem-Specific PCGrad 3-Way Split** — split Group B further into tandem vs. extreme-Re/AoA; expected -2 to -5% p_tan; ~15 LoC; MEDIUM risk
+2. **Langevin Gradient Noise (SGLD-style)** — Gaussian noise to gradients after Lion update; expected -1 to -3% p_in; ~10 LoC; LOW-MEDIUM risk
+3. **Precomputed Pressure-Poisson Soft Constraint** — finite-diff Laplacian stencil as auxiliary loss; targets p_tan/p_oodc
 
 **Deferred pending current results:**
 - Expand ensemble to 23 seeds (seeds 100-106 already trained) — do after single-model improvements land
@@ -125,6 +125,7 @@ Baseline config now includes `--aft_foil_srf`. All new experiments must use it.
 
 | Direction | PRs | Finding |
 |-----------|-----|---------|
+| Mesh-Density Weighted L1 | #2112 | All metrics regressed 5–16%; train/eval distribution shift; compounds with hard-node mining |
 | TTA via AoA Perturbation (training-loop) | #2111 | Self-defeating under timeout; marginal at matching epochs |
 | Progressive surface focus (curriculum ramp) | #2110 | p_in regresses +0.7%; dynamic surf_weight already optimal |
 | Contrastive tandem-single regularization | #2109 | Hypothesis falsified: rep entanglement NOT bottleneck |
