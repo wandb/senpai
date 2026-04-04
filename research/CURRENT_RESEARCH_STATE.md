@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-04 ~22:15 UTC
+- **Date:** 2026-04-04 ~23:30 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -46,7 +46,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | tanjiro | #2133 | Foil-1 DSDF Magnitude Aug — Front Foil Shape Transfer | WIP |
 | fern | #2130 | Gap/Stagger-Conditioned Spatial Bias — Tandem-Geometry-Aware Slice Routing | WIP |
 | alphonse | #2131 | Tandem-Slice Carve-Out — Reserved Physics Slices for Tandem Samples | WIP |
-| nezuko | #2129 | Supervised Surface Pressure Gradient Aux Loss (w=0.05/0.10) | WIP |
+| nezuko | #2129 | Supervised Surface Pressure Gradient Aux Loss — **v2** (per-foil fix + aft_srf_context rebase) | WIP — sent back for revision |
 | askeladd | #2119 | PCGrad 2-Way Validation — 8-seed validation | WIP |
 | thorfinn | #2132 | Tandem DSDF Channel Mixup — Synthetic Foil-Shape Interpolation | WIP |
 | frieren | #2134 | Fore-Foil TE Relative Coords — Inter-Foil Jet Frame for AftSRF Context | WIP — just assigned |
@@ -54,10 +54,11 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 **All 8 students active. Zero idle GPUs.**
 
-## Recently Reviewed (2026-04-04 ~22:00)
+## Recently Reviewed (2026-04-04 ~23:30)
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
+| #2129 | nezuko | Supervised Surface Pressure Gradient Aux Loss | **SENT BACK** | All metrics regress vs current baseline. Cross-foil gradient bug identified. Sent back for per-foil fix + aft_srf_context rebase. |
 | #2127 | frieren | Context-Aware AftSRF — KNN Volume Context K=8 | **MERGED** | All 4 metrics beat baseline. p_tan 30.11→29.91 (-0.7%), p_oodc -0.5%, p_re -1.0%. W&B verified. |
 | #2128 | edward | Reynolds-Conditional SRF — FiLM on (Re, AoA) | **CLOSED** | Null result. FiLM worse than own control on p_oodc (+4%) and p_tan (+1.2%). AdaLN already handles Re/AoA conditioning. |
 | #2126 | tanjiro | Foil-2 DSDF Magnitude Augmentation — σ=0.05 | **MERGED** (prior round) | p_tan -1.4%, p_in -1.5%, p_oodc -0.9%. |
@@ -98,7 +99,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 1. **per_foil_pnorm** — Per-foil physics normalization: for tandem samples, split Cp normalization so fore-foil nodes use q_fore and aft-foil nodes use q_aft. Corrects a physical bias baked into all Cp computations since training began. ~25 LoC. **Expected p_tan -2% to -5%. ASSIGN NEXT.**
 2. **foil2_aoa_rot_aug** — Independent AoA rotation aug for aft-foil nodes in tandem samples only. Creates novel (fore_AoA, aft_AoA) combinations absent from training data. ~35 LoC. Expected p_tan -2% to -4%.
 3. **ema_perturb** — EMA stochastic weight perturbation (σ sweep {5e-4, 1e-3, 3e-3}) at ema_start_epoch to probe flat minima. ~12 LoC. Expected p_tan -1% to -3%.
-4. **aft_foil_tv_loss** — Chord-wise TV regularization on aft-foil pressure predictions. HOLD until nezuko #2129 results are known.
+4. **aft_foil_tv_loss** — Chord-wise TV regularization on aft-foil pressure predictions. ⚠️ DEPRIORITIZED — nezuko #2129 (gradient aux, same family) showed weak results. May revisit if per-foil fix in #2129 v2 shows promise.
 5. **Combined DSDF1+DSDF2 aug at lower σ** — Simultaneous aug of both foil DSDF channels at σ=0.02-0.03; may compound. Depends on tanjiro #2133 outcome.
 
 ### Existing Queue

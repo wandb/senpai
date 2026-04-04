@@ -2,6 +2,31 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 ~23:30 — PR #2129: Supervised Surface Pressure Gradient Aux Loss — nezuko — **SENT BACK** (revision requested)
+
+- Branch: `nezuko/surf-pressure-gradient-aux`
+- Hypothesis: Add an auxiliary L1 loss on the chord-wise first-order pressure gradient (finite differences between consecutive surface nodes sorted by x-coordinate). Forces the model to reproduce the spatial structure of the Cp distribution, not just point-wise accuracy. Tested at weight=0.05 and weight=0.10.
+
+| Run | W&B ID | Weight | Seed | p_in | p_oodc | p_tan | p_re |
+|-----|--------|--------|------|------|--------|-------|------|
+| surfgrad-w05-s42 | bnskf03a | 0.05 | 42 | 13.518 | 7.574 | 30.387 | 6.451 |
+| surfgrad-w05-s73 | yfy3efjq | 0.05 | 73 | 13.644 | 7.854 | 30.826 | 6.650 |
+| surfgrad-w10-s42 | s2txmpe9 | 0.10 | 42 | 13.113 | 7.836 | 30.311 | 6.475 |
+| surfgrad-w10-s73 | 3is100bp | 0.10 | 73 | 13.185 | 7.631 | 30.428 | 6.393 |
+| **w=0.05 avg** | — | 0.05 | — | **13.581** | **7.714** | **30.607** | **6.551** |
+| **w=0.10 avg** | — | 0.10 | — | **13.149** | **7.734** | **30.370** | **6.434** |
+| **Current baseline** | — | — | — | **13.02** | **7.62** | **29.91** | **6.47** |
+
+W&B group: `phase6/surf-grad-aux`
+
+**Results commentary:**
+- **DOES NOT BEAT BASELINE.** Against the current baseline (PR #2127, +aft_foil_srf_context), all metrics except p_re regress.
+- **w=0.10 > w=0.05** across the board. Weight=0.10 is clearly the better setting.
+- **Known bug:** Runs used stale baseline (missing `--aft_foil_srf_context`). More importantly, chord-wise sorting over ALL surface nodes creates spurious gradients between fore-foil TE and aft-foil LE in tandem samples. These cross-foil gradients are physically meaningless and likely suppress the p_tan signal.
+- **Sent back** with instructions to: (1) split gradient computation per-foil to eliminate cross-foil artifacts, (2) add `--aft_foil_srf_context` to match current baseline, (3) re-run w=0.10 only (2 seeds). Final iteration — close if no improvement.
+
+---
+
 ### 2026-04-04 ~22:00 — PR #2127: Context-Aware AftSRF — KNN Volume Context — frieren — **MERGED** (winner)
 
 - Branch: `frieren/aft-srf-knn-context`
