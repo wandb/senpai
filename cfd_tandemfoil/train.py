@@ -2154,14 +2154,26 @@ for epoch in range(MAX_EPOCHS):
             if val_loss_3split > swad_prev_val:
                 swad_done = True
                 if swad_checkpoints:
-                    avg_state = {k: torch.stack([c[k].float() for c in swad_checkpoints]).mean(0).to(device)
-                                 for k in swad_checkpoints[0]}
+                    avg_state = {k: torch.stack([c[0][k].float() for c in swad_checkpoints]).mean(0).to(device)
+                                 for k in swad_checkpoints[0][0]}
                     if ema_model is None:
                         ema_model = deepcopy(_base_model)
                     ema_model.load_state_dict(avg_state)
+                    # Also average refine head
+                    if refine_head is not None and swad_checkpoints[0][1] is not None:
+                        avg_refine = {k: torch.stack([c[1][k].float() for c in swad_checkpoints]).mean(0).to(device)
+                                      for k in swad_checkpoints[0][1]}
+                        _refine_base = refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
+                        if ema_refine_head is None:
+                            ema_refine_head = deepcopy(_refine_base)
+                        ema_refine_head.load_state_dict(avg_refine)
             else:
                 snap = {k: v.cpu().clone() for k, v in _base_model.state_dict().items()}
-                swad_checkpoints.append(snap)
+                refine_snap = None
+                if refine_head is not None:
+                    _refine_base = refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
+                    refine_snap = {k: v.cpu().clone() for k, v in _refine_base.state_dict().items()}
+                swad_checkpoints.append((snap, refine_snap))
                 if len(swad_checkpoints) > 20:
                     swad_checkpoints.pop(0)
             swad_prev_val = val_loss_3split
