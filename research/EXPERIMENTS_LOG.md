@@ -2,6 +2,51 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 ~22:00 — PR #2127: Context-Aware AftSRF — KNN Volume Context — frieren — **MERGED** (winner)
+
+- Branch: `frieren/aft-srf-knn-context`
+- Hypothesis: AftFoilRefinementHead receives no non-local context. Aft-foil surface pressure depends on upstream wake state arriving from the fore-foil. Augmenting each aft-foil surface node's hidden state with the averaged hidden states of K=8 nearest zone-2 volume neighbors gives the correction head direct access to wake-state information.
+
+| Metric | Seed 42 (zosxwjmm) | Seed 73 (twilqf1x) | 2-Seed Avg | Baseline | Δ |
+|--------|--------------------|--------------------|------------|----------|---|
+| p_in | 12.87 | 13.18 | **13.02** | 13.04 | -0.2% |
+| p_oodc | 7.47 | 7.76 | **7.62** | 7.66 | -0.5% |
+| **p_tan** | 29.96 | 29.87 | **29.91** | 30.11 | **-0.7%** |
+| p_re | 6.56 | 6.37 | **6.47** | 6.52 | -1.0% |
+| val/loss | 0.388 | 0.386 | 0.387 | — | — |
+
+W&B group: `phase6/aft-srf-knn-context`
+
+**Results commentary:**
+- **MERGE DECISION:** All 4 metrics beat baseline. Primary target p_tan: 29.91 < 30.11 (-0.7%). Physical intuition holds: giving the aft-foil correction head access to upstream wake flow information improves aft-foil surface pressure.
+- **Note:** Run WITHOUT `--aug_dsdf2_sigma 0.05`. KNN context alone beats the baseline that INCLUDES dsdf2 aug. This suggests the two improvements are orthogonal and may compound.
+- **VRAM:** 69-95GB peak per seed — dedicated H100 required per seed. +25% per-epoch overhead vs non-context baseline.
+- **New baseline flag:** `--aft_foil_srf_context` added to all future baseline runs.
+
+---
+
+### 2026-04-04 ~22:00 — PR #2128: Reynolds-Conditional SRF FiLM — edward — **CLOSED** (null result)
+
+- Branch: `edward/re-conditional-srf`
+- Hypothesis: Conditioning the SRF head on (Re, AoA) via FiLM modulation allows the correction MLP to adapt its strategy to the flow regime, targeting p_re and p_oodc.
+
+| Run | p_in | p_oodc | p_tan | p_re | W&B ID |
+|-----|------|--------|-------|------|--------|
+| FiLM s42 | 13.34 | 7.96 | 30.57 | 6.60 | 7bnlke5o |
+| FiLM s73 | 12.72 | 7.73 | 29.73 | 6.52 | yh5ixlx8 |
+| **FiLM avg** | **13.03** | **7.84** | **30.15** | **6.56** | — |
+| Control s42 | 12.81 | 7.79 | 29.70 | 6.83 | np3anmah |
+| Control s73 | 14.16 | 7.31 | 29.86 | 6.49 | fcri663y |
+| **Control avg** | **13.49** | **7.55** | **29.78** | **6.66** | — |
+| **Baseline** | **13.04** | **7.66** | **30.11** | **6.52** | — |
+
+**Results commentary:**
+- **CLOSE DECISION:** FiLM conditioning on (Re, AoA) shows no improvement. FiLM avg vs baseline: p_oodc +2.4%, p_tan +0.1%, p_re +0.8%. FiLM is also worse than its own control on p_oodc and p_tan.
+- **Why it fails:** The SRF head already receives Re/AoA conditioning implicitly through the Transolver backbone's AdaLN at every block. Adding explicit FiLM modulation is redundant — 960 extra parameters cannot learn anything new beyond what AdaLN already encodes.
+- **Mechanism confirmed dead:** Explicit Re/AoA conditioning on the SRF head via FiLM is a dead end. Alternative: condition on local flow features rather than global scalars.
+
+---
+
 ### 2026-04-04 ~20:30 — PR #2126: Foil-2 DSDF Magnitude Augmentation — tanjiro — **MERGED** (winner)
 
 - Branch: `tanjiro/dsdf2-mag-aug`
