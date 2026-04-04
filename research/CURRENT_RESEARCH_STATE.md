@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-04 ~07:55 UTC
+- **Date:** 2026-04-04 ~10:10 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -15,33 +15,31 @@
 
 16-seed ensemble beats 8-seed baseline: p_in -0.8%, p_oodc -1.5%. Seeds 100-106 also trained (mean p_in=13.0), available for future 23-seed evaluation.
 
-## Student Status (2026-04-04 ~06:25 UTC)
+## Student Status (2026-04-04 ~10:10 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| tanjiro | #2109 | Contrastive Tandem-Single Regularization | WIP — just assigned |
-| edward | #2108 | Asymmetric Fixed Asinh Scales (pos/neg pressure) | WIP — just assigned |
+| tanjiro | #2109 | Contrastive Tandem-Single Regularization | WIP |
+| edward | #2113 | Smooth L1 (Huber) Loss — Node-Level Gradient Emphasis | WIP — just assigned |
 | askeladd | #2106 | Fourier Feature Position Encoding | WIP |
-| frieren | #2107 | Aft-Foil Coordinate Frame Normalization | WIP — just assigned |
+| frieren | #2107 | Aft-Foil Coordinate Frame Normalization | WIP |
 | fern | #2104 | Dedicated Aft-Foil SRF Branch (ID=7) | WIP |
-| nezuko | #2110 | Progressive Surface Focus Schedule (curriculum) | WIP — just assigned |
-| alphonse | #2111 | TTA via AoA Perturbation (inference-only) | WIP — just assigned |
-| thorfinn | #2112 | Mesh-Density Weighted L1 Loss | WIP — just assigned |
+| nezuko | #2110 | Progressive Surface Focus Schedule (curriculum) | WIP |
+| alphonse | #2111 | TTA via AoA Perturbation (inference-only) | WIP |
+| thorfinn | #2112 | Mesh-Density Weighted L1 Loss | WIP |
 
 **All 8 students active. Zero idle GPUs.**
 
-## Recently Reviewed (2026-04-04 ~06:55 UTC)
+## Recently Reviewed (2026-04-04 ~10:10 UTC)
 
 | PR | Student | Experiment | Decision | Reason |
 |----|---------|-----------|---------|--------|
-| #2101 | tanjiro | OHEM (hard example mining) | CLOSED | Negative: no improvement; stronger weight actively hurts. OHEM compounds with existing tandem_ramp/adaptive_boost. Sample-level reweighting is NOT the p_tan bottleneck. |
-| #2100 | frieren | Model Scale-Up (5L, 3L/160s, 4L/128s) | CLOSED | Negative: no config beats 3L/96s baseline. **Key finding: p_tan is similar (~30-32) across ALL model scales — tandem problem is NOT capacity-limited.** |
-| #2094 | edward | SWAD Dense Weight Averaging | CLOSED | Catastrophic: +268% p_in, +369% p_oodc. SWAD suppresses EMA but never triggers collection (eval-at-end loop). **EMA is load-bearing.** |
-| #2099 | askeladd | Stochastic Depth (DropPath) | CLOSED | Dead end: all metrics worse (p_oodc +9-10%), 3-layer too shallow for DropPath |
-| #2090 | fern | Knowledge Distillation (Ensemble→Single) | CLOSED | Clean negative: offline regression KD provides no improvement at convergence |
-| #2096 | thorfinn | Learnable Asinh Scale | CLOSED | Scale collapse: s → 0.003, trivial shortcut |
-| #2098 | alphonse | Asinh Velocity Transform | CLOSED | Negative: all scales degrade p_tan; velocity doesn't have outlier problem |
-| #2097 | nezuko | Deep Supervision (aux loss) | SENT BACK | Promising: aux_w=0.2 shows p_oodc -1.7%, p_re -1.6%; needs 8-seed validation |
+| #2108 | edward | Asymmetric Fixed Asinh Scales | CLOSED | Negative: both configs worse on all metrics. Strong (1.5/0.5) p_oodc +5.4%; moderate (1.0/0.75) p_oodc +2.2%. Symmetric s=0.75 is optimal; z-score normalization already handles sign asymmetry. **Closes asinh direction entirely** (with #2096, #2098). |
+| #2103 | thorfinn | Iterative Weight-Tied Transolver | CLOSED | Monotonic degradation; n_iter=2 still -2-6% at same depth. Blocks learn complementary reps, not iterative refinement. |
+| #2102 | alphonse | SIREN Activation in SRF Head | CLOSED | Monotonic degradation with omega; GELU well-calibrated for srf corrections. |
+| #2101 | tanjiro | OHEM (hard example mining) | CLOSED | Negative: sample-level reweighting is NOT the p_tan bottleneck. |
+| #2100 | frieren | Model Scale-Up (5L, 3L/160s, 4L/128s) | CLOSED | p_tan NOT capacity-limited — similar across all scales. |
+| #2097 | nezuko | Deep Supervision (aux loss) | CLOSED | p_in -1.7% but p_tan +2.7% — constrains representational flexibility. |
 
 ## Current Research Focus
 
@@ -51,16 +49,15 @@ Active experiments attacking p_tan from multiple angles:
 1. **Contrastive Tandem-Single Regularization** (tanjiro #2109) — cosine similarity loss pushes apart tandem vs single-foil hidden representations; directly addresses the confirmed representation bottleneck
 2. **Progressive Surface Focus Schedule** (nezuko #2110) — curriculum learning: ramp surf_weight from 1→target over first N epochs; builds solid backbone before amplifying surface loss
 3. **Mesh-Density Weighted L1** (thorfinn #2112) — upweight fine-mesh nodes (leading edge, suction peaks) proportional to 1/local_spacing; targets high-gradient regions
-4. **Model Scale-Up** (frieren #2100) — larger model backbone (5L, 4L/128s)
-5. **Dedicated Aft-Foil SRF Branch** (fern #2104) — separate refinement MLP exclusively for boundary ID=7 (aft foil tandem nodes), with optional FiLM conditioning on gap/stagger
+4. **Dedicated Aft-Foil SRF Branch** (fern #2104) — separate refinement MLP exclusively for boundary ID=7 (aft foil tandem nodes), with optional FiLM conditioning on gap/stagger
 
 ### Representation and signal quality:
-6. **Fourier Feature Position Encoding** (askeladd #2106) — Random Fourier Features for spatial coordinates (Tancik et al., NeurIPS 2020), addressing spectral bias and helping model capture high-frequency suction peaks
-7. **TTA via AoA Perturbation** (alphonse #2111) — inference-only: average predictions at AoA ± δ for variance reduction; zero training cost
-8. **Aft-Foil Coordinate Frame Normalization** (frieren #2107) — normalize aft foil coords to local centroid frame; equivariance for tandem geometry; directly targets p_tan
+5. **Fourier Feature Position Encoding** (askeladd #2106) — Random Fourier Features for spatial coordinates (Tancik et al., NeurIPS 2020), addressing spectral bias and helping model capture high-frequency suction peaks
+6. **TTA via AoA Perturbation** (alphonse #2111) — inference-only: average predictions at AoA ± δ for variance reduction; zero training cost
+7. **Aft-Foil Coordinate Frame Normalization** (frieren #2107) — normalize aft foil coords to local centroid frame; equivariance for tandem geometry; directly targets p_tan
 
-### Target-space representation:
-9. **Asymmetric Fixed Asinh Scales** (edward #2108) — separate non-learnable scales for positive/negative pressure; targets the physical asymmetry between suction peaks and stagnation
+### Loss function reformulation:
+8. **Smooth L1 (Huber) Loss** (edward #2113) — replace L1 with smooth L1; gives proportionally weaker gradient to small-error nodes and relatively stronger emphasis on large-error nodes (tandem leading edge, separation points). Node-level adaptive weighting, distinct from sample-level OHEM (#2101). Sweep beta={0.5, 1.0, 2.0}.
 
 ## Key Research Insights
 
@@ -76,11 +73,13 @@ Active experiments attacking p_tan from multiple angles:
 10. **EMA is load-bearing** — SWAD (#2094) catastrophe: disabling EMA → +268% p_in. Any technique that touches EMA must provide equivalent smoothing.
 11. **Transolver blocks learn complementary representations** — Weight-tied iteration (#2103) proves the 3 blocks are NOT doing iterative refinement; each learns a distinct function. Weight sharing removes this specialization capacity.
 12. **SIREN doesn't help surface refinement** — (#2102) srf_head corrections lack the oscillatory structure SIREN is optimized for; GELU is well-calibrated.
+13. **Asinh transform direction is exhausted** — Symmetric s=0.75 is optimal. Learnable scale (#2096) collapses, asymmetric (#2108) is worse, velocity asinh (#2098) hurts. Z-score normalization on top of asinh already handles distributional asymmetries.
 
 ## Confirmed Dead Ends (all time)
 
 | Direction | PRs | Finding |
 |-----------|-----|---------|
+| Asymmetric Asinh Scales (pos/neg) | #2108 | All metrics worse; symmetric s=0.75 is optimal; z-score handles sign asymmetry. **Closes entire asinh direction** with #2096, #2098. |
 | Weight-Tied Iterative Transolver | #2103 | Monotonic degradation; n_iter=2 at same depth still -2-6%; blocks learn complementary reps, not iterative |
 | SIREN Activation in SRF Head | #2102 | Monotonic degradation with omega; w=30 → p_tan +8.8%; GELU is well-calibrated for srf corrections |
 | Deep Supervision (aux loss) | #2097 | p_in -1.7% but p_tan +2.7% at 8-seed scale — constrains representational flexibility for tandem transfer |
@@ -130,7 +129,9 @@ Active experiments attacking p_tan from multiple angles:
 ## Potential Next Research Directions
 
 **Available (not yet assigned), in priority order:**
-1. **Precomputed Pressure-Poisson Soft Constraint** — baked finite-diff Laplacian stencil; distinct from failed WLS; targets p_tan/p_oodc; complex (~65 lines)
-2. **Geometry-Conditioned AoA Interpolation** — physics-space interpolation (distinct from failed feature-space Mixup); targets p_oodc; moderate complexity
+1. **Gradient Centralization** — subtract gradient mean per weight tensor before optimizer step (Yong et al., ECCV 2020). Compatible with Lion. Proven to improve generalization in vision. ~5 lines. Novel interaction with Lion's sign-based updates.
+2. **Precomputed Pressure-Poisson Soft Constraint** — baked finite-diff Laplacian stencil; distinct from failed WLS; targets p_tan/p_oodc; complex (~65 lines)
+3. **Geometry-Conditioned AoA Interpolation** — physics-space interpolation (distinct from failed feature-space Mixup); targets p_oodc; moderate complexity
+4. **Charbonnier Loss** — `sqrt(x^2 + eps^2) - eps` — smoother alternative to L1/Huber, widely used in optical flow and image restoration. If Huber (#2113) shows promise, Charbonnier is a natural follow-up.
 
 Human researcher messages: #1860 (think bigger), #1834 (data integrity) — both acknowledged and incorporated.

@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 10:00 — PR #2108: Phase 6: Asymmetric Fixed Asinh Scales (Pos/Neg Pressure) — edward — CLOSED (negative)
+- Branch: `edward/asymmetric-asinh-scales`
+- Hypothesis: Separate fixed (non-learnable) asinh scales for positive vs negative pressure should improve over the symmetric s=0.75, since suction peaks (-5 to -10 Cp) need stronger compression than stagnation pressures.
+- W&B group: `phase6/asymmetric-asinh`
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B Run |
+|--------|------|------|--------|-------|------|---------|
+| Baseline (symmetric 0.75) | mean | 13.03 | 7.83 | 30.29 | 6.45 | — |
+| Strong (neg=1.5, pos=0.5) | 42 | 13.6 | 8.3 | 30.8 | 6.5 | 7uz2d0ol |
+| Strong (neg=1.5, pos=0.5) | 73 | 13.2 | 8.2 | 30.6 | 6.7 | 1v86awoi |
+| Moderate (neg=1.0, pos=0.75) | 42 | 13.4 | 7.9 | 30.6 | 6.5 | dj0elhj2 |
+| Moderate (neg=1.0, pos=0.75) | 73 | 13.1 | 8.1 | 30.2 | 6.5 | rgs2r8jj |
+
+**Analysis:** Both asymmetric variants worse than symmetric baseline on ALL metrics. Strong asymmetry: p_oodc +5.4%, p_in +2.8%. Moderate asymmetry: p_oodc +2.2%, p_in +1.7%. The symmetric asinh(p×0.75) is already well-tuned — breaking sign symmetry introduces distributional mismatch at the zero-crossing boundary. The z-score normalization applied on top of asinh already handles scale differences between suction and stagnation regions. **Combined with learnable scale (#2096) and asinh velocity (#2098), this closes the asinh transform direction entirely.**
+
+Code note: Student refactored 14 inline asinh transform sites into 2 helper functions (`_asinh_fwd`, `_asinh_inv`) — good code quality improvement but not mergeable without a metric win.
+
 ### 2026-04-04 07:50 — PR #2103: Phase 6: Iterative Weight-Tied Transolver — thorfinn — CLOSED (negative, key insight)
 - Branch: `thorfinn/iterative-weight-tied-transolver`
 - Hypothesis: Weight-tied iterations (K passes through a single shared block) give effective depth without more parameters — inspired by DEQ (Bai et al., NeurIPS 2019).
