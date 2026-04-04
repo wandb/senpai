@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-04 ~07:30 UTC
+- **Date:** 2026-04-04 ~07:55 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -26,7 +26,7 @@
 | fern | #2104 | Dedicated Aft-Foil SRF Branch (ID=7) | WIP |
 | nezuko | #2110 | Progressive Surface Focus Schedule (curriculum) | WIP — just assigned |
 | alphonse | #2111 | TTA via AoA Perturbation (inference-only) | WIP — just assigned |
-| thorfinn | #2103 | Iterative Weight-Tied Transolver (K=2,3,4) | WIP |
+| thorfinn | #2112 | Mesh-Density Weighted L1 Loss | WIP — just assigned |
 
 **All 8 students active. Zero idle GPUs.**
 
@@ -50,7 +50,7 @@
 Active experiments attacking p_tan from multiple angles:
 1. **Contrastive Tandem-Single Regularization** (tanjiro #2109) — cosine similarity loss pushes apart tandem vs single-foil hidden representations; directly addresses the confirmed representation bottleneck
 2. **Progressive Surface Focus Schedule** (nezuko #2110) — curriculum learning: ramp surf_weight from 1→target over first N epochs; builds solid backbone before amplifying surface loss
-3. **Iterative Weight-Tied Transolver** (thorfinn #2103) — deeper effective receptive field via block reuse, targets long-range fore→aft signal propagation
+3. **Mesh-Density Weighted L1** (thorfinn #2112) — upweight fine-mesh nodes (leading edge, suction peaks) proportional to 1/local_spacing; targets high-gradient regions
 4. **Model Scale-Up** (frieren #2100) — larger model backbone (5L, 4L/128s)
 5. **Dedicated Aft-Foil SRF Branch** (fern #2104) — separate refinement MLP exclusively for boundary ID=7 (aft foil tandem nodes), with optional FiLM conditioning on gap/stagger
 
@@ -74,11 +74,14 @@ Active experiments attacking p_tan from multiple angles:
 8. **Per-node adaptive temperature is a known null** — Ada-Temp tried in PRs #1879, #1793, #1615 — all null results; do NOT reassign
 9. **Model capacity is NOT the p_tan bottleneck** — Scale-up (#2100): p_tan ~30-32 across 3L/96s, 5L/96s, 3L/160s, 4L/128s. Tandem problem is representational, not capacity-limited.
 10. **EMA is load-bearing** — SWAD (#2094) catastrophe: disabling EMA → +268% p_in. Any technique that touches EMA must provide equivalent smoothing.
+11. **Transolver blocks learn complementary representations** — Weight-tied iteration (#2103) proves the 3 blocks are NOT doing iterative refinement; each learns a distinct function. Weight sharing removes this specialization capacity.
+12. **SIREN doesn't help surface refinement** — (#2102) srf_head corrections lack the oscillatory structure SIREN is optimized for; GELU is well-calibrated.
 
 ## Confirmed Dead Ends (all time)
 
 | Direction | PRs | Finding |
 |-----------|-----|---------|
+| Weight-Tied Iterative Transolver | #2103 | Monotonic degradation; n_iter=2 at same depth still -2-6%; blocks learn complementary reps, not iterative |
 | SIREN Activation in SRF Head | #2102 | Monotonic degradation with omega; w=30 → p_tan +8.8%; GELU is well-calibrated for srf corrections |
 | Deep Supervision (aux loss) | #2097 | p_in -1.7% but p_tan +2.7% at 8-seed scale — constrains representational flexibility for tandem transfer |
 | OHEM (hard example mining) | #2101 | No improvement; stronger weight hurts; compounds with existing tandem_ramp — sample reweighting is not the bottleneck |
@@ -128,8 +131,6 @@ Active experiments attacking p_tan from multiple angles:
 
 **Available (not yet assigned), in priority order:**
 1. **Precomputed Pressure-Poisson Soft Constraint** — baked finite-diff Laplacian stencil; distinct from failed WLS; targets p_tan/p_oodc; complex (~65 lines)
-4. **Precomputed Pressure-Poisson Soft Constraint** — baked finite-diff Laplacian stencil; distinct from failed WLS; targets p_tan/p_oodc; complex (~65 lines)
-5. **Mesh-Density Weighted L1 Loss** — upweight fine-mesh nodes proportional to 1/local_spacing; targets p_in, p_tan; ~15 lines
-6. **Geometry-Conditioned AoA Interpolation** — physics-space interpolation (distinct from failed feature-space Mixup); targets p_oodc; moderate complexity
+2. **Geometry-Conditioned AoA Interpolation** — physics-space interpolation (distinct from failed feature-space Mixup); targets p_oodc; moderate complexity
 
 Human researcher messages: #1860 (think bigger), #1834 (data integrity) — both acknowledged and incorporated.

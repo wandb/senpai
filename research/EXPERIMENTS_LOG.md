@@ -2,6 +2,20 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 07:50 — PR #2103: Phase 6: Iterative Weight-Tied Transolver — thorfinn — CLOSED (negative, key insight)
+- Branch: `thorfinn/iterative-weight-tied-transolver`
+- Hypothesis: Weight-tied iterations (K passes through a single shared block) give effective depth without more parameters — inspired by DEQ (Bai et al., NeurIPS 2019).
+- W&B group: `phase6/iterative-transolver`
+
+| Config | p_in | p_oodc | p_tan | p_re | Epochs | W&B Runs |
+|--------|------|--------|-------|------|--------|----------|
+| Baseline (3 distinct) | 12.9 | 7.8 | 30.1 | 6.5 | 156-157 | onmaryjt, xhpmloz0 |
+| n_iter=2 (shared) | 13.7 (+6%) | 8.0 (+2%) | 31.1 (+3%) | 6.6 (+2%) | 156 | i8xsa2g0, 9ny3ctv2 |
+| n_iter=3 | 15.4 (+19%) | 8.9 (+14%) | 31.4 (+4%) | 7.1 (+9%) | 127-128 | 55m69afg, i6ucjvki |
+| n_iter=4 | 18.5 (+43%) | 10.5 (+34%) | 31.9 (+6%) | 8.0 (+23%) | 107 | i048aror, 1dxezufa |
+
+**Analysis:** Monotonic degradation with iteration count. **Key insight from n_iter=2:** Even at identical computational depth and training epochs, weight sharing hurts 2-6%. The two intermediate blocks learn *complementary* (not repetitive) representations — the "iterative solver" analogy from DEQ doesn't hold here. Combined with #2100 (scale-up): the 3-block architecture is the right structural choice — distinct blocks matter, but more blocks don't help. **Confirmed dead end: weight-tied iteration is wrong for Transolver.**
+
 ### 2026-04-04 07:25 — PR #2102: Phase 6: Sin Activation in SRF Head — alphonse — CLOSED (dead end)
 - Branch: `alphonse/sin-activation-srf-head`
 - Hypothesis: SIREN (sinusoidal activation) in the surface refinement head should capture oscillatory Cp distributions better than GELU.
