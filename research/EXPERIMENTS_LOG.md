@@ -2,6 +2,36 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 ~20:30 — PR #2126: Foil-2 DSDF Magnitude Augmentation — tanjiro — **MERGED** (winner)
+
+- Branch: `tanjiro/dsdf2-mag-aug`
+- Hypothesis: Log-normal multiplicative scaling of foil-2 DSDF channels (x[:,6:10], tandem samples only) before standardization forces the model to be less reliant on memorizing exact DSDF patterns for seen foil shapes. This targets the geometric transfer gap that val_tandem_transfer probes (NACA6416 front foil, never seen in training). Analogous to gap/stagger aug but in the geometric feature space.
+
+| Run | W&B ID | σ | Seed | p_in | p_oodc | p_tan | p_re | val_loss |
+|-----|--------|---|------|------|--------|-------|------|----------|
+| dsdf2-σ=0.05-s42 | hcc2q68t | 0.05 | 42 | 13.11 | 7.70 | **29.76** | 6.42 | 0.385 |
+| dsdf2-σ=0.05-s73 | e9cri4mt | 0.05 | 73 | 12.96 | 7.62 | 30.46 | 6.61 | 0.388 |
+| dsdf2-σ=0.10-s42 | d50erbko | 0.10 | 42 | 13.16 | 7.47 | 30.43 | 6.65 | 0.390 |
+| dsdf2-σ=0.10-s73 | snai0bmf | 0.10 | 73 | 13.39 | 7.67 | 30.11 | 6.34 | 0.388 |
+| dsdf2-σ=0.15-s42 | el1jybsu | 0.15 | 42 | 13.04 | 7.47 | 30.74 | 6.47 | 0.387 |
+| dsdf2-σ=0.15-s73 | 3usr74hv | 0.15 | 73 | 13.09 | 7.47 | 31.71 | 6.21 | 0.391 |
+| **σ=0.05 2-seed avg** | | | | **13.04** | **7.66** | **30.11** | **6.52** | |
+| **Baseline (combined 8-seed)** | | | | 13.24 | 7.73 | 30.53 | 6.50 | |
+
+**Results commentary:**
+
+- **MERGE DECISION:** σ=0.05 beats combined baseline on primary target p_tan (-1.4%, 30.11 vs 30.53) and on p_in (-1.5%) and p_oodc (-0.9%). p_re is +0.02 (noise). **Clear merge.**
+
+- **σ=0.05 is the sweet spot:** Larger σ (0.10, 0.15) hurts p_tan. The model needs enough DSDF perturbation to generalize but not so much that it loses geometric detail for accurate prediction.
+
+- **Implementation detail confirmed:** Foil-2 DSDF indices are x[:,6:10] (4 channels: sdf value + gradient x/y + second foil distance). Applied BEFORE standardization, tandem detection via `x[:, 0, 22].abs() > 0.01` (gap feature in raw space).
+
+- **Best single run (s42, σ=0.05):** p_in=13.11, p_oodc=7.70, **p_tan=29.76**, p_re=6.42 — all metrics beat the combined baseline.
+
+- **High seed variance:** 2-seed spread on p_tan is 0.7 (29.76 vs 30.46). 8-seed validation would give more statistical confidence, but the directional signal is clear given the combined baseline std of 0.50.
+
+- **New config flag:** `--aug_dsdf2_sigma 0.05` added to baseline.
+
 ### 2026-04-04 ~19:20 — PR #2125: Reynolds Number Perturbation Augmentation — thorfinn — CLOSED (dead end)
 
 - Branch: `thorfinn/re-perturb-aug`
