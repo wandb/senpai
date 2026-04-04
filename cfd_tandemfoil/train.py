@@ -947,6 +947,10 @@ class Config:
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
+    # Phase 6: Mesh-density weighted loss
+    mesh_density_weight: bool = False        # weight surface loss by inverse local mesh spacing
+    density_weight_k: int = 4                # number of nearest neighbors for spacing estimate
+    density_weight_clip: float = 10.0        # max weight clip to prevent extreme upweighting
 
 
 cfg = sp.parse(Config)
@@ -1361,6 +1365,31 @@ ema_val_loss = float("inf")
 ema_decay_val = 0.9
 best_metrics = {}
 global_step = 0
+
+
+@torch.no_grad()
+def _compute_density_weights(pos, is_surface, mask, k=4, clip=10.0):
+    """Compute per-node density weights for surface nodes. Returns [B, N] tensor (detached)."""
+    B, N, _ = pos.shape
+    weights = torch.ones(B, N, device=pos.device)
+    for b in range(B):
+        surf = is_surface[b] & mask[b]  # surface nodes that are valid
+        if surf.sum() < k + 1:
+            continue
+        surf_idx = surf.nonzero(as_tuple=True)[0]
+        surf_pos = pos[b, surf_idx]  # [S, 2]
+        # Compute pairwise distances for surface nodes only
+        dists = torch.cdist(surf_pos.unsqueeze(0), surf_pos.unsqueeze(0)).squeeze(0)  # [S, S]
+        # k+1 smallest distances (includes self=0), take k nearest after self
+        topk_dists, _ = dists.topk(k + 1, largest=False)  # [S, k+1]
+        local_spacing = topk_dists[:, 1:].mean(dim=1)  # [S], exclude self
+        w = 1.0 / (local_spacing + 1e-8)
+        w = w / w.mean()  # normalize to mean=1
+        w = w.clamp(max=clip)
+        weights[b, surf_idx] = w
+    return weights
+
+
 train_start = time.time()
 prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
@@ -1457,6 +1486,7 @@ for epoch in range(MAX_EPOCHS):
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
+        _raw_pos = x[:, :, :2].clone()  # save raw xy before normalization for density weights
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1638,7 +1668,13 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        # Mesh-density weighted surface loss
+        if cfg.mesh_density_weight:
+            _dw = _compute_density_weights(_raw_pos, is_surface, mask, k=cfg.density_weight_k, clip=cfg.density_weight_clip)
+            surf_per_sample = (abs_err[:, :, 2:3] * _dw.unsqueeze(-1) * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / \
+                              (_dw * surf_mask.float()).sum(dim=1).clamp(min=1)
+        else:
+            surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
@@ -1652,7 +1688,11 @@ for epoch in range(MAX_EPOCHS):
             thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
             hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
-            surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            if cfg.mesh_density_weight:
+                surf_per_sample = (surf_pres * hard_weights * _dw.unsqueeze(-1) * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / \
+                                  (_dw * surf_mask.float()).sum(dim=1).clamp(min=1)
+            else:
+                surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         if cfg.tandem_ramp:
             tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
@@ -1819,7 +1859,14 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _step_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.mesh_density_weight and '_dw' in dir():
+            _surf_dw = _dw[surf_mask]
+            if _surf_dw.numel() > 0:
+                _step_log["train/density_weight_mean"] = _surf_dw.mean().item()
+                _step_log["train/density_weight_max"] = _surf_dw.max().item()
+                _step_log["train/density_weight_std"] = _surf_dw.std().item()
+        wandb.log(_step_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
