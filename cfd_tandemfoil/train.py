@@ -448,6 +448,12 @@ class TransolverBlock(nn.Module):
         return fx
 
 
+class SinActivation(nn.Module):
+    """Sinusoidal activation for SIREN networks (Sitzmann et al. NeurIPS 2020)."""
+    def forward(self, x):
+        return torch.sin(x)
+
+
 class SurfaceRefinementHead(nn.Module):
     """Lightweight MLP that predicts additive corrections for surface nodes.
 
@@ -457,17 +463,27 @@ class SurfaceRefinementHead(nn.Module):
     """
 
     def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 128,
-                 n_layers: int = 2, p_only: bool = False):
+                 n_layers: int = 2, p_only: bool = False,
+                 siren_srf: bool = False, omega0: float = 10.0):
+        import math
         super().__init__()
         self.p_only = p_only
         actual_out = 1 if p_only else out_dim  # 1 for pressure-only, 3 for all fields
+        act_cls = SinActivation if siren_srf else nn.GELU
         layers: list[nn.Module] = []
         # Input: hidden features (n_hidden) + base predictions (out_dim)
         in_dim = n_hidden + out_dim
         for i in range(n_layers):
-            layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
-            layers.append(nn.LayerNorm(hidden_dim))
-            layers.append(nn.GELU())
+            lin = nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim)
+            if siren_srf:
+                if i == 0:
+                    nn.init.uniform_(lin.weight, -1.0 / lin.in_features, 1.0 / lin.in_features)
+                else:
+                    bound = math.sqrt(6.0 / lin.in_features) / omega0
+                    nn.init.uniform_(lin.weight, -bound, bound)
+            layers.append(lin)
+            layers.append(nn.LayerNorm(hidden_dim))  # normalizes into sin's informative range
+            layers.append(act_cls())
         layers.append(nn.Linear(hidden_dim, actual_out))
         # Zero-init last layer so refinement starts as identity
         nn.init.zeros_(layers[-1].weight)
@@ -947,6 +963,9 @@ class Config:
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
+    # Phase 6: SIREN activation in surface refinement head
+    siren_srf: bool = False                  # replace GELU with sin() in surface refinement head
+    siren_omega0: float = 10.0               # frequency scaling for SIREN initialization
 
 
 cfg = sp.parse(Config)
@@ -1132,6 +1151,8 @@ if cfg.surface_refine:
             hidden_dim=cfg.surface_refine_hidden,
             n_layers=cfg.surface_refine_layers,
             p_only=cfg.surface_refine_p_only,
+            siren_srf=cfg.siren_srf,
+            omega0=cfg.siren_omega0,
         ).to(device)
     refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
     _refine_n_params = sum(p.numel() for p in refine_head.parameters())
