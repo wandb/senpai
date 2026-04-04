@@ -2,6 +2,28 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 06:00 — PR #2099: Phase 6: Stochastic Depth (DropPath) — askeladd — CLOSED (dead end)
+- Branch: `askeladd/stochastic-depth-droppath`
+- Hypothesis: DropPath randomly skips entire residual branches during training, creating an implicit ensemble of subnetworks. Forces more geometry-agnostic representations that might improve OOD generalization, especially p_tan.
+- W&B group: `phase6/stochastic-depth`
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | val/loss | W&B Run |
+|--------|------|------|--------|-------|------|----------|---------|
+| DropPath 0.1 | 42 | 13.32 | 8.19 | 30.74 | 6.63 | 0.3965 | s93o0li2 |
+| DropPath 0.1 | 73 | 13.65 | 8.86 | 31.25 | 6.65 | 0.4037 | fovffeeg |
+| DropPath 0.2 | 42 | 13.57 | 8.37 | 31.50 | 6.93 | 0.4110 | 6dt5ofgn |
+| DropPath 0.2 | 73 | 13.03 | 8.81 | 30.93 | 6.82 | 0.4033 | lqq102pu |
+
+**Baseline (8-seed mean):** p_in=13.03, p_oodc=7.83, p_tan=30.29, p_re=6.45
+
+| Config | p_in | p_oodc | p_tan | p_re |
+|--------|------|--------|-------|------|
+| Baseline (8-seed mean) | 13.03 | 7.83 | 30.29 | 6.45 |
+| DropPath 0.1 (2-seed mean) | 13.50 (+3.6%) | 8.55 (+9.2%) | 31.00 (+2.3%) | 6.65 (+3.1%) |
+| DropPath 0.2 (2-seed mean) | 13.30 (+2.1%) | 8.60 (+9.8%) | 31.20 (+3.0%) | 6.85 (+6.2%) |
+
+**Analysis:** All DropPath runs are significantly worse than baseline. p_oodc is the worst-hit metric (+9-10%). Metrics verified against W&B — student's reported numbers accurate to within rounding. Root cause: Transolver has only 3 blocks — far too shallow for stochastic depth to provide meaningful path diversity. DropPath works in 12-24 layer ViTs; with 3 layers and a linear schedule, only the last block gets meaningful drop probability, simply removing compute the model needs. **Confirmed dead end: stochastic depth is not suitable for this 3-layer architecture. Revisit only if model grows to 6+ blocks.**
+
 ### 2026-04-04 05:00 — PR #2090: Phase 6: Knowledge Distillation — fern — CLOSED (clean negative result)
 - Branch: `fern/knowledge-distillation`
 - Hypothesis: Train a single model using the 8-seed ensemble's predictions as soft targets (offline KD). Distilled model should approach ensemble quality at 1/8th inference cost.

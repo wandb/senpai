@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-04 ~05:00 UTC
+- **Date:** 2026-04-04 ~06:00 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -15,25 +15,26 @@
 
 16-seed ensemble beats 8-seed baseline: p_in -0.8%, p_oodc -1.5%. Seeds 100-106 also trained (mean p_in=13.0), available for future 23-seed evaluation.
 
-## Student Status (2026-04-04 ~05:00 UTC)
+## Student Status (2026-04-04 ~06:00 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | tanjiro | #2101 | OHEM — Online Hard Example Mining | WIP |
 | edward | #2094 | SWAD Dense Weight Averaging | WIP |
-| askeladd | #2099 | Stochastic Depth (DropPath) | WIP |
+| askeladd | #2106 | Fourier Feature Position Encoding | WIP — just assigned |
 | frieren | #2100 | Model Scale-Up (3L/96s vs 5L/96s vs 3L/160s vs 4L/128s) | WIP |
-| fern | #2104 | Dedicated Aft-Foil SRF Branch (ID=7) | WIP — just assigned |
+| fern | #2104 | Dedicated Aft-Foil SRF Branch (ID=7) | WIP |
 | nezuko | #2097 | Deep Supervision (aux_w=0.2) — 8-seed validation | WIP (sent back) |
 | alphonse | #2102 | Sin Activation in Surface Refinement Head | WIP |
 | thorfinn | #2103 | Iterative Weight-Tied Transolver (K=2,3,4) | WIP |
 
 **All 8 students active. Zero idle GPUs.**
 
-## Recently Reviewed (2026-04-04 ~05:00 UTC)
+## Recently Reviewed (2026-04-04 ~06:00 UTC)
 
 | PR | Student | Experiment | Decision | Reason |
 |----|---------|-----------|---------|--------|
+| #2099 | askeladd | Stochastic Depth (DropPath) | CLOSED | Dead end: all metrics worse (p_oodc +9-10%), 3-layer Transolver too shallow for stochastic depth to provide path diversity — DropPath works in 12-24 layer ViTs, not 3-block models |
 | #2090 | fern | Knowledge Distillation (Ensemble→Single) | CLOSED | Clean negative: offline regression KD provides no improvement at convergence; ensemble advantage too small for soft targets to capture |
 | #2096 | thorfinn | Learnable Asinh Scale | CLOSED | Scale collapse: s → 0.003, trivial shortcut, 100-175% regression |
 | #2098 | alphonse | Asinh Velocity Transform | CLOSED | Negative: all scales degrade p_tan +1-3 pts; velocity doesn't have pressure's outlier problem |
@@ -50,12 +51,12 @@ Active experiments attacking p_tan from multiple angles:
 4. **Model Scale-Up** (frieren #2100) — larger model backbone (5L, 4L/128s)
 5. **Dedicated Aft-Foil SRF Branch** (fern #2104) — separate refinement MLP exclusively for boundary ID=7 (aft foil tandem nodes), with optional FiLM conditioning on gap/stagger
 
-### Regularization and optimization experiments:
-6. **SWAD** (edward #2094) — flat-basin checkpoint averaging
-7. **DropPath** (askeladd #2099) — stochastic depth regularization
+### Representation and signal quality:
+6. **Fourier Feature Position Encoding** (askeladd #2106) — Random Fourier Features for spatial coordinates (Tancik et al., NeurIPS 2020), addressing spectral bias and helping model capture high-frequency suction peaks
+7. **Sin Activation in srf_head** (alphonse #2102) — periodic activation for oscillatory pressure distributions
 
-### Output representation:
-8. **Sin Activation in srf_head** (alphonse #2102) — periodic activation for oscillatory pressure distributions
+### Regularization and optimization:
+8. **SWAD** (edward #2094) — flat-basin checkpoint averaging
 
 ## Key Research Insights
 
@@ -65,11 +66,14 @@ Active experiments attacking p_tan from multiple angles:
 4. **Ensembling is near-saturating** — 16→23 seeds gains diminish; single-model improvements are the priority
 5. **Deep supervision is promising** — The only bright result this round: auxiliary loss on intermediate features shows consistent improvements across all 4 metrics at aux_w=0.2
 6. **Offline regression KD doesn't work** — (#2090) confirms: the ensemble's single-model gap is too small for soft-target distillation to reliably capture at convergence
+7. **Stochastic depth requires depth** — DropPath (#2099) is ineffective for 3-block architectures; requires 6+ layers for meaningful path diversity
+8. **Per-node adaptive temperature is a known null** — Ada-Temp tried in PRs #1879, #1793, #1615 — all null results; do NOT reassign
 
 ## Confirmed Dead Ends (all time)
 
 | Direction | PRs | Finding |
 |-----------|-----|---------|
+| Stochastic Depth (DropPath) | #2099 | All metrics worse; 3-block too shallow for path diversity |
 | Knowledge Distillation | #2090 | No improvement at convergence; ensemble advantage too small for regression KD |
 | SGDR warm restarts | #2095 | All T_0 values worse — restarts disrupt Lion+cosine |
 | SAM Phase-Only | #2086 | SAM destabilizes Lion; best ckpt always pre-SAM |
@@ -93,6 +97,8 @@ Active experiments attacking p_tan from multiple angles:
 | Magnitude-Weighted Loss | #2068 | No sweet spot at any alpha |
 | Asinh Velocity Transform | #2098 | Hurts p_tan, velocity doesn't have outlier problem |
 | Learnable Asinh Scale | #2096 | Scale collapse to ~0.003, trivial shortcut |
+| Ada-Temp (per-node) | #1879, #1793, #1615 | Null result across multiple phases |
+| Foil-2 (ID=7) Loss Upweighting | #1893 | Marginal improvement (still only one head) |
 
 ## Ensemble Seed Pool (Complete)
 
@@ -109,20 +115,12 @@ Active experiments attacking p_tan from multiple angles:
 
 ## Potential Next Research Directions
 
-From RESEARCH_IDEAS_2026-04-04_03:30.md and _04:00.md (partially assigned):
-
-**Assigned this round:**
-- Aft-Foil SRF Branch → fern #2104 (directly attacks p_tan with dedicated head for ID=7)
-
-**Available (not yet assigned):**
-1. **Precomputed Pressure-Poisson soft constraint** — baked finite-diff Laplacian stencil; distinct from failed WLS; targets p_tan/p_oodc (complex, ~65 lines)
-2. **Tandem Fore/Aft Decoupled Loss** — upweight aft foil (ID=7) by 2-3x in loss; ~8 lines; targets p_tan
-3. **Mesh-Density Weighted L1** — upweight fine-mesh nodes (leading edge); ~15 lines; targets p_in, p_tan
-4. **Gradient Noise Injection (Langevin)** — flat-basin finding via gradient perturbation; distinct from SAM; ~10 lines
-5. **Coordinate Frame Normalization per-Foil** — aft foil in local frame; equivariance for tandem; ~20 lines
-6. **Progressive Surface Focus Schedule** — ramp surf_weight from 1 to N; curriculum learning; ~8 lines
-7. **Fourier Feature Augmentation** — random Fourier features for spatial coordinates; targets high-freq suction peaks; ~15 lines
-8. **Contrastive Tandem-Single Regularization** — push apart hidden reps of tandem vs single-foil; ~25 lines; targets p_tan
-9. **Per-Node Adaptive Temperature** — NOTE: Phase 5 Ada-Temp was tried and was a null result; do not re-assign
+**Available (not yet assigned), in priority order:**
+1. **Precomputed Pressure-Poisson Soft Constraint** — baked finite-diff Laplacian stencil as offline sparse matrix; penalize Poisson residual at training time; distinct from failed WLS (no numerical instability); targets p_tan/p_oodc; complex (~65 lines)
+2. **Mesh-Density Weighted L1 Loss** — upweight fine-mesh nodes (leading edge, trailing edge, suction peak) proportional to 1/local_spacing; targets p_in, p_tan; ~15 lines
+3. **Contrastive Tandem-Single Regularization** — push apart hidden representations of tandem vs single-foil configurations; targets tandem OOD generalization; ~25 lines
+4. **Progressive Surface Focus Schedule** — curriculum learning: ramp surf_weight from 1 to N over training; ~8 lines
+5. **Coordinate Frame Normalization per-Foil** — normalize aft foil coordinates in its own local frame; equivariance for tandem; ~20 lines
+6. **Geometry-Conditioned AoA Interpolation** — physics-space interpolation between samples at different AoA (distinct from failed feature-space Mixup); targets p_oodc; moderate complexity
 
 Human researcher messages: #1860 (think bigger), #1834 (data integrity) — both acknowledged and incorporated.
