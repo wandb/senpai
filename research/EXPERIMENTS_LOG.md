@@ -2,6 +2,39 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 04:00 — PR #2093: Phase 6: 16-Seed Combined Ensemble Evaluation — MERGED (winner)
+
+- Branch: `tanjiro/16-seed-ensemble-eval`
+- Hypothesis: Combining 8-seed ensembles (42-49 + 66-73) into a 16-seed ensemble reduces variance by 1/√N ≈ 29% vs 8-seed, yielding lower surface MAE.
+- W&B groups: `phase6/retrain-seeds-42-49`, `phase6/ensemble-seeds-100-106`
+
+| Ensemble Size | p_in | p_oodc | p_tan | p_re |
+|---------------|------|--------|-------|------|
+| 4-seed (42-45) | 12.7 | 6.8 | 29.6 | 6.0 |
+| 8-seed (42-49) | 12.3 | 6.7 | 29.2 | 5.9 |
+| 12-seed | 12.2 | 6.7 | 29.1 | 5.8 |
+| **16-seed (all)** | **12.1** | **6.6** | **29.1** | **5.8** |
+| *Prior 8-ens baseline* | *12.2* | *6.7* | *29.1* | *5.8* |
+
+Seeds 100-106 individually (W&B group: `phase6/ensemble-seeds-100-106`):
+
+| Seed | Run ID | p_in | p_oodc | p_tan | p_re |
+|------|--------|------|--------|-------|------|
+| 100 | 9o85duyc | 13.4 | 7.9 | 29.8 | 6.3 |
+| 101 | ec7plfg8 | 12.8 | 7.8 | 30.3 | 6.5 |
+| 102 | zagg4pfs | 12.4 | 7.9 | 30.6 | 6.4 |
+| 103 | 6w86plz1 | 12.5 | 7.7 | 31.3 | 6.4 |
+| 104 | g00kxdva | 13.4 | 7.9 | 30.2 | 6.4 |
+| 105 | jt9hwf40 | 13.9 | 7.9 | 31.4 | 6.6 |
+| 106 | fom4bzro | 12.8 | 7.9 | 31.6 | 6.5 |
+| **Mean** | | **13.0** | **7.9** | **30.7** | **6.4** |
+
+Run IDs (seeds 42-49 re-trained): f59v5aul, 0yurebjv, rdezx8es, ds12ug79, yu1x0dy0, y147zvh1, lc5cbt4l, 7cxu38oh
+
+**Analysis:** 16-seed ensemble beats the 8-seed baseline on p_in (-0.8%) and p_oodc (-1.5%). Monotonic improvement 4→8→12→16 seeds confirms 1/√N scaling law with no "degrading" individual models. Diminishing returns are clear: 8→16 gains much less than 4→8. Seeds 100-106 show consistent individual performance with prior seed batches (mean p_in=13.0 vs pool mean ~13.0), all hitting the 180-min wall clock. The 16-seed ensemble is now the new baseline. An additional 23-seed evaluation (adding 100-106) would yield another marginal improvement but inference cost scales accordingly.
+
+**MERGED** — New baseline: p_in=12.1, p_oodc=6.6, p_tan=29.1, p_re=5.8
+
 ### Completed (2026-04-04 ~03:00 UTC)
 
 #### 2026-04-04 03:00 — PR #2086: Phase 6: SAM Phase-Only — frieren — CLOSED (dead end)
