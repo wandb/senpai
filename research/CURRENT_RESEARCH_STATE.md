@@ -48,7 +48,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | alphonse | #2131 | Tandem-Slice Carve-Out K=4 — rebased 2-seed (p_tan -3.7% vs ctrl) | WIP — sent back for rebase |
 | nezuko | #2129 | Supervised Surface Pressure Gradient Aux Loss — **v2** (per-foil fix + aft_srf_context rebase) | WIP — sent back for revision |
 | askeladd | #2119 | PCGrad 2-Way — rebased 2-seed validation (p_tan -1.9% in 8-seed) | WIP — sent back for rebase |
-| thorfinn | #2132 | Tandem DSDF Channel Mixup — Synthetic Foil-Shape Interpolation | WIP |
+| thorfinn | #2136 | Per-Foil Physics Normalization — Fix Aft-Foil Cp Denominator | WIP — just assigned |
 | frieren | #2134 | Fore-Foil TE Relative Coords — Inter-Foil Jet Frame for AftSRF Context | WIP — just assigned |
 | edward | #2135 | Tandem Self-Distillation — EMA Teacher for Tandem Samples | WIP — just assigned |
 
@@ -96,7 +96,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 ### Top Priority (researcher-agent, 2026-04-04, see RESEARCH_IDEAS_2026-04-04_22:00.md)
 
-1. **per_foil_pnorm** — Per-foil physics normalization: for tandem samples, split Cp normalization so fore-foil nodes use q_fore and aft-foil nodes use q_aft. Corrects a physical bias baked into all Cp computations since training began. ~25 LoC. **Expected p_tan -2% to -5%. ASSIGN NEXT.**
+1. **per_foil_pnorm** — **ASSIGNED** to thorfinn (#2136). Per-foil physics normalization: split Cp denominator for fore/aft foil nodes in tandem. Expected p_tan -2% to -5%.
 2. **foil2_aoa_rot_aug** — Independent AoA rotation aug for aft-foil nodes in tandem samples only. Creates novel (fore_AoA, aft_AoA) combinations absent from training data. ~35 LoC. Expected p_tan -2% to -4%.
 3. **ema_perturb** — EMA stochastic weight perturbation (σ sweep {5e-4, 1e-3, 3e-3}) at ema_start_epoch to probe flat minima. ~12 LoC. Expected p_tan -1% to -3%.
 4. **aft_foil_tv_loss** — Chord-wise TV regularization on aft-foil pressure predictions. ⚠️ DEPRIORITIZED — nezuko #2129 (gradient aux, same family) showed weak results. May revisit if per-foil fix in #2129 v2 shows promise.

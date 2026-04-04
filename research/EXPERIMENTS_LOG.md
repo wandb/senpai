@@ -2,6 +2,31 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~00:25 — PR #2132: Tandem DSDF Channel Mixup — thorfinn — **CLOSED** (dead end)
+
+- Branch: `thorfinn/tandem-dsdf-mixup`
+- Hypothesis: Interpolate DSDF channels between tandem training samples to create synthetic intermediate foil geometries, expanding the model's exposure to novel shapes. Alpha sweep {0.7, 0.5}.
+
+| Run | Alpha | Seed | p_in | p_oodc | p_tan | p_re | W&B ID |
+|-----|-------|------|------|--------|-------|------|--------|
+| a07-s42 | 0.7 | 42 | 12.419 | 7.608 | 31.628 | 5.489 | 6asz230g |
+| a07-s43 | 0.7 | 43 | 13.243 | 8.056 | 30.285 | 6.802 | 2f5h1bqy |
+| **α=0.7 avg** | — | — | **12.831** | **7.832** | **30.957** | **6.146** | — |
+| a05-s42 | 0.5 | 42 | 13.130 | 7.774 | 30.983 | 5.975 | oladith7 |
+| a05-s43 | 0.5 | 43 | 13.852 | 9.469 | 30.541 | 6.677 | v5b43gi4 |
+| **α=0.5 avg** | — | — | **13.491** | **8.621** | **30.762** | **6.326** | — |
+
+W&B group: `phase6/tandem-dsdf-mixup`
+
+**Results commentary:**
+- **DEAD END.** p_tan regresses in both variants (+3.5% and +2.8% vs current baseline 29.91).
+- α=0.5/s43 p_oodc=9.47 — catastrophic. High variance throughout.
+- Student correctly identified root cause: mixing NACA0012 DSDFs creates more NACA0012-like shapes, not novel geometries toward NACA6416.
+- p_re improved strongly (α=0.7 avg: 6.15, -5.0% vs baseline 6.47) — interesting but secondary.
+- Closed. Thorfinn reassigned to per_foil_pnorm.
+
+---
+
 ### 2026-04-05 ~00:10 — PR #2131: Tandem-Slice Carve-Out — alphonse — **SENT BACK** (rebase + 2-seed validation)
 
 - Branch: `alphonse/tandem-slice-carveout`
