@@ -2,6 +2,30 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 05:00 — PR #2090: Phase 6: Knowledge Distillation — fern — CLOSED (clean negative result)
+- Branch: `fern/knowledge-distillation`
+- Hypothesis: Train a single model using the 8-seed ensemble's predictions as soft targets (offline KD). Distilled model should approach ensemble quality at 1/8th inference cost.
+- W&B group: `phase6/knowledge-distill`
+
+**v2 results (full training ~157 epochs):**
+
+| Config | Seed | p_in | p_tan | p_oodc | p_re | val/loss | W&B run |
+|--------|------|------|-------|--------|------|----------|---------|
+| Baseline | 42 | 13.2 | 31.4 | 7.7 | 6.3 | 0.3908 | thssa2ru |
+| Baseline | 43 | 13.3 | 30.9 | 7.6 | 6.6 | 0.3891 | 4lj8ch8s |
+| **Baseline avg** | | **13.2** | **31.2** | **7.7** | **6.5** | **0.3900** | |
+| Distill α=0.6 | 42 | 14.4 | 31.6 | 8.0 | 6.6 | 0.3978 | qq24kqqv |
+| Distill α=0.6 | 43 | 14.3 | 32.2 | 8.3 | 6.8 | 0.4010 | o2ir8mc6 |
+| **α=0.6 avg** | | **14.4** | **31.9** | **8.2** | **6.7** | **0.3994** | |
+| Distill α=0.7 | 42 | 14.1 | 30.8 | 7.7 | 6.5 | 0.3917 | fjqz35fa |
+| Distill α=0.7 | 43 | 13.6 | 30.3 | 8.0 | 6.5 | 0.3906 | m5smb3w6 |
+| **α=0.7 avg** | | **13.9** | **30.6** | **7.9** | **6.5** | **0.3912** | |
+| Distill α=0.8 | 42 | 13.2 | 30.5 | 7.8 | 6.5 | 0.3889 | whoha5za |
+| Distill α=0.8 | 43 | 13.2 | 30.4 | 7.8 | 6.6 | 0.3908 | j2pc23lk |
+| **α=0.8 avg** | | **13.2** | **30.5** | **7.8** | **6.6** | **0.3899** | |
+
+**Analysis:** Knowledge distillation provides no meaningful improvement at convergence. α=0.8 (best) is statistically tied with baseline (val/loss 0.3899 vs 0.3900). α=0.7 shows marginal p_tan improvement (-2%) but p_in regression (+5%). α=0.6 is uniformly worse (+2-9%). Root causes: (1) ensemble's advantage over single models is too small (~1 Pa on p_oodc) for soft target signal to reliably capture; (2) at convergence the student already fits ground truth well — soft targets add noise rather than signal; (3) loss competition between hard and soft targets degrades metrics where ensemble has no edge (p_in, velocity). **Confirmed dead end: offline regression KD from seed-diverse ensembles does not help when base model is well-tuned.**
+
 ### 2026-04-04 04:15 — PR #2096: Phase 6: Learnable Asinh Scale — thorfinn — CLOSED (dead end)
 - Branch: `thorfinn/learnable-asinh-scale`
 - Hypothesis: Making asinh_scale a learnable nn.Parameter (init 0.75) allows gradient descent to find optimal compression jointly with model weights. Extension: asymmetric with separate pos/neg scales.
