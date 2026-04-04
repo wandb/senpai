@@ -139,7 +139,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False,
+                 tandem_slice_carveout=0, tandem_carveout_bias=-100.0):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -154,6 +155,13 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.decouple_slice = decouple_slice
         self.zone_temp = zone_temp
         self.prog_slices = prog_slices
+        self.tandem_slice_carveout = tandem_slice_carveout
+        self.tandem_carveout_bias = tandem_carveout_bias
+        if tandem_slice_carveout > 0:
+            # Pre-compute carve-out bias mask: 0 for shared slices, bias for reserved slices
+            _co_bias = torch.zeros(slice_num)
+            _co_bias[-tandem_slice_carveout:] = tandem_carveout_bias
+            self.register_buffer('carveout_bias_mask', _co_bias)
         if prog_slices:
             # Buffer for masking inactive slices; updated per-epoch by training loop
             self.register_buffer('slice_mask', torch.zeros(slice_num))
@@ -221,6 +229,12 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         if self.prog_slices:
             # Apply slice mask: 0 for active slices, -1e9 for inactive (updated each epoch)
             slice_logits = slice_logits + self.slice_mask
+        if self.tandem_slice_carveout > 0 and tandem_mask is not None:
+            # Reserve last K slices for tandem samples: apply large negative bias for non-tandem
+            is_nontandem = 1.0 - tandem_mask.float()  # [B, 1, 1, 1]
+            # carveout_bias_mask: [S] — 0 for shared, -100 for reserved
+            # Broadcast: [S] * [B, 1, 1, 1] → [B, 1, 1, S] + [B, H, N, S]
+            slice_logits = slice_logits + self.carveout_bias_mask * is_nontandem
         slice_weights = self.softmax(slice_logits)
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
@@ -283,6 +297,8 @@ class TransolverBlock(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         spatial_bias_input_dim=4,
+        tandem_slice_carveout=0,
+        tandem_carveout_bias=-100.0,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -308,6 +324,8 @@ class TransolverBlock(nn.Module):
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
             prog_slices=prog_slices,
+            tandem_slice_carveout=tandem_slice_carveout,
+            tandem_carveout_bias=tandem_carveout_bias,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -700,6 +718,8 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        tandem_slice_carveout=0,
+        tandem_carveout_bias=-100.0,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -772,6 +792,8 @@ class Transolver(nn.Module):
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
                     spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
+                    tandem_slice_carveout=tandem_slice_carveout,
+                    tandem_carveout_bias=tandem_carveout_bias,
                 )
                 for idx in range(n_layers)
             ]
@@ -1070,6 +1092,9 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Phase 6: Tandem slice carve-out — reserve slices exclusively for tandem samples
+    tandem_slice_carveout: int = 0           # number of slices to reserve for tandem; 0 = off
+    tandem_carveout_bias: float = -100.0     # logit bias applied to reserved slices for non-tandem
 
 
 cfg = sp.parse(Config)
@@ -1230,6 +1255,8 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    tandem_slice_carveout=cfg.tandem_slice_carveout,
+    tandem_carveout_bias=cfg.tandem_carveout_bias,
 )
 
 model = Transolver(**model_config).to(device)
