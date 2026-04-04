@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-04 ~01:30 UTC
+- **Date:** 2026-04-04 ~03:30 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -13,18 +13,18 @@
 | p_tan | **29.1** | 30.29 |
 | p_re | **5.8** | 6.45 |
 
-## Student Status (2026-04-04 ~01:30 UTC)
+## Student Status (2026-04-04 ~03:30 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| edward | #2094 | SWAD Dense Weight Averaging | WIP (1 run, ~180+ min — may be stuck on refine_head fix) |
-| askeladd | #2099 | Stochastic Depth (DropPath) | NEW — just assigned |
-| thorfinn | #2096 | Learnable Asinh Scale | WIP (~120+ min) |
-| nezuko | #2097 | Multi-Scale Deep Supervision | WIP (~130+ min) |
-| alphonse | #2098 | Asinh Velocity Transform | WIP (~115+ min) |
-| frieren | #2086 | SAM Phase-Only | WIP (~170+ min) |
-| fern | #2090 | Knowledge Distillation v2 | WIP (~65+ min) |
-| tanjiro | #2093 | 16-Seed Eval + Seeds 100-106 | WIP (~155+ min) |
+| edward | #2094 | SWAD Dense Weight Averaging | WIP |
+| askeladd | #2099 | Stochastic Depth (DropPath) | WIP |
+| thorfinn | #2096 | Learnable Asinh Scale | WIP |
+| nezuko | #2097 | Multi-Scale Deep Supervision | WIP |
+| alphonse | #2098 | Asinh Velocity Transform | WIP |
+| frieren | #2100 | Model Scale-Up (3L/96s vs 5L/96s vs 3L/160s vs 4L/128s) | WIP — just assigned |
+| fern | #2090 | Knowledge Distillation v2 | WIP |
+| tanjiro | #2093 | 16-Seed Eval + Seeds 100-106 | WIP |
 
 ## Current Research Direction: Training Improvements
 
@@ -43,9 +43,9 @@ We are now focused on **training procedure improvements** that alter optimizatio
 3. **Learnable Asinh Scale** (thorfinn #2096) — adaptive pressure compression
 4. **Deep Supervision** (nezuko #2097) — auxiliary loss on intermediate features
 5. **Asinh Velocity** (alphonse #2098) — compression on Ux/Uy channels
-6. **SAM Phase-Only** (frieren #2086) — flat minima via SAM
-7. **Knowledge Distillation** (fern #2090) — ensemble → single model distillation
-8. **16-Seed Combined Eval** (tanjiro #2093) — quantify N-model scaling
+6. **Knowledge Distillation** (fern #2090) — ensemble → single model distillation
+7. **16-Seed Combined Eval** (tanjiro #2093) — quantify N-model scaling
+8. **Model Scale-Up** (frieren #2100) — 3L/96s vs 5L/96s vs 3L/160s vs 4L/128s, 2 seeds each
 
 ## Confirmed Dead Ends (all time)
 
@@ -65,6 +65,7 @@ We are now focused on **training procedure improvements** that alter optimizatio
 | Inviscid Cp | #2034 | Single-foil wrong for tandem |
 | All-to-all surface attn | #2035 | +8% worse |
 | Physics losses | #2016,2023 | WLS instability |
+| SAM Phase-Only | #2086 | Dead end — SAM destabilizes Lion training, best ckpt always pre-SAM |
 | MC Dropout | #2088 | Null result |
 | Packed Ensemble | #2082 | Model too small |
 | Ensemble Weight Opt | #2089 | Equal weights — no benefit |
