@@ -1004,6 +1004,8 @@ class Config:
     aft_foil_srf_film: bool = False          # FiLM conditioning on gap/stagger for aft-foil head
     aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
     aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
+    # Phase 6: Langevin noise (SGLD-style parameter perturbation after Lion step)
+    langevin_noise: float = 0.0              # noise scale; 0 = disabled. Anneals to 0 at 80% of training.
 
 
 cfg = sp.parse(Config)
@@ -1909,6 +1911,22 @@ for epoch in range(MAX_EPOCHS):
                 scheduler.step()
             except ValueError:
                 pass
+        # Langevin noise: SGLD-style parameter perturbation (anneals to 0 at 80% of training)
+        if cfg.langevin_noise > 0.0 and (use_pcgrad or _should_step):
+            _ln_scale = cfg.langevin_noise * max(0.0, 1.0 - epoch / (cfg.cosine_T_max * 0.8))
+            if _ln_scale > 0.0:
+                with torch.no_grad():
+                    for p in model.parameters():
+                        if p.requires_grad:
+                            p.data.add_(torch.randn_like(p.data) * _ln_scale)
+                    if refine_head is not None:
+                        for p in refine_head.parameters():
+                            if p.requires_grad:
+                                p.data.add_(torch.randn_like(p.data) * _ln_scale)
+                    if aft_srf_head is not None:
+                        for p in aft_srf_head.parameters():
+                            if p.requires_grad:
+                                p.data.add_(torch.randn_like(p.data) * _ln_scale)
         if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa and not cfg.swa_cyclic and not cfg.snapshot_ensemble:
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
@@ -1935,7 +1953,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _aft_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.langevin_noise > 0.0:
+            _log_dict["train/langevin_scale"] = cfg.langevin_noise * max(0.0, 1.0 - epoch / (cfg.cosine_T_max * 0.8))
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
