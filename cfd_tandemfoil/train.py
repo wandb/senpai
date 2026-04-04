@@ -959,6 +959,8 @@ class Config:
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
+    aug_tandem_dsdf_mixup: bool = False       # mix DSDF channels between tandem samples
+    aug_tandem_dsdf_mixup_alpha: float = 0.7  # Beta distribution alpha parameter
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1552,6 +1554,23 @@ for epoch in range(MAX_EPOCHS):
                     # Apply: broadcast [B] → [B, 1] → adds to [B, N]
                     x[:, :, 22] = x[:, :, 22] + _gap_noise.unsqueeze(1)
                     x[:, :, 23] = x[:, :, 23] + _stag_noise.unsqueeze(1)
+
+        # Tandem DSDF Channel Mixup (tandem-only)
+        if cfg.aug_tandem_dsdf_mixup:
+            _is_tan_mixup = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero -> tandem
+            if _is_tan_mixup.sum() >= 2:
+                _tan_idx = _is_tan_mixup.nonzero(as_tuple=False).squeeze(1)
+                _perm = _tan_idx[torch.randperm(len(_tan_idx), device=x.device)]
+                _beta_dist = torch.distributions.Beta(
+                    torch.tensor(cfg.aug_tandem_dsdf_mixup_alpha, device=x.device),
+                    torch.tensor(0.4, device=x.device),
+                )
+                _lam = _beta_dist.sample((_tan_idx.shape[0],)).view(-1, 1, 1)
+                # Mix ONLY DSDF channels (indices 2:10) — positions, scalars, targets unchanged
+                x[_tan_idx, :, 2:10] = (
+                    _lam * x[_tan_idx, :, 2:10]
+                    + (1 - _lam) * x[_perm, :, 2:10]
+                )
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
