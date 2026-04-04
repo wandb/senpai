@@ -2,6 +2,64 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 ~22:00 — PR #2123: Combined Baseline 8-Seed Validation (aft_foil_srf + gap/stagger aug) — alphonse — CLOSED (validation complete)
+
+- Branch: `alphonse/combined-baseline-8seed`
+- Hypothesis: Pure validation run — measure the TRUE combined baseline with both `--aft_foil_srf` and `--aug_gap_stagger_sigma 0.02` over 8 seeds (42-49). No code changes.
+
+| Seed | W&B ID | p_in | p_oodc | p_tan | p_re | val/loss |
+|------|--------|------|--------|-------|------|----------|
+| 42 | zapen0x3 | 12.49 | 7.4 | 30.7 | 6.5 | 0.3878 |
+| 43 | 3vuz3adi | 13.33 | 7.9 | 30.9 | 6.5 | 0.3918 |
+| 44 | g1uhcorj | 13.57 | 7.9 | 30.8 | 6.6 | 0.3945 |
+| 45 | ea551p6b | 13.21 | 7.7 | 30.4 | 6.4 | 0.3891 |
+| 46 | fdf1vsi3 | 13.38 | 8.0 | 31.0 | 6.4 | 0.3944 |
+| 47 | al6opl9g | 13.09 | 7.8 | 29.6 | 6.6 | 0.3850 |
+| 48 | jg15oow3 | 13.49 | 7.4 | 29.9 | 6.5 | 0.3859 |
+| 49 | vzm3s42y | 13.33 | 7.7 | 30.9 | 6.5 | 0.3897 |
+| **Mean** | | **13.24** | **7.73** | **30.53** | **6.50** | **0.3898** |
+| **Std** | | **0.33** | **0.22** | **0.50** | **0.07** | **0.0034** |
+
+W&B group: `phase6/combined-baseline-8seed`
+
+**Results commentary:**
+- **CRITICAL FINDING:** The combination is NOT simply additive. Gap/stagger augmentation helps p_oodc (-2.4% vs aft_srf-only 7.92) but REGRESSES p_tan (+1.6% vs aft_srf-only 30.05).
+- p_in and p_re are approximately neutral.
+- **Implication:** Merge decision targets updated from aft_srf-only numbers to these combined numbers. All in-flight experiments running with both flags should compare against p_tan=30.53, not 30.05.
+- **Follow-up consideration:** Gap/stagger augmentation may be worth dropping from the baseline in a future round if p_tan improvements stall, since it costs +0.48 on our primary metric.
+
+---
+
+### 2026-04-04 ~22:00 — PR #2124: Fore-Foil Stacked SRF Head (ID=6) — fern — CLOSED (dead end)
+
+- Branch: `fern/fore-foil-srf-stacked`
+- Hypothesis: Add a stacked (additive) fore_srf_head on top of the shared srf_head for fore-foil (ID=6) nodes, mirroring how aft_foil_srf works for ID=7. Unlike PR #2117 which split the shared head, this keeps the shared head untouched and adds a pure correction.
+
+| Config | Seed | W&B ID | p_in | p_oodc | p_tan | p_re | val/loss |
+|--------|------|--------|------|--------|-------|------|----------|
+| Baseline (aft_srf only) | 42 | 4e65pcn2 | 13.1 | 7.5 | 29.8 | 6.5 | 0.3856 |
+| Baseline (aft_srf only) | 43 | ic3133oe | 13.1 | 7.8 | 30.2 | 6.6 | 0.3888 |
+| fore_srf 192/3L | 42 | 5er3uk4r | 13.4 | 8.1 | 30.7 | 6.6 | 0.3955 |
+| fore_srf 192/3L | 43 | 819huufp | 13.3 | 8.1 | 29.9 | 6.6 | 0.3874 |
+| fore_srf 128/2L | 42 | abpealjg | 13.1 | 7.9 | 29.6 | 6.4 | 0.3835 |
+| fore_srf 128/2L | 43 | mmovvvih | 13.7 | 8.1 | 32.8 | 6.6 | 0.4005 |
+
+W&B group: `phase6/fore-foil-srf-stacked`
+
+2-seed means vs baseline:
+- **192/3L:** p_in=13.35, p_oodc=8.1, p_tan=30.3, p_re=6.6 — worse across the board
+- **128/2L:** p_in=13.4, p_oodc=8.0, p_tan=31.2, p_re=6.5 — worse, high variance (s43 p_tan=32.8)
+- **Control:** p_in=13.1, p_oodc=7.65, p_tan=30.0, p_re=6.55
+
+**Results commentary:**
+- Both formulations degrade p_oodc by ~0.4 (8.0-8.1 vs 7.65 control), suggesting optimizer interference.
+- 128/2L s43 is catastrophic (p_tan=32.8), indicating the small head is unstable.
+- Combined with PR #2117 (split formulation, +9-11% p_tan regression), this definitively closes fore-foil SRF.
+- **Root cause:** Fore-foil (ID=6) sees channel-accelerated flow that the shared srf_head already handles well. Unlike aft-foil wake flow (ID=7), there is no qualitatively distinct correction signal for a dedicated head to learn.
+- **Conclusion:** Fore-foil SRF is a dead end in all formulations. Boundary-type improvements for ID=6 must come through other mechanisms (e.g., spatial bias conditioning, trunk-level awareness).
+
+---
+
 ### 2026-04-04 ~20:30 — PR #2122: Phase 6: Fore-Foil Loss Upweighting (ID=6) — nezuko — CLOSED (dead end)
 
 - Branch: `nezuko/fore-foil-loss-weight`

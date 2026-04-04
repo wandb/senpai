@@ -1,19 +1,23 @@
 # Baseline Metrics
 
-## Current Single-Model Baseline (Phase 6 — 2026-04-04, +aft_foil_srf +aug_gap_stagger, 8-Seed Mean, Seeds 42-49)
+## Current Single-Model Baseline (Phase 6 — 2026-04-04, +aft_foil_srf +aug_gap_stagger, 8-Seed Combined Validation, Seeds 42-49)
 
-| Metric | aft_srf 8-seed mean | vs prior 8-seed baseline | vs Asinh-only |
+| Metric | Combined 8-seed mean | vs aft_srf-only (PR #2104) | vs Asinh-only |
 |--------|---------------------|--------------------------|---------------|
-| p_in | **13.19 ± 0.33** | +1.2% | +1.2% |
-| p_oodc | **7.92 ± 0.17** | +1.2% | +1.2% |
-| p_tan | **30.05 ± 0.36** | **-0.8%** | **-0.8%** |
-| p_re | **6.45 ± 0.07** | 0% | 0% |
+| p_in | **13.24 ± 0.33** | +0.4% | +1.6% |
+| p_oodc | **7.73 ± 0.22** | **-2.4%** | -1.3% |
+| p_tan | **30.53 ± 0.50** | +1.6% | +0.8% |
+| p_re | **6.50 ± 0.07** | +0.8% | +0.8% |
 
-**PR #2104** — Dedicated aft-foil Surface Refinement Head (boundary ID=7 only). Beats prior single-model baseline on p_tan (-0.8%, our primary target). W&B group: `phase6/aft-foil-srf-8seed`. Run IDs: fctgmn1d, rc40fpuu, ygqo9rom, r5uxnp4b, yxhjfisl, qrbprrli, 9whdgscd, ekdcwekr.
+**PR #2123** (validated 2026-04-04) — Combined 8-seed validation of aft_foil_srf + aug_gap_stagger_sigma=0.02. W&B group: `phase6/combined-baseline-8seed`. Run IDs: zapen0x3, 3vuz3adi, g1uhcorj, ea551p6b, fdf1vsi3, al6opl9g, jg15oow3, vzm3s42y.
 
-**PR #2115** (merged 2026-04-04) — Gap/Stagger Perturbation Augmentation (`--aug_gap_stagger_sigma 0.02`). Validated without `--aft_foil_srf` (in-flight during experiment); results vs pre-aft_foil_srf asinh-only baseline: p_oodc **-4.9%** (7.446 vs 7.83), p_re **-1.5%** (6.351 vs 6.45), p_tan -0.25%. Augmentation is orthogonal (adds Gaussian noise to gap/stagger scalars during training only). Added to baseline reproduce command. W&B group: `phase6/gap-stagger-aug`. Best run IDs: hszpxxof (σ=0.02, s42), weovkf6s (σ=0.02, s73).
+⚠️ **Key finding:** Gap/stagger augmentation (PR #2115) is NOT additive with aft_foil_srf (PR #2104). The combination helps p_oodc (-2.4%) but **regresses p_tan (+1.6%)**. This suggests gap/stagger noise during training may slightly disrupt the aft-foil SRF head's ability to learn tandem wake corrections.
 
-**Reproduce (new baseline):**
+**Component baselines for reference:**
+- aft_foil_srf only (PR #2104, 8-seed): p_in=13.19, p_oodc=7.92, **p_tan=30.05**, p_re=6.45
+- gap/stagger only (PR #2115, 2-seed, no aft_srf): p_in≈13.04, p_oodc=7.45, p_tan=30.21, p_re=6.35
+
+**Reproduce (current baseline):**
 ```bash
 cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baseline-aft-srf-aug" \
   --asinh_pressure --asinh_scale 0.75 --field_decoder --adaln_output --use_lion --lr 2e-4 \
@@ -24,7 +28,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
   --aft_foil_srf --aug_gap_stagger_sigma 0.02
 ```
 
-**For merge decisions:** Compare 2-seed avg against single-model mean targets: p_tan < 30.05, p_oodc < 7.92, p_in < 13.19, p_re < 6.45.
+**For merge decisions:** Compare 2-seed avg against combined 8-seed mean targets: p_tan < 30.53, p_oodc < 7.73, p_in < 13.24, p_re < 6.50.
 
 ---
 
