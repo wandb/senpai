@@ -696,6 +696,7 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        self._fourier_features = 0  # set from cfg after construction
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -784,6 +785,12 @@ class Transolver(nn.Module):
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
 
         fx = self.preprocess(x)
+        # Random Fourier Feature residual (if enabled via cfg post-construction)
+        if self._fourier_features > 0 and hasattr(self, 'fourier_B') and hasattr(self, 'fourier_proj'):
+            pos_xy = x[:, :, :2]  # [B, N, 2] — normalized (x, y) coordinates
+            proj = (2 * torch.pi * pos_xy) @ self.fourier_B.to(pos_xy)  # [B, N, fourier_features]
+            fourier_enc = torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)  # [B, N, 2F]
+            fx = fx + self.fourier_proj(fourier_enc)  # zero-init → residual starts at 0
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
@@ -947,6 +954,9 @@ class Config:
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
+    # Phase 6: Random Fourier Feature position encoding (spectral bias correction)
+    fourier_features: int = 0               # number of random Gaussian Fourier frequency bands (0=disabled, try 16 or 32)
+    fourier_scale: float = 10.0             # Gaussian scale for Fourier feature sampling
 
 
 cfg = sp.parse(Config)
@@ -1110,6 +1120,16 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 model._pressure_separate = cfg.pressure_separate_last_block
+# Random Fourier Feature setup (post-construction to avoid save_config issues)
+if cfg.fourier_features > 0:
+    torch.manual_seed(0)  # fixed seed for reproducible random frequencies
+    B_matrix = torch.randn(2, cfg.fourier_features) * cfg.fourier_scale
+    model.register_buffer('fourier_B', B_matrix)
+    _fourier_proj = torch.nn.Linear(2 * cfg.fourier_features, cfg.n_hidden, bias=True)
+    torch.nn.init.zeros_(_fourier_proj.weight)
+    torch.nn.init.zeros_(_fourier_proj.bias)
+    model.fourier_proj = _fourier_proj.to(device)
+    model._fourier_features = cfg.fourier_features
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
