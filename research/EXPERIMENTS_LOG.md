@@ -2,6 +2,33 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 14:45 — PR #2115: Phase 6: Gap/Stagger Perturbation Augmentation — nezuko — MERGED
+
+- Branch: `nezuko/gap-stagger-perturbation-aug`
+- Hypothesis: Adding Gaussian noise to gap and stagger scalar features (indices 22, 23) during training forces the model to generalize across the local neighborhood of tandem configurations — domain randomization targeting the p_oodc/p_tan OOD axis.
+
+| Run | σ | Seed | p_in | p_oodc | p_tan | p_re | W&B ID |
+|-----|---|------|------|--------|-------|------|--------|
+| gapstagger-s02-s42 | 0.02 | 42 | 13.166 | 7.514 | 29.645 | 6.486 | hszpxxof |
+| gapstagger-s02-s73 | 0.02 | 73 | 12.907 | 7.377 | 30.781 | 6.216 | weovkf6s |
+| gapstagger-s05-s42 | 0.05 | 42 | 13.232 | 7.643 | 30.162 | 6.359 | 7lpt7n7o |
+| gapstagger-s05-s73 | 0.05 | 73 | 13.006 | 7.603 | 30.407 | 6.483 | k1oihv6h |
+| gapstagger-s10-s42 | 0.10 | 42 | 13.316 | 7.704 | 31.113 | 6.542 | x8xxcpt0 |
+| gapstagger-s10-s73 | 0.10 | 73 | 12.815 | 7.559 | 30.631 | 6.359 | vnfp0i7s |
+| **σ=0.02 2-seed mean** | — | — | **13.037** | **7.446** | **30.213** | **6.351** | — |
+| Pre-aft_foil_srf baseline | — | — | 13.03 | 7.83 | 30.29 | 6.45 | — |
+
+W&B group: `phase6/gap-stagger-aug`. W&B metrics verified by automated script — all within rounding error (max diff 0.0005).
+
+**Results commentary:**
+- σ=0.02 is the clear winner: p_oodc **-4.9%** (7.446 vs 7.83), p_re -1.5%, p_tan -0.25%, p_in flat.
+- Inverse σ-quality relationship confirmed: larger noise (σ=0.10) hurts p_tan (+1.9% regression). The gap/stagger signal is sensitive to feature distribution — excessive noise corrupts it.
+- Individual highlight: weovkf6s (s73, σ=0.02) achieves p_oodc=7.377 and p_re=6.216, both below baseline mean.
+- Experiment was run WITHOUT `--aft_foil_srf` (which merged in PR #2104 while this experiment was in flight). Comparison against pre-aft_foil_srf asinh-only baseline is fair. Augmentation is orthogonal — adds noise to 2 scalar features only — and should compound with aft_foil_srf.
+- **Decision: MERGED.** p_oodc -4.9% is the largest single-experiment OOD improvement since pressure_first. Added `--aug_gap_stagger_sigma 0.02` to baseline reproduce command.
+
+---
+
 ### 2026-04-04 14:30 — PR #2107: Phase 6: Aft-Foil Coordinate Frame Normalization (Dual-Frame v2) — frieren — SENT BACK
 
 - Branch: `frieren/aft-foil-local-frame`
