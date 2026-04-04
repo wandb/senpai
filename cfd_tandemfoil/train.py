@@ -601,10 +601,12 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        aft_foil_local_frame=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.pressure_first = pressure_first
+        self.aft_foil_local_frame = aft_foil_local_frame
         self.ref = ref
         self.unified_pos = unified_pos
         self.adaln_output = adaln_output
@@ -947,6 +949,8 @@ class Config:
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
+    # Phase 6: Aft-foil local frame normalization
+    aft_foil_local_frame: bool = False       # subtract aft foil centroid from aft foil node coords before embedding
 
 
 cfg = sp.parse(Config)
@@ -961,10 +965,44 @@ if cfg.debug:
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}" + (" [DEBUG MODE]" if cfg.debug else ""))
 
+# Monkey-patch preprocessing to inject is_aft_surface sideband for aft-foil local frame.
+# boundary_id is discarded by preprocess_sample_multi; we add (boundary==7).float()
+# as a 25th feature to x. It will be consumed and stripped before model/stats see x.
+if cfg.aft_foil_local_frame:
+    import data.prepare_multi as _pm
+    _orig_preprocess = _pm.preprocess_sample_multi
+    def _patched_preprocess(sample, _orig=_orig_preprocess):
+        x, y, is_surface = _orig(sample)
+        is_aft = (sample.boundary == 7).float().unsqueeze(1)  # [N, 1]
+        x = torch.cat([x, is_aft], dim=1)  # [N, 25]
+        return x, y, is_surface
+    _pm.preprocess_sample_multi = _patched_preprocess
+
 train_ds, val_splits, stats, sample_weights = load_data(
     cfg.manifest, cfg.stats_file, debug=cfg.debug,
 )
 stats = {k: v.to(device) for k, v in stats.items()}
+
+
+def _apply_aft_local_frame(x):
+    """Strip is_aft_surface sideband (idx 24), normalize aft foil coords to local centroid frame.
+
+    The sideband feature was injected by the monkey-patched preprocess_sample_multi.
+    After stripping, x returns to its standard 24-dim shape for stats compatibility.
+    """
+    aft_mask = x[:, :, 24] > 0.5  # [B, N] — True for boundary_id==7 nodes
+    x = x[:, :, :24]  # strip sideband → [B, N, 24]
+    is_tandem_b = (x[:, 0, 21].abs() > 0.01)  # [B] — NACA1[2] tandem sentinel
+    aft_mask_tandem = aft_mask & is_tandem_b.unsqueeze(1)  # [B, N]
+    if aft_mask_tandem.any():
+        aft_float = aft_mask_tandem.float()  # [B, N]
+        aft_count = aft_float.sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1]
+        cx = (x[:, :, 0] * aft_float).sum(dim=1, keepdim=True) / aft_count  # [B, 1]
+        cy = (x[:, :, 1] * aft_float).sum(dim=1, keepdim=True) / aft_count  # [B, 1]
+        x = x.clone()  # avoid in-place modification of DataLoader output
+        x[:, :, 0] = x[:, :, 0] - cx * aft_float
+        x[:, :, 1] = x[:, :, 1] - cy * aft_float
+    return x
 
 
 def _umag_q(y, mask):
@@ -1106,6 +1144,7 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    aft_foil_local_frame=cfg.aft_foil_local_frame,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1452,6 +1491,10 @@ for epoch in range(MAX_EPOCHS):
                     x[_b, _in_region] = x[_cut_idx[_b], _in_region]
                     y[_b, _in_region] = y[_cut_idx[_b], _in_region]
                     is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
+
+        # Aft-foil local frame: strip sideband and normalize coords before stats
+        if cfg.aft_foil_local_frame:
+            x = _apply_aft_local_frame(x)
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
@@ -1943,6 +1986,10 @@ for epoch in range(MAX_EPOCHS):
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
 
+                # Aft-foil local frame: strip sideband and normalize coords before stats
+                if cfg.aft_foil_local_frame:
+                    x = _apply_aft_local_frame(x)
+
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
@@ -2288,6 +2335,9 @@ if best_metrics:
                     y_dev = y_true.unsqueeze(0).to(device)
                     is_surf_dev = is_surface.unsqueeze(0).to(device)
                     mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
+                    # Aft-foil local frame
+                    if cfg.aft_foil_local_frame:
+                        x_dev = _apply_aft_local_frame(x_dev)
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
@@ -2384,6 +2434,8 @@ if cfg.surface_refine and best_metrics:
                     all_re_values.append(_re_raw)
 
                     # Preprocess (same as val loop)
+                    if cfg.aft_foil_local_frame:
+                        x = _apply_aft_local_frame(x)
                     raw_dsdf = x[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
