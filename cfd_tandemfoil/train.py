@@ -945,11 +945,33 @@ class Config:
     # Phase 6: Asinh pressure transform
     asinh_pressure: bool = False             # transform pressure targets with asinh for dynamic range compression
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
+    asinh_asymmetric: bool = False           # use separate fixed asinh scales for pos/neg pressure
+    asinh_scale_neg: float = 1.5             # asinh scale for negative pressure (suction peaks)
+    asinh_scale_pos: float = 0.5             # asinh scale for positive pressure (stagnation)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
 
 
 cfg = sp.parse(Config)
+
+
+def _asinh_fwd(p: torch.Tensor) -> torch.Tensor:
+    """Apply asinh pressure transform (forward: raw -> compressed)."""
+    if cfg.asinh_asymmetric:
+        return torch.where(p < 0,
+                           torch.asinh(p * cfg.asinh_scale_neg),
+                           torch.asinh(p * cfg.asinh_scale_pos))
+    return torch.asinh(p * cfg.asinh_scale)
+
+
+def _asinh_inv(p: torch.Tensor) -> torch.Tensor:
+    """Apply inverse asinh pressure transform (compressed -> raw)."""
+    if cfg.asinh_asymmetric:
+        return torch.where(p < 0,
+                           torch.sinh(p) / cfg.asinh_scale_neg,
+                           torch.sinh(p) / cfg.asinh_scale_pos)
+    return torch.sinh(p) / cfg.asinh_scale
+
 
 if cfg.seed >= 0:
     torch.manual_seed(cfg.seed)
@@ -1042,7 +1064,7 @@ with torch.no_grad():
             _yp[:, :, 2:3] = _yp[:, :, 2:3].abs().add(1).log() * _yp[:, :, 2:3].sign()
         if cfg.asinh_pressure:
             _yp = _yp.clone()
-            _yp[:, :, 2:3] = torch.asinh(_yp[:, :, 2:3] * cfg.asinh_scale)
+            _yp[:, :, 2:3] = _asinh_fwd(_yp[:, :, 2:3])
         _m = _mask.float().unsqueeze(-1)  # [B, N, 1]
         _phys_sum += (_yp * _m).sum(dim=(0, 1))
         _phys_sq_sum += (_yp ** 2 * _m).sum(dim=(0, 1))
@@ -1063,7 +1085,7 @@ if cfg.raw_targets or cfg.adaptive_norm:
             _y, _mask = _y.to(device), _mask.to(device)
             _yt = _y.clone()
             if cfg.adaptive_norm and cfg.asinh_pressure:
-                _yt[:, :, 2:3] = torch.asinh(_yt[:, :, 2:3] * cfg.asinh_scale)
+                _yt[:, :, 2:3] = _asinh_fwd(_yt[:, :, 2:3])
             _m = _mask.float().unsqueeze(-1)
             _raw_sum += (_yt * _m).sum(dim=(0, 1))
             _raw_sq_sum += (_yt ** 2 * _m).sum(dim=(0, 1))
@@ -1484,7 +1506,7 @@ for epoch in range(MAX_EPOCHS):
         elif cfg.adaptive_norm:
             y_adapt = y.clone()
             if cfg.asinh_pressure:
-                y_adapt[:, :, 2:3] = torch.asinh(y_adapt[:, :, 2:3] * cfg.asinh_scale)
+                y_adapt[:, :, 2:3] = _asinh_fwd(y_adapt[:, :, 2:3])
             y_norm = (y_adapt - raw_stats["y_mean"]) / raw_stats["y_std"]
         else:
             y_phys = _phys_norm(y, Umag, q)
@@ -1493,7 +1515,7 @@ for epoch in range(MAX_EPOCHS):
                 y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
             if cfg.asinh_pressure:
                 y_phys = y_phys.clone()
-                y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
+                y_phys[:, :, 2:3] = _asinh_fwd(y_phys[:, :, 2:3])
             y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         # Residual prediction: subtract freestream from normalized targets
         _freestream = None
@@ -1971,7 +1993,7 @@ for epoch in range(MAX_EPOCHS):
                 elif cfg.adaptive_norm:
                     y_adapt = y.clone()
                     if cfg.asinh_pressure:
-                        y_adapt[:, :, 2:3] = torch.asinh(y_adapt[:, :, 2:3] * cfg.asinh_scale)
+                        y_adapt[:, :, 2:3] = _asinh_fwd(y_adapt[:, :, 2:3])
                     y_norm = (y_adapt - raw_stats["y_mean"]) / raw_stats["y_std"]
                 else:
                     y_phys = _phys_norm(y, Umag, q)
@@ -1980,7 +2002,7 @@ for epoch in range(MAX_EPOCHS):
                         y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
                     if cfg.asinh_pressure:
                         y_phys = y_phys.clone()
-                        y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
+                        y_phys[:, :, 2:3] = _asinh_fwd(y_phys[:, :, 2:3])
                     y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
                 # Residual prediction: subtract freestream in val loop
@@ -2088,7 +2110,7 @@ for epoch in range(MAX_EPOCHS):
                     pred_adapt = pred * raw_stats["y_std"] + raw_stats["y_mean"]
                     if cfg.asinh_pressure:
                         pred_adapt = pred_adapt.clone()
-                        pred_adapt[:, :, 2:3] = torch.sinh(pred_adapt[:, :, 2:3]) / cfg.asinh_scale
+                        pred_adapt[:, :, 2:3] = _asinh_inv(pred_adapt[:, :, 2:3])
                     pred_orig = pred_adapt
                 else:
                     pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
@@ -2097,7 +2119,7 @@ for epoch in range(MAX_EPOCHS):
                         pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
                     if cfg.asinh_pressure:
                         pred_phys = pred_phys.clone()
-                        pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
+                        pred_phys[:, :, 2:3] = _asinh_inv(pred_phys[:, :, 2:3])
                     if cfg.tight_denorm_clamps:
                         _pd = pred_phys.clone()
                         _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
@@ -2311,7 +2333,7 @@ if best_metrics:
                         pred_adapt = pred * raw_stats["y_std"] + raw_stats["y_mean"]
                         if cfg.asinh_pressure:
                             pred_adapt = pred_adapt.clone()
-                            pred_adapt[:, :, 2:3] = torch.sinh(pred_adapt[:, :, 2:3]) / cfg.asinh_scale
+                            pred_adapt[:, :, 2:3] = _asinh_inv(pred_adapt[:, :, 2:3])
                         y_pred = pred_adapt.squeeze(0).cpu()
                     else:
                         pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
@@ -2320,7 +2342,7 @@ if best_metrics:
                             pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
                         if cfg.asinh_pressure:
                             pred_phys = pred_phys.clone()
-                            pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
+                            pred_phys[:, :, 2:3] = _asinh_inv(pred_phys[:, :, 2:3])
                         if cfg.tight_denorm_clamps:
                             _pd = pred_phys.clone()
                             _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
@@ -2409,13 +2431,13 @@ if cfg.surface_refine and best_metrics:
                     if cfg.adaptive_norm:
                         y_adapt = y.clone()
                         if cfg.asinh_pressure:
-                            y_adapt[:, :, 2:3] = torch.asinh(y_adapt[:, :, 2:3] * cfg.asinh_scale)
+                            y_adapt[:, :, 2:3] = _asinh_fwd(y_adapt[:, :, 2:3])
                         y_norm = (y_adapt - raw_stats["y_mean"]) / raw_stats["y_std"]
                     else:
                         y_phys = _phys_norm(y, Umag, q)
                         if cfg.asinh_pressure:
                             y_phys = y_phys.clone()
-                            y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
+                            y_phys[:, :, 2:3] = _asinh_fwd(y_phys[:, :, 2:3])
                         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
                     # Residual prediction
@@ -2488,7 +2510,7 @@ if cfg.surface_refine and best_metrics:
                     pred_phys_A = pred_refined * _zs["y_std"] + _zs["y_mean"]
                     if cfg.asinh_pressure:
                         pred_phys_A = pred_phys_A.clone()
-                        pred_phys_A[:, :, 2:3] = torch.sinh(pred_phys_A[:, :, 2:3]) / cfg.asinh_scale
+                        pred_phys_A[:, :, 2:3] = _asinh_inv(pred_phys_A[:, :, 2:3])
                     # Physics denorm (skip for adaptive_norm — already in raw space)
                     pred_orig_A = pred_phys_A if cfg.adaptive_norm else _phys_denorm(pred_phys_A, Umag, q)
 
@@ -2509,7 +2531,7 @@ if cfg.surface_refine and best_metrics:
                     pred_manual_phys = pred_manual * _zs["y_std"] + _zs["y_mean"]
                     if cfg.asinh_pressure:
                         pred_manual_phys = pred_manual_phys.clone()
-                        pred_manual_phys[:, :, 2:3] = torch.sinh(pred_manual_phys[:, :, 2:3]) / cfg.asinh_scale
+                        pred_manual_phys[:, :, 2:3] = _asinh_inv(pred_manual_phys[:, :, 2:3])
                     # Step 6: undo physics norm: Ux*Umag, Uy*Umag, p*q
                     if cfg.adaptive_norm:
                         pred_manual_orig = pred_manual_phys
@@ -2529,7 +2551,7 @@ if cfg.surface_refine and best_metrics:
                     pred_norefine_phys = pred_norefine * _zs["y_std"] + _zs["y_mean"]
                     if cfg.asinh_pressure:
                         pred_norefine_phys = pred_norefine_phys.clone()
-                        pred_norefine_phys[:, :, 2:3] = torch.sinh(pred_norefine_phys[:, :, 2:3]) / cfg.asinh_scale
+                        pred_norefine_phys[:, :, 2:3] = _asinh_inv(pred_norefine_phys[:, :, 2:3])
                     pred_norefine_orig = pred_norefine_phys if cfg.adaptive_norm else _phys_denorm(pred_norefine_phys, Umag, q)
 
                     # Compute surface pressure MAE for all paths
