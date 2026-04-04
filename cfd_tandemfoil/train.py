@@ -989,22 +989,24 @@ def _apply_aft_local_frame(x):
 
     Dual-frame approach: global coords are preserved, local-frame coords returned separately.
     For non-aft nodes and single-foil samples, local coords equal global coords.
+    Local coords are detached from autograd to avoid retaining intermediate tensors in memory.
 
     Returns:
         x: [B, N, 24] — original features with sideband stripped (global coords intact)
-        local_xy: [B, N, 2] — local-frame (x, y) coords
+        local_xy: [B, N, 2] — local-frame (x, y) coords (detached)
     """
     aft_mask = x[:, :, 24] > 0.5  # [B, N] — True for boundary_id==7 nodes
-    x = x[:, :, :24]  # strip sideband → [B, N, 24]
-    is_tandem_b = (x[:, 0, 21].abs() > 0.01)  # [B] — NACA1[2] tandem sentinel
-    aft_mask_tandem = aft_mask & is_tandem_b.unsqueeze(1)  # [B, N]
-    aft_float = aft_mask_tandem.float()  # [B, N]
-    aft_count = aft_float.sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1]
-    cx = (x[:, :, 0] * aft_float).sum(dim=1, keepdim=True) / aft_count  # [B, 1]
-    cy = (x[:, :, 1] * aft_float).sum(dim=1, keepdim=True) / aft_count  # [B, 1]
-    local_x = x[:, :, 0] - cx * aft_float  # [B, N]
-    local_y = x[:, :, 1] - cy * aft_float  # [B, N]
-    local_xy = torch.stack([local_x, local_y], dim=-1)  # [B, N, 2]
+    x = x[:, :, :24].contiguous()  # strip sideband → [B, N, 24], break view to free 25-dim tensor
+    with torch.no_grad():
+        is_tandem_b = (x[:, 0, 21].abs() > 0.01)  # [B] — NACA1[2] tandem sentinel
+        aft_mask_tandem = aft_mask & is_tandem_b.unsqueeze(1)  # [B, N]
+        aft_float = aft_mask_tandem.float()  # [B, N]
+        aft_count = aft_float.sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1]
+        cx = (x[:, :, 0] * aft_float).sum(dim=1, keepdim=True) / aft_count  # [B, 1]
+        cy = (x[:, :, 1] * aft_float).sum(dim=1, keepdim=True) / aft_count  # [B, 1]
+        local_x = x[:, :, 0] - cx * aft_float  # [B, N]
+        local_y = x[:, :, 1] - cy * aft_float  # [B, N]
+        local_xy = torch.stack([local_x, local_y], dim=-1)  # [B, N, 2]
     return x, local_xy
 
 
