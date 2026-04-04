@@ -45,7 +45,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 |---------|-----|-----------|--------|
 | tanjiro | #2133 | Foil-1 DSDF Magnitude Aug — Front Foil Shape Transfer | WIP |
 | fern | #2130 | Gap/Stagger Spatial Bias — rebased 2-seed validation (beats control all 4 metrics) | WIP — sent back for rebase |
-| alphonse | #2131 | Tandem-Slice Carve-Out — Reserved Physics Slices for Tandem Samples | WIP |
+| alphonse | #2131 | Tandem-Slice Carve-Out K=4 — rebased 2-seed (p_tan -3.7% vs ctrl) | WIP — sent back for rebase |
 | nezuko | #2129 | Supervised Surface Pressure Gradient Aux Loss — **v2** (per-foil fix + aft_srf_context rebase) | WIP — sent back for revision |
 | askeladd | #2119 | PCGrad 2-Way — rebased 2-seed validation (p_tan -1.9% in 8-seed) | WIP — sent back for rebase |
 | thorfinn | #2132 | Tandem DSDF Channel Mixup — Synthetic Foil-Shape Interpolation | WIP |

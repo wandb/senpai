@@ -2,6 +2,34 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~00:10 — PR #2131: Tandem-Slice Carve-Out — alphonse — **SENT BACK** (rebase + 2-seed validation)
+
+- Branch: `alphonse/tandem-slice-carveout`
+- Hypothesis: Reserve K physics slices exclusively for tandem samples by applying large negative logit bias (-100) to reserved slices for single-foil. Prevents single-foil from co-opting tandem-specialized capacity.
+
+| Config | p_in | p_oodc | p_tan | p_re | W&B ID |
+|--------|------|--------|-------|------|--------|
+| Control s42 | 12.480 | 7.407 | 30.767 | 6.492 | wwil2gdr |
+| Control s43 | 13.243 | 7.940 | 30.907 | 6.477 | bfa65aup |
+| **Control avg** | **12.861** | **7.673** | **30.837** | **6.485** | — |
+| K=4 s42 | 12.801 | 7.772 | 30.059 | 6.545 | z3b8tdfy |
+| K=4 s43 | 13.225 | 7.700 | 29.358 | 6.303 | p5pljk4j |
+| **K=4 avg** | **13.013** | **7.736** | **29.709** | **6.424** | — |
+| K=8 s42 | 13.318 | 7.675 | 29.303 | 6.455 | nicjx1g0 |
+| K=8 s43 | 13.316 | 7.939 | 31.550 | 6.687 | a4jaduno |
+| **K=8 avg** | **13.317** | **7.807** | **30.427** | **6.571** | — |
+
+W&B group: `phase6/tandem-slice-carveout`. Confirmed `--aug_gap_stagger_sigma 0.02` active in all runs.
+
+**Results commentary:**
+- **K=4 is the clear winner.** p_tan -3.7% vs control (29.71 vs 30.84). Both seeds improve. Strongest p_tan signal of this round.
+- **K=8 too aggressive.** High variance (seed 43 catastrophic at 31.55). p_in regresses +3.6%.
+- **K=4 vs current baseline (PR #2127):** p_tan 29.71 < 29.91 ✅, p_re 6.42 < 6.47 ✅, p_in 13.01 ≈ 13.02 ✅. Only p_oodc regresses (7.74 vs 7.62, +1.5%).
+- Runs missing `--aft_foil_srf_context`. Sent back for rebased 2-seed validation.
+- **Note:** p_oodc regression expected — fewer shared slices = less OOD-condition generalization.
+
+---
+
 ### 2026-04-05 ~00:00 — PR #2130: Gap/Stagger-Conditioned Spatial Bias — fern — **SENT BACK** (rebase + 2-seed validation)
 
 - Branch: `fern/gap-stagger-spatial-bias`
