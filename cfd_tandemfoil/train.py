@@ -1052,6 +1052,9 @@ class Config:
     aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
     aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
     aft_foil_srf_context: bool = False       # KNN volume context for aft-foil SRF (wake pressure recovery)
+    # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
+    pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
+    pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
 
 
 cfg = sp.parse(Config)
@@ -1987,6 +1990,80 @@ for epoch in range(MAX_EPOCHS):
                     p.grad = ((ga - (dot_ab / gb_ns) * gb) + (gb - (dot_ab / ga_ns) * ga)) * 0.5
                 else:
                     p.grad = (ga + gb) * 0.5
+        elif cfg.pcgrad_3way and is_tandem_batch.any() and (~is_tandem_batch).any():
+            # 3-way PCGrad: Group A=single-foil, B=tandem-normal, C=tandem-extreme-Re
+            re_vals = x[:, 0, 13]  # normalized log(Re), same for all nodes in sample
+            re_tandem = re_vals[is_tandem_batch]
+            if is_tandem_batch.sum() >= 4:
+                lo = torch.quantile(re_tandem, cfg.pcgrad_extreme_pct)
+                hi = torch.quantile(re_tandem, 1.0 - cfg.pcgrad_extreme_pct)
+                is_extreme = is_tandem_batch & ((re_vals < lo) | (re_vals > hi))
+                is_normal_tan = is_tandem_batch & ~is_extreme
+            else:
+                is_extreme = torch.zeros(B, dtype=torch.bool, device=device)
+                is_normal_tan = is_tandem_batch
+
+            def _grp_loss(mask_1d):
+                n = mask_1d.float().sum().clamp(min=1)
+                vol_mask_g = vol_mask_train & mask_1d.unsqueeze(1)
+                vol_loss_g = (abs_err * vol_mask_g.unsqueeze(-1)).sum() / vol_mask_g.sum().clamp(min=1)
+                surf_loss_g = (surf_per_sample * mask_1d.float() * tandem_boost).sum() / n
+                coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
+                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+
+            loss_A = _grp_loss(~is_tandem_batch)
+            # Only include non-empty groups to avoid backward() on no-grad tensors
+            task_losses_with_masks = [
+                (loss_A, (~is_tandem_batch)),
+                (_grp_loss(is_normal_tan), is_normal_tan),
+                (_grp_loss(is_extreme), is_extreme),
+            ]
+            task_losses = [l for l, m in task_losses_with_masks if m.any()]
+            if len(task_losses) == 0:
+                task_losses = [loss_A]  # fallback
+
+            # Compute per-task gradients with retain_graph
+            task_grads = []
+            for i, tl in enumerate(task_losses):
+                optimizer.zero_grad()
+                tl.backward(retain_graph=(i < len(task_losses) - 1))
+                task_grads.append([p.grad.clone() if p.grad is not None else None
+                                   for p in model.parameters()])
+
+            # PCGrad projection: project g_i onto normal plane of each g_j
+            def pcgrad_project(g_i, g_j):
+                dot = sum((a * b).sum() for a, b in zip(g_i, g_j) if a is not None and b is not None)
+                if dot < 0:
+                    norm_sq = sum((b * b).sum() for b in g_j if b is not None) + 1e-12
+                    return [a - (dot / norm_sq) * b if (a is not None and b is not None) else a
+                            for a, b in zip(g_i, g_j)]
+                return list(g_i)
+
+            n_tasks = len(task_grads)
+            projected = [list(g) for g in task_grads]
+            for i in range(n_tasks):
+                for j in range(n_tasks):
+                    if i != j:
+                        projected[i] = pcgrad_project(projected[i], task_grads[j])
+
+            # Sum projected gradients and write back
+            optimizer.zero_grad()
+            for param_idx, p in enumerate(model.parameters()):
+                parts = [projected[t][param_idx] for t in range(n_tasks)
+                         if projected[t][param_idx] is not None]
+                if parts:
+                    p.grad = sum(parts)
+
+            n_extreme = is_extreme.sum().item()
+            n_normal_tan = is_normal_tan.sum().item()
+            wandb.log({
+                "train/pcgrad3w_loss_A": loss_A.item(),
+                "train/pcgrad3w_n_extreme": n_extreme,
+                "train/pcgrad3w_n_normal_tan": n_normal_tan,
+                "global_step": global_step,
+            })
+            loss = sum(task_losses) / len(task_losses)  # for logging only
+            use_pcgrad = True  # downstream logic: treat as if pcgrad ran
         else:
             if cfg.grad_accum_steps <= 1:
                 optimizer.zero_grad()
