@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-04 ~14:55 UTC
+- **Date:** 2026-04-04 ~15:20 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -36,7 +36,7 @@
 | edward | #2120 | Langevin Gradient Noise (SGLD) — Stochastic Exploration for Lion | WIP |
 | askeladd | #2119 | PCGrad 3-Way Task Split — Gradient Surgery (single/tandem-normal/tandem-extreme) | WIP |
 | frieren | #2107 | Aft-Foil Coordinate Frame Normalization (dual-frame v2) — VRAM fix + 2 more seeds | WIP — sent back |
-| alphonse | #2116 | Charbonnier Loss — Fully Smooth L1 (eps sweep: 0.05, 0.1, 0.2) | WIP |
+| alphonse | #2123 | Combined Baseline 8-Seed Validation (aft_foil_srf + gap/stagger aug, seeds 42-49) | WIP — just assigned |
 | thorfinn | #2118 | Boundary-ID One-Hot Feature — Explicit Surface-Type Conditioning | WIP |
 
 **All 8 students active. Zero idle GPUs.**
@@ -51,6 +51,7 @@
 | #2106 | askeladd | Fourier Feature Position Encoding | CLOSED | p_tan -1.3% (FF=32) but p_oodc +4.8%, p_re +6.2% |
 | #2112 | thorfinn | Mesh-Density Weighted L1 | CLOSED | All metrics regressed 5–16% |
 | #2104 | fern | Dedicated Aft-Foil SRF Head (ID=7) | **MERGED** | p_tan -0.8% (30.29→30.05) |
+| #2116 | alphonse | Charbonnier Loss (eps 0.05/0.1/0.2) | CLOSED | Dead end: all eps values degrade all metrics; p_oodc +12-24%. L1 smooth-loss family exhausted. |
 | #2113 | edward | Smooth L1 (Huber) Loss | CLOSED | Catastrophic: p_in +15%, p_tan +7% |
 
 ## Current Research Focus
@@ -70,7 +71,7 @@
 5. **Boundary-ID One-Hot Feature** (thorfinn #2118) — append 3-dim one-hot (ID=5/6/7) to all nodes
 6. **PCGrad 3-Way Task Split** (askeladd #2119) — gradient surgery across single/tandem-normal/tandem-extreme-Re
 7. **Langevin Gradient Noise / SGLD** (edward #2120) — Gaussian noise after Lion step; sweep {5e-5, 1e-4, 3e-4}
-8. **Charbonnier Loss** (alphonse #2116) — fully smooth L1; eps sweep {0.05, 0.1, 0.2}; watch for Smooth L1 failure mode
+8. **Combined Baseline 8-Seed Validation** (alphonse #2123) — runs seeds 42-49 with aft_foil_srf + aug_gap_stagger_sigma=0.02 combined; gives accurate merge targets for 7 incoming WIP results
 
 **Confirmed bottleneck findings:**
 - NOT capacity-limited (scale-up #2100)
@@ -86,8 +87,10 @@
 
 **Priority queue (assign to next idle students):**
 1. **Precomputed Pressure-Poisson Soft Constraint** — finite-diff Laplacian stencil as auxiliary physics loss; targets p_tan/p_oodc; ~65 LoC; MEDIUM-HIGH risk; highest remaining novel idea
-2. **8-seed combined baseline validation** — re-run 8 seeds with aft_foil_srf + aug_gap_stagger combined to get accurate numeric baseline for future merge decisions; defer until slot opens
-3. **Learnable per-boundary asinh scale** — different compression per boundary type (ID=5/6/7); builds on gap/stagger aug insight about OOD robustness
+2. **Fixed per-boundary asinh scale** — different fixed scales for each boundary type (ID=5/6/7); aft-foil wake pressure sharper gradients may need different compression; build on gap/stagger aug OOD insight
+3. **MC Dropout on SRF head** — `nn.Dropout(p=0.05)` in SurfaceRefinementHead only, K=8 forward passes at inference, average predictions; cheap variance reduction without training extra models
+4. **AoA-consistent augmentation fix** — current `aoa_perturb` perturbs x but not y (inconsistent); scale y-targets proportionally with AoA delta; may improve p_oodc
+5. ~~8-seed combined baseline validation~~ — **ASSIGNED to alphonse #2123**
 
 **Deferred pending current results:**
 - Expand ensemble to 23 seeds (seeds 100-106 already trained) — do after single-model improvements land
@@ -148,6 +151,7 @@
 | Muon | #2006 | 30-70% worse |
 | Gradient Centralization (GC-Lion) | #2114 | p_in +12-17%, p_oodc +15-38%; GC changes direction which Lion's sign-op treats as noise; incompatible |
 | Smooth L1 / Huber Loss | #2113 | Catastrophic: gradient attenuation for small errors incompatible with residual-prediction+asinh; L1 constant gradient is optimal |
+| Charbonnier Loss (smooth L1 variant) | #2116 | Dead end: all eps values degrade all metrics; p_oodc +12-24%; smooth loss family fully exhausted |
 | FiLM on gap/stagger | #2104 | p_oodc catastrophe (+41.6%) |
 | Foil-2 Loss Upweighting | #1893 | Marginal (still shared head); retesting as #2121 WITH aft-foil SRF head in baseline |
 | Ada-Temp (per-node) | #1879,#1793,#1615 | Null across multiple phases |

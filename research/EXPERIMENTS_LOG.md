@@ -2,6 +2,43 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 15:15 — PR #2116: Phase 6: Charbonnier Loss — Fully Smooth L1 — alphonse — CLOSED
+
+- Branch: `alphonse/charbonnier-loss`
+- Hypothesis: Replace L1 `abs()` with Charbonnier `sqrt((pred-y)^2 + eps^2) - eps` for fully smooth (C∞) gradient everywhere. The hypothesis: L1's constant ±1 gradient ignores residual magnitude; Charbonnier's smooth interpolation provides proportional signal for small residuals.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | val/loss | W&B Run ID |
+|--------|------|------|--------|-------|------|----------|------------|
+| Baseline (L1) | 42 | 12.87 | 7.90 | 30.4 | 6.5 | 0.3906 | wemzzic2 |
+| Baseline (L1) | 43 | 12.59 | 8.00 | 29.6 | 6.5 | 0.3851 | v7ulm4nt |
+| Charb eps=0.05 | 42 | 14.17 | 8.70 | 30.7 | 7.2 | 0.4054 | d79f5gab |
+| Charb eps=0.05 | 43 | 13.54 | 9.10 | 30.7 | 7.2 | 0.4030 | r619gn21 |
+| Charb eps=0.1 | 42 | 13.87 | 9.40 | 30.5 | 7.2 | 0.4056 | 51vbivxc |
+| Charb eps=0.1 | 43 | 14.03 | 9.60 | 30.8 | 7.2 | 0.4095 | 4ert76ho |
+| Charb eps=0.2 | 42 | 14.72 | 9.60 | 30.3 | 7.5 | 0.4160 | br80gpr2 |
+| Charb eps=0.2 | 43 | 14.58 | 10.10 | 32.2 | 7.8 | 0.4234 | 290ls7cp |
+
+**2-seed means vs. in-run L1 baseline:**
+
+| Config | p_in | p_oodc | p_tan | p_re |
+|--------|------|--------|-------|------|
+| Baseline (L1) | 12.73 | 7.95 | 30.00 | 6.50 |
+| Charb eps=0.05 | 13.85 (+8.8%) | 8.90 (+12.0%) | 30.70 (+2.3%) | 7.20 (+10.8%) |
+| Charb eps=0.1 | 13.95 (+9.6%) | 9.50 (+19.5%) | 30.65 (+2.2%) | 7.20 (+10.8%) |
+| Charb eps=0.2 | 14.65 (+15.1%) | 9.85 (+23.9%) | 31.25 (+4.2%) | 7.65 (+17.7%) |
+
+W&B group: `phase6/charbonnier-loss`.
+
+**Results commentary:**
+- **Clear dead end.** All eps values degrade all metrics. Monotonic degradation with increasing eps.
+- p_oodc hit hardest (+12% to +24%); OOD robustness suffers most from gradient attenuation near zero.
+- Even eps=0.05 (closest to L1) causes +8.8% p_in regression.
+- Root cause: L1's constant ±1 gradient is a *feature* — it provides uniform optimization pressure on all residuals regardless of magnitude. Charbonnier's gradient attenuation near zero slows convergence on the many near-zero residuals that dominate surface MAE in a well-trained model.
+- The smooth loss family (Huber #2113, Charbonnier #2116) is now exhaustively explored. L1 is the correct loss shape for this problem.
+- **Decision: CLOSED.** Student suggestion of super-linear-near-zero (|x|^p, p<1) or asymmetric loss noted for potential future exploration.
+
+---
+
 ### 2026-04-04 14:45 — PR #2115: Phase 6: Gap/Stagger Perturbation Augmentation — nezuko — MERGED
 
 - Branch: `nezuko/gap-stagger-perturbation-aug`
