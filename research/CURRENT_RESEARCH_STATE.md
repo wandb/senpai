@@ -87,11 +87,12 @@
 
 ## Potential Next Research Directions (available, not yet assigned)
 
-**Priority queue:**
-1. **Precomputed Pressure-Poisson Soft Constraint** — baked finite-diff Laplacian stencil; distinct from failed WLS; targets p_tan/p_oodc; moderate complexity (~65 lines)
-2. **Geometry-Conditioned AoA Interpolation** — physics-space interpolation (distinct from failed feature-space Mixup); targets p_oodc; moderate complexity
-3. **Charbonnier Loss** — `sqrt(x^2 + eps^2) - eps` — smoother than L1/Huber; if Huber (#2113) shows promise, Charbonnier is a natural follow-up
-4. **Langevin Gradient Noise** — add Gaussian noise to gradients after Lion computes them (SGLD-style); distinct from SAM (no second forward pass); targets flat basin finding
+**Priority queue (assign next idle students):**
+1. **Gap/Stagger Perturbation Augmentation** — perturb gap/stagger features ±10% Gaussian noise during training; feature-space domain randomization directly on the tandem OOD axes; supported by Cambridge 2025, SIMSHIFT 2025, ML4CFD 2024; expected -5 to -10% p_tan; ~35 LoC; medium risk
+2. **Separate SRF Heads for Fore-Foil (ID=6) vs Single-Foil (ID=5)** — extend the aft-foil SRF concept to the fore-foil; fore-foil sees aerodynamically different flow in tandem vs single; queue after #2104 results; expected -3 to -6% p_tan; ~30 LoC; low risk
+3. **Precomputed Pressure-Poisson Soft Constraint** — baked finite-diff Laplacian stencil; distinct from failed WLS; targets p_tan/p_oodc; ~65 lines
+4. **Charbonnier Loss** — `sqrt(x^2 + eps^2) - eps` — smoother than L1/Huber; natural follow-up if Huber (#2113) shows promise
+5. **Langevin Gradient Noise** — Gaussian noise to gradients after Lion (SGLD-style); distinct from SAM; targets flat basin finding
 
 **Deferred pending current results:**
 - Expand ensemble to 23 seeds (100-106 already trained) — do this after any single-model improvements land
