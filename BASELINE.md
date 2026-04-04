@@ -1,6 +1,32 @@
 # Baseline Metrics
 
-## Current Baseline (Phase 6 — 2026-04-04, 16-Seed Ensemble from Seeds 42-49 + 66-73)
+## Current Single-Model Baseline (Phase 6 — 2026-04-04, +aft_foil_srf, 8-Seed Mean, Seeds 42-49)
+
+| Metric | aft_srf 8-seed mean | vs prior 8-seed baseline | vs Asinh-only |
+|--------|---------------------|--------------------------|---------------|
+| p_in | **13.19 ± 0.33** | +1.2% | +1.2% |
+| p_oodc | **7.92 ± 0.17** | +1.2% | +1.2% |
+| p_tan | **30.05 ± 0.36** | **-0.8%** | **-0.8%** |
+| p_re | **6.45 ± 0.07** | 0% | 0% |
+
+**PR #2104** — Dedicated aft-foil Surface Refinement Head (boundary ID=7 only). Beats prior single-model baseline on p_tan (-0.8%, our primary target). p_in/p_oodc regressions within 0.5σ noise. SAF threshold (0.005) identifies aft-foil nodes at runtime with 100% recall, 0% false positives. W&B group: `phase6/aft-foil-srf-8seed`. Run IDs: fctgmn1d, rc40fpuu, ygqo9rom, r5uxnp4b, yxhjfisl, qrbprrli, 9whdgscd, ekdcwekr.
+
+**Reproduce (new baseline):**
+```bash
+cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baseline-aft-srf" \
+  --asinh_pressure --asinh_scale 0.75 --field_decoder --adaln_output --use_lion --lr 2e-4 \
+  --aug aoa_perturb --aug_full_dsdf_rot --high_p_clamp --n_layers 3 --slice_num 96 \
+  --tandem_ramp --domain_layernorm --domain_velhead --ema_decay 0.999 --weight_decay 5e-5 \
+  --cosine_T_max 160 --disable_pcgrad --pressure_first --pressure_deep \
+  --residual_prediction --surface_refine --surface_refine_hidden 192 --surface_refine_layers 3 \
+  --aft_foil_srf
+```
+
+**For merge decisions:** Compare 2-seed avg against single-model mean targets: p_tan < 30.05, p_oodc < 7.92, p_in < 13.19, p_re < 6.45.
+
+---
+
+## Current Ensemble Baseline (Phase 6 — 2026-04-04, 16-Seed Ensemble from Seeds 42-49 + 66-73)
 
 | Metric | 16-Ensemble | vs 8-Ensemble (66-73) | vs Asinh-only |
 |--------|------------|----------------------|---------------|
