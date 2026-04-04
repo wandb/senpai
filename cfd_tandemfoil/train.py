@@ -947,6 +947,8 @@ class Config:
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
+    # Phase 6: Contrastive tandem-single regularization
+    contrastive_tandem_weight: float = 0.0   # weight for tandem-single contrastive loss (0=disabled)
 
 
 cfg = sp.parse(Config)
@@ -1349,6 +1351,7 @@ for _sname in VAL_SPLIT_NAMES:
 wandb.define_metric("lr", step_metric="global_step")
 wandb.define_metric("epoch_time_s", step_metric="global_step")
 wandb.define_metric("val_predictions", step_metric="global_step")
+wandb.define_metric("contrastive/*", step_metric="global_step")
 
 model_dir = Path(f"models/model-{run.id}")
 model_dir.mkdir(parents=True)
@@ -1720,6 +1723,21 @@ for epoch in range(MAX_EPOCHS):
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
 
+        # Contrastive tandem-single regularization
+        contrastive_loss_val = 0.0
+        if cfg.contrastive_tandem_weight > 0.0 and model.training:
+            if is_tandem_batch.any() and (~is_tandem_batch).any():
+                # Mean-pool hidden state per sample → [B, n_hidden]
+                h_mean = (hidden * mask.float().unsqueeze(-1)).sum(dim=1) / mask.float().sum(dim=1, keepdim=True).clamp(min=1)
+                # Mean centroid for tandem and single batches
+                h_tandem = h_mean[is_tandem_batch].mean(dim=0)
+                h_single = h_mean[~is_tandem_batch].mean(dim=0)
+                # Cosine similarity; push toward 0 (orthogonal)
+                cos_sim = F.normalize(h_tandem, dim=0) @ F.normalize(h_single, dim=0)
+                contrastive_loss = cfg.contrastive_tandem_weight * (1.0 + cos_sim)
+                loss = loss + contrastive_loss
+                contrastive_loss_val = contrastive_loss.item()
+
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
@@ -1819,7 +1837,11 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.contrastive_tandem_weight > 0.0 and contrastive_loss_val > 0:
+            _log_dict["contrastive/loss"] = contrastive_loss_val
+            _log_dict["contrastive/cos_sim"] = cos_sim.item()
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
