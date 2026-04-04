@@ -2,6 +2,34 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 ~20:10 — PR #2120: Phase 6: Langevin Gradient Noise (SGLD) — edward — CLOSED (dead end)
+
+- Branch: `edward/langevin-noise`
+- Hypothesis: Adding isotropic Gaussian noise after each Lion optimizer step (SGLD-style) would encourage exploration of flatter loss basins, improving generalization metrics. Noise annealed to 0 at epoch 128.
+- **Note:** Used `--ema_start_epoch 100` (default 140 doesn't activate within 180-min timeout at ~82s/epoch). All runs used internal baseline controls (noise=0, same config) for fair comparison.
+
+| Run | W&B ID | Noise Scale | Seed | p_in | p_oodc | p_tan | p_re |
+|-----|--------|-------------|------|------|--------|-------|------|
+| Baseline | vhz8bzct | 0 | 42 | 12.9 | 7.9 | 29.9 | 6.6 |
+| Baseline | ei43kzqz | 0 | 73 | 13.1 | 8.0 | 30.1 | 6.5 |
+| Langevin | cbm4a9fs | 5e-5 | 42 | 13.4 | 7.7 | 29.9 | 6.6 |
+| Langevin | 13f5pbul | 5e-5 | 73 | 13.3 | 7.7 | 30.0 | 6.4 |
+| Langevin | twgrbt24 | 1e-4 | 42 | 13.0 | 7.9 | 30.9 | 6.5 |
+| Langevin | 3ao1faty | 1e-4 | 73 | 13.8 | 8.0 | 30.2 | 6.3 |
+| Langevin | ff02he97 | 3e-4 | 42 | 13.4 | 7.9 | 31.2 | 6.4 |
+| Langevin | namev902 | 3e-4 | 73 | 13.0 | 8.2 | 29.7 | 6.6 |
+
+W&B group: `phase6/langevin-noise`
+
+**Results commentary:**
+- No meaningful improvement over internal control baseline at any noise scale.
+- p_oodc marginal improvement at 5e-5 (7.7 vs 7.95) is within typical seed variance (±0.2).
+- p_tan highly variable at 3e-4 (29.7 to 31.2) — noise adds instability without benefit.
+- **Root cause:** Lion's sign-based update already provides implicit gradient noise (all updates are ±lr regardless of gradient magnitude). Adding isotropic Gaussian noise on top is redundant. EMA (decay=0.999 over ~16,500 batches from epoch 100) further smooths out any exploration benefit.
+- **Conclusion:** Rules out the entire family of continuous gradient perturbation approaches for Lion optimizer.
+
+---
+
 ### 2026-04-04 ~19:00 — PR #2119: Phase 6: PCGrad 3-Way Task Split — Gradient Surgery — askeladd — SENT BACK (8-seed validation)
 
 - Branch: `askeladd/pcgrad-3way`

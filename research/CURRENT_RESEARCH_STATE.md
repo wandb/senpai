@@ -34,7 +34,7 @@
 | frieren | #2127 | Context-Aware AftSRF — KNN Volume Context for Wake Pressure (K=8) | WIP — just assigned |
 | nezuko | #2122 | Fore-Foil Loss Upweighting (ID=6) — Symmetric to Aft-Foil Weight | WIP |
 | fern | #2124 | Fore-Foil Stacked SRF Head (ID=6) — Additive, Not Split | WIP |
-| edward | #2120 | Langevin Gradient Noise (SGLD) — Stochastic Exploration for Lion | WIP |
+| edward | #2128 | Reynolds-Conditional SRF — FiLM on (Re, AoA) for surface_refine head | WIP — just assigned |
 | askeladd | #2119 | PCGrad 2-Way Validation — 8-seed (seeds 42-49) with gap_stagger aug | WIP (sent back for validation) |
 | alphonse | #2123 | Combined Baseline 8-Seed Validation (aft_foil_srf + gap/stagger aug, seeds 42-49) | WIP |
 | thorfinn | #2125 | Reynolds Number Perturbation Augmentation — OOD-Re Robustness | WIP |
@@ -65,7 +65,7 @@
 4. **Fore-Foil Stacked SRF Head (ID=6)** (fern #2124) — additive fore_srf_head on top of shared srf_head
 5. **Reynolds Number Perturbation Augmentation** (thorfinn #2125) — add Gaussian noise to log_Re during training; σ sweep {0.05, 0.1, 0.2}; targets p_re < 6.45
 6. **PCGrad 2-Way Validation** (askeladd #2119) — 8-seed validation of 2-way PCGrad (single-foil vs all-tandem); p_oodc signal -1.3% to -5.4% in initial 4 runs
-7. **Langevin Gradient Noise / SGLD** (edward #2120) — Gaussian noise after Lion step; sweep {5e-5, 1e-4, 3e-4}
+7. **Reynolds-Conditional SRF** (edward #2128) — FiLM conditioning on (Re, AoA) for surface_refine head; targets p_re and p_oodc; ~18 LoC, no memory overhead
 8. **Combined Baseline 8-Seed Validation** (alphonse #2123) — runs seeds 42-49 with aft_foil_srf + aug_gap_stagger_sigma=0.02 combined; gives accurate merge targets
 
 **Key research patterns from recent experiments:**
@@ -106,6 +106,7 @@
 | Mesh-Density Weighted L1 | #2112 | All metrics regressed 5–16% |
 | Smooth L1 / Huber Loss | #2113 | Catastrophic |
 | Gradient Centralization (GC-Lion) | #2114 | Incompatible with Lion sign operation |
+| Langevin Gradient Noise (SGLD) | #2120 | All noise scales within seed variance of control; Lion sign-based updates already provide implicit gradient noise; EMA smooths out any exploration benefit |
 | Fourier Feature Position Encoding | #2106 | p_oodc +4.8%, p_re +6.2% regression |
 | Deep Supervision (aux loss) | #2097 | p_tan +2.7% regression |
 | SWAD | #2094 | Catastrophic |
