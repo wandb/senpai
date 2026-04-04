@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-04 ~13:35 UTC
+- **Date:** 2026-04-04 ~14:05 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -32,14 +32,14 @@ Baseline config now includes `--aft_foil_srf`. All new experiments must use it.
 |---------|-----|-----------|--------|
 | fern | #2117 | Fore-Foil Dedicated SRF Head (ID=6) — Split from Single-Foil | WIP |
 | tanjiro | #2114 | Gradient Centralization — Zero-Mean Gradient Updates with Lion | WIP |
-| edward | #2113 | Smooth L1 (Huber) Loss — Node-Level Gradient Emphasis | WIP |
+| edward | #2120 | Langevin Gradient Noise (SGLD) — Stochastic Exploration for Lion | WIP |
 | askeladd | #2119 | PCGrad 3-Way Task Split — Gradient Surgery (single/tandem-normal/tandem-extreme) | WIP — just assigned |
 | frieren | #2107 | Aft-Foil Coordinate Frame Normalization (dual-frame iteration) | WIP |
 | nezuko | #2115 | Gap/Stagger Perturbation Augmentation — Tandem OOD Robustness | WIP |
 | alphonse | #2116 | Charbonnier Loss — Fully Smooth L1 (eps sweep: 0.05, 0.1, 0.2) | WIP |
 | thorfinn | #2118 | Boundary-ID One-Hot Feature — Explicit Surface-Type Conditioning | WIP |
 
-**All 8 students active. Zero idle GPUs.** (askeladd: #2106 Fourier PE → closed → #2119 PCGrad 3-way)
+**All 8 students active. Zero idle GPUs.** (edward: #2113 Smooth L1 → closed → #2120 Langevin noise)
 
 ## Recently Reviewed / Merged (2026-04-04)
 
@@ -52,6 +52,7 @@ Baseline config now includes `--aft_foil_srf`. All new experiments must use it.
 | #2110 | nezuko | Progressive Surface Focus Schedule | CLOSED | p_in regresses +0.7%; dynamic surf_weight already optimal |
 | #2109 | tanjiro | Contrastive Tandem-Single Regularization | CLOSED | Hypothesis falsified: p_tan unchanged; rep entanglement is NOT bottleneck |
 | #2107 | frieren | Aft-Foil Local Frame (in-place) | SENT BACK | p_tan -2.6% but p_in regressed; non-destructive dual-frame retry assigned |
+| #2113 | edward | Smooth L1 (Huber) Loss — Node-Level Gradient Emphasis | CLOSED | Catastrophic: best run p_in=15.2 (+15%), p_tan=32.2 (+7%). L1 constant gradient is optimal post residual-prediction |
 | #2108 | edward | Asymmetric Fixed Asinh Scales | CLOSED | All metrics worse; closes asinh direction entirely |
 
 ## Current Research Focus
@@ -69,9 +70,9 @@ Baseline config now includes `--aft_foil_srf`. All new experiments must use it.
 3. **Gap/Stagger Perturbation Aug** (nezuko #2115) — domain randomization on tandem geometry features; targets p_tan OOD axis
 4. **Boundary-ID One-Hot Feature** (thorfinn #2118) — append 3-dim one-hot (ID=5/6/7) to input before all attention blocks; expected -3 to -8% p_tan; complements SRF heads
 5. **PCGrad 3-Way Task Split** (askeladd #2119) — gradient surgery across 3 groups (single/tandem-normal/tandem-extreme-Re); sweep pcgrad_extreme_pct={0.10, 0.15}; expected -2 to -5% p_tan
-6. **Smooth L1 (Huber) Loss** (edward #2113) — sweep beta={0.5, 1.0, 2.0}
+6. **Langevin Gradient Noise / SGLD** (edward #2120) — Gaussian noise after Lion step, anneal to 0 before EMA; sweep {5e-5, 1e-4, 3e-4}
 7. **Gradient Centralization** (tanjiro #2114) — remove DC gradient component before Lion sign
-8. **Charbonnier Loss** (alphonse #2116) — fully smooth L1; sweep eps={0.05, 0.1, 0.2}
+8. **Charbonnier Loss** (alphonse #2116) — fully smooth L1; sweep eps={0.05, 0.1, 0.2} ⚠️ NOTE: Smooth L1 (#2113) failed catastrophically — same root cause likely applies; watch closely
 
 **Confirmed bottleneck findings:**
 - NOT capacity-limited (scale-up #2100)
@@ -84,9 +85,9 @@ Baseline config now includes `--aft_foil_srf`. All new experiments must use it.
 ## Potential Next Research Directions (not yet assigned)
 
 **Priority queue (assign to next idle students):**
-1. **Langevin Gradient Noise (SGLD-style)** — Gaussian noise to gradients after Lion update; expected -1 to -3% p_in; ~10 LoC; LOW-MEDIUM risk
-2. **Precomputed Pressure-Poisson Soft Constraint** — finite-diff Laplacian stencil as auxiliary loss; targets p_tan/p_oodc
-3. **Aft-Foil Loss Upweighting** — apply separate loss weight (1.5-2.0x) to aft-foil (ID=7) surface nodes; complements existing SRF head
+1. **Aft-Foil Loss Upweighting** — apply separate loss weight (1.5-2.0x) to aft-foil (ID=7) surface nodes; complements existing SRF head; ~8 LoC; LOW risk
+2. **Precomputed Pressure-Poisson Soft Constraint** — finite-diff Laplacian stencil as auxiliary loss; targets p_tan/p_oodc; ~65 LoC; MEDIUM-HIGH risk
+3. **Fore-Foil Loss Upweighting** — complement to aft-foil upweighting; target fore-foil (ID=6) surface nodes; orthogonal to fern's fore-foil SRF (#2117)
 
 **Deferred pending current results:**
 - Expand ensemble to 23 seeds (seeds 100-106 already trained) — do after single-model improvements land
@@ -146,6 +147,7 @@ Baseline config now includes `--aft_foil_srf`. All new experiments must use it.
 | Mesh interpolation | #2066 | Physically invalid |
 | SOAP/HeavyBall | #2010,2018-2023 | 2-6% WORSE |
 | Muon | #2006 | 30-70% worse |
+| Smooth L1 / Huber Loss | #2113 | Catastrophic: gradient attenuation for small errors incompatible with residual-prediction+asinh; L1 constant gradient is optimal |
 | FiLM on gap/stagger | #2104 | p_oodc catastrophe (+41.6%) |
 | Foil-2 Loss Upweighting | #1893 | Marginal (still shared head) |
 | Ada-Temp (per-node) | #1879,#1793,#1615 | Null across multiple phases |

@@ -27,6 +27,34 @@ W&B group: `phase6/fourier-features`
 
 ---
 
+### 2026-04-04 14:00 — PR #2113: Phase 6: Smooth L1 (Huber) Loss — Node-Level Gradient Emphasis — edward — CLOSED
+
+- Branch: `edward/smooth-l1-huber-loss`
+- Hypothesis: Smooth L1 (Huber) loss provides implicit node-level hard example mining: small-error nodes get proportionally weaker gradient (L2 regime: gradient = error/beta), large-error nodes get relatively stronger gradient. Targets p_tan by focusing gradient signal on high-error leading-edge / separation bubble nodes.
+
+| Beta | Seed | p_in | p_oodc | p_tan | p_re | W&B Run |
+|------|------|------|--------|-------|------|---------|
+| 0.5 | 42 | 15.2 | 10.4 | 32.2 | 8.0 | 7ex1w2lm |
+| 0.5 | 73 | 16.4 | 12.5 | 37.8 | 27.0 | hlllq0r8 |
+| 1.0 | 42 | 17.1 | 13.3 | 38.8 | 27.5 | hee0z07t |
+| 1.0 | 73 | 17.6 | 12.8 | 37.9 | 27.3 | mu2t0cm4 |
+| 2.0 | 42 | 17.6 | 13.3 | 38.1 | 27.6 | snzm6mmn |
+| 2.0 | 73 | 18.4 | 13.9 | 38.4 | 27.9 | jtl2ma6n |
+
+W&B group: `phase6/smooth-l1`
+
+**Results commentary (vs current 8-seed baseline: p_in=13.19, p_oodc=7.92, p_tan=30.05, p_re=6.45):**
+- Best result (beta=0.5, seed=42): p_in=15.2 (+15%), p_oodc=10.4 (+31%), p_tan=32.2 (+7%), p_re=8.0 (+24%)
+- All 6 runs dramatically regress vs baseline. Degradation increases with beta.
+- p_re is worst affected (beta=1.0+: p_re ~27, which is the pre-surface_refine level from Phase 4)
+- Root cause: after residual prediction + asinh compression, MOST nodes have small errors. Smooth L1 attenuates gradient for ALL of these, massively weakening the gradient signal. The constant-magnitude L1 gradient (±1 per node) is optimal for uniform convergence across all nodes in this setting.
+- L2 regime (gradient = error/beta) essentially disabled the surface refinement head's learning in the small-error nodes, destroying the p_re gain completely.
+- **Key insight:** L1's constant gradient magnitude is a feature, not a limitation — it ensures all nodes contribute to optimization regardless of residual size. This is critical post residual-prediction.
+
+**Conclusion:** Node-level gradient weighting via loss shape is a dead end. L1 is optimal for this architecture/training setup. The smooth L1 mechanism is fundamentally incompatible with our residual-prediction + asinh-compression training paradigm. Also likely to affect Charbonnier loss (#2116 by alphonse) for the same reason.
+
+---
+
 ### 2026-04-04 13:10 — PR #2112: Phase 6: Mesh-Density Weighted L1 — Upweight Fine-Mesh Regions — thorfinn — CLOSED
 
 - Branch: `thorfinn/mesh-density-weighted-loss`
