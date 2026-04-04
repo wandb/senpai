@@ -78,18 +78,14 @@
 
 ## Potential Next Research Directions (not yet assigned)
 
-**From RESEARCH_IDEAS_2026-04-04_ROUND2.md (high priority):**
-1. **DSDF Mixup in Tandem Samples** (Idea 2) — Mixup between two tandem samples in DSDF channel space only; interpolates foil shape encodings; targets p_tan geometric transfer gap
-2. **Pressure-Gradient Consistency Aux Loss** (Idea 5) — L1 loss on pressure gradient differences between adjacent aft-foil surface nodes; TV-style physics regularizer; ~40 LoC
-3. **Tandem-Aware Temperature Annealing** (Idea 6) — Check if tandem_temp_offset is already wired in Physics_Attention; if not, enable it; soft/hard slice assignment per regime
-4. **Foil-2 AoA Rotation Aug** (Idea 7, bold) — Independent AoA perturbation for aft-foil nodes; increases (fore_AoA, aft_AoA) diversity; small perturbation (~0.17 deg)
+**TOP PRIORITY — From RESEARCH_IDEAS_2026-04-04_20:00.md (researcher-agent, latest):**
+1. **Gap/Stagger-Conditioned Spatial Bias** — Extend `raw_xy` in TransolverBlock spatial_bias from 4→6 dims by appending gap+stagger features; makes slice routing tandem-geometry-aware; ~18 LoC; zero effect on single-foil (gap=stagger=0); expected -3 to -7% p_tan; **ASSIGN NEXT IDLE STUDENT**
+2. **Tandem-Slice Specialization** — Reserve K dedicated physics slices for tandem samples via large neg bias on reserved slice logits for single-foil; ~20 LoC; MEDIUM risk
 
-**From CURRENT_RESEARCH_STATE.md priority queue:**
-5. **Precomputed Pressure-Poisson Soft Constraint** — finite-diff Laplacian stencil as auxiliary physics loss; ~65 LoC; MEDIUM-HIGH risk
-6. **Fixed per-boundary asinh scale** — different fixed scales for each boundary type (ID=5/6/7)
-7. **AoA-consistent augmentation fix** — current aoa_perturb perturbs x but not y proportionally
-
-**Researcher-agent background run:** Launched 2026-04-04 ~17:45 to generate additional fresh hypotheses from literature search.
+**From RESEARCH_IDEAS_2026-04-04_ROUND2.md:**
+3. **DSDF Mixup in Tandem Samples** (Idea 2) — Mixup between two tandem samples in DSDF channel space only; targets p_tan geometric transfer gap
+4. **Tandem-Aware Temperature Annealing** (Idea 6) — Check if tandem_temp_offset is already wired in Physics_Attention; if not, enable it
+5. **Foil-2 AoA Rotation Aug** (Idea 7, bold) — Independent AoA perturbation for aft-foil nodes; increases (fore_AoA, aft_AoA) diversity
 
 **Deferred pending current results:**
 - Expand ensemble to 23 seeds (seeds 100-106 already trained) — defer until single-model improvements land
