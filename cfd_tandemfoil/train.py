@@ -945,6 +945,7 @@ class Config:
     # Phase 6: Asinh pressure transform
     asinh_pressure: bool = False             # transform pressure targets with asinh for dynamic range compression
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
+    smooth_l1_beta: float = 0.0              # 0 = standard L1, >0 = smooth L1 with this beta
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
 
@@ -1593,12 +1594,18 @@ for epoch in range(MAX_EPOCHS):
 
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
+        # Smooth L1 for loss gradient (or fall back to L1 when beta=0)
+        if cfg.smooth_l1_beta > 0:
+            loss_err = F.smooth_l1_loss(pred, y_norm, beta=cfg.smooth_l1_beta, reduction='none')
+        else:
+            loss_err = abs_err
         if cfg.tandem_ramp:
             pass  # no hard curriculum; tandem_weight applied via tandem_boost below
         elif epoch < cfg.tandem_curriculum_epochs:
             is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
             sample_mask = (~is_tandem_curr).float()[:, None, None]
             abs_err = abs_err * sample_mask
+            loss_err = loss_err * sample_mask
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
@@ -1631,28 +1638,29 @@ for epoch in range(MAX_EPOCHS):
                 threshold = valid_dists.quantile(0.1)
                 near_wall = vol_mask_train & (vol_dist < threshold)
                 node_weight = (1.0 + near_wall.float()).unsqueeze(-1)  # 2x near-wall, 1x else
-                vol_loss = (abs_err * node_weight * vol_mask_train.float().unsqueeze(-1)).sum() / \
+                vol_loss = (loss_err * node_weight * vol_mask_train.float().unsqueeze(-1)).sum() / \
                            (node_weight.squeeze(-1) * vol_mask_train.float()).sum().clamp(min=1)
             else:
-                vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+                vol_loss = (loss_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         else:
-            vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+            vol_loss = (loss_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
         surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        surf_per_sample_loss = (loss_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
         running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
         # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
         if epoch >= 30:
-            surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
+            surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1] — used for hard-node detection
             surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
             surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
             thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
             thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
             hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
-            surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            surf_per_sample_loss = (loss_err[:, :, 2:3] * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         if cfg.tandem_ramp:
             tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
@@ -1661,12 +1669,12 @@ for epoch in range(MAX_EPOCHS):
                                        torch.ones(B, device=device))
         else:
             tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
-        surf_loss = (surf_per_sample * tandem_boost).mean()
+        surf_loss = (surf_per_sample_loss * tandem_boost).mean()
         if cfg.uncertainty_loss:
             bm = _base_model
-            surf_ux_loss = (abs_err[:, :, 0:1] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
-            surf_uy_loss = (abs_err[:, :, 1:2] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
-            surf_p_loss  = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            surf_ux_loss = (loss_err[:, :, 0:1] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            surf_uy_loss = (loss_err[:, :, 1:2] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            surf_p_loss  = (loss_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
             loss = (vol_loss    * torch.exp(-2 * bm.log_sigma_vol)    / 2 + bm.log_sigma_vol +
                     surf_ux_loss * torch.exp(-2 * bm.log_sigma_surf_ux) / 2 + bm.log_sigma_surf_ux +
                     surf_uy_loss * torch.exp(-2 * bm.log_sigma_surf_uy) / 2 + bm.log_sigma_surf_uy +
@@ -1731,10 +1739,10 @@ for epoch in range(MAX_EPOCHS):
             n_b = is_ood_pcgrad.float().sum().clamp(min=1)
             vol_mask_a = vol_mask_train & is_indist_pcgrad.unsqueeze(1)
             vol_mask_b = vol_mask_train & is_ood_pcgrad.unsqueeze(1)
-            vol_loss_a = (abs_err * vol_mask_a.unsqueeze(-1)).sum() / vol_mask_a.sum().clamp(min=1)
-            vol_loss_b = (abs_err * vol_mask_b.unsqueeze(-1)).sum() / vol_mask_b.sum().clamp(min=1)
-            surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
-            surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
+            vol_loss_a = (loss_err * vol_mask_a.unsqueeze(-1)).sum() / vol_mask_a.sum().clamp(min=1)
+            vol_loss_b = (loss_err * vol_mask_b.unsqueeze(-1)).sum() / vol_mask_b.sum().clamp(min=1)
+            surf_loss_a = (surf_per_sample_loss * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
+            surf_loss_b = (surf_per_sample_loss * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
             loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
             loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
@@ -1784,8 +1792,9 @@ for epoch in range(MAX_EPOCHS):
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
             abs_err2 = (pred2 - y_norm).abs()
-            vol_loss2 = (abs_err2 * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
-            surf_ps2 = (abs_err2[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            loss_err2 = F.smooth_l1_loss(pred2, y_norm, beta=cfg.smooth_l1_beta, reduction='none') if cfg.smooth_l1_beta > 0 else abs_err2
+            vol_loss2 = (loss_err2 * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+            surf_ps2 = (loss_err2[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
             surf_loss2 = (surf_ps2 * tandem_boost).mean()
             re_loss2 = F.mse_loss(re_pred2, log_re_target)
             aoa_loss2 = F.mse_loss(aoa_pred2, aoa_target)
