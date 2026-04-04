@@ -959,6 +959,7 @@ class Config:
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
+    aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1552,6 +1553,19 @@ for epoch in range(MAX_EPOCHS):
                     # Apply: broadcast [B] → [B, 1] → adds to [B, N]
                     x[:, :, 22] = x[:, :, 22] + _gap_noise.unsqueeze(1)
                     x[:, :, 23] = x[:, :, 23] + _stag_noise.unsqueeze(1)
+
+        # Foil-2 DSDF magnitude augmentation (tandem samples only, training only)
+        # x layout: [pos(2), saf(2), dsdf(8), ...]; foil-2 SDF = dsdf[4:8] = x[:, :, 6:10]
+        # Scaling is log-normal (preserves gradient directions, adjusts magnitude only)
+        if model.training and cfg.aug_dsdf2_sigma > 0.0:
+            _is_tandem_aug2 = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero → tandem
+            if _is_tandem_aug2.any():
+                _dsdf2_scale = torch.exp(
+                    torch.randn(x.size(0), device=x.device) * cfg.aug_dsdf2_sigma
+                )
+                # Identity for non-tandem samples
+                _dsdf2_scale = _dsdf2_scale * _is_tandem_aug2.float() + (~_is_tandem_aug2).float()
+                x[:, :, 6:10] = x[:, :, 6:10] * _dsdf2_scale.view(-1, 1, 1)
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
