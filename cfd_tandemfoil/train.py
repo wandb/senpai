@@ -947,6 +947,8 @@ class Config:
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
+    # Phase 6: Progressive surface focus — curriculum schedule for surf_weight
+    surf_weight_ramp_epochs: int = 0         # epochs to ramp surf_weight from 1.0 to dynamic target (0=disabled)
 
 
 cfg = sp.parse(Config)
@@ -1376,7 +1378,13 @@ for epoch in range(MAX_EPOCHS):
     t0 = time.time()
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
-    surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+    dynamic_surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+    # Progressive surface focus: ramp from 1.0 to dynamic target
+    if cfg.surf_weight_ramp_epochs > 0 and epoch < cfg.surf_weight_ramp_epochs:
+        ramp_frac = epoch / max(cfg.surf_weight_ramp_epochs, 1)
+        surf_weight = 1.0 + (dynamic_surf_weight - 1.0) * ramp_frac
+    else:
+        surf_weight = dynamic_surf_weight
 
     # --- Train ---
     model.train()
