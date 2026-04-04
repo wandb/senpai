@@ -947,6 +947,8 @@ class Config:
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
+    # Phase 6: Charbonnier loss
+    charbonnier_eps: float = 0.0             # Charbonnier eps (0=disabled, uses standard L1)
 
 
 cfg = sp.parse(Config)
@@ -1592,7 +1594,10 @@ for epoch in range(MAX_EPOCHS):
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
 
         sq_err = (pred - y_norm) ** 2
-        abs_err = (pred - y_norm).abs()
+        if cfg.charbonnier_eps > 0:
+            abs_err = (sq_err + cfg.charbonnier_eps ** 2).sqrt() - cfg.charbonnier_eps
+        else:
+            abs_err = (pred - y_norm).abs()
         if cfg.tandem_ramp:
             pass  # no hard curriculum; tandem_weight applied via tandem_boost below
         elif epoch < cfg.tandem_curriculum_epochs:
@@ -1783,7 +1788,10 @@ for epoch in range(MAX_EPOCHS):
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
-            abs_err2 = (pred2 - y_norm).abs()
+            if cfg.charbonnier_eps > 0:
+                abs_err2 = ((pred2 - y_norm) ** 2 + cfg.charbonnier_eps ** 2).sqrt() - cfg.charbonnier_eps
+            else:
+                abs_err2 = (pred2 - y_norm).abs()
             vol_loss2 = (abs_err2 * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
             surf_ps2 = (abs_err2[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
             surf_loss2 = (surf_ps2 * tandem_boost).mean()
