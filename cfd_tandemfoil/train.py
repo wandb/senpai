@@ -601,6 +601,7 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        n_iter=0,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -675,6 +676,13 @@ class Transolver(nn.Module):
                 for idx in range(n_layers)
             ]
         )
+        # Weight-tied iterative mode: keep only shared intermediate + last block
+        if n_iter > 0:
+            assert len(self.blocks) >= 2, "n_iter requires at least 2 blocks"
+            shared_block = self.blocks[0]   # shared intermediate (run n_iter times)
+            last_block = self.blocks[-1]    # last block (run once, has output heads)
+            self.blocks = nn.ModuleList([shared_block, last_block])
+        self.n_iter = n_iter if n_iter > 0 else len(self.blocks) - 1
         # Separate pressure pathway (pressure_separate_last_block):
         # Independent MLP + pres_head that processes shared hidden features
         self._pressure_separate = False  # set from Config after construction
@@ -787,8 +795,14 @@ class Transolver(nn.Module):
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
-        for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+        if self.n_iter > 0 and len(self.blocks) == 2:
+            # Weight-tied mode: run shared block (blocks[0]) n_iter times
+            for _ in range(self.n_iter):
+                fx = self.blocks[0](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+        else:
+            # Standard mode: run each distinct intermediate block once
+            for block in self.blocks[:-1]:
+                fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
 
         # Deep hidden representation (post all non-last blocks, pre output head)
         fx_deep = fx  # [B, N, n_hidden]
@@ -947,6 +961,8 @@ class Config:
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
+    # Phase 6: Iterative Weight-Tied Transolver
+    n_iter: int = 0                          # if > 0, use weight-tied iterative intermediate blocks (0 = standard n_layers)
 
 
 cfg = sp.parse(Config)
@@ -1106,6 +1122,7 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    n_iter=cfg.n_iter,
 )
 
 model = Transolver(**model_config).to(device)
