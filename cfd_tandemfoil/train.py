@@ -1004,6 +1004,8 @@ class Config:
     aft_foil_srf_film: bool = False          # FiLM conditioning on gap/stagger for aft-foil head
     aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
     aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
+    # Phase 6: Boundary-ID one-hot feature conditioning
+    boundary_id_onehot: bool = False         # append 3-dim boundary-type one-hot to input (ID=5/6/7)
 
 
 cfg = sp.parse(Config)
@@ -1134,7 +1136,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32 + (3 if cfg.boundary_id_onehot else 0),  # +curv, +dist, [+foil2dist], +32 fourier PE, [+3 bid onehot]
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1549,6 +1551,17 @@ for epoch in range(MAX_EPOCHS):
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
+        # Boundary-ID one-hot: compute from raw features before normalization
+        _bid_onehot = None
+        if cfg.boundary_id_onehot:
+            _b_saf_norm = x[:, :, 2:4].norm(dim=-1)           # [B, N]
+            _b_is_tandem = (x[:, 0, 22].abs() > 0.01)         # [B]
+            _bid_single = is_surface & ~_b_is_tandem.unsqueeze(1)                            # ID=5
+            _bid_fore   = is_surface & (_b_saf_norm <= 0.005) & _b_is_tandem.unsqueeze(1)   # ID=6
+            _bid_aft    = is_surface & (_b_saf_norm  > 0.005) & _b_is_tandem.unsqueeze(1)   # ID=7
+            _bid_onehot = torch.stack([
+                _bid_single.float(), _bid_fore.float(), _bid_aft.float()
+            ], dim=-1)  # [B, N, 3]
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1567,6 +1580,16 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
+        # Append boundary-ID one-hot if enabled (after all other features, before model input)
+        if _bid_onehot is not None:
+            x = torch.cat([x, _bid_onehot], dim=-1)  # input dim +3
+            if batch_idx == 0 and epoch == 0:
+                wandb.log({
+                    "bid/frac_single": _bid_single.float().mean().item(),
+                    "bid/frac_fore":   _bid_fore.float().mean().item(),
+                    "bid/frac_aft":    _bid_aft.float().mean().item(),
+                    "global_step": global_step,
+                })
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -2078,6 +2101,17 @@ for epoch in range(MAX_EPOCHS):
                     _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
                     _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
                     _v_gap_stagger = x[:, 0, 22:24]  # [B, 2]
+                # Boundary-ID one-hot for eval (same logic as training)
+                _v_bid_onehot = None
+                if cfg.boundary_id_onehot:
+                    _vb_saf_norm = x[:, :, 2:4].norm(dim=-1)
+                    _vb_is_tandem = (x[:, 0, 22].abs() > 0.01)
+                    _v_bid_single = is_surface & ~_vb_is_tandem.unsqueeze(1)
+                    _v_bid_fore   = is_surface & (_vb_saf_norm <= 0.005) & _vb_is_tandem.unsqueeze(1)
+                    _v_bid_aft    = is_surface & (_vb_saf_norm  > 0.005) & _vb_is_tandem.unsqueeze(1)
+                    _v_bid_onehot = torch.stack([
+                        _v_bid_single.float(), _v_bid_fore.float(), _v_bid_aft.float()
+                    ], dim=-1)  # [B, N, 3]
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -2096,6 +2130,9 @@ for epoch in range(MAX_EPOCHS):
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
+                # Append boundary-ID one-hot if enabled
+                if _v_bid_onehot is not None:
+                    x = torch.cat([x, _v_bid_onehot], dim=-1)  # input dim +3
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
