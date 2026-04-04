@@ -1788,26 +1788,42 @@ for epoch in range(MAX_EPOCHS):
         else:
             tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
-        # Supervised surface pressure gradient auxiliary loss
+        # Supervised surface pressure gradient auxiliary loss (per-foil)
         grad_aux_loss = torch.tensor(0.0, device=device)
         if cfg.surf_grad_aux:
+            # SAF norm for foil splitting — use raw_dsdf (saved before normalization)
+            _grad_saf_norm = raw_dsdf[:, :, 0:2].norm(dim=-1)  # [B, N]
+            _grad_is_tandem = (is_tandem_batch)  # [B] — already computed above
             for b in range(B):
                 if not is_surface[b].any():
                     continue
                 surf_idx_b = is_surface[b].nonzero(as_tuple=True)[0]  # [M]
                 if surf_idx_b.numel() < 4:
                     continue
-                # Sort surface nodes by x-coordinate for chord-wise ordering
-                x_coords = x[b, surf_idx_b, 0]
-                sort_order = x_coords.argsort()
-                sorted_idx = surf_idx_b[sort_order]
-                # Predicted and true pressure (normalized)
-                pred_p = pred[b, sorted_idx, 2]
-                true_p = y_norm[b, sorted_idx, 2]
-                # First-order finite differences (chord-wise pressure gradient)
-                pred_grad = pred_p[1:] - pred_p[:-1]
-                true_grad = true_p[1:] - true_p[:-1]
-                grad_aux_loss = grad_aux_loss + (pred_grad - true_grad).abs().mean()
+                # Split by foil boundary for tandem samples
+                if _grad_is_tandem[b]:
+                    # Fore-foil: SAF norm <= 0.005, Aft-foil: SAF norm > 0.005
+                    saf_vals = _grad_saf_norm[b, surf_idx_b]
+                    foil_groups = [(surf_idx_b[saf_vals <= 0.005], "fore"),
+                                   (surf_idx_b[saf_vals > 0.005], "aft")]
+                else:
+                    foil_groups = [(surf_idx_b, "single")]
+                foil_grad_loss = 0.0
+                n_foils = 0
+                for foil_surf, _ in foil_groups:
+                    if foil_surf.numel() < 4:
+                        continue
+                    x_coords = x[b, foil_surf, 0]
+                    sort_order = x_coords.argsort()
+                    sorted_idx = foil_surf[sort_order]
+                    pred_p = pred[b, sorted_idx, 2]
+                    true_p = y_norm[b, sorted_idx, 2]
+                    pred_grad = pred_p[1:] - pred_p[:-1]
+                    true_grad = true_p[1:] - true_p[:-1]
+                    foil_grad_loss = foil_grad_loss + (pred_grad - true_grad).abs().mean()
+                    n_foils += 1
+                if n_foils > 0:
+                    grad_aux_loss = grad_aux_loss + foil_grad_loss / n_foils
             grad_aux_loss = grad_aux_loss / B
             if epoch == 0 and batch_idx == 0:
                 print(f"[Grad aux] surf_loss={surf_loss.item():.4f}, "
