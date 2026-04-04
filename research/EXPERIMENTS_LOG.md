@@ -2,6 +2,37 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 10:30 — PR #2109: Phase 6: Contrastive Tandem-Single Regularization — tanjiro — CLOSED (negative, hypothesis falsified)
+- Branch: `tanjiro/contrastive-tandem-regularization`
+- Hypothesis: Tandem and single-foil samples share the same hidden representations in the Transolver. Adding a contrastive loss to push apart mean hidden states (cosine similarity) should force distinct internal representations and improve p_tan.
+- W&B group: `phase6/contrastive-tandem`
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | cos_sim | W&B Run |
+|--------|------|------|--------|-------|------|---------|---------|
+| Baseline | 42 | 13.3 | 7.7 | 30.3 | 6.5 | — | tqlbfz9y |
+| Baseline | 73 | 12.9 | 8.1 | 30.5 | 6.6 | — | dck4ur8w |
+| w=0.01 | 42 | 13.3 | 7.8 | 30.3 | 6.4 | 0.74 | ftrzalka |
+| w=0.01 | 73 | 13.1 | 7.8 | 30.0 | 6.4 | 0.60 | fceuhys3 |
+| w=0.05 | 42 | 12.5 | 7.7 | 30.6 | 6.5 | 0.62 | pfm9qsaj |
+| w=0.05 | 73 | 13.3 | 8.2 | 30.3 | 6.6 | 0.30 | iyi2npzd |
+| w=0.1 | 42 | 12.9 | 7.7 | 31.0 | 6.3 | 0.70 | opnlewzj |
+| w=0.1 | 73 | 12.7 | 7.9 | 30.3 | 6.6 | 0.21 | atize8g5 |
+
+**Analysis:** Contrastive mean p_tan=30.4 vs baseline mean 30.4 — no improvement. Higher weights made p_tan worse (w=0.1 avg: 30.65). Cosine similarity was successfully reduced (0.21-0.74 from ~0.9+) but didn't translate to better predictions. **Hypothesis falsified: representational entanglement between tandem and single-foil is NOT the p_tan bottleneck.** The model already distinguishes regimes internally; forcing stronger separation doesn't help because the difficulty is in the tandem physics itself (wake interactions, gap/stagger sensitivity), not in regime confusion. Centroid-based cosine loss is also a weak formulation (1 scalar gradient per batch). Interesting but inconsistent p_in improvement at w=0.05-s42 (12.5 vs 13.3) suggests mild regularization benefit at low weights.
+
+### 2026-04-04 10:30 — PR #2107: Phase 6: Aft-Foil Coordinate Frame Normalization — frieren — SENT BACK (promising direction, needs non-destructive implementation)
+- Branch: `frieren/aft-foil-local-frame`
+- Hypothesis: Subtracting the aft-foil centroid from its coordinates before embedding gives the model a position-invariant view of the aft foil, decoupling shape from global position (gap/stagger).
+- W&B group: `phase6/aft-foil-local-frame`
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B Run |
+|--------|------|------|--------|-------|------|---------|
+| 8-seed mean | — | 13.03 | 7.83 | 30.29 | 6.45 | — |
+| Local frame | 42 | 13.83 | 8.20 | 30.17 | 6.59 | 00lod6uk |
+| Local frame | 73 | 13.55 | 8.16 | 29.51 | 6.62 | 3llpj5yj |
+
+**Analysis:** p_tan improved as hypothesized — s73 hit 29.51 (-2.6% vs mean), confirming the tandem OOD has a coordinate-frame representation component. However, p_in regressed severely (13.55-13.83 vs 12.2-12.71 refs) because in-place coordinate modification destroys positional information needed for single-foil predictions. **Sent back with instructions to add local-frame coords as ADDITIONAL sideband features (non-destructive), preserving global coords.** This should retain the p_tan benefit while avoiding p_in regression.
+
 ### 2026-04-04 10:00 — PR #2108: Phase 6: Asymmetric Fixed Asinh Scales (Pos/Neg Pressure) — edward — CLOSED (negative)
 - Branch: `edward/asymmetric-asinh-scales`
 - Hypothesis: Separate fixed (non-learnable) asinh scales for positive vs negative pressure should improve over the symmetric s=0.75, since suction peaks (-5 to -10 Cp) need stronger compression than stagnation pressures.
