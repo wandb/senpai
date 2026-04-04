@@ -947,6 +947,9 @@ class Config:
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
+    # Phase 6: Test-time augmentation via AoA perturbation
+    tta_aoa: bool = False                    # enable TTA via AoA perturbation at inference
+    tta_aoa_delta: float = 1.0              # AoA perturbation magnitude in degrees
 
 
 cfg = sp.parse(Config)
@@ -1943,6 +1946,10 @@ for epoch in range(MAX_EPOCHS):
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
 
+                # Save raw x for TTA passes
+                if cfg.tta_aoa:
+                    _tta_x_raw = x.clone()
+
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
@@ -2106,6 +2113,95 @@ for epoch in range(MAX_EPOCHS):
                         pred_orig = _pd
                     else:
                         pred_orig = _phys_denorm(pred_phys, Umag, q)
+                # --- TTA: average pred_orig from AoA perturbations ---
+                if cfg.tta_aoa:
+                    _tta_preds = [pred_orig]
+                    for _tta_sign in [-1.0, 1.0]:
+                        _tta_deg = _tta_sign * cfg.tta_aoa_delta
+                        _tta_rad = _tta_deg * (torch.pi / 180.0)
+                        _tta_cos = torch.cos(torch.tensor(_tta_rad, device=device))
+                        _tta_sin = torch.sin(torch.tensor(_tta_rad, device=device))
+                        # Rotate raw x
+                        _xt = _tta_x_raw.clone()
+                        _xc, _yc = _xt[:, :, 0:1].clone(), _xt[:, :, 1:2].clone()
+                        _xt[:, :, 0:1] = _tta_cos * _xc - _tta_sin * _yc
+                        _xt[:, :, 1:2] = _tta_sin * _xc + _tta_cos * _yc
+                        if cfg.aug_full_dsdf_rot:
+                            for _di, _dj in [(2,3),(4,5),(6,7),(8,9)]:
+                                _dx = _xt[:, :, _di:_di+1].clone()
+                                _dy = _xt[:, :, _dj:_dj+1].clone()
+                                _xt[:, :, _di:_di+1] = _tta_cos * _dx - _tta_sin * _dy
+                                _xt[:, :, _dj:_dj+1] = _tta_sin * _dx + _tta_cos * _dy
+                        # Preprocess rotated x
+                        _t_dsdf = _xt[:, :, 2:10]
+                        _t_dist = torch.log1p(_t_dsdf.abs().min(dim=-1, keepdim=True).values * 10.0)
+                        _xt = (_xt - stats["x_mean"]) / stats["x_std"]
+                        _t_curv = _xt[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                        if cfg.foil2_dist:
+                            _t_f2 = torch.log1p(_t_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                            _xt = torch.cat([_xt, _t_curv, _t_dist, _t_f2], dim=-1)
+                        else:
+                            _xt = torch.cat([_xt, _t_curv, _t_dist], dim=-1)
+                        _t_xy = _xt[:, :, :2]
+                        _t_mn = _t_xy.amin(dim=1, keepdim=True)
+                        _t_mx = _t_xy.amax(dim=1, keepdim=True)
+                        _t_xyn = (_t_xy - _t_mn) / (_t_mx - _t_mn + 1e-8)
+                        _t_fr = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                        _t_sc = _t_xyn.unsqueeze(-1) * _t_fr
+                        _t_fpe = torch.cat([_t_sc.sin().flatten(-2), _t_sc.cos().flatten(-2)], dim=-1)
+                        _xt = torch.cat([_xt, _t_fpe], dim=-1)
+                        # Model forward
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            _t_out = eval_model({"x": _xt})
+                            _t_pred = _t_out["preds"].float()
+                            _t_hid = _t_out["hidden"].float()
+                        if cfg.multiply_std:
+                            _t_pl = _t_pred * sample_stds
+                        else:
+                            _t_pl = _t_pred / sample_stds
+                        # Refinement head
+                        if eval_refine_head is not None:
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                if cfg.surface_refine_context:
+                                    _t_rc = eval_refine_head(_t_hid, _t_pl, is_surface, mask, _xt[:, :, :2]).float()
+                                    _t_pl = _t_pl + _t_rc
+                                else:
+                                    _t_si = is_surface.nonzero(as_tuple=False)
+                                    if _t_si.numel() > 0:
+                                        _t_sh = _t_hid[_t_si[:, 0], _t_si[:, 1]]
+                                        _t_sp = _t_pl[_t_si[:, 0], _t_si[:, 1]]
+                                        _t_corr = eval_refine_head(_t_sh, _t_sp).float()
+                                        _t_pl = _t_pl.clone()
+                                        _t_pl[_t_si[:, 0], _t_si[:, 1]] += _t_corr
+                            if cfg.multiply_std:
+                                _t_pred = _t_pl / sample_stds
+                            else:
+                                _t_pred = _t_pl * sample_stds
+                        # Add freestream back
+                        if cfg.residual_prediction and _v_freestream is not None:
+                            _t_pred = _t_pred + _v_freestream
+                        # Denormalize to physical space
+                        if cfg.raw_targets:
+                            _t_orig = _t_pred * raw_stats["y_std"] + raw_stats["y_mean"]
+                        elif cfg.adaptive_norm:
+                            _t_orig = _t_pred * raw_stats["y_std"] + raw_stats["y_mean"]
+                            if cfg.asinh_pressure:
+                                _t_orig = _t_orig.clone()
+                                _t_orig[:, :, 2:3] = torch.sinh(_t_orig[:, :, 2:3]) / cfg.asinh_scale
+                        else:
+                            _t_ph = _t_pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                            if cfg.asinh_pressure:
+                                _t_ph = _t_ph.clone()
+                                _t_ph[:, :, 2:3] = torch.sinh(_t_ph[:, :, 2:3]) / cfg.asinh_scale
+                            _t_orig = _phys_denorm(_t_ph, Umag, q)
+                        # Inverse rotate velocity back to original frame
+                        _ux = _t_orig[:, :, 0:1].clone()
+                        _uy = _t_orig[:, :, 1:2].clone()
+                        _t_orig[:, :, 0:1] = _tta_cos * _ux + _tta_sin * _uy
+                        _t_orig[:, :, 1:2] = -_tta_sin * _ux + _tta_cos * _uy
+                        _tta_preds.append(_t_orig)
+                    pred_orig = torch.stack(_tta_preds).mean(0)
+
                 y_clamped = y.clamp(-1e6, 1e6)
                 err = (pred_orig - y_clamped).abs()
                 finite = err.isfinite()
