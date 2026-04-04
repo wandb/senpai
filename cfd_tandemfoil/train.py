@@ -947,6 +947,9 @@ class Config:
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
+    # Phase 6: Deep supervision — auxiliary loss on intermediate hidden features
+    deep_supervision: bool = False           # enable auxiliary head on pre-final-block hidden features
+    aux_loss_weight: float = 0.1             # weight for auxiliary surface loss
 
 
 cfg = sp.parse(Config)
@@ -1139,6 +1142,18 @@ if cfg.surface_refine:
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
           f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
 
+# Deep supervision auxiliary head (training-only, not in EMA/eval)
+aux_head = None
+if cfg.deep_supervision:
+    aux_head = nn.Sequential(
+        nn.Linear(cfg.n_hidden, cfg.n_hidden // 2),
+        nn.GELU(),
+        nn.Linear(cfg.n_hidden // 2, 3),  # predict [Ux, Uy, p]
+    ).to(device)
+    aux_head = torch.compile(aux_head, mode=cfg.compile_mode)
+    _aux_n_params = sum(p.numel() for p in aux_head.parameters())
+    print(f"Deep supervision aux head: {_aux_n_params:,} params (weight={cfg.aux_loss_weight})")
+
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
@@ -1159,6 +1174,8 @@ snapshot_epoch_list = [int(e) for e in cfg.snapshot_epochs_str.split(",")] if cf
 n_params = sum(p.numel() for p in model.parameters())
 if refine_head is not None:
     n_params += sum(p.numel() for p in refine_head.parameters())
+if aux_head is not None:
+    n_params += sum(p.numel() for p in aux_head.parameters())
 
 
 class SAM:
@@ -1290,6 +1307,12 @@ if refine_head is not None:
     base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
 
+# Add deep supervision aux head params to optimizer if enabled
+if aux_head is not None:
+    _aux_params = list(aux_head.parameters())
+    base_opt.add_param_group({'params': _aux_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _aux_params):,} aux head params to optimizer")
+
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
     _warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
@@ -1382,8 +1405,11 @@ for epoch in range(MAX_EPOCHS):
     model.train()
     if refine_head is not None:
         refine_head.train()
+    if aux_head is not None:
+        aux_head.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
+    epoch_aux = 0.0
     n_batches = 0
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
@@ -1703,6 +1729,18 @@ for epoch in range(MAX_EPOCHS):
             _coarse_loss = coarse_loss
             loss = loss + 1.0 * coarse_loss
 
+        # Deep supervision: auxiliary loss on intermediate hidden features
+        _aux_loss_val = 0.0
+        if cfg.deep_supervision and aux_head is not None and model.training:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                aux_pred = aux_head(hidden)  # [B, N, 3]
+            aux_pred = aux_pred.float()
+            # Surface-only auxiliary loss (L1)
+            aux_err = (aux_pred - y_norm).abs()
+            aux_loss = (aux_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            loss = loss + cfg.aux_loss_weight * aux_loss
+            _aux_loss_val = aux_loss.item()
+
         log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
         re_loss = F.mse_loss(re_pred, log_re_target)
         loss = loss + 0.01 * re_loss
@@ -1823,6 +1861,7 @@ for epoch in range(MAX_EPOCHS):
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
+        epoch_aux += _aux_loss_val
         n_batches += 1
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
@@ -1874,6 +1913,7 @@ for epoch in range(MAX_EPOCHS):
                     _blk.attn.slice_mask[active:].fill_(-1e9)
     epoch_vol /= n_batches
     epoch_surf /= n_batches
+    epoch_aux /= n_batches
     prev_vol_loss = epoch_vol
     prev_surf_loss = epoch_surf
     # Snapshot ensemble: save running average at specified epochs
@@ -1893,13 +1933,16 @@ for epoch in range(MAX_EPOCHS):
     _do_val = (epoch + 1) % cfg.val_every == 0 or epoch == 0 or epoch == MAX_EPOCHS - 1
     if not _do_val:
         dt = time.time() - t0
-        wandb.log({
+        _log = {
             "train/vol_loss": epoch_vol,
             "train/surf_loss": epoch_surf,
             "epoch_time_s": dt,
             "lr": scheduler.get_last_lr()[0],
             "global_step": global_step,
-        })
+        }
+        if cfg.deep_supervision:
+            _log["train/aux_loss"] = epoch_aux
+        wandb.log(_log)
         print(f"Epoch {epoch+1:3d} ({dt:.0f}s)  train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  [val skipped]")
         continue
 
@@ -2198,6 +2241,8 @@ for epoch in range(MAX_EPOCHS):
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
+    if cfg.deep_supervision:
+        metrics["train/aux_loss"] = epoch_aux
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
