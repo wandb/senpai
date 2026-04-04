@@ -2,6 +2,42 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 06:20 — PR #2100: Phase 6: Model Scale-Up — frieren — CLOSED (negative, key insight)
+- Branch: `frieren/model-scale-up`
+- Hypothesis: 3L/96s Transolver uses only 38/96GB VRAM. Deeper (5L) or wider (160s) models may improve metrics, especially p_tan which could be capacity-limited.
+- W&B group: `phase6/model-scale-up`
+
+| Config | p_in | p_oodc | p_tan | p_re | Epochs | VRAM | W&B Run |
+|--------|------|--------|-------|------|--------|------|---------|
+| 3L/96s s42 (BL) | 13.0 | 7.6 | 31.1 | 6.4 | 157 | 38GB | u00xzh8z |
+| 3L/96s s73 (BL) | 12.9 | 7.9 | 30.3 | 6.4 | 157 | 38GB | 3y9kazhf |
+| 5L/96s s42 | 19.0 | 10.4 | 31.5 | 8.6 | 105 | 55GB | z8xu1h7q |
+| 5L/96s s73 | 16.3 | 10.0 | 30.4 | 8.2 | 106 | 55GB | u1zdhi63 |
+| 3L/160s s42 | 13.7 | 7.9 | 30.8 | 6.5 | 141 | 41GB | mkxyc0mf |
+| 3L/160s s73 | 13.0 | 8.3 | 30.2 | 6.5 | 142 | 41GB | fzabfqmz |
+| 4L/128s s42 | 15.9 | 9.4 | 32.0 | 7.5 | 119 | 48GB | i4o4g2qm |
+| 4L/128s s73 | 15.6 | 9.7 | 31.5 | 7.8 | 118 | 48GB | 910al9e9 |
+
+**Analysis:** No configuration beats baseline. 5L/96s is catastrophically worse (+36% p_in) though undertrained (105/157 epochs). 3L/160s (wider) is closest but still +3% p_in after 142 epochs. **Critical finding: p_tan is remarkably similar across ALL configs (~30-32).** This proves the tandem transfer problem is NOT capacity-limited — it's a representation/distribution problem. Model scale-up is not the answer. The 3L/96s architecture is the right size for this task at the current training budget.
+
+### 2026-04-04 06:20 — PR #2094: Phase 6: SWAD — edward — CLOSED (catastrophic failure)
+- Branch: `edward/swad-averaging`
+- Hypothesis: SWAD (Cha et al., NeurIPS 2021) averages checkpoints densely from a flat loss region. Already implemented in train.py but untested. Bug fix applied: SWAD now also averages the refine_head.
+- W&B group: `phase6/swad-averaging`
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B Run |
+|--------|------|------|--------|-------|------|---------|
+| Baseline | 42 | 13.2 | 8.0 | 29.7 | 6.4 | 3mim1mhi |
+| Baseline | 43 | 12.8 | 8.2 | 30.3 | 6.4 | gk16mcse |
+| SWAD | 42 | 49.4 | 37.2 | 57.2 | 26.9 | 1ee50z25 |
+| SWAD | 43 | 54.2 | 41.2 | 64.9 | 29.4 | hbm6rfcg |
+| SWAD | 44 | 46.5 | 38.9 | 55.4 | 27.9 | hsvhokae |
+| SWAD | 45 | 43.9 | 35.0 | 55.3 | 24.6 | r632qi5f |
+| SWAD | 66 | 45.8 | 36.3 | 58.3 | 26.3 | 86sd67n7 |
+| SWAD | 67 | 47.9 | 39.6 | 58.9 | 31.5 | tm0513wp |
+
+**Analysis:** Catastrophic failure: SWAD is +268% p_in, +369% p_oodc vs baseline. Root cause: SWAD suppresses EMA updates (line 1805) but requires intermediate val evaluations to trigger checkpoint collection. Our eval-at-end training loop means SWAD never activates → model trains without EMA → raw weights are dramatically worse. **Key insight: EMA is load-bearing. Any technique that disables EMA without equivalent smoothing will fail catastrophically.**
+
 ### 2026-04-04 06:00 — PR #2099: Phase 6: Stochastic Depth (DropPath) — askeladd — CLOSED (dead end)
 - Branch: `askeladd/stochastic-depth-droppath`
 - Hypothesis: DropPath randomly skips entire residual branches during training, creating an implicit ensemble of subnetworks. Forces more geometry-agnostic representations that might improve OOD generalization, especially p_tan.

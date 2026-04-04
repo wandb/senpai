@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-04 ~06:00 UTC
+- **Date:** 2026-04-04 ~06:25 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -15,14 +15,14 @@
 
 16-seed ensemble beats 8-seed baseline: p_in -0.8%, p_oodc -1.5%. Seeds 100-106 also trained (mean p_in=13.0), available for future 23-seed evaluation.
 
-## Student Status (2026-04-04 ~06:00 UTC)
+## Student Status (2026-04-04 ~06:25 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | tanjiro | #2101 | OHEM — Online Hard Example Mining | WIP |
-| edward | #2094 | SWAD Dense Weight Averaging | WIP |
-| askeladd | #2106 | Fourier Feature Position Encoding | WIP — just assigned |
-| frieren | #2100 | Model Scale-Up (3L/96s vs 5L/96s vs 3L/160s vs 4L/128s) | WIP |
+| edward | #2108 | Asymmetric Fixed Asinh Scales (pos/neg pressure) | WIP — just assigned |
+| askeladd | #2106 | Fourier Feature Position Encoding | WIP |
+| frieren | #2107 | Aft-Foil Coordinate Frame Normalization | WIP — just assigned |
 | fern | #2104 | Dedicated Aft-Foil SRF Branch (ID=7) | WIP |
 | nezuko | #2097 | Deep Supervision (aux_w=0.2) — 8-seed validation | WIP (sent back) |
 | alphonse | #2102 | Sin Activation in Surface Refinement Head | WIP |
@@ -30,15 +30,17 @@
 
 **All 8 students active. Zero idle GPUs.**
 
-## Recently Reviewed (2026-04-04 ~06:00 UTC)
+## Recently Reviewed (2026-04-04 ~06:25 UTC)
 
 | PR | Student | Experiment | Decision | Reason |
 |----|---------|-----------|---------|--------|
-| #2099 | askeladd | Stochastic Depth (DropPath) | CLOSED | Dead end: all metrics worse (p_oodc +9-10%), 3-layer Transolver too shallow for stochastic depth to provide path diversity — DropPath works in 12-24 layer ViTs, not 3-block models |
-| #2090 | fern | Knowledge Distillation (Ensemble→Single) | CLOSED | Clean negative: offline regression KD provides no improvement at convergence; ensemble advantage too small for soft targets to capture |
-| #2096 | thorfinn | Learnable Asinh Scale | CLOSED | Scale collapse: s → 0.003, trivial shortcut, 100-175% regression |
-| #2098 | alphonse | Asinh Velocity Transform | CLOSED | Negative: all scales degrade p_tan +1-3 pts; velocity doesn't have pressure's outlier problem |
-| #2097 | nezuko | Deep Supervision (aux loss) | SENT BACK | Promising: aux_w=0.2 shows p_oodc -1.7%, p_re -1.6% vs 8-seed mean; needs 8-seed validation |
+| #2100 | frieren | Model Scale-Up (5L, 3L/160s, 4L/128s) | CLOSED | Negative: no config beats 3L/96s baseline. **Key finding: p_tan is similar (~30-32) across ALL model scales — tandem problem is NOT capacity-limited.** |
+| #2094 | edward | SWAD Dense Weight Averaging | CLOSED | Catastrophic: +268% p_in, +369% p_oodc. SWAD suppresses EMA but never triggers collection (eval-at-end loop). **EMA is load-bearing.** |
+| #2099 | askeladd | Stochastic Depth (DropPath) | CLOSED | Dead end: all metrics worse (p_oodc +9-10%), 3-layer too shallow for DropPath |
+| #2090 | fern | Knowledge Distillation (Ensemble→Single) | CLOSED | Clean negative: offline regression KD provides no improvement at convergence |
+| #2096 | thorfinn | Learnable Asinh Scale | CLOSED | Scale collapse: s → 0.003, trivial shortcut |
+| #2098 | alphonse | Asinh Velocity Transform | CLOSED | Negative: all scales degrade p_tan; velocity doesn't have outlier problem |
+| #2097 | nezuko | Deep Supervision (aux loss) | SENT BACK | Promising: aux_w=0.2 shows p_oodc -1.7%, p_re -1.6%; needs 8-seed validation |
 
 ## Current Research Focus
 
@@ -54,9 +56,10 @@ Active experiments attacking p_tan from multiple angles:
 ### Representation and signal quality:
 6. **Fourier Feature Position Encoding** (askeladd #2106) — Random Fourier Features for spatial coordinates (Tancik et al., NeurIPS 2020), addressing spectral bias and helping model capture high-frequency suction peaks
 7. **Sin Activation in srf_head** (alphonse #2102) — periodic activation for oscillatory pressure distributions
+8. **Aft-Foil Coordinate Frame Normalization** (frieren #2107) — normalize aft foil coords to local centroid frame; equivariance for tandem geometry; directly targets p_tan
 
-### Regularization and optimization:
-8. **SWAD** (edward #2094) — flat-basin checkpoint averaging
+### Target-space representation:
+9. **Asymmetric Fixed Asinh Scales** (edward #2108) — separate non-learnable scales for positive/negative pressure; targets the physical asymmetry between suction peaks and stagnation
 
 ## Key Research Insights
 
@@ -68,11 +71,15 @@ Active experiments attacking p_tan from multiple angles:
 6. **Offline regression KD doesn't work** — (#2090) confirms: the ensemble's single-model gap is too small for soft-target distillation to reliably capture at convergence
 7. **Stochastic depth requires depth** — DropPath (#2099) is ineffective for 3-block architectures; requires 6+ layers for meaningful path diversity
 8. **Per-node adaptive temperature is a known null** — Ada-Temp tried in PRs #1879, #1793, #1615 — all null results; do NOT reassign
+9. **Model capacity is NOT the p_tan bottleneck** — Scale-up (#2100): p_tan ~30-32 across 3L/96s, 5L/96s, 3L/160s, 4L/128s. Tandem problem is representational, not capacity-limited.
+10. **EMA is load-bearing** — SWAD (#2094) catastrophe: disabling EMA → +268% p_in. Any technique that touches EMA must provide equivalent smoothing.
 
 ## Confirmed Dead Ends (all time)
 
 | Direction | PRs | Finding |
 |-----------|-----|---------|
+| Model Scale-Up (5L, 160s, 4L/128s) | #2100 | No config beats 3L/96s; p_tan similar across all scales — NOT capacity-limited |
+| SWAD | #2094 | Catastrophic (+268% p_in); suppresses EMA, never triggers collection with eval-at-end loop |
 | Stochastic Depth (DropPath) | #2099 | All metrics worse; 3-block too shallow for path diversity |
 | Knowledge Distillation | #2090 | No improvement at convergence; ensemble advantage too small for regression KD |
 | SGDR warm restarts | #2095 | All T_0 values worse — restarts disrupt Lion+cosine |
@@ -116,11 +123,11 @@ Active experiments attacking p_tan from multiple angles:
 ## Potential Next Research Directions
 
 **Available (not yet assigned), in priority order:**
-1. **Precomputed Pressure-Poisson Soft Constraint** — baked finite-diff Laplacian stencil as offline sparse matrix; penalize Poisson residual at training time; distinct from failed WLS (no numerical instability); targets p_tan/p_oodc; complex (~65 lines)
-2. **Mesh-Density Weighted L1 Loss** — upweight fine-mesh nodes (leading edge, trailing edge, suction peak) proportional to 1/local_spacing; targets p_in, p_tan; ~15 lines
-3. **Contrastive Tandem-Single Regularization** — push apart hidden representations of tandem vs single-foil configurations; targets tandem OOD generalization; ~25 lines
-4. **Progressive Surface Focus Schedule** — curriculum learning: ramp surf_weight from 1 to N over training; ~8 lines
-5. **Coordinate Frame Normalization per-Foil** — normalize aft foil coordinates in its own local frame; equivariance for tandem; ~20 lines
-6. **Geometry-Conditioned AoA Interpolation** — physics-space interpolation between samples at different AoA (distinct from failed feature-space Mixup); targets p_oodc; moderate complexity
+1. **Contrastive Tandem-Single Regularization** — push apart hidden representations of tandem vs single-foil configs; targets p_tan OOD generalization; ~20 lines
+2. **Progressive Surface Focus Schedule** — curriculum: ramp surf_weight from 1 to target over first N epochs; ~8 lines; targets all tracks
+3. **TTA via AoA Perturbation** — inference-only: average predictions at AoA ± δ; zero training cost; ~25 eval-only lines; targets p_oodc/p_tan
+4. **Precomputed Pressure-Poisson Soft Constraint** — baked finite-diff Laplacian stencil; distinct from failed WLS; targets p_tan/p_oodc; complex (~65 lines)
+5. **Mesh-Density Weighted L1 Loss** — upweight fine-mesh nodes proportional to 1/local_spacing; targets p_in, p_tan; ~15 lines
+6. **Geometry-Conditioned AoA Interpolation** — physics-space interpolation (distinct from failed feature-space Mixup); targets p_oodc; moderate complexity
 
 Human researcher messages: #1860 (think bigger), #1834 (data integrity) — both acknowledged and incorporated.
