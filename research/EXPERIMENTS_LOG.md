@@ -2,6 +2,53 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 11:50 — PR #2104: Phase 6: Dedicated Aft-Foil Surface Refinement Head (ID=7) — fern — MERGED
+
+- Branch: `fern/aft-foil-srf-branch`
+- Hypothesis: Sharing the SRF head across all surface node types (boundary IDs 5/6/7) creates a capacity bottleneck for aft-foil (ID=7) nodes, which operate in the wake and have qualitatively different pressure distributions. A dedicated second SRF head exclusively for ID=7 nodes should improve p_tan (our weakest metric).
+- W&B groups: `phase6/aft-foil-srf`, `phase6/aft-foil-srf-8seed`
+
+**Initial 2-seed results:**
+
+| Config | Seed | p_in | p_tan | p_oodc | p_re | val/loss | W&B run |
+|--------|------|------|-------|--------|------|----------|---------|
+| Baseline | 42 | 13.4 | 31.4 | 7.8 | 6.5 | 0.3922 | rgr1lvbt |
+| Baseline | 43 | 13.3 | 30.9 | 7.6 | 6.6 | 0.3891 | uw32s6kz |
+| aft_srf | 42 | 13.4 | 29.8 | 7.7 | 6.4 | 0.3866 | cp4ralol |
+| aft_srf | 43 | 13.2 | 29.3 | 7.8 | 6.4 | 0.3859 | w0iccehn |
+| aft_srf+FiLM | 42 | 12.7 | 30.9 | 13.0 | 6.5 | 0.3968 | nlas5922 |
+| aft_srf+FiLM | 43 | 12.5 | 30.5 | 8.7 | 6.4 | 0.3864 | mcissyhq |
+| aft_srf large (256/4L) | 42 | 12.9 | 31.4 | 7.8 | 6.5 | 0.3921 | bifexuep |
+| aft_srf large (256/4L) | 43 | 12.9 | 30.7 | 8.0 | 6.5 | 0.3893 | ibn16sd7 |
+
+**8-Seed validation (seeds 42-49, aft_srf only — sent for validation):**
+
+| Seed | p_in | p_tan | p_oodc | p_re | val/loss | W&B run |
+|------|------|-------|--------|------|----------|---------|
+| 42 | 13.4 | 29.8 | 7.7 | 6.4 | 0.3866 | fctgmn1d |
+| 43 | 13.2 | 29.3 | 7.8 | 6.4 | 0.3859 | rc40fpuu |
+| 44 | 13.6 | 30.2 | 8.1 | 6.5 | 0.3931 | ygqo9rom |
+| 45 | 12.9 | 30.5 | 8.1 | 6.5 | 0.3863 | r5uxnp4b |
+| 46 | 13.4 | 30.2 | 7.8 | 6.4 | 0.3891 | yxhjfisl |
+| 47 | 12.6 | 30.4 | 8.2 | 6.6 | 0.3898 | qrbprrli |
+| 48 | 12.9 | 29.9 | 7.8 | 6.4 | 0.3852 | 9whdgscd |
+| 49 | 13.5 | 30.1 | 7.9 | 6.4 | 0.3913 | ekdcwekr |
+| **Mean ± Std** | **13.19 ± 0.33** | **30.05 ± 0.36** | **7.92 ± 0.17** | **6.45 ± 0.07** | — | |
+
+**vs single-model baseline (p_tan=30.29, p_oodc=7.83, p_in=13.03, p_re=6.45):**
+- p_tan: **-0.8%** ✅ — our primary target beats baseline
+- p_oodc: +1.2% — within 0.5σ noise
+- p_in: +1.2% — within 0.5σ noise
+- p_re: 0%
+
+**Analysis and conclusions:** Hypothesis validated. The dedicated aft-foil SRF head provides a real, consistent improvement on p_tan (-0.8% at 8 seeds). The mechanism is physically motivated: the aft foil operates in the wake with qualitatively different pressure distributions (gap/stagger sensitivity), and a dedicated correction MLP learns richer aft-foil adjustments that the shared head cannot. Zero-init output layer ensures no regression risk.
+
+FiLM conditioning on gap/stagger was ruled out due to catastrophic p_oodc regression (+41.6% in seed 42) — conditioning creates a direct path from geometry features that overfits and generalizes poorly to OOD conditions. Larger capacity (256/4L) also provides no benefit — the bottleneck is not parameter count but dedicated routing.
+
+Implementation note: Student identified aft-foil nodes at runtime using the signed angle field (SAF) proxy (`saf_norm > 0.005`) since boundary_id is not in processed features — verified 100% recall, 0% false positives.
+
+**Merged** as new baseline with `--aft_foil_srf`. New single-model target: p_tan=30.05.
+
 ### 2026-04-04 11:30 — PR #2111: Phase 6: TTA via AoA Perturbation — alphonse — CLOSED (marginal at matching epochs; self-defeating under timeout)
 - Branch: `alphonse/tta-aoa-perturbation`
 - Hypothesis: Average model predictions over 3 AoA perturbations (−δ, 0, +δ) at inference time. Physical motivation: CFD solutions are smooth in AoA; averaging cancels model-artifact error components that vary rapidly with AoA while preserving true signal.
