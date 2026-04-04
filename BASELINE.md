@@ -1,6 +1,29 @@
 # Baseline Metrics
 
-## Current Baseline (Phase 6 — 2026-04-03, 8-Seed Ensemble from Seeds 66-73)
+## Current Baseline (Phase 6 — 2026-04-04, 16-Seed Ensemble from Seeds 42-49 + 66-73)
+
+| Metric | 16-Ensemble | vs 8-Ensemble (66-73) | vs Asinh-only |
+|--------|------------|----------------------|---------------|
+| p_in | **12.1** | **-0.8%** | -7.2% |
+| p_oodc | **6.6** | **-1.5%** | **-15.7%** |
+| p_tan | **29.1** | 0% | -3.9% |
+| p_re | **5.8** | 0% | **-10.1%** |
+
+**PR #2093** — 16-seed ensemble: re-trained seeds 42-49 (run IDs: f59v5aul, 0yurebjv, rdezx8es, ds12ug79, yu1x0dy0, y147zvh1, lc5cbt4l, 7cxu38oh) + original seeds 66-73 (run IDs: j9w7d1r7, mc4jvgqj, cbbvhl62, bigqfn3k, bqhg6lq8, 5ukk7wv6, xlnhwuqc, ii1tz4vv). Beats 8-seed baseline on p_in (-0.8%) and p_oodc (-1.5%), consistent with 1/√N variance-reduction scaling. Additionally, seeds 100-106 are trained and available for future 23-seed ensemble expansion (run IDs: 9o85duyc, ec7plfg8, zagg4pfs, 6w86plz1, g00kxdva, jt9hwf40, fom4bzro).
+
+**Reproduce:**
+```bash
+python eval_ensemble.py \
+  --run_ids f59v5aul 0yurebjv rdezx8es ds12ug79 yu1x0dy0 y147zvh1 lc5cbt4l 7cxu38oh \
+            j9w7d1r7 mc4jvgqj cbbvhl62 bigqfn3k bqhg6lq8 5ukk7wv6 xlnhwuqc ii1tz4vv \
+  --asinh_scale 0.75
+```
+
+⚠️ **Note:** Requires 16x inference cost. Each model uses 38GB VRAM. Run serially or on 16 GPUs in parallel.
+
+---
+
+## Prior Baseline (Phase 6 — 2026-04-03, 8-Seed Ensemble from Seeds 66-73)
 
 | Metric | 8-Ensemble (66-73) | vs prior 8-ensemble (42-49) | vs Asinh-only |
 |--------|-------------------|-----------------------------|---------------|
