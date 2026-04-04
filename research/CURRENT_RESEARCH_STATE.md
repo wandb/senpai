@@ -95,12 +95,13 @@ We are now focused on **training procedure improvements** that alter optimizatio
 6. **Asinh transform big win for pressure** — testing on velocity channels now
 7. **Next frontier: training procedure changes** (SWAD, DropPath, deep supervision)
 
-## Potential Next Research Directions
+## Potential Next Research Directions (from researcher-agent 2026-04-04 03:30)
 
-If current batch produces no winners:
-- TTA via AoA perturbation (inference-only, zero training cost)
-- R-Drop / consistency regularization
-- Larger model (more slices, more layers) — haven't tried scale-up
-- Fourier feature augmentation for geometry encoding
-- HyperP (hypernetwork-conditioned weights, from issue #1926)
-- Gradient accumulation for effectively larger batch sizes
+Ranked by priority for next idle students:
+1. **Asymmetric Pressure Loss** — higher penalty for under-predicting suction peaks; ~5 lines; physically motivated for p_tan
+2. **Explicit Gap/Stagger Input Features** — normalized inter-foil geometry as conditioning; directly targets p_tan=29.1 (2.5x worse than p_in)
+3. **OHEM (Online Hard Example Mining)** — per-sample EMA loss tracking, upweight persistently hard samples; ~20 lines
+4. **SWA (two-checkpoint averaging)** — average checkpoint at epoch 140 with final EMA; distinct from SWAD and snapshot ensemble
+5. **Pressure-Conditioned Tandem Attention Bias** — aft-foil attention conditioned on fore-foil hidden state; speculative but targeted
+6. **TTA via AoA perturbation** — inference-only, zero training cost
+7. **Model scale-up** — in-flight with frieren #2100 (first capacity test)
