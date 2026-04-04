@@ -20,6 +20,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     Tandem surface loss is therefore underweighted.
 """
 
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -601,10 +602,23 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        learnable_asinh=False,
+        asymmetric_asinh=False,
+        asinh_scale_init=0.75,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.pressure_first = pressure_first
+        self.learnable_asinh = learnable_asinh
+        self.asymmetric_asinh = asymmetric_asinh
+        if learnable_asinh:
+            # Use inverse softplus so that softplus(param) == asinh_scale_init
+            inv_sp = math.log(math.exp(asinh_scale_init) - 1)
+            if asymmetric_asinh:
+                self.asinh_raw_pos = nn.Parameter(torch.tensor(inv_sp))
+                self.asinh_raw_neg = nn.Parameter(torch.tensor(inv_sp))
+            else:
+                self.asinh_raw = nn.Parameter(torch.tensor(inv_sp))
         self.ref = ref
         self.unified_pos = unified_pos
         self.adaln_output = adaln_output
@@ -739,6 +753,33 @@ class Transolver(nn.Module):
     def _validate_output_dims(self, preds):
         if sum(self.output_dims) != preds.shape[-1]:
             raise ValueError("Sum of output_dims must match preds last dimension")
+
+    def get_asinh_scale(self, p=None):
+        """Get the current asinh scale(s). Returns a scalar or tensor matching p's sign."""
+        if not self.learnable_asinh:
+            return None
+        if self.asymmetric_asinh:
+            s_pos = F.softplus(self.asinh_raw_pos)
+            s_neg = F.softplus(self.asinh_raw_neg)
+            if p is not None:
+                return torch.where(p >= 0, s_pos, s_neg)
+            return s_pos, s_neg
+        return F.softplus(self.asinh_raw)
+
+    def asinh_forward(self, p):
+        """Apply asinh transform: asinh(p * scale)."""
+        scale = self.get_asinh_scale(p)
+        return torch.asinh(p * scale)
+
+    def asinh_inverse(self, p_transformed):
+        """Inverse asinh transform: sinh(p_transformed) / scale."""
+        if self.asymmetric_asinh:
+            # For inverse, we don't know the sign of the original p, but sinh preserves sign
+            # and the scale should match. Use the sign of p_transformed as proxy.
+            scale = self.get_asinh_scale(p_transformed)
+        else:
+            scale = self.get_asinh_scale()
+        return torch.sinh(p_transformed) / scale
 
     def forward(self, data, pos=None, condition=None):
         x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
@@ -945,6 +986,8 @@ class Config:
     # Phase 6: Asinh pressure transform
     asinh_pressure: bool = False             # transform pressure targets with asinh for dynamic range compression
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
+    learnable_asinh: bool = False            # make asinh_scale a learnable nn.Parameter (init from asinh_scale)
+    asymmetric_asinh: bool = False           # separate learnable scales for positive/negative pressure
     # Phase 6: Adaptive per-channel target normalization
     adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
 
@@ -1106,6 +1149,9 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    learnable_asinh=cfg.learnable_asinh,
+    asymmetric_asinh=cfg.asymmetric_asinh,
+    asinh_scale_init=cfg.asinh_scale,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1159,6 +1205,37 @@ snapshot_epoch_list = [int(e) for e in cfg.snapshot_epochs_str.split(",")] if cf
 n_params = sum(p.numel() for p in model.parameters())
 if refine_head is not None:
     n_params += sum(p.numel() for p in refine_head.parameters())
+
+
+# ---------------------------------------------------------------------------
+# Asinh helpers — choose between fixed cfg.asinh_scale and learnable model param
+# ---------------------------------------------------------------------------
+def _asinh_fwd(p_channel, mdl=None):
+    """Apply asinh transform to pressure channel [B, N, 1]."""
+    if cfg.learnable_asinh and mdl is not None:
+        _m = mdl._orig_mod if hasattr(mdl, '_orig_mod') else mdl
+        return _m.asinh_forward(p_channel)
+    return torch.asinh(p_channel * cfg.asinh_scale)
+
+
+def _asinh_inv(p_channel, mdl=None):
+    """Inverse asinh transform on pressure channel [B, N, 1]."""
+    if cfg.learnable_asinh and mdl is not None:
+        _m = mdl._orig_mod if hasattr(mdl, '_orig_mod') else mdl
+        return _m.asinh_inverse(p_channel)
+    return torch.sinh(p_channel) / cfg.asinh_scale
+
+
+def _apply_asinh_to_tensor(t, mdl=None):
+    """Apply asinh to pressure channel (index 2) of a [B, N, 3] tensor, avoiding in-place ops."""
+    p_new = _asinh_fwd(t[:, :, 2:3], mdl)
+    return torch.cat([t[:, :, :2], p_new], dim=-1)
+
+
+def _apply_asinh_inv_to_tensor(t, mdl=None):
+    """Apply inverse asinh to pressure channel (index 2) of a [B, N, 3] tensor, avoiding in-place ops."""
+    p_new = _asinh_inv(t[:, :, 2:3], mdl)
+    return torch.cat([t[:, :, :2], p_new], dim=-1)
 
 
 class SAM:
@@ -1484,7 +1561,7 @@ for epoch in range(MAX_EPOCHS):
         elif cfg.adaptive_norm:
             y_adapt = y.clone()
             if cfg.asinh_pressure:
-                y_adapt[:, :, 2:3] = torch.asinh(y_adapt[:, :, 2:3] * cfg.asinh_scale)
+                y_adapt = _apply_asinh_to_tensor(y_adapt, model)
             y_norm = (y_adapt - raw_stats["y_mean"]) / raw_stats["y_std"]
         else:
             y_phys = _phys_norm(y, Umag, q)
@@ -1492,8 +1569,7 @@ for epoch in range(MAX_EPOCHS):
                 y_phys = y_phys.clone()
                 y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
             if cfg.asinh_pressure:
-                y_phys = y_phys.clone()
-                y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
+                y_phys = _apply_asinh_to_tensor(y_phys, model)
             y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
         # Residual prediction: subtract freestream from normalized targets
         _freestream = None
@@ -1971,7 +2047,7 @@ for epoch in range(MAX_EPOCHS):
                 elif cfg.adaptive_norm:
                     y_adapt = y.clone()
                     if cfg.asinh_pressure:
-                        y_adapt[:, :, 2:3] = torch.asinh(y_adapt[:, :, 2:3] * cfg.asinh_scale)
+                        y_adapt[:, :, 2:3] = _asinh_fwd(y_adapt[:, :, 2:3], eval_model)
                     y_norm = (y_adapt - raw_stats["y_mean"]) / raw_stats["y_std"]
                 else:
                     y_phys = _phys_norm(y, Umag, q)
@@ -1980,7 +2056,7 @@ for epoch in range(MAX_EPOCHS):
                         y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
                     if cfg.asinh_pressure:
                         y_phys = y_phys.clone()
-                        y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
+                        y_phys[:, :, 2:3] = _asinh_fwd(y_phys[:, :, 2:3], eval_model)
                     y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
                 # Residual prediction: subtract freestream in val loop
@@ -2088,7 +2164,7 @@ for epoch in range(MAX_EPOCHS):
                     pred_adapt = pred * raw_stats["y_std"] + raw_stats["y_mean"]
                     if cfg.asinh_pressure:
                         pred_adapt = pred_adapt.clone()
-                        pred_adapt[:, :, 2:3] = torch.sinh(pred_adapt[:, :, 2:3]) / cfg.asinh_scale
+                        pred_adapt[:, :, 2:3] = _asinh_inv(pred_adapt[:, :, 2:3], eval_model)
                     pred_orig = pred_adapt
                 else:
                     pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
@@ -2097,7 +2173,7 @@ for epoch in range(MAX_EPOCHS):
                         pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
                     if cfg.asinh_pressure:
                         pred_phys = pred_phys.clone()
-                        pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
+                        pred_phys[:, :, 2:3] = _asinh_inv(pred_phys[:, :, 2:3], eval_model)
                     if cfg.tight_denorm_clamps:
                         _pd = pred_phys.clone()
                         _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
@@ -2201,6 +2277,13 @@ for epoch in range(MAX_EPOCHS):
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
+    if cfg.learnable_asinh:
+        _bm = _base_model
+        if cfg.asymmetric_asinh:
+            metrics["asinh_scale_pos"] = F.softplus(_bm.asinh_raw_pos).item()
+            metrics["asinh_scale_neg"] = F.softplus(_bm.asinh_raw_neg).item()
+        else:
+            metrics["asinh_scale"] = F.softplus(_bm.asinh_raw).item()
     wandb.log(metrics)
 
     if torch.cuda.is_available():
@@ -2311,7 +2394,7 @@ if best_metrics:
                         pred_adapt = pred * raw_stats["y_std"] + raw_stats["y_mean"]
                         if cfg.asinh_pressure:
                             pred_adapt = pred_adapt.clone()
-                            pred_adapt[:, :, 2:3] = torch.sinh(pred_adapt[:, :, 2:3]) / cfg.asinh_scale
+                            pred_adapt[:, :, 2:3] = _asinh_inv(pred_adapt[:, :, 2:3], vis_model)
                         y_pred = pred_adapt.squeeze(0).cpu()
                     else:
                         pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
@@ -2320,7 +2403,7 @@ if best_metrics:
                             pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
                         if cfg.asinh_pressure:
                             pred_phys = pred_phys.clone()
-                            pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
+                            pred_phys[:, :, 2:3] = _asinh_inv(pred_phys[:, :, 2:3], vis_model)
                         if cfg.tight_denorm_clamps:
                             _pd = pred_phys.clone()
                             _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
@@ -2409,13 +2492,13 @@ if cfg.surface_refine and best_metrics:
                     if cfg.adaptive_norm:
                         y_adapt = y.clone()
                         if cfg.asinh_pressure:
-                            y_adapt[:, :, 2:3] = torch.asinh(y_adapt[:, :, 2:3] * cfg.asinh_scale)
+                            y_adapt[:, :, 2:3] = _asinh_fwd(y_adapt[:, :, 2:3], verify_model)
                         y_norm = (y_adapt - raw_stats["y_mean"]) / raw_stats["y_std"]
                     else:
                         y_phys = _phys_norm(y, Umag, q)
                         if cfg.asinh_pressure:
                             y_phys = y_phys.clone()
-                            y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
+                            y_phys[:, :, 2:3] = _asinh_fwd(y_phys[:, :, 2:3], verify_model)
                         y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
                     # Residual prediction
@@ -2488,7 +2571,7 @@ if cfg.surface_refine and best_metrics:
                     pred_phys_A = pred_refined * _zs["y_std"] + _zs["y_mean"]
                     if cfg.asinh_pressure:
                         pred_phys_A = pred_phys_A.clone()
-                        pred_phys_A[:, :, 2:3] = torch.sinh(pred_phys_A[:, :, 2:3]) / cfg.asinh_scale
+                        pred_phys_A[:, :, 2:3] = _asinh_inv(pred_phys_A[:, :, 2:3], verify_model)
                     # Physics denorm (skip for adaptive_norm — already in raw space)
                     pred_orig_A = pred_phys_A if cfg.adaptive_norm else _phys_denorm(pred_phys_A, Umag, q)
 
@@ -2509,7 +2592,7 @@ if cfg.surface_refine and best_metrics:
                     pred_manual_phys = pred_manual * _zs["y_std"] + _zs["y_mean"]
                     if cfg.asinh_pressure:
                         pred_manual_phys = pred_manual_phys.clone()
-                        pred_manual_phys[:, :, 2:3] = torch.sinh(pred_manual_phys[:, :, 2:3]) / cfg.asinh_scale
+                        pred_manual_phys[:, :, 2:3] = _asinh_inv(pred_manual_phys[:, :, 2:3], verify_model)
                     # Step 6: undo physics norm: Ux*Umag, Uy*Umag, p*q
                     if cfg.adaptive_norm:
                         pred_manual_orig = pred_manual_phys
@@ -2529,7 +2612,7 @@ if cfg.surface_refine and best_metrics:
                     pred_norefine_phys = pred_norefine * _zs["y_std"] + _zs["y_mean"]
                     if cfg.asinh_pressure:
                         pred_norefine_phys = pred_norefine_phys.clone()
-                        pred_norefine_phys[:, :, 2:3] = torch.sinh(pred_norefine_phys[:, :, 2:3]) / cfg.asinh_scale
+                        pred_norefine_phys[:, :, 2:3] = _asinh_inv(pred_norefine_phys[:, :, 2:3], verify_model)
                     pred_norefine_orig = pred_norefine_phys if cfg.adaptive_norm else _phys_denorm(pred_norefine_phys, Umag, q)
 
                     # Compute surface pressure MAE for all paths
