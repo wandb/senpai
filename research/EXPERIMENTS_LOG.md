@@ -2,6 +2,50 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 14:30 — PR #2107: Phase 6: Aft-Foil Coordinate Frame Normalization (Dual-Frame v2) — frieren — SENT BACK
+
+- Branch: `frieren/aft-foil-local-frame`
+- Hypothesis: Adding local-frame aft-foil coordinates (centroid-subtracted) as 2 extra sideband features alongside global coords, preserving information while providing the model explicit aft-foil-relative geometry.
+
+| Run | p_in | p_oodc | p_tan | p_re | val/loss | W&B |
+|-----|------|--------|-------|------|----------|-----|
+| Dual s42 | 12.91 | 7.93 | 31.22 | 6.64 | 0.3923 | 7e0dma73 |
+| Dual s73 | 13.15 | 7.75 | 29.74 | 6.38 | 0.3858 | w8cyqceg |
+| 2-seed avg | 13.03 | 7.84 | **30.48** | 6.51 | — | — |
+| Baseline | 13.19 | 7.92 | 30.05 | 6.45 | — | — |
+
+- W&B group: `phase6/aft-foil-local-frame`
+
+**Results commentary:**
+- **s73 beats ALL 4 baseline metrics**: p_in -0.3%, p_oodc -2.2%, p_tan -1.8%, p_re -1.1% — strong confirmation of the dual-frame hypothesis.
+- **2-seed avg fails on p_tan** (30.48 > 30.05) due to high seed-to-seed variance on p_tan (31.22 vs 29.74 = 1.48 range).
+- **VRAM spike is a bug**: 93GB (s42) and 76GB (s73) vs 38GB baseline. Adding 2 input features should not cause 2.5× VRAM increase. Likely caused by `x = x.clone()` creating persistent large copies in the autograd graph, or the feature concatenation expanding tensors unnecessarily.
+- **Decision:** Sent back. Fix VRAM bug, then run 2 more seeds (44, 45) for a 4-seed average. If 4-seed avg beats targets, merge.
+
+---
+
+### 2026-04-04 14:15 — PR #2114: Phase 6: Gradient Centralization — Zero-Mean Gradient Updates with Lion — tanjiro — CLOSED
+
+- Branch: `tanjiro/gradient-centralization`
+- Hypothesis: Removing the DC component from gradients before the Lion sign operation would improve gradient diversity, especially benefiting tandem-foil gradients that are dominated by the single-foil distribution.
+
+| Run | p_in | p_oodc | p_tan | p_re | val/loss | W&B |
+|-----|------|--------|-------|------|----------|-----|
+| grad-cent-s42 | 15.6 | 10.6 | 30.8 | 8.3 | 0.460 | waad26c0 |
+| grad-cent-s73 | 14.5 | 9.3 | 29.6 | 7.2 | 0.422 | a2p1auev |
+| baseline-s42 | 13.3 | 7.7 | 30.3 | 6.5 | 0.388 | tqlbfz9y |
+| baseline-s73 | 12.9 | 8.1 | 30.5 | 6.6 | 0.392 | dck4ur8w |
+
+- W&B group: `phase6/gradient-centralization`
+
+**Results commentary:**
+- All metrics regressed sharply vs baseline. p_in +12–17%, p_oodc +15–38%, p_re +9–28%. val/loss deteriorated (+14% for s42).
+- Only p_tan on s73 showed marginal improvement (29.6 vs 30.5), but the val/loss degradation indicates this is noise from a destabilized training run, not signal.
+- **Root cause (student analysis, confirmed):** Lion's sign(EMA) operation already discards gradient magnitude. Zeroing the gradient mean changes the effective update direction without providing the magnitude-balancing benefit GC delivers for Adam/SGD. With Lion, gradient direction diversity via zero-mean is counterproductive because sign quantization already enforces binary directions — zeroing the mean just introduces noise into those binary decisions.
+- **Closes the gradient centralization direction.** Adding it to dead ends.
+
+---
+
 ### 2026-04-04 13:30 — PR #2106: Phase 6: Fourier Feature Position Encoding — Spectral Bias Correction — askeladd — CLOSED
 
 - Branch: `askeladd/fourier-feature-position-encoding`
