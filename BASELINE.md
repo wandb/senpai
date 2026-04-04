@@ -1,6 +1,34 @@
 # Baseline Metrics
 
-## Current Single-Model Baseline (Phase 6 — 2026-04-04, +aft_foil_srf +aug_gap_stagger, 8-Seed Combined Validation, Seeds 42-49)
+## Current Single-Model Baseline (Phase 6 — 2026-04-04, +aft_foil_srf +aug_gap_stagger +aug_dsdf2_sigma=0.05, 2-Seed Evidence, PR #2126)
+
+| Metric | 2-seed avg (σ=0.05) | vs prior combined baseline | Δ |
+|--------|---------------------|---------------------------|---|
+| p_in | **13.04** | 13.24 | **-1.5%** |
+| p_oodc | **7.66** | 7.73 | **-0.9%** |
+| **p_tan** | **30.11** | 30.53 | **-1.4%** |
+| p_re | 6.52 | 6.50 | +0.3% (noise) |
+
+**PR #2126** (merged 2026-04-04) — Foil-2 DSDF Magnitude Augmentation (σ=0.05). Log-normal scaling of foil-2 DSDF channels (x[:,6:10], tandem samples only) before standardization forces shape-transfer generalization. W&B runs: hcc2q68t (seed 42, p_tan=29.76), e9cri4mt (seed 73, p_tan=30.46).
+
+⚠️ **2-seed only** — Requires 8-seed validation for statistical confidence. Best single run: p_in=13.11, p_oodc=7.70, **p_tan=29.76**, p_re=6.42 (seed 42). For merge decisions: use p_tan < 30.11, p_oodc < 7.66, p_in < 13.04 as targets.
+
+**Reproduce (current baseline):**
+```bash
+cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baseline-dsdf2-aug" \
+  --asinh_pressure --asinh_scale 0.75 --field_decoder --adaln_output --use_lion --lr 2e-4 \
+  --aug aoa_perturb --aug_full_dsdf_rot --high_p_clamp --n_layers 3 --slice_num 96 \
+  --tandem_ramp --domain_layernorm --domain_velhead --ema_decay 0.999 --weight_decay 5e-5 \
+  --cosine_T_max 160 --disable_pcgrad --pressure_first --pressure_deep \
+  --residual_prediction --surface_refine --surface_refine_hidden 192 --surface_refine_layers 3 \
+  --aft_foil_srf --aug_gap_stagger_sigma 0.02 --aug_dsdf2_sigma 0.05
+```
+
+**For merge decisions:** Compare 2-seed avg against: p_tan < 30.11, p_oodc < 7.66, p_in < 13.04, p_re < 6.52.
+
+---
+
+## Prior Single-Model Baseline (Phase 6 — 2026-04-04, +aft_foil_srf +aug_gap_stagger, 8-Seed Combined Validation, Seeds 42-49)
 
 | Metric | Combined 8-seed mean | vs aft_srf-only (PR #2104) | vs Asinh-only |
 |--------|---------------------|--------------------------|---------------|
