@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 10:45 — PR #2110: Phase 6: Progressive Surface Focus Schedule — nezuko — CLOSED (negative, p_in regresses)
+- Branch: `nezuko/progressive-surface-focus`
+- Hypothesis: Starting with surf_weight=1.0 and ramping to dynamic target over a warm-in period lets the model build a coherent bulk-flow backbone before amplifying surface loss, improving surface MAE.
+- W&B group: `phase6/progressive-surface`
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B Run |
+|--------|------|------|--------|-------|------|---------|
+| Baseline 8-seed mean | — | 13.03 | 7.83 | 30.29 | 6.45 | — |
+| 40ep ramp | 42 | 13.334 | 7.927 | 30.574 | 6.487 | 7n8v8nlh |
+| 40ep ramp | 73 | 12.912 | 7.917 | 29.349 | 6.638 | ui8t0t7g |
+| 80ep ramp | 42 | 13.396 | 7.690 | 29.716 | 6.291 | mqu6c2vd |
+| 80ep ramp | 73 | 12.854 | 8.093 | 29.864 | 6.347 | vkrnehh2 |
+| **40ep mean** | — | **13.123** | **7.922** | **29.962** | **6.563** | — |
+| **80ep mean** | — | **13.125** | **7.892** | **29.790** | **6.319** | — |
+
+**Analysis:** Both ramp variants regress p_in (+0.7%) and p_oodc (+0.8-1.2%) relative to baseline. The 80ep ramp shows mild improvement on p_tan (-1.7%) and p_re (-2.0%), but these gains are within seed variance and come at the cost of the primary metric p_in. The existing dynamic surf_weight scheduling from epoch 0 is already well-tuned — delaying surface focus hurts in-distribution performance without compensating gains. The hypothesis that the model needs a "backbone-first" training phase is not supported: the EMA + cosine schedule already provides sufficient stability for early training. **Closed as dead end.** Student noted tandem transfer benefit from gradual ramp is theoretically interesting but not actionable without solving the p_in regression.
+
 ### 2026-04-04 10:30 — PR #2109: Phase 6: Contrastive Tandem-Single Regularization — tanjiro — CLOSED (negative, hypothesis falsified)
 - Branch: `tanjiro/contrastive-tandem-regularization`
 - Hypothesis: Tandem and single-foil samples share the same hidden representations in the Transolver. Adding a contrastive loss to push apart mean hidden states (cosine similarity) should force distinct internal representations and improve p_tan.

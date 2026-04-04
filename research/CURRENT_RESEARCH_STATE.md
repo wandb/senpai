@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-04 ~10:40 UTC
+- **Date:** 2026-04-04 ~10:50 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -15,27 +15,28 @@
 
 16-seed ensemble beats 8-seed baseline: p_in -0.8%, p_oodc -1.5%. Seeds 100-106 also trained (mean p_in=13.0), available for future 23-seed evaluation.
 
-## Student Status (2026-04-04 ~10:40 UTC)
+## Student Status (2026-04-04 ~10:50 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| tanjiro | #2114 | Gradient Centralization — Zero-Mean Gradient Updates with Lion | WIP — just assigned |
+| tanjiro | #2114 | Gradient Centralization — Zero-Mean Gradient Updates with Lion | WIP |
 | edward | #2113 | Smooth L1 (Huber) Loss — Node-Level Gradient Emphasis | WIP |
 | askeladd | #2106 | Fourier Feature Position Encoding | WIP |
 | frieren | #2107 | Aft-Foil Coordinate Frame Normalization (dual-frame iteration) | WIP — sent back |
 | fern | #2104 | Dedicated Aft-Foil SRF Branch (ID=7) | WIP |
-| nezuko | #2110 | Progressive Surface Focus Schedule (curriculum) | WIP |
+| nezuko | #2115 | Gap/Stagger Perturbation Augmentation — Tandem OOD Robustness | WIP — just assigned |
 | alphonse | #2111 | TTA via AoA Perturbation (inference-only) | WIP |
 | thorfinn | #2112 | Mesh-Density Weighted L1 Loss | WIP |
 
 **All 8 students active. Zero idle GPUs.**
 
-## Recently Reviewed (2026-04-04 ~10:40 UTC)
+## Recently Reviewed (2026-04-04 ~10:50 UTC)
 
 | PR | Student | Experiment | Decision | Reason |
 |----|---------|-----------|---------|--------|
-| #2109 | tanjiro | Contrastive Tandem-Single Regularization | CLOSED | p_tan did NOT improve: mean 30.4 vs baseline 30.4 across 6 runs (3 weights × 2 seeds). Higher weights made p_tan worse. Hypothesis falsified: representational entanglement is NOT the p_tan bottleneck. The model already distinguishes tandem/single internally; forcing stronger separation doesn't help. |
-| #2107 | frieren | Aft-Foil Coordinate Frame Normalization (in-place) | SENT BACK | p_tan improved on s73 (29.51, -2.6% vs mean), but p_in regressed severely (13.55-13.83 vs refs 12.2-12.71). Direction validated but implementation destroys positional info. **Sent back with dual-frame instruction**: add local-frame coords as ADDITIONAL sideband features, not replace global coords. |
+| #2110 | nezuko | Progressive Surface Focus Schedule (curriculum) | CLOSED | p_in regressed +0.7% in both variants (40ep, 80ep). Dynamic surf_weight from epoch 0 is already well-tuned. p_tan improved -1.7% with 80ep but doesn't compensate p_in regression. |
+| #2109 | tanjiro | Contrastive Tandem-Single Regularization | CLOSED | p_tan did NOT improve: mean 30.4 vs baseline 30.4 across 6 runs. Hypothesis falsified: representational entanglement is NOT the p_tan bottleneck. |
+| #2107 | frieren | Aft-Foil Coordinate Frame Normalization (in-place) | SENT BACK | p_tan improved on s73 (29.51, -2.6% vs mean), but p_in regressed severely (13.55-13.83). Direction validated but implementation destroys positional info. **Sent back with dual-frame instruction**: add local-frame coords as ADDITIONAL sideband features. |
 | #2108 | edward | Asymmetric Fixed Asinh Scales | CLOSED | Negative: both configs worse on all metrics. Closes asinh direction entirely. |
 | #2103 | thorfinn | Iterative Weight-Tied Transolver | CLOSED | Monotonic degradation; blocks learn complementary reps, not iterative refinement. |
 | #2102 | alphonse | SIREN Activation in SRF Head | CLOSED | Monotonic degradation with omega; GELU well-calibrated for srf corrections. |
@@ -56,7 +57,7 @@
 **Active experiments attacking p_tan from multiple angles:**
 1. **Dual-Frame Coordinate Features** (frieren #2107) — add local-frame coords as ADDITIONAL features alongside global (non-destructive); directly confirmed p_tan component
 2. **Dedicated Aft-Foil SRF Branch** (fern #2104) — separate refinement MLP for boundary ID=7, FiLM conditioning on gap/stagger
-3. **Progressive Surface Focus Schedule** (nezuko #2110) — curriculum learning: ramp surf_weight 1→target over first N epochs
+3. **Gap/Stagger Perturbation Augmentation** (nezuko #2115) — domain randomization on tandem conditioning features (σ={0.02,0.05,0.10}); most direct attack on p_tan OOD axis
 4. **Mesh-Density Weighted L1** (thorfinn #2112) — upweight fine-mesh nodes (leading edge, suction peaks)
 
 **Representation and signal quality:**
@@ -84,12 +85,12 @@
 13. **Asinh transform direction is exhausted** — Symmetric s=0.75 is optimal
 14. **Contrastive tandem-single rep separation is NOT the bottleneck** — (#2109) hypothesis cleanly falsified; the model already routes tandem/single differently; forcing separation doesn't help
 15. **p_tan has a coordinate-frame component** — (#2107) local-frame normalization improved p_tan -2.6% but cost p_in regression; non-destructive dual-frame approach is the next test
+16. **Progressive surface weight scheduling doesn't help** — (#2110) dynamic surf_weight from epoch 0 is already well-tuned; delaying surface focus reduces total surface gradient → p_in regresses; p_tan mild improvement doesn't compensate
 
 ## Potential Next Research Directions (available, not yet assigned)
 
 **Priority queue (assign next idle students):**
-1. **Gap/Stagger Perturbation Augmentation** — perturb gap/stagger features ±10% Gaussian noise during training; feature-space domain randomization directly on the tandem OOD axes; supported by Cambridge 2025, SIMSHIFT 2025, ML4CFD 2024; expected -5 to -10% p_tan; ~35 LoC; medium risk
-2. **Separate SRF Heads for Fore-Foil (ID=6) vs Single-Foil (ID=5)** — extend the aft-foil SRF concept to the fore-foil; fore-foil sees aerodynamically different flow in tandem vs single; queue after #2104 results; expected -3 to -6% p_tan; ~30 LoC; low risk
+1. **Separate SRF Heads for Fore-Foil (ID=6) vs Single-Foil (ID=5)** — extend the aft-foil SRF concept to the fore-foil; fore-foil sees aerodynamically different flow in tandem vs single; queue after #2104 results; expected -3 to -6% p_tan; ~30 LoC; low risk
 3. **Precomputed Pressure-Poisson Soft Constraint** — baked finite-diff Laplacian stencil; distinct from failed WLS; targets p_tan/p_oodc; ~65 lines
 4. **Charbonnier Loss** — `sqrt(x^2 + eps^2) - eps` — smoother than L1/Huber; natural follow-up if Huber (#2113) shows promise
 5. **Langevin Gradient Noise** — Gaussian noise to gradients after Lion (SGLD-style); distinct from SAM; targets flat basin finding
@@ -102,6 +103,7 @@
 
 | Direction | PRs | Finding |
 |-----------|-----|---------|
+| Progressive surface focus (curriculum ramp) | #2110 | p_in regresses +0.7%; dynamic surf_weight already optimal; p_tan mild improvement insufficient |
 | Contrastive tandem-single regularization | #2109 | Hypothesis falsified: rep entanglement is NOT the bottleneck; p_tan unchanged across 3 weights |
 | Asymmetric Asinh Scales (pos/neg) | #2108 | All metrics worse; symmetric s=0.75 is optimal; **closes entire asinh direction** with #2096, #2098 |
 | Weight-Tied Iterative Transolver | #2103 | Monotonic degradation; blocks learn complementary reps, not iterative |
