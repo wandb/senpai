@@ -2,6 +2,20 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 ~19:20 — PR #2125: Reynolds Number Perturbation Augmentation — thorfinn — CLOSED (dead end)
+
+- Branch: `thorfinn/re-perturb-aug`
+- Hypothesis: Add Gaussian noise σ=0.05 to log_Re feature (index 13) during training to improve OOD-Re robustness by domain randomization. Target: p_re < 6.50.
+
+| Run | W&B ID | Seed | σ | p_in | p_oodc | p_tan | p_re |
+|-----|--------|------|---|------|--------|-------|------|
+| 1 | ecxe1ti3 | 42 | 0.05 | 13.38 | 7.82 | 30.24 | 6.51 |
+| 2 | 29xvq9bz | 43 | 0.05 | 13.08 | 7.72 | 30.79 | 6.49 |
+| **2-seed avg** | | | | **13.23** | **7.77** | **30.52** | **6.50** |
+| **Baseline** | | | | **13.24** | **7.73** | **30.53** | **6.50** |
+
+**Commentary:** Clear null result. All metrics within noise of baseline. Seed 43 showed a significant p_tan regression (+1.5 to 30.8), indicating Re noise interferes with tandem pressure learning. The OOD-Re split (Re=4.445M, log(Re)≈15.3) is not far enough in log-space from training Re values to benefit from domain randomization. p_re showed no improvement at all (+0.01 avg). Adding Re perturbation augmentation to confirmed dead-ends list.
+
 ### 2026-04-04 ~22:00 — PR #2123: Combined Baseline 8-Seed Validation (aft_foil_srf + gap/stagger aug) — alphonse — CLOSED (validation complete)
 
 - Branch: `alphonse/combined-baseline-8seed`
