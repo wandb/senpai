@@ -2,6 +2,64 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-04 ~17:30 — PR #2121: Phase 6: Aft-Foil Loss Upweighting — Stronger Gradient for Wake Nodes — tanjiro — CLOSED
+
+- Branch: `tanjiro/aft-foil-loss-weight`
+- Hypothesis: Upweighting aft-foil (ID=7) surface nodes in the main L1 loss by 1.5–2.0x would force the Transolver trunk to develop richer representations for wake-region nodes, complementing the existing `--aft_foil_srf` post-hoc correction head and reducing p_tan.
+
+| Run | W&B ID | p_in | p_oodc | p_tan | p_re | val_loss |
+|-----|--------|------|--------|-------|------|----------|
+| w=1.5 s42 | ghq78pj6 | 12.95 | 7.75 | 30.57 | 6.50 | 0.3896 |
+| w=1.5 s73 | 4r0rksil | 13.80 | 7.77 | 30.53 | 6.36 | 0.3932 |
+| w=2.0 s42 | svqikz02 | 13.76 | 7.75 | 29.91 | 6.57 | 0.3886 |
+| w=2.0 s73 | rk53nwzs | 12.96 | 7.84 | 31.08 | 6.49 | 0.3921 |
+| **w=1.5 mean** | | **13.37** | **7.76** | **30.55** | **6.43** | |
+| **w=2.0 mean** | | **13.36** | **7.80** | **30.50** | **6.53** | |
+| Baseline | | 13.19 | 7.92 | 30.05 | 6.45 | |
+
+W&B group: `phase6/aft-foil-loss-weight`
+
+**Results commentary:**
+- p_oodc consistently beats baseline across all 4 runs (7.75-7.84 vs 7.92), confirming that aft-foil loss upweighting improves trunk wake-region representations for OOD-C generalization.
+- p_tan (primary target) regresses by +1.5-1.7% at both weights. The w=2.0/s42 p_tan=29.91 is contradicted by s73 at 31.08 — seed variance, not signal.
+- p_in and p_re are mixed across seeds.
+- **Key insight:** Foil-specific loss weighting improves p_oodc but trades off against p_tan. The SRF head may absorb most trunk-level benefit before it reaches tandem predictions.
+- **Adds to knowledge:** Loss reweighting for specific surface regions helps OOD-C but hurts tandem — suggests the trunk's aft-foil representations are already adequate for p_tan, and forcing them further creates imbalance.
+
+---
+
+### 2026-04-04 ~17:30 — PR #2107: Phase 6: Aft-Foil Coordinate Frame Normalization — Equivariant Tandem Repr — frieren — CLOSED
+
+- Branch: `frieren/aft-foil-local-frame`
+- Hypothesis: Subtracting the aft-foil (boundary_id=7) centroid from its node coordinates before the Transolver embedding should decouple shape from global position, improving tandem OOD generalization (p_tan).
+- 3 iterations: v1 coord replace → v2 dual frame → v2 4-seed validation
+
+| Run | W&B ID | p_in | p_oodc | p_tan | p_re | val_loss |
+|-----|--------|------|--------|-------|------|----------|
+| v1-replace s42 | 00lod6uk | 13.83 | 8.20 | 30.17 | 6.59 | 0.3935 |
+| v1-replace s73 | 3llpj5yj | 13.55 | 8.16 | 29.51 | 6.62 | 0.3890 |
+| dual-frame s42 | 7e0dma73 | 12.91 | 7.93 | 31.22 | 6.64 | 0.3923 |
+| dual-frame s73 | w8cyqceg | 13.15 | 7.75 | 29.74 | 6.38 | 0.3858 |
+| v2-4seed s42 | bklq38ec | 13.90 | 7.84 | 30.11 | 6.46 | 0.3903 |
+| v2-4seed s73 | qlkaovuv | 13.34 | 7.98 | 29.97 | 6.46 | 0.3896 |
+| v2-4seed s44 | bw5ny846 | 13.28 | 7.96 | 31.19 | 6.63 | 0.3944 |
+| v2-4seed s45 | 74cxcgue | 13.80 | 7.67 | 29.64 | 6.48 | 0.3867 |
+| **v2 4-seed mean** | | **13.58** | **7.86** | **30.23** | **6.51** | |
+| Baseline | | 13.19 | 7.92 | 30.05 | 6.45 | |
+| **Δ** | | **+3.0%** | **-0.7%** | **+0.6%** | **+0.9%** | |
+
+W&B groups: `phase6/aft-foil-local-frame`, `phase6/aft-foil-local-frame-v2`
+
+**Results commentary:**
+- After 3 iterations and 8 runs, the dual-frame approach produces a genuine p_oodc signal but cannot reliably beat baseline on primary metrics.
+- p_in regression (+3.0%) is the main blocker — the extra features add noise for non-tandem samples.
+- p_tan seed variance is very high (range 1.55, 29.64-31.19), making it impossible to confirm improvement.
+- Best individual seeds beat all metrics, but not simultaneously.
+- **Key insight:** Local coordinate frames for specific foils improve individual-seed OOD but increase variance and regress p_in. Geometric auxiliary features need a sparser, more targeted formulation.
+- **Adds to knowledge:** Coordinate transforms as input features are a noisy delivery mechanism for geometric information. Architecture-level changes (dedicated heads like SRF) are more reliable.
+
+---
+
 ### 2026-04-04 ~16:30 — PR #2118: Phase 6: Boundary-ID One-Hot Feature — Explicit Surface-Type Conditioning — thorfinn — CLOSED
 
 - Branch: `thorfinn/boundary-id-onehot`
