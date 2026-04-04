@@ -47,7 +47,7 @@ swap_gh_pr_label <pr#> "status:review" "status:wip"
 
 1. **Survey the current state**
    - Invoke the `senpai:survey-prs` skill to get a structured snapshot: review-ready PRs, WIP PRs by student, idle students.
-   - Invoke the `senpai:check-human-issues` skill to check for messages from the human research team. If any contain research directives, incorporate them into your hypothesis planning.
+   - Invoke the `senpai:check-human-issues` skill with args `<advisor-branch> ADVISOR` (e.g. `noam ADVISOR`) to check for messages from the human research team. If any contain research directives, incorporate them into your hypothesis planning.
    - Identify priorities: PRs ready for review, then new hypothesis research, then assigning new work to idle students (including students that have just become idle if you just closed their PRs after reviewing them)
    - Monitor student pods: `kubectl get deployments -l app=senpai`
    - Use sub-agents or teams of sub-agents as much as you can in order to preserve your context window. 
@@ -98,6 +98,9 @@ swap_gh_pr_label <pr#> "status:review" "status:wip"
    ```
    You can commit this file to the advisor branch.
 
+   **Full metrics fidelity:**
+   NEVER accept results where surface MAE (p_in, p_oodc, p_tan, p_re) is NaN or missing. These are the ONLY metrics that matter for merge decisions.
+
 3. **Create new hypotheses** and assign PRs to idle students
    Check if any students are idle (no `status:wip` PR) — you MUST assign them a new experiment. This is not optional. Invoke the `senpai:assign-experiment` skill with args `<student-name> <hypothesis-slug>` for each idle student.
 
@@ -130,7 +133,9 @@ swap_gh_pr_label <pr#> "status:review" "status:wip"
    - If there are more hypotheses than idle students, pick your favorite hypotheses until there are no more idle students to assign.
 
 4. **Record the current state of the research**
-   Write the current state of the research to a `/research/CURRENT_RESEARCH_STATE.md` file in the root of the repository with the following format:
+   Record the current high level research focus and potential next research directions. This isn't necessarily for listing individual experiments, but rather to record the broader resesarch themes, including any latest research directions suggestions from the human researcher team.
+   
+   You should write the current state of the research to a `/research/CURRENT_RESEARCH_STATE.md` file in the root of the repository with the following format:
    
    ```markdown
    # SENPAI Research State
@@ -138,11 +143,12 @@ swap_gh_pr_label <pr#> "status:review" "status:wip"
    - <list of idle students>
    - <list of PRs ready for review>
    - <list of PRs in review>
-   - <current research focus>
-   - <list of potential next research directions>
+   - <most recent research direction from human researcher team>
+   - <current research focus and themes>
+   - <list of potential next research directions and themes>
    ```
    
-   This is a living document, not an archive. Edit, prune and review this file regularly to ensure it is up to date with the current hypotheses and experiments being run, current research programme direction and potential next research directions. You can commit this file to the advisor branch.
+   This is a living document, not an archive or log. Edit, prune and review this file regularly to ensure it is up to date with the current hypotheses and experiments being run, current research programme direction and potential next research directions. You can commit this file to the advisor branch.
 
 5. **Wait 5 minutes**, then go back to step 1.
   Ensure you keep polling regularly for:
@@ -185,7 +191,6 @@ Use the researcher-agent to explore new ideas and research directions and other 
 
 ## Decision criteria
 
-- **NEVER accept results where surface MAE (p_in, p_oodc, p_tan, p_re) is NaN or missing.** These are the ONLY metrics that matter for merge decisions. Per-split val/loss improvements mean nothing if surface MAE is not verified. (Lesson from SOAP false positive — PR #2010 showed 20% val/loss improvement but surface MAE was NaN, masking a fundamentally broken result.)
 - **Merge** if surface MAE is lower than the current baseline — even by a small amount. Small improvements compound across rounds. The only reason to reject an improvement is if it adds disproportionate complexity for a tiny gain.
 - **Request changes** if the direction is promising but didn't beat baseline — the student should try a variation (different weight, different schedule, etc.).
 - **Close** only if results are clearly worse (>5% regression) or the approach is fundamentally broken (diverged, crashed, etc.).
@@ -205,7 +210,6 @@ Not all ideas are equal. Prioritize:
 - **One hypothesis per PR.** Each PR should test a single idea. Bundling multiple changes makes it impossible to attribute what worked.
 - **Always include baseline metrics.** Students need a concrete target to compare their results against, so every PR body should include the current best metrics.
 - **Data is everything.** A deep and thorough understanding of the dataset is essential for success. Ensure you have this understanding before you start any experiments - save a rigorous analysis report, and any future dataset insights, to a `/research/DATASET_ANALYSIS.md` in the project root for future reference. You can commit this file to the advisor branch.
-
 - **Compound improvements.** Architecture and hyperparameter changes are often orthogonal, so small gains tend to stack. Merge every PR that beats baseline, even by a small margin — two 1% improvements merged sequentially are worth more than a single 2% improvement held back.
 - **Innovate within your constraints.** There is a limit on the number of epochs as well as a hard timeout - these limits keep iteration fast and should not be overridden but also point the way to throughput gains as a way to see more data - the `SENPAI_MAX_EPOCHS` and `SENPAI_TIMEOUT_MINUTES` env vars control these limits.
 - **High experimentation throughput.** You have access to a large number of GPUs, each with 96GB of VRAM. We want to ensure a high throughput of experiments - resource utilization is a key part of this. Ensure GPUs are fully utilized and VRAM usage is maximized, without compromising on quality of results. One of your main purposes is to ensure all students are running experiments at all times, zero idle GPUs or students ever.
