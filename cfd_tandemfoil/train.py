@@ -1070,6 +1070,9 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Phase 6: Tandem surface mixup — swap aft-foil surface nodes between tandem samples (CutMix for mesh data)
+    tandem_surface_mixup: bool = False       # enable between-sample aft-foil node swapping
+    tandem_surface_mixup_prob: float = 0.3   # probability of applying mixup per eligible pair
 
 
 cfg = sp.parse(Config)
@@ -1666,6 +1669,15 @@ for epoch in range(MAX_EPOCHS):
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
+        # Tandem surface mixup: precompute aft-foil masks (needs raw features before standardization)
+        _tmix_aft_masks = None
+        if cfg.tandem_surface_mixup and model.training:
+            if _aft_foil_mask is not None:
+                _tmix_aft_masks = _aft_foil_mask  # reuse existing aft-foil mask
+            else:
+                _tmix_saf_norm = x[:, :, 2:4].norm(dim=-1)  # [B, N]
+                _tmix_is_tandem = (x[:, 0, 22].abs() > 0.01)
+                _tmix_aft_masks = is_surface & (_tmix_saf_norm > 0.005) & _tmix_is_tandem.unsqueeze(1)
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1733,6 +1745,63 @@ for epoch in range(MAX_EPOCHS):
                 p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
             noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
             y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
+
+        # Tandem surface mixup: swap aft-foil surface nodes between tandem sample pairs
+        if cfg.tandem_surface_mixup and model.training and _tmix_aft_masks is not None:
+            # Find tandem samples that have aft-foil nodes
+            _tmix_tandem_idx = _tmix_aft_masks.any(dim=1).nonzero(as_tuple=True)[0]
+
+            if len(_tmix_tandem_idx) >= 2:
+                _tmix_perm = _tmix_tandem_idx[torch.randperm(len(_tmix_tandem_idx), device=device)]
+                _tmix_n_pairs = len(_tmix_tandem_idx) // 2
+
+                _tmix_swap_count = 0
+                _tmix_skip_count = 0
+                for _si in range(_tmix_n_pairs):
+                    _a = _tmix_tandem_idx[_si * 2]
+                    _b = _tmix_perm[_si * 2]
+                    if _a == _b:
+                        _b = _tmix_perm[_si * 2 + 1] if _si * 2 + 1 < len(_tmix_perm) else _tmix_perm[0]
+                    if _a == _b:
+                        continue
+
+                    # Apply with probability
+                    if torch.rand(1, device=device).item() > cfg.tandem_surface_mixup_prob:
+                        continue
+
+                    # Aft-foil surface masks for both samples
+                    _aft_a = _tmix_aft_masks[_a]  # [N] bool
+                    _aft_b = _tmix_aft_masks[_b]  # [N] bool
+
+                    _na = _aft_a.sum().item()
+                    _nb = _aft_b.sum().item()
+                    if _na == 0 or _nb == 0:
+                        _tmix_skip_count += 1
+                        continue
+
+                    # Subsample to min count when node counts differ (variable mesh topologies)
+                    _n_swap = min(_na, _nb)
+                    _idx_a = _aft_a.nonzero(as_tuple=True)[0]
+                    _idx_b = _aft_b.nonzero(as_tuple=True)[0]
+                    _sel_a = _idx_a[torch.randperm(len(_idx_a), device=device)[:_n_swap]]
+                    _sel_b = _idx_b[torch.randperm(len(_idx_b), device=device)[:_n_swap]]
+
+                    # Swap x features AND y_norm targets for selected aft-foil surface nodes
+                    _xa_aft = x[_a, _sel_a].clone()
+                    _ya_aft = y_norm[_a, _sel_a].clone()
+                    x[_a, _sel_a] = x[_b, _sel_b]
+                    y_norm[_a, _sel_a] = y_norm[_b, _sel_b]
+                    x[_b, _sel_b] = _xa_aft
+                    y_norm[_b, _sel_b] = _ya_aft
+                    _tmix_swap_count += 1
+
+                # Diagnostic logging at epoch 1
+                if epoch == 1 and batch_idx == 0:
+                    _aft_counts = [_tmix_aft_masks[i].sum().item() for i in _tmix_tandem_idx.tolist()[:10]]
+                    print(f"[tandem_surface_mixup] {_tmix_swap_count}/{_tmix_n_pairs} pairs swapped "
+                          f"(prob={cfg.tandem_surface_mixup_prob}), "
+                          f"{_tmix_skip_count} skipped (no aft nodes), "
+                          f"aft-foil node counts (first 10 tandem): {_aft_counts}")
 
         # Per-sample std normalization: skip tandem samples (gap feature index 21)
         raw_gap = x[:, 0, 21]
