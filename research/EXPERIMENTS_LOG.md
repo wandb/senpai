@@ -2,6 +2,30 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~04:45 — PR #2138: Foil-2 Independent AoA Rotation Aug — edward — **CLOSED** (dead end)
+
+- Branch: `edward/foil2-aoa-rot-aug`
+- Hypothesis: Rotate aft-foil nodes independently by small angle δ ~ N(0, σ) for tandem samples. Creates novel (fore_AoA, aft_AoA) combinations.
+
+| σ | p_in | p_oodc | p_tan | p_re |
+|---|------|--------|-------|------|
+| 0.02 avg | 13.0 | 7.85 | **30.85** | 6.50 |
+| 0.05 avg | 13.35 | 7.75 | **30.15** | 6.50 |
+| 0.10 avg | 13.55 | 7.70 | **30.60** | 6.60 |
+| Old baseline | 13.04 | 7.66 | **30.11** | 6.52 |
+| **Current baseline** | **13.20** | **7.91** | **29.48** | **6.50** |
+
+W&B group: `phase6/foil2-aoa-rot-aug`. Runs: gfu688cc, v6h6nas7 (σ=0.02), etpcv1p5, mhnn4yq3 (σ=0.05), g61pmdvs, gwpe7dgh (σ=0.10). Epochs: ~149 (180-min timeout).
+
+**Results commentary:**
+- No sigma beats even the OLD baseline on p_tan. σ=0.05 is closest (30.15 vs 30.11) but within noise.
+- **Fundamental flaw:** Rotating aft-foil geometry without re-simulating the flow field creates target inconsistency. Velocity (Ux, Uy) is rotated but pressure (scalar) depends nonlinearly on geometry. The augmented samples teach inconsistent geometry→pressure mappings.
+- p_oodc improves monotonically with σ (7.85→7.75→7.70) — more aft-foil diversity helps OOD conditions, but at the cost of p_tan.
+- Runs used old baseline flags (missing PCGrad, DSDF2 aug, has no-op aft_foil_srf_context).
+- Edward reassigned to input-noise-aug (#2144).
+
+---
+
 ### 2026-04-05 ~02:45 — PR #2136: Per-Foil Physics Normalization — thorfinn — **CLOSED** (dead end)
 
 - Branch: `thorfinn/per-foil-pnorm`
