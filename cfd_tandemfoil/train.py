@@ -1019,6 +1019,7 @@ class Config:
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
+    aug_anneal: float = 1.0             # final aug strength multiplier (1.0=no annealing, 0.0=full decay to zero)
     gap_stagger_spatial_bias: bool = False  # condition spatial bias MLP on gap/stagger (tandem geometry-aware routing)
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
@@ -1544,6 +1545,15 @@ for epoch in range(MAX_EPOCHS):
 
     t0 = time.time()
 
+    # Augmentation annealing: linear decay from 1.0 to cfg.aug_anneal over training
+    if cfg.aug_anneal < 1.0:
+        _aug_scale = 1.0 - (1.0 - cfg.aug_anneal) * (epoch / cfg.cosine_T_max)
+        _aug_scale = max(_aug_scale, cfg.aug_anneal)
+    else:
+        _aug_scale = 1.0
+    if cfg.aug_anneal < 1.0 and epoch in (0, 50, 100, 140, 155):
+        print(f"[Aug anneal] epoch={epoch}, _aug_scale={_aug_scale:.4f}")
+
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
 
@@ -1632,8 +1642,9 @@ for epoch in range(MAX_EPOCHS):
                 if _is_tandem_aug.any():
                     _B = x.size(0)
                     # Per-sample Gaussian noise, broadcast to all N nodes
-                    _gap_noise  = torch.randn(_B, device=x.device) * cfg.aug_gap_stagger_sigma
-                    _stag_noise = torch.randn(_B, device=x.device) * cfg.aug_gap_stagger_sigma
+                    _gs_sigma = cfg.aug_gap_stagger_sigma * _aug_scale
+                    _gap_noise  = torch.randn(_B, device=x.device) * _gs_sigma
+                    _stag_noise = torch.randn(_B, device=x.device) * _gs_sigma
                     # Zero out noise for non-tandem samples (preserve single-foil sentinel exactly)
                     _gap_noise  = _gap_noise  * _is_tandem_aug.float()
                     _stag_noise = _stag_noise * _is_tandem_aug.float()
@@ -1647,8 +1658,9 @@ for epoch in range(MAX_EPOCHS):
         if model.training and cfg.aug_dsdf2_sigma > 0.0:
             _is_tandem_aug2 = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero → tandem
             if _is_tandem_aug2.any():
+                _dsdf2_sig = cfg.aug_dsdf2_sigma * _aug_scale
                 _dsdf2_scale = torch.exp(
-                    torch.randn(x.size(0), device=x.device) * cfg.aug_dsdf2_sigma
+                    torch.randn(x.size(0), device=x.device) * _dsdf2_sig
                 )
                 # Identity for non-tandem samples
                 _dsdf2_scale = _dsdf2_scale * _is_tandem_aug2.float() + (~_is_tandem_aug2).float()
