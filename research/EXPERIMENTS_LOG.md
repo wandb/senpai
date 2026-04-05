@@ -2,6 +2,31 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~06:20 — PR #2143: DSDF Spatial Dropout — thorfinn — **CLOSED** (dead end)
+
+- Branch: `thorfinn/dsdf-spatial-dropout`
+- Hypothesis: Zero out DSDF shape features for random nodes during training (p={0.05, 0.10, 0.20}) to reduce shape-dependence and improve tandem transfer.
+
+| p | p_in avg | p_oodc avg | p_tan avg | p_re avg |
+|---|---------|-----------|----------|---------|
+| 0.05 | 14.05 (+6.4%) | 8.05 (+1.8%) | **29.45 (-0.1%)** | 6.95 (+6.9%) |
+| 0.10 | 15.55 (+17.8%) | 8.55 (+8.1%) | 29.60 (+0.4%) | 7.30 (+12.3%) |
+| 0.20 | 16.30 (+23.5%) | 9.95 (+25.8%) | 30.90 (+4.8%) | 8.20 (+26.2%) |
+| Old baseline | 13.20 | 7.91 | 29.48 | 6.50 |
+| **Current baseline** | **13.05** | **7.70** | **28.60** | **6.55** |
+
+W&B group: `phase6/dsdf-spatial-dropout`. Runs: mw6tn1ku, wzd9lyua (p=0.05), 3pwfoanz, h9vkjcli (p=0.10), wm1objzw, 4vpd6u0c (p=0.20). Ran against OLD baseline (no GSB). 150-151 epochs.
+
+**Results commentary:**
+- Clear dose-response: all metrics degrade monotonically with higher dropout. DSDF features carry essential information.
+- p=0.05 gives essentially flat p_tan (-0.1%) while p_in regresses 6.4%. Not worth it.
+- Against current baseline (28.60), all configurations clearly worse.
+- Seed 42 at p=0.05 gave p_tan=28.9 (promising single-run) but seed 73 was 30.0 — high variance, not reliable.
+- **Dead end.** DSDF channels too information-dense to drop.
+- Thorfinn reassigned to actual 3-way PCGrad test (#2147).
+
+---
+
 ### 2026-04-05 ~05:30 — PR #2142: Cross-Seed Model Soup — frieren — **CLOSED** (dead end)
 
 - Branch: `frieren/model-soup`

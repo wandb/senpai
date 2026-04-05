@@ -49,7 +49,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | fern | #2145 | Weight Decay Sweep: 5e-5 → {1e-5, 2e-5} on new baseline | WIP |
 | alphonse | #2131 | Tandem-Slice Carve-Out K=4 — corrected instructions sent | WIP — rebasing |
 | nezuko | #2141 | EMA Decay Rate Sweep: 0.9995 rebased onto GSB baseline | WIP — rebasing |
-| thorfinn | #2143 | DSDF Spatial Dropout — Zero-Out Foil Shape Features for Random Nodes | WIP |
+| thorfinn | #2147 | Actual 3-Way PCGrad — enable untested elif branch with --disable_pcgrad | WIP — just assigned |
 | frieren | #2146 | Tail EMA Checkpoint Averaging — average last 4-5 EMA snapshots | WIP — just assigned |
 | edward | #2144 | Input Feature Noise Augmentation — Gaussian on all standardized features | WIP |
 
@@ -128,6 +128,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | Surface Pressure Gradient Aux Loss | #2129 (3 rounds) | p_oodc improves -1.5% but p_tan regresses. 3 iterations with diminishing returns. Signal too weak. |
 | Foil-1 DSDF Magnitude Augmentation | #2133 | All σ values regress p_tan. Front-foil is KNOWN component in val_tandem_transfer |
 | Tandem DSDF Channel Mixup | #2132 | Mixup between NACA0012 samples adds no geometric diversity |
+| DSDF Spatial Dropout | #2143 | All metrics degrade monotonically (p_in +6.4% at p=0.05). DSDF too information-dense to drop |
 | Cross-Seed Model Soup (weight averaging) | #2142 | Catastrophic: MAE 50-400x worse. Loss barriers between independent basins. Only works with shared initialization |
 | Tandem Self-Distillation (EMA teacher) | #2135 | Post-cosine degradation; w=0.05 regressed; GPU speed variance invalidates multi-seed |
 | Reynolds-Conditional SRF FiLM | #2128 | Null — AdaLN already handles Re/AoA; FiLM redundant |
