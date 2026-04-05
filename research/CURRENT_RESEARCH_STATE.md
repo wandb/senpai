@@ -15,7 +15,9 @@
 | **p_tan** | **29.91** | **-0.7%** |
 | p_re | **6.47** | -1.0% |
 
-**Latest merge:** PR #2127 (frieren) — AftSRF KNN Volume Context (K=8). W&B: zosxwjmm (s42, p_tan=29.96), twilqf1x (s73, p_tan=29.87). All 4 metrics beat the prior baseline. Note: run WITHOUT --aug_dsdf2_sigma 0.05.
+**Latest merge:** PR #2127 (frieren) — AftSRF KNN Volume Context (K=8). W&B: zosxwjmm (s42, p_tan=29.96), twilqf1x (s73, p_tan=29.87).
+
+⚠️ **CRITICAL BUG (2026-04-05):** frieren (#2134) discovered that `--aft_foil_srf_context` was a NO-OP due to a guard bug: `if aft_srf_head is not None:` is False when context=True (only `aft_srf_ctx_head` is set). The context head was never applied in PR #2127 or any subsequent run. PR #2127's improvement was likely seed variance. True baseline is PR #2126 (p_tan=30.11). Bug fix is in frieren's #2134 branch; awaiting results to validate and cherry-pick.
 
 ⚠️ **2-seed only.** Target for merge decisions: p_tan < 29.91, p_oodc < 7.62, p_in < 13.02, p_re < 6.47. VRAM: 69-95GB per seed (dedicated H100 required).
 
@@ -49,7 +51,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | nezuko | #2129 | Supervised Surface Pressure Gradient Aux Loss — **v2** (per-foil fix + aft_srf_context rebase) | WIP — sent back for revision |
 | askeladd | #2119 | PCGrad 2-Way — rebased 2-seed validation (p_tan -1.9% in 8-seed) | WIP — sent back for rebase |
 | thorfinn | #2136 | Per-Foil Physics Normalization — Fix Aft-Foil Cp Denominator | WIP — just assigned |
-| frieren | #2134 | Fore-Foil TE Relative Coords — Inter-Foil Jet Frame for AftSRF Context | WIP — just assigned |
+| frieren | #2134 | Fore-Foil TE Relative Coords + **CRITICAL BUG FIX** (aft_srf_ctx head never applied) | WIP — awaiting results |
 | edward | #2135 | Tandem Self-Distillation — EMA Teacher for Tandem Samples | WIP — just assigned |
 
 **All 8 students active. Zero idle GPUs.**
