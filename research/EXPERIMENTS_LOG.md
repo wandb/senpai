@@ -2,6 +2,32 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~11:00 — PR #2148: Gap/Stagger Aug Removal (σ=0) — tanjiro — **CLOSED** (dead end)
+
+- Branch: `tanjiro/gs-aug-removal`
+- Hypothesis: GSB (gap_stagger_spatial_bias) may have made gap/stagger augmentation redundant. Removing σ=0.02 should recover p_tan penalty without p_oodc regression.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| σ=0 (no aug) | 42 | 13.0 | 7.7 | 29.5 | 6.4 | 3h9fj0ym |
+| σ=0 (no aug) | 73 | 14.0 | 7.9 | 30.0 | 6.4 | j40ez5v3 |
+| **σ=0 avg** | — | **13.5** | **7.80** | **29.75** | **6.4** | — |
+| **Baseline (σ=0.02)** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Baseline comparison (σ=0 avg):**
+| Metric | Baseline | σ=0 | Delta |
+|--------|----------|-----|-------|
+| p_in | 13.05 | 13.5 | +3.4% ❌ |
+| p_oodc | 7.70 | 7.80 | +1.3% ❌ |
+| p_tan | **28.60** | **29.75** | **+4.0%** ❌ |
+| p_re | 6.55 | 6.4 | -2.3% ✓ |
+
+**Results:** Hypothesis falsified. Removing gap/stagger aug hurts all primary metrics. GSB and aug are complementary, not redundant: GSB provides geometry-aware routing, aug provides regularization against distribution shift. Only p_re improved slightly.
+- **Key insight:** Gap/stagger sigma parameter space now fully explored: σ={0, 0.01(#2140), 0.02(baseline), 0.03(#2153 in-progress)}. σ=0.02 is confirmed optimal or near-optimal.
+- Tanjiro reassigned — pending new hypothesis.
+
+---
+
 ### 2026-04-05 ~10:00 — PR #2147: Actual 3-Way PCGrad — thorfinn — **CLOSED** (negative)
 
 - Branch: `thorfinn/actual-3way-pcgrad`
