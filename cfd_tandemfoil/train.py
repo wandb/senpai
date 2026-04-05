@@ -1052,6 +1052,7 @@ class Config:
     aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
     aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
     aft_foil_srf_context: bool = False       # KNN volume context for aft-foil SRF (wake pressure recovery)
+    per_foil_pnorm: bool = False             # per-foil Cp normalization: separate q for fore/aft in tandem
 
 
 cfg = sp.parse(Config)
@@ -1107,6 +1108,46 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 0:1] = y_p[:, :, 0:1].clamp(-10, 10) * Umag
     y[:, :, 1:2] = y_p[:, :, 1:2].clamp(-10, 10) * Umag
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
+    return y
+
+
+def _build_perfoil_q(y, mask, aft_foil_mask, is_tandem, q_global):
+    """Build per-node q map: aft-foil nodes get q_aft, everything else gets q_global.
+
+    Returns q_map [B, N, 1] suitable for element-wise pressure division.
+    """
+    B, N = mask.shape
+    q_map = q_global.expand(B, N, 1).clone()  # [B, N, 1] start with global q
+    for b in range(B):
+        if not is_tandem[b]:
+            continue
+        fore_mask_b = mask[b] & ~aft_foil_mask[b]  # fore-foil + volume nodes
+        aft_mask_b = mask[b] & aft_foil_mask[b]     # aft-foil nodes only
+        if not aft_mask_b.any() or not fore_mask_b.any():
+            continue
+        # Compute q_aft from aft-foil region nodes only
+        _, q_aft = _umag_q(y[b:b+1], aft_mask_b.unsqueeze(0))
+        # Clamp: q_aft >= 0.1 * q_global to prevent blow-up
+        q_aft = q_aft.clamp(min=0.1 * q_global[b].item())
+        q_map[b, aft_mask_b, :] = q_aft.squeeze()
+    return q_map
+
+
+def _phys_norm_perfoil(y, Umag, q_map):
+    """Like _phys_norm but with per-node q for pressure."""
+    y_p = y.clone()
+    y_p[:, :, 0:1] = y[:, :, 0:1] / Umag
+    y_p[:, :, 1:2] = y[:, :, 1:2] / Umag
+    y_p[:, :, 2:3] = y[:, :, 2:3] / q_map  # q_map is [B, N, 1]
+    return y_p
+
+
+def _phys_denorm_perfoil(y_p, Umag, q_map):
+    """Reverse per-foil normalization."""
+    y = y_p.clone()
+    y[:, :, 0:1] = y_p[:, :, 0:1].clamp(-10, 10) * Umag
+    y[:, :, 1:2] = y_p[:, :, 1:2].clamp(-10, 10) * Umag
+    y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q_map
     return y
 
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=cfg.num_workers, pin_memory=True,
@@ -1642,7 +1683,8 @@ for epoch in range(MAX_EPOCHS):
         # Aft-foil mask: boundary ID=7 nodes identified by saf norm > 0.005
         # saf is at raw x[:,:,2:4]; foil-1 surface has saf≈0, foil-2 has saf>>0
         _aft_foil_mask = None
-        if aft_srf_head is not None:
+        _is_tandem = None
+        if aft_srf_head is not None or cfg.per_foil_pnorm:
             _raw_saf_norm = x[:, :, 2:4].norm(dim=-1)  # [B, N]
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
@@ -1669,6 +1711,15 @@ for epoch in range(MAX_EPOCHS):
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
         Umag, q = _umag_q(y, mask)
+        # Per-foil q map for tandem samples (aft-foil gets local q)
+        _q_map = None
+        if cfg.per_foil_pnorm and _aft_foil_mask is not None and _is_tandem is not None:
+            _q_map = _build_perfoil_q(y, mask, _aft_foil_mask, _is_tandem, q)
+            if epoch == 0 and global_step == 0:
+                for _b in range(min(4, y.shape[0])):
+                    if _is_tandem[_b] and _aft_foil_mask[_b].any():
+                        _q_aft_b = _q_map[_b, _aft_foil_mask[_b], 0].mean()
+                        print(f"[per_foil_pnorm] b={_b}: q_global={q[_b].item():.4f}, q_aft={_q_aft_b.item():.4f}, ratio={_q_aft_b.item()/q[_b].item():.3f}")
         if cfg.raw_targets:
             y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
         elif cfg.adaptive_norm:
@@ -1677,7 +1728,10 @@ for epoch in range(MAX_EPOCHS):
                 y_adapt[:, :, 2:3] = torch.asinh(y_adapt[:, :, 2:3] * cfg.asinh_scale)
             y_norm = (y_adapt - raw_stats["y_mean"]) / raw_stats["y_std"]
         else:
-            y_phys = _phys_norm(y, Umag, q)
+            if _q_map is not None:
+                y_phys = _phys_norm_perfoil(y, Umag, _q_map)
+            else:
+                y_phys = _phys_norm(y, Umag, q)
             if cfg.log_pressure:
                 y_phys = y_phys.clone()
                 y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
@@ -2205,7 +2259,8 @@ for epoch in range(MAX_EPOCHS):
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
                 # Aft-foil mask for eval (same logic as training)
                 _eval_aft_mask = None
-                if eval_aft_srf_head is not None:
+                _v_is_tandem = None
+                if eval_aft_srf_head is not None or cfg.per_foil_pnorm:
                     _v_saf_norm = x[:, :, 2:4].norm(dim=-1)
                     _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
                     _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
@@ -2229,6 +2284,9 @@ for epoch in range(MAX_EPOCHS):
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
                 Umag, q = _umag_q(y, mask)
+                _v_q_map = None
+                if cfg.per_foil_pnorm and _eval_aft_mask is not None and _v_is_tandem is not None:
+                    _v_q_map = _build_perfoil_q(y, mask, _eval_aft_mask, _v_is_tandem, q)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
                 elif cfg.adaptive_norm:
@@ -2237,7 +2295,10 @@ for epoch in range(MAX_EPOCHS):
                         y_adapt[:, :, 2:3] = torch.asinh(y_adapt[:, :, 2:3] * cfg.asinh_scale)
                     y_norm = (y_adapt - raw_stats["y_mean"]) / raw_stats["y_std"]
                 else:
-                    y_phys = _phys_norm(y, Umag, q)
+                    if _v_q_map is not None:
+                        y_phys = _phys_norm_perfoil(y, Umag, _v_q_map)
+                    else:
+                        y_phys = _phys_norm(y, Umag, q)
                     if cfg.log_pressure:
                         y_phys = y_phys.clone()
                         y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
@@ -2398,14 +2459,18 @@ for epoch in range(MAX_EPOCHS):
                     if cfg.asinh_pressure:
                         pred_phys = pred_phys.clone()
                         pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
+                    _denorm_q = _v_q_map if _v_q_map is not None else q
                     if cfg.tight_denorm_clamps:
                         _pd = pred_phys.clone()
                         _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
                         _pd[:, :, 1:2] = pred_phys[:, :, 1:2].clamp(-5, 5) * Umag
-                        _pd[:, :, 2:3] = pred_phys[:, :, 2:3].clamp(-10, 10) * q
+                        _pd[:, :, 2:3] = pred_phys[:, :, 2:3].clamp(-10, 10) * _denorm_q
                         pred_orig = _pd
                     else:
-                        pred_orig = _phys_denorm(pred_phys, Umag, q)
+                        if _v_q_map is not None:
+                            pred_orig = _phys_denorm_perfoil(pred_phys, Umag, _v_q_map)
+                        else:
+                            pred_orig = _phys_denorm(pred_phys, Umag, q)
                 y_clamped = y.clamp(-1e6, 1e6)
                 err = (pred_orig - y_clamped).abs()
                 finite = err.isfinite()
@@ -2614,6 +2679,12 @@ if best_metrics:
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
+                    _vis_q_map = None
+                    if cfg.per_foil_pnorm:
+                        _vis_saf_norm = x_dev[:, :, 2:4].norm(dim=-1)
+                        _vis_is_tandem = (x_dev[:, 0, 22].abs() > 0.01)
+                        _vis_aft_mask = is_surf_dev & (_vis_saf_norm > 0.005) & _vis_is_tandem.unsqueeze(1)
+                        _vis_q_map = _build_perfoil_q(y_dev, mask, _vis_aft_mask, _vis_is_tandem, q)
                     pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
                     if cfg.raw_targets:
                         y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
@@ -2631,14 +2702,18 @@ if best_metrics:
                         if cfg.asinh_pressure:
                             pred_phys = pred_phys.clone()
                             pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
+                        _vis_denorm_q = _vis_q_map if _vis_q_map is not None else q
                         if cfg.tight_denorm_clamps:
                             _pd = pred_phys.clone()
                             _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
                             _pd[:, :, 1:2] = pred_phys[:, :, 1:2].clamp(-5, 5) * Umag
-                            _pd[:, :, 2:3] = pred_phys[:, :, 2:3].clamp(-10, 10) * q
+                            _pd[:, :, 2:3] = pred_phys[:, :, 2:3].clamp(-10, 10) * _vis_denorm_q
                             y_pred = _pd.squeeze(0).cpu()
                         else:
-                            y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
+                            if _vis_q_map is not None:
+                                y_pred = _phys_denorm_perfoil(pred_phys, Umag, _vis_q_map).squeeze(0).cpu()
+                            else:
+                                y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
                 samples.append((x[:, :2], y_true, y_pred, is_surface))
             images = visualize(samples, out_dir=plot_dir / split_name)
             if images:
@@ -2716,6 +2791,12 @@ if cfg.surface_refine and best_metrics:
 
                     # Ground truth denormalization reference
                     Umag, q = _umag_q(y, mask)
+                    _ver_q_map = None
+                    if cfg.per_foil_pnorm:
+                        _ver_saf_norm = raw_dsdf[:, :, :2].norm(dim=-1)  # saf channels
+                        _ver_is_tandem = (_re_raw.to(device).abs() > 0)  # placeholder; OOD-Re is typically single-foil
+                        # For verification: compute aft mask from raw x (already consumed by standardization)
+                        # OOD-Re split is single-foil so per-foil q degenerates to global q
                     if cfg.adaptive_norm:
                         y_adapt = y.clone()
                         if cfg.asinh_pressure:
