@@ -1005,6 +1005,7 @@ class Config:
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
+    aug_foil2_aoa_sigma: float = 0.0    # independent aft-foil AoA rotation sigma in radians (0=disabled, tandem only)
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1634,6 +1635,41 @@ for epoch in range(MAX_EPOCHS):
                 # Identity for non-tandem samples
                 _dsdf2_scale = _dsdf2_scale * _is_tandem_aug2.float() + (~_is_tandem_aug2).float()
                 x[:, :, 6:10] = x[:, :, 6:10] * _dsdf2_scale.view(-1, 1, 1)
+
+        # Foil-2 independent AoA rotation augmentation (tandem surface nodes only)
+        if model.training and cfg.aug_foil2_aoa_sigma > 0.0:
+            _saf_norm_rot = x[:, :, 2:4].norm(dim=-1)  # [B, N]
+            _is_tandem_rot = (x[:, 0, 22].abs() > 0.01)  # [B]
+            _aft_mask_rot = is_surface & (_saf_norm_rot > 0.005) & _is_tandem_rot.unsqueeze(1)  # [B, N]
+            if _is_tandem_rot.any():
+                _delta_aoa = torch.randn(x.size(0), device=x.device) * cfg.aug_foil2_aoa_sigma
+                _delta_aoa = _delta_aoa * _is_tandem_rot.float()  # zero for non-tandem
+                for b in range(x.size(0)):
+                    if _delta_aoa[b].abs() < 1e-8:
+                        continue
+                    aft_b = _aft_mask_rot[b]  # [N] bool
+                    if not aft_b.any():
+                        continue
+                    theta = _delta_aoa[b]
+                    cos_t, sin_t = torch.cos(theta), torch.sin(theta)
+                    # Rotate positions around aft-foil centroid
+                    aft_x = x[b, aft_b, 0]
+                    aft_y = x[b, aft_b, 1]
+                    cx, cy = aft_x.mean(), aft_y.mean()
+                    dx, dy = aft_x - cx, aft_y - cy
+                    x[b, aft_b, 0] = cos_t * dx - sin_t * dy + cx
+                    x[b, aft_b, 1] = sin_t * dx + cos_t * dy + cy
+                    # Rotate foil-2 DSDF gradient pairs (6,7) and (8,9)
+                    for ch_s in [6, 8]:
+                        gdx = x[b, aft_b, ch_s].clone()
+                        gdy = x[b, aft_b, ch_s + 1].clone()
+                        x[b, aft_b, ch_s] = cos_t * gdx - sin_t * gdy
+                        x[b, aft_b, ch_s + 1] = sin_t * gdx + cos_t * gdy
+                    # Rotate velocity targets (Ux=0, Uy=1); pressure is scalar, no rotation
+                    ux = y[b, aft_b, 0].clone()
+                    uy = y[b, aft_b, 1].clone()
+                    y[b, aft_b, 0] = cos_t * ux - sin_t * uy
+                    y[b, aft_b, 1] = sin_t * ux + cos_t * uy
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
