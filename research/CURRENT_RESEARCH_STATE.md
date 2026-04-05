@@ -47,7 +47,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | fern | #2181 | GEPS Test-Time Low-Rank Adaptation for OOD Tandem | WIP — just assigned |
 | askeladd | #2175 | SWD Tandem Domain Alignment: slice token distribution matching | WIP |
 | nezuko | #2177 | Coordinated Tandem Ramp: sigma decay synced with loss ramp | WIP |
-| tanjiro | #2178 | Smaller SRF Head: hidden 128/96 vs baseline 192 | WIP |
+| tanjiro | #2182 | Ensemble Distillation: soft targets from 16-seed ensemble | WIP — just assigned |
 | alphonse | #2166 | dp/dn=0 Physics Loss: **SENT BACK — most promising, needs 6 more seeds** | WIP — sent back for 6 more runs |
 | thorfinn | #2179 | Panel-Method Inviscid Cp as physics-informed input feature | WIP |
 | frieren | #2176 | Spectral Shaping: depthwise conv filter on GatedMLP activations | WIP |
@@ -95,7 +95,7 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 5. **dp/dn=0 Physics Loss** (alphonse #2166) — surface normal pressure gradient constraint. **MOST PROMISING — sent back for 6 more seeds.**
 6. **Multi-Resolution Hash Grid Encoding** (edward #2180) — 2D hash grid (L=8, 16→2048) appended to DSDF features.
 7. **Spectral Shaping** (frieren #2176) — depthwise conv filter on GatedMLP activations
-8. **Smaller SRF Head** (tanjiro #2178) — hidden 128/96 vs baseline 192
+8. **Ensemble Distillation** (tanjiro #2182) — soft targets from 16-seed ensemble. Tier 2 radical.
 
 **Key research patterns:**
 - **What works:** DSDF magnitude augmentation (foil-2 only), specialized correction heads (aft_srf), gradient surgery (2-way PCGrad), tandem-geometry-aware routing (GSB), geometry-conditioned mechanisms
@@ -111,7 +111,7 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 ### RADICAL — Researcher-Agent Round 4 (2026-04-06) — Plateau-Breaking Ideas
 1. ~~**Panel-Method Inviscid Cp as Input Feature**~~ → assigned to thorfinn #2179
 2. ~~**Test-Time Low-Rank Adaptation (GEPS)**~~ → assigned to fern #2181
-3. **Ensemble Distillation** — soft targets from 23-model ensemble as KD signal. Leverages our 45 trained models.
+3. ~~**Ensemble Distillation**~~ → assigned to tanjiro #2182
 4. ~~**Multi-Resolution Hash Grid Encoding**~~ → assigned to edward #2180
 5. **Frequency-Weighted Surface Pressure Loss** — DCT-domain loss upweighting high-freq components (Tier 3)
 6. **Vorticity-Streamfunction Auxiliary Targets** — predict ω and ψ to force explicit wake structure learning (Tier 3)
@@ -181,6 +181,7 @@ See `/research/RESEARCH_IDEAS_2026-04-06_ROUND4.md` for full details.
 | **BSP Spectral Loss** | **#2172** | **w=0.1 catastrophic collapse, w=0.05 all +3-6%. Spectral bias not the bottleneck.** |
 | **Foil-1 Geometry Adapter** | **#2173** | **p_tan +2.1-2.4%. DSDF 4-moment stats too coarse, discard spatial structure.** |
 | **Attention Temperature Curriculum** | **#2174** | **p_tan +2.7-4.2%. High initial temp disrupts GSB routing, wastes early epochs.** |
+| **Smaller SRF Head (h=128/96)** | **#2178** | **p_tan +3.9-4.5%. h=192 confirmed optimal (full sweep: 96<128<256<384<192).** |
 
 ## Ensemble Seed Pool (Complete)
 

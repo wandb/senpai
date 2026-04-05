@@ -2,6 +2,21 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~07:30 — PR #2178: Smaller SRF Head — tanjiro — **CLOSED** (h=192 confirmed optimal)
+
+- Branch: `tanjiro/smaller-srf`
+- Hypothesis: Smaller SRF head (h=128/96) may improve OOD generalization via implicit regularization.
+
+| Config | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|--------|-------|------|-----|
+| **h=128 avg** | **13.12** | **7.71** | **29.90** | **6.57** | 281pher3, w6apleaz |
+| **h=96 avg** | **13.10** | **7.82** | **29.71** | **6.51** | uoaonrpq, u9a830l5 |
+| **Baseline (h=192)** | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** Both worse. h=128 p_tan +4.5%, h=96 +3.9%. Combined with #2170 (h=256/384 also worse), h=192 is definitively confirmed optimal — classic bias-variance sweet spot. SRF head size fully characterized: 96 < 128 < 256 < 384 < **192 (optimal)**.
+
+---
+
 ### 2026-04-06 ~07:00 — PR #2174: Attention Temperature Curriculum — fern — **CLOSED** (disrupts slice routing)
 
 - Branch: `fern/attn-temp-curriculum`
