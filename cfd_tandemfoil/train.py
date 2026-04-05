@@ -635,6 +635,53 @@ class ForeAftFoilRefinementHead(nn.Module):
         return self.mlp(h)
 
 
+class ForeFoilRefinementHead(nn.Module):
+    """FiLM-conditioned fore-foil surface correction MLP (revised design).
+
+    Conditioning: 4D vector [dsdf1_mean, dsdf1_std, gap, stagger].
+    FiLM modulation is applied AFTER the main MLP layers (pre-output),
+    giving the conditioning signal direct control over the correction amplitude.
+    Zero-initialized output layer for safe initialization.
+    """
+
+    def __init__(self, n_hidden: int, n_out: int = 3, hidden: int = 192,
+                 n_layers: int = 3, film_dim: int = 4, film_hidden: int = 32):
+        super().__init__()
+        self.film_mlp = nn.Sequential(
+            nn.Linear(film_dim, film_hidden), nn.SiLU(),
+            nn.Linear(film_hidden, hidden * 2),  # gamma and beta
+        )
+        # Zero-init FiLM output → no modulation at init
+        nn.init.zeros_(self.film_mlp[-1].weight)
+        nn.init.zeros_(self.film_mlp[-1].bias)
+        # Main MLP takes cat(hidden, pred) as input
+        in_dim = n_hidden + n_out
+        layers: list[nn.Module] = [nn.Linear(in_dim, hidden), nn.GELU()]
+        for _ in range(n_layers - 1):
+            layers += [nn.Linear(hidden, hidden), nn.GELU()]
+        self.main = nn.Sequential(*layers)
+        self.out = nn.Linear(hidden, n_out)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, h: torch.Tensor, pred: torch.Tensor,
+                film_cond: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            h:         [M, n_hidden] — hidden features for fore-foil nodes
+            pred:      [M, n_out]    — base predictions
+            film_cond: [M, 4]        — [dsdf1_mean, dsdf1_std, gap, stagger]
+        Returns:
+            correction: [M, n_out] — additive correction
+        """
+        x = torch.cat([h, pred], dim=-1)
+        x = self.main(x)
+        film = self.film_mlp(film_cond)
+        gamma, beta = film.chunk(2, dim=-1)
+        x = x * (1.0 + gamma) + beta   # FiLM modulation post-MLP
+        return self.out(x)
+
+
 class SurfaceRefinementContextHead(nn.Module):
     """Surface refinement head that incorporates nearest-volume context.
 
@@ -1113,7 +1160,8 @@ class Config:
     aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
     aft_foil_srf_context: bool = False       # KNN volume context for aft-foil SRF (wake pressure recovery)
     # Phase 6: FiLM-conditioned fore-foil surface refinement head (boundary ID=6 nodes, tandem only)
-    fore_foil_srf_film: bool = False         # enable FiLM-conditioned correction for fore-foil surface nodes
+    fore_foil_srf_film: bool = False         # enable FiLM-conditioned correction (ForeAftFoilRefinementHead: FiLM pre-MLP)
+    fore_foil_srf: bool = False              # enable FiLM-conditioned correction (ForeFoilRefinementHead: FiLM post-MLP)
     fore_foil_srf_hidden: int = 192          # hidden dim for fore-foil refinement MLP
     fore_foil_srf_layers: int = 3            # number of hidden layers for fore-foil refinement MLP
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
@@ -1354,7 +1402,20 @@ if cfg.fore_foil_srf_film:
     ).to(device)
     fore_srf_head = torch.compile(fore_srf_head, mode=cfg.compile_mode)
     _fore_n_params = sum(p.numel() for p in fore_srf_head.parameters())
-    print(f"Fore-foil SRF FiLM head: {_fore_n_params:,} params "
+    print(f"Fore-foil SRF FiLM head (pre-MLP): {_fore_n_params:,} params "
+          f"(hidden={cfg.fore_foil_srf_hidden}, layers={cfg.fore_foil_srf_layers})")
+elif cfg.fore_foil_srf:
+    fore_srf_head = ForeFoilRefinementHead(
+        n_hidden=cfg.n_hidden,
+        n_out=3,
+        hidden=cfg.fore_foil_srf_hidden,
+        n_layers=cfg.fore_foil_srf_layers,
+        film_dim=4,
+        film_hidden=32,
+    ).to(device)
+    fore_srf_head = torch.compile(fore_srf_head, mode=cfg.compile_mode)
+    _fore_n_params = sum(p.numel() for p in fore_srf_head.parameters())
+    print(f"Fore-foil SRF FiLM head (post-MLP): {_fore_n_params:,} params "
           f"(hidden={cfg.fore_foil_srf_hidden}, layers={cfg.fore_foil_srf_layers})")
 
 from copy import deepcopy
