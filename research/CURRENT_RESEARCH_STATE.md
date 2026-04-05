@@ -50,7 +50,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | alphonse | #2131 | Tandem-Slice Carve-Out K=4 — corrected instructions sent | WIP — rebasing |
 | nezuko | #2152 | Augmentation Annealing — linearly decay aug σ over training | WIP — just assigned |
 | thorfinn | #2147 | Actual 3-Way PCGrad — enable untested elif branch with --disable_pcgrad | WIP — just assigned |
-| frieren | #2146 | Tail EMA Checkpoint Averaging — average last 4-5 EMA snapshots | WIP — just assigned |
+| frieren | #2153 | Gap/Stagger Sigma Increase σ=0.03 — more geometric diversity | WIP — just assigned |
 | edward | #2149 | Learning Rate Sweep: lr={1e-4, 3e-4} vs baseline lr=2e-4 | WIP — just assigned |
 
 **All 8 students active. Zero idle GPUs.**
@@ -128,6 +128,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | Surface Pressure Gradient Aux Loss | #2129 (3 rounds) | p_oodc improves -1.5% but p_tan regresses. 3 iterations with diminishing returns. Signal too weak. |
 | Foil-1 DSDF Magnitude Augmentation | #2133 | All σ values regress p_tan. Front-foil is KNOWN component in val_tandem_transfer |
 | Tandem DSDF Channel Mixup | #2132 | Mixup between NACA0012 samples adds no geometric diversity |
+| Tail EMA Checkpoint Averaging | #2146 | Null result: ±0.3% noise. EMA already smooth; snapshot averaging redundant. Post-hoc weight avg exhausted class |
 | EMA Decay 0.9995 + GSB | #2141 (Round 2) | All metrics regress. GSB obsoleted the 0.9995 advantage. ema_decay=0.999 confirmed optimal |
 | Gap/Stagger σ=0.01 | #2140 | Worse than σ=0.02 on p_oodc (+3.3%) and p_tan (+1.5%). σ=0.02 is well-calibrated |
 | Weight Decay 1e-5, 2e-5 | #2145 | p_tan regresses +2.1-2.3%. wd=5e-5 confirmed optimal with Lion |

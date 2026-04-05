@@ -2,6 +2,27 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~09:15 — PR #2146: Tail EMA Checkpoint Averaging — frieren — **CLOSED** (null result)
+
+- Branch: `frieren/tail-ema-avg`
+- Hypothesis: Average last 2-3 EMA snapshots from converged tail of training for smoother model.
+
+| Config | Standard EMA p_tan | Tail-Avg p_tan | Δ |
+|--------|-------------------|----------------|---|
+| A (start=135) s42 | 29.0 | 29.11 | +0.4% |
+| A (start=135) s73 | 29.2 | 29.16 | -0.1% |
+| B (start=145) s42 | 29.8 | 29.85 | +0.2% |
+| B (start=145) s73 | 29.7 | 29.62 | -0.3% |
+
+W&B: fh7f24u6, azir19g1 (Config A), wrh72afu, 6hhy1mih (Config B).
+
+**Results:** Pure noise (±0.3%). EMA decay=0.999 already averages over ~1000 steps — additional snapshot averaging is redundant. Snapshots barely differ because cosine LR is near zero in the tail.
+- **Post-hoc weight averaging confirmed as exhausted class:** SWAD (#2094), model soup (#2142), tail averaging (#2146) all fail. EMA + cosine is already optimal averaging.
+- Individual runs also don't match baseline (best standard EMA: 29.0 vs baseline 28.60) — run variance.
+- Frieren reassigned to gap/stagger σ=0.03 (#2153).
+
+---
+
 ### 2026-04-05 ~08:20 — PR #2141 (Round 2): EMA Decay 0.9995 Rebased — nezuko — **CLOSED** (negative)
 
 - Branch: `nezuko/ema-decay-sweep`
