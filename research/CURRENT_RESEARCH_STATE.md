@@ -45,7 +45,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | fern | #2161 | FiLM-Conditioned Fore-Foil SRF: shape-aware correction on NACA6416 fore surface | WIP — just assigned |
-| askeladd | #2162 | Tandem Cross-DSDF Features: per-node dist_ratio + rel_angle inter-foil geometry | WIP — just assigned |
+| askeladd | #2168 | Tandem Pressure Correction MLP: gated tandem-specific pressure pathway | WIP — just assigned |
 | nezuko | #2163 | Differential LR: boost aft_srf/surface_refine/GSB heads 2x-3x vs backbone | WIP — just assigned |
 | tanjiro | #2156 | DSDF-1 Channel Dropout: p={0.2, 0.3} force shape-invariant tandem prediction | WIP |
 | alphonse | #2166 | dp/dn=0 Physics Loss: surface normal pressure gradient constraint | WIP — just assigned |
@@ -143,6 +143,7 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 | Gap/Stagger σ=0.03 | #2153 | Worse: p_tan +3.3%, p_in +4.2%. σ=0.02 confirmed optimal (inverted-U). |
 | EMA Decay 0.9995 | #2141 | Regresses with GSB. 0.999 optimal. |
 | Reynolds Number Perturbation | #2125 | Null + regression. |
+| Tandem Cross-DSDF Features | #2162 | p_tan +4.4%. Hand-crafted features add noise over raw DSDF. |
 | Foil Shape Similarity Bias (GSB 7D) | #2157 | p_tan +3.7%. Sample-level cosine sim too coarse. |
 | Fore-foil SRF (unconditioned) | #2117,#2124 | Worsen p_tan. Conditioned variant now in #2161. |
 | Aft/Fore-Foil Loss Upweighting | #2121,#2122 | p_oodc mild benefit, p_tan regression. |

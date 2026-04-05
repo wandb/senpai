@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~20:30 — PR #2162: Tandem Cross-DSDF Features — askeladd — **CLOSED** (hand-crafted features add noise)
+
+- Branch: `askeladd/tandem-cross-dsdf-features`
+- Hypothesis: Per-node dist_ratio + rel_angle features extending GSB from global to per-node geometry. Zero new parameters — pure feature engineering.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| cross-dsdf | 42 | 12.6 | 7.8 | 30.3 | 6.7 | jkm5f1yx |
+| cross-dsdf | 73 | 13.2 | 7.8 | 29.4 | 6.5 | vgm0gla2 |
+| **cross-dsdf avg** | — | **12.9** | **7.8** | **29.85** | **6.6** | — |
+| **Baseline** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** p_tan +4.4%, p_oodc +1.3%. Model already has raw 8-channel DSDF field — hand-crafted summaries (min, atan2) are lossy and add noise. Feature engineering on top of existing DSDF is a dead end.
+- Askeladd now idle — reassigning to tandem pressure correction MLP.
+
+---
+
 ### 2026-04-05 ~19:55 — PR #2158: Asymmetric PCGrad — edward — **CLOSED** (symmetric baseline better)
 
 - Branch: `edward/asymmetric-pcgrad`
