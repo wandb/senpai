@@ -942,6 +942,7 @@ class Config:
     cosine_eta_min: float = 1e-5
     ema_start_epoch: int = 140
     ema_decay: float = 0.998
+    ema_perturb_sigma: float = 0.0  # One-time weight perturbation magnitude at EMA start (0 = disabled)
     temp_anneal_epoch: int = 50
     vol_ramp_epochs: int = 40
     tandem_curriculum_epochs: int = 10
@@ -2028,6 +2029,29 @@ for epoch in range(MAX_EPOCHS):
                 pass
         if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa and not cfg.swa_cyclic and not cfg.snapshot_ensemble:
             if ema_model is None:
+                # One-time weight perturbation to explore flat minima
+                if cfg.ema_perturb_sigma > 0.0:
+                    with torch.no_grad():
+                        for p in _base_model.parameters():
+                            if p.requires_grad:
+                                p.data.add_(torch.randn_like(p.data) * cfg.ema_perturb_sigma)
+                        if refine_head is not None:
+                            _rh = refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
+                            for p in _rh.parameters():
+                                if p.requires_grad:
+                                    p.data.add_(torch.randn_like(p.data) * cfg.ema_perturb_sigma)
+                        if aft_srf_head is not None:
+                            _ah = aft_srf_head._orig_mod if hasattr(aft_srf_head, '_orig_mod') else aft_srf_head
+                            for p in _ah.parameters():
+                                if p.requires_grad:
+                                    p.data.add_(torch.randn_like(p.data) * cfg.ema_perturb_sigma)
+                        if aft_srf_ctx_head is not None:
+                            _ch = aft_srf_ctx_head._orig_mod if hasattr(aft_srf_ctx_head, '_orig_mod') else aft_srf_ctx_head
+                            for p in _ch.parameters():
+                                if p.requires_grad:
+                                    p.data.add_(torch.randn_like(p.data) * cfg.ema_perturb_sigma)
+                    print(f"[ema_perturb] Applied sigma={cfg.ema_perturb_sigma} perturbation at epoch {epoch}")
+                    wandb.log({"ema_perturb/applied_epoch": epoch, "ema_perturb/sigma": cfg.ema_perturb_sigma, "global_step": global_step})
                 ema_model = deepcopy(_base_model)
             else:
                 with torch.no_grad():
