@@ -2,6 +2,30 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~01:45 — PR #2135: Tandem Self-Distillation — edward — **CLOSED** (inconclusive/negative)
+
+- Branch: `edward/tandem-selfdistill`
+- Hypothesis: Use EMA model as soft teacher for tandem samples after ema_start_epoch. KD loss (MSE between online and EMA predictions) on tandem surface pressure.
+
+| Run | Weight | Epochs | p_in | p_oodc | p_tan | p_re | W&B ID |
+|-----|--------|--------|------|--------|-------|------|--------|
+| w=0.05 s42 | 0.05 | 136 | 13.6 | 8.3 | 30.4 | 6.7 | swsmtceu |
+| w=0.10 s42 | 0.10 | 219 | 14.1 | 10.8 | 38.2 | 25.9 | ewrhonfl |
+| w=0.20 s42 | 0.20 | 220 | 14.9 | 10.4 | 35.6 | 25.6 | d6x7l5cg |
+| ctrl s42 | — | 252 | 15.0 | 9.9 | 36.5 | 25.4 | ivs2xoxz |
+
+W&B group: `phase6/tandem-selfdistill`
+
+**Results commentary:**
+- **INCONCLUSIVE/NEGATIVE.** Post-cosine degradation killed 3 of 4 runs (GPUs ran faster than expected → exceeded cosine_T_max=160 → severe OOD regression).
+- Only w=0.05 (136 epochs) was valid; all metrics regress vs baseline (p_tan +1.6%, p_oodc +8.9%).
+- KD had only 36 epochs of exposure (EMA starts at epoch 100) — barely enough time to test.
+- **Important finding:** GPU speed variance with --aft_foil_srf_context causes some GPUs to run 250+ epochs, well past cosine_T_max=160.
+- Also confounded by aft_foil_srf_context guard bug (frieren #2134) — context head was never applied.
+- Edward reassigned to foil2-aoa-rot-aug (#2138).
+
+---
+
 ### 2026-04-05 ~01:15 — PR #2133: Foil-1 DSDF Magnitude Augmentation — tanjiro — **CLOSED** (dead end)
 
 - Branch: `tanjiro/foil1-dsdf-mag-aug`

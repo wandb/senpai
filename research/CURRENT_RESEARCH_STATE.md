@@ -52,7 +52,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | askeladd | #2119 | PCGrad 2-Way — rebased 2-seed validation (p_tan -1.9% in 8-seed) | WIP — sent back for rebase |
 | thorfinn | #2136 | Per-Foil Physics Normalization — Fix Aft-Foil Cp Denominator | WIP — just assigned |
 | frieren | #2134 | Fore-Foil TE Relative Coords + **CRITICAL BUG FIX** (aft_srf_ctx head never applied) | WIP — awaiting results |
-| edward | #2135 | Tandem Self-Distillation — EMA Teacher for Tandem Samples | WIP — just assigned |
+| edward | #2138 | Foil-2 Independent AoA Rotation Aug — Decoupled Tandem Geometry | WIP — just assigned |
 
 **All 8 students active. Zero idle GPUs.**
 
