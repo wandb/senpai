@@ -47,13 +47,13 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | fern | #2161 | FiLM-Conditioned Fore-Foil SRF: shape-aware correction on NACA6416 fore surface | WIP |
 | askeladd | #2168 | Tandem Pressure Correction MLP: gated tandem-specific pressure pathway | WIP |
 | nezuko | #2169 | Online Hard Example Mining: adaptive per-sample loss upweighting | WIP |
-| tanjiro | — | **IDLE** — awaiting new assignment | IDLE |
+| tanjiro | #2171 | Slice Number Sweep: 128, 144 vs baseline 96 | WIP — just assigned |
 | alphonse | #2166 | dp/dn=0 Physics Loss: surface normal pressure gradient constraint | WIP |
 | thorfinn | #2165 | Iterative 2-Pass Refinement: AlphaFold2-style recycling, zero new params | WIP |
-| frieren | — | **IDLE** — awaiting new assignment | IDLE |
+| frieren | #2170 | Wider/Deeper SRF: hidden 256/384, layers 3/4 | WIP — just assigned |
 | edward | #2167 | Tandem Surface Mixup: between-sample aft-foil node swapping | WIP |
 
-**6 students active, 2 idle (frieren, tanjiro). Researcher-agent generating new hypotheses.**
+**All 8 students active. Zero idle GPUs.**
 
 ## Recently Reviewed (2026-04-06 ~00:15)
 
@@ -83,13 +83,15 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 4. `--pcgrad_3way --pcgrad_extreme_pct 0.15` — 2-way PCGrad gradient surgery (p_tan -2.1%)
 5. `--gap_stagger_spatial_bias` — tandem-geometry-aware slice routing (p_tan -3.0%)
 
-**Active experiments (6 students WIP):**
+**Active experiments (8 students WIP):**
 1. **FiLM-Conditioned Fore-Foil SRF** (fern #2161) — shape-aware correction on NACA6416 fore surface
 2. **Tandem Pressure Correction MLP** (askeladd #2168) — gated tandem-specific pressure pathway
 3. **Online Hard Example Mining** (nezuko #2169) — adaptive per-sample loss upweighting
 4. **Iterative 2-Pass Refinement** (thorfinn #2165) — AlphaFold2-style recycling, zero new params
 5. **dp/dn=0 Physics Loss** (alphonse #2166) — surface normal pressure gradient constraint
 6. **Tandem Surface Mixup** (edward #2167) — between-sample aft-foil node swapping
+7. **Wider/Deeper SRF Head** (frieren #2170) — hidden 256/384, layers 3/4
+8. **Slice Number Sweep** (tanjiro #2171) — 128, 144 vs baseline 96
 
 **Key research patterns:**
 - **What works:** DSDF magnitude augmentation (foil-2 only), specialized correction heads (aft_srf), gradient surgery (2-way PCGrad), tandem-geometry-aware routing (GSB), geometry-conditioned mechanisms
@@ -101,8 +103,6 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 ⚠️ `--pcgrad_3way` in the baseline runs 2-way PCGrad (correct behavior). The flag requires `--disable_pcgrad` to activate true 3-way, which was tested in PR #2147 and FAILED. Baseline is fine as-is.
 
 ## Potential Next Research Directions (queue for next idle students)
-
-**Awaiting researcher-agent Round 3 output — new hypotheses needed for frieren and tanjiro.**
 
 ### Human Researcher Directives
 - **#1860 (2026-03-27):** Think bigger — radical new full model changes and data aug.
