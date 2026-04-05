@@ -1,35 +1,36 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-05 ~00:00 UTC
+- **Date:** 2026-04-05 ~02:00 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
 ## Current Baseline
 
-### Single-Model Baseline (PR #2127, +aft_foil_srf_context K=8, 2-seed evidence)
+### Single-Model Baseline (PR #2119, PCGrad 2-way, 8-seed mean)
 
-| Metric | 2-seed avg | vs prior (DSDF2 aug) |
-|--------|------------|----------------------|
-| p_in | **13.02** | -0.2% |
-| p_oodc | **7.62** | -0.5% |
-| **p_tan** | **29.91** | **-0.7%** |
-| p_re | **6.47** | -1.0% |
+| Metric | 8-seed mean | 2-seed target |
+|--------|------------|---------------|
+| p_in | **13.20** | < 13.20 |
+| p_oodc | **7.91** | < 7.91 |
+| **p_tan** | **29.48** | **< 29.48** |
+| p_re | **6.50** | < 6.50 |
 
-**Latest merge:** PR #2127 (frieren) — AftSRF KNN Volume Context (K=8). W&B: zosxwjmm (s42, p_tan=29.96), twilqf1x (s73, p_tan=29.87).
+**Latest merge:** PR #2119 (askeladd) — PCGrad 2-way gradient surgery (8 seeds: tmqq1xlo, g0ukmibf, 1fge4f0m, s0akrj5a, kxs75gcq, 0m1vbsam, 75d4hhzm + rebased s42/s73: jpe1t13t, cdccuyl7).
 
-⚠️ **CRITICAL BUG (2026-04-05):** frieren (#2134) discovered that `--aft_foil_srf_context` was a NO-OP due to a guard bug: `if aft_srf_head is not None:` is False when context=True (only `aft_srf_ctx_head` is set). The context head was never applied in PR #2127 or any subsequent run. PR #2127's improvement was likely seed variance. True baseline is PR #2126 (p_tan=30.11). Bug fix is in frieren's #2134 branch; awaiting results to validate and cherry-pick.
+⚠️ **CRITICAL BUG:** `--aft_foil_srf_context` is a NO-OP — guard bug `if aft_srf_head is not None:` is False when context=True. Context head NEVER applied. PR #2127's improvement was likely seed variance. True pre-PCGrad baseline is PR #2126 (p_tan=30.11). Bug fix in frieren's #2134; awaiting results.
 
-⚠️ **2-seed only.** Target for merge decisions: p_tan < 29.91, p_oodc < 7.62, p_in < 13.02, p_re < 6.47. VRAM: 69-95GB per seed (dedicated H100 required).
+⚠️ **Post-cosine degradation risk:** Some GPUs run faster (~43-45s/epoch vs ~63s), reaching 220+ epochs past cosine_T_max=160, causing OOD metric regression. Validate all runs stop near epoch 160.
 
 **Reproduce current baseline:**
 ```bash
-cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baseline-aft-srf-ctx" \
+cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baseline" \
   --asinh_pressure --asinh_scale 0.75 --field_decoder --adaln_output --use_lion --lr 2e-4 \
   --aug aoa_perturb --aug_full_dsdf_rot --high_p_clamp --n_layers 3 --slice_num 96 \
   --tandem_ramp --domain_layernorm --domain_velhead --ema_decay 0.999 --weight_decay 5e-5 \
-  --cosine_T_max 160 --disable_pcgrad --pressure_first --pressure_deep \
+  --cosine_T_max 160 --pressure_first --pressure_deep \
   --residual_prediction --surface_refine --surface_refine_hidden 192 --surface_refine_layers 3 \
-  --aft_foil_srf --aug_gap_stagger_sigma 0.02 --aft_foil_srf_context
+  --aft_foil_srf --aug_gap_stagger_sigma 0.02 --aug_dsdf2_sigma 0.05 \
+  --pcgrad_3way --pcgrad_extreme_pct 0.15
 ```
 
 ### Ensemble Baseline (PR #2093 — 16-Seed Ensemble, Seeds 42-49 + 66-73)
@@ -41,79 +42,84 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | p_tan | **29.1** |
 | p_re | **5.8** |
 
-## Student Status (~22:15 UTC)
+## Student Status (~02:00 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| tanjiro | #2137 | EMA Stochastic Weight Perturbation — Flat Minima Seeking | WIP — just assigned |
-| fern | #2130 | Gap/Stagger Spatial Bias — rebased 2-seed validation (beats control all 4 metrics) | WIP — sent back for rebase |
-| alphonse | #2131 | Tandem-Slice Carve-Out K=4 — rebased 2-seed (p_tan -3.7% vs ctrl) | WIP — sent back for rebase |
-| nezuko | #2129 | Supervised Surface Pressure Gradient Aux Loss — **v2** (per-foil fix + aft_srf_context rebase) | WIP — sent back for revision |
-| askeladd | #2119 | PCGrad 2-Way — rebased 2-seed validation (p_tan -1.9% in 8-seed) | WIP — sent back for rebase |
-| thorfinn | #2136 | Per-Foil Physics Normalization — Fix Aft-Foil Cp Denominator | WIP — just assigned |
-| frieren | #2134 | Fore-Foil TE Relative Coords + **CRITICAL BUG FIX** (aft_srf_ctx head never applied) | WIP — awaiting results |
-| edward | #2138 | Foil-2 Independent AoA Rotation Aug — Decoupled Tandem Geometry | WIP — just assigned |
+| askeladd | #2139 | PCGrad + DSDF2 Aug Compound Validation | WIP — just assigned |
+| tanjiro | #2137 | EMA Stochastic Weight Perturbation — σ sweep {5e-4, 1e-3, 3e-3} | WIP |
+| fern | #2130 | Gap/Stagger Spatial Bias — rebased 2-seed validation | WIP — rebasing |
+| alphonse | #2131 | Tandem-Slice Carve-Out K=4 — rebased 2-seed | WIP — rebasing |
+| nezuko | #2129 | Supervised Surface Pressure Gradient Aux Loss v2 (per-foil fix) | WIP — revising |
+| thorfinn | #2136 | Per-Foil Physics Normalization — Fix Aft-Foil Cp Denominator | WIP |
+| frieren | #2134 | Fore-Foil TE Relative Coords + CRITICAL BUG FIX | WIP — awaiting results |
+| edward | #2138 | Foil-2 Independent AoA Rotation Aug — Decoupled Tandem Geometry | WIP |
 
 **All 8 students active. Zero idle GPUs.**
 
-## Recently Reviewed (2026-04-04 ~23:30)
+## Recently Reviewed (2026-04-05 ~02:00)
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
-| #2129 | nezuko | Supervised Surface Pressure Gradient Aux Loss | **SENT BACK** | All metrics regress vs current baseline. Cross-foil gradient bug identified. Sent back for per-foil fix + aft_srf_context rebase. |
-| #2127 | frieren | Context-Aware AftSRF — KNN Volume Context K=8 | **MERGED** | All 4 metrics beat baseline. p_tan 30.11→29.91 (-0.7%), p_oodc -0.5%, p_re -1.0%. W&B verified. |
-| #2128 | edward | Reynolds-Conditional SRF — FiLM on (Re, AoA) | **CLOSED** | Null result. FiLM worse than own control on p_oodc (+4%) and p_tan (+1.2%). AdaLN already handles Re/AoA conditioning. |
-| #2126 | tanjiro | Foil-2 DSDF Magnitude Augmentation — σ=0.05 | **MERGED** (prior round) | p_tan -1.4%, p_in -1.5%, p_oodc -0.9%. |
-| #2125 | thorfinn | Reynolds Number Perturbation Aug | **CLOSED** (prior round) | Null result. |
-| #2124 | fern | Fore-Foil Stacked SRF Head | **CLOSED** (prior round) | p_oodc degrades all formulations. |
+| #2119 | askeladd | PCGrad 2-way Gradient Surgery (8-seed validation) | **MERGED** | p_tan 30.11→29.48 (-2.1%), p_oodc -3.2%, all metrics beat baseline. 8 seeds confirmed. |
+| #2135 | edward | Tandem Self-Distillation (EMA teacher) | **CLOSED** | Post-cosine degradation on most seeds. Only w=0.05 valid; still regressed vs baseline. |
+| #2133 | tanjiro | Foil-1 DSDF Magnitude Augmentation | **CLOSED** | All σ values regress p_tan. Front-foil is KNOWN component in val_tandem_transfer — augmenting it hurts. Dead end. |
+| #2132 | thorfinn | Tandem DSDF Channel Mixup | **CLOSED** | Mixup between NACA0012 samples creates more NACA0012, not NACA6416. No geometric diversity. Approach unsound. |
+| #2131 | alphonse | Tandem-Slice Carve-Out (K=4,8) | **SENT BACK** | K=4 beats control -3.7%, K=8 catastrophic. Rebase onto noam, validate K=4 only. |
+| #2130 | fern | Gap/Stagger-Conditioned Spatial Bias | **SENT BACK** | Wrong feature indices (22:24 vs 21:23) fixed. Rebase onto noam for clean validation. |
+| #2129 | nezuko | Supervised Surface Pressure Gradient Aux Loss | **SENT BACK** | Cross-foil gradient bug. Sent back for per-foil fix + aft_srf_context rebase. |
+| #2128 | edward | Reynolds-Conditional SRF FiLM | **CLOSED** | Null result. AdaLN already handles Re/AoA conditioning. |
 
 ## Current Research Focus
 
-### Primary target: p_tan = 29.91 → push toward 29.1 (ensemble floor)
+### Primary target: p_tan = 29.48 → push toward 29.1 (ensemble floor)
 
 **Confirmed wins (merged into baseline):**
 1. `--aft_foil_srf`: dedicated aft-foil SRF head (ID=7) — PR #2104
 2. `--aug_gap_stagger_sigma 0.02`: tandem scalar domain randomization — PR #2115
 3. `--aug_dsdf2_sigma 0.05`: foil-2 DSDF magnitude aug — PR #2126 (p_tan -1.4%)
-4. `--aft_foil_srf_context`: KNN volume context for aft-foil SRF head — PR #2127 (p_tan -0.7%)
-5. `--surface_refine`, `--residual_prediction`, `--pressure_first`, `--pressure_deep`, `--asinh_pressure 0.75`, etc.
+4. `--aft_foil_srf_context`: KNN volume context (BUG — was no-op, improvement was seed variance) — PR #2127
+5. `--pcgrad_3way --pcgrad_extreme_pct 0.15`: PCGrad 2-way gradient surgery — PR #2119 (p_tan -2.1%)
+6. `--surface_refine`, `--residual_prediction`, `--pressure_first`, `--pressure_deep`, `--asinh_pressure 0.75`, etc.
 
 **Active experiments (8 students):**
-1. **EMA Stochastic Weight Perturbation** (tanjiro #2137) — One-time Gaussian perturbation at EMA start to explore flat minima. σ sweep {5e-4, 1e-3, 3e-3}.
-2. **Gap/Stagger-Conditioned Spatial Bias** (fern #2130) — Extend spatial_bias 4→6 dims by appending gap+stagger; tandem-geometry-aware slice routing.
-3. **Tandem-Slice Carve-Out** (alphonse #2131) — Reserve K dedicated physics slices for tandem via large negative bias on single-foil. K sweep {4, 8}.
-4. **Supervised Surface Pressure Gradient Aux Loss** (nezuko #2129) — L1 on chord-wise pressure gradient finite differences; w=0.05/0.10 sweep.
-5. **Tandem DSDF Channel Mixup** (thorfinn #2132) — interpolate DSDF channels between tandem training samples; creates synthetic intermediate foil geometries. α sweep {0.7, 0.5}.
-6. **PCGrad 2-Way Validation** (askeladd #2119) — 8-seed validation of 2-way PCGrad; prior 4-seed showed p_oodc -1.3% to -5.4%.
-7. **Fore-Foil TE Relative Coords** (frieren #2134) — Add (x,y) relative to fore-foil TE as extra features to AftFoilRefinementContextHead. Complementary to KNN context: KNN = what wake carries, rel_coords = where aft-foil sits in wake. Expected p_tan -3% to -7%.
-8. **Tandem Self-Distillation** (edward #2135) — EMA model as soft teacher for tandem samples after epoch ema_start_epoch. KD loss (w=0.05/0.10/0.20 sweep). Expected p_tan -2% to -5%.
+1. **PCGrad + DSDF2 Aug Compound** (askeladd #2139) — Validates PCGrad and DSDF2 gains stack; both were merged sequentially, never tested simultaneously from scratch.
+2. **EMA Stochastic Weight Perturbation** (tanjiro #2137) — One-time Gaussian perturbation at EMA start, σ sweep {5e-4, 1e-3, 3e-3}.
+3. **Gap/Stagger-Conditioned Spatial Bias** (fern #2130) — Rebasing onto noam with correct feature indices (21:23).
+4. **Tandem-Slice Carve-Out K=4** (alphonse #2131) — Rebasing onto noam, K=4 only (K=8 catastrophic).
+5. **Supervised Surface Pressure Gradient Aux Loss v2** (nezuko #2129) — Per-foil fix, w=0.05/0.10 sweep.
+6. **Per-Foil Physics Normalization** (thorfinn #2136) — Split Cp denominator for fore/aft foil nodes.
+7. **Fore-Foil TE Relative Coords + Bug Fix** (frieren #2134) — TE relative coords feature + critical aft_srf_context guard fix.
+8. **Foil-2 Independent AoA Rotation Aug** (edward #2138) — Decoupled fore/aft AoA rotation for tandem samples.
 
 **Key research patterns:**
-- **What works:** DSDF magnitude augmentation (foil-2 confirmed, foil-1 being tested), additive specialized correction heads (aft_srf), non-local context (KNN wake), target transforms (asinh)
-- **What doesn't work:** Fore-foil SRF (all formulations), explicit Re/AoA FiLM on SRF (redundant with AdaLN), Re perturbation aug, Charbonnier/Smooth-L1 loss families
+- **What works:** DSDF magnitude augmentation (foil-2 only), additive specialized correction heads (aft_srf), gradient surgery (PCGrad 2-way), target transforms (asinh), non-local context (KNN wake — pending bug fix validation)
+- **What doesn't work:** Foil-1 DSDF aug (hurts known component), fore-foil SRF, Re/AoA FiLM, self-distillation at current training lengths, DSDF mixup between same-type samples
 - **Critical interaction:** gap_stagger aug + aft_foil_srf NOT additive alone — helps p_oodc but hurts p_tan by +1.6%
-- **Emerging mechanism:** The aft-foil correction head benefits from richer context — volume neighbors (KNN) and now relative coordinate frame (foil1-relative-coords). Physical inductive biases around wake geometry are productive.
+- **Post-cosine degradation:** GPU speed variance causes some runs to overshoot cosine_T_max=160, causing OOD metric collapse. Must validate epoch count.
 
 ## Potential Next Research Directions (not yet assigned)
 
-### Top Priority (researcher-agent, 2026-04-04, see RESEARCH_IDEAS_2026-04-04_22:00.md)
+### Top Priority
 
-1. **per_foil_pnorm** — **ASSIGNED** to thorfinn (#2136). Per-foil physics normalization: split Cp denominator for fore/aft foil nodes in tandem. Expected p_tan -2% to -5%.
-2. **foil2_aoa_rot_aug** — Independent AoA rotation aug for aft-foil nodes in tandem samples only. Creates novel (fore_AoA, aft_AoA) combinations absent from training data. ~35 LoC. Expected p_tan -2% to -4%.
-3. **ema_perturb** — EMA stochastic weight perturbation (σ sweep {5e-4, 1e-3, 3e-3}) at ema_start_epoch to probe flat minima. ~12 LoC. Expected p_tan -1% to -3%.
-4. **aft_foil_tv_loss** — Chord-wise TV regularization on aft-foil pressure predictions. ⚠️ DEPRIORITIZED — nezuko #2129 (gradient aux, same family) showed weak results. May revisit if per-foil fix in #2129 v2 shows promise.
-5. **Combined DSDF1+DSDF2 aug at lower σ** — ⚠️ DEAD — Foil-1 DSDF aug (#2133) regresses p_tan at all σ values. Augmenting the known front-foil DSDF hurts.
+1. **aft_foil_srf_context bug fix validation** — Frieren #2134 critical. Once TE-coords + true context head results arrive, decide whether to cherry-pick bug fix and re-test KNN context.
+2. **Upstream-only KNN context** — Filter vol neighbors to x_vol < x_aft for wake-specific context. Follow-up to PR #2127 (after bug fix).
+3. **Learnable distance weighting** — Replace mean K-neighbor aggregation with attention-weighted. Upgrade to PR #2127 mechanism.
+4. **Gap/stagger sigma reduction** (0.02→0.01) — reduce p_tan hurt while keeping p_oodc benefit.
+5. **aft_foil_tv_loss** — Chord-wise TV regularization on aft-foil pressure predictions. ⚠️ DEPRIORITIZED — nezuko #2129 gradient aux (same family) showed weak results.
+6. **foil1-relative-coords** — Add (x,y) relative to fore-foil TE as features to context head (subset of frieren #2134).
 
 ### Existing Queue
 
-6. **Upstream-only KNN context** (frieren suggested) — Filter vol neighbors to x_vol < x_aft for wake-specific context. Follow-up to PR #2127.
-7. **Learnable distance weighting** — Replace mean K-neighbor aggregation with attention-weighted (distance-aware). Upgrade to PR #2127 mechanism.
-8. **Gap/stagger sigma reduction** (0.02→0.01) — reduce p_tan hurt while keeping p_oodc benefit.
+7. **Combined foil1+foil2 aug at lower σ** — ⚠️ DEAD — Foil-1 DSDF aug regresses at all σ. Only foil-2 aug productive.
 
 ## Confirmed Dead Ends (Phase 6)
 
 | Direction | PRs | Finding |
 |-----------|-----|---------|
+| Foil-1 DSDF Magnitude Augmentation | #2133 | All σ values regress p_tan. Front-foil is KNOWN component in val_tandem_transfer |
+| Tandem DSDF Channel Mixup | #2132 | Mixup between NACA0012 samples adds no geometric diversity |
+| Tandem Self-Distillation (EMA teacher) | #2135 | Post-cosine degradation; w=0.05 regressed; GPU speed variance invalidates multi-seed comparison |
 | Reynolds-Conditional SRF FiLM | #2128 | Null — AdaLN already handles Re/AoA; FiLM redundant |
 | Fore-Foil SRF (all formulations) | #2117, #2124 | Split: +9-11% p_tan. Stacked: +1-4% p_tan, p_oodc degrades |
 | Aft-Foil Loss Upweighting | #2121 | p_oodc improves -2% but p_tan regresses +1.5% |
