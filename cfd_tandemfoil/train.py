@@ -1070,6 +1070,8 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Phase 6: dp/dn=0 physics loss — surface normal pressure gradient constraint
+    pde_surf_normal_weight: float = 0.0     # weight for dp/dn=0 auxiliary loss (0 = disabled)
 
 
 cfg = sp.parse(Config)
@@ -1953,6 +1955,55 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # dp/dn=0 physics loss: penalize pressure differences between nearby surface nodes
+        # in the wall-normal direction. Fully vectorized, no per-sample loop.
+        _pde_loss = torch.tensor(0.0, device=device)
+        if cfg.pde_surf_normal_weight > 0.0 and model.training:
+            _s_flat = surf_mask.nonzero(as_tuple=False)  # [M, 2] — (batch_idx, node_idx)
+            _M = _s_flat.shape[0]
+            if _M >= 2:
+                _K = min(16, _M) * B
+                _idx_i = torch.randint(_M, (_K,), device=device)
+                _idx_j = torch.randint(_M, (_K,), device=device)
+                # Keep only pairs from same batch element and not identical
+                _bi = _s_flat[_idx_i, 0]
+                _bj = _s_flat[_idx_j, 0]
+                _same = (_bi == _bj) & (_idx_i != _idx_j)
+                if _same.any():
+                    _idx_i = _idx_i[_same]
+                    _idx_j = _idx_j[_same]
+                    _bi = _s_flat[_idx_i, 0]
+                    _ni_idx = _s_flat[_idx_i, 1]
+                    _nj_idx = _s_flat[_idx_j, 1]
+                    # Spatial displacement
+                    _xi = x[_bi, _ni_idx, :2]
+                    _xj = x[_bi, _nj_idx, :2]
+                    _dx = _xj - _xi
+                    _dist = _dx.norm(dim=-1).clamp(min=0.01)  # clamp at 0.01 in standardized space
+                    # Filter: only keep pairs with moderate distance (avoid near-duplicates and far pairs)
+                    _dist_ok = (_dist > 0.02) & (_dist < 1.0)
+                    if _dist_ok.any():
+                        _bi = _bi[_dist_ok]
+                        _ni_idx = _ni_idx[_dist_ok]
+                        _nj_idx = _nj_idx[_dist_ok]
+                        _dx = _dx[_dist_ok]
+                        _dist = _dist[_dist_ok]
+                        # Wall normal from DSDF gradient (channels 2:4)
+                        _n_i = x[_bi, _ni_idx, 2:4]
+                        _n_j = x[_bi, _nj_idx, 2:4]
+                        _sum_n = _n_i + _n_j
+                        _n_norm = _sum_n.norm(dim=-1).clamp(min=1e-4)
+                        _avg_n = _sum_n / _n_norm.unsqueeze(-1)
+                        # Normal component of displacement direction
+                        _dir = _dx / _dist.unsqueeze(-1)
+                        _normal_proj = (_dir * _avg_n).sum(dim=-1).abs()
+                        # Pressure difference (no division by distance — just penalize dp along normal)
+                        _dp = pred[_bi, _nj_idx, 2] - pred[_bi, _ni_idx, 2]
+                        _pde_loss = (_dp * _normal_proj).pow(2).mean()
+            loss = loss + cfg.pde_surf_normal_weight * _pde_loss
+            if batch_idx % 100 == 0:
+                wandb.log({"train/pde_dpdn_loss": _pde_loss.item(), "global_step": global_step})
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -1979,8 +2030,9 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            _pde_shared = cfg.pde_surf_normal_weight * _pde_loss * 0.5 if cfg.pde_surf_normal_weight > 0.0 else 0.0
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + _pde_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + _pde_shared + 0.005 * re_loss + 0.005 * aoa_loss
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -2025,7 +2077,8 @@ for epoch in range(MAX_EPOCHS):
                 vol_loss_g = (abs_err * vol_mask_g.unsqueeze(-1)).sum() / vol_mask_g.sum().clamp(min=1)
                 surf_loss_g = (surf_per_sample * mask_1d.float() * tandem_boost).sum() / n
                 coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                _pde_shared = cfg.pde_surf_normal_weight * _pde_loss / 3.0 if cfg.pde_surf_normal_weight > 0.0 else 0.0
+                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + _pde_shared + 0.005 * re_loss + 0.005 * aoa_loss
 
             loss_A = _grp_loss(~is_tandem_batch)
             # Only include non-empty groups to avoid backward() on no-grad tensors
