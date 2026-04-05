@@ -134,6 +134,38 @@ class DomainLayerNorm(nn.Module):
         return torch.where(mask_t, self.ln_tandem(x), self.ln_single(x))
 
 
+class FoilGeomAdapter(nn.Module):
+    """Foil-1 geometry adapter: compute DSDF distribution statistics → slice logit bias.
+
+    Takes foil-1 DSDF channels (x[:,4:8]) across all nodes, computes per-sample
+    distribution statistics (mean, std, skewness, kurtosis), and projects them to
+    a per-sample slice logit bias that is injected into the first TransolverBlock.
+    Zero-init on final layer (LoRA/AdaIN paradigm): starts as identity, no bias added.
+    """
+    def __init__(self, dsdf_channels=4, stats_per_channel=4, slice_num=96):
+        super().__init__()
+        in_dim = dsdf_channels * stats_per_channel  # 16
+        self.proj = nn.Sequential(
+            nn.Linear(in_dim, 32),
+            nn.GELU(),
+            nn.Linear(32, slice_num),
+        )
+        # Zero-init: adapter starts as identity (no bias on slice logits)
+        nn.init.zeros_(self.proj[-1].weight)
+        nn.init.zeros_(self.proj[-1].bias)
+
+    def forward(self, x_dsdf_foil1):
+        """x_dsdf_foil1: [B, N, 4] — foil-1 DSDF channels across all nodes."""
+        eps = 1e-8
+        mean = x_dsdf_foil1.mean(dim=1)                                     # [B, 4]
+        std = x_dsdf_foil1.std(dim=1) + eps                                  # [B, 4]
+        centered = (x_dsdf_foil1 - mean.unsqueeze(1)) / std.unsqueeze(1)    # [B, N, 4]
+        skew = (centered ** 3).mean(dim=1)                                   # [B, 4]
+        kurt = (centered ** 4).mean(dim=1)                                   # [B, 4]
+        stats = torch.cat([mean, std, skew, kurt], dim=-1)                   # [B, 16]
+        return self.proj(stats)  # [B, slice_num]
+
+
 class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
@@ -186,7 +218,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
                 nn.Linear(dim_head, 1),
             )
 
-    def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None):
+    def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None, foil_geom_bias=None):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -218,6 +250,9 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             slice_logits = self.in_project_slice(x_mid) / temp
         if spatial_bias is not None:
             slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
+        if foil_geom_bias is not None:
+            # [B, slice_num] → [B, 1, 1, slice_num]: broadcast across heads and nodes
+            slice_logits = slice_logits + foil_geom_bias[:, None, None, :]
         if self.prog_slices:
             # Apply slice mask: 0 for active slices, -1e9 for inactive (updated each epoch)
             slice_logits = slice_logits + self.slice_mask
@@ -392,7 +427,7 @@ class TransolverBlock(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None, foil_geom_bias=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         # DomainLayerNorm helper: pass is_tandem when enabled, else plain call
         dln_it = (tandem_mask.view(-1) > 0.5) if (self.domain_layernorm and tandem_mask is not None) else None
@@ -404,11 +439,11 @@ class TransolverBlock(nn.Module):
             cond_out = self.adaln_net(condition)  # [B, H*4]
             s1, b1, s2, b2 = cond_out.chunk(4, dim=-1)  # each [B, H]
             fx_norm = _ln(self.ln_1, fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
-            fx = _ln(self.ln_1_post, self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            fx = _ln(self.ln_1_post, self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features, foil_geom_bias=foil_geom_bias) + fx)
             fx_norm = _ln(self.ln_2, fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
             fx = _ln(self.ln_2_post, self.mlp(fx_norm) + fx)
         else:
-            fx = _ln(self.ln_1_post, self.attn(_ln(self.ln_1, fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            fx = _ln(self.ln_1_post, self.attn(_ln(self.ln_1, fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features, foil_geom_bias=foil_geom_bias) + fx)
             fx = _ln(self.ln_2_post, self.mlp(_ln(self.ln_2, fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
@@ -700,6 +735,8 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        foil1_geom_adapter=False,
+        geom_adapter_scale=0.1,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -802,6 +839,12 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        # Foil-1 geometry adapter (created after initialize_weights so zero-init sticks)
+        self._geom_adapter_scale = geom_adapter_scale
+        if foil1_geom_adapter:
+            self.foil_geom_adapter = FoilGeomAdapter(
+                dsdf_channels=4, stats_per_channel=4, slice_num=slice_num,
+            )
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -898,8 +941,18 @@ class Transolver(nn.Module):
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
-        for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+        # Foil-1 geometry adapter: compute per-sample slice logit bias from foil-1 DSDF stats
+        # Channels x[:,4:8] = foil-1 DSDF (4 channels, verified from data layout: pos(2)+saf(2)+dsdf(8))
+        _foil_geom_bias = None
+        if hasattr(self, 'foil_geom_adapter'):
+            _foil_geom_bias = self.foil_geom_adapter(x[:, :, 4:8].float()) * self._geom_adapter_scale
+
+        # First non-last block with foil geometry bias; rest without
+        _non_last = self.blocks[:-1]
+        if _non_last:
+            fx = _non_last[0](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features, foil_geom_bias=_foil_geom_bias)
+            for block in _non_last[1:]:
+                fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
 
         # Deep hidden representation (post all non-last blocks, pre output head)
         fx_deep = fx  # [B, N, n_hidden]
@@ -1070,6 +1123,12 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Phase 6: Foil-1 geometry adapter — DSDF distribution statistics → slice logit bias in first block
+    foil1_geom_adapter: bool = False        # enable foil-1 DSDF stats adapter injected into first TransolverBlock
+    geom_adapter_scale: float = 0.1        # scale factor for geometry adapter bias
+    # Phase 6: Tandem surface mixup
+    tandem_surface_mixup: bool = False       # enable between-sample aft-foil node swapping
+    tandem_surface_mixup_prob: float = 0.3   # probability of applying mixup per eligible pair
 
 
 cfg = sp.parse(Config)
@@ -1230,6 +1289,8 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    foil1_geom_adapter=cfg.foil1_geom_adapter,
+    geom_adapter_scale=cfg.geom_adapter_scale,
 )
 
 model = Transolver(**model_config).to(device)
