@@ -45,7 +45,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | fern | #2174 | Attention Temperature Curriculum: broad→sharp slice routing | WIP — just assigned |
-| askeladd | — | **IDLE** — awaiting new assignment | IDLE |
+| askeladd | #2175 | SWD Tandem Domain Alignment: slice token distribution matching | WIP — just assigned |
 | nezuko | #2169 | Online Hard Example Mining: adaptive per-sample loss upweighting | WIP |
 | tanjiro | #2171 | Slice Number Sweep: 128, 144 vs baseline 96 | WIP — just assigned |
 | alphonse | #2166 | dp/dn=0 Physics Loss: surface normal pressure gradient constraint | WIP |
@@ -87,7 +87,7 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 
 **Active experiments (8 students WIP):**
 1. **Attention Temperature Curriculum** (fern #2174) — schedule temp 2.0→0.3 over 80 epochs then release, zero new params
-2. **Tandem Pressure Correction MLP** (askeladd #2168) — gated tandem-specific pressure pathway
+2. **SWD Tandem Domain Alignment** (askeladd #2175) — Sliced Wasserstein Distance between tandem/single-foil slice tokens
 3. **Online Hard Example Mining** (nezuko #2169) — adaptive per-sample loss upweighting
 4. **Binned Spectral Power Loss** (thorfinn #2172) — frequency-weighted 1D DFT loss targeting high-freq surface pressure features
 5. **dp/dn=0 Physics Loss** (alphonse #2166) — surface normal pressure gradient constraint
