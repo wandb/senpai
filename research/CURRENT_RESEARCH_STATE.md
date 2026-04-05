@@ -44,9 +44,9 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| askeladd | #2140 | Gap/Stagger Aug Sigma Reduction: 0.02→0.01 | WIP (stale baseline, no GSB) |
+| askeladd | #2150 | DSDF2 Sigma Optimization: σ={0.03, 0.08} vs baseline 0.05 | WIP — just assigned |
 | tanjiro | #2148 | Gap/Stagger Aug Removal — test σ=0 (no aug) now that GSB exists | WIP — just assigned |
-| fern | #2145 | Weight Decay Sweep: 5e-5 → {1e-5, 2e-5} on new baseline | WIP |
+| fern | #2151 | EMA Start Epoch Sweep: {100, 120} vs default ~140 | WIP — just assigned |
 | alphonse | #2131 | Tandem-Slice Carve-Out K=4 — corrected instructions sent | WIP — rebasing |
 | nezuko | #2141 | EMA Decay Rate Sweep: 0.9995 rebased onto GSB baseline | WIP — rebasing |
 | thorfinn | #2147 | Actual 3-Way PCGrad — enable untested elif branch with --disable_pcgrad | WIP — just assigned |

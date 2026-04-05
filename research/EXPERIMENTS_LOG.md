@@ -2,6 +2,40 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~08:10 — PR #2145: Weight Decay Sweep — fern — **CLOSED** (negative)
+
+- Branch: `fern/weight-decay-sweep`
+- Hypothesis: Reduce weight decay from 5e-5 to {1e-5, 2e-5} to reduce regularization.
+
+| wd | p_in avg | p_oodc avg | p_tan avg | p_re avg | W&B |
+|----|---------|-----------|----------|---------|-----|
+| 1e-5 | 12.95 (-0.8%) | 7.55 (-1.9%) | **29.25 (+2.3%)** ❌ | 6.50 | dxftthwn, nu632qqg |
+| 2e-5 | 12.95 (-0.8%) | 7.55 (-1.9%) | **29.20 (+2.1%)** ❌ | 6.55 | nx9xnwcm, r5w9nr6a |
+| **Baseline (5e-5)** | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+Runs on new baseline (with GSB). 151-152 epochs.
+
+**Results:** p_in/p_oodc slightly improve but p_tan regresses 2.1-2.3%. Seed 73 drives the regression (29.6 vs baseline 28.3). wd=5e-5 confirmed optimal — Lion's built-in weight decay behavior means explicit wd has limited impact at these low values.
+- Fern reassigned to EMA start epoch sweep (#2151).
+
+---
+
+### 2026-04-05 ~08:10 — PR #2140: Gap/Stagger Sigma Reduction — askeladd — **CLOSED** (negative)
+
+- Branch: `askeladd/gap-stagger-sigma-sweep`
+- Hypothesis: Reduce gap/stagger aug σ from 0.02 to 0.01 to reduce p_tan penalty.
+
+| σ | p_in avg | p_oodc avg | p_tan avg | p_re avg | W&B |
+|---|---------|-----------|----------|---------|-----|
+| 0.01 | 13.25 | 7.75 (+3.3%) | **29.75 (+1.5%)** ❌ | 6.45 | 7biulneh, 8v9fka4m |
+| **Old baseline (0.02)** | **13.35** | **7.50** | **29.30** | **6.45** | — |
+| **Current baseline** | **13.05** | **7.70** | **28.60** | **6.55** | — |
+
+Ran against OLD baseline (no GSB). σ=0.01 is worse than σ=0.02 on both p_oodc and p_tan. Current σ=0.02 is well-calibrated. Combined with tanjiro's σ=0 test (#2148), we're building a 3-point sweep.
+- Askeladd reassigned to DSDF2 sigma sweep (#2150).
+
+---
+
 ### 2026-04-05 ~08:00 — PR #2144: Input Feature Noise Augmentation — edward — **CLOSED** (dead end)
 
 - Branch: `edward/input-noise-aug`
