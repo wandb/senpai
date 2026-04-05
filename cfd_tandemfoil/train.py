@@ -1005,6 +1005,7 @@ class Config:
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
+    dsdf_spatial_dropout: float = 0.0   # probability of zeroing DSDF for each node during training
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1637,6 +1638,11 @@ for epoch in range(MAX_EPOCHS):
                 # Identity for non-tandem samples
                 _dsdf2_scale = _dsdf2_scale * _is_tandem_aug2.float() + (~_is_tandem_aug2).float()
                 x[:, :, 6:10] = x[:, :, 6:10] * _dsdf2_scale.view(-1, 1, 1)
+
+        # DSDF spatial dropout: zero out DSDF channels for random nodes (training only)
+        if cfg.dsdf_spatial_dropout > 0.0 and model.training:
+            _dsdf_drop_mask = (torch.rand(x.shape[0], x.shape[1], 1, device=x.device) > cfg.dsdf_spatial_dropout).float()
+            x[:, :, 2:10] = x[:, :, 2:10] * _dsdf_drop_mask
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
