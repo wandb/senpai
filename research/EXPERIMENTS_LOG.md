@@ -2,6 +2,28 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~14:00 — PR #2149: Learning Rate Sweep lr={3e-4, 1e-4} — edward — **CLOSED** (lr=2e-4 confirmed optimal)
+
+- Branch: `edward/lr-sweep`
+- Hypothesis: lr=2e-4 was set when the architecture was simpler; after adding GSB, PCGrad, aft-foil SRF head, the optimal LR may have shifted. Lion optimizer papers suggest LR should be 3-10x higher than AdamW.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| lr=3e-4 | 42 | 13.2 | 8.1 | 29.8 | 6.7 | 3at64dy4 |
+| lr=3e-4 | 73 | 13.9 | 8.0 | 29.9 | 6.4 | vohbzzhi |
+| **lr=3e-4 avg** | — | **13.55** | **8.05** | **29.85** | **6.55** | — |
+| lr=1e-4 | 42 | 13.7 | 8.2 | 29.6 | 6.6 | 8s56fget |
+| lr=1e-4 | 73 | 14.0 | 8.2 | 29.0 | 6.8 | pyhi4uri |
+| **lr=1e-4 avg** | — | **13.85** | **8.20** | **29.30** | **6.70** | — |
+| **Baseline (lr=2e-4)** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** Neither alternative beats baseline on any metric. lr=3e-4: p_in +3.8%, p_oodc +4.5%, p_tan +4.4%. lr=1e-4: p_in +6.1%, p_oodc +6.5%, p_tan +2.4%. The cosine schedule (T_max=160) is calibrated for lr=2e-4 — changing LR without adjusting T_max creates a schedule mismatch. lr=1e-4 underfits within 180 min, lr=3e-4 overshoots.
+- **Key insight:** lr=2e-4 confirmed optimal and robust to ±50% perturbation. Adding to confirmed hyperparameter dead ends.
+- **Note:** Individual best seed at lr=1e-4 (s73) gave p_tan=29.0 — still worse than baseline 28.60.
+- Edward reassigned to Asymmetric PCGrad (#2158).
+
+---
+
 ### 2026-04-05 ~13:30 — PR #2131: Tandem-Slice Carve-Out K=4 (rebased) — alphonse — **CLOSED** (doesn't compound with GSB)
 
 - Branch: `alphonse/tandem-slice-carveout`
