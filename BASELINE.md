@@ -1,6 +1,35 @@
 # Baseline Metrics
 
-## Current Single-Model Baseline (Phase 6 — 2026-04-04, +aft_foil_srf_context K=8, 2-Seed Evidence, PR #2127)
+## Current Single-Model Baseline (Phase 6 — 2026-04-05, +PCGrad 2-Way, 10-Seed Evidence, PR #2119)
+
+| Metric | 8-seed mean | Rebased 2-seed | vs prior (aft_srf only, 8-seed) | Δ |
+|--------|-------------|----------------|----------------------------------|---|
+| p_in | **13.20 ± 0.26** | **12.92** | 13.19 | **-0.1%** |
+| p_oodc | **7.91 ± 0.16** | **7.94** | 7.92 | flat |
+| **p_tan** | **29.48 ± 0.43** | **29.47** | 30.05 | **-1.9%** |
+| p_re | **6.50 ± 0.12** | **6.52** | 6.45 | +0.8% (noise) |
+
+**PR #2119** (merged 2026-04-05) — PCGrad 2-Way: gradient surgery between single-foil and all-tandem batches. Prevents tandem tasks from stealing single-foil gradient capacity. 10 seeds total (8-seed: tmqq1xlo,84aff7cq,23y1pfj5,yw2djp6d,afis6090,c80t1a69,xcmpfkqs,75d4hhzm; rebased 2-seed: jpe1t13t,cdccuyl7). VRAM ~45-46 GB per run (+22% from 3 backward passes).
+
+⚠️ **NOTE:** `--aft_foil_srf_context` flag is currently a **NO-OP** due to a guard bug discovered by frieren (#2134). The actual context head code in `AftFoilRefinementContextHead` was never applied. Fix pending. For merge decisions: use **p_tan < 29.48** (8-seed mean), **p_oodc < 7.91**, **p_in < 13.20**, **p_re < 6.50**.
+
+**Reproduce (current baseline):**
+```bash
+cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baseline-pcgrad2w" \
+  --asinh_pressure --asinh_scale 0.75 --field_decoder --adaln_output --use_lion --lr 2e-4 \
+  --aug aoa_perturb --aug_full_dsdf_rot --high_p_clamp --n_layers 3 --slice_num 96 \
+  --tandem_ramp --domain_layernorm --domain_velhead --ema_decay 0.999 --weight_decay 5e-5 \
+  --cosine_T_max 160 --disable_pcgrad --pcgrad_3way --pcgrad_extreme_pct 0.15 \
+  --pressure_first --pressure_deep \
+  --residual_prediction --surface_refine --surface_refine_hidden 192 --surface_refine_layers 3 \
+  --aft_foil_srf --aug_gap_stagger_sigma 0.02
+```
+
+**For merge decisions:** Compare 2-seed avg against: p_tan < 29.48, p_oodc < 7.91, p_in < 13.20, p_re < 6.50.
+
+---
+
+## Prior Baseline (Phase 6 — 2026-04-04, +aft_foil_srf_context K=8 [BUGGY — no-op], 2-Seed Evidence, PR #2127)
 
 | Metric | 2-seed avg | vs prior (DSDF2 aug) | Δ |
 |--------|------------|----------------------|---|
