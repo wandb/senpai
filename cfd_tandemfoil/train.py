@@ -1020,6 +1020,7 @@ class Config:
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
     gap_stagger_spatial_bias: bool = False  # condition spatial bias MLP on gap/stagger (tandem geometry-aware routing)
+    head_lr_mult: float = 1.0  # LR multiplier for specialized heads (aft_srf, surface_refine, GSB spatial_bias). 1.0=no change
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1424,20 +1425,24 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
-attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
-other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+_boost_keywords = ['spatial_bias']
+backbone_attn = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale']) and not any(k in n for k in _boost_keywords)]
+backbone_gsb  = [p for n, p in model.named_parameters() if 'spatial_bias' in n]
+other_params  = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
+_head_lr = _base_lr * cfg.head_lr_mult
+_param_groups = [
+    {'params': backbone_attn, 'lr': _base_lr * 0.5},
+    {'params': other_params, 'lr': _base_lr},
+    {'params': backbone_gsb, 'lr': _head_lr},
+]
+if cfg.head_lr_mult != 1.0:
+    print(f"[Differential LR] backbone_attn: {_base_lr*0.5:.1e}, backbone_other: {_base_lr:.1e}, GSB spatial_bias: {_head_lr:.1e} (mult={cfg.head_lr_mult}x)")
 if cfg.use_lion:
-    base_opt = Lion([
-        {'params': attn_params, 'lr': _base_lr * 0.5},
-        {'params': other_params, 'lr': _base_lr}
-    ], weight_decay=cfg.weight_decay)
+    base_opt = Lion(_param_groups, weight_decay=cfg.weight_decay)
     optimizer = base_opt  # Lion has its own momentum; skip Lookahead
 else:
-    base_opt = torch.optim.AdamW([
-        {'params': attn_params, 'lr': _base_lr * 0.5},
-        {'params': other_params, 'lr': _base_lr}
-    ], weight_decay=cfg.weight_decay)
+    base_opt = torch.optim.AdamW(_param_groups, weight_decay=cfg.weight_decay)
     if cfg.use_lookahead:
         optimizer = Lookahead(base_opt, k=10, alpha=0.8)
     else:
@@ -1446,18 +1451,18 @@ else:
 # Add refinement head params to optimizer if enabled
 if refine_head is not None:
     _refine_params = list(refine_head.parameters())
-    base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
-    print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
+    base_opt.add_param_group({'params': _refine_params, 'lr': _head_lr})
+    print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer (lr={_head_lr:.1e})")
 
 # Add aft-foil SRF head params to optimizer if enabled
 if aft_srf_head is not None:
     _aft_params = list(aft_srf_head.parameters())
-    base_opt.add_param_group({'params': _aft_params, 'lr': _base_lr})
-    print(f"Added {sum(p.numel() for p in _aft_params):,} aft-foil SRF head params to optimizer")
+    base_opt.add_param_group({'params': _aft_params, 'lr': _head_lr})
+    print(f"Added {sum(p.numel() for p in _aft_params):,} aft-foil SRF head params to optimizer (lr={_head_lr:.1e})")
 if aft_srf_ctx_head is not None:
     _ctx_params = list(aft_srf_ctx_head.parameters())
-    base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
-    print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
+    base_opt.add_param_group({'params': _ctx_params, 'lr': _head_lr})
+    print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer (lr={_head_lr:.1e})")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
