@@ -6,29 +6,29 @@
 
 ## Current Baseline
 
-### Single-Model Baseline (PR #2119, PCGrad 2-way, 8-seed mean)
+### Single-Model Baseline (PR #2130, GSB + PCGrad, 2-seed)
 
-| Metric | 8-seed mean | 2-seed target |
-|--------|------------|---------------|
-| p_in | **13.20** | < 13.20 |
-| p_oodc | **7.91** | < 7.91 |
-| **p_tan** | **29.48** | **< 29.48** |
-| p_re | **6.50** | < 6.50 |
+| Metric | 2-seed avg | 2-seed target |
+|--------|-----------|---------------|
+| p_in | **13.05** | < 13.05 |
+| p_oodc | **7.70** | < 7.70 |
+| **p_tan** | **28.60** | **< 28.60** |
+| p_re | **6.55** | < 6.55 |
 
-**Latest merge:** PR #2119 (askeladd) — PCGrad 2-way gradient surgery. W&B rebased: jpe1t13t (s42), cdccuyl7 (s73).
+**Latest merge:** PR #2130 (fern) — Gap/Stagger Spatial Bias + PCGrad compound. W&B: d7l91p0x (s42, p_tan=28.9), j9btfx09 (s73, p_tan=28.3). p_tan -3.0% from prior baseline.
 
 ⚠️ **RESOLVED BUG (PR #2134):** `--aft_foil_srf_context` guard bug confirmed. When bug fixed and context head actually fires, results are WORSE (p_tan +1.2%, p_in +21% due to KNN overhead → undertrained 132 epochs). Context head officially removed from baseline. PR #2127 improvement was seed variance.
 
 **Reproduce current baseline:**
 ```bash
-cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baseline" \
+cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baseline-gsb-pcgrad" \
   --asinh_pressure --asinh_scale 0.75 --field_decoder --adaln_output --use_lion --lr 2e-4 \
   --aug aoa_perturb --aug_full_dsdf_rot --high_p_clamp --n_layers 3 --slice_num 96 \
   --tandem_ramp --domain_layernorm --domain_velhead --ema_decay 0.999 --weight_decay 5e-5 \
   --cosine_T_max 160 --pressure_first --pressure_deep \
   --residual_prediction --surface_refine --surface_refine_hidden 192 --surface_refine_layers 3 \
   --aft_foil_srf --aug_gap_stagger_sigma 0.02 --aug_dsdf2_sigma 0.05 \
-  --pcgrad_3way --pcgrad_extreme_pct 0.15
+  --pcgrad_3way --pcgrad_extreme_pct 0.15 --gap_stagger_spatial_bias
 ```
 
 ### Ensemble Baseline (PR #2093 — 16-Seed Ensemble, Seeds 42-49 + 66-73)
@@ -46,7 +46,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 |---------|-----|-----------|--------|
 | askeladd | #2140 | Gap/Stagger Aug Sigma Reduction: 0.02→0.01 | WIP — just assigned |
 | tanjiro | #2137 | EMA Stochastic Weight Perturbation — σ sweep {5e-4, 1e-3, 3e-3} | WIP |
-| fern | #2130 | Gap/Stagger Spatial Bias — FINAL: PCGrad + GSB validation (s42/73) | WIP — sent back |
+| fern | #2145 | Weight Decay Sweep: 5e-5 → {1e-5, 2e-5} on new baseline | WIP — just assigned |
 | alphonse | #2131 | Tandem-Slice Carve-Out K=4 — rebased 2-seed | WIP — rebasing |
 | nezuko | #2141 | EMA Decay Rate Sweep: 0.999→{0.9995, 0.9998} | WIP — just assigned |
 | thorfinn | #2143 | DSDF Spatial Dropout — Zero-Out Foil Shape Features for Random Nodes | WIP — just assigned |
@@ -77,6 +77,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 3. `--aug_dsdf2_sigma 0.05`: foil-2 DSDF magnitude aug — PR #2126 (p_tan -1.4%)
 4. ~~`--aft_foil_srf_context`~~: KNN volume context — **REMOVED** (was no-op due to guard bug; when fixed, harmful due to training slowdown) — PR #2127 retracted
 5. `--pcgrad_3way --pcgrad_extreme_pct 0.15`: PCGrad 2-way gradient surgery — PR #2119 (p_tan -2.1%)
+6. `--gap_stagger_spatial_bias`: tandem-geometry-aware slice routing (gap+stagger in spatial_bias MLP) — PR #2130 (p_tan -3.0%!)
 
 **Active experiments (7 students + 1 idle):**
 1. **Gap/Stagger Sigma Reduction σ=0.01** (askeladd #2140) — Test if smaller aug perturbation preserves p_oodc benefit while reducing p_tan penalty. Expected p_tan -0.5% to -1.5%.

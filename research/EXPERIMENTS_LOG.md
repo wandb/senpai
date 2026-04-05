@@ -2,6 +2,30 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~05:00 — PR #2130 (Round 3): GSB + PCGrad Compound Validation — fern — **MERGED** (winner)
+
+- Branch: `fern/gap-stagger-spatial-bias`
+- Hypothesis: Gap/Stagger Spatial Bias (GSB, extending spatial_bias MLP 4→6 inputs with gap/stagger) compounds with PCGrad 2-way gradient surgery.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| GSB + PCGrad | 42 | 12.9 | 7.6 | **28.9** | 6.6 | d7l91p0x |
+| GSB + PCGrad | 73 | 13.2 | 7.8 | **28.3** | 6.5 | j9btfx09 |
+| **avg** | — | **13.05** | **7.70** | **28.60** | **6.55** | — |
+| **Prior baseline (PR #2119)** | — | **13.20** | **7.91** | **29.48** | **6.50** | — |
+
+W&B group: `phase6/gsb-pcgrad`. ~150-152 epochs. No `--aft_foil_srf_context`.
+
+**Results commentary:**
+- **MERGED.** GSB + PCGrad compound: p_tan 29.48→28.60 (-3.0%), p_oodc -2.7%, p_in -1.1%. Only p_re slightly misses (+0.8%).
+- Both seeds beat the baseline on p_tan individually (28.9, 28.3). Seed 73 at 28.3 is the best single-seed p_tan seen this phase.
+- GSB and PCGrad are orthogonal mechanisms (routing vs gradient surgery) → compound correctly.
+- 3 rounds of iteration: original result (seeds 42/43, no PCGrad) → rebased with context+seeds 42/73 (failed due to context bug) → rebased with PCGrad, no context (this winner).
+- **New baseline: p_tan < 28.60, p_oodc < 7.70, p_in < 13.05, p_re < 6.55.**
+- New reproduce command adds `--gap_stagger_spatial_bias` to the PCGrad baseline.
+
+---
+
 ### 2026-04-05 ~04:45 — PR #2138: Foil-2 Independent AoA Rotation Aug — edward — **CLOSED** (dead end)
 
 - Branch: `edward/foil2-aoa-rot-aug`
