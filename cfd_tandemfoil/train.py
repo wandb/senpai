@@ -1020,6 +1020,7 @@ class Config:
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
     gap_stagger_spatial_bias: bool = False  # condition spatial bias MLP on gap/stagger (tandem geometry-aware routing)
+    ohem_top_k: float = 0.0  # fraction of hardest samples to upweight per batch (0=disabled, 0.3=top 30%)
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1904,6 +1905,20 @@ for epoch in range(MAX_EPOCHS):
                                        torch.ones(B, device=device))
         else:
             tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
+        # OHEM: upweight hardest samples adaptively
+        if cfg.ohem_top_k > 0.0 and model.training:
+            _ohem_loss = surf_per_sample.detach()
+            _k = max(1, int(cfg.ohem_top_k * _ohem_loss.shape[0]))
+            _ohem_thresh = _ohem_loss.topk(_k).values[-1]
+            _ohem_w = torch.where(_ohem_loss >= _ohem_thresh,
+                                  torch.tensor(2.0, device=device),
+                                  torch.tensor(1.0, device=device))
+            _ohem_w = _ohem_w / _ohem_w.mean()  # normalize to preserve gradient magnitude
+            if epoch in (0, 1, 80) and batch_idx == 0:
+                _n_hard = (_ohem_loss >= _ohem_thresh).sum().item()
+                _n_hard_tandem = ((_ohem_loss >= _ohem_thresh) & is_tandem_batch).sum().item()
+                print(f"[OHEM] epoch={epoch}, hard={_n_hard}/{_ohem_loss.shape[0]}, tandem_in_hard={_n_hard_tandem}/{_n_hard}")
+            surf_per_sample = surf_per_sample * _ohem_w
         surf_loss = (surf_per_sample * tandem_boost).mean()
         if cfg.uncertainty_loss:
             bm = _base_model
