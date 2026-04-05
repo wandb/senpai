@@ -1055,6 +1055,9 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Model soup evaluation: load multiple checkpoints, average weights, evaluate
+    soup_eval: bool = False                 # skip training, run soup evaluation only
+    soup_dirs: str = ""                     # comma-separated model directories (e.g. "models/model-abc,models/model-def")
 
 
 cfg = sp.parse(Config)
@@ -1519,6 +1522,271 @@ prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
+
+# ---------------------------------------------------------------------------
+# Model Soup Evaluation: load multiple checkpoints, average weights, evaluate
+# ---------------------------------------------------------------------------
+if cfg.soup_eval:
+    import itertools as _itertools
+    import sys as _sys
+
+    soup_dir_list = [d.strip() for d in cfg.soup_dirs.split(",") if d.strip()]
+    assert len(soup_dir_list) >= 2, f"Need at least 2 checkpoint dirs, got {len(soup_dir_list)}"
+    print(f"\n{'='*70}")
+    print(f"MODEL SOUP EVALUATION — {len(soup_dir_list)} checkpoints")
+    print(f"{'='*70}")
+    for i, d in enumerate(soup_dir_list):
+        print(f"  [{i}] {d}")
+
+    # Load all checkpoints to CPU
+    all_ckpts = {}
+    for d in soup_dir_list:
+        dp = Path(d)
+        ck = {"model": torch.load(dp / "checkpoint.pt", map_location="cpu", weights_only=True)}
+        if (dp / "refine_head.pt").exists():
+            ck["refine"] = torch.load(dp / "refine_head.pt", map_location="cpu", weights_only=True)
+        if (dp / "aft_srf_head.pt").exists():
+            ck["aft_srf"] = torch.load(dp / "aft_srf_head.pt", map_location="cpu", weights_only=True)
+        all_ckpts[d] = ck
+        print(f"  Loaded {d}: model={len(ck['model'])} keys, refine={'refine' in ck}, aft_srf={'aft_srf' in ck}")
+
+    # Build evaluation combos: individual + pairwise + all-N
+    indices = list(range(len(soup_dir_list)))
+    combos = [(i,) for i in indices]  # individuals
+    for r in range(2, len(soup_dir_list) + 1):
+        combos.extend(_itertools.combinations(indices, r))
+
+    all_results = {}
+
+    def _avg_state_dicts(sd_list):
+        """Average a list of state dicts, handling non-floating-point tensors."""
+        avg = {}
+        for k in sd_list[0]:
+            if sd_list[0][k].is_floating_point():
+                avg[k] = sum(sd[k].float() for sd in sd_list) / len(sd_list)
+            else:
+                avg[k] = sd_list[0][k]
+        return avg
+
+    def _strip_prefix(sd):
+        return {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
+
+    for combo in combos:
+        combo_dirs = [soup_dir_list[i] for i in combo]
+        seeds = [Path(d).name.split("-")[-1] for d in combo_dirs]
+        label = "soup_" + "+".join(seeds) if len(combo) > 1 else f"individual_{seeds[0]}"
+        print(f"\n--- Evaluating: {label} ({len(combo)} checkpoint{'s' if len(combo)>1 else ''}) ---")
+
+        # Average (or just load) checkpoints
+        if len(combo_dirs) == 1:
+            m_sd = all_ckpts[combo_dirs[0]]["model"]
+            r_sd = all_ckpts[combo_dirs[0]].get("refine")
+            a_sd = all_ckpts[combo_dirs[0]].get("aft_srf")
+        else:
+            m_sd = _avg_state_dicts([all_ckpts[d]["model"] for d in combo_dirs])
+            r_sd = _avg_state_dicts([all_ckpts[d]["refine"] for d in combo_dirs]) \
+                if all("refine" in all_ckpts[d] for d in combo_dirs) else None
+            a_sd = _avg_state_dicts([all_ckpts[d]["aft_srf"] for d in combo_dirs]) \
+                if all("aft_srf" in all_ckpts[d] for d in combo_dirs) else None
+
+        # Load into model
+        _base_model.load_state_dict(_strip_prefix(m_sd))
+        _rh = None
+        if refine_head is not None and r_sd is not None:
+            _rh_mod = refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
+            _rh_mod.load_state_dict(_strip_prefix(r_sd))
+            _rh = refine_head
+        _ash = None
+        if aft_srf_head is not None and a_sd is not None:
+            _ash_mod = aft_srf_head._orig_mod if hasattr(aft_srf_head, '_orig_mod') else aft_srf_head
+            _ash_mod.load_state_dict(_strip_prefix(a_sd))
+            _ash = aft_srf_head
+
+        # Run evaluation across all val splits
+        _base_model.eval()
+        if _rh is not None:
+            _rh.eval()
+        if _ash is not None:
+            _ash.eval()
+
+        combo_metrics = {}
+        for split_name, vloader in val_loaders.items():
+            mae_surf = torch.zeros(3, device=device)
+            mae_vol = torch.zeros(3, device=device)
+            n_surf = torch.zeros(3, device=device)
+            n_vol = torch.zeros(3, device=device)
+
+            with torch.no_grad():
+                for x, y, is_surface, mask in tqdm(vloader, desc=f"[{label}] {split_name}", leave=False):
+                    x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                    is_surface = is_surface.to(device, non_blocking=True)
+                    mask = mask.to(device, non_blocking=True)
+
+                    raw_dsdf = x[:, :, 2:10]
+                    dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+                    dist_feat = torch.log1p(dist_surf * 10.0)
+                    _raw_aoa = x[:, 0, 14:15]
+
+                    # Aft-foil mask
+                    _eval_aft_mask = None
+                    if _ash is not None:
+                        _v_saf_norm = x[:, :, 2:4].norm(dim=-1)
+                        _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
+                        _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
+                        _v_gap_stagger = x[:, 0, 22:24]
+
+                    x = (x - stats["x_mean"]) / stats["x_std"]
+                    curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                    if cfg.foil2_dist:
+                        foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                        x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
+                    else:
+                        x = torch.cat([x, curv, dist_feat], dim=-1)
+
+                    # Fourier PE
+                    raw_xy = x[:, :, :2]
+                    xy_min = raw_xy.amin(dim=1, keepdim=True)
+                    xy_max = raw_xy.amax(dim=1, keepdim=True)
+                    xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                    freqs = torch.cat([_base_model.fourier_freqs_fixed.to(device), _base_model.fourier_freqs_learned.abs()])
+                    xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                    fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                    x = torch.cat([x, fourier_pe], dim=-1)
+
+                    Umag, q = _umag_q(y, mask)
+                    y_phys = _phys_norm(y, Umag, q)
+                    if cfg.asinh_pressure:
+                        y_phys = y_phys.clone()
+                        y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
+                    y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+
+                    # Residual prediction
+                    _v_freestream = None
+                    if cfg.residual_prediction:
+                        _aoa = _raw_aoa
+                        _fs_phys = torch.zeros(y_norm.shape[0], 1, 3, device=device)
+                        _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))
+                        _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))
+                        _v_freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                        y_norm = y_norm - _v_freestream
+
+                    # Per-sample std
+                    raw_gap = x[:, 0, 21]
+                    is_tandem = raw_gap.abs() > 0.5
+                    B = y_norm.shape[0]
+                    sample_stds = torch.ones(B, 1, 3, device=device)
+                    if not cfg.no_perstd and not cfg.raw_targets and not cfg.adaptive_norm:
+                        if cfg.high_p_clamp:
+                            channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
+                            tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
+                        else:
+                            channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
+                            tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+                        for b in range(B):
+                            valid = mask[b]
+                            if is_tandem[b]:
+                                sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
+                            else:
+                                sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+                    y_norm_scaled = y_norm / sample_stds
+
+                    # Model forward
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _eval_out = _base_model({"x": x})
+                        pred = _eval_out["preds"]
+                        _eval_hidden = _eval_out["hidden"]
+                    pred = pred.float()
+                    _eval_hidden = _eval_hidden.float()
+                    pred_loss = pred / sample_stds
+
+                    # Surface refinement
+                    if _rh is not None:
+                        surf_idx = is_surface.nonzero(as_tuple=False)
+                        if surf_idx.numel() > 0:
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                surf_hidden = _eval_hidden[surf_idx[:, 0], surf_idx[:, 1]]
+                                surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
+                                correction = _rh(surf_hidden, surf_pred).float()
+                            pred_loss = pred_loss.clone()
+                            pred_loss[surf_idx[:, 0], surf_idx[:, 1]] += correction
+                            pred = pred_loss * sample_stds
+
+                    # Aft-foil SRF
+                    if _ash is not None and _eval_aft_mask is not None:
+                        aft_idx = _eval_aft_mask.nonzero(as_tuple=False)
+                        if aft_idx.numel() > 0:
+                            _ah = _eval_hidden[aft_idx[:, 0], aft_idx[:, 1]]
+                            _ap = pred_loss[aft_idx[:, 0], aft_idx[:, 1]]
+                            _ac = _v_gap_stagger[aft_idx[:, 0]] if cfg.aft_foil_srf_film else None
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                _aft_corr = _ash(_ah, _ap, _ac).float()
+                            pred_loss = pred_loss.clone()
+                            pred_loss[aft_idx[:, 0], aft_idx[:, 1]] += _aft_corr
+                            pred = pred_loss * sample_stds
+
+                    # MAE in normalized space (for loss-based metrics)
+                    abs_err_norm = (pred_loss - y_norm_scaled).abs().nan_to_num(0.0)
+
+                    # Denormalize for physical MAE
+                    if cfg.residual_prediction and _v_freestream is not None:
+                        pred = pred + _v_freestream
+                    pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                    if cfg.asinh_pressure:
+                        pred_phys = pred_phys.clone()
+                        pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
+                    pred_orig = _phys_denorm(pred_phys, Umag, q)
+
+                    y_clamped = y.clamp(-1e6, 1e6)
+                    err = (pred_orig - y_clamped).abs()
+                    finite = err.isfinite()
+                    err = err.where(finite, torch.zeros_like(err))
+
+                    vol_mask = mask & ~is_surface
+                    surf_mask = mask & is_surface
+                    mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                    mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                    n_surf += (surf_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+                    n_vol += (vol_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+
+            mae_surf /= n_surf.clamp(min=1)
+            mae_vol /= n_vol.clamp(min=1)
+            combo_metrics[f"{split_name}/mae_surf_Ux"] = mae_surf[0].item()
+            combo_metrics[f"{split_name}/mae_surf_Uy"] = mae_surf[1].item()
+            combo_metrics[f"{split_name}/mae_surf_p"] = mae_surf[2].item()
+            combo_metrics[f"{split_name}/mae_vol_Ux"] = mae_vol[0].item()
+            combo_metrics[f"{split_name}/mae_vol_Uy"] = mae_vol[1].item()
+            combo_metrics[f"{split_name}/mae_vol_p"] = mae_vol[2].item()
+
+        # Print results
+        print(f"\n  Results for {label}:")
+        for sn in VAL_SPLIT_NAMES:
+            k = f"{sn}/mae_surf_p"
+            if k in combo_metrics:
+                print(f"    {sn:30s}  mae_surf_p = {combo_metrics[k]:.2f}")
+
+        # Log to W&B
+        wandb.log({f"soup/{label}/{k}": v for k, v in combo_metrics.items()})
+        all_results[label] = combo_metrics
+
+    # Print summary table
+    print(f"\n{'='*70}")
+    print("MODEL SOUP SUMMARY")
+    print(f"{'='*70}")
+    header = f"{'Config':40s} {'p_in':>8s} {'p_oodc':>8s} {'p_tan':>8s} {'p_re':>8s}"
+    print(header)
+    print("-" * len(header))
+    for label, metrics in all_results.items():
+        p_in = metrics.get("val_in_dist/mae_surf_p", float("nan"))
+        p_oodc = metrics.get("val_ood_cond/mae_surf_p", float("nan"))
+        p_tan = metrics.get("val_tandem_transfer/mae_surf_p", float("nan"))
+        p_re = metrics.get("val_ood_re/mae_surf_p", float("nan"))
+        print(f"  {label:38s} {p_in:8.2f} {p_oodc:8.2f} {p_tan:8.2f} {p_re:8.2f}")
+
+    # Save summary to W&B
+    wandb.summary.update({"soup_results": all_results})
+    wandb.finish()
+    print("\nSoup evaluation complete.")
+    _sys.exit(0)
 
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
