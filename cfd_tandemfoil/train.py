@@ -1019,6 +1019,7 @@ class Config:
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
+    dsdf1_channel_dropout: float = 0.0  # p(zero out foil-1 DSDF channels) per tandem sample; 0 = off
     gap_stagger_spatial_bias: bool = False  # condition spatial bias MLP on gap/stagger (tandem geometry-aware routing)
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
@@ -1653,6 +1654,16 @@ for epoch in range(MAX_EPOCHS):
                 # Identity for non-tandem samples
                 _dsdf2_scale = _dsdf2_scale * _is_tandem_aug2.float() + (~_is_tandem_aug2).float()
                 x[:, :, 6:10] = x[:, :, 6:10] * _dsdf2_scale.view(-1, 1, 1)
+
+        # Foil-1 DSDF channel dropout (tandem samples only, training only)
+        # Zeros out foil-1 shape channels x[:,:,2:6] to force shape-invariant wake prediction
+        if model.training and cfg.dsdf1_channel_dropout > 0.0:
+            _is_tandem_d1 = (x[:, 0, 22].abs() > 0.01)
+            _drop_mask = torch.rand(x.size(0), device=x.device) < cfg.dsdf1_channel_dropout
+            _tandem_and_drop = _is_tandem_d1 & _drop_mask
+            if _tandem_and_drop.any():
+                x = x.clone()
+                x[_tandem_and_drop, :, 2:6] = 0.0
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
