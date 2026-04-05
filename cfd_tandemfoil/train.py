@@ -989,6 +989,9 @@ class Config:
     adaln_zone_temp: bool = False      # zone-aware temperature modulation
     # Phase 2 R5: tandem warm-in combinations
     tandem_ramp: bool = False          # gradual tandem surface loss warm-in (0→1 over epochs 10-50)
+    coordinated_ramp: bool = False     # coordinate gap/stagger sigma with tandem_ramp (high→low sigma as ramp rises)
+    ramp_sigma_start: float = 0.06     # starting sigma when coordinated_ramp (high diversity early)
+    ramp_sigma_end: float = 0.02       # ending sigma when coordinated_ramp (precise late)
     foil2_dist: bool = False           # explicit foil-2 distance feature (from secondary dsdf)
     slice_num: int = 48                # slice count (default 48, GPU6: 96)
     # Phase 3: training dynamics experiments
@@ -1627,13 +1630,21 @@ for epoch in range(MAX_EPOCHS):
                     is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
 
             # Gap/stagger perturbation augmentation (tandem samples only)
-            if cfg.aug_gap_stagger_sigma > 0.0:
+            # Compute dynamic sigma: coordinated ramp decays sigma as tandem_ramp rises
+            if cfg.coordinated_ramp:
+                _ramp_frac = min(1.0, max(0.0, (epoch - 10) / 40.0))
+                _dynamic_sigma = cfg.ramp_sigma_start * (1.0 - _ramp_frac) + cfg.ramp_sigma_end * _ramp_frac
+                if batch_idx == 0 and epoch in (0, 10, 25, 50, 100):
+                    print(f"[Coord ramp] epoch={epoch}, ramp_frac={_ramp_frac:.3f}, sigma={_dynamic_sigma:.4f}")
+            else:
+                _dynamic_sigma = cfg.aug_gap_stagger_sigma
+            if _dynamic_sigma > 0.0:
                 _is_tandem_aug = (x[:, 0, 21].abs() > 0.01)  # [B] — matches existing tandem detection
                 if _is_tandem_aug.any():
                     _B = x.size(0)
                     # Per-sample Gaussian noise, broadcast to all N nodes
-                    _gap_noise  = torch.randn(_B, device=x.device) * cfg.aug_gap_stagger_sigma
-                    _stag_noise = torch.randn(_B, device=x.device) * cfg.aug_gap_stagger_sigma
+                    _gap_noise  = torch.randn(_B, device=x.device) * _dynamic_sigma
+                    _stag_noise = torch.randn(_B, device=x.device) * _dynamic_sigma
                     # Zero out noise for non-tandem samples (preserve single-foil sentinel exactly)
                     _gap_noise  = _gap_noise  * _is_tandem_aug.float()
                     _stag_noise = _stag_noise * _is_tandem_aug.float()
@@ -2153,7 +2164,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _step_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.coordinated_ramp:
+            _step_log["train/dynamic_sigma"] = _dynamic_sigma
+        wandb.log(_step_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
