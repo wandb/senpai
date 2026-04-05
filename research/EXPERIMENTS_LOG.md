@@ -2,6 +2,32 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~13:30 — PR #2131: Tandem-Slice Carve-Out K=4 (rebased) — alphonse — **CLOSED** (doesn't compound with GSB)
+
+- Branch: `alphonse/tandem-slice-carveout`
+- Hypothesis: Reserving K physics slices exclusively for tandem samples (large negative bias for single-foil) would carve out dedicated representational capacity for tandem wake interactions. K=4 showed strong initial signal (-3.7% p_tan vs control) on old baseline.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| K=4 (rebased) | 42 | 12.83 | 7.63 | 29.31 | 6.49 | vej21fcz |
+| K=4 (rebased) | 73 | 13.59 | 7.75 | 29.55 | 6.37 | m2kk8eq2 |
+| **K=4 avg** | — | **13.21** | **7.69** | **29.43** | **6.43** | — |
+| **Baseline (PR #2130)** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Baseline comparison (K=4 rebased avg):**
+| Metric | Baseline | K=4 | Delta |
+|--------|----------|-----|-------|
+| p_in | 13.05 | 13.21 | +1.2% ❌ |
+| p_oodc | 7.70 | 7.69 | -0.1% ✅ |
+| p_tan | **28.60** | **29.43** | **+2.9%** ❌ |
+| p_re | 6.55 | 6.43 | -1.8% ✅ |
+
+**Results:** K=4 carve-out does NOT compound with GSB+PCGrad baseline. The original K=4 signal (-3.7% vs control) was real, but GSB already handles tandem-geometry-aware routing by conditioning slice routing on (gap, stagger) scalars. The carve-out mechanism is mechanistically redundant with GSB — both address tandem slice specialization through different means (hard partitioning vs conditioned routing), so they don't stack additively.
+- **Key insight:** GSB essentially achieved the same goal as tandem carve-out (tandem-specific slice specialization) through a more powerful, conditioned mechanism. Once GSB was in the baseline, the carve-out's marginal benefit vanished.
+- Alphonse reassigned to Foil Shape Similarity Bias (#2157).
+
+---
+
 ### 2026-04-05 ~11:00 — PR #2148: Gap/Stagger Aug Removal (σ=0) — tanjiro — **CLOSED** (dead end)
 
 - Branch: `tanjiro/gs-aug-removal`
