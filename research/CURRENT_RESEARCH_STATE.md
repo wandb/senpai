@@ -50,7 +50,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | tanjiro | #2156 | DSDF-1 Channel Dropout: p={0.2, 0.3} force shape-invariant tandem prediction | WIP |
 | alphonse | #2157 | Foil Shape Similarity Bias: extend GSB 6D→7D with inter-foil cosine similarity | WIP |
 | thorfinn | #2154 | Cosine T_max Sweep: T_max={140, 180} vs baseline 160 | WIP |
-| frieren | #2153 | Gap/Stagger Sigma Increase σ=0.03 — more geometric diversity | WIP |
+| frieren | #2164 | Backbone Gap/Stagger AdaLN: thread gap/stagger into ALL TransolverBlocks | WIP — just assigned |
 | edward | #2158 | Asymmetric PCGrad: protect in-dist gradients, project OOD only | WIP |
 
 **All 8 students active. Zero idle GPUs.**
@@ -138,6 +138,7 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 | Weight Decay 1e-5, 2e-5 | #2145 | 5e-5 confirmed optimal. |
 | Learning Rate ±50% (1e-4, 3e-4) | #2149 | lr=2e-4 confirmed optimal. |
 | Gap/Stagger σ=0.01 | #2140 | Worse than 0.02. |
+| Gap/Stagger σ=0.03 | #2153 | Worse: p_tan +3.3%, p_in +4.2%. σ=0.02 confirmed optimal (inverted-U). |
 | EMA Decay 0.9995 | #2141 | Regresses with GSB. 0.999 optimal. |
 | Reynolds Number Perturbation | #2125 | Null + regression. |
 | Fore-foil SRF (unconditioned) | #2117,#2124 | Worsen p_tan. Conditioned variant now in #2161. |

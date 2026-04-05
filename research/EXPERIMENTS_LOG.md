@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~18:40 — PR #2153: Gap/Stagger Sigma Increase σ=0.03 — frieren — **CLOSED** (σ=0.02 confirmed optimal)
+
+- Branch: `frieren/gs-sigma-increase`
+- Hypothesis: With GSB in the baseline, the model has explicit tandem-geometry-aware routing. Higher σ=0.03 might compound with GSB rather than fighting it.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| σ=0.03 | 42 | 13.5 | 7.7 | 29.2 | 6.4 | 2ahp1qdy |
+| σ=0.03 | 73 | 13.7 | 7.8 | 29.9 | 6.4 | 1zmqzcvi |
+| **σ=0.03 avg** | — | **13.6** | **7.75** | **29.55** | **6.4** | — |
+| **Baseline (σ=0.02)** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** All key metrics worse: p_tan +3.3%, p_in +4.2%. Only p_re marginally better (-2.3%).
+- **Gap/stagger sigma sweep complete:** σ=0.00 (worse), σ=0.01 (worse), **σ=0.02 (optimal)**, σ=0.03 (worse). Inverted-U response confirmed.
+- Frieren now idle — reassigning to bold backbone conditioning experiment.
+
+---
+
 ### 2026-04-05 ~18:15 — PR #2152: Augmentation Annealing — nezuko — **CLOSED** (p_tan regression)
 
 - Branch: `nezuko/aug-annealing`
