@@ -104,6 +104,17 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 
 ## Potential Next Research Directions (queue for next idle students)
 
+### Top Priority (Researcher-Agent Round 3 — 2026-04-05)
+1. **Binned Spectral Power (BSP) Loss** — 1D DFT on arc-length surface pressure, bin-weighted loss targeting high-frequency components suppressed by spectral bias. Paper: Koh & Kim JCP 2026. Expected -2 to -5% p_tan.
+2. **Geometry-Disentangled Contrastive Loss** — NT-Xent contrastive on slice tokens pairing same-(Re,AoA)-different-foil samples. Attacks OOD generalization root cause. Expected -2 to -6% p_tan, high variance.
+3. **Low-Rank Foil-1 Geometry Adapter** — per-sample DSDF stats → tiny MLP → additive bias on slice logits. Zero-init. GEPS-inspired. Expected -1 to -4% p_tan.
+4. **SWD Tandem Domain Alignment** — Sliced Wasserstein Distance between tandem/single-foil slice token distributions. Expected -1 to -4% p_tan.
+5. **Attention Temperature Curriculum** — schedule temp from 2.0→0.3 over first 80 epochs then release. Zero new params. Expected -1 to -3%.
+6. **Spectral Shaping of GatedMLP Activations** — depthwise 1D conv (k=3) after gate op. 576 extra params/block. Expected -1 to -3%.
+7. **Coordinated Tandem Ramp Curriculum** — ramp aug sigma from 0.06→0.02 as tandem_ramp rises. Expected -0.5 to -2%.
+
+See `/research/RESEARCH_IDEAS_2026-04-05_ROUND3.md` for full details.
+
 ### Human Researcher Directives
 - **#1860 (2026-03-27):** Think bigger — radical new full model changes and data aug.
 - **#1834 (2026-03-27):** Never use raw data files outside assigned training split.
