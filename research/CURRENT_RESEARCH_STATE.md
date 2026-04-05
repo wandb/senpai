@@ -46,11 +46,11 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 |---------|-----|-----------|--------|
 | fern | #2174 | Attention Temperature Curriculum: broad→sharp slice routing | WIP — just assigned |
 | askeladd | #2175 | SWD Tandem Domain Alignment: slice token distribution matching | WIP — just assigned |
-| nezuko | — | **IDLE** — awaiting new assignment | IDLE |
+| nezuko | #2177 | Coordinated Tandem Ramp: sigma decay synced with loss ramp | WIP — just assigned |
 | tanjiro | #2171 | Slice Number Sweep: 128, 144 vs baseline 96 | WIP — just assigned |
 | alphonse | #2166 | dp/dn=0 Physics Loss: surface normal pressure gradient constraint | WIP |
 | thorfinn | #2172 | Binned Spectral Power Loss: frequency-weighted surface pressure loss | WIP — just assigned |
-| frieren | — | **IDLE** — awaiting new assignment | IDLE |
+| frieren | #2176 | Spectral Shaping: depthwise conv filter on GatedMLP activations | WIP — just assigned |
 | edward | #2173 | Foil-1 Geometry Adapter: DSDF stats → slice logit bias | WIP — just assigned |
 
 **All 8 students active. Zero idle GPUs.** (thorfinn reassigned after #2165 close)
