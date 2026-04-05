@@ -553,11 +553,12 @@ class AftFoilRefinementContextHead(nn.Module):
     """
 
     def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 192,
-                 n_layers: int = 3, k_neighbors: int = 8):
+                 n_layers: int = 3, k_neighbors: int = 8, use_rel_coords: bool = False):
         super().__init__()
         self.k = k_neighbors
-        # Input: aft surface hidden + volume KNN context + base pred
-        in_dim = n_hidden + n_hidden + out_dim
+        self.use_rel_coords = use_rel_coords
+        # Input: aft surface hidden + volume KNN context + base pred (+ 2 rel coords if enabled)
+        in_dim = n_hidden + n_hidden + out_dim + (2 if use_rel_coords else 0)
         layers: list[nn.Module] = []
         for i in range(n_layers):
             layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
@@ -570,14 +571,16 @@ class AftFoilRefinementContextHead(nn.Module):
 
     def forward(self, aft_hidden: torch.Tensor, aft_positions: torch.Tensor,
                 vol_hidden: torch.Tensor, vol_positions: torch.Tensor,
-                aft_base_pred: torch.Tensor) -> torch.Tensor:
+                aft_base_pred: torch.Tensor,
+                fore_te_pos: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             aft_hidden: [A, n_hidden] — hidden features for aft-foil surface nodes
-            aft_positions: [A, 2] — xy coords of aft-foil surface nodes
+            aft_positions: [A, 2] — xy coords of aft-foil surface nodes (standardized)
             vol_hidden: [V, n_hidden] — hidden features of volume (non-surface) nodes
-            vol_positions: [V, 2] — xy coords of volume nodes
+            vol_positions: [V, 2] — xy coords of volume nodes (standardized)
             aft_base_pred: [A, out_dim] — base predictions for aft-foil nodes
+            fore_te_pos: [2] — standardized xy of fore-foil trailing edge node (optional)
         Returns:
             correction: [A, out_dim] — additive correction
         """
@@ -585,7 +588,11 @@ class AftFoilRefinementContextHead(nn.Module):
         dists = torch.cdist(aft_positions, vol_positions)  # [A, V]
         _, nn_idx = dists.topk(k, dim=-1, largest=False)  # [A, k]
         vol_context = vol_hidden[nn_idx].mean(dim=1)  # [A, n_hidden]
-        inp = torch.cat([aft_hidden, vol_context, aft_base_pred], dim=-1)
+        if self.use_rel_coords and fore_te_pos is not None:
+            rel_coords = aft_positions - fore_te_pos.unsqueeze(0)  # [A, 2]
+            inp = torch.cat([aft_hidden, vol_context, aft_base_pred, rel_coords], dim=-1)
+        else:
+            inp = torch.cat([aft_hidden, vol_context, aft_base_pred], dim=-1)
         return self.mlp(inp)
 
 
@@ -1052,6 +1059,7 @@ class Config:
     aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
     aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
     aft_foil_srf_context: bool = False       # KNN volume context for aft-foil SRF (wake pressure recovery)
+    aft_foil_srf_rel_coords: bool = False    # add (x_rel, y_rel) = node - fore-TE to context head input
 
 
 cfg = sp.parse(Config)
@@ -1255,6 +1263,7 @@ if cfg.aft_foil_srf:
             hidden_dim=cfg.aft_foil_srf_hidden,
             n_layers=cfg.aft_foil_srf_layers,
             k_neighbors=8,
+            use_rel_coords=cfg.aft_foil_srf_rel_coords,
         ).to(device)
         aft_srf_ctx_head = torch.compile(aft_srf_ctx_head, mode=cfg.compile_mode)
         _aft_n_params = sum(p.numel() for p in aft_srf_ctx_head.parameters())
@@ -1642,11 +1651,15 @@ for epoch in range(MAX_EPOCHS):
         # Aft-foil mask: boundary ID=7 nodes identified by saf norm > 0.005
         # saf is at raw x[:,:,2:4]; foil-1 surface has saf≈0, foil-2 has saf>>0
         _aft_foil_mask = None
-        if aft_srf_head is not None:
+        _fore_foil_mask = None
+        if aft_srf_head is not None or aft_srf_ctx_head is not None:
             _raw_saf_norm = x[:, :, 2:4].norm(dim=-1)  # [B, N]
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
+            if cfg.aft_foil_srf_rel_coords:
+                # Fore-foil (foil-1) surface nodes: saf_norm ≈ 0 (secondary airfoil field only nonzero on foil-2)
+                _fore_foil_mask = is_surface & (_raw_saf_norm <= 0.005) & _is_tandem.unsqueeze(1)
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1792,6 +1805,14 @@ for epoch in range(MAX_EPOCHS):
                 _vol_b = _vol_mask[b].nonzero(as_tuple=True)[0]
                 if _aft_b.numel() == 0 or _vol_b.numel() == 0:
                     continue
+                # Fore-foil trailing edge: rightmost (max-x) fore-foil surface node
+                fore_te_pos = None
+                if cfg.aft_foil_srf_rel_coords and _fore_foil_mask is not None:
+                    _fore_b = _fore_foil_mask[b].nonzero(as_tuple=True)[0]
+                    if _fore_b.numel() > 0:
+                        _fore_coords = _coords[b, _fore_b]  # [N_fore, 2] standardized
+                        _te_idx = _fore_coords[:, 0].argmax()
+                        fore_te_pos = _fore_coords[_te_idx].detach()  # [2]
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     _corr = aft_srf_ctx_head(
                         hidden[b, _aft_b],     # aft surface hidden
@@ -1799,6 +1820,7 @@ for epoch in range(MAX_EPOCHS):
                         hidden[b, _vol_b],     # volume hidden
                         _coords[b, _vol_b],    # volume positions
                         pred[b, _aft_b],       # aft base prediction
+                        fore_te_pos,           # fore-foil trailing edge position (or None)
                     ).float()
                 pred[b, _aft_b] = pred[b, _aft_b] + _corr
         elif aft_srf_head is not None and model.training and _aft_foil_mask is not None:
@@ -2205,11 +2227,14 @@ for epoch in range(MAX_EPOCHS):
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
                 # Aft-foil mask for eval (same logic as training)
                 _eval_aft_mask = None
-                if eval_aft_srf_head is not None:
+                _eval_fore_foil_mask = None
+                if eval_aft_srf_head is not None or eval_aft_srf_ctx_head is not None:
                     _v_saf_norm = x[:, :, 2:4].norm(dim=-1)
                     _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
                     _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
                     _v_gap_stagger = x[:, 0, 22:24]  # [B, 2]
+                    if cfg.aft_foil_srf_rel_coords:
+                        _eval_fore_foil_mask = is_surface & (_v_saf_norm <= 0.005) & _v_is_tandem.unsqueeze(1)
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -2334,11 +2359,19 @@ for epoch in range(MAX_EPOCHS):
                         _vol_b = _vol_mask_v[b].nonzero(as_tuple=True)[0]
                         if _aft_b.numel() == 0 or _vol_b.numel() == 0:
                             continue
+                        fore_te_pos_v = None
+                        if cfg.aft_foil_srf_rel_coords and _eval_fore_foil_mask is not None:
+                            _fore_b_v = _eval_fore_foil_mask[b].nonzero(as_tuple=True)[0]
+                            if _fore_b_v.numel() > 0:
+                                _fore_coords_v = _coords_v[b, _fore_b_v]
+                                _te_idx_v = _fore_coords_v[:, 0].argmax()
+                                fore_te_pos_v = _fore_coords_v[_te_idx_v].detach()
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                             _corr = eval_aft_srf_ctx_head(
                                 _eval_hidden[b, _aft_b], _coords_v[b, _aft_b],
                                 _eval_hidden[b, _vol_b], _coords_v[b, _vol_b],
                                 pred_loss[b, _aft_b],
+                                fore_te_pos_v,
                             ).float()
                         pred_loss[b, _aft_b] += _corr
                     if cfg.multiply_std:
