@@ -48,7 +48,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | askeladd | #2175 | SWD Tandem Domain Alignment: slice token distribution matching | WIP |
 | nezuko | #2184 | DCT Frequency-Weighted Surface Pressure Loss | WIP — just assigned |
 | tanjiro | #2182 | Ensemble Distillation: soft targets from 16-seed ensemble | WIP — just assigned |
-| alphonse | #2166 | dp/dn=0 Physics Loss: **SENT BACK — most promising, needs 6 more seeds** | WIP — sent back for 6 more runs |
+| alphonse | #2185 | MAE Pretraining: self-supervised geometry encoder initialization | WIP — just assigned |
 | thorfinn | #2179 | Panel-Method Inviscid Cp as physics-informed input feature | WIP |
 | frieren | #2183 | Vorticity Auxiliary Target: explicit wake structure learning | WIP — just assigned |
 | edward | #2180 | Multi-Resolution Hash Grid Encoding of mesh coordinates | WIP — just assigned |
@@ -92,7 +92,7 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 2. **SWD Tandem Domain Alignment** (askeladd #2175) — Sliced Wasserstein Distance between tandem/single-foil slice tokens
 3. **DCT Frequency-Weighted Loss** (nezuko #2184) — smooth DCT-domain frequency upweighting. Different from failed BSP (stable, auxiliary).
 4. **Panel-Method Inviscid Cp** (thorfinn #2179) — pre-compute vortex panel Cp as input feature. **TOP PRIORITY — Tier 1 radical.**
-5. **dp/dn=0 Physics Loss** (alphonse #2166) — surface normal pressure gradient constraint. **MOST PROMISING — sent back for 6 more seeds.**
+5. **MAE Pretraining** (alphonse #2185) — self-supervised masked geometry reconstruction before supervised training. Tier 3 radical.
 6. **Multi-Resolution Hash Grid Encoding** (edward #2180) — 2D hash grid (L=8, 16→2048) appended to DSDF features.
 7. **Vorticity Auxiliary Target** (frieren #2183) — KNN-computed ω as auxiliary prediction target. Forces explicit wake learning.
 8. **Ensemble Distillation** (tanjiro #2182) — soft targets from 16-seed ensemble. Tier 2 radical.
@@ -184,6 +184,7 @@ See `/research/RESEARCH_IDEAS_2026-04-06_ROUND4.md` for full details.
 | **Smaller SRF Head (h=128/96)** | **#2178** | **p_tan +3.9-4.5%. h=192 confirmed optimal (full sweep: 96<128<256<384<192).** |
 | **Spectral Shaping (k=3 filter)** | **#2176** | **p_tan +2.3% avg. Unstable: s42=28.59 (baseline) vs s73=29.95 (+4.7%).** |
 | **Coordinated Tandem Ramp** | **#2177** | **p_tan +2.2% avg. Concurrent schedules interfere during tandem warmup.** |
+| **dp/dn=0 Physics Loss (6-seed)** | **#2166** | **p_tan neutral (28.97 vs 28.60, within σ=0.67). Regularizer for p_in/p_re, not p_tan.** |
 
 ## Ensemble Seed Pool (Complete)
 

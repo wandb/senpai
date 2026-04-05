@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~09:30 — PR #2166: dp/dn=0 Physics Loss (Extended) — alphonse — **CLOSED** (6-seed confirms: regularizer for p_in/p_re, neutral for p_tan)
+
+- Branch: `alphonse/dpdn-physics-loss`
+- Hypothesis: Zero wall-normal pressure gradient constraint as auxiliary loss on surface nodes.
+
+| Config | Seeds | p_in | p_oodc | p_tan | p_re |
+|--------|-------|------|--------|-------|------|
+| **w=0.1 avg** | **6** | **13.02** ✅ | **7.82** ❌ | **28.97** ❌ | **6.45** ✅ |
+| **w=0.05 avg** | **2** | **12.94** ✅ | **7.61** ✅ | **29.73** ❌ | **6.49** ✅ |
+| **Baseline** | **2** | **13.05** | **7.70** | **28.60** | **6.55** |
+
+**w=0.1 individual seeds:** 29.82, **27.77**, 29.37, 29.04, 28.71, 29.07 (σ=0.67). Seed 73's 27.77 was a 1.8σ outlier.
+
+**Key finding:** dp/dn=0 is a genuine physics regularizer. Consistently improves p_in (-0.2%) and p_re (-1.5%). w=0.05 gives best p_oodc (7.61, -1.2%). But p_tan is NEUTRAL — 28.97 vs 28.60 is within noise (σ=0.67). The physics loss doesn't specifically help tandem transfer. Direction has long-term value for compounding with future baseline improvements.
+
+---
+
 ### 2026-04-06 ~08:30 — PR #2177: Coordinated Tandem Ramp — nezuko — **CLOSED** (unstable, concurrent schedules interfere)
 
 - Branch: `nezuko/coordinated-ramp`
