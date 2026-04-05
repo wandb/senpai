@@ -2,6 +2,28 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~18:15 — PR #2152: Augmentation Annealing — nezuko — **CLOSED** (p_tan regression)
+
+- Branch: `nezuko/aug-annealing`
+- Hypothesis: Standard competition ML practice — apply full augmentation early for diversity, then linearly decay aug sigma to a fraction by the final epoch. Tests anneal→50% and anneal→0%.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| anneal→50% | 42 | 12.878 | 7.838 | 28.443 | 6.341 | 7ofuolg3 |
+| anneal→50% | 73 | 13.294 | 7.857 | 29.348 | 6.380 | zt31115v |
+| **anneal→50% avg** | — | **13.086** | **7.848** | **28.896** | **6.361** | — |
+| anneal→0% | 42 | 12.739 | 7.993 | 29.278 | 6.533 | ibywi5rr |
+| anneal→0% | 73 | 13.796 | 7.817 | 29.125 | 6.439 | 4jd564uq |
+| **anneal→0% avg** | — | **13.268** | **7.905** | **29.202** | **6.486** | — |
+| **Baseline** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** Neither config beats baseline on p_tan. anneal→50% avg p_tan=28.90 (+1.0%), anneal→0% avg p_tan=29.20 (+2.1%). Only p_re improved with anneal→50% (6.36 vs 6.55, -2.9%).
+- **Key insight:** Tandem transfer generalization (p_tan) requires sustained augmentation diversity throughout training. Annealing gap/stagger sigma reduces the domain randomization needed for unseen tandem configs. Constant σ=0.02 confirmed optimal schedule.
+- **Interesting note:** p_re benefits from cleaner late-training data (Reynolds OOD less affected by geometry aug reduction), but this is a secondary metric.
+- Nezuko now idle — reassigning.
+
+---
+
 ### 2026-04-05 ~17:00 — PR #2151: EMA Start Epoch Sweep (100, 120 vs ~140) — fern — **CLOSED** (dead end)
 
 - Branch: `fern/ema-start-epoch`
