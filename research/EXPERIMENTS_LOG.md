@@ -2,6 +2,35 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~05:30 — PR #2142: Cross-Seed Model Soup — frieren — **CLOSED** (dead end)
+
+- Branch: `frieren/model-soup`
+- Hypothesis: Average EMA weights from 3 independently trained seeds (42, 73, 91). Cross-seed weight averaging produces flatter loss basin model (Wortsman et al., ICML 2022).
+
+| Config | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|--------|-------|------|-----|
+| Seed 42 (individual) | 12.96 | 7.47 | **29.10** | 6.55 | vs5z9ji8 |
+| Seed 73 (individual) | 13.02 | 7.70 | 29.56 | 6.42 | xla7mati |
+| Seed 91 (individual) | 13.73 | 7.98 | 29.40 | 6.40 | 8ziujhj6 |
+| **3-seed arithmetic mean** | **13.24** | **7.72** | **29.35** | **6.46** | — |
+| Soup 42+73 | 833.3 | 1013.3 | 573.9 | 895.0 | — |
+| Soup 42+91 | 4919.8 | 4292.1 | 1473.4 | 5410.3 | — |
+| Soup 73+91 | 2539.3 | 2482.2 | 1699.7 | 3165.3 | — |
+| **Soup 42+73+91** | **3618.5** | **4763.9** | **1982.2** | **4582.3** | — |
+| **Current baseline (PR #2130)** | **13.05** | **7.70** | **28.60** | **6.55** | — |
+
+W&B group: `phase6/model-soup`. Runs used old baseline (no `--gap_stagger_spatial_bias`). Student added `--disable_pcgrad` (flagged for investigation). Epochs: 154.
+
+**Results commentary:**
+- **Weight averaging catastrophically fails.** All soup models (pairwise and 3-way) produce MAE 50-400x worse than individual models.
+- **Root cause:** Models trained from different random seeds occupy different loss basins. Weight-space midpoint between independent local minima is NOT a minimum — it's a high-loss saddle/ridge. Model soups only work when models share initialization (fine-tuned from same checkpoint).
+- Individual seeds don't beat current baseline (p_tan=28.60). Seed 42 at 29.10 beats OLD baseline (29.48) but this is on stale flags.
+- **Key insight:** Prediction averaging (ensembling) works (3-seed mean 29.35 < 29.48), but weight averaging from scratch training does not.
+- **Student note:** `--disable_pcgrad` may be needed for `--pcgrad_3way` to activate — flagged for investigation.
+- Dead end for naive model soups. Fork-then-merge (shared initialization) remains theoretically viable.
+
+---
+
 ### 2026-04-05 ~05:00 — PR #2130 (Round 3): GSB + PCGrad Compound Validation — fern — **MERGED** (winner)
 
 - Branch: `fern/gap-stagger-spatial-bias`

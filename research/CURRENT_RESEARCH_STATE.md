@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-05 ~02:20 UTC
+- **Date:** 2026-04-05 ~05:35 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -40,36 +40,36 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | p_tan | **29.1** |
 | p_re | **5.8** |
 
-## Student Status (~02:20 UTC)
+## Student Status (~05:35 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| askeladd | #2140 | Gap/Stagger Aug Sigma Reduction: 0.02→0.01 | WIP — just assigned |
-| tanjiro | #2137 | EMA Stochastic Weight Perturbation — σ sweep {5e-4, 1e-3, 3e-3} | WIP |
-| fern | #2145 | Weight Decay Sweep: 5e-5 → {1e-5, 2e-5} on new baseline | WIP — just assigned |
-| alphonse | #2131 | Tandem-Slice Carve-Out K=4 — rebased 2-seed | WIP — rebasing |
-| nezuko | #2141 | EMA Decay Rate Sweep: 0.999→{0.9995, 0.9998} | WIP — just assigned |
-| thorfinn | #2143 | DSDF Spatial Dropout — Zero-Out Foil Shape Features for Random Nodes | WIP — just assigned |
-| frieren | #2142 | Cross-Seed Model Soup — Weight-Averaging 3 Seeds | WIP — just assigned |
-| edward | #2144 | Input Feature Noise Augmentation — Gaussian on all standardized features | WIP — just assigned |
+| askeladd | #2140 | Gap/Stagger Aug Sigma Reduction: 0.02→0.01 | WIP (stale baseline, no GSB) |
+| tanjiro | #2137 | EMA Stochastic Weight Perturbation — σ sweep {5e-4, 1e-3, 3e-3} | WIP (stale baseline) |
+| fern | #2145 | Weight Decay Sweep: 5e-5 → {1e-5, 2e-5} on new baseline | WIP |
+| alphonse | #2131 | Tandem-Slice Carve-Out K=4 — corrected instructions sent | WIP — rebasing |
+| nezuko | #2141 | EMA Decay Rate Sweep: 0.9995 rebased onto GSB baseline | WIP — rebasing |
+| thorfinn | #2143 | DSDF Spatial Dropout — Zero-Out Foil Shape Features for Random Nodes | WIP |
+| frieren | #2146 | Tail EMA Checkpoint Averaging — average last 4-5 EMA snapshots | WIP — just assigned |
+| edward | #2144 | Input Feature Noise Augmentation — Gaussian on all standardized features | WIP |
 
 **All 8 students active. Zero idle GPUs.**
 
-## Recently Reviewed (2026-04-05 ~02:20)
+## Recently Reviewed (2026-04-05 ~05:35)
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
-| #2130 | fern | Gap/Stagger Spatial Bias (Round 2 rebased) | **SENT BACK** | GSB+context regressed to p_tan=31.1. Sent back for final PCGrad+GSB validation vs baseline 29.48 |
-| #2129 | nezuko | Supervised Surface Pressure Gradient Aux Loss (Round 3) | **CLOSED** | v2 mean p_tan=29.778 misses current baseline 29.48. 3 iterations exhausted. |
-| #2119 | askeladd | PCGrad 2-way Gradient Surgery (8-seed validation) | **MERGED** | p_tan 30.11→29.48 (-2.1%), 8 seeds confirmed. New baseline. |
-| #2135 | edward | Tandem Self-Distillation (EMA teacher) | **CLOSED** | Post-cosine degradation. Only w=0.05 valid; still regressed. |
-| #2133 | tanjiro | Foil-1 DSDF Magnitude Augmentation | **CLOSED** | All σ values regress p_tan. Front-foil DSDF aug hurts. Dead end. |
-| #2132 | thorfinn | Tandem DSDF Channel Mixup | **CLOSED** | Mixup between NACA0012 samples adds no geometric diversity. |
-| #2131 | alphonse | Tandem-Slice Carve-Out (K=4,8) | **SENT BACK** | K=4 beats control -3.7%, K=8 catastrophic. Rebase + K=4 only. |
+| #2142 | frieren | Cross-Seed Model Soup (3-seed weight avg) | **CLOSED** | Catastrophic failure: weight avg produces MAE 50-400x worse due to loss barriers between basins. Individual seeds don't beat current baseline. |
+| #2130 | fern | GSB + PCGrad Compound (Round 3) | **MERGED** | p_tan 29.48→28.60 (-3.0%). New baseline. GSB + PCGrad compound correctly. |
+| #2138 | edward | Foil-2 Independent AoA Rotation Aug | **CLOSED** | Target inconsistency: rotated geometry without re-simulated flow. No σ beats baseline. |
+| #2136 | thorfinn | Per-Foil Physics Normalization | **CLOSED** | phys_stats mismatch → all metrics +5-19%. |
+| #2134 | frieren | Fore-Foil TE Relative Coords + Bug Fix | **CLOSED** | Critical finding: context head when working is harmful (p_in +21%, training 17% slower). |
+| #2129 | nezuko | Surface Pressure Gradient Aux Loss (Round 3) | **CLOSED** | p_tan=29.78 misses baseline 29.48. 3 iterations exhausted. |
+| #2131 | alphonse | Tandem-Slice Carve-Out (K=4,8) | **SENT BACK** | K=4 beats control -3.7%. Corrected instructions sent for rebase. |
 
 ## Current Research Focus
 
-### Primary target: p_tan = 29.48 → push toward 29.1 (ensemble floor)
+### Primary target: p_tan = 28.60 → push below 28.0 (single model now beats 16-seed ensemble!)
 
 **Confirmed wins (merged into baseline):**
 1. `--aft_foil_srf`: dedicated aft-foil SRF head — PR #2104
@@ -124,6 +124,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | Surface Pressure Gradient Aux Loss | #2129 (3 rounds) | p_oodc improves -1.5% but p_tan regresses. 3 iterations with diminishing returns. Signal too weak. |
 | Foil-1 DSDF Magnitude Augmentation | #2133 | All σ values regress p_tan. Front-foil is KNOWN component in val_tandem_transfer |
 | Tandem DSDF Channel Mixup | #2132 | Mixup between NACA0012 samples adds no geometric diversity |
+| Cross-Seed Model Soup (weight averaging) | #2142 | Catastrophic: MAE 50-400x worse. Loss barriers between independent basins. Only works with shared initialization |
 | Tandem Self-Distillation (EMA teacher) | #2135 | Post-cosine degradation; w=0.05 regressed; GPU speed variance invalidates multi-seed |
 | Reynolds-Conditional SRF FiLM | #2128 | Null — AdaLN already handles Re/AoA; FiLM redundant |
 | Fore-Foil SRF (all formulations) | #2117, #2124 | Split: +9-11% p_tan. Stacked: +1-4% p_tan, p_oodc degrades |
