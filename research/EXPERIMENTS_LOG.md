@@ -2,6 +2,21 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~05:00 — PR #2172: BSP Spectral Loss — thorfinn — **CLOSED** (w=0.1 catastrophic, w=0.05 all worse)
+
+- Branch: `thorfinn/bsp-spectral-loss`
+- Hypothesis: 1D DFT on arc-length surface pressure, bin-weighted spectral loss targeting high-frequency components.
+
+| Config | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|--------|-------|------|-----|
+| **w=0.1 avg** | **29.05** | **20.0** | **39.15** | **16.25** | k2owbp8q, an1gycr5 |
+| **w=0.05 avg** | **13.5** | **8.1** | **30.25** | **6.85** | nxw9vfgh, 4wo682ce |
+| **Baseline** | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** w=0.1 training collapse at epoch 60 (relative spectral error amplifies near-zero bins in asinh targets). w=0.05 stable but all metrics +3-6% worse. Spectral bias hypothesis doesn't apply — Transolver+SRF already handles multi-scale features.
+
+---
+
 ### 2026-04-06 ~04:20 — PR #2171: Slice Number Sweep — tanjiro — **CLOSED** (96 confirmed optimal)
 
 - Branch: `tanjiro/slice-num-sweep`
