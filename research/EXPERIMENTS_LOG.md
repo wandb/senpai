@@ -2,6 +2,21 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~08:30 — PR #2177: Coordinated Tandem Ramp — nezuko — **CLOSED** (unstable, concurrent schedules interfere)
+
+- Branch: `nezuko/coordinated-ramp`
+- Hypothesis: Sigma decay synced with tandem loss ramp — start high sigma for diversity, anneal to baseline σ=0.02.
+
+| Config | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|--------|-------|------|-----|
+| **A (0.06→0.02) avg** | **13.58** | **7.86** | **29.49** | **6.51** | x2mkegnk, pvjzi2ov |
+| **B (0.04→0.02) avg** | **13.10** | **7.89** | **29.22** | **6.48** | q5bprc0t, i4144o3d |
+| **Baseline** | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** Neither config beats baseline. Config B s42 individually: p_tan=28.47 (-0.5%), but s73: 29.97 (+4.8%). High seed variance from concurrent sigma+loss schedule changes during tandem ramp warmup (epochs 10-50). p_re improved consistently (~-1.1%), but primary target regressed.
+
+---
+
 ### 2026-04-06 ~08:00 — PR #2176: Spectral Shaping — frieren — **CLOSED** (unstable across seeds)
 
 - Branch: `frieren/spectral-shaping`
