@@ -49,7 +49,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | nezuko | #2177 | Coordinated Tandem Ramp: sigma decay synced with loss ramp | WIP — just assigned |
 | tanjiro | #2178 | Smaller SRF Head: hidden 128/96 vs baseline 192 | WIP — just assigned |
 | alphonse | #2166 | dp/dn=0 Physics Loss: surface normal pressure gradient constraint | WIP |
-| thorfinn | — | **IDLE** — awaiting new assignment (Panel-Method Cp) | IDLE |
+| thorfinn | #2179 | Panel-Method Inviscid Cp as physics-informed input feature | WIP — just assigned |
 | frieren | #2176 | Spectral Shaping: depthwise conv filter on GatedMLP activations | WIP — just assigned |
 | edward | #2173 | Foil-1 Geometry Adapter: DSDF stats → slice logit bias | WIP — just assigned |
 
