@@ -51,7 +51,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | nezuko | #2141 | EMA Decay Rate Sweep: 0.9995 rebased onto GSB baseline | WIP — rebasing |
 | thorfinn | #2147 | Actual 3-Way PCGrad — enable untested elif branch with --disable_pcgrad | WIP — just assigned |
 | frieren | #2146 | Tail EMA Checkpoint Averaging — average last 4-5 EMA snapshots | WIP — just assigned |
-| edward | #2144 | Input Feature Noise Augmentation — Gaussian on all standardized features | WIP |
+| edward | #2149 | Learning Rate Sweep: lr={1e-4, 3e-4} vs baseline lr=2e-4 | WIP — just assigned |
 
 **All 8 students active. Zero idle GPUs.**
 
@@ -128,6 +128,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | Surface Pressure Gradient Aux Loss | #2129 (3 rounds) | p_oodc improves -1.5% but p_tan regresses. 3 iterations with diminishing returns. Signal too weak. |
 | Foil-1 DSDF Magnitude Augmentation | #2133 | All σ values regress p_tan. Front-foil is KNOWN component in val_tandem_transfer |
 | Tandem DSDF Channel Mixup | #2132 | Mixup between NACA0012 samples adds no geometric diversity |
+| Input Feature Noise Augmentation | #2144 | Catastrophic: p_in +17% at σ=0.01. Generic input perturbation incompatible with CFD mesh features |
 | EMA Stochastic Weight Perturbation | #2137 | All σ values regress p_tan. Flat-minima-seeking confirmed DEAD CLASS (SAM, SGLD, SWAD, EMA perturb all fail) |
 | DSDF Spatial Dropout | #2143 | All metrics degrade monotonically (p_in +6.4% at p=0.05). DSDF too information-dense to drop |
 | Cross-Seed Model Soup (weight averaging) | #2142 | Catastrophic: MAE 50-400x worse. Loss barriers between independent basins. Only works with shared initialization |

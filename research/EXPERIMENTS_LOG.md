@@ -2,6 +2,30 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~08:00 — PR #2144: Input Feature Noise Augmentation — edward — **CLOSED** (dead end)
+
+- Branch: `edward/input-noise-aug`
+- Hypothesis: Add Gaussian noise to standardized input features during training to improve OOD generalization.
+
+| σ | p_in avg | p_oodc avg | p_tan avg | p_re avg |
+|---|---------|-----------|----------|---------|
+| 0.01 | 15.5 (+17%) | 9.6 (+21%) | 30.7 (+4.1%) | 7.95 (+22%) |
+| 0.03 | 26.95 (+104%) | 10.95 (+38%) | 32.3 (+9.6%) | 9.1 (+40%) |
+| 0.05 | 23.5 (+78%) | 11.7 (+48%) | 32.3 (+9.6%) | 9.65 (+48%) |
+| Old baseline | 13.20 | 7.91 | 29.48 | 6.50 |
+| **Current baseline** | **13.05** | **7.70** | **28.60** | **6.55** |
+
+W&B group: `phase6/input-noise-aug`. Runs: ibpmve5e, cxyu1uvk (σ=0.01), 0hfbsp66, o3embbbn (σ=0.03), d2otilbo, fgczv5yq (σ=0.05). Old baseline (no GSB). 145-147 epochs.
+
+**Results commentary:**
+- Catastrophic degradation at ALL noise levels. Even σ=0.01 causes p_in +17%, p_re +22%.
+- CFD inputs carry precise geometric information — noise corrupts geometry→flow mapping.
+- Monotonic degradation confirms noise is pure corruption, not regularization.
+- **Confirms dead end CLASS:** Generic input perturbation (noise, dropout) fundamentally incompatible with mesh-based CFD prediction. Only physically-consistent augmentations work.
+- Edward reassigned to LR sweep (#2149).
+
+---
+
 ### 2026-04-05 ~06:40 — PR #2137: EMA Stochastic Weight Perturbation — tanjiro — **CLOSED** (dead end)
 
 - Branch: `tanjiro/ema-perturb`
