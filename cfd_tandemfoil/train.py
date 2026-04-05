@@ -60,6 +60,27 @@ ACTIVATION = {
 }
 
 
+class SpectralShaping(nn.Module):
+    """Learnable 1D filter along feature dimension, initialized to Gaussian blur.
+
+    Equivalent to a 1D conv with kernel_size=3 along the feature axis,
+    implemented as shifted-tensor weighted sum for torch.compile efficiency.
+    """
+    def __init__(self, kernel_size=3):
+        super().__init__()
+        assert kernel_size == 3, "Only kernel_size=3 supported"
+        self.w = nn.Parameter(torch.tensor([0.25, 0.50, 0.25]))
+
+    def forward(self, x):
+        # x: [B, N, D] — filter along D using learned 3-tap kernel
+        w0, w1, w2 = self.w[0], self.w[1], self.w[2]
+        # Pad by replicating edge features
+        left = x[..., :1]   # [B, N, 1]
+        right = x[..., -1:]  # [B, N, 1]
+        padded = torch.cat([left, x, right], dim=-1)  # [B, N, D+2]
+        return w0 * padded[..., :-2] + w1 * padded[..., 1:-1] + w2 * padded[..., 2:]
+
+
 class GatedMLP(nn.Module):
     def __init__(self, n_input, n_hidden, n_output, act='gelu'):
         super().__init__()
@@ -283,6 +304,8 @@ class TransolverBlock(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         spatial_bias_input_dim=4,
+        spectral_shaping=False,
+        spectral_shaping_kernel=3,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -328,6 +351,7 @@ class TransolverBlock(nn.Module):
             nn.init.zeros_(self.film_net[-1].bias)
         self.ln_2 = _LN(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        self.spec_shape = SpectralShaping(kernel_size=spectral_shaping_kernel) if spectral_shaping else None
         self.spatial_bias = nn.Sequential(
             nn.Linear(spatial_bias_input_dim, 64), nn.GELU(),
             nn.Linear(64, 64), nn.GELU(),
@@ -400,16 +424,21 @@ class TransolverBlock(nn.Module):
             def _ln(m, x): return m(x, is_tandem=dln_it)
         else:
             def _ln(m, x): return m(x)
+        def _mlp_fwd(x):
+            h = self.mlp(x)
+            if self.spec_shape is not None:
+                h = self.spec_shape(h)
+            return h
         if self.adaln_all and condition is not None:
             cond_out = self.adaln_net(condition)  # [B, H*4]
             s1, b1, s2, b2 = cond_out.chunk(4, dim=-1)  # each [B, H]
             fx_norm = _ln(self.ln_1, fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
             fx = _ln(self.ln_1_post, self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
             fx_norm = _ln(self.ln_2, fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
-            fx = _ln(self.ln_2_post, self.mlp(fx_norm) + fx)
+            fx = _ln(self.ln_2_post, _mlp_fwd(fx_norm) + fx)
         else:
             fx = _ln(self.ln_1_post, self.attn(_ln(self.ln_1, fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
-            fx = _ln(self.ln_2_post, self.mlp(_ln(self.ln_2, fx)) + fx)
+            fx = _ln(self.ln_2_post, _mlp_fwd(_ln(self.ln_2, fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
@@ -700,6 +729,8 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        spectral_shaping=False,
+        spectral_shaping_kernel=3,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -772,6 +803,8 @@ class Transolver(nn.Module):
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
                     spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
+                    spectral_shaping=spectral_shaping,
+                    spectral_shaping_kernel=spectral_shaping_kernel,
                 )
                 for idx in range(n_layers)
             ]
@@ -1070,6 +1103,9 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Phase 6: Spectral shaping — depthwise conv filter on MLP activations
+    spectral_shaping: bool = False           # add spectral shaping conv after MLP in TransolverBlocks
+    spectral_shaping_kernel: int = 3         # kernel size for spectral shaping conv
 
 
 cfg = sp.parse(Config)
@@ -1230,6 +1266,8 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    spectral_shaping=cfg.spectral_shaping,
+    spectral_shaping_kernel=cfg.spectral_shaping_kernel,
 )
 
 model = Transolver(**model_config).to(device)
