@@ -2,6 +2,37 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~02:30 — PR #2134: Fore-Foil TE Relative Coords + Bug Fix — frieren — **CLOSED** (dead end + critical finding)
+
+- Branch: `frieren/foil1-relative-coords`
+- Hypothesis: Add (x_rel, y_rel) relative to fore-foil trailing edge as features to AftFoilRefinementContextHead. Additionally: **critical bug fix** — changed guard from `if aft_srf_head is not None:` to `if aft_srf_head is not None or aft_srf_ctx_head is not None:` so context head actually fires.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | Epochs | W&B |
+|--------|------|------|--------|-------|------|--------|-----|
+| + rel_coords | 42 | 14.952 | 8.535 | 30.846 | 7.438 | 132 | r2gh8csf |
+| + rel_coords | 73 | 15.146 | 9.221 | 31.528 | 7.049 | 133 | o0sa3a8b |
+| **rel avg** | — | **15.049** | **8.878** | **31.187** | **7.244** | — | — |
+| control (no rel) | 42 | 15.470 | 8.252 | 30.203 | 7.261 | 132 | 8nw4yzw3 |
+| control (no rel) | 73 | 16.484 | 8.288 | 30.612 | 7.156 | 133 | wm0seo1f |
+| **ctrl avg** | — | **15.977** | **8.270** | **30.408** | **7.209** | — | — |
+| **Non-context baseline** | — | **13.19** | **7.92** | **30.05** | **6.45** | 155+ | — |
+| **Current baseline** (PCGrad) | — | **13.20** | **7.91** | **29.48** | **6.50** | 155+ | — |
+
+W&B group: `phase6/foil1-relative-coords`. VRAM: 38.8 GB. Runs did NOT include PCGrad or aug_dsdf2_sigma.
+
+**CRITICAL FINDING — Context head when working is harmful:**
+- These are the FIRST runs where the context head actually fires (bug fix applied).
+- Control runs (context working) vs non-context baseline: p_in +21% ❌, p_oodc +4.4% ❌, p_tan +1.2% ❌, p_re +11.8% ❌
+- **Undertraining confound:** Runs hit only 132-133 epochs (vs 155-160 baseline). KNN computation adds ~17% per-epoch overhead → cosine schedule (T_max=160) never completes → LR doesn't reach 0. This likely explains the catastrophic p_in and p_re regression.
+- **PR #2127 improvement confirmed as seed variance.** Context head was never applied in those runs.
+- **Decision:** `--aft_foil_srf_context` officially removed from baseline. The approach needs fundamental optimization (faster KNN, lower K) to be viable within the 180-minute training budget.
+
+Rel_coords: p_tan +2.6% worse than control. TE relative coordinate frame doesn't help. Dead end.
+
+Frieren reassigned to model-soup (#2142).
+
+---
+
 ### 2026-04-05 ~02:15 — PR #2130 (Round 2): Gap/Stagger Spatial Bias + aft_foil_srf_context rebase — fern — **SENT BACK** (final validation: PCGrad + GSB)
 
 - Branch: `fern/gap-stagger-spatial-bias`

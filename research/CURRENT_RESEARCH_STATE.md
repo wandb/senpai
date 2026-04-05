@@ -17,7 +17,7 @@
 
 **Latest merge:** PR #2119 (askeladd) — PCGrad 2-way gradient surgery. W&B rebased: jpe1t13t (s42), cdccuyl7 (s73).
 
-⚠️ **CRITICAL BUG:** `--aft_foil_srf_context` is a NO-OP — guard bug `if aft_srf_head is not None:` is False when context=True. Context head NEVER applied. PR #2127's improvement was likely seed variance. Bug fix in frieren's #2134; awaiting results.
+⚠️ **RESOLVED BUG (PR #2134):** `--aft_foil_srf_context` guard bug confirmed. When bug fixed and context head actually fires, results are WORSE (p_tan +1.2%, p_in +21% due to KNN overhead → undertrained 132 epochs). Context head officially removed from baseline. PR #2127 improvement was seed variance.
 
 **Reproduce current baseline:**
 ```bash
@@ -50,7 +50,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | alphonse | #2131 | Tandem-Slice Carve-Out K=4 — rebased 2-seed | WIP — rebasing |
 | nezuko | #2141 | EMA Decay Rate Sweep: 0.999→{0.9995, 0.9998} | WIP — just assigned |
 | thorfinn | #2136 | Per-Foil Physics Normalization — Fix Aft-Foil Cp Denominator | WIP |
-| frieren | #2134 | Fore-Foil TE Relative Coords + CRITICAL BUG FIX | WIP — awaiting results |
+| frieren | #2142 | Cross-Seed Model Soup — Weight-Averaging 3 Seeds | WIP — just assigned |
 | edward | #2138 | Foil-2 Independent AoA Rotation Aug — Decoupled Tandem Geometry | WIP |
 
 **All 8 students active. Zero idle GPUs.**
@@ -75,7 +75,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 1. `--aft_foil_srf`: dedicated aft-foil SRF head — PR #2104
 2. `--aug_gap_stagger_sigma 0.02`: tandem scalar domain randomization — PR #2115
 3. `--aug_dsdf2_sigma 0.05`: foil-2 DSDF magnitude aug — PR #2126 (p_tan -1.4%)
-4. `--aft_foil_srf_context`: KNN volume context (BUG — was no-op, improvement was seed variance) — PR #2127
+4. ~~`--aft_foil_srf_context`~~: KNN volume context — **REMOVED** (was no-op due to guard bug; when fixed, harmful due to training slowdown) — PR #2127 retracted
 5. `--pcgrad_3way --pcgrad_extreme_pct 0.15`: PCGrad 2-way gradient surgery — PR #2119 (p_tan -2.1%)
 
 **Active experiments (7 students + 1 idle):**
@@ -84,7 +84,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 3. **Gap/Stagger Spatial Bias + PCGrad** (fern #2130) — Final validation: does GSB compound with PCGrad? GSB showed -0.8% p_tan vs control. Expected compound: ~29.24.
 4. **Tandem-Slice Carve-Out K=4** (alphonse #2131) — Rebasing onto noam. Original result K=4: p_tan -3.7% vs control.
 5. **Per-Foil Physics Normalization** (thorfinn #2136) — Split Cp denominator for fore/aft foil nodes.
-6. **Fore-Foil TE Relative Coords + Bug Fix** (frieren #2134) — TE relative coords + critical aft_srf_context guard fix. **Critical priority.**
+6. **Cross-Seed Model Soup** (frieren #2142) — Train 3 seeds (42, 73, 91), average EMA weights post-training. Weight averaging across independent seeds creates flatter loss basin model. Expected p_tan -1% to -3%.
 7. **Foil-2 Independent AoA Rotation Aug** (edward #2138) — Decoupled fore/aft AoA rotation for tandem samples.
 8. **EMA Decay Rate Sweep** (nezuko #2141) — Test 0.9995 and 0.9998 vs baseline 0.999. Higher decay = more averaging = flatter basin = better OOD. Expected p_tan -0.5% to -1.5%.
 
@@ -98,11 +98,11 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 ### High Priority
 1. **Nezuko reassignment** — immediate. Options:
-   - Upstream-only KNN context (filter vol neighbors to x_vol < x_aft) — follow-up to PR #2127, wait for frieren #2134 bug fix
+   - ~~Upstream-only KNN context~~ — DEAD: context head when working is harmful (PR #2134 confirmed)
    - Checkpoint ensemble averaging (save last 3 checkpoints, average weights) — simple, ~20 LoC, often +0.5-2% OOD
    - Attention sparsification / top-k slice assignment — force sparser routing to prevent single slice domination
    - Adversarial tandem augmentation — generate worst-case gap/stagger perturbations via gradient ascent on validation loss
-2. **aft_foil_srf_context bug fix** — frieren #2134 critical. Once results arrive, cherry-pick fix and re-test true KNN context improvement.
+2. ~~aft_foil_srf_context~~ — **DEAD.** Frieren #2134 confirmed: context head when correctly applied is harmful (p_tan +1.2%, p_in +21%). KNN overhead causes undertraining (132 vs 160 epochs). Whole context head approach dead within current training budget.
 3. **Upstream-only KNN context** — after bug fix confirmed.
 4. **Learnable distance weighting** — replace mean K-neighbor aggregation with attention-weighted.
 5. **AoA stagger flip augmentation** — mirror tandem stagger sign to create novel asymmetric configurations.
@@ -116,6 +116,8 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 | Direction | PRs | Finding |
 |-----------|-----|---------|
+| Fore-Foil TE Relative Coords | #2134 | p_tan +2.6% worse than control. TE relative frame doesn't help |
+| AftSRF KNN Context Head (when working) | #2134, #2127 | Context head adds 17% overhead → 132 vs 160 epochs → catastrophic: p_in +21%, p_tan +1.2% |
 | Surface Pressure Gradient Aux Loss | #2129 (3 rounds) | p_oodc improves -1.5% but p_tan regresses. 3 iterations with diminishing returns. Signal too weak. |
 | Foil-1 DSDF Magnitude Augmentation | #2133 | All σ values regress p_tan. Front-foil is KNOWN component in val_tandem_transfer |
 | Tandem DSDF Channel Mixup | #2132 | Mixup between NACA0012 samples adds no geometric diversity |
