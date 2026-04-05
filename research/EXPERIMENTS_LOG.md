@@ -2,6 +2,49 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~02:15 — PR #2130 (Round 2): Gap/Stagger Spatial Bias + aft_foil_srf_context rebase — fern — **SENT BACK** (final validation: PCGrad + GSB)
+
+- Branch: `fern/gap-stagger-spatial-bias`
+- This entry covers fern's rebased validation run (added `--aft_foil_srf_context`, seeds 42/73).
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B ID |
+|--------|------|------|--------|-------|------|--------|
+| GSB + context | 42 | 13.5 | 7.7 | 30.8 | 6.5 | bwuglnin |
+| GSB + context | 73 | 12.8 | 7.6 | 31.4 | 6.3 | td8fcpt7 |
+| **GSB+ctx avg** | — | **13.15** | **7.65** | **31.1** | **6.4** | — |
+| **Current baseline** | — | **13.20** | **7.91** | **29.48** | **6.50** | — |
+
+**Results commentary:**
+- GSB + aft_foil_srf_context (rebased) = p_tan 31.1 — much worse than both the original GSB result (29.82) and current baseline (29.48).
+- Root causes: (1) aft_foil_srf_context is a no-op due to guard bug (frieren #2134) — its presence changes training dynamics slightly (VRAM/speed), (2) seeds 42/73 is harder than 42/43 used in original, (3) baseline has since moved with PCGrad merger.
+- The original GSB signal (+0.8% p_tan improvement) remains valid but the current PCGrad baseline (29.48) is a tougher target.
+- **Sent back for final validation:** GSB + PCGrad (no aft_foil_srf_context), seeds 42/73, vs current baseline 29.48.
+
+---
+
+### 2026-04-05 ~02:15 — PR #2129 (Round 2+3): Supervised Surface Pressure Gradient Aux Loss v2 — nezuko — **CLOSED** (exhausted)
+
+- Branch: `nezuko/surf-pressure-gradient-aux`
+- This entry covers the per-foil fix (v2) results.
+
+| Run | W&B ID | Seed | p_in | p_oodc | p_tan | p_re |
+|-----|--------|------|------|--------|-------|------|
+| surfgrad-v2-w10-s42 | 9twwqobo | 42 | 13.089 | 7.843 | 29.450 | 6.390 |
+| surfgrad-v2-w10-s73 | lraags91 | 73 | 13.402 | 7.732 | 30.106 | 6.559 |
+| **v2 mean** | — | — | **13.246** | **7.788** | **29.778** | **6.475** |
+| **Current baseline (PR #2119)** | — | — | **13.20** | **7.91** | **29.48** | **6.50** |
+
+W&B group: `phase6/surf-grad-aux-v2`
+
+**Results commentary:**
+- **CLOSED after 3 iterations.** Per-foil fix successfully corrected the p_tan regression (from +1.1% to -0.4% vs same-epoch control), confirming the cross-foil gradient bug was real.
+- Against current PCGrad baseline: p_in misses (+0.35%), p_oodc beats (-1.5%), p_tan misses (+1.0%), p_re roughly matches (+0.4%).
+- Seed 42 (29.45) is very close to baseline but seed 73 (30.11) drags the mean up. High variance between seeds suggests the signal is weak.
+- After 3 iterations with diminishing returns (round 1 cross-foil bug → round 2 rebase bug → round 3 correct but insufficient), the approach is exhausted.
+- **p_oodc improvement (~-1.5%) is consistently real** but not sufficient to justify p_in and p_tan misses.
+
+---
+
 ### 2026-04-05 ~01:45 — PR #2135: Tandem Self-Distillation — edward — **CLOSED** (inconclusive/negative)
 
 - Branch: `edward/tandem-selfdistill`
@@ -129,6 +172,33 @@ W&B group: `phase6/gap-stagger-spatial-bias`
 - Feature index correction: gap=22, stagger=23 (not 21, 22 as in PR instructions). Student caught this.
 - VRAM: 38.4 GB — identical to baseline (negligible parameter overhead).
 - **Sent back** for rebased 2-seed validation with `--aft_foil_srf_context`. Expect compounding — merge if p_tan < 29.91.
+
+---
+
+### 2026-04-05 ~02:00 — PR #2119: PCGrad 2-Way (10-seed) — askeladd — **MERGED** (winner)
+
+- Branch: `askeladd/pcgrad-3way`
+- Hypothesis: PCGrad gradient surgery between single-foil and all-tandem batches (2-way). Prevents single-foil signal from corrupting tandem representation. 10 seeds total.
+
+**8-seed validation (phase6/pcgrad-2way-validation):**
+| Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|------|------|--------|-------|------|-----|
+| 42-49 | 13.20 ± 0.26 | 7.91 ± 0.16 | **29.48 ± 0.43** | 6.50 ± 0.12 | tmqq1xlo...75d4hhzm |
+
+**Rebased 2-seed (phase6/pcgrad-2way-rebased):**
+| Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|------|------|--------|-------|------|-----|
+| 42 | 13.018 | 7.906 | **28.851** | 6.504 | jpe1t13t |
+| 73 | 12.824 | 7.973 | 30.095 | 6.537 | cdccuyl7 |
+| **mean** | **12.921** | **7.940** | **29.473** | **6.521** | — |
+
+**Results commentary:**
+- **MERGED.** p_tan -1.9% (8-seed mean: 29.48 vs baseline 30.05). Consistent across 10 seeds.
+- p_in improved (-2.4% rebased, -0.1% vs 8-seed baseline).
+- p_oodc flat (+0.4% vs aft_srf-only baseline, regressed vs gap_stagger baseline).
+- VRAM: 45-46 GB (+22% from 3 backward passes).
+- New baseline command adds `--pcgrad_3way --pcgrad_extreme_pct 0.15` (removes `--disable_pcgrad`).
+- NOTE: `--aft_foil_srf_context` was a no-op in all runs due to guard bug (frieren #2134).
 
 ---
 
