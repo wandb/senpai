@@ -51,7 +51,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | alphonse | #2166 | dp/dn=0 Physics Loss: surface normal pressure gradient constraint | WIP |
 | thorfinn | #2172 | Binned Spectral Power Loss: frequency-weighted surface pressure loss | WIP — just assigned |
 | frieren | #2170 | Wider/Deeper SRF: hidden 256/384, layers 3/4 | WIP — just assigned |
-| edward | — | **IDLE** — awaiting new assignment | IDLE |
+| edward | #2173 | Foil-1 Geometry Adapter: DSDF stats → slice logit bias | WIP — just assigned |
 
 **All 8 students active. Zero idle GPUs.** (thorfinn reassigned after #2165 close)
 
@@ -91,7 +91,7 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 3. **Online Hard Example Mining** (nezuko #2169) — adaptive per-sample loss upweighting
 4. **Binned Spectral Power Loss** (thorfinn #2172) — frequency-weighted 1D DFT loss targeting high-freq surface pressure features
 5. **dp/dn=0 Physics Loss** (alphonse #2166) — surface normal pressure gradient constraint
-6. ~~Tandem Surface Mixup (edward #2167)~~ — CLOSED, replaced below
+6. **Foil-1 Geometry Adapter** (edward #2173) — DSDF stats → slice logit bias, GEPS-inspired zero-init
 7. **Wider/Deeper SRF Head** (frieren #2170) — hidden 256/384, layers 3/4
 8. **Slice Number Sweep** (tanjiro #2171) — 128, 144 vs baseline 96
 
