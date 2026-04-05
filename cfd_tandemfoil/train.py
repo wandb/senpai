@@ -700,9 +700,12 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        iterative_refinement=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
+        self.iterative_refinement = iterative_refinement
+        self._refinement_active = False  # set externally when epoch >= warmup
         self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
         self.pressure_first = pressure_first
         self.ref = ref
@@ -802,6 +805,10 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        # Iterative refinement: project pass-1 predictions back into hidden space
+        if self.iterative_refinement:
+            self.correction_proj = nn.Linear(out_dim, n_hidden, bias=False)
+            nn.init.zeros_(self.correction_proj.weight)  # zero-init: pass-2 starts identical to pass-1
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -894,6 +901,56 @@ class Transolver(nn.Module):
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
 
+        # Last block condition (computed once, used in all passes)
+        last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
+
+        # --- Iterative refinement: 2-pass forward ---
+        if self._refinement_active:
+            # Pass 1: standard forward, no gradients (saves ~50% memory)
+            with torch.no_grad():
+                fx_p1 = self.preprocess(x)
+                fx_pre_p1 = fx_p1
+                fx_p1 = fx_p1 * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
+                for block in self.blocks[:-1]:
+                    fx_p1 = block(fx_p1, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+                if self._pressure_separate and self.pressure_first:
+                    p_sep_p1 = self.pressure_sep_mlp(fx_p1)
+                    fx_p1 = self.blocks[-1](fx_p1, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+                    fx_p1 = torch.cat([fx_p1[:, :, :2], p_sep_p1], dim=-1)
+                else:
+                    fx_p1 = self.blocks[-1](fx_p1, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+                gate_p1 = self.skip_gate(fx_pre_p1)
+                pass1_pred = fx_p1 + gate_p1 * self.out_skip(fx_pre_p1)  # [B, N, out_dim]
+
+            # Pass 2: preprocess + correction from pass-1 predictions
+            fx = self.preprocess(x)
+            fx_pre = fx  # save for skip
+            fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
+            # Add correction signal: correction_proj is zero-init so pass-2 starts ≡ pass-1
+            correction = self.correction_proj(pass1_pred)  # [B, N, n_hidden]
+            fx = fx + correction
+
+            for block in self.blocks[:-1]:
+                fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+
+            fx_deep = fx
+            re_pred = self.re_head(fx.mean(dim=1))
+            aoa_pred = self.aoa_head(fx.mean(dim=1))
+
+            if self._pressure_separate and self.pressure_first:
+                fx_for_pressure = fx
+                p_sep = self.pressure_sep_mlp(fx_for_pressure)
+                fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+                fx = torch.cat([fx[:, :, :2], p_sep], dim=-1)
+            else:
+                fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+
+            gate = self.skip_gate(fx_pre)
+            fx = fx + gate * self.out_skip(fx_pre)
+            self._validate_output_dims(fx)
+            return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred, "hidden": fx_deep}
+
+        # --- Standard single-pass forward ---
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
@@ -907,9 +964,6 @@ class Transolver(nn.Module):
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
-
-        # Last block: use adaln_all condition if enabled, else fallback to adaln_output
-        last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
 
         if self._pressure_separate and self.pressure_first:
             # Separate pressure pathway: independent MLP processes pre-last features
@@ -1070,6 +1124,9 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Phase 6: Iterative 2-pass refinement (AlphaFold2-style recycling)
+    iterative_refinement: bool = False       # run model twice: pass-1 → correction → pass-2
+    iterative_warmup_epoch: int = 60         # use single-pass before this epoch (garbage pass-1 predictions)
 
 
 cfg = sp.parse(Config)
@@ -1230,6 +1287,7 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    iterative_refinement=cfg.iterative_refinement,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1549,6 +1607,9 @@ for epoch in range(MAX_EPOCHS):
 
     # --- Train ---
     model.train()
+    # Iterative refinement: activate 2-pass after warmup epoch
+    if cfg.iterative_refinement:
+        _base_model._refinement_active = (epoch >= cfg.iterative_warmup_epoch)
     if refine_head is not None:
         refine_head.train()
     if aft_srf_head is not None:
@@ -2249,6 +2310,10 @@ for epoch in range(MAX_EPOCHS):
         eval_model = model
     eval_model.eval()
     model.eval()
+    # Iterative refinement: set on eval model too
+    if cfg.iterative_refinement:
+        _eval_base = eval_model._orig_mod if hasattr(eval_model, '_orig_mod') else eval_model
+        _eval_base._refinement_active = (epoch >= cfg.iterative_warmup_epoch)
     # Select the right refinement head for validation (EMA if available)
     eval_refine_head = refine_head  # default: use training head
     if refine_head is not None:
@@ -2680,6 +2745,8 @@ if best_metrics:
         _sd = {k.removeprefix("_orig_mod."): v for k, v in _sd.items()}
         vis_model.load_state_dict(_sd)
         vis_model.eval()
+        if cfg.iterative_refinement:
+            vis_model._refinement_active = True  # always use 2-pass at visualization time
         plot_dir = Path("plots") / run.id
         n = 1 if cfg.debug else 4
         for split_name, split_ds in val_splits.items():
@@ -2757,6 +2824,8 @@ if cfg.surface_refine and best_metrics:
         _verify_sd = {k.removeprefix("_orig_mod."): v for k, v in _verify_sd.items()}
         verify_model.load_state_dict(_verify_sd)
         verify_model.eval()
+        if cfg.iterative_refinement:
+            verify_model._refinement_active = True  # always use 2-pass at verification time
 
         # Use EMA refinement head if available, else training head
         verify_refine = ema_refine_head if ema_refine_head is not None else (
