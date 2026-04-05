@@ -44,7 +44,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| fern | #2174 | Attention Temperature Curriculum: broad→sharp slice routing | WIP |
+| fern | #2181 | GEPS Test-Time Low-Rank Adaptation for OOD Tandem | WIP — just assigned |
 | askeladd | #2175 | SWD Tandem Domain Alignment: slice token distribution matching | WIP |
 | nezuko | #2177 | Coordinated Tandem Ramp: sigma decay synced with loss ramp | WIP |
 | tanjiro | #2178 | Smaller SRF Head: hidden 128/96 vs baseline 192 | WIP |
@@ -59,6 +59,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
+| #2174 | fern | Attention Temperature Curriculum | **CLOSED** | p_tan +2.7-4.2%. High temp disrupts GSB slice routing. |
 | #2173 | edward | Foil-1 Geometry Adapter | **CLOSED** | p_tan +2.1-2.4%. DSDF stats too coarse — 4 moments discard spatial structure. |
 | #2167 | edward | Tandem Surface Mixup | **CLOSED** | p_tan +5.8-5.9%. Physical inconsistency — aft-foil targets coupled to upstream wake. |
 | #2165 | thorfinn | Iterative 2-Pass Refinement | **CLOSED** | p_tan=30.5 (+6.6%). 1.3x epoch cost → only 131 epochs. Still converging at wall clock. |
@@ -87,7 +88,7 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 5. `--gap_stagger_spatial_bias` — tandem-geometry-aware slice routing (p_tan -3.0%)
 
 **Active experiments (8 students WIP):**
-1. **Attention Temperature Curriculum** (fern #2174) — schedule temp 2.0→0.3 over 80 epochs then release, zero new params
+1. **GEPS Test-Time Adaptation** (fern #2181) — LoRA context params + continuity residual TTA at inference. **Tier 1 radical — zero training change.**
 2. **SWD Tandem Domain Alignment** (askeladd #2175) — Sliced Wasserstein Distance between tandem/single-foil slice tokens
 3. **Coordinated Tandem Ramp** (nezuko #2177) — sigma decay synced with loss ramp
 4. **Panel-Method Inviscid Cp** (thorfinn #2179) — pre-compute vortex panel Cp as input feature. **TOP PRIORITY — Tier 1 radical.**
@@ -109,7 +110,7 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 
 ### RADICAL — Researcher-Agent Round 4 (2026-04-06) — Plateau-Breaking Ideas
 1. ~~**Panel-Method Inviscid Cp as Input Feature**~~ → assigned to thorfinn #2179
-2. **Test-Time Low-Rank Adaptation (GEPS)** — ~4600 learnable context params adapted at inference using physics self-supervised signal. Zero training change. **NEXT PRIORITY.**
+2. ~~**Test-Time Low-Rank Adaptation (GEPS)**~~ → assigned to fern #2181
 3. **Ensemble Distillation** — soft targets from 23-model ensemble as KD signal. Leverages our 45 trained models.
 4. ~~**Multi-Resolution Hash Grid Encoding**~~ → assigned to edward #2180
 5. **Frequency-Weighted Surface Pressure Loss** — DCT-domain loss upweighting high-freq components (Tier 3)
@@ -179,6 +180,7 @@ See `/research/RESEARCH_IDEAS_2026-04-06_ROUND4.md` for full details.
 | **Slice Number 128/144** | **#2171** | **p_tan +3.3/3.8%. More slices = more overfitting, fewer epochs. 96 confirmed.** |
 | **BSP Spectral Loss** | **#2172** | **w=0.1 catastrophic collapse, w=0.05 all +3-6%. Spectral bias not the bottleneck.** |
 | **Foil-1 Geometry Adapter** | **#2173** | **p_tan +2.1-2.4%. DSDF 4-moment stats too coarse, discard spatial structure.** |
+| **Attention Temperature Curriculum** | **#2174** | **p_tan +2.7-4.2%. High initial temp disrupts GSB routing, wastes early epochs.** |
 
 ## Ensemble Seed Pool (Complete)
 

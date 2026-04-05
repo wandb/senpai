@@ -2,6 +2,21 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~07:00 — PR #2174: Attention Temperature Curriculum — fern — **CLOSED** (disrupts slice routing)
+
+- Branch: `fern/attn-temp-curriculum`
+- Hypothesis: Schedule attention temperature 2.0→0.3 over 80 epochs (broad→sharp routing), then release. Zero new params.
+
+| Config | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|--------|-------|------|-----|
+| **A (2.0→0.3, 80ep) avg** | **13.15** | **8.14** | **29.79** | **6.41** | nvyisrfa, zjx1jmy9 |
+| **B (1.5→0.5, 60ep) avg** | **13.35** | **8.12** | **29.38** | **6.55** | 9uii4cn2, k4k8ko01 |
+| **Baseline** | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** Both configs regress p_tan (+2.7-4.2%) and p_oodc (+5.5-5.7%). High initial temperature forces near-uniform attention, preventing early slice specialization. Interferes with GSB routing which needs correct routing from the start. Shorter/milder annealing (B) marginally better than aggressive (A), consistent with less disruption.
+
+---
+
 ### 2026-04-06 ~06:00 — PR #2173: Foil-1 Geometry Adapter — edward — **CLOSED** (DSDF stats too coarse)
 
 - Branch: `edward/foil1-geom-adapter`
