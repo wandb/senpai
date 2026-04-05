@@ -1,6 +1,36 @@
 # Baseline Metrics
 
-## Current Single-Model Baseline (Phase 6 — 2026-04-05, +PCGrad 2-Way, 10-Seed Evidence, PR #2119)
+## Current Single-Model Baseline (Phase 6 — 2026-04-05, +Gap/Stagger Spatial Bias + PCGrad, 2-Seed Evidence, PR #2130)
+
+| Metric | 2-seed avg | vs prior (PCGrad only) | Δ |
+|--------|------------|------------------------|---|
+| p_in | **13.05** | 13.20 | **-1.1%** |
+| p_oodc | **7.70** | 7.91 | **-2.7%** |
+| **p_tan** | **28.60** | 29.48 | **-3.0%** |
+| p_re | **6.55** | 6.50 | +0.8% (noise) |
+
+**PR #2130** (merged 2026-04-05) — Gap/Stagger-Conditioned Spatial Bias: extends Transolver spatial_bias MLP from 4→6 inputs by appending (gap, stagger) scalars from feature indices 22:24. Makes slice routing tandem-geometry-aware. Zero-init on new input columns ensures identical routing at epoch 0. W&B runs: d7l91p0x (seed 42, p_tan=28.9), j9btfx09 (seed 73, p_tan=28.3). Combined with PCGrad 2-way — the two mechanisms are orthogonal (routing vs gradient surgery) and compound.
+
+⚠️ **2-seed only.** For merge decisions: p_tan < 28.60, p_oodc < 7.70, p_in < 13.05, p_re < 6.55.
+
+**Reproduce (current baseline):**
+```bash
+cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baseline-gsb-pcgrad" \
+  --asinh_pressure --asinh_scale 0.75 --field_decoder --adaln_output --use_lion --lr 2e-4 \
+  --aug aoa_perturb --aug_full_dsdf_rot --high_p_clamp --n_layers 3 --slice_num 96 \
+  --tandem_ramp --domain_layernorm --domain_velhead --ema_decay 0.999 --weight_decay 5e-5 \
+  --cosine_T_max 160 --pcgrad_3way --pcgrad_extreme_pct 0.15 \
+  --pressure_first --pressure_deep \
+  --residual_prediction --surface_refine --surface_refine_hidden 192 --surface_refine_layers 3 \
+  --aft_foil_srf --aug_gap_stagger_sigma 0.02 --aug_dsdf2_sigma 0.05 \
+  --gap_stagger_spatial_bias
+```
+
+**For merge decisions:** Compare 2-seed avg against: p_tan < 28.60, p_oodc < 7.70, p_in < 13.05, p_re < 6.55.
+
+---
+
+## Prior Baseline (Phase 6 — 2026-04-05, +PCGrad 2-Way, 10-Seed Evidence, PR #2119)
 
 | Metric | 8-seed mean | Rebased 2-seed | vs prior (aft_srf only, 8-seed) | Δ |
 |--------|-------------|----------------|----------------------------------|---|
