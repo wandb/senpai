@@ -2,6 +2,36 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~04:00 — PR #2170: Wider/Deeper Surface Refinement — frieren — **CLOSED** (SRF capacity overfits)
+
+- Branch: `frieren/wider-deeper-srf`
+- Hypothesis: More SRF capacity (h=256/384) for finer-grained pressure correction.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| **h=256 avg** | — | **13.3** | **7.8** | **29.95** | **6.4** | me8pq3ec, 068695h7 |
+| **h=384 avg** | — | **13.5** | **7.75** | **29.75** | **6.5** | b2yqrp7k, h3r5gz4p |
+| **Baseline (h=192)** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** Both worse. h=256 p_tan +4.7%, h=384 +4.0%. More capacity overfits to training surface patterns. h=192 confirmed optimal.
+
+---
+
+### 2026-04-06 ~04:00 — PR #2169: Online Hard Example Mining (OHEM) — nezuko — **CLOSED** (redundant with existing difficulty mechanisms)
+
+- Branch: `nezuko/hard-sample-mining`
+- Hypothesis: Adaptive per-sample loss upweighting for hardest K% samples.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| **ohem=0.25 avg** | — | **13.434** | **8.192** | **29.237** | **6.648** | 6cwidgyx, ja9nrkx4 |
+| **ohem=0.50 avg** | — | **13.167** | **8.123** | **29.275** | **6.695** | 3bklpibu, ip5qhz7s |
+| **Baseline** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** All metrics worse. p_tan +2.2-2.4%, p_oodc +5.5-6.4%. Redundant with existing tandem_boost + hard-node mining + PCGrad. 4th difficulty layer pushes training distribution too far, causing OOD overfitting.
+
+---
+
 ### 2026-04-06 ~03:30 — PR #2168: Tandem Pressure Correction MLP — askeladd — **CLOSED** (p_tan +2.8%, mixed result)
 
 - Branch: `askeladd/tandem-pressure-head`
