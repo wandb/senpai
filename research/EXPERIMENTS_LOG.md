@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~03:30 — PR #2168: Tandem Pressure Correction MLP — askeladd — **CLOSED** (p_tan +2.8%, mixed result)
+
+- Branch: `askeladd/tandem-pressure-head`
+- Hypothesis: Gated correction head for tandem-only pressure. Zero-init gate (bias=-2.0). Hidden=96, 28K params.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| tandem_phead | 42 | 12.6 | 7.6 | 29.5 | 6.2 | 6xar22ki |
+| tandem_phead | 73 | 13.3 | 7.4 | 29.3 | 6.5 | lt4ygmej |
+| **avg** | — | **12.95** | **7.50** | **29.40** | **6.35** | — |
+| **Baseline** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** Mixed. p_oodc -2.6%, p_re -3.1% (consistent improvements). But p_tan +2.8% — primary target regressed. Double-correction interference: head applies on top of aft_foil_srf for aft-foil nodes. 28K extra params, minimal VRAM impact. Fore-foil restriction would face same collapse issue as 4 failed SRF attempts.
+- Askeladd now idle — reassigning.
+
+---
+
 ### 2026-04-06 ~03:00 — PR #2161: FiLM-Conditioned Fore-Foil SRF — fern — **CLOSED** (4th consecutive fore-foil SRF failure)
 
 - Branch: `fern/film-conditioned-fore-foil-srf`
