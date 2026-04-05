@@ -2,6 +2,47 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~00:15 — PR #2164: Backbone Gap/Stagger AdaLN — frieren — **CLOSED** (backbone AdaLN disrupts attention routing)
+
+- Branch: `frieren/backbone-gs-adaln`
+- Hypothesis: Thread gap/stagger conditioning through ALL TransolverBlocks via AdaLN-Zero. Currently only decoder sees geometry; backbone attention can't modulate for tandem configs.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| adaln_all + gs 4cond | 42 | — | — | ~30.55 | — | (see PR) |
+| adaln_all + gs 4cond | 73 | — | — | ~30.55 | — | (see PR) |
+| **adaln_all + gs 4cond avg** | — | — | — | **30.55** | — | — |
+| adaln_all + Re/AoA 2cond | 42 | — | — | ~30.3 | — | (see PR) |
+| adaln_all + Re/AoA 2cond | 73 | — | — | ~30.3 | — | (see PR) |
+| **adaln_all + Re/AoA avg** | — | — | — | **30.3** | — | — |
+| **Baseline** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** Both configs regress p_tan heavily (+6.8%, +5.9%). Modulating ALL backbone LayerNorms via AdaLN-Zero interferes with optimized attention routing and slice assignments. VRAM jumped to ~50GB, epochs dropped to 142-144 (under-trained). GSB (spatial bias level) is the right abstraction for geometry injection — normalization-level conditioning disrupts the backbone.
+- Dead end: backbone-wide AdaLN conditioning.
+- Frieren now idle — reassigning.
+
+---
+
+### 2026-04-06 ~00:15 — PR #2156: DSDF-1 Channel Dropout — tanjiro — **CLOSED** (foil-1 DSDF channels need exact values)
+
+- Branch: `tanjiro/dsdf-channel-dropout`
+- Hypothesis: Drop foil-1 DSDF channels (p=0.2, 0.3) during tandem training to force shape-invariant prediction.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| p=0.2 | 42 | — | — | ~30.20 | — | (see PR) |
+| p=0.2 | 73 | — | — | ~30.20 | — | (see PR) |
+| **p=0.2 avg** | — | — | — | **30.20** | — | — |
+| p=0.3 | 42 | — | — | ~30.40 | — | (see PR) |
+| p=0.3 | 73 | — | — | ~30.40 | — | (see PR) |
+| **p=0.3 avg** | — | — | — | **30.40** | — | — |
+| **Baseline** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** Both dropout rates regress p_tan (+5.6%, +6.3%). Foil-1 DSDF encodes upstream geometry creating the wake impinging on aft foil — dropping it removes critical causal information. Notable: p_re improved -9.2% at p=0.2 (strong OOD Reynolds regularization), but p_tan regression too severe. Combined with PR #2133 (foil-1 magnitude aug failed), foil-1 DSDF perturbation in any form is a dead end.
+- Tanjiro now idle — reassigning.
+
+---
+
 ### 2026-04-05 ~20:45 — PR #2163: Differential LR for Specialized Heads — nezuko — **CLOSED** (p_tan regression)
 
 - Branch: `nezuko/differential-lr-specialized-heads`

@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-05 ~18:30 UTC
+- **Date:** 2026-04-06 ~00:15 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -40,29 +40,34 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble (29.1) on p_tan.
 
-## Student Status (~18:30 UTC)
+## Student Status (~00:15 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| fern | #2161 | FiLM-Conditioned Fore-Foil SRF: shape-aware correction on NACA6416 fore surface | WIP — just assigned |
-| askeladd | #2168 | Tandem Pressure Correction MLP: gated tandem-specific pressure pathway | WIP — just assigned |
-| nezuko | #2169 | Online Hard Example Mining: adaptive per-sample loss upweighting | WIP — just assigned |
-| tanjiro | #2156 | DSDF-1 Channel Dropout: p={0.2, 0.3} force shape-invariant tandem prediction | WIP |
-| alphonse | #2166 | dp/dn=0 Physics Loss: surface normal pressure gradient constraint | WIP — just assigned |
-| thorfinn | #2165 | Iterative 2-Pass Refinement: AlphaFold2-style recycling, zero new params | WIP — just assigned |
-| frieren | #2164 | Backbone Gap/Stagger AdaLN: thread gap/stagger into ALL TransolverBlocks | WIP — just assigned |
-| edward | #2167 | Tandem Surface Mixup: between-sample aft-foil node swapping | WIP — just assigned |
+| fern | #2161 | FiLM-Conditioned Fore-Foil SRF: shape-aware correction on NACA6416 fore surface | WIP |
+| askeladd | #2168 | Tandem Pressure Correction MLP: gated tandem-specific pressure pathway | WIP |
+| nezuko | #2169 | Online Hard Example Mining: adaptive per-sample loss upweighting | WIP |
+| tanjiro | — | **IDLE** — awaiting new assignment | IDLE |
+| alphonse | #2166 | dp/dn=0 Physics Loss: surface normal pressure gradient constraint | WIP |
+| thorfinn | #2165 | Iterative 2-Pass Refinement: AlphaFold2-style recycling, zero new params | WIP |
+| frieren | — | **IDLE** — awaiting new assignment | IDLE |
+| edward | #2167 | Tandem Surface Mixup: between-sample aft-foil node swapping | WIP |
 
-**All 8 students active. Zero idle GPUs.**
+**6 students active, 2 idle (frieren, tanjiro). Researcher-agent generating new hypotheses.**
 
-## Recently Reviewed (2026-04-05 ~18:30)
+## Recently Reviewed (2026-04-06 ~00:15)
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
-| #2152 | nezuko | Augmentation Annealing: linearly decay aug σ | **CLOSED** | anneal→50% p_tan=28.90 (+1.0%), anneal→0% p_tan=29.20 (+2.1%). Only p_re improved (-2.9%). Constant aug essential for p_tan generalization. |
-| #2151 | fern | EMA Start Epoch Sweep: {100, 120} vs default ~140 | **CLOSED** | Both regress p_tan +3.7-3.8%. ema_start ~140 confirmed optimal. |
-| #2150 | askeladd | DSDF2 Sigma Optimization: σ={0.03, 0.08} vs 0.05 | **CLOSED** | σ=0.05 confirmed optimal. Neither direction helps. |
-| #2149 | edward | LR Sweep: lr={1e-4, 3e-4} vs baseline 2e-4 | **CLOSED** | All variants worse. lr=2e-4 confirmed. |
+| #2164 | frieren | Backbone Gap/Stagger AdaLN | **CLOSED** | adaln_all + gs 4cond p_tan=30.55 (+6.8%), adaln_all Re/AoA p_tan=30.3 (+5.9%). AdaLN disrupts optimized attention routing. |
+| #2156 | tanjiro | DSDF-1 Channel Dropout | **CLOSED** | p=0.2 p_tan=30.20 (+5.6%), p=0.3 p_tan=30.40 (+6.3%). Foil-1 DSDF carries critical upstream geometry. p_re improved -9.2% (regularization). |
+| #2163 | nezuko | Differential LR | **CLOSED** | Both mult regress p_tan. Uniform LR best. |
+| #2162 | askeladd | Tandem Cross-DSDF Features | **CLOSED** | Hand-crafted features add noise. p_tan +4.4%. |
+| #2158 | edward | Asymmetric PCGrad | **CLOSED** | All key metrics worse. Symmetric 2-way optimal. |
+| #2157 | alphonse | Foil Shape Similarity Bias (GSB 7D) | **CLOSED** | p_tan +3.7%. Sample-level cosine sim too coarse. |
+| #2153 | frieren | Gap/Stagger σ=0.03 | **CLOSED** | p_tan +3.3%. σ=0.02 confirmed optimal. |
+| #2154 | thorfinn | Cosine T_max Sweep | **CLOSED** | Both +2.8%. T_max=160 confirmed. |
+| #2152 | nezuko | Augmentation Annealing | **CLOSED** | p_tan +1.0-2.1%. Constant aug essential. |
 | #2130 | fern | GSB + PCGrad Compound | **MERGED** | p_tan 29.48→28.60 (-3.0%). Current baseline. |
 
 ## Current Research Focus
@@ -78,19 +83,17 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 4. `--pcgrad_3way --pcgrad_extreme_pct 0.15` — 2-way PCGrad gradient surgery (p_tan -2.1%)
 5. `--gap_stagger_spatial_bias` — tandem-geometry-aware slice routing (p_tan -3.0%)
 
-**Active experiments (8 students WIP):**
-1. **FiLM-Conditioned Fore-Foil SRF** (fern #2161) — FiLM-conditioned correction on fore-foil surface, conditioned on DSDF1 stats + gap/stagger. Differentiates NACA6416 from training shapes. Expected -2 to -5% p_tan.
-2. **Tandem Cross-DSDF Features** (askeladd #2162) — per-node dist_ratio + rel_angle from existing DSDF channels. Direct extension of GSB from global to per-node geometry. Expected -2 to -4% p_tan.
-3. **Differential LR** (nezuko #2163) — boost aft_srf/surface_refine/GSB heads 2x-3x vs backbone. GSB currently under-trained at lr*0.5. Expected -1 to -3%.
-4. **DSDF-1 Channel Dropout** (tanjiro #2156) — p={0.2, 0.3} tandem-only dropout of foil-1 DSDF channels
-5. **Foil Shape Similarity Bias** (alphonse #2157) — extend GSB 6D→7D with inter-foil cosine similarity
-6. **Cosine T_max Sweep** (thorfinn #2154) — T_max={140, 180} vs baseline 160
-7. **Gap/Stagger Sigma Increase** (frieren #2153) — σ=0.03 vs baseline 0.02
-8. **Asymmetric PCGrad** (edward #2158) — only project OOD onto in-dist normal plane
+**Active experiments (6 students WIP):**
+1. **FiLM-Conditioned Fore-Foil SRF** (fern #2161) — shape-aware correction on NACA6416 fore surface
+2. **Tandem Pressure Correction MLP** (askeladd #2168) — gated tandem-specific pressure pathway
+3. **Online Hard Example Mining** (nezuko #2169) — adaptive per-sample loss upweighting
+4. **Iterative 2-Pass Refinement** (thorfinn #2165) — AlphaFold2-style recycling, zero new params
+5. **dp/dn=0 Physics Loss** (alphonse #2166) — surface normal pressure gradient constraint
+6. **Tandem Surface Mixup** (edward #2167) — between-sample aft-foil node swapping
 
 **Key research patterns:**
 - **What works:** DSDF magnitude augmentation (foil-2 only), specialized correction heads (aft_srf), gradient surgery (2-way PCGrad), tandem-geometry-aware routing (GSB), geometry-conditioned mechanisms
-- **What doesn't work:** Augmentation annealing, foil-1 aug, fore-foil SRF (unconditioned), tandem slice carve-out, 3-way PCGrad, flat-minima-seeking, LR changes ±50%, earlier EMA starts, DSDF2 sigma variations
+- **What doesn't work:** Augmentation annealing, foil-1 aug/dropout, fore-foil SRF (unconditioned), tandem slice carve-out, 3-way PCGrad, flat-minima-seeking, LR changes, earlier EMA starts, DSDF2 sigma variations, backbone AdaLN, cross-DSDF features, shape similarity bias, differential LR, asymmetric PCGrad
 - **Confirmed optimal hyperparams:** ema_decay=0.999, ema_start_epoch~140, weight_decay=5e-5, aug_gap_stagger_sigma=0.02, aug_dsdf2_sigma=0.05, lr=2e-4, cosine_T_max=160
 
 ## Critical Finding: PCGrad Flag Logic
@@ -99,14 +102,7 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 
 ## Potential Next Research Directions (queue for next idle students)
 
-### Top Priority (Bold / High Expected Impact)
-1. **Backbone-Wide AdaLN-All Conditioning** — thread gap/stagger through ALL 3 TransolverBlocks via existing `adaln_all=True` infrastructure. Currently only the decoder sees this info. Backbone attention can't modulate slice assignments for different tandem configs. Infrastructure already in place — just need to pass `cond_backbone = gap_stagger * is_tandem` to blocks. Expected -5 to -15% p_tan.
-2. **Iterative 2-Pass Refinement (AlphaFold2-style recycling)** — two forward passes with shared weights. Pass-1 output concatenated as additional input for pass-2. Zero extra parameters. Warmup from epoch 60. 1.8x training time, 2x activation memory. Expected -5 to -15% p_tan. HIGH RISK, HIGH REWARD.
-3. **dp/dn=0 Physics Loss** — zero-parameter auxiliary loss penalizing pressure gradients in wall-normal direction at surface nodes (Euler momentum at no-slip walls). Uses SAF gradient vectors already in input. Expected -2 to -6% across all surface metrics.
-
-### Medium Priority
-4. **Tandem Surface Mixup** — swap aft-foil surface node sets between tandem samples. Novel CutMix analog for mesh data. Expected -2 to -5% p_tan.
-5. **Tandem Pressure Correction MLP** — gated correction head for tandem-only pressure. Zero-init + gate bias=-2.0 for safe start. Expected -2 to -4% p_tan.
+**Awaiting researcher-agent Round 3 output — new hypotheses needed for frieren and tanjiro.**
 
 ### Human Researcher Directives
 - **#1860 (2026-03-27):** Think bigger — radical new full model changes and data aug.
@@ -138,17 +134,19 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 | Weight Decay 1e-5, 2e-5 | #2145 | 5e-5 confirmed optimal. |
 | Learning Rate ±50% (1e-4, 3e-4) | #2149 | lr=2e-4 confirmed optimal. |
 | Cosine T_max {140, 180} | #2154 | Both +2.8% p_tan. T_max=160 confirmed optimal. |
-| Asymmetric PCGrad | #2158 | p_in +2.7%, all key metrics worse. Symmetric 2-way optimal. PCGrad exhausted. |
-| Differential LR (mult=2,3) | #2163 | Both regress p_tan. mult=3 helps p_oodc (-3.5%) but hurts p_tan. Uniform LR best. |
+| Asymmetric PCGrad | #2158 | p_in +2.7%, all key metrics worse. Symmetric 2-way optimal. |
+| Differential LR (mult=2,3) | #2163 | Both regress p_tan. Uniform LR best. |
 | Gap/Stagger σ=0.01 | #2140 | Worse than 0.02. |
-| Gap/Stagger σ=0.03 | #2153 | Worse: p_tan +3.3%, p_in +4.2%. σ=0.02 confirmed optimal (inverted-U). |
+| Gap/Stagger σ=0.03 | #2153 | Worse: p_tan +3.3%. σ=0.02 confirmed optimal. |
 | EMA Decay 0.9995 | #2141 | Regresses with GSB. 0.999 optimal. |
 | Reynolds Number Perturbation | #2125 | Null + regression. |
-| Tandem Cross-DSDF Features | #2162 | p_tan +4.4%. Hand-crafted features add noise over raw DSDF. |
+| Tandem Cross-DSDF Features | #2162 | p_tan +4.4%. Hand-crafted features add noise. |
 | Foil Shape Similarity Bias (GSB 7D) | #2157 | p_tan +3.7%. Sample-level cosine sim too coarse. |
-| Fore-foil SRF (unconditioned) | #2117,#2124 | Worsen p_tan. Conditioned variant now in #2161. |
+| Fore-foil SRF (unconditioned) | #2117,#2124 | Worsen p_tan. |
 | Aft/Fore-Foil Loss Upweighting | #2121,#2122 | p_oodc mild benefit, p_tan regression. |
 | Various Phase 5 architectures | multiple | 5–59% worse. |
+| **Backbone-wide AdaLN** | **#2164** | **p_tan +5.9-6.8%. AdaLN disrupts optimized attention routing.** |
+| **DSDF-1 Channel Dropout** | **#2156** | **p_tan +5.6-6.3%. Foil-1 channels need exact values.** |
 
 ## Ensemble Seed Pool (Complete)
 
