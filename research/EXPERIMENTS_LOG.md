@@ -2,6 +2,26 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~18:55 — PR #2154: Cosine T_max Sweep {140, 180} vs 160 — thorfinn — **CLOSED** (T_max=160 confirmed optimal)
+
+- Branch: `thorfinn/cosine-tmax-sweep`
+- Hypothesis: T_max not tuned since GSB/aft_srf/PCGrad added. Test T_max=140 (faster decay) and T_max=180 (extended warmth).
+
+| T_max | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|-------|------|------|--------|-------|------|-----|
+| 140 | 42 | 13.2 | 7.6 | 29.5 | 6.4 | 9cg2dt2a |
+| 140 | 73 | 12.7 | 7.9 | 29.3 | 6.5 | scwsj91y |
+| **140 avg** | — | **12.95** | **7.75** | **29.40** | **6.45** | — |
+| 180 | 42 | 13.5 | 7.6 | 29.6 | 6.7 | 3beaxpua |
+| 180 | 73 | 13.8 | 8.3 | 29.2 | 6.6 | tz7aj1ji |
+| **180 avg** | — | **13.65** | **7.95** | **29.40** | **6.65** | — |
+| **Baseline (160)** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** Both T_max=140 and 180 regress p_tan identically (+2.8%). T_max=160 is the sweet spot. LR schedule is not a bottleneck.
+- Thorfinn now idle — reassigning to iterative 2-pass refinement.
+
+---
+
 ### 2026-04-05 ~18:40 — PR #2153: Gap/Stagger Sigma Increase σ=0.03 — frieren — **CLOSED** (σ=0.02 confirmed optimal)
 
 - Branch: `frieren/gs-sigma-increase`
