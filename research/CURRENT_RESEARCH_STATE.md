@@ -49,7 +49,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | fern | #2130 | Gap/Stagger Spatial Bias — FINAL: PCGrad + GSB validation (s42/73) | WIP — sent back |
 | alphonse | #2131 | Tandem-Slice Carve-Out K=4 — rebased 2-seed | WIP — rebasing |
 | nezuko | #2141 | EMA Decay Rate Sweep: 0.999→{0.9995, 0.9998} | WIP — just assigned |
-| thorfinn | #2136 | Per-Foil Physics Normalization — Fix Aft-Foil Cp Denominator | WIP |
+| thorfinn | #2143 | DSDF Spatial Dropout — Zero-Out Foil Shape Features for Random Nodes | WIP — just assigned |
 | frieren | #2142 | Cross-Seed Model Soup — Weight-Averaging 3 Seeds | WIP — just assigned |
 | edward | #2138 | Foil-2 Independent AoA Rotation Aug — Decoupled Tandem Geometry | WIP |
 
@@ -116,6 +116,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 | Direction | PRs | Finding |
 |-----------|-----|---------|
+| Per-Foil Physics Normalization | #2136 | phys_stats mismatch → all metrics +5-19%. Don't change normalization without recomputing stats |
 | Fore-Foil TE Relative Coords | #2134 | p_tan +2.6% worse than control. TE relative frame doesn't help |
 | AftSRF KNN Context Head (when working) | #2134, #2127 | Context head adds 17% overhead → 132 vs 160 epochs → catastrophic: p_in +21%, p_tan +1.2% |
 | Surface Pressure Gradient Aux Loss | #2129 (3 rounds) | p_oodc improves -1.5% but p_tan regresses. 3 iterations with diminishing returns. Signal too weak. |

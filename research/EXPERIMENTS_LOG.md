@@ -2,6 +2,30 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~02:45 — PR #2136: Per-Foil Physics Normalization — thorfinn — **CLOSED** (dead end)
+
+- Branch: `thorfinn/per-foil-pnorm`
+- Hypothesis: Split Cp normalization denominator (q) per-foil for tandem samples. Aft-foil nodes use q_aft (local), fore-foil nodes use q_fore.
+
+| Metric | Baseline | s42 | s73 | 2-seed avg | Delta |
+|--------|----------|-----|-----|-----------|-------|
+| p_in | 13.02 | 14.8 | 16.2 | 15.50 | +19.0% ❌ |
+| p_oodc | 7.62 | 8.3 | 8.6 | 8.45 | +10.9% ❌ |
+| p_tan | 29.91 | 30.9 | 31.7 | 31.30 | +4.6% ❌ |
+| p_re | 6.47 | 7.4 | 6.9 | 7.15 | +10.5% ❌ |
+
+W&B: bc8yxmb6 (s42), urq07o3e (s73). Group: `phase6/per-foil-pnorm`. Epochs: 133 (180-min timeout).
+
+**Results commentary:**
+- **All metrics regressed massively.** Root cause: phys_stats mismatch — normalization stats computed with global q, but per-foil q shifts the Cp distribution for ~30% of samples. The model had already compensated for global q via learned weights.
+- p_in +19% despite single-foil being unaffected → global training destabilization.
+- Per-sample for-loop also slowed training (133 vs 155 epochs).
+- Runs included `--aft_foil_srf_context` (no-op bug) and `--disable_pcgrad` (old baseline).
+- **Generalizable lesson:** Don't change data normalization without recomputing all derived statistics.
+- Thorfinn reassigned to dsdf-spatial-dropout (#2143).
+
+---
+
 ### 2026-04-05 ~02:30 — PR #2134: Fore-Foil TE Relative Coords + Bug Fix — frieren — **CLOSED** (dead end + critical finding)
 
 - Branch: `frieren/foil1-relative-coords`
