@@ -43,7 +43,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| tanjiro | #2133 | Foil-1 DSDF Magnitude Aug — Front Foil Shape Transfer | WIP |
+| tanjiro | #2137 | EMA Stochastic Weight Perturbation — Flat Minima Seeking | WIP — just assigned |
 | fern | #2130 | Gap/Stagger Spatial Bias — rebased 2-seed validation (beats control all 4 metrics) | WIP — sent back for rebase |
 | alphonse | #2131 | Tandem-Slice Carve-Out K=4 — rebased 2-seed (p_tan -3.7% vs ctrl) | WIP — sent back for rebase |
 | nezuko | #2129 | Supervised Surface Pressure Gradient Aux Loss — **v2** (per-foil fix + aft_srf_context rebase) | WIP — sent back for revision |
@@ -77,7 +77,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 5. `--surface_refine`, `--residual_prediction`, `--pressure_first`, `--pressure_deep`, `--asinh_pressure 0.75`, etc.
 
 **Active experiments (8 students):**
-1. **Foil-1 DSDF Magnitude Aug** (tanjiro #2133) — Mirror of DSDF2 aug for front foil. σ sweep {0.05, 0.10, 0.15}. **HIGH PRIORITY** — if foil-1 DSDF also benefits from magnitude aug, the gain may be additive with DSDF2 aug.
+1. **EMA Stochastic Weight Perturbation** (tanjiro #2137) — One-time Gaussian perturbation at EMA start to explore flat minima. σ sweep {5e-4, 1e-3, 3e-3}.
 2. **Gap/Stagger-Conditioned Spatial Bias** (fern #2130) — Extend spatial_bias 4→6 dims by appending gap+stagger; tandem-geometry-aware slice routing.
 3. **Tandem-Slice Carve-Out** (alphonse #2131) — Reserve K dedicated physics slices for tandem via large negative bias on single-foil. K sweep {4, 8}.
 4. **Supervised Surface Pressure Gradient Aux Loss** (nezuko #2129) — L1 on chord-wise pressure gradient finite differences; w=0.05/0.10 sweep.
@@ -100,7 +100,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 2. **foil2_aoa_rot_aug** — Independent AoA rotation aug for aft-foil nodes in tandem samples only. Creates novel (fore_AoA, aft_AoA) combinations absent from training data. ~35 LoC. Expected p_tan -2% to -4%.
 3. **ema_perturb** — EMA stochastic weight perturbation (σ sweep {5e-4, 1e-3, 3e-3}) at ema_start_epoch to probe flat minima. ~12 LoC. Expected p_tan -1% to -3%.
 4. **aft_foil_tv_loss** — Chord-wise TV regularization on aft-foil pressure predictions. ⚠️ DEPRIORITIZED — nezuko #2129 (gradient aux, same family) showed weak results. May revisit if per-foil fix in #2129 v2 shows promise.
-5. **Combined DSDF1+DSDF2 aug at lower σ** — Simultaneous aug of both foil DSDF channels at σ=0.02-0.03; may compound. Depends on tanjiro #2133 outcome.
+5. **Combined DSDF1+DSDF2 aug at lower σ** — ⚠️ DEAD — Foil-1 DSDF aug (#2133) regresses p_tan at all σ values. Augmenting the known front-foil DSDF hurts.
 
 ### Existing Queue
 

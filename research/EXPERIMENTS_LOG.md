@@ -2,6 +2,34 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~01:15 — PR #2133: Foil-1 DSDF Magnitude Augmentation — tanjiro — **CLOSED** (dead end)
+
+- Branch: `tanjiro/foil1-dsdf-mag-aug`
+- Hypothesis: Mirror of DSDF2 aug (PR #2126) for foil-1 channels. Log-normal scaling of x[:,4:8] (foil-1 DSDF) to force front-foil shape generalization. σ sweep {0.05, 0.10, 0.15}.
+
+| σ | Seed | p_in | p_oodc | p_tan | p_re | W&B ID |
+|---|------|------|--------|-------|------|--------|
+| 0.05 | 42 | 13.10 | 7.53 | 30.31 | 6.40 | k1wy49ut |
+| 0.05 | 73 | 13.49 | 7.76 | 30.76 | 6.43 | fnlvz7nq |
+| **σ=0.05 avg** | — | **13.30** | **7.65** | **30.53** | **6.41** | — |
+| 0.10 | 42 | 13.36 | 7.58 | 31.06 | 6.43 | blimyxen |
+| 0.10 | 73 | 13.51 | 7.51 | 31.17 | 6.22 | ft2fidfq |
+| **σ=0.10 avg** | — | **13.43** | **7.55** | **31.12** | **6.33** | — |
+| 0.15 | 42 | 12.62 | 7.57 | 31.53 | 6.42 | h8qcpxig |
+| 0.15 | 73 | 13.38 | 8.10 | 30.47 | 6.52 | bp75nqq0 |
+| **σ=0.15 avg** | — | **13.00** | **7.83** | **31.00** | **6.47** | — |
+
+W&B group: `phase6/dsdf1-mag-aug`. Runs include --aug_dsdf2_sigma 0.05 but NOT --aft_foil_srf_context.
+
+**Results commentary:**
+- **DEAD END.** p_tan regresses at ALL σ values (+1.4% to +3.4% vs DSDF2 baseline, +2.1% to +4.0% vs current baseline).
+- Asymmetry with foil-2 aug explained: val_tandem_transfer uses NACA6416 as FRONT foil — augmenting the known front-foil DSDF adds noise rather than generalization.
+- p_oodc marginally improved at σ=0.10 (7.55), but irrelevant given p_tan regression.
+- Combined DSDF1+DSDF2 aug (research priority #5) is now also dead — foil-1 aug doesn't help.
+- Tanjiro reassigned to ema_perturb (#2137).
+
+---
+
 ### 2026-04-05 ~00:25 — PR #2132: Tandem DSDF Channel Mixup — thorfinn — **CLOSED** (dead end)
 
 - Branch: `thorfinn/tandem-dsdf-mixup`
