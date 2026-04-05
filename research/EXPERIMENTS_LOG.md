@@ -2,6 +2,21 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~04:20 — PR #2171: Slice Number Sweep — tanjiro — **CLOSED** (96 confirmed optimal)
+
+- Branch: `tanjiro/slice-num-sweep`
+- Hypothesis: More slices = more GSB routing paths for tandem geometry specialization.
+
+| Config | p_in | p_tan | p_oodc | p_re | W&B |
+|--------|------|-------|--------|------|-----|
+| **slice=128 avg** | **13.55** | **29.55** | **7.85** | **6.55** | 245dka5p, aasc7vel |
+| **slice=144 avg** | **14.75** | **29.70** | **8.25** | **6.95** | pz5vo3h0, 1wzqtn7w |
+| **Baseline (96)** | **13.05** | **28.60** | **7.70** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** Both worse. p_tan +3.3% (128) and +3.8% (144). More slices = more overfitting, fewer epochs in 180-min window. Confirms 96 optimal (also PR #2155).
+
+---
+
 ### 2026-04-06 ~04:00 — PR #2170: Wider/Deeper Surface Refinement — frieren — **CLOSED** (SRF capacity overfits)
 
 - Branch: `frieren/wider-deeper-srf`
