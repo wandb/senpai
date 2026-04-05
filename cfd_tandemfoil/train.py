@@ -545,6 +545,50 @@ class AftFoilRefinementHead(nn.Module):
         return x
 
 
+class TandemPressureHead(nn.Module):
+    """Gated pressure correction for tandem surface nodes only.
+
+    Applies a learned additive correction to the pressure channel of tandem
+    surface predictions. The gate starts near-zero (sigmoid bias=-2.0) so
+    corrections are initially tiny. Output layer is zero-initialized.
+    """
+
+    def __init__(self, n_hidden: int, hidden_dim: int = 96, gs_dim: int = 2):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(n_hidden + 1 + gs_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),  # pressure correction only
+        )
+        self.gate = nn.Sequential(
+            nn.Linear(n_hidden + gs_dim, 1),
+            nn.Sigmoid(),
+        )
+        # Zero-init: correction starts as zero
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+        # Gate starts near-zero: sigmoid(-2) ≈ 0.12
+        nn.init.zeros_(self.gate[0].weight)
+        nn.init.constant_(self.gate[0].bias, -2.0)
+
+    def forward(self, h, base_p, gs_cond):
+        """
+        Args:
+            h: [M, n_hidden] — backbone hidden features for tandem surface nodes
+            base_p: [M, 1] — base pressure prediction for those nodes
+            gs_cond: [M, 2] — gap/stagger conditioning
+        Returns:
+            correction: [M, 1] — gated additive pressure correction
+        """
+        inp = torch.cat([h, base_p, gs_cond], dim=-1)
+        gate_inp = torch.cat([h, gs_cond], dim=-1)
+        corr = self.mlp(inp)
+        gate = self.gate(gate_inp)
+        return corr * gate
+
+
 class AftFoilRefinementContextHead(nn.Module):
     """Aft-foil refinement head with KNN volume context for wake pressure recovery.
 
@@ -1067,6 +1111,9 @@ class Config:
     aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
     aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
     aft_foil_srf_context: bool = False       # KNN volume context for aft-foil SRF (wake pressure recovery)
+    # Phase 6: Tandem pressure correction MLP — gated correction for tandem surface pressure
+    tandem_pressure_head: bool = False       # enable gated tandem pressure correction
+    tandem_pressure_head_hidden: int = 96    # hidden dim for tandem pressure correction MLP
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
@@ -1297,6 +1344,7 @@ from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
 ema_aft_srf_head = None  # EMA copy of aft-foil SRF head
+ema_tandem_p_head = None  # EMA copy of tandem pressure correction head
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -1459,6 +1507,19 @@ if aft_srf_ctx_head is not None:
     base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
 
+# Tandem pressure correction head
+tandem_p_head = None
+if cfg.tandem_pressure_head:
+    tandem_p_head = TandemPressureHead(
+        n_hidden=cfg.n_hidden,
+        hidden_dim=cfg.tandem_pressure_head_hidden,
+        gs_dim=2,
+    ).to(device)
+    _tp_params = list(tandem_p_head.parameters())
+    base_opt.add_param_group({'params': _tp_params, 'lr': _base_lr})
+    n_params += sum(p.numel() for p in _tp_params)
+    print(f"Tandem pressure head: {sum(p.numel() for p in _tp_params):,} params (hidden={cfg.tandem_pressure_head_hidden})")
+
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
     _warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
@@ -1555,6 +1616,8 @@ for epoch in range(MAX_EPOCHS):
         aft_srf_head.train()
     if aft_srf_ctx_head is not None:
         aft_srf_ctx_head.train()
+    if tandem_p_head is not None:
+        tandem_p_head.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
@@ -1661,7 +1724,7 @@ for epoch in range(MAX_EPOCHS):
         # Aft-foil mask: boundary ID=7 nodes identified by saf norm > 0.005
         # saf is at raw x[:,:,2:4]; foil-1 surface has saf≈0, foil-2 has saf>>0
         _aft_foil_mask = None
-        if aft_srf_head is not None:
+        if aft_srf_head is not None or tandem_p_head is not None:
             _raw_saf_norm = x[:, :, 2:4].norm(dim=-1)  # [B, N]
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
@@ -1833,6 +1896,25 @@ for epoch in range(MAX_EPOCHS):
                     aft_correction = aft_srf_head(aft_hidden, aft_pred, _aft_cond).float()
                 pred = pred.clone()
                 pred[aft_idx[:, 0], aft_idx[:, 1]] = pred[aft_idx[:, 0], aft_idx[:, 1]] + aft_correction
+
+        # Tandem pressure correction: gated MLP correction for tandem surface nodes
+        _tp_gate_mean = None
+        if tandem_p_head is not None and model.training:
+            _tan_surf_mask = is_surface & _is_tandem.unsqueeze(1)  # [B, N]
+            if _tan_surf_mask.any():
+                _tan_idx = _tan_surf_mask.nonzero(as_tuple=False)  # [M, 2]
+                if _tan_idx.numel() > 0:
+                    _h_tan = hidden[_tan_idx[:, 0], _tan_idx[:, 1]]       # [M, n_hidden]
+                    _p_tan = pred[_tan_idx[:, 0], _tan_idx[:, 1], 2:3]    # [M, 1] — pressure channel
+                    _gs_tan = _raw_gap_stagger[_tan_idx[:, 0]]             # [M, 2]
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _p_corr = tandem_p_head(_h_tan, _p_tan, _gs_tan).float()  # [M, 1]
+                    # Log gate activation for monitoring
+                    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _gate_inp = torch.cat([_h_tan, _gs_tan], dim=-1)
+                        _tp_gate_mean = tandem_p_head.gate(_gate_inp).float().mean().item()
+                    pred = pred.clone()
+                    pred[_tan_idx[:, 0], _tan_idx[:, 1], 2:3] = pred[_tan_idx[:, 0], _tan_idx[:, 1], 2:3] + _p_corr
 
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
@@ -2152,8 +2234,21 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for tandem pressure head
+            if tandem_p_head is not None:
+                _tp_base = tandem_p_head._orig_mod if hasattr(tandem_p_head, '_orig_mod') else tandem_p_head
+                if ema_tandem_p_head is None:
+                    ema_tandem_p_head = deepcopy(_tp_base)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_tandem_p_head.parameters(), _tp_base.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _wlog = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if _tp_gate_mean is not None and global_step % 20 == 1:
+            _wlog["train/tandem_phead_gate_mean"] = _tp_gate_mean
+            _wlog["train/tandem_phead_corr_abs"] = _p_corr.abs().mean().item()
+        wandb.log(_wlog)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -2272,6 +2367,14 @@ for epoch in range(MAX_EPOCHS):
             eval_aft_srf_ctx_head.eval()
         else:
             aft_srf_ctx_head.eval()
+    # Select tandem pressure head for eval (EMA if available)
+    eval_tandem_p_head = tandem_p_head
+    if tandem_p_head is not None:
+        if ema_tandem_p_head is not None and ema_model is not None and eval_model is ema_model:
+            eval_tandem_p_head = ema_tandem_p_head
+            eval_tandem_p_head.eval()
+        else:
+            tandem_p_head.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -2298,7 +2401,7 @@ for epoch in range(MAX_EPOCHS):
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
                 # Aft-foil mask for eval (same logic as training)
                 _eval_aft_mask = None
-                if eval_aft_srf_head is not None:
+                if eval_aft_srf_head is not None or eval_tandem_p_head is not None:
                     _v_saf_norm = x[:, :, 2:4].norm(dim=-1)
                     _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
                     _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
@@ -2453,6 +2556,24 @@ for epoch in range(MAX_EPOCHS):
                             pred = pred_loss / sample_stds
                         else:
                             pred = pred_loss * sample_stds
+
+                # Tandem pressure correction in eval
+                if eval_tandem_p_head is not None and _v_is_tandem is not None:
+                    _vtan_surf_mask = is_surface & _v_is_tandem.unsqueeze(1)
+                    if _vtan_surf_mask.any():
+                        _vtan_idx = _vtan_surf_mask.nonzero(as_tuple=False)
+                        if _vtan_idx.numel() > 0:
+                            _vh_tan = _eval_hidden[_vtan_idx[:, 0], _vtan_idx[:, 1]]
+                            _vp_tan = pred_loss[_vtan_idx[:, 0], _vtan_idx[:, 1], 2:3]
+                            _vgs_tan = _v_gap_stagger[_vtan_idx[:, 0]]
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                _vp_corr = eval_tandem_p_head(_vh_tan, _vp_tan, _vgs_tan).float()
+                            pred_loss = pred_loss.clone()
+                            pred_loss[_vtan_idx[:, 0], _vtan_idx[:, 1], 2:3] += _vp_corr
+                            if cfg.multiply_std:
+                                pred = pred_loss / sample_stds
+                            else:
+                                pred = pred_loss * sample_stds
 
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
