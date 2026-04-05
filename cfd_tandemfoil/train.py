@@ -1070,6 +1070,9 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Tail EMA checkpoint averaging: average EMA snapshots from late training
+    tail_avg_start_epoch: int = 0           # 0 = disabled. Start saving EMA snapshots from this epoch (0-indexed)
+    tail_avg_interval: int = 5              # save EMA snapshot every N epochs after tail_avg_start_epoch
 
 
 cfg = sp.parse(Config)
@@ -1535,6 +1538,9 @@ prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
+_tail_ckpts = []           # for tail EMA averaging: stores (model_sd, refine_sd, aft_srf_sd) tuples
+_tail_refine_ckpts = []
+_tail_aft_srf_ckpts = []
 
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
@@ -2222,6 +2228,16 @@ for epoch in range(MAX_EPOCHS):
                 sa = snapshot_avg_model.state_dict()
                 for k in snap:
                     sa[k].mul_((snapshot_n - 1) / snapshot_n).add_(snap[k].to(device) / snapshot_n)
+    # Tail EMA averaging: save EMA snapshot once per epoch at configured intervals
+    if (cfg.tail_avg_start_epoch > 0 and ema_model is not None
+            and epoch >= cfg.tail_avg_start_epoch
+            and (epoch - cfg.tail_avg_start_epoch) % cfg.tail_avg_interval == 0):
+        _tail_ckpts.append({k: v.cpu().clone() for k, v in ema_model.state_dict().items()})
+        if ema_refine_head is not None:
+            _tail_refine_ckpts.append({k: v.cpu().clone() for k, v in ema_refine_head.state_dict().items()})
+        if ema_aft_srf_head is not None:
+            _tail_aft_srf_ckpts.append({k: v.cpu().clone() for k, v in ema_aft_srf_head.state_dict().items()})
+        print(f"[tail_avg] Saved EMA snapshot at epoch {epoch+1} (total: {len(_tail_ckpts)})")
 
     # --- Validate across all splits ---
     _do_val = (epoch + 1) % cfg.val_every == 0 or epoch == 0 or epoch == MAX_EPOCHS - 1
@@ -2643,6 +2659,197 @@ for epoch in range(MAX_EPOCHS):
         f"val[{split_summary}]{tag}"
     )
 
+
+# ---------------------------------------------------------------------------
+# Tail EMA Averaging: average all saved EMA snapshots and reload into EMA model
+# ---------------------------------------------------------------------------
+if cfg.tail_avg_start_epoch > 0 and len(_tail_ckpts) >= 2:
+    n_snaps = len(_tail_ckpts)
+    print(f"\n[tail_avg] Averaging {n_snaps} EMA snapshots...")
+    avg_state = deepcopy(_tail_ckpts[0])
+    for key in avg_state:
+        if avg_state[key].is_floating_point():
+            avg_state[key] = sum(c[key] for c in _tail_ckpts) / n_snaps
+    _dev = next(ema_model.parameters()).device
+    ema_model.load_state_dict({k: v.to(_dev) for k, v in avg_state.items()})
+    print(f"[tail_avg] Loaded averaged EMA model ({n_snaps} snapshots) — running final eval")
+    wandb.summary.update({"tail_avg_n_snapshots": n_snaps})
+    # Average refinement head if snapshots were saved
+    if ema_refine_head is not None and len(_tail_refine_ckpts) >= 2:
+        avg_r = deepcopy(_tail_refine_ckpts[0])
+        for key in avg_r:
+            if avg_r[key].is_floating_point():
+                avg_r[key] = sum(c[key] for c in _tail_refine_ckpts) / len(_tail_refine_ckpts)
+        ema_refine_head.load_state_dict({k: v.to(_dev) for k, v in avg_r.items()})
+    # Average aft-foil SRF head if snapshots were saved
+    if ema_aft_srf_head is not None and len(_tail_aft_srf_ckpts) >= 2:
+        avg_a = deepcopy(_tail_aft_srf_ckpts[0])
+        for key in avg_a:
+            if avg_a[key].is_floating_point():
+                avg_a[key] = sum(c[key] for c in _tail_aft_srf_ckpts) / len(_tail_aft_srf_ckpts)
+        ema_aft_srf_head.load_state_dict({k: v.to(_dev) for k, v in avg_a.items()})
+    # Run one final validation pass with the tail-averaged EMA model
+    _base_model.eval()
+    ema_model.eval()
+    eval_model = ema_model
+    eval_refine_head = ema_refine_head
+    eval_aft_srf_head = ema_aft_srf_head
+    eval_aft_srf_ctx_head = aft_srf_ctx_head
+    if eval_refine_head is not None:
+        eval_refine_head.eval()
+    if eval_aft_srf_head is not None:
+        eval_aft_srf_head.eval()
+    val_metrics_per_split_tailavg: dict = {}
+    for split_name, vloader in val_loaders.items():
+        mae_surf = torch.zeros(3, device=device)
+        mae_vol = torch.zeros(3, device=device)
+        n_surf = torch.zeros(3, device=device)
+        n_vol = torch.zeros(3, device=device)
+        n_vbatches = 0
+        val_vol_ta = 0.0
+        val_surf_ta = 0.0
+        with torch.no_grad():
+            for x, y, is_surface, mask in tqdm(vloader, desc=f"[tail_avg] {split_name}", leave=False):
+                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                is_surface = is_surface.to(device, non_blocking=True)
+                mask = mask.to(device, non_blocking=True)
+                raw_dsdf = x[:, :, 2:10]
+                dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+                dist_feat = torch.log1p(dist_surf * 10.0)
+                _raw_aoa = x[:, 0, 14:15]
+                _eval_aft_mask = None
+                if eval_aft_srf_head is not None:
+                    _v_saf_norm = x[:, :, 2:4].norm(dim=-1)
+                    _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
+                    _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
+                    _v_gap_stagger = x[:, 0, 22:24]
+                x = (x - stats["x_mean"]) / stats["x_std"]
+                curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                if cfg.foil2_dist:
+                    foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                    x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
+                else:
+                    x = torch.cat([x, curv, dist_feat], dim=-1)
+                raw_xy = x[:, :, :2]
+                xy_min = raw_xy.amin(dim=1, keepdim=True)
+                xy_max = raw_xy.amax(dim=1, keepdim=True)
+                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                freqs = torch.cat([eval_model.fourier_freqs_fixed.to(device), eval_model.fourier_freqs_learned.abs()])
+                xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                x = torch.cat([x, fourier_pe], dim=-1)
+                Umag, q = _umag_q(y, mask)
+                y_phys = _phys_norm(y, Umag, q)
+                if cfg.asinh_pressure:
+                    y_phys = y_phys.clone()
+                    y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
+                y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                _v_freestream = None
+                if cfg.residual_prediction:
+                    _fs_phys = torch.zeros(y_norm.shape[0], 1, 3, device=device)
+                    _fs_phys[:, 0, 0] = torch.cos(_raw_aoa.squeeze(-1))
+                    _fs_phys[:, 0, 1] = torch.sin(_raw_aoa.squeeze(-1))
+                    _v_freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                    y_norm = y_norm - _v_freestream
+                raw_gap = x[:, 0, 21]
+                is_tandem = raw_gap.abs() > 0.5
+                B = y_norm.shape[0]
+                sample_stds = torch.ones(B, 1, 3, device=device)
+                if not cfg.no_perstd and not cfg.raw_targets and not cfg.adaptive_norm:
+                    if cfg.high_p_clamp:
+                        channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
+                        tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
+                    else:
+                        channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
+                        tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+                    for b in range(B):
+                        valid = mask[b]
+                        if is_tandem[b]:
+                            sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
+                        else:
+                            sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+                y_norm_scaled = y_norm / sample_stds
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _ta_out = eval_model({"x": x})
+                    pred = _ta_out["preds"]
+                    _ta_hidden = _ta_out["hidden"]
+                pred = pred.float()
+                _ta_hidden = _ta_hidden.float()
+                pred_loss = pred / sample_stds
+                if eval_refine_head is not None:
+                    surf_idx = is_surface.nonzero(as_tuple=False)
+                    if surf_idx.numel() > 0:
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            surf_hidden = _ta_hidden[surf_idx[:, 0], surf_idx[:, 1]]
+                            surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
+                            correction = eval_refine_head(surf_hidden, surf_pred).float()
+                        pred_loss = pred_loss.clone()
+                        pred_loss[surf_idx[:, 0], surf_idx[:, 1]] += correction
+                        pred = pred_loss * sample_stds
+                if eval_aft_srf_head is not None and _eval_aft_mask is not None:
+                    aft_idx = _eval_aft_mask.nonzero(as_tuple=False)
+                    if aft_idx.numel() > 0:
+                        _ah = _ta_hidden[aft_idx[:, 0], aft_idx[:, 1]]
+                        _ap = pred_loss[aft_idx[:, 0], aft_idx[:, 1]]
+                        _ac = _v_gap_stagger[aft_idx[:, 0]] if cfg.aft_foil_srf_film else None
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            _aft_corr = eval_aft_srf_head(_ah, _ap, _ac).float()
+                        pred_loss = pred_loss.clone()
+                        pred_loss[aft_idx[:, 0], aft_idx[:, 1]] += _aft_corr
+                        pred = pred_loss * sample_stds
+                abs_err_n = (pred_loss - y_norm_scaled).abs().nan_to_num(0.0)
+                vol_mask = mask & ~is_surface
+                surf_mask_ta = mask & is_surface
+                val_vol_ta += min(
+                    (abs_err_n * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item(), 1e6
+                )
+                val_surf_ta += min(
+                    (abs_err_n[:, :, 2:3] * surf_mask_ta.unsqueeze(-1)).sum().item() / surf_mask_ta.sum().clamp(min=1).item(), 1e6
+                )
+                n_vbatches += 1
+                if cfg.residual_prediction and _v_freestream is not None:
+                    pred = pred + _v_freestream
+                pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                if cfg.asinh_pressure:
+                    pred_phys = pred_phys.clone()
+                    pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
+                pred_orig = _phys_denorm(pred_phys, Umag, q)
+                y_clamped = y.clamp(-1e6, 1e6)
+                err = (pred_orig - y_clamped).abs()
+                finite = err.isfinite()
+                err = err.where(finite, torch.zeros_like(err))
+                mae_surf += (err * surf_mask_ta.unsqueeze(-1)).sum(dim=(0, 1))
+                mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                n_surf += (surf_mask_ta.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+                n_vol += (vol_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+        val_vol_ta /= max(n_vbatches, 1)
+        val_surf_ta /= max(n_vbatches, 1)
+        mae_surf /= n_surf.clamp(min=1)
+        mae_vol /= n_vol.clamp(min=1)
+        _ta_metrics = {
+            f"tail_avg/{split_name}/mae_surf_Ux": mae_surf[0].item(),
+            f"tail_avg/{split_name}/mae_surf_Uy": mae_surf[1].item(),
+            f"tail_avg/{split_name}/mae_surf_p":  mae_surf[2].item(),
+            f"tail_avg/{split_name}/mae_vol_Ux":  mae_vol[0].item(),
+            f"tail_avg/{split_name}/mae_vol_Uy":  mae_vol[1].item(),
+            f"tail_avg/{split_name}/mae_vol_p":   mae_vol[2].item(),
+            f"tail_avg/{split_name}/vol_loss": val_vol_ta,
+            f"tail_avg/{split_name}/surf_loss": val_surf_ta,
+        }
+        val_metrics_per_split_tailavg[split_name] = _ta_metrics
+        print(f"  [tail_avg] {split_name:30s}  mae_surf_p = {mae_surf[2].item():.2f}")
+        wandb.summary.update(_ta_metrics)
+    # Also update checkpoint if tail avg is better
+    _ta_p_vals = [val_metrics_per_split_tailavg[n][f"tail_avg/{n}/mae_surf_p"]
+                  for n in VAL_SPLIT_NAMES if n in val_metrics_per_split_tailavg]
+    print(f"[tail_avg] Final: " + "  ".join(
+        f"{n}={val_metrics_per_split_tailavg[n][f'tail_avg/{n}/mae_surf_p']:.2f}"
+        for n in VAL_SPLIT_NAMES if n in val_metrics_per_split_tailavg
+    ))
+    torch.save(ema_model.state_dict(), model_path)
+    print(f"[tail_avg] Saved tail-averaged checkpoint to {model_path}")
+elif cfg.tail_avg_start_epoch > 0 and len(_tail_ckpts) < 2:
+    print(f"[tail_avg] Only {len(_tail_ckpts)} snapshot(s) collected — skipping averaging (need ≥2)")
 
 # --- Final summary ---
 total_time = (time.time() - train_start) / 60.0
