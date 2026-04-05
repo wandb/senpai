@@ -1070,6 +1070,11 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Phase 6: Attention temperature curriculum: broad→sharp slice routing schedule
+    temp_curriculum: bool = False           # enable attention temperature annealing schedule
+    temp_init: float = 2.0                  # starting temperature (high = broad softmax)
+    temp_floor: float = 0.3                 # ending temperature before free learning
+    temp_anneal_epochs: int = 80            # epochs over which to anneal temp_init → temp_floor
 
 
 cfg = sp.parse(Config)
@@ -1546,6 +1551,25 @@ for epoch in range(MAX_EPOCHS):
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+
+    # Attention temperature curriculum: broad→sharp slice routing
+    if cfg.temp_curriculum:
+        with torch.no_grad():
+            if epoch < cfg.temp_anneal_epochs:
+                frac = epoch / cfg.temp_anneal_epochs
+                scheduled_temp = cfg.temp_init * (1 - frac) + cfg.temp_floor * frac
+                for module in _base_model.modules():
+                    if hasattr(module, 'temperature') and isinstance(module.temperature, nn.Parameter):
+                        module.temperature.data.fill_(scheduled_temp)
+                        module.temperature.requires_grad_(False)
+            elif epoch == cfg.temp_anneal_epochs:
+                # Release: unfreeze temperature parameters for free learning
+                for module in _base_model.modules():
+                    if hasattr(module, 'temperature') and isinstance(module.temperature, nn.Parameter):
+                        module.temperature.requires_grad_(True)
+        # Log current temperature value
+        _cur_temp = _base_model.blocks[0].attn.temperature.mean().item() if hasattr(_base_model.blocks[0].attn, 'temperature') else float('nan')
+        wandb.log({"train/attn_temperature": _cur_temp, "global_step": global_step})
 
     # --- Train ---
     model.train()
