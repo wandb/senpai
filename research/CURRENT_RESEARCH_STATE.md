@@ -48,12 +48,12 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | tanjiro | #2137 | EMA Stochastic Weight Perturbation — σ sweep {5e-4, 1e-3, 3e-3} | WIP |
 | fern | #2130 | Gap/Stagger Spatial Bias — FINAL: PCGrad + GSB validation (s42/73) | WIP — sent back |
 | alphonse | #2131 | Tandem-Slice Carve-Out K=4 — rebased 2-seed | WIP — rebasing |
-| nezuko | — | **JUST FREED** — PR #2129 closed after 3 iterations | **NEEDS NEW ASSIGNMENT** |
+| nezuko | #2141 | EMA Decay Rate Sweep: 0.999→{0.9995, 0.9998} | WIP — just assigned |
 | thorfinn | #2136 | Per-Foil Physics Normalization — Fix Aft-Foil Cp Denominator | WIP |
 | frieren | #2134 | Fore-Foil TE Relative Coords + CRITICAL BUG FIX | WIP — awaiting results |
 | edward | #2138 | Foil-2 Independent AoA Rotation Aug — Decoupled Tandem Geometry | WIP |
 
-**7 students active. Nezuko idle — needs assignment.**
+**All 8 students active. Zero idle GPUs.**
 
 ## Recently Reviewed (2026-04-05 ~02:20)
 
@@ -86,7 +86,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 5. **Per-Foil Physics Normalization** (thorfinn #2136) — Split Cp denominator for fore/aft foil nodes.
 6. **Fore-Foil TE Relative Coords + Bug Fix** (frieren #2134) — TE relative coords + critical aft_srf_context guard fix. **Critical priority.**
 7. **Foil-2 Independent AoA Rotation Aug** (edward #2138) — Decoupled fore/aft AoA rotation for tandem samples.
-8. **nezuko — IDLE** — needs new assignment.
+8. **EMA Decay Rate Sweep** (nezuko #2141) — Test 0.9995 and 0.9998 vs baseline 0.999. Higher decay = more averaging = flatter basin = better OOD. Expected p_tan -0.5% to -1.5%.
 
 **Key research patterns:**
 - **What works:** DSDF magnitude augmentation (foil-2 only), additive specialized correction heads (aft_srf), gradient surgery (PCGrad 2-way), non-local context (KNN wake — pending bug fix)
