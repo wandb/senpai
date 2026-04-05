@@ -1070,6 +1070,8 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Phase 6: Tandem Cross-DSDF features — per-node inter-foil geometry scalars
+    tandem_cross_dsdf: bool = False         # append dsdf_dist_ratio and dsdf_rel_angle as per-node features
 
 
 cfg = sp.parse(Config)
@@ -1200,7 +1202,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32 + (2 if cfg.tandem_cross_dsdf else 0),  # +curv, +dist, [+foil2dist], +32 fourier PE, [+2 cross-dsdf]
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1666,6 +1668,19 @@ for epoch in range(MAX_EPOCHS):
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
+        # Cross-DSDF features: per-node inter-foil geometry (computed from raw x before standardization)
+        # foil-1 DSDF: x[:,:,2:6]; foil-2 DSDF: x[:,:,6:10]
+        if cfg.tandem_cross_dsdf:
+            _tandem_mask_f = (x[:, 0, 22].abs() > 0.01).float().view(-1, 1, 1)  # [B,1,1]
+            _dsdf1_min = x[:, :, 2:6].abs().min(dim=-1, keepdim=True).values  # [B,N,1]
+            _dsdf2_min = x[:, :, 6:10].abs().min(dim=-1, keepdim=True).values  # [B,N,1]
+            _dist_ratio = _dsdf2_min / (_dsdf1_min + _dsdf2_min + 1e-4)  # [B,N,1] in [0,1]
+            _dsdf1_angle = torch.atan2(x[:, :, 3:4], x[:, :, 2:3])  # foil-1 DSDF gradient angle
+            _dsdf2_angle = torch.atan2(x[:, :, 7:8], x[:, :, 6:7])  # foil-2 DSDF gradient angle
+            _rel_angle = _dsdf2_angle - _dsdf1_angle  # [B,N,1] in ~[-pi, pi]
+            # Zero out for non-tandem samples
+            _dist_ratio = _dist_ratio * _tandem_mask_f
+            _rel_angle = _rel_angle * _tandem_mask_f
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1674,6 +1689,8 @@ for epoch in range(MAX_EPOCHS):
             x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
         else:
             x = torch.cat([x, curv, dist_feat], dim=-1)
+        if cfg.tandem_cross_dsdf:
+            x = torch.cat([x, _dist_ratio, _rel_angle], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2153,7 +2170,11 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _wlog = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.tandem_cross_dsdf and global_step % 50 == 1 and is_tandem_batch.any():
+            _wlog["train/cross_dsdf_dist_ratio_mean"] = _dist_ratio[is_tandem_batch].mean().item()
+            _wlog["train/cross_dsdf_rel_angle_mean_abs"] = _rel_angle[is_tandem_batch].abs().mean().item()
+        wandb.log(_wlog)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -2303,6 +2324,14 @@ for epoch in range(MAX_EPOCHS):
                     _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
                     _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
                     _v_gap_stagger = x[:, 0, 22:24]  # [B, 2]
+                if cfg.tandem_cross_dsdf:
+                    _v_tandem_mask_f = (x[:, 0, 22].abs() > 0.01).float().view(-1, 1, 1)
+                    _v_dsdf1_min = x[:, :, 2:6].abs().min(dim=-1, keepdim=True).values
+                    _v_dsdf2_min = x[:, :, 6:10].abs().min(dim=-1, keepdim=True).values
+                    _v_dist_ratio = _v_dsdf2_min / (_v_dsdf1_min + _v_dsdf2_min + 1e-4) * _v_tandem_mask_f
+                    _v_dsdf1_angle = torch.atan2(x[:, :, 3:4], x[:, :, 2:3])
+                    _v_dsdf2_angle = torch.atan2(x[:, :, 7:8], x[:, :, 6:7])
+                    _v_rel_angle = ((_v_dsdf2_angle - _v_dsdf1_angle) * _v_tandem_mask_f)
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -2311,6 +2340,8 @@ for epoch in range(MAX_EPOCHS):
                     x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
                 else:
                     x = torch.cat([x, curv, dist_feat], dim=-1)
+                if cfg.tandem_cross_dsdf:
+                    x = torch.cat([x, _v_dist_ratio, _v_rel_angle], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2694,9 +2725,23 @@ if best_metrics:
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
+                    if cfg.tandem_cross_dsdf:
+                        _vis_tandem_f = (x_dev[:, 0, 22].abs() > 0.01).float().view(-1, 1, 1)
+                        _vis_dsdf1_min = x_dev[:, :, 2:6].abs().min(dim=-1, keepdim=True).values
+                        _vis_dsdf2_min = x_dev[:, :, 6:10].abs().min(dim=-1, keepdim=True).values
+                        _vis_dist_ratio = _vis_dsdf2_min / (_vis_dsdf1_min + _vis_dsdf2_min + 1e-4) * _vis_tandem_f
+                        _vis_dsdf1_angle = torch.atan2(x_dev[:, :, 3:4], x_dev[:, :, 2:3])
+                        _vis_dsdf2_angle = torch.atan2(x_dev[:, :, 7:8], x_dev[:, :, 6:7])
+                        _vis_rel_angle = (_vis_dsdf2_angle - _vis_dsdf1_angle) * _vis_tandem_f
                     x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                     curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
-                    x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                    if cfg.foil2_dist:
+                        foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                        x_n = torch.cat([x_n, curv, dist_feat, foil2_dist_feat], dim=-1)
+                    else:
+                        x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                    if cfg.tandem_cross_dsdf:
+                        x_n = torch.cat([x_n, _vis_dist_ratio, _vis_rel_angle], dim=-1)
                     # Fourier PE (must match training loop)
                     raw_xy = x_n[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
@@ -2791,6 +2836,14 @@ if cfg.surface_refine and best_metrics:
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
+                    if cfg.tandem_cross_dsdf:
+                        _vr_tandem_f = (x[:, 0, 22].abs() > 0.01).float().view(-1, 1, 1)
+                        _vr_dsdf1_min = x[:, :, 2:6].abs().min(dim=-1, keepdim=True).values
+                        _vr_dsdf2_min = x[:, :, 6:10].abs().min(dim=-1, keepdim=True).values
+                        _vr_dist_ratio = _vr_dsdf2_min / (_vr_dsdf1_min + _vr_dsdf2_min + 1e-4) * _vr_tandem_f
+                        _vr_dsdf1_angle = torch.atan2(x[:, :, 3:4], x[:, :, 2:3])
+                        _vr_dsdf2_angle = torch.atan2(x[:, :, 7:8], x[:, :, 6:7])
+                        _vr_rel_angle = (_vr_dsdf2_angle - _vr_dsdf1_angle) * _vr_tandem_f
                     x = (x - stats["x_mean"]) / stats["x_std"]
                     curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                     if cfg.foil2_dist:
@@ -2798,6 +2851,8 @@ if cfg.surface_refine and best_metrics:
                         x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
                     else:
                         x = torch.cat([x, curv, dist_feat], dim=-1)
+                    if cfg.tandem_cross_dsdf:
+                        x = torch.cat([x, _vr_dist_ratio, _vr_rel_angle], dim=-1)
                     raw_xy = x[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
                     xy_max = raw_xy.amax(dim=1, keepdim=True)
