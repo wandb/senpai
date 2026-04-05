@@ -1052,6 +1052,8 @@ class Config:
     aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
     aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
     aft_foil_srf_context: bool = False       # KNN volume context for aft-foil SRF (wake pressure recovery)
+    tandem_selfdistill: bool = False         # EMA self-distillation on tandem samples
+    tandem_selfdistill_weight: float = 0.1   # KD loss weight
 
 
 cfg = sp.parse(Config)
@@ -1944,6 +1946,22 @@ for epoch in range(MAX_EPOCHS):
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
 
+        # Tandem self-distillation: use EMA model as soft teacher on tandem samples
+        kd_loss = torch.tensor(0.0, device=device)
+        if cfg.tandem_selfdistill and ema_model is not None and is_tandem_batch.any():
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    ema_kd_out = ema_model({"x": x[is_tandem_batch]})
+                ema_kd_pred = ema_kd_out["preds"].float()
+            # Online backbone predictions for tandem samples (with grad)
+            online_kd_pred = out["preds"][is_tandem_batch].float()
+            # KD loss: MSE on surface pressure (channel 2) for tandem surface nodes
+            kd_surf_mask = (mask & is_surface)[is_tandem_batch]  # [N_tan, N_nodes]
+            n_surf_kd = kd_surf_mask.sum().clamp(min=1)
+            kd_diff_sq = (online_kd_pred[:, :, 2:3] - ema_kd_pred[:, :, 2:3]) ** 2
+            kd_loss = (kd_diff_sq * kd_surf_mask.unsqueeze(-1).float()).sum() / n_surf_kd
+            loss = loss + cfg.tandem_selfdistill_weight * kd_loss
+
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
@@ -2060,7 +2078,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _train_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.tandem_selfdistill:
+            _train_log["train/kd_loss"] = kd_loss.item()
+        wandb.log(_train_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
