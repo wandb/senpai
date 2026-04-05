@@ -663,6 +663,23 @@ class SurfaceRefinementContextHead(nn.Module):
         return correction
 
 
+class LoRAContext(nn.Module):
+    """Low-rank context adaptation parameters (GEPS-style).
+
+    Applied after each TransolverBlock. Initialized to zero so the model
+    behaves identically at init. Only adapted during test-time adaptation (TTA).
+    """
+
+    def __init__(self, hidden_dim: int, rank: int = 4):
+        super().__init__()
+        self.lora_A = nn.Parameter(torch.zeros(hidden_dim, rank))
+        self.lora_B = nn.Parameter(torch.zeros(rank, hidden_dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, N, D] — low-rank residual: x + x @ A @ B
+        return x + x @ self.lora_A @ self.lora_B
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -700,10 +717,12 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        geps_lora_rank=0,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
+        self.geps_lora_rank = geps_lora_rank
         self.pressure_first = pressure_first
         self.ref = ref
         self.unified_pos = unified_pos
@@ -781,6 +800,11 @@ class Transolver(nn.Module):
             with torch.no_grad():
                 for block in self.blocks:
                     block.spatial_bias[0].weight[:, 4:].zero_()
+        # GEPS LoRA context: low-rank adaptation parameters for test-time adaptation
+        # Only applied to non-last blocks (last block outputs predictions, not hidden features)
+        self.lora_ctxs = None
+        if geps_lora_rank > 0:
+            self.lora_ctxs = nn.ModuleList([LoRAContext(n_hidden, geps_lora_rank) for _ in range(n_layers - 1)])
         # Separate pressure pathway (pressure_separate_last_block):
         # Independent MLP + pres_head that processes shared hidden features
         self._pressure_separate = False  # set from Config after construction
@@ -898,8 +922,10 @@ class Transolver(nn.Module):
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
-        for block in self.blocks[:-1]:
+        for i, block in enumerate(self.blocks[:-1]):
             fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+            if self.lora_ctxs is not None:
+                fx = self.lora_ctxs[i](fx)
 
         # Deep hidden representation (post all non-last blocks, pre output head)
         fx_deep = fx  # [B, N, n_hidden]
@@ -921,6 +947,7 @@ class Transolver(nn.Module):
             fx = torch.cat([fx[:, :, :2], p_sep], dim=-1)
         else:
             fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+        # Note: no LoRAContext after last block (it outputs predictions, not hidden features)
 
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
@@ -1070,6 +1097,11 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Phase 6: GEPS test-time adaptation — low-rank LoRA context adaptation at inference
+    geps_tta: bool = False                  # enable GEPS test-time adaptation during validation
+    geps_tta_steps: int = 10               # number of TTA adaptation steps per batch
+    geps_tta_lr: float = 1e-3              # learning rate for LoRA adaptation
+    geps_tta_rank: int = 4                 # rank of LoRA context parameters
 
 
 cfg = sp.parse(Config)
@@ -1108,6 +1140,59 @@ def _umag_q(y, mask):
     Umag = (Ux_mean ** 2 + Uy_mean ** 2).sqrt().clamp(min=1.0).unsqueeze(-1)  # [B, 1, 1]
     q = 0.5 * Umag ** 2
     return Umag, q
+
+
+def _compute_continuity_residual(coords_t: torch.Tensor, Ux: torch.Tensor, Uy: torch.Tensor,
+                                  mask: torch.Tensor, K: int = 8,
+                                  max_nodes: int = 4096) -> torch.Tensor:
+    """Compute mean |div(U)|^2 using vectorized KNN least-squares gradient estimation.
+
+    Args:
+        coords_t:  [N, 2] float32 — node (x, y) positions (physical, not normalized)
+        Ux, Uy:   [N] float32 — predicted velocity components (must have grad)
+        mask:     [N] bool — valid node mask (e.g. non-padding interior nodes)
+        K:        number of nearest neighbors for local gradient estimation
+        max_nodes: subsample to this many nodes if M > max_nodes (avoids O(M^2) OOM)
+    Returns:
+        scalar — mean continuity residual over sampled valid nodes
+    """
+    coords_v = coords_t[mask]  # [M, 2]
+    Ux_v = Ux[mask]            # [M]
+    Uy_v = Uy[mask]            # [M]
+    M = coords_v.shape[0]
+    if M < K + 1:
+        return torch.tensor(0.0, device=Ux.device, requires_grad=True)
+
+    # Subsample to avoid O(M^2) OOM for large meshes
+    if M > max_nodes:
+        perm = torch.randperm(M, device=coords_v.device)[:max_nodes]
+        coords_v = coords_v[perm]
+        Ux_v = Ux_v[perm]
+        Uy_v = Uy_v[perm]
+        M = max_nodes
+
+    # Pairwise distances — cdist on subsampled set (max_nodes × max_nodes)
+    dists = torch.cdist(coords_v, coords_v)  # [M, M]
+    dists.fill_diagonal_(float('inf'))
+    k = min(K, M - 1)
+    _, nbr_idx = dists.topk(k, dim=-1, largest=False)  # [M, k]
+
+    # Delta coordinates and velocity differences
+    delta = coords_v[nbr_idx] - coords_v.unsqueeze(1)   # [M, k, 2]
+    dUx = Ux_v[nbr_idx] - Ux_v.unsqueeze(1)             # [M, k]
+    dUy = Uy_v[nbr_idx] - Uy_v.unsqueeze(1)             # [M, k]
+
+    # Batch normal equations: (A^T A)^{-1} A^T dU, where A = delta [M, k, 2]
+    ATA = torch.bmm(delta.transpose(1, 2), delta)  # [M, 2, 2]
+    ATA = ATA + 1e-8 * torch.eye(2, device=ATA.device).unsqueeze(0)
+    ATdUx = torch.bmm(delta.transpose(1, 2), dUx.unsqueeze(2)).squeeze(2)  # [M, 2]
+    ATdUy = torch.bmm(delta.transpose(1, 2), dUy.unsqueeze(2)).squeeze(2)  # [M, 2]
+
+    grad_Ux = torch.linalg.solve(ATA, ATdUx.unsqueeze(2)).squeeze(2)  # [M, 2]
+    grad_Uy = torch.linalg.solve(ATA, ATdUy.unsqueeze(2)).squeeze(2)  # [M, 2]
+
+    div_U = grad_Ux[:, 0] + grad_Uy[:, 1]  # ∂Ux/∂x + ∂Uy/∂y
+    return (div_U ** 2).mean()
 
 
 def _phys_norm(y, Umag, q):
@@ -1230,6 +1315,7 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    geps_lora_rank=cfg.geps_tta_rank if cfg.geps_tta else 0,
 )
 
 model = Transolver(**model_config).to(device)
@@ -2296,6 +2382,8 @@ for epoch in range(MAX_EPOCHS):
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
+                # Save raw physical coordinates for GEPS TTA continuity residual
+                _raw_pos_v = x[:, :, :2].clone()  # [B, N, 2] — physical (x, y) before normalization
                 # Aft-foil mask for eval (same logic as training)
                 _eval_aft_mask = None
                 if eval_aft_srf_head is not None:
@@ -2383,6 +2471,49 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm * sample_stds
                 else:
                     y_norm_scaled = y_norm / sample_stds
+
+                # GEPS test-time adaptation: adapt LoRA params via continuity residual
+                # Only for val_tandem_transfer where OOD generalization matters most
+                _geps_active = (cfg.geps_tta and split_name == "val_tandem_transfer"
+                                and eval_model.lora_ctxs is not None)
+                if _geps_active:
+                    # Reset LoRA params to zero before each batch
+                    _lora_params = [p for n, p in eval_model.named_parameters() if 'lora' in n]
+                    with torch.no_grad():
+                        for p in _lora_params:
+                            p.zero_()
+                    # Run TTA: adapt LoRA using continuity residual (no ground truth needed)
+                    # torch.enable_grad() needed because the outer val loop runs under torch.no_grad()
+                    _tta_opt = torch.optim.Adam(_lora_params, lr=cfg.geps_tta_lr)
+                    eval_model.train()
+                    with torch.enable_grad():
+                        for _tta_step in range(cfg.geps_tta_steps):
+                            _tta_opt.zero_grad()
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                _tta_out = eval_model({"x": x})
+                            _tta_pred = _tta_out["preds"].float()  # [B, N, 3] — [Ux, Uy, p]
+                            # Add freestream back if residual prediction mode
+                            if cfg.residual_prediction and _v_freestream is not None:
+                                _tta_pred_phys = _tta_pred + _v_freestream
+                            else:
+                                _tta_pred_phys = _tta_pred
+                            # Compute continuity residual per batch item
+                            _cont_loss = torch.tensor(0.0, device=device)
+                            for _b in range(x.shape[0]):
+                                _bmask = mask[_b]
+                                _Ux_b = _tta_pred_phys[_b, :, 0]
+                                _Uy_b = _tta_pred_phys[_b, :, 1]
+                                _coords_b = _raw_pos_v[_b]  # [N, 2]
+                                _cont_loss = _cont_loss + _compute_continuity_residual(
+                                    _coords_b, _Ux_b, _Uy_b, _bmask, K=8
+                                )
+                            _cont_loss = _cont_loss / x.shape[0]
+                            _cont_loss.backward()
+                            _tta_opt.step()
+                    eval_model.eval()
+                    if n_vbatches == 0:
+                        wandb.log({"val_tandem_transfer/tta_cont_loss": _cont_loss.item(),
+                                   "global_step": global_step})
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     _eval_out = eval_model({"x": x})
