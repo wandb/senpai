@@ -99,9 +99,14 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 
 ## Potential Next Research Directions (queue for next idle students)
 
-1. **Tandem Surface Mixup** — swap aft-foil surface node sets between tandem samples in batch. Forces shape-invariant wake prediction. Novel augmentation, medium risk. Expected -2 to -5% p_tan.
-2. **Tandem Pressure Head** — dedicated gated MLP for tandem-only pressure on top of backbone features, conditioned on gap/stagger. Expected -2 to -4% p_tan.
-3. **Researcher-agent ideas** — fresh hypotheses being generated (background agent running).
+### Top Priority (Bold / High Expected Impact)
+1. **Backbone-Wide AdaLN-All Conditioning** — thread gap/stagger through ALL 3 TransolverBlocks via existing `adaln_all=True` infrastructure. Currently only the decoder sees this info. Backbone attention can't modulate slice assignments for different tandem configs. Infrastructure already in place — just need to pass `cond_backbone = gap_stagger * is_tandem` to blocks. Expected -5 to -15% p_tan.
+2. **Iterative 2-Pass Refinement (AlphaFold2-style recycling)** — two forward passes with shared weights. Pass-1 output concatenated as additional input for pass-2. Zero extra parameters. Warmup from epoch 60. 1.8x training time, 2x activation memory. Expected -5 to -15% p_tan. HIGH RISK, HIGH REWARD.
+3. **dp/dn=0 Physics Loss** — zero-parameter auxiliary loss penalizing pressure gradients in wall-normal direction at surface nodes (Euler momentum at no-slip walls). Uses SAF gradient vectors already in input. Expected -2 to -6% across all surface metrics.
+
+### Medium Priority
+4. **Tandem Surface Mixup** — swap aft-foil surface node sets between tandem samples. Novel CutMix analog for mesh data. Expected -2 to -5% p_tan.
+5. **Tandem Pressure Correction MLP** — gated correction head for tandem-only pressure. Zero-init + gate bias=-2.0 for safe start. Expected -2 to -4% p_tan.
 
 ### Human Researcher Directives
 - **#1860 (2026-03-27):** Think bigger — radical new full model changes and data aug.
