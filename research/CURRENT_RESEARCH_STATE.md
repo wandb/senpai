@@ -49,7 +49,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | nezuko | #2169 | Online Hard Example Mining: adaptive per-sample loss upweighting | WIP |
 | tanjiro | #2171 | Slice Number Sweep: 128, 144 vs baseline 96 | WIP — just assigned |
 | alphonse | #2166 | dp/dn=0 Physics Loss: surface normal pressure gradient constraint | WIP |
-| thorfinn | #2165 | Iterative 2-Pass Refinement: AlphaFold2-style recycling, zero new params | WIP |
+| thorfinn | — | **IDLE** — awaiting new assignment | IDLE |
 | frieren | #2170 | Wider/Deeper SRF: hidden 256/384, layers 3/4 | WIP — just assigned |
 | edward | #2167 | Tandem Surface Mixup: between-sample aft-foil node swapping | WIP |
 
@@ -59,6 +59,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
+| #2165 | thorfinn | Iterative 2-Pass Refinement | **CLOSED** | p_tan=30.5 (+6.6%). 1.3x epoch cost → only 131 epochs. Still converging at wall clock. |
 | #2164 | frieren | Backbone Gap/Stagger AdaLN | **CLOSED** | adaln_all + gs 4cond p_tan=30.55 (+6.8%), adaln_all Re/AoA p_tan=30.3 (+5.9%). AdaLN disrupts optimized attention routing. |
 | #2156 | tanjiro | DSDF-1 Channel Dropout | **CLOSED** | p=0.2 p_tan=30.20 (+5.6%), p=0.3 p_tan=30.40 (+6.3%). Foil-1 DSDF carries critical upstream geometry. p_re improved -9.2% (regularization). |
 | #2163 | nezuko | Differential LR | **CLOSED** | Both mult regress p_tan. Uniform LR best. |
@@ -158,6 +159,7 @@ See `/research/RESEARCH_IDEAS_2026-04-05_ROUND3.md` for full details.
 | Various Phase 5 architectures | multiple | 5–59% worse. |
 | **Backbone-wide AdaLN** | **#2164** | **p_tan +5.9-6.8%. AdaLN disrupts optimized attention routing.** |
 | **DSDF-1 Channel Dropout** | **#2156** | **p_tan +5.6-6.3%. Foil-1 channels need exact values.** |
+| **Iterative 2-Pass Refinement** | **#2165** | **p_tan +6.6%. 1.3x epoch cost, only 131 epochs. Still converging at wall clock. Correction signal doesn't exist for CFD.** |
 
 ## Ensemble Seed Pool (Complete)
 

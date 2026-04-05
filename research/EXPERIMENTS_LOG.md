@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~00:25 — PR #2165: Iterative 2-Pass Refinement — thorfinn — **CLOSED** (training budget penalty, all metrics worse)
+
+- Branch: `thorfinn/iterative-refinement`
+- Hypothesis: AlphaFold2-style recycling — two forward passes with shared weights, pass-1 output concatenated as input for pass-2. Zero extra parameters. Warmup from epoch 60.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | VRAM | W&B |
+|--------|------|------|--------|-------|------|------|-----|
+| iter 2-pass | 42 | 14.5 | 8.6 | 30.3 | 7.1 | 46.6GB | u0nsat3a |
+| iter 2-pass | 73 | 14.8 | 9.1 | 30.7 | 7.4 | 46.4GB | 5yxjk7be |
+| **iter avg** | — | **14.65** | **8.85** | **30.5** | **7.25** | ~46.5GB | — |
+| **Baseline** | — | **13.05** | **7.70** | **28.60** | **6.55** | ~46GB | d7l91p0x, j9btfx09 |
+
+**Results:** All metrics worse. p_tan +6.6%. The 2-pass costs 1.3x per epoch → only 131 total epochs vs baseline ~150+. Model still converging at 180-min wall clock. Core issue: CFD surface pressure errors are from missing flow interaction info, not correctable biases — pass-2 can't recover what pass-1 couldn't encode. VRAM management was excellent (torch.no_grad on pass-1), warmup transition was smooth.
+- Dead end: iterative refinement under fixed training budget. Thorfinn now idle — reassigning.
+
+---
+
 ### 2026-04-06 ~00:15 — PR #2164: Backbone Gap/Stagger AdaLN — frieren — **CLOSED** (backbone AdaLN disrupts attention routing)
 
 - Branch: `frieren/backbone-gs-adaln`
