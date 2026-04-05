@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-05 ~05:35 UTC
+- **Date:** 2026-04-05 ~10:30 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -49,7 +49,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | fern | #2151 | EMA Start Epoch Sweep: {100, 120} vs default ~140 | WIP — just assigned |
 | alphonse | #2131 | Tandem-Slice Carve-Out K=4 — corrected instructions sent | WIP — rebasing |
 | nezuko | #2152 | Augmentation Annealing — linearly decay aug σ over training | WIP — just assigned |
-| thorfinn | #2147 | Actual 3-Way PCGrad — enable untested elif branch with --disable_pcgrad | WIP — just assigned |
+| thorfinn | #2154 | Cosine T_max Sweep: T_max={140, 180} vs baseline 160 | WIP — just assigned |
 | frieren | #2153 | Gap/Stagger Sigma Increase σ=0.03 — more geometric diversity | WIP — just assigned |
 | edward | #2149 | Learning Rate Sweep: lr={1e-4, 3e-4} vs baseline lr=2e-4 | WIP — just assigned |
 
@@ -106,9 +106,9 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 ## Potential Next Research Directions (not yet assigned)
 
 ### High Priority
-1. **Actual 3-Way PCGrad** — `--disable_pcgrad --pcgrad_3way --pcgrad_extreme_pct 0.15`. Never tested. 3-way splits single-foil / tandem-normal / tandem-extreme-Re. Could beat 2-way if the more granular gradient surgery resolves finer-grained conflicts.
-2. **Gap/stagger aug removal** — test if completely removing σ=0.02 (removing p_tan penalty) beats current baseline. Askeladd is testing σ=0.01, but σ=0 is also worth testing.
-3. **Tandem carve-out K=4 + current baseline** — Alphonse #2131 showed -3.7% vs control. If it compounds with GSB+PCGrad, could be huge.
+1. **Gap/stagger aug removal** — test if completely removing σ=0.02 (removing p_tan penalty) beats current baseline. Tanjiro testing σ=0 (#2148).
+2. **Tandem carve-out K=4 + current baseline** — Alphonse #2131 showed -3.7% vs control. If it compounds with GSB+PCGrad, could be huge.
+3. **Cosine T_max sweep** — T_max={140, 180} vs baseline 160. Untested since architecture changed significantly.
 4. **Attention sparsification / top-k slice assignment** — force sparser routing to prevent single slice domination.
 5. **AoA stagger flip augmentation** — mirror tandem stagger sign to create novel asymmetric configurations.
 
@@ -137,6 +137,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | DSDF Spatial Dropout | #2143 | All metrics degrade monotonically (p_in +6.4% at p=0.05). DSDF too information-dense to drop |
 | Cross-Seed Model Soup (weight averaging) | #2142 | Catastrophic: MAE 50-400x worse. Loss barriers between independent basins. Only works with shared initialization |
 | Tandem Self-Distillation (EMA teacher) | #2135 | Post-cosine degradation; w=0.05 regressed; GPU speed variance invalidates multi-seed |
+| Actual 3-Way PCGrad | #2147 | All pct values (0.10, 0.15, 0.20) worse than 2-way. Tandem-extreme-Re carve-out too small for stable gradients |
 | Reynolds-Conditional SRF FiLM | #2128 | Null — AdaLN already handles Re/AoA; FiLM redundant |
 | Fore-Foil SRF (all formulations) | #2117, #2124 | Split: +9-11% p_tan. Stacked: +1-4% p_tan, p_oodc degrades |
 | Aft-Foil Loss Upweighting | #2121 | p_oodc -2% but p_tan +1.5% |

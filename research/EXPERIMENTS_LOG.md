@@ -2,6 +2,33 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~10:00 — PR #2147: Actual 3-Way PCGrad — thorfinn — **CLOSED** (negative)
+
+- Branch: `thorfinn/actual-3way-pcgrad`
+- Hypothesis: True 3-way PCGrad (single-foil / tandem-normal / tandem-extreme-Re) via `--disable_pcgrad --pcgrad_3way` may beat 2-way PCGrad by resolving finer-grained gradient conflicts.
+
+| pct | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|-----|------|------|--------|-------|------|-----|
+| 0.15 | 42 | 13.6 | 8.1 | 29.2 | 6.7 | sl98yydy |
+| 0.15 | 73 | 13.2 | 7.8 | 28.8 | 6.6 | u3pvgipm |
+| 0.15 | avg | 13.4 | 7.95 | **29.00** | 6.65 | — |
+| 0.10 | 42 | 13.8 | 8.3 | 29.5 | 6.8 | 6dmvry4i |
+| 0.20 | 42 | 13.5 | 8.0 | 29.1 | 6.7 | 6padkn2v |
+
+**Baseline comparison (pct=0.15 avg):**
+| Metric | Baseline | 3-Way | Delta |
+|--------|----------|-------|-------|
+| p_in | 13.05 | 13.4 | +2.7% ❌ |
+| p_oodc | 7.70 | 7.95 | +3.2% ❌ |
+| p_tan | **28.60** | **29.00** | **+1.4%** ❌ |
+| p_re | 6.55 | 6.65 | +1.5% ❌ |
+
+**Results:** 3-way PCGrad worse than 2-way across all metrics. The tandem-extreme-Re carve-out (pct=0.15) creates too small a group for stable gradient estimation, while 2-way's simpler in-dist vs OOD split is more robust. All three pct values tested (0.10, 0.15, 0.20) fail to beat baseline. 2-way PCGrad confirmed optimal.
+- **Key insight:** PCGrad effectiveness depends on group size stability. Splitting OOD into normal/extreme creates noisy gradient estimates.
+- Thorfinn reassigned to Cosine T_max Sweep (#2154).
+
+---
+
 ### 2026-04-05 ~09:15 — PR #2146: Tail EMA Checkpoint Averaging — frieren — **CLOSED** (null result)
 
 - Branch: `frieren/tail-ema-avg`
