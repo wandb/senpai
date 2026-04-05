@@ -2,6 +2,30 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~06:40 — PR #2137: EMA Stochastic Weight Perturbation — tanjiro — **CLOSED** (dead end)
+
+- Branch: `tanjiro/ema-perturb`
+- Hypothesis: One-time Gaussian perturbation at EMA start (epoch 140) to explore flat minima. σ sweep {5e-4, 1e-3, 3e-3}.
+
+| σ | p_in avg | p_oodc avg | p_tan avg | p_re avg |
+|---|---------|-----------|----------|---------|
+| 5e-4 | 12.9 (-0.9%) | 7.6 (-0.3%) | **30.5 (+2.0%)** ❌ | 6.5 (+0.5%) |
+| 1e-3 | 13.2 (+1.4%) | 7.75 (+1.7%) | **30.1 (+0.6%)** ❌ | 6.5 (+0.5%) |
+| 3e-3 | 13.2 (+1.4%) | 7.7 (+1.0%) | **30.2 (+1.0%)** ❌ | 6.5 (+0.5%) |
+| Old baseline | 13.02 | 7.62 | 29.91 | 6.47 |
+| **Current baseline** | **13.05** | **7.70** | **28.60** | **6.55** |
+
+W&B group: `phase6/ema-perturb`. Runs: er41ypz5, asbtprv1 (5e-4); obkrg47t, 6s1r2mu7 (1e-3); 4w1o1rnr, 2nxtud27 (3e-3). Stale flags: --disable_pcgrad, --aft_foil_srf_context, no GSB. ~156-157 epochs.
+
+**Results commentary:**
+- All σ values regress p_tan vs old baseline. Not competitive with current baseline (28.60).
+- Seed 42 vs 73 shows 0.6-1.4 points divergence — perturbation adds noise, not systematic improvement.
+- **Flat-minima-seeking confirmed as dead end CLASS:** SAM (#2086), SGLD (#2120), SWAD (#2094), and EMA perturbation all failed. Lion + cosine + EMA already provides sufficient implicit regularization.
+- Recovery time too short (17 epochs from epoch 140), LR near minimum → model barely moves after perturbation.
+- Tanjiro reassigned to gap/stagger aug removal (#2148).
+
+---
+
 ### 2026-04-05 ~06:20 — PR #2143: DSDF Spatial Dropout — thorfinn — **CLOSED** (dead end)
 
 - Branch: `thorfinn/dsdf-spatial-dropout`
