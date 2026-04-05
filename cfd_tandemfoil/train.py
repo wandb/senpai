@@ -282,6 +282,7 @@ class TransolverBlock(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        spatial_bias_input_dim=4,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -328,7 +329,7 @@ class TransolverBlock(nn.Module):
         self.ln_2 = _LN(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         self.spatial_bias = nn.Sequential(
-            nn.Linear(4, 64), nn.GELU(),
+            nn.Linear(spatial_bias_input_dim, 64), nn.GELU(),
             nn.Linear(64, 64), nn.GELU(),
             nn.Linear(64, slice_num),
         )
@@ -698,9 +699,11 @@ class Transolver(nn.Module):
         pressure_first=False,
         pressure_no_detach=False,
         pressure_deep=False,
+        gap_stagger_spatial_bias=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
+        self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
         self.pressure_first = pressure_first
         self.ref = ref
         self.unified_pos = unified_pos
@@ -768,10 +771,16 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
+                    spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
                 )
                 for idx in range(n_layers)
             ]
         )
+        # Zero-init the 2 new input columns of spatial_bias so initial routing is unchanged
+        if gap_stagger_spatial_bias:
+            with torch.no_grad():
+                for block in self.blocks:
+                    block.spatial_bias[0].weight[:, 4:].zero_()
         # Separate pressure pathway (pressure_separate_last_block):
         # Independent MLP + pres_head that processes shared hidden features
         self._pressure_separate = False  # set from Config after construction
@@ -875,7 +884,12 @@ class Transolver(nn.Module):
 
         x_cross = x * self.feature_cross(x)
         x = x + 0.1 * x_cross  # residual with small scale
-        raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)  # x, y, curvature, dist
+        if self.gap_stagger_spatial_bias:
+            # Gap (idx 22) and stagger (idx 23) are global per-sample scalars; broadcast to all nodes
+            gap_stagger = x[:, 0:1, 22:24].expand(-1, x.shape[1], -1)  # [B, N, 2]
+            raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26], gap_stagger], dim=-1)  # [B, N, 6]
+        else:
+            raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)  # x, y, curvature, dist
 
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
@@ -1005,6 +1019,7 @@ class Config:
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
+    gap_stagger_spatial_bias: bool = False  # condition spatial bias MLP on gap/stagger (tandem geometry-aware routing)
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1214,6 +1229,7 @@ model_config = dict(
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
+    gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
 )
 
 model = Transolver(**model_config).to(device)
