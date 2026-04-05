@@ -44,7 +44,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| fern | — | **IDLE** — awaiting new assignment | IDLE |
+| fern | #2174 | Attention Temperature Curriculum: broad→sharp slice routing | WIP — just assigned |
 | askeladd | #2168 | Tandem Pressure Correction MLP: gated tandem-specific pressure pathway | WIP |
 | nezuko | #2169 | Online Hard Example Mining: adaptive per-sample loss upweighting | WIP |
 | tanjiro | #2171 | Slice Number Sweep: 128, 144 vs baseline 96 | WIP — just assigned |
@@ -86,7 +86,7 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 5. `--gap_stagger_spatial_bias` — tandem-geometry-aware slice routing (p_tan -3.0%)
 
 **Active experiments (8 students WIP):**
-1. **FiLM-Conditioned Fore-Foil SRF** (fern #2161) — shape-aware correction on NACA6416 fore surface
+1. **Attention Temperature Curriculum** (fern #2174) — schedule temp 2.0→0.3 over 80 epochs then release, zero new params
 2. **Tandem Pressure Correction MLP** (askeladd #2168) — gated tandem-specific pressure pathway
 3. **Online Hard Example Mining** (nezuko #2169) — adaptive per-sample loss upweighting
 4. **Binned Spectral Power Loss** (thorfinn #2172) — frequency-weighted 1D DFT loss targeting high-freq surface pressure features
