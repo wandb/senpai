@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-05 ~14:00 UTC
+- **Date:** 2026-04-05 ~17:30 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -40,39 +40,37 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble (29.1) on p_tan.
 
-## Student Status (~14:00 UTC)
+## Student Status (~17:30 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| askeladd | #2150 | DSDF2 Sigma Optimization: σ={0.03, 0.08} vs baseline 0.05 | WIP |
+| fern | #2159 | FiLM-Conditioned Fore-Foil SRF: Shape-Aware Correction for NACA6416 Gap | WIP — just assigned |
+| askeladd | #2160 | Tandem Cross-DSDF Features: Per-Node Inter-Foil Geometry | WIP — just assigned |
 | tanjiro | #2156 | DSDF-1 Channel Dropout: p={0.2, 0.3} force shape-invariant tandem | WIP |
-| fern | #2151 | EMA Start Epoch Sweep: {100, 120} vs default ~140 | WIP |
 | alphonse | #2157 | Foil Shape Similarity Bias: extend GSB 6D→7D with inter-foil cosine similarity | WIP |
 | nezuko | #2152 | Augmentation Annealing — linearly decay aug σ over training | WIP |
 | thorfinn | #2154 | Cosine T_max Sweep: T_max={140, 180} vs baseline 160 | WIP |
 | frieren | #2153 | Gap/Stagger Sigma Increase σ=0.03 — more geometric diversity | WIP |
-| edward | #2158 | Asymmetric PCGrad: protect in-dist gradients, project OOD only | WIP — just assigned |
+| edward | #2158 | Asymmetric PCGrad: protect in-dist gradients, project OOD only | WIP |
 
 **All 8 students active. Zero idle GPUs.**
 
-⚠️ **tanjiro/slice-count-sweep (#2155):** Merged at 10:03 UTC without result comments. W&B runs: `fnmekuhn` (slice64-s42), `5yoyekex` (slice64-s73), `c9ev82c9` (slice128-s42), `4vpi753k` (slice128-s73). Monitor — if either slice count beats baseline once converged, update baseline.
-
-## Recently Reviewed (2026-04-05 ~14:00)
+## Recently Reviewed (2026-04-05 ~17:30)
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
-| #2149 | edward | LR Sweep: lr={1e-4, 3e-4} vs baseline 2e-4 | **CLOSED** | All variants worse. lr=3e-4 avg: p_tan=29.85 (+4.4%), lr=1e-4 avg: p_tan=29.30 (+2.4%). lr=2e-4 confirmed optimal. |
+| #2151 | fern | EMA Start Epoch Sweep: {100, 120} vs default ~140 | **CLOSED** | Both regress p_tan: start=100 avg +3.7%, start=120 avg +3.8%. ema_start ~140 confirmed optimal — earlier averaging contaminates EMA with high-LR exploration phase. |
+| #2150 | askeladd | DSDF2 Sigma Optimization: σ={0.03, 0.08} vs 0.05 | **CLOSED** | Neither beats baseline: σ=0.03 p_tan +0.9%, σ=0.08 p_tan +1.9%. σ=0.05 confirmed optimal sweet spot — tighter is insufficient diversity, wider is too noisy. |
+| #2149 | edward | LR Sweep: lr={1e-4, 3e-4} vs baseline 2e-4 | **CLOSED** | All variants worse. lr=2e-4 confirmed optimal. |
 | #2131 | alphonse | Tandem-Slice Carve-Out K=4 (rebased on GSB+PCGrad) | **CLOSED** | p_tan=29.43 vs baseline 28.60 (+2.9%). K=4 redundant with GSB. |
 | #2148 | tanjiro | Gap/Stagger Aug Removal (σ=0) | **CLOSED** | All metrics worse. |
-| #2147 | thorfinn | Actual 3-Way PCGrad | **CLOSED** | All pct values worse than 2-way. |
-| #2146 | frieren | Tail EMA Checkpoint Averaging | **CLOSED** | Null result. |
 | #2130 | fern | GSB + PCGrad Compound | **MERGED** | p_tan 29.48→28.60 (-3.0%). Current baseline. |
 
 ## Current Research Focus
 
 ### Primary target: p_tan = 28.60 → push below 28.0
 
-Single model already beats 16-seed ensemble on p_tan. More headroom exists — attacking the **NACA6416 representation gap**.
+Single model already beats 16-seed ensemble on p_tan. More headroom exists — attacking the **NACA6416 representation gap** via input representation and specialized correction heads.
 
 **Confirmed wins (merged into baseline):**
 1. `--aft_foil_srf` — dedicated aft-foil SRF head
@@ -82,9 +80,9 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 5. `--gap_stagger_spatial_bias` — tandem-geometry-aware slice routing (p_tan -3.0%)
 
 **Active experiments (8 students WIP):**
-1. **DSDF2 Sigma Optimization** (askeladd #2150) — σ={0.03, 0.08} vs baseline 0.05
-2. **DSDF-1 Channel Dropout** (tanjiro #2156) — p={0.2, 0.3} tandem-only dropout of foil-1 DSDF channels; forces shape-invariant wake prediction
-3. **EMA Start Epoch Sweep** (fern #2151) — {100, 120} vs default ~140
+1. **FiLM-Conditioned Fore-Foil SRF** (fern #2159) — shape-aware correction on fore-foil surface, conditioned on DSDF1 stats + gap/stagger. Differentiates NACA6416 OOD shape from training shapes. Expected -2 to -5% p_tan.
+2. **Tandem Cross-DSDF Features** (askeladd #2160) — per-node dist_ratio + rel_angle features from existing DSDF channels. Physics-motivated inter-foil geometry. Expected -2 to -4% p_tan.
+3. **DSDF-1 Channel Dropout** (tanjiro #2156) — p={0.2, 0.3} tandem-only dropout of foil-1 DSDF channels; forces shape-invariant wake prediction
 4. **Foil Shape Similarity Bias** (alphonse #2157) — extend GSB 6D→7D with inter-foil cosine similarity; geometry-type-conditioned routing
 5. **Augmentation Annealing** (nezuko #2152) — linearly decay aug σ over training
 6. **Cosine T_max Sweep** (thorfinn #2154) — T_max={140, 180} vs baseline 160
@@ -92,9 +90,9 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 8. **Asymmetric PCGrad** (edward #2158) — only project OOD (g_B) onto in-dist (g_A) normal plane; protect in-dist gradient from modification
 
 **Key research patterns:**
-- **What works:** DSDF magnitude augmentation (foil-2 only), specialized correction heads (aft_srf), gradient surgery (2-way PCGrad), tandem-geometry-aware routing (GSB)
-- **What doesn't work:** Foil-1 DSDF aug (scaling), fore-foil SRF (unconditioned), tandem slice carve-out (redundant with GSB), 3-way PCGrad, post-hoc weight averaging, flat-minima-seeking, LR changes ±50%
-- **Confirmed optimal hyperparams:** ema_decay=0.999, weight_decay=5e-5, aug_gap_stagger_sigma=0.02, aug_dsdf2_sigma=0.05, lr=2e-4, cosine_T_max=160
+- **What works:** DSDF magnitude augmentation (foil-2 only), specialized correction heads (aft_srf), gradient surgery (2-way PCGrad), tandem-geometry-aware routing (GSB), geometry-conditioned mechanisms
+- **What doesn't work:** Foil-1 DSDF aug (scaling), fore-foil SRF (**unconditioned**), tandem slice carve-out, 3-way PCGrad, post-hoc weight averaging, flat-minima-seeking, LR changes ±50%, earlier EMA starts, DSDF2 sigma variations
+- **Confirmed optimal hyperparams:** ema_decay=0.999, ema_start_epoch~140, weight_decay=5e-5, aug_gap_stagger_sigma=0.02, aug_dsdf2_sigma=0.05, lr=2e-4, cosine_T_max=160
 
 ## Critical Finding: PCGrad Flag Logic
 
@@ -103,10 +101,9 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 ## Potential Next Research Directions (queue for next idle students)
 
 ### High Priority
-1. **FiLM-Conditioned Fore-Foil SRF** — additive fore-foil correction conditioned on DSDF1 statistics (shape fingerprint). Key differentiator from failed #2117/#2124: conditioned on foil shape. Expected -2 to -5% p_tan. Medium risk, ~60 LoC.
-2. **Tandem Cross-DSDF Features** — explicit inter-foil geometry features (dist_ratio, relative angle) as raw inputs. Expected -2 to -4% p_tan. Low-Med risk, ~20 LoC.
-3. **Fork-then-merge Model Soup** — shared init to epoch 100, branch to 3 seeds, average. Solves loss barrier problem from #2142. Medium risk.
-4. **Differential Learning Rates** — higher LR for specialized heads (aft_srf, GSB MLP) vs backbone. Expected -1 to -2% across metrics. Low risk.
+1. **Differential Learning Rates** — higher LR multiplier (2x-3x) for specialized heads (aft_srf, surface_refine, GSB MLP) vs backbone. Expected -1 to -3% across metrics. Low risk, ~15 LoC.
+2. **Tandem Surface Mixup** — swap aft-foil surface node sets between tandem samples in batch. Forces shape-invariant wake prediction. Novel augmentation, medium risk.
+3. **Tandem Pressure Head** — dedicated MLP for tandem-only pressure prediction on top of backbone features, conditioned on gap/stagger.
 
 ### Human Researcher Directives
 - **#1860 (2026-03-27):** Think bigger — radical new full model changes and data aug. ← Prioritize architecturally novel experiments.
@@ -116,6 +113,8 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 
 | Direction | PRs | Finding |
 |-----------|-----|---------|
+| EMA Start Epoch Earlier (100, 120) | #2151 | Both regress p_tan +3.7-3.8%. Start ~140 optimal. |
+| DSDF2 Sigma (0.03, 0.08) | #2150 | σ=0.05 confirmed optimal. Neither direction helps. |
 | Tandem-Slice Carve-Out (K=4,8) | #2131 | Redundant with GSB; doesn't compound. |
 | Gap/Stagger σ=0 (removal) | #2148 | All metrics worse. GSB+aug complementary. |
 | Actual 3-Way PCGrad | #2147 | All pct values worse than 2-way. |
@@ -137,7 +136,7 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 | Gap/Stagger σ=0.01 | #2140 | Worse than 0.02. |
 | EMA Decay 0.9995 | #2141 | Regresses with GSB. 0.999 optimal. |
 | Reynolds Number Perturbation | #2125 | Null + regression. |
-| Fore-foil SRF (all formulations) | #2117,#2124 | All worsen p_tan. |
+| Fore-foil SRF (unconditioned) | #2117,#2124 | All worsen p_tan. Conditioned variant now being tested (#2159). |
 | Aft/Fore-Foil Loss Upweighting | #2121,#2122 | p_oodc mild benefit, p_tan regression. |
 | Various Phase 5 architectures | multiple | 5–59% worse. |
 

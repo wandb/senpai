@@ -2,6 +2,48 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~17:00 — PR #2151: EMA Start Epoch Sweep (100, 120 vs ~140) — fern — **CLOSED** (dead end)
+
+- Branch: `fern/ema-start-epoch`
+- Hypothesis: Starting EMA accumulation earlier (epoch 100 or 120 vs default ~140) would provide more checkpoint averaging, producing a smoother model that generalizes better to OOD data. With training running ~150-155 epochs, start=100 gives 3.7x more averaging epochs than the default.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| start=100 | 42 | 12.8 | 7.8 | 29.7 | 6.6 | g9qbvs9v |
+| start=100 | 73 | 12.9 | 7.6 | 29.6 | 6.5 | 4dyfrlfk |
+| **start=100 avg** | — | **12.85** | **7.7** | **29.65** | **6.55** | — |
+| start=120 | 42 | 12.9 | 7.8 | 29.8 | 6.6 | 352ovdc3 |
+| start=120 | 73 | 12.9 | 7.6 | 29.6 | 6.5 | nuys4pcb |
+| **start=120 avg** | — | **12.9** | **7.7** | **29.7** | **6.55** | — |
+| **Baseline (~140)** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** Both earlier EMA starts regress p_tan significantly: start=100 +3.7%, start=120 +3.8%. The two configs are nearly identical, suggesting the 100-120 range doesn't matter much — what matters is that EMA starts too early during the high-LR exploration phase of the cosine schedule (T_max=160). The default start ~140 captures only the final converged trajectory.
+- **Key insight:** Fewer averaging epochs (15 at default) beats more (35-55). The sweet spot for EMA is the last ~10% of training when the model is converged. Added to confirmed hyperparameter dead ends.
+- Fern now idle — reassigning.
+
+---
+
+### 2026-04-05 ~17:00 — PR #2150: DSDF2 Sigma Optimization σ={0.03, 0.08} vs 0.05 — askeladd — **CLOSED** (σ=0.05 confirmed optimal)
+
+- Branch: `askeladd/dsdf2-sigma-sweep`
+- Hypothesis: The foil-2 DSDF magnitude augmentation (σ=0.05, PR #2126) was merged without systematic optimization. σ=0.03 (tighter: [0.94, 1.06]) and σ=0.08 (wider: [0.85, 1.17]) bracket the current value.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| σ=0.03 | 42 | 12.9 | 7.8 | 28.2 | 6.6 | cm9uz650 |
+| σ=0.03 | 73 | 13.6 | 8.1 | 29.5 | 6.6 | kj8cvxpw |
+| **σ=0.03 avg** | — | **13.25** | **7.95** | **28.85** | **6.60** | — |
+| σ=0.08 | 42 | 12.9 | 7.9 | 28.9 | 6.6 | js6sm78l |
+| σ=0.08 | 73 | 13.4 | 7.9 | 29.4 | 6.5 | 2o2499gz |
+| **σ=0.08 avg** | — | **13.15** | **7.90** | **29.15** | **6.55** | — |
+| **Baseline (σ=0.05)** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** Neither variant beats baseline. σ=0.03: p_tan +0.9%, p_oodc +3.2%. σ=0.08: p_tan +1.9%, p_oodc +2.6%. The seed-42 p_tan=28.2 for σ=0.03 is tempting but seed 73's 29.5 confirms high variance — not a real signal.
+- **Key insight:** σ=0.05 sits at the sweet spot for DSDF2 augmentation in the compound baseline (PCGrad + GSB + DSDF2). Tighter = insufficient diversity, wider = too much noise. Added to confirmed hyperparameter dead ends.
+- Askeladd now idle — reassigning.
+
+---
+
 ### 2026-04-05 ~14:00 — PR #2149: Learning Rate Sweep lr={3e-4, 1e-4} — edward — **CLOSED** (lr=2e-4 confirmed optimal)
 
 - Branch: `edward/lr-sweep`
