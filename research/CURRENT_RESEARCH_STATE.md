@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-05 ~10:30 UTC
+- **Date:** 2026-04-05 ~11:00 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -40,31 +40,30 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | p_tan | **29.1** |
 | p_re | **5.8** |
 
-## Student Status (~05:35 UTC)
+## Student Status (~11:00 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| askeladd | #2150 | DSDF2 Sigma Optimization: σ={0.03, 0.08} vs baseline 0.05 | WIP — just assigned |
-| tanjiro | #2148 | Gap/Stagger Aug Removal — test σ=0 (no aug) now that GSB exists | WIP — just assigned |
-| fern | #2151 | EMA Start Epoch Sweep: {100, 120} vs default ~140 | WIP — just assigned |
+| askeladd | #2150 | DSDF2 Sigma Optimization: σ={0.03, 0.08} vs baseline 0.05 | WIP |
+| tanjiro | #2155 | Slice Count Sweep: slice_num={64, 128} vs baseline 96 | WIP — just assigned |
+| fern | #2151 | EMA Start Epoch Sweep: {100, 120} vs default ~140 | WIP |
 | alphonse | #2131 | Tandem-Slice Carve-Out K=4 — corrected instructions sent | WIP — rebasing |
-| nezuko | #2152 | Augmentation Annealing — linearly decay aug σ over training | WIP — just assigned |
-| thorfinn | #2154 | Cosine T_max Sweep: T_max={140, 180} vs baseline 160 | WIP — just assigned |
-| frieren | #2153 | Gap/Stagger Sigma Increase σ=0.03 — more geometric diversity | WIP — just assigned |
-| edward | #2149 | Learning Rate Sweep: lr={1e-4, 3e-4} vs baseline lr=2e-4 | WIP — just assigned |
+| nezuko | #2152 | Augmentation Annealing — linearly decay aug σ over training | WIP |
+| thorfinn | #2154 | Cosine T_max Sweep: T_max={140, 180} vs baseline 160 | WIP |
+| frieren | #2153 | Gap/Stagger Sigma Increase σ=0.03 — more geometric diversity | WIP |
+| edward | #2149 | Learning Rate Sweep: lr={1e-4, 3e-4} vs baseline lr=2e-4 | WIP |
 
 **All 8 students active. Zero idle GPUs.**
 
-## Recently Reviewed (2026-04-05 ~05:35)
+## Recently Reviewed (2026-04-05 ~11:00)
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
-| #2142 | frieren | Cross-Seed Model Soup (3-seed weight avg) | **CLOSED** | Catastrophic failure: weight avg produces MAE 50-400x worse due to loss barriers between basins. Individual seeds don't beat current baseline. |
-| #2130 | fern | GSB + PCGrad Compound (Round 3) | **MERGED** | p_tan 29.48→28.60 (-3.0%). New baseline. GSB + PCGrad compound correctly. |
-| #2138 | edward | Foil-2 Independent AoA Rotation Aug | **CLOSED** | Target inconsistency: rotated geometry without re-simulated flow. No σ beats baseline. |
-| #2136 | thorfinn | Per-Foil Physics Normalization | **CLOSED** | phys_stats mismatch → all metrics +5-19%. |
-| #2134 | frieren | Fore-Foil TE Relative Coords + Bug Fix | **CLOSED** | Critical finding: context head when working is harmful (p_in +21%, training 17% slower). |
-| #2129 | nezuko | Surface Pressure Gradient Aux Loss (Round 3) | **CLOSED** | p_tan=29.78 misses baseline 29.48. 3 iterations exhausted. |
+| #2148 | tanjiro | Gap/Stagger Aug Removal (σ=0) | **CLOSED** | All primary metrics worse: p_in +3.4%, p_tan +4.0%, p_oodc +1.3%. GSB and aug are complementary. σ parameter space fully explored. |
+| #2147 | thorfinn | Actual 3-Way PCGrad | **CLOSED** | All pct values worse than 2-way. Tandem-extreme-Re carve-out too small. |
+| #2146 | frieren | Tail EMA Checkpoint Averaging | **CLOSED** | Null result: ±0.3% noise. Post-hoc weight avg exhausted. |
+| #2142 | frieren | Cross-Seed Model Soup | **CLOSED** | Catastrophic: MAE 50-400x worse due to loss barriers. |
+| #2130 | fern | GSB + PCGrad Compound | **MERGED** | p_tan 29.48→28.60 (-3.0%). New baseline. |
 | #2131 | alphonse | Tandem-Slice Carve-Out (K=4,8) | **SENT BACK** | K=4 beats control -3.7%. Corrected instructions sent for rebase. |
 
 ## Current Research Focus
@@ -79,21 +78,21 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 5. `--pcgrad_3way --pcgrad_extreme_pct 0.15`: PCGrad 2-way gradient surgery — PR #2119 (p_tan -2.1%)
 6. `--gap_stagger_spatial_bias`: tandem-geometry-aware slice routing (gap+stagger in spatial_bias MLP) — PR #2130 (p_tan -3.0%!)
 
-**Active experiments (7 students + 1 idle):**
-1. **Gap/Stagger Sigma Reduction σ=0.01** (askeladd #2140) — Test if smaller aug perturbation preserves p_oodc benefit while reducing p_tan penalty. Expected p_tan -0.5% to -1.5%.
-2. **EMA Stochastic Weight Perturbation** (tanjiro #2137) — One-time Gaussian perturbation at EMA start, σ sweep {5e-4, 1e-3, 3e-3}. Expected p_tan -1% to -3%.
-3. **Gap/Stagger Spatial Bias + PCGrad** (fern #2130) — Final validation: does GSB compound with PCGrad? GSB showed -0.8% p_tan vs control. Expected compound: ~29.24.
-4. **Tandem-Slice Carve-Out K=4** (alphonse #2131) — Rebasing onto noam. Original result K=4: p_tan -3.7% vs control.
-5. **Per-Foil Physics Normalization** (thorfinn #2136) — Split Cp denominator for fore/aft foil nodes.
-6. **Cross-Seed Model Soup** (frieren #2142) — Train 3 seeds (42, 73, 91), average EMA weights post-training. Weight averaging across independent seeds creates flatter loss basin model. Expected p_tan -1% to -3%.
-7. **Foil-2 Independent AoA Rotation Aug** (edward #2138) — Decoupled fore/aft AoA rotation for tandem samples.
-8. **EMA Decay Rate Sweep** (nezuko #2141) — Test 0.9995 and 0.9998 vs baseline 0.999. Higher decay = more averaging = flatter basin = better OOD. Expected p_tan -0.5% to -1.5%.
+**Active experiments (8 students WIP):**
+1. **DSDF2 Sigma Optimization** (askeladd #2150) — σ={0.03, 0.08} vs baseline 0.05.
+2. **EMA Start Epoch Sweep** (fern #2151) — {100, 120} vs default ~140.
+3. **Augmentation Annealing** (nezuko #2152) — Linearly decay aug σ over training.
+4. **Cosine T_max Sweep** (thorfinn #2154) — T_max={140, 180} vs baseline 160.
+5. **Gap/Stagger Sigma Increase** (frieren #2153) — σ=0.03 vs baseline 0.02.
+6. **Learning Rate Sweep** (edward #2149) — lr={1e-4, 3e-4} vs baseline 2e-4.
+7. **Tandem-Slice Carve-Out K=4** (alphonse #2131) — Rebasing onto noam.
+8. **Slice Count Sweep** (tanjiro #2155) — slice_num={64, 128} vs baseline 96. Tests interaction with GSB's geometry-aware routing.
 
 **Key research patterns:**
-- **What works:** DSDF magnitude augmentation (foil-2 only), additive specialized correction heads (aft_srf), gradient surgery (PCGrad 2-way), non-local context (KNN wake — pending bug fix)
-- **What doesn't work:** Foil-1 DSDF aug, fore-foil SRF, Re/AoA FiLM, self-distillation, DSDF mixup between same-type samples, surface gradient aux loss (3 iterations, weak signal)
-- **Mixed results:** Gap/stagger aug helps p_oodc but hurts p_tan; sigma reduction worth testing
-- **Critical interaction:** GSB + aft_foil_srf_context (buggy no-op) gave p_tan=31.1 — unexpectedly bad. Likely a seed issue (42/73 vs 42/43).
+- **What works:** DSDF magnitude augmentation (foil-2 only), additive specialized correction heads (aft_srf), gradient surgery (PCGrad 2-way), tandem-geometry-aware routing (GSB)
+- **What doesn't work:** Foil-1 DSDF aug, fore-foil SRF, Re/AoA FiLM, self-distillation, DSDF mixup, surface gradient aux loss, flat-minima-seeking (SAM/SGLD/SWAD/EMA perturb all fail), post-hoc weight averaging (tail avg, model soup), 3-way PCGrad, gap/stagger σ reduction to 0 or 0.01
+- **Confirmed optimal hyperparams:** ema_decay=0.999, weight_decay=5e-5, aug_gap_stagger_sigma=0.02
+- **Gap/stagger σ sweep complete:** σ={0, 0.01, 0.02(best), 0.03(in-progress)}. σ=0.02 confirmed optimal.
 
 ## Critical Finding: PCGrad Flag Logic (2026-04-05 ~05:40)
 
@@ -106,16 +105,17 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 ## Potential Next Research Directions (not yet assigned)
 
 ### High Priority
-1. **Gap/stagger aug removal** — test if completely removing σ=0.02 (removing p_tan penalty) beats current baseline. Tanjiro testing σ=0 (#2148).
-2. **Tandem carve-out K=4 + current baseline** — Alphonse #2131 showed -3.7% vs control. If it compounds with GSB+PCGrad, could be huge.
-3. **Cosine T_max sweep** — T_max={140, 180} vs baseline 160. Untested since architecture changed significantly.
-4. **Attention sparsification / top-k slice assignment** — force sparser routing to prevent single slice domination.
-5. **AoA stagger flip augmentation** — mirror tandem stagger sign to create novel asymmetric configurations.
+1. **Tandem carve-out K=4 + current baseline** — Alphonse #2131 showed -3.7% vs control. If it compounds with GSB+PCGrad, could be huge. In progress.
+2. **Slice count sweep** — Currently 96 slices, never revisited since architecture expanded with GSB+aft_srf+PCGrad. Try 64 and 128.
+3. **Attention sparsification / top-k slice assignment** — force sparser routing to prevent single slice domination.
+4. **Fork-then-merge model soup** — Train 1 model to epoch 100, branch into 3 seeds for remaining epochs, then average. Solves loss barrier (shared initialization).
+5. **Differential learning rates** — Different LR for backbone vs specialized heads (SRF, aft_srf, spatial_bias). Heads may benefit from higher LR.
 
 ### Longer-term
-6. **Fork-then-merge model soup** — Train 1 model to epoch 100, branch into 3 seeds for remaining epochs, then average. Solves loss barrier (shared initialization).
-7. **Learning rate exploration** — Try lr=3e-4 or lr=1.5e-4 with Lion. Not extensively tuned since baseline architecture changed.
-8. **Adversarial tandem augmentation** — gradient ascent on gap/stagger to find worst-case perturbations.
+6. **Adversarial tandem augmentation** — gradient ascent on gap/stagger to find worst-case perturbations.
+7. **Volume node subsampling** — Reduce vol_subsample_frac to 0.5-0.8 to shift compute budget toward surface.
+8. **Extended tandem curriculum** — Increase tandem_curriculum_epochs from 10 to 30-50 to build stronger single-foil foundation.
+9. **New ideas from researcher-agent** — awaiting deep literature review for paradigm-shifting approaches.
 
 ## Confirmed Dead Ends (Phase 6)
 
@@ -130,6 +130,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | Tandem DSDF Channel Mixup | #2132 | Mixup between NACA0012 samples adds no geometric diversity |
 | Tail EMA Checkpoint Averaging | #2146 | Null result: ±0.3% noise. EMA already smooth; snapshot averaging redundant. Post-hoc weight avg exhausted class |
 | EMA Decay 0.9995 + GSB | #2141 (Round 2) | All metrics regress. GSB obsoleted the 0.9995 advantage. ema_decay=0.999 confirmed optimal |
+| Gap/Stagger σ=0 (removal) | #2148 | All metrics worse: p_in +3.4%, p_tan +4.0%, p_oodc +1.3%. GSB and aug complementary, not redundant |
 | Gap/Stagger σ=0.01 | #2140 | Worse than σ=0.02 on p_oodc (+3.3%) and p_tan (+1.5%). σ=0.02 is well-calibrated |
 | Weight Decay 1e-5, 2e-5 | #2145 | p_tan regresses +2.1-2.3%. wd=5e-5 confirmed optimal with Lion |
 | Input Feature Noise Augmentation | #2144 | Catastrophic: p_in +17% at σ=0.01. Generic input perturbation incompatible with CFD mesh features |
