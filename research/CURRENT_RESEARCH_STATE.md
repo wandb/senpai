@@ -50,7 +50,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | tanjiro | #2182 | Ensemble Distillation: soft targets from 16-seed ensemble | WIP — just assigned |
 | alphonse | #2166 | dp/dn=0 Physics Loss: **SENT BACK — most promising, needs 6 more seeds** | WIP — sent back for 6 more runs |
 | thorfinn | #2179 | Panel-Method Inviscid Cp as physics-informed input feature | WIP |
-| frieren | #2176 | Spectral Shaping: depthwise conv filter on GatedMLP activations | WIP |
+| frieren | #2183 | Vorticity Auxiliary Target: explicit wake structure learning | WIP — just assigned |
 | edward | #2180 | Multi-Resolution Hash Grid Encoding of mesh coordinates | WIP — just assigned |
 
 **All 8 students active. Zero idle GPUs.**
@@ -94,7 +94,7 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 4. **Panel-Method Inviscid Cp** (thorfinn #2179) — pre-compute vortex panel Cp as input feature. **TOP PRIORITY — Tier 1 radical.**
 5. **dp/dn=0 Physics Loss** (alphonse #2166) — surface normal pressure gradient constraint. **MOST PROMISING — sent back for 6 more seeds.**
 6. **Multi-Resolution Hash Grid Encoding** (edward #2180) — 2D hash grid (L=8, 16→2048) appended to DSDF features.
-7. **Spectral Shaping** (frieren #2176) — depthwise conv filter on GatedMLP activations
+7. **Vorticity Auxiliary Target** (frieren #2183) — KNN-computed ω as auxiliary prediction target. Forces explicit wake learning.
 8. **Ensemble Distillation** (tanjiro #2182) — soft targets from 16-seed ensemble. Tier 2 radical.
 
 **Key research patterns:**
@@ -182,6 +182,7 @@ See `/research/RESEARCH_IDEAS_2026-04-06_ROUND4.md` for full details.
 | **Foil-1 Geometry Adapter** | **#2173** | **p_tan +2.1-2.4%. DSDF 4-moment stats too coarse, discard spatial structure.** |
 | **Attention Temperature Curriculum** | **#2174** | **p_tan +2.7-4.2%. High initial temp disrupts GSB routing, wastes early epochs.** |
 | **Smaller SRF Head (h=128/96)** | **#2178** | **p_tan +3.9-4.5%. h=192 confirmed optimal (full sweep: 96<128<256<384<192).** |
+| **Spectral Shaping (k=3 filter)** | **#2176** | **p_tan +2.3% avg. Unstable: s42=28.59 (baseline) vs s73=29.95 (+4.7%).** |
 
 ## Ensemble Seed Pool (Complete)
 

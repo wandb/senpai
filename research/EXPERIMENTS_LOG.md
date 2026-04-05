@@ -2,6 +2,20 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~08:00 — PR #2176: Spectral Shaping — frieren — **CLOSED** (unstable across seeds)
+
+- Branch: `frieren/spectral-shaping`
+- Hypothesis: Learnable 3-tap depthwise conv filter on GatedMLP activations to smooth feature representations.
+
+| Config | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|--------|-------|------|-----|
+| **k=3 avg** | **13.53** | **7.80** | **29.27** | **6.60** | i469q07m, 4ta4863c |
+| **Baseline** | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** avg p_tan +2.3%. BUT: seed 42 exactly matched baseline (28.59), seed 73 badly regressed (29.95). Seed variance 4.5% (double baseline 2.1%). Learned filter evolves unpredictably — feature smoothing not robust. Only 9 learnable params total. torch.compile-compatible tensor-slicing implementation (no Conv1d slowdown).
+
+---
+
 ### 2026-04-06 ~07:30 — PR #2178: Smaller SRF Head — tanjiro — **CLOSED** (h=192 confirmed optimal)
 
 - Branch: `tanjiro/smaller-srf`
