@@ -700,10 +700,12 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        gsb_shape_similarity=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
+        self.gsb_shape_similarity = gsb_shape_similarity
         self.pressure_first = pressure_first
         self.ref = ref
         self.unified_pos = unified_pos
@@ -771,13 +773,13 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
-                    spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
+                    spatial_bias_input_dim=7 if gsb_shape_similarity else (6 if gap_stagger_spatial_bias else 4),
                 )
                 for idx in range(n_layers)
             ]
         )
-        # Zero-init the 2 new input columns of spatial_bias so initial routing is unchanged
-        if gap_stagger_spatial_bias:
+        # Zero-init the new input columns of spatial_bias so initial routing is unchanged
+        if gap_stagger_spatial_bias or gsb_shape_similarity:
             with torch.no_grad():
                 for block in self.blocks:
                     block.spatial_bias[0].weight[:, 4:].zero_()
@@ -882,9 +884,20 @@ class Transolver(nn.Module):
             new_pos = self.get_grid(pos)
             x = torch.cat((x, new_pos), dim=-1)
 
+        # Compute inter-foil shape similarity before feature_cross modifies x
+        if self.gsb_shape_similarity:
+            # foil-1 DSDF: x[:,:,2:6], foil-2 DSDF: x[:,:,6:10] (standardized)
+            dsdf1_mean = x[:, :, 2:6].mean(dim=1)   # [B, 4]
+            dsdf2_mean = x[:, :, 6:10].mean(dim=1)   # [B, 4]
+            shape_sim = torch.nn.functional.cosine_similarity(dsdf1_mean, dsdf2_mean, dim=-1, eps=1e-8)  # [B]
+
         x_cross = x * self.feature_cross(x)
         x = x + 0.1 * x_cross  # residual with small scale
-        if self.gap_stagger_spatial_bias:
+        if self.gsb_shape_similarity:
+            gap_stagger = x[:, 0:1, 22:24].expand(-1, x.shape[1], -1)  # [B, N, 2]
+            shape_sim_feat = shape_sim[:, None, None].expand(-1, x.shape[1], 1)  # [B, N, 1]
+            raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26], gap_stagger, shape_sim_feat], dim=-1)  # [B, N, 7]
+        elif self.gap_stagger_spatial_bias:
             # Gap (idx 22) and stagger (idx 23) are global per-sample scalars; broadcast to all nodes
             gap_stagger = x[:, 0:1, 22:24].expand(-1, x.shape[1], -1)  # [B, N, 2]
             raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26], gap_stagger], dim=-1)  # [B, N, 6]
@@ -1020,6 +1033,7 @@ class Config:
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
     gap_stagger_spatial_bias: bool = False  # condition spatial bias MLP on gap/stagger (tandem geometry-aware routing)
+    gsb_shape_similarity: bool = False     # extend GSB from 6D to 7D with inter-foil DSDF shape similarity
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1230,6 +1244,7 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    gsb_shape_similarity=cfg.gsb_shape_similarity,
 )
 
 model = Transolver(**model_config).to(device)
