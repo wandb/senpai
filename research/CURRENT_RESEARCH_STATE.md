@@ -95,23 +95,27 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 - **Mixed results:** Gap/stagger aug helps p_oodc but hurts p_tan; sigma reduction worth testing
 - **Critical interaction:** GSB + aft_foil_srf_context (buggy no-op) gave p_tan=31.1 — unexpectedly bad. Likely a seed issue (42/73 vs 42/43).
 
+## Critical Finding: PCGrad Flag Logic (2026-04-05 ~05:40)
+
+⚠️ `--pcgrad_3way` in the baseline command is a **NO-OP** because `--disable_pcgrad` is not set. The code has an `if/elif` chain where 2-way PCGrad fires first (when `not cfg.disable_pcgrad`), making the `elif cfg.pcgrad_3way` branch unreachable. The code comment explicitly states: `pcgrad_3way: bool = False  # requires --disable_pcgrad`.
+
+**Impact:** All baseline and experiment runs with `--pcgrad_3way --pcgrad_extreme_pct 0.15` are actually running **2-way PCGrad** (in-dist vs OOD). This is correct — 2-way was validated in PR #2119. But actual 3-way PCGrad (single-foil / tandem-normal / tandem-extreme-Re) has **never been tested**.
+
+**Action:** The baseline is fine as-is (2-way PCGrad works). Testing actual 3-way PCGrad (with `--disable_pcgrad --pcgrad_3way --pcgrad_extreme_pct 0.15`) is a high-priority experiment — assign when a student becomes idle.
+
 ## Potential Next Research Directions (not yet assigned)
 
 ### High Priority
-1. **Nezuko reassignment** — immediate. Options:
-   - ~~Upstream-only KNN context~~ — DEAD: context head when working is harmful (PR #2134 confirmed)
-   - Checkpoint ensemble averaging (save last 3 checkpoints, average weights) — simple, ~20 LoC, often +0.5-2% OOD
-   - Attention sparsification / top-k slice assignment — force sparser routing to prevent single slice domination
-   - Adversarial tandem augmentation — generate worst-case gap/stagger perturbations via gradient ascent on validation loss
-2. ~~aft_foil_srf_context~~ — **DEAD.** Frieren #2134 confirmed: context head when correctly applied is harmful (p_tan +1.2%, p_in +21%). KNN overhead causes undertraining (132 vs 160 epochs). Whole context head approach dead within current training budget.
-3. **Upstream-only KNN context** — after bug fix confirmed.
-4. **Learnable distance weighting** — replace mean K-neighbor aggregation with attention-weighted.
+1. **Actual 3-Way PCGrad** — `--disable_pcgrad --pcgrad_3way --pcgrad_extreme_pct 0.15`. Never tested. 3-way splits single-foil / tandem-normal / tandem-extreme-Re. Could beat 2-way if the more granular gradient surgery resolves finer-grained conflicts.
+2. **Gap/stagger aug removal** — test if completely removing σ=0.02 (removing p_tan penalty) beats current baseline. Askeladd is testing σ=0.01, but σ=0 is also worth testing.
+3. **Tandem carve-out K=4 + current baseline** — Alphonse #2131 showed -3.7% vs control. If it compounds with GSB+PCGrad, could be huge.
+4. **Attention sparsification / top-k slice assignment** — force sparser routing to prevent single slice domination.
 5. **AoA stagger flip augmentation** — mirror tandem stagger sign to create novel asymmetric configurations.
 
 ### Longer-term
-6. **Gap/stagger aug removal** — test if completely removing σ=0.02 (removing p_tan penalty) beats current baseline. If yes, remove from baseline and reclaim the metric headroom.
-7. **Combined aft_srf_context + GSB + PCGrad** — once bug fix is available, the true three-way compound.
-8. **Tandem carve-out K=4 + PCGrad** — orthogonal mechanisms; if alphonse #2131 rebase passes, these may compound.
+6. **Fork-then-merge model soup** — Train 1 model to epoch 100, branch into 3 seeds for remaining epochs, then average. Solves loss barrier (shared initialization).
+7. **Learning rate exploration** — Try lr=3e-4 or lr=1.5e-4 with Lion. Not extensively tuned since baseline architecture changed.
+8. **Adversarial tandem augmentation** — gradient ascent on gap/stagger to find worst-case perturbations.
 
 ## Confirmed Dead Ends (Phase 6)
 
