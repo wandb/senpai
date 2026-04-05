@@ -858,10 +858,9 @@ class Transolver(nn.Module):
         if use_cond:
             cond_2 = x[:, 0, 13:15]  # Re, AoA [B, 2]
             if self.adaln_4cond:
-                gap_feat = x[:, 0, 21:22]  # gap feature [B, 1]
-                # surf_frac: fraction of nodes near a surface (curvature at index 24)
-                surf_frac = (x[:, :, 24].abs() > 0.01).float().mean(dim=1, keepdim=True)  # [B, 1]
-                block_condition = torch.cat([cond_2, gap_feat, surf_frac], dim=-1)  # [B, 4]
+                # Use gap and stagger (indices 22:24) — same global tandem-geometry scalars used by GSB
+                gap_stagger = x[:, 0, 22:24]  # [B, 2] — gap and stagger; both 0 for single-foil
+                block_condition = torch.cat([cond_2, gap_stagger], dim=-1)  # [B, 4] = (Re, AoA, gap, stagger)
             else:
                 block_condition = cond_2  # [B, 2]
         else:
@@ -981,7 +980,7 @@ class Config:
     # Phase 2 R4: AdaLN-Zero all blocks
     n_hidden: int = 192                # model width (override default)
     adaln_all_blocks: bool = False     # AdaLN-Zero on ALL TransolverBlocks
-    adaln_4cond: bool = False          # use 4-dim condition (Re, AoA, gap, surf_frac)
+    adaln_4cond: bool = False          # use 4-dim condition (Re, AoA, gap, stagger)
     adaln_decouple: bool = False       # decoupled slice assignment for tandem
     adaln_nozero: bool = False         # ablation: no zero-init on adaln projection
     adaln_sam: bool = False            # SAM optimizer in last 25% of training
