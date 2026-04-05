@@ -1070,6 +1070,11 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Phase 6: Binned Spectral Power (BSP) loss — frequency-weighted surface pressure loss
+    bsp_loss: bool = False                   # enable BSP spectral loss on fore-foil surface pressure
+    bsp_loss_weight: float = 0.1             # weight of BSP loss term
+    bsp_num_bins: int = 3                    # number of frequency bins (low/mid/high)
+    bsp_bin_weights_str: str = "1.0,2.0,3.0" # comma-sep weights per bin (low to high freq)
 
 
 cfg = sp.parse(Config)
@@ -1117,6 +1122,50 @@ def _phys_norm(y, Umag, q):
     y_p[:, :, 1:2] = y[:, :, 1:2] / Umag
     y_p[:, :, 2:3] = y[:, :, 2:3] / q
     return y_p
+
+
+def bsp_loss_fn(pred_surf, target_surf, num_bins=3, bin_weights=(1.0, 2.0, 3.0)):
+    """Binned Spectral Power loss on arc-length-sorted surface pressure.
+
+    Uses RELATIVE spectral error (per Chakraborty et al. 2026, arXiv:2502.00472):
+    loss = mean((1 - pred_spec / tgt_spec)^2) per bin, weighted by bin_weights.
+    Relative error ensures high-frequency bins (small absolute magnitudes) are
+    penalized proportionally, counteracting neural network spectral bias.
+
+    Args:
+        pred_surf: [N_surf] predicted pressure along arc-length
+        target_surf: [N_surf] target pressure along arc-length
+        num_bins: number of frequency bins
+        bin_weights: tuple of per-bin weights (low→high freq)
+    Returns:
+        Scalar loss value.
+    """
+    N = pred_surf.shape[0]
+    if N < 4:
+        return torch.tensor(0.0, device=pred_surf.device)
+    # Resample to next power of 2 via linear interpolation (avoids NN artifacts)
+    N_fft = 2 ** int(torch.tensor(float(N)).log2().ceil().item())
+    N_fft = max(N_fft, 4)
+    p = F.interpolate(pred_surf.unsqueeze(0).unsqueeze(0), size=N_fft,
+                       mode='linear', align_corners=True).squeeze()
+    t = F.interpolate(target_surf.unsqueeze(0).unsqueeze(0), size=N_fft,
+                       mode='linear', align_corners=True).squeeze()
+    # Compute FFT magnitude spectra, drop Nyquist bin (unreliable)
+    pred_fft = torch.fft.rfft(p).abs()[:-1]
+    tgt_fft = torch.fft.rfft(t).abs()[:-1]
+    n_freq = pred_fft.shape[0]
+    bin_size = max(1, n_freq // num_bins)
+    eps = 1e-7
+    loss = torch.tensor(0.0, device=pred_surf.device)
+    for b_idx in range(num_bins):
+        w = bin_weights[b_idx] if b_idx < len(bin_weights) else bin_weights[-1]
+        lo = b_idx * bin_size
+        hi = (b_idx + 1) * bin_size if b_idx < num_bins - 1 else n_freq
+        if lo < n_freq:
+            # Relative spectral error: penalizes fractional mismatch per frequency
+            ratio = (pred_fft[lo:hi] + eps) / (tgt_fft[lo:hi] + eps)
+            loss = loss + w * torch.mean((1.0 - ratio) ** 2)
+    return loss
 
 
 def _phys_denorm(y_p, Umag, q):
@@ -1953,6 +2002,35 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # BSP spectral loss on fore-foil surface pressure (tandem samples only)
+        _bsp_loss_val = torch.tensor(0.0, device=device)
+        if cfg.bsp_loss and is_tandem_batch.any():
+            bsp_bin_weights = [float(w) for w in cfg.bsp_bin_weights_str.split(',')]
+            _raw_saf_norm_bsp = x[:, :, 2:4].norm(dim=-1)  # [B, N]
+            # Fore-foil surface = surface nodes with saf_norm ≈ 0 (not aft-foil)
+            fore_foil_mask = is_surface & (_raw_saf_norm_bsp <= 0.005)  # [B, N]
+            bsp_accum = torch.tensor(0.0, device=device)
+            bsp_count = 0
+            for b in range(B):
+                if not is_tandem_batch[b]:
+                    continue
+                fore_idx = fore_foil_mask[b].nonzero(as_tuple=True)[0]
+                if fore_idx.numel() < 8:
+                    continue
+                # Sort fore-foil nodes by angle from centroid for arc-length ordering
+                xy = x[b, fore_idx, :2]  # [M, 2]
+                cx, cy = xy[:, 0].mean(), xy[:, 1].mean()
+                angles = torch.atan2(xy[:, 1] - cy, xy[:, 0] - cx)
+                sort_order = angles.argsort()
+                # Extract pressure predictions and targets in arc-length order
+                pred_p = pred[b, fore_idx[sort_order], 2]   # [M] pressure channel
+                tgt_p = y_norm[b, fore_idx[sort_order], 2]  # [M]
+                bsp_accum = bsp_accum + bsp_loss_fn(pred_p, tgt_p, cfg.bsp_num_bins, bsp_bin_weights)
+                bsp_count += 1
+            if bsp_count > 0:
+                _bsp_loss_val = bsp_accum / bsp_count
+                loss = loss + cfg.bsp_loss_weight * _bsp_loss_val
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -1979,8 +2057,9 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
+            bsp_shared = cfg.bsp_loss_weight * _bsp_loss_val if cfg.bsp_loss else 0.0
             loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + bsp_shared
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -2028,11 +2107,12 @@ for epoch in range(MAX_EPOCHS):
                 return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
 
             loss_A = _grp_loss(~is_tandem_batch)
+            bsp_tandem = cfg.bsp_loss_weight * _bsp_loss_val * 0.5 if cfg.bsp_loss else 0.0
             # Only include non-empty groups to avoid backward() on no-grad tensors
             task_losses_with_masks = [
                 (loss_A, (~is_tandem_batch)),
-                (_grp_loss(is_normal_tan), is_normal_tan),
-                (_grp_loss(is_extreme), is_extreme),
+                (_grp_loss(is_normal_tan) + bsp_tandem, is_normal_tan),
+                (_grp_loss(is_extreme) + bsp_tandem, is_extreme),
             ]
             task_losses = [l for l, m in task_losses_with_masks if m.any()]
             if len(task_losses) == 0:
@@ -2153,7 +2233,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.bsp_loss:
+            log_dict["train/bsp_loss"] = _bsp_loss_val.item()
+        wandb.log(log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
