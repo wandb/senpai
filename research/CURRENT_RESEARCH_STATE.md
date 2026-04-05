@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-06 ~00:15 UTC
+- **Date:** 2026-04-06 ~06:30 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -40,25 +40,26 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble (29.1) on p_tan.
 
-## Student Status (~00:15 UTC)
+## Student Status (~06:30 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| fern | #2174 | Attention Temperature Curriculum: broad→sharp slice routing | WIP — just assigned |
-| askeladd | #2175 | SWD Tandem Domain Alignment: slice token distribution matching | WIP — just assigned |
-| nezuko | #2177 | Coordinated Tandem Ramp: sigma decay synced with loss ramp | WIP — just assigned |
-| tanjiro | #2178 | Smaller SRF Head: hidden 128/96 vs baseline 192 | WIP — just assigned |
-| alphonse | #2166 | dp/dn=0 Physics Loss: **SENT BACK — most promising, needs more seeds** | WIP — sent back for 6 more runs |
-| thorfinn | #2179 | Panel-Method Inviscid Cp as physics-informed input feature | WIP — just assigned |
-| frieren | #2176 | Spectral Shaping: depthwise conv filter on GatedMLP activations | WIP — just assigned |
-| edward | #2173 | Foil-1 Geometry Adapter: DSDF stats → slice logit bias | WIP — just assigned |
+| fern | #2174 | Attention Temperature Curriculum: broad→sharp slice routing | WIP |
+| askeladd | #2175 | SWD Tandem Domain Alignment: slice token distribution matching | WIP |
+| nezuko | #2177 | Coordinated Tandem Ramp: sigma decay synced with loss ramp | WIP |
+| tanjiro | #2178 | Smaller SRF Head: hidden 128/96 vs baseline 192 | WIP |
+| alphonse | #2166 | dp/dn=0 Physics Loss: **SENT BACK — most promising, needs 6 more seeds** | WIP — sent back for 6 more runs |
+| thorfinn | #2179 | Panel-Method Inviscid Cp as physics-informed input feature | WIP |
+| frieren | #2176 | Spectral Shaping: depthwise conv filter on GatedMLP activations | WIP |
+| edward | #2180 | Multi-Resolution Hash Grid Encoding of mesh coordinates | WIP — just assigned |
 
-**All 8 students active. Zero idle GPUs.** (thorfinn reassigned after #2165 close)
+**All 8 students active. Zero idle GPUs.**
 
-## Recently Reviewed (2026-04-06 ~00:15)
+## Recently Reviewed (2026-04-06 ~06:30)
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
+| #2173 | edward | Foil-1 Geometry Adapter | **CLOSED** | p_tan +2.1-2.4%. DSDF stats too coarse — 4 moments discard spatial structure. |
 | #2167 | edward | Tandem Surface Mixup | **CLOSED** | p_tan +5.8-5.9%. Physical inconsistency — aft-foil targets coupled to upstream wake. |
 | #2165 | thorfinn | Iterative 2-Pass Refinement | **CLOSED** | p_tan=30.5 (+6.6%). 1.3x epoch cost → only 131 epochs. Still converging at wall clock. |
 | #2164 | frieren | Backbone Gap/Stagger AdaLN | **CLOSED** | adaln_all + gs 4cond p_tan=30.55 (+6.8%), adaln_all Re/AoA p_tan=30.3 (+5.9%). AdaLN disrupts optimized attention routing. |
@@ -88,16 +89,16 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 **Active experiments (8 students WIP):**
 1. **Attention Temperature Curriculum** (fern #2174) — schedule temp 2.0→0.3 over 80 epochs then release, zero new params
 2. **SWD Tandem Domain Alignment** (askeladd #2175) — Sliced Wasserstein Distance between tandem/single-foil slice tokens
-3. **Online Hard Example Mining** (nezuko #2169) — adaptive per-sample loss upweighting
-4. **Binned Spectral Power Loss** (thorfinn #2172) — frequency-weighted 1D DFT loss targeting high-freq surface pressure features
-5. **dp/dn=0 Physics Loss** (alphonse #2166) — surface normal pressure gradient constraint
-6. **Foil-1 Geometry Adapter** (edward #2173) — DSDF stats → slice logit bias, GEPS-inspired zero-init
-7. **Wider/Deeper SRF Head** (frieren #2170) — hidden 256/384, layers 3/4
-8. **Slice Number Sweep** (tanjiro #2171) — 128, 144 vs baseline 96
+3. **Coordinated Tandem Ramp** (nezuko #2177) — sigma decay synced with loss ramp
+4. **Panel-Method Inviscid Cp** (thorfinn #2179) — pre-compute vortex panel Cp as input feature. **TOP PRIORITY — Tier 1 radical.**
+5. **dp/dn=0 Physics Loss** (alphonse #2166) — surface normal pressure gradient constraint. **MOST PROMISING — sent back for 6 more seeds.**
+6. **Multi-Resolution Hash Grid Encoding** (edward #2180) — 2D hash grid (L=8, 16→2048) appended to DSDF features.
+7. **Spectral Shaping** (frieren #2176) — depthwise conv filter on GatedMLP activations
+8. **Smaller SRF Head** (tanjiro #2178) — hidden 128/96 vs baseline 192
 
 **Key research patterns:**
 - **What works:** DSDF magnitude augmentation (foil-2 only), specialized correction heads (aft_srf), gradient surgery (2-way PCGrad), tandem-geometry-aware routing (GSB), geometry-conditioned mechanisms
-- **What doesn't work:** Augmentation annealing, foil-1 aug/dropout, fore-foil SRF (unconditioned), tandem slice carve-out, 3-way PCGrad, flat-minima-seeking, LR changes, earlier EMA starts, DSDF2 sigma variations, backbone AdaLN, cross-DSDF features, shape similarity bias, differential LR, asymmetric PCGrad
+- **What doesn't work:** Augmentation annealing, foil-1 aug/dropout, fore-foil SRF (4 failures), tandem slice carve-out, 3-way PCGrad, flat-minima-seeking, LR changes, earlier EMA starts, DSDF2 sigma variations, backbone AdaLN, cross-DSDF features, shape similarity bias, differential LR, asymmetric PCGrad, OHEM, wider/deeper SRF, more slices, iterative refinement, tandem surface mixup, BSP spectral loss, foil-1 geometry adapter
 - **Confirmed optimal hyperparams:** ema_decay=0.999, ema_start_epoch~140, weight_decay=5e-5, aug_gap_stagger_sigma=0.02, aug_dsdf2_sigma=0.05, lr=2e-4, cosine_T_max=160
 
 ## Critical Finding: PCGrad Flag Logic
@@ -107,10 +108,13 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 ## Potential Next Research Directions (queue for next idle students)
 
 ### RADICAL — Researcher-Agent Round 4 (2026-04-06) — Plateau-Breaking Ideas
-1. **Panel-Method Inviscid Cp as Input Feature** — pre-compute vortex panel solver Cp, feed as additional input channel. Model predicts viscous correction only. B-GNN showed 88% OOD error reduction. **TOP PRIORITY.**
-2. **Test-Time Low-Rank Adaptation (GEPS)** — ~4600 learnable context params adapted at inference using physics self-supervised signal. Zero training change.
+1. ~~**Panel-Method Inviscid Cp as Input Feature**~~ → assigned to thorfinn #2179
+2. **Test-Time Low-Rank Adaptation (GEPS)** — ~4600 learnable context params adapted at inference using physics self-supervised signal. Zero training change. **NEXT PRIORITY.**
 3. **Ensemble Distillation** — soft targets from 23-model ensemble as KD signal. Leverages our 45 trained models.
-4. **Multi-Resolution Hash Grid Encoding** — 2D hash grid (L=8, 16→2048) appended to DSDF features.
+4. ~~**Multi-Resolution Hash Grid Encoding**~~ → assigned to edward #2180
+5. **Frequency-Weighted Surface Pressure Loss** — DCT-domain loss upweighting high-freq components (Tier 3)
+6. **Vorticity-Streamfunction Auxiliary Targets** — predict ω and ψ to force explicit wake structure learning (Tier 3)
+7. **MAE Pretraining on Mesh Geometry** — self-supervised geometry encoder pretraining (Tier 3)
 
 See `/research/RESEARCH_IDEAS_2026-04-06_ROUND4.md` for full details.
 
@@ -173,6 +177,8 @@ See `/research/RESEARCH_IDEAS_2026-04-06_ROUND4.md` for full details.
 | **Wider/Deeper SRF (h=256,384)** | **#2170** | **p_tan +4.0-4.7%. More capacity overfits. h=192 confirmed optimal.** |
 | **OHEM Hard Sample Mining** | **#2169** | **p_tan +2.2-2.4%. Redundant with existing 3-layer difficulty system.** |
 | **Slice Number 128/144** | **#2171** | **p_tan +3.3/3.8%. More slices = more overfitting, fewer epochs. 96 confirmed.** |
+| **BSP Spectral Loss** | **#2172** | **w=0.1 catastrophic collapse, w=0.05 all +3-6%. Spectral bias not the bottleneck.** |
+| **Foil-1 Geometry Adapter** | **#2173** | **p_tan +2.1-2.4%. DSDF 4-moment stats too coarse, discard spatial structure.** |
 
 ## Ensemble Seed Pool (Complete)
 

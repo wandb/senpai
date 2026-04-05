@@ -2,6 +2,21 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~06:00 — PR #2173: Foil-1 Geometry Adapter — edward — **CLOSED** (DSDF stats too coarse)
+
+- Branch: `edward/foil1-geom-adapter`
+- Hypothesis: Per-sample DSDF-1 distribution statistics (mean/std/skew/kurt) → MLP → slice logit bias. Gives GSB routing a geometry fingerprint for upstream foil shape.
+
+| Config | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|--------|-------|------|-----|
+| **scale=0.1 avg** | **13.9** | **7.85** | **29.3** | **6.7** | 8ryjbj4w, 1n7jwpzy |
+| **scale=0.3 avg** | **13.15** | **7.75** | **29.2** | **6.4** | ex4uj2k8, lytgamfh |
+| **Baseline** | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** Both scales regress p_tan (+2.1-2.4%). 4-moment statistics (mean/std/skew/kurt) too coarse — captures global distribution but discards spatial structure. scale=0.3 marginally better than 0.1 (bias too weak at 0.1). p_re slightly improved at 0.3 (6.4 vs 6.55). **Important finding:** foil-1 DSDF channels are at x[:,4:8] NOT x[:,2:6] (after pos(2) + saf(2)).
+
+---
+
 ### 2026-04-06 ~05:20 — PR #2166: dp/dn=0 Physics Loss — alphonse — **SENT BACK** (MOST PROMISING — needs more seeds)
 
 - Branch: `alphonse/dpdn-physics-loss`
