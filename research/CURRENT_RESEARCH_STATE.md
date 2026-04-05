@@ -111,11 +111,23 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 4. **Fork-then-merge model soup** — Train 1 model to epoch 100, branch into 3 seeds for remaining epochs, then average. Solves loss barrier (shared initialization).
 5. **Differential learning rates** — Different LR for backbone vs specialized heads (SRF, aft_srf, spatial_bias). Heads may benefit from higher LR.
 
+### Representation Gap Ideas (from researcher-agent 2026-04-05 11:00)
+
+The current 7 WIP PRs are ALL hyperparameter sweeps — classic local neighborhood saturation. Next gains require attacking the **representation gap** for unseen NACA6416 geometry. Full details in `/research/RESEARCH_IDEAS_2026-04-05_11:00.md`.
+
+| Rank | Idea | Expected Impact | Risk | LoC |
+|------|------|-----------------|------|-----|
+| 1 | **DSDF Channel Dropout** — zero out foil-1 DSDF channels randomly (p=0.2) to force shape-invariant prediction | -2% to -5% p_tan | LOW | 12 |
+| 2 | **FiLM-Conditioned Fore-Foil SRF** — additive fore-foil correction head conditioned on DSDF1 statistics (shape fingerprint). Key differentiator from failed #2117/#2124: conditioned on foil shape, purely additive | -2% to -5% p_tan | MEDIUM | 60 |
+| 3 | **Foil Shape Similarity Bias** — extend GSB raw_xy from 6D→7D with cosine similarity between foil-1 and foil-2 DSDF vectors. Zero-init, no regression risk | -1% to -3% p_tan | LOW | 30 |
+| 4 | **Asymmetric PCGrad** — only project OOD gradients onto in-dist normal plane, never sacrifice in-dist. Simple 3-line change | -1% to -3% all OOD | LOW | 8 |
+| 5 | **Tandem Cross-DSDF Features** — explicit inter-foil geometry features (dist_ratio, foil_angle) as raw inputs | -2% to -4% p_tan | LOW-MED | 20 |
+| 6 | **DSDF Normal Features** — disentangle DSDF direction (unit normal) from magnitude (distance) as separate features | -1% to -3% p_tan | LOW | 20 |
+
 ### Longer-term
-6. **Adversarial tandem augmentation** — gradient ascent on gap/stagger to find worst-case perturbations.
-7. **Volume node subsampling** — Reduce vol_subsample_frac to 0.5-0.8 to shift compute budget toward surface.
-8. **Extended tandem curriculum** — Increase tandem_curriculum_epochs from 10 to 30-50 to build stronger single-foil foundation.
-9. **New ideas from researcher-agent** — awaiting deep literature review for paradigm-shifting approaches.
+7. **Fork-then-merge model soup** — shared initialization solves loss barrier problem from #2142.
+8. **Volume node subsampling** — Reduce vol_subsample_frac to 0.5-0.8 to shift compute budget toward surface.
+9. **Extended tandem curriculum** — Increase tandem_curriculum_epochs from 10 to 30-50.
 
 ## Confirmed Dead Ends (Phase 6)
 
