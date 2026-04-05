@@ -25,6 +25,7 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -39,6 +40,292 @@ import simple_parsing as sp
 
 from data.utils import visualize
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
+
+
+# ---------------------------------------------------------------------------
+# Panel Method: Hess-Smith vortex panel solver for inviscid Cp computation
+# ---------------------------------------------------------------------------
+
+def _naca4_coords(camber_frac, pos_frac, thick_frac, n_panels=120):
+    """Generate NACA 4-digit airfoil coordinates from normalized fractions.
+
+    Args:
+        camber_frac: max camber / 9 (from parse_naca encoding)
+        pos_frac: camber position / 9
+        thick_frac: thickness / 24
+    Returns:
+        coords: (N, 2) numpy array, upper surface TE → LE → lower surface TE
+    """
+    m = camber_frac * 9 / 100.0   # max camber as fraction of chord
+    p = pos_frac * 9 / 10.0       # camber position as fraction of chord
+    t = thick_frac * 24 / 100.0   # thickness as fraction of chord
+
+    # Cosine spacing for better LE resolution
+    beta = np.linspace(0, np.pi, n_panels // 2 + 1)
+    xc = 0.5 * (1 - np.cos(beta))  # [0, 1]
+
+    # Thickness distribution (NACA 4-digit)
+    yt = 5 * t * (0.2969 * np.sqrt(xc + 1e-12) - 0.1260 * xc - 0.3516 * xc**2
+                  + 0.2843 * xc**3 - 0.1015 * xc**4)
+
+    # Camber line
+    if m > 0 and p > 0:
+        yc = np.where(xc <= p,
+                      m / p**2 * (2 * p * xc - xc**2),
+                      m / (1 - p)**2 * ((1 - 2 * p) + 2 * p * xc - xc**2))
+        dyc = np.where(xc <= p,
+                       2 * m / p**2 * (p - xc),
+                       2 * m / (1 - p)**2 * (p - xc))
+    else:
+        yc = np.zeros_like(xc)
+        dyc = np.zeros_like(xc)
+
+    theta = np.arctan(dyc)
+    xu = xc - yt * np.sin(theta)
+    yu = yc + yt * np.cos(theta)
+    xl = xc + yt * np.sin(theta)
+    yl = yc - yt * np.cos(theta)
+
+    # Concatenate: upper surface (TE→LE) + lower surface (LE→TE), skip duplicate LE
+    coords = np.vstack([
+        np.column_stack([xu[::-1], yu[::-1]]),  # upper: TE → LE
+        np.column_stack([xl[1:], yl[1:]]),       # lower: LE+1 → TE
+    ])
+    return coords
+
+
+def _hess_smith_solve(panels_x, panels_y, V_inf=1.0, alpha=0.0):
+    """Hess-Smith panel method for one or more airfoil elements.
+
+    Args:
+        panels_x, panels_y: (N+1,) arrays of panel endpoint coordinates
+            For multi-element: concatenate all elements' coordinates
+        V_inf: freestream velocity magnitude
+        alpha: angle of attack in radians
+
+    Returns:
+        cp: (N,) pressure coefficient at each panel midpoint
+        xm, ym: (N,) midpoint coordinates
+    """
+    N = len(panels_x) - 1
+    if N < 3:
+        return np.zeros(0), np.zeros(0), np.zeros(0)
+
+    # Panel geometry
+    xm = 0.5 * (panels_x[:-1] + panels_x[1:])
+    ym = 0.5 * (panels_y[:-1] + panels_y[1:])
+    dx = panels_x[1:] - panels_x[:-1]
+    dy = panels_y[1:] - panels_y[:-1]
+    S = np.sqrt(dx**2 + dy**2)
+    S = np.maximum(S, 1e-12)
+    sin_t = dy / S
+    cos_t = dx / S
+    nx = -sin_t   # outward normal x
+    ny = cos_t    # outward normal y
+
+    # Influence coefficients
+    An = np.zeros((N, N))   # normal velocity from sources
+    At = np.zeros((N, N))   # tangential velocity from sources
+    Bn = np.zeros((N,))     # normal velocity from unit vortex
+    Bt = np.zeros((N,))     # tangential velocity from unit vortex
+
+    for j in range(N):
+        for i in range(N):
+            if i == j:
+                An[i, j] = 0.5
+                At[i, j] = 0.0
+                continue
+            # Transform to panel j local coords
+            dx_ij = xm[i] - panels_x[j]
+            dy_ij = ym[i] - panels_y[j]
+            # Local coords
+            xi = dx_ij * cos_t[j] + dy_ij * sin_t[j]
+            eta = -dx_ij * sin_t[j] + dy_ij * cos_t[j]
+
+            sj = S[j]
+            r1_sq = xi**2 + eta**2
+            r2_sq = (xi - sj)**2 + eta**2
+            r1_sq = max(r1_sq, 1e-20)
+            r2_sq = max(r2_sq, 1e-20)
+
+            log_r = 0.5 * np.log(r2_sq / r1_sq)
+            theta_diff = np.arctan2(eta * sj, eta**2 + xi * (xi - sj) + 1e-20)
+
+            # Source influence (normal and tangential)
+            u_s = (1.0 / (2 * np.pi)) * log_r
+            v_s = (1.0 / (2 * np.pi)) * theta_diff
+
+            # Vortex influence
+            u_v = (1.0 / (2 * np.pi)) * theta_diff
+            v_v = -(1.0 / (2 * np.pi)) * log_r
+
+            # Transform back to global and project onto normal/tangential of panel i
+            u_global_s = u_s * cos_t[j] - v_s * sin_t[j]
+            v_global_s = u_s * sin_t[j] + v_s * cos_t[j]
+            u_global_v = u_v * cos_t[j] - v_v * sin_t[j]
+            v_global_v = u_v * sin_t[j] + v_v * cos_t[j]
+
+            An[i, j] = u_global_s * nx[i] + v_global_s * ny[i]
+            At[i, j] = u_global_s * cos_t[i] + v_global_s * sin_t[i]
+            Bn[i] += u_global_v * nx[i] + v_global_v * ny[i]
+            Bt[i] += u_global_v * cos_t[i] + v_global_v * sin_t[i]
+
+    # Build system: [An | Bn; Kutta row] * [sigma; gamma] = -V_inf * [cos(a-t); ...]
+    # RHS: V_inf normal component at each panel
+    V_n = V_inf * (np.sin(alpha) * nx - np.cos(alpha) * ny)
+    # Wait, let me redo: V_freestream = (V_inf*cos(alpha), V_inf*sin(alpha))
+    # V_n = V_free . n = V_inf*(cos(alpha)*nx + sin(alpha)*ny)
+    rhs_n = -V_inf * (np.cos(alpha) * nx + np.sin(alpha) * ny)
+
+    # Kutta condition: sum of source panels at TE → tangential velocity = 0
+    # For simplicity: gamma such that V_t[0] + V_t[-1] = 0 (first+last panel)
+    A = np.zeros((N + 1, N + 1))
+    A[:N, :N] = An
+    A[:N, N] = Bn
+    # Kutta: V_t at panel 0 + V_t at panel -1 = 0
+    A[N, :N] = At[0] + At[-1]
+    A[N, N] = Bt[0] + Bt[-1]
+
+    rhs = np.zeros(N + 1)
+    rhs[:N] = rhs_n
+    V_t_free_0 = V_inf * (np.cos(alpha) * cos_t[0] + np.sin(alpha) * sin_t[0])
+    V_t_free_last = V_inf * (np.cos(alpha) * cos_t[-1] + np.sin(alpha) * sin_t[-1])
+    rhs[N] = -(V_t_free_0 + V_t_free_last)
+
+    try:
+        sol = np.linalg.solve(A, rhs)
+    except np.linalg.LinAlgError:
+        return np.zeros(N), xm, ym
+
+    sigma = sol[:N]
+    gamma = sol[N]
+
+    # Tangential velocity at each panel
+    V_t = V_inf * (np.cos(alpha) * cos_t + np.sin(alpha) * sin_t)
+    V_t += At @ sigma + gamma * Bt
+
+    # Pressure coefficient
+    cp = 1.0 - (V_t / V_inf) ** 2
+    return cp, xm, ym
+
+
+def compute_panel_cp_for_sample(x_tensor):
+    """Compute inviscid panel Cp for a single sample.
+
+    Args:
+        x_tensor: (N, 24+) tensor — preprocessed sample features
+
+    Returns:
+        panel_cp: (N,) numpy array of panel Cp values (0 for volume nodes)
+    """
+    N = x_tensor.shape[0]
+    panel_cp = np.zeros(N, dtype=np.float32)
+
+    # Extract foil parameters from global features (same for all nodes)
+    aoa0_rad = x_tensor[0, 14].item()
+    naca0 = x_tensor[0, 15:18].numpy()  # (camber/9, pos/9, thick/24)
+    aoa1_rad = x_tensor[0, 18].item()
+    naca1 = x_tensor[0, 19:22].numpy()
+    gap = x_tensor[0, 22].item()
+    stagger = x_tensor[0, 23].item()
+    is_tandem = abs(gap) > 0.01
+
+    # Surface node mask
+    is_surf = x_tensor[:, 12] > 0.5  # is_surface channel
+    surf_coords = x_tensor[is_surf, :2].numpy()  # (M, 2)
+
+    if surf_coords.shape[0] < 4:
+        return panel_cp
+
+    # Generate foil 1 coordinates
+    foil1 = _naca4_coords(naca0[0], naca0[1], naca0[2], n_panels=80)
+
+    if is_tandem:
+        # Generate foil 2 coordinates
+        foil2_raw = _naca4_coords(naca1[0], naca1[1], naca1[2], n_panels=80)
+        # Position foil 2: translate by (gap, stagger) relative to foil 1 TE (1,0)
+        foil2 = foil2_raw.copy()
+        foil2[:, 0] += 1.0 + gap
+        foil2[:, 1] += stagger
+
+        # Rotate both foils by AoA (foil 1 by aoa0, foil 2 by aoa1 + local)
+        # For simplicity, rotate whole configuration by foil 1 AoA
+        cos_a, sin_a = np.cos(-aoa0_rad), np.sin(-aoa0_rad)
+        R = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+        foil1 = (R @ foil1.T).T
+        foil2 = (R @ foil2.T).T
+
+        # Solve panel method for combined configuration
+        # Concatenate both foils (with a gap between endpoints)
+        all_x = np.concatenate([foil1[:, 0], [np.nan], foil2[:, 0]])
+        all_y = np.concatenate([foil1[:, 1], [np.nan], foil2[:, 1]])
+
+        # Solve each foil separately (simple approach: ignore interaction)
+        cp1, xm1, ym1 = _hess_smith_solve(foil1[:, 0], foil1[:, 1], alpha=0.0)
+        cp2, xm2, ym2 = _hess_smith_solve(foil2[:, 0], foil2[:, 1], alpha=aoa1_rad - aoa0_rad)
+
+        if len(cp1) == 0 and len(cp2) == 0:
+            return panel_cp
+
+        # Combine panel midpoints and Cp
+        if len(cp1) > 0 and len(cp2) > 0:
+            panel_xm = np.concatenate([xm1, xm2])
+            panel_ym = np.concatenate([ym1, ym2])
+            panel_cp_vals = np.concatenate([cp1, cp2])
+        elif len(cp1) > 0:
+            panel_xm, panel_ym, panel_cp_vals = xm1, ym1, cp1
+        else:
+            panel_xm, panel_ym, panel_cp_vals = xm2, ym2, cp2
+    else:
+        # Single foil: rotate by AoA and solve
+        cos_a, sin_a = np.cos(-aoa0_rad), np.sin(-aoa0_rad)
+        R = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+        foil1 = (R @ foil1.T).T
+
+        cp1, xm1, ym1 = _hess_smith_solve(foil1[:, 0], foil1[:, 1], alpha=0.0)
+        if len(cp1) == 0:
+            return panel_cp
+        panel_xm, panel_ym, panel_cp_vals = xm1, ym1, cp1
+
+    # Interpolate panel Cp to mesh surface nodes (nearest neighbor)
+    from scipy.spatial import cKDTree
+    panel_points = np.column_stack([panel_xm, panel_ym])
+    tree = cKDTree(panel_points)
+    _, idx = tree.query(surf_coords)
+    panel_cp_vals = np.clip(panel_cp_vals, -10.0, 10.0)  # clamp extreme values
+    surf_indices = np.where(is_surf.numpy())[0]
+    panel_cp[surf_indices] = panel_cp_vals[idx]
+
+    return panel_cp
+
+
+def precompute_panel_cp_cache(dataset, cache_path):
+    """Pre-compute panel Cp for all samples and save to disk.
+
+    Args:
+        dataset: MultiFieldDataset instance
+        cache_path: Path to save the cache (.npz file)
+    Returns:
+        List of panel_cp arrays, one per sample
+    """
+    cache_path = Path(cache_path)
+    if cache_path.exists():
+        print(f"Loading panel Cp cache from {cache_path}")
+        data = np.load(cache_path, allow_pickle=True)
+        return [data[f"s{i}"] for i in range(len(dataset))]
+
+    print(f"Pre-computing panel Cp for {len(dataset)} samples...")
+    panel_cp_list = []
+    for i in tqdm(range(len(dataset)), desc="Panel Cp"):
+        x, y, is_surface = dataset[i]
+        cp = compute_panel_cp_for_sample(x)
+        panel_cp_list.append(cp)
+
+    # Save cache
+    save_dict = {f"s{i}": cp for i, cp in enumerate(panel_cp_list)}
+    np.savez_compressed(cache_path, **save_dict)
+    print(f"Saved panel Cp cache to {cache_path}")
+    return panel_cp_list
 
 torch.set_float32_matmul_precision('high')
 
@@ -1070,6 +1357,8 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Phase 7: Panel-method inviscid Cp as physics-informed input feature
+    panel_cp_feature: bool = False           # pre-compute and add panel Cp as extra input channel
 
 
 cfg = sp.parse(Config)
@@ -1088,6 +1377,44 @@ train_ds, val_splits, stats, sample_weights = load_data(
     cfg.manifest, cfg.stats_file, debug=cfg.debug,
 )
 stats = {k: v.to(device) for k, v in stats.items()}
+
+# Panel Cp feature: pre-compute inviscid Cp and augment dataset cache
+if cfg.panel_cp_feature:
+    _panel_cache_path = Path("panel_cp_cache.npz")
+    _panel_cp_list = precompute_panel_cp_cache(train_ds, _panel_cache_path)
+    # Augment each cached sample's x tensor with panel Cp as extra channel.
+    # train_ds is a Subset wrapping a MultiFieldDataset; access via .dataset.
+    # The underlying _cache may be empty in debug/lazy mode, so always fetch via
+    # __getitem__ and write back so downstream __getitem__ returns the augmented version.
+    print("Augmenting dataset with panel Cp feature...")
+    _train_base_ds = train_ds.dataset if hasattr(train_ds, 'dataset') else train_ds
+    for _local_idx in range(len(train_ds)):
+        _real_idx = train_ds.indices[_local_idx] if hasattr(train_ds, 'indices') else _local_idx
+        _x, _y, _is_surf = _train_base_ds[_real_idx]  # fetches from cache or disk
+        _cp = torch.tensor(_panel_cp_list[_local_idx], dtype=torch.float32)
+        if len(_cp) < _x.shape[0]:
+            _cp = F.pad(_cp, (0, _x.shape[0] - len(_cp)))
+        elif len(_cp) > _x.shape[0]:
+            _cp = _cp[:_x.shape[0]]
+        # Write augmented sample back into the cache keyed by real dataset index
+        _train_base_ds._cache[_real_idx] = (torch.cat([_x, _cp.unsqueeze(-1)], dim=-1), _y, _is_surf)
+    # Also augment validation splits (they share the same underlying MultiFieldDataset)
+    for _split_name, _split_ds in val_splits.items():
+        _base_ds = _split_ds.dataset if hasattr(_split_ds, 'dataset') else _split_ds
+        for _vi in range(len(_split_ds)):
+            _real_idx = _split_ds.indices[_vi] if hasattr(_split_ds, 'indices') else _vi
+            _x, _y, _is_surf = _base_ds[_real_idx]  # fetches from cache or disk
+            if _x.shape[-1] == X_DIM:  # not yet augmented
+                _cp = torch.tensor(compute_panel_cp_for_sample(_x), dtype=torch.float32)
+                if len(_cp) < _x.shape[0]:
+                    _cp = F.pad(_cp, (0, _x.shape[0] - len(_cp)))
+                elif len(_cp) > _x.shape[0]:
+                    _cp = _cp[:_x.shape[0]]
+                _base_ds._cache[_real_idx] = (torch.cat([_x, _cp.unsqueeze(-1)], dim=-1), _y, _is_surf)
+    # Extend normalization stats to cover the new channel (panel Cp: mean=0, std=1 → no normalization)
+    stats["x_mean"] = torch.cat([stats["x_mean"], torch.zeros(1, device=device)])
+    stats["x_std"] = torch.cat([stats["x_std"], torch.ones(1, device=device)])
+    print(f"  Panel Cp feature added (x dim: {X_DIM} → {X_DIM + 1})")
 
 
 def _umag_q(y, mask):
@@ -1200,7 +1527,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (1 if cfg.panel_cp_feature else 0) + 32,  # +curv, +dist, [+foil2dist], [+panel_cp], +32 fourier PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
