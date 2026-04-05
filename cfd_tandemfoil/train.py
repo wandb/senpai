@@ -1070,6 +1070,7 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    pcgrad_asymmetric: bool = False         # asymmetric projection: only project OOD grad, preserve in-dist
 
 
 cfg = sp.parse(Config)
@@ -2003,7 +2004,11 @@ for epoch in range(MAX_EPOCHS):
                 elif gb is None:
                     p.grad = ga
                 elif dot_ab < 0:
-                    p.grad = ((ga - (dot_ab / gb_ns) * gb) + (gb - (dot_ab / ga_ns) * ga)) * 0.5
+                    if cfg.pcgrad_asymmetric:
+                        gb_proj = gb - (dot_ab / ga_ns) * ga
+                        p.grad = (ga + gb_proj) * 0.5
+                    else:
+                        p.grad = ((ga - (dot_ab / gb_ns) * gb) + (gb - (dot_ab / ga_ns) * ga)) * 0.5
                 else:
                     p.grad = (ga + gb) * 0.5
         elif cfg.pcgrad_3way and is_tandem_batch.any() and (~is_tandem_batch).any():
