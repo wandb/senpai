@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~03:00 — PR #2161: FiLM-Conditioned Fore-Foil SRF — fern — **CLOSED** (4th consecutive fore-foil SRF failure)
+
+- Branch: `fern/film-conditioned-fore-foil-srf`
+- Hypothesis: FiLM conditioning on fore-foil SRF head using DSDF1 stats + gap/stagger to differentiate NACA6416.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| post-MLP FiLM | 42 | 13.1 | 7.4 | 30.8 | 6.3 | snmfs7bm |
+| post-MLP FiLM | 73 | 13.1 | 7.4 | 29.7 | 6.5 | o692pxsi |
+| **avg** | — | **13.10** | **7.40** | **30.25** | **6.40** | — |
+| **Baseline** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** p_tan +5.8%. Correction norm collapses to zero (same pattern as #2117, #2124, #2159). Interesting: p_oodc -3.9%, p_re -2.3% — SRF regularizes non-tandem metrics but hurts p_tan. 125K extra params, ~149 epochs (wall-clock limited). DEFINITIVE: fore-foil SRF dead across 4 architectures.
+- Fern now idle — reassigning.
+
+---
+
 ### 2026-04-06 ~01:45 — PR #2167: Tandem Surface Mixup — edward — **CLOSED** (physical inconsistency at swap boundary)
 
 - Branch: `edward/tandem-surface-mixup`

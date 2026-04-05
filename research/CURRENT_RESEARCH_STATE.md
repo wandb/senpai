@@ -44,7 +44,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| fern | #2161 | FiLM-Conditioned Fore-Foil SRF: shape-aware correction on NACA6416 fore surface | WIP |
+| fern | — | **IDLE** — awaiting new assignment | IDLE |
 | askeladd | #2168 | Tandem Pressure Correction MLP: gated tandem-specific pressure pathway | WIP |
 | nezuko | #2169 | Online Hard Example Mining: adaptive per-sample loss upweighting | WIP |
 | tanjiro | #2171 | Slice Number Sweep: 128, 144 vs baseline 96 | WIP — just assigned |
@@ -162,6 +162,7 @@ See `/research/RESEARCH_IDEAS_2026-04-05_ROUND3.md` for full details.
 | **DSDF-1 Channel Dropout** | **#2156** | **p_tan +5.6-6.3%. Foil-1 channels need exact values.** |
 | **Iterative 2-Pass Refinement** | **#2165** | **p_tan +6.6%. 1.3x epoch cost, only 131 epochs. Still converging at wall clock. Correction signal doesn't exist for CFD.** |
 | **Tandem Surface Mixup** | **#2167** | **p_tan +5.8-5.9%. Physical inconsistency — aft-foil targets coupled to upstream wake.** |
+| **FiLM-Conditioned Fore-Foil SRF** | **#2161** | **p_tan +5.8%. 4th fore-foil SRF failure. Correction norm collapses. Direction exhausted.** |
 
 ## Ensemble Seed Pool (Complete)
 
