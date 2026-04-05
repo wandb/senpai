@@ -2,6 +2,25 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~08:20 — PR #2141 (Round 2): EMA Decay 0.9995 Rebased — nezuko — **CLOSED** (negative)
+
+- Branch: `nezuko/ema-decay-sweep`
+- Hypothesis: decay=0.9995 showed promise against old baseline (p_oodc -2.7%, p_tan -0.4%). Rebased onto GSB baseline.
+
+| Metric | Baseline (GSB) | decay=0.9995+GSB avg | Delta |
+|--------|---------------|---------------------|-------|
+| p_in | 13.05 | 13.52 | +3.6% ❌ |
+| p_oodc | 7.70 | 7.77 | +0.9% ❌ |
+| p_tan | **28.60** | **29.75** | **+4.0%** ❌ |
+| p_re | 6.55 | 6.62 | +1.0% ❌ |
+
+W&B: mnbrh0r2 (s42), kptwsdvt (s73).
+
+**Results:** GSB obsoleted the decay=0.9995 advantage. GSB provides spatial smoothing that higher EMA decay was approximating. ema_decay=0.999 confirmed optimal with current architecture.
+- Nezuko reassigned to augmentation annealing (#2152).
+
+---
+
 ### 2026-04-05 ~08:10 — PR #2145: Weight Decay Sweep — fern — **CLOSED** (negative)
 
 - Branch: `fern/weight-decay-sweep`
