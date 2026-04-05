@@ -47,7 +47,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | fern | #2174 | Attention Temperature Curriculum: broad→sharp slice routing | WIP — just assigned |
 | askeladd | #2175 | SWD Tandem Domain Alignment: slice token distribution matching | WIP — just assigned |
 | nezuko | #2177 | Coordinated Tandem Ramp: sigma decay synced with loss ramp | WIP — just assigned |
-| tanjiro | — | **IDLE** — awaiting new assignment | IDLE |
+| tanjiro | #2178 | Smaller SRF Head: hidden 128/96 vs baseline 192 | WIP — just assigned |
 | alphonse | #2166 | dp/dn=0 Physics Loss: surface normal pressure gradient constraint | WIP |
 | thorfinn | #2172 | Binned Spectral Power Loss: frequency-weighted surface pressure loss | WIP — just assigned |
 | frieren | #2176 | Spectral Shaping: depthwise conv filter on GatedMLP activations | WIP — just assigned |
