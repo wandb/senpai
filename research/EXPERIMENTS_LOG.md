@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~19:25 — PR #2157: Foil Shape Similarity Bias (GSB 7D) — alphonse — **CLOSED** (sample-level similarity too coarse)
+
+- Branch: `alphonse/foil-shape-similarity-bias`
+- Hypothesis: Extend GSB 6D→7D by appending cosine similarity of foil-1 vs foil-2 mean DSDF vectors. Shape-similarity-conditioned routing for similar vs dissimilar foil pairs.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| GSB 7D | 42 | 12.93 | 8.04 | 30.04 | 6.36 | yvrpikxi |
+| GSB 7D | 73 | 13.48 | 7.82 | 29.27 | 6.62 | j20oel6q |
+| **GSB 7D avg** | — | **13.20** | **7.93** | **29.66** | **6.49** | — |
+| **Baseline (GSB 6D)** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** All key metrics worse: p_tan +3.7%, p_oodc +3.0%, p_in +1.1%. Sample-level cosine similarity loses spatial structure — too coarse for p_tan discrimination. Degenerate for single-foil samples (foil-2 DSDF ≈ 0). Per-node features (askeladd #2162) are the right approach.
+- Alphonse now idle — reassigning to dp/dn=0 physics loss.
+
+---
+
 ### 2026-04-05 ~18:55 — PR #2154: Cosine T_max Sweep {140, 180} vs 160 — thorfinn — **CLOSED** (T_max=160 confirmed optimal)
 
 - Branch: `thorfinn/cosine-tmax-sweep`
