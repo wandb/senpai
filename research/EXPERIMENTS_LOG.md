@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~19:55 — PR #2158: Asymmetric PCGrad — edward — **CLOSED** (symmetric baseline better)
+
+- Branch: `edward/asymmetric-pcgrad`
+- Hypothesis: Only project OOD gradient (g_B) onto in-dist normal plane; preserve in-dist gradient (g_A) unchanged. Should hold/improve p_in.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| asymmetric | 42 | 13.3 | 7.7 | 28.9 | 6.5 | amb3ci1h |
+| asymmetric | 73 | 13.5 | 8.0 | 28.8 | 6.5 | hc1vp76q |
+| **asymmetric avg** | — | **13.4** | **7.85** | **28.85** | **6.50** | — |
+| **Baseline (symmetric)** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** All key metrics worse except p_re (-0.8%). Surprisingly, p_in regressed +2.7% — protecting in-dist from OOD interference actually hurt. Symmetric projection acts as implicit regularization preventing in-dist overfitting.
+- **PCGrad fully explored:** 3-way (#2147) worse, asymmetric (#2158) worse, symmetric 2-way = optimal. Direction exhausted.
+- Edward now idle — reassigning to tandem surface mixup.
+
+---
+
 ### 2026-04-05 ~19:25 — PR #2157: Foil Shape Similarity Bias (GSB 7D) — alphonse — **CLOSED** (sample-level similarity too coarse)
 
 - Branch: `alphonse/foil-shape-similarity-bias`

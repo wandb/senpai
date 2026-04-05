@@ -51,7 +51,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | alphonse | #2166 | dp/dn=0 Physics Loss: surface normal pressure gradient constraint | WIP — just assigned |
 | thorfinn | #2165 | Iterative 2-Pass Refinement: AlphaFold2-style recycling, zero new params | WIP — just assigned |
 | frieren | #2164 | Backbone Gap/Stagger AdaLN: thread gap/stagger into ALL TransolverBlocks | WIP — just assigned |
-| edward | #2158 | Asymmetric PCGrad: protect in-dist gradients, project OOD only | WIP |
+| edward | #2167 | Tandem Surface Mixup: between-sample aft-foil node swapping | WIP — just assigned |
 
 **All 8 students active. Zero idle GPUs.**
 
@@ -138,6 +138,7 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 | Weight Decay 1e-5, 2e-5 | #2145 | 5e-5 confirmed optimal. |
 | Learning Rate ±50% (1e-4, 3e-4) | #2149 | lr=2e-4 confirmed optimal. |
 | Cosine T_max {140, 180} | #2154 | Both +2.8% p_tan. T_max=160 confirmed optimal. |
+| Asymmetric PCGrad | #2158 | p_in +2.7%, all key metrics worse. Symmetric 2-way optimal. PCGrad exhausted. |
 | Gap/Stagger σ=0.01 | #2140 | Worse than 0.02. |
 | Gap/Stagger σ=0.03 | #2153 | Worse: p_tan +3.3%, p_in +4.2%. σ=0.02 confirmed optimal (inverted-U). |
 | EMA Decay 0.9995 | #2141 | Regresses with GSB. 0.999 optimal. |
