@@ -46,7 +46,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 |---------|-----|-----------|--------|
 | fern | #2161 | FiLM-Conditioned Fore-Foil SRF: shape-aware correction on NACA6416 fore surface | WIP — just assigned |
 | askeladd | #2168 | Tandem Pressure Correction MLP: gated tandem-specific pressure pathway | WIP — just assigned |
-| nezuko | #2163 | Differential LR: boost aft_srf/surface_refine/GSB heads 2x-3x vs backbone | WIP — just assigned |
+| nezuko | #2169 | Online Hard Example Mining: adaptive per-sample loss upweighting | WIP — just assigned |
 | tanjiro | #2156 | DSDF-1 Channel Dropout: p={0.2, 0.3} force shape-invariant tandem prediction | WIP |
 | alphonse | #2166 | dp/dn=0 Physics Loss: surface normal pressure gradient constraint | WIP — just assigned |
 | thorfinn | #2165 | Iterative 2-Pass Refinement: AlphaFold2-style recycling, zero new params | WIP — just assigned |
@@ -139,6 +139,7 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 | Learning Rate ±50% (1e-4, 3e-4) | #2149 | lr=2e-4 confirmed optimal. |
 | Cosine T_max {140, 180} | #2154 | Both +2.8% p_tan. T_max=160 confirmed optimal. |
 | Asymmetric PCGrad | #2158 | p_in +2.7%, all key metrics worse. Symmetric 2-way optimal. PCGrad exhausted. |
+| Differential LR (mult=2,3) | #2163 | Both regress p_tan. mult=3 helps p_oodc (-3.5%) but hurts p_tan. Uniform LR best. |
 | Gap/Stagger σ=0.01 | #2140 | Worse than 0.02. |
 | Gap/Stagger σ=0.03 | #2153 | Worse: p_tan +3.3%, p_in +4.2%. σ=0.02 confirmed optimal (inverted-U). |
 | EMA Decay 0.9995 | #2141 | Regresses with GSB. 0.999 optimal. |

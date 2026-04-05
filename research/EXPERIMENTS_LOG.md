@@ -2,6 +2,26 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-05 ~20:45 — PR #2163: Differential LR for Specialized Heads — nezuko — **CLOSED** (p_tan regression)
+
+- Branch: `nezuko/differential-lr-specialized-heads`
+- Hypothesis: Boost aft_srf/surface_refine/GSB heads 2x-3x vs backbone. GSB was in attn_params at lr×0.5.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| mult=2.0 | 42 | 13.507 | 7.898 | 28.770 | 6.495 | jg8ummcf |
+| mult=2.0 | 73 | 13.469 | 7.945 | 30.194 | 6.577 | mth1a9p8 |
+| **mult=2.0 avg** | — | **13.488** | **7.922** | **29.482** | **6.536** | — |
+| mult=3.0 | 42 | 13.397 | 7.543 | 29.893 | 6.597 | aadm4fz6 |
+| mult=3.0 | 73 | 13.767 | 7.317 | 29.444 | 6.404 | ltvxv838 |
+| **mult=3.0 avg** | — | **13.582** | **7.430** | **29.669** | **6.501** | — |
+| **Baseline** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** Both multipliers regress p_tan (+3.1%, +3.7%). Interesting: mult=3.0 improves p_oodc (-3.5%) but at the cost of p_tan/p_in. Higher head LR disrupts co-adaptation between backbone and specialized heads.
+- Nezuko now idle — reassigning.
+
+---
+
 ### 2026-04-05 ~20:30 — PR #2162: Tandem Cross-DSDF Features — askeladd — **CLOSED** (hand-crafted features add noise)
 
 - Branch: `askeladd/tandem-cross-dsdf-features`
