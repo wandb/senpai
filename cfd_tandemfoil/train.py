@@ -1005,6 +1005,7 @@ class Config:
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
+    input_noise_sigma: float = 0.0      # std of Gaussian noise added to standardized input features (0=disabled)
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1651,6 +1652,8 @@ for epoch in range(MAX_EPOCHS):
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
         x = (x - stats["x_mean"]) / stats["x_std"]
+        if cfg.input_noise_sigma > 0.0 and model.training:
+            x = x + torch.randn_like(x) * cfg.input_noise_sigma
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         if cfg.foil2_dist:
