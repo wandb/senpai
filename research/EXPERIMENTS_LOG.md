@@ -2,6 +2,25 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~05:20 — PR #2166: dp/dn=0 Physics Loss — alphonse — **SENT BACK** (MOST PROMISING — needs more seeds)
+
+- Branch: `alphonse/dpdn-physics-loss`
+- Hypothesis: Zero wall-normal pressure gradient constraint as auxiliary loss on surface nodes.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| w=0.01 | 42 | 13.14 | 7.81 | 29.22 | 6.43 | hz2gibgb |
+| w=0.01 | 73 | 13.03 | 7.66 | 29.75 | 6.63 | eb34djbn |
+| **w=0.01 avg** | — | **13.09** | **7.74** | **29.49** | **6.53** | — |
+| w=0.1 | 42 | 12.95 | 7.77 | 29.82 | 6.49 | bmjgaeqp |
+| w=0.1 | 73 | 13.36 | 7.74 | **27.77** | 6.38 | e7iu2ix3 |
+| **w=0.1 avg** | — | **13.16** | **7.76** | **28.80** | **6.44** | — |
+| **Baseline** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** MOST PROMISING since GSB+PCGrad! w=0.1 seed 73 achieves p_tan=27.77 (-2.9%), but seed 42 is 29.82 (+4.3%). High variance. p_re consistently improved. Sent back for 4 additional seeds at w=0.1 + 2 seeds at w=0.05 to confirm.
+
+---
+
 ### 2026-04-06 ~05:00 — PR #2172: BSP Spectral Loss — thorfinn — **CLOSED** (w=0.1 catastrophic, w=0.05 all worse)
 
 - Branch: `thorfinn/bsp-spectral-loss`
