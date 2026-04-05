@@ -2,6 +2,26 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~01:45 — PR #2167: Tandem Surface Mixup — edward — **CLOSED** (physical inconsistency at swap boundary)
+
+- Branch: `edward/tandem-surface-mixup`
+- Hypothesis: CutMix-style augmentation — swap aft-foil surface node sets between tandem samples to create geometry diversity.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| prob=0.3 | 42 | 12.7 | 8.1 | 30.5 | 6.7 | b2zqlruz |
+| prob=0.3 | 73 | 14.1 | 8.0 | 30.1 | 6.7 | x2riufv5 |
+| **prob=0.3 avg** | — | **13.40** | **8.05** | **30.30** | **6.70** | — |
+| prob=0.5 | 42 | 13.1 | 8.4 | 30.4 | 6.7 | 4qsfyw3z |
+| prob=0.5 | 73 | 13.8 | 8.2 | 30.1 | 6.8 | yyqw2jqc |
+| **prob=0.5 avg** | — | **13.45** | **8.30** | **30.25** | **6.75** | — |
+| **Baseline** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** Both probs regress all metrics. p_tan +5.8-5.9%. Core issue: aft-foil targets are coupled to fore-foil wake — swapping targets across samples creates contradictory training signal. Node count mismatch required subsampling workaround. Generalizes: any augmentation that decouples aft-foil targets from upstream flow context will fail.
+- Dead end: tandem surface/node mixing. Edward now idle — reassigning.
+
+---
+
 ### 2026-04-06 ~00:25 — PR #2165: Iterative 2-Pass Refinement — thorfinn — **CLOSED** (training budget penalty, all metrics worse)
 
 - Branch: `thorfinn/iterative-refinement`
