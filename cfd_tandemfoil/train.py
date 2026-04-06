@@ -1020,6 +1020,10 @@ class Config:
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
     gap_stagger_spatial_bias: bool = False  # condition spatial bias MLP on gap/stagger (tandem geometry-aware routing)
+    dct_freq_loss: bool = False   # DCT frequency-weighted auxiliary loss on surface pressure
+    dct_freq_weight: float = 0.05 # weight for DCT freq loss
+    dct_freq_gamma: float = 2.0   # frequency upweighting strength
+    dct_freq_alpha: float = 1.5   # frequency exponent
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1658,6 +1662,9 @@ for epoch in range(MAX_EPOCHS):
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
+        _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
+        _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
+        _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
         # Aft-foil mask: boundary ID=7 nodes identified by saf norm > 0.005
         # saf is at raw x[:,:,2:4]; foil-1 surface has saf≈0, foil-2 has saf>>0
         _aft_foil_mask = None
@@ -1952,6 +1959,43 @@ for epoch in range(MAX_EPOCHS):
         aoa_target = x[:, 0, 14:15]  # AoA0_rad from normalized input
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
+
+        # DCT frequency-weighted auxiliary loss on surface pressure
+        if cfg.dct_freq_loss and model.training:
+            _dct_loss = torch.tensor(0.0, device=device)
+            _n_foils_dct = 0
+            for b in range(B):
+                surf_idx_b = is_surface[b].nonzero(as_tuple=True)[0]
+                if surf_idx_b.numel() < 8:
+                    continue
+                _is_tan_b = _raw_tandem_for_dct[b].item()
+                if _is_tan_b:
+                    saf_vals = _raw_saf_for_dct[b, surf_idx_b]
+                    foil_groups = [surf_idx_b[saf_vals <= 0.005], surf_idx_b[saf_vals > 0.005]]
+                else:
+                    foil_groups = [surf_idx_b]
+                for foil_surf in foil_groups:
+                    if foil_surf.numel() < 8:
+                        continue
+                    # Sort by raw x-coordinate for 1D signal ordering
+                    x_coords = _raw_x_for_dct[b, foil_surf]
+                    sort_order = x_coords.argsort()
+                    sorted_idx = foil_surf[sort_order]
+                    # Extract pressure channel (channel 2 in output)
+                    p_pred = pred[b, sorted_idx, 2]  # [M]
+                    p_gt = y_norm[b, sorted_idx, 2]  # [M]
+                    # FFT-based frequency loss
+                    M = p_pred.shape[0]
+                    pred_fft = torch.fft.rfft(p_pred).abs()  # [M//2+1]
+                    gt_fft = torch.fft.rfft(p_gt).abs()
+                    # Frequency weighting: w_k = 1 + gamma * (k/M)^alpha
+                    k = torch.arange(pred_fft.shape[0], device=device, dtype=pred_fft.dtype)
+                    w = 1.0 + cfg.dct_freq_gamma * (k / M) ** cfg.dct_freq_alpha
+                    _dct_loss = _dct_loss + (w * (pred_fft - gt_fft).abs()).mean()
+                    _n_foils_dct += 1
+            if _n_foils_dct > 0:
+                _dct_loss = _dct_loss / _n_foils_dct
+                loss = loss + cfg.dct_freq_weight * _dct_loss
 
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
