@@ -134,6 +134,125 @@ class DomainLayerNorm(nn.Module):
         return torch.where(mask_t, self.ln_tandem(x), self.ln_single(x))
 
 
+def compute_surface_normals_batch(positions, is_surface):
+    """Compute outward unit normals at surface nodes using the tangent method.
+
+    For each sample, surface nodes are sorted by angle around their centroid.
+    Tangents are computed from adjacent sorted nodes; normals are the perpendicular,
+    oriented outward (away from centroid).
+
+    Args:
+        positions:   (B, N, 2) float — x, y mesh coordinates in physical space
+        is_surface:  (B, N)    bool  — True at airfoil surface nodes
+
+    Returns:
+        normals:     (B, N, 2) float — unit outward normal at surface nodes,
+                     zero vector at non-surface nodes
+    """
+    B, N, _ = positions.shape
+    normals = torch.zeros_like(positions)  # (B, N, 2)
+
+    for b in range(B):
+        surf_idx = is_surface[b].nonzero(as_tuple=True)[0]  # (M,)
+        if surf_idx.numel() < 3:
+            continue
+
+        surf_pos = positions[b, surf_idx]  # (M, 2)
+        centroid = surf_pos.mean(dim=0)    # (2,)
+
+        # Sort surface nodes by angle around centroid
+        delta = surf_pos - centroid        # (M, 2)
+        angles = torch.atan2(delta[:, 1], delta[:, 0])  # (M,)
+        order = angles.argsort()
+        sorted_pos = surf_pos[order]       # (M, 2)
+
+        # Compute tangent from neighboring sorted nodes (circular)
+        M = sorted_pos.shape[0]
+        prev_idx = (torch.arange(M, device=positions.device) - 1) % M
+        next_idx = (torch.arange(M, device=positions.device) + 1) % M
+        tangent = sorted_pos[next_idx] - sorted_pos[prev_idx]  # (M, 2)
+
+        # Normal = 90-degree rotation of tangent
+        n = torch.stack([-tangent[:, 1], tangent[:, 0]], dim=-1)  # (M, 2)
+
+        # Normalize
+        nlen = n.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        n = n / nlen
+
+        # Ensure outward direction (dot product with centroid-to-node should be positive)
+        outward = (sorted_pos - centroid)  # (M, 2)
+        flip = (n * outward).sum(dim=-1) < 0  # (M,) bool
+        n[flip] = -n[flip]
+
+        # Scatter back to original (unsorted) surface node order
+        inv_order = order.argsort()
+        n_unsorted = n[inv_order]
+
+        normals[b, surf_idx] = n_unsorted
+
+    return normals
+
+
+def _project_no_penetration(pred, surf_normals, is_surface, sample_stds,
+                             phys_stats, freestream, multiply_std):
+    """Project out surface-normal velocity to enforce no-penetration BC.
+
+    Works in Cp-normalized velocity space (Ux/Umag, Uy/Umag) where both
+    components share the same Umag scale, making physical-space unit normals valid.
+    Only modifies velocity channels (0, 1); pressure (channel 2) is unchanged.
+
+    Args:
+        pred:         [B, N, 3]  predictions in loss scale
+        surf_normals: [B, N, 2]  outward unit normals in physical position space
+        is_surface:   [B, N]     bool mask for surface nodes
+        sample_stds:  [B, 1, 3]  per-sample std used for loss scaling
+        phys_stats:   dict with "y_mean" [3] and "y_std" [3] (Cp-normalized stats)
+        freestream:   [B, 1, 3] or None — freestream offset in phys_stats-norm space
+        multiply_std: bool — True: loss = phys_norm * std; False: loss = phys_norm / std
+
+    Returns:
+        pred with u·n̂ = 0 enforced at all surface nodes (differentiable).
+    """
+    # Undo sample_stds → phys_stats-normalized residual space
+    if multiply_std:
+        pred_psnorm = pred / sample_stds
+    else:
+        pred_psnorm = pred * sample_stds
+
+    # Add freestream back → full phys_stats-normalized space
+    if freestream is not None:
+        pred_psnorm = pred_psnorm + freestream
+
+    # Undo phys_stats normalization for velocity → Cp-normalized space (Ux/Umag, Uy/Umag)
+    pstd = phys_stats["y_std"].to(pred.device)   # [3]
+    pmean = phys_stats["y_mean"].to(pred.device)  # [3]
+    u_cp = pred_psnorm[:, :, :2] * pstd[:2] + pmean[:2]  # [B, N, 2]
+
+    # Project out normal component u·n̂ at surface nodes (Gram-Schmidt)
+    surf_idx = is_surface.nonzero(as_tuple=False)  # [M, 2]
+    if surf_idx.numel() > 0:
+        b_idx, n_idx = surf_idx[:, 0], surf_idx[:, 1]
+        u_surf = u_cp[b_idx, n_idx]           # [M, 2]
+        n_hat = surf_normals[b_idx, n_idx]     # [M, 2]
+        u_dot_n = (u_surf * n_hat).sum(dim=-1, keepdim=True)  # [M, 1]
+        u_cp = u_cp.clone()
+        u_cp[b_idx, n_idx] = u_surf - u_dot_n * n_hat
+
+    # Re-apply phys_stats normalization for velocity
+    pred_psnorm_corrected = pred_psnorm.clone()
+    pred_psnorm_corrected[:, :, :2] = (u_cp - pmean[:2]) / pstd[:2]
+
+    # Subtract freestream back
+    if freestream is not None:
+        pred_psnorm_corrected = pred_psnorm_corrected - freestream
+
+    # Re-apply sample_stds → loss scale
+    if multiply_std:
+        return pred_psnorm_corrected * sample_stds
+    else:
+        return pred_psnorm_corrected / sample_stds
+
+
 class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
@@ -1070,6 +1189,8 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Hard no-penetration boundary condition: project out surface-normal velocity after prediction
+    normal_vel_projection: bool = False      # enforce u·n̂=0 at surface nodes via Gram-Schmidt projection
 
 
 cfg = sp.parse(Config)
@@ -1666,6 +1787,10 @@ for epoch in range(MAX_EPOCHS):
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
+        # Surface normals (computed in physical space before normalization, after augmentation)
+        _surf_normals = None
+        if cfg.normal_vel_projection:
+            _surf_normals = compute_surface_normals_batch(x[:, :, :2], is_surface)
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1833,6 +1958,14 @@ for epoch in range(MAX_EPOCHS):
                     aft_correction = aft_srf_head(aft_hidden, aft_pred, _aft_cond).float()
                 pred = pred.clone()
                 pred[aft_idx[:, 0], aft_idx[:, 1]] = pred[aft_idx[:, 0], aft_idx[:, 1]] + aft_correction
+
+        # Hard no-penetration BC: project out u·n̂ at surface nodes (training)
+        if cfg.normal_vel_projection and _surf_normals is not None:
+            if not cfg.raw_targets and not cfg.adaptive_norm:
+                pred = _project_no_penetration(
+                    pred, _surf_normals, is_surface, sample_stds,
+                    phys_stats, _freestream, cfg.multiply_std,
+                )
 
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
@@ -2303,6 +2436,10 @@ for epoch in range(MAX_EPOCHS):
                     _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
                     _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
                     _v_gap_stagger = x[:, 0, 22:24]  # [B, 2]
+                # Surface normals (computed in physical space before normalization)
+                _v_surf_normals = None
+                if cfg.normal_vel_projection:
+                    _v_surf_normals = compute_surface_normals_batch(x[:, :, :2], is_surface)
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -2453,6 +2590,14 @@ for epoch in range(MAX_EPOCHS):
                             pred = pred_loss / sample_stds
                         else:
                             pred = pred_loss * sample_stds
+
+                # Hard no-penetration BC: project out u·n̂ at surface nodes (val)
+                if cfg.normal_vel_projection and _v_surf_normals is not None:
+                    if not cfg.raw_targets and not cfg.adaptive_norm:
+                        pred_loss = _project_no_penetration(
+                            pred_loss, _v_surf_normals, is_surface, sample_stds,
+                            phys_stats, _v_freestream, cfg.multiply_std,
+                        )
 
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
