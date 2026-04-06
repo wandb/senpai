@@ -700,10 +700,18 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        se2_spatial_bias=False,
+        aoa_stats=None,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
+        self.se2_spatial_bias = se2_spatial_bias
+        if se2_spatial_bias:
+            if aoa_stats is None:
+                raise ValueError("se2_spatial_bias requires aoa_stats=(mean, std) for feature 14")
+            self.register_buffer("aoa_mean", torch.tensor(aoa_stats[0], dtype=torch.float32))
+            self.register_buffer("aoa_std", torch.tensor(aoa_stats[1], dtype=torch.float32))
         self.pressure_first = pressure_first
         self.ref = ref
         self.unified_pos = unified_pos
@@ -884,7 +892,20 @@ class Transolver(nn.Module):
 
         x_cross = x * self.feature_cross(x)
         x = x + 0.1 * x_cross  # residual with small scale
-        if self.gap_stagger_spatial_bias:
+        if self.se2_spatial_bias:
+            # Rotate (x,y) into AoA-aligned (freestream-aligned) frame for spatial bias
+            # De-standardize feature 14 to recover raw AoA in radians
+            aoa = x[:, 0:1, 14:15] * self.aoa_std + self.aoa_mean  # [B, 1, 1] raw AoA radians
+            cos_a, sin_a = torch.cos(aoa), torch.sin(aoa)           # [B, 1, 1]
+            x_mesh, y_mesh = x[:, :, 0:1], x[:, :, 1:2]            # [B, N, 1] each
+            x_rot = x_mesh * cos_a + y_mesh * sin_a                 # along-freestream
+            y_rot = -x_mesh * sin_a + y_mesh * cos_a                # cross-freestream
+            if self.gap_stagger_spatial_bias:
+                gap_stagger = x[:, 0:1, 22:24].expand(-1, x.shape[1], -1)  # [B, N, 2]
+                raw_xy = torch.cat([x_rot, y_rot, x[:, :, 24:26], gap_stagger], dim=-1)  # [B, N, 6]
+            else:
+                raw_xy = torch.cat([x_rot, y_rot, x[:, :, 24:26]], dim=-1)  # [B, N, 4]
+        elif self.gap_stagger_spatial_bias:
             # Gap (idx 22) and stagger (idx 23) are global per-sample scalars; broadcast to all nodes
             gap_stagger = x[:, 0:1, 22:24].expand(-1, x.shape[1], -1)  # [B, N, 2]
             raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26], gap_stagger], dim=-1)  # [B, N, 6]
@@ -1020,6 +1041,7 @@ class Config:
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
     gap_stagger_spatial_bias: bool = False  # condition spatial bias MLP on gap/stagger (tandem geometry-aware routing)
+    se2_spatial_bias: bool = False  # rotate (x,y) into AoA-aligned frame before spatial bias MLP
     dct_freq_loss: bool = False   # DCT frequency-weighted auxiliary loss on surface pressure
     dct_freq_weight: float = 0.05 # weight for DCT freq loss
     dct_freq_gamma: float = 2.0   # frequency upweighting strength
@@ -1234,6 +1256,8 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    se2_spatial_bias=cfg.se2_spatial_bias,
+    aoa_stats=(stats["x_mean"][14].item(), stats["x_std"][14].item()) if cfg.se2_spatial_bias else None,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1662,6 +1686,8 @@ for epoch in range(MAX_EPOCHS):
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
+        if cfg.se2_spatial_bias and epoch == 0 and batch_idx == 0:
+            print(f"AoA stats: mean={_raw_aoa.mean():.3f}, std={_raw_aoa.std():.3f}, range=[{_raw_aoa.min():.3f}, {_raw_aoa.max():.3f}]")
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
