@@ -1020,6 +1020,8 @@ class Config:
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
     gap_stagger_spatial_bias: bool = False  # condition spatial bias MLP on gap/stagger (tandem geometry-aware routing)
+    gradnorm: bool = False          # GradNorm adaptive loss weighting (requires --pcgrad_3way)
+    gradnorm_alpha: float = 1.5     # GradNorm asymmetry: higher = more aggressive rebalancing toward lagging tasks
     dct_freq_loss: bool = False   # DCT frequency-weighted auxiliary loss on surface pressure
     dct_freq_weight: float = 0.05 # weight for DCT freq loss
     dct_freq_gamma: float = 2.0   # frequency upweighting strength
@@ -1462,6 +1464,20 @@ if aft_srf_ctx_head is not None:
     _ctx_params = list(aft_srf_ctx_head.parameters())
     base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
+
+# GradNorm state (task weight balancing, works alongside --pcgrad_3way)
+_gradnorm_state = None
+if cfg.gradnorm and cfg.pcgrad_3way:
+    _gradnorm_n_tasks = 3  # single-foil | tandem-normal | tandem-extreme
+    _gn_weights = nn.Parameter(torch.ones(_gradnorm_n_tasks, device=device))
+    _gn_optim = torch.optim.Adam([_gn_weights], lr=1e-3)
+    _gn_L0 = None        # initial per-task losses, set on first step
+    _gn_ema = torch.ones(_gradnorm_n_tasks, device=device)  # EMA of weights
+    # Reference layer: last TransolverBlock's MLP output projection
+    _gn_ref_params = list(_base_model.blocks[-1].mlp.linear_post.parameters())
+    _gradnorm_state = (_gn_weights, _gn_optim, _gn_ema)
+    print(f"GradNorm enabled: {_gradnorm_n_tasks} tasks, alpha={cfg.gradnorm_alpha}, "
+          f"ref_params={sum(p.numel() for p in _gn_ref_params)}")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
@@ -2072,12 +2088,65 @@ for epoch in range(MAX_EPOCHS):
                 return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
 
             loss_A = _grp_loss(~is_tandem_batch)
+            loss_B_raw = _grp_loss(is_normal_tan) if is_normal_tan.any() else None
+            loss_C_raw = _grp_loss(is_extreme) if is_extreme.any() else None
+
+            # GradNorm: update task weights based on gradient norms (before PCGrad)
+            if cfg.gradnorm and _gradnorm_state is not None and loss_B_raw is not None and loss_C_raw is not None:
+                _raw_losses_3 = [loss_A, loss_B_raw, loss_C_raw]
+                # Initialize L0 on the first step
+                if _gn_L0 is None:
+                    _gn_L0 = torch.stack([l.detach() for l in _raw_losses_3])
+                # Compute per-task gradient norms w.r.t. last shared layer (retain_graph for PCGrad)
+                _gn_norms = []
+                for _i, _rl in enumerate(_raw_losses_3):
+                    _grads_ref = torch.autograd.grad(
+                        _gn_weights[_i] * _rl, _gn_ref_params,
+                        retain_graph=True, allow_unused=True, create_graph=False,
+                    )
+                    _gnorm = sum(g.norm() ** 2 for g in _grads_ref if g is not None).sqrt().clamp(min=1e-12)
+                    _gn_norms.append(_gnorm)
+                _gn_norms_t = torch.stack(_gn_norms)
+                _gn_G_mean = (_gn_norms_t * _gn_weights.detach()).mean().detach()
+                # Relative inverse training rate
+                _cur_losses = torch.stack([l.detach() for l in _raw_losses_3])
+                _loss_ratios = (_cur_losses / _gn_L0.clamp(min=1e-8)) / (_cur_losses / _gn_L0.clamp(min=1e-8)).mean().clamp(min=1e-8)
+                _gn_targets = (_gn_G_mean * _loss_ratios ** cfg.gradnorm_alpha).detach()
+                # GradNorm loss: L1 mismatch between actual and target gradient norms
+                _L_grad = (_gn_norms_t * _gn_weights - _gn_targets).abs().sum()
+                # Update task weights via separate Adam step (zero model grads first)
+                _gn_optim.zero_grad()
+                _L_grad.backward(retain_graph=True)  # only propagates to _gn_weights
+                _gn_optim.step()
+                # Renormalize to keep total scale stable
+                with torch.no_grad():
+                    _gn_weights.data.clamp_(min=0.01)
+                    _gn_weights.data = _gn_weights.data / _gn_weights.data.mean() * _gradnorm_n_tasks
+                    # EMA smoothing
+                    _gn_ema.mul_(0.9).add_(_gn_weights.data * 0.1)
+                wandb.log({
+                    "gradnorm/weight_single_foil": _gn_ema[0].item(),
+                    "gradnorm/weight_tandem_normal": _gn_ema[1].item(),
+                    "gradnorm/weight_tandem_extreme": _gn_ema[2].item(),
+                    "gradnorm/G_mean": _gn_G_mean.item(),
+                    "gradnorm/loss": _L_grad.item(),
+                    "global_step": global_step,
+                })
+                # Apply EMA-smoothed weights to task losses
+                loss_A = _gn_ema[0] * loss_A
+                loss_B_raw = _gn_ema[1] * loss_B_raw
+                loss_C_raw = _gn_ema[2] * loss_C_raw
+
             # Only include non-empty groups to avoid backward() on no-grad tensors
-            task_losses_with_masks = [
-                (loss_A, (~is_tandem_batch)),
-                (_grp_loss(is_normal_tan), is_normal_tan),
-                (_grp_loss(is_extreme), is_extreme),
-            ]
+            task_losses_with_masks = [(loss_A, (~is_tandem_batch))]
+            if loss_B_raw is not None:
+                task_losses_with_masks.append((loss_B_raw, is_normal_tan))
+            elif is_normal_tan.any():
+                task_losses_with_masks.append((_grp_loss(is_normal_tan), is_normal_tan))
+            if loss_C_raw is not None:
+                task_losses_with_masks.append((loss_C_raw, is_extreme))
+            elif is_extreme.any():
+                task_losses_with_masks.append((_grp_loss(is_extreme), is_extreme))
             task_losses = [l for l, m in task_losses_with_masks if m.any()]
             if len(task_losses) == 0:
                 task_losses = [loss_A]  # fallback
