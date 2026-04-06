@@ -142,6 +142,18 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 7. **Transient Conditioning** — Condition model on Reynolds number explicitly; separate normalizations per Re regime.
 8. **Hopfield Memory Bank** — k-NN geometry retrieval from training set → pressure prior injection. (Same as Round 6 idea 3, still unassigned.)
 
+### Round 8 — Researcher-Agent (2026-04-06) — See `/research/RESEARCH_IDEAS_2026-04-06_ROUND8.md`
+1. **Fore-Aft Cross-Attention in AftFoilRefinementHead** (`fore-aft-crossattn-srf`) — Cross-attend from aft-foil surface nodes to fore-foil hidden states in the SRF head. Directly models the physical wake coupling responsible for p_tan difficulty. Medium-high confidence.
+2. **Asinh Scale Progressive Annealing** (`asinh-scale-anneal`) — Anneal asinh scale from 1.5→0.5 during training. Curriculum in prediction space.
+3. **Slice Diversity Regularization** (`slice-diversity-reg`) — Gram-matrix orthogonality loss on slice tokens to prevent OOD routing collapse.
+4. **Chord-Normalized Coordinates** (`chord-normalized-coords`) — x/c, y/c coordinates as geometry-invariant features.
+5. **Wake Deficit Feature** (`wake-deficit-feature`) — Explicit dx/gap, dy/gap from fore-foil TE per node. Makes wake interaction signal explicit.
+6. **Kutta Condition Loss** (`kutta-condition-loss`) — Enforce TE pressure continuity as physics constraint.
+7. **Tandem-Biased Stochastic Depth** (`tandem-biased-stochastic-depth`) — Conditional drop path: lower for tandem samples to preserve depth for complex interaction.
+8. **Iterative SRF (RAFT-style)** (`iterative-srf`) — Run surface refinement head N=3 times, feeding output back as input. Proven in optical flow (RAFT) and protein folding (AlphaFold recycling). Low complexity, high confidence.
+9. **Tandem-Conditioned Feature Cross** (`tandem-feature-cross`) — Tandem-specific multiplicative feature interaction before backbone.
+10. **Fourier Position Embedding for Spatial Bias** (`fourier-pos-embed`) — Replace raw xy with multi-scale sinusoidal features in spatial_bias MLP.
+
 ### Human Researcher Directives
 - **#1860 (2026-03-27):** Think bigger — radical new full model changes and data aug.
 - **#1834 (2026-03-27):** Never use raw data files outside assigned training split.
