@@ -1,6 +1,37 @@
 # Baseline Metrics
 
-## Current Single-Model Baseline (Phase 6 — 2026-04-05, +Gap/Stagger Spatial Bias + PCGrad, 2-Seed Evidence, PR #2130)
+## Current Single-Model Baseline (Phase 6 — 2026-04-06, +DCT Frequency-Weighted Loss w=0.05, 2-Seed Evidence, PR #2184)
+
+| Metric | 2-seed avg | vs prior (GSB+PCGrad) | Δ |
+|--------|------------|------------------------|---|
+| p_in | **13.205** | 13.05 | +1.2% (slight regression) |
+| p_oodc | **7.816** | 7.70 | +1.5% (slight regression) |
+| **p_tan** | **28.502** | 28.60 | **-0.3%** |
+| p_re | **6.453** | 6.55 | **-1.5%** |
+
+**PR #2184** (merged 2026-04-06) — DCT Frequency-Weighted Auxiliary Loss: applies an rfft-based frequency-weighted loss on ordered surface pressure nodes (w_k = 1 + 2.0*(k/N)^1.5) as an auxiliary term with weight 0.05, exploiting spectral bias theory to force attention to high-frequency leading-edge and trailing-edge features. Unlike failed BSP (#2172) which used relative spectral error with DFT, this uses absolute DCT coefficient difference with smooth polynomial weighting — numerically stable. W&B runs: 6yfv5lio (seed 42, p_tan=28.432), etepxvjc (seed 73, p_tan=28.572).
+
+⚠️ **2-seed only.** For merge decisions: **p_tan < 28.50**, p_oodc < 7.82, p_in < 13.21, p_re < 6.45.
+
+**Reproduce (current baseline):**
+```bash
+cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baseline-dct-freq" \
+  --asinh_pressure --asinh_scale 0.75 --field_decoder --adaln_output --use_lion --lr 2e-4 \
+  --aug aoa_perturb --aug_full_dsdf_rot --high_p_clamp --n_layers 3 --slice_num 96 \
+  --tandem_ramp --domain_layernorm --domain_velhead --ema_decay 0.999 --weight_decay 5e-5 \
+  --cosine_T_max 160 --pcgrad_3way --pcgrad_extreme_pct 0.15 \
+  --pressure_first --pressure_deep \
+  --residual_prediction --surface_refine --surface_refine_hidden 192 --surface_refine_layers 3 \
+  --aft_foil_srf --aug_gap_stagger_sigma 0.02 --aug_dsdf2_sigma 0.05 \
+  --gap_stagger_spatial_bias \
+  --dct_freq_loss --dct_freq_weight 0.05 --dct_freq_gamma 2.0 --dct_freq_alpha 1.5
+```
+
+**For merge decisions:** Compare 2-seed avg against: p_tan < 28.50, p_oodc < 7.82, p_in < 13.21, p_re < 6.45.
+
+---
+
+## Prior Single-Model Baseline (Phase 6 — 2026-04-05, +Gap/Stagger Spatial Bias + PCGrad, 2-Seed Evidence, PR #2130)
 
 | Metric | 2-seed avg | vs prior (PCGrad only) | Δ |
 |--------|------------|------------------------|---|
