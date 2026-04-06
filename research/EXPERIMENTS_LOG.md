@@ -2,6 +2,20 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~10:30 — PR #2180: Multi-Resolution Hash Grid Encoding — edward — **CLOSED** (per-sample normalization breaks spatial coherence)
+
+- Branch: `edward/hash-grid-encoding`
+- Hypothesis: 8-level hash grid encoding (base 16→2048) of mesh (x,y) coordinates, appended to DSDF features. Provides explicit multi-resolution spatial info to complement learned Fourier PE.
+
+| Config | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|--------|-------|------|-----|
+| **Hash Grid avg** | **17.9** | **9.25** | **32.1** | **7.85** | 3sb91xty, kie1y6kb |
+| **Baseline** | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** Catastrophic regression across ALL metrics. p_tan +12.2%, p_in +37%, p_oodc +20%, p_re +20%. Three contributing factors: (1) Per-sample coordinate normalization to [0,1] defeats the hash grid's core mechanism — same physical point maps to different hash entries across samples, producing conflicting gradients. (2) 1.14M extra params (+25%) with 5x higher LR overfit quickly. (3) 20s/epoch overhead → only 121 epochs (19% fewer), barely 75% through cosine schedule. Hash grid fundamentally incompatible with variable-domain CFD meshes without fixed coordinate system.
+
+---
+
 ### 2026-04-06 ~10:00 — PR #2179: Panel-Method Inviscid Cp as Input Feature — thorfinn — **CLOSED** (single-foil solver lacks tandem interaction)
 
 - Branch: `thorfinn/panel-cp-features`

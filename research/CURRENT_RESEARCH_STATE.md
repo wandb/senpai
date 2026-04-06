@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-06 ~06:30 UTC
+- **Date:** 2026-04-06 ~11:00 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -51,7 +51,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | alphonse | #2185 | MAE Pretraining: self-supervised geometry encoder initialization | WIP — just assigned |
 | thorfinn | #2186 | Panel Cp Residual Target: predict viscous correction only | WIP — just assigned |
 | frieren | #2183 | Vorticity Auxiliary Target: explicit wake structure learning | WIP — just assigned |
-| edward | #2180 | Multi-Resolution Hash Grid Encoding of mesh coordinates | WIP — just assigned |
+| edward | #2187 | Normal-Velocity Hard Constraint at surface nodes | WIP — just assigned |
 
 **All 8 students active. Zero idle GPUs.**
 
@@ -93,7 +93,7 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 3. **DCT Frequency-Weighted Loss** (nezuko #2184) — smooth DCT-domain frequency upweighting. Different from failed BSP (stable, auxiliary).
 4. **Panel Cp Residual Target** (thorfinn #2186) — predict (p_gt - p_panel) viscous correction instead of full pressure. Iteration on #2179.
 5. **MAE Pretraining** (alphonse #2185) — self-supervised masked geometry reconstruction before supervised training. Tier 3 radical.
-6. **Multi-Resolution Hash Grid Encoding** (edward #2180) — 2D hash grid (L=8, 16→2048) appended to DSDF features.
+6. **Normal-Velocity Hard Constraint** (edward #2187) — project out normal velocity at surface nodes. Hard BC enforcement.
 7. **Vorticity Auxiliary Target** (frieren #2183) — KNN-computed ω as auxiliary prediction target. Forces explicit wake learning.
 8. **Ensemble Distillation** (tanjiro #2182) — soft targets from 16-seed ensemble. Tier 2 radical.
 
@@ -196,6 +196,7 @@ See `/research/RESEARCH_IDEAS_2026-04-06_ROUND4.md` for full details.
 | **Coordinated Tandem Ramp** | **#2177** | **p_tan +2.2% avg. Concurrent schedules interfere during tandem warmup.** |
 | **dp/dn=0 Physics Loss (6-seed)** | **#2166** | **p_tan neutral (28.97 vs 28.60, within σ=0.67). Regularizer for p_in/p_re, not p_tan.** |
 | **Panel Cp as Input Feature** | **#2179** | **p_tan +3.7%. Single-foil solver lacks tandem interaction. p_oodc/p_re improved.** |
+| **Multi-Resolution Hash Grid** | **#2180** | **p_tan +12.2%. Per-sample coord normalization breaks spatial coherence. 1.14M extra params overfit, 20s/epoch overhead.** |
 
 ## Ensemble Seed Pool (Complete)
 
