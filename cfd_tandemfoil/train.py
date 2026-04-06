@@ -25,6 +25,7 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,6 +33,7 @@ import wandb
 import yaml
 from dataclasses import dataclass, asdict
 from einops import rearrange
+from scipy.spatial import cKDTree
 from timm.layers import trunc_normal_
 from tqdm import tqdm
 from torch.utils.data import DataLoader, WeightedRandomSampler
@@ -58,6 +60,54 @@ ACTIVATION = {
     "ELU": nn.ELU,
     "silu": nn.SiLU,
 }
+
+
+def compute_vorticity_batch(coords_np, Ux_np, Uy_np, mask_np, K=8):
+    """Compute vorticity ω = ∂Uy/∂x - ∂Ux/∂y via KNN least-squares gradient."""
+    B, N = Ux_np.shape
+    omega = np.zeros((B, N), dtype=np.float32)
+    for b in range(B):
+        valid = mask_np[b]
+        n_valid = valid.sum()
+        if n_valid < K + 1:
+            continue
+        coords_b = coords_np[b, valid]
+        Ux_b = Ux_np[b, valid]
+        Uy_b = Uy_np[b, valid]
+        tree = cKDTree(coords_b)
+        _, indices = tree.query(coords_b, k=K + 1)
+        indices = indices[:, 1:]  # (n_valid, K) exclude self
+        nbr_coords = coords_b[indices]  # (n_valid, K, 2)
+        delta = nbr_coords - coords_b[:, None, :]  # (n_valid, K, 2)
+        dUx = Ux_b[indices] - Ux_b[:, None]
+        dUy = Uy_b[indices] - Uy_b[:, None]
+        ATA = np.einsum('nki,nkj->nij', delta, delta)  # (n_valid, 2, 2)
+        ATA[:, 0, 0] += 1e-10
+        ATA[:, 1, 1] += 1e-10
+        ATdUx = np.einsum('nki,nk->ni', delta, dUx)
+        ATdUy = np.einsum('nki,nk->ni', delta, dUy)
+        # Stack RHS to make b 3D: (n_valid, 2, 2) — avoids numpy gufunc ambiguity
+        ATb = np.stack([ATdUx, ATdUy], axis=-1)  # (n_valid, 2, 2)
+        grads = np.linalg.solve(ATA, ATb)  # (n_valid, 2, 2)
+        # grads[:, :, 0] = [∂Ux/∂x, ∂Ux/∂y], grads[:, :, 1] = [∂Uy/∂x, ∂Uy/∂y]
+        omega[b, valid] = grads[:, 0, 1] - grads[:, 1, 0]  # ∂Uy/∂x - ∂Ux/∂y
+    return omega
+
+
+class VorticityHead(nn.Module):
+    """Auxiliary head predicting vorticity from backbone hidden representation."""
+    def __init__(self, hidden_dim=192):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, h):
+        return self.mlp(h).squeeze(-1)  # [B, N]
 
 
 class GatedMLP(nn.Module):
@@ -1070,6 +1120,10 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Vorticity auxiliary target
+    aux_vorticity: bool = False              # enable vorticity auxiliary prediction head
+    aux_vorticity_weight: float = 0.1        # loss weight for vorticity auxiliary loss
+    vorticity_clip: float = 0.0              # clip threshold for vorticity targets (0=auto from data)
 
 
 cfg = sp.parse(Config)
@@ -1088,6 +1142,74 @@ train_ds, val_splits, stats, sample_weights = load_data(
     cfg.manifest, cfg.stats_file, debug=cfg.debug,
 )
 stats = {k: v.to(device) for k, v in stats.items()}
+
+# Pre-compute vorticity for all training samples (avoids on-the-fly CPU overhead)
+vort_mean = 0.0
+vort_std = 1.0
+vort_clip_threshold = 3.0  # in normalized units (±3σ)
+_train_vort_cache: list[torch.Tensor] = []  # per-sample vorticity tensors
+if cfg.aux_vorticity:
+    import time as _vt
+    _vt0 = _vt.time()
+    print(f"Pre-computing vorticity for {len(train_ds)} training samples...")
+    _all_vort_vals = []
+    for _i in range(len(train_ds)):
+        _sample = train_ds[_i]
+        _x_s, _y_s = _sample[0], _sample[1]
+        _N = _x_s.shape[0]
+        _coords = _x_s[:, :2].numpy()[None]
+        _Ux = _y_s[:, 0].numpy()[None]
+        _Uy = _y_s[:, 1].numpy()[None]
+        _mask = np.ones((1, _N), dtype=bool)
+        _omega = compute_vorticity_batch(_coords, _Ux, _Uy, _mask, K=8)[0]
+        _train_vort_cache.append(torch.from_numpy(_omega.copy()))
+        _all_vort_vals.append(_omega)
+        if (_i + 1) % 200 == 0:
+            print(f"  {_i + 1}/{len(train_ds)} samples...")
+    _all_vort = np.concatenate([v.ravel() for v in _all_vort_vals])
+    vort_mean = float(np.mean(_all_vort))
+    vort_std = float(np.std(_all_vort))
+    if cfg.vorticity_clip > 0:
+        vort_clip_threshold = cfg.vorticity_clip
+    # Normalize cached vorticity
+    for _i in range(len(_train_vort_cache)):
+        _train_vort_cache[_i] = (_train_vort_cache[_i] - vort_mean) / max(vort_std, 1e-8)
+        _train_vort_cache[_i] = _train_vort_cache[_i].clamp(-vort_clip_threshold, vort_clip_threshold)
+    print(f"Vorticity pre-computed in {_vt.time() - _vt0:.1f}s — "
+          f"mean={vort_mean:.3f}, std={vort_std:.3f}, "
+          f"clip=±{vort_clip_threshold:.1f}σ (±{vort_clip_threshold * vort_std:.1f} raw)")
+    del _all_vort, _all_vort_vals
+
+
+class VorticityDatasetWrapper(torch.utils.data.Dataset):
+    """Wraps a dataset to include pre-computed vorticity targets."""
+    def __init__(self, ds, vort_cache):
+        self.ds = ds
+        self.vort_cache = vort_cache
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        sample = self.ds[idx]
+        return (*sample, self.vort_cache[idx])
+
+
+def pad_collate_with_vort(batch):
+    """Extends pad_collate to handle the extra vorticity field."""
+    vorts = [b[-1] for b in batch]
+    base_batch = [b[:-1] for b in batch]
+    x_pad, y_pad, surf_pad, mask = pad_collate(base_batch)
+    max_n = x_pad.shape[1]
+    vort_pad = torch.zeros(len(vorts), max_n)
+    for i, v in enumerate(vorts):
+        vort_pad[i, :v.shape[0]] = v
+    return x_pad, y_pad, surf_pad, mask, vort_pad
+
+
+_train_ds_base = train_ds  # keep unwrapped reference for stats computation
+if cfg.aux_vorticity and _train_vort_cache:
+    train_ds = VorticityDatasetWrapper(train_ds, _train_vort_cache)
 
 
 def _umag_q(y, mask):
@@ -1127,13 +1249,16 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
 
+_train_collate = pad_collate_with_vort if (cfg.aux_vorticity and _train_vort_cache) else pad_collate
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=cfg.num_workers, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
+train_loader_kwargs = dict(collate_fn=_train_collate, num_workers=cfg.num_workers, pin_memory=True,
+                           persistent_workers=True, prefetch_factor=2)
 
 if cfg.debug:
     # Avoid sampler/length mismatch when train_ds is truncated
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
-                              shuffle=True, **loader_kwargs)
+                              shuffle=True, **train_loader_kwargs)
 else:
     sampler = WeightedRandomSampler(
         weights=sample_weights,
@@ -1141,7 +1266,7 @@ else:
         replacement=True,
     )
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
-                              sampler=sampler, **loader_kwargs)
+                              sampler=sampler, **train_loader_kwargs)
 
 val_loaders = {
     name: DataLoader(subset, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
@@ -1154,7 +1279,7 @@ print("Computing physics normalization stats...")
 _phys_sum = torch.zeros(3, device=device)
 _phys_sq_sum = torch.zeros(3, device=device)
 _phys_n = 0.0
-_stats_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
+_stats_loader = DataLoader(_train_ds_base, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
 with torch.no_grad():
     for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc="Phys stats", leave=False):
         _y, _mask = _y.to(device), _mask.to(device)
@@ -1293,6 +1418,15 @@ if cfg.aft_foil_srf:
               f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, "
               f"film={cfg.aft_foil_srf_film})")
 
+# Vorticity auxiliary head
+vort_head = None
+ema_vort_head = None
+if cfg.aux_vorticity:
+    vort_head = VorticityHead(hidden_dim=cfg.n_hidden).to(device)
+    vort_head = torch.compile(vort_head, mode=cfg.compile_mode)
+    _vort_n_params = sum(p.numel() for p in vort_head.parameters())
+    print(f"Vorticity head: {_vort_n_params:,} params (hidden={cfg.n_hidden // 2})")
+
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
@@ -1318,6 +1452,8 @@ if aft_srf_head is not None:
     n_params += sum(p.numel() for p in aft_srf_head.parameters())
 if aft_srf_ctx_head is not None:
     n_params += sum(p.numel() for p in aft_srf_ctx_head.parameters())
+if vort_head is not None:
+    n_params += sum(p.numel() for p in vort_head.parameters())
 
 
 class SAM:
@@ -1458,6 +1594,10 @@ if aft_srf_ctx_head is not None:
     _ctx_params = list(aft_srf_ctx_head.parameters())
     base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
+if vort_head is not None:
+    _vort_params = list(vort_head.parameters())
+    base_opt.add_param_group({'params': _vort_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _vort_params):,} vorticity head params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
@@ -1505,6 +1645,9 @@ run = wandb.init(
         "train_samples": len(train_ds),
         "val_samples": {k: len(v) for k, v in val_splits.items()},
         "split_manifest": cfg.manifest,
+        "vort_clip_threshold": vort_clip_threshold,
+        "vort_mean": vort_mean,
+        "vort_std": vort_std,
     },
     mode=os.environ.get("WANDB_MODE", "online"),
 )
@@ -1555,14 +1698,23 @@ for epoch in range(MAX_EPOCHS):
         aft_srf_head.train()
     if aft_srf_ctx_head is not None:
         aft_srf_ctx_head.train()
+    if vort_head is not None:
+        vort_head.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
+    epoch_vort = 0.0
     n_batches = 0
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     if cfg.grad_accum_steps > 1:
         optimizer.zero_grad()
-    for batch_idx, (x, y, is_surface, mask) in enumerate(pbar):
+    for batch_idx, batch_data in enumerate(pbar):
+        if cfg.aux_vorticity and len(batch_data) == 5:
+            x, y, is_surface, mask, vort_target_batch = batch_data
+            vort_target_batch = vort_target_batch.to(device, non_blocking=True)
+        else:
+            x, y, is_surface, mask = batch_data
+            vort_target_batch = None
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -1653,6 +1805,9 @@ for epoch in range(MAX_EPOCHS):
                 # Identity for non-tandem samples
                 _dsdf2_scale = _dsdf2_scale * _is_tandem_aug2.float() + (~_is_tandem_aug2).float()
                 x[:, :, 6:10] = x[:, :, 6:10] * _dsdf2_scale.view(-1, 1, 1)
+
+        # Vorticity auxiliary target (pre-computed and cached, already normalized + clipped)
+        vort_target = vort_target_batch  # None if aux_vorticity disabled
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
@@ -1953,6 +2108,16 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # Vorticity auxiliary loss
+        vort_loss = torch.tensor(0.0, device=device)
+        if cfg.aux_vorticity and vort_target is not None and vort_head is not None:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                vort_pred = vort_head(hidden)  # [B, N]
+            vort_pred = vort_pred.float()
+            _vort_mask = mask.float()
+            vort_loss = (torch.abs(vort_pred - vort_target) * _vort_mask).sum() / _vort_mask.sum().clamp(min=1)
+            loss = loss + cfg.aux_vorticity_weight * vort_loss
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -1979,8 +2144,9 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            _vort_shared = cfg.aux_vorticity_weight * 0.5 * vort_loss if cfg.aux_vorticity else 0.0
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + _vort_shared
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + _vort_shared
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -2019,13 +2185,15 @@ for epoch in range(MAX_EPOCHS):
                 is_extreme = torch.zeros(B, dtype=torch.bool, device=device)
                 is_normal_tan = is_tandem_batch
 
+            _vort_shared_3 = cfg.aux_vorticity_weight * 0.5 * vort_loss if cfg.aux_vorticity else 0.0
+
             def _grp_loss(mask_1d):
                 n = mask_1d.float().sum().clamp(min=1)
                 vol_mask_g = vol_mask_train & mask_1d.unsqueeze(1)
                 vol_loss_g = (abs_err * vol_mask_g.unsqueeze(-1)).sum() / vol_mask_g.sum().clamp(min=1)
                 surf_loss_g = (surf_per_sample * mask_1d.float() * tandem_boost).sum() / n
                 coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + _vort_shared_3
 
             loss_A = _grp_loss(~is_tandem_batch)
             # Only include non-empty groups to avoid backward() on no-grad tensors
@@ -2152,11 +2320,22 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for vorticity head
+            if vort_head is not None:
+                _vort_base = vort_head._orig_mod if hasattr(vort_head, '_orig_mod') else vort_head
+                if ema_vort_head is None:
+                    ema_vort_head = deepcopy(_vort_base)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_vort_head.parameters(), _vort_base.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
+        if cfg.aux_vorticity:
+            epoch_vort += vort_loss.item()
         n_batches += 1
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
@@ -2208,6 +2387,8 @@ for epoch in range(MAX_EPOCHS):
                     _blk.attn.slice_mask[active:].fill_(-1e9)
     epoch_vol /= n_batches
     epoch_surf /= n_batches
+    if cfg.aux_vorticity and n_batches > 0:
+        epoch_vort /= n_batches
     prev_vol_loss = epoch_vol
     prev_surf_loss = epoch_surf
     # Snapshot ensemble: save running average at specified epochs
@@ -2227,13 +2408,16 @@ for epoch in range(MAX_EPOCHS):
     _do_val = (epoch + 1) % cfg.val_every == 0 or epoch == 0 or epoch == MAX_EPOCHS - 1
     if not _do_val:
         dt = time.time() - t0
-        wandb.log({
+        _skip_metrics = {
             "train/vol_loss": epoch_vol,
             "train/surf_loss": epoch_surf,
             "epoch_time_s": dt,
             "lr": scheduler.get_last_lr()[0],
             "global_step": global_step,
-        })
+        }
+        if cfg.aux_vorticity:
+            _skip_metrics["train/vort_loss"] = epoch_vort
+        wandb.log(_skip_metrics)
         print(f"Epoch {epoch+1:3d} ({dt:.0f}s)  train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  [val skipped]")
         continue
 
@@ -2588,6 +2772,8 @@ for epoch in range(MAX_EPOCHS):
         "lr": scheduler.get_last_lr()[0],
         "epoch_time_s": dt,
     }
+    if cfg.aux_vorticity:
+        metrics["train/vort_loss"] = epoch_vort
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
@@ -2631,6 +2817,11 @@ for epoch in range(MAX_EPOCHS):
                 aft_srf_ctx_head._orig_mod if hasattr(aft_srf_ctx_head, '_orig_mod') else aft_srf_ctx_head
             )
             torch.save(_ctx_save.state_dict(), model_dir / "aft_srf_ctx_head.pt")
+        if vort_head is not None:
+            _vort_save = ema_vort_head if ema_vort_head is not None else (
+                vort_head._orig_mod if hasattr(vort_head, '_orig_mod') else vort_head
+            )
+            torch.save(_vort_save.state_dict(), model_dir / "vort_head.pt")
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(

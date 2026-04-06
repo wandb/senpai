@@ -18,6 +18,7 @@ dependencies = [
     "weave",
     "tqdm",
     "matplotlib",
+    "scipy>=1.15.3",
 ]
 
 [tool.setuptools.packages.find]
