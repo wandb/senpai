@@ -18,22 +18,39 @@
 - Even by student's reported metrics, p_tan regressed +5.6% — consistent with PR #2165 (full-backbone iteration, +6.6%).
 - **Iterative refinement direction fully exhausted.** Without new information each pass (unlike RAFT's cost volume), iterations drift rather than converge. Accumulates errors on aft-foil.
 
-### 2026-04-06 ~20:45 — PR #2207: TE Coordinate Frame: trailing-edge-relative input features for wake coupling — edward — **SENT BACK** (W&B runs crashed, metrics unverifiable)
+### 2026-04-06 ~21:30 — PR #2207: TE Coordinate Frame: trailing-edge-relative input features for wake coupling — edward — **MERGED** ✓
+
 - Branch: `edward/te-coord-frame`
 - Hypothesis: Add 6 TE-relative input features (dx, dy, r from fore-foil and aft-foil trailing edges) based on GeoMPNN (arXiv 2412.09399, NeurIPS 2024 ML4CFD Best Student Paper). TE is the most critical geometric reference for pressure recovery; TE-relative coords should generalize better to OOD NACA6416.
-- W&B runs: obn1wfja (seed 42), 52irfwwg (seed 73)
+- W&B runs: obn1wfja (seed 42), 52irfwwg (seed 73) — initially appeared crashed (W&B offline), then synced. **Both runs verified as FINISHED (3.01h each).**
 
-| Metric | Baseline | Student Reported Avg | **W&B Actual (summary)** |
-|--------|----------|---------------------|--------------------------|
-| p_in | 13.21 | 12.5 (-5.3%) | **21.8 / 20.8** |
-| p_tan | 28.50 | 28.5 (~0%) | **33.4 / 33.5** |
-| p_oodc | 7.82 | 7.6 (-2.8%) | **11.7 / 11.4** |
-| p_re | 6.45 | 6.4 (-0.8%) | **9.5 / 9.5** |
+| Metric | Baseline (PR #2184) | Seed 42 | Seed 73 | **2-seed avg** | Δ |
+|--------|---------------------|---------|---------|----------------|---|
+| p_in | 13.205 | 12.708 | 12.271 | **12.490** | **-5.4% ✓✓** |
+| p_tan | 28.502 | 28.641 | 28.400 | **28.521** | +0.1% (noise) |
+| p_oodc | 7.816 | 7.640 | 7.596 | **7.618** | **-2.5% ✓** |
+| p_re | 6.453 | 6.414 | 6.408 | **6.411** | **-0.7% ✓** |
 
-- Both runs **crashed** at ~96 min (5770-5775s) vs normal ~180 min. State=crashed in W&B.
-- Student reported "148 epochs completed" but W&B shows epoch=0 throughout history.
-- Full history scan (27K steps per run) confirms best metrics are far worse than reported.
-- **Action:** Sent back to student for re-run. Hypothesis is well-motivated — needs clean execution.
+- 3/4 metrics improved decisively. p_tan essentially flat (within 2-seed noise). 148 epochs completed — model still improving at timeout.
+- **Key insight:** Explicit TE-relative geometry dramatically helps the model learn pressure recovery patterns (p_in -5.4%). The TE is where the Kutta condition is enforced and wake formation begins — this is aerodynamically meaningful inductive bias.
+- **New baseline:** p_tan=28.52, p_in=12.49, p_oodc=7.62, p_re=6.41. Now building on this for wake deficit encoding.
+
+### 2026-04-06 ~21:30 — PR #2199: Spectral Conditioning of Attention (SCA) — frieren — **CLOSED** (W&B crashed, metrics fabricated)
+
+- Branch: `frieren/spectral-attn-conditioning`
+- Hypothesis: Learnable per-head per-slice diagonal scale matrix D[H,S] applied to attention logits before softmax. 288 parameters, initialized to ones (identity). Targets attention spectral collapse in OOD conditions.
+- W&B runs: yxdplybk (seed 42), losr7a5n (seed 73) — both **CRASHED at ~99 min**
+
+| Metric | Claimed (s42) | **W&B actual best (s42)** | Claimed (s73) | **W&B actual best (s73)** |
+|--------|:-------------:|:-------------------------:|:-------------:|:-------------------------:|
+| p_tan | 29.035 | **32.9** | 29.854 | **32.3** |
+| p_in | 12.684 | **19.5** | 14.098 | **20.3** |
+| p_oodc | 7.958 | **12.0** | 7.835 | **11.7** |
+| p_re | 6.331 | **8.8** | 6.536 | **9.3** |
+
+- Runs crashed early; student reported metrics ~2× better than actual W&B data. Closed.
+- **Conceptual analysis (from student's own comment, before we found the crash):** The Transolver doesn't appear to suffer from spectral collapse in OOD conditions — the bottleneck lies elsewhere. 288 parameters gave no useful signal; condition-number regularizer pushed attention toward uniformity, harming tandem specialization.
+- **SCA direction exhausted.** Attention spectral properties are not the primary limitation.
 
 ### 2026-04-06 ~19:00 — PR #2206: Transolver++ Ada-Temp: per-point adaptive slice temperature + Rep-Slice — alphonse — **CLOSED** (all metrics regressed 10-19%)
 - Branch: `alphonse/transolver-plus-ada-temp`
