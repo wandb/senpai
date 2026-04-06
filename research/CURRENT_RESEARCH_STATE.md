@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-06 ~22:00 UTC
+- **Date:** 2026-04-06 ~23:30 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -96,10 +96,12 @@ TE coordinate frame (PR #2207, merged) showed +5.4% p_in improvement. The hypoth
 - Fore-aft cross-attention as SRF REPLACEMENT (#2202) — instability; additive version still viable
 - Laplacian PE (#2190) — random eigenvector sign ambiguity; spectral graph theory doesn't transfer OOD
 
-## Potential Next Hypotheses (Round 14 — from researcher-agent)
+## Potential Next Hypotheses (Round 15 — from researcher-agent 2026-04-06)
 
-1. **pirate-residuals** — PirateNets gated adaptive residuals `x = (1-tanh(s))*x + tanh(s)*f(x)`, s init 0. LOW risk, ~10 LoC.
-2. **mhc-residuals** — Learnable alpha/beta per block for residual blend. MEDIUM-LOW risk.
-3. **tandem-feature-cross** — Sigmoid gate on input features conditioned on (gap, stagger, Re). MEDIUM risk.
-4. **fore-srf-additive-skip** — Fore-foil mean surface hidden state as zero-init additive skip into AftSRF. MEDIUM risk.
-5. Additional geometry encoding variants building on TE frame success.
+1. ~~**pirate-residuals**~~ — ASSIGNED to thorfinn (#2215)
+2. **geotransolver-gale** — Pool per-foil surface hidden states into geometry latent (dim=32), cross-attend slice tokens against it at each TransolverBlock. Zero-init output projection. Targets OOD shape generalization. MEDIUM-HIGH confidence, MEDIUM risk.
+3. **domain-split-srf-norm** — Domain-conditional LayerNorm ONLY in AftSRF MLP (NOT backbone). Separate learned scale/bias deltas for tandem vs single, zero-init. Distinct from dead-end #2164 (backbone-wide). MEDIUM-HIGH confidence, LOW-MEDIUM risk.
+4. **additive-fore-aft-crossattn-srf** — Targeted retry of PR #2202 with ADDITIVE (not replacement) formulation. Keep AftSRF MLP, add parallel cross-attention (aft surface queries fore surface hidden states) with zero-init out_proj. MEDIUM confidence, MEDIUM risk.
+5. **slice-diversity-reg** — Gram matrix orthogonality penalty on slice attention weights `L = λ * ||A^T A / N - I_S||_F^2`. Encourages routing diversity on OOD inputs. Start λ=0.01. MEDIUM confidence, MEDIUM risk.
+6. (Carried from Round 14) **tandem-feature-cross** — Sigmoid gate on input features conditioned on (gap, stagger, Re). MEDIUM risk.
+7. (Carried from Round 14) **fore-srf-additive-skip** — Fore-foil mean surface hidden state as zero-init additive skip into AftSRF. MEDIUM risk.
