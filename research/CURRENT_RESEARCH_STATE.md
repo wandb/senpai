@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-06 ~06:30 UTC
+- **Date:** 2026-04-06 ~10:00 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -44,18 +44,18 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble (29.1) on p_tan.
 
-## Student Status (~06:30 UTC 2026-04-06)
+## Student Status (~10:00 UTC 2026-04-06)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | fern | #2181 | GEPS Test-Time Low-Rank Adaptation for OOD Tandem | WIP |
 | nezuko | #2190 | Laplacian Eigenvector Mesh Positional Encoding | WIP |
 | alphonse | #2192 | Stochastic Depth: Layer Drop Regularization for Transolver | WIP |
-| thorfinn | #2191 | SE(2) AoA-Aligned Spatial Bias: Chord-Frame Slice Routing | WIP |
-| frieren | #2183 | Vorticity Auxiliary Target: explicit wake structure learning | WIP |
+| thorfinn | #2198 | GradNorm Adaptive Loss Weighting for Tandem-Transfer | WIP |
+| frieren | #2199 | Spectral Conditioning of Attention (SCA) to prevent OOD collapse | WIP |
 | edward | #2193 | Curvature-Conditioned Spatial Bias: True Arc-Length Curvature | WIP |
-| tanjiro | #2194 | Inter-Foil Distance Spatial Bias: Aerodynamic Coupling Routing | WIP — just assigned |
-| askeladd | #2196 | Curvature-Adaptive Surface Loss: Spatial High-Frequency Weighting | WIP — just assigned |
+| tanjiro | #2197 | Geometry-Adaptive Curvature Loss Weighting on Surface Nodes | WIP |
+| askeladd | #2195 | Inter-Foil Distance Feature in Spatial Bias Routing | WIP |
 
 **All 8 students active. Zero idle GPUs.**
 
@@ -63,6 +63,8 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
+| #2191 | thorfinn | SE(2) AoA-Aligned Spatial Bias | **CLOSED** | p_tan +1.8% avg (29.0 vs 28.50). All 4 metrics regressed. AoA ±4° → cos(AoA)≈0.998, rotation is near-identity. Existing aug_full_dsdf_rot already provides invariance. |
+| #2183 | frieren | Vorticity Auxiliary Target | **CLOSED** | Never ran. KNN finite-difference vorticity on unstructured mesh too complex for autonomous implementation. |
 | #2189 | tanjiro | DSDF TTA Feature Alignment | **CLOSED** | p_tan +69% (48.20 vs 28.50). Catastrophic. Double-normalizes DSDF, destroys geometry signal. |
 | #2188 | askeladd | MixStyle Tandem Feature Regularization | **CLOSED** | p_tan +18-26%. CFD feature statistics = physics, not nuisance style info. 3rd feature-manipulation failure. |
 | #2187 | edward | Normal-Velocity Hard Constraint | **CLOSED** | p_tan +3.0% (29.34 vs 28.50). Multi-foil normal bug + constraint already ~satisfied. |
@@ -92,10 +94,10 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 2. **Laplacian Eigenvector Mesh PE** (nezuko #2190) — Replace Fourier PE with intrinsic graph Laplacian eigenvectors. High-potential positional encoding overhaul.
 3. **Stochastic Depth** (alphonse #2192) — randomly skip TransolverBlocks during training (p∈{0.05,0.10,0.15}). Standard DeiT/ViT regularizer; forces each layer to be independently useful. 5-line change.
 4. **Curvature-Conditioned Spatial Bias** (edward #2193) — Extend spatial_bias MLP from 6→7 inputs by adding true Menger arc-length curvature at surface nodes. Extends biggest historical win (GSB).
-5. **Vorticity Auxiliary Target** (frieren #2183) — KNN-computed ω as auxiliary prediction target. Forces explicit wake learning.
-6. **SE(2) AoA-Aligned Spatial Bias** (thorfinn #2191) — Rotate (x, y) to AoA-aligned frame before spatial_bias MLP. Makes GSB routing invariant to AoA changes. Extends the biggest historical win.
-7. **Inter-Foil Distance Spatial Bias** (tanjiro #2194) — Add foil2_dist_feat as 7th input to spatial_bias MLP. Per-node aerodynamic coupling signal; extends GSB pattern. Zero for single-foil, meaningful for gap nodes.
-8. **Curvature-Adaptive Surface Loss** (askeladd #2196) — Per-node loss weighting by curvature proxy. Upweights LE/TE nodes (high curvature) by (1+alpha)x. Spatial complement to DCT freq loss. 3 alpha values tested.
+5. **Inter-Foil Distance Feature** (askeladd #2195) — Add `log(1+d_interfoil)` as 7th input to spatial_bias MLP. Distance from each mesh node to foil-2 center. Extends GSB pattern with aerodynamic coupling signal.
+6. **Curvature Loss Weighting** (tanjiro #2197) — Per-node curvature-weighted surface loss: `w_i = 1 + alpha * normalize(|kappa_i|)`. Tests alpha={0.5, 1.0, 2.0}. Upweights LE/TE nodes during training; val metric stays uniform.
+7. **GradNorm Adaptive Loss Weighting** (thorfinn #2198) — Dynamic per-task loss weight balancing via GradNorm algorithm. `task_weights = nn.Parameter(torch.ones(N_tasks))`, grad norms from fc2 of last TransolverBlock, GradNorm loss = L1 norm mismatch, separate Adam lr=1e-3, EMA decay=0.9. Tests `--gradnorm --gradnorm_alpha 1.5`, two seeds {42, 73}.
+8. **Spectral Conditioning of Attention** (frieren #2199) — Learnable diagonal `D = nn.Parameter(torch.ones(n_heads, slice_num))` right-multiplied into attention logits before softmax (~288 params). Applied to all 3 TransolverBlocks. Initialized to identity. Optional condition number regularization via log-variance proxy (`--spectral_attn_conditioning --sac_lambda 0.01`), two seeds {42, 73}.
 
 **Key research patterns:**
 - **What works:** DSDF magnitude augmentation (foil-2 only), specialized correction heads (aft_srf), gradient surgery (2-way PCGrad), tandem-geometry-aware routing (GSB), geometry-conditioned mechanisms
@@ -119,12 +121,22 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 
 ### Round 6 — Researcher-Agent (2026-04-06) — See `/research/RESEARCH_IDEAS_2026-04-06_ROUND6.md`
 1. ~~**Boundary ID 7 Surface Loss Fix**~~ — FALSE ALARM: prepare_multi.py already uses SURFACE_IDS_MULTI=(5,6,7). Comment in train.py:19 is stale.
-2. ~~**SE(2) Chord-Aligned Slice Routing**~~ → thorfinn #2191
+2. ~~**SE(2) Chord-Aligned Slice Routing**~~ → thorfinn #2191 — DEAD END (p_tan +1.8%)
 3. **Hopfield Geometry Memory Bank** — k-NN retrieval: find nearest training geometries at inference, retrieve pressure patterns as SRF prior. Targets NACA6416 distribution shift directly.
 4. ~~**Stochastic Depth**~~ → alphonse #2192
 5. ~~**Curvature-Conditioned Spatial Bias**~~ → edward #2193 (true Menger curvature, not the existing crude proxy)
 6. ~~**Tandem Inter-Foil Distance Feature**~~ → tanjiro #2194
 7. ~~**Geometry-Adaptive Curvature Loss Weighting**~~ → askeladd #2196
+
+### Round 7 — Researcher-Agent (2026-04-06) — See `/research/RESEARCH_IDEAS_2026-04-06_ROUND7.md`
+1. ~~**Inter-Foil Distance Feature in Spatial Bias**~~ → askeladd #2195
+2. ~~**Geometry-Adaptive Curvature Loss Weighting**~~ → tanjiro #2197
+3. **Adaptive Boundary Layer Sampling** — Oversample near-wall mesh nodes during training proportional to gradient magnitude. Dense physics there.
+4. ~~**GradNorm Adaptive Loss Weighting**~~ → thorfinn #2198
+5. **Learned Anisotropic Attention Kernel** — Replace isotropic slice attention with axis-aligned kernel; chord and camber directions have different pressure gradients.
+6. ~~**Spectral Conditioning of Attention**~~ → frieren #2199
+7. **Transient Conditioning** — Condition model on Reynolds number explicitly; separate normalizations per Re regime.
+8. **Hopfield Memory Bank** — k-NN geometry retrieval from training set → pressure prior injection. (Same as Round 6 idea 3, still unassigned.)
 
 ### Human Researcher Directives
 - **#1860 (2026-03-27):** Think bigger — radical new full model changes and data aug.
@@ -194,6 +206,8 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 | **DSDF TTA Feature Alignment** | **#2189** | **p_tan +69% (48.20 vs 28.50). Per-sample normalization destroys geometry-specific DSDF info. Double-normalizes with x-standardization.** |
 | **MixStyle Tandem Feature Regularization** | **#2188** | **p_tan +18-26% (both configs). Feature statistics encode physics (pressure magnitudes, velocity regimes), not nuisance style. Damage scales with mixing strength.** |
 | **⚠️ FEATURE-DISTRIBUTION MANIPULATION** | **#2175,#2189,#2188** | **3 consecutive failures: SWD alignment, raw-input TTA, feature-space MixStyle. ALL catastrophically degrade OOD metrics. Tandem representations are physically meaningful — do NOT perturb at any level.** |
+| **SE(2) AoA-Aligned Spatial Bias** | **#2191** | **p_tan avg +1.8% (29.0 vs 28.50). All 4 metrics regressed. AoA range ±4° makes rotation near-identity (cos≈0.998). aug_full_dsdf_rot already provides this invariance.** |
+| **Vorticity Auxiliary Target** | **#2183** | **Never ran. KNN finite-difference curl on unstructured mesh too complex for autonomous impl. Deferred indefinitely; structured mesh or precomputed ω required.** |
 
 ## Ensemble Seed Pool (Complete)
 
