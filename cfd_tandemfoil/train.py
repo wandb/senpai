@@ -34,7 +34,7 @@ from dataclasses import dataclass, asdict
 from einops import rearrange
 from timm.layers import trunc_normal_
 from tqdm import tqdm
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 import simple_parsing as sp
 
 from data.utils import visualize
@@ -1070,6 +1070,9 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Phase 6: Ensemble distillation
+    ensemble_distill_path: str = ""         # path to pre-computed ensemble soft targets .pt file (empty = disabled)
+    ensemble_distill_alpha: float = 0.3     # weight for soft target loss (0 = GT only, 1 = soft only)
 
 
 cfg = sp.parse(Config)
@@ -1127,21 +1130,64 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
 
-loader_kwargs = dict(collate_fn=pad_collate, num_workers=cfg.num_workers, pin_memory=True,
-                     persistent_workers=True, prefetch_factor=2)
+# Load ensemble soft targets for distillation (if enabled)
+_distill_targets = None
+if cfg.ensemble_distill_path:
+    print(f"Loading ensemble soft targets from {cfg.ensemble_distill_path}...")
+    _distill_targets = torch.load(cfg.ensemble_distill_path, map_location="cpu", weights_only=False)
+    print(f"  Loaded {len(_distill_targets)} soft targets (alpha={cfg.ensemble_distill_alpha})")
+
+def _distill_collate(batch):
+    """Collate that handles optional 4th element (soft target) from distillation wrapper."""
+    if len(batch[0]) == 4:
+        xs, ys, surfs, softs = zip(*batch)
+        x_pad, y_pad, surf_pad, mask = pad_collate(list(zip(xs, ys, surfs)))
+        # Pad soft targets the same way
+        max_n = x_pad.shape[1]
+        B = len(softs)
+        soft_pad = torch.zeros(B, max_n, 3)
+        for i, s in enumerate(softs):
+            if s is not None:
+                n = min(s.shape[0], max_n)
+                soft_pad[i, :n] = s[:n]
+        return x_pad, y_pad, surf_pad, mask, soft_pad
+    else:
+        return pad_collate(batch) + (None,)
+
+if _distill_targets is not None:
+    class _DistillWrapper(Dataset):
+        def __init__(self, ds, targets):
+            self.ds = ds
+            self.targets = targets
+        def __len__(self):
+            return len(self.ds)
+        def __getitem__(self, idx):
+            x, y, is_surf = self.ds[idx]
+            soft = self.targets.get(idx)
+            return x, y, is_surf, soft
+    _train_ds_for_loader = _DistillWrapper(train_ds, _distill_targets)
+    _collate_fn = _distill_collate
+else:
+    _train_ds_for_loader = train_ds
+    _collate_fn = pad_collate
+
+_base_loader_kwargs = dict(num_workers=cfg.num_workers, pin_memory=True,
+                           persistent_workers=True, prefetch_factor=2)
+loader_kwargs = dict(collate_fn=pad_collate, **_base_loader_kwargs)
+_train_loader_kwargs = dict(collate_fn=_collate_fn, **_base_loader_kwargs)
 
 if cfg.debug:
     # Avoid sampler/length mismatch when train_ds is truncated
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
-                              shuffle=True, **loader_kwargs)
+    train_loader = DataLoader(_train_ds_for_loader, batch_size=cfg.batch_size,
+                              shuffle=True, **_train_loader_kwargs)
 else:
     sampler = WeightedRandomSampler(
         weights=sample_weights,
         num_samples=len(train_ds),
         replacement=True,
     )
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
-                              sampler=sampler, **loader_kwargs)
+    train_loader = DataLoader(_train_ds_for_loader, batch_size=cfg.batch_size,
+                              sampler=sampler, **_train_loader_kwargs)
 
 val_loaders = {
     name: DataLoader(subset, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
@@ -1562,7 +1608,13 @@ for epoch in range(MAX_EPOCHS):
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     if cfg.grad_accum_steps > 1:
         optimizer.zero_grad()
-    for batch_idx, (x, y, is_surface, mask) in enumerate(pbar):
+    for batch_idx, batch_data in enumerate(pbar):
+        if len(batch_data) == 5:
+            x, y, is_surface, mask, soft_y = batch_data
+            soft_y = soft_y.to(device, non_blocking=True) if soft_y is not None else None
+        else:
+            x, y, is_surface, mask = batch_data
+            soft_y = None
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -1916,6 +1968,22 @@ for epoch in range(MAX_EPOCHS):
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
         else:
             loss = vol_loss + surf_weight * surf_loss
+
+        # Ensemble distillation loss (pressure only, surface nodes)
+        if soft_y is not None and cfg.ensemble_distill_alpha > 0.0:
+            # Normalize soft_y through the same pipeline as GT
+            _sy_phys = _phys_norm(soft_y, Umag, q)
+            _sy_phys = _sy_phys.clone()
+            _sy_phys[:, :, 2:3] = torch.asinh(_sy_phys[:, :, 2:3] * cfg.asinh_scale)
+            _sy_norm = (_sy_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+            if _freestream is not None:
+                _sy_norm = _sy_norm - _freestream
+            if not cfg.no_perstd and not cfg.raw_targets and not cfg.adaptive_norm:
+                _sy_norm = _sy_norm / sample_stds
+            # L1 on pressure channel only, surface nodes only
+            _distill_err = (pred[:, :, 2:3] - _sy_norm[:, :, 2:3]).abs()
+            _distill_loss = (_distill_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            loss = (1 - cfg.ensemble_distill_alpha) * loss + cfg.ensemble_distill_alpha * _distill_loss
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
