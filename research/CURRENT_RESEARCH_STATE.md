@@ -157,8 +157,24 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 9. **Tandem-Conditioned Feature Cross** (`tandem-feature-cross`) — Tandem-specific multiplicative feature interaction before backbone.
 10. **Fourier Position Embedding for Spatial Bias** (`fourier-pos-embed`) — Replace raw xy with multi-scale sinusoidal features in spatial_bias MLP.
 
+### Round 10 — Researcher-Agent (2026-04-06) — See `/research/RESEARCH_IDEAS_2026-04-06_ROUND10.md`
+1. **Transolver++ Ada-Temp** (`transolver-plus-ada-temp`) — Per-point adaptive softmax temperature + Gumbel reparameterization for slice weight computation. From Transolver++ (arXiv 2502.02414, ICML 2025). 62% surface error reduction in ablations. Distinct from SCA (#2199). **HIGHEST PRIORITY.**
+2. **TE Coordinate Frame** (`te-coord-frame`) — Trailing-edge relative coordinates as additional input features. From GeoMPNN (arXiv 2412.09399, NeurIPS 2024 ML4CFD Best Student). TE is where Kutta condition, pressure recovery, and wake shedding occur.
+3. **Arc-Length Surface Loss** (`arclength-surface-loss`) — Reweight surface loss by arc-length element to correct for non-uniform mesh density at LE/TE. ~15 LoC.
+4. **Polar Coordinate Bias** (`polar-coord-bias`) — Polar coords relative to foil centroid as spatial_bias MLP inputs. GeoMPNN-motivated.
+5. **Domain-Split SRF Norm** (`domain-split-srf-norm`) — Zero-init tandem-specific delta scale/bias in AftFoilRefinementHead LayerNorm.
+6. **Attention Register Tokens** (`attention-register-tokens`) — Learnable global register tokens to prevent attention sink formation (arXiv 2309.16588).
+7. **Pressure-Conditioned Attn Temp** (`pressure-conditioned-attn-temp`) — Lightweight Ada-Temp variant using spatial_bias output. Only if Idea 1 not in-flight.
+
+### Round 9 — Human Suggestions (Issue #1926) — See `/research/RESEARCH_IDEAS_2026-04-06_ROUND9.md`
+1. ~~**NOBLE**~~ → nezuko #2204
+2. **GeoTransolver/GALE** — Geometry context cross-attention per block.
+3. **PirateNets Adaptive Residuals** — Learnable identity-to-transform gating. Prior crash was code bug.
+4. **Moon Optimizer** — Muon variant with corrected update order.
+5. **mHC Residuals** — Manifold-constrained hyper-connections.
+
 ### Human Researcher Directives
-- **#1926 (2026-04-06):** Try NOBLE, XSA (retry), Muon/Gram-NS (retry), HyperP, MSA, mHC, PirateNets, Geosolver, HeavyBall variants. Muon retry assigned immediately (#2203). Researcher-agent generating Round 9 hypotheses for remaining ideas.
+- **#1926 (2026-04-06):** Try NOBLE, XSA (retry), Muon/Gram-NS (retry), HyperP, MSA, mHC, PirateNets, Geosolver, HeavyBall variants. Muon retry assigned (#2203). NOBLE assigned (#2204). Researcher-agent generated Round 9 + Round 10 hypotheses for remaining ideas.
 - **#1860 (2026-03-27):** Think bigger — radical new full model changes and data aug.
 - **#1834 (2026-03-27):** Never use raw data files outside assigned training split.
 
