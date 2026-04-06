@@ -700,10 +700,12 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        interfoil_spatial_bias=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
+        self.interfoil_spatial_bias = interfoil_spatial_bias
         self.pressure_first = pressure_first
         self.ref = ref
         self.unified_pos = unified_pos
@@ -771,12 +773,12 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
-                    spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
+                    spatial_bias_input_dim=7 if (gap_stagger_spatial_bias and interfoil_spatial_bias) else (6 if gap_stagger_spatial_bias else 4),
                 )
                 for idx in range(n_layers)
             ]
         )
-        # Zero-init the 2 new input columns of spatial_bias so initial routing is unchanged
+        # Zero-init new input columns of spatial_bias so initial routing is unchanged
         if gap_stagger_spatial_bias:
             with torch.no_grad():
                 for block in self.blocks:
@@ -887,7 +889,12 @@ class Transolver(nn.Module):
         if self.gap_stagger_spatial_bias:
             # Gap (idx 22) and stagger (idx 23) are global per-sample scalars; broadcast to all nodes
             gap_stagger = x[:, 0:1, 22:24].expand(-1, x.shape[1], -1)  # [B, N, 2]
-            raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26], gap_stagger], dim=-1)  # [B, N, 6]
+            if self.interfoil_spatial_bias:
+                # foil2_dist_sb is appended after curv(24) and dist(25), at index 26
+                foil2_dist_sb = x[:, :, 26:27]  # [B, N, 1]
+                raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26], gap_stagger, foil2_dist_sb], dim=-1)  # [B, N, 7]
+            else:
+                raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26], gap_stagger], dim=-1)  # [B, N, 6]
         else:
             raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)  # x, y, curvature, dist
 
@@ -1020,6 +1027,7 @@ class Config:
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
     gap_stagger_spatial_bias: bool = False  # condition spatial bias MLP on gap/stagger (tandem geometry-aware routing)
+    interfoil_spatial_bias: bool = False    # add foil2_dist to spatial_bias inputs (requires gap_stagger_spatial_bias)
     dct_freq_loss: bool = False   # DCT frequency-weighted auxiliary loss on surface pressure
     dct_freq_weight: float = 0.05 # weight for DCT freq loss
     dct_freq_gamma: float = 2.0   # frequency upweighting strength
@@ -1204,7 +1212,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (1 if cfg.interfoil_spatial_bias else 0) + 32,  # +curv, +dist, [+foil2dist], [+interfoil_dist], +32 fourier PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1234,6 +1242,7 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    interfoil_spatial_bias=cfg.interfoil_spatial_bias,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1676,11 +1685,14 @@ for epoch in range(MAX_EPOCHS):
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+        _extra_feats = [curv, dist_feat]
         if cfg.foil2_dist:
             foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
-            x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
-        else:
-            x = torch.cat([x, curv, dist_feat], dim=-1)
+            _extra_feats.append(foil2_dist_feat)
+        if cfg.interfoil_spatial_bias:
+            foil2_dist_feat_sb = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+            _extra_feats.append(foil2_dist_feat_sb)
+        x = torch.cat([x] + _extra_feats, dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2350,11 +2362,14 @@ for epoch in range(MAX_EPOCHS):
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                _extra_feats_v = [curv, dist_feat]
                 if cfg.foil2_dist:
                     foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
-                    x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
-                else:
-                    x = torch.cat([x, curv, dist_feat], dim=-1)
+                    _extra_feats_v.append(foil2_dist_feat)
+                if cfg.interfoil_spatial_bias:
+                    foil2_dist_feat_sb = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                    _extra_feats_v.append(foil2_dist_feat_sb)
+                x = torch.cat([x] + _extra_feats_v, dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2837,11 +2852,14 @@ if cfg.surface_refine and best_metrics:
                     _raw_aoa = x[:, 0, 14:15]
                     x = (x - stats["x_mean"]) / stats["x_std"]
                     curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                    _extra_feats_r = [curv, dist_feat]
                     if cfg.foil2_dist:
                         foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
-                        x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
-                    else:
-                        x = torch.cat([x, curv, dist_feat], dim=-1)
+                        _extra_feats_r.append(foil2_dist_feat)
+                    if cfg.interfoil_spatial_bias:
+                        foil2_dist_feat_sb = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                        _extra_feats_r.append(foil2_dist_feat_sb)
+                    x = torch.cat([x] + _extra_feats_r, dim=-1)
                     raw_xy = x[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
                     xy_max = raw_xy.amax(dim=1, keepdim=True)
