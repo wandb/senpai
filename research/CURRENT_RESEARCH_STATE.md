@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-07 ~07:30 UTC
+- **Date:** 2026-04-06 ~21:30 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -54,11 +54,11 @@ Single-model p_tan (28.52) already **BEATS** ensemble (29.1). Gap continues to w
 | alphonse | #2219 | Additive Fore→Aft Cross-Attention in AftSRF | WIP (just assigned) |
 | thorfinn | #2216 | GeoTransolver GALE (geometry-latent cross-attention) | WIP |
 | tanjiro | #2218 | LE Coordinate Frame: leading-edge-relative input features | WIP (just assigned) |
-| askeladd | #2212 | Analytical Cp Delta (thin-airfoil SRF) | WIP |
+| askeladd | — | **IDLE** (PR #2212 closed — dead end) | Needs assignment |
 | frieren | #2213 | Wake Deficit Feature (gap-normalized fore-TE offset) | WIP |
 | edward | #2214 | Deep Supervision on fx_deep intermediate rep | WIP |
 
-**All 8 students active. Zero idle GPUs.**
+**7 students active, 1 idle (askeladd). Assigning new experiment.**
 
 ### Closed/Merged this cycle (2026-04-06 to 2026-04-07)
 - #2218 tanjiro: LE Coordinate Frame — ASSIGNED. Leading-edge-relative input features (+6 channels), mirroring successful TE coord frame.
@@ -69,6 +69,7 @@ Single-model p_tan (28.52) already **BEATS** ensemble (29.1). Gap continues to w
 - #2205 nezuko: NOBLE Nonlinear Low-Rank Branches — CLOSED. All metrics regressed 5-19%. CosNet periodic activation introduces oscillatory gradients.
 - #2215 thorfinn: PirateNets Adaptive Residuals — MERGED by human (tcapelle) as no-op. Hypothesis untested.
 - #2209 thorfinn: Attention Register Tokens — CLOSED. p_tan +4.0% regression. Register tokens solve a problem that doesn't exist in Transolver.
+- #2212 askeladd: Analytical Cp Delta — CLOSED. Simplified AoA-based thin-airfoil Cp baseline too crude; p_oodc +50%, p_re +34%. DSDF features are distances, not normals.
 
 ## Human Research Directives (from GitHub Issues)
 
@@ -91,7 +92,7 @@ TE coordinate frame (PR #2207, merged) showed +5.4% p_in improvement. The hypoth
 - **#2216 thorfinn:** GeoTransolver GALE — pool per-foil surface features → geometry latent (dim=32) → cross-attend slice tokens in each TransolverBlock. Based on arXiv 2412.14171. Zero-init out_proj.
 - **#2219 alphonse:** Fore→Aft Cross-Attention Additive — per-node cross-attention from aft surface to fore surface in AftSRF. Directly targets p_tan by giving aft nodes spatially-resolved fore-foil context. Complements #2217 (global mean) with fine-grained per-node attention.
 - **#2217 nezuko:** Fore-SRF Skip — coarse global mean of fore surface hidden into AftSRF. A weaker version of #2219 to test whether fore-foil info helps at all.
-- **#2212 askeladd:** Analytical Cp delta (thin-airfoil physics prior as SRF correction baseline).
+- ~~**#2212 askeladd:** Analytical Cp delta~~ — CLOSED. Simplified AoA-based Cp baseline too crude; p_oodc +50%, p_re +34%. DSDF features confirmed as distances, not normals.
 - ~~**#2205 nezuko:** NOBLE/CosNet FFN branches~~ — CLOSED. Periodic activations interfere with smooth pressure landscape.
 - ~~**#2197 tanjiro:** Curvature loss weighting~~ — CLOSED. Noisy curvature proxy from standardized features.
 
@@ -107,6 +108,7 @@ TE coordinate frame (PR #2207, merged) showed +5.4% p_in improvement. The hypoth
 - Iterative SRF/RAFT-style heads (#2208, #2165) — iterations drift without new info per pass
 - Fore-aft cross-attention as SRF REPLACEMENT (#2202) — instability; additive version still viable
 - Laplacian PE (#2190) — random eigenvector sign ambiguity; spectral graph theory doesn't transfer OOD
+- Analytical Cp delta (#2212) — simplified Cp ≈ -2α × sign(y) baseline too crude; DSDF features are clamped SDF distances (not normals); p_oodc +50%, p_re +34%
 
 ## Potential Next Hypotheses (Round 16/17)
 

@@ -2772,3 +2772,22 @@ Baseline (PR #2184): p_in=13.205, p_oodc=7.816, p_tan=28.502, p_re=6.453
 - **Decision: CLOSED** — p_tan regresses 2.6% on 2-seed average (29.25 vs 28.50). Even worse vs current baseline (28.52).
 - **Analysis:** Seed 42 looks individually close to baseline (p_tan=28.6), but seed 73 shows large p_tan regression (29.9). The finite-difference dp/ds proxy sorted by x-coordinate is fundamentally flawed for closed airfoil geometries: at the leading edge, upper and lower surface nodes overlap in x, causing the sort to conflate nodes from different surfaces and generating spurious large gradients. DCT freq loss (merged) is robust to this ordering problem because it operates in frequency space.
 - **Student's follow-up suggestions:** (1) Arc-length-ordered dp/ds (fern #2210 addresses this with arc-length reweighting); (2) Lower weight dp_ds_weight=0.02; (3) Aft-foil-only dp/ds. The fundamental ordering instability needs resolution before these variations would help.
+
+### 2026-04-06 ~21:16 — PR #2212: Analytical Cp Delta (thin-airfoil physics baseline for SRF correction) — askeladd — **CLOSED** (p_oodc +50%, p_re +34%, clear dead end)
+- Branch: `askeladd/analytical-cp-delta`
+- **Hypothesis:** Subtract analytical thin-airfoil Cp baseline from SRF head predictions so the head only learns the residual delta. Based on DeltaPhi principle (residual learning on physics baseline) — analogous to residual_prediction but at the surface level.
+- **Implementation note:** Student discovered that DSDF features at indices 4:12 are multi-scale clamped SDF **distances** (range 0-5), NOT surface normal components as assumed in the PR instructions. Pivoted to simplified AoA-based baseline: `Cp ≈ -2α × sign(y)` (upper surface suction, lower surface pressure).
+- W&B runs: e7lucein (seed 42), vuxgzmui (seed 73)
+- W&B group: `askeladd/analytical-cp-delta`
+
+| Metric | Baseline (PR #2207, current) | Seed 42 | Seed 73 | **2-seed avg** | Δ vs current |
+|--------|------------------------------|---------|---------|----------------|--------------|
+| p_in   | 12.490                       | 13.4    | 14.3    | **13.85**      | **+10.9% ✗** |
+| p_oodc | 7.618                        | 11.9    | 10.9    | **11.40**      | **+49.7% ✗** |
+| **p_tan** | **28.521**                | 27.8    | 28.8    | **28.30**      | -0.8% ✓ (marginal) |
+| p_re   | 6.411                        | 8.8     | 8.4     | **8.60**       | **+34.2% ✗** |
+
+- **Decision: CLOSED — clear dead end.** Massive regressions on p_oodc (+50%), p_re (+34%), and p_in (+11%). Only p_tan marginally improved (-0.8%), far from compensating.
+- **Analysis:** The simplified `Cp ≈ -2α × sign(y)` baseline is too crude for effective residual learning: (1) Assumes symmetric airfoils — NACA profiles have camber; (2) Ignores thickness, local curvature, and separation effects; (3) For OOD conditions (different Re, AoA ranges), the baseline mismatch grows; (4) The SRF head must now correct both the baseline error AND the actual physics delta, making the task harder. The original hypothesis (using DSDF normal components) was invalidated by the data format discovery.
+- **Key insight for future experiments:** DSDF features at x[:,4:12] are multi-scale clamped SDF distance values, NOT gradient/normal components. Any experiment using these as normals will fail. Proper surface normals would require computing finite-difference gradients of the SDF field.
+- **Student's follow-up suggestions:** (1) Close approach (agreed); (2) Revisit with proper surface normals if available; (3) Learned per-node baseline (small MLP) — this is a different hypothesis worth considering separately.
