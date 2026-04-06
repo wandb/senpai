@@ -44,13 +44,13 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble (29.1) on p_tan.
 
-## Student Status (~10:00 UTC 2026-04-06)
+## Student Status (~11:00 UTC 2026-04-06)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | fern | #2181 | GEPS Test-Time Low-Rank Adaptation for OOD Tandem | WIP |
 | nezuko | #2190 | Laplacian Eigenvector Mesh Positional Encoding | WIP |
-| alphonse | #2192 | Stochastic Depth: Layer Drop Regularization for Transolver | WIP |
+| alphonse | #2200 | Local KNN Attention: parallel local pathway in TransolverBlock | WIP |
 | thorfinn | #2198 | GradNorm Adaptive Loss Weighting for Tandem-Transfer | WIP |
 | frieren | #2199 | Spectral Conditioning of Attention (SCA) to prevent OOD collapse | WIP |
 | edward | #2193 | Curvature-Conditioned Spatial Bias: True Arc-Length Curvature | WIP |
@@ -92,7 +92,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 **Active experiments (8 students WIP):**
 1. **GEPS Test-Time Adaptation** (fern #2181) — LoRA context params + continuity residual TTA at inference. Zero training change.
 2. **Laplacian Eigenvector Mesh PE** (nezuko #2190) — Replace Fourier PE with intrinsic graph Laplacian eigenvectors. High-potential positional encoding overhaul.
-3. **Stochastic Depth** (alphonse #2192) — randomly skip TransolverBlocks during training (p∈{0.05,0.10,0.15}). Standard DeiT/ViT regularizer; forces each layer to be independently useful. 5-line change.
+3. **Local KNN Attention** (alphonse #2200) — parallel k-nearest-neighbor local attention pathway alongside global slice attention in TransolverBlock. Captures fine-scale boundary layer and wake physics missed by coarse global slicing. Zero-init gating for safe integration.
 4. **Curvature-Conditioned Spatial Bias** (edward #2193) — Extend spatial_bias MLP from 6→7 inputs by adding true Menger arc-length curvature at surface nodes. Extends biggest historical win (GSB).
 5. **Inter-Foil Distance Feature** (askeladd #2195) — Add `log(1+d_interfoil)` as 7th input to spatial_bias MLP. Distance from each mesh node to foil-2 center. Extends GSB pattern with aerodynamic coupling signal.
 6. **Curvature Loss Weighting** (tanjiro #2197) — Per-node curvature-weighted surface loss: `w_i = 1 + alpha * normalize(|kappa_i|)`. Tests alpha={0.5, 1.0, 2.0}. Upweights LE/TE nodes during training; val metric stays uniform.
@@ -208,6 +208,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 | **⚠️ FEATURE-DISTRIBUTION MANIPULATION** | **#2175,#2189,#2188** | **3 consecutive failures: SWD alignment, raw-input TTA, feature-space MixStyle. ALL catastrophically degrade OOD metrics. Tandem representations are physically meaningful — do NOT perturb at any level.** |
 | **SE(2) AoA-Aligned Spatial Bias** | **#2191** | **p_tan avg +1.8% (29.0 vs 28.50). All 4 metrics regressed. AoA range ±4° makes rotation near-identity (cos≈0.998). aug_full_dsdf_rot already provides this invariance.** |
 | **Vorticity Auxiliary Target** | **#2183** | **Never ran. KNN finite-difference curl on unstructured mesh too complex for autonomous impl. Deferred indefinitely; structured mesh or precomputed ω required.** |
+| **Stochastic Depth** | **#2192** | **p_tan +2.1% (29.10 avg). Layer drop regularizer absorbed by EMA + cosine schedule. 3-layer backbone too shallow for drop path benefit (DeiT uses 12+ layers).** |
 
 ## Ensemble Seed Pool (Complete)
 
