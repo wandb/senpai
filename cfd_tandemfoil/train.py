@@ -253,6 +253,73 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         return self.to_out(out_x)
 
 
+class LocalKNNAttention(nn.Module):
+    """Sparse local attention: strided anchor sampling + soft scatter back to all nodes.
+
+    For large meshes (N~120k), full pairwise KNN is infeasible. This module:
+    1. Selects M evenly-strided anchor nodes (deterministic, torch.compile-friendly)
+    2. Runs full self-attention among M anchors: O(M^2), M=512 → 262k ops (fast)
+    3. Propagates anchor updates to all N nodes via soft inverse-distance weighting
+       using k nearest anchors per node (k=self.k, tiny M^2 lookup)
+
+    Gate init=0 ensures model starts identical to baseline.
+    """
+    def __init__(self, n_hidden, n_heads, k=16, n_anchors=512):
+        super().__init__()
+        self.k = k
+        self.n_anchors = n_anchors
+        self.n_heads = n_heads
+        self.head_dim = n_hidden // n_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(n_hidden, 3 * n_hidden)
+        self.out_proj = nn.Linear(n_hidden, n_hidden)
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x, coords):
+        """
+        x: (B, N, C) — hidden features
+        coords: (B, N, 2) — spatial coordinates
+        """
+        B, N, C = x.shape
+        M = min(self.n_anchors, N)
+        k = min(self.k, M)
+
+        # Evenly-strided anchor selection — deterministic, no graph breaks
+        stride = max(1, N // M)
+        anchor_idx = torch.arange(0, M * stride, stride, device=x.device)[:M]  # (M,)
+        anchor_idx = anchor_idx.unsqueeze(0).expand(B, M)  # (B, M)
+
+        # Gather anchor features: (B, M, C)
+        anchor_exp = anchor_idx.unsqueeze(-1).expand(B, M, C)
+        x_anchors = x.gather(1, anchor_exp)
+
+        # Self-attention among M anchors: O(M^2) = O(512^2) ≈ fast
+        qkv = self.qkv(x_anchors).reshape(B, M, 3, self.n_heads, self.head_dim)
+        q, k_a, v_a = qkv.unbind(dim=2)  # each (B, M, H, D)
+        attn = torch.einsum('bihd,bjhd->bijh', q, k_a) * self.scale  # (B, M, M, H)
+        attn = attn.softmax(dim=2)
+        out_anchors = torch.einsum('bijh,bjhd->bihd', attn, v_a).reshape(B, M, C)
+        out_anchors = self.out_proj(out_anchors)  # (B, M, C)
+
+        # Soft propagation: each of N nodes gets a weighted sum of k nearest anchor outputs
+        # Anchor coords: (B, M, 2)
+        anchor_coords = coords.float().gather(1, anchor_idx.unsqueeze(-1).expand(B, M, 2))
+        # Node-to-anchor distances: (B, N, M) — M=512 fits in memory (4×120k×512×4 ≈ 1GB)
+        d2 = ((coords.float().unsqueeze(2) - anchor_coords.unsqueeze(1)) ** 2).sum(-1)  # (B, N, M)
+        # Top-k nearest anchors per node (k is small, e.g., 4-8)
+        neg_d2_topk, topk_anchor = (-d2).topk(k, dim=2)  # (B, N, k)
+        weights = neg_d2_topk.softmax(dim=2)              # (B, N, k)
+
+        # Gather k anchor outputs per node: avoid O(B*N*M*C) expansion
+        # topk_anchor: (B, N, k) → flat gather from out_anchors (B, M, C)
+        topk_flat = topk_anchor.reshape(B, N * k)                    # (B, N*k)
+        topk_flat_exp = topk_flat.unsqueeze(-1).expand(B, N * k, C)
+        anchor_out_k = out_anchors.gather(1, topk_flat_exp).reshape(B, N, k, C)  # (B, N, k, C)
+        out = (weights.unsqueeze(-1) * anchor_out_k).sum(2)  # (B, N, C)
+
+        return out * self.gate.tanh()
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -283,11 +350,15 @@ class TransolverBlock(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         spatial_bias_input_dim=4,
+        local_knn_attn=False,
+        local_knn_k=16,
     ):
         super().__init__()
         self.last_layer = last_layer
         self.field_decoder = field_decoder
         self.domain_velhead = domain_velhead
+        # Local KNN attention pathway (parallel to global slice attention)
+        self.local_attn = LocalKNNAttention(hidden_dim, num_heads, k=local_knn_k) if local_knn_attn else None
         self.pressure_first = pressure_first
         self.pressure_no_detach = pressure_no_detach
         self.adaln_output = adaln_output
@@ -400,15 +471,24 @@ class TransolverBlock(nn.Module):
             def _ln(m, x): return m(x, is_tandem=dln_it)
         else:
             def _ln(m, x): return m(x)
+        # Local KNN attention coords: first 2 columns of raw_xy are (x, y) spatial coords
+        _xy_coords = raw_xy[:, :, :2] if (self.local_attn is not None and raw_xy is not None) else None
         if self.adaln_all and condition is not None:
             cond_out = self.adaln_net(condition)  # [B, H*4]
             s1, b1, s2, b2 = cond_out.chunk(4, dim=-1)  # each [B, H]
             fx_norm = _ln(self.ln_1, fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
-            fx = _ln(self.ln_1_post, self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            attn_out = self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features)
+            if self.local_attn is not None and _xy_coords is not None:
+                attn_out = attn_out + self.local_attn(fx_norm, _xy_coords)
+            fx = _ln(self.ln_1_post, attn_out + fx)
             fx_norm = _ln(self.ln_2, fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
             fx = _ln(self.ln_2_post, self.mlp(fx_norm) + fx)
         else:
-            fx = _ln(self.ln_1_post, self.attn(_ln(self.ln_1, fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            fx_norm = _ln(self.ln_1, fx)
+            attn_out = self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features)
+            if self.local_attn is not None and _xy_coords is not None:
+                attn_out = attn_out + self.local_attn(fx_norm, _xy_coords)
+            fx = _ln(self.ln_1_post, attn_out + fx)
             fx = _ln(self.ln_2_post, self.mlp(_ln(self.ln_2, fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
@@ -700,6 +780,8 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        local_knn_attn=False,
+        local_knn_k=16,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -772,6 +854,8 @@ class Transolver(nn.Module):
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
                     spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
+                    local_knn_attn=local_knn_attn,
+                    local_knn_k=local_knn_k,
                 )
                 for idx in range(n_layers)
             ]
@@ -1074,6 +1158,9 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Phase 6: Local KNN attention — parallel local pathway alongside global slice attention
+    local_knn_attn: bool = False            # enable local k-nearest-neighbor attention pathway
+    local_knn_k: int = 16                   # number of nearest neighbors for local attention
 
 
 cfg = sp.parse(Config)
@@ -1234,6 +1321,8 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    local_knn_attn=cfg.local_knn_attn,
+    local_knn_k=cfg.local_knn_k,
 )
 
 model = Transolver(**model_config).to(device)
