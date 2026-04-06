@@ -34,7 +34,7 @@ from dataclasses import dataclass, asdict
 from einops import rearrange
 from timm.layers import trunc_normal_
 from tqdm import tqdm
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 import simple_parsing as sp
 
 from data.utils import visualize
@@ -1024,6 +1024,9 @@ class Config:
     dct_freq_weight: float = 0.05 # weight for DCT freq loss
     dct_freq_gamma: float = 2.0   # frequency upweighting strength
     dct_freq_alpha: float = 1.5   # frequency exponent
+    laplacian_pe: bool = False    # replace Fourier PE with Laplacian eigenvector PE
+    laplacian_pe_k: int = 16      # number of Laplacian eigenvectors
+    lap_pe_cache_dir: str = "cache/lap_pe/"  # path to cached PE files
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1093,6 +1096,26 @@ train_ds, val_splits, stats, sample_weights = load_data(
 )
 stats = {k: v.to(device) for k, v in stats.items()}
 
+# Load Laplacian PE cache if enabled
+_lap_pe_all = {}  # global_idx -> (N, k) tensor
+if cfg.laplacian_pe:
+    from pathlib import Path as _Path
+    _lap_dir = _Path(cfg.lap_pe_cache_dir)
+    for _f in sorted(_lap_dir.glob("lap_pe_*.pt")):
+        _idx = int(_f.stem.split("_")[-1])
+        _lap_pe_all[_idx] = torch.load(_f, map_location="cpu", weights_only=True)[:, :cfg.laplacian_pe_k]
+    print(f"Loaded {len(_lap_pe_all)} Laplacian PE files from {_lap_dir} (k={cfg.laplacian_pe_k})")
+
+    # Create index-returning wrapper for Subset
+    class _IndexedSubset(Subset):
+        __getitems__ = None  # disable batch fetching so __getitem__ is always used
+        def __getitem__(self, idx):
+            glob_idx = self.indices[idx]
+            return (*self.dataset[glob_idx], glob_idx)
+    # Replace train_ds and val_splits with indexed versions
+    train_ds = _IndexedSubset(train_ds.dataset, train_ds.indices)
+    val_splits = {k: _IndexedSubset(v.dataset, v.indices) for k, v in val_splits.items()}
+
 
 def _umag_q(y, mask):
     """Per-sample reference velocity and dynamic pressure from mean velocity.
@@ -1131,7 +1154,30 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
 
-loader_kwargs = dict(collate_fn=pad_collate, num_workers=cfg.num_workers, pin_memory=True,
+def _collate_with_lap_pe(batch):
+    """Collate that handles (x, y, surf, glob_idx) tuples and constructs lap_pe batch."""
+    xs, ys, surfs, idxs = zip(*batch)
+    max_n = max(x.shape[0] for x in xs)
+    B = len(xs)
+    x_pad = torch.zeros(B, max_n, xs[0].shape[1])
+    y_pad = torch.zeros(B, max_n, ys[0].shape[1])
+    surf_pad = torch.zeros(B, max_n, dtype=torch.bool)
+    mask_pad = torch.zeros(B, max_n, dtype=torch.bool)
+    pe_pad = torch.zeros(B, max_n, cfg.laplacian_pe_k)
+    for i, (x, y, sf, gi) in enumerate(zip(xs, ys, surfs, idxs)):
+        n = x.shape[0]
+        x_pad[i, :n] = x
+        y_pad[i, :n] = y
+        surf_pad[i, :n] = sf
+        mask_pad[i, :n] = True
+        pe = _lap_pe_all.get(gi)
+        if pe is not None:
+            _m = min(n, pe.shape[0])
+            pe_pad[i, :_m] = pe[:_m]
+    return x_pad, y_pad, surf_pad, mask_pad, pe_pad
+
+_collate_fn = _collate_with_lap_pe if cfg.laplacian_pe else pad_collate
+loader_kwargs = dict(collate_fn=_collate_fn, num_workers=cfg.num_workers, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
 
 if cfg.debug:
@@ -1160,7 +1206,8 @@ _phys_sq_sum = torch.zeros(3, device=device)
 _phys_n = 0.0
 _stats_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
 with torch.no_grad():
-    for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc="Phys stats", leave=False):
+    for _stat_batch in tqdm(_stats_loader, desc="Phys stats", leave=False):
+        _x, _y, _is_surf, _mask = _stat_batch[0], _stat_batch[1], _stat_batch[2], _stat_batch[3]
         _y, _mask = _y.to(device), _mask.to(device)
         _Um, _q = _umag_q(_y, _mask)
         _yp = _phys_norm(_y, _Um, _q)
@@ -1186,7 +1233,8 @@ if cfg.raw_targets or cfg.adaptive_norm:
     _raw_sq_sum = torch.zeros(3, device=device)
     _raw_n = 0.0
     with torch.no_grad():
-        for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc=f"{_label} stats", leave=False):
+        for _stat_batch in tqdm(_stats_loader, desc=f"{_label} stats", leave=False):
+            _x, _y, _is_surf, _mask = _stat_batch[0], _stat_batch[1], _stat_batch[2], _stat_batch[3]
             _y, _mask = _y.to(device), _mask.to(device)
             _yt = _y.clone()
             if cfg.adaptive_norm and cfg.asinh_pressure:
@@ -1204,7 +1252,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (cfg.laplacian_pe_k if cfg.laplacian_pe else 32),  # +curv, +dist, [+foil2dist], +PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1566,7 +1614,12 @@ for epoch in range(MAX_EPOCHS):
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     if cfg.grad_accum_steps > 1:
         optimizer.zero_grad()
-    for batch_idx, (x, y, is_surface, mask) in enumerate(pbar):
+    for batch_idx, _batch in enumerate(pbar):
+        if cfg.laplacian_pe:
+            x, y, is_surface, mask, _batch_lap_pe = _batch
+            _batch_lap_pe = _batch_lap_pe.to(device, non_blocking=True)
+        else:
+            x, y, is_surface, mask = _batch
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -1681,16 +1734,18 @@ for epoch in range(MAX_EPOCHS):
             x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
         else:
             x = torch.cat([x, curv, dist_feat], dim=-1)
-        # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
-        raw_xy = x[:, :, :2]
-        # Normalize xy to [0,1] per-sample for consistent Fourier encoding
-        xy_min = raw_xy.amin(dim=1, keepdim=True)
-        xy_max = raw_xy.amax(dim=1, keepdim=True)
-        xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-        freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-        xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
-        x = torch.cat([x, fourier_pe], dim=-1)
+        # Positional encoding: Laplacian eigenvectors OR Fourier PE
+        if cfg.laplacian_pe:
+            x = torch.cat([x, _batch_lap_pe], dim=-1)
+        else:
+            raw_xy = x[:, :, :2]
+            xy_min = raw_xy.amin(dim=1, keepdim=True)
+            xy_max = raw_xy.amax(dim=1, keepdim=True)
+            xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+            freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+            xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
+            fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+            x = torch.cat([x, fourier_pe], dim=-1)
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -2329,9 +2384,14 @@ for epoch in range(MAX_EPOCHS):
         n_vbatches = 0
 
         with torch.no_grad():
-            for x, y, is_surface, mask in tqdm(
+            for _vbatch in tqdm(
                 vloader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [{split_name}]", leave=False
             ):
+                if cfg.laplacian_pe:
+                    x, y, is_surface, mask, _batch_lap_pe = _vbatch
+                    _batch_lap_pe = _batch_lap_pe.to(device, non_blocking=True)
+                else:
+                    x, y, is_surface, mask = _vbatch
                 x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
@@ -2355,16 +2415,18 @@ for epoch in range(MAX_EPOCHS):
                     x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
                 else:
                     x = torch.cat([x, curv, dist_feat], dim=-1)
-                # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
-                raw_xy = x[:, :, :2]
-                # Normalize xy to [0,1] per-sample for consistent Fourier encoding
-                xy_min = raw_xy.amin(dim=1, keepdim=True)
-                xy_max = raw_xy.amax(dim=1, keepdim=True)
-                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
-                xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
-                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
-                x = torch.cat([x, fourier_pe], dim=-1)
+                # Positional encoding: Laplacian eigenvectors OR Fourier PE
+                if cfg.laplacian_pe:
+                    x = torch.cat([x, _batch_lap_pe], dim=-1)
+                else:
+                    raw_xy = x[:, :, :2]
+                    xy_min = raw_xy.amin(dim=1, keepdim=True)
+                    xy_max = raw_xy.amax(dim=1, keepdim=True)
+                    xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                    freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                    xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
+                    fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+                    x = torch.cat([x, fourier_pe], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
@@ -2729,7 +2791,11 @@ if best_metrics:
         for split_name, split_ds in val_splits.items():
             samples = []
             for i in range(min(n, len(split_ds))):
-                x, y_true, is_surface = split_ds[i]
+                _vis_sample = split_ds[i]
+                if cfg.laplacian_pe:
+                    x, y_true, is_surface, _vis_glob_idx = _vis_sample
+                else:
+                    x, y_true, is_surface = _vis_sample
                 with torch.no_grad():
                     x_dev = x.unsqueeze(0).to(device)
                     y_dev = y_true.unsqueeze(0).to(device)
@@ -2741,15 +2807,23 @@ if best_metrics:
                     x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                     curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                     x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
-                    # Fourier PE (must match training loop)
-                    raw_xy = x_n[:, :, :2]
-                    xy_min = raw_xy.amin(dim=1, keepdim=True)
-                    xy_max = raw_xy.amax(dim=1, keepdim=True)
-                    xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                    freqs = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
-                    xy_scaled = xy_norm.unsqueeze(-1) * freqs
-                    fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
-                    x_n = torch.cat([x_n, fourier_pe], dim=-1)
+                    # Positional encoding (must match training loop)
+                    if cfg.laplacian_pe:
+                        _vis_pe = _lap_pe_all.get(_vis_glob_idx)
+                        if _vis_pe is not None:
+                            _vis_pe_dev = _vis_pe[:x_dev.shape[1]].unsqueeze(0).to(device)
+                        else:
+                            _vis_pe_dev = torch.zeros(1, x_dev.shape[1], cfg.laplacian_pe_k, device=device)
+                        x_n = torch.cat([x_n, _vis_pe_dev], dim=-1)
+                    else:
+                        raw_xy = x_n[:, :, :2]
+                        xy_min = raw_xy.amin(dim=1, keepdim=True)
+                        xy_max = raw_xy.amax(dim=1, keepdim=True)
+                        xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                        freqs = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
+                        xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                        x_n = torch.cat([x_n, fourier_pe], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
                     pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
                     if cfg.raw_targets:
@@ -2820,7 +2894,12 @@ if cfg.surface_refine and best_metrics:
             all_re_values = []  # Reynolds numbers for correlation check
 
             with torch.no_grad():
-                for x, y, is_surface, mask in tqdm(_ood_re_loader, desc="Verify OOD-Re", leave=False):
+                for _ver_batch in tqdm(_ood_re_loader, desc="Verify OOD-Re", leave=False):
+                    if cfg.laplacian_pe:
+                        x, y, is_surface, mask, _batch_lap_pe = _ver_batch
+                        _batch_lap_pe = _batch_lap_pe.to(device, non_blocking=True)
+                    else:
+                        x, y, is_surface, mask = _ver_batch
                     x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
                     is_surface = is_surface.to(device, non_blocking=True)
                     mask = mask.to(device, non_blocking=True)
@@ -2842,14 +2921,17 @@ if cfg.surface_refine and best_metrics:
                         x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
                     else:
                         x = torch.cat([x, curv, dist_feat], dim=-1)
-                    raw_xy = x[:, :, :2]
-                    xy_min = raw_xy.amin(dim=1, keepdim=True)
-                    xy_max = raw_xy.amax(dim=1, keepdim=True)
-                    xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
-                    freqs = torch.cat([verify_model.fourier_freqs_fixed.to(device), verify_model.fourier_freqs_learned.abs()])
-                    xy_scaled = xy_norm.unsqueeze(-1) * freqs
-                    fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
-                    x = torch.cat([x, fourier_pe], dim=-1)
+                    if cfg.laplacian_pe:
+                        x = torch.cat([x, _batch_lap_pe], dim=-1)
+                    else:
+                        raw_xy = x[:, :, :2]
+                        xy_min = raw_xy.amin(dim=1, keepdim=True)
+                        xy_max = raw_xy.amax(dim=1, keepdim=True)
+                        xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                        freqs = torch.cat([verify_model.fourier_freqs_fixed.to(device), verify_model.fourier_freqs_learned.abs()])
+                        xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                        x = torch.cat([x, fourier_pe], dim=-1)
 
                     # Ground truth denormalization reference
                     Umag, q = _umag_q(y, mask)
