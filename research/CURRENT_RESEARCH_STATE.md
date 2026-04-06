@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-06 ~17:45 UTC
+- **Date:** 2026-04-06 ~21:00 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -44,25 +44,29 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble (29.1) on p_tan.
 
-## Student Status (~19:00 UTC 2026-04-06)
+## Student Status (~21:00 UTC 2026-04-06)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | fern | #2210 | Arc-Length Surface Loss Reweighting: fix non-uniform mesh density bias | WIP |
 | nezuko | #2205 | NOBLE Nonlinear Low-Rank Branches in TransolverBlock FFN (Retry) | WIP |
-| alphonse | #2211 | Surface Pressure Gradient Loss: penalize dp/ds mismatch along surface | WIP (just assigned) |
+| alphonse | #2211 | Surface Pressure Gradient Loss: penalize dp/ds mismatch along surface | WIP |
 | thorfinn | #2209 | Attention Register Tokens: learnable global slots in Physics-Attention | WIP |
 | frieren | #2199 | Spectral Conditioning of Attention (SCA) to prevent OOD collapse | WIP |
-| edward | #2207 | TE Coordinate Frame: trailing-edge-relative input features for wake coupling | WIP |
+| edward | #2207 | TE Coordinate Frame: trailing-edge-relative input features (re-running, W&B crashed) | WIP |
 | tanjiro | #2197 | Geometry-Adaptive Curvature Loss Weighting on Surface Nodes | WIP |
-| askeladd | #2208 | Iterative SRF Heads (RAFT-style): N=3 correction passes on surface nodes | WIP |
+| askeladd | #2212 | Analytical Cp Delta: thin-airfoil physics baseline for SRF correction | WIP (just assigned) |
 
 **All 8 students active. Zero idle GPUs.**
+
+⚠️ **W&B Crash Issue:** PRs #2207 (edward) and #2208 (askeladd) both had W&B runs crash at ~82-96 min with terrible metrics. Student-reported results were unverifiable. #2207 sent back for re-run. #2208 closed (dead end even by student's numbers). Possible infrastructure issue affecting W&B logging — monitor future runs.
 
 ## Recently Reviewed
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
+| #2208 | askeladd | Iterative SRF RAFT-style (N=3 passes) | **CLOSED** | p_tan +5.6% (reported). W&B runs crashed at 82 min — metrics unverifiable. 2nd iteration failure (with #2165). Direction exhausted. |
+| #2207 | edward | TE Coordinate Frame | **SENT BACK** | W&B runs crashed at 96 min — student metrics (p_in=12.5, p_tan=28.5) don't match W&B (p_in=21.8, p_tan=33.4). Hypothesis well-motivated, needs clean re-run. |
 | #2206 | alphonse | Transolver++ Ada-Temp + Rep-Slice | **CLOSED** | ALL metrics catastrophic: p_tan +10% (31.4), p_in +19%, p_oodc +18%, p_re +12%. 3 competing temperature mechanisms fight each other; Gumbel noise from Rep-Slice incompatible with Lion+PCGrad+EMA. |
 | #2181 | fern | GEPS TTA (Low-Rank Test-Time Adaptation) | **CLOSED** | p_tan +3.5% (29.59 vs 28.50). Continuity residual signal too noisy (div(U) values 1695-2895). Training epoch deficit at 145 vs baseline. LoRA gradient path too indirect. TTA direction exhausted. |
 | #2203 | thorfinn | Muon/Gram-NS Optimizer | **CLOSED** | ALL metrics catastrophic: p_tan +5.3% (30.0), p_in +24.9% (16.5), p_oodc +46.5% (11.45), p_re +33.3% (8.6). Newton-Schulz orthogonalization destroys physics gradient geometry. 2nd Muon attempt — direction fully exhausted. |
@@ -106,7 +110,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 5. **Curvature Loss Weighting** (tanjiro #2197) — Per-node curvature-weighted surface loss: `w_i = 1 + alpha * normalize(|kappa_i|)`. Tests alpha={0.5, 1.0, 2.0}. Upweights LE/TE nodes during training; val metric stays uniform.
 6. **Attention Register Tokens** (thorfinn #2209) — Add K=4 learnable global register tokens to Physics-Attention slice-token self-attention (per block). Addresses attention sink pathology on OOD inputs: registers provide explicit global memory slots, freeing physics slices from absorbing OOD signals. Tokens discarded after attention, before deslice. Based on arXiv 2309.16588 (NeurIPS 2023 ViT Registers). Seeds {42, 73}.
 7. **Spectral Conditioning of Attention** (frieren #2199) — Learnable diagonal `D = nn.Parameter(torch.ones(n_heads, slice_num))` right-multiplied into attention logits before softmax (~288 params). Applied to all 3 TransolverBlocks. Initialized to identity. Optional condition number regularization via log-variance proxy (`--spectral_attn_conditioning --sac_lambda 0.01`), two seeds {42, 73}.
-8. **Iterative SRF Heads (RAFT-style)** (askeladd #2208) — Runs both SurfaceRefinementHead and AftFoilRefinementHead N=3 times, feeding the current prediction back as input each pass. Analogous to RAFT (optical flow) and AlphaFold recycling. Adds <1% epoch overhead (vs 1.3x for failed full-model PR #2165). Zero-init ensures first pass = baseline behavior. Seeds {42, 73}.
+8. **Analytical Cp Delta** (askeladd #2212) — Thin-airfoil physics baseline (Cp ≈ -2·dY/dX) subtracted from SRF prediction, so heads only learn the delta from analytical pressure. DeltaPhi principle applied at surface level. Changes the prediction task (historically the winning category). Seeds {42, 73}.
 
 **Key research patterns:**
 - **What works:** DSDF magnitude augmentation (foil-2 only), specialized correction heads (aft_srf), gradient surgery (2-way PCGrad), tandem-geometry-aware routing (GSB), geometry-conditioned mechanisms
@@ -200,6 +204,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 
 | Direction | PRs | Finding |
 |-----------|-----|---------|
+| **Iterative SRF (RAFT-style, N=3 passes)** | **#2208** | **p_tan +5.6% (student-reported, W&B crashed). 2nd iteration failure after #2165 (+6.6%). Without new information each pass, SRF corrections drift. Aft-foil error accumulation. Direction fully exhausted.** |
 | **Muon/Gram-NS Optimizer (2nd attempt)** | **#2203** | **ALL metrics catastrophic: p_tan +5.3% (30.0 vs 28.50), p_in +24.9% (16.5), p_oodc +46.5% (11.45), p_re +33.3% (8.6). Newton-Schulz gradient orthogonalization destroys physics signal. First attempt (PR #2006) also failed. Direction fully exhausted.** |
 | **Fore-Aft Cross-Attn SRF (replacement)** | **#2202** | **p_tan +2.1% avg (29.10 vs 28.50). Replacing standard SRF head with cross-attention creates optimization instability (s42=28.3 good, s73=29.9 bad, Δ=1.6). All 4 metrics regressed. Additive approach (keep both) may be worth revisiting.** |
 | **Multi-Scale Slice Hierarchy [32,64,96]** | **#2201** | **p_tan +1.8% (29.01 vs 28.50). OOD oodc improved -4.6% but primary target regressed. High seed variance on p_tan (Δ=1.20 vs baseline Δ~0.14). Fewer slices in early blocks lose gap_stagger_spatial_bias routing resolution. 96 confirmed optimal across all blocks (PR #2171 also showed 128/144 failed).** |

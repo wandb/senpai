@@ -2,6 +2,39 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~21:00 — PR #2208: Iterative SRF Heads (RAFT-style): N=3 correction passes on surface nodes — askeladd — **CLOSED** (p_tan +5.6% reported, W&B crashed)
+- Branch: `askeladd/iterative-srf-raft`
+- Hypothesis: RAFT-style iterative refinement on SRF heads — run 3 sequential correction passes on surface nodes. Zero-init final layers so pass 1 = baseline. Inspired by RAFT's iterative GRU for optical flow.
+- W&B runs: dgrq8hby (seed 42), d02cmzx6 (seed 73) — **BOTH CRASHED** at ~82 min
+
+| Metric | Baseline | Student Reported Avg | **W&B Actual (last logged)** |
+|--------|----------|---------------------|------------------------------|
+| p_in | 13.21 | 13.1 (-0.8%) | **22.0 / 22.1** |
+| p_tan | 28.50 | 30.1 (+5.6%) | **34.1 / 35.1** |
+| p_oodc | 7.82 | 7.75 (-0.8%) | **13.7 / 13.7** |
+| p_re | 6.45 | 6.5 (+0.7%) | **10.0 / 10.7** |
+
+- W&B shows runs crashed at rt=4905s (~82 min) — student claimed "180 min, 147 epochs". Metrics unverifiable.
+- Even by student's reported metrics, p_tan regressed +5.6% — consistent with PR #2165 (full-backbone iteration, +6.6%).
+- **Iterative refinement direction fully exhausted.** Without new information each pass (unlike RAFT's cost volume), iterations drift rather than converge. Accumulates errors on aft-foil.
+
+### 2026-04-06 ~20:45 — PR #2207: TE Coordinate Frame: trailing-edge-relative input features for wake coupling — edward — **SENT BACK** (W&B runs crashed, metrics unverifiable)
+- Branch: `edward/te-coord-frame`
+- Hypothesis: Add 6 TE-relative input features (dx, dy, r from fore-foil and aft-foil trailing edges) based on GeoMPNN (arXiv 2412.09399, NeurIPS 2024 ML4CFD Best Student Paper). TE is the most critical geometric reference for pressure recovery; TE-relative coords should generalize better to OOD NACA6416.
+- W&B runs: obn1wfja (seed 42), 52irfwwg (seed 73)
+
+| Metric | Baseline | Student Reported Avg | **W&B Actual (summary)** |
+|--------|----------|---------------------|--------------------------|
+| p_in | 13.21 | 12.5 (-5.3%) | **21.8 / 20.8** |
+| p_tan | 28.50 | 28.5 (~0%) | **33.4 / 33.5** |
+| p_oodc | 7.82 | 7.6 (-2.8%) | **11.7 / 11.4** |
+| p_re | 6.45 | 6.4 (-0.8%) | **9.5 / 9.5** |
+
+- Both runs **crashed** at ~96 min (5770-5775s) vs normal ~180 min. State=crashed in W&B.
+- Student reported "148 epochs completed" but W&B shows epoch=0 throughout history.
+- Full history scan (27K steps per run) confirms best metrics are far worse than reported.
+- **Action:** Sent back to student for re-run. Hypothesis is well-motivated — needs clean execution.
+
 ### 2026-04-06 ~19:00 — PR #2206: Transolver++ Ada-Temp: per-point adaptive slice temperature + Rep-Slice — alphonse — **CLOSED** (all metrics regressed 10-19%)
 - Branch: `alphonse/transolver-plus-ada-temp`
 - Hypothesis: Per-point adaptive temperature (Ada-Temp) from Transolver++ (arXiv 2502.02414, ICML 2025) prevents slice-weight homogenization. Rep-Slice (Gumbel-Softmax reparameterization) encourages sparse slice assignments. Both enabled simultaneously.
