@@ -139,7 +139,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False,
+                 register_tokens=False, register_k=4):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -185,6 +186,15 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
                 nn.Linear(2 * dim_head, dim_head), nn.GELU(),
                 nn.Linear(dim_head, 1),
             )
+        # Register tokens: [heads, K, dim_head] — independent per-head, small random init
+        if register_tokens and not linear_no_attention:
+            self.register_tokens_param = nn.Parameter(
+                torch.randn(heads, register_k, dim_head) * 0.02
+            )
+            self._register_k = register_k
+        else:
+            self.register_tokens_param = None
+            self._register_k = 0
 
     def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None):
         bsz, num_points, _ = x.shape
@@ -229,14 +239,23 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         if self.linear_no_attention:
             out_slice_token = slice_token
         else:
-            q_slice_token = self.to_q(slice_token)
-            slice_token_kv = slice_token.mean(dim=1, keepdim=True)
+            S = slice_token.size(2)  # number of physics slices
+            # Augment slice tokens with register tokens before self-attention
+            if self.register_tokens_param is not None:
+                B = slice_token.size(0)
+                regs = self.register_tokens_param.unsqueeze(0).expand(B, -1, -1, -1)  # [B, H, K, D]
+                slice_aug = torch.cat([slice_token, regs], dim=2)  # [B, H, S+K, D]
+            else:
+                slice_aug = slice_token
+
+            q_slice_token = self.to_q(slice_aug)
+            slice_token_kv = slice_aug.mean(dim=1, keepdim=True)
             k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
             v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
             if self.learned_kernel:
-                B, H, S, D = q_slice_token.shape
-                q_exp = q_slice_token.unsqueeze(-2).expand(B, H, S, S, D)
-                k_exp = k_slice_token.unsqueeze(-3).expand(B, H, S, S, D)
+                B, H, SK, D = q_slice_token.shape
+                q_exp = q_slice_token.unsqueeze(-2).expand(B, H, SK, SK, D)
+                k_exp = k_slice_token.unsqueeze(-3).expand(B, H, SK, SK, D)
                 qk_cat = torch.cat([q_exp, k_exp], dim=-1)
                 attn_logits = self.kernel_mlp(qk_cat).squeeze(-1)
                 attn_weights = F.softmax(attn_logits, dim=-1)
@@ -245,7 +264,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
                 k_norm = F.normalize(k_slice_token, dim=-1)
                 attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
                 attn_weights = F.softmax(attn_logits, dim=-1)
-            out_slice_token = torch.matmul(attn_weights, v_slice_token)
+            out_aug = torch.matmul(attn_weights, v_slice_token)
+            out_slice_token = out_aug[:, :, :S, :]  # discard register outputs [B, H, S, D]
             out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
 
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
@@ -283,6 +303,8 @@ class TransolverBlock(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         spatial_bias_input_dim=4,
+        register_tokens=False,
+        register_k=4,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -308,6 +330,8 @@ class TransolverBlock(nn.Module):
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
             prog_slices=prog_slices,
+            register_tokens=register_tokens,
+            register_k=register_k,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -700,6 +724,8 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        register_tokens=False,
+        register_k=4,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -772,6 +798,8 @@ class Transolver(nn.Module):
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
                     spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
+                    register_tokens=register_tokens,
+                    register_k=register_k,
                 )
                 for idx in range(n_layers)
             ]
@@ -1020,6 +1048,8 @@ class Config:
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
     gap_stagger_spatial_bias: bool = False  # condition spatial bias MLP on gap/stagger (tandem geometry-aware routing)
+    register_tokens: bool = False  # add learnable register tokens to Physics-Attention (prevent OOD attention sink)
+    register_k: int = 4            # number of register tokens per attention block
     dct_freq_loss: bool = False   # DCT frequency-weighted auxiliary loss on surface pressure
     dct_freq_weight: float = 0.05 # weight for DCT freq loss
     dct_freq_gamma: float = 2.0   # frequency upweighting strength
@@ -1234,6 +1264,8 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    register_tokens=cfg.register_tokens,
+    register_k=cfg.register_k,
 )
 
 model = Transolver(**model_config).to(device)
