@@ -248,6 +248,9 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             out_slice_token = torch.matmul(attn_weights, v_slice_token)
             out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
 
+        # Store for SWD domain alignment (training only; accessed via _base_model.blocks[-1].attn)
+        if self.training:
+            self._last_slice_token = out_slice_token  # [B, H, G, D_head]
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
         return self.to_out(out_x)
@@ -933,6 +936,28 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def sliced_wasserstein_distance(x: torch.Tensor, y: torch.Tensor, n_projections: int = 50) -> torch.Tensor:
+    """Sliced Wasserstein Distance between two point clouds via random projections.
+
+    x: [N_x, d] — slice tokens from tandem samples (flattened across heads and slices)
+    y: [N_y, d] — slice tokens from single-foil samples
+    Returns: scalar SWD loss (differentiable w.r.t. both x and y).
+
+    Reference: Lee et al. "Sliced Wasserstein Discrepancy for Unsupervised Domain Adaptation"
+    (CVPR 2019, arXiv:1904.11430).
+    """
+    d = x.shape[-1]
+    directions = F.normalize(torch.randn(n_projections, d, device=x.device), dim=-1)
+    x_proj = x @ directions.T   # [N_x, n_proj]
+    y_proj = y @ directions.T   # [N_y, n_proj]
+    x_sorted = x_proj.sort(dim=0).values
+    y_sorted = y_proj.sort(dim=0).values
+    n = min(x_sorted.shape[0], y_sorted.shape[0])
+    x_sorted = x_sorted[:n]
+    y_sorted = y_sorted[:n]
+    return ((x_sorted - y_sorted) ** 2).mean()
+
+
 MAX_TIMEOUT = 180.0  # minutes
 MAX_EPOCHS = 500
 
@@ -1070,6 +1095,11 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # SWD domain alignment: match slice token distributions between tandem and single-foil
+    swd_align: bool = False
+    swd_weight: float = 0.01
+    swd_n_proj: int = 50
+    swd_start_epoch: int = 20
 
 
 cfg = sp.parse(Config)
@@ -1963,6 +1993,28 @@ for epoch in range(MAX_EPOCHS):
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
 
+        # SWD domain alignment: pull tandem and single-foil slice token distributions together
+        swd_loss_tensor = None
+        swd_loss_val = 0.0
+        if cfg.swd_align and epoch >= cfg.swd_start_epoch:
+            _last_attn = _base_model.blocks[-1].attn
+            if hasattr(_last_attn, '_last_slice_token') and _last_attn._last_slice_token is not None:
+                _swd_tok = _last_attn._last_slice_token  # [B, H, G, D_head]
+                _is_tandem_swd = is_tandem_batch  # [B] bool
+                if _is_tandem_swd.any() and (~_is_tandem_swd).any():
+                    _Bs, _H, _G, _D = _swd_tok.shape
+                    # Flatten heads into feature dim: [B, G, H*D_head=n_hidden]
+                    _tokens_flat = _swd_tok.permute(0, 2, 1, 3).reshape(_Bs, _G, _H * _D).float()
+                    _tan_tok = _tokens_flat[_is_tandem_swd].reshape(-1, _H * _D)   # [Btan*G, n_hidden]
+                    _sin_tok = _tokens_flat[~_is_tandem_swd].reshape(-1, _H * _D)  # [Bsin*G, n_hidden]
+                    swd_loss_tensor = sliced_wasserstein_distance(_tan_tok, _sin_tok, cfg.swd_n_proj)
+                    swd_loss_val = swd_loss_tensor.item()
+                    loss = loss + cfg.swd_weight * swd_loss_tensor
+                    if global_step % 20 == 0:
+                        wandb.log({"train/swd_loss": swd_loss_val, "global_step": global_step})
+                elif global_step % 20 == 0:
+                    wandb.log({"train/swd_skip": 1, "global_step": global_step})
+
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
@@ -1981,6 +2033,10 @@ for epoch in range(MAX_EPOCHS):
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
             loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
             loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            if swd_loss_tensor is not None:
+                _swd_half = 0.5 * cfg.swd_weight * swd_loss_tensor
+                loss_a = loss_a + _swd_half
+                loss_b = loss_b + _swd_half
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -2034,6 +2090,9 @@ for epoch in range(MAX_EPOCHS):
                 (_grp_loss(is_normal_tan), is_normal_tan),
                 (_grp_loss(is_extreme), is_extreme),
             ]
+            if swd_loss_tensor is not None:
+                _swd_per_task = (cfg.swd_weight / 3.0) * swd_loss_tensor
+                task_losses_with_masks = [(l + _swd_per_task, m) for l, m in task_losses_with_masks]
             task_losses = [l for l, m in task_losses_with_masks if m.any()]
             if len(task_losses) == 0:
                 task_losses = [loss_A]  # fallback
@@ -2119,6 +2178,10 @@ for epoch in range(MAX_EPOCHS):
                 scheduler.step()
             except ValueError:
                 pass
+        # Clear stored slice tokens before EMA deepcopy (non-leaf tensors break deepcopy)
+        if cfg.swd_align:
+            for _blk in _base_model.blocks:
+                _blk.attn._last_slice_token = None
         if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa and not cfg.swa_cyclic and not cfg.snapshot_ensemble:
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
