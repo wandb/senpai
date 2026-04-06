@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-06 ~16:45 UTC
+- **Date:** 2026-04-06 ~21:15 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -53,7 +53,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | alphonse | #2200 | Local KNN Attention: parallel local pathway in TransolverBlock | WIP |
 | thorfinn | #2198 | GradNorm Adaptive Loss Weighting for Tandem-Transfer | WIP |
 | frieren | #2199 | Spectral Conditioning of Attention (SCA) to prevent OOD collapse | WIP |
-| edward | #2193 | Curvature-Conditioned Spatial Bias: True Arc-Length Curvature | WIP |
+| edward | #2201 | Multi-Scale Slice Hierarchy: Coarse-to-Fine Attention [32,64,96] | WIP |
 | tanjiro | #2197 | Geometry-Adaptive Curvature Loss Weighting on Surface Nodes | WIP |
 | askeladd | #2195 | Inter-Foil Distance Feature in Spatial Bias Routing | WIP |
 
@@ -93,7 +93,8 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 1. **GEPS Test-Time Adaptation** (fern #2181) — LoRA context params + continuity residual TTA at inference. Zero training change.
 2. **Laplacian Eigenvector Mesh PE** (nezuko #2190) — Replace Fourier PE with intrinsic graph Laplacian eigenvectors. High-potential positional encoding overhaul.
 3. **Local KNN Attention** (alphonse #2200) — parallel k-nearest-neighbor local attention pathway alongside global slice attention in TransolverBlock. Captures fine-scale boundary layer and wake physics missed by coarse global slicing. Zero-init gating for safe integration.
-4. **Curvature-Conditioned Spatial Bias** (edward #2193) — Extend spatial_bias MLP from 6→7 inputs by adding true Menger arc-length curvature at surface nodes. Extends biggest historical win (GSB).
+4. ~~**Curvature-Conditioned Spatial Bias**~~ (edward #2193) — **CLOSED.** p_tan +2.5%. Curvature redundant with position (high-κ = LE/TE = known x,y).
+5. **Multi-Scale Slice Hierarchy** (edward #2201) — 3 TransolverBlocks with [32,64,96] slices. Block 1 captures global flow patterns (coarse), Block 3 refines boundary layer (fine). OOD hypothesis: global patterns generalize better than fine-grained ones. Also expected 5-8% epoch speedup from fewer slices in early blocks.
 5. **Inter-Foil Distance Feature** (askeladd #2195) — Add `log(1+d_interfoil)` as 7th input to spatial_bias MLP. Distance from each mesh node to foil-2 center. Extends GSB pattern with aerodynamic coupling signal.
 6. **Curvature Loss Weighting** (tanjiro #2197) — Per-node curvature-weighted surface loss: `w_i = 1 + alpha * normalize(|kappa_i|)`. Tests alpha={0.5, 1.0, 2.0}. Upweights LE/TE nodes during training; val metric stays uniform.
 7. **GradNorm Adaptive Loss Weighting** (thorfinn #2198) — Dynamic per-task loss weight balancing via GradNorm algorithm. `task_weights = nn.Parameter(torch.ones(N_tasks))`, grad norms from fc2 of last TransolverBlock, GradNorm loss = L1 norm mismatch, separate Adam lr=1e-3, EMA decay=0.9. Tests `--gradnorm --gradnorm_alpha 1.5`, two seeds {42, 73}.
@@ -212,6 +213,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 | **SE(2) AoA-Aligned Spatial Bias** | **#2191** | **p_tan avg +1.8% (29.0 vs 28.50). All 4 metrics regressed. AoA range ±4° makes rotation near-identity (cos≈0.998). aug_full_dsdf_rot already provides this invariance.** |
 | **Vorticity Auxiliary Target** | **#2183** | **p_tan +2.5–3.0% (29.20–29.35 vs 28.502). Vorticity auxiliary loss competes with backbone pressure representation; backbone already implicitly encodes vorticity via velocity targets (ω=curl(v)). Noisy KNN-FD targets on unstructured mesh add harmful gradients. Config B improved p_re (-2.8%) but primary metric regressed across all 4 seeds.** |
 | **Stochastic Depth** | **#2192** | **p_tan +2.1% (29.10 avg). Layer drop regularizer absorbed by EMA + cosine schedule. 3-layer backbone too shallow for drop path benefit (DeiT uses 12+ layers).** |
+| **Curvature-Conditioned Spatial Bias** | **#2193** | **p_tan +2.5% (29.20 avg). Curvature redundant with position — high-κ concentrates at LE/TE, already captured by (x,y). Python loop overhead reduced epoch budget. Only p_in improved (-2.0%).** |
 
 ## Ensemble Seed Pool (Complete)
 

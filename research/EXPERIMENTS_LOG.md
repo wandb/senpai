@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~21:00 — PR #2193: Curvature-Conditioned Spatial Bias: True Arc-Length Curvature for Slice Routing — edward — **CLOSED** (p_tan +2.5% vs baseline)
+- Branch: `edward/curvature-spatial-bias`
+- Hypothesis: True Menger arc-length curvature (κ = 2|area|/(d₁·d₂·d₃)) added as 7th input to spatial_bias MLP, extending the biggest historical win (GSB, -3.0% p_tan). Curvature varies dramatically at LE/TE and should enable geometry-aware routing that generalizes to unseen camber values (NACA6416). Orthogonal to existing inputs.
+- W&B runs: y0mce10q (seed 42), nv7ahjp4 (seed 73)
+- W&B group: `edward/curvature-spatial-bias`
+
+| Split | Baseline | Seed 42 | Seed 73 | Avg | Δ |
+|-------|----------|---------|---------|-----|---|
+| p_in | 13.21 | 13.06 | 12.82 | **12.94** | -2.0% ✓ |
+| **p_tan** | **28.50** | **29.62** | **28.78** | **29.20** | **+2.5% ✗** |
+| p_oodc | 7.82 | 7.86 | 7.98 | **7.92** | +1.3% ✗ |
+| p_re | 6.45 | 6.39 | 6.54 | **6.46** | +0.2% ✗ |
+
+- Epochs: 145 (s42), 144 (s73) — both hit 180-min timeout, ~5% overhead from Python per-sample curvature loop
+- VRAM: ~45-46 GB
+- **Analysis:** Curvature routing improved p_in (-2.0%) showing it helps single-foil node routing, but regressed p_tan (+2.5%) — the primary metric. Student's excellent analysis identified the root cause: curvature is largely **redundant with position** (high-κ concentrates at LE/TE, already captured by x,y in spatial_bias MLP). The Python loop overhead reduced epoch budget from ~155-160 to ~145, but even correcting for this the regression persists. Foil-2 curvature in the tandem gap region is noisy. The log1p normalization (student's choice over the specified linear clamp) may have compressed mid-range signal. **Verdict:** Curvature-as-routing-signal provides no new information beyond what position already encodes. Dead end for this specific mechanism. The student's suggestion of curvature as auxiliary *loss* weighting (upweight high-κ nodes) is a genuinely different mechanism — explored separately by tanjiro in PR #2197.
+
 ### 2026-04-06 ~16:00 — PR #2183: Vorticity Auxiliary Target: Explicit Wake Structure Learning — frieren — **CLOSED** (p_tan +2.5–3.0% vs baseline)
 
 - Branch: `frieren/vorticity-aux`
