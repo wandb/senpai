@@ -134,6 +134,58 @@ class DomainLayerNorm(nn.Module):
         return torch.where(mask_t, self.ln_tandem(x), self.ln_single(x))
 
 
+def compute_surface_curvature_batch(coords_raw, is_surface, saf_norm, is_tandem):
+    """Compute Menger curvature at surface nodes for each sample in the batch.
+
+    Processes foil-1 and foil-2 surfaces separately to avoid cross-foil angle
+    sorting artifacts (foil-1: saf_norm ≤ 0.005; foil-2: saf_norm > 0.005).
+
+    Args:
+        coords_raw: [B, N, 2] raw (pre-standardization) x,y coordinates
+        is_surface: [B, N] boolean
+        saf_norm:   [B, N] norm of saf channels (x[:, :, 2:4]) before standardization
+        is_tandem:  [B] boolean — True for tandem samples
+
+    Returns:
+        kappa: [B, N, 1] log1p-scaled curvature at surface nodes, 0 elsewhere.
+               Scaled as log1p(κ) / log1p(50) → approximately [0, 1] for typical foils.
+    """
+    B, N = coords_raw.shape[:2]
+    kappa = torch.zeros(B, N, 1, device=coords_raw.device, dtype=coords_raw.dtype)
+
+    for b in range(B):
+        foil_masks = [is_surface[b] & (saf_norm[b] <= 0.005)]  # foil-1 surface
+        if is_tandem[b]:
+            foil_masks.append(is_surface[b] & (saf_norm[b] > 0.005))  # foil-2 surface
+
+        for mask in foil_masks:
+            idx = mask.nonzero(as_tuple=False).squeeze(-1)
+            if idx.numel() < 3:
+                continue
+            pts = coords_raw[b, idx, :2]           # [M, 2]
+            centroid = pts.mean(0)
+            angles = torch.atan2(pts[:, 1] - centroid[1], pts[:, 0] - centroid[0])
+            order = angles.argsort()
+            pts_s = pts[order]                      # [M, 2] sorted by angle
+            M = pts_s.shape[0]
+            arange = torch.arange(M, device=pts_s.device)
+            p0  = pts_s[arange]
+            pm1 = pts_s[(arange - 1) % M]
+            pp1 = pts_s[(arange + 1) % M]
+            d1 = (p0 - pm1).norm(dim=-1)
+            d2 = (pp1 - p0).norm(dim=-1)
+            d3 = (pp1 - pm1).norm(dim=-1)
+            cross = ((p0 - pm1)[:, 0] * (pp1 - p0)[:, 1]
+                   - (p0 - pm1)[:, 1] * (pp1 - p0)[:, 0])
+            k = 2.0 * cross.abs() / (d1 * d2 * d3).clamp(min=1e-10)
+            kappa[b, idx[order], 0] = k
+
+    # log1p normalization: maps typical LE curvature (20-50 units) to ~0.8-1.0
+    log50 = torch.tensor(51.0, device=kappa.device, dtype=kappa.dtype).log1p()
+    kappa = kappa.clamp(max=50.0).log1p() / log50
+    return kappa
+
+
 class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
@@ -700,10 +752,12 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        curvature_spatial_bias=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
+        self.curvature_spatial_bias = curvature_spatial_bias
         self.pressure_first = pressure_first
         self.ref = ref
         self.unified_pos = unified_pos
@@ -771,16 +825,23 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
-                    spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
+                    spatial_bias_input_dim=(4
+                                           + (2 if gap_stagger_spatial_bias else 0)
+                                           + (1 if curvature_spatial_bias else 0)),
                 )
                 for idx in range(n_layers)
             ]
         )
-        # Zero-init the 2 new input columns of spatial_bias so initial routing is unchanged
+        # Zero-init extra input columns of spatial_bias so initial routing is unchanged
         if gap_stagger_spatial_bias:
             with torch.no_grad():
                 for block in self.blocks:
-                    block.spatial_bias[0].weight[:, 4:].zero_()
+                    block.spatial_bias[0].weight[:, 4:6].zero_()
+        if curvature_spatial_bias:
+            _curv_col = 6 if gap_stagger_spatial_bias else 4
+            with torch.no_grad():
+                for block in self.blocks:
+                    block.spatial_bias[0].weight[:, _curv_col].zero_()
         # Separate pressure pathway (pressure_separate_last_block):
         # Independent MLP + pres_head that processes shared hidden features
         self._pressure_separate = False  # set from Config after construction
@@ -846,7 +907,7 @@ class Transolver(nn.Module):
         if sum(self.output_dims) != preds.shape[-1]:
             raise ValueError("Sum of output_dims must match preds last dimension")
 
-    def forward(self, data, pos=None, condition=None):
+    def forward(self, data, pos=None, condition=None, curvature=None):
         x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
         if x is None:
             raise ValueError("Missing required input tensor: x")
@@ -890,6 +951,13 @@ class Transolver(nn.Module):
             raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26], gap_stagger], dim=-1)  # [B, N, 6]
         else:
             raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)  # x, y, curvature, dist
+        # Append true arc-length curvature (per-foil Menger curvature) if enabled
+        if self.curvature_spatial_bias:
+            if curvature is not None:
+                raw_xy = torch.cat([raw_xy, curvature], dim=-1)  # → [B, N, +1]
+            else:
+                # Fallback: zeros (e.g., visualization/verification without precomputed curvature)
+                raw_xy = torch.cat([raw_xy, torch.zeros(*raw_xy.shape[:2], 1, device=raw_xy.device, dtype=raw_xy.dtype)], dim=-1)
 
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
@@ -1020,6 +1088,7 @@ class Config:
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
     gap_stagger_spatial_bias: bool = False  # condition spatial bias MLP on gap/stagger (tandem geometry-aware routing)
+    curvature_spatial_bias: bool = False    # condition spatial bias MLP on true arc-length Menger curvature
     dct_freq_loss: bool = False   # DCT frequency-weighted auxiliary loss on surface pressure
     dct_freq_weight: float = 0.05 # weight for DCT freq loss
     dct_freq_gamma: float = 2.0   # frequency upweighting strength
@@ -1234,6 +1303,7 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    curvature_spatial_bias=cfg.curvature_spatial_bias,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1673,6 +1743,14 @@ for epoch in range(MAX_EPOCHS):
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
+        # True arc-length curvature (computed in physical space before normalization)
+        _curv_feat = None
+        if cfg.curvature_spatial_bias:
+            _csb_saf_norm = x[:, :, 2:4].norm(dim=-1)   # [B, N]
+            _csb_is_tandem = (x[:, 0, 22].abs() > 0.01)  # [B]
+            _curv_feat = compute_surface_curvature_batch(
+                x[:, :, :2], is_surface, _csb_saf_norm, _csb_is_tandem,
+            )  # [B, N, 1]
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1773,7 +1851,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x}, curvature=_curv_feat)
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -2001,7 +2079,7 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x})
+                rdrop_out = model({"x": x}, curvature=_curv_feat)
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -2140,7 +2218,7 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                out2 = model({"x": x}, curvature=_curv_feat)
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -2347,6 +2425,14 @@ for epoch in range(MAX_EPOCHS):
                     _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
                     _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
                     _v_gap_stagger = x[:, 0, 22:24]  # [B, 2]
+                # True arc-length curvature for val loop (before normalization)
+                _v_curv_feat = None
+                if cfg.curvature_spatial_bias:
+                    _v_saf_n = x[:, :, 2:4].norm(dim=-1)
+                    _v_is_tan = (x[:, 0, 22].abs() > 0.01)
+                    _v_curv_feat = compute_surface_curvature_batch(
+                        x[:, :, :2], is_surface, _v_saf_n, _v_is_tan,
+                    )  # [B, N, 1]
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -2429,7 +2515,7 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    _eval_out = eval_model({"x": x})
+                    _eval_out = eval_model({"x": x}, curvature=_v_curv_feat)
                     pred = _eval_out["preds"]
                     _eval_hidden = _eval_out["hidden"]
                 pred = pred.float()
