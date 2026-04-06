@@ -846,6 +846,34 @@ class Transolver(nn.Module):
         if sum(self.output_dims) != preds.shape[-1]:
             raise ValueError("Sum of output_dims must match preds last dimension")
 
+    @torch.compiler.disable
+    def _apply_mixstyle(self, fx, is_tandem):
+        """MixStyle: mix feature statistics between tandem samples (Zhou et al., ICLR 2021)."""
+        import random as _rand
+        if _rand.random() < getattr(self, '_mixstyle_prob', 0.5):
+            tandem_mask_flat = (is_tandem.view(-1) > 0.5)  # [B]
+            n_tandem = tandem_mask_flat.sum().item()
+            if n_tandem >= 2:
+                tandem_idx = tandem_mask_flat.nonzero(as_tuple=True)[0]
+                perm = tandem_idx[torch.randperm(n_tandem, device=fx.device)]
+
+                eps = 1e-6
+                # Detach stats per reference impl — prevents model from "undoing" mixing via gradients
+                mu = fx[tandem_idx].mean(dim=1, keepdim=True).detach()          # [n_tandem, 1, H]
+                sigma = (fx[tandem_idx].var(dim=1, keepdim=True) + eps).sqrt().detach()  # [n_tandem, 1, H]
+                mu_perm = fx[perm].mean(dim=1, keepdim=True).detach()
+                sigma_perm = (fx[perm].var(dim=1, keepdim=True) + eps).sqrt().detach()
+
+                _ms_alpha = getattr(self, '_mixstyle_alpha', 0.3)
+                lam = torch.distributions.Beta(_ms_alpha, _ms_alpha).sample().item()
+
+                fx_normed = (fx[tandem_idx] - mu) / sigma
+                mu_mix = lam * mu + (1 - lam) * mu_perm
+                sigma_mix = lam * sigma + (1 - lam) * sigma_perm
+                fx = fx.clone()
+                fx[tandem_idx] = fx_normed * sigma_mix + mu_mix
+        return fx
+
     def forward(self, data, pos=None, condition=None):
         x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
         if x is None:
@@ -900,6 +928,10 @@ class Transolver(nn.Module):
 
         for block in self.blocks[:-1]:
             fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+
+        # MixStyle: mix feature statistics between tandem samples for OOD regularization
+        if self.training and getattr(self, '_mixstyle', False) and is_tandem is not None:
+            fx = self._apply_mixstyle(fx, is_tandem)
 
         # Deep hidden representation (post all non-last blocks, pre output head)
         fx_deep = fx  # [B, N, n_hidden]
@@ -1070,6 +1102,10 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # MixStyle: feature-space style regularization for tandem OOD generalization
+    mixstyle: bool = False
+    mixstyle_alpha: float = 0.3              # Beta distribution alpha for mixing coefficient
+    mixstyle_prob: float = 0.5               # probability of applying MixStyle per forward pass
 
 
 cfg = sp.parse(Config)
@@ -1237,6 +1273,11 @@ model._pressure_separate = cfg.pressure_separate_last_block
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+
+# MixStyle attributes (set on uncompiled model so forward() can access them)
+_base_model._mixstyle = cfg.mixstyle
+_base_model._mixstyle_alpha = cfg.mixstyle_alpha
+_base_model._mixstyle_prob = cfg.mixstyle_prob
 
 # Surface refinement head (separate module, not compiled with main model)
 refine_head = None
@@ -1518,6 +1559,7 @@ for _sname in VAL_SPLIT_NAMES:
 wandb.define_metric("lr", step_metric="global_step")
 wandb.define_metric("epoch_time_s", step_metric="global_step")
 wandb.define_metric("val_predictions", step_metric="global_step")
+wandb.define_metric("mixstyle/*", step_metric="global_step")
 
 model_dir = Path(f"models/model-{run.id}")
 model_dir.mkdir(parents=True)
@@ -2153,7 +2195,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.mixstyle and global_step % 20 == 0:
+            _log_dict["mixstyle/enabled"] = 1
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
