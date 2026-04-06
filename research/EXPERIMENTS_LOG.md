@@ -2622,3 +2622,20 @@ Baseline (PR #2184): p_in=13.205, p_oodc=7.816, p_tan=28.502, p_re=6.453
 
 - **Decision: CLOSED — primary target regressed**
 - **Analysis:** Mixed result. OOD condition (p_oodc -4.6%) and Reynolds (p_re -0.6%) improved, suggesting the coarse-to-fine inductive bias helps some generalization. However, p_tan regressed +1.8% and p_in regressed +1.7% — both primary targets. High seed variance on p_tan (28.41 vs 29.61, Δ=1.20 vs baseline spread ~0.14) confirms instability in the tandem prediction pathway. The underlying mechanism: fewer slices in Block 0 (32 vs 96) reduces routing resolution that `gap_stagger_spatial_bias` relies on for tandem geometry awareness. Any configuration with fewer-than-96 slices in any block loses capacity — confirmed by PR #2171 (128/144 slices both regressed; 96 is already the optimum). The OOD oodc improvement is interesting but cannot be harvested without hurting p_tan. Student suggested reverse [96,64,32] and wider [48,64,96] variants, but the fundamental trade-off (early-block resolution vs capacity) is unlikely to resolve in p_tan's favor.
+
+### 2026-04-06 ~17:30 — PR #2181: GEPS Test-Time Low-Rank Adaptation for OOD Tandem — fern — **CLOSED** (all metrics worse than baseline)
+- Branch: `fern/geps-tta`
+- Hypothesis: GEPS-style (NeurIPS 2024, arXiv:2410.23889) test-time low-rank adaptation of physics-attention using continuity residual (div(U)=0) as self-supervised physics signal. LoRA-style context parameters (rank=4, zero-init, 4608 total params) added to each TransolverBlock attention output. At test time, only these LoRA params are adapted (10 or 20 steps) using KNN finite-difference divergence of velocity predictions as the objective. Intended to bridge the NACA6416 OOD gap by "fine-tuning" the representation on each test sample without ground truth.
+- W&B runs: otj5j4ka (seed 42, 10-step — INVALID, bug), evz9po4m (seed 73, 10-step), fdodi6m3 (seed 42, 20-step), ldf4sof7 (seed 73, 20-step)
+- W&B group: `fern/geps-tta`
+
+| Config | Seed | Epochs | p_in | p_oodc | **p_tan** | p_re |
+|--------|------|--------|------|--------|-----------|------|
+| Baseline (DCT) | avg | ~145 | 13.05 | 7.70 | **28.60** | 6.55 |
+| 10-step TTA | s73 | 146 | 13.47 | 8.27 | 29.57 | 6.55 |
+| 20-step TTA | s42 | 145 | 13.11 | 7.82 | 29.47 | 6.64 |
+| 20-step TTA | s73 | 145 | 13.56 | 8.30 | 29.71 | 6.58 |
+| **20-step avg** | | | **13.34** | **8.06** | **29.59** | **6.61** |
+
+- Note: Initial 10-step s42 run (otj5j4ka, 77 epochs) invalid — TTA bug ran adaptation every validation epoch, adding ~12 min overhead per epoch, causing only 77 epochs in 180 min. Student fixed in commit 0ba0b41.
+- **Analysis:** All metrics regressed vs baseline (p_tan +3.5%, p_oodc +4.7%). Three root causes: (1) Training epoch deficit: fixed runs hit 180-min wall at 145-146 epochs; (2) Noisy physics signal: KNN finite-difference div(U) values of 1695–2895 indicate the continuity residual is too noisy for clean gradient signal at this mesh resolution/subsampling (4096 nodes from 200K+); (3) Disconnected gradient path: LoRA applied in hidden attention space but signal comes from velocity outputs — long indirect gradient path. GEPS TTA direction closed. The student's suggested follow-up (TTA on pre-trained checkpoint) wouldn't resolve the fundamental signal quality issue.

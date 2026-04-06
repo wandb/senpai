@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-06 ~16:45 UTC
+- **Date:** 2026-04-06 ~17:45 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -44,11 +44,11 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble (29.1) on p_tan.
 
-## Student Status (~16:45 UTC 2026-04-06)
+## Student Status (~17:45 UTC 2026-04-06)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| fern | #2181 | GEPS Test-Time Low-Rank Adaptation for OOD Tandem | WIP |
+| fern | #2210 | Arc-Length Surface Loss Reweighting: fix non-uniform mesh density bias | WIP (just assigned) |
 | nezuko | #2205 | NOBLE Nonlinear Low-Rank Branches in TransolverBlock FFN (Retry) | WIP |
 | alphonse | #2206 | Transolver++ Ada-Temp: per-point adaptive slice temperature + Rep-Slice | WIP |
 | thorfinn | #2209 | Attention Register Tokens: learnable global slots in Physics-Attention | WIP (just assigned) |
@@ -63,6 +63,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
+| #2181 | fern | GEPS TTA (Low-Rank Test-Time Adaptation) | **CLOSED** | p_tan +3.5% (29.59 vs 28.50). Continuity residual signal too noisy (div(U) values 1695-2895). Training epoch deficit at 145 vs baseline. LoRA gradient path too indirect. TTA direction exhausted. |
 | #2203 | thorfinn | Muon/Gram-NS Optimizer | **CLOSED** | ALL metrics catastrophic: p_tan +5.3% (30.0), p_in +24.9% (16.5), p_oodc +46.5% (11.45), p_re +33.3% (8.6). Newton-Schulz orthogonalization destroys physics gradient geometry. 2nd Muon attempt — direction fully exhausted. |
 | #2202 | askeladd | Fore-Aft Cross-Attention in AftFoilRefinementHead | **CLOSED** | p_tan +2.1% avg (29.10 vs 28.50); all 4 metrics regressed. Cross-attn replaced the standard SRF head entirely → optimization instability (s42 p_tan=28.3, s73=29.9). Additive approach (keep both heads) may be worth revisiting. |
 | #2201 | edward | Multi-Scale Slice Hierarchy [32,64,96] | **CLOSED** | p_tan +1.8% (29.01 vs 28.50). p_oodc improved -4.6% but primary target regressed. High seed variance (p_tan: 28.41 vs 29.61, Δ=1.20). Fewer slices in early blocks lose gap_stagger_spatial_bias routing resolution. |
