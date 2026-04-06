@@ -2,6 +2,21 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~19:00 — PR #2206: Transolver++ Ada-Temp: per-point adaptive slice temperature + Rep-Slice — alphonse — **CLOSED** (all metrics regressed 10-19%)
+- Branch: `alphonse/transolver-plus-ada-temp`
+- Hypothesis: Per-point adaptive temperature (Ada-Temp) from Transolver++ (arXiv 2502.02414, ICML 2025) prevents slice-weight homogenization. Rep-Slice (Gumbel-Softmax reparameterization) encourages sparse slice assignments. Both enabled simultaneously.
+- W&B runs: zjux1n0n (seed 42), 6t805fa9 (seed 73)
+
+| Metric | Baseline | Seed 42 | Seed 73 | Avg | Δ |
+|--------|----------|---------|---------|-----|---|
+| p_in | 13.21 | 15.6 | 15.9 | **15.7** | **+19% ✗** |
+| p_oodc | 7.82 | 9.1 | 9.3 | **9.2** | **+18% ✗** |
+| **p_tan** | **28.50** | **31.4** | **31.4** | **31.4** | **+10% ✗** |
+| p_re | 6.45 | 7.3 | 7.1 | **7.2** | **+12% ✗** |
+
+- Epochs: 141-142 (~5 it/s, comparable to baseline), VRAM comparable
+- **Analysis:** All metrics significantly worse. Three competing temperature mechanisms (existing tandem_temp_offset + zone_temp_proj + new Ada-Temp) fight each other. Rep-Slice Gumbel noise destabilizes PCGrad gradient surgery. Transolver++ paper used standard Adam with different training dynamics — improvements don't transfer to Lion+PCGrad+EMA pipeline. Student correctly identified mechanism interaction as likely cause. **Ada-Temp/Rep-Slice direction exhausted given existing temperature infrastructure.**
+
 ### 2026-04-06 ~16:30 — PR #2203: Muon/Gram-NS Optimizer: orthogonalized gradient updates for weight matrices — thorfinn — **CLOSED** (all metrics regressed 5-47%)
 - Branch: `thorfinn/muon-gram-ns-retry`
 - Hypothesis: Replace Lion optimizer with Muon (Newton-Schulz orthogonalized gradients) for 2D+ weight matrices, AdamW for scalar/1D params. Muon normalizes gradient singular values to ~1, preventing large eigenvalue directions from dominating updates. lr_muon=0.02, lr_adamw_scalar=3e-4. Previous attempt PR #2006 crashed due to implementation bugs. This retry has correct param group separation and custom single-GPU MuonOptimizer with 5-step quintic NS iteration.

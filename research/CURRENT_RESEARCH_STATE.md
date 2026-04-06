@@ -44,14 +44,14 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble (29.1) on p_tan.
 
-## Student Status (~17:45 UTC 2026-04-06)
+## Student Status (~19:00 UTC 2026-04-06)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| fern | #2210 | Arc-Length Surface Loss Reweighting: fix non-uniform mesh density bias | WIP (just assigned) |
+| fern | #2210 | Arc-Length Surface Loss Reweighting: fix non-uniform mesh density bias | WIP |
 | nezuko | #2205 | NOBLE Nonlinear Low-Rank Branches in TransolverBlock FFN (Retry) | WIP |
-| alphonse | #2206 | Transolver++ Ada-Temp: per-point adaptive slice temperature + Rep-Slice | WIP |
-| thorfinn | #2209 | Attention Register Tokens: learnable global slots in Physics-Attention | WIP (just assigned) |
+| alphonse | #2211 | Surface Pressure Gradient Loss: penalize dp/ds mismatch along surface | WIP (just assigned) |
+| thorfinn | #2209 | Attention Register Tokens: learnable global slots in Physics-Attention | WIP |
 | frieren | #2199 | Spectral Conditioning of Attention (SCA) to prevent OOD collapse | WIP |
 | edward | #2207 | TE Coordinate Frame: trailing-edge-relative input features for wake coupling | WIP |
 | tanjiro | #2197 | Geometry-Adaptive Curvature Loss Weighting on Surface Nodes | WIP |
@@ -63,6 +63,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
+| #2206 | alphonse | Transolver++ Ada-Temp + Rep-Slice | **CLOSED** | ALL metrics catastrophic: p_tan +10% (31.4), p_in +19%, p_oodc +18%, p_re +12%. 3 competing temperature mechanisms fight each other; Gumbel noise from Rep-Slice incompatible with Lion+PCGrad+EMA. |
 | #2181 | fern | GEPS TTA (Low-Rank Test-Time Adaptation) | **CLOSED** | p_tan +3.5% (29.59 vs 28.50). Continuity residual signal too noisy (div(U) values 1695-2895). Training epoch deficit at 145 vs baseline. LoRA gradient path too indirect. TTA direction exhausted. |
 | #2203 | thorfinn | Muon/Gram-NS Optimizer | **CLOSED** | ALL metrics catastrophic: p_tan +5.3% (30.0), p_in +24.9% (16.5), p_oodc +46.5% (11.45), p_re +33.3% (8.6). Newton-Schulz orthogonalization destroys physics gradient geometry. 2nd Muon attempt — direction fully exhausted. |
 | #2202 | askeladd | Fore-Aft Cross-Attention in AftFoilRefinementHead | **CLOSED** | p_tan +2.1% avg (29.10 vs 28.50); all 4 metrics regressed. Cross-attn replaced the standard SRF head entirely → optimization instability (s42 p_tan=28.3, s73=29.9). Additive approach (keep both heads) may be worth revisiting. |
@@ -100,7 +101,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 **Active experiments (8 students WIP):**
 1. **GEPS Test-Time Adaptation** (fern #2181) — LoRA context params + continuity residual TTA at inference. Zero training change.
 2. **NOBLE Nonlinear Low-Rank Branches** (nezuko #2205) — CosNet-activated low-rank residual branches in TransolverBlock FFN layers. Periodic activation physically motivated for pressure fields. Zero-init for safe start. From human team suggestions (issue #1926). Note: PR #2204 was merged prematurely (no student code) — #2205 is the true first run.
-3. **Transolver++ Ada-Temp + Rep-Slice** (alphonse #2206) — Per-point adaptive slice temperature (from Transolver++ ICML 2025) replacing global shared temp. Projected per-point offset on top of existing global temp; zero-initialized so baseline-equivalent at epoch 0. Rep-Slice adds Gumbel noise before softmax for sharp discrete routing. Paper reports 62% surface error reduction on aircraft datasets. Highest priority Round 10 idea. Seeds {42, 73}.
+3. **Surface Pressure Gradient Loss** (alphonse #2211) — Auxiliary loss on consecutive surface node pressure differences (Δp = p[i+1]-p[i]). Complements DCT freq loss (spectral domain) with spatial domain gradient matching. Physics motivation: dp/ds determines boundary layer separation and lift; aft foil in tandem has steepest gradients from wake impingement. Same ordering infrastructure as DCT loss. dp_ds_weight=0.05, seeds {42, 73}.
 4. **TE Coordinate Frame** (edward #2207) — Trailing-edge-relative coordinate features (dx, dy, r for fore-foil TE and aft-foil TE) appended as 6 new input channels. Targets NACA6416 OOD gap: TE location/shape differs significantly from training foils and model has no special TE-relative reference frame. Motivated by GeoMPNN (NeurIPS 2024 ML4CFD Best Student Paper, arXiv 2412.09399) which showed +3–5 OOD score pts from TE frame alone.
 5. **Curvature Loss Weighting** (tanjiro #2197) — Per-node curvature-weighted surface loss: `w_i = 1 + alpha * normalize(|kappa_i|)`. Tests alpha={0.5, 1.0, 2.0}. Upweights LE/TE nodes during training; val metric stays uniform.
 6. **Attention Register Tokens** (thorfinn #2209) — Add K=4 learnable global register tokens to Physics-Attention slice-token self-attention (per block). Addresses attention sink pathology on OOD inputs: registers provide explicit global memory slots, freeing physics slices from absorbing OOD signals. Tokens discarded after attention, before deslice. Based on arXiv 2309.16588 (NeurIPS 2023 ViT Registers). Seeds {42, 73}.
