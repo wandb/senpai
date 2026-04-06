@@ -1020,6 +1020,8 @@ class Config:
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
     gap_stagger_spatial_bias: bool = False  # condition spatial bias MLP on gap/stagger (tandem geometry-aware routing)
+    curvature_loss_weight: bool = False  # weight surface loss by per-node curvature magnitude
+    curvature_alpha: float = 1.0         # strength: w_i = 1 + alpha * normalize(|kappa_i|)
     dct_freq_loss: bool = False   # DCT frequency-weighted auxiliary loss on surface pressure
     dct_freq_weight: float = 0.05 # weight for DCT freq loss
     dct_freq_gamma: float = 2.0   # frequency upweighting strength
@@ -1888,7 +1890,18 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        # Curvature-weighted surface loss: per-node weights based on curvature magnitude
+        _curv_node_weights = None
+        if cfg.curvature_loss_weight:
+            _kappa = x[:, :, 24].abs()  # curvature proxy, [B, N]
+            _kappa_surf = _kappa * surf_mask.float()  # zero off-surface
+            _kappa_max = _kappa_surf.max(dim=1, keepdim=True).values.clamp(min=1e-6)  # [B, 1]
+            _kappa_norm = _kappa_surf / _kappa_max  # [B, N], in [0, 1]
+            _curv_node_weights = (1.0 + cfg.curvature_alpha * _kappa_norm) * surf_mask.float()  # [B, N]
+        if _curv_node_weights is not None:
+            surf_per_sample = (abs_err[:, :, 2:3].squeeze(-1) * _curv_node_weights).sum(dim=1) / _curv_node_weights.sum(dim=1).clamp(min=1e-6)
+        else:
+            surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
@@ -1902,7 +1915,10 @@ for epoch in range(MAX_EPOCHS):
             thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
             hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
-            surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            if _curv_node_weights is not None:
+                surf_per_sample = (surf_pres.squeeze(-1) * hard_weights.squeeze(-1) * _curv_node_weights).sum(dim=1) / _curv_node_weights.sum(dim=1).clamp(min=1e-6)
+            else:
+                surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         if cfg.tandem_ramp:
             tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
