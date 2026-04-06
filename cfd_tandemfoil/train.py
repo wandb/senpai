@@ -139,7 +139,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False,
+                 ada_temp=False, rep_slice=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -148,6 +149,13 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
         self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
+        # Transolver++ Ada-Temp: per-point adaptive slice temperature
+        self.ada_temp_on = ada_temp
+        self.rep_slice_on = rep_slice
+        if self.ada_temp_on:
+            self.ada_temp_proj = nn.Linear(dim, heads)
+            nn.init.zeros_(self.ada_temp_proj.weight)
+            nn.init.zeros_(self.ada_temp_proj.bias)
         self.tandem_temp_offset = nn.Parameter(torch.zeros(1, heads, 1, 1))
         self.linear_no_attention = linear_no_attention
         self.learned_kernel = learned_kernel
@@ -209,6 +217,11 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         if tandem_mask is not None:
             temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
         temp = temp.clamp(min=1e-4)
+        if self.ada_temp_on:
+            # Per-point, per-head temperature offset from input features
+            ada_offset = self.ada_temp_proj(x)  # [B, N, heads]
+            ada_offset = ada_offset.permute(0, 2, 1).unsqueeze(-1)  # [B, heads, N, 1]
+            temp = (temp + ada_offset).clamp(min=0.01)  # now per-point
         if self.decouple_slice and tandem_mask is not None:
             std_logits = self.in_project_slice(x_mid) / temp
             tan_logits = self.in_project_slice_tandem(x_mid) / temp
@@ -221,6 +234,11 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         if self.prog_slices:
             # Apply slice mask: 0 for active slices, -1e9 for inactive (updated each epoch)
             slice_logits = slice_logits + self.slice_mask
+        if self.rep_slice_on and self.training:
+            gumbel = -torch.log(-torch.log(
+                torch.empty_like(slice_logits).uniform_(1e-7, 1 - 1e-7)
+            ))
+            slice_logits = slice_logits + gumbel
         slice_weights = self.softmax(slice_logits)
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
@@ -283,6 +301,8 @@ class TransolverBlock(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         spatial_bias_input_dim=4,
+        ada_temp=False,
+        rep_slice=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -308,6 +328,8 @@ class TransolverBlock(nn.Module):
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
             prog_slices=prog_slices,
+            ada_temp=ada_temp,
+            rep_slice=rep_slice,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -700,6 +722,8 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        ada_temp=False,
+        rep_slice=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -772,6 +796,8 @@ class Transolver(nn.Module):
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
                     spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
+                    ada_temp=ada_temp,
+                    rep_slice=rep_slice,
                 )
                 for idx in range(n_layers)
             ]
@@ -1074,6 +1100,10 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Phase 6: Transolver++ Ada-Temp and Rep-Slice
+    ada_temp: bool = False                  # per-point adaptive slice temperature (Transolver++)
+    ada_temp_tau0: float = 0.5              # base temperature for Ada-Temp
+    rep_slice: bool = False                 # Gumbel-Softmax reparameterization for sharp slice routing
 
 
 cfg = sp.parse(Config)
@@ -1234,6 +1264,8 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    ada_temp=cfg.ada_temp,
+    rep_slice=cfg.rep_slice,
 )
 
 model = Transolver(**model_config).to(device)
