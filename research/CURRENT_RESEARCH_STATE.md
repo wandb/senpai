@@ -170,6 +170,18 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 6. **Attention Register Tokens** (`attention-register-tokens`) — Learnable global register tokens to prevent attention sink formation (arXiv 2309.16588).
 7. **Pressure-Conditioned Attn Temp** (`pressure-conditioned-attn-temp`) — Lightweight Ada-Temp variant using spatial_bias output. Only if Idea 1 not in-flight.
 
+### Round 11 — Researcher-Agent (2026-04-06 ~16:45) — See `/research/RESEARCH_IDEAS_2026-04-06_ROUND11.md`
+1. **Arc-Length Surface Loss** (`arclength-surface-loss`) — Reweight surface loss by arc-length element to correct non-uniform mesh density bias. ~15 LoC. Medium-high confidence.
+2. **PirateNets Adaptive Residuals** (`pirate-residuals`) — `tanh(s_l)` gated residuals, zero-init. Cures spectral bias at architecture level. ~10 LoC. Human team request.
+3. **mHC Residuals** (`mhc-residuals`) — Learnable alpha/beta per-layer residual mixing, init (1,1). ~15 LoC. Human team request.
+4. **Polar Coordinate Spatial Bias** (`polar-coord-bias`) — Replace Cartesian xy with (r, cos, sin) polar per foil in spatial_bias MLP. ~12 LoC.
+5. **Wake Deficit Feature** (`wake-deficit-feature`) — Gap-normalized dx/dy from fore-foil TE + wake cone. ~25 LoC.
+6. **Slice Diversity Regularization** (`slice-diversity-reg`) — Gram-matrix orthogonality loss on slice tokens. Complementary to register tokens (#2209). ~20 LoC.
+7. **GeoTransolver GALE** (`geotransolver-gale`) — Geometry cross-attention: surface shape latent conditions slice tokens. ~55 LoC.
+8. **Tandem Feature Cross** (`tandem-feature-cross`) — Input-level sigmoid gate MLP(gap, stagger, Re). ~25 LoC.
+9. **Chord-Normalized Coords** (`chord-normalized-coords`) — Divide (x,y) by per-sample chord length. ~18 LoC. Verify dataset first.
+10. **Hopfield Geometry Memory Bank** (`hopfield-geometry-memory`) — Retrieval-augmented SRF via geometry-indexed Hopfield memory. ~50 LoC.
+
 ### Round 9 — Human Suggestions (Issue #1926) — See `/research/RESEARCH_IDEAS_2026-04-06_ROUND9.md`
 1. ~~**NOBLE**~~ → nezuko #2205 (retry; #2204 merged prematurely without student execution)
 2. **GeoTransolver/GALE** — Geometry context cross-attention per block.
@@ -178,7 +190,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 5. **mHC Residuals** — Manifold-constrained hyper-connections.
 
 ### Human Researcher Directives
-- **#1926 (2026-04-06):** Try NOBLE, XSA (retry), Muon/Gram-NS (retry), HyperP, MSA, mHC, PirateNets, Geosolver, HeavyBall variants. Muon retry assigned (#2203). NOBLE assigned (#2204). Researcher-agent generated Round 9 + Round 10 hypotheses for remaining ideas.
+- **#1926 (2026-04-06):** Try NOBLE, XSA (retry), Muon/Gram-NS (retry), HyperP, MSA, mHC, PirateNets, Geosolver, HeavyBall variants. Muon retry #2203 CLOSED (dead end). NOBLE assigned #2205. Researcher-agent generated Rounds 9–11 hypotheses. PirateNets and mHC queued in R11 with detailed implementation.
 - **#1860 (2026-03-27):** Think bigger — radical new full model changes and data aug.
 - **#1834 (2026-03-27):** Never use raw data files outside assigned training split.
 
