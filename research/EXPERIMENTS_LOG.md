@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~22:00 — PR #2195: Add Inter-Foil Distance Feature to Spatial Bias Routing — askeladd — **CLOSED** (p_tan +2.4% vs baseline)
+- Branch: `askeladd/interfoil-dist-feature`
+- Hypothesis: Add `log(1+d_interfoil)` — log-distance from each mesh node to foil-2's geometric center — as 7th input to spatial_bias MLP. Physical motivation: pressure perturbations decay as ~1/r from upstream foil; distance to foil-2 is a meaningful routing signal for near-wake vs far-field regions. Zero-init on the new 7th column for baseline-equivalent start. Single-foil sentinel = 10.0.
+- W&B runs: gf94dd2t (seed 42), x5l2mf4g (seed 73)
+- W&B group: `round7/interfoil-dist-feature`
+
+| Metric | Baseline | Seed 42 | Seed 73 | Avg | Δ |
+|--------|----------|---------|---------|-----|---|
+| p_in | 13.21 | 12.9 | 12.9 | **12.90** | -2.3% ✓ |
+| **p_tan** | **28.50** | **28.7** | **29.7** | **29.20** | **+2.4% ✗** |
+| p_oodc | 7.82 | 7.7 | 7.9 | **7.80** | -0.2% ✓ |
+| p_re | 6.45 | 6.3 | 6.4 | **6.35** | -1.6% ✓ |
+
+- Epochs: 148 (both seeds)
+- VRAM: ~43 GB (identical to baseline)
+- **Analysis:** Mixed results — p_in (-2.3%) and p_re (-1.6%) improved, confirming the feature captures useful geometry for in-distribution and OOD-Re. But p_tan (primary target) regressed +2.4%, driven by seed 73 outlier (p_tan=29.7 vs baseline 28.572). Root cause: inter-foil distance computed from (gap, stagger) → foil-2 center proxy. For OOD NACA6416, the relationship between center offset and actual wake interaction zones differs from NACA0012 training distribution. Spatial bias MLP overfits slice routing to training-specific distance patterns. This is consistent with the pattern: adding per-node tandem-specific spatial features to spatial_bias helps in-distribution but hurts OOD tandem transfer. The gap/stagger scalars already capture sufficient tandem configuration information; more granular distance features add noise for OOD. **Dead end for raw geometric distance features in spatial bias.**
+
 ### 2026-04-06 ~21:00 — PR #2193: Curvature-Conditioned Spatial Bias: True Arc-Length Curvature for Slice Routing — edward — **CLOSED** (p_tan +2.5% vs baseline)
 - Branch: `edward/curvature-spatial-bias`
 - Hypothesis: True Menger arc-length curvature (κ = 2|area|/(d₁·d₂·d₃)) added as 7th input to spatial_bias MLP, extending the biggest historical win (GSB, -3.0% p_tan). Curvature varies dramatically at LE/TE and should enable geometry-aware routing that generalizes to unseen camber values (NACA6416). Orthogonal to existing inputs.

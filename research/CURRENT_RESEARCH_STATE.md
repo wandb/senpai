@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-06 ~21:15 UTC
+- **Date:** 2026-04-06 ~22:30 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -55,7 +55,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | frieren | #2199 | Spectral Conditioning of Attention (SCA) to prevent OOD collapse | WIP |
 | edward | #2201 | Multi-Scale Slice Hierarchy: Coarse-to-Fine Attention [32,64,96] | WIP |
 | tanjiro | #2197 | Geometry-Adaptive Curvature Loss Weighting on Surface Nodes | WIP |
-| askeladd | #2195 | Inter-Foil Distance Feature in Spatial Bias Routing | WIP |
+| askeladd | #2202 | Fore-Aft Cross-Attention in AftFoilRefinementHead for Wake Coupling | WIP |
 
 **All 8 students active. Zero idle GPUs.**
 
@@ -63,6 +63,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
+| #2195 | askeladd | Inter-Foil Distance Feature in Spatial Bias | **CLOSED** | p_tan +2.4% (29.20 vs 28.50). p_in/p_re improved but primary metric regressed. Per-node distance to foil-2 center overfits spatial routing to training tandem patterns, doesn't transfer to OOD NACA6416. |
 | #2191 | thorfinn | SE(2) AoA-Aligned Spatial Bias | **CLOSED** | p_tan +1.8% avg (29.0 vs 28.50). All 4 metrics regressed. AoA ±4° → cos(AoA)≈0.998, rotation is near-identity. Existing aug_full_dsdf_rot already provides invariance. |
 | #2183 | frieren | Vorticity Auxiliary Target | **CLOSED** | p_tan +2.5–3.0% (29.20–29.35 vs 28.502). Vorticity auxiliary loss competes with backbone pressure representation. Backbone already captures vorticity implicitly via velocity targets. KNN-based FD targets are noisy on unstructured mesh. Config B improved p_re (-2.8%) but p_tan regressed consistently across all 4 seeds. |
 | #2189 | tanjiro | DSDF TTA Feature Alignment | **CLOSED** | p_tan +69% (48.20 vs 28.50). Catastrophic. Double-normalizes DSDF, destroys geometry signal. |
@@ -99,6 +100,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 6. **Curvature Loss Weighting** (tanjiro #2197) — Per-node curvature-weighted surface loss: `w_i = 1 + alpha * normalize(|kappa_i|)`. Tests alpha={0.5, 1.0, 2.0}. Upweights LE/TE nodes during training; val metric stays uniform.
 7. **GradNorm Adaptive Loss Weighting** (thorfinn #2198) — Dynamic per-task loss weight balancing via GradNorm algorithm. `task_weights = nn.Parameter(torch.ones(N_tasks))`, grad norms from fc2 of last TransolverBlock, GradNorm loss = L1 norm mismatch, separate Adam lr=1e-3, EMA decay=0.9. Tests `--gradnorm --gradnorm_alpha 1.5`, two seeds {42, 73}.
 8. **Spectral Conditioning of Attention** (frieren #2199) — Learnable diagonal `D = nn.Parameter(torch.ones(n_heads, slice_num))` right-multiplied into attention logits before softmax (~288 params). Applied to all 3 TransolverBlocks. Initialized to identity. Optional condition number regularization via log-variance proxy (`--spectral_attn_conditioning --sac_lambda 0.01`), two seeds {42, 73}.
+9. **Fore-Aft Cross-Attention in AftFoilRefinementHead** (askeladd #2202) — Single-head cross-attention (d_attn=64) from aft-foil surface nodes (queries) to fore-foil surface nodes (keys/values) inside the SRF head. Injects direct upstream wake information into the correction head. Zero-init output projection for baseline-equivalent start. Differentiates from failed KNN context (#2127/#2134) by targeting surface nodes only (~300×300 attention vs 15K-node KNN lookup → <1% overhead). Physical motivation: aft-foil pressure is physically determined by fore-foil wake; this gives the SRF head a learnable direct channel for this dependency.
 
 **Key research patterns:**
 - **What works:** DSDF magnitude augmentation (foil-2 only), specialized correction heads (aft_srf), gradient surgery (2-way PCGrad), tandem-geometry-aware routing (GSB), geometry-conditioned mechanisms
@@ -133,7 +135,8 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 1. **Vorticity Input Feature** — Pre-compute KNN-based vorticity (ω ≈ curl(v)) from velocity fields and add as per-node input feature (rather than auxiliary loss target). Avoids gradient competition with backbone. Could give the model explicit wake structure information at inference time. Would need ~6th input feature channel.
 
 ### Round 7 — Researcher-Agent (2026-04-06) — See `/research/RESEARCH_IDEAS_2026-04-06_ROUND7.md`
-1. ~~**Inter-Foil Distance Feature in Spatial Bias**~~ → askeladd #2195
+1. ~~**Inter-Foil Distance Feature in Spatial Bias**~~ → askeladd #2195 — DEAD END (p_tan +2.4%)
+2. ~~**Fore-Aft Cross-Attention in AftFoilRefinementHead**~~ → askeladd #2202
 2. ~~**Geometry-Adaptive Curvature Loss Weighting**~~ → tanjiro #2197
 3. **Adaptive Boundary Layer Sampling** — Oversample near-wall mesh nodes during training proportional to gradient magnitude. Dense physics there.
 4. ~~**GradNorm Adaptive Loss Weighting**~~ → thorfinn #2198
@@ -225,6 +228,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 | **SE(2) AoA-Aligned Spatial Bias** | **#2191** | **p_tan avg +1.8% (29.0 vs 28.50). All 4 metrics regressed. AoA range ±4° makes rotation near-identity (cos≈0.998). aug_full_dsdf_rot already provides this invariance.** |
 | **Vorticity Auxiliary Target** | **#2183** | **p_tan +2.5–3.0% (29.20–29.35 vs 28.502). Vorticity auxiliary loss competes with backbone pressure representation; backbone already implicitly encodes vorticity via velocity targets (ω=curl(v)). Noisy KNN-FD targets on unstructured mesh add harmful gradients. Config B improved p_re (-2.8%) but primary metric regressed across all 4 seeds.** |
 | **Stochastic Depth** | **#2192** | **p_tan +2.1% (29.10 avg). Layer drop regularizer absorbed by EMA + cosine schedule. 3-layer backbone too shallow for drop path benefit (DeiT uses 12+ layers).** |
+| **Inter-Foil Distance Feature in Spatial Bias** | **#2195** | **p_tan +2.4% (29.20 avg). Per-node log-distance to foil-2 center overfits spatial routing to training NACA0012 tandem patterns. Seed 73 diverged (29.7). Gap/stagger scalars already capture sufficient tandem config info.** |
 | **Curvature-Conditioned Spatial Bias** | **#2193** | **p_tan +2.5% (29.20 avg). Curvature redundant with position — high-κ concentrates at LE/TE, already captured by (x,y). Python loop overhead reduced epoch budget. Only p_in improved (-2.0%).** |
 
 ## Ensemble Seed Pool (Complete)
