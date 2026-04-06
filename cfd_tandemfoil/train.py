@@ -1024,6 +1024,8 @@ class Config:
     dct_freq_weight: float = 0.05 # weight for DCT freq loss
     dct_freq_gamma: float = 2.0   # frequency upweighting strength
     dct_freq_alpha: float = 1.5   # frequency exponent
+    dp_ds_loss: bool = False      # auxiliary loss on surface pressure gradients (dp/ds)
+    dp_ds_weight: float = 0.05    # weight for dp/ds gradient loss
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1662,9 +1664,10 @@ for epoch in range(MAX_EPOCHS):
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
-        _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
-        _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
-        _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
+        _need_raw_dct = cfg.dct_freq_loss or cfg.dp_ds_loss
+        _raw_x_for_dct = x[:, :, 0].clone() if _need_raw_dct else None  # save raw x before normalization
+        _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if _need_raw_dct else None
+        _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if _need_raw_dct else None
         # Aft-foil mask: boundary ID=7 nodes identified by saf norm > 0.005
         # saf is at raw x[:,:,2:4]; foil-1 surface has saf≈0, foil-2 has saf>>0
         _aft_foil_mask = None
@@ -1996,6 +1999,36 @@ for epoch in range(MAX_EPOCHS):
             if _n_foils_dct > 0:
                 _dct_loss = _dct_loss / _n_foils_dct
                 loss = loss + cfg.dct_freq_weight * _dct_loss
+
+        # Surface pressure gradient (dp/ds) auxiliary loss
+        if cfg.dp_ds_loss and model.training:
+            _dp_loss = torch.tensor(0.0, device=device)
+            _n_foils_dp = 0
+            for b in range(B):
+                surf_idx_b = is_surface[b].nonzero(as_tuple=True)[0]
+                if surf_idx_b.numel() < 4:
+                    continue
+                _is_tan_b = _raw_tandem_for_dct[b].item()
+                if _is_tan_b:
+                    saf_vals = _raw_saf_for_dct[b, surf_idx_b]
+                    foil_groups = [surf_idx_b[saf_vals <= 0.005], surf_idx_b[saf_vals > 0.005]]
+                else:
+                    foil_groups = [surf_idx_b]
+                for foil_surf in foil_groups:
+                    if foil_surf.numel() < 4:
+                        continue
+                    x_coords = _raw_x_for_dct[b, foil_surf]
+                    sort_order = x_coords.argsort()
+                    sorted_idx = foil_surf[sort_order]
+                    p_pred = pred[b, sorted_idx, 2]
+                    p_gt = y_norm[b, sorted_idx, 2]
+                    dp_pred = p_pred[1:] - p_pred[:-1]
+                    dp_gt = p_gt[1:] - p_gt[:-1]
+                    _dp_loss = _dp_loss + (dp_pred - dp_gt).abs().mean()
+                    _n_foils_dp += 1
+            if _n_foils_dp > 0:
+                _dp_loss = _dp_loss / _n_foils_dp
+                loss = loss + cfg.dp_ds_weight * _dp_loss
 
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
