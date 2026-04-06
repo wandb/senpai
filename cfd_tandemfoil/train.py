@@ -1071,6 +1071,7 @@ class Config:
     aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
     aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
     aft_foil_srf_context: bool = False       # KNN volume context for aft-foil SRF (wake pressure recovery)
+    srf_iterations: int = 1                  # number of SRF head passes (RAFT-style iterative refinement)
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
@@ -1798,14 +1799,15 @@ for epoch in range(MAX_EPOCHS):
                     ).float()
                     pred = pred + refine_correction
                 else:
-                    # Standard: extract surface nodes, apply MLP, scatter back
+                    # Standard: extract surface nodes, apply MLP iteratively, scatter back
                     surf_idx = is_surface.nonzero(as_tuple=False)  # [M, 2] (batch, node)
                     if surf_idx.numel() > 0:
                         surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]  # [M, n_hidden]
-                        surf_pred = pred[surf_idx[:, 0], surf_idx[:, 1]]      # [M, 3]
-                        correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
+                        current_surf_pred = pred[surf_idx[:, 0], surf_idx[:, 1]].clone()  # [M, 3]
+                        for _ in range(cfg.srf_iterations):
+                            current_surf_pred = current_surf_pred + refine_head(surf_hidden, current_surf_pred).float()
                         pred = pred.clone()
-                        pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
+                        pred[surf_idx[:, 0], surf_idx[:, 1]] = current_surf_pred
 
         # Aft-foil dedicated refinement head: additive correction on boundary ID=7 nodes only
         if aft_srf_ctx_head is not None and model.training and _aft_foil_mask is not None:
@@ -1831,15 +1833,16 @@ for epoch in range(MAX_EPOCHS):
             aft_idx = _aft_foil_mask.nonzero(as_tuple=False)  # [A, 2] (batch, node)
             if aft_idx.numel() > 0:
                 aft_hidden = hidden[aft_idx[:, 0], aft_idx[:, 1]]  # [A, n_hidden]
-                aft_pred = pred[aft_idx[:, 0], aft_idx[:, 1]]      # [A, 3]
-                # FiLM conditioning: expand gap/stagger per aft-foil node
+                current_aft_pred = pred[aft_idx[:, 0], aft_idx[:, 1]].clone()  # [A, 3]
                 _aft_cond = None
                 if cfg.aft_foil_srf_film:
                     _aft_cond = _raw_gap_stagger[aft_idx[:, 0]]  # [A, 2]
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    aft_correction = aft_srf_head(aft_hidden, aft_pred, _aft_cond).float()
+                for _ in range(cfg.srf_iterations):
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        aft_correction = aft_srf_head(aft_hidden, current_aft_pred, _aft_cond).float()
+                    current_aft_pred = current_aft_pred + aft_correction
                 pred = pred.clone()
-                pred[aft_idx[:, 0], aft_idx[:, 1]] = pred[aft_idx[:, 0], aft_idx[:, 1]] + aft_correction
+                pred[aft_idx[:, 0], aft_idx[:, 1]] = current_aft_pred
 
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
@@ -2451,10 +2454,11 @@ for epoch in range(MAX_EPOCHS):
                             surf_idx = is_surface.nonzero(as_tuple=False)
                             if surf_idx.numel() > 0:
                                 surf_hidden = _eval_hidden[surf_idx[:, 0], surf_idx[:, 1]]
-                                surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                                correction = eval_refine_head(surf_hidden, surf_pred).float()
+                                current_surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]].clone()
+                                for _ in range(cfg.srf_iterations):
+                                    current_surf_pred = current_surf_pred + eval_refine_head(surf_hidden, current_surf_pred).float()
                                 pred_loss = pred_loss.clone()
-                                pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
+                                pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = current_surf_pred
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
                     if cfg.multiply_std:
                         pred = pred_loss / sample_stds
@@ -2486,12 +2490,14 @@ for epoch in range(MAX_EPOCHS):
                     aft_idx = _eval_aft_mask.nonzero(as_tuple=False)
                     if aft_idx.numel() > 0:
                         _ah = _eval_hidden[aft_idx[:, 0], aft_idx[:, 1]]
-                        _ap = pred_loss[aft_idx[:, 0], aft_idx[:, 1]]
+                        _current_ap = pred_loss[aft_idx[:, 0], aft_idx[:, 1]].clone()
                         _ac = _v_gap_stagger[aft_idx[:, 0]] if cfg.aft_foil_srf_film else None
-                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                            _aft_corr = eval_aft_srf_head(_ah, _ap, _ac).float()
+                        for _ in range(cfg.srf_iterations):
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                _aft_corr = eval_aft_srf_head(_ah, _current_ap, _ac).float()
+                            _current_ap = _current_ap + _aft_corr
                         pred_loss = pred_loss.clone()
-                        pred_loss[aft_idx[:, 0], aft_idx[:, 1]] += _aft_corr
+                        pred_loss[aft_idx[:, 0], aft_idx[:, 1]] = _current_ap
                         # Back-compute pred for denormalization
                         if cfg.multiply_std:
                             pred = pred_loss / sample_stds
