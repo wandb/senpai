@@ -54,11 +54,11 @@ Single-model p_tan (28.52) already **BEATS** ensemble (29.1). Gap continues to w
 | alphonse | #2219 | Additive Fore→Aft Cross-Attention in AftSRF | WIP (just assigned) |
 | thorfinn | #2216 | GeoTransolver GALE (geometry-latent cross-attention) | WIP |
 | tanjiro | #2218 | LE Coordinate Frame: leading-edge-relative input features | WIP (just assigned) |
-| askeladd | — | **IDLE** (PR #2212 closed — dead end) | Needs assignment |
+| askeladd | #2220 | Slice Diversity Reg: Gram matrix orthogonality on slice attention | WIP (just assigned) |
 | frieren | #2213 | Wake Deficit Feature (gap-normalized fore-TE offset) | WIP |
 | edward | #2214 | Deep Supervision on fx_deep intermediate rep | WIP |
 
-**7 students active, 1 idle (askeladd). Assigning new experiment.**
+**All 8 students active. Zero idle GPUs.**
 
 ### Closed/Merged this cycle (2026-04-06 to 2026-04-07)
 - #2218 tanjiro: LE Coordinate Frame — ASSIGNED. Leading-edge-relative input features (+6 channels), mirroring successful TE coord frame.
