@@ -2398,3 +2398,19 @@ Run IDs (seeds 42-49 re-trained): f59v5aul, 0yurebjv, rdezx8es, ds12ug79, yu1x0d
 ### Key Non-Winners (Closed — Phase 5)
 - 50+ Phase 5 experiments explored: throughput optimization, data augmentation, architecture variants, loss formulations, ensemble methods, curriculum learning, distillation
 - Most incremental tuning exhausted — motivates Phase 6 shift
+
+## 2026-04-06 04:XX — PR #2185: MAE Pretraining — Self-Supervised Geometry Encoder Initialization
+- alphonse/mae-pretrain
+- **Hypothesis:** Pretraining the Transolver encoder with a Masked Autoencoder (MAE) objective on mesh geometry before supervised training would learn richer geometric representations, improving OOD generalization on NACA6416 tandem geometry.
+- **Results:**
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| 20ep pretrain | 42 | 20.57 | 16.21 | 39.46 | 10.63 | `8a4c3ojp` |
+| 20ep pretrain | 73 | 25.08 | 18.00 | 45.32 | 11.51 | `lr8mow5f` |
+| 10ep pretrain | 42 | 27.74 | 26.59 | 47.86 | 17.68 | `twf3alql` |
+| 10ep pretrain | 73 | 17.35 | 15.87 | 42.56 | 9.54 | `bv9rangq` |
+| **Baseline** | — | **13.05** | **7.70** | **28.60** | **6.55** | |
+
+- **Decision: CLOSED — strong negative result (2-5x worse than baseline)**
+- **Analysis:** The MAE pretraining objective (feature reconstruction via L1 loss) is fundamentally incompatible with downstream physics prediction: it biases the encoder toward spatial interpolation rather than flow physics. Combined with reduced supervised training budget (10-20 epochs consumed by pretraining) and a dataset too small (1322 samples) to benefit from self-supervised priors, this is a clean conceptual failure. The MAE loss did converge (0.50→0.36 over 20 epochs), confirming correct implementation — the idea itself is the problem, not the code. Self-supervised pretraining on the same dataset as supervised training provides no meaningful data diversity benefit.

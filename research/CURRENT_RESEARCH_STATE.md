@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-06 ~16:30 UTC
+- **Date:** 2026-04-06 ~04:30 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -52,8 +52,8 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | askeladd | #2188 | MixStyle Tandem Feature Regularization for OOD Generalization | WIP |
 | nezuko | #2190 | Laplacian Eigenvector Mesh Positional Encoding | WIP |
 | tanjiro | #2189 | DSDF Test-Time Feature Alignment for OOD Tandem | WIP |
-| alphonse | #2185 | MAE Pretraining: self-supervised geometry encoder initialization | WIP |
-| thorfinn | #2191 | SE(2) AoA-Aligned Spatial Bias: Chord-Frame Slice Routing | WIP — just assigned |
+| alphonse | #2192 | Stochastic Depth: Layer Drop Regularization for Transolver | WIP — just assigned |
+| thorfinn | #2191 | SE(2) AoA-Aligned Spatial Bias: Chord-Frame Slice Routing | WIP |
 | frieren | #2183 | Vorticity Auxiliary Target: explicit wake structure learning | WIP |
 | edward | #2187 | Normal-Velocity Hard Constraint at surface nodes | WIP |
 
@@ -63,6 +63,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
+| #2185 | alphonse | MAE Pretraining (self-supervised geometry init) | **CLOSED** | p_tan +38-67% (2-5x worse). MAE objective conflicts with physics prediction; dataset too small for SSL. |
 | #2186 | thorfinn | Panel Cp Residual Target | **CLOSED** | p_tan +349% (catastrophic). Panel solver fails for tandem. |
 | #2184 | nezuko | DCT Freq-Weighted Loss (w=0.05) | **MERGED** | p_tan 28.60→28.50 (-0.3%). New baseline. |
 | #2182 | tanjiro | Ensemble Distillation (alpha=0.3, 0.5) | **CLOSED** | p_tan +1.6-2.8%. Teacher quality gap. |
@@ -90,7 +91,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 2. **MixStyle Tandem Feature Regularization** (askeladd #2188) — Feature-space style mixing between tandem samples for OOD generalization.
 3. **Laplacian Eigenvector Mesh PE** (nezuko #2190) — Replace Fourier PE with intrinsic graph Laplacian eigenvectors. High-potential positional encoding overhaul.
 4. **DSDF Test-Time Feature Alignment** (tanjiro #2189) — Align OOD DSDF feature distribution to training stats at inference. 5-line change, zero training cost.
-5. **MAE Pretraining** (alphonse #2185) — self-supervised masked geometry reconstruction before supervised training.
+5. **Stochastic Depth** (alphonse #2192) — randomly skip TransolverBlocks during training (p∈{0.05,0.10,0.15}). Standard DeiT/ViT regularizer; forces each layer to be independently useful. 5-line change.
 6. **Normal-Velocity Hard Constraint** (edward #2187) — project out normal velocity at surface nodes. Hard BC enforcement.
 7. **Vorticity Auxiliary Target** (frieren #2183) — KNN-computed ω as auxiliary prediction target. Forces explicit wake learning.
 8. **SE(2) AoA-Aligned Spatial Bias** (thorfinn #2191) — Rotate (x, y) to AoA-aligned frame before spatial_bias MLP. Makes GSB routing invariant to AoA changes. Extends the biggest historical win. Expected -1 to -2% p_tan.
@@ -119,7 +120,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 1. ~~**Boundary ID 7 Surface Loss Fix**~~ — FALSE ALARM: prepare_multi.py already uses SURFACE_IDS_MULTI=(5,6,7). Comment in train.py:19 is stale.
 2. ~~**SE(2) Chord-Aligned Slice Routing**~~ → thorfinn #2191
 3. **Hopfield Geometry Memory Bank** — k-NN retrieval: find nearest training geometries at inference, retrieve pressure patterns as SRF prior. Targets NACA6416 distribution shift directly.
-4. **Stochastic Depth** — Skip TransolverBlocks randomly during training (p=0.05-0.15). Standard DeiT/ViT regularizer. 5-line change.
+4. ~~**Stochastic Depth**~~ → alphonse #2192
 5. **Curvature-Conditioned Spatial Bias** — Extend GSB MLP from 6→7 inputs by appending local curvature (DSDF Laplacian proxy). Natural extension of biggest historical win.
 6. **Tandem Inter-Foil Distance Feature** — log(min distance to opposite foil) per node. Encodes aerodynamic coupling strength.
 7. **Geometry-Adaptive Curvature Loss Weighting** — Upweight surface loss at high-curvature nodes (LE, TE). Spatial analog of merged DCT freq loss.
@@ -187,6 +188,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 | **DCT Frequency-Weighted Loss** | **#2184** | **MERGED. w=0.05 p_tan -0.3% (new baseline). w=0.1 unstable (high seed variance).** |
 | **Ensemble Distillation** | **#2182** | **p_tan +1.6-2.8%. Teacher quality gap — ensemble pre-dates GSB/PCGrad, weaker than student.** |
 | **Multi-Resolution Hash Grid** | **#2180** | **p_tan +12.2%. Per-sample coord normalization breaks spatial coherence. 1.14M extra params overfit, 20s/epoch overhead.** |
+| **MAE Pretraining (SSL geometry init)** | **#2185** | **p_tan +38-67% (2-5x worse). MAE reconstruction conflicts with physics prediction objective. Dataset (1322 samples) too small for SSL benefit. Pretraining wastes 10-20 epochs of supervised budget.** |
 
 ## Ensemble Seed Pool (Complete)
 
