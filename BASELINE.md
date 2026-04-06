@@ -1,6 +1,38 @@
 # Baseline Metrics
 
-## Current Single-Model Baseline (Phase 6 — 2026-04-06, +DCT Frequency-Weighted Loss w=0.05, 2-Seed Evidence, PR #2184)
+## Current Single-Model Baseline (Phase 6 — 2026-04-06, +TE Coordinate Frame, 2-Seed Evidence, PR #2207)
+
+| Metric | 2-seed avg | vs prior (DCT freq loss) | Δ |
+|--------|------------|--------------------------|---|
+| **p_in** | **12.490** | 13.205 | **-5.4%** |
+| **p_oodc** | **7.618** | 7.816 | **-2.5%** |
+| p_tan | **28.521** | 28.502 | +0.1% (noise) |
+| **p_re** | **6.411** | 6.453 | **-0.7%** |
+
+**PR #2207** (merged 2026-04-06) — TE Coordinate Frame: adds 6 new input channels representing trailing-edge-relative coordinates for both the fore-foil TE and aft-foil TE. For each node, computes signed offsets (dx, dy) and Euclidean distance from each foil's trailing edge (max-x surface node). Aft-foil TE features are zeroed for single-foil samples. Based on GeoMPNN (arXiv:2412.09399, NeurIPS 2024 ML4CFD Best Student Paper). Delivers a striking -5.4% improvement on p_in and meaningful improvements on p_oodc and p_re. p_tan is essentially flat (within 2-seed noise). W&B runs: obn1wfja (seed 42, p_tan=28.641, p_in=12.708), 52irfwwg (seed 73, p_tan=28.400, p_in=12.271). Runs completed 148/200 epochs — model still improving at timeout.
+
+⚠️ **2-seed only.** For merge decisions: **p_tan < 28.52**, p_oodc < 7.62, p_in < 12.49, p_re < 6.41.
+
+**Reproduce (current baseline):**
+```bash
+cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baseline-te-coord" \
+  --asinh_pressure --asinh_scale 0.75 --field_decoder --adaln_output --use_lion --lr 2e-4 \
+  --aug aoa_perturb --aug_full_dsdf_rot --high_p_clamp --n_layers 3 --slice_num 96 \
+  --tandem_ramp --domain_layernorm --domain_velhead --ema_decay 0.999 --weight_decay 5e-5 \
+  --cosine_T_max 160 --pcgrad_3way --pcgrad_extreme_pct 0.15 \
+  --pressure_first --pressure_deep \
+  --residual_prediction --surface_refine --surface_refine_hidden 192 --surface_refine_layers 3 \
+  --aft_foil_srf --aug_gap_stagger_sigma 0.02 --aug_dsdf2_sigma 0.05 \
+  --gap_stagger_spatial_bias \
+  --dct_freq_loss --dct_freq_weight 0.05 --dct_freq_gamma 2.0 --dct_freq_alpha 1.5 \
+  --te_coord_frame
+```
+
+**For merge decisions:** Compare 2-seed avg against: p_tan < 28.52, p_oodc < 7.62, p_in < 12.49, p_re < 6.41.
+
+---
+
+## Prior Single-Model Baseline (Phase 6 — 2026-04-06, +DCT Frequency-Weighted Loss w=0.05, 2-Seed Evidence, PR #2184)
 
 | Metric | 2-seed avg | vs prior (GSB+PCGrad) | Δ |
 |--------|------------|------------------------|---|
