@@ -285,6 +285,7 @@ class TransolverBlock(nn.Module):
         spatial_bias_input_dim=4,
     ):
         super().__init__()
+        self.drop_path_rate = 0.0  # stochastic depth: set externally after construction
         self.last_layer = last_layer
         self.field_decoder = field_decoder
         self.domain_velhead = domain_velhead
@@ -393,6 +394,10 @@ class TransolverBlock(nn.Module):
                 )
 
     def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
+        # Stochastic depth: skip entire block during training with probability drop_path_rate
+        if self.training and self.drop_path_rate > 0.0:
+            if torch.rand(1, device=fx.device).item() < self.drop_path_rate:
+                return fx  # pass through unchanged
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         # DomainLayerNorm helper: pass is_tandem when enabled, else plain call
         dln_it = (tandem_mask.view(-1) > 0.5) if (self.domain_layernorm and tandem_mask is not None) else None
@@ -1074,6 +1079,8 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Phase 6: Stochastic depth — random layer skip regularization
+    stochastic_depth_p: float = 0.0          # max drop rate (layer i gets p*i/(n_layers-1)), 0=disabled
 
 
 cfg = sp.parse(Config)
@@ -1238,6 +1245,11 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 model._pressure_separate = cfg.pressure_separate_last_block
+# Stochastic depth: linearly increasing drop rate per non-last layer (last has output head, never skipped)
+if cfg.stochastic_depth_p > 0.0:
+    n_droppable = len(model.blocks) - 1  # exclude last block
+    for i, block in enumerate(model.blocks[:-1]):
+        block.drop_path_rate = cfg.stochastic_depth_p * (i + 1) / max(1, n_droppable)
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
