@@ -2,6 +2,22 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~23:30 — PR #2209: Attention Register Tokens — thorfinn — **CLOSED** (p_tan +4.0%, p_in +6.1%, p_oodc +5.7% vs current baseline)
+- Branch: `thorfinn/attention-register-tokens`
+- Hypothesis: Append K=4 learnable register tokens to Physics-Attention slice sequence [B,96,192]→[B,100,192], discard after attention. Motivated by "Vision Transformers Need Registers" (arXiv 2309.16588, NeurIPS 2023) — prevents OOD attention sink pathology by providing explicit allocation for global state.
+- W&B runs: `78svenp2` (seed 42), `329os002` (seed 73)
+
+| Metric | Current Baseline (PR #2207) | Seed 42 | Seed 73 | 2-seed avg | Δ |
+|--------|----------------------------|---------|---------|-----------|---|
+| p_in | 12.490 | 13.2 | 13.3 | **13.25** | **+6.1% ✗** |
+| p_oodc | 7.618 | 8.2 | 7.9 | **8.05** | **+5.7% ✗** |
+| p_tan | 28.521 | 30.0 | 29.3 | **29.65** | **+4.0% ✗** |
+| p_re | 6.411 | 6.4 | 6.4 | **6.40** | flat |
+
+- Training: 148/148 epochs, ~45.8 GB VRAM, ~73-80s/epoch (identical to baseline). 2,304 new params total.
+- **Analysis:** Decisive negative result across all metrics. Student's post-mortem is correct and insightful: Transolver's Physics-Attention is not analogous to ViT spatial attention. Slice tokens are already global weighted aggregates over all mesh nodes — the "dump token" sink pathology requires local patch tokens to form. The existing shared-K/V pattern (from head-averaged slice tokens) already provides the global pooling that registers would redundantly supply. Additionally: only 3 blocks (vs 12-24 in ViT register paper), registers absorbed attention mass from physics-relevant slices.
+- **Conclusion:** Register tokens direction fully exhausted for this architecture. Attention architecture modifications targeting OOD routing collapse are not the bottleneck.
+
 ### 2026-04-06 ~21:00 — PR #2208: Iterative SRF Heads (RAFT-style): N=3 correction passes on surface nodes — askeladd — **CLOSED** (p_tan +5.6% reported, W&B crashed)
 - Branch: `askeladd/iterative-srf-raft`
 - Hypothesis: RAFT-style iterative refinement on SRF heads — run 3 sequential correction passes on surface nodes. Zero-init final layers so pass 1 = baseline. Inspired by RAFT's iterative GRU for optical flow.
