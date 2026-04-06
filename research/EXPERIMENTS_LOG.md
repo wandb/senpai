@@ -2522,3 +2522,20 @@ Run IDs (seeds 42-49 re-trained): f59v5aul, 0yurebjv, rdezx8es, ds12ug79, yu1x0d
 
 - **Decision: CLOSED — strong negative result (2-5x worse than baseline)**
 - **Analysis:** The MAE pretraining objective (feature reconstruction via L1 loss) is fundamentally incompatible with downstream physics prediction: it biases the encoder toward spatial interpolation rather than flow physics. Combined with reduced supervised training budget (10-20 epochs consumed by pretraining) and a dataset too small (1322 samples) to benefit from self-supervised priors, this is a clean conceptual failure. The MAE loss did converge (0.50→0.36 over 20 epochs), confirming correct implementation — the idea itself is the problem, not the code. Self-supervised pretraining on the same dataset as supervised training provides no meaningful data diversity benefit.
+
+## 2026-04-06 ~10:30 UTC — PR #2198: GradNorm Adaptive Loss Weighting for Tandem-Transfer
+- thorfinn/gradnorm-adaptive-loss
+- **Hypothesis:** Fixed PCGrad loss weights treat all tasks as equally learnable, but p_tan consistently dominates error. GradNorm (Chen et al., 2018) dynamically adjusts per-task weights so gradient norms grow at the same normalized rate — preventing easy tasks from crowding out hard ones. alpha=1.5 biases toward lagging tasks (p_tan). GradNorm + PCGrad address orthogonal aspects (scalar weights vs gradient directions).
+- **Results:**
+
+| Run | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|-----|------|------|--------|-------|------|-----|
+| gradnorm-alpha1.5 | 42 | 12.900 | 7.586 | 28.611 | 6.371 | `3wkhlz4a` |
+| gradnorm-alpha1.5 | 73 | 13.239 | 8.042 | 29.347 | 6.545 | `5aw7ac8m` |
+| **2-seed avg** | — | **13.070** | **7.814** | **28.979** | **6.458** | — |
+| **vs baseline** | — | **-1.0%** | **flat** | **+1.7% ✗** | **flat** | — |
+
+Baseline (PR #2184): p_in=13.205, p_oodc=7.816, p_tan=28.502, p_re=6.453
+
+- **Decision: CLOSED — dead end**
+- **Analysis:** GradNorm actually hurt p_tan (+1.7% regression, 28.979 vs 28.502), the exact metric it was designed to improve. p_in improved (-1.0%) but the primary target regressed. Paradoxically, the algorithm designed to upweight the tandem loss made it worse — likely because GradNorm's adaptive weight updates disturbed the carefully balanced PCGrad gradient surgery dynamics. When GradNorm detects tandem gradient norms are smaller, it increases tandem weight, but this destabilizes the PCGrad conflict resolution operating at gradient-direction level. EMA smoothing (decay=0.9) was not enough to prevent oscillation between the two mechanisms. Seed 73 was particularly bad (p_tan=29.347, +3%). Gradient norm balancing and gradient direction surgery are NOT fully orthogonal in practice with EMA interaction. The lesson: PCGrad's balance is already well-calibrated; adding a second layer of adaptive weighting on top creates interference.
