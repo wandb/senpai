@@ -998,6 +998,9 @@ class Config:
     half_target_noise: bool = False  # GPU 3: reduce target noise by 50%
     no_target_noise: bool = False    # Phase 4: completely disable target noise injection
     use_lion: bool = False        # GPU 4: Lion optimizer instead of AdamW
+    use_muon: bool = False        # Muon optimizer (Newton-Schulz orthogonalized updates for 2D+ weight matrices)
+    lr_muon: float = 0.02         # Muon LR (spectral norm units, much higher than AdamW)
+    lr_adamw_scalar: float = 3e-4 # AdamW LR for scalar/1D params when using Muon
     rdrop: bool = False           # GPU 7: R-drop regularization
     rdrop_alpha: float = 1.0     # R-drop consistency loss weight
     # Phase 3 R3: normalization/prediction-space experiments
@@ -1400,6 +1403,77 @@ class Lion(torch.optim.Optimizer):
         return loss
 
 
+def _zeropower_via_newtonschulz5(G, steps=5):
+    """Newton-Schulz iteration to compute the zeroth power / orthogonalization of G.
+    Uses quintic iteration with coefficients maximizing slope at zero.
+    From: https://kellerjordan.github.io/posts/muon/
+    """
+    assert G.ndim >= 2
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    for _ in range(steps):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+
+class MuonOptimizer(torch.optim.Optimizer):
+    """Muon - MomentUm Orthogonalized by Newton-Schulz (single-GPU version).
+
+    Applies Newton-Schulz orthogonalization to gradient momentum updates for 2D+ weight matrices.
+    Only use for hidden weight layers; biases, norms, and embeddings should use AdamW.
+
+    Args:
+        lr: Learning rate in units of spectral norm per update (default 0.02).
+        momentum: Momentum coefficient (default 0.95).
+        nesterov: Whether to use Nesterov momentum (default True).
+        weight_decay: AdamW-style weight decay (default 0).
+        ns_steps: Number of Newton-Schulz iteration steps (default 5).
+    """
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0, ns_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay, ns_steps=ns_steps)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                state = self.state[p]
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(p.data)
+                buf = state['momentum_buffer']
+                buf.lerp_(grad, 1 - group['momentum'])
+                if group['nesterov']:
+                    update = grad.lerp(buf, group['momentum'])
+                else:
+                    update = buf.clone()
+                # Reshape to 2D for Newton-Schulz if needed (e.g. conv filters)
+                orig_shape = update.shape
+                if update.ndim > 2:
+                    update = update.view(update.size(0), -1)
+                update = _zeropower_via_newtonschulz5(update, steps=group['ns_steps'])
+                update = update.view(orig_shape).to(p.data.dtype)
+                update *= max(1, p.size(0) / p.size(-1)) ** 0.5
+                # Weight decay (AdamW-style)
+                if group['weight_decay'] > 0:
+                    p.data.mul_(1 - group['lr'] * group['weight_decay'])
+                p.data.add_(update, alpha=-group['lr'])
+        return loss
+
+
 class Lookahead:
     def __init__(self, base_optimizer, k=5, alpha=0.5):
         self.base_optimizer = base_optimizer
@@ -1431,7 +1505,30 @@ class Lookahead:
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
-if cfg.use_lion:
+
+# Muon dual-optimizer: Muon for 2D+ weight matrices, AdamW for scalars/1D/norms/embeddings
+_muon_adamw_opt = None  # secondary AdamW when using Muon
+if cfg.use_muon:
+    assert not cfg.use_lion, "--use_muon and --use_lion are mutually exclusive"
+    _muon_params, _adamw_params = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        is_matrix = param.ndim >= 2
+        is_norm = any(k in name for k in ['norm', 'ln_', 'layer_norm', 'LayerNorm'])
+        is_embed = 'embed' in name or 'pos_' in name
+        if is_matrix and not is_norm and not is_embed:
+            _muon_params.append(param)
+        else:
+            _adamw_params.append(param)
+    print(f"Muon optimizer: {len(_muon_params)} matrix params ({sum(p.numel() for p in _muon_params):,} total), "
+          f"{len(_adamw_params)} scalar/1D params ({sum(p.numel() for p in _adamw_params):,} total)")
+    base_opt = MuonOptimizer(_muon_params, lr=cfg.lr_muon, momentum=0.95, nesterov=True,
+                             weight_decay=cfg.weight_decay)
+    _muon_adamw_opt = torch.optim.AdamW(_adamw_params, lr=cfg.lr_adamw_scalar,
+                                         betas=(0.9, 0.99), weight_decay=cfg.weight_decay)
+    optimizer = base_opt  # Muon has its own momentum; skip Lookahead
+elif cfg.use_lion:
     base_opt = Lion([
         {'params': attn_params, 'lr': _base_lr * 0.5},
         {'params': other_params, 'lr': _base_lr}
@@ -1450,17 +1547,45 @@ else:
 # Add refinement head params to optimizer if enabled
 if refine_head is not None:
     _refine_params = list(refine_head.parameters())
-    base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
+    if cfg.use_muon:
+        # Refinement head has 2D weights → split into Muon/AdamW
+        _ref_muon = [p for p in _refine_params if p.ndim >= 2]
+        _ref_adamw = [p for p in _refine_params if p.ndim < 2]
+        if _ref_muon:
+            base_opt.add_param_group({'params': _ref_muon, 'lr': cfg.lr_muon, 'momentum': 0.95,
+                                      'nesterov': True, 'weight_decay': cfg.weight_decay, 'ns_steps': 5})
+        if _ref_adamw:
+            _muon_adamw_opt.add_param_group({'params': _ref_adamw, 'lr': cfg.lr_adamw_scalar})
+    else:
+        base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
 
 # Add aft-foil SRF head params to optimizer if enabled
 if aft_srf_head is not None:
     _aft_params = list(aft_srf_head.parameters())
-    base_opt.add_param_group({'params': _aft_params, 'lr': _base_lr})
+    if cfg.use_muon:
+        _aft_muon = [p for p in _aft_params if p.ndim >= 2]
+        _aft_adamw = [p for p in _aft_params if p.ndim < 2]
+        if _aft_muon:
+            base_opt.add_param_group({'params': _aft_muon, 'lr': cfg.lr_muon, 'momentum': 0.95,
+                                      'nesterov': True, 'weight_decay': cfg.weight_decay, 'ns_steps': 5})
+        if _aft_adamw:
+            _muon_adamw_opt.add_param_group({'params': _aft_adamw, 'lr': cfg.lr_adamw_scalar})
+    else:
+        base_opt.add_param_group({'params': _aft_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _aft_params):,} aft-foil SRF head params to optimizer")
 if aft_srf_ctx_head is not None:
     _ctx_params = list(aft_srf_ctx_head.parameters())
-    base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
+    if cfg.use_muon:
+        _ctx_muon = [p for p in _ctx_params if p.ndim >= 2]
+        _ctx_adamw = [p for p in _ctx_params if p.ndim < 2]
+        if _ctx_muon:
+            base_opt.add_param_group({'params': _ctx_muon, 'lr': cfg.lr_muon, 'momentum': 0.95,
+                                      'nesterov': True, 'weight_decay': cfg.weight_decay, 'ns_steps': 5})
+        if _ctx_adamw:
+            _muon_adamw_opt.add_param_group({'params': _ctx_adamw, 'lr': cfg.lr_adamw_scalar})
+    else:
+        base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
@@ -1494,6 +1619,41 @@ else:  # sequential (default)
         milestones=[cfg.warmup_total_iters]
     )
 step_scheduler_per_batch = (cfg.scheduler_type == "onecycle")
+
+# Secondary scheduler for Muon's AdamW optimizer
+_muon_adamw_scheduler = None
+if cfg.use_muon and _muon_adamw_opt is not None:
+    _muon_adamw_warmup = torch.optim.lr_scheduler.LinearLR(
+        _muon_adamw_opt, start_factor=cfg.warmup_start_factor, total_iters=cfg.warmup_total_iters
+    )
+    _muon_adamw_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        _muon_adamw_opt, T_max=cfg.cosine_T_max, eta_min=cfg.lr_adamw_scalar * 0.01
+    )
+    _muon_adamw_scheduler = torch.optim.lr_scheduler.SequentialLR(
+        _muon_adamw_opt, schedulers=[_muon_adamw_warmup, _muon_adamw_cosine],
+        milestones=[cfg.warmup_total_iters]
+    )
+    # Wrap optimizer to call both Muon and AdamW in sync
+    class _DualOptimizer:
+        """Wraps Muon + AdamW so existing optimizer.zero_grad()/step() calls hit both."""
+        def __init__(self, muon_opt, adamw_opt):
+            self.muon_opt = muon_opt
+            self.adamw_opt = adamw_opt
+        def zero_grad(self):
+            self.muon_opt.zero_grad()
+            self.adamw_opt.zero_grad()
+        def step(self):
+            self.muon_opt.step()
+            self.adamw_opt.step()
+        @property
+        def param_groups(self):
+            return self.muon_opt.param_groups + self.adamw_opt.param_groups
+        def state_dict(self):
+            return {'muon': self.muon_opt.state_dict(), 'adamw': self.adamw_opt.state_dict()}
+        def load_state_dict(self, sd):
+            self.muon_opt.load_state_dict(sd['muon'])
+            self.adamw_opt.load_state_dict(sd['adamw'])
+    optimizer = _DualOptimizer(base_opt, _muon_adamw_opt)
 
 # --- wandb ---
 run = wandb.init(
@@ -2161,6 +2321,8 @@ for epoch in range(MAX_EPOCHS):
         if step_scheduler_per_batch and (use_pcgrad or _should_step):
             try:
                 scheduler.step()
+                if _muon_adamw_scheduler is not None:
+                    _muon_adamw_scheduler.step()
             except ValueError:
                 pass
         if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa and not cfg.swa_cyclic and not cfg.snapshot_ensemble:
@@ -2226,6 +2388,8 @@ for epoch in range(MAX_EPOCHS):
                     swa_cyclic_n += 1
         else:
             scheduler.step()
+            if _muon_adamw_scheduler is not None:
+                _muon_adamw_scheduler.step()
     # Two-phase LR: at switch epoch, reset optimizer LR and replace scheduler
     if cfg.two_phase_lr and epoch + 1 == cfg.two_phase_switch_epoch:
         lrs = [cfg.two_phase_lr_2 * 0.5, cfg.two_phase_lr_2]
@@ -2276,6 +2440,8 @@ for epoch in range(MAX_EPOCHS):
             "train/surf_loss": epoch_surf,
             "epoch_time_s": dt,
             "lr": scheduler.get_last_lr()[0],
+            **({"lr/muon": scheduler.get_last_lr()[0],
+                "lr/adamw_scalar": _muon_adamw_scheduler.get_last_lr()[0]} if _muon_adamw_scheduler is not None else {}),
             "global_step": global_step,
         })
         print(f"Epoch {epoch+1:3d} ({dt:.0f}s)  train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  [val skipped]")
@@ -2630,6 +2796,8 @@ for epoch in range(MAX_EPOCHS):
         "val/loss_3split": val_loss_3split,
         "val/loss_4split": val_loss_4split,
         "lr": scheduler.get_last_lr()[0],
+        **({"lr/muon": scheduler.get_last_lr()[0],
+            "lr/adamw_scalar": _muon_adamw_scheduler.get_last_lr()[0]} if _muon_adamw_scheduler is not None else {}),
         "epoch_time_s": dt,
     }
     for split_metrics in val_metrics_per_split.values():
