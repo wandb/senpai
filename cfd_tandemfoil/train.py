@@ -700,10 +700,12 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        interfoil_dist_feature=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
+        self.interfoil_dist_feature = interfoil_dist_feature
         self.pressure_first = pressure_first
         self.ref = ref
         self.unified_pos = unified_pos
@@ -771,7 +773,7 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
-                    spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
+                    spatial_bias_input_dim=(7 if interfoil_dist_feature and gap_stagger_spatial_bias else 6) if gap_stagger_spatial_bias else 4,
                 )
                 for idx in range(n_layers)
             ]
@@ -781,6 +783,11 @@ class Transolver(nn.Module):
             with torch.no_grad():
                 for block in self.blocks:
                     block.spatial_bias[0].weight[:, 4:].zero_()
+        # Zero-init the 7th column for inter-foil distance feature
+        if interfoil_dist_feature and gap_stagger_spatial_bias:
+            with torch.no_grad():
+                for block in self.blocks:
+                    block.spatial_bias[0].weight[:, 6:].zero_()
         # Separate pressure pathway (pressure_separate_last_block):
         # Independent MLP + pres_head that processes shared hidden features
         self._pressure_separate = False  # set from Config after construction
@@ -893,6 +900,19 @@ class Transolver(nn.Module):
 
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
+
+        # Inter-foil distance feature: log(1 + d_interfoil) for spatial bias routing
+        if self.interfoil_dist_feature and self.gap_stagger_spatial_bias:
+            foil2_center = x[:, 0:1, 22:24]  # [B, 1, 2]: (gap, stagger) ≈ foil-2 offset
+            node_xy = x[:, :, :2]  # [B, N, 2]
+            d_sq = ((node_xy - foil2_center) ** 2).sum(dim=-1, keepdim=True)  # [B, N, 1]
+            d_interfoil = torch.sqrt(d_sq + 1e-8)  # [B, N, 1]
+            # Single-foil: sentinel 10.0 so log1p(10)≈2.4 distinguishes from tandem
+            is_tandem_1d = (x[:, 0, 21].abs() > 0.01).float()  # [B]
+            mask = is_tandem_1d[:, None, None]  # [B, 1, 1]
+            d_interfoil = d_interfoil * mask + 10.0 * (1.0 - mask)
+            log_d = torch.log1p(d_interfoil)  # [B, N, 1]
+            raw_xy = torch.cat([raw_xy, log_d], dim=-1)  # [B, N, 7]
 
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
@@ -1020,6 +1040,7 @@ class Config:
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
     gap_stagger_spatial_bias: bool = False  # condition spatial bias MLP on gap/stagger (tandem geometry-aware routing)
+    interfoil_dist_feature: bool = False   # add log(1+d_interfoil) as 7th spatial_bias input channel
     dct_freq_loss: bool = False   # DCT frequency-weighted auxiliary loss on surface pressure
     dct_freq_weight: float = 0.05 # weight for DCT freq loss
     dct_freq_gamma: float = 2.0   # frequency upweighting strength
@@ -1234,6 +1255,7 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    interfoil_dist_feature=cfg.interfoil_dist_feature,
 )
 
 model = Transolver(**model_config).to(device)
