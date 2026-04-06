@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~16:30 — PR #2203: Muon/Gram-NS Optimizer: orthogonalized gradient updates for weight matrices — thorfinn — **CLOSED** (all metrics regressed 5-47%)
+- Branch: `thorfinn/muon-gram-ns-retry`
+- Hypothesis: Replace Lion optimizer with Muon (Newton-Schulz orthogonalized gradients) for 2D+ weight matrices, AdamW for scalar/1D params. Muon normalizes gradient singular values to ~1, preventing large eigenvalue directions from dominating updates. lr_muon=0.02, lr_adamw_scalar=3e-4. Previous attempt PR #2006 crashed due to implementation bugs. This retry has correct param group separation and custom single-GPU MuonOptimizer with 5-step quintic NS iteration.
+- W&B runs: kylbayco (seed 42), fhlwq5hr (seed 73)
+- W&B group: `muon-gram-ns`
+
+| Metric | Baseline | Seed 42 | Seed 73 | Avg | Δ |
+|--------|----------|---------|---------|-----|---|
+| p_in | 13.21 | 17.0 | 16.0 | **16.5** | **+24.9% ✗** |
+| p_oodc | 7.82 | 11.4 | 11.5 | **11.45** | **+46.5% ✗** |
+| **p_tan** | **28.50** | **30.0** | **30.0** | **30.0** | **+5.3% ✗** |
+| p_re | 6.45 | 8.6 | 8.6 | **8.6** | **+33.3% ✗** |
+
+- Epochs: 135-138, ~80s/epoch (+10% vs baseline ~73s due to NS iterations), VRAM ~45-46 GB
+- Muon applied to 71 matrix params (1.68M weights), AdamW for 110 scalar/1D params (18.7K)
+- **Analysis:** 2nd Muon attempt (PR #2006 crashed, PR #2203 ran cleanly). All 4 metrics regressed catastrophically, especially p_oodc (+46.5%) and p_re (+33.3%). Newton-Schulz orthogonalization flattens gradient singular structure, destroying the physics-specific update geometry that Lion preserves. The spectral normalization that benefits LLM training is counterproductive for physics-informed PDE surrogates where gradient singular structure encodes physical field information. **Muon/Gram-NS optimizer direction fully exhausted. No further variants.**
+
 ### 2026-04-06 ~15:30 — PR #2202: Fore-Aft Cross-Attention in AftFoilRefinementHead for Wake Coupling — askeladd — **CLOSED** (p_tan +2.1% vs baseline)
 - Branch: `askeladd/fore-aft-crossattn-srf`
 - Hypothesis: Single-head cross-attention (d_attn=64) from aft-foil surface nodes (queries) to fore-foil surface nodes (keys/values) inside the SRF head. Directly models physical wake coupling. O(N_aft×N_fore) on ~300×300 surface nodes → <1% overhead. Zero-init output projection for baseline-equivalent start. Differentiates from failed KNN context (#2127/#2134) by targeting surface nodes only.
