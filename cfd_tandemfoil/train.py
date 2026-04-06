@@ -749,6 +749,7 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        deep_supervision=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -851,6 +852,16 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        self.deep_supervision = deep_supervision
+        if deep_supervision:
+            self.aux_pressure_head = nn.Sequential(
+                nn.Linear(n_hidden, n_hidden // 2),
+                nn.GELU(),
+                nn.Linear(n_hidden // 2, 1),
+            )
+            # Zero-init final layer so aux head starts as a no-op
+            nn.init.zeros_(self.aux_pressure_head[-1].weight)
+            nn.init.zeros_(self.aux_pressure_head[-1].bias)
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -974,7 +985,11 @@ class Transolver(nn.Module):
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred, "hidden": fx_deep}
+        out_dict = {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred, "hidden": fx_deep}
+        if self.deep_supervision and self.training:
+            aux_pred = self.aux_pressure_head(fx_deep).squeeze(-1)  # [B, N]
+            out_dict["aux_pressure_pred"] = aux_pred
+        return out_dict
 
 
 # ---------------------------------------------------------------------------
@@ -1124,6 +1139,8 @@ class Config:
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
+    deep_supervision: bool = False          # auxiliary pressure head on fx_deep for short-path gradients
+    deep_supervision_weight: float = 0.12   # weight for deep supervision aux loss
 
 
 cfg = sp.parse(Config)
@@ -1284,6 +1301,7 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    deep_supervision=cfg.deep_supervision,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1838,6 +1856,9 @@ for epoch in range(MAX_EPOCHS):
         re_pred = re_pred.float()
         aoa_pred = aoa_pred.float()
         hidden = hidden.float()
+        aux_pressure_pred = out.get("aux_pressure_pred")
+        if aux_pressure_pred is not None:
+            aux_pressure_pred = aux_pressure_pred.float()
         if model.training and not cfg.no_perstd and not cfg.raw_targets and not cfg.adaptive_norm:
             if cfg.multiply_std:
                 pred = pred * sample_stds
@@ -2063,6 +2084,17 @@ for epoch in range(MAX_EPOCHS):
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
 
+        # Deep supervision: auxiliary pressure loss from intermediate representation (fx_deep)
+        _aux_loss = torch.tensor(0.0, device=device)
+        if cfg.deep_supervision and aux_pressure_pred is not None:
+            # Compare aux head output to normalized pressure target on surface nodes
+            # aux_pressure_pred is raw model output; y_norm[:, :, 2] is already per-sample-std-normalized
+            aux_pred_surf = aux_pressure_pred[surf_mask]
+            aux_target_surf = y_norm[:, :, 2][surf_mask]
+            if aux_pred_surf.numel() > 0:
+                _aux_loss = F.l1_loss(aux_pred_surf, aux_target_surf)
+                loss = loss + cfg.deep_supervision_weight * _aux_loss
+
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
@@ -2079,8 +2111,9 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            aux_shared = cfg.deep_supervision_weight * _aux_loss if cfg.deep_supervision else torch.tensor(0.0, device=device)
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + aux_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + aux_shared + 0.005 * re_loss + 0.005 * aoa_loss
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -2125,7 +2158,10 @@ for epoch in range(MAX_EPOCHS):
                 vol_loss_g = (abs_err * vol_mask_g.unsqueeze(-1)).sum() / vol_mask_g.sum().clamp(min=1)
                 surf_loss_g = (surf_per_sample * mask_1d.float() * tandem_boost).sum() / n
                 coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                base = vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                if cfg.deep_supervision:
+                    base = base + cfg.deep_supervision_weight * _aux_loss
+                return base
 
             loss_A = _grp_loss(~is_tandem_batch)
             # Only include non-empty groups to avoid backward() on no-grad tensors
@@ -2253,7 +2289,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _wandb_batch_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.deep_supervision and _aux_loss.item() > 0:
+            _wandb_batch_log["train/aux_pressure_loss"] = _aux_loss.item()
+        wandb.log(_wandb_batch_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
