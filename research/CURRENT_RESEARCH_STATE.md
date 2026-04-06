@@ -45,20 +45,23 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 Single-model p_tan (28.52) already **BEATS** ensemble (29.1). Gap continues to widen.
 
-## Student Status (~22:00 UTC 2026-04-06)
+## Student Status (~23:30 UTC 2026-04-06)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | fern | #2210 | Arc-Length Surface Loss Reweighting | WIP |
 | nezuko | #2205 | NOBLE Nonlinear Low-Rank Branches (Retry) | WIP |
 | alphonse | #2211 | Surface Pressure Gradient Loss (dp/ds) | WIP |
-| thorfinn | #2209 | Attention Register Tokens | WIP |
+| thorfinn | #2215 | PirateNets Adaptive Residuals (tanh-gated blend) | WIP (just assigned) |
 | tanjiro | #2197 | Geometry-Adaptive Curvature Loss Weighting | WIP |
 | askeladd | #2212 | Analytical Cp Delta (thin-airfoil SRF) | WIP |
-| frieren | #2213 | Wake Deficit Feature (gap-normalized fore-TE offset) | WIP (just assigned) |
-| edward | #2214 | Deep Supervision on fx_deep intermediate rep | WIP (just assigned) |
+| frieren | #2213 | Wake Deficit Feature (gap-normalized fore-TE offset) | WIP |
+| edward | #2214 | Deep Supervision on fx_deep intermediate rep | WIP |
 
 **All 8 students active. Zero idle GPUs.**
+
+### Closed this cycle
+- #2209 thorfinn: Attention Register Tokens — CLOSED. p_in +6.1%, p_oodc +5.7%, p_tan +4.0% regression. Dead end: slice-deslice mechanism already provides global aggregates, so ViT-style register tokens solve a problem that doesn't exist here.
 
 ## Human Research Directives (from GitHub Issues)
 
@@ -78,13 +81,14 @@ TE coordinate frame (PR #2207, merged) showed +5.4% p_in improvement. The hypoth
 - **#2211 alphonse:** Surface pressure gradient loss (penalize dp/ds mismatch).
 
 ### Architecture Novelty (ACTIVE — mixed results so far)
-- **#2209 thorfinn:** Attention register tokens (learnable global slots prevent OOD routing collapse).
+- **#2215 thorfinn:** PirateNets adaptive residuals — tanh-gated blend on TransolverBlock residual connections (s init 0 → identity at start, 6 learned scalars total).
 - **#2205 nezuko:** NOBLE nonlinear low-rank FFN branches (retry).
 - **#2212 askeladd:** Analytical Cp delta (thin-airfoil physics prior as SRF correction baseline).
 - **#2197 tanjiro:** Curvature loss weighting.
 
 ## Dead Ends (Do Not Revisit)
 
+- **Register tokens in Physics-Attention (#2209)** — slice-deslice already provides global aggregates; ViT dump token pathology doesn't apply here
 - Muon/Gram-NS optimizer (#2203) — catastrophic regression, destroys physics gradient geometry
 - Ada-Temp/Rep-Slice from Transolver++ (#2206) — three temperature mechanisms fight each other
 - Spectral attention conditioning SCA (#2199) — attention spectral collapse is NOT the bottleneck; runs crashed
