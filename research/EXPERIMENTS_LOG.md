@@ -2,6 +2,20 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~10:00 — PR #2179: Panel-Method Inviscid Cp as Input Feature — thorfinn — **CLOSED** (single-foil solver lacks tandem interaction)
+
+- Branch: `thorfinn/panel-cp-features`
+- Hypothesis: Pre-computed single-foil Hess-Smith panel Cp as input channel 25. Model predicts viscous correction.
+
+| Config | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|--------|-------|------|-----|
+| **Panel Cp avg** | **13.30** | **7.61** | **29.66** | **6.48** | xdxcew1g, 7j0gg5jb |
+| **Baseline** | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** p_tan +3.7%. p_oodc improved -1.3%, p_re -1.1% — panel Cp helps non-tandem OOD. But the solver computed each foil independently, missing the tandem fore-aft interaction that determines p_tan. Inviscid Cp is already implicitly learnable from geometry features. Reassigned to try panel Cp as RESIDUAL TARGET (predict viscous correction).
+
+---
+
 ### 2026-04-06 ~09:30 — PR #2166: dp/dn=0 Physics Loss (Extended) — alphonse — **CLOSED** (6-seed confirms: regularizer for p_in/p_re, neutral for p_tan)
 
 - Branch: `alphonse/dpdn-physics-loss`
