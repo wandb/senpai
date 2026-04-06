@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-06 ~23:30 UTC
+- **Date:** 2026-04-07 ~00:15 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -52,7 +52,7 @@ Single-model p_tan (28.52) already **BEATS** ensemble (29.1). Gap continues to w
 | fern | #2210 | Arc-Length Surface Loss Reweighting | WIP |
 | nezuko | #2205 | NOBLE Nonlinear Low-Rank Branches (Retry) | WIP |
 | alphonse | #2211 | Surface Pressure Gradient Loss (dp/ds) | WIP |
-| thorfinn | #2215 | PirateNets Adaptive Residuals (tanh-gated blend) | WIP (just assigned) |
+| thorfinn | #2216 | GeoTransolver GALE (geometry-latent cross-attention) | WIP (just assigned) |
 | tanjiro | #2197 | Geometry-Adaptive Curvature Loss Weighting | WIP |
 | askeladd | #2212 | Analytical Cp Delta (thin-airfoil SRF) | WIP |
 | frieren | #2213 | Wake Deficit Feature (gap-normalized fore-TE offset) | WIP |
@@ -60,7 +60,8 @@ Single-model p_tan (28.52) already **BEATS** ensemble (29.1). Gap continues to w
 
 **All 8 students active. Zero idle GPUs.**
 
-### Closed this cycle
+### Closed/Merged this cycle
+- #2215 thorfinn: PirateNets Adaptive Residuals — MERGED by human (tcapelle) as no-op before student ran. Hypothesis untested.
 - #2209 thorfinn: Attention Register Tokens — CLOSED. p_in +6.1%, p_oodc +5.7%, p_tan +4.0% regression. Dead end: slice-deslice mechanism already provides global aggregates, so ViT-style register tokens solve a problem that doesn't exist here.
 
 ## Human Research Directives (from GitHub Issues)
@@ -81,7 +82,7 @@ TE coordinate frame (PR #2207, merged) showed +5.4% p_in improvement. The hypoth
 - **#2211 alphonse:** Surface pressure gradient loss (penalize dp/ds mismatch).
 
 ### Architecture Novelty (ACTIVE — mixed results so far)
-- **#2215 thorfinn:** PirateNets adaptive residuals — tanh-gated blend on TransolverBlock residual connections (s init 0 → identity at start, 6 learned scalars total).
+- **#2216 thorfinn:** GeoTransolver GALE — pool per-foil surface features → geometry latent (dim=32) → cross-attend slice tokens in each TransolverBlock. Based on arXiv 2412.14171. Zero-init out_proj.
 - **#2205 nezuko:** NOBLE nonlinear low-rank FFN branches (retry).
 - **#2212 askeladd:** Analytical Cp delta (thin-airfoil physics prior as SRF correction baseline).
 - **#2197 tanjiro:** Curvature loss weighting.
@@ -98,8 +99,8 @@ TE coordinate frame (PR #2207, merged) showed +5.4% p_in improvement. The hypoth
 
 ## Potential Next Hypotheses (Round 15 — from researcher-agent 2026-04-06)
 
-1. ~~**pirate-residuals**~~ — ASSIGNED to thorfinn (#2215)
-2. **geotransolver-gale** — Pool per-foil surface hidden states into geometry latent (dim=32), cross-attend slice tokens against it at each TransolverBlock. Zero-init output projection. Targets OOD shape generalization. MEDIUM-HIGH confidence, MEDIUM risk.
+1. ~~**pirate-residuals**~~ — Was assigned to thorfinn (#2215), merged as no-op by human. Hypothesis untested.
+2. ~~**geotransolver-gale**~~ — ASSIGNED to thorfinn (#2216). Pool per-foil surface hidden states into geometry latent (dim=32), cross-attend slice tokens against it at each TransolverBlock.
 3. **domain-split-srf-norm** — Domain-conditional LayerNorm ONLY in AftSRF MLP (NOT backbone). Separate learned scale/bias deltas for tandem vs single, zero-init. Distinct from dead-end #2164 (backbone-wide). MEDIUM-HIGH confidence, LOW-MEDIUM risk.
 4. **additive-fore-aft-crossattn-srf** — Targeted retry of PR #2202 with ADDITIVE (not replacement) formulation. Keep AftSRF MLP, add parallel cross-attention (aft surface queries fore surface hidden states) with zero-init out_proj. MEDIUM confidence, MEDIUM risk.
 5. **slice-diversity-reg** — Gram matrix orthogonality penalty on slice attention weights `L = λ * ||A^T A / N - I_S||_F^2`. Encourages routing diversity on OOD inputs. Start λ=0.01. MEDIUM confidence, MEDIUM risk.
