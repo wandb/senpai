@@ -545,6 +545,56 @@ class AftFoilRefinementHead(nn.Module):
         return x
 
 
+class AftFoilCrossAttnRefinementHead(nn.Module):
+    """Aft-foil refinement head with lightweight cross-attention to fore-foil.
+
+    Single-head cross-attention from aft-foil surface nodes to fore-foil surface
+    nodes injects direct upstream wake information into the correction head.
+    Zero-initialized output projection for baseline-equivalent initialization.
+    """
+
+    def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 192,
+                 n_layers: int = 3, d_attn: int = 64):
+        super().__init__()
+        self.d_attn = d_attn
+        self.q_proj = nn.Linear(n_hidden, d_attn, bias=False)
+        self.k_proj = nn.Linear(n_hidden, d_attn, bias=False)
+        self.v_proj = nn.Linear(n_hidden, d_attn, bias=False)
+        self.out_proj = nn.Linear(d_attn, n_hidden)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+        self.norm = nn.LayerNorm(n_hidden)
+        in_dim = n_hidden + out_dim
+        layers: list[nn.Module] = []
+        for i in range(n_layers):
+            layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
+            layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.GELU())
+        layers.append(nn.Linear(hidden_dim, out_dim))
+        nn.init.zeros_(layers[-1].weight)
+        nn.init.zeros_(layers[-1].bias)
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, aft_hidden: torch.Tensor, fore_hidden: torch.Tensor,
+                base_pred: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            aft_hidden: [A, n_hidden] — aft-foil surface hidden features
+            fore_hidden: [Nf, n_hidden] — fore-foil surface hidden features
+            base_pred: [A, out_dim] — base predictions for aft-foil nodes
+        Returns:
+            correction: [A, out_dim]
+        """
+        scale = self.d_attn ** -0.5
+        Q = self.q_proj(aft_hidden)                       # [A, d_attn]
+        K = self.k_proj(fore_hidden)                      # [Nf, d_attn]
+        V = self.v_proj(fore_hidden)                      # [Nf, d_attn]
+        attn = F.softmax((Q @ K.T) * scale, dim=-1)       # [A, Nf]
+        ctx = self.out_proj(attn @ V)                     # [A, n_hidden]
+        enriched = self.norm(aft_hidden + ctx)            # residual + LN [A, n_hidden]
+        return self.mlp(torch.cat([enriched, base_pred], dim=-1))
+
+
 class AftFoilRefinementContextHead(nn.Module):
     """Aft-foil refinement head with KNN volume context for wake pressure recovery.
 
@@ -1071,6 +1121,7 @@ class Config:
     aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
     aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
     aft_foil_srf_context: bool = False       # KNN volume context for aft-foil SRF (wake pressure recovery)
+    aft_foil_crossattn_srf: bool = False     # cross-attend fore-foil hidden → aft-foil SRF head
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
@@ -1297,10 +1348,24 @@ if cfg.aft_foil_srf:
               f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, "
               f"film={cfg.aft_foil_srf_film})")
 
+aft_srf_ca_head = None
+if cfg.aft_foil_srf and cfg.aft_foil_crossattn_srf:
+    aft_srf_ca_head = AftFoilCrossAttnRefinementHead(
+        n_hidden=cfg.n_hidden,
+        out_dim=3,
+        hidden_dim=cfg.aft_foil_srf_hidden,
+        n_layers=cfg.aft_foil_srf_layers,
+    ).to(device)
+    aft_srf_ca_head = torch.compile(aft_srf_ca_head, mode=cfg.compile_mode)
+    print(f"Aft-foil cross-attn SRF head: {sum(p.numel() for p in aft_srf_ca_head.parameters()):,} params (d_attn=64)")
+    # Disable the standard aft_srf_head — use cross-attn version instead
+    aft_srf_head = None
+
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
 ema_aft_srf_head = None  # EMA copy of aft-foil SRF head
+ema_aft_srf_ca_head = None  # EMA copy of cross-attn aft-foil SRF head
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -1462,6 +1527,10 @@ if aft_srf_ctx_head is not None:
     _ctx_params = list(aft_srf_ctx_head.parameters())
     base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
+if aft_srf_ca_head is not None:
+    _ca_params = list(aft_srf_ca_head.parameters())
+    base_opt.add_param_group({'params': _ca_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _ca_params):,} aft-foil cross-attn SRF head params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
@@ -1668,11 +1737,15 @@ for epoch in range(MAX_EPOCHS):
         # Aft-foil mask: boundary ID=7 nodes identified by saf norm > 0.005
         # saf is at raw x[:,:,2:4]; foil-1 surface has saf≈0, foil-2 has saf>>0
         _aft_foil_mask = None
-        if aft_srf_head is not None:
+        _fore_foil_mask = None
+        if aft_srf_head is not None or aft_srf_ca_head is not None:
             _raw_saf_norm = x[:, :, 2:4].norm(dim=-1)  # [B, N]
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
+        if aft_srf_ca_head is not None:
+            # Fore-foil surface nodes: on foil-1 surface → saf_norm ≈ 0, tandem only
+            _fore_foil_mask = is_surface & (_raw_saf_norm <= 0.005) & _is_tandem.unsqueeze(1)
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1840,6 +1913,22 @@ for epoch in range(MAX_EPOCHS):
                     aft_correction = aft_srf_head(aft_hidden, aft_pred, _aft_cond).float()
                 pred = pred.clone()
                 pred[aft_idx[:, 0], aft_idx[:, 1]] = pred[aft_idx[:, 0], aft_idx[:, 1]] + aft_correction
+        elif aft_srf_ca_head is not None and model.training \
+                and _aft_foil_mask is not None and _fore_foil_mask is not None:
+            pred = pred.clone()
+            B = hidden.shape[0]
+            for b in range(B):
+                aft_b = _aft_foil_mask[b].nonzero(as_tuple=True)[0]
+                fore_b = _fore_foil_mask[b].nonzero(as_tuple=True)[0]
+                if aft_b.numel() == 0 or fore_b.numel() == 0:
+                    continue
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    corr = aft_srf_ca_head(
+                        hidden[b, aft_b],   # [A_b, n_hidden]
+                        hidden[b, fore_b],  # [Nf_b, n_hidden]
+                        pred[b, aft_b],     # [A_b, 3]
+                    ).float()
+                pred[b, aft_b] = pred[b, aft_b] + corr
 
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
@@ -2196,6 +2285,14 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            if aft_srf_ca_head is not None:
+                _ca_base = aft_srf_ca_head._orig_mod if hasattr(aft_srf_ca_head, '_orig_mod') else aft_srf_ca_head
+                if ema_aft_srf_ca_head is None:
+                    ema_aft_srf_ca_head = deepcopy(_ca_base)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_aft_srf_ca_head.parameters(), _ca_base.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -2316,6 +2413,13 @@ for epoch in range(MAX_EPOCHS):
             eval_aft_srf_ctx_head.eval()
         else:
             aft_srf_ctx_head.eval()
+    eval_aft_srf_ca_head = aft_srf_ca_head
+    if aft_srf_ca_head is not None:
+        if ema_aft_srf_ca_head is not None and ema_model is not None and eval_model is ema_model:
+            eval_aft_srf_ca_head = ema_aft_srf_ca_head
+            eval_aft_srf_ca_head.eval()
+        else:
+            aft_srf_ca_head.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -2342,11 +2446,14 @@ for epoch in range(MAX_EPOCHS):
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
                 # Aft-foil mask for eval (same logic as training)
                 _eval_aft_mask = None
-                if eval_aft_srf_head is not None:
+                _eval_fore_mask = None
+                if eval_aft_srf_head is not None or eval_aft_srf_ca_head is not None:
                     _v_saf_norm = x[:, :, 2:4].norm(dim=-1)
                     _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
                     _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
                     _v_gap_stagger = x[:, 0, 22:24]  # [B, 2]
+                if eval_aft_srf_ca_head is not None:
+                    _eval_fore_mask = is_surface & (_v_saf_norm <= 0.005) & _v_is_tandem.unsqueeze(1)
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -2497,6 +2604,24 @@ for epoch in range(MAX_EPOCHS):
                             pred = pred_loss / sample_stds
                         else:
                             pred = pred_loss * sample_stds
+                elif eval_aft_srf_ca_head is not None and _eval_aft_mask is not None and _eval_fore_mask is not None:
+                    pred_loss = pred_loss.clone()
+                    for b in range(_eval_hidden.shape[0]):
+                        aft_b = _eval_aft_mask[b].nonzero(as_tuple=True)[0]
+                        fore_b = _eval_fore_mask[b].nonzero(as_tuple=True)[0]
+                        if aft_b.numel() == 0 or fore_b.numel() == 0:
+                            continue
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            _aft_corr = eval_aft_srf_ca_head(
+                                _eval_hidden[b, aft_b],
+                                _eval_hidden[b, fore_b],
+                                pred_loss[b, aft_b],
+                            ).float()
+                        pred_loss[b, aft_b] += _aft_corr
+                    if cfg.multiply_std:
+                        pred = pred_loss / sample_stds
+                    else:
+                        pred = pred_loss * sample_stds
 
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
@@ -2675,6 +2800,11 @@ for epoch in range(MAX_EPOCHS):
                 aft_srf_ctx_head._orig_mod if hasattr(aft_srf_ctx_head, '_orig_mod') else aft_srf_ctx_head
             )
             torch.save(_ctx_save.state_dict(), model_dir / "aft_srf_ctx_head.pt")
+        if aft_srf_ca_head is not None:
+            _ca_save = ema_aft_srf_ca_head if ema_aft_srf_ca_head is not None else (
+                aft_srf_ca_head._orig_mod if hasattr(aft_srf_ca_head, '_orig_mod') else aft_srf_ca_head
+            )
+            torch.save(_ca_save.state_dict(), model_dir / "aft_srf_ca_head.pt")
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
