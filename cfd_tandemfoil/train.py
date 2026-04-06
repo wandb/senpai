@@ -265,7 +265,7 @@ def compute_te_features(raw_xy, is_surface, saf_norm):
         saf_norm:   [B, N] norm of raw saf channels (x[:,:,2:4] before normalization)
                     ≤ 0.005 → foil-1 surface, > 0.005 → foil-2 surface
 
-    Returns: ([B, N, 6], fore_te_x [B], fore_te_y [B])
+    Returns: ([B, N, 6], fore_te_x [B], fore_te_y [B], aft_te_x [B])
              features = [dx_fore, dy_fore, r_fore, dx_aft, dy_aft, r_aft]
              aft features are zero for single-foil samples
     """
@@ -300,7 +300,7 @@ def compute_te_features(raw_xy, is_surface, saf_norm):
     dy_aft = (y_coords - aft_te_y[:, None]) * is_tandem
     r_aft = (dx_aft ** 2 + dy_aft ** 2).sqrt().clamp(min=1e-6) * is_tandem
 
-    return torch.stack([dx_fore, dy_fore, r_fore, dx_aft, dy_aft, r_aft], dim=-1), fore_te_x, fore_te_y
+    return torch.stack([dx_fore, dy_fore, r_fore, dx_aft, dy_aft, r_aft], dim=-1), fore_te_x, fore_te_y, aft_te_x
 
 
 def compute_wake_deficit_features(raw_xy, is_surface, saf_norm, gap_raw, fore_te_x=None, fore_te_y=None):
@@ -345,6 +345,68 @@ def compute_wake_deficit_features(raw_xy, is_surface, saf_norm, gap_raw, fore_te
     dy_norm = dy_norm * is_tandem
 
     return torch.stack([dx_norm, dy_norm], dim=-1)  # [B, N, 2]
+
+
+def compute_le_features(raw_xy, is_surface, saf_norm, fore_te_x=None, aft_te_x=None):
+    """Compute chord-normalized leading-edge-relative coordinate features.
+
+    Finds the leading edge (min x-coord among surface nodes) for each foil
+    and computes per-node offsets (dx, dy, radius) from each LE, normalized
+    by chord length (TE_x - LE_x) for OOD generalization.
+
+    Args:
+        raw_xy:     [B, N, 2] raw (pre-standardization) x, y coordinates
+        is_surface: [B, N] bool
+        saf_norm:   [B, N] norm of raw saf channels (x[:,:,2:4] before normalization)
+        fore_te_x:  [B] pre-computed fore TE x (for chord calculation)
+        aft_te_x:   [B] pre-computed aft TE x (for chord calculation, zeroed for single-foil)
+
+    Returns: [B, N, 6] = [dx_fore_le/chord, dy_fore_le/chord, r_fore_le/chord,
+                           dx_aft_le/chord, dy_aft_le/chord, r_aft_le/chord]
+             aft features are zero for single-foil samples
+    """
+    x_coords = raw_xy[:, :, 0]  # [B, N]
+    y_coords = raw_xy[:, :, 1]  # [B, N]
+    INF = 1e6
+
+    # Fore-foil surface (foil-1): saf_norm <= 0.005
+    fore_surf = is_surface & (saf_norm <= 0.005)
+    fore_x_masked = x_coords * fore_surf.float() + INF * (~fore_surf).float()
+    fore_le_idx = fore_x_masked.topk(1, dim=1, largest=False)[1].squeeze(1)
+    fore_le_x = x_coords.gather(1, fore_le_idx.unsqueeze(1)).squeeze(1)
+    fore_le_y = y_coords.gather(1, fore_le_idx.unsqueeze(1)).squeeze(1)
+
+    # Aft-foil surface (foil-2): saf_norm > 0.005
+    aft_surf = is_surface & (saf_norm > 0.005)
+    is_tandem = aft_surf.any(dim=1).float()[:, None]
+    aft_surf_safe = aft_surf | (~aft_surf.any(dim=1, keepdim=True))
+    aft_x_masked = x_coords * aft_surf.float() + INF * (~aft_surf_safe).float()
+    aft_le_idx = aft_x_masked.topk(1, dim=1, largest=False)[1].squeeze(1)
+    aft_le_x = x_coords.gather(1, aft_le_idx.unsqueeze(1)).squeeze(1) * is_tandem.squeeze(1)
+    aft_le_y = y_coords.gather(1, aft_le_idx.unsqueeze(1)).squeeze(1) * is_tandem.squeeze(1)
+
+    # Chord lengths for normalization
+    if fore_te_x is not None:
+        chord_fore = (fore_te_x - fore_le_x).clamp(min=1e-4)  # [B]
+    else:
+        chord_fore = torch.ones(x_coords.shape[0], device=x_coords.device)
+    if aft_te_x is not None:
+        chord_aft = (aft_te_x - aft_le_x).clamp(min=1e-4) * is_tandem.squeeze(1)  # [B]
+        chord_aft = chord_aft.clamp(min=1e-4)  # safe div
+    else:
+        chord_aft = torch.ones(x_coords.shape[0], device=x_coords.device)
+
+    # Per-node offsets from fore LE, normalized by fore chord
+    dx_fore = (x_coords - fore_le_x[:, None]) / chord_fore[:, None]
+    dy_fore = (y_coords - fore_le_y[:, None]) / chord_fore[:, None]
+    r_fore = (dx_fore ** 2 + dy_fore ** 2).sqrt().clamp(min=1e-6)
+
+    # Per-node offsets from aft LE, normalized by aft chord (zero for single-foil)
+    dx_aft = (x_coords - aft_le_x[:, None]) / chord_aft[:, None] * is_tandem
+    dy_aft = (y_coords - aft_le_y[:, None]) / chord_aft[:, None] * is_tandem
+    r_aft = (dx_aft ** 2 + dy_aft ** 2).sqrt().clamp(min=1e-6) * is_tandem
+
+    return torch.stack([dx_fore, dy_fore, r_fore, dx_aft, dy_aft, r_aft], dim=-1)  # [B, N, 6]
 
 
 class TransolverBlock(nn.Module):
@@ -1170,6 +1232,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    le_coord_frame: bool = False            # chord-normalized leading-edge-relative coordinate features (+6 input channels)
 
 
 cfg = sp.parse(Config)
@@ -1300,7 +1363,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + (6 if cfg.le_coord_frame else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], [+le_feats], +32 fourier PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1761,8 +1824,8 @@ for epoch in range(MAX_EPOCHS):
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
-        # TE coordinate frame / wake deficit: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature
+        # TE coordinate frame / wake deficit / LE coord: save raw xy and saf_norm before normalization
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.le_coord_frame
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
@@ -1781,13 +1844,17 @@ for epoch in range(MAX_EPOCHS):
             foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
             x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
         elif cfg.te_coord_frame:
-            te_feats, _fore_te_x, _fore_te_y = compute_te_features(_raw_xy_te, is_surface, _raw_saf_norm_te)
+            te_feats, _fore_te_x, _fore_te_y, _aft_te_x = compute_te_features(_raw_xy_te, is_surface, _raw_saf_norm_te)
             x = torch.cat([x, curv, dist_feat, te_feats], dim=-1)
             if cfg.wake_deficit_feature:
                 wake_feats = compute_wake_deficit_features(
                     _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake,
                     fore_te_x=_fore_te_x, fore_te_y=_fore_te_y)
                 x = torch.cat([x, wake_feats], dim=-1)
+            if cfg.le_coord_frame:
+                le_feats = compute_le_features(_raw_xy_te, is_surface, _raw_saf_norm_te,
+                                               fore_te_x=_fore_te_x, aft_te_x=_aft_te_x)
+                x = torch.cat([x, le_feats], dim=-1)
         else:
             x = torch.cat([x, curv, dist_feat], dim=-1)
             if cfg.wake_deficit_feature:
@@ -2471,13 +2538,17 @@ for epoch in range(MAX_EPOCHS):
                     foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
                     x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
                 elif cfg.te_coord_frame:
-                    te_feats, _fore_te_x, _fore_te_y = compute_te_features(_raw_xy_te, is_surface, _raw_saf_norm_te)
+                    te_feats, _fore_te_x, _fore_te_y, _aft_te_x = compute_te_features(_raw_xy_te, is_surface, _raw_saf_norm_te)
                     x = torch.cat([x, curv, dist_feat, te_feats], dim=-1)
                     if cfg.wake_deficit_feature:
                         wake_feats = compute_wake_deficit_features(
                             _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake,
                             fore_te_x=_fore_te_x, fore_te_y=_fore_te_y)
                         x = torch.cat([x, wake_feats], dim=-1)
+                    if cfg.le_coord_frame:
+                        le_feats = compute_le_features(_raw_xy_te, is_surface, _raw_saf_norm_te,
+                                                       fore_te_x=_fore_te_x, aft_te_x=_aft_te_x)
+                        x = torch.cat([x, le_feats], dim=-1)
                 else:
                     x = torch.cat([x, curv, dist_feat], dim=-1)
                     if cfg.wake_deficit_feature:
@@ -2874,7 +2945,7 @@ if best_metrics:
                     x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                     curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                     if cfg.te_coord_frame:
-                        te_feats_vis, _fore_te_x_vis, _fore_te_y_vis = compute_te_features(
+                        te_feats_vis, _fore_te_x_vis, _fore_te_y_vis, _aft_te_x_vis = compute_te_features(
                             _raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis)
                         x_n = torch.cat([x_n, curv, dist_feat, te_feats_vis], dim=-1)
                         if cfg.wake_deficit_feature:
@@ -2882,6 +2953,10 @@ if best_metrics:
                                 _raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis, _raw_gap_wake_vis,
                                 fore_te_x=_fore_te_x_vis, fore_te_y=_fore_te_y_vis)
                             x_n = torch.cat([x_n, wake_feats_vis], dim=-1)
+                        if cfg.le_coord_frame:
+                            le_feats_vis = compute_le_features(_raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis,
+                                                               fore_te_x=_fore_te_x_vis, aft_te_x=_aft_te_x_vis)
+                            x_n = torch.cat([x_n, le_feats_vis], dim=-1)
                     else:
                         x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
                         if cfg.wake_deficit_feature:
@@ -2992,7 +3067,7 @@ if cfg.surface_refine and best_metrics:
                         foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
                         x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
                     elif cfg.te_coord_frame:
-                        te_feats, _fore_te_x_vv, _fore_te_y_vv = compute_te_features(
+                        te_feats, _fore_te_x_vv, _fore_te_y_vv, _aft_te_x_vv = compute_te_features(
                             _raw_xy_te, is_surface, _raw_saf_norm_te)
                         x = torch.cat([x, curv, dist_feat, te_feats], dim=-1)
                         if cfg.wake_deficit_feature:
@@ -3000,6 +3075,10 @@ if cfg.surface_refine and best_metrics:
                                 _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake_vv,
                                 fore_te_x=_fore_te_x_vv, fore_te_y=_fore_te_y_vv)
                             x = torch.cat([x, wake_feats_vv], dim=-1)
+                        if cfg.le_coord_frame:
+                            le_feats_vv = compute_le_features(_raw_xy_te, is_surface, _raw_saf_norm_te,
+                                                              fore_te_x=_fore_te_x_vv, aft_te_x=_aft_te_x_vv)
+                            x = torch.cat([x, le_feats_vv], dim=-1)
                     else:
                         x = torch.cat([x, curv, dist_feat], dim=-1)
                         if cfg.wake_deficit_feature:
