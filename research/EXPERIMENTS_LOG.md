@@ -2,6 +2,21 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~12:00 — PR #2190: Laplacian Eigenvector Mesh Positional Encoding for OOD Geometry Transfer — nezuko — **CLOSED** (p_tan +3.1% vs baseline)
+- Branch: `nezuko/laplacian-pe`
+- Hypothesis: Replace 16-dim Fourier PE (channels 26:42, sin/cos over raw xy) with 16 smallest eigenvectors of the mesh graph Laplacian. Eigenvectors encode intrinsic mesh topology (topological role of each node) rather than extrinsic 2D position, potentially generalizing better to OOD geometries (NACA6416) where familiar xy-based encodings produce unfamiliar patterns at topologically similar locations (LE, PS, TE).
+- W&B runs: zvjnp6jr (seed 42), eeyknib7 (seed 73)
+- W&B group: `nezuko/laplacian-pe`
+
+| Metric | Baseline | Seed 42 | Seed 73 | Avg | Δ |
+|--------|----------|---------|---------|-----|---|
+| p_in | 13.21 | 13.103 | 12.969 | **13.04** | -1.3% ✓ |
+| **p_tan** | **28.50** | **29.997** | **28.779** | **29.39** | **+3.1% ✗** |
+| p_oodc | 7.82 | 8.625 | 8.624 | **8.62** | **+10.3% ✗** |
+| p_re | 6.45 | 6.897 | 7.087 | **6.99** | **+8.4% ✗** |
+
+- **Analysis:** Laplacian PE replacement hurt all OOD metrics severely. While p_in improved marginally (-1.3%), all three OOD metrics regressed significantly: p_oodc +10.3%, p_re +8.4%, p_tan +3.1%. Root cause: (1) dimensionality mismatch — 16-dim LapPE vs 32-dim Fourier PE reduces representational capacity; (2) loss of explicit spatial coordinate information that the backbone depends on — the model needs to know *where* a node is spatially, not just its topological role; (3) crude absolute-value sign invariance for eigenvector sign ambiguity is insufficient; (4) eigenvector ordering instability across different mesh structures. The existing DSDF and walldist features already provide geometry context — Fourier PE provides complementary coordinate information that eigenvectors cannot replace. **Dead end for Laplacian PE replacement. Current 32-dim Fourier PE is well-suited.**
+
 ### 2026-04-06 ~22:00 — PR #2195: Add Inter-Foil Distance Feature to Spatial Bias Routing — askeladd — **CLOSED** (p_tan +2.4% vs baseline)
 - Branch: `askeladd/interfoil-dist-feature`
 - Hypothesis: Add `log(1+d_interfoil)` — log-distance from each mesh node to foil-2's geometric center — as 7th input to spatial_bias MLP. Physical motivation: pressure perturbations decay as ~1/r from upstream foil; distance to foil-2 is a meaningful routing signal for near-wake vs far-field regions. Zero-init on the new 7th column for baseline-equivalent start. Single-foil sentinel = 10.0.

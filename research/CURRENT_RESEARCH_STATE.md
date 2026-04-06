@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-06 ~10:45 UTC
+- **Date:** 2026-04-06 ~12:00 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -49,7 +49,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | fern | #2181 | GEPS Test-Time Low-Rank Adaptation for OOD Tandem | WIP |
-| nezuko | #2190 | Laplacian Eigenvector Mesh Positional Encoding | WIP |
+| nezuko | #2204 | NOBLE Nonlinear Low-Rank Branches in TransolverBlock MLPs | WIP |
 | alphonse | #2200 | Local KNN Attention: parallel local pathway in TransolverBlock | WIP |
 | thorfinn | #2203 | Muon/Gram-NS Optimizer: orthogonalized gradient updates | WIP |
 | frieren | #2199 | Spectral Conditioning of Attention (SCA) to prevent OOD collapse | WIP |
@@ -63,6 +63,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
+| #2190 | nezuko | Laplacian Eigenvector Mesh PE | **CLOSED** | p_tan +3.1% (29.39 vs 28.50), p_oodc +10.3%, p_re +8.4%. Topology-only PE loses spatial coordinates; 16-dim too small vs 32-dim Fourier PE. |
 | #2198 | thorfinn | GradNorm Adaptive Loss Weighting | **CLOSED** | p_tan +1.7% (28.979 vs 28.502). GradNorm disrupted PCGrad balance — adaptive weights and gradient surgery are NOT fully orthogonal with EMA. p_in improved -1.0% but primary target regressed. |
 | #2195 | askeladd | Inter-Foil Distance Feature in Spatial Bias | **CLOSED** | p_tan +2.4% (29.20 vs 28.50). p_in/p_re improved but primary metric regressed. Per-node distance to foil-2 center overfits spatial routing to training tandem patterns, doesn't transfer to OOD NACA6416. |
 | #2191 | thorfinn | SE(2) AoA-Aligned Spatial Bias | **CLOSED** | p_tan +1.8% avg (29.0 vs 28.50). All 4 metrics regressed. AoA ±4° → cos(AoA)≈0.998, rotation is near-identity. Existing aug_full_dsdf_rot already provides invariance. |
@@ -93,7 +94,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 
 **Active experiments (8 students WIP):**
 1. **GEPS Test-Time Adaptation** (fern #2181) — LoRA context params + continuity residual TTA at inference. Zero training change.
-2. **Laplacian Eigenvector Mesh PE** (nezuko #2190) — Replace Fourier PE with intrinsic graph Laplacian eigenvectors. High-potential positional encoding overhaul.
+2. **NOBLE Nonlinear Low-Rank Branches** (nezuko #2204) — CosNet-activated low-rank residual branches in TransolverBlock FFN layers. Periodic activation physically motivated for pressure fields. Zero-init for safe start. From human team suggestions (issue #1926).
 3. **Local KNN Attention** (alphonse #2200) — parallel k-nearest-neighbor local attention pathway alongside global slice attention in TransolverBlock. Captures fine-scale boundary layer and wake physics missed by coarse global slicing. Zero-init gating for safe integration.
 4. **Multi-Scale Slice Hierarchy** (edward #2201) — 3 TransolverBlocks with [32,64,96] slices. Block 1 captures global flow patterns (coarse), Block 3 refines boundary layer (fine). OOD hypothesis: global patterns generalize better than fine-grained ones. Also expected 5-8% epoch speedup from fewer slices in early blocks.
 5. **Curvature Loss Weighting** (tanjiro #2197) — Per-node curvature-weighted surface loss: `w_i = 1 + alpha * normalize(|kappa_i|)`. Tests alpha={0.5, 1.0, 2.0}. Upweights LE/TE nodes during training; val metric stays uniform.
@@ -165,6 +166,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 
 | Direction | PRs | Finding |
 |-----------|-----|---------|
+| **Laplacian Eigenvector Mesh PE** | **#2190** | **p_tan +3.1%, p_oodc +10.3%, p_re +8.4%. Topology-only PE loses spatial coordinates; 16-dim too small vs 32-dim Fourier. Existing walldist+DSDF provide geometry context; Fourier PE provides coordinate info eigenvectors cannot replace.** |
 | **GradNorm Adaptive Loss Weighting** | **#2198** | **p_tan +1.7% (28.979 vs 28.502). GradNorm's adaptive scalar weights interfere with PCGrad's gradient direction surgery. EMA smoothing (0.9) insufficient to prevent oscillation. p_in improved but primary target regressed.** |
 | Augmentation Annealing | #2152 | p_tan +1.0-2.1%. Constant aug essential for tandem transfer. |
 | EMA Start Epoch Earlier (100, 120) | #2151 | Both regress p_tan +3.7-3.8%. Start ~140 optimal. |
