@@ -1074,6 +1074,8 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Phase 7: DSDF test-time feature alignment
+    dsdf_tta_align: bool = False            # align OOD tandem DSDF stats to training distribution at val time
 
 
 cfg = sp.parse(Config)
@@ -1178,6 +1180,27 @@ _pmean = (_phys_sum / _phys_n).float()
 _pstd = ((_phys_sq_sum / _phys_n - _pmean ** 2).clamp(min=0.0).sqrt()).clamp(min=1e-6).float()
 phys_stats = {"y_mean": _pmean, "y_std": _pstd}
 print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
+
+# --- DSDF training channel stats (for test-time alignment) ---
+DSDF_TRAIN_MEAN = None
+DSDF_TRAIN_STD = None
+if cfg.dsdf_tta_align:
+    print("Computing DSDF training channel statistics for TTA alignment...")
+    _dsdf_sum = torch.zeros(8, device=device)
+    _dsdf_sq_sum = torch.zeros(8, device=device)
+    _dsdf_n = 0.0
+    with torch.no_grad():
+        for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc="DSDF stats", leave=False):
+            _x, _mask = _x.to(device), _mask.to(device)
+            _dsdf = _x[:, :, 2:10]  # 8 DSDF channels (saf + dsdf)
+            _m = _mask.float().unsqueeze(-1)  # [B, N, 1]
+            _dsdf_sum += (_dsdf * _m).sum(dim=(0, 1))
+            _dsdf_sq_sum += (_dsdf ** 2 * _m).sum(dim=(0, 1))
+            _dsdf_n += _mask.float().sum().item()
+    DSDF_TRAIN_MEAN = (_dsdf_sum / _dsdf_n).float()
+    DSDF_TRAIN_STD = ((_dsdf_sq_sum / _dsdf_n - DSDF_TRAIN_MEAN ** 2).clamp(min=0.0).sqrt()).clamp(min=1e-6).float()
+    print(f"  DSDF train mean: {DSDF_TRAIN_MEAN.tolist()}")
+    print(f"  DSDF train std:  {DSDF_TRAIN_STD.tolist()}")
 
 if cfg.raw_targets or cfg.adaptive_norm:
     _label = "Adaptive norm" if cfg.adaptive_norm else "Raw"
@@ -2335,6 +2358,19 @@ for epoch in range(MAX_EPOCHS):
                 x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
+
+                # DSDF test-time alignment: shift OOD tandem sample DSDF stats → training distribution
+                if cfg.dsdf_tta_align and DSDF_TRAIN_MEAN is not None:
+                    _tta_is_tandem = (x[:, 0, 22].abs() > 0.01)
+                    if _tta_is_tandem.any():
+                        x = x.clone()
+                        for _b in range(x.shape[0]):
+                            if _tta_is_tandem[_b]:
+                                _valid = mask[_b]  # only align real (non-padded) nodes
+                                _dsdf = x[_b, _valid, 2:10]  # (N_valid, 8)
+                                _smean = _dsdf.mean(dim=0)
+                                _sstd = _dsdf.std(dim=0).clamp(min=1e-6)
+                                x[_b, _valid, 2:10] = (_dsdf - _smean) / _sstd * DSDF_TRAIN_STD + DSDF_TRAIN_MEAN
 
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
