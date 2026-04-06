@@ -44,13 +44,13 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble (29.1) on p_tan.
 
-## Student Status (~10:45 UTC 2026-04-06)
+## Student Status (~13:30 UTC 2026-04-06)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | fern | #2181 | GEPS Test-Time Low-Rank Adaptation for OOD Tandem | WIP |
 | nezuko | #2205 | NOBLE Nonlinear Low-Rank Branches in TransolverBlock FFN (Retry) | WIP |
-| alphonse | #2200 | Local KNN Attention: parallel local pathway in TransolverBlock | WIP |
+| alphonse | #2206 | Transolver++ Ada-Temp: per-point adaptive slice temperature + Rep-Slice | WIP |
 | thorfinn | #2203 | Muon/Gram-NS Optimizer: orthogonalized gradient updates | WIP |
 | frieren | #2199 | Spectral Conditioning of Attention (SCA) to prevent OOD collapse | WIP |
 | edward | #2201 | Multi-Scale Slice Hierarchy: Coarse-to-Fine Attention [32,64,96] | WIP |
@@ -63,6 +63,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
+| #2200 | alphonse | Local KNN Attention | **CLOSED** | p_tan +14% (32.45 vs 28.50). O(N²) infeasibility for N=120k forced strided anchor fallback; 38% epoch deficit from overhead; uniform anchors miss surface regions. |
 | #2190 | nezuko | Laplacian Eigenvector Mesh PE | **CLOSED** | p_tan +3.1% (29.39 vs 28.50), p_oodc +10.3%, p_re +8.4%. Topology-only PE loses spatial coordinates; 16-dim too small vs 32-dim Fourier PE. |
 | #2198 | thorfinn | GradNorm Adaptive Loss Weighting | **CLOSED** | p_tan +1.7% (28.979 vs 28.502). GradNorm disrupted PCGrad balance — adaptive weights and gradient surgery are NOT fully orthogonal with EMA. p_in improved -1.0% but primary target regressed. |
 | #2195 | askeladd | Inter-Foil Distance Feature in Spatial Bias | **CLOSED** | p_tan +2.4% (29.20 vs 28.50). p_in/p_re improved but primary metric regressed. Per-node distance to foil-2 center overfits spatial routing to training tandem patterns, doesn't transfer to OOD NACA6416. |
@@ -95,7 +96,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 **Active experiments (8 students WIP):**
 1. **GEPS Test-Time Adaptation** (fern #2181) — LoRA context params + continuity residual TTA at inference. Zero training change.
 2. **NOBLE Nonlinear Low-Rank Branches** (nezuko #2205) — CosNet-activated low-rank residual branches in TransolverBlock FFN layers. Periodic activation physically motivated for pressure fields. Zero-init for safe start. From human team suggestions (issue #1926). Note: PR #2204 was merged prematurely (no student code) — #2205 is the true first run.
-3. **Local KNN Attention** (alphonse #2200) — parallel k-nearest-neighbor local attention pathway alongside global slice attention in TransolverBlock. Captures fine-scale boundary layer and wake physics missed by coarse global slicing. Zero-init gating for safe integration.
+3. **Transolver++ Ada-Temp + Rep-Slice** (alphonse #2206) — Per-point adaptive slice temperature (from Transolver++ ICML 2025) replacing global shared temp. Projected per-point offset on top of existing global temp; zero-initialized so baseline-equivalent at epoch 0. Rep-Slice adds Gumbel noise before softmax for sharp discrete routing. Paper reports 62% surface error reduction on aircraft datasets. Highest priority Round 10 idea. Seeds {42, 73}.
 4. **Multi-Scale Slice Hierarchy** (edward #2201) — 3 TransolverBlocks with [32,64,96] slices. Block 1 captures global flow patterns (coarse), Block 3 refines boundary layer (fine). OOD hypothesis: global patterns generalize better than fine-grained ones. Also expected 5-8% epoch speedup from fewer slices in early blocks.
 5. **Curvature Loss Weighting** (tanjiro #2197) — Per-node curvature-weighted surface loss: `w_i = 1 + alpha * normalize(|kappa_i|)`. Tests alpha={0.5, 1.0, 2.0}. Upweights LE/TE nodes during training; val metric stays uniform.
 6. **Muon/Gram-NS Optimizer** (thorfinn #2203) — Replace Lion with Muon optimizer. Applies Newton-Schulz orthogonalization to gradient matrices for 2D+ weight matrices; AdamW for scalar params. lr_muon=0.02, lr_adamw_scalar=3e-4. Previous crash (PR #2006) was a code bug — this retry has correct param group separation. Directly from human researcher team's directive (issue #1926).
@@ -158,7 +159,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 10. **Fourier Position Embedding for Spatial Bias** (`fourier-pos-embed`) — Replace raw xy with multi-scale sinusoidal features in spatial_bias MLP.
 
 ### Round 10 — Researcher-Agent (2026-04-06) — See `/research/RESEARCH_IDEAS_2026-04-06_ROUND10.md`
-1. **Transolver++ Ada-Temp** (`transolver-plus-ada-temp`) — Per-point adaptive softmax temperature + Gumbel reparameterization for slice weight computation. From Transolver++ (arXiv 2502.02414, ICML 2025). 62% surface error reduction in ablations. Distinct from SCA (#2199). **HIGHEST PRIORITY.**
+1. ~~**Transolver++ Ada-Temp**~~ → alphonse #2206 (per-point adaptive temp + Rep-Slice Gumbel reparameterization)
 2. **TE Coordinate Frame** (`te-coord-frame`) — Trailing-edge relative coordinates as additional input features. From GeoMPNN (arXiv 2412.09399, NeurIPS 2024 ML4CFD Best Student). TE is where Kutta condition, pressure recovery, and wake shedding occur.
 3. **Arc-Length Surface Loss** (`arclength-surface-loss`) — Reweight surface loss by arc-length element to correct for non-uniform mesh density at LE/TE. ~15 LoC.
 4. **Polar Coordinate Bias** (`polar-coord-bias`) — Polar coords relative to foil centroid as spatial_bias MLP inputs. GeoMPNN-motivated.

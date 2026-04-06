@@ -2554,3 +2554,20 @@ Baseline (PR #2184): p_in=13.205, p_oodc=7.816, p_tan=28.502, p_re=6.453
 
 - **Decision: CLOSED — dead end**
 - **Analysis:** GradNorm actually hurt p_tan (+1.7% regression, 28.979 vs 28.502), the exact metric it was designed to improve. p_in improved (-1.0%) but the primary target regressed. Paradoxically, the algorithm designed to upweight the tandem loss made it worse — likely because GradNorm's adaptive weight updates disturbed the carefully balanced PCGrad gradient surgery dynamics. When GradNorm detects tandem gradient norms are smaller, it increases tandem weight, but this destabilizes the PCGrad conflict resolution operating at gradient-direction level. EMA smoothing (decay=0.9) was not enough to prevent oscillation between the two mechanisms. Seed 73 was particularly bad (p_tan=29.347, +3%). Gradient norm balancing and gradient direction surgery are NOT fully orthogonal in practice with EMA interaction. The lesson: PCGrad's balance is already well-calibrated; adding a second layer of adaptive weighting on top creates interference.
+
+## 2026-04-06 ~13:00 UTC — PR #2200: Local KNN Attention: parallel local pathway in TransolverBlock — alphonse — **CLOSED** (p_tan +13-15% vs baseline)
+- alphonse/local-knn-attention
+- **Hypothesis:** Global slice attention treats all spatial scales uniformly. Adding a local KNN attention pathway operating on each node's k-nearest neighbors should capture fine-scale boundary layer and wake physics. The implementation used a zero-init gate for baseline-equivalent initialization. Architecture is orthogonal to existing improvements.
+- **Results:**
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B | Epochs |
+|--------|------|------|--------|-------|------|-----|--------|
+| k=16 | 42 | 20.0 | 11.2 | 32.0 | 8.5 | `bpgzy063` | 95 |
+| k=16 | 73 | 17.9 | 10.9 | 32.9 | 8.2 | `9x2f1pis` | 96 |
+| **2-seed avg** | — | **18.95** | **11.05** | **32.45** | **8.35** | — | — |
+| **vs baseline** | — | **+43%** | **+41%** | **+14% ✗** | **+29%** | — | — |
+
+Baseline (PR #2184): p_in=13.205, p_oodc=7.816, p_tan=28.502, p_re=6.453
+
+- **Decision: CLOSED — dead end**
+- **Analysis:** Implementation adapted from true KNN to strided anchor attention due to O(N²) infeasibility for N=120k mesh nodes. Anchor attention: 512 evenly-spaced anchors → full anchor self-attention → propagate to all nodes via distance-weighted interpolation. This modification introduced severe problems: (1) **Throughput degradation** — only 95-96 epochs reached (vs ~155 baseline, -38%) due to per-forward-pass `(B, N, M) = (4, 120k, 512)` distance matrix computation x3 blocks; (2) **Spatial non-adaptivity** — uniform anchors mostly sample volume, missing critical surface regions where boundary layer physics occur; (3) **Coarse interpolation** — 512 anchors serving ~234 nodes each is too coarse for fine-scale surface physics; (4) **Architecture competition** — Transolver's slice attention already provides learned spatial grouping via physics slices; a second cruder spatial decomposition competes rather than complements. Student's suggestion of surface-only local attention (~1-3k surface nodes) is more tractable and physically motivated. Global attention on 120k-node meshes is computationally infeasible for standard KNN approaches.
