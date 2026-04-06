@@ -676,6 +676,7 @@ class Transolver(nn.Module):
         fun_dim=1,
         out_dim=1,
         slice_num=32,
+        slice_nums=None,
         ref=8,
         unified_pos=False,
         output_fields: list[str] | None = None,
@@ -704,6 +705,7 @@ class Transolver(nn.Module):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
+        _per_block_slices = slice_nums if slice_nums is not None else [slice_num] * n_layers
         self.pressure_first = pressure_first
         self.ref = ref
         self.unified_pos = unified_pos
@@ -751,7 +753,7 @@ class Transolver(nn.Module):
                     act=act,
                     mlp_ratio=mlp_ratio,
                     out_dim=out_dim,
-                    slice_num=slice_num,
+                    slice_num=_per_block_slices[idx],
                     last_layer=(idx == n_layers - 1),
                     linear_no_attention=linear_no_attention,
                     learned_kernel=learned_kernel,
@@ -1074,6 +1076,7 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    multiscale_slices: str = ''             # comma-separated slice counts per block, e.g. "32,64,96"
 
 
 cfg = sp.parse(Config)
@@ -1202,6 +1205,15 @@ if cfg.raw_targets or cfg.adaptive_norm:
 else:
     raw_stats = None
 
+# Parse per-block slice counts for multiscale slice hierarchy
+if cfg.multiscale_slices:
+    _slice_nums = [int(s.strip()) for s in cfg.multiscale_slices.split(',')]
+    assert len(_slice_nums) == cfg.n_layers, \
+        f"multiscale_slices must have exactly n_layers={cfg.n_layers} values, got {len(_slice_nums)}"
+    print(f"Multiscale slices: {_slice_nums}")
+else:
+    _slice_nums = None
+
 model_config = dict(
     space_dim=2,
     fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
@@ -1210,6 +1222,7 @@ model_config = dict(
     n_layers=cfg.n_layers,
     n_head=3,
     slice_num=cfg.prog_slices_end if cfg.prog_slices else cfg.slice_num,
+    slice_nums=_slice_nums,
     mlp_ratio=2,
     dropout=0.05 if cfg.rdrop else 0.0,
     output_fields=["Ux", "Uy", "p"],
