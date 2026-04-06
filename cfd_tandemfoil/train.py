@@ -663,6 +663,20 @@ class SurfaceRefinementContextHead(nn.Module):
         return correction
 
 
+class MAEDecoder(nn.Module):
+    """Lightweight decoder for masked autoencoder pretraining."""
+    def __init__(self, hidden_dim=192, output_dim=24):
+        super().__init__()
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, h):
+        return self.decoder(h)
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -1070,6 +1084,10 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Phase 6: MAE pretraining — self-supervised geometry encoder initialization
+    mae_pretrain: bool = False              # enable MAE pretraining phase before supervised training
+    mae_pretrain_epochs: int = 20           # number of MAE pretraining epochs
+    mae_mask_ratio: float = 0.25            # fraction of nodes to mask during pretraining
 
 
 cfg = sp.parse(Config)
@@ -1524,6 +1542,113 @@ model_dir.mkdir(parents=True)
 model_path = model_dir / "checkpoint.pt"
 with open(model_dir / "config.yaml", "w") as f:
     yaml.dump(model_config, f)
+
+# --- MAE Pretraining Phase ---
+if cfg.mae_pretrain:
+    print(f"\n=== Phase 1: MAE Pretraining ({cfg.mae_pretrain_epochs} epochs, mask_ratio={cfg.mae_mask_ratio}) ===")
+    _mae_start = time.time()
+    # Get the uncompiled model for pretraining (compile after pretrain)
+    _mae_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+    mae_decoder = MAEDecoder(hidden_dim=cfg.n_hidden, output_dim=X_DIM).to(device)
+    # Learned mask token: replaces masked node features (raw 24-dim, before normalization)
+    mae_mask_token = nn.Parameter(torch.zeros(1, 1, X_DIM, device=device))
+    mae_opt = Lion(
+        list(_mae_model.parameters()) + list(mae_decoder.parameters()) + [mae_mask_token],
+        lr=2e-4, weight_decay=5e-5,
+    )
+    for mae_epoch in range(cfg.mae_pretrain_epochs):
+        _mae_model.train()
+        mae_decoder.train()
+        _mae_epoch_loss = 0.0
+        _mae_n_batches = 0
+        for x_mae, y_mae, is_surface_mae, mask_mae in train_loader:
+            x_mae = x_mae.to(device, non_blocking=True)
+            mask_mae = mask_mae.to(device, non_blocking=True)
+            is_surface_mae = is_surface_mae.to(device, non_blocking=True)
+            B_mae, N_mae, _ = x_mae.shape
+            # Save raw features as reconstruction targets (pre-normalization)
+            x_raw_target = x_mae[:, :, :X_DIM].clone()
+            # Random node mask: True = masked
+            node_mask = torch.rand(B_mae, N_mae, device=device) < cfg.mae_mask_ratio
+            node_mask = node_mask & mask_mae  # only mask valid (non-padded) nodes
+            # Replace masked node features with learned mask token
+            x_masked = x_mae.clone()
+            x_masked[:, :, :X_DIM] = torch.where(
+                node_mask.unsqueeze(-1).expand(-1, -1, X_DIM),
+                mae_mask_token.expand(B_mae, N_mae, -1),
+                x_mae[:, :, :X_DIM],
+            )
+            # Standardize (same as training loop)
+            raw_dsdf_mae = x_masked[:, :, 2:10]
+            dist_surf_mae = raw_dsdf_mae.abs().min(dim=-1, keepdim=True).values
+            dist_feat_mae = torch.log1p(dist_surf_mae * 10.0)
+            x_masked = (x_masked - stats["x_mean"]) / stats["x_std"]
+            curv_mae = x_masked[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface_mae.float().unsqueeze(-1)
+            x_masked = torch.cat([x_masked, curv_mae, dist_feat_mae], dim=-1)
+            # Fourier PE
+            raw_xy_mae = x_masked[:, :, :2]
+            xy_min_mae = raw_xy_mae.amin(dim=1, keepdim=True)
+            xy_max_mae = raw_xy_mae.amax(dim=1, keepdim=True)
+            xy_norm_mae = (raw_xy_mae - xy_min_mae) / (xy_max_mae - xy_min_mae + 1e-8)
+            freqs_mae = torch.cat([_mae_model.fourier_freqs_fixed.to(device), _mae_model.fourier_freqs_learned.abs()])
+            xy_scaled_mae = xy_norm_mae.unsqueeze(-1) * freqs_mae
+            fourier_pe_mae = torch.cat([xy_scaled_mae.sin().flatten(-2), xy_scaled_mae.cos().flatten(-2)], dim=-1)
+            x_masked = torch.cat([x_masked, fourier_pe_mae], dim=-1)
+            # Forward through encoder (no compile during pretrain)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out_mae = _mae_model({"x": x_masked})
+                hidden_mae = out_mae["hidden"]  # [B, N, n_hidden]
+            hidden_mae = hidden_mae.float()
+            # Decode masked positions only
+            masked_hidden = hidden_mae[node_mask]  # [M, n_hidden]
+            x_recon = mae_decoder(masked_hidden)  # [M, X_DIM]
+            # Standardize targets too for consistent loss
+            x_raw_normed = (x_raw_target - stats["x_mean"][:X_DIM]) / stats["x_std"][:X_DIM]
+            masked_target = x_raw_normed[node_mask]  # [M, X_DIM]
+            mae_loss = F.l1_loss(x_recon, masked_target)
+            mae_opt.zero_grad()
+            mae_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(_mae_model.parameters()) + list(mae_decoder.parameters()) + [mae_mask_token],
+                max_norm=1.0,
+            )
+            mae_opt.step()
+            _mae_epoch_loss += mae_loss.item()
+            _mae_n_batches += 1
+        _avg_mae_loss = _mae_epoch_loss / max(_mae_n_batches, 1)
+        _mae_elapsed = (time.time() - _mae_start) / 60.0
+        print(f"  MAE epoch {mae_epoch+1}/{cfg.mae_pretrain_epochs} — loss: {_avg_mae_loss:.4f} ({_mae_elapsed:.1f} min)")
+        wandb.log({"mae_pretrain/loss": _avg_mae_loss, "mae_pretrain/epoch": mae_epoch})
+    # Cleanup: discard MAE decoder and optimizer, keep pretrained encoder weights
+    del mae_decoder, mae_opt, mae_mask_token
+    torch.cuda.empty_cache()
+    _mae_total = (time.time() - _mae_start) / 60.0
+    print(f"=== MAE Pretraining complete ({_mae_total:.1f} min). Starting supervised training. ===\n")
+    # Re-create optimizer and scheduler for supervised training
+    attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+    other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+    base_opt = Lion([
+        {'params': attn_params, 'lr': cfg.lr * 0.5},
+        {'params': other_params, 'lr': cfg.lr}
+    ], weight_decay=cfg.weight_decay)
+    optimizer = base_opt
+    if refine_head is not None:
+        base_opt.add_param_group({'params': list(refine_head.parameters()), 'lr': cfg.lr})
+    if aft_srf_head is not None:
+        base_opt.add_param_group({'params': list(aft_srf_head.parameters()), 'lr': cfg.lr})
+    if aft_srf_ctx_head is not None:
+        base_opt.add_param_group({'params': list(aft_srf_ctx_head.parameters()), 'lr': cfg.lr})
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        base_opt, start_factor=cfg.warmup_start_factor, total_iters=cfg.warmup_total_iters
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        base_opt, T_max=cfg.cosine_T_max, eta_min=cfg.cosine_eta_min
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        base_opt, schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[cfg.warmup_total_iters]
+    )
+    sam_optimizer = None
 
 best_val = float("inf")
 ema_val_loss = float("inf")
