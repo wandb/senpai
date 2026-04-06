@@ -113,9 +113,19 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 2. ~~**Test-Time Low-Rank Adaptation (GEPS)**~~ → assigned to fern #2181
 3. ~~**Ensemble Distillation**~~ → assigned to tanjiro #2182
 4. ~~**Multi-Resolution Hash Grid Encoding**~~ → assigned to edward #2180
-5. **Frequency-Weighted Surface Pressure Loss** — DCT-domain loss upweighting high-freq components (Tier 3)
-6. **Vorticity-Streamfunction Auxiliary Targets** — predict ω and ψ to force explicit wake structure learning (Tier 3)
-7. **MAE Pretraining on Mesh Geometry** — self-supervised geometry encoder pretraining (Tier 3)
+5. **Frequency-Weighted Surface Pressure Loss** — DCT-domain loss upweighting high-freq components (Tier 3) → assigned nezuko #2184
+6. **Vorticity-Streamfunction Auxiliary Targets** → assigned frieren #2183
+7. **MAE Pretraining on Mesh Geometry** → assigned alphonse #2185
+
+### Round 5 — Researcher-Agent (2026-04-06) — Fresh Structural Ideas
+See `/research/RESEARCH_IDEAS_2026-04-06_ROUND5.md` for full details.
+1. **Normal-Velocity Hard Constraint** — project out normal component at surface nodes. Hard BC, not soft loss. **TOP PRIORITY.**
+2. **DSDF Test-Time Feature Alignment** — align OOD DSDF distribution to training stats. 5-line change, zero training cost.
+3. **Laplacian Eigenvector Mesh PE** — replace Fourier PE with intrinsic mesh encoding. Geometry-aware.
+4. **Learned Geometry Tokenizer** — compress foil shape into latent code, inject into backbone.
+5. **Stochastic Depth** — randomly drop TransolverBlocks during training. Standard regularizer.
+6. **Local KNN Attention** — add local attention alongside global slice attention.
+7. **SIREN INR Pressure Decoder** — continuous neural field for pressure prediction. Bold swing.
 
 See `/research/RESEARCH_IDEAS_2026-04-06_ROUND4.md` for full details.
 
