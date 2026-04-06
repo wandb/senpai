@@ -2737,3 +2737,38 @@ Baseline (PR #2184): p_in=13.205, p_oodc=7.816, p_tan=28.502, p_re=6.453
 
 - Note: Initial 10-step s42 run (otj5j4ka, 77 epochs) invalid — TTA bug ran adaptation every validation epoch, adding ~12 min overhead per epoch, causing only 77 epochs in 180 min. Student fixed in commit 0ba0b41.
 - **Analysis:** All metrics regressed vs baseline (p_tan +3.5%, p_oodc +4.7%). Three root causes: (1) Training epoch deficit: fixed runs hit 180-min wall at 145-146 epochs; (2) Noisy physics signal: KNN finite-difference div(U) values of 1695–2895 indicate the continuity residual is too noisy for clean gradient signal at this mesh resolution/subsampling (4096 nodes from 200K+); (3) Disconnected gradient path: LoRA applied in hidden attention space but signal comes from velocity outputs — long indirect gradient path. GEPS TTA direction closed. The student's suggested follow-up (TTA on pre-trained checkpoint) wouldn't resolve the fundamental signal quality issue.
+
+### 2026-04-06 ~18:55 — PR #2197: Geometry-Adaptive Curvature Loss Weighting — tanjiro — **CLOSED** (p_tan +1.8%, all metrics regressed vs even old baseline)
+- Branch: `tanjiro/curvature-loss-weight`
+- Hypothesis: Weight surface loss by per-node Menger curvature magnitude: `w_i = 1 + alpha * normalize(|kappa_i|)`, where kappa is x[:,:,24] (DSDF gradient norm proxy). Higher weight at high-curvature nodes (LE, TE, suction peak) forces model to prioritize aerodynamically critical regions. Loss reformulation only — no architectural change.
+- W&B runs: z94hfr0m (α=0.5, s42), i3p6sfhs (α=1.0, s42), xyvlpjc3 (α=2.0, s42), dte1drat (α=0.5, s73). Earlier failed runs: 3q6owtec (failed), 2gj144rz (finished). Student also ran unauthorized interfoil-sb experiments (17l5t3we, srn2nh08) duplicating askeladd #2195.
+- W&B group: `round7/curvature-loss-weight`
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re |
+|--------|------|------|--------|-------|------|
+| Baseline (old, PR #2184) | 2-seed avg | 13.21 | 7.82 | **28.50** | 6.45 |
+| α=0.5 | s42 | **12.8** | **7.8** | 28.5 | 6.5 |
+| α=1.0 | s42 | 12.8 | 8.0 | 28.6 | 6.5 |
+| α=2.0 | s42 | 13.0 | 8.1 | 28.9 | 6.5 |
+| **α=0.5 (2-seed avg)** | s42+s73 | **13.45** | **7.80** | **29.00** | **6.55** |
+
+- **Decision: CLOSED** — 2-seed average p_tan=29.00 vs 28.50 old baseline (+1.8%); p_in=13.45 vs 13.21 (+1.8%); p_re=6.55 vs 6.45 (+1.6%). Even worse vs current baseline (p_tan=28.52).
+- **Analysis:** Single-seed α=0.5 looked promising (p_in improved 3%), but seed 73 consistently worse across all metrics, creating high variance. Root cause: the curvature proxy from standardized features (x[:,:,24]) is noisy. Normalization per-sample curvature (dividing by max) amplifies noise in samples with low overall curvature, creating different effective loss landscapes per seed. The conceptual approach is sound but the curvature signal is too unreliable in this form.
+- **Student's follow-up suggestions:** (1) Raw curvature before standardization; (2) Softer alpha=0.25; (3) Curvature weighting on velocity channels too. Not pursued — too incremental.
+
+### 2026-04-06 ~19:13 — PR #2211: Surface Pressure Gradient Loss (dp/ds) — alphonse — **CLOSED** (p_tan +2.6%, fails on primary metric)
+- Branch: `alphonse/surface-pressure-gradient-loss`
+- Hypothesis: Add auxiliary loss on consecutive surface node pressure differences (finite-difference dp/ds proxy). DCT freq loss penalizes spectral amplitude mismatch; gradient loss penalizes transitions between adjacent nodes — complementary in theory. Weight=0.05, nodes sorted by x-coordinate per foil, applied alongside DCT freq loss.
+- W&B runs: cuehr0b0 (seed 42), nqkaw1cf (seed 73)
+- W&B group: `round12/surface-dp-ds`
+
+| Metric | Baseline (PR #2184, old) | Seed 42 | Seed 73 | **2-seed avg** | Δ |
+|--------|--------------------------|---------|---------|----------------|---|
+| p_in | 13.205 | 13.007 | 13.426 | **13.22** | ≈flat |
+| p_oodc | 7.816 | 7.600 | 8.000 | **7.80** | ≈flat |
+| **p_tan** | **28.502** | 28.600 | 29.900 | **29.25** | **+2.6% ✗** |
+| p_re | 6.453 | 6.300 | 6.600 | **6.45** | flat |
+
+- **Decision: CLOSED** — p_tan regresses 2.6% on 2-seed average (29.25 vs 28.50). Even worse vs current baseline (28.52).
+- **Analysis:** Seed 42 looks individually close to baseline (p_tan=28.6), but seed 73 shows large p_tan regression (29.9). The finite-difference dp/ds proxy sorted by x-coordinate is fundamentally flawed for closed airfoil geometries: at the leading edge, upper and lower surface nodes overlap in x, causing the sort to conflate nodes from different surfaces and generating spurious large gradients. DCT freq loss (merged) is robust to this ordering problem because it operates in frequency space.
+- **Student's follow-up suggestions:** (1) Arc-length-ordered dp/ds (fern #2210 addresses this with arc-length reweighting); (2) Lower weight dp_ds_weight=0.02; (3) Aft-foil-only dp/ds. The fundamental ordering instability needs resolution before these variations would help.

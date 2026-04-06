@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-07 ~00:15 UTC
+- **Date:** 2026-04-07 ~07:30 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -45,26 +45,30 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 Single-model p_tan (28.52) already **BEATS** ensemble (29.1). Gap continues to widen.
 
-## Student Status (~01:00 UTC 2026-04-07)
+## Student Status (~07:30 UTC 2026-04-07)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | fern | #2210 | Arc-Length Surface Loss Reweighting | WIP |
-| nezuko | #2217 | Fore-SRF Skip: inject fore-foil mean hidden into AftSRF input | WIP (just assigned) |
-| alphonse | #2211 | Surface Pressure Gradient Loss (dp/ds) | WIP |
+| nezuko | #2217 | Fore-SRF Skip: inject fore-foil mean hidden into AftSRF input | WIP |
+| alphonse | #2219 | Additive Fore→Aft Cross-Attention in AftSRF | WIP (just assigned) |
 | thorfinn | #2216 | GeoTransolver GALE (geometry-latent cross-attention) | WIP |
-| tanjiro | #2197 | Geometry-Adaptive Curvature Loss Weighting | WIP |
+| tanjiro | #2218 | LE Coordinate Frame: leading-edge-relative input features | WIP (just assigned) |
 | askeladd | #2212 | Analytical Cp Delta (thin-airfoil SRF) | WIP |
 | frieren | #2213 | Wake Deficit Feature (gap-normalized fore-TE offset) | WIP |
 | edward | #2214 | Deep Supervision on fx_deep intermediate rep | WIP |
 
 **All 8 students active. Zero idle GPUs.**
 
-### Closed/Merged this cycle
+### Closed/Merged this cycle (2026-04-06 to 2026-04-07)
+- #2218 tanjiro: LE Coordinate Frame — ASSIGNED. Leading-edge-relative input features (+6 channels), mirroring successful TE coord frame.
+- #2219 alphonse: Fore→Aft Cross-Attention Additive — ASSIGNED. Per-node cross-attention from aft surface to fore surface in AftSRF. Zero-init, additive.
+- #2197 tanjiro: Curvature Loss Weighting — CLOSED. 2-seed p_tan=29.00 vs 28.50 (+1.8% regression). Curvature proxy from standardized features is too noisy.
+- #2211 alphonse: Surface Pressure Gradient Loss — CLOSED. 2-seed p_tan=29.25 vs 28.50 (+2.6% regression). x-coordinate-sorted dp/ds conflates upper/lower surface nodes at LE.
 - #2217 nezuko: Fore-SRF Skip — ASSIGNED. Zero-init projection of fore-foil mean surface hidden into AftSRF input.
-- #2205 nezuko: NOBLE Nonlinear Low-Rank Branches — CLOSED. All metrics regressed 5-19%. CosNet periodic activation introduces oscillatory gradients that conflict with the smooth FFN training landscape.
-- #2215 thorfinn: PirateNets Adaptive Residuals — MERGED by human (tcapelle) as no-op before student ran. Hypothesis untested.
-- #2209 thorfinn: Attention Register Tokens — CLOSED. p_in +6.1%, p_oodc +5.7%, p_tan +4.0% regression. Dead end: slice-deslice mechanism already provides global aggregates, so ViT-style register tokens solve a problem that doesn't exist here.
+- #2205 nezuko: NOBLE Nonlinear Low-Rank Branches — CLOSED. All metrics regressed 5-19%. CosNet periodic activation introduces oscillatory gradients.
+- #2215 thorfinn: PirateNets Adaptive Residuals — MERGED by human (tcapelle) as no-op. Hypothesis untested.
+- #2209 thorfinn: Attention Register Tokens — CLOSED. p_tan +4.0% regression. Register tokens solve a problem that doesn't exist in Transolver.
 
 ## Human Research Directives (from GitHub Issues)
 
@@ -81,18 +85,22 @@ TE coordinate frame (PR #2207, merged) showed +5.4% p_in improvement. The hypoth
 ### Gradient Quality / Training Dynamics (ACTIVE — medium confidence)
 - **#2214 edward:** Deep supervision on fx_deep intermediate rep (weight 0.12). Gives earlier blocks direct surface pressure signal — reduces gradient path length.
 - **#2210 fern:** Arc-length surface loss reweighting (fixes non-uniform mesh density bias).
-- **#2211 alphonse:** Surface pressure gradient loss (penalize dp/ds mismatch).
+- ~~**#2211 alphonse:** Surface pressure gradient loss~~ — CLOSED. x-sorted dp/ds fundamentally broken for closed airfoil geometry.
 
 ### Architecture Novelty (ACTIVE — mixed results so far)
 - **#2216 thorfinn:** GeoTransolver GALE — pool per-foil surface features → geometry latent (dim=32) → cross-attend slice tokens in each TransolverBlock. Based on arXiv 2412.14171. Zero-init out_proj.
-- **#2205 nezuko:** NOBLE nonlinear low-rank FFN branches (retry).
+- **#2219 alphonse:** Fore→Aft Cross-Attention Additive — per-node cross-attention from aft surface to fore surface in AftSRF. Directly targets p_tan by giving aft nodes spatially-resolved fore-foil context. Complements #2217 (global mean) with fine-grained per-node attention.
+- **#2217 nezuko:** Fore-SRF Skip — coarse global mean of fore surface hidden into AftSRF. A weaker version of #2219 to test whether fore-foil info helps at all.
 - **#2212 askeladd:** Analytical Cp delta (thin-airfoil physics prior as SRF correction baseline).
-- **#2197 tanjiro:** Curvature loss weighting.
+- ~~**#2205 nezuko:** NOBLE/CosNet FFN branches~~ — CLOSED. Periodic activations interfere with smooth pressure landscape.
+- ~~**#2197 tanjiro:** Curvature loss weighting~~ — CLOSED. Noisy curvature proxy from standardized features.
 
 ## Dead Ends (Do Not Revisit)
 
-- **NOBLE/CosNet FFN branches (#2205)** — periodic activation `cos(ω·x + φ)` introduces oscillatory gradients; harms all 4 metrics; this problem's smooth pressure field doesn't benefit from high-frequency periodic corrections
+- **NOBLE/CosNet FFN branches (#2205)** — periodic activation `cos(ω·x + φ)` introduces oscillatory gradients; all metrics regressed 5-19%; smooth pressure field doesn't benefit from high-frequency corrections
 - **Register tokens in Physics-Attention (#2209)** — slice-deslice already provides global aggregates; ViT dump token pathology doesn't apply here
+- **Curvature loss weighting (#2197)** — curvature proxy from standardized features is too noisy; high seed variance; conceptually sound but implementation pathway unstable
+- **Surface pressure gradient loss (dp/ds, #2211)** — x-coordinate ordering conflates upper/lower surface nodes at LE; fundamental implementation flaw for closed airfoil geometry
 - Muon/Gram-NS optimizer (#2203) — catastrophic regression, destroys physics gradient geometry
 - Ada-Temp/Rep-Slice from Transolver++ (#2206) — three temperature mechanisms fight each other
 - Spectral attention conditioning SCA (#2199) — attention spectral collapse is NOT the bottleneck; runs crashed
@@ -100,13 +108,15 @@ TE coordinate frame (PR #2207, merged) showed +5.4% p_in improvement. The hypoth
 - Fore-aft cross-attention as SRF REPLACEMENT (#2202) — instability; additive version still viable
 - Laplacian PE (#2190) — random eigenvector sign ambiguity; spectral graph theory doesn't transfer OOD
 
-## Potential Next Hypotheses (Round 15/16)
+## Potential Next Hypotheses (Round 16/17)
 
-1. ~~**pirate-residuals**~~ — Was assigned to thorfinn (#2215), merged as no-op by human. Hypothesis untested.
+1. ~~**pirate-residuals**~~ — MERGED as no-op by human. Untested.
 2. ~~**geotransolver-gale**~~ — ASSIGNED to thorfinn (#2216).
-3. ~~**fore-srf-additive-skip**~~ — ASSIGNED to nezuko (#2217). Zero-init projection of fore-foil mean surface hidden into AftSRF aft-foil hidden features.
-4. **domain-split-srf-norm** — Domain-conditional LayerNorm ONLY in AftSRF MLP (NOT backbone). Note: AftSRF only sees tandem samples, so this is less impactful than originally thought. MEDIUM confidence.
-5. **additive-fore-aft-crossattn-srf** — Targeted retry of PR #2202 with ADDITIVE (not replacement) formulation. Keep AftSRF MLP, add parallel cross-attention (aft surface queries fore surface hidden states) with zero-init out_proj. MEDIUM confidence, MEDIUM risk.
-6. **slice-diversity-reg** — Gram matrix orthogonality penalty on slice attention weights. Encourages routing diversity on OOD inputs. Start λ=0.01. MEDIUM confidence.
-7. **tandem-feature-cross** — Sigmoid gate on input features conditioned on (gap, stagger, Re). MEDIUM risk.
-8. **surface-node-positional-encoding** — Arc-length-based positional encoding for surface nodes (distance from leading edge, normalized). Gives SRF head explicit knowledge of airfoil location for each node. Complements TE coord frame direction.
+3. ~~**fore-srf-additive-skip**~~ — ASSIGNED to nezuko (#2217).
+4. ~~**le-coord-frame**~~ — ASSIGNED to tanjiro (#2218). Leading-edge-relative input features, mirrors TE coord frame success.
+5. ~~**additive-fore-aft-crossattn-srf**~~ — ASSIGNED to alphonse (#2219). Per-node cross-attention from aft→fore surface in AftSRF.
+6. **domain-split-srf-norm** — Domain-conditional LayerNorm ONLY in AftSRF MLP. MEDIUM confidence.
+7. **slice-diversity-reg** — Gram matrix orthogonality penalty on slice attention weights. Encourages routing diversity on OOD inputs. Start λ=0.01. MEDIUM confidence.
+8. **tandem-feature-cross** — Sigmoid gate on input features conditioned on (gap, stagger, Re). MEDIUM risk.
+9. **aft-foil-le-coord** — LE coord frame specific to aft foil nodes only (more targeted than #2218 which adds for all nodes).
+10. (Fresh ideas to be generated by researcher-agent — pending)
