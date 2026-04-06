@@ -90,8 +90,29 @@ class GatedMLP2(nn.Module):
         return self.down(h)
 
 
+class NOBLELinear(nn.Module):
+    """Linear + low-rank nonlinear branch (NOBLE, arXiv 2603.06492).
+    y = xW + cos(omega * xW_down + phi) * W_up
+    CosNet activation with learnable frequency omega and phase phi per channel.
+    W_up zero-initialized so correction=0 at step 0 (baseline-equivalent start).
+    """
+    def __init__(self, in_f, out_f, rank=16, bias=True):
+        super().__init__()
+        self.linear = nn.Linear(in_f, out_f, bias=bias)
+        self.down = nn.Linear(in_f, rank, bias=False)
+        self.up = nn.Linear(rank, out_f, bias=False)
+        self.omega = nn.Parameter(torch.ones(rank))   # CosNet frequency
+        self.phi = nn.Parameter(torch.zeros(rank))    # CosNet phase
+        nn.init.zeros_(self.up.weight)                # zero-init: correction starts at 0
+
+    def forward(self, x):
+        h = self.down(x)
+        h = torch.cos(self.omega * h + self.phi)      # CosNet periodic activation
+        return self.linear(x) + self.up(h)
+
+
 class MLP(nn.Module):
-    def __init__(self, n_input, n_hidden, n_output, n_layers=1, act="gelu", res=True):
+    def __init__(self, n_input, n_hidden, n_output, n_layers=1, act="gelu", res=True, noble_rank=0):
         super().__init__()
         if act not in ACTIVATION:
             raise NotImplementedError
@@ -101,9 +122,10 @@ class MLP(nn.Module):
         self.n_output = n_output
         self.n_layers = n_layers
         self.res = res
-        self.linear_pre = nn.Sequential(nn.Linear(n_input, n_hidden), act_fn())
-        self.linear_post = nn.Linear(n_hidden, n_output)
-        self.linears = nn.ModuleList([nn.Sequential(nn.Linear(n_hidden, n_hidden), act_fn()) for _ in range(n_layers)])
+        _Lin = (lambda i, o, **kw: NOBLELinear(i, o, rank=noble_rank, **kw)) if noble_rank > 0 else nn.Linear
+        self.linear_pre = nn.Sequential(_Lin(n_input, n_hidden), act_fn())
+        self.linear_post = _Lin(n_hidden, n_output)
+        self.linears = nn.ModuleList([nn.Sequential(_Lin(n_hidden, n_hidden), act_fn()) for _ in range(n_layers)])
 
     def forward(self, x):
         x = self.linear_pre(x)
@@ -283,6 +305,7 @@ class TransolverBlock(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         spatial_bias_input_dim=4,
+        noble_rank=0,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -327,7 +350,7 @@ class TransolverBlock(nn.Module):
             nn.init.zeros_(self.film_net[-1].weight)
             nn.init.zeros_(self.film_net[-1].bias)
         self.ln_2 = _LN(hidden_dim)
-        self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act, noble_rank=noble_rank)
         self.spatial_bias = nn.Sequential(
             nn.Linear(spatial_bias_input_dim, 64), nn.GELU(),
             nn.Linear(64, 64), nn.GELU(),
@@ -700,6 +723,7 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        noble_rank=0,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -772,6 +796,7 @@ class Transolver(nn.Module):
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
                     spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
+                    noble_rank=noble_rank,
                 )
                 for idx in range(n_layers)
             ]
@@ -1024,6 +1049,8 @@ class Config:
     dct_freq_weight: float = 0.05 # weight for DCT freq loss
     dct_freq_gamma: float = 2.0   # frequency upweighting strength
     dct_freq_alpha: float = 1.5   # frequency exponent
+    noble_branches: bool = False  # NOBLE: nonlinear low-rank branches in TransolverBlock FFN
+    noble_rank: int = 16          # rank of NOBLE low-rank correction branch
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1234,6 +1261,7 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    noble_rank=cfg.noble_rank if cfg.noble_branches else 0,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1428,8 +1456,9 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
-attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
-other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+_attn_keys = ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias', 'omega', 'phi']
+attn_params = [p for n, p in model.named_parameters() if any(k in n for k in _attn_keys)]
+other_params = [p for n, p in model.named_parameters() if not any(k in n for k in _attn_keys)]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
 if cfg.use_lion:
     base_opt = Lion([
