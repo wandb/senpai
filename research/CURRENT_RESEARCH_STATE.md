@@ -115,8 +115,14 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 6. **Local KNN Attention** — add local attention alongside global slice attention.
 7. **SIREN INR Pressure Decoder** — continuous neural field for pressure prediction. Bold swing.
 
-### Round 6 — Researcher-Agent (in progress, 2026-04-06)
-See `/research/RESEARCH_IDEAS_2026-04-06_ROUND6.md` when available.
+### Round 6 — Researcher-Agent (2026-04-06) — See `/research/RESEARCH_IDEAS_2026-04-06_ROUND6.md`
+1. ~~**Boundary ID 7 Surface Loss Fix**~~ — FALSE ALARM: prepare_multi.py already uses SURFACE_IDS_MULTI=(5,6,7). Comment in train.py:19 is stale.
+2. **SE(2) Chord-Aligned Slice Routing** — AoA-rotate spatial_bias MLP inputs so coord frame is always chord-aligned. Makes GSB equivariant to AoA variation. Expected -1 to -2% p_tan.
+3. **Hopfield Geometry Memory Bank** — k-NN retrieval: find nearest training geometries at inference, retrieve pressure patterns as SRF prior. Targets NACA6416 distribution shift directly.
+4. **Stochastic Depth** — Skip TransolverBlocks randomly during training (p=0.05-0.15). Standard DeiT/ViT regularizer. 5-line change.
+5. **Curvature-Conditioned Spatial Bias** — Extend GSB MLP from 6→7 inputs by appending local curvature (DSDF Laplacian proxy). Natural extension of biggest historical win.
+6. **Tandem Inter-Foil Distance Feature** — log(min distance to opposite foil) per node. Encodes aerodynamic coupling strength.
+7. **Geometry-Adaptive Curvature Loss Weighting** — Upweight surface loss at high-curvature nodes (LE, TE). Spatial analog of merged DCT freq loss.
 
 ### Human Researcher Directives
 - **#1860 (2026-03-27):** Think bigger — radical new full model changes and data aug.
@@ -177,6 +183,8 @@ See `/research/RESEARCH_IDEAS_2026-04-06_ROUND6.md` when available.
 | **dp/dn=0 Physics Loss (6-seed)** | **#2166** | **p_tan neutral (28.97 vs 28.60, within σ=0.67). Regularizer for p_in/p_re, not p_tan.** |
 | **Panel Cp as Input Feature** | **#2179** | **p_tan +3.7%. Single-foil solver lacks tandem interaction. p_oodc/p_re improved.** |
 | **SWD Domain Alignment** | **#2175** | **w=0.01 neutral (+0.5%), w=0.05 all worse (+3.7%). Tandem slice token differences encode real physics — forced alignment counterproductive.** |
+| **DCT Frequency-Weighted Loss** | **#2184** | **MERGED. w=0.05 p_tan -0.3% (new baseline). w=0.1 unstable (high seed variance).** |
+| **Ensemble Distillation** | **#2182** | **p_tan +1.6-2.8%. Teacher quality gap — ensemble pre-dates GSB/PCGrad, weaker than student.** |
 | **Multi-Resolution Hash Grid** | **#2180** | **p_tan +12.2%. Per-sample coord normalization breaks spatial coherence. 1.14M extra params overfit, 20s/epoch overhead.** |
 
 ## Ensemble Seed Pool (Complete)
