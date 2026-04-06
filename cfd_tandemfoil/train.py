@@ -139,11 +139,13 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False,
+                 spectral_attn_conditioning=False, sac_lambda=0.0):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
         self.heads = heads
+        self.sac_lambda = sac_lambda
         self.scale = dim_head**-0.5
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
@@ -180,6 +182,10 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout),
         )
         self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
+        if spectral_attn_conditioning:
+            # Learnable per-head per-slice scaling of attention logits
+            # sac_scale: [H, S] — initialized to ones (identity at epoch 0)
+            self.sac_scale = nn.Parameter(torch.ones(heads, slice_num))
         if learned_kernel:
             self.kernel_mlp = nn.Sequential(
                 nn.Linear(2 * dim_head, dim_head), nn.GELU(),
@@ -244,7 +250,18 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
                 q_norm = F.normalize(q_slice_token, dim=-1)
                 k_norm = F.normalize(k_slice_token, dim=-1)
                 attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
+                if hasattr(self, 'sac_scale'):
+                    # sac_scale: [H, S] → [1, H, 1, S] — scale key dimension of attn logits
+                    attn_logits = attn_logits * self.sac_scale.unsqueeze(0).unsqueeze(2)
                 attn_weights = F.softmax(attn_logits, dim=-1)
+                if hasattr(self, 'sac_scale') and self.sac_lambda > 0 and self.training:
+                    # Condition number proxy: penalize variance in log-attention distribution
+                    # High variance = some slices dominate = collapsed rank
+                    A_mean = attn_weights.detach().mean(dim=0).mean(dim=-1)  # [H, S]
+                    log_A = torch.log(A_mean + 1e-8)
+                    self._sac_cond_loss = self.sac_lambda * log_A.var(dim=-1).mean()
+                else:
+                    self._sac_cond_loss = None
             out_slice_token = torch.matmul(attn_weights, v_slice_token)
             out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
 
@@ -283,6 +300,8 @@ class TransolverBlock(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         spatial_bias_input_dim=4,
+        spectral_attn_conditioning=False,
+        sac_lambda=0.0,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -308,6 +327,8 @@ class TransolverBlock(nn.Module):
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
             prog_slices=prog_slices,
+            spectral_attn_conditioning=spectral_attn_conditioning,
+            sac_lambda=sac_lambda,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -700,6 +721,8 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        spectral_attn_conditioning=False,
+        sac_lambda=0.0,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -772,6 +795,8 @@ class Transolver(nn.Module):
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
                     spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
+                    spectral_attn_conditioning=spectral_attn_conditioning,
+                    sac_lambda=sac_lambda,
                 )
                 for idx in range(n_layers)
             ]
@@ -1074,6 +1099,9 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Spectral Conditioning of Attention (SCA)
+    spectral_attn_conditioning: bool = False  # learnable per-head per-slice diagonal scaling of attn logits
+    sac_lambda: float = 0.01                  # condition number proxy regularization weight (0=disabled)
 
 
 cfg = sp.parse(Config)
@@ -1234,6 +1262,8 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    spectral_attn_conditioning=cfg.spectral_attn_conditioning,
+    sac_lambda=cfg.sac_lambda,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1428,8 +1458,8 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
-attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
-other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias', 'sac_scale'])]
+other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias', 'sac_scale'])]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
 if cfg.use_lion:
     base_opt = Lion([
@@ -1997,6 +2027,14 @@ for epoch in range(MAX_EPOCHS):
                 _dct_loss = _dct_loss / _n_foils_dct
                 loss = loss + cfg.dct_freq_weight * _dct_loss
 
+        # Spectral Attention Conditioning regularization loss
+        sac_cond_loss = torch.tensor(0.0, device=device)
+        if cfg.spectral_attn_conditioning and cfg.sac_lambda > 0 and model.training:
+            for block in _base_model.blocks:
+                if block.attn._sac_cond_loss is not None:
+                    sac_cond_loss = sac_cond_loss + block.attn._sac_cond_loss
+            loss = loss + sac_cond_loss
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -2023,8 +2061,9 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            sac_shared = sac_cond_loss * 0.5
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + sac_shared
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + sac_shared
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -2197,7 +2236,8 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step,
+                   **({"train/sac_cond_loss": sac_cond_loss.item()} if cfg.spectral_attn_conditioning else {})})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
