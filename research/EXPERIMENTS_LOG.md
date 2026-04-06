@@ -2,6 +2,40 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~16:00 — PR #2184: DCT Frequency-Weighted Surface Pressure Loss — nezuko — **MERGED** (p_tan -0.3%, new baseline)
+
+- Branch: `nezuko/dct-freq-loss`
+- Hypothesis: Apply rfft-based frequency-weighted auxiliary loss on ordered surface pressure nodes (w_k = 1 + gamma*(k/N)^alpha) to combat spectral bias — force model to attend to high-frequency leading-edge/TE features without disrupting main training.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| w=0.05 | 42 | 12.845 | 8.061 | 28.432 | 6.479 | 6yfv5lio |
+| w=0.05 | 73 | 13.564 | 7.570 | 28.572 | 6.427 | etepxvjc |
+| **w=0.05 avg** | — | **13.205** | **7.816** | **28.502** | **6.453** | |
+| w=0.1 | 42 | 12.862 | 8.152 | 28.265 | 6.552 | d3p6cz67 |
+| w=0.1 | 73 | 13.642 | 7.842 | 29.632 | 6.581 | o1x49ur6 |
+| **w=0.1 avg** | — | **13.252** | **7.997** | **28.949** | **6.567** | |
+| **Baseline (PR #2130)** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** w=0.05 beats baseline on p_tan (-0.3%) and p_re (-1.5%). p_in/p_oodc slightly regress. w=0.1 is unstable (high seed variance on p_tan: 28.27 vs 29.63). The gentle w=0.05 is the sweet spot — absolute DCT coefficient difference with smooth polynomial weighting is numerically stable unlike failed BSP (#2172). **New baseline: p_tan=28.502.** Standout: w=0.1-s42 achieved p_tan=28.265 suggesting there's more headroom if training can be stabilized.
+
+---
+
+### 2026-04-06 ~16:00 — PR #2182: Ensemble Distillation — tanjiro — **CLOSED** (teacher quality gap: ensemble weaker than student)
+
+- Branch: `tanjiro/ensemble-distill`
+- Hypothesis: Use 8-seed ensemble (seeds 66-73) soft targets as distillation signal for a fresh model. Ensemble mean = lower-variance training signal → student can outperform individual models.
+
+| Config | p_in | p_oodc | p_tan | p_re |
+|--------|------|--------|-------|------|
+| alpha=0.3 avg | 13.45 | 7.90 | 29.05 | 6.40 |
+| alpha=0.5 avg | 13.45 | 7.85 | 29.40 | 6.50 |
+| **Baseline** | **13.05** | **7.70** | **28.60** | **6.55** |
+
+**Results:** All configs worse on p_tan (+1.6% and +2.8%). Root cause: the 8-teacher ensemble (seeds 66-73) was trained WITHOUT GSB and PCGrad — their individual p_tan ≈30-32, significantly weaker than our current baseline. Distillation from weaker teachers adds noise, not variance reduction. p_re improved (-2.3%) suggesting some regularization benefit, but p_tan is the bottleneck. **Dead end: distillation only works when teacher > student. Requiring 8x budget to train a current-config ensemble is prohibitive.**
+
+---
+
 ### 2026-04-06 ~14:30 — PR #2175: SWD Tandem Domain Alignment — askeladd — **CLOSED** (distributional difference is informative, not harmful)
 
 - Branch: `askeladd/swd-domain-align`
