@@ -1071,6 +1071,7 @@ class Config:
     aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
     aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
     aft_foil_srf_context: bool = False       # KNN volume context for aft-foil SRF (wake pressure recovery)
+    analytical_cp_delta: bool = False        # Thin-airfoil Cp baseline subtraction for SRF pressure channel
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
@@ -1673,6 +1674,35 @@ for epoch in range(MAX_EPOCHS):
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
+        # Thin-airfoil Cp baseline (pre-standardization): Cp ≈ -2α × sign(y)
+        # Upper surface (y>0): Cp≈-2α (suction), lower surface (y<0): Cp≈+2α (pressure)
+        # x[:,:,1]=y-coord, x[:,:,14]=AoA0_rad (fore-foil), x[:,:,18]=AoA1_rad (aft-foil)
+        _cp_base_fore_norm = _cp_base_aft_norm = None
+        if cfg.analytical_cp_delta and not cfg.raw_targets and not cfg.adaptive_norm:
+            _y_sign = x[:, :, 1].sign()  # [B, N] upper=+1 lower=-1
+            _cp_raw_fore = (-2.0 * x[:, :, 14] * _y_sign).clamp(-3.0, 1.5)  # [B, N] foil-0 Cp
+            _cp_raw_aft  = (-2.0 * x[:, :, 18] * _y_sign).clamp(-3.0, 1.5)  # [B, N] foil-1 Cp
+            _p_mean = phys_stats["y_mean"][2].to(device)
+            _p_std  = phys_stats["y_std"][2].to(device)
+            if cfg.asinh_pressure:
+                _cp_base_fore_norm = (torch.asinh(_cp_raw_fore * cfg.asinh_scale) - _p_mean) / _p_std
+                _cp_base_aft_norm  = (torch.asinh(_cp_raw_aft  * cfg.asinh_scale) - _p_mean) / _p_std
+            else:
+                _cp_base_fore_norm = (_cp_raw_fore - _p_mean) / _p_std
+                _cp_base_aft_norm  = (_cp_raw_aft  - _p_mean) / _p_std
+            _cp_base_fore_norm = _cp_base_fore_norm.detach()
+            _cp_base_aft_norm  = _cp_base_aft_norm.detach()
+            if epoch == 0 and global_step == 0:
+                # One-time diagnostic: log Cp baseline statistics
+                _surf_fore = is_surface & (_aft_foil_mask.logical_not() if _aft_foil_mask is not None else is_surface)
+                _surf_aft  = _aft_foil_mask if _aft_foil_mask is not None else torch.zeros_like(is_surface)
+                wandb.log({
+                    "diag/cp_base_fore_mean": _cp_base_fore_norm[is_surface].mean().item(),
+                    "diag/cp_base_fore_std":  _cp_base_fore_norm[is_surface].std().item(),
+                    "diag/cp_base_aft_mean":  _cp_base_aft_norm[_surf_aft].mean().item() if _surf_aft.any() else float("nan"),
+                    "diag/cp_base_aft_std":   _cp_base_aft_norm[_surf_aft].std().item() if _surf_aft.any() else float("nan"),
+                    "global_step": global_step,
+                })
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1805,7 +1835,22 @@ for epoch in range(MAX_EPOCHS):
                         surf_pred = pred[surf_idx[:, 0], surf_idx[:, 1]]      # [M, 3]
                         correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
                         pred = pred.clone()
-                        pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
+                        if cfg.analytical_cp_delta and _cp_base_fore_norm is not None:
+                            # Per-node: fore-foil uses foil-1 baseline, aft-foil uses foil-2 baseline
+                            _s_is_aft = _aft_foil_mask[surf_idx[:, 0], surf_idx[:, 1]] \
+                                if _aft_foil_mask is not None \
+                                else torch.zeros(surf_idx.shape[0], dtype=torch.bool, device=pred.device)
+                            _s_cp_base = torch.where(
+                                _s_is_aft,
+                                _cp_base_aft_norm[surf_idx[:, 0], surf_idx[:, 1]],
+                                _cp_base_fore_norm[surf_idx[:, 0], surf_idx[:, 1]],
+                            )  # [M] normalized Cp baseline per surface node
+                            pred[surf_idx[:, 0], surf_idx[:, 1], :2] = \
+                                pred[surf_idx[:, 0], surf_idx[:, 1], :2] + correction[:, :2]
+                            pred[surf_idx[:, 0], surf_idx[:, 1], 2] = _s_cp_base + correction[:, 2]
+                        else:
+                            pred[surf_idx[:, 0], surf_idx[:, 1]] = \
+                                pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
 
         # Aft-foil dedicated refinement head: additive correction on boundary ID=7 nodes only
         if aft_srf_ctx_head is not None and model.training and _aft_foil_mask is not None:
@@ -2347,6 +2392,20 @@ for epoch in range(MAX_EPOCHS):
                     _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
                     _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
                     _v_gap_stagger = x[:, 0, 22:24]  # [B, 2]
+                # Thin-airfoil Cp baseline for eval: Cp ≈ -2α × sign(y)
+                _v_cp_base_fore_norm = _v_cp_base_aft_norm = None
+                if cfg.analytical_cp_delta and not cfg.raw_targets and not cfg.adaptive_norm:
+                    _v_y_sign = x[:, :, 1].sign()
+                    _v_cp_raw_fore = (-2.0 * x[:, :, 14] * _v_y_sign).clamp(-3.0, 1.5)
+                    _v_cp_raw_aft  = (-2.0 * x[:, :, 18] * _v_y_sign).clamp(-3.0, 1.5)
+                    _p_mean_v = phys_stats["y_mean"][2].to(device)
+                    _p_std_v  = phys_stats["y_std"][2].to(device)
+                    if cfg.asinh_pressure:
+                        _v_cp_base_fore_norm = (torch.asinh(_v_cp_raw_fore * cfg.asinh_scale) - _p_mean_v) / _p_std_v
+                        _v_cp_base_aft_norm  = (torch.asinh(_v_cp_raw_aft  * cfg.asinh_scale) - _p_mean_v) / _p_std_v
+                    else:
+                        _v_cp_base_fore_norm = (_v_cp_raw_fore - _p_mean_v) / _p_std_v
+                        _v_cp_base_aft_norm  = (_v_cp_raw_aft  - _p_mean_v) / _p_std_v
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -2454,7 +2513,21 @@ for epoch in range(MAX_EPOCHS):
                                 surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
                                 correction = eval_refine_head(surf_hidden, surf_pred).float()
                                 pred_loss = pred_loss.clone()
-                                pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
+                                if cfg.analytical_cp_delta and _v_cp_base_fore_norm is not None:
+                                    _sv_is_aft = _eval_aft_mask[surf_idx[:, 0], surf_idx[:, 1]] \
+                                        if _eval_aft_mask is not None \
+                                        else torch.zeros(surf_idx.shape[0], dtype=torch.bool, device=pred_loss.device)
+                                    _sv_cp_base = torch.where(
+                                        _sv_is_aft,
+                                        _v_cp_base_aft_norm[surf_idx[:, 0], surf_idx[:, 1]],
+                                        _v_cp_base_fore_norm[surf_idx[:, 0], surf_idx[:, 1]],
+                                    )
+                                    pred_loss[surf_idx[:, 0], surf_idx[:, 1], :2] = \
+                                        pred_loss[surf_idx[:, 0], surf_idx[:, 1], :2] + correction[:, :2]
+                                    pred_loss[surf_idx[:, 0], surf_idx[:, 1], 2] = _sv_cp_base + correction[:, 2]
+                                else:
+                                    pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = \
+                                        pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
                     if cfg.multiply_std:
                         pred = pred_loss / sample_stds
@@ -2835,6 +2908,20 @@ if cfg.surface_refine and best_metrics:
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
+                    # Thin-airfoil Cp baseline (verification): Cp ≈ -2α × sign(y)
+                    _vfy_cp_base_fore_norm = _vfy_cp_base_aft_norm = None
+                    if cfg.analytical_cp_delta and not cfg.raw_targets and not cfg.adaptive_norm:
+                        _vfy_y_sign = x[:, :, 1].sign()
+                        _vfy_cp_raw_fore = (-2.0 * x[:, :, 14] * _vfy_y_sign).clamp(-3.0, 1.5)
+                        _vfy_cp_raw_aft  = (-2.0 * x[:, :, 18] * _vfy_y_sign).clamp(-3.0, 1.5)
+                        _p_mean_vfy = phys_stats["y_mean"][2].to(device)
+                        _p_std_vfy  = phys_stats["y_std"][2].to(device)
+                        if cfg.asinh_pressure:
+                            _vfy_cp_base_fore_norm = (torch.asinh(_vfy_cp_raw_fore * cfg.asinh_scale) - _p_mean_vfy) / _p_std_vfy
+                            _vfy_cp_base_aft_norm  = (torch.asinh(_vfy_cp_raw_aft  * cfg.asinh_scale) - _p_mean_vfy) / _p_std_vfy
+                        else:
+                            _vfy_cp_base_fore_norm = (_vfy_cp_raw_fore - _p_mean_vfy) / _p_std_vfy
+                            _vfy_cp_base_aft_norm  = (_vfy_cp_raw_aft  - _p_mean_vfy) / _p_std_vfy
                     x = (x - stats["x_mean"]) / stats["x_std"]
                     curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                     if cfg.foil2_dist:
@@ -2918,7 +3005,13 @@ if cfg.surface_refine and best_metrics:
                             surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
                             correction = verify_refine(surf_hidden, surf_pred).float()
                         pred_loss_refined = pred_loss.clone()
-                        pred_loss_refined[surf_idx[:, 0], surf_idx[:, 1]] += correction
+                        if cfg.analytical_cp_delta and _vfy_cp_base_fore_norm is not None:
+                            pred_loss_refined[surf_idx[:, 0], surf_idx[:, 1], :2] = \
+                                pred_loss[surf_idx[:, 0], surf_idx[:, 1], :2] + correction[:, :2]
+                            pred_loss_refined[surf_idx[:, 0], surf_idx[:, 1], 2] = \
+                                _vfy_cp_base_fore_norm[surf_idx[:, 0], surf_idx[:, 1]] + correction[:, 2]
+                        else:
+                            pred_loss_refined[surf_idx[:, 0], surf_idx[:, 1]] += correction
                         correction_full[surf_idx[:, 0], surf_idx[:, 1]] = correction
                     else:
                         pred_loss_refined = pred_loss
