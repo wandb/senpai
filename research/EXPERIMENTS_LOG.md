@@ -2,6 +2,22 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~05:30 — PR #2187: Normal-Velocity Hard Constraint: No-Penetration BC Projection — edward — **CLOSED** (p_tan +3.0%)
+
+- Branch: `edward/normal-vel-constraint`
+- Hypothesis: Hard-constraint normal-velocity projection at surface nodes — project out the normal component of predicted velocity so no-penetration BC is structurally impossible to violate. Differentiable projection applied in both training and validation after SRF heads, before loss.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| normal_vel_projection | 42 | 12.792 | 7.833 | 28.981 | 6.520 | ey0n53eo |
+| normal_vel_projection | 73 | 12.758 | 7.651 | 29.706 | 6.487 | ejjcn6kq |
+| **Experiment avg** | — | **12.775** | **7.742** | **29.344** | **6.504** | |
+| **Baseline (DCT #2184)** | — | **13.205** | **7.816** | **28.502** | **6.453** | 6yfv5lio, etepxvjc |
+
+**Results:** p_tan regressed +3.0% (29.344 vs 28.502). p_in improved -3.3% (12.775 vs 13.205) — noteworthy but doesn't compensate. Student identified two key issues: (1) multi-foil angle-sorting bug wraps foil-1 and foil-2 into a single contour producing incorrect normals at foil boundaries, corrupting tandem predictions; (2) model already satisfies near-zero normal velocity implicitly (mean |u·n| = 0.008, 0.5% of tangential) so the hard constraint removes degrees of freedom without solving a real problem. Zero extra parameters. **Closed — p_tan regression clear and well-understood.**
+
+---
+
 ### 2026-04-06 ~16:00 — PR #2184: DCT Frequency-Weighted Surface Pressure Loss — nezuko — **MERGED** (p_tan -0.3%, new baseline)
 
 - Branch: `nezuko/dct-freq-loss`

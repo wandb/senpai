@@ -44,7 +44,7 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble (29.1) on p_tan.
 
-## Student Status (~17:30 UTC)
+## Student Status (~05:30 UTC 2026-04-06)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
@@ -52,10 +52,10 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | askeladd | #2188 | MixStyle Tandem Feature Regularization for OOD Generalization | WIP |
 | nezuko | #2190 | Laplacian Eigenvector Mesh Positional Encoding | WIP |
 | tanjiro | #2189 | DSDF Test-Time Feature Alignment for OOD Tandem | WIP |
-| alphonse | #2192 | Stochastic Depth: Layer Drop Regularization for Transolver | WIP — just assigned |
+| alphonse | #2192 | Stochastic Depth: Layer Drop Regularization for Transolver | WIP |
 | thorfinn | #2191 | SE(2) AoA-Aligned Spatial Bias: Chord-Frame Slice Routing | WIP |
 | frieren | #2183 | Vorticity Auxiliary Target: explicit wake structure learning | WIP |
-| edward | #2187 | Normal-Velocity Hard Constraint at surface nodes | WIP |
+| edward | #2193 | Curvature-Conditioned Spatial Bias: True Arc-Length Curvature | WIP — just assigned |
 
 **All 8 students active. Zero idle GPUs.**
 
@@ -63,14 +63,13 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
+| #2187 | edward | Normal-Velocity Hard Constraint | **CLOSED** | p_tan +3.0% (29.34 vs 28.50). Multi-foil normal bug + constraint already ~satisfied (|u·n|=0.008). p_in improved -3.3% but irrelevant. |
 | #2185 | alphonse | MAE Pretraining (self-supervised geometry init) | **CLOSED** | p_tan +38-67% (2-5x worse). MAE objective conflicts with physics prediction; dataset too small for SSL. |
 | #2186 | thorfinn | Panel Cp Residual Target | **CLOSED** | p_tan +349% (catastrophic). Panel solver fails for tandem. |
 | #2184 | nezuko | DCT Freq-Weighted Loss (w=0.05) | **MERGED** | p_tan 28.60→28.50 (-0.3%). New baseline. |
 | #2182 | tanjiro | Ensemble Distillation (alpha=0.3, 0.5) | **CLOSED** | p_tan +1.6-2.8%. Teacher quality gap. |
 | #2175 | askeladd | SWD Tandem Domain Alignment | **CLOSED** | w=0.01 neutral, w=0.05 +3.7%. Distributional diff = real physics. |
 | #2180 | edward | Multi-Resolution Hash Grid | **CLOSED** | p_tan +12.2%. Per-sample normalization breaks spatial coherence. |
-| #2174 | fern | Attention Temperature Curriculum | **CLOSED** | p_tan +2.7-4.2%. High temp disrupts GSB routing. |
-| #2173 | edward | Foil-1 Geometry Adapter | **CLOSED** | p_tan +2.1-2.4%. DSDF 4-moment stats too coarse. |
 
 ## Current Research Focus
 
@@ -92,7 +91,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 3. **Laplacian Eigenvector Mesh PE** (nezuko #2190) — Replace Fourier PE with intrinsic graph Laplacian eigenvectors. High-potential positional encoding overhaul.
 4. **DSDF Test-Time Feature Alignment** (tanjiro #2189) — Align OOD DSDF feature distribution to training stats at inference. 5-line change, zero training cost.
 5. **Stochastic Depth** (alphonse #2192) — randomly skip TransolverBlocks during training (p∈{0.05,0.10,0.15}). Standard DeiT/ViT regularizer; forces each layer to be independently useful. 5-line change.
-6. **Normal-Velocity Hard Constraint** (edward #2187) — project out normal velocity at surface nodes. Hard BC enforcement.
+6. **Curvature-Conditioned Spatial Bias** (edward #2193) — Extend spatial_bias MLP from 6→7 inputs by adding true Menger arc-length curvature at surface nodes. The current channel 24 "curvature proxy" is norm(saf+dsdf) ~ constant (~1) everywhere — NOT actual curvature. True κ peaks at LE/TE, zero at mid-chord. Extends biggest historical win (GSB).
 7. **Vorticity Auxiliary Target** (frieren #2183) — KNN-computed ω as auxiliary prediction target. Forces explicit wake learning.
 8. **SE(2) AoA-Aligned Spatial Bias** (thorfinn #2191) — Rotate (x, y) to AoA-aligned frame before spatial_bias MLP. Makes GSB routing invariant to AoA changes. Extends the biggest historical win. Expected -1 to -2% p_tan.
 
@@ -121,7 +120,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 2. ~~**SE(2) Chord-Aligned Slice Routing**~~ → thorfinn #2191
 3. **Hopfield Geometry Memory Bank** — k-NN retrieval: find nearest training geometries at inference, retrieve pressure patterns as SRF prior. Targets NACA6416 distribution shift directly.
 4. ~~**Stochastic Depth**~~ → alphonse #2192
-5. **Curvature-Conditioned Spatial Bias** — Extend GSB MLP from 6→7 inputs by appending local curvature (DSDF Laplacian proxy). Natural extension of biggest historical win.
+5. ~~**Curvature-Conditioned Spatial Bias**~~ → edward #2193 (true Menger curvature, not the existing crude proxy)
 6. **Tandem Inter-Foil Distance Feature** — log(min distance to opposite foil) per node. Encodes aerodynamic coupling strength.
 7. **Geometry-Adaptive Curvature Loss Weighting** — Upweight surface loss at high-curvature nodes (LE, TE). Spatial analog of merged DCT freq loss.
 
@@ -189,6 +188,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 | **Ensemble Distillation** | **#2182** | **p_tan +1.6-2.8%. Teacher quality gap — ensemble pre-dates GSB/PCGrad, weaker than student.** |
 | **Multi-Resolution Hash Grid** | **#2180** | **p_tan +12.2%. Per-sample coord normalization breaks spatial coherence. 1.14M extra params overfit, 20s/epoch overhead.** |
 | **MAE Pretraining (SSL geometry init)** | **#2185** | **p_tan +38-67% (2-5x worse). MAE reconstruction conflicts with physics prediction objective. Dataset (1322 samples) too small for SSL benefit. Pretraining wastes 10-20 epochs of supervised budget.** |
+| **Normal-Velocity Hard Constraint** | **#2187** | **p_tan +3.0% (29.34 vs 28.50). Multi-foil angle-sorting bug corrupts tandem normals. Constraint already near-satisfied implicitly (|u·n|=0.008 = 0.5% of tangential). Hard constraint removes gradient flexibility.** |
 
 ## Ensemble Seed Pool (Complete)
 
