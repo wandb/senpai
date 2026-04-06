@@ -2837,3 +2837,21 @@ Baseline (PR #2184): p_in=13.205, p_oodc=7.816, p_tan=28.502, p_re=6.453
 - **Analysis:** The simplified `Cp ≈ -2α × sign(y)` baseline is too crude for effective residual learning: (1) Assumes symmetric airfoils — NACA profiles have camber; (2) Ignores thickness, local curvature, and separation effects; (3) For OOD conditions (different Re, AoA ranges), the baseline mismatch grows; (4) The SRF head must now correct both the baseline error AND the actual physics delta, making the task harder. The original hypothesis (using DSDF normal components) was invalidated by the data format discovery.
 - **Key insight for future experiments:** DSDF features at x[:,4:12] are multi-scale clamped SDF distance values, NOT gradient/normal components. Any experiment using these as normals will fail. Proper surface normals would require computing finite-difference gradients of the SDF field.
 - **Student's follow-up suggestions:** (1) Close approach (agreed); (2) Revisit with proper surface normals if available; (3) Learned per-node baseline (small MLP) — this is a different hypothesis worth considering separately.
+
+---
+
+### 2026-04-06 22:30 — PR #2216: GeoTransolver GALE — thorfinn — **CLOSED** (all metrics worse)
+- Branch: `thorfinn/geotransolver-gale`
+- Hypothesis: Add geometry-latent cross-attention in TransolverBlock — a learnable 32-dim geometry latent per-sample, updated via cross-attention from mesh features, then injected into each TransolverBlock to condition the slice-attention on global shape information. Zero-initialized output projection for safe warmup.
+
+| Metric | Baseline (#2213) | Seed 42 (8b6u00qn) | Δ |
+|--------|-----------------|-------------------|---|
+| p_in | 11.979 | 15.442 | +28.9% ✗ |
+| p_oodc | 7.643 | 8.861 | +15.9% ✗ |
+| p_tan | 28.341 | 29.219 | +3.1% ✗ |
+| p_re | 6.300 | 7.635 | +21.2% ✗ |
+
+- W&B: Run `8b6u00qn` (finished, 126 epochs, 180.9 min). Only seed 42 run — student correctly skipped seed 73 given clear regression.
+- GALE out_proj Frobenius norms: block 0=15.5, block 1=16.4, block 2=21.7 — large, meaning the geometry cross-attention actively contributed but harmfully.
+- **Analysis:** The geometry latent creates a competing information pathway that the slice-attention has to reconcile, hurting not helping. The Transolver's existing slice-attention already captures geometry via spatial bias + DSDF features implicitly. Explicit geometry latent injection is redundant and noisy. +3.9 GB VRAM overhead for a negative result.
+- **Conclusion:** CLOSED. The approach of injecting global geometry via cross-attention is incompatible with this architecture. Lighter-touch geometry conditioning (AdaLN, frozen encoder) suggested by student but the magnitude of regression across ALL metrics makes this family of ideas low-priority.

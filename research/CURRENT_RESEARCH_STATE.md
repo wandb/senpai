@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-06 22:15 UTC
+- **Date:** 2026-04-06 22:35 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -17,7 +17,7 @@
 
 **Latest merge:** PR #2213 (frieren) — Wake Deficit Feature: 2 gap-normalized fore-TE offset channels (dx/gap, dy/gap). Delivers striking -4.1% p_in, -0.6% p_tan, -1.7% p_re. p_oodc marginal miss (+0.3%). W&B: hgml7i2r (s42), qic03vrg (s73).
 
-**Key note:** The wake deficit feature success confirms: **explicitly encoding physical aerodynamic quantities as input features is the most productive direction**. The model can learn from geometric proxies it previously had to infer. Three geometric feature layers now active: DSDF, TE coord frame, wake deficit. Focus shifts to: what other physical quantities can be encoded explicitly?
+**Key note:** Explicit physical feature encoding continues to be the most productive direction. Three geometric feature layers now active: DSDF, TE coord frame, wake deficit. Now also exploring loss-level physics coupling (Bernoulli).
 
 **Reproduce current baseline:**
 ```bash
@@ -43,66 +43,72 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 | p_tan | **29.1** |
 | p_re | **5.8** |
 
-Single-model p_tan (28.341) **BEATS** ensemble (29.1) by a large margin. p_in (11.979) also beats ensemble (12.1).
+Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats ensemble (12.1).
 
-## Student Status (2026-04-06 22:15 UTC)
+## Student Status (2026-04-06 22:35 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| frieren | #2221 | Wake Angle Feature (atan2 wake direction) | WIP (just assigned) |
-| edward | #2222 | mHC Learnable Residual Mixing (alpha/beta per sublayer) | WIP (just assigned) |
-| fern | #2223 | Surface Arc-Length PE (curvilinear position for surface nodes) | WIP (just assigned) |
+| thorfinn | #2224 | Bernoulli Consistency Loss (p + 0.5|u|² = C coupling) | WIP (just assigned) |
+| frieren | #2221 | Wake Angle Feature (atan2 wake direction) | WIP |
+| edward | #2222 | mHC Learnable Residual Mixing (alpha/beta per sublayer) | WIP |
+| fern | #2223 | Surface Arc-Length PE (curvilinear position for surface nodes) | WIP |
 | nezuko | #2217 | Fore-SRF Skip: inject fore-foil mean hidden into AftSRF input | WIP |
 | alphonse | #2219 | Additive Fore→Aft Cross-Attention in AftSRF | WIP |
-| thorfinn | #2216 | GeoTransolver GALE (geometry-latent cross-attention) | WIP |
 | tanjiro | #2218 | LE Coordinate Frame: leading-edge-relative input features | WIP |
 | askeladd | #2220 | Slice Diversity Reg: Gram matrix orthogonality on slice attention | WIP |
+
+**Idle students:** None.
 
 ## PRs Ready for Review
 None currently.
 
 ## Most Recent Research Direction from Human Researcher Team
 
-No new issues since last check. Prior directives:
-- Issue #1860: "Think bigger — radical model changes, not just incremental tweaks" (addressed Phase 5, Phase 6)
+No new issues. Prior directives still in effect:
+- Issue #1860: "Think bigger — radical model changes, not just incremental tweaks" (addressed Phase 5+)
 - Issue #1834: Never use raw data files besides assigned training split
 
 ## Current Research Focus and Themes
 
-**Theme 1: Explicit Physical Feature Engineering (HIGHEST PRIORITY — proving fruitful)**
-- TE coord frame (PR #2207): -5.4% p_in via radial position encoding
-- Wake deficit feature (PR #2213): -4.1% p_in, -1.7% p_re via wake-relative position
-- In flight: wake angle (atan2), LE coord frame, surface arc-length PE
-- The model responds strongly to explicit aerodynamic geometry — keep exploiting this
+**Theme 1: Explicit Physical Feature Engineering (HIGHEST PRIORITY — proven fruitful)**
+- TE coord frame (PR #2207): -5.4% p_in
+- Wake deficit feature (PR #2213): -4.1% p_in, -1.7% p_re
+- In flight: wake angle atan2 (#2221), LE coord frame (#2218), surface arc-length PE (#2223)
+- The model responds strongly to explicit aerodynamic geometry — continue exploiting this
 
-**Theme 2: Fore-Aft Information Coupling (MEDIUM PRIORITY)**
-- Core problem: aft-foil pressure depends on fore-foil wake, but the backbone processes both foils together
+**Theme 2: Physics-Informed Loss Reformulation (NEW — exploring)**
+- Bernoulli consistency loss (#2224, thorfinn): soft p + 0.5|u|² = C constraint on surface nodes
+- This couples velocity and pressure heads at the gradient level — novel direction vs feature engineering
+- Complementary to the pressure-first decoder already in baseline
+
+**Theme 3: Fore-Aft Information Coupling (MEDIUM PRIORITY)**
 - In flight: additive fore-aft cross-attention (#2219), fore-SRF skip (#2217)
-- Previous approaches that failed: replacement cross-attention (#2202), context-only (#2127 buggy), fore-foil mean hidden
+- Core problem: aft-foil pressure depends on fore-foil wake but backbone processes both foils together
 
-**Theme 3: Training Dynamics and Attention Optimization**
-- In flight: slice diversity regularization (#2220), GeoTransolver GALE (#2216)
-- In flight: mHC learnable residual mixing (#2222) — 12 parameters, safe init
-- Closed dead ends: NOBLE/CosNet, register tokens, Ada-Temp
+**Theme 4: Training Dynamics and Attention Optimization**
+- In flight: slice diversity regularization (#2220), mHC learnable residual mixing (#2222)
+- GeoTransolver GALE (#2216): CLOSED — geometry cross-attention competes with slice-attention, all metrics regressed significantly
 
-**Theme 4: Architecture Dead Ends (DO NOT REVISIT)**
-- NOBLE/CosNet, register tokens, Muon/Gram-NS, Ada-Temp, SCA, iterative SRF
-- Domain AdaLN (backbone), XSA, GNOT/Galerkin/Hierarchical models (all catastrophically failed Phase 5)
+**Theme 5: Architecture Dead Ends (DO NOT REVISIT)**
+- NOBLE/CosNet, register tokens, Ada-Temp, GNOT, Galerkin, Hierarchical, FactFormer, DeepONet, INR
+- Geometry latent cross-attention (GALE, #2216) — creates competing pathway
 
 ## Potential Next Research Directions
 
 After current wave completes:
-1. **Wake distance feature**: Euclidean distance from fore-TE to aft node (complement to dx/gap, dy/gap, theta)
-2. **Tandem feature cross (global gate)**: sigmoid gate on encoded features parameterized by (gap, stagger, Re, AoA)
-3. **Domain-split SRF normalization**: separate LayerNorm scale/bias for tandem vs single-foil in AftSRF (distinct from dead-end #2164)
-4. **Panel method Cp as input**: inject inviscid potential-flow Cp as a physics prior input channel — model learns viscous correction only
-5. **Pressure Laplacian smoothness loss**: graph-Laplacian penalty on surface pressure predictions (topology-aware, distinct from DCT freq loss)
-6. **Stochastic depth curriculum**: block dropping with linear schedule (forces early blocks to be independently predictive)
-7. **Researcher-agent hypothesis queue** (in progress): background agent generating fresh ideas informed by new baseline
+1. **Stagnation-point coordinate frame**: explicit LE/stagnation-relative features (complement to TE frame) — expected -3% to -6% p_in
+2. **Re-scaled DSDF features**: multiply DSDF by 1/sqrt(Re) to encode viscous length scale — targets p_re
+3. **Cp-informed surface loss weight**: upweight nodes with high |p| or high |dp/ds| — adaptive loss mining
+4. **Wake centerline coord**: single channel y_node - y_fore_TE normalized by gap — complement to wake deficit
+5. **Camber-line arc-length coord**: s ∈ [0,1] along each foil surface — geometry-invariant parameterization
+6. **OOD joint augmentation**: joint (AoA, Re) perturbation targeting p_oodc
+7. **Researcher-agent**: generate fresh Round 18 hypotheses once current wave completes
 
 ## Recent Closed Dead Ends
 
-- PR #2214 (edward): Deep Supervision — aux head never activated (aux_loss=0.004-0.008), redundant with --pressure_deep
-- PR #2210 (fern): Arc-Length Surface Loss — conflicts with hard-node mining (opposing objectives); p_in +14.2%
+- PR #2216 (thorfinn): GeoTransolver GALE — geometry cross-attention creates competing pathway, p_in +29%, all metrics worse
+- PR #2214 (edward): Deep Supervision — aux_loss never activated (redundant with --pressure_deep)
+- PR #2210 (fern): Arc-Length Surface Loss — conflicts with hard-node mining; p_in +14.2%
 - PR #2209 (thorfinn): Attention Register Tokens — p_tan +4.0%, p_in +6.1%
 - PR #2205 (nezuko): NOBLE/CosNet — all metrics regressed 5-19%
