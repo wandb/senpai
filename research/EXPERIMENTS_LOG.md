@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 ~01:00 — PR #2205: NOBLE Nonlinear Low-Rank Branches (CosNet, rank=16) — nezuko — **CLOSED** (all metrics regressed 5-19%)
+- Branch: `nezuko/noble-branches-v2`
+- Hypothesis: Add residual low-rank branch `σ(x·W_down)·W_up` alongside each FFN linear layer in TransolverBlock, where σ is CosNet `cos(ω·x + φ)` with learnable frequency/phase. Rank=16, zero-init on W_up. From arXiv 2603.06492. Motivated by human research directive (issue #1926).
+- W&B runs: `uxlbo67c` (seed 42, online), `xphiwlhu` (seed 73, offline — W&B auth expired)
+
+| Metric | Current Baseline (PR #2207) | Seed 42 | Seed 73 | 2-seed avg | Δ |
+|--------|----------------------------|---------|---------|-----------|---|
+| p_in | 12.490 | 14.59 | 15.00 | **14.80** | **+18.5% ✗** |
+| p_oodc | 7.618 | 8.93 | 8.55 | **8.74** | **+14.7% ✗** |
+| p_tan | 28.521 | 29.77 | 30.05 | **29.91** | **+4.9% ✗** |
+| p_re | 6.411 | 6.92 | 6.87 | **6.90** | **+7.6% ✗** |
+
+- Training: 132/200 epochs, ~180 min per seed (hit timeout). Both converged normally (no divergence).
+- **Analysis:** CosNet periodic activation `cos(ω·x + φ)` introduces oscillatory gradients that interfere with the well-conditioned FFN linear path. Even with zero-init on W_up, the trigonometric nonlinearity creates optimization noise that harms all metrics. p_in regressed hardest (+18.5%), indicating the branches harm the core learning task, not just OOD.
+- **Root cause:** The rank-16 bottleneck (4% of hidden=384) doesn't capture enough structure to be useful, while the periodic activation adds gradient interference. This problem's smooth pressure field doesn't benefit from high-frequency periodic corrections.
+- **Conclusion:** NOBLE/CosNet FFN branches direction exhausted for this architecture. Periodic activations in FFN are counterproductive.
+
 ### 2026-04-06 ~23:30 — PR #2209: Attention Register Tokens — thorfinn — **CLOSED** (p_tan +4.0%, p_in +6.1%, p_oodc +5.7% vs current baseline)
 - Branch: `thorfinn/attention-register-tokens`
 - Hypothesis: Append K=4 learnable register tokens to Physics-Attention slice sequence [B,96,192]→[B,100,192], discard after attention. Motivated by "Vision Transformers Need Registers" (arXiv 2309.16588, NeurIPS 2023) — prevents OOD attention sink pathology by providing explicit allocation for global state.
