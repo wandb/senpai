@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-06 ~12:00 UTC
+- **Date:** 2026-04-06 ~13:00 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -49,7 +49,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | fern | #2181 | GEPS Test-Time Low-Rank Adaptation for OOD Tandem | WIP |
-| nezuko | #2204 | NOBLE Nonlinear Low-Rank Branches in TransolverBlock MLPs | WIP |
+| nezuko | #2205 | NOBLE Nonlinear Low-Rank Branches in TransolverBlock FFN (Retry) | WIP |
 | alphonse | #2200 | Local KNN Attention: parallel local pathway in TransolverBlock | WIP |
 | thorfinn | #2203 | Muon/Gram-NS Optimizer: orthogonalized gradient updates | WIP |
 | frieren | #2199 | Spectral Conditioning of Attention (SCA) to prevent OOD collapse | WIP |
@@ -94,7 +94,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 
 **Active experiments (8 students WIP):**
 1. **GEPS Test-Time Adaptation** (fern #2181) — LoRA context params + continuity residual TTA at inference. Zero training change.
-2. **NOBLE Nonlinear Low-Rank Branches** (nezuko #2204) — CosNet-activated low-rank residual branches in TransolverBlock FFN layers. Periodic activation physically motivated for pressure fields. Zero-init for safe start. From human team suggestions (issue #1926).
+2. **NOBLE Nonlinear Low-Rank Branches** (nezuko #2205) — CosNet-activated low-rank residual branches in TransolverBlock FFN layers. Periodic activation physically motivated for pressure fields. Zero-init for safe start. From human team suggestions (issue #1926). Note: PR #2204 was merged prematurely (no student code) — #2205 is the true first run.
 3. **Local KNN Attention** (alphonse #2200) — parallel k-nearest-neighbor local attention pathway alongside global slice attention in TransolverBlock. Captures fine-scale boundary layer and wake physics missed by coarse global slicing. Zero-init gating for safe integration.
 4. **Multi-Scale Slice Hierarchy** (edward #2201) — 3 TransolverBlocks with [32,64,96] slices. Block 1 captures global flow patterns (coarse), Block 3 refines boundary layer (fine). OOD hypothesis: global patterns generalize better than fine-grained ones. Also expected 5-8% epoch speedup from fewer slices in early blocks.
 5. **Curvature Loss Weighting** (tanjiro #2197) — Per-node curvature-weighted surface loss: `w_i = 1 + alpha * normalize(|kappa_i|)`. Tests alpha={0.5, 1.0, 2.0}. Upweights LE/TE nodes during training; val metric stays uniform.
@@ -167,7 +167,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 7. **Pressure-Conditioned Attn Temp** (`pressure-conditioned-attn-temp`) — Lightweight Ada-Temp variant using spatial_bias output. Only if Idea 1 not in-flight.
 
 ### Round 9 — Human Suggestions (Issue #1926) — See `/research/RESEARCH_IDEAS_2026-04-06_ROUND9.md`
-1. ~~**NOBLE**~~ → nezuko #2204
+1. ~~**NOBLE**~~ → nezuko #2205 (retry; #2204 merged prematurely without student execution)
 2. **GeoTransolver/GALE** — Geometry context cross-attention per block.
 3. **PirateNets Adaptive Residuals** — Learnable identity-to-transform gating. Prior crash was code bug.
 4. **Moon Optimizer** — Muon variant with corrected update order.
