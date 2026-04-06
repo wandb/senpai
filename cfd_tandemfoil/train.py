@@ -960,8 +960,8 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-MAX_TIMEOUT = 180.0  # minutes
-MAX_EPOCHS = 500
+MAX_TIMEOUT = float(os.environ.get("SENPAI_TIMEOUT_MINUTES", 180.0))
+MAX_EPOCHS = int(os.environ.get("SENPAI_MAX_EPOCHS", 500))
 
 
 @dataclass
@@ -1102,6 +1102,7 @@ class Config:
     geps_tta_steps: int = 10               # number of TTA adaptation steps per batch
     geps_tta_lr: float = 1e-3              # learning rate for LoRA adaptation
     geps_tta_rank: int = 4                 # rank of LoRA context parameters
+    geps_tta_eval_every: int = 0          # apply TTA every N epochs (0 = only at last epoch/timeout)
 
 
 cfg = sp.parse(Config)
@@ -2473,9 +2474,16 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 # GEPS test-time adaptation: adapt LoRA params via continuity residual
-                # Only for val_tandem_transfer where OOD generalization matters most
+                # Only for val_tandem_transfer where OOD generalization matters most.
+                # Only activate at the last epoch (or every geps_tta_eval_every epochs) to avoid
+                # making every training epoch slow (TTA adds ~12 min per validation pass).
+                _elapsed_now = (time.time() - train_start) / 60.0
+                _is_last_epoch = (epoch == MAX_EPOCHS - 1
+                                  or _elapsed_now >= MAX_TIMEOUT - 5.0
+                                  or (cfg.geps_tta_eval_every > 0 and (epoch + 1) % cfg.geps_tta_eval_every == 0))
                 _geps_active = (cfg.geps_tta and split_name == "val_tandem_transfer"
-                                and eval_model.lora_ctxs is not None)
+                                and eval_model.lora_ctxs is not None
+                                and _is_last_epoch)
                 if _geps_active:
                     # Reset LoRA params to zero before each batch
                     _lora_params = [p for n, p in eval_model.named_parameters() if 'lora' in n]
