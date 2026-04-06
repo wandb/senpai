@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-06 22:35 UTC
+- **Date:** 2026-04-06 23:00 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -55,10 +55,10 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | fern | #2223 | Surface Arc-Length PE (curvilinear position for surface nodes) | WIP |
 | nezuko | #2217 | Fore-SRF Skip: inject fore-foil mean hidden into AftSRF input | WIP |
 | alphonse | #2219 | Additive Fore→Aft Cross-Attention in AftSRF | WIP |
-| tanjiro | #2218 | LE Coordinate Frame: leading-edge-relative input features | WIP |
+| tanjiro | #2218 | LE Coordinate Frame v2: chord-normalized LE + wake deficit rebase | WIP (sent back) |
 | askeladd | #2220 | Slice Diversity Reg: Gram matrix orthogonality on slice attention | WIP |
 
-**Idle students:** None.
+**Idle students:** None (tanjiro sent back to iterate on #2218).
 
 ## PRs Ready for Review
 None currently.

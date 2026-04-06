@@ -2,6 +2,25 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 23:00 — PR #2218: LE Coordinate Frame (+6 channels) — tanjiro — **SENT BACK** (mixed results, needs chord normalization)
+- Branch: `tanjiro/le-coord-frame`
+- Hypothesis: Leading-edge-relative coordinate features (+6 input channels: dx/dy/r from fore and aft LE) complement existing TE coordinate frame. LE is where stagnation point forms and wake impinges on aft foil. Pure input feature addition, mirrors TE coord frame implementation with min-x instead of max-x.
+- **Note:** Experiment ran against old TE-only baseline (PR #2207), NOT current wake deficit baseline (PR #2213). Command missing `--wake_deficit_feature`.
+
+| Metric | TE-only Baseline (#2207) | Seed 42 (oy1fu86u) | Seed 73 (shkekpq4) | 2-seed avg | Δ vs TE-only | vs Current Baseline (#2213) |
+|--------|-------------------------|--------------------|--------------------|-----------|--------------|----------------------------|
+| p_in | 12.490 | 11.6 | 12.3 | **11.95** | **-4.3%** ✅ | -0.2% (marginal) |
+| p_oodc | 7.618 | 9.1 | 7.6 | **8.35** | **+9.6% ✗** | **+9.3% ✗** |
+| p_tan | 28.521 | 27.5 | 28.7 | **28.10** | **-1.5%** ✅ | **-0.8%** ✅ |
+| p_re | 6.411 | 7.1 | 6.0 | **6.55** | **+2.2% ✗** | **+4.0% ✗** |
+
+- Training: 145-147 epochs, both hit ~180 min timeout.
+- **Analysis:** LE features improve p_in and p_tan (stagnation-point and wake-impingement encoding), but p_oodc regresses dramatically (+9.6%). High seed variance on p_oodc (9.1 vs 7.6) indicates raw LE distances don't generalize to OOD conditions — the stagnation point shifts with AoA, making raw (dx, dy) from geometric min-x node misleading for OOD.
+- **Decision:** Sent back with instructions to: (1) rebase on current baseline with `--wake_deficit_feature`, (2) chord-normalize all LE features (divide by chord length, like wake deficit uses gap normalization), (3) optionally try fore-only LE (3 channels) to reduce OOD noise.
+- **Conclusion:** Concept shows promise but needs geometry-invariant normalization. The p_tan gain confirms LE encodes meaningful aerodynamic information. Chord normalization should fix OOD regression.
+
+---
+
 ### 2026-04-06 22:10 — PR #2213: Wake Deficit Feature — frieren — **MERGED** (new baseline)
 - Branch: `frieren/wake-deficit-feature`
 - Hypothesis: Add 2 gap-normalized fore-TE offset channels (dx/gap, dy/gap) encoding each node's dimensionless wake-relative position. Gap-normalization makes the feature geometry-invariant across tandem configurations. Builds on TE coordinate frame (PR #2207), re-uses TE computation in shared helper.
