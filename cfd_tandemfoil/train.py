@@ -332,6 +332,8 @@ class TransolverBlock(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         spatial_bias_input_dim=4,
+        geotransolver_gale=False,
+        gale_latent_dim=32,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -390,6 +392,15 @@ class TransolverBlock(nn.Module):
         self.se_fc2 = nn.Linear(hidden_dim // 4, hidden_dim)
         nn.init.zeros_(self.se_fc2.weight)
         nn.init.zeros_(self.se_fc2.bias)
+        self.geotransolver_gale = geotransolver_gale
+        if geotransolver_gale:
+            gale_total_dim = gale_latent_dim * 2  # fore + aft foil latents concatenated
+            self.gale_q_proj = nn.Linear(hidden_dim, hidden_dim)
+            self.gale_k_proj = nn.Linear(gale_total_dim, hidden_dim)
+            self.gale_v_proj = nn.Linear(gale_total_dim, hidden_dim)
+            self.gale_out_proj = nn.Linear(hidden_dim, hidden_dim)
+            nn.init.zeros_(self.gale_out_proj.weight)
+            nn.init.zeros_(self.gale_out_proj.bias)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
             if soft_moe:
@@ -441,7 +452,7 @@ class TransolverBlock(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None, geom_latent=None):
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         # DomainLayerNorm helper: pass is_tandem when enabled, else plain call
         dln_it = (tandem_mask.view(-1) > 0.5) if (self.domain_layernorm and tandem_mask is not None) else None
@@ -454,10 +465,26 @@ class TransolverBlock(nn.Module):
             s1, b1, s2, b2 = cond_out.chunk(4, dim=-1)  # each [B, H]
             fx_norm = _ln(self.ln_1, fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
             fx = _ln(self.ln_1_post, self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            # GALE: geometry-latent cross-attention after physics attention, before FFN
+            if self.geotransolver_gale and geom_latent is not None:
+                gale_q = self.gale_q_proj(fx)          # [B, N, D]
+                gale_kv = geom_latent.unsqueeze(1)     # [B, 1, 2*latent_dim]
+                gale_k = self.gale_k_proj(gale_kv)    # [B, 1, D]
+                gale_v = self.gale_v_proj(gale_kv)    # [B, 1, D]
+                cross_out = F.scaled_dot_product_attention(gale_q, gale_k, gale_v)  # [B, N, D]
+                fx = fx + self.gale_out_proj(cross_out)
             fx_norm = _ln(self.ln_2, fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
             fx = _ln(self.ln_2_post, self.mlp(fx_norm) + fx)
         else:
             fx = _ln(self.ln_1_post, self.attn(_ln(self.ln_1, fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            # GALE: geometry-latent cross-attention after physics attention, before FFN
+            if self.geotransolver_gale and geom_latent is not None:
+                gale_q = self.gale_q_proj(fx)          # [B, N, D]
+                gale_kv = geom_latent.unsqueeze(1)     # [B, 1, 2*latent_dim]
+                gale_k = self.gale_k_proj(gale_kv)    # [B, 1, D]
+                gale_v = self.gale_v_proj(gale_kv)    # [B, 1, D]
+                cross_out = F.scaled_dot_product_attention(gale_q, gale_k, gale_v)  # [B, N, D]
+                fx = fx + self.gale_out_proj(cross_out)
             fx = _ln(self.ln_2_post, self.mlp(_ln(self.ln_2, fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
@@ -712,6 +739,25 @@ class SurfaceRefinementContextHead(nn.Module):
         return correction
 
 
+class GeometryEncoder(nn.Module):
+    """Pool surface node features into a fixed-size geometry latent."""
+
+    def __init__(self, in_dim, latent_dim):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(in_dim, latent_dim * 2),
+            nn.GELU(),
+            nn.Linear(latent_dim * 2, latent_dim),
+        )
+
+    def forward(self, surface_x, surface_mask):
+        # surface_x: [B, N, D], surface_mask: [B, N] bool
+        masked = surface_x * surface_mask.unsqueeze(-1).float()
+        count = surface_mask.float().sum(1, keepdim=True).clamp(min=1)
+        pooled = masked.sum(1) / count  # [B, D]
+        return self.proj(pooled)  # [B, latent_dim]
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -749,10 +795,13 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        geotransolver_gale=False,
+        gale_latent_dim=32,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
+        self.geotransolver_gale = geotransolver_gale
         self.pressure_first = pressure_first
         self.ref = ref
         self.unified_pos = unified_pos
@@ -821,6 +870,8 @@ class Transolver(nn.Module):
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
                     spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
+                    geotransolver_gale=geotransolver_gale,
+                    gale_latent_dim=gale_latent_dim,
                 )
                 for idx in range(n_layers)
             ]
@@ -830,6 +881,10 @@ class Transolver(nn.Module):
             with torch.no_grad():
                 for block in self.blocks:
                     block.spatial_bias[0].weight[:, 4:].zero_()
+        # GeoTransolver GALE: geometry-latent encoders (fore and aft foil)
+        if geotransolver_gale:
+            self.fore_geom_enc = GeometryEncoder(fun_dim + space_dim, gale_latent_dim)
+            self.aft_geom_enc = GeometryEncoder(fun_dim + space_dim, gale_latent_dim)
         # Separate pressure pathway (pressure_separate_last_block):
         # Independent MLP + pres_head that processes shared hidden features
         self._pressure_separate = False  # set from Config after construction
@@ -925,6 +980,19 @@ class Transolver(nn.Module):
         else:
             zone_features = None
 
+        # GeoTransolver GALE: compute geometry latent from raw input features
+        if self.geotransolver_gale:
+            fore_surf_mask = data.get("fore_surf_mask") if isinstance(data, Mapping) else None
+            aft_surf_mask = data.get("aft_surf_mask") if isinstance(data, Mapping) else None
+            if fore_surf_mask is not None and aft_surf_mask is not None:
+                fore_latent = self.fore_geom_enc(x, fore_surf_mask)   # [B, latent_dim]
+                aft_latent = self.aft_geom_enc(x, aft_surf_mask)      # [B, latent_dim]
+                geom_latent = torch.cat([fore_latent, aft_latent], dim=-1)  # [B, 2*latent_dim]
+            else:
+                geom_latent = None
+        else:
+            geom_latent = None
+
         if self.unified_pos:
             if pos is None:
                 raise ValueError("Missing required input tensor: pos")
@@ -948,7 +1016,7 @@ class Transolver(nn.Module):
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
         for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features, geom_latent=geom_latent)
 
         # Deep hidden representation (post all non-last blocks, pre output head)
         fx_deep = fx  # [B, N, n_hidden]
@@ -965,11 +1033,11 @@ class Transolver(nn.Module):
             fx_for_pressure = fx  # save for separate pressure branch
             p_sep = self.pressure_sep_mlp(fx_for_pressure)  # [B, N, 1]
             # Main last block produces vel only (pressure_first still active but p comes from separate branch)
-            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features, geom_latent=geom_latent)
             # Override: replace the pressure channel from the last block with the separate branch's output
             fx = torch.cat([fx[:, :, :2], p_sep], dim=-1)
         else:
-            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features, geom_latent=geom_latent)
 
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
@@ -1124,6 +1192,8 @@ class Config:
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
+    geotransolver_gale: bool = False  # Geometry-latent cross-attention conditioning
+    gale_latent_dim: int = 32         # Geometry latent dimension per foil
 
 
 cfg = sp.parse(Config)
@@ -1284,6 +1354,8 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    geotransolver_gale=cfg.geotransolver_gale,
+    gale_latent_dim=cfg.gale_latent_dim,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1726,6 +1798,13 @@ for epoch in range(MAX_EPOCHS):
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
+        # GALE: fore/aft surface masks computed from raw saf_norm before normalization
+        _fore_surf_mask_gale = None
+        _aft_surf_mask_gale = None
+        if cfg.geotransolver_gale:
+            _raw_saf_norm_gale = x[:, :, 2:4].norm(dim=-1)  # [B, N]
+            _fore_surf_mask_gale = is_surface & (_raw_saf_norm_gale <= 0.005)
+            _aft_surf_mask_gale = is_surface & (_raw_saf_norm_gale > 0.005)
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1829,7 +1908,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x, "fore_surf_mask": _fore_surf_mask_gale, "aft_surf_mask": _aft_surf_mask_gale})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -2057,7 +2136,7 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x})
+                rdrop_out = model({"x": x, "fore_surf_mask": _fore_surf_mask_gale, "aft_surf_mask": _aft_surf_mask_gale})
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -2196,7 +2275,7 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                out2 = model({"x": x, "fore_surf_mask": _fore_surf_mask_gale, "aft_surf_mask": _aft_surf_mask_gale})
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -2405,6 +2484,13 @@ for epoch in range(MAX_EPOCHS):
                     _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
                     _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
                     _v_gap_stagger = x[:, 0, 22:24]  # [B, 2]
+                # GALE: fore/aft surface masks for eval (same logic as training)
+                _fore_surf_mask_gale_v = None
+                _aft_surf_mask_gale_v = None
+                if cfg.geotransolver_gale:
+                    _raw_saf_norm_gale_v = x[:, :, 2:4].norm(dim=-1)
+                    _fore_surf_mask_gale_v = is_surface & (_raw_saf_norm_gale_v <= 0.005)
+                    _aft_surf_mask_gale_v = is_surface & (_raw_saf_norm_gale_v > 0.005)
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -2490,7 +2576,7 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    _eval_out = eval_model({"x": x})
+                    _eval_out = eval_model({"x": x, "fore_surf_mask": _fore_surf_mask_gale_v, "aft_surf_mask": _aft_surf_mask_gale_v})
                     pred = _eval_out["preds"]
                     _eval_hidden = _eval_out["hidden"]
                 pred = pred.float()
@@ -2768,6 +2854,18 @@ wandb.summary.update({"total_epochs": epoch + 1, "total_time_min": total_time})
 if best_metrics:
     wandb.summary.update({"best_" + k: v for k, v in best_metrics.items()})
 
+# GALE diagnostic: log gale_out_proj.weight Frobenius norms per block
+if cfg.geotransolver_gale:
+    _gale_norms = {}
+    _raw_model = _base_model._orig_mod if hasattr(_base_model, "_orig_mod") else _base_model
+    for _bi, _block in enumerate(_raw_model.blocks):
+        if hasattr(_block, "gale_out_proj"):
+            _norm = _block.gale_out_proj.weight.detach().float().norm().item()
+            _gale_norms[f"gale/block{_bi}_out_proj_norm_F"] = _norm
+            print(f"  GALE block {_bi}: ||gale_out_proj.weight||_F = {_norm:.4f}")
+    if _gale_norms:
+        wandb.summary.update(_gale_norms)
+
     print("\nGenerating flow field plots...")
     try:
         if cfg.swa_cyclic and swa_cyclic_model is not None:
@@ -2801,6 +2899,13 @@ if best_metrics:
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_xy_te_vis = x_dev[:, :, :2].clone() if cfg.te_coord_frame else None
                     _raw_saf_norm_te_vis = x_dev[:, :, 2:4].norm(dim=-1) if cfg.te_coord_frame else None
+                    # GALE: fore/aft surface masks for visualization
+                    _fore_surf_mask_gale_vis = None
+                    _aft_surf_mask_gale_vis = None
+                    if cfg.geotransolver_gale:
+                        _raw_saf_norm_gale_vis = x_dev[:, :, 2:4].norm(dim=-1)
+                        _fore_surf_mask_gale_vis = is_surf_dev & (_raw_saf_norm_gale_vis <= 0.005)
+                        _aft_surf_mask_gale_vis = is_surf_dev & (_raw_saf_norm_gale_vis > 0.005)
                     x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                     curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                     if cfg.te_coord_frame:
@@ -2818,7 +2923,7 @@ if best_metrics:
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
-                    pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
+                    pred = vis_model({"x": x_n, "mask": mask, "fore_surf_mask": _fore_surf_mask_gale_vis, "aft_surf_mask": _aft_surf_mask_gale_vis})["preds"].float()
                     if cfg.raw_targets:
                         y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                     elif cfg.adaptive_norm:
@@ -2904,6 +3009,13 @@ if cfg.surface_refine and best_metrics:
                     _raw_aoa = x[:, 0, 14:15]
                     _raw_xy_te = x[:, :, :2].clone() if cfg.te_coord_frame else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if cfg.te_coord_frame else None
+                    # GALE: fore/aft surface masks for OOD-Re verify loop
+                    _fore_surf_mask_gale_r = None
+                    _aft_surf_mask_gale_r = None
+                    if cfg.geotransolver_gale:
+                        _raw_saf_norm_gale_r = x[:, :, 2:4].norm(dim=-1)
+                        _fore_surf_mask_gale_r = is_surface & (_raw_saf_norm_gale_r <= 0.005)
+                        _aft_surf_mask_gale_r = is_surface & (_raw_saf_norm_gale_r > 0.005)
                     x = (x - stats["x_mean"]) / stats["x_std"]
                     curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                     if cfg.foil2_dist:
@@ -2975,7 +3087,7 @@ if cfg.surface_refine and best_metrics:
 
                     # Model forward
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        out = verify_model({"x": x})
+                        out = verify_model({"x": x, "fore_surf_mask": _fore_surf_mask_gale_r, "aft_surf_mask": _aft_surf_mask_gale_r})
                         pred_raw = out["preds"].float()
                         hidden = out["hidden"].float()
 
