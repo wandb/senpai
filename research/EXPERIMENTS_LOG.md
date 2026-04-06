@@ -51,6 +51,29 @@
 
 ---
 
+### 2026-04-06 ~17:30 — PR #2186: Panel Cp Residual Target — thorfinn — **CLOSED** (catastrophic degradation, 3-5x worse)
+
+- Branch: `thorfinn/panel-cp-residual`
+- Hypothesis: Instead of predicting `p - p_freestream`, predict `p - p_panel` (viscous correction only). Panel Cp captures deterministic inviscid flow; the viscous correction (boundary layer, separation, wake) is a smaller residual that should be easier to learn. Motivated by NeuralFoil (arXiv:2503.16323) which uses panel method baseline + neural viscous correction.
+
+| Metric | Seed 42 (3j7eqs2i) | Seed 73 (zvkocnap) | 2-seed avg | vs Baseline |
+|--------|-------------------|-------------------|------------|-------------|
+| p_in | 57.0 | 58.1 | **57.6** | +341% ❌ |
+| p_oodc | 45.2 | 44.3 | **44.8** | +473% ❌ |
+| p_tan | 125.2 | 131.5 | **128.4** | +349% ❌ |
+| p_re | 23.8 | 24.6 | **24.2** | +269% ❌ |
+| **Baseline** | — | — | — | d7l91p0x, j9btfx09 |
+
+**Results:** Catastrophic degradation across all splits. Root causes identified by student (confirmed):
+1. **Viscous correction is harder to learn, not easier** — the full Cp field has smooth, spatially coherent gradients (stagnation, suction peaks) that help the model. The viscous correction has more complex structure (separation, wake effects) without those global anchors.
+2. **asinh/normalization mismatch** — existing hyperparameters (asinh_scale=0.75, z-score stats) tuned for full Cp distribution, not the residual. The residual has a fundamentally different statistical distribution.
+3. **Panel solver error compounds in tandem** — single-foil Hess-Smith fails for tandem configurations (wake interference). p_tan degraded most (+349%) because the panel Cp is unreliable for the exact geometry we care most about.
+4. **Information loss** — subtracting panel Cp before asinh removes absolute pressure scale context that helps global prediction.
+
+**Conclusion:** Panel-method-based target reformulation direction is fully exhausted (#2179 as input: +3.7%, #2186 as target: +340%). Both approaches failed. The baseline's asinh + freestream residual is the correct normalization. Move on.
+
+---
+
 ### 2026-04-06 ~10:30 — PR #2180: Multi-Resolution Hash Grid Encoding — edward — **CLOSED** (per-sample normalization breaks spatial coherence)
 
 - Branch: `edward/hash-grid-encoding`

@@ -44,16 +44,16 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble (29.1) on p_tan.
 
-## Student Status (~16:30 UTC)
+## Student Status (~17:30 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | fern | #2181 | GEPS Test-Time Low-Rank Adaptation for OOD Tandem | WIP |
 | askeladd | #2188 | MixStyle Tandem Feature Regularization for OOD Generalization | WIP |
-| nezuko | #2190 | Laplacian Eigenvector Mesh Positional Encoding | WIP — just assigned |
-| tanjiro | #2189 | DSDF Test-Time Feature Alignment for OOD Tandem | WIP — just assigned |
+| nezuko | #2190 | Laplacian Eigenvector Mesh Positional Encoding | WIP |
+| tanjiro | #2189 | DSDF Test-Time Feature Alignment for OOD Tandem | WIP |
 | alphonse | #2185 | MAE Pretraining: self-supervised geometry encoder initialization | WIP |
-| thorfinn | #2186 | Panel Cp Residual Target: predict viscous correction only | WIP |
+| thorfinn | #2191 | SE(2) AoA-Aligned Spatial Bias: Chord-Frame Slice Routing | WIP — just assigned |
 | frieren | #2183 | Vorticity Auxiliary Target: explicit wake structure learning | WIP |
 | edward | #2187 | Normal-Velocity Hard Constraint at surface nodes | WIP |
 
@@ -63,13 +63,13 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
+| #2186 | thorfinn | Panel Cp Residual Target | **CLOSED** | p_tan +349% (catastrophic). Panel solver fails for tandem. |
 | #2184 | nezuko | DCT Freq-Weighted Loss (w=0.05) | **MERGED** | p_tan 28.60→28.50 (-0.3%). New baseline. |
 | #2182 | tanjiro | Ensemble Distillation (alpha=0.3, 0.5) | **CLOSED** | p_tan +1.6-2.8%. Teacher quality gap. |
 | #2175 | askeladd | SWD Tandem Domain Alignment | **CLOSED** | w=0.01 neutral, w=0.05 +3.7%. Distributional diff = real physics. |
 | #2180 | edward | Multi-Resolution Hash Grid | **CLOSED** | p_tan +12.2%. Per-sample normalization breaks spatial coherence. |
 | #2174 | fern | Attention Temperature Curriculum | **CLOSED** | p_tan +2.7-4.2%. High temp disrupts GSB routing. |
 | #2173 | edward | Foil-1 Geometry Adapter | **CLOSED** | p_tan +2.1-2.4%. DSDF 4-moment stats too coarse. |
-| #2130 | fern | GSB + PCGrad Compound | **MERGED** | p_tan 29.48→28.60 (-3.0%). Prior baseline. |
 
 ## Current Research Focus
 
@@ -93,7 +93,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 5. **MAE Pretraining** (alphonse #2185) — self-supervised masked geometry reconstruction before supervised training.
 6. **Normal-Velocity Hard Constraint** (edward #2187) — project out normal velocity at surface nodes. Hard BC enforcement.
 7. **Vorticity Auxiliary Target** (frieren #2183) — KNN-computed ω as auxiliary prediction target. Forces explicit wake learning.
-8. **Panel Cp Residual Target** (thorfinn #2186) — predict (p_gt - p_panel) viscous correction instead of full pressure.
+8. **SE(2) AoA-Aligned Spatial Bias** (thorfinn #2191) — Rotate (x, y) to AoA-aligned frame before spatial_bias MLP. Makes GSB routing invariant to AoA changes. Extends the biggest historical win. Expected -1 to -2% p_tan.
 
 **Key research patterns:**
 - **What works:** DSDF magnitude augmentation (foil-2 only), specialized correction heads (aft_srf), gradient surgery (2-way PCGrad), tandem-geometry-aware routing (GSB), geometry-conditioned mechanisms
@@ -117,7 +117,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 
 ### Round 6 — Researcher-Agent (2026-04-06) — See `/research/RESEARCH_IDEAS_2026-04-06_ROUND6.md`
 1. ~~**Boundary ID 7 Surface Loss Fix**~~ — FALSE ALARM: prepare_multi.py already uses SURFACE_IDS_MULTI=(5,6,7). Comment in train.py:19 is stale.
-2. **SE(2) Chord-Aligned Slice Routing** — AoA-rotate spatial_bias MLP inputs so coord frame is always chord-aligned. Makes GSB equivariant to AoA variation. Expected -1 to -2% p_tan.
+2. ~~**SE(2) Chord-Aligned Slice Routing**~~ → thorfinn #2191
 3. **Hopfield Geometry Memory Bank** — k-NN retrieval: find nearest training geometries at inference, retrieve pressure patterns as SRF prior. Targets NACA6416 distribution shift directly.
 4. **Stochastic Depth** — Skip TransolverBlocks randomly during training (p=0.05-0.15). Standard DeiT/ViT regularizer. 5-line change.
 5. **Curvature-Conditioned Spatial Bias** — Extend GSB MLP from 6→7 inputs by appending local curvature (DSDF Laplacian proxy). Natural extension of biggest historical win.
@@ -182,6 +182,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 | **Coordinated Tandem Ramp** | **#2177** | **p_tan +2.2% avg. Concurrent schedules interfere during tandem warmup.** |
 | **dp/dn=0 Physics Loss (6-seed)** | **#2166** | **p_tan neutral (28.97 vs 28.60, within σ=0.67). Regularizer for p_in/p_re, not p_tan.** |
 | **Panel Cp as Input Feature** | **#2179** | **p_tan +3.7%. Single-foil solver lacks tandem interaction. p_oodc/p_re improved.** |
+| **Panel Cp Residual Target** | **#2186** | **p_tan +349% (57x worse). asinh mismatch + panel error compounds in tandem. Direction fully exhausted.** |
 | **SWD Domain Alignment** | **#2175** | **w=0.01 neutral (+0.5%), w=0.05 all worse (+3.7%). Tandem slice token differences encode real physics — forced alignment counterproductive.** |
 | **DCT Frequency-Weighted Loss** | **#2184** | **MERGED. w=0.05 p_tan -0.3% (new baseline). w=0.1 unstable (high seed variance).** |
 | **Ensemble Distillation** | **#2182** | **p_tan +1.6-2.8%. Teacher quality gap — ensemble pre-dates GSB/PCGrad, weaker than student.** |
