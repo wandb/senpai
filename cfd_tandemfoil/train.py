@@ -134,6 +134,82 @@ class DomainLayerNorm(nn.Module):
         return torch.where(mask_t, self.ln_tandem(x), self.ln_single(x))
 
 
+class HashGrid2D(nn.Module):
+    """Multi-resolution 2D hash grid encoding (Instant-NGP style).
+
+    Expects per-sample normalized coordinates in [0, 1]^2.
+    Output dim = n_levels * features_per_level.
+    """
+    def __init__(self, n_levels=8, features_per_level=4, base_resolution=16,
+                 max_resolution=2048, hash_table_size=2**16):
+        super().__init__()
+        self.n_levels = n_levels
+        self.features_per_level = features_per_level
+        self.output_dim = n_levels * features_per_level  # 32
+
+        # Compute resolution at each level (geometric progression)
+        b = (max_resolution / base_resolution) ** (1.0 / (n_levels - 1))
+        self.resolutions = [int(base_resolution * b**i) for i in range(n_levels)]
+
+        # Hash tables: one embedding table per level
+        self.hash_tables = nn.ModuleList([
+            nn.Embedding(min(res * res, hash_table_size), features_per_level)
+            for res in self.resolutions
+        ])
+
+        # Initialize small so it starts near-zero (doesn't disrupt baseline)
+        for table in self.hash_tables:
+            nn.init.uniform_(table.weight, -1e-4, 1e-4)
+
+    def forward(self, xy_norm):
+        """
+        xy_norm: (B, N, 2) — per-sample normalized mesh coordinates in [0, 1].
+        Returns: (B, N, output_dim) hash grid features.
+        """
+        xy_norm = xy_norm.clamp(0.0, 1.0)
+        features = []
+        for level_idx, res in enumerate(self.resolutions):
+            # Scale to grid resolution
+            xy_scaled = xy_norm * (res - 1)  # (B, N, 2)
+
+            # Floor and ceil for bilinear interpolation
+            xy_floor = xy_scaled.long().clamp(0, res - 2)
+            xy_ceil = xy_floor + 1
+            frac = xy_scaled - xy_floor.float()  # fractional part
+
+            # 4 corner indices for bilinear interp (XOR spatial hash)
+            hash_size = self.hash_tables[level_idx].num_embeddings
+            ix0, iy0 = xy_floor[..., 0], xy_floor[..., 1]
+            ix1, iy1 = xy_ceil[..., 0], xy_ceil[..., 1]
+
+            def _hash(ix, iy):
+                return ((ix * 2654435761) ^ (iy * 805459861)) % hash_size
+
+            idx_00 = _hash(ix0, iy0)
+            idx_01 = _hash(ix0, iy1)
+            idx_10 = _hash(ix1, iy0)
+            idx_11 = _hash(ix1, iy1)
+
+            # Look up features
+            table = self.hash_tables[level_idx]
+            f00 = table(idx_00)  # (B, N, F)
+            f01 = table(idx_01)
+            f10 = table(idx_10)
+            f11 = table(idx_11)
+
+            # Bilinear interpolation
+            fx = frac[..., 0:1]  # (B, N, 1)
+            fy = frac[..., 1:2]
+            f = (f00 * (1 - fx) * (1 - fy) +
+                 f01 * (1 - fx) * fy +
+                 f10 * fx * (1 - fy) +
+                 f11 * fx * fy)
+
+            features.append(f)
+
+        return torch.cat(features, dim=-1)  # (B, N, n_levels * features_per_level)
+
+
 class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
@@ -700,6 +776,7 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        hash_grid_encoding=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -802,6 +879,13 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        # Hash grid encoding — instantiated after initialize_weights() to preserve small init
+        if hash_grid_encoding:
+            self.hash_grid = HashGrid2D(
+                n_levels=8, features_per_level=4,
+                base_resolution=16, max_resolution=2048,
+                hash_table_size=2**16,
+            )
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -1070,6 +1154,8 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    # Multi-resolution hash grid encoding of mesh coordinates
+    hash_grid_encoding: bool = False         # enable Instant-NGP-style hash grid spatial encoding
 
 
 cfg = sp.parse(Config)
@@ -1200,7 +1286,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32,  # +curv, +dist, [+foil2dist], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + 32 + (32 if cfg.hash_grid_encoding else 0),  # +curv, +dist, [+foil2dist], +32 fourier PE, [+32 hash grid]
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1230,6 +1316,7 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    hash_grid_encoding=cfg.hash_grid_encoding,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1424,20 +1511,25 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
-attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
-other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+_hash_grid_names = {'hash_grid'}
+_attn_keys = ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias']
+attn_params = [p for n, p in model.named_parameters() if any(k in n for k in _attn_keys) and not any(h in n for h in _hash_grid_names)]
+other_params = [p for n, p in model.named_parameters() if not any(k in n for k in _attn_keys) and not any(h in n for h in _hash_grid_names)]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
+_param_groups = [
+    {'params': attn_params, 'lr': _base_lr * 0.5},
+    {'params': other_params, 'lr': _base_lr},
+]
+# Hash grid params get 5x higher LR for faster spatial feature learning
+if cfg.hash_grid_encoding:
+    _hash_params = [p for n, p in model.named_parameters() if any(h in n for h in _hash_grid_names)]
+    _param_groups.append({'params': _hash_params, 'lr': _base_lr * 5.0})
+    print(f"Hash grid: {sum(p.numel() for p in _hash_params):,} params at lr={_base_lr * 5.0:.1e}")
 if cfg.use_lion:
-    base_opt = Lion([
-        {'params': attn_params, 'lr': _base_lr * 0.5},
-        {'params': other_params, 'lr': _base_lr}
-    ], weight_decay=cfg.weight_decay)
+    base_opt = Lion(_param_groups, weight_decay=cfg.weight_decay)
     optimizer = base_opt  # Lion has its own momentum; skip Lookahead
 else:
-    base_opt = torch.optim.AdamW([
-        {'params': attn_params, 'lr': _base_lr * 0.5},
-        {'params': other_params, 'lr': _base_lr}
-    ], weight_decay=cfg.weight_decay)
+    base_opt = torch.optim.AdamW(_param_groups, weight_decay=cfg.weight_decay)
     if cfg.use_lookahead:
         optimizer = Lookahead(base_opt, k=10, alpha=0.8)
     else:
@@ -1684,6 +1776,9 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
+        if hasattr(_base_model, 'hash_grid'):
+            hash_feat = _base_model.hash_grid(xy_norm)
+            x = torch.cat([x, hash_feat], dim=-1)
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -2321,6 +2416,9 @@ for epoch in range(MAX_EPOCHS):
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
+                if hasattr(eval_model, 'hash_grid'):
+                    hash_feat = eval_model.hash_grid(xy_norm)
+                    x = torch.cat([x, hash_feat], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
@@ -2706,6 +2804,9 @@ if best_metrics:
                     xy_scaled = xy_norm.unsqueeze(-1) * freqs
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
+                    if hasattr(vis_model, 'hash_grid'):
+                        hash_feat = vis_model.hash_grid(xy_norm)
+                        x_n = torch.cat([x_n, hash_feat], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
                     pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
                     if cfg.raw_targets:
@@ -2806,6 +2907,9 @@ if cfg.surface_refine and best_metrics:
                     xy_scaled = xy_norm.unsqueeze(-1) * freqs
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x = torch.cat([x, fourier_pe], dim=-1)
+                    if hasattr(verify_model, 'hash_grid'):
+                        hash_feat = verify_model.hash_grid(xy_norm)
+                        x = torch.cat([x, hash_feat], dim=-1)
 
                     # Ground truth denormalization reference
                     Umag, q = _umag_q(y, mask)
