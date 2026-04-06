@@ -2,6 +2,41 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~06:15 — PR #2188: MixStyle Tandem Feature Regularization for OOD Generalization — askeladd — **CLOSED** (p_tan +18-26%)
+
+- Branch: `askeladd/mixstyle-tandem-ood`
+- Hypothesis: MixStyle (Zhou et al., ICLR 2021) mixes feature statistics (mean + std) between tandem samples during training, creating virtual samples with novel statistical profiles to improve OOD generalization. Applied selectively to tandem samples after Transolver blocks.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| A (α=0.3, p=0.5) | 42 | 13.6 | 8.6 | 33.3 | 7.1 | s79jy7si |
+| A (α=0.3, p=0.5) | 73 | 13.4 | 8.4 | 34.4 | 6.8 | 6d382ygc |
+| **A avg** | — | **13.50** | **8.50** | **33.85** | **6.95** | |
+| B (α=0.5, p=1.0) | 42 | 17.3 | 11.0 | 36.0 | 8.5 | 3prht0km |
+| B (α=0.5, p=1.0) | 73 | 14.8 | 9.6 | 36.1 | 7.3 | ov3k8rfp |
+| **B avg** | — | **16.05** | **10.30** | **36.05** | **7.90** | |
+| **Baseline (PR #2130)** | — | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** Both configs significantly degrade ALL metrics. Damage scales with mixing strength: A p_tan +18.4%, B p_tan +26.0%. In CFD, feature statistics (mean, std) encode physical flow state — pressure magnitudes, velocity regimes, geometric conditioning. MixStyle's core assumption (feature stats are "nuisance" style info) is violated. This is the **3rd consecutive feature-distribution-manipulation experiment to fail** (after SWD #2175, DSDF TTA #2189). **Closed — clear dead end. Tandem feature representations are physically meaningful and must not be perturbed.**
+
+---
+
+### 2026-04-06 ~06:10 — PR #2189: DSDF Test-Time Feature Alignment for OOD Tandem Generalization — tanjiro — **CLOSED** (p_tan +69%)
+
+- Branch: `tanjiro/dsdf-tta-align`
+- Hypothesis: Align per-sample DSDF channel statistics to training distribution at test time for OOD tandem samples, analogous to test-time BN adaptation (Schneider et al., NeurIPS 2020). Applied only during validation, only to tandem samples.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| TTA align | 42 | 12.7 | 31.2 | 47.5 | 25.3 | 3wr2j3e2 |
+| TTA align | 73 | 13.4 | 39.8 | 48.9 | 33.0 | kwpqw6gv |
+| **Experiment avg** | — | **13.05** | **35.50** | **48.20** | **29.15** | |
+| **Baseline (PR #2184)** | — | **13.205** | **7.816** | **28.502** | **6.453** | 6yfv5lio, etepxvjc |
+
+**Results:** Catastrophic degradation. p_tan +69%, p_oodc +354%, p_re +352%. Only p_in marginally improved (-1.2%). The per-sample normalization destroyed geometry-specific information in absolute DSDF values — the model uses these to differentiate foil shapes. The x-standardization already handles bringing features into a consistent range; TTA effectively double-normalizes, collapsing the geometry signal. **Closed — clear dead end.**
+
+---
+
 ### 2026-04-06 ~05:30 — PR #2187: Normal-Velocity Hard Constraint: No-Penetration BC Projection — edward — **CLOSED** (p_tan +3.0%)
 
 - Branch: `edward/normal-vel-constraint`
