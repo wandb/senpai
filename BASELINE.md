@@ -1,6 +1,38 @@
 # Baseline Metrics
 
-## Current Single-Model Baseline (Phase 6 — 2026-04-06, +TE Coordinate Frame, 2-Seed Evidence, PR #2207)
+## Current Single-Model Baseline (Phase 6 — 2026-04-06, +Wake Deficit Feature, 2-Seed Evidence, PR #2213)
+
+| Metric | 2-seed avg | vs prior (TE coord frame) | Δ |
+|--------|------------|--------------------------|---|
+| **p_in** | **11.979** | 12.490 | **-4.1%** |
+| p_oodc | 7.643 | 7.618 | +0.3% (noise) |
+| **p_tan** | **28.341** | 28.521 | **-0.6%** |
+| **p_re** | **6.300** | 6.411 | **-1.7%** |
+
+**PR #2213** (merged 2026-04-06) — Wake Deficit Feature: adds 2 gap-normalized fore-TE offset channels (dx/gap, dy/gap) encoding each node's dimensionless wake-relative position. Gap normalization makes the geometry invariant across tandem configurations — where the model previously had to infer wake depth indirectly, it now receives it explicitly. Builds on the TE coordinate frame from PR #2207 and refactors TE computation into a shared helper. Zeroed for single-foil samples. Delivers a striking -4.1% improvement on p_in and meaningful improvements on p_tan and p_re. p_oodc is +0.3% (within run-to-run noise). W&B runs: hgml7i2r (seed 42, p_tan=28.733, p_in=11.641), qic03vrg (seed 73, p_tan=27.949, p_in=12.316).
+
+⚠️ **2-seed only.** For merge decisions: **p_in < 11.98**, p_oodc < 7.65, **p_tan < 28.34**, **p_re < 6.30**.
+
+**Reproduce (current baseline):**
+```bash
+cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baseline-wake-deficit" \
+  --asinh_pressure --asinh_scale 0.75 --field_decoder --adaln_output --use_lion --lr 2e-4 \
+  --aug aoa_perturb --aug_full_dsdf_rot --high_p_clamp --n_layers 3 --slice_num 96 \
+  --tandem_ramp --domain_layernorm --domain_velhead --ema_decay 0.999 --weight_decay 5e-5 \
+  --cosine_T_max 160 --pcgrad_3way --pcgrad_extreme_pct 0.15 \
+  --pressure_first --pressure_deep \
+  --residual_prediction --surface_refine --surface_refine_hidden 192 --surface_refine_layers 3 \
+  --aft_foil_srf --aug_gap_stagger_sigma 0.02 --aug_dsdf2_sigma 0.05 \
+  --gap_stagger_spatial_bias \
+  --dct_freq_loss --dct_freq_weight 0.05 --dct_freq_gamma 2.0 --dct_freq_alpha 1.5 \
+  --te_coord_frame --wake_deficit_feature
+```
+
+**For merge decisions:** Compare 2-seed avg against: p_in < 11.98, p_oodc < 7.65, p_tan < 28.34, p_re < 6.30.
+
+---
+
+## Prior Single-Model Baseline (Phase 6 — 2026-04-06, +TE Coordinate Frame, 2-Seed Evidence, PR #2207)
 
 | Metric | 2-seed avg | vs prior (DCT freq loss) | Δ |
 |--------|------------|--------------------------|---|
