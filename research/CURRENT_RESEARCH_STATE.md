@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-06 ~14:00 UTC
+- **Date:** 2026-04-06 ~15:45 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -55,7 +55,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | frieren | #2199 | Spectral Conditioning of Attention (SCA) to prevent OOD collapse | WIP |
 | edward | #2207 | TE Coordinate Frame: trailing-edge-relative input features for wake coupling | WIP |
 | tanjiro | #2197 | Geometry-Adaptive Curvature Loss Weighting on Surface Nodes | WIP |
-| askeladd | #2202 | Fore-Aft Cross-Attention in AftFoilRefinementHead for Wake Coupling | WIP |
+| askeladd | #2208 | Iterative SRF Heads (RAFT-style): N=3 correction passes on surface nodes | WIP |
 
 **All 8 students active. Zero idle GPUs.**
 
@@ -63,6 +63,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
+| #2202 | askeladd | Fore-Aft Cross-Attention in AftFoilRefinementHead | **CLOSED** | p_tan +2.1% avg (29.10 vs 28.50); all 4 metrics regressed. Cross-attn replaced the standard SRF head entirely → optimization instability (s42 p_tan=28.3, s73=29.9). Additive approach (keep both heads) may be worth revisiting. |
 | #2201 | edward | Multi-Scale Slice Hierarchy [32,64,96] | **CLOSED** | p_tan +1.8% (29.01 vs 28.50). p_oodc improved -4.6% but primary target regressed. High seed variance (p_tan: 28.41 vs 29.61, Δ=1.20). Fewer slices in early blocks lose gap_stagger_spatial_bias routing resolution. |
 | #2200 | alphonse | Local KNN Attention | **CLOSED** | p_tan +14% (32.45 vs 28.50). O(N²) infeasibility for N=120k forced strided anchor fallback; 38% epoch deficit from overhead; uniform anchors miss surface regions. |
 | #2190 | nezuko | Laplacian Eigenvector Mesh PE | **CLOSED** | p_tan +3.1% (29.39 vs 28.50), p_oodc +10.3%, p_re +8.4%. Topology-only PE loses spatial coordinates; 16-dim too small vs 32-dim Fourier PE. |
@@ -102,7 +103,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 5. **Curvature Loss Weighting** (tanjiro #2197) — Per-node curvature-weighted surface loss: `w_i = 1 + alpha * normalize(|kappa_i|)`. Tests alpha={0.5, 1.0, 2.0}. Upweights LE/TE nodes during training; val metric stays uniform.
 6. **Muon/Gram-NS Optimizer** (thorfinn #2203) — Replace Lion with Muon optimizer. Applies Newton-Schulz orthogonalization to gradient matrices for 2D+ weight matrices; AdamW for scalar params. lr_muon=0.02, lr_adamw_scalar=3e-4. Previous crash (PR #2006) was a code bug — this retry has correct param group separation. Directly from human researcher team's directive (issue #1926).
 7. **Spectral Conditioning of Attention** (frieren #2199) — Learnable diagonal `D = nn.Parameter(torch.ones(n_heads, slice_num))` right-multiplied into attention logits before softmax (~288 params). Applied to all 3 TransolverBlocks. Initialized to identity. Optional condition number regularization via log-variance proxy (`--spectral_attn_conditioning --sac_lambda 0.01`), two seeds {42, 73}.
-8. **Fore-Aft Cross-Attention in AftFoilRefinementHead** (askeladd #2202) — Single-head cross-attention (d_attn=64) from aft-foil surface nodes (queries) to fore-foil surface nodes (keys/values) inside the SRF head. Injects direct upstream wake information into the correction head. Zero-init output projection for baseline-equivalent start. Differentiates from failed KNN context (#2127/#2134) by targeting surface nodes only (~300×300 attention vs 15K-node KNN lookup → <1% overhead).
+8. **Iterative SRF Heads (RAFT-style)** (askeladd #2208) — Runs both SurfaceRefinementHead and AftFoilRefinementHead N=3 times, feeding the current prediction back as input each pass. Analogous to RAFT (optical flow) and AlphaFold recycling. Adds <1% epoch overhead (vs 1.3x for failed full-model PR #2165). Zero-init ensures first pass = baseline behavior. Seeds {42, 73}.
 
 **Key research patterns:**
 - **What works:** DSDF magnitude augmentation (foil-2 only), specialized correction heads (aft_srf), gradient surgery (2-way PCGrad), tandem-geometry-aware routing (GSB), geometry-conditioned mechanisms
@@ -184,6 +185,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 
 | Direction | PRs | Finding |
 |-----------|-----|---------|
+| **Fore-Aft Cross-Attn SRF (replacement)** | **#2202** | **p_tan +2.1% avg (29.10 vs 28.50). Replacing standard SRF head with cross-attention creates optimization instability (s42=28.3 good, s73=29.9 bad, Δ=1.6). All 4 metrics regressed. Additive approach (keep both) may be worth revisiting.** |
 | **Multi-Scale Slice Hierarchy [32,64,96]** | **#2201** | **p_tan +1.8% (29.01 vs 28.50). OOD oodc improved -4.6% but primary target regressed. High seed variance on p_tan (Δ=1.20 vs baseline Δ~0.14). Fewer slices in early blocks lose gap_stagger_spatial_bias routing resolution. 96 confirmed optimal across all blocks (PR #2171 also showed 128/144 failed).** |
 | **Laplacian Eigenvector Mesh PE** | **#2190** | **p_tan +3.1%, p_oodc +10.3%, p_re +8.4%. Topology-only PE loses spatial coordinates; 16-dim too small vs 32-dim Fourier. Existing walldist+DSDF provide geometry context; Fourier PE provides coordinate info eigenvectors cannot replace.** |
 | **GradNorm Adaptive Loss Weighting** | **#2198** | **p_tan +1.7% (28.979 vs 28.502). GradNorm's adaptive scalar weights interfere with PCGrad's gradient direction surgery. EMA smoothing (0.9) insufficient to prevent oscillation. p_in improved but primary target regressed.** |

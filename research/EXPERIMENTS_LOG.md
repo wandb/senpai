@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~15:30 — PR #2202: Fore-Aft Cross-Attention in AftFoilRefinementHead for Wake Coupling — askeladd — **CLOSED** (p_tan +2.1% vs baseline)
+- Branch: `askeladd/fore-aft-crossattn-srf`
+- Hypothesis: Single-head cross-attention (d_attn=64) from aft-foil surface nodes (queries) to fore-foil surface nodes (keys/values) inside the SRF head. Directly models physical wake coupling. O(N_aft×N_fore) on ~300×300 surface nodes → <1% overhead. Zero-init output projection for baseline-equivalent start. Differentiates from failed KNN context (#2127/#2134) by targeting surface nodes only.
+- W&B runs: dq0blopc (seed 42), a0d4jbyz (seed 73)
+- W&B group: `round8/fore-aft-crossattn-srf`
+
+| Metric | Baseline | Seed 42 | Seed 73 | Avg | Δ |
+|--------|----------|---------|---------|-----|---|
+| p_in | 13.205 | 13.9 | 13.9 | **13.90** | +5.3% ✗ |
+| **p_tan** | **28.502** | **28.3** | **29.9** | **29.10** | **+2.1% ✗** |
+| p_oodc | 7.816 | 8.3 | 8.0 | **8.15** | +4.3% ✗ |
+| p_re | 6.453 | 6.7 | 6.9 | **6.80** | +5.4% ✗ |
+
+- Epochs: 141 (both seeds), ~76s/epoch (+7% vs baseline ~71s)
+- VRAM: ~43 GB (identical to baseline)
+- **Analysis:** Cross-attention REPLACED the standard aft-foil SRF head (`aft_srf_head = None`), removing the proven stable correction path. Seed 42 p_tan=28.3 beat baseline seed 42 (28.432), showing cross-attention can capture useful wake coupling. But seed 73 regressed to 29.9 (+1.3 absolute), indicating high optimization instability from 163K extra params (~4% of total). All non-p_tan metrics degraded significantly. Root cause: removing the simpler MLP-based SRF head in favor of a more complex cross-attention module creates optimization sensitivity. Student's suggestion #1 (additive approach: keep standard SRF + zero-init cross-attn on top) is the right direction if revisited. **Dead end for cross-attention as SRF replacement; potential as additive correction.**
+
 ### 2026-04-06 ~12:00 — PR #2190: Laplacian Eigenvector Mesh Positional Encoding for OOD Geometry Transfer — nezuko — **CLOSED** (p_tan +3.1% vs baseline)
 - Branch: `nezuko/laplacian-pe`
 - Hypothesis: Replace 16-dim Fourier PE (channels 26:42, sin/cos over raw xy) with 16 smallest eigenvectors of the mesh graph Laplacian. Eigenvectors encode intrinsic mesh topology (topological role of each node) rather than extrinsic 2D position, potentially generalizing better to OOD geometries (NACA6416) where familiar xy-based encodings produce unfamiliar patterns at topologically similar locations (LE, PS, TE).
