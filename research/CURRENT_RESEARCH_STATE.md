@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-06 ~11:00 UTC
+- **Date:** 2026-04-06 ~14:30 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -45,7 +45,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | fern | #2181 | GEPS Test-Time Low-Rank Adaptation for OOD Tandem | WIP — just assigned |
-| askeladd | #2175 | SWD Tandem Domain Alignment: slice token distribution matching | WIP |
+| askeladd | #2188 | MixStyle Tandem Feature Regularization for OOD Generalization | WIP — just assigned |
 | nezuko | #2184 | DCT Frequency-Weighted Surface Pressure Loss | WIP — just assigned |
 | tanjiro | #2182 | Ensemble Distillation: soft targets from 16-seed ensemble | WIP — just assigned |
 | alphonse | #2185 | MAE Pretraining: self-supervised geometry encoder initialization | WIP — just assigned |
@@ -89,7 +89,7 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 
 **Active experiments (8 students WIP):**
 1. **GEPS Test-Time Adaptation** (fern #2181) — LoRA context params + continuity residual TTA at inference. **Tier 1 radical — zero training change.**
-2. **SWD Tandem Domain Alignment** (askeladd #2175) — Sliced Wasserstein Distance between tandem/single-foil slice tokens
+2. **MixStyle Tandem Feature Regularization** (askeladd #2188) — Feature-space style mixing between tandem samples for OOD generalization (Zhou et al., ICLR 2021)
 3. **DCT Frequency-Weighted Loss** (nezuko #2184) — smooth DCT-domain frequency upweighting. Different from failed BSP (stable, auxiliary).
 4. **Panel Cp Residual Target** (thorfinn #2186) — predict (p_gt - p_panel) viscous correction instead of full pressure. Iteration on #2179.
 5. **MAE Pretraining** (alphonse #2185) — self-supervised masked geometry reconstruction before supervised training. Tier 3 radical.
@@ -196,6 +196,7 @@ See `/research/RESEARCH_IDEAS_2026-04-06_ROUND4.md` for full details.
 | **Coordinated Tandem Ramp** | **#2177** | **p_tan +2.2% avg. Concurrent schedules interfere during tandem warmup.** |
 | **dp/dn=0 Physics Loss (6-seed)** | **#2166** | **p_tan neutral (28.97 vs 28.60, within σ=0.67). Regularizer for p_in/p_re, not p_tan.** |
 | **Panel Cp as Input Feature** | **#2179** | **p_tan +3.7%. Single-foil solver lacks tandem interaction. p_oodc/p_re improved.** |
+| **SWD Domain Alignment** | **#2175** | **w=0.01 neutral (+0.5%), w=0.05 all worse (+3.7%). Tandem slice token differences encode real physics — forced alignment counterproductive.** |
 | **Multi-Resolution Hash Grid** | **#2180** | **p_tan +12.2%. Per-sample coord normalization breaks spatial coherence. 1.14M extra params overfit, 20s/epoch overhead.** |
 
 ## Ensemble Seed Pool (Complete)

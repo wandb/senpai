@@ -2,6 +2,21 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~14:30 — PR #2175: SWD Tandem Domain Alignment — askeladd — **CLOSED** (distributional difference is informative, not harmful)
+
+- Branch: `askeladd/swd-domain-align`
+- Hypothesis: Sliced Wasserstein Distance between tandem/single-foil slice token distributions forces domain-agnostic representations, improving OOD tandem generalization.
+
+| Config | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|--------|-------|------|-----|
+| **SWD w=0.01 avg** | 13.10 | 7.75 | 28.75 | 6.55 | mrqnyv82, uwphs04i |
+| **SWD w=0.05 avg** | 13.40 | 8.00 | 29.65 | 6.60 | ukxu3q8i, qa84ir9x |
+| **Baseline** | **13.05** | **7.70** | **28.60** | **6.55** | d7l91p0x, j9btfx09 |
+
+**Results:** w=0.01 is neutral (p_tan +0.5%, within seed variance). w=0.05 actively hurts all metrics (p_tan +3.7%, p_oodc +3.9%). SWD loss converged (0.115) — alignment was enforced, but the alignment itself is counterproductive. The distributional difference between tandem and single-foil slice tokens encodes physically meaningful multi-body interaction effects (wake interference, gap flow dynamics) that are lost when forced to match. **Key insight: tandem-specific routing is feature, not bug.**
+
+---
+
 ### 2026-04-06 ~10:30 — PR #2180: Multi-Resolution Hash Grid Encoding — edward — **CLOSED** (per-sample normalization breaks spatial coherence)
 
 - Branch: `edward/hash-grid-encoding`
