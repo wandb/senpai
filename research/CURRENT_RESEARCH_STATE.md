@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-06 ~10:00 UTC
+- **Date:** 2026-04-06 ~16:45 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -64,7 +64,7 @@ Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
 | #2191 | thorfinn | SE(2) AoA-Aligned Spatial Bias | **CLOSED** | p_tan +1.8% avg (29.0 vs 28.50). All 4 metrics regressed. AoA ±4° → cos(AoA)≈0.998, rotation is near-identity. Existing aug_full_dsdf_rot already provides invariance. |
-| #2183 | frieren | Vorticity Auxiliary Target | **CLOSED** | Never ran. KNN finite-difference vorticity on unstructured mesh too complex for autonomous implementation. |
+| #2183 | frieren | Vorticity Auxiliary Target | **CLOSED** | p_tan +2.5–3.0% (29.20–29.35 vs 28.502). Vorticity auxiliary loss competes with backbone pressure representation. Backbone already captures vorticity implicitly via velocity targets. KNN-based FD targets are noisy on unstructured mesh. Config B improved p_re (-2.8%) but p_tan regressed consistently across all 4 seeds. |
 | #2189 | tanjiro | DSDF TTA Feature Alignment | **CLOSED** | p_tan +69% (48.20 vs 28.50). Catastrophic. Double-normalizes DSDF, destroys geometry signal. |
 | #2188 | askeladd | MixStyle Tandem Feature Regularization | **CLOSED** | p_tan +18-26%. CFD feature statistics = physics, not nuisance style info. 3rd feature-manipulation failure. |
 | #2187 | edward | Normal-Velocity Hard Constraint | **CLOSED** | p_tan +3.0% (29.34 vs 28.50). Multi-foil normal bug + constraint already ~satisfied. |
@@ -127,6 +127,9 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 5. ~~**Curvature-Conditioned Spatial Bias**~~ → edward #2193 (true Menger curvature, not the existing crude proxy)
 6. ~~**Tandem Inter-Foil Distance Feature**~~ → tanjiro #2194
 7. ~~**Geometry-Adaptive Curvature Loss Weighting**~~ → askeladd #2196
+
+### Round 8 — Unassigned (from PR #2183 student follow-up analysis)
+1. **Vorticity Input Feature** — Pre-compute KNN-based vorticity (ω ≈ curl(v)) from velocity fields and add as per-node input feature (rather than auxiliary loss target). Avoids gradient competition with backbone. Could give the model explicit wake structure information at inference time. Would need ~6th input feature channel.
 
 ### Round 7 — Researcher-Agent (2026-04-06) — See `/research/RESEARCH_IDEAS_2026-04-06_ROUND7.md`
 1. ~~**Inter-Foil Distance Feature in Spatial Bias**~~ → askeladd #2195
@@ -207,7 +210,7 @@ Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exis
 | **MixStyle Tandem Feature Regularization** | **#2188** | **p_tan +18-26% (both configs). Feature statistics encode physics (pressure magnitudes, velocity regimes), not nuisance style. Damage scales with mixing strength.** |
 | **⚠️ FEATURE-DISTRIBUTION MANIPULATION** | **#2175,#2189,#2188** | **3 consecutive failures: SWD alignment, raw-input TTA, feature-space MixStyle. ALL catastrophically degrade OOD metrics. Tandem representations are physically meaningful — do NOT perturb at any level.** |
 | **SE(2) AoA-Aligned Spatial Bias** | **#2191** | **p_tan avg +1.8% (29.0 vs 28.50). All 4 metrics regressed. AoA range ±4° makes rotation near-identity (cos≈0.998). aug_full_dsdf_rot already provides this invariance.** |
-| **Vorticity Auxiliary Target** | **#2183** | **Never ran. KNN finite-difference curl on unstructured mesh too complex for autonomous impl. Deferred indefinitely; structured mesh or precomputed ω required.** |
+| **Vorticity Auxiliary Target** | **#2183** | **p_tan +2.5–3.0% (29.20–29.35 vs 28.502). Vorticity auxiliary loss competes with backbone pressure representation; backbone already implicitly encodes vorticity via velocity targets (ω=curl(v)). Noisy KNN-FD targets on unstructured mesh add harmful gradients. Config B improved p_re (-2.8%) but primary metric regressed across all 4 seeds.** |
 | **Stochastic Depth** | **#2192** | **p_tan +2.1% (29.10 avg). Layer drop regularizer absorbed by EMA + cosine schedule. 3-layer backbone too shallow for drop path benefit (DeiT uses 12+ layers).** |
 
 ## Ensemble Seed Pool (Complete)

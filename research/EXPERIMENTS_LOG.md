@@ -2,6 +2,29 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 ~16:00 — PR #2183: Vorticity Auxiliary Target: Explicit Wake Structure Learning — frieren — **CLOSED** (p_tan +2.5–3.0% vs baseline)
+
+- Branch: `frieren/vorticity-aux`
+- Hypothesis: Pre-compute approximate vorticity (ω ≈ curl(v)) from velocity fields using KNN-based least-squares gradient estimation on unstructured mesh, then supervise a lightweight VorticityHead auxiliary branch with L1 loss to force explicit wake-structure representation in the backbone.
+
+| Config | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|--------|------|------|--------|-------|------|-----|
+| A (w=0.05) | 42 | 13.5 | 7.9 | 29.3 | 6.5 | vw3jpr15 |
+| A (w=0.05) | 73 | 13.0 | 7.9 | 29.1 | 6.5 | lo2dayem |
+| **A avg** | — | **13.25** | **7.90** | **29.20** | **6.50** | |
+| B (w=0.1) | 42 | 13.4 | 7.7 | 29.4 | 6.5 | avivx0eh |
+| B (w=0.1) | 73 | 13.5 | 7.7 | 29.3 | 6.2 | 9afvei72 |
+| **B avg** | — | **13.45** | **7.70** | **29.35** | **6.35** | |
+| **Baseline (PR #2184)** | — | **13.205** | **7.816** | **28.502** | **6.453** | 6yfv5lio, etepxvjc |
+
+**Results:** Both configs regress p_tan (+2.5% and +3.0%). Config B improves p_re (-2.8%) and matches baseline p_oodc (7.70), but primary metric p_tan is consistently worse across all 4 seeds. Note: all runs hit 180-min timeout at epoch 149/500.
+
+**Analysis:** Three failure modes: (1) Gradient competition — vorticity loss gradient through shared backbone diverts capacity from the already well-optimized pressure representation; (2) Redundancy — backbone already implicitly encodes vorticity via velocity targets (ω = curl(v)); (3) Noisy FD targets — KNN-based curl estimation on unstructured mesh injects harmful gradients even at low weight.
+
+**Follow-up idea (future round):** Vorticity as *input feature* (pre-computed, added to node features) rather than auxiliary loss target — would give the model wake information without gradient interference. Deferred to hypothesis queue.
+
+---
+
 ### 2026-04-06 ~06:15 — PR #2188: MixStyle Tandem Feature Regularization for OOD Generalization — askeladd — **CLOSED** (p_tan +18-26%)
 
 - Branch: `askeladd/mixstyle-tandem-ood`
