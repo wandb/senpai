@@ -2571,3 +2571,20 @@ Baseline (PR #2184): p_in=13.205, p_oodc=7.816, p_tan=28.502, p_re=6.453
 
 - **Decision: CLOSED — dead end**
 - **Analysis:** Implementation adapted from true KNN to strided anchor attention due to O(N²) infeasibility for N=120k mesh nodes. Anchor attention: 512 evenly-spaced anchors → full anchor self-attention → propagate to all nodes via distance-weighted interpolation. This modification introduced severe problems: (1) **Throughput degradation** — only 95-96 epochs reached (vs ~155 baseline, -38%) due to per-forward-pass `(B, N, M) = (4, 120k, 512)` distance matrix computation x3 blocks; (2) **Spatial non-adaptivity** — uniform anchors mostly sample volume, missing critical surface regions where boundary layer physics occur; (3) **Coarse interpolation** — 512 anchors serving ~234 nodes each is too coarse for fine-scale surface physics; (4) **Architecture competition** — Transolver's slice attention already provides learned spatial grouping via physics slices; a second cruder spatial decomposition competes rather than complements. Student's suggestion of surface-only local attention (~1-3k surface nodes) is more tractable and physically motivated. Global attention on 120k-node meshes is computationally infeasible for standard KNN approaches.
+
+## 2026-04-06 ~14:00 UTC — PR #2201: Multi-Scale Slice Hierarchy — edward — **CLOSED** (p_tan +1.8%, p_oodc -4.6% mixed)
+- edward/multiscale-slice-hierarchy
+- **Hypothesis:** Instead of uniform `slice_num=96` across all 3 TransolverBlocks, use progressively finer slice granularity: `[32, 64, 96]` (coarse-to-fine). Block 0 at 32 slices captures global flow topology; Block 2 at 96 slices resolves boundary layer detail. Hypothesis: global patterns generalize better to OOD NACA6416 geometry. Also expected 5-8% epoch speedup from fewer slices in early blocks.
+- **Results:**
+
+| Run | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|-----|------|------|--------|-------|------|-----|
+| multiscale [32,64,96] | 42 | 13.4985 | 7.5693 | 28.4139 | 6.3045 | `r5s4apc5` |
+| multiscale [32,64,96] | 73 | 13.3499 | 7.3478 | 29.6078 | 6.5213 | `uwlgfj78` |
+| **2-seed avg** | — | **13.424** | **7.459** | **29.011** | **6.413** | — |
+| **vs baseline** | — | **+1.7% ✗** | **-4.6% ✓** | **+1.8% ✗** | **-0.6% ✓** | — |
+
+Baseline (PR #2184): p_in=13.205, p_oodc=7.816, p_tan=28.502, p_re=6.453
+
+- **Decision: CLOSED — primary target regressed**
+- **Analysis:** Mixed result. OOD condition (p_oodc -4.6%) and Reynolds (p_re -0.6%) improved, suggesting the coarse-to-fine inductive bias helps some generalization. However, p_tan regressed +1.8% and p_in regressed +1.7% — both primary targets. High seed variance on p_tan (28.41 vs 29.61, Δ=1.20 vs baseline spread ~0.14) confirms instability in the tandem prediction pathway. The underlying mechanism: fewer slices in Block 0 (32 vs 96) reduces routing resolution that `gap_stagger_spatial_bias` relies on for tandem geometry awareness. Any configuration with fewer-than-96 slices in any block loses capacity — confirmed by PR #2171 (128/144 slices both regressed; 96 is already the optimum). The OOD oodc improvement is interesting but cannot be harvested without hurting p_tan. Student suggested reverse [96,64,32] and wider [48,64,96] variants, but the fundamental trade-off (early-block resolution vs capacity) is unlikely to resolve in p_tan's favor.
