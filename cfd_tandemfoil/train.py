@@ -25,6 +25,7 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -39,6 +40,215 @@ import simple_parsing as sp
 
 from data.utils import visualize
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
+
+
+# ---------------------------------------------------------------------------
+# Panel Method: Hess-Smith vortex panel solver for inviscid Cp computation
+# ---------------------------------------------------------------------------
+
+def _naca4_coords(camber_frac, pos_frac, thick_frac, n_panels=120):
+    """Generate NACA 4-digit airfoil coordinates from normalized fractions.
+
+    Args:
+        camber_frac: max camber / 9 (from parse_naca encoding)
+        pos_frac: camber position / 9
+        thick_frac: thickness / 24
+    Returns:
+        coords: (N, 2) numpy array, upper surface TE -> LE -> lower surface TE
+    """
+    m = camber_frac * 9 / 100.0
+    p = pos_frac * 9 / 10.0
+    t = thick_frac * 24 / 100.0
+
+    beta = np.linspace(0, np.pi, n_panels // 2 + 1)
+    xc = 0.5 * (1 - np.cos(beta))
+
+    yt = 5 * t * (0.2969 * np.sqrt(xc + 1e-12) - 0.1260 * xc - 0.3516 * xc**2
+                  + 0.2843 * xc**3 - 0.1015 * xc**4)
+
+    if m > 0 and p > 0:
+        yc = np.where(xc <= p,
+                      m / p**2 * (2 * p * xc - xc**2),
+                      m / (1 - p)**2 * ((1 - 2 * p) + 2 * p * xc - xc**2))
+        dyc = np.where(xc <= p,
+                       2 * m / p**2 * (p - xc),
+                       2 * m / (1 - p)**2 * (p - xc))
+    else:
+        yc = np.zeros_like(xc)
+        dyc = np.zeros_like(xc)
+
+    theta = np.arctan(dyc)
+    xu = xc - yt * np.sin(theta)
+    yu = yc + yt * np.cos(theta)
+    xl = xc + yt * np.sin(theta)
+    yl = yc - yt * np.cos(theta)
+
+    coords = np.vstack([
+        np.column_stack([xu[::-1], yu[::-1]]),
+        np.column_stack([xl[1:], yl[1:]]),
+    ])
+    return coords
+
+
+def _hess_smith_solve(panels_x, panels_y, V_inf=1.0, alpha=0.0):
+    """Hess-Smith panel method for one or more airfoil elements."""
+    N = len(panels_x) - 1
+    if N < 3:
+        return np.zeros(0), np.zeros(0), np.zeros(0)
+
+    xm = 0.5 * (panels_x[:-1] + panels_x[1:])
+    ym = 0.5 * (panels_y[:-1] + panels_y[1:])
+    dx = panels_x[1:] - panels_x[:-1]
+    dy = panels_y[1:] - panels_y[:-1]
+    S = np.sqrt(dx**2 + dy**2)
+    S = np.maximum(S, 1e-12)
+    sin_t = dy / S
+    cos_t = dx / S
+    nx = -sin_t
+    ny = cos_t
+
+    An = np.zeros((N, N))
+    At = np.zeros((N, N))
+    Bn = np.zeros((N,))
+    Bt = np.zeros((N,))
+
+    for j in range(N):
+        for i in range(N):
+            if i == j:
+                An[i, j] = 0.5
+                At[i, j] = 0.0
+                continue
+            dx_ij = xm[i] - panels_x[j]
+            dy_ij = ym[i] - panels_y[j]
+            xi = dx_ij * cos_t[j] + dy_ij * sin_t[j]
+            eta = -dx_ij * sin_t[j] + dy_ij * cos_t[j]
+            sj = S[j]
+            r1_sq = max(xi**2 + eta**2, 1e-20)
+            r2_sq = max((xi - sj)**2 + eta**2, 1e-20)
+            log_r = 0.5 * np.log(r2_sq / r1_sq)
+            theta_diff = np.arctan2(eta * sj, eta**2 + xi * (xi - sj) + 1e-20)
+
+            u_s = (1.0 / (2 * np.pi)) * log_r
+            v_s = (1.0 / (2 * np.pi)) * theta_diff
+            u_v = (1.0 / (2 * np.pi)) * theta_diff
+            v_v = -(1.0 / (2 * np.pi)) * log_r
+
+            u_global_s = u_s * cos_t[j] - v_s * sin_t[j]
+            v_global_s = u_s * sin_t[j] + v_s * cos_t[j]
+            u_global_v = u_v * cos_t[j] - v_v * sin_t[j]
+            v_global_v = u_v * sin_t[j] + v_v * cos_t[j]
+
+            An[i, j] = u_global_s * nx[i] + v_global_s * ny[i]
+            At[i, j] = u_global_s * cos_t[i] + v_global_s * sin_t[i]
+            Bn[i] += u_global_v * nx[i] + v_global_v * ny[i]
+            Bt[i] += u_global_v * cos_t[i] + v_global_v * sin_t[i]
+
+    rhs_n = -V_inf * (np.cos(alpha) * nx + np.sin(alpha) * ny)
+    A = np.zeros((N + 1, N + 1))
+    A[:N, :N] = An
+    A[:N, N] = Bn
+    A[N, :N] = At[0] + At[-1]
+    A[N, N] = Bt[0] + Bt[-1]
+
+    rhs = np.zeros(N + 1)
+    rhs[:N] = rhs_n
+    V_t_free_0 = V_inf * (np.cos(alpha) * cos_t[0] + np.sin(alpha) * sin_t[0])
+    V_t_free_last = V_inf * (np.cos(alpha) * cos_t[-1] + np.sin(alpha) * sin_t[-1])
+    rhs[N] = -(V_t_free_0 + V_t_free_last)
+
+    try:
+        sol = np.linalg.solve(A, rhs)
+    except np.linalg.LinAlgError:
+        return np.zeros(N), xm, ym
+
+    sigma = sol[:N]
+    gamma = sol[N]
+    V_t = V_inf * (np.cos(alpha) * cos_t + np.sin(alpha) * sin_t)
+    V_t += At @ sigma + gamma * Bt
+    cp = 1.0 - (V_t / V_inf) ** 2
+    return cp, xm, ym
+
+
+def compute_panel_cp_for_sample(x_tensor):
+    """Compute inviscid panel Cp for a single sample."""
+    N = x_tensor.shape[0]
+    panel_cp = np.zeros(N, dtype=np.float32)
+
+    aoa0_rad = x_tensor[0, 14].item()
+    naca0 = x_tensor[0, 15:18].numpy()
+    aoa1_rad = x_tensor[0, 18].item()
+    naca1 = x_tensor[0, 19:22].numpy()
+    gap = x_tensor[0, 22].item()
+    stagger = x_tensor[0, 23].item()
+    is_tandem = abs(gap) > 0.01
+    is_surf = x_tensor[:, 12] > 0.5
+    surf_coords = x_tensor[is_surf, :2].numpy()
+
+    if surf_coords.shape[0] < 4:
+        return panel_cp
+
+    foil1 = _naca4_coords(naca0[0], naca0[1], naca0[2], n_panels=80)
+
+    if is_tandem:
+        foil2_raw = _naca4_coords(naca1[0], naca1[1], naca1[2], n_panels=80)
+        foil2 = foil2_raw.copy()
+        foil2[:, 0] += 1.0 + gap
+        foil2[:, 1] += stagger
+        cos_a, sin_a = np.cos(-aoa0_rad), np.sin(-aoa0_rad)
+        R = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+        foil1 = (R @ foil1.T).T
+        foil2 = (R @ foil2.T).T
+        cp1, xm1, ym1 = _hess_smith_solve(foil1[:, 0], foil1[:, 1], alpha=0.0)
+        cp2, xm2, ym2 = _hess_smith_solve(foil2[:, 0], foil2[:, 1], alpha=aoa1_rad - aoa0_rad)
+        if len(cp1) == 0 and len(cp2) == 0:
+            return panel_cp
+        if len(cp1) > 0 and len(cp2) > 0:
+            panel_xm = np.concatenate([xm1, xm2])
+            panel_ym = np.concatenate([ym1, ym2])
+            panel_cp_vals = np.concatenate([cp1, cp2])
+        elif len(cp1) > 0:
+            panel_xm, panel_ym, panel_cp_vals = xm1, ym1, cp1
+        else:
+            panel_xm, panel_ym, panel_cp_vals = xm2, ym2, cp2
+    else:
+        cos_a, sin_a = np.cos(-aoa0_rad), np.sin(-aoa0_rad)
+        R = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+        foil1 = (R @ foil1.T).T
+        cp1, xm1, ym1 = _hess_smith_solve(foil1[:, 0], foil1[:, 1], alpha=0.0)
+        if len(cp1) == 0:
+            return panel_cp
+        panel_xm, panel_ym, panel_cp_vals = xm1, ym1, cp1
+
+    from scipy.spatial import cKDTree
+    panel_points = np.column_stack([panel_xm, panel_ym])
+    tree = cKDTree(panel_points)
+    _, idx = tree.query(surf_coords)
+    panel_cp_vals = np.clip(panel_cp_vals, -10.0, 10.0)
+    surf_indices = np.where(is_surf.numpy())[0]
+    panel_cp[surf_indices] = panel_cp_vals[idx]
+    return panel_cp
+
+
+def precompute_panel_cp_cache(dataset, cache_path):
+    """Pre-compute panel Cp for all samples and save to disk."""
+    cache_path = Path(cache_path)
+    if cache_path.exists():
+        print(f"Loading panel Cp cache from {cache_path}")
+        data = np.load(cache_path, allow_pickle=True)
+        return [data[f"s{i}"] for i in range(len(data.files))]
+
+    print(f"Pre-computing panel Cp for {len(dataset)} samples...")
+    panel_cp_list = []
+    for i in tqdm(range(len(dataset)), desc="Panel Cp"):
+        x, y, is_surface = dataset[i]
+        cp = compute_panel_cp_for_sample(x)
+        panel_cp_list.append(cp)
+
+    save_dict = {f"s{i}": cp for i, cp in enumerate(panel_cp_list)}
+    np.savez_compressed(cache_path, **save_dict)
+    print(f"Saved panel Cp cache to {cache_path}")
+    return panel_cp_list
+
 
 torch.set_float32_matmul_precision('high')
 
@@ -1050,6 +1260,7 @@ class Config:
     pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
     # Phase 5: Residual prediction
     residual_prediction: bool = False   # predict residual from freestream instead of full field
+    panel_cp_residual: bool = False      # use panel Cp as residual target: predict (Cp - Cp_panel) at surface
     # Phase 5: Surface refinement head — additive correction MLP on surface nodes
     surface_refine: bool = False              # enable surface refinement head
     surface_refine_hidden: int = 128          # hidden dimension of refinement MLP
@@ -1088,6 +1299,44 @@ train_ds, val_splits, stats, sample_weights = load_data(
     cfg.manifest, cfg.stats_file, debug=cfg.debug,
 )
 stats = {k: v.to(device) for k, v in stats.items()}
+
+# Panel Cp residual: load cache and augment dataset with panel Cp as extra x channel (metadata)
+if cfg.panel_cp_residual:
+    _panel_cache_path = Path("panel_cp_cache.npz")
+    _base_ds = train_ds.dataset if hasattr(train_ds, 'dataset') else train_ds
+    _panel_cp_list = precompute_panel_cp_cache(_base_ds, _panel_cache_path)
+    print("Augmenting dataset with panel Cp metadata channel...")
+    # Augment training samples
+    _train_base_ds = train_ds.dataset if hasattr(train_ds, 'dataset') else train_ds
+    for _local_idx in range(len(train_ds)):
+        _real_idx = train_ds.indices[_local_idx] if hasattr(train_ds, 'indices') else _local_idx
+        _x, _y, _is_surf = _train_base_ds[_real_idx]
+        if _x.shape[-1] == X_DIM:  # not yet augmented
+            _cp = torch.tensor(_panel_cp_list[_real_idx] if _real_idx < len(_panel_cp_list) else
+                               compute_panel_cp_for_sample(_x), dtype=torch.float32)
+            if len(_cp) < _x.shape[0]:
+                _cp = F.pad(_cp, (0, _x.shape[0] - len(_cp)))
+            elif len(_cp) > _x.shape[0]:
+                _cp = _cp[:_x.shape[0]]
+            _train_base_ds._cache[_real_idx] = (torch.cat([_x, _cp.unsqueeze(-1)], dim=-1), _y, _is_surf)
+    # Augment validation samples (may share same base dataset)
+    for _split_name, _split_ds in val_splits.items():
+        _val_base_ds = _split_ds.dataset if hasattr(_split_ds, 'dataset') else _split_ds
+        for _vi in range(len(_split_ds)):
+            _real_idx = _split_ds.indices[_vi] if hasattr(_split_ds, 'indices') else _vi
+            _x, _y, _is_surf = _val_base_ds[_real_idx]
+            if _x.shape[-1] == X_DIM:
+                _cp = torch.tensor(
+                    _panel_cp_list[_real_idx] if _real_idx < len(_panel_cp_list)
+                    else compute_panel_cp_for_sample(_x),
+                    dtype=torch.float32)
+                if len(_cp) < _x.shape[0]:
+                    _cp = F.pad(_cp, (0, _x.shape[0] - len(_cp)))
+                elif len(_cp) > _x.shape[0]:
+                    _cp = _cp[:_x.shape[0]]
+                _val_base_ds._cache[_real_idx] = (torch.cat([_x, _cp.unsqueeze(-1)], dim=-1), _y, _is_surf)
+    # Note: x stats stay at X_DIM (24 dims) — panel_cp channel is stripped before normalization
+    print(f"  Panel Cp metadata added (x dim: {X_DIM} -> {X_DIM + 1}, stripped before model input)")
 
 
 def _umag_q(y, mask):
@@ -1160,6 +1409,11 @@ with torch.no_grad():
         _y, _mask = _y.to(device), _mask.to(device)
         _Um, _q = _umag_q(_y, _mask)
         _yp = _phys_norm(_y, _Um, _q)
+        # Panel Cp residual: subtract panel Cp from pressure in Cp space (before asinh)
+        if cfg.panel_cp_residual:
+            _panel_cp_batch = _x[:, :, 24].to(device)  # [B, N] panel Cp metadata channel
+            _yp = _yp.clone()
+            _yp[:, :, 2:3] = _yp[:, :, 2:3] - _panel_cp_batch.unsqueeze(-1)
         if cfg.log_pressure:
             _yp = _yp.clone()
             _yp[:, :, 2:3] = _yp[:, :, 2:3].abs().add(1).log() * _yp[:, :, 2:3].sign()
@@ -1654,6 +1908,11 @@ for epoch in range(MAX_EPOCHS):
                 _dsdf2_scale = _dsdf2_scale * _is_tandem_aug2.float() + (~_is_tandem_aug2).float()
                 x[:, :, 6:10] = x[:, :, 6:10] * _dsdf2_scale.view(-1, 1, 1)
 
+        # Extract panel Cp metadata and strip from x (model doesn't see it as input)
+        _panel_cp_batch = None
+        if cfg.panel_cp_residual and x.shape[-1] > X_DIM:
+            _panel_cp_batch = x[:, :, 24].clone()  # [B, N] panel Cp values
+            x = x[:, :, :X_DIM]  # strip panel_cp channel, keep original 24 dims
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
@@ -1697,6 +1956,10 @@ for epoch in range(MAX_EPOCHS):
             y_norm = (y_adapt - raw_stats["y_mean"]) / raw_stats["y_std"]
         else:
             y_phys = _phys_norm(y, Umag, q)
+            # Panel Cp residual: subtract inviscid Cp from pressure in Cp space (before asinh)
+            if cfg.panel_cp_residual and _panel_cp_batch is not None:
+                y_phys = y_phys.clone()
+                y_phys[:, :, 2:3] = y_phys[:, :, 2:3] - _panel_cp_batch.unsqueeze(-1)
             if cfg.log_pressure:
                 y_phys = y_phys.clone()
                 y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
@@ -2292,6 +2555,11 @@ for epoch in range(MAX_EPOCHS):
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
 
+                # Extract panel Cp metadata and strip from x (same as training)
+                _v_panel_cp = None
+                if cfg.panel_cp_residual and x.shape[-1] > X_DIM:
+                    _v_panel_cp = x[:, :, 24].clone()  # [B, N]
+                    x = x[:, :, :X_DIM]
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
@@ -2331,6 +2599,10 @@ for epoch in range(MAX_EPOCHS):
                     y_norm = (y_adapt - raw_stats["y_mean"]) / raw_stats["y_std"]
                 else:
                     y_phys = _phys_norm(y, Umag, q)
+                    # Panel Cp residual: subtract panel Cp from pressure in Cp space (before asinh)
+                    if cfg.panel_cp_residual and _v_panel_cp is not None:
+                        y_phys = y_phys.clone()
+                        y_phys[:, :, 2:3] = y_phys[:, :, 2:3] - _v_panel_cp.unsqueeze(-1)
                     if cfg.log_pressure:
                         y_phys = y_phys.clone()
                         y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
@@ -2491,6 +2763,10 @@ for epoch in range(MAX_EPOCHS):
                     if cfg.asinh_pressure:
                         pred_phys = pred_phys.clone()
                         pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
+                    # Panel Cp residual: add panel Cp back to predicted Cp (undo residual)
+                    if cfg.panel_cp_residual and _v_panel_cp is not None:
+                        pred_phys = pred_phys.clone()
+                        pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3] + _v_panel_cp.unsqueeze(-1)
                     if cfg.tight_denorm_clamps:
                         _pd = pred_phys.clone()
                         _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
@@ -2691,6 +2967,11 @@ if best_metrics:
                     y_dev = y_true.unsqueeze(0).to(device)
                     is_surf_dev = is_surface.unsqueeze(0).to(device)
                     mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
+                    # Extract and strip panel_cp metadata
+                    _vis_panel_cp = None
+                    if cfg.panel_cp_residual and x_dev.shape[-1] > X_DIM:
+                        _vis_panel_cp = x_dev[:, :, 24].clone()
+                        x_dev = x_dev[:, :, :X_DIM]
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
@@ -2724,6 +3005,10 @@ if best_metrics:
                         if cfg.asinh_pressure:
                             pred_phys = pred_phys.clone()
                             pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
+                        # Panel Cp residual: add panel Cp back to predicted Cp
+                        if cfg.panel_cp_residual and _vis_panel_cp is not None:
+                            pred_phys = pred_phys.clone()
+                            pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3] + _vis_panel_cp.unsqueeze(-1)
                         if cfg.tight_denorm_clamps:
                             _pd = pred_phys.clone()
                             _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
@@ -2787,6 +3072,10 @@ if cfg.surface_refine and best_metrics:
                     all_re_values.append(_re_raw)
 
                     # Preprocess (same as val loop)
+                    _verify_panel_cp = None
+                    if cfg.panel_cp_residual and x.shape[-1] > X_DIM:
+                        _verify_panel_cp = x[:, :, 24].clone()
+                        x = x[:, :, :X_DIM]
                     raw_dsdf = x[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
@@ -2892,6 +3181,9 @@ if cfg.surface_refine and best_metrics:
                     if cfg.asinh_pressure:
                         pred_phys_A = pred_phys_A.clone()
                         pred_phys_A[:, :, 2:3] = torch.sinh(pred_phys_A[:, :, 2:3]) / cfg.asinh_scale
+                    if cfg.panel_cp_residual and _verify_panel_cp is not None:
+                        pred_phys_A = pred_phys_A.clone()
+                        pred_phys_A[:, :, 2:3] = pred_phys_A[:, :, 2:3] + _verify_panel_cp.unsqueeze(-1)
                     # Physics denorm (skip for adaptive_norm — already in raw space)
                     pred_orig_A = pred_phys_A if cfg.adaptive_norm else _phys_denorm(pred_phys_A, Umag, q)
 
@@ -2913,6 +3205,9 @@ if cfg.surface_refine and best_metrics:
                     if cfg.asinh_pressure:
                         pred_manual_phys = pred_manual_phys.clone()
                         pred_manual_phys[:, :, 2:3] = torch.sinh(pred_manual_phys[:, :, 2:3]) / cfg.asinh_scale
+                    if cfg.panel_cp_residual and _verify_panel_cp is not None:
+                        pred_manual_phys = pred_manual_phys.clone()
+                        pred_manual_phys[:, :, 2:3] = pred_manual_phys[:, :, 2:3] + _verify_panel_cp.unsqueeze(-1)
                     # Step 6: undo physics norm: Ux*Umag, Uy*Umag, p*q
                     if cfg.adaptive_norm:
                         pred_manual_orig = pred_manual_phys
@@ -2933,6 +3228,9 @@ if cfg.surface_refine and best_metrics:
                     if cfg.asinh_pressure:
                         pred_norefine_phys = pred_norefine_phys.clone()
                         pred_norefine_phys[:, :, 2:3] = torch.sinh(pred_norefine_phys[:, :, 2:3]) / cfg.asinh_scale
+                    if cfg.panel_cp_residual and _verify_panel_cp is not None:
+                        pred_norefine_phys = pred_norefine_phys.clone()
+                        pred_norefine_phys[:, :, 2:3] = pred_norefine_phys[:, :, 2:3] + _verify_panel_cp.unsqueeze(-1)
                     pred_norefine_orig = pred_norefine_phys if cfg.adaptive_norm else _phys_denorm(pred_norefine_phys, Umag, q)
 
                     # Compute surface pressure MAE for all paths
