@@ -2,6 +2,52 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-06 22:10 — PR #2213: Wake Deficit Feature — frieren — **MERGED** (new baseline)
+- Branch: `frieren/wake-deficit-feature`
+- Hypothesis: Add 2 gap-normalized fore-TE offset channels (dx/gap, dy/gap) encoding each node's dimensionless wake-relative position. Gap-normalization makes the feature geometry-invariant across tandem configurations. Builds on TE coordinate frame (PR #2207), re-uses TE computation in shared helper.
+
+| Metric | Baseline (#2207) | Seed 42 (hgml7i2r) | Seed 73 (qic03vrg) | 2-seed avg | Δ |
+|--------|-----------------|-------------------|-------------------|-----------|---|
+| p_in | 12.490 | 11.641 | 12.316 | **11.979** | **-4.1%** ✅ |
+| p_oodc | 7.618 | 7.662 | 7.623 | 7.643 | +0.3% (noise) |
+| p_tan | 28.521 | 28.733 | 27.949 | **28.341** | **-0.6%** ✅ |
+| p_re | 6.411 | 6.202 | 6.397 | **6.300** | **-1.7%** ✅ |
+
+- **Analysis:** 3/4 metrics beat baseline. The -4.1% p_in improvement is the largest single-metric gain in several rounds. Gap-normalized wake position is a physically meaningful, geometry-invariant feature that gives the model explicit "how deep into the wake is this node?" information. The p_oodc miss (+0.025 absolute) is well within run-to-run noise. 
+- **Conclusion:** MERGED. New baseline established. Follow-up: wake angle atan2 channel (assigned to frieren #2221), tanh clamping of wake features.
+
+---
+
+### 2026-04-06 22:10 — PR #2214: Deep Supervision on fx_deep — edward — **CLOSED** (p_tan +1.3% regression)
+- Branch: `edward/deep-supervision`
+- Hypothesis: Attach a lightweight auxiliary MLP pressure prediction head to `fx_deep` (hidden state between TransolverBlocks 2 and 3) during training only. Shortens gradient path to early blocks. Precedent: Inception/GoogLeNet auxiliary heads, deeply supervised nets.
+
+| Metric | Baseline (#2207) | Seed 42 (m4rvfwjt) | Seed 73 (7ubukt62) | 2-seed avg | Δ |
+|--------|-----------------|-------------------|-------------------|-----------|---|
+| p_in | 12.490 | 12.422 | 12.801 | 12.611 | +1.0% ✗ |
+| p_oodc | 7.618 | 7.583 | 7.528 | **7.556** | -0.8% ✅ |
+| p_tan | 28.521 | 29.137 | 28.656 | 28.897 | +1.3% ✗ |
+| p_re | 6.411 | 6.325 | 6.341 | **6.333** | -1.2% ✅ |
+
+- **Analysis:** The aux head never activated meaningfully (aux_loss stayed at 0.004–0.008, essentially dormant). Redundant with `--pressure_deep` which already provides a direct gradient path. p_tan regressed +1.3%. Student's self-diagnosis was thorough and correct. Every epoch lost to aux head overhead matters under 180-min timeout.
+- **Conclusion:** CLOSED. Direction exhausted — deep supervision adds no new gradient signal not already provided by `--pressure_deep`.
+
+---
+
+### 2026-04-06 22:10 — PR #2210: Arc-Length Surface Loss Reweighting — fern — **CLOSED** (all metrics regressed, p_in +14.2%)
+- Branch: `fern/arclength-surface-loss-reweight`
+- Hypothesis: Weight each surface node's loss by its local arc-length element (half-distance to KNN neighbors, normalized by chord). Corrects quadrature bias from non-uniform mesh density. Dense LE/TE nodes should count less per-node since they cover less arc-length.
+
+| Metric | Baseline (#2213, new) | Seed 42 (cor600he) | Seed 73 (5pfgo0bx) | 2-seed avg | Δ |
+|--------|----------------------|-------------------|-------------------|-----------|---|
+| p_in | 11.979 | 14.08 | 14.46 | 14.27 | +19.1% ✗ |
+| p_oodc | 7.643 | 8.10 | 7.80 | 7.95 | +4.1% ✗ |
+| p_tan | 28.341 | 28.30 | 29.60 | 28.95 | +2.1% ✗ |
+| p_re | 6.300 | 6.60 | 6.40 | 6.50 | +3.2% ✗ |
+
+- **Analysis:** Arc-length weights (min=0.094 at LE/TE dense regions, max=10.35 at sparse mid-chord) structurally conflict with hard-node mining which upweights LE/TE. The two mechanisms cancel — arc-length suppresses LE/TE gradient signal, hard-node mining amplifies it. LE/TE regions are the most information-rich for pressure prediction.
+- **Conclusion:** CLOSED. The hypothesis was physically motivated but incompatible with the existing hard-node mining mechanism. Would require disabling hard-node mining first, which is itself a performance-contributing feature.
+
 ### 2026-04-07 ~01:00 — PR #2205: NOBLE Nonlinear Low-Rank Branches (CosNet, rank=16) — nezuko — **CLOSED** (all metrics regressed 5-19%)
 - Branch: `nezuko/noble-branches-v2`
 - Hypothesis: Add residual low-rank branch `σ(x·W_down)·W_up` alongside each FFN linear layer in TransolverBlock, where σ is CosNet `cos(ω·x + φ)` with learnable frequency/phase. Rank=16, zero-init on W_up. From arXiv 2603.06492. Motivated by human research directive (issue #1926).
