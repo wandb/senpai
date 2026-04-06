@@ -1020,6 +1020,7 @@ class Config:
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
     gap_stagger_spatial_bias: bool = False  # condition spatial bias MLP on gap/stagger (tandem geometry-aware routing)
+    arclength_surface_loss: bool = False  # arc-length reweight surface loss (fix non-uniform mesh density bias)
     dct_freq_loss: bool = False   # DCT frequency-weighted auxiliary loss on surface pressure
     dct_freq_weight: float = 0.05 # weight for DCT freq loss
     dct_freq_gamma: float = 2.0   # frequency upweighting strength
@@ -1112,6 +1113,45 @@ def _umag_q(y, mask):
     Umag = (Ux_mean ** 2 + Uy_mean ** 2).sqrt().clamp(min=1.0).unsqueeze(-1)  # [B, 1, 1]
     q = 0.5 * Umag ** 2
     return Umag, q
+
+
+def _compute_arclength_weights(pos: torch.Tensor, surf_mask: torch.Tensor,
+                                K: int = 2, clamp_lo: float = 0.1, clamp_hi: float = 10.0) -> torch.Tensor:
+    """Compute per-node arc-length weights for surface nodes in a batch.
+
+    Each surface node's weight ∝ average distance to its K nearest surface neighbors,
+    normalized so mean weight = 1.0. This corrects non-uniform mesh density:
+    nodes in dense regions (LE/TE) get lower weight, sparse regions (mid-chord) get higher.
+
+    Args:
+        pos:       [B, N, 2] float — node (x, y) positions
+        surf_mask: [B, N] bool — True for surface nodes
+        K:         number of surface neighbors to consider (default 2)
+        clamp_lo, clamp_hi: clamp range for normalized weights
+    Returns:
+        weights: [B, N] float — arc-length weights (1.0 for non-surface/padding nodes)
+    """
+    B, N, _ = pos.shape
+    weights = torch.ones(B, N, device=pos.device)
+    for b in range(B):
+        sidx = surf_mask[b].nonzero(as_tuple=True)[0]  # surface node indices
+        M = sidx.shape[0]
+        if M < K + 1:
+            continue
+        coords = pos[b, sidx]  # [M, 2]
+        # Pairwise distances among surface nodes — M is typically O(500-2000)
+        dists = torch.cdist(coords, coords)  # [M, M]
+        dists.fill_diagonal_(float('inf'))
+        k = min(K, M - 1)
+        topk_dists, _ = dists.topk(k, dim=-1, largest=False)  # [M, k]
+        ds = topk_dists.mean(dim=-1)  # [M] — arc-length element per node
+        ds_mean = ds.mean().clamp(min=1e-8)
+        w = ds / ds_mean  # normalize so mean ≈ 1.0
+        w = w.clamp(clamp_lo, clamp_hi)
+        # Re-normalize after clamping so mean = 1.0
+        w = w / w.mean().clamp(min=1e-8)
+        weights[b, sidx] = w
+    return weights
 
 
 def _phys_norm(y, Umag, q):
@@ -1661,6 +1701,11 @@ for epoch in range(MAX_EPOCHS):
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+        # Arc-length surface loss weights: compute from raw positions before normalization
+        _arclength_w = None
+        if cfg.arclength_surface_loss:
+            with torch.no_grad():
+                _arclength_w = _compute_arclength_weights(x[:, :, :2], mask & is_surface)
         _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
@@ -1888,7 +1933,19 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        # Arc-length weighted surface mask: multiply per-node weights into surf_mask
+        _surf_w = surf_mask.float()  # [B, N] — default: uniform weights (1.0 for surface, 0.0 otherwise)
+        if _arclength_w is not None:
+            _surf_w = _surf_w * _arclength_w  # element-wise: arc-length-weighted surface mask
+            # Log weight stats on first batch of first epoch
+            if global_step == 0:
+                _aw_surf = _arclength_w[surf_mask]
+                wandb.log({"arclength_w_mean": _aw_surf.mean().item(),
+                           "arclength_w_max": _aw_surf.max().item(),
+                           "arclength_w_min": _aw_surf.min().item(),
+                           "global_step": global_step})
+        _surf_w_sum = _surf_w.sum(dim=1).clamp(min=1.0)  # [B] — weighted denominator per sample
+        surf_per_sample = (abs_err[:, :, 2:3] * _surf_w.unsqueeze(-1)).sum(dim=(1, 2)) / _surf_w_sum
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
@@ -1902,7 +1959,7 @@ for epoch in range(MAX_EPOCHS):
             thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
             hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
-            surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            surf_per_sample = (surf_pres * hard_weights * _surf_w.unsqueeze(-1)).sum(dim=(1, 2)) / _surf_w_sum
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         if cfg.tandem_ramp:
             tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
@@ -2146,7 +2203,7 @@ for epoch in range(MAX_EPOCHS):
                 aoa_pred2 = out2["aoa_pred"].float()
             abs_err2 = (pred2 - y_norm).abs()
             vol_loss2 = (abs_err2 * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
-            surf_ps2 = (abs_err2[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            surf_ps2 = (abs_err2[:, :, 2:3] * _surf_w.unsqueeze(-1)).sum(dim=(1, 2)) / _surf_w_sum
             surf_loss2 = (surf_ps2 * tandem_boost).mean()
             re_loss2 = F.mse_loss(re_pred2, log_re_target)
             aoa_loss2 = F.mse_loss(aoa_pred2, aoa_target)
