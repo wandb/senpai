@@ -1,32 +1,36 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-06 ~14:30 UTC
+- **Date:** 2026-04-06 ~16:30 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
 ## Current Baseline
 
-### Single-Model Baseline (PR #2130, GSB + PCGrad, 2-seed)
+### Single-Model Baseline (PR #2184, DCT Freq Loss w=0.05, 2-seed)
 
 | Metric | 2-seed avg | Target to beat |
 |--------|-----------|----------------|
-| p_in | **13.05** | < 13.05 |
-| p_oodc | **7.70** | < 7.70 |
-| **p_tan** | **28.60** | **< 28.60** |
-| p_re | **6.55** | < 6.55 |
+| p_in | **13.21** | < 13.21 |
+| p_oodc | **7.82** | < 7.82 |
+| **p_tan** | **28.50** | **< 28.50** |
+| p_re | **6.45** | < 6.45 |
 
-**Latest merge:** PR #2130 (fern) — Gap/Stagger Spatial Bias + PCGrad compound. W&B: d7l91p0x (s42, p_tan=28.9), j9btfx09 (s73, p_tan=28.3). p_tan -3.0% from prior baseline.
+**Latest merge:** PR #2184 (nezuko) — DCT frequency-weighted auxiliary loss (w=0.05, gamma=2.0, alpha=1.5). Exploits spectral bias theory to force attention to high-frequency leading-edge/TE features. Absolute DCT coefficient difference is numerically stable (unlike failed BSP #2172). W&B: 6yfv5lio (s42, p_tan=28.432), etepxvjc (s73, p_tan=28.572). p_tan -0.3% from prior baseline.
+
+**Key note:** p_in/p_oodc slightly regressed vs prior baseline (PR #2130). All 4 metrics together represent the current Pareto frontier. Priority is p_tan.
 
 **Reproduce current baseline:**
 ```bash
-cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baseline-gsb-pcgrad" \
+cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baseline-dct-freq" \
   --asinh_pressure --asinh_scale 0.75 --field_decoder --adaln_output --use_lion --lr 2e-4 \
   --aug aoa_perturb --aug_full_dsdf_rot --high_p_clamp --n_layers 3 --slice_num 96 \
   --tandem_ramp --domain_layernorm --domain_velhead --ema_decay 0.999 --weight_decay 5e-5 \
-  --cosine_T_max 160 --pressure_first --pressure_deep \
+  --cosine_T_max 160 --pcgrad_3way --pcgrad_extreme_pct 0.15 \
+  --pressure_first --pressure_deep \
   --residual_prediction --surface_refine --surface_refine_hidden 192 --surface_refine_layers 3 \
   --aft_foil_srf --aug_gap_stagger_sigma 0.02 --aug_dsdf2_sigma 0.05 \
-  --pcgrad_3way --pcgrad_extreme_pct 0.15 --gap_stagger_spatial_bias
+  --gap_stagger_spatial_bias \
+  --dct_freq_loss --dct_freq_weight 0.05 --dct_freq_gamma 2.0 --dct_freq_alpha 1.5
 ```
 
 ### Ensemble Baseline (PR #2093 — 16-Seed Ensemble, Seeds 42-49 + 66-73)
@@ -40,45 +44,38 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 Note: Current single model (p_tan=28.60) already **BEATS** the 16-seed ensemble (29.1) on p_tan.
 
-## Student Status (~06:30 UTC)
+## Student Status (~16:30 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| fern | #2181 | GEPS Test-Time Low-Rank Adaptation for OOD Tandem | WIP — just assigned |
-| askeladd | #2188 | MixStyle Tandem Feature Regularization for OOD Generalization | WIP — just assigned |
-| nezuko | #2184 | DCT Frequency-Weighted Surface Pressure Loss | WIP — just assigned |
-| tanjiro | #2182 | Ensemble Distillation: soft targets from 16-seed ensemble | WIP — just assigned |
-| alphonse | #2185 | MAE Pretraining: self-supervised geometry encoder initialization | WIP — just assigned |
-| thorfinn | #2186 | Panel Cp Residual Target: predict viscous correction only | WIP — just assigned |
-| frieren | #2183 | Vorticity Auxiliary Target: explicit wake structure learning | WIP — just assigned |
-| edward | #2187 | Normal-Velocity Hard Constraint at surface nodes | WIP — just assigned |
+| fern | #2181 | GEPS Test-Time Low-Rank Adaptation for OOD Tandem | WIP |
+| askeladd | #2188 | MixStyle Tandem Feature Regularization for OOD Generalization | WIP |
+| nezuko | #2190 | Laplacian Eigenvector Mesh Positional Encoding | WIP — just assigned |
+| tanjiro | #2189 | DSDF Test-Time Feature Alignment for OOD Tandem | WIP — just assigned |
+| alphonse | #2185 | MAE Pretraining: self-supervised geometry encoder initialization | WIP |
+| thorfinn | #2186 | Panel Cp Residual Target: predict viscous correction only | WIP |
+| frieren | #2183 | Vorticity Auxiliary Target: explicit wake structure learning | WIP |
+| edward | #2187 | Normal-Velocity Hard Constraint at surface nodes | WIP |
 
 **All 8 students active. Zero idle GPUs.**
 
-## Recently Reviewed (2026-04-06 ~06:30)
+## Recently Reviewed
 
 | PR | Student | Experiment | Decision | Key result |
 |----|---------|-----------|---------|------------|
-| #2174 | fern | Attention Temperature Curriculum | **CLOSED** | p_tan +2.7-4.2%. High temp disrupts GSB slice routing. |
-| #2173 | edward | Foil-1 Geometry Adapter | **CLOSED** | p_tan +2.1-2.4%. DSDF stats too coarse — 4 moments discard spatial structure. |
-| #2167 | edward | Tandem Surface Mixup | **CLOSED** | p_tan +5.8-5.9%. Physical inconsistency — aft-foil targets coupled to upstream wake. |
-| #2165 | thorfinn | Iterative 2-Pass Refinement | **CLOSED** | p_tan=30.5 (+6.6%). 1.3x epoch cost → only 131 epochs. Still converging at wall clock. |
-| #2164 | frieren | Backbone Gap/Stagger AdaLN | **CLOSED** | adaln_all + gs 4cond p_tan=30.55 (+6.8%), adaln_all Re/AoA p_tan=30.3 (+5.9%). AdaLN disrupts optimized attention routing. |
-| #2156 | tanjiro | DSDF-1 Channel Dropout | **CLOSED** | p=0.2 p_tan=30.20 (+5.6%), p=0.3 p_tan=30.40 (+6.3%). Foil-1 DSDF carries critical upstream geometry. p_re improved -9.2% (regularization). |
-| #2163 | nezuko | Differential LR | **CLOSED** | Both mult regress p_tan. Uniform LR best. |
-| #2162 | askeladd | Tandem Cross-DSDF Features | **CLOSED** | Hand-crafted features add noise. p_tan +4.4%. |
-| #2158 | edward | Asymmetric PCGrad | **CLOSED** | All key metrics worse. Symmetric 2-way optimal. |
-| #2157 | alphonse | Foil Shape Similarity Bias (GSB 7D) | **CLOSED** | p_tan +3.7%. Sample-level cosine sim too coarse. |
-| #2153 | frieren | Gap/Stagger σ=0.03 | **CLOSED** | p_tan +3.3%. σ=0.02 confirmed optimal. |
-| #2154 | thorfinn | Cosine T_max Sweep | **CLOSED** | Both +2.8%. T_max=160 confirmed. |
-| #2152 | nezuko | Augmentation Annealing | **CLOSED** | p_tan +1.0-2.1%. Constant aug essential. |
-| #2130 | fern | GSB + PCGrad Compound | **MERGED** | p_tan 29.48→28.60 (-3.0%). Current baseline. |
+| #2184 | nezuko | DCT Freq-Weighted Loss (w=0.05) | **MERGED** | p_tan 28.60→28.50 (-0.3%). New baseline. |
+| #2182 | tanjiro | Ensemble Distillation (alpha=0.3, 0.5) | **CLOSED** | p_tan +1.6-2.8%. Teacher quality gap. |
+| #2175 | askeladd | SWD Tandem Domain Alignment | **CLOSED** | w=0.01 neutral, w=0.05 +3.7%. Distributional diff = real physics. |
+| #2180 | edward | Multi-Resolution Hash Grid | **CLOSED** | p_tan +12.2%. Per-sample normalization breaks spatial coherence. |
+| #2174 | fern | Attention Temperature Curriculum | **CLOSED** | p_tan +2.7-4.2%. High temp disrupts GSB routing. |
+| #2173 | edward | Foil-1 Geometry Adapter | **CLOSED** | p_tan +2.1-2.4%. DSDF 4-moment stats too coarse. |
+| #2130 | fern | GSB + PCGrad Compound | **MERGED** | p_tan 29.48→28.60 (-3.0%). Prior baseline. |
 
 ## Current Research Focus
 
-### Primary target: p_tan = 28.60 → push below 28.0
+### Primary target: p_tan = 28.50 → push below 28.0
 
-Single model already beats 16-seed ensemble on p_tan. More headroom exists — attacking the **NACA6416 representation gap** via input representation and specialized correction heads.
+Single model beats 16-seed ensemble on p_tan (28.50 vs 29.1). More headroom exists — attacking the **NACA6416 representation gap** via input representation, physics constraints, and spectral techniques.
 
 **Confirmed wins (merged into baseline):**
 1. `--aft_foil_srf` — dedicated aft-foil SRF head
@@ -86,16 +83,17 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 3. `--aug_dsdf2_sigma 0.05` — foil-2 DSDF magnitude aug (p_tan -1.4%)
 4. `--pcgrad_3way --pcgrad_extreme_pct 0.15` — 2-way PCGrad gradient surgery (p_tan -2.1%)
 5. `--gap_stagger_spatial_bias` — tandem-geometry-aware slice routing (p_tan -3.0%)
+6. `--dct_freq_loss --dct_freq_weight 0.05 --dct_freq_gamma 2.0 --dct_freq_alpha 1.5` — DCT spectral auxiliary loss (p_tan -0.3%)
 
 **Active experiments (8 students WIP):**
-1. **GEPS Test-Time Adaptation** (fern #2181) — LoRA context params + continuity residual TTA at inference. **Tier 1 radical — zero training change.**
-2. **MixStyle Tandem Feature Regularization** (askeladd #2188) — Feature-space style mixing between tandem samples for OOD generalization (Zhou et al., ICLR 2021)
-3. **DCT Frequency-Weighted Loss** (nezuko #2184) — smooth DCT-domain frequency upweighting. Different from failed BSP (stable, auxiliary).
-4. **Panel Cp Residual Target** (thorfinn #2186) — predict (p_gt - p_panel) viscous correction instead of full pressure. Iteration on #2179.
-5. **MAE Pretraining** (alphonse #2185) — self-supervised masked geometry reconstruction before supervised training. Tier 3 radical.
+1. **GEPS Test-Time Adaptation** (fern #2181) — LoRA context params + continuity residual TTA at inference. Zero training change.
+2. **MixStyle Tandem Feature Regularization** (askeladd #2188) — Feature-space style mixing between tandem samples for OOD generalization.
+3. **Laplacian Eigenvector Mesh PE** (nezuko #2190) — Replace Fourier PE with intrinsic graph Laplacian eigenvectors. High-potential positional encoding overhaul.
+4. **DSDF Test-Time Feature Alignment** (tanjiro #2189) — Align OOD DSDF feature distribution to training stats at inference. 5-line change, zero training cost.
+5. **MAE Pretraining** (alphonse #2185) — self-supervised masked geometry reconstruction before supervised training.
 6. **Normal-Velocity Hard Constraint** (edward #2187) — project out normal velocity at surface nodes. Hard BC enforcement.
 7. **Vorticity Auxiliary Target** (frieren #2183) — KNN-computed ω as auxiliary prediction target. Forces explicit wake learning.
-8. **Ensemble Distillation** (tanjiro #2182) — soft targets from 16-seed ensemble. Tier 2 radical.
+8. **Panel Cp Residual Target** (thorfinn #2186) — predict (p_gt - p_panel) viscous correction instead of full pressure.
 
 **Key research patterns:**
 - **What works:** DSDF magnitude augmentation (foil-2 only), specialized correction heads (aft_srf), gradient surgery (2-way PCGrad), tandem-geometry-aware routing (GSB), geometry-conditioned mechanisms
@@ -108,35 +106,17 @@ Single model already beats 16-seed ensemble on p_tan. More headroom exists — a
 
 ## Potential Next Research Directions (queue for next idle students)
 
-### RADICAL — Researcher-Agent Round 4 (2026-04-06) — Plateau-Breaking Ideas
-1. ~~**Panel-Method Inviscid Cp as Input Feature**~~ → assigned to thorfinn #2179
-2. ~~**Test-Time Low-Rank Adaptation (GEPS)**~~ → assigned to fern #2181
-3. ~~**Ensemble Distillation**~~ → assigned to tanjiro #2182
-4. ~~**Multi-Resolution Hash Grid Encoding**~~ → assigned to edward #2180
-5. **Frequency-Weighted Surface Pressure Loss** — DCT-domain loss upweighting high-freq components (Tier 3) → assigned nezuko #2184
-6. **Vorticity-Streamfunction Auxiliary Targets** → assigned frieren #2183
-7. **MAE Pretraining on Mesh Geometry** → assigned alphonse #2185
-
-### Round 5 — Researcher-Agent (2026-04-06) — Fresh Structural Ideas
-See `/research/RESEARCH_IDEAS_2026-04-06_ROUND5.md` for full details.
-1. **Normal-Velocity Hard Constraint** — project out normal component at surface nodes. Hard BC, not soft loss. **TOP PRIORITY.**
-2. **DSDF Test-Time Feature Alignment** — align OOD DSDF distribution to training stats. 5-line change, zero training cost.
-3. **Laplacian Eigenvector Mesh PE** — replace Fourier PE with intrinsic mesh encoding. Geometry-aware.
+### Round 5 — Unassigned (from `/research/RESEARCH_IDEAS_2026-04-06_ROUND5.md`)
+1. ~~**Normal-Velocity Hard Constraint**~~ → edward #2187
+2. ~~**DSDF Test-Time Feature Alignment**~~ → tanjiro #2189
+3. ~~**Laplacian Eigenvector Mesh PE**~~ → nezuko #2190
 4. **Learned Geometry Tokenizer** — compress foil shape into latent code, inject into backbone.
 5. **Stochastic Depth** — randomly drop TransolverBlocks during training. Standard regularizer.
 6. **Local KNN Attention** — add local attention alongside global slice attention.
 7. **SIREN INR Pressure Decoder** — continuous neural field for pressure prediction. Bold swing.
 
-See `/research/RESEARCH_IDEAS_2026-04-06_ROUND4.md` for full details.
-
-### Round 3 (currently being tested)
-- BSP Spectral Loss (thorfinn #2172)
-- SWD Domain Alignment (askeladd #2175)
-- Attention Temp Curriculum (fern #2174)
-- Spectral Shaping (frieren #2176)
-- Coordinated Ramp (nezuko #2177)
-- Foil-1 Geometry Adapter (edward #2173)
-- Smaller SRF (tanjiro #2178)
+### Round 6 — Researcher-Agent (in progress, 2026-04-06)
+See `/research/RESEARCH_IDEAS_2026-04-06_ROUND6.md` when available.
 
 ### Human Researcher Directives
 - **#1860 (2026-03-27):** Think bigger — radical new full model changes and data aug.
