@@ -118,18 +118,25 @@ TE coordinate frame (PR #2207, merged) showed +5.4% p_in improvement. The hypoth
 - ~~**geotransolver-gale**~~ → thorfinn #2216
 - ~~**fore-srf-additive-skip**~~ → nezuko #2217
 
-**Ready to assign (from researcher-agent, `/research/RESEARCH_IDEAS_2026-04-07_00:00.md`):**
+**Assigned this cycle:**
+- ~~**slice-diversity-reg**~~ → askeladd #2220
+
+**Ready to assign (from researcher-agent, `/research/RESEARCH_IDEAS_2026-04-06_21:30.md` + earlier queue):**
 
 | Priority | Slug | Idea | Confidence | Notes |
 |----------|------|------|------------|-------|
+| **HIGH** | fore-pressure-conditioning | Condition AftSRF on predicted fore-foil Cp shape (6-scalar: mean, std, 4 DCT coeffs) via zero-init MLP | HIGH | Physically causal — aft-foil depends on fore-foil Cp. Novel: neither #2219 nor #2217 use predicted pressure. |
+| HIGH | srf-re-film-conditioning | FiLM on Re in SurfaceRefinementHead: `(1+γ(Re))·x + β(Re)`, zero-init | MED-HIGH | Targets p_re directly. Re governs viscous correction to Cp (BL thickness ~ Re^{-0.5}). ~20 LoC. |
+| HIGH | pressure-laplacian-loss | Graph-Laplacian smoothness on adjacent surface nodes: `λ·(dp/ds)²` | MED-HIGH | Topology-aware unlike DCT. Complementary to in-flight #2210 (arc-length reweight). |
 | HIGH | mhc-residuals | Learnable alpha/beta on TransolverBlock residual connections (12 params, init (1,1)) | Medium | Human team requested (issue #1926). Ultra-simple. |
-| HIGH | slice-diversity-reg | Gram matrix orthogonality penalty on slice attention weights (λ=0.005) | Medium | Loss-side OOD fix, no architecture change, zero inference cost. |
+| MED-HIGH | fore-stagnation-feature | Distance to fore-foil aerodynamic stagnation point as input channel | MED-HIGH | Complementary to TE frame (#2207) and LE frame (#2218). Camber/AoA-corrected. |
+| MED-HIGH | te-velocity-coupling | Focused auxiliary loss on fore-TE velocity (Ux, Uy) for tandem samples | Medium | TE velocity = causal bottleneck for wake. Reuses TE coord logic. |
+| MED-HIGH | input-channel-uncertainty | Learnable 24-vector multiplying input features, L2 regularized toward 1 | Medium | Continuous feature selection. Diagnostically interesting. |
 | MED-HIGH | domain-split-srf-norm | Conditional LayerNorm in AftSRF only (zero-init embeddings) | Medium | NOT same as dead-end #2164 (backbone domain AdaLN). |
 | MED-HIGH | tandem-feature-cross | Sigmoid gate on input encodings from (gap, stagger, Re, AoA), bias=5.0 near-identity | Medium | Complementary to gap_stagger_spatial_bias (routing vs features). |
-| MED-HIGH | surface-arc-length-pe | Arc-length from LE normalized by chord as input channel (+1 dim) | Medium | Complements TE coord frame. Related to #2218. |
-| MEDIUM | panel-method-cp-input | Hess-Smith inviscid Cp as input feature (proposed as #1865, never ran) | Medium | Coordinate with askeladd #2212 (analytical Cp delta). |
-| MEDIUM | chord-adaptive-le-te-loss | Extra loss weight on LE/TE regions (5% chord, boost 2x) | Medium | Wait for #2210 (fern) result first. |
-| MEDIUM | kutta-condition-loss | Auxiliary loss: L2(p_upper_TE - p_lower_TE) for TE pressure continuity | Medium | Novel physics constraint. Check if TE is sharp or blunt. |
-| MEDIUM | lift-drag-integral-loss | Cl/Cd integral loss from predicted surface pressure | Medium | Global physics consistency. |
-| MEDIUM | geometry-moment-conditioning | 7-scalar shape moments (area, centroid, Ixx/Iyy/Ixy) as backbone conditioning | Medium | Wait for #2216 (GALE) result. |
+| MEDIUM | re-mixup-augmentation | Mixup same-geometry different-Re samples (β(0.4,0.4)), 30% of batches | Medium | Physics-plausible interpolation for OOD-Re. |
+| MEDIUM | circulation-auxiliary-task | Predict fore-foil circulation Γ from pooled surface hidden states | Medium | Kutta-Joukowski: Γ ties lift to wake strength. Global scalar constraint. |
+| MEDIUM | surface-loss-adaptive-mask | OHEM on surface nodes — keep top-K% error nodes, ramp K 100%→60% | Medium | Error-based, complements geometry-based (#2210) and freq-based (#2184). |
+| MEDIUM | re-curriculum | Sample loss weighting by Re distance from center, ramped 0→1 over 80 epochs | Medium | Curriculum on Re axis. Distinct from PCGrad extreme_pct. |
+| MEDIUM | rff-boundary-encoding | Replace fixed Fourier PE with Randomized Fourier Features (σ=10) | Medium | Adapts spatial frequencies to pressure field. Check if PE already fixed. |
 | MEDIUM | node-type-boundary-embedding | Learned embedding per boundary_id, zero-init, added to input encoding | Medium | ~10 LoC, explicit node type awareness. |
