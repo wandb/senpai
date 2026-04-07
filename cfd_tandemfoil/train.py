@@ -1057,6 +1057,7 @@ class Config:
     scheduler_type: str = "sequential"  # "sequential", "warm_restarts", "onecycle"
     cosine_T_0: int = 50       # warm_restarts only
     cosine_T_mult: int = 2     # warm_restarts only
+    cosine_warm_restarts: bool = False   # SGDR: cosine annealing with warm restarts (overrides scheduler_type)
     onecycle_max_lr: float = 3e-3        # onecycle only
     onecycle_epochs: int = 200           # onecycle only
     onecycle_pct_start: float = 0.15    # onecycle only
@@ -1560,7 +1561,11 @@ if aft_srf_ctx_head is not None:
     print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
-if cfg.scheduler_type == "warm_restarts":
+if cfg.cosine_warm_restarts:
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        base_opt, T_0=cfg.cosine_T_0, T_mult=cfg.cosine_T_mult, eta_min=cfg.cosine_eta_min
+    )
+elif cfg.scheduler_type == "warm_restarts":
     _warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
     _restarts = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         base_opt, T_0=cfg.cosine_T_0, T_mult=cfg.cosine_T_mult, eta_min=cfg.cosine_eta_min
