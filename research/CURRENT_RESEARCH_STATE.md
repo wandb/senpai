@@ -50,8 +50,8 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | thorfinn | #2239 | EMA Self-Distillation: use EMA predictions as soft targets | WIP |
-| frieren | — | **IDLE** — assigning SAM optimizer | IDLE |
-| edward | — | **IDLE** — assigning spectral norm SRF | IDLE |
+| frieren | #2242 | SAM: Sharpness-Aware Minimization for flat minima | WIP (just assigned) |
+| edward | #2243 | Spectral Norm SRF: Lipschitz constraint on output heads | WIP (just assigned) |
 | fern | #2234 | SWA Training: stochastic weight averaging for wider optima | WIP |
 | nezuko | #2237 | Manifold Mixup: feature-level interpolation for OOD generalization | WIP |
 | alphonse | #2240 | Deeper Backbone: 4 TransolverBlocks for increased capacity | WIP (just assigned) |
