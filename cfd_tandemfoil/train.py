@@ -512,6 +512,8 @@ class TransolverBlock(nn.Module):
             film_out = self.film_net(condition)  # [B, H*2]
             gamma, beta = film_out.chunk(2, dim=-1)  # each [B, H]
             fx = gamma.unsqueeze(1) * fx + beta.unsqueeze(1)
+        if self.training and cfg.backbone_noise > 0:
+            fx = fx + torch.randn_like(fx) * cfg.backbone_noise
         if self.last_layer:
             fx_ln = self.ln_3(fx)
             if self.soft_moe:
@@ -1170,6 +1172,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    backbone_noise: float = 0.0             # std of Gaussian noise added to backbone hidden states during training (0=disabled)
 
 
 cfg = sp.parse(Config)
