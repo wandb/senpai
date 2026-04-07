@@ -56,7 +56,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | nezuko | #2246 | Higher Weight Decay: 5e-4 for stronger regularization | WIP (just assigned) |
 | alphonse | #2245 | SRF Dropout: regularize output heads for OOD | WIP (just assigned) |
 | tanjiro | #2218 | LE Coordinate Frame v3: single chordwise ratio le/(le+te) | WIP |
-| askeladd | — | **IDLE** — assigning higher LR experiment | IDLE |
+| askeladd | #2247 | Higher Learning Rate: 3e-4 for broader exploration | WIP (just assigned) |
 
 **Idle students:** None.
 
