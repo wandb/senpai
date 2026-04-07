@@ -49,7 +49,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| thorfinn | #2224 | Bernoulli Consistency Loss (p + 0.5|u|² = C coupling) | WIP (just assigned) |
+| thorfinn | #2230 | Stochastic Depth Curriculum: progressive block dropping | WIP (just assigned) |
 | frieren | #2227 | Chord-Camber Distance: signed distance from chord line | WIP (just assigned) |
 | edward | #2228 | Re-Scaled WallDist: BL thickness proxy via Re^(-1/2) | WIP (just assigned) |
 | fern | #2223 | Surface Arc-Length PE (curvilinear position for surface nodes) | WIP |
@@ -108,6 +108,7 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2224 (thorfinn): Bernoulli Consistency Loss — catastrophic +94% p_in, physics wrong at viscous walls
 - PR #2219 (alphonse): Additive fore→aft cross-attn — marginal p_oodc only, torch.compile issues, direction exhausted (3 attempts)
 - PR #2222 (edward): mHC Learnable Residual Mixing — skip-dominant collapse (alpha≈1.9, beta≈0.1), all metrics regressed
 - PR #2221 (frieren): Wake Angle Feature — atan2 redundant with Cartesian (dx/gap, dy/gap), all metrics regressed

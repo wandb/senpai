@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 02:30 — PR #2224: Bernoulli Consistency Loss (p + 0.5|u|² = C) — thorfinn — **CLOSED** (catastrophic failure, +94% p_in)
+- Branch: `thorfinn/bernoulli-consistency-loss`
+- Hypothesis: Soft Bernoulli constraint on surface nodes coupling pressure and velocity heads. Weight=0.01. Only seed 42 run (catastrophic, stopped early).
+
+| Metric | Baseline (#2213) | Seed 42 (9guzym40) | Δ |
+|--------|-----------------|--------------------|----|
+| p_in | 11.979 | **23.274** | **+94.3% ✗✗✗** |
+| p_oodc | 7.643 | **14.0** | **+83.2% ✗✗✗** |
+| p_tan | 28.341 | **33.4** | **+17.8% ✗✗** |
+| p_re | 6.300 | **10.8** | **+71.4% ✗✗✗** |
+
+- **Analysis:** Three compounding failures: (1) Bernoulli is physically WRONG at viscous walls — no-slip → Cp≈1 everywhere, but actual viscous Cp varies strongly. The loss pushed predictions toward constant Cp=1. (2) pressure-first detach blocks gradient from Bernoulli to pressure head, creating asymmetric training. (3) Growing gradient magnitudes in late training caused wild oscillations.
+- **Key lesson:** Physics losses must enforce constraints the true solution actually satisfies. Inviscid Bernoulli is violated at the surface in viscous flow (Re=1-5M). The "consistency barrier" means the constraint itself introduces irreducible error.
+- **Conclusion:** CLOSED. Surface-level physics-informed losses are exhausted for this viscous flow regime. Any future physics loss must apply only where the physics actually holds (e.g., volume nodes for Bernoulli).
+
+---
+
 ### 2026-04-07 02:15 — PR #2219: Additive Fore→Aft Cross-Attention in AftSRF — alphonse — **CLOSED** (mixed/marginal, torch.compile issues)
 - Branch: `alphonse/fore-aft-crossattn-additive`
 - Hypothesis: Add per-node cross-attention from aft-foil surface nodes to fore-foil backbone hidden states, additively on top of existing AftSRF MLP. Zero-init output projection. 49K new params.
