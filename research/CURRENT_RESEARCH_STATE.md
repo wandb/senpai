@@ -49,7 +49,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| thorfinn | — | **IDLE** — assigning stronger augmentation | IDLE |
+| thorfinn | #2248 | Stronger Augmentation: 2x gap/stagger and DSDF sigma | WIP (just assigned) |
 | frieren | #2242 | SAM: Sharpness-Aware Minimization for flat minima | WIP (just assigned) |
 | edward | #2243 | Spectral Norm SRF: Lipschitz constraint on output heads | WIP (just assigned) |
 | fern | #2244 | Higher EMA Decay: 0.9995 for longer-memory averaging | WIP (just assigned) |
