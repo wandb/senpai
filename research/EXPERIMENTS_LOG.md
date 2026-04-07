@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 05:45 — PR #2223: Surface Arc-Length PE — fern — **CLOSED** (p_oodc +4.7%, p_re +5.6%, p_in +3.1%, p_tan flat)
+- Branch: `fern/surface-arc-length-pe`
+- Hypothesis: Normalized arc-length s ∈ [0,1] from LE as curvilinear position encoding for surface nodes. Single channel appended to input features. Angle-based sorting from centroid for ring ordering.
+
+| Metric | Baseline (#2213) | Seed 42 (nbi3l00s) | Seed 73 (a2dbpn02) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 11.8 | 12.9 | **12.35** | **+3.1% ✗** |
+| p_oodc | 7.643 | 8.1 | 7.9 | **8.00** | **+4.7% ✗** |
+| p_tan | 28.341 | 28.4 | 28.3 | **28.35** | ~0% |
+| p_re | 6.300 | 6.6 | 6.7 | **6.65** | **+5.6% ✗** |
+
+- **Analysis:** 1D arc-length is largely redundant with the 6D TE coordinate frame. The model already knows "where along the surface" from TE frame + Fourier PE. Angle-based sorting introduces noise for cambered foils (NACA6416).
+- **Key lesson:** Surface position is already well-encoded by TE coord frame. Adding a simpler 1D parameterization provides no new information. Confirms TE coord frame captured the surface position signal thoroughly.
+- **Conclusion:** CLOSED. Surface position features are saturated.
+
+---
+
 ### 2026-04-07 05:30 — PR #2228: Re-Scaled WallDist — edward — **CLOSED** (all metrics worse, p_re +4.3%)
 - Branch: `edward/re-scaled-walldist`
 - Hypothesis: BL thickness proxy via Re^(-1/2) scaling of wall distance. Single channel: `dist_surf * Re^(-0.5)` as dimensionless BL coordinate y/δ.

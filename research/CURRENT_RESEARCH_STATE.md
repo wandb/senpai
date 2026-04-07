@@ -52,7 +52,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | thorfinn | #2230 | Stochastic Depth Curriculum: progressive block dropping | WIP |
 | frieren | #2232 | Pressure Laplacian Smoothness: topology-aware surface Cp regularization | WIP (just assigned) |
 | edward | #2233 | Re Input Augmentation: Gaussian noise on log(Re) for OOD robustness | WIP (just assigned) |
-| fern | #2223 | Surface Arc-Length PE (curvilinear position for surface nodes) | WIP |
+| fern | #2234 | SWA Training: stochastic weight averaging for wider optima | WIP (just assigned) |
 | nezuko | #2226 | Tandem Feature Cross: config-aware sigmoid gate on encoded features | WIP |
 | alphonse | #2229 | Surface Normal Features: outward normal (nx,ny) per surface node | WIP |
 | tanjiro | #2218 | LE Coordinate Frame v3: single chordwise ratio le/(le+te) | WIP (sent back) |
@@ -107,6 +107,7 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2223 (fern): Surface Arc-Length PE — redundant with TE coord frame; all metrics +3-6%
 - PR #2228 (edward): Re-Scaled WallDist — redundant with DSDF + log(Re); all metrics +2-5%
 - PR #2227 (frieren): Chord-Camber Distance — geometry-frame upper/lower ≠ flow-frame suction/pressure; all metrics +0.9-5.5%
 - PR #2225 (askeladd): Domain-Split SRF Norm — p_in +4.3%, p_re +3.2%; SRF heads too late in pipeline for domain conditioning
