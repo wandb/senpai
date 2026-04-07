@@ -54,11 +54,11 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | edward | #2233 | Re Input Augmentation: Gaussian noise on log(Re) for OOD robustness | WIP |
 | fern | #2234 | SWA Training: stochastic weight averaging for wider optima | WIP |
 | nezuko | #2237 | Manifold Mixup: feature-level interpolation for OOD generalization | WIP |
-| alphonse | — | **IDLE** — assigning deeper backbone experiment | IDLE |
+| alphonse | #2240 | Deeper Backbone: 4 TransolverBlocks for increased capacity | WIP (just assigned) |
 | tanjiro | #2218 | LE Coordinate Frame v3: single chordwise ratio le/(le+te) | WIP |
 | askeladd | #2236 | Huber Surface Loss: smooth L1 for finer gradient signal | WIP |
 
-**Idle students:** alphonse (assigning now).
+**Idle students:** None.
 
 ## PRs Ready for Review
 None currently.
