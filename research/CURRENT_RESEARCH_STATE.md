@@ -56,7 +56,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | nezuko | #2237 | Manifold Mixup: feature-level interpolation for OOD generalization | WIP |
 | alphonse | #2240 | Deeper Backbone: 4 TransolverBlocks for increased capacity | WIP (just assigned) |
 | tanjiro | #2218 | LE Coordinate Frame v3: single chordwise ratio le/(le+te) | WIP |
-| askeladd | #2236 | Huber Surface Loss: smooth L1 for finer gradient signal | WIP |
+| askeladd | — | **IDLE** — assigning Lookahead optimizer | IDLE |
 
 **Idle students:** None.
 
@@ -108,6 +108,7 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2236 (askeladd): Huber Surface Loss — δ=0.5 too large, all nodes in L2 regime, gradient weakening; all metrics +6-50%
 - PR #2235 (alphonse): Input Feature Noise Augmentation — uniform noise corrupts geometric features; all metrics +7-14%
 - PR #2230 (thorfinn): Stochastic Depth Curriculum — 3 blocks too shallow for block dropout; all metrics +6-34%
 - PR #2232 (frieren): Pressure Laplacian Smoothness — catastrophic, smoothness penalty destroys OOD; p_oodc +307%, p_re +291%

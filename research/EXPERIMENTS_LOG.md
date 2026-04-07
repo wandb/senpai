@@ -2,6 +2,22 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 11:15 — PR #2236: Huber Surface Loss — askeladd — **CLOSED** (all metrics worse, p_in +49%, p_oodc +50%)
+- Branch: `askeladd/huber-surface-loss`
+- Hypothesis: Replace L1 (MAE) with smooth L1 (Huber, δ=0.5) for surface pressure loss. L2-like gradients for small errors → finer convergence; L1 for large errors → outlier robustness.
+
+| Metric | Baseline (#2213) | Seed 42 (3onbhuby) | Seed 73 (kn5v2ib6) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 15.0 | 20.8 | **17.900** | **+49.4% ✗✗✗** |
+| p_oodc | 7.643 | 10.8 | 12.2 | **11.500** | **+50.5% ✗✗✗** |
+| p_tan | 28.341 | 28.9 | 30.9 | **29.900** | **+5.5% ✗** |
+| p_re | 6.300 | 8.2 | 9.9 | **9.050** | **+43.7% ✗✗✗** |
+
+- **Analysis:** δ=0.5 is far too large for asinh-normalized pressure space (typical errors 0.01-0.05). Puts virtually all nodes in L2 regime where gradient ∝ error → dramatic gradient weakening at convergence. The entire training pipeline (surf_weight, high_p_clamp, hard-node mining, PCGrad) is co-tuned for L1-scale gradients. Swapping loss function requires re-tuning the whole system. High seed variance (s73 much worse) indicates unstable optimization landscape.
+- **Conclusion:** CLOSED. L1 loss function is deeply integrated with the training pipeline. Loss shape changes require re-tuning all downstream components.
+
+---
+
 ### 2026-04-07 09:15 — PR #2235: Input Feature Noise Augmentation — alphonse — **CLOSED** (all metrics worse, p_in +10.8%, p_re +14.2%)
 - Branch: `alphonse/input-noise-augmentation`
 - Hypothesis: Gaussian noise (sigma=0.02) on ALL input feature channels after normalization as isotropic regularization. Equivalent to Tikhonov regularization for small noise.
