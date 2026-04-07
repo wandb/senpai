@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 04:30 — PR #2225: Domain-Split SRF Norm — askeladd — **CLOSED** (p_in +4.3%, p_re +3.2%)
+- Branch: `askeladd/domain-split-srf-norm`
+- Hypothesis: Tandem-conditional LayerNorm in AftSRF head. Zero-initialized nn.Embedding(2, hidden_dim) for separate scale/bias corrections for tandem vs non-tandem samples. Applied to both SurfaceRefinementHead and AftFoilRefinementHead after layer index 2.
+
+| Metric | Baseline (#2213) | Seed 42 (rgwx848w) | Seed 73 (9n5ia3rk) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 12.078 | 12.900 | **12.489** | **+4.3% ✗** |
+| p_oodc | 7.643 | 7.6 | 7.6 | **7.600** | -0.6% |
+| p_tan | 28.341 | 28.6 | 28.1 | **28.350** | +0.03% ✗ |
+| p_re | 6.300 | 6.5 | 6.5 | **6.500** | **+3.2% ✗** |
+
+- **Analysis:** Zero-init worked correctly (verified identical first pass), but domain conditioning at the SRF head level doesn't help. The SRF heads process ~2% of nodes — by the time features reach the SRF, the backbone has already adapted its representations. Adding scale/bias perturbation at the head level just adds noise. High per-seed variance on p_tan (28.1 vs 28.6) suggests the conditioning interacts unpredictably with training dynamics.
+- **Key lesson:** Domain conditioning applied to post-backbone heads is too late in the pipeline. This is the second failed domain conditioning attempt (#2164 backbone, #2225 SRF heads). Domain awareness may need to be embedded in the feature representation itself rather than as architecture conditioning.
+- **Conclusion:** CLOSED. Domain conditioning at the SRF head level is a dead end.
+
+---
+
 ### 2026-04-07 02:45 — PR #2218 v2: LE Coordinate Frame (chord-normalized, +wake deficit) — tanjiro — **SENT BACK** (p_re -4.2% but p_in +2.1%)
 - Branch: `tanjiro/le-coord-frame` (v2 iteration)
 - Change from v1: chord-normalized LE features, rebased on current baseline with `--wake_deficit_feature`.

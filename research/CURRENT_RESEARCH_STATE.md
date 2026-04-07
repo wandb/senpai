@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-07 02:00 UTC
+- **Date:** 2026-04-07 04:30 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -45,20 +45,20 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats ensemble (12.1).
 
-## Student Status (2026-04-06 22:35 UTC)
+## Student Status (2026-04-07 04:30 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| thorfinn | #2230 | Stochastic Depth Curriculum: progressive block dropping | WIP (just assigned) |
-| frieren | #2227 | Chord-Camber Distance: signed distance from chord line | WIP (just assigned) |
-| edward | #2228 | Re-Scaled WallDist: BL thickness proxy via Re^(-1/2) | WIP (just assigned) |
+| thorfinn | #2230 | Stochastic Depth Curriculum: progressive block dropping | WIP |
+| frieren | #2227 | Chord-Camber Distance: signed distance from chord line | WIP |
+| edward | #2228 | Re-Scaled WallDist: BL thickness proxy via Re^(-1/2) | WIP |
 | fern | #2223 | Surface Arc-Length PE (curvilinear position for surface nodes) | WIP |
-| nezuko | #2226 | Tandem Feature Cross: config-aware sigmoid gate on encoded features | WIP (just assigned) |
-| alphonse | #2229 | Surface Normal Features: outward normal (nx,ny) per surface node | WIP (just assigned) |
-| tanjiro | #2218 | LE Coordinate Frame v2: chord-normalized LE + wake deficit rebase | WIP (sent back) |
-| askeladd | #2225 | Domain-Split SRF Norm: tandem-conditional LayerNorm in AftSRF | WIP (just assigned) |
+| nezuko | #2226 | Tandem Feature Cross: config-aware sigmoid gate on encoded features | WIP |
+| alphonse | #2229 | Surface Normal Features: outward normal (nx,ny) per surface node | WIP |
+| tanjiro | #2218 | LE Coordinate Frame v3: single chordwise ratio le/(le+te) | WIP (sent back) |
+| askeladd | #2231 | Surface Curvature Feature: local κ for surface nodes | WIP (just assigned) |
 
-**Idle students:** None (tanjiro sent back to iterate on #2218).
+**Idle students:** None.
 
 ## PRs Ready for Review
 None currently.
@@ -74,26 +74,25 @@ No new issues. Prior directives still in effect:
 **Theme 1: Explicit Physical Feature Engineering (HIGHEST PRIORITY — proven fruitful)**
 - TE coord frame (PR #2207): -5.4% p_in
 - Wake deficit feature (PR #2213): -4.1% p_in, -1.7% p_re
-- In flight: wake angle atan2 (#2221), LE coord frame (#2218), surface arc-length PE (#2223)
+- In flight: LE coord frame v3 (#2218), surface arc-length PE (#2223), chord-camber distance (#2227), Re-scaled wall dist (#2228), surface normals (#2229), surface curvature (#2231)
 - The model responds strongly to explicit aerodynamic geometry — continue exploiting this
 
-**Theme 2: Physics-Informed Loss Reformulation (NEW — exploring)**
-- Bernoulli consistency loss (#2224, thorfinn): soft p + 0.5|u|² = C constraint on surface nodes
-- This couples velocity and pressure heads at the gradient level — novel direction vs feature engineering
-- Complementary to the pressure-first decoder already in baseline
+**Theme 2: Tandem-Specific Coupling and Conditioning**
+- In flight: tandem feature cross (#2226 nezuko) — config-aware sigmoid gate on encoded features
+- Domain-split SRF norm (#2225): CLOSED — SRF heads process too few nodes, domain signal too dilute post-backbone
+- Domain AdaLN (#2164): CLOSED — disturbed slice routing in backbone
+- Fore-aft cross-attention (#2219, #2217, #2202): CLOSED — direction exhausted after 3 attempts
 
-**Theme 3: Fore-Aft Information Coupling (MEDIUM PRIORITY)**
-- In flight: additive fore-aft cross-attention (#2219), fore-SRF skip (#2217)
-- Core problem: aft-foil pressure depends on fore-foil wake but backbone processes both foils together
+**Theme 3: Training Dynamics**
+- In flight: stochastic depth curriculum (#2230 thorfinn)
+- Bernoulli consistency loss (#2224): CLOSED — physics wrong at viscous walls
+- mHC residuals (#2222): CLOSED — skip-dominant collapse
+- Slice diversity reg (#2220): CLOSED — slice collapse is beneficial
 
-**Theme 4: Training Dynamics and Attention Optimization**
-- In flight: slice diversity regularization (#2220), mHC learnable residual mixing (#2222)
-- GeoTransolver GALE (#2216): CLOSED — geometry cross-attention competes with slice-attention, all metrics regressed significantly
-- Slice diversity reg (#2220): CLOSED — forcing slice orthogonality hurts; slice collapse is beneficial (concentrates capacity on hard regions)
-
-**Theme 5: Architecture Dead Ends (DO NOT REVISIT)**
+**Theme 4: Architecture Dead Ends (DO NOT REVISIT)**
 - NOBLE/CosNet, register tokens, Ada-Temp, GNOT, Galerkin, Hierarchical, FactFormer, DeepONet, INR
 - Geometry latent cross-attention (GALE, #2216) — creates competing pathway
+- Domain conditioning at SRF heads (#2225) — too late in pipeline
 
 ## Potential Next Research Directions
 
@@ -108,6 +107,7 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2225 (askeladd): Domain-Split SRF Norm — p_in +4.3%, p_re +3.2%; SRF heads too late in pipeline for domain conditioning
 - PR #2224 (thorfinn): Bernoulli Consistency Loss — catastrophic +94% p_in, physics wrong at viscous walls
 - PR #2219 (alphonse): Additive fore→aft cross-attn — marginal p_oodc only, torch.compile issues, direction exhausted (3 attempts)
 - PR #2222 (edward): mHC Learnable Residual Mixing — skip-dominant collapse (alpha≈1.9, beta≈0.1), all metrics regressed
