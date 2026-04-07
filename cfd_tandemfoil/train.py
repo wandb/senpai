@@ -1002,6 +1002,13 @@ class Transolver(nn.Module):
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
 
+        # Manifold Mixup: interpolate hidden features before last block (output head)
+        if isinstance(data, Mapping):
+            _mm_lam = data.get("manifold_mix_lam", None)
+            _mm_perm = data.get("manifold_mix_perm", None)
+            if _mm_lam is not None and _mm_perm is not None:
+                fx = _mm_lam * fx + (1.0 - _mm_lam) * fx[_mm_perm]
+
         # Last block: use adaln_all condition if enabled, else fallback to adaln_output
         last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
 
@@ -1170,6 +1177,8 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    manifold_mixup: bool = False            # feature-level mixup: mix hidden state after backbone blocks
+    mixup_alpha: float = 0.2               # Beta(alpha, alpha) concentration — 0.2 = mild mixing
 
 
 cfg = sp.parse(Config)
@@ -1885,8 +1894,23 @@ for epoch in range(MAX_EPOCHS):
             else:
                 y_norm = y_norm / sample_stds
 
+        # Manifold Mixup: sample λ and permutation (training only, requires B > 1)
+        _mm_lam = None
+        _mm_perm = None
+        if cfg.manifold_mixup and model.training and B > 1:
+            _mm_lam = torch.distributions.Beta(
+                torch.tensor(cfg.mixup_alpha, device=device),
+                torch.tensor(cfg.mixup_alpha, device=device),
+            ).sample()
+            _mm_perm = torch.randperm(B, device=device)
+
+        _model_input = {"x": x}
+        if _mm_lam is not None:
+            _model_input["manifold_mix_lam"] = _mm_lam
+            _model_input["manifold_mix_perm"] = _mm_perm
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model(_model_input)
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -1896,10 +1920,15 @@ for epoch in range(MAX_EPOCHS):
         aoa_pred = aoa_pred.float()
         hidden = hidden.float()
         if model.training and not cfg.no_perstd and not cfg.raw_targets and not cfg.adaptive_norm:
+            # For Manifold Mixup, use interpolated sample_stds matching the mixed prediction scale
+            _stds_for_pred = (
+                (_mm_lam * sample_stds + (1.0 - _mm_lam) * sample_stds[_mm_perm])
+                if _mm_lam is not None else sample_stds
+            )
             if cfg.multiply_std:
-                pred = pred * sample_stds
+                pred = pred * _stds_for_pred
             else:
-                pred = pred / sample_stds
+                pred = pred / _stds_for_pred
 
         # Surface refinement head: additive correction on surface nodes
         if refine_head is not None and model.training:
@@ -1953,6 +1982,10 @@ for epoch in range(MAX_EPOCHS):
                     aft_correction = aft_srf_head(aft_hidden, aft_pred, _aft_cond).float()
                 pred = pred.clone()
                 pred[aft_idx[:, 0], aft_idx[:, 1]] = pred[aft_idx[:, 0], aft_idx[:, 1]] + aft_correction
+
+        # Manifold Mixup: mix normalized targets to match the mixed predictions
+        if _mm_lam is not None:
+            y_norm = _mm_lam * y_norm + (1.0 - _mm_lam) * y_norm[_mm_perm]
 
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
