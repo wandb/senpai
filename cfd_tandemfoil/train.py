@@ -552,7 +552,7 @@ class SurfaceRefinementHead(nn.Module):
     """
 
     def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 128,
-                 n_layers: int = 2, p_only: bool = False):
+                 n_layers: int = 2, p_only: bool = False, dropout: float = 0.0):
         super().__init__()
         self.p_only = p_only
         actual_out = 1 if p_only else out_dim  # 1 for pressure-only, 3 for all fields
@@ -563,6 +563,8 @@ class SurfaceRefinementHead(nn.Module):
             layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
             layers.append(nn.LayerNorm(hidden_dim))
             layers.append(nn.GELU())
+            if dropout > 0.0:
+                layers.append(nn.Dropout(dropout))
         layers.append(nn.Linear(hidden_dim, actual_out))
         # Zero-init last layer so refinement starts as identity
         nn.init.zeros_(layers[-1].weight)
@@ -595,7 +597,7 @@ class AftFoilRefinementHead(nn.Module):
     """
 
     def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 192,
-                 n_layers: int = 3, film: bool = False):
+                 n_layers: int = 3, film: bool = False, dropout: float = 0.0):
         super().__init__()
         self.film = film
         in_dim = n_hidden + out_dim
@@ -604,11 +606,15 @@ class AftFoilRefinementHead(nn.Module):
             layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
             layers.append(nn.LayerNorm(hidden_dim))
             layers.append(nn.GELU())
+            if dropout > 0.0:
+                layers.append(nn.Dropout(dropout))
         layers.append(nn.Linear(hidden_dim, out_dim))
         nn.init.zeros_(layers[-1].weight)
         nn.init.zeros_(layers[-1].bias)
         self.mlp = nn.Sequential(*layers)
         # FiLM modulation from gap/stagger (2-dim condition)
+        # film_apply_idx: index of layer after which FiLM is applied (end of first block)
+        self.film_apply_idx = 3 if dropout > 0.0 else 2  # Linear(0), LN(1), GELU(2), [Dropout(3)]
         if film:
             self.film_scale = nn.Linear(2, hidden_dim, bias=False)
             self.film_shift = nn.Linear(2, hidden_dim)
@@ -627,12 +633,11 @@ class AftFoilRefinementHead(nn.Module):
             correction: [A, out_dim] — additive correction
         """
         inp = torch.cat([hidden, base_pred], dim=-1)
-        # Run through layers, applying FiLM after first hidden activation
+        # Run through layers, applying FiLM after first hidden activation block
         x = inp
         for i, layer in enumerate(self.mlp):
             x = layer(x)
-            # Apply FiLM after first LayerNorm+GELU (i.e., after index 2)
-            if self.film and cond is not None and i == 2:
+            if self.film and cond is not None and i == self.film_apply_idx:
                 gamma = self.film_scale(cond)   # [A, hidden_dim]
                 beta = self.film_shift(cond)    # [A, hidden_dim]
                 x = x * (1.0 + gamma) + beta
@@ -1170,6 +1175,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    srf_dropout: float = 0.0               # dropout probability in SRF MLP hidden layers (0 = disabled)
 
 
 cfg = sp.parse(Config)
@@ -1356,6 +1362,7 @@ if cfg.surface_refine:
             hidden_dim=cfg.surface_refine_hidden,
             n_layers=cfg.surface_refine_layers,
             p_only=cfg.surface_refine_p_only,
+            dropout=cfg.srf_dropout,
         ).to(device)
     refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
     _refine_n_params = sum(p.numel() for p in refine_head.parameters())
@@ -1386,6 +1393,7 @@ if cfg.aft_foil_srf:
             hidden_dim=cfg.aft_foil_srf_hidden,
             n_layers=cfg.aft_foil_srf_layers,
             film=cfg.aft_foil_srf_film,
+            dropout=cfg.srf_dropout,
         ).to(device)
         aft_srf_head = torch.compile(aft_srf_head, mode=cfg.compile_mode)
         _aft_n_params = sum(p.numel() for p in aft_srf_head.parameters())
