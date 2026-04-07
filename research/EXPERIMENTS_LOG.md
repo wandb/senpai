@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 16:30 — PR #2245: SRF Dropout — alphonse — **CLOSED** (p_tan +8.8%, mixed)
+- Branch: `alphonse/srf-dropout`
+- Hypothesis: Add dropout (p=0.1) to SRF heads during training to regularize output corrections for OOD robustness.
+
+| Metric | Baseline (#2213) | Seed 42 (nq2e1w8v) | Seed 73 (d46kd21a) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 12.107 | 12.243 | **12.175** | +1.6% ✗ |
+| p_oodc | 7.643 | 7.687 | 7.573 | **7.630** | -0.2% (noise) |
+| p_tan | 28.341 | 31.067 | 30.614 | **30.841** | **+8.8% ✗✗** |
+| p_re | 6.300 | 6.587 | 6.478 | **6.533** | +3.7% ✗ |
+
+- **Analysis:** Marginal p_oodc improvement (-0.2%) is within noise and doesn't compensate for severe p_tan regression (+8.8%). SRF heads are precision output modules — already constrained by zero-init + LayerNorm. Dropout introduces variance that directly hurts correction accuracy, especially for aft-foil SRF which handles tandem geometry.
+- **Key insight:** Regularizing output heads doesn't address OOD generalization — the bottleneck is in the backbone representation, not the refinement pathway. SRF heads need full capacity for precise corrections.
+- **Conclusion:** CLOSED. Dead end — SRF heads should not be regularized with dropout.
+
+---
+
 ### 2026-04-07 16:00 — PR #2242: SAM Optimizer — frieren — **CLOSED** (catastrophic, all metrics +39-188%)
 - Branch: `frieren/sam-optimizer`
 - Hypothesis: Sharpness-Aware Minimization (SAM, rho=0.05) wrapping Lion optimizer. Seek flatter minima for better OOD generalization.
