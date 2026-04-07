@@ -56,7 +56,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | nezuko | #2246 | Higher Weight Decay: 5e-4 for stronger regularization | WIP (just assigned) |
 | alphonse | #2245 | SRF Dropout: regularize output heads for OOD | WIP (just assigned) |
 | tanjiro | #2218 | LE Coordinate Frame v3: single chordwise ratio le/(le+te) | WIP |
-| askeladd | #2241 | Lookahead Optimizer: slow-weight averaging wrapper for Lion | WIP (just assigned) |
+| askeladd | — | **IDLE** — assigning higher LR experiment | IDLE |
 
 **Idle students:** None.
 
@@ -108,6 +108,7 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2241 (askeladd): Lookahead Optimizer — triple-smoothing (Lion+Lookahead+EMA) over-constrains; all metrics +3-14%
 - PR #2237 (nezuko): Manifold Mixup — node index misalignment across meshes; physically incoherent mixed representations; all metrics +16-28%
 - PR #2240 (alphonse): Deeper Backbone 4L — undertrained (118 vs 145 epochs), infeasible in wall-clock budget; all metrics +2-12%
 - PR #2234 (fern): SWA Training — uniform averaging dilutes converged weights; EMA superior; p_in +54.9%

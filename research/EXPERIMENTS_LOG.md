@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 14:40 — PR #2241: Lookahead Optimizer — askeladd — **CLOSED** (all metrics worse, p_re +14.3%)
+- Branch: `askeladd/lookahead-optimizer`
+- Hypothesis: Wrap Lion with Lookahead (k=5, alpha=0.5). Slow-weight averaging every 5 steps for flatter minima.
+
+| Metric | Baseline (#2213) | Seed 42 (dz0uw7nc) | Seed 73 (yrkwmdty) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 13.3 | 12.8 | **13.050** | **+8.9% ✗** |
+| p_oodc | 7.643 | 8.7 | 8.5 | **8.600** | **+12.5% ✗✗** |
+| p_tan | 28.341 | 29.7 | 28.5 | **29.100** | +2.7% ✗ |
+| p_re | 6.300 | 7.2 | 7.2 | **7.200** | **+14.3% ✗✗** |
+
+- **Analysis:** Triple-smoothing effect: Lion momentum + Lookahead slow weights + EMA for eval. Lookahead DOES stabilize training (very low seed variance), but over-constrains the optimizer, preventing fine-grained exploration. α=0.5 pulls fast weights back 50% every 5 steps — too aggressive. Epoch count identical to baseline (~146-148), confirming negligible overhead.
+- **Key insight:** Low seed variance confirms Lookahead stabilizes. But stabilization ≠ improvement. The baseline Lion+EMA combo already provides sufficient smoothing.
+- **Conclusion:** CLOSED. Additional optimizer smoothing layers are counterproductive with Lion+EMA.
+
+---
+
 ### 2026-04-07 14:30 — PR #2237: Manifold Mixup — nezuko — **CLOSED** (all metrics worse, p_oodc +27.6%)
 - Branch: `nezuko/manifold-mixup`
 - Hypothesis: Mix hidden features (after backbone blocks) with lambda ~ Beta(0.2,0.2) for OOD generalization.
