@@ -35,6 +35,7 @@ from einops import rearrange
 from timm.layers import trunc_normal_
 from tqdm import tqdm
 from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.optim.swa_utils import SWALR
 import simple_parsing as sp
 
 from data.utils import visualize
@@ -1088,6 +1089,8 @@ class Config:
     # Phase 3: training dynamics experiments
     swa: bool = False             # GPU 0/6: uniform SWA weight averaging
     swa_start_epoch: int = 200   # epoch to start SWA (GPU 0: 200, GPU 6: 160)
+    swa_lr: float = 5e-5         # constant LR during SWA phase
+    swa_anneal_epochs: int = 5   # epochs to anneal from current LR to swa_lr
     grad_accum_steps: int = 1    # GPU 2: gradient accumulation (step every N batches)
     half_target_noise: bool = False  # GPU 3: reduce target noise by 50%
     no_target_noise: bool = False    # Phase 4: completely disable target noise injection
@@ -1590,6 +1593,11 @@ else:  # sequential (default)
         milestones=[cfg.warmup_total_iters]
     )
 step_scheduler_per_batch = (cfg.scheduler_type == "onecycle")
+
+# SWA LR scheduler (created now, used after swa_start_epoch)
+swa_lr_scheduler = None
+if cfg.swa:
+    swa_lr_scheduler = SWALR(base_opt, swa_lr=cfg.swa_lr, anneal_epochs=cfg.swa_anneal_epochs)
 
 # --- wandb ---
 run = wandb.init(
@@ -2276,7 +2284,7 @@ for epoch in range(MAX_EPOCHS):
                 scheduler.step()
             except ValueError:
                 pass
-        if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa and not cfg.swa_cyclic and not cfg.snapshot_ensemble:
+        if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa_cyclic and not cfg.snapshot_ensemble:
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
             else:
@@ -2337,6 +2345,8 @@ for epoch in range(MAX_EPOCHS):
                         for k in snap:
                             cs[k].mul_(swa_cyclic_n / (swa_cyclic_n + 1)).add_(snap[k].to(device) / (swa_cyclic_n + 1))
                     swa_cyclic_n += 1
+        elif cfg.swa and swa_lr_scheduler is not None and epoch >= cfg.swa_start_epoch:
+            swa_lr_scheduler.step()
         else:
             scheduler.step()
     # Two-phase LR: at switch epoch, reset optimizer LR and replace scheduler
@@ -2384,11 +2394,12 @@ for epoch in range(MAX_EPOCHS):
     _do_val = (epoch + 1) % cfg.val_every == 0 or epoch == 0 or epoch == MAX_EPOCHS - 1
     if not _do_val:
         dt = time.time() - t0
+        _lr = swa_lr_scheduler.get_last_lr()[0] if (cfg.swa and swa_lr_scheduler is not None and epoch >= cfg.swa_start_epoch) else scheduler.get_last_lr()[0]
         wandb.log({
             "train/vol_loss": epoch_vol,
             "train/surf_loss": epoch_surf,
             "epoch_time_s": dt,
-            "lr": scheduler.get_last_lr()[0],
+            "lr": _lr,
             "global_step": global_step,
         })
         print(f"Epoch {epoch+1:3d} ({dt:.0f}s)  train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  [val skipped]")
@@ -2758,12 +2769,14 @@ for epoch in range(MAX_EPOCHS):
         "val/loss": val_loss_3split,
         "val/loss_3split": val_loss_3split,
         "val/loss_4split": val_loss_4split,
-        "lr": scheduler.get_last_lr()[0],
+        "lr": swa_lr_scheduler.get_last_lr()[0] if (cfg.swa and swa_lr_scheduler is not None and epoch >= cfg.swa_start_epoch) else scheduler.get_last_lr()[0],
         "epoch_time_s": dt,
     }
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
+    if cfg.swa and epoch >= cfg.swa_start_epoch:
+        metrics["swa_n"] = swa_n
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
@@ -2835,6 +2848,14 @@ else:
 wandb.summary.update({"total_epochs": epoch + 1, "total_time_min": total_time})
 if best_metrics:
     wandb.summary.update({"best_" + k: v for k, v in best_metrics.items()})
+    if cfg.swa:
+        wandb.summary.update({"swa_" + k: v for k, v in best_metrics.items()})
+
+# If SWA is active and EMA model exists, print EMA metrics for comparison
+if cfg.swa and ema_model is not None and best_metrics:
+    print(f"\n--- EMA model metrics (for comparison with SWA above) ---")
+    print(f"  SWA averaging started at epoch {cfg.swa_start_epoch}, collected {swa_n} snapshots")
+    print(f"  SWA LR: {cfg.swa_lr}, anneal epochs: {cfg.swa_anneal_epochs}")
 
     print("\nGenerating flow field plots...")
     try:
