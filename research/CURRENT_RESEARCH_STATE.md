@@ -50,7 +50,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | thorfinn | #2248 | Stronger Augmentation: 2x gap/stagger and DSDF sigma | WIP (just assigned) |
-| frieren | — | **IDLE** — awaiting assignment | — |
+| frieren | #2249 | Online Hard Node Mining: error-weighted surface loss | WIP (just assigned) |
 | edward | #2243 | Spectral Norm SRF: Lipschitz constraint on output heads | WIP (just assigned) |
 | fern | #2244 | Higher EMA Decay: 0.9995 for longer-memory averaging | WIP (just assigned) |
 | nezuko | #2246 | Higher Weight Decay: 5e-4 for stronger regularization | WIP (just assigned) |
@@ -58,7 +58,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | tanjiro | #2218 | LE Coordinate Frame v3: single chordwise ratio le/(le+te) | WIP |
 | askeladd | #2247 | Higher Learning Rate: 3e-4 for broader exploration | WIP (just assigned) |
 
-**Idle students:** frieren.
+**Idle students:** None.
 
 ## PRs Ready for Review
 None currently.
