@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-07 20:05 UTC
+- **Date:** 2026-04-07 20:45 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -39,7 +39,7 @@ Single-model p_tan (28.341) and p_in (11.979) both BEAT the ensemble.
 | askeladd | #2255 | Augmentation annealing: disable aug after epoch 120 for clean fine-tuning | WIP |
 | alphonse | #2256 | Val-every-3 throughput: validate every 3 epochs for ~20 more training epochs | WIP |
 | tanjiro | #2257 | Focal sample reweighting: loss^0.5 upweight on hard samples | WIP |
-| frieren | #2249 | Online Hard Node Mining: error-weighted surface loss | WIP |
+| frieren | #2258 | Decoupled Tandem Slice Projection: separate routing matrix for tandem samples | WIP |
 
 **Idle students:** None. All 8 GPUs occupied.
 
@@ -55,14 +55,10 @@ No new issues since last check. Prior directives still in effect:
 
 ## Just Completed Reviews (this session)
 
-### PR #2250 — Blended L1+L2 Surface Loss (alphonse) — CLOSED
-- p_tan +4.3% worse, p_re +1.6% worse
-- L2 gradient conflicts with existing hard-node mining (PCGrad extreme + tandem_ramp)
-- **Key insight:** Additive loss penalties that overlap with PCGrad/tandem_ramp fail — double-penalizing
-
-### PR #2218 — LE Coordinate Frame v1/v2/v3 (tanjiro) — CLOSED
-- All 3 iterations failed (v1: OOD catastrophe, v2: mixed, v3: all worse)
-- **Key insight:** Feature engineering is exhausted. TE coord + wake deficit + Fourier PE capture all useful spatial info
+### PR #2249 — Online Hard Node Mining gamma=1.0 (frieren) — CLOSED
+- All 4 metrics worse: p_oodc +7.3%, p_re +7.4%, p_in +1.1%, p_tan +1.6%
+- Root cause: baseline already has asymmetric hard-node mining (1.5× at epoch ≥30); stacking OHNM multiplicatively creates 3-5× concentration on small node subsets, hurting OOD generalization
+- **Key insight:** Never stack a second hard-node weighting on top of the existing mining. Any future OHNM must replace (not add to) the existing mechanism.
 
 ## Current Research Focus and Themes
 
@@ -72,18 +68,18 @@ No new issues since last check. Prior directives still in effect:
 
 **Most informative result:** Spectral norm SRF showed p_in -2.5% but p_tan +1.8%. This proved OOD failure is in the BACKBONE representation, not the output heads.
 
-### Round 20 Strategy (current, 2026-04-07)
+### Round 21 Strategy (current, 2026-04-07)
 
-Eight diverse experiments targeting different levels of the training pipeline:
+Eight experiments targeting diverse levers:
 
-1. **Schedule (T_max=140)** — Match cosine annealing to actual training length
-2. **Output capacity (wider SRF 384)** — Double surface refinement head width
-3. **Loss targeting (aft-foil upweight 1.5x)** — Direct p_tan gradient budget shift
-4. **Backbone regularization (hidden noise σ=0.01)** — Target backbone OOD instability
-5. **Training strategy (aug annealing at epoch 120)** — Clean fine-tuning phase
-6. **Throughput (val_every=3)** — More training epochs within wall-clock budget
-7. **Sample-level reweighting (focal gamma=0.5)** — Upweight hard samples dynamically
-8. **Node-level reweighting (OHNM)** — Error-weighted surface node loss
+1. **Schedule (T_max=140)** — Match cosine annealing to actual training length (thorfinn #2251)
+2. **Output capacity (wider SRF 384)** — Double surface refinement head width (fern #2252)
+3. **Loss targeting (aft-foil upweight 1.5x)** — Direct p_tan gradient budget shift (nezuko #2253)
+4. **Backbone regularization (hidden noise σ=0.01)** — Target backbone OOD instability (edward #2254)
+5. **Training strategy (aug annealing at epoch 120)** — Clean fine-tuning phase (askeladd #2255)
+6. **Throughput (val_every=3)** — More training epochs within wall-clock budget (alphonse #2256)
+7. **Sample-level reweighting (focal gamma=0.5)** — Upweight hard samples dynamically (tanjiro #2257)
+8. **Decoupled tandem slice routing** — Separate `in_project_slice_tandem` for tandem samples, never tested on Phase 6 baseline (frieren #2258)
 
 ### What Works (confirmed and merged)
 
