@@ -54,7 +54,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | edward | #2243 | Spectral Norm SRF: Lipschitz constraint on output heads | WIP (just assigned) |
 | fern | #2244 | Higher EMA Decay: 0.9995 for longer-memory averaging | WIP (just assigned) |
 | nezuko | #2237 | Manifold Mixup: feature-level interpolation for OOD generalization | WIP |
-| alphonse | — | **IDLE** — needs new assignment | IDLE |
+| alphonse | #2245 | SRF Dropout: regularize output heads for OOD | WIP (just assigned) |
 | tanjiro | #2218 | LE Coordinate Frame v3: single chordwise ratio le/(le+te) | WIP |
 | askeladd | #2241 | Lookahead Optimizer: slow-weight averaging wrapper for Lion | WIP (just assigned) |
 
