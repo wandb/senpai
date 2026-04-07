@@ -1170,6 +1170,8 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    huber_surface_loss: bool = False        # use smooth L1 (Huber) instead of L1 for surface pressure
+    huber_delta: float = 0.5               # Huber transition threshold in normalized pressure space
 
 
 cfg = sp.parse(Config)
@@ -2001,14 +2003,21 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        # Surface pressure error: Huber (smooth L1) or standard L1
+        if cfg.huber_surface_loss:
+            _p_diff = pred[:, :, 2:3] - y_norm[:, :, 2:3]
+            _surf_pres_err = torch.nn.functional.smooth_l1_loss(
+                _p_diff, torch.zeros_like(_p_diff), beta=cfg.huber_delta, reduction='none')
+        else:
+            _surf_pres_err = abs_err[:, :, 2:3]
+        surf_per_sample = (_surf_pres_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
         running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
         # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
         if epoch >= 30:
-            surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
+            surf_pres = _surf_pres_err  # pressure errors [B, N, 1]
             surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
             surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
             thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
