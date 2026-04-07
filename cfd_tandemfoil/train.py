@@ -1170,6 +1170,8 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    input_noise: bool = False               # Gaussian noise on all input features during training (regularization)
+    input_noise_sigma: float = 0.02         # std of noise (applied after normalization + feature assembly)
 
 
 cfg = sp.parse(Config)
@@ -1807,6 +1809,9 @@ for epoch in range(MAX_EPOCHS):
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
+        # Input feature noise augmentation: isotropic Gaussian noise on ALL channels
+        if cfg.input_noise and model.training:
+            x = x + torch.randn_like(x) * cfg.input_noise_sigma
         Umag, q = _umag_q(y, mask)
         if cfg.raw_targets:
             y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
