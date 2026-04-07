@@ -1114,6 +1114,7 @@ class Config:
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
     gap_stagger_spatial_bias: bool = False  # condition spatial bias MLP on gap/stagger (tandem geometry-aware routing)
+    tandem_feature_cross: bool = False   # config-aware sigmoid gate on encoded features (conditioned on gap/stagger/Re/AoA)
     dct_freq_loss: bool = False   # DCT frequency-weighted auxiliary loss on surface pressure
     dct_freq_weight: float = 0.05 # weight for DCT freq loss
     dct_freq_gamma: float = 2.0   # frequency upweighting strength
@@ -1338,6 +1339,21 @@ torch._functorch.config.donated_buffer = False  # required for retain_graph=True
 model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
+# Tandem feature cross gate: sigmoid gate on encoded features conditioned on (gap, stagger, Re, AoA)
+tandem_gate = None
+if cfg.tandem_feature_cross:
+    _gate_output_dim = _base_model.feature_cross.in_features  # fun_dim + space_dim
+    tandem_gate = nn.Sequential(
+        nn.Linear(4, 32),
+        nn.GELU(),
+        nn.Linear(32, _gate_output_dim),
+    ).to(device)
+    nn.init.zeros_(tandem_gate[-1].weight)
+    nn.init.constant_(tandem_gate[-1].bias, 5.0)  # sigmoid(5) ≈ 0.993 → near-identity gate
+    tandem_gate = torch.compile(tandem_gate, mode=cfg.compile_mode)
+    _gate_n = sum(p.numel() for p in tandem_gate.parameters())
+    print(f"Tandem feature cross gate: {_gate_n:,} params (out_dim={_gate_output_dim}, sigmoid(5) init)")
+
 # Surface refinement head (separate module, not compiled with main model)
 refine_head = None
 if cfg.surface_refine:
@@ -1397,6 +1413,7 @@ from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
 ema_aft_srf_head = None  # EMA copy of aft-foil SRF head
+ema_tandem_gate = None  # EMA copy of tandem feature cross gate
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -1558,6 +1575,10 @@ if aft_srf_ctx_head is not None:
     _ctx_params = list(aft_srf_ctx_head.parameters())
     base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
+if tandem_gate is not None:
+    _gate_params = list(tandem_gate.parameters())
+    base_opt.add_param_group({'params': _gate_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _gate_params):,} tandem gate params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
@@ -1758,6 +1779,15 @@ for epoch in range(MAX_EPOCHS):
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
+        # Tandem gate: save raw config scalars before normalization
+        _raw_gate_scalars = None
+        if tandem_gate is not None:
+            _raw_gate_scalars = torch.stack([
+                x[:, 0, 22].float(),  # gap (raw)
+                x[:, 0, 23].float(),  # stagger (raw)
+                x[:, 0, 13].float(),  # log(Re) (raw)
+                x[:, 0, 14].float(),  # AoA (raw)
+            ], dim=-1)  # [B, 4]
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
@@ -1804,6 +1834,11 @@ for epoch in range(MAX_EPOCHS):
         xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
+        # Tandem feature cross: apply sigmoid gate conditioned on (gap, stagger, Re, AoA)
+        if tandem_gate is not None and _raw_gate_scalars is not None:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                gate_vals = torch.sigmoid(tandem_gate(_raw_gate_scalars.to(device)))  # [B, D]
+            x = x * gate_vals[:, None, :].float()
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -2309,6 +2344,14 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            if tandem_gate is not None:
+                _gate_base = tandem_gate._orig_mod if hasattr(tandem_gate, '_orig_mod') else tandem_gate
+                if ema_tandem_gate is None:
+                    ema_tandem_gate = deepcopy(_gate_base)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_tandem_gate.parameters(), _gate_base.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -2429,6 +2472,13 @@ for epoch in range(MAX_EPOCHS):
             eval_aft_srf_ctx_head.eval()
         else:
             aft_srf_ctx_head.eval()
+    eval_tandem_gate = tandem_gate
+    if tandem_gate is not None:
+        if ema_tandem_gate is not None and ema_model is not None and eval_model is ema_model:
+            eval_tandem_gate = ema_tandem_gate
+            eval_tandem_gate.eval()
+        else:
+            tandem_gate.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -2453,6 +2503,15 @@ for epoch in range(MAX_EPOCHS):
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
+                # Tandem gate: save raw config scalars before normalization
+                _v_raw_gate_scalars = None
+                if eval_tandem_gate is not None:
+                    _v_raw_gate_scalars = torch.stack([
+                        x[:, 0, 22].float(),  # gap (raw)
+                        x[:, 0, 23].float(),  # stagger (raw)
+                        x[:, 0, 13].float(),  # log(Re) (raw)
+                        x[:, 0, 14].float(),  # AoA (raw)
+                    ], dim=-1)  # [B, 4]
                 _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
@@ -2494,6 +2553,11 @@ for epoch in range(MAX_EPOCHS):
                 xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
+                # Tandem gate: apply sigmoid gate conditioned on (gap, stagger, Re, AoA)
+                if eval_tandem_gate is not None and _v_raw_gate_scalars is not None:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        gate_vals = torch.sigmoid(eval_tandem_gate(_v_raw_gate_scalars.to(device)))
+                    x = x * gate_vals[:, None, :].float()
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
