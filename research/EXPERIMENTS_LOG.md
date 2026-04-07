@@ -2,6 +2,57 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 23:45 — PR #2257: Focal Sample Reweighting (γ=0.5) — tanjiro — **CLOSED** (all metrics worse)
+- Branch: `tanjiro/focal-sample-reweight`
+- Hypothesis: Per-sample focal-style loss reweighting on surface loss. Weight each sample's contribution by `(loss_i / mean_loss)^gamma` with gamma=0.5. Analogous to Focal Loss (Lin et al., RetinaNet) applied to regression.
+
+| Metric | Baseline (#2213) | Seed 42 (3sjfouvz) | Seed 73 (jzcb7n89) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 13.0 | 12.7 | **12.83** | +7.1% ✗ |
+| p_oodc | 7.643 | 8.3 | 7.9 | **8.10** | +5.9% ✗ |
+| p_tan | 28.341 | 28.4 | 28.7 | **28.55** | +0.7% ✗ |
+| p_re | 6.300 | 6.5 | 6.5 | **6.50** | +3.2% ✗ |
+
+- **Analysis:** Existing hard-sample mechanisms (PCGrad 3-way, tandem_ramp, hard-node mining) already cover sample-level difficulty. Stacking focal reweighting creates over-correction — hardest samples get boosted multiple times. The `(loss/mean)^0.5` weights reduce effective contribution of easy in-distribution samples, explaining the severe p_in regression.
+- **Key insight:** The sample weighting stack is already near-optimal. Future gains more likely from architecture/loss formulation/new features, not additional sample weighting.
+- **Conclusion:** CLOSED. Do not revisit per-sample focal reweighting while existing hard-sample mechanisms remain.
+
+---
+
+### 2026-04-07 23:45 — PR #2256: Val-Every-3 Throughput — alphonse — **CLOSED** (no improvement)
+- Branch: `alphonse/val-every-3-throughput`
+- Hypothesis: Validate every 3rd epoch to reclaim ~10% wall-clock time, enabling ~165+ epochs vs ~148 baseline.
+
+| Metric | Baseline (#2213) | Seed 42 (1lluk2kk) | Seed 73 (gl1g71km) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 12.09 | 11.96 | **12.025** | +0.4% ✗ |
+| p_oodc | 7.643 | 7.8 | 7.7 | **7.750** | +1.4% ✗ |
+| p_tan | 28.341 | 28.5 | 28.2 | **28.350** | +0.03% ✗ |
+| p_re | 6.300 | 6.4 | 6.3 | **6.350** | +0.8% ✗ |
+
+- 159 epochs completed (vs ~148 baseline) — throughput hypothesis confirmed (+11 epochs).
+- **Analysis:** Extra epochs were all in the lowest-LR phase of cosine annealing (epochs 148-159), producing negligible gradient signal. Coarser checkpoint granularity (val_every=3) likely missed optimal EMA snapshot. LR schedule is the binding constraint, not validation overhead.
+- **Key insight:** If we want more useful training, we need to match the LR schedule to the training window (T_max optimization), not reduce validation frequency.
+- **Conclusion:** CLOSED. Naive throughput gains don't help when LR schedule is the bottleneck.
+
+---
+
+### 2026-04-07 23:45 — PR #2251: Cosine T_max=140 — thorfinn — **SENT BACK** for T_max=150 follow-up
+- Branch: `thorfinn/cosine-tmax-140`
+- Hypothesis: Set T_max=140 so cosine annealing completes before training timeout (~149 epochs), giving 9+ epochs at near-zero LR for fine convergence.
+
+| Metric | Baseline (#2213) | Seed 42 (bonncq4u) | Seed 73 (67hjyn0w) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 11.932 | 11.612 | **11.772** | -1.7% ✓ |
+| p_oodc | 7.643 | 7.775 | 7.333 | **7.554** | -1.2% ✓ |
+| p_tan | 28.341 | 28.473 | 28.456 | **28.465** | +0.4% ✗ |
+| p_re | 6.300 | 6.301 | 6.438 | **6.370** | +1.1% ✗ |
+
+- **Analysis:** Strong signal on p_in and p_oodc — completing the cosine schedule helps in-distribution and OOD-condition convergence. But T_max=140 decays too aggressively, reducing plasticity for tandem transfer and Re generalization. High seed variance (s73 much better on p_in/p_oodc, worse on p_re).
+- **Next step:** T_max=150 — schedule completes exactly at training cutoff, maximizing time at moderate LR for generalization while still reaching minimum LR. Sent back for this follow-up.
+
+---
+
 ### 2026-04-07 23:10 — PR #2254: Backbone Hidden Noise (σ=0.01 Gaussian) — edward — **CLOSED** (all metrics worse)
 - Branch: `edward/backbone-hidden-noise`
 - Hypothesis: Add Gaussian noise (σ=0.01) to TransolverBlock hidden outputs during training to force noise-robust representations and improve OOD generalization. Applied after residual connection in all 3 blocks.
