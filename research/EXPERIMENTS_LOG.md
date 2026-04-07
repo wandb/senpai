@@ -2,6 +2,57 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 23:10 — PR #2254: Backbone Hidden Noise (σ=0.01 Gaussian) — edward — **CLOSED** (all metrics worse)
+- Branch: `edward/backbone-hidden-noise`
+- Hypothesis: Add Gaussian noise (σ=0.01) to TransolverBlock hidden outputs during training to force noise-robust representations and improve OOD generalization. Applied after residual connection in all 3 blocks.
+
+| Metric | Baseline (#2213) | Seed 42 (qhex5dph) | Seed 73 (sq588kij) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 12.216 | 12.000 | **12.108** | +1.1% ✗ |
+| p_oodc | 7.643 | 8.032 | 7.620 | **7.826** | +2.4% ✗ |
+| p_tan | 28.341 | 28.711 | 28.192 | **28.451** | +0.4% ✗ |
+| p_re | 6.300 | 6.659 | 6.423 | **6.541** | +3.8% ✗ |
+
+- **Analysis:** Baseline's heavy regularization stack (EMA 0.999 + cosine + WD + Lion) already prevents brittle representations. Additive noise across all 3 blocks compounds through residual connections, creating instability (p_oodc seed variance: 8.03 vs 7.62). Too blunt an instrument for the targeted backbone OOD fragility identified by spectral norm experiments.
+- **Key insight:** Backbone OOD failure needs targeted intervention (attention-level perturbation) not hidden-state noise. Additive noise is redundant with existing regularization.
+- **Conclusion:** CLOSED. Global hidden noise is a dead end. Do not revisit additive backbone noise.
+
+---
+
+### 2026-04-07 23:10 — PR #2253: Aft-Foil Surface Loss Upweighting (1.5x) — nezuko — **CLOSED** (all metrics worse)
+- Branch: `nezuko/aft-foil-loss-upweight`
+- Hypothesis: Upweight aft-foil surface nodes by 1.5x in loss to shift gradient budget toward the harder predictions (aft-foil in tandem). Analogous to class-imbalance weighting.
+
+| Metric | Baseline (#2213) | Seed 42 (2i2u2sb4) | Seed 73 (81who7b3) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 11.872 | 12.621 | **12.247** | +2.2% ✗ |
+| p_oodc | 7.643 | 7.855 | 7.439 | **7.647** | +0.05% ✗ |
+| p_tan | 28.341 | 28.518 | 28.774 | **28.646** | +1.1% ✗ |
+| p_re | 6.300 | 6.385 | 6.264 | **6.324** | +0.4% ✗ |
+
+- **Analysis:** 1.5x upweight compounds with existing tandem_ramp + adaptive_boost + PCGrad 3-way. The baseline already aggressively upweights tandem/hard cases at sample level — node-level upweighting creates gradient instability (p_in seed variance: 11.87 vs 12.62). p_tan (the target) worsened, indicating the bottleneck is representational capacity not gradient allocation.
+- **Key insight:** The multi-objective gradient pipeline (PCGrad extreme + tandem ramp) has saturated gradient budget for hard samples. Further loss weighting is redundant. Aft-foil improvements need new information or structural capacity, not more gradient pressure.
+- **Conclusion:** CLOSED. Node-level loss upweighting is redundant with existing mechanisms. Do not revisit loss-weighting approaches that overlap with PCGrad/tandem_ramp.
+
+---
+
+### 2026-04-07 23:10 — PR #2251: Cosine T_max=140 — thorfinn — **SENT BACK** (p_in, p_oodc beat; p_tan, p_re regress → try T_max=150)
+- Branch: `thorfinn/cosine-tmax-140`
+- Hypothesis: Baseline uses T_max=160 but training stops at ~149 epochs. T_max=140 ensures cosine schedule completes, giving ~9 epochs at near-zero LR for fine convergence.
+
+| Metric | Baseline (#2213) | Seed 42 (bonncq4u) | Seed 73 (67hjyn0w) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 11.932 | 11.612 | **11.772** | **-1.7% ✓** |
+| p_oodc | 7.643 | 7.775 | 7.333 | **7.554** | **-1.2% ✓** |
+| p_tan | 28.341 | 28.473 | 28.456 | **28.464** | +0.4% ✗ |
+| p_re | 6.300 | 6.301 | 6.438 | **6.370** | +1.1% ✗ |
+
+- **Analysis:** Completing cosine annealing before timeout delivers real gains on p_in and p_oodc. The aggressive schedule (near-zero LR by epoch 140) locks in representations too early for tandem transfer and Re generalization. T_max=150 is the logical sweet spot — schedule completes just before timeout, maximizing time at moderate LR for generalization.
+- **Key insight:** Schedule optimization has clear headroom. The baseline T_max=160 wastes ~10 epochs of uncompleted annealing. The optimal T_max likely matches actual training length.
+- **Status:** Sent back for T_max=150 follow-up. If all 4 metrics beat baseline, this is a merge.
+
+---
+
 ### 2026-04-07 23:00 — PR #2252: Wider SRF Heads (384 hidden dim) — fern — **CLOSED** (all metrics worse)
 - Branch: `fern/wider-srf-384`
 - Hypothesis: Double SRF hidden dim from 192→384 to give surface refinement heads more capacity for complex corrections (leading-edge suction peaks, aft-foil wake interactions). 3.3x more SRF parameters.
