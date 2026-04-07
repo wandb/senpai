@@ -2,6 +2,22 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 09:15 — PR #2235: Input Feature Noise Augmentation — alphonse — **CLOSED** (all metrics worse, p_in +10.8%, p_re +14.2%)
+- Branch: `alphonse/input-noise-augmentation`
+- Hypothesis: Gaussian noise (sigma=0.02) on ALL input feature channels after normalization as isotropic regularization. Equivalent to Tikhonov regularization for small noise.
+
+| Metric | Baseline (#2213) | Seed 42 (946piami) | Seed 73 (ej0qyopf) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 12.821 | 13.718 | **13.269** | **+10.8% ✗✗** |
+| p_oodc | 7.643 | 8.715 | 8.542 | **8.629** | **+12.9% ✗✗** |
+| p_tan | 28.341 | 30.959 | 29.519 | **30.239** | **+6.7% ✗** |
+| p_re | 6.300 | 7.120 | 7.273 | **7.197** | **+14.2% ✗✗** |
+
+- **Analysis:** Uniform noise on all channels corrupts exact geometric features (coordinates, DSDF, boundary indicators, TE frame, wake deficit) that the model needs for spatial reasoning. sigma=0.02 adds 2% noise to normalized features, but for binary/precise channels this destroys signal. Noise on Fourier PE is especially harmful — breaks frequency-position mapping. The existing targeted augmentations (AoA, DSDF sigma, gap/stagger) are already optimally tuned for physically meaningful channels. OOD metrics regressed MOST (+12.9-14.2%), opposite of what was hoped — noise made representations noisier and less generalizable.
+- **Conclusion:** CLOSED. Isotropic input noise is fundamentally wrong for this model — input channels encode exact geometry, not noisy observations. Only targeted, physics-motivated augmentations help.
+
+---
+
 ### 2026-04-07 09:10 — PR #2230: Stochastic Depth Curriculum — thorfinn — **CLOSED** (all metrics worse, p_in +33.6%)
 - Branch: `thorfinn/stochastic-depth-curriculum`
 - Hypothesis: Progressive block dropping during early training. Block 1 dropped with max p=0.15, decaying to 0 by epoch 80. Block 2 (last) never dropped.

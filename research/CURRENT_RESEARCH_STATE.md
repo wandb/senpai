@@ -45,20 +45,20 @@ cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/baselin
 
 Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats ensemble (12.1).
 
-## Student Status (2026-04-07 04:30 UTC)
+## Student Status (2026-04-07 09:15 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| thorfinn | #2239 | EMA Self-Distillation: use EMA predictions as soft targets | WIP (just assigned) |
-| frieren | #2238 | Cosine Warm Restarts: SGDR cyclical LR for multi-basin exploration | WIP (just assigned) |
-| edward | #2233 | Re Input Augmentation: Gaussian noise on log(Re) for OOD robustness | WIP (just assigned) |
-| fern | #2234 | SWA Training: stochastic weight averaging for wider optima | WIP (just assigned) |
-| nezuko | #2237 | Manifold Mixup: feature-level interpolation for OOD generalization | WIP (just assigned) |
-| alphonse | #2235 | Input Feature Noise Augmentation: Gaussian noise on all channels | WIP (just assigned) |
-| tanjiro | #2218 | LE Coordinate Frame v3: single chordwise ratio le/(le+te) | WIP (sent back) |
-| askeladd | #2236 | Huber Surface Loss: smooth L1 for finer gradient signal | WIP (just assigned) |
+| thorfinn | #2239 | EMA Self-Distillation: use EMA predictions as soft targets | WIP |
+| frieren | #2238 | Cosine Warm Restarts: SGDR cyclical LR for multi-basin exploration | WIP |
+| edward | #2233 | Re Input Augmentation: Gaussian noise on log(Re) for OOD robustness | WIP |
+| fern | #2234 | SWA Training: stochastic weight averaging for wider optima | WIP |
+| nezuko | #2237 | Manifold Mixup: feature-level interpolation for OOD generalization | WIP |
+| alphonse | — | **IDLE** — assigning deeper backbone experiment | IDLE |
+| tanjiro | #2218 | LE Coordinate Frame v3: single chordwise ratio le/(le+te) | WIP |
+| askeladd | #2236 | Huber Surface Loss: smooth L1 for finer gradient signal | WIP |
 
-**Idle students:** None.
+**Idle students:** alphonse (assigning now).
 
 ## PRs Ready for Review
 None currently.
@@ -108,6 +108,7 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2235 (alphonse): Input Feature Noise Augmentation — uniform noise corrupts geometric features; all metrics +7-14%
 - PR #2230 (thorfinn): Stochastic Depth Curriculum — 3 blocks too shallow for block dropout; all metrics +6-34%
 - PR #2232 (frieren): Pressure Laplacian Smoothness — catastrophic, smoothness penalty destroys OOD; p_oodc +307%, p_re +291%
 - PR #2226 (nezuko): Tandem Feature Cross — global sigmoid gate too blunt, p_tan +1.3%, p_oodc -1.2% but p_re +1.6%
