@@ -1118,6 +1118,8 @@ class Config:
     dct_freq_weight: float = 0.05 # weight for DCT freq loss
     dct_freq_gamma: float = 2.0   # frequency upweighting strength
     dct_freq_alpha: float = 1.5   # frequency exponent
+    ohnm: bool = False            # online hard node mining: weight surface nodes by current error
+    ohnm_gamma: float = 1.0       # error exponent (1.0=linear focus, 2.0=quadratic focus)
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -2001,14 +2003,24 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        # OHNM: compute per-node weights based on current prediction error (detached)
+        if cfg.ohnm:
+            with torch.no_grad():
+                node_mean_err = abs_err.detach().mean(dim=-1)  # [B, N] mean across Ux,Uy,p channels
+                raw_w = (node_mean_err ** cfg.ohnm_gamma) * surf_mask.float()  # [B, N]
+                w_mean = (raw_w * surf_mask.float()).sum(dim=1, keepdim=True) / surf_mask.sum(dim=1, keepdim=True).clamp(min=1)
+                ohnm_w = raw_w / (w_mean + 1e-8)  # normalize so mean surface weight = 1
+            _surf_pres_base = abs_err[:, :, 2:3] * ohnm_w.unsqueeze(-1)  # OHNM-weighted pressure error
+        else:
+            _surf_pres_base = abs_err[:, :, 2:3]
+        surf_per_sample = (_surf_pres_base * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
         running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
         # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
         if epoch >= 30:
-            surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
+            surf_pres = _surf_pres_base  # use OHNM-weighted pressure errors if enabled
             surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
             surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
             thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
@@ -2310,7 +2322,11 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.ohnm:
+            _log_dict["train/ohnm_w_max"] = ohnm_w.max().item()
+            _log_dict["train/ohnm_w_std"] = (ohnm_w * surf_mask.float()).sum(dim=1).std().item() if B > 1 else 0.0
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
