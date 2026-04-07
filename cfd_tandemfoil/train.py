@@ -347,6 +347,71 @@ def compute_wake_deficit_features(raw_xy, is_surface, saf_norm, gap_raw, fore_te
     return torch.stack([dx_norm, dy_norm], dim=-1)  # [B, N, 2]
 
 
+def compute_surface_normals(raw_xy: torch.Tensor, is_surface: torch.Tensor,
+                            saf_norm: torch.Tensor, k: int = 5) -> torch.Tensor:
+    """Compute outward-pointing surface normal (nx, ny) for each surface node.
+
+    For each surface node: find k nearest surface neighbors on the same foil,
+    estimate local tangent from neighbor displacements, rotate 90° for the normal,
+    then orient outward (away from foil centroid).
+
+    Vectorized over nodes within each (batch, foil) group for efficiency.
+    Computed from raw pre-normalization coordinates for geometric accuracy.
+
+    Args:
+        raw_xy:     [B, N, 2] raw x, y coordinates (before normalization)
+        is_surface: [B, N] bool surface mask
+        saf_norm:   [B, N] norm of saf channels (<=0.005 = fore-foil, >0.005 = aft-foil)
+        k: number of nearest neighbors for local tangent estimation
+    Returns:
+        [B, N, 2] (nx, ny) unit outward normal. Zero for volume nodes.
+    """
+    B, N = raw_xy.shape[:2]
+    result = torch.zeros(B, N, 2, device=raw_xy.device, dtype=raw_xy.dtype)
+
+    fore_threshold = lambda sn: sn <= 0.005
+    aft_threshold = lambda sn: sn > 0.005
+
+    for b in range(B):
+        for threshold_fn in (fore_threshold, aft_threshold):
+            mask = is_surface[b] & threshold_fn(saf_norm[b])
+            M = mask.sum().item()
+            if M < 3:
+                continue
+
+            indices = mask.nonzero(as_tuple=True)[0]  # [M]
+            xy = raw_xy[b, indices]                    # [M, 2]
+            centroid = xy.mean(dim=0)                  # [2]
+
+            # Pairwise distances → kNN indices (exclude self, column 0)
+            k_eff = min(k, M - 1)
+            dists = torch.cdist(xy.unsqueeze(0), xy.unsqueeze(0)).squeeze(0)  # [M, M]
+            _, knn_idx = dists.topk(k_eff + 1, dim=1, largest=False)          # [M, k+1]
+            knn_idx = knn_idx[:, 1:]                                           # [M, k]
+
+            # Neighbor displacements and tangent estimation (vectorized over nodes)
+            neighbors_xy = xy[knn_idx]                 # [M, k, 2]
+            displacements = neighbors_xy - xy.unsqueeze(1)  # [M, k, 2]
+            d_norms = displacements.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            d_unit = displacements / d_norms           # [M, k, 2] unit directions
+            tangent = d_unit.mean(dim=1)               # [M, 2] average tangent direction
+            t_norms = tangent.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            tangent = tangent / t_norms                # [M, 2] unit tangent
+
+            # Normal = rotate tangent 90° CCW: (tx, ty) → (-ty, tx)
+            normals = torch.stack([-tangent[:, 1], tangent[:, 0]], dim=-1)  # [M, 2]
+
+            # Orient outward: flip normals pointing toward centroid
+            to_centroid = centroid.unsqueeze(0) - xy   # [M, 2]
+            dot = (normals * to_centroid).sum(dim=-1)  # [M] positive = points toward centroid
+            flip = (dot > 0).float().unsqueeze(-1) * 2 - 1  # +1 or -1
+            normals = normals * (-flip)                # flip inward-pointing normals
+
+            result[b, indices] = normals
+
+    return result  # [B, N, 2]
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -1170,6 +1235,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    surface_normal_features: bool = False   # outward surface normal (nx, ny) per surface node (+2 channels)
 
 
 cfg = sp.parse(Config)
@@ -1300,7 +1366,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + (2 if cfg.surface_normal_features else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], [+normals], +32 fourier PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1761,8 +1827,8 @@ for epoch in range(MAX_EPOCHS):
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
-        # TE coordinate frame / wake deficit: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature
+        # TE coordinate frame / wake deficit / surface normals: save raw xy and saf_norm before normalization
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.surface_normal_features
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
@@ -1794,6 +1860,9 @@ for epoch in range(MAX_EPOCHS):
                 wake_feats = compute_wake_deficit_features(
                     _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
                 x = torch.cat([x, wake_feats], dim=-1)
+        if cfg.surface_normal_features:
+            surf_normals = compute_surface_normals(_raw_xy_te, is_surface, _raw_saf_norm_te)
+            x = torch.cat([x, surf_normals], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2453,7 +2522,7 @@ for epoch in range(MAX_EPOCHS):
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
-                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature
+                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.surface_normal_features
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
                 _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -2484,6 +2553,9 @@ for epoch in range(MAX_EPOCHS):
                         wake_feats = compute_wake_deficit_features(
                             _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
                         x = torch.cat([x, wake_feats], dim=-1)
+                if cfg.surface_normal_features:
+                    surf_normals = compute_surface_normals(_raw_xy_te, is_surface, _raw_saf_norm_te)
+                    x = torch.cat([x, surf_normals], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2867,7 +2939,7 @@ if best_metrics:
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
-                    _need_te_raw_vis = cfg.te_coord_frame or cfg.wake_deficit_feature
+                    _need_te_raw_vis = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.surface_normal_features
                     _raw_xy_te_vis = x_dev[:, :, :2].clone() if _need_te_raw_vis else None
                     _raw_saf_norm_te_vis = x_dev[:, :, 2:4].norm(dim=-1) if _need_te_raw_vis else None
                     _raw_gap_wake_vis = x_dev[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -2888,6 +2960,9 @@ if best_metrics:
                             wake_feats_vis = compute_wake_deficit_features(
                                 _raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis, _raw_gap_wake_vis)
                             x_n = torch.cat([x_n, wake_feats_vis], dim=-1)
+                    if cfg.surface_normal_features:
+                        surf_normals_vis = compute_surface_normals(_raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis)
+                        x_n = torch.cat([x_n, surf_normals_vis], dim=-1)
                     # Fourier PE (must match training loop)
                     raw_xy = x_n[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
@@ -2982,7 +3057,7 @@ if cfg.surface_refine and best_metrics:
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
-                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature
+                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.surface_normal_features
                     _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
                     _raw_gap_wake_vv = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -3006,6 +3081,9 @@ if cfg.surface_refine and best_metrics:
                             wake_feats_vv = compute_wake_deficit_features(
                                 _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake_vv)
                             x = torch.cat([x, wake_feats_vv], dim=-1)
+                    if cfg.surface_normal_features:
+                        surf_normals_vv = compute_surface_normals(_raw_xy_te, is_surface, _raw_saf_norm_te)
+                        x = torch.cat([x, surf_normals_vv], dim=-1)
                     raw_xy = x[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
                     xy_max = raw_xy.amax(dim=1, keepdim=True)
