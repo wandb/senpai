@@ -1168,6 +1168,7 @@ class Config:
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    focal_sample_gamma: float = 0.0         # focal-style per-sample loss reweighting; 0=disabled
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
 
@@ -1657,6 +1658,7 @@ for epoch in range(MAX_EPOCHS):
         aft_srf_ctx_head.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
+    epoch_focal_std = 0.0
     n_batches = 0
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
@@ -2016,6 +2018,13 @@ for epoch in range(MAX_EPOCHS):
             hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
             surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        # Focal sample reweighting: upweight hard samples by (loss_i / mean_loss)^gamma
+        if cfg.focal_sample_gamma > 0.0:
+            _focal_mean = surf_per_sample.detach().mean().clamp(min=1e-8)
+            focal_w = (surf_per_sample.detach() / _focal_mean).pow(cfg.focal_sample_gamma)
+            focal_w = focal_w / focal_w.mean()  # normalize to preserve gradient scale
+            surf_per_sample = surf_per_sample * focal_w
+            epoch_focal_std += focal_w.std().item()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         if cfg.tandem_ramp:
             tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
@@ -2260,6 +2269,10 @@ for epoch in range(MAX_EPOCHS):
             abs_err2 = (pred2 - y_norm).abs()
             vol_loss2 = (abs_err2 * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
             surf_ps2 = (abs_err2[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            if cfg.focal_sample_gamma > 0.0:
+                _fm2 = surf_ps2.detach().mean().clamp(min=1e-8)
+                _fw2 = (surf_ps2.detach() / _fm2).pow(cfg.focal_sample_gamma)
+                surf_ps2 = surf_ps2 * (_fw2 / _fw2.mean())
             surf_loss2 = (surf_ps2 * tandem_boost).mean()
             re_loss2 = F.mse_loss(re_pred2, log_re_target)
             aoa_loss2 = F.mse_loss(aoa_pred2, aoa_target)
@@ -2384,13 +2397,16 @@ for epoch in range(MAX_EPOCHS):
     _do_val = (epoch + 1) % cfg.val_every == 0 or epoch == 0 or epoch == MAX_EPOCHS - 1
     if not _do_val:
         dt = time.time() - t0
-        wandb.log({
+        _log = {
             "train/vol_loss": epoch_vol,
             "train/surf_loss": epoch_surf,
             "epoch_time_s": dt,
             "lr": scheduler.get_last_lr()[0],
             "global_step": global_step,
-        })
+        }
+        if cfg.focal_sample_gamma > 0.0:
+            _log["train/focal_weight_std"] = epoch_focal_std / max(n_batches, 1)
+        wandb.log(_log)
         print(f"Epoch {epoch+1:3d} ({dt:.0f}s)  train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  [val skipped]")
         continue
 
@@ -2764,6 +2780,8 @@ for epoch in range(MAX_EPOCHS):
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
+    if cfg.focal_sample_gamma > 0.0:
+        metrics["train/focal_weight_std"] = epoch_focal_std / max(n_batches, 1)
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
