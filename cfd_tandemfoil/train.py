@@ -594,6 +594,49 @@ class AftFoilRefinementHead(nn.Module):
         return x
 
 
+class ForeSurfaceCrossAttention(nn.Module):
+    """Per-node cross-attention from aft-foil surface to fore-foil surface hidden states.
+
+    Each aft-foil node queries the full fore-foil surface to get a wake-context vector.
+    Zero-init output projection for safe additive integration with AftSRF.
+    """
+
+    def __init__(self, n_hidden: int, d_attn: int = 64, n_heads: int = 4):
+        super().__init__()
+        assert d_attn % n_heads == 0
+        self.d_attn = d_attn
+        self.n_heads = n_heads
+        self.d_head = d_attn // n_heads
+        self.q_proj = nn.Linear(n_hidden, d_attn, bias=False)
+        self.k_proj = nn.Linear(n_hidden, d_attn, bias=False)
+        self.v_proj = nn.Linear(n_hidden, d_attn, bias=False)
+        self.out_proj = nn.Linear(d_attn, n_hidden)
+        # Small Q/K init to prevent attention entropy collapse with small d_attn
+        nn.init.normal_(self.q_proj.weight, std=0.02)
+        nn.init.normal_(self.k_proj.weight, std=0.02)
+        # Zero-init output: model starts as pure AftSRF, cross-attn is a no-op at epoch 0
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, aft_h: torch.Tensor, fore_h: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            aft_h:  [A, n_hidden] -- aft-foil surface node hidden states
+            fore_h: [F, n_hidden] -- fore-foil surface node hidden states
+        Returns:
+            [A, n_hidden] -- per-aft-node context vector (zero at init)
+        """
+        A, F = aft_h.shape[0], fore_h.shape[0]
+        H, D = self.n_heads, self.d_head
+        Q = self.q_proj(aft_h).view(A, H, D).transpose(0, 1)   # [H, A, D]
+        K = self.k_proj(fore_h).view(F, H, D).transpose(0, 1)  # [H, F, D]
+        V = self.v_proj(fore_h).view(F, H, D).transpose(0, 1)  # [H, F, D]
+        scores = torch.bmm(Q, K.transpose(1, 2)) / (D ** 0.5)  # [H, A, F]
+        attn = torch.softmax(scores, dim=-1)                     # [H, A, F]
+        ctx = torch.bmm(attn, V).transpose(0, 1).reshape(A, self.d_attn)  # [A, d_attn]
+        return self.out_proj(ctx)                                # [A, n_hidden]
+
+
 class AftFoilRefinementContextHead(nn.Module):
     """Aft-foil refinement head with KNN volume context for wake pressure recovery.
 
@@ -1120,6 +1163,9 @@ class Config:
     aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
     aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
     aft_foil_srf_context: bool = False       # KNN volume context for aft-foil SRF (wake pressure recovery)
+    aft_srf_fore_crossattn: bool = False     # additive fore->aft cross-attn context in AftSRF
+    aft_srf_crossattn_dim: int = 64          # attention projection dimension (d_attn)
+    aft_srf_crossattn_heads: int = 4         # number of attention heads
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
@@ -1341,11 +1387,28 @@ if cfg.aft_foil_srf:
             n_layers=cfg.aft_foil_srf_layers,
             film=cfg.aft_foil_srf_film,
         ).to(device)
-        aft_srf_head = torch.compile(aft_srf_head, mode=cfg.compile_mode)
+        # Skip compile when cross-attention is active: compiled aft_srf_head + dynamic
+        # cross-attention tensors triggers intermittent cudaErrorIllegalAddress
+        if not cfg.aft_srf_fore_crossattn:
+            aft_srf_head = torch.compile(aft_srf_head, mode=cfg.compile_mode)
         _aft_n_params = sum(p.numel() for p in aft_srf_head.parameters())
         print(f"Aft-foil SRF head: {_aft_n_params:,} params "
               f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, "
-              f"film={cfg.aft_foil_srf_film})")
+              f"film={cfg.aft_foil_srf_film}, compiled={not cfg.aft_srf_fore_crossattn})")
+
+# Fore->aft cross-attention module for AftSRF enrichment
+fore_crossattn = None
+ema_fore_crossattn = None
+if cfg.aft_srf_fore_crossattn and cfg.aft_foil_srf:
+    fore_crossattn = ForeSurfaceCrossAttention(
+        n_hidden=cfg.n_hidden,
+        d_attn=cfg.aft_srf_crossattn_dim,
+        n_heads=cfg.aft_srf_crossattn_heads,
+    ).to(device)
+    # Not compiled: variable fore/aft node counts per sample cause shape mismatches with torch.compile
+    _xattn_n_params = sum(p.numel() for p in fore_crossattn.parameters())
+    print(f"Fore->aft cross-attention: {_xattn_n_params:,} params "
+          f"(d_attn={cfg.aft_srf_crossattn_dim}, heads={cfg.aft_srf_crossattn_heads})")
 
 from copy import deepcopy
 ema_model = None
@@ -1372,6 +1435,8 @@ if aft_srf_head is not None:
     n_params += sum(p.numel() for p in aft_srf_head.parameters())
 if aft_srf_ctx_head is not None:
     n_params += sum(p.numel() for p in aft_srf_ctx_head.parameters())
+if fore_crossattn is not None:
+    n_params += sum(p.numel() for p in fore_crossattn.parameters())
 
 
 class SAM:
@@ -1512,6 +1577,10 @@ if aft_srf_ctx_head is not None:
     _ctx_params = list(aft_srf_ctx_head.parameters())
     base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
+if fore_crossattn is not None:
+    _xattn_params = list(fore_crossattn.parameters())
+    base_opt.add_param_group({'params': _xattn_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _xattn_params):,} fore->aft cross-attention params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
@@ -1609,6 +1678,8 @@ for epoch in range(MAX_EPOCHS):
         aft_srf_head.train()
     if aft_srf_ctx_head is not None:
         aft_srf_ctx_head.train()
+    if fore_crossattn is not None:
+        fore_crossattn.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
@@ -1888,6 +1959,26 @@ for epoch in range(MAX_EPOCHS):
             if aft_idx.numel() > 0:
                 aft_hidden = hidden[aft_idx[:, 0], aft_idx[:, 1]]  # [A, n_hidden]
                 aft_pred = pred[aft_idx[:, 0], aft_idx[:, 1]]      # [A, 3]
+
+                # Additive fore->aft cross-attention (per-sample, since attention is sample-local)
+                if fore_crossattn is not None:
+                    _fore_surf_mask = is_surface & (_raw_saf_norm <= 0.005) & _is_tandem.unsqueeze(1)
+                    # Clone hidden to break refs from compiled graph before per-sample loop
+                    _hidden_for_xattn = hidden.detach().clone()
+                    _aft_hidden_detached = aft_hidden.detach().clone()
+                    ctx_all = torch.zeros_like(aft_hidden)
+                    for b in range(_hidden_for_xattn.shape[0]):
+                        aft_b_mask = aft_idx[:, 0] == b
+                        fore_b_nodes = _fore_surf_mask[b].nonzero(as_tuple=True)[0]
+                        if aft_b_mask.sum() == 0 or fore_b_nodes.numel() == 0:
+                            continue
+                        aft_h_b = _aft_hidden_detached[aft_b_mask]
+                        fore_h_b = _hidden_for_xattn[b, fore_b_nodes]
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            ctx_b = fore_crossattn(aft_h_b, fore_h_b).float()
+                        ctx_all[aft_b_mask] = ctx_b
+                    aft_hidden = aft_hidden + ctx_all
+
                 # FiLM conditioning: expand gap/stagger per aft-foil node
                 _aft_cond = None
                 if cfg.aft_foil_srf_film:
@@ -2252,6 +2343,15 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for fore->aft cross-attention
+            if fore_crossattn is not None:
+                _xattn_base = fore_crossattn._orig_mod if hasattr(fore_crossattn, '_orig_mod') else fore_crossattn
+                if ema_fore_crossattn is None:
+                    ema_fore_crossattn = deepcopy(_xattn_base)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_fore_crossattn.parameters(), _xattn_base.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -2372,6 +2472,14 @@ for epoch in range(MAX_EPOCHS):
             eval_aft_srf_ctx_head.eval()
         else:
             aft_srf_ctx_head.eval()
+    # Select fore->aft cross-attention for eval (EMA if available)
+    eval_fore_crossattn = fore_crossattn
+    if fore_crossattn is not None:
+        if ema_fore_crossattn is not None and ema_model is not None and eval_model is ema_model:
+            eval_fore_crossattn = ema_fore_crossattn
+            eval_fore_crossattn.eval()
+        else:
+            fore_crossattn.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -2548,6 +2656,25 @@ for epoch in range(MAX_EPOCHS):
                     if aft_idx.numel() > 0:
                         _ah = _eval_hidden[aft_idx[:, 0], aft_idx[:, 1]]
                         _ap = pred_loss[aft_idx[:, 0], aft_idx[:, 1]]
+
+                        # Additive fore->aft cross-attention (eval path)
+                        if eval_fore_crossattn is not None:
+                            _fore_surf_mask_v = is_surface & (_v_saf_norm <= 0.005) & _v_is_tandem.unsqueeze(1)
+                            _eval_hidden_xattn = _eval_hidden.clone()
+                            _ah_xattn = _ah.clone()
+                            _ctx_all = torch.zeros_like(_ah)
+                            for b in range(x.shape[0]):
+                                _ab_mask = aft_idx[:, 0] == b
+                                _fore_b = _fore_surf_mask_v[b].nonzero(as_tuple=True)[0]
+                                if _ab_mask.sum() == 0 or _fore_b.numel() == 0:
+                                    continue
+                                _ah_b = _ah_xattn[_ab_mask]
+                                _fh_b = _eval_hidden_xattn[b, _fore_b]
+                                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                    _ctx_b = eval_fore_crossattn(_ah_b, _fh_b).float()
+                                _ctx_all[_ab_mask] = _ctx_b
+                            _ah = _ah + _ctx_all
+
                         _ac = _v_gap_stagger[aft_idx[:, 0]] if cfg.aft_foil_srf_film else None
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                             _aft_corr = eval_aft_srf_head(_ah, _ap, _ac).float()
@@ -2736,6 +2863,11 @@ for epoch in range(MAX_EPOCHS):
                 aft_srf_ctx_head._orig_mod if hasattr(aft_srf_ctx_head, '_orig_mod') else aft_srf_ctx_head
             )
             torch.save(_ctx_save.state_dict(), model_dir / "aft_srf_ctx_head.pt")
+        if fore_crossattn is not None:
+            _xattn_save = ema_fore_crossattn if ema_fore_crossattn is not None else (
+                fore_crossattn._orig_mod if hasattr(fore_crossattn, '_orig_mod') else fore_crossattn
+            )
+            torch.save(_xattn_save.state_dict(), model_dir / "fore_crossattn.pt")
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
