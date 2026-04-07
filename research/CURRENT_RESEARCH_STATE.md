@@ -54,11 +54,11 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | edward | #2243 | Spectral Norm SRF: Lipschitz constraint on output heads | WIP (just assigned) |
 | fern | #2244 | Higher EMA Decay: 0.9995 for longer-memory averaging | WIP (just assigned) |
 | nezuko | #2246 | Higher Weight Decay: 5e-4 for stronger regularization | WIP (just assigned) |
-| alphonse | — | **IDLE** — awaiting assignment | — |
+| alphonse | #2250 | Blended L1+L2 Surface Loss: MSE auxiliary (alpha=0.1) | WIP (just assigned) |
 | tanjiro | #2218 | LE Coordinate Frame v3: single chordwise ratio le/(le+te) | WIP |
 | askeladd | #2247 | Higher Learning Rate: 3e-4 for broader exploration | WIP (just assigned) |
 
-**Idle students:** alphonse.
+**Idle students:** None.
 
 ## PRs Ready for Review
 None currently.
