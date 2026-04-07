@@ -54,7 +54,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | edward | #2243 | Spectral Norm SRF: Lipschitz constraint on output heads | WIP (just assigned) |
 | fern | #2244 | Higher EMA Decay: 0.9995 for longer-memory averaging | WIP (just assigned) |
 | nezuko | #2237 | Manifold Mixup: feature-level interpolation for OOD generalization | WIP |
-| alphonse | #2240 | Deeper Backbone: 4 TransolverBlocks for increased capacity | WIP (just assigned) |
+| alphonse | — | **IDLE** — needs new assignment | IDLE |
 | tanjiro | #2218 | LE Coordinate Frame v3: single chordwise ratio le/(le+te) | WIP |
 | askeladd | #2241 | Lookahead Optimizer: slow-weight averaging wrapper for Lion | WIP (just assigned) |
 
@@ -108,6 +108,7 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2240 (alphonse): Deeper Backbone 4L — undertrained (118 vs 145 epochs), infeasible in wall-clock budget; all metrics +2-12%
 - PR #2234 (fern): SWA Training — uniform averaging dilutes converged weights; EMA superior; p_in +54.9%
 - PR #2238 (frieren): Cosine Warm Restarts — T_0=40 too short, third cycle cut at high LR; all metrics +8-19%
 - PR #2233 (edward): Re Input Augmentation — Re is critical signal, σ=0.1 too large; p_re +4.5% (target metric worse)

@@ -2,6 +2,22 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 12:45 — PR #2240: Deeper Backbone (4 TransolverBlocks) — alphonse — **CLOSED** (undertrained, all metrics worse)
+- Branch: `alphonse/deeper-backbone`
+- Hypothesis: Increase model capacity by adding 4th TransolverBlock. VRAM headroom (46→55GB). cosine_T_max=120 for reduced epoch budget.
+
+| Metric | Baseline (#2213, 3L) | Seed 42 (2xd7vf84) | Seed 73 (dqupxvd5) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 12.621 | 14.096 | **13.358** | **+11.5% ✗✗** |
+| p_oodc | 7.643 | 8.177 | 8.879 | **8.528** | **+11.6% ✗✗** |
+| p_tan | 28.341 | 28.884 | 28.624 | **28.754** | +1.5% ✗ |
+| p_re | 6.300 | 6.323 | 7.186 | **6.754** | **+7.2% ✗** |
+
+- **Analysis:** Only 118-119 epochs achieved (vs ~145 for 3-layer) due to ~91s/epoch (vs 73s). Model still declining at timeout — undertrained, not conclusive. Seed 42 nearly matched baseline on p_re (6.32 vs 6.30). VRAM: 54.8GB. High seed variance (1.5 units p_in gap between seeds) suggests 4-layer landscape is less stable. cosine_T_max=120 may have been set too aggressively.
+- **Conclusion:** CLOSED. 4-layer model infeasible within current wall-clock budget. 3-layer well-matched to training constraints.
+
+---
+
 ### 2026-04-07 12:00 — PR #2234: SWA Training — fern — **CLOSED** (all metrics worse, p_in +54.9%)
 - Branch: `fern/swa-training`
 - Hypothesis: Stochastic Weight Averaging (epochs 100+, swa_lr=5e-5). Uniform weight averaging across SWA phase for wider optima.
