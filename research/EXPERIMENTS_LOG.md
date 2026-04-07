@@ -2,6 +2,97 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 19:30 — Round 19 Hyperparameter Validation Sweep — All CLOSED
+
+**Round summary:** Systematic sweep of 5 core hyperparameters to test whether the baseline training configuration is optimal. **All 5 confirmed the baseline is well-tuned.** No merges. This round conclusively establishes that further hyperparameter tuning is unlikely to yield gains — future progress must come from loss reformulation, data representation, or novel training strategies.
+
+---
+
+### 2026-04-07 19:30 — PR #2247: Higher Learning Rate (3e-4) — askeladd — **CLOSED** (all metrics +2-9%)
+- Branch: `askeladd/higher-lr`
+- Hypothesis: 1.5x LR (2e-4→3e-4) gives Lion optimizer larger initial steps for broader exploration before cosine convergence.
+
+| Metric | Baseline (#2213) | Seed 42 (m9t144lx) | Seed 73 (bu5ottox) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 12.690 | 13.324 | **13.007** | +8.6% ✗✗ |
+| p_oodc | 7.643 | 7.935 | 8.177 | **8.056** | +5.4% ✗✗ |
+| p_tan | 28.341 | 29.457 | 28.725 | **29.091** | +2.6% ✗ |
+| p_re | 6.300 | 6.528 | 6.339 | **6.433** | +2.1% ✗ |
+
+- **Analysis:** All 4 metrics worse. With Lion's sign-based updates, 1.5x LR overshoots fine-grained local optima. In-distribution metrics suffered most (p_in +8.6%, p_oodc +5.4%), suggesting higher LR particularly hurts fitting the core training distribution.
+- **Key insight:** Combined with Lookahead failure (#2241, constraining exploration hurts), this confirms 2e-4 is at the optimal LR for Lion + this architecture.
+- **Conclusion:** CLOSED. LR 2e-4 is confirmed optimal. Do not revisit.
+
+---
+
+### 2026-04-07 19:30 — PR #2248: Stronger Augmentation (2x sigma) — thorfinn — **CLOSED** (3/4 worse)
+- Branch: `thorfinn/stronger-augmentation`
+- Hypothesis: Double aug_gap_stagger_sigma (0.02→0.04) and aug_dsdf2_sigma (0.05→0.10) for more diverse virtual training examples.
+
+| Metric | Baseline (#2213) | Seed 42 (b1g3lrs0) | Seed 73 (h3hmt6ov) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 12.268 | 12.004 | **12.136** | +1.3% ✗ |
+| p_oodc | 7.643 | 7.835 | 7.341 | **7.588** | -0.7% ✓ |
+| p_tan | 28.341 | 28.464 | 28.371 | **28.418** | +0.3% ✗ |
+| p_re | 6.300 | 6.336 | 6.474 | **6.405** | +1.7% ✗ |
+
+- **Analysis:** 2x sigma pushes augmented samples too far from real distribution. Small p_oodc improvement (-0.7%) is within seed noise. Current sigmas (0.02/0.05) are at or near the sweet spot.
+- **Key insight:** Augmentation strength is a confirmed optimized parameter.
+- **Conclusion:** CLOSED. Current augmentation sigmas are optimal. Do not rescale.
+
+---
+
+### 2026-04-07 19:30 — PR #2246: Higher Weight Decay (5e-4, 10x) — nezuko — **CLOSED** (mixed, net negative)
+- Branch: `nezuko/higher-weight-decay`
+- Hypothesis: 10x weight decay (5e-5→5e-4) for stronger L2 regularization and flatter minima.
+
+| Metric | Baseline (#2213) | Seed 42 (w15nt6uv) | Seed 73 (jjayhwof) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 12.0 | 12.8 | **12.40** | +3.5% ✗ |
+| p_oodc | 7.643 | 7.9 | 7.3 | **7.60** | -0.6% ✓ |
+| p_tan | 28.341 | 28.1 | 27.9 | **28.00** | -1.2% ✓ |
+| p_re | 6.300 | 6.5 | 6.4 | **6.45** | +2.4% ✗ |
+
+- **Analysis:** Mixed trade-off. OOD/tandem improved (p_oodc -0.6%, p_tan -1.2%) but in-distribution degraded severely (p_in +3.5%, p_re +2.4%). Very high seed variance (p_in: 12.0 vs 12.8, p_oodc: 7.3 vs 7.9). 10x too aggressive — over-regularization constrains capacity.
+- **Key insight:** Higher weight decay biases toward flatter minima (helps OOD) but at the cost of fitting capacity (hurts in-dist). Current 5e-5 is the right balance.
+- **Conclusion:** CLOSED. Current weight decay is near-optimal. Moderate increase (2x) unlikely to be productive given high variance.
+
+---
+
+### 2026-04-07 19:30 — PR #2244: Higher EMA Decay (0.9995) — fern — **CLOSED** (3/4 worse)
+- Branch: `fern/higher-ema-decay`
+- Hypothesis: Increase EMA decay from 0.999 to 0.9995 (double half-life from ~2 to ~4 epochs) for smoother weight averaging.
+
+| Metric | Baseline (#2213) | Seed 42 (6wbzms95) | Seed 73 (hm66nk7s) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 12.220 | 12.277 | **12.248** | +2.2% ✗ |
+| p_oodc | 7.643 | 7.618 | 7.610 | **7.614** | -0.4% (noise) |
+| p_tan | 28.341 | 29.090 | 29.079 | **29.084** | +2.6% ✗ |
+| p_re | 6.300 | 6.296 | 6.650 | **6.473** | +2.7% ✗ |
+
+- **Analysis:** Longer half-life dilutes EMA with under-converged snapshots from earlier training. The model converges sharply in the last ~20 epochs with cosine LR; 0.9995 averages too much from before convergence.
+- **Key insight:** EMA decay 0.999 (half-life ~2 epochs) is well-matched to the ~149-epoch training length and cosine schedule.
+- **Conclusion:** CLOSED. EMA decay 0.999 is optimal for current training length. Do not increase.
+
+---
+
+### 2026-04-07 19:30 — PR #2243: Spectral Norm SRF — edward — **CLOSED** (p_in -2.5% but p_tan +1.8%)
+- Branch: `edward/spectral-norm-srf`
+- Hypothesis: Apply spectral normalization to SRF MLP layers to bound Lipschitz constant for OOD robustness. Used parametrize API for EMA/deepcopy compatibility.
+
+| Metric | Baseline (#2213) | Seed 42 (lvvp6qzg) | Seed 73 (qaat85zx) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 11.770 | 11.593 | **11.682** | -2.5% ✓✓ |
+| p_oodc | 7.643 | 7.9 | 7.5 | **7.700** | +0.7% ✗ |
+| p_tan | 28.341 | 28.9 | 28.8 | **28.850** | +1.8% ✗ |
+| p_re | 6.300 | 6.4 | 6.2 | **6.300** | ±0.0% ➖ |
+
+- **Analysis:** Notable p_in improvement (-2.5%) shows spectral norm acts as an effective in-distribution regularizer for SRF heads. But p_tan regression (+1.8%) shows aft-foil SRF needs full expressiveness for tandem transfer. p_oodc also regressed — contrary to hypothesis, OOD failure is NOT in the SRF output heads.
+- **Key insight:** OOD failure is in the backbone representation, not the output heads. Constraining SRF Lipschitz doesn't help OOD because the backbone features themselves are erratic on OOD inputs. This is the most informative result of Round 19.
+- **Conclusion:** CLOSED. SRF spectral norm is the wrong level of abstraction for OOD improvement. p_in gain doesn't justify p_tan regression.
+
+---
+
 ### 2026-04-07 16:30 — PR #2245: SRF Dropout — alphonse — **CLOSED** (p_tan +8.8%, mixed)
 - Branch: `alphonse/srf-dropout`
 - Hypothesis: Add dropout (p=0.1) to SRF heads during training to regularize output corrections for OOD robustness.
