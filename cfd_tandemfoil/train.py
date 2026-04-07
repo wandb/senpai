@@ -1117,6 +1117,7 @@ class Config:
     # Phase 6: Dedicated aft-foil surface refinement head (boundary ID=7 nodes only)
     aft_foil_srf: bool = False               # enable second SRF head for aft-foil (ID=7) nodes
     aft_foil_srf_film: bool = False          # FiLM conditioning on gap/stagger for aft-foil head
+    aft_srf_fore_skip: bool = False          # inject fore-foil mean surface hidden into AftSRF input (zero-init)
     aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
     aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
     aft_foil_srf_context: bool = False       # KNN volume context for aft-foil SRF (wake pressure recovery)
@@ -1347,10 +1348,20 @@ if cfg.aft_foil_srf:
               f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, "
               f"film={cfg.aft_foil_srf_film})")
 
+# Fore-to-aft surface context projection (zero-init — fore skip connection)
+fore_to_aft_proj = None
+if cfg.aft_srf_fore_skip and aft_srf_head is not None:
+    fore_to_aft_proj = nn.Linear(cfg.n_hidden, cfg.n_hidden, bias=False).to(device)
+    nn.init.zeros_(fore_to_aft_proj.weight)
+    fore_to_aft_proj = torch.compile(fore_to_aft_proj, mode=cfg.compile_mode)
+    _proj_n = sum(p.numel() for p in fore_to_aft_proj.parameters())
+    print(f"Fore-to-aft skip projection: {_proj_n:,} params (zero-init)")
+
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
 ema_aft_srf_head = None  # EMA copy of aft-foil SRF head
+ema_fore_to_aft_proj = None  # EMA copy of fore-to-aft projection
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -1506,6 +1517,8 @@ if refine_head is not None:
 # Add aft-foil SRF head params to optimizer if enabled
 if aft_srf_head is not None:
     _aft_params = list(aft_srf_head.parameters())
+    if fore_to_aft_proj is not None:
+        _aft_params.extend(list(fore_to_aft_proj.parameters()))
     base_opt.add_param_group({'params': _aft_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _aft_params):,} aft-foil SRF head params to optimizer")
 if aft_srf_ctx_head is not None:
@@ -1888,6 +1901,19 @@ for epoch in range(MAX_EPOCHS):
             if aft_idx.numel() > 0:
                 aft_hidden = hidden[aft_idx[:, 0], aft_idx[:, 1]]  # [A, n_hidden]
                 aft_pred = pred[aft_idx[:, 0], aft_idx[:, 1]]      # [A, 3]
+                # Fore-foil skip: inject fore-foil mean surface hidden into aft hidden
+                if fore_to_aft_proj is not None:
+                    _fore_foil_mask = is_surface & (_raw_saf_norm <= 0.005) & _is_tandem.unsqueeze(1)
+                    enriched = aft_hidden.clone()
+                    for b in aft_idx[:, 0].unique():
+                        fore_b = _fore_foil_mask[b].nonzero(as_tuple=True)[0]
+                        if fore_b.numel() > 0:
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                fore_mean = hidden[b, fore_b].detach().mean(dim=0)  # [n_hidden]
+                                fore_ctx = fore_to_aft_proj(fore_mean)              # [n_hidden]
+                            b_mask = (aft_idx[:, 0] == b)
+                            enriched[b_mask] = enriched[b_mask] + fore_ctx.float()
+                    aft_hidden = enriched
                 # FiLM conditioning: expand gap/stagger per aft-foil node
                 _aft_cond = None
                 if cfg.aft_foil_srf_film:
@@ -2244,6 +2270,14 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _aft_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            if fore_to_aft_proj is not None:
+                _fwd_base = fore_to_aft_proj._orig_mod if hasattr(fore_to_aft_proj, '_orig_mod') else fore_to_aft_proj
+                if ema_fore_to_aft_proj is None:
+                    ema_fore_to_aft_proj = deepcopy(_fwd_base)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_fore_to_aft_proj.parameters(), _fwd_base.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
             if aft_srf_ctx_head is not None:
                 _ctx_base = aft_srf_ctx_head._orig_mod if hasattr(aft_srf_ctx_head, '_orig_mod') else aft_srf_ctx_head
                 if ema_aft_srf_head is None:
@@ -2360,12 +2394,19 @@ for epoch in range(MAX_EPOCHS):
     # Select aft-foil SRF head for eval (EMA if available)
     eval_aft_srf_head = aft_srf_head
     eval_aft_srf_ctx_head = aft_srf_ctx_head
+    eval_fore_to_aft_proj = fore_to_aft_proj
     if aft_srf_head is not None:
         if ema_aft_srf_head is not None and ema_model is not None and eval_model is ema_model:
             eval_aft_srf_head = ema_aft_srf_head
             eval_aft_srf_head.eval()
         elif aft_srf_head is not None:
             aft_srf_head.eval()
+    if fore_to_aft_proj is not None:
+        if ema_fore_to_aft_proj is not None and ema_model is not None and eval_model is ema_model:
+            eval_fore_to_aft_proj = ema_fore_to_aft_proj
+            eval_fore_to_aft_proj.eval()
+        else:
+            fore_to_aft_proj.eval()
     if aft_srf_ctx_head is not None:
         if ema_aft_srf_head is not None and ema_model is not None and eval_model is ema_model:
             eval_aft_srf_ctx_head = ema_aft_srf_head
@@ -2547,6 +2588,19 @@ for epoch in range(MAX_EPOCHS):
                     aft_idx = _eval_aft_mask.nonzero(as_tuple=False)
                     if aft_idx.numel() > 0:
                         _ah = _eval_hidden[aft_idx[:, 0], aft_idx[:, 1]]
+                        # Fore-foil skip: inject fore-foil mean surface hidden into aft hidden
+                        if eval_fore_to_aft_proj is not None:
+                            _v_fore_mask = is_surface & (_v_saf_norm <= 0.005) & _v_is_tandem.unsqueeze(1)
+                            _ah_enriched = _ah.clone()
+                            for b in aft_idx[:, 0].unique():
+                                fore_b = _v_fore_mask[b].nonzero(as_tuple=True)[0]
+                                if fore_b.numel() > 0:
+                                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                        fore_mean = _eval_hidden[b, fore_b].mean(dim=0)
+                                        fore_ctx = eval_fore_to_aft_proj(fore_mean)
+                                    b_mask = (aft_idx[:, 0] == b)
+                                    _ah_enriched[b_mask] = _ah_enriched[b_mask] + fore_ctx.float()
+                            _ah = _ah_enriched
                         _ap = pred_loss[aft_idx[:, 0], aft_idx[:, 1]]
                         _ac = _v_gap_stagger[aft_idx[:, 0]] if cfg.aft_foil_srf_film else None
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
