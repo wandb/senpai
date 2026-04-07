@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 01:00 — PR #2220: Slice Diversity Reg (Gram matrix orthogonality) — askeladd — **CLOSED** (all metrics regressed 5-10%)
+- Branch: `askeladd/slice-diversity-reg`
+- Hypothesis: Penalize cosine similarity between slice attention profiles via Gram matrix orthogonality loss `((G - I)^2).mean()` weighted by λ=0.005. Forces each of 96 slices to specialize in distinct spatial regions. Zero architecture change, inference-time free.
+
+| Metric | Baseline (#2207) | Seed 42 (2e2pvqll) | Seed 73 (gy4k4lpr) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 12.490 | 13.9 | 13.6 | **13.75** | **+10.1% ✗** |
+| p_oodc | 7.618 | 8.0 | 8.4 | **8.20** | **+7.6% ✗** |
+| p_tan | 28.521 | 30.9 | 29.1 | **30.00** | **+5.2% ✗** |
+| p_re | 6.411 | 6.8 | 7.0 | **6.90** | **+7.6% ✗** |
+
+- Training: 134 epochs (vs 148 baseline), 80s/epoch (vs 72s baseline). div_loss dropped steadily from 0.8→0.1 (diversity DID improve).
+- **Analysis:** Slice collapse is likely *beneficial* — the model concentrates multiple slices on critical regions (boundary layer, wake, pressure peaks) that need more representational capacity. Forcing diversity redistributes compute to well-predicted freestream regions. The diversity penalty creates opposing gradients against the main task loss. Slower convergence (134 vs 148 epochs) compounds the damage under timeout.
+- **Conclusion:** CLOSED. Slice attention diversity regularization direction exhausted. Slice routing is not the bottleneck — the model allocates slices intelligently via the task gradient alone.
+
+---
+
 ### 2026-04-06 23:00 — PR #2218: LE Coordinate Frame (+6 channels) — tanjiro — **SENT BACK** (mixed results, needs chord normalization)
 - Branch: `tanjiro/le-coord-frame`
 - Hypothesis: Leading-edge-relative coordinate features (+6 input channels: dx/dy/r from fore and aft LE) complement existing TE coordinate frame. LE is where stagnation point forms and wake impinges on aft foil. Pure input feature addition, mirrors TE coord frame implementation with min-x instead of max-x.

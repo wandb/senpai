@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-06 23:00 UTC
+- **Date:** 2026-04-07 01:00 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -56,7 +56,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | nezuko | #2217 | Fore-SRF Skip: inject fore-foil mean hidden into AftSRF input | WIP |
 | alphonse | #2219 | Additive Fore→Aft Cross-Attention in AftSRF | WIP |
 | tanjiro | #2218 | LE Coordinate Frame v2: chord-normalized LE + wake deficit rebase | WIP (sent back) |
-| askeladd | #2220 | Slice Diversity Reg: Gram matrix orthogonality on slice attention | WIP |
+| askeladd | #2225 | Domain-Split SRF Norm: tandem-conditional LayerNorm in AftSRF | WIP (just assigned) |
 
 **Idle students:** None (tanjiro sent back to iterate on #2218).
 
@@ -89,6 +89,7 @@ No new issues. Prior directives still in effect:
 **Theme 4: Training Dynamics and Attention Optimization**
 - In flight: slice diversity regularization (#2220), mHC learnable residual mixing (#2222)
 - GeoTransolver GALE (#2216): CLOSED — geometry cross-attention competes with slice-attention, all metrics regressed significantly
+- Slice diversity reg (#2220): CLOSED — forcing slice orthogonality hurts; slice collapse is beneficial (concentrates capacity on hard regions)
 
 **Theme 5: Architecture Dead Ends (DO NOT REVISIT)**
 - NOBLE/CosNet, register tokens, Ada-Temp, GNOT, Galerkin, Hierarchical, FactFormer, DeepONet, INR
@@ -107,6 +108,7 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2220 (askeladd): Slice Diversity Reg — forcing slice orthogonality harms all metrics +5-10%, slice collapse is beneficial
 - PR #2216 (thorfinn): GeoTransolver GALE — geometry cross-attention creates competing pathway, p_in +29%, all metrics worse
 - PR #2214 (edward): Deep Supervision — aux_loss never activated (redundant with --pressure_deep)
 - PR #2210 (fern): Arc-Length Surface Loss — conflicts with hard-node mining; p_in +14.2%
