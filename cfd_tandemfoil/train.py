@@ -1170,6 +1170,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    re_scaled_walldist: bool = False        # Re^(-1/2) scaled wall distance for BL thickness proxy (+1 channel)
 
 
 cfg = sp.parse(Config)
@@ -1300,7 +1301,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + (1 if cfg.re_scaled_walldist else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], [+re_scaled_wdist], +32 fourier PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1758,6 +1759,7 @@ for epoch in range(MAX_EPOCHS):
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
+        _raw_log_re = x[:, 0, 13].clone() if cfg.re_scaled_walldist else None  # log(Re) before normalization
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
@@ -1794,6 +1796,11 @@ for epoch in range(MAX_EPOCHS):
                 wake_feats = compute_wake_deficit_features(
                     _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
                 x = torch.cat([x, wake_feats], dim=-1)
+        if cfg.re_scaled_walldist:
+            # BL thickness proxy: wall_dist * Re^(-0.5) — encodes node position relative to BL
+            _re_factor = torch.exp(_raw_log_re * (-0.5)).clamp(max=1.0)[:, None, None]  # [B, 1, 1]
+            _bl_scaled = dist_surf * _re_factor  # [B, N, 1]
+            x = torch.cat([x, _bl_scaled], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2453,6 +2460,7 @@ for epoch in range(MAX_EPOCHS):
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
+                _raw_log_re_v = x[:, 0, 13].clone() if cfg.re_scaled_walldist else None
                 _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
@@ -2484,6 +2492,9 @@ for epoch in range(MAX_EPOCHS):
                         wake_feats = compute_wake_deficit_features(
                             _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
                         x = torch.cat([x, wake_feats], dim=-1)
+                if cfg.re_scaled_walldist:
+                    _re_factor_v = torch.exp(_raw_log_re_v * (-0.5)).clamp(max=1.0)[:, None, None]
+                    x = torch.cat([x, dist_surf * _re_factor_v], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2867,6 +2878,7 @@ if best_metrics:
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
+                    _raw_log_re_vis = x_dev[:, 0, 13].clone() if cfg.re_scaled_walldist else None
                     _need_te_raw_vis = cfg.te_coord_frame or cfg.wake_deficit_feature
                     _raw_xy_te_vis = x_dev[:, :, :2].clone() if _need_te_raw_vis else None
                     _raw_saf_norm_te_vis = x_dev[:, :, 2:4].norm(dim=-1) if _need_te_raw_vis else None
@@ -2888,6 +2900,9 @@ if best_metrics:
                             wake_feats_vis = compute_wake_deficit_features(
                                 _raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis, _raw_gap_wake_vis)
                             x_n = torch.cat([x_n, wake_feats_vis], dim=-1)
+                    if cfg.re_scaled_walldist:
+                        _re_factor_vis = torch.exp(_raw_log_re_vis * (-0.5)).clamp(max=1.0)[:, None, None]
+                        x_n = torch.cat([x_n, dist_surf * _re_factor_vis], dim=-1)
                     # Fourier PE (must match training loop)
                     raw_xy = x_n[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
@@ -2982,6 +2997,7 @@ if cfg.surface_refine and best_metrics:
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
+                    _raw_log_re_vv = x[:, 0, 13].clone() if cfg.re_scaled_walldist else None
                     _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature
                     _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
@@ -3006,6 +3022,9 @@ if cfg.surface_refine and best_metrics:
                             wake_feats_vv = compute_wake_deficit_features(
                                 _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake_vv)
                             x = torch.cat([x, wake_feats_vv], dim=-1)
+                    if cfg.re_scaled_walldist:
+                        _re_factor_vv = torch.exp(_raw_log_re_vv * (-0.5)).clamp(max=1.0)[:, None, None]
+                        x = torch.cat([x, dist_surf * _re_factor_vv], dim=-1)
                     raw_xy = x[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
                     xy_max = raw_xy.amax(dim=1, keepdim=True)
