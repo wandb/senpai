@@ -1170,6 +1170,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    l2_surface_weight: float = 0.0          # auxiliary L2 (MSE) surface loss weight added on top of L1; 0=disabled
 
 
 cfg = sp.parse(Config)
@@ -1657,6 +1658,7 @@ for epoch in range(MAX_EPOCHS):
         aft_srf_ctx_head.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
+    epoch_surf_l2 = 0.0
     n_batches = 0
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
@@ -2025,6 +2027,12 @@ for epoch in range(MAX_EPOCHS):
         else:
             tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
+        # Auxiliary L2 surface loss: adds MSE penalty for large errors on top of L1
+        _surf_l2_item = 0.0
+        if cfg.l2_surface_weight > 0.0:
+            surf_l2 = (sq_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            _surf_l2_item = surf_l2.item()
+            surf_loss = surf_loss + cfg.l2_surface_weight * surf_l2
         if cfg.uncertainty_loss:
             bm = _base_model
             surf_ux_loss = (abs_err[:, :, 0:1] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
@@ -2314,6 +2322,7 @@ for epoch in range(MAX_EPOCHS):
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
+        epoch_surf_l2 += _surf_l2_item
         n_batches += 1
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
@@ -2387,6 +2396,7 @@ for epoch in range(MAX_EPOCHS):
         wandb.log({
             "train/vol_loss": epoch_vol,
             "train/surf_loss": epoch_surf,
+            **({"train/surf_l2_loss": epoch_surf_l2} if cfg.l2_surface_weight > 0.0 else {}),
             "epoch_time_s": dt,
             "lr": scheduler.get_last_lr()[0],
             "global_step": global_step,
@@ -2755,6 +2765,7 @@ for epoch in range(MAX_EPOCHS):
     metrics = {
         "train/vol_loss": epoch_vol,
         "train/surf_loss": epoch_surf,
+        **({"train/surf_l2_loss": epoch_surf_l2} if cfg.l2_surface_weight > 0.0 else {}),
         "val/loss": val_loss_3split,
         "val/loss_3split": val_loss_3split,
         "val/loss_4split": val_loss_4split,
