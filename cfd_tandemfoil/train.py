@@ -1170,6 +1170,10 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    # Phase 7: EMA self-distillation
+    ema_self_distill: bool = False          # distill online model from EMA predictions (soft target regularizer)
+    distill_weight: float = 0.1            # weight for EMA distillation loss
+    distill_start_epoch: int = 20          # delay distillation until EMA has stabilized
 
 
 cfg = sp.parse(Config)
@@ -2120,6 +2124,19 @@ for epoch in range(MAX_EPOCHS):
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
 
+        # EMA self-distillation: push online model predictions toward EMA's stable predictions
+        _distill_loss = None
+        if cfg.ema_self_distill and model.training and ema_model is not None and epoch >= cfg.distill_start_epoch:
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _ema_out = ema_model({"x": x})
+                _ema_pred_p = (_ema_out["preds"].float() / sample_stds)[:, :, 2]  # surface pressure channel
+            _online_pred_p = pred[:, :, 2]  # same channel from online model (already float, /sample_stds applied)
+            _surf_valid = surf_mask  # [B, N] bool: surface nodes with valid labels
+            if _surf_valid.any():
+                _distill_loss = F.mse_loss(_online_pred_p[_surf_valid], _ema_pred_p[_surf_valid])
+                loss = loss + cfg.distill_weight * _distill_loss
+
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
@@ -2136,8 +2153,9 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            distill_shared = cfg.distill_weight * _distill_loss if _distill_loss is not None else 0.0
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + distill_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + distill_shared + 0.005 * re_loss + 0.005 * aoa_loss
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -2182,7 +2200,8 @@ for epoch in range(MAX_EPOCHS):
                 vol_loss_g = (abs_err * vol_mask_g.unsqueeze(-1)).sum() / vol_mask_g.sum().clamp(min=1)
                 surf_loss_g = (surf_per_sample * mask_1d.float() * tandem_boost).sum() / n
                 coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                distill_shared = cfg.distill_weight * _distill_loss if _distill_loss is not None else 0.0
+                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + distill_shared + 0.005 * re_loss + 0.005 * aoa_loss
 
             loss_A = _grp_loss(~is_tandem_batch)
             # Only include non-empty groups to avoid backward() on no-grad tensors
@@ -2310,7 +2329,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _step_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if _distill_loss is not None:
+            _step_log["train/distill_loss"] = _distill_loss.item()
+        wandb.log(_step_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
