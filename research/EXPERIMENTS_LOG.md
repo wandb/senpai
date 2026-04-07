@@ -3454,3 +3454,21 @@ Baseline (PR #2184): p_in=13.205, p_oodc=7.816, p_tan=28.502, p_re=6.453
 - GALE out_proj Frobenius norms: block 0=15.5, block 1=16.4, block 2=21.7 — large, meaning the geometry cross-attention actively contributed but harmfully.
 - **Analysis:** The geometry latent creates a competing information pathway that the slice-attention has to reconcile, hurting not helping. The Transolver's existing slice-attention already captures geometry via spatial bias + DSDF features implicitly. Explicit geometry latent injection is redundant and noisy. +3.9 GB VRAM overhead for a negative result.
 - **Conclusion:** CLOSED. The approach of injecting global geometry via cross-attention is incompatible with this architecture. Lighter-touch geometry conditioning (AdaLN, frozen encoder) suggested by student but the magnitude of regression across ALL metrics makes this family of ideas low-priority.
+
+---
+
+## 2026-04-07 20:30 — PR #2249: Online Hard Node Mining: error-weighted surface loss
+- Branch: `frieren/online-hard-node-mining`
+- Hypothesis: Weight each surface node's loss contribution by its current prediction error (detached), analogous to focal loss (Lin et al. 2017) and OHEM (Shrivastava et al. 2016) for regression. gamma=1.0 (linear error weighting), mean-normalized so total loss magnitude stays comparable to baseline. Applied only to surface MAE loss, not DCT/volume/SRF losses.
+
+| Metric | Baseline (PR #2213) | Seed 42 (wugogei0) | Seed 73 (9xl8ixv0) | 2-seed avg | Δ vs baseline |
+|--------|--------------------|--------------------|--------------------|-----------:|:-------------|
+| p_in | 11.979 | 11.903 | 12.319 | **12.111** | +1.1% ❌ |
+| p_oodc | 7.643 | 8.414 | 7.988 | **8.201** | +7.3% ❌ |
+| p_tan | 28.341 | 28.755 | 28.816 | **28.786** | +1.6% ❌ |
+| p_re | 6.300 | 6.766 | 6.772 | **6.769** | +7.4% ❌ |
+
+- W&B runs: `wugogei0` (seed 42, 148 epochs, best epoch 147, 180 min), `9xl8ixv0` (seed 73, 148 epochs, best epoch 147, 181 min). Both runs completed normally with no divergence.
+- **Decision: CLOSED — clear dead end.** All four metrics regressed, OOD metrics (p_oodc +7.3%, p_re +7.4%) hurt most. Results verified against W&B and match student report exactly.
+- **Analysis:** The baseline already implements asymmetric hard-node mining (epoch ≥30: 1.5× weight for above-median-error nodes on non-tandem samples). Stacking OHNM multiplicatively creates effective node weights of 3-5× — extreme gradient concentration on a small subset that overfits to specific training-distribution hard nodes (suction peaks, stagnation patterns) while sacrificing OOD generalization. The two mechanisms interfere rather than complement.
+- **Key insight:** The baseline is already well-optimized for hard nodes via: (1) existing asymmetric mining, (2) surface refinement heads, (3) pressure-first architecture. Additional error-weighting schemes are redundant and harmful when the baseline already addresses this. Any future hard-node mining must account for and potentially replace (not stack on) the existing mechanism.
