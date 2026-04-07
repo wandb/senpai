@@ -2,6 +2,22 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 12:00 — PR #2234: SWA Training — fern — **CLOSED** (all metrics worse, p_in +54.9%)
+- Branch: `fern/swa-training`
+- Hypothesis: Stochastic Weight Averaging (epochs 100+, swa_lr=5e-5). Uniform weight averaging across SWA phase for wider optima.
+
+| Metric | Baseline (#2213) | Seed 42 (btknscaj) | Seed 73 (g2griuf2) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 19.1 | 18.0 | **18.550** | **+54.9% ✗✗✗** |
+| p_oodc | 7.643 | 8.7 | 8.6 | **8.650** | **+13.2% ✗✗** |
+| p_tan | 28.341 | 33.2 | 32.4 | **32.800** | **+15.7% ✗✗** |
+| p_re | 6.300 | 7.3 | 7.4 | **7.350** | **+16.7% ✗✗** |
+
+- **Analysis:** SWA's uniform averaging dilutes well-converged late-epoch weights with transitional snapshots from the LR switch at epoch 100. Existing EMA (0.999) naturally upweights recent, better-converged weights — strictly superior for this training regime. LR discontinuity (cosine→constant 5e-5) creates instability contaminating the SWA average. The Transolver's slice-routing mechanism creates a complex landscape where weight-space averaging may not correspond to function-space averaging.
+- **Conclusion:** CLOSED. EMA is the superior averaging method for this model. SWA's uniform averaging is harmful.
+
+---
+
 ### 2026-04-07 11:50 — PR #2238: Cosine Warm Restarts — frieren — **CLOSED** (all metrics worse, p_oodc +18.7%)
 - Branch: `frieren/cosine-warm-restarts`
 - Hypothesis: SGDR cyclical LR (T_0=40, T_mult=2) for multi-basin exploration. EMA averages across cycles for implicit ensembling.

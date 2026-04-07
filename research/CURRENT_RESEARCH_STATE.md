@@ -52,7 +52,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | thorfinn | #2239 | EMA Self-Distillation: use EMA predictions as soft targets | WIP |
 | frieren | #2242 | SAM: Sharpness-Aware Minimization for flat minima | WIP (just assigned) |
 | edward | #2243 | Spectral Norm SRF: Lipschitz constraint on output heads | WIP (just assigned) |
-| fern | #2234 | SWA Training: stochastic weight averaging for wider optima | WIP |
+| fern | — | **IDLE** — assigning higher EMA decay experiment | IDLE |
 | nezuko | #2237 | Manifold Mixup: feature-level interpolation for OOD generalization | WIP |
 | alphonse | #2240 | Deeper Backbone: 4 TransolverBlocks for increased capacity | WIP (just assigned) |
 | tanjiro | #2218 | LE Coordinate Frame v3: single chordwise ratio le/(le+te) | WIP |
@@ -108,6 +108,7 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2234 (fern): SWA Training — uniform averaging dilutes converged weights; EMA superior; p_in +54.9%
 - PR #2238 (frieren): Cosine Warm Restarts — T_0=40 too short, third cycle cut at high LR; all metrics +8-19%
 - PR #2233 (edward): Re Input Augmentation — Re is critical signal, σ=0.1 too large; p_re +4.5% (target metric worse)
 - PR #2236 (askeladd): Huber Surface Loss — δ=0.5 too large, all nodes in L2 regime, gradient weakening; all metrics +6-50%
