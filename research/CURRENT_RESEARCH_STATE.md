@@ -50,7 +50,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | thorfinn | #2230 | Stochastic Depth Curriculum: progressive block dropping | WIP |
-| frieren | #2227 | Chord-Camber Distance: signed distance from chord line | WIP |
+| frieren | #2232 | Pressure Laplacian Smoothness: topology-aware surface Cp regularization | WIP (just assigned) |
 | edward | #2228 | Re-Scaled WallDist: BL thickness proxy via Re^(-1/2) | WIP |
 | fern | #2223 | Surface Arc-Length PE (curvilinear position for surface nodes) | WIP |
 | nezuko | #2226 | Tandem Feature Cross: config-aware sigmoid gate on encoded features | WIP |
@@ -107,6 +107,7 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2227 (frieren): Chord-Camber Distance — geometry-frame upper/lower ≠ flow-frame suction/pressure; all metrics +0.9-5.5%
 - PR #2225 (askeladd): Domain-Split SRF Norm — p_in +4.3%, p_re +3.2%; SRF heads too late in pipeline for domain conditioning
 - PR #2224 (thorfinn): Bernoulli Consistency Loss — catastrophic +94% p_in, physics wrong at viscous walls
 - PR #2219 (alphonse): Additive fore→aft cross-attn — marginal p_oodc only, torch.compile issues, direction exhausted (3 attempts)

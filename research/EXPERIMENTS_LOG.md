@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 05:05 — PR #2227: Chord-Camber Distance — frieren — **CLOSED** (all metrics worse, p_in +5.5%)
+- Branch: `frieren/chord-camber-distance`
+- Hypothesis: Signed distance from chord line (LE-to-TE) for each surface node. Encodes upper/lower surface discrimination and thickness distribution. Single channel, normalized by chord.
+
+| Metric | Baseline (#2213) | Seed 42 (zs57oi9m) | Seed 73 (xfhmmdcg) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 12.828 | 12.443 | **12.636** | **+5.5% ✗** |
+| p_oodc | 7.643 | 7.848 | 7.891 | **7.870** | **+3.0% ✗** |
+| p_tan | 28.341 | 28.914 | 28.304 | **28.609** | **+0.9% ✗** |
+| p_re | 6.300 | 6.556 | 6.741 | **6.649** | **+5.5% ✗** |
+
+- **Analysis:** Geometry-frame chord distance is misleading. At nonzero AoA, geometric upper/lower does NOT equal flow-frame suction/pressure — the signed distance provides labels that flip meaning as AoA changes. Additionally, DSDF gradient orientation already partially encodes surface normal direction, making the feature partially redundant. The extra noisy channel actively interferes with learning.
+- **Key lesson:** Surface features must be either (a) flow-relative (AoA-aware) or (b) encoding genuinely new shape information not derivable from DSDF. Geometry-frame surface parameterizations are not useful.
+- **Conclusion:** CLOSED. Geometry-relative surface position features are a dead end.
+
+---
+
 ### 2026-04-07 04:30 — PR #2225: Domain-Split SRF Norm — askeladd — **CLOSED** (p_in +4.3%, p_re +3.2%)
 - Branch: `askeladd/domain-split-srf-norm`
 - Hypothesis: Tandem-conditional LayerNorm in AftSRF head. Zero-initialized nn.Embedding(2, hidden_dim) for separate scale/bias corrections for tandem vs non-tandem samples. Applied to both SurfaceRefinementHead and AftFoilRefinementHead after layer index 2.
