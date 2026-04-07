@@ -303,22 +303,27 @@ def compute_te_features(raw_xy, is_surface, saf_norm):
     return torch.stack([dx_fore, dy_fore, r_fore, dx_aft, dy_aft, r_aft], dim=-1), fore_te_x, fore_te_y
 
 
-def compute_wake_deficit_features(raw_xy, is_surface, saf_norm, gap_raw, fore_te_x=None, fore_te_y=None):
+def compute_wake_deficit_features(raw_xy, is_surface, saf_norm, gap_raw,
+                                   fore_te_x=None, fore_te_y=None, include_angle=False):
     """Compute gap-normalized fore-TE offset features for wake coupling.
 
     Encodes each node's position relative to the fore-foil trailing edge,
     normalized by the inter-foil gap. This gives dimensionless wake-relative
     position: (dx/gap, dy/gap) → "how deep into the fore-foil wake am I?"
+    Optionally appends the wake angle theta = atan2(dy_raw, dx_raw) as a
+    third channel for direct angular encoding of wake impingement direction.
 
     Args:
-        raw_xy:     [B, N, 2] raw x, y coordinates
-        is_surface: [B, N] bool
-        saf_norm:   [B, N] saf channel norm (fore-foil: <= 0.005)
-        gap_raw:    [B] raw gap values (x[:,:,22].mean(dim=1))
-        fore_te_x:  [B] pre-computed fore TE x (if None, recomputes from raw_xy)
-        fore_te_y:  [B] pre-computed fore TE y (if None, recomputes from raw_xy)
+        raw_xy:       [B, N, 2] raw x, y coordinates
+        is_surface:   [B, N] bool
+        saf_norm:     [B, N] saf channel norm (fore-foil: <= 0.005)
+        gap_raw:      [B] raw gap values (x[:,:,22].mean(dim=1))
+        fore_te_x:    [B] pre-computed fore TE x (if None, recomputes from raw_xy)
+        fore_te_y:    [B] pre-computed fore TE y (if None, recomputes from raw_xy)
+        include_angle: if True, append atan2(dy_raw, dx_raw) as 3rd channel
 
-    Returns: [B, N, 2] = [dx/gap, dy/gap], zeroed for single-foil samples
+    Returns: [B, N, 2] = [dx/gap, dy/gap], or [B, N, 3] if include_angle=True
+             zeroed for single-foil samples
     """
     x_coords = raw_xy[:, :, 0]  # [B, N]
     y_coords = raw_xy[:, :, 1]  # [B, N]
@@ -331,12 +336,16 @@ def compute_wake_deficit_features(raw_xy, is_surface, saf_norm, gap_raw, fore_te
         fore_te_x = x_coords.gather(1, fore_te_idx.unsqueeze(1)).squeeze(1)
         fore_te_y = y_coords.gather(1, fore_te_idx.unsqueeze(1)).squeeze(1)
 
+    # Raw offsets from fore-foil TE
+    dx_raw = x_coords - fore_te_x[:, None]  # [B, N]
+    dy_raw = y_coords - fore_te_y[:, None]  # [B, N]
+
     # Gap-safe division: clamp to avoid div-by-zero on single-foil samples
     gap_safe = gap_raw.clamp(min=0.05)  # [B]
 
     # Gap-normalized offsets from fore-foil TE
-    dx_norm = (x_coords - fore_te_x[:, None]) / gap_safe[:, None]  # [B, N]
-    dy_norm = (y_coords - fore_te_y[:, None]) / gap_safe[:, None]  # [B, N]
+    dx_norm = dx_raw / gap_safe[:, None]  # [B, N]
+    dy_norm = dy_raw / gap_safe[:, None]  # [B, N]
 
     # Zero out for single-foil samples (gap ≈ 0 means no tandem)
     aft_surf = is_surface & (saf_norm > 0.005)
@@ -344,7 +353,13 @@ def compute_wake_deficit_features(raw_xy, is_surface, saf_norm, gap_raw, fore_te
     dx_norm = dx_norm * is_tandem
     dy_norm = dy_norm * is_tandem
 
-    return torch.stack([dx_norm, dy_norm], dim=-1)  # [B, N, 2]
+    if not include_angle:
+        return torch.stack([dx_norm, dy_norm], dim=-1)  # [B, N, 2]
+
+    # Wake angle: atan2 of raw offsets — disambiguates quadrant, scale-invariant
+    theta = torch.atan2(dy_raw, dx_raw)  # [B, N] in [-pi, pi]
+    theta = theta * is_tandem  # zero for single-foil
+    return torch.stack([dx_norm, dy_norm, theta], dim=-1)  # [B, N, 3]
 
 
 class TransolverBlock(nn.Module):
@@ -1170,6 +1185,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    wake_angle_feature: bool = False        # atan2(dy,dx) wake angle channel, requires wake_deficit_feature (+1 input channel)
 
 
 cfg = sp.parse(Config)
@@ -1300,7 +1316,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + (1 if cfg.wake_angle_feature else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], [+wake_angle], +32 fourier PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1786,13 +1802,15 @@ for epoch in range(MAX_EPOCHS):
             if cfg.wake_deficit_feature:
                 wake_feats = compute_wake_deficit_features(
                     _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake,
-                    fore_te_x=_fore_te_x, fore_te_y=_fore_te_y)
+                    fore_te_x=_fore_te_x, fore_te_y=_fore_te_y,
+                    include_angle=cfg.wake_angle_feature)
                 x = torch.cat([x, wake_feats], dim=-1)
         else:
             x = torch.cat([x, curv, dist_feat], dim=-1)
             if cfg.wake_deficit_feature:
                 wake_feats = compute_wake_deficit_features(
-                    _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
+                    _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake,
+                    include_angle=cfg.wake_angle_feature)
                 x = torch.cat([x, wake_feats], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
@@ -2476,13 +2494,15 @@ for epoch in range(MAX_EPOCHS):
                     if cfg.wake_deficit_feature:
                         wake_feats = compute_wake_deficit_features(
                             _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake,
-                            fore_te_x=_fore_te_x, fore_te_y=_fore_te_y)
+                            fore_te_x=_fore_te_x, fore_te_y=_fore_te_y,
+                            include_angle=cfg.wake_angle_feature)
                         x = torch.cat([x, wake_feats], dim=-1)
                 else:
                     x = torch.cat([x, curv, dist_feat], dim=-1)
                     if cfg.wake_deficit_feature:
                         wake_feats = compute_wake_deficit_features(
-                            _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
+                            _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake,
+                            include_angle=cfg.wake_angle_feature)
                         x = torch.cat([x, wake_feats], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
@@ -2880,13 +2900,15 @@ if best_metrics:
                         if cfg.wake_deficit_feature:
                             wake_feats_vis = compute_wake_deficit_features(
                                 _raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis, _raw_gap_wake_vis,
-                                fore_te_x=_fore_te_x_vis, fore_te_y=_fore_te_y_vis)
+                                fore_te_x=_fore_te_x_vis, fore_te_y=_fore_te_y_vis,
+                                include_angle=cfg.wake_angle_feature)
                             x_n = torch.cat([x_n, wake_feats_vis], dim=-1)
                     else:
                         x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
                         if cfg.wake_deficit_feature:
                             wake_feats_vis = compute_wake_deficit_features(
-                                _raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis, _raw_gap_wake_vis)
+                                _raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis, _raw_gap_wake_vis,
+                                include_angle=cfg.wake_angle_feature)
                             x_n = torch.cat([x_n, wake_feats_vis], dim=-1)
                     # Fourier PE (must match training loop)
                     raw_xy = x_n[:, :, :2]
@@ -2998,13 +3020,15 @@ if cfg.surface_refine and best_metrics:
                         if cfg.wake_deficit_feature:
                             wake_feats_vv = compute_wake_deficit_features(
                                 _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake_vv,
-                                fore_te_x=_fore_te_x_vv, fore_te_y=_fore_te_y_vv)
+                                fore_te_x=_fore_te_x_vv, fore_te_y=_fore_te_y_vv,
+                                include_angle=cfg.wake_angle_feature)
                             x = torch.cat([x, wake_feats_vv], dim=-1)
                     else:
                         x = torch.cat([x, curv, dist_feat], dim=-1)
                         if cfg.wake_deficit_feature:
                             wake_feats_vv = compute_wake_deficit_features(
-                                _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake_vv)
+                                _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake_vv,
+                                include_angle=cfg.wake_angle_feature)
                             x = torch.cat([x, wake_feats_vv], dim=-1)
                     raw_xy = x[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
