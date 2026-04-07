@@ -1170,6 +1170,8 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    aug_re_noise: bool = False              # Gaussian noise on log(Re) input during training for OOD robustness
+    aug_re_sigma: float = 0.1              # std of noise in log(Re) space (~±10% Re)
 
 
 cfg = sp.parse(Config)
@@ -1753,6 +1755,11 @@ for epoch in range(MAX_EPOCHS):
                 # Identity for non-tandem samples
                 _dsdf2_scale = _dsdf2_scale * _is_tandem_aug2.float() + (~_is_tandem_aug2).float()
                 x[:, :, 6:10] = x[:, :, 6:10] * _dsdf2_scale.view(-1, 1, 1)
+
+        # Re input noise augmentation (training only)
+        if model.training and cfg.aug_re_noise:
+            _re_noise = torch.randn(x.size(0), 1, 1, device=x.device) * cfg.aug_re_sigma
+            x[:, :, 13:14] = x[:, :, 13:14] + _re_noise  # log(Re) channel
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
