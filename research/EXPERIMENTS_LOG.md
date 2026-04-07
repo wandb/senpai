@@ -2,6 +2,22 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 14:30 — PR #2237: Manifold Mixup — nezuko — **CLOSED** (all metrics worse, p_oodc +27.6%)
+- Branch: `nezuko/manifold-mixup`
+- Hypothesis: Mix hidden features (after backbone blocks) with lambda ~ Beta(0.2,0.2) for OOD generalization.
+
+| Metric | Baseline (#2213) | Seed 42 (5fiy4jn6) | Seed 73 (bsil84ca) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 13.954 | 13.818 | **13.886** | **+15.9% ✗✗** |
+| p_oodc | 7.643 | 9.9 | 9.6 | **9.750** | **+27.6% ✗✗✗** |
+| p_tan | 28.341 | 34.9 | 35.3 | **35.100** | **+23.9% ✗✗✗** |
+| p_re | 6.300 | 7.4 | 7.5 | **7.450** | **+18.3% ✗✗** |
+
+- **Analysis:** Mesh node indices have NO spatial alignment across samples — node k in sample A may be at LE while node k in B is in the wake. Mixing hidden states at unaligned nodes creates physically incoherent representations. Per-sample std normalization further compounds the scale mismatch. Manifold mixup is fundamentally inapplicable to variable-mesh point cloud architectures.
+- **Conclusion:** CLOSED. Manifold mixup requires node/pixel alignment that doesn't exist in variable-mesh CFD data.
+
+---
+
 ### 2026-04-07 12:45 — PR #2240: Deeper Backbone (4 TransolverBlocks) — alphonse — **CLOSED** (undertrained, all metrics worse)
 - Branch: `alphonse/deeper-backbone`
 - Hypothesis: Increase model capacity by adding 4th TransolverBlock. VRAM headroom (46→55GB). cosine_T_max=120 for reduced epoch budget.

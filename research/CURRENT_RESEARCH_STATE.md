@@ -53,7 +53,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | frieren | #2242 | SAM: Sharpness-Aware Minimization for flat minima | WIP (just assigned) |
 | edward | #2243 | Spectral Norm SRF: Lipschitz constraint on output heads | WIP (just assigned) |
 | fern | #2244 | Higher EMA Decay: 0.9995 for longer-memory averaging | WIP (just assigned) |
-| nezuko | #2237 | Manifold Mixup: feature-level interpolation for OOD generalization | WIP |
+| nezuko | — | **IDLE** — assigning increased weight decay | IDLE |
 | alphonse | #2245 | SRF Dropout: regularize output heads for OOD | WIP (just assigned) |
 | tanjiro | #2218 | LE Coordinate Frame v3: single chordwise ratio le/(le+te) | WIP |
 | askeladd | #2241 | Lookahead Optimizer: slow-weight averaging wrapper for Lion | WIP (just assigned) |
@@ -108,6 +108,7 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2237 (nezuko): Manifold Mixup — node index misalignment across meshes; physically incoherent mixed representations; all metrics +16-28%
 - PR #2240 (alphonse): Deeper Backbone 4L — undertrained (118 vs 145 epochs), infeasible in wall-clock budget; all metrics +2-12%
 - PR #2234 (fern): SWA Training — uniform averaging dilutes converged weights; EMA superior; p_in +54.9%
 - PR #2238 (frieren): Cosine Warm Restarts — T_0=40 too short, third cycle cut at high LR; all metrics +8-19%
