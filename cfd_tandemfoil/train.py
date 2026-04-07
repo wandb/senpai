@@ -347,6 +347,74 @@ def compute_wake_deficit_features(raw_xy, is_surface, saf_norm, gap_raw, fore_te
     return torch.stack([dx_norm, dy_norm], dim=-1)  # [B, N, 2]
 
 
+def compute_pressure_laplacian_loss(p_pred, xy_coords, is_surface, saf_norm, le_te_exclude=0.05):
+    """Graph-Laplacian smoothness loss on surface pressure predictions.
+
+    For each foil's surface nodes, sorted into a ring by angle from centroid,
+    computes the squared pressure spatial gradient between adjacent nodes.
+    Excludes nodes near LE (min-x) and TE (max-x) within le_te_exclude fraction
+    of chord, where sharp gradients are physically expected.
+
+    Args:
+        p_pred:      [B, N] predicted pressure (normalized space)
+        xy_coords:   [B, N, 2] raw node coordinates (pre-normalization)
+        is_surface:  [B, N] bool surface node mask
+        saf_norm:    [B, N] SAF channel norm (<=0.005 = fore foil, >0.005 = aft foil)
+        le_te_exclude: fraction of chord to exclude near LE and TE
+
+    Returns: scalar loss (mean squared pressure gradient over valid adjacent pairs)
+    """
+    B = p_pred.shape[0]
+    total_loss = torch.tensor(0.0, device=p_pred.device, dtype=p_pred.dtype)
+    count = 0
+
+    for foil_idx, foil_mask_fn in enumerate([
+        lambda sn: sn <= 0.005,   # fore-foil
+        lambda sn: sn > 0.005,    # aft-foil
+    ]):
+        for b in range(B):
+            mask = is_surface[b] & foil_mask_fn(saf_norm[b])
+            n_surf = mask.sum().item()
+            if n_surf < 5:
+                continue
+
+            xy = xy_coords[b, mask]  # [M, 2]
+            p = p_pred[b, mask]      # [M]
+
+            # Sort by angle from centroid (ring ordering for airfoil boundary)
+            centroid = xy.mean(dim=0)
+            angles = torch.atan2(xy[:, 1] - centroid[1], xy[:, 0] - centroid[0])
+            order = angles.argsort()
+            xy_sorted = xy[order]          # [M, 2]
+            p_sorted = p[order]            # [M]
+
+            # LE/TE exclusion zone by x-position
+            x_sorted = xy_sorted[:, 0]
+            x_min = x_sorted.min()
+            x_max = x_sorted.max()
+            chord = (x_max - x_min).clamp(min=1e-6)
+
+            not_le = (x_sorted - x_min) > le_te_exclude * chord
+            not_te = (x_max - x_sorted) > le_te_exclude * chord
+            valid = not_le & not_te  # [M]
+
+            # Adjacent pairs (ring: i, i+1 for i=0..M-2, plus wrap M-1→0)
+            dp = p_sorted[1:] - p_sorted[:-1]        # [M-1]
+            ds = (xy_sorted[1:] - xy_sorted[:-1]).norm(dim=-1).clamp(min=1e-6)  # [M-1]
+            pair_valid = valid[:-1] & valid[1:]       # [M-1]
+
+            if pair_valid.sum() < 3:
+                continue
+
+            grad_sq = (dp / ds) ** 2                  # [M-1]
+            total_loss = total_loss + (grad_sq * pair_valid.float()).sum()
+            count += int(pair_valid.sum().item())
+
+    if count > 0:
+        return total_loss / count
+    return total_loss
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -1118,6 +1186,9 @@ class Config:
     dct_freq_weight: float = 0.05 # weight for DCT freq loss
     dct_freq_gamma: float = 2.0   # frequency upweighting strength
     dct_freq_alpha: float = 1.5   # frequency exponent
+    pressure_laplacian_loss: bool = False   # topology-aware surface pressure smoothness
+    laplacian_weight: float = 0.01          # weight for Laplacian smoothness loss
+    laplacian_le_te_exclude: float = 0.05   # exclude nodes within this fraction of chord from LE/TE
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1762,7 +1833,7 @@ for epoch in range(MAX_EPOCHS):
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
         # TE coordinate frame / wake deficit: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.pressure_laplacian_loss
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
@@ -2110,6 +2181,14 @@ for epoch in range(MAX_EPOCHS):
                 _dct_loss = _dct_loss / _n_foils_dct
                 loss = loss + cfg.dct_freq_weight * _dct_loss
 
+        # Graph-Laplacian smoothness loss on surface pressure (training only)
+        _lap_loss = torch.tensor(0.0, device=device)
+        if cfg.pressure_laplacian_loss and model.training and _raw_xy_te is not None:
+            _lap_loss = compute_pressure_laplacian_loss(
+                pred[:, :, 2], _raw_xy_te, is_surface, _raw_saf_norm_te,
+                le_te_exclude=cfg.laplacian_le_te_exclude)
+            loss = loss + cfg.laplacian_weight * _lap_loss
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -2310,7 +2389,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _wandb_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.pressure_laplacian_loss:
+            _wandb_log["train/laplacian_loss"] = _lap_loss.item()
+        wandb.log(_wandb_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
