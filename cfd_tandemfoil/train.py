@@ -1165,6 +1165,7 @@ class Config:
     aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
     aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
     aft_foil_srf_context: bool = False       # KNN volume context for aft-foil SRF (wake pressure recovery)
+    aft_foil_loss_weight: float = 1.0        # multiplier for aft-foil surface loss (1.0 = no change)
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
@@ -1774,6 +1775,12 @@ for epoch in range(MAX_EPOCHS):
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
+        # Aft-foil loss upweighting mask (independent of aft_srf_head)
+        _aft_loss_mask = None
+        if cfg.aft_foil_loss_weight != 1.0:
+            _afw_saf_norm = x[:, :, 2:4].norm(dim=-1) if _aft_foil_mask is None else _raw_saf_norm
+            _afw_is_tandem = (x[:, 0, 22].abs() > 0.01) if _aft_foil_mask is None else _is_tandem
+            _aft_loss_mask = is_surface & (_afw_saf_norm > 0.005) & _afw_is_tandem.unsqueeze(1)
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -2001,7 +2008,16 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        # Aft-foil loss upweighting: apply per-node weights before reduction
+        _aft_w = None
+        if _aft_loss_mask is not None:
+            _aft_w = torch.ones_like(abs_err[:, :, :1])  # [B, N, 1]
+            _aft_w[_aft_loss_mask] = cfg.aft_foil_loss_weight
+            if batch_idx == 0 and epoch == 0:
+                n_aft = _aft_loss_mask.sum().item()
+                n_surf = surf_mask.sum().item()
+                print(f"Aft-foil loss upweight: {n_aft}/{n_surf} surface nodes at {cfg.aft_foil_loss_weight}x")
+        surf_per_sample = (abs_err[:, :, 2:3] * (_aft_w if _aft_w is not None else 1.0) * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
@@ -2015,7 +2031,7 @@ for epoch in range(MAX_EPOCHS):
             thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
             hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
-            surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            surf_per_sample = (surf_pres * hard_weights * (_aft_w if _aft_w is not None else 1.0) * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         if cfg.tandem_ramp:
             tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
@@ -2259,7 +2275,7 @@ for epoch in range(MAX_EPOCHS):
                 aoa_pred2 = out2["aoa_pred"].float()
             abs_err2 = (pred2 - y_norm).abs()
             vol_loss2 = (abs_err2 * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
-            surf_ps2 = (abs_err2[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            surf_ps2 = (abs_err2[:, :, 2:3] * (_aft_w if _aft_w is not None else 1.0) * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
             surf_loss2 = (surf_ps2 * tandem_boost).mean()
             re_loss2 = F.mse_loss(re_pred2, log_re_target)
             aoa_loss2 = F.mse_loss(aoa_pred2, aoa_target)
