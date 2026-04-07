@@ -52,7 +52,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | thorfinn | #2239 | EMA Self-Distillation: use EMA predictions as soft targets | WIP |
 | frieren | #2242 | SAM: Sharpness-Aware Minimization for flat minima | WIP (just assigned) |
 | edward | #2243 | Spectral Norm SRF: Lipschitz constraint on output heads | WIP (just assigned) |
-| fern | — | **IDLE** — assigning higher EMA decay experiment | IDLE |
+| fern | #2244 | Higher EMA Decay: 0.9995 for longer-memory averaging | WIP (just assigned) |
 | nezuko | #2237 | Manifold Mixup: feature-level interpolation for OOD generalization | WIP |
 | alphonse | #2240 | Deeper Backbone: 4 TransolverBlocks for increased capacity | WIP (just assigned) |
 | tanjiro | #2218 | LE Coordinate Frame v3: single chordwise ratio le/(le+te) | WIP |
