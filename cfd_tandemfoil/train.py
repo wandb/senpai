@@ -185,6 +185,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
                 nn.Linear(2 * dim_head, dim_head), nn.GELU(),
                 nn.Linear(dim_head, 1),
             )
+        self._div_loss = torch.tensor(0.0)  # slice diversity loss (populated in forward)
 
     def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None):
         bsz, num_points, _ = x.shape
@@ -222,6 +223,13 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             # Apply slice mask: 0 for active slices, -1e9 for inactive (updated each epoch)
             slice_logits = slice_logits + self.slice_mask
         slice_weights = self.softmax(slice_logits)
+        # Slice diversity: Gram matrix orthogonality loss on slice profiles
+        # slice_weights: [B, H, N, S] — average over heads → [B, N, S]
+        w = slice_weights.mean(dim=1)  # [B, N, S]
+        w_norm = w / (w.norm(dim=1, keepdim=True) + 1e-6)  # L2-normalize over nodes
+        G = torch.bmm(w_norm.transpose(1, 2), w_norm)  # [B, S, S] cosine sim
+        eye = torch.eye(G.shape[-1], device=G.device, dtype=G.dtype).unsqueeze(0)
+        self._div_loss = ((G - eye) ** 2).mean()
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
@@ -1124,6 +1132,8 @@ class Config:
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
+    slice_diversity_reg: bool = False       # Gram matrix orthogonality penalty on slice attention weights
+    slice_diversity_weight: float = 0.005   # weight for slice diversity regularization loss
 
 
 cfg = sp.parse(Config)
@@ -2052,6 +2062,20 @@ for epoch in range(MAX_EPOCHS):
             if _n_foils_dct > 0:
                 _dct_loss = _dct_loss / _n_foils_dct
                 loss = loss + cfg.dct_freq_weight * _dct_loss
+
+        # Slice diversity regularization: penalize cosine similarity between slice profiles
+        if cfg.slice_diversity_reg and model.training:
+            _div_total = torch.tensor(0.0, device=device)
+            _n_blocks = 0
+            _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+            for _blk in _base_model.blocks:
+                _div_total = _div_total + _blk.attn._div_loss.to(device)
+                _n_blocks += 1
+            if _n_blocks > 0:
+                _div_loss_avg = _div_total / _n_blocks
+                loss = loss + cfg.slice_diversity_weight * _div_loss_avg
+                if global_step % 50 == 0:
+                    wandb.log({"train/div_loss": _div_loss_avg.item(), "global_step": global_step})
 
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
