@@ -54,7 +54,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | edward | #2228 | Re-Scaled WallDist: BL thickness proxy via Re^(-1/2) | WIP (just assigned) |
 | fern | #2223 | Surface Arc-Length PE (curvilinear position for surface nodes) | WIP |
 | nezuko | #2226 | Tandem Feature Cross: config-aware sigmoid gate on encoded features | WIP (just assigned) |
-| alphonse | #2219 | Additive Fore→Aft Cross-Attention in AftSRF | WIP |
+| alphonse | #2229 | Surface Normal Features: outward normal (nx,ny) per surface node | WIP (just assigned) |
 | tanjiro | #2218 | LE Coordinate Frame v2: chord-normalized LE + wake deficit rebase | WIP (sent back) |
 | askeladd | #2225 | Domain-Split SRF Norm: tandem-conditional LayerNorm in AftSRF | WIP (just assigned) |
 
@@ -108,6 +108,7 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2219 (alphonse): Additive fore→aft cross-attn — marginal p_oodc only, torch.compile issues, direction exhausted (3 attempts)
 - PR #2222 (edward): mHC Learnable Residual Mixing — skip-dominant collapse (alpha≈1.9, beta≈0.1), all metrics regressed
 - PR #2221 (frieren): Wake Angle Feature — atan2 redundant with Cartesian (dx/gap, dy/gap), all metrics regressed
 - PR #2217 (nezuko): Fore-SRF Skip — mean-pooled fore hidden too coarse, 3/4 metrics worse, high seed variance

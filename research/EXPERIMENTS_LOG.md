@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 02:15 — PR #2219: Additive Fore→Aft Cross-Attention in AftSRF — alphonse — **CLOSED** (mixed/marginal, torch.compile issues)
+- Branch: `alphonse/fore-aft-crossattn-additive`
+- Hypothesis: Add per-node cross-attention from aft-foil surface nodes to fore-foil backbone hidden states, additively on top of existing AftSRF MLP. Zero-init output projection. 49K new params.
+- **Note:** Ran against old TE-only baseline (#2207), missing `--wake_deficit_feature`. Bug fix required: torch.compile crash → disabled compile on cross-attn + SRF head. Gradient flow blocked by detach/clone workaround.
+
+| Metric | Baseline (#2207) | Seed 42 (2y7ai6nt) | Seed 73 (8953fle4) | 2-seed avg | Δ vs TE-only | vs Current (#2213) |
+|--------|-----------------|--------------------|--------------------|-----------|--------------|---------------------|
+| p_in | 12.490 | 13.3 | 12.4 | **12.850** | +2.9% ✗ | +7.3% ✗ |
+| p_oodc | 7.618 | 7.1 | 7.9 | **7.500** | **-1.5%** ✅ | -1.9% ✅ |
+| p_tan | 28.521 | 28.6 | 28.0 | **28.300** | -0.8% ✅ | flat |
+| p_re | 6.411 | 6.4 | 6.5 | **6.450** | +0.6% ✗ | +2.4% ✗ |
+
+- **Analysis:** Fore→aft cross-attention shows consistent p_oodc improvement (-1.5%) across this and related PRs (#2202, #2217), but this likely comes from adding parameters near AftSRF rather than the specific cross-attention mechanism. torch.compile incompatibility (variable-size tensors) required disabling compilation and blocking gradient flow — structural limitation caps upside.
+- **Fore→aft direction summary:** Tested 3 ways: #2202 (replacement, failed), #2217 (mean skip, failed), #2219 (additive cross-attn, marginal). All show p_oodc improvement only. Direction exhausted.
+- **Conclusion:** CLOSED. The backbone's attention mechanism already handles fore-aft coupling adequately.
+
+---
+
 ### 2026-04-07 02:00 — PR #2222: mHC Learnable Residual Mixing (alpha/beta per sublayer) — edward — **CLOSED** (all metrics regressed 1-6%)
 - Branch: `edward/mhc-residuals`
 - Hypothesis: Replace fixed residual `x + F(x)` with learnable `alpha*x + beta*F(x)` per sublayer per block. 12 new params total. Init (1,1). Human team requested (issue #1926).
