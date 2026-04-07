@@ -53,7 +53,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | frieren | #2232 | Pressure Laplacian Smoothness: topology-aware surface Cp regularization | WIP (just assigned) |
 | edward | #2233 | Re Input Augmentation: Gaussian noise on log(Re) for OOD robustness | WIP (just assigned) |
 | fern | #2234 | SWA Training: stochastic weight averaging for wider optima | WIP (just assigned) |
-| nezuko | #2226 | Tandem Feature Cross: config-aware sigmoid gate on encoded features | WIP |
+| nezuko | #2237 | Manifold Mixup: feature-level interpolation for OOD generalization | WIP (just assigned) |
 | alphonse | #2235 | Input Feature Noise Augmentation: Gaussian noise on all channels | WIP (just assigned) |
 | tanjiro | #2218 | LE Coordinate Frame v3: single chordwise ratio le/(le+te) | WIP (sent back) |
 | askeladd | #2236 | Huber Surface Loss: smooth L1 for finer gradient signal | WIP (just assigned) |
@@ -108,6 +108,7 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2226 (nezuko): Tandem Feature Cross — global sigmoid gate too blunt, p_tan +1.3%, p_oodc -1.2% but p_re +1.6%
 - PR #2231 (askeladd): Surface Curvature Feature — catastrophic, mesh noise in finite-difference curvature; seed 42 diverged +160% p_in
 - PR #2229 (alphonse): Surface Normal Features — DSDF already encodes orientation; kNN noise at LE/TE; all metrics +3-7%
 - PR #2223 (fern): Surface Arc-Length PE — redundant with TE coord frame; all metrics +3-6%

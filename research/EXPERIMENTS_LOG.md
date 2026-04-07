@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 08:15 — PR #2226: Tandem Feature Cross — nezuko — **CLOSED** (p_tan +1.3%, mixed results)
+- Branch: `nezuko/tandem-feature-cross`
+- Hypothesis: Config-aware sigmoid gate (4→32→66 MLP) conditioned on (gap, stagger, log_Re, AoA), applied to all 66 input feature channels. Near-identity init (bias=5.0, sigmoid≈0.993).
+
+| Metric | Baseline (#2213) | Seed 42 (zb4kh079) | Seed 73 (j70lmc3s) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | **11.628** | 12.285 | **11.956** | -0.2% ✅ |
+| p_oodc | 7.643 | **7.5** | 7.6 | **7.55** | **-1.2%** ✅ |
+| p_tan | 28.341 | 28.8 | 28.6 | **28.70** | **+1.3% ✗** |
+| p_re | 6.300 | 6.4 | 6.4 | **6.40** | +1.6% ✗ |
+
+- **Analysis:** Mixed results. p_in and p_oodc show marginal improvement, but p_tan (most critical) and p_re both regress. The global gate learns to optimize for training distribution but hurts OOD generalization. Conditioning all 66 channels on 4 collinear global scalars is too blunt.
+- **Key lesson:** Config-awareness CAN help p_oodc, but global gating of all features is too coarse. More targeted modulation (gate only geometry channels, or FiLM deeper in network) might work, but the direction has structural limitations for OOD configs.
+- **Conclusion:** CLOSED. p_tan regression is a deal-breaker.
+
+---
+
 ### 2026-04-07 08:00 — PR #2231: Surface Curvature Feature — askeladd — **CLOSED** (catastrophic, seed 42 diverged +160% p_in)
 - Branch: `askeladd/surface-curvature-feature`
 - Hypothesis: Dimensionless local curvature κ×chord for surface nodes. 2 channels (kappa_fore, kappa_aft). Angle-sorted finite differences of tangent angle.
