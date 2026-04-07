@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 05:30 — PR #2228: Re-Scaled WallDist — edward — **CLOSED** (all metrics worse, p_re +4.3%)
+- Branch: `edward/re-scaled-walldist`
+- Hypothesis: BL thickness proxy via Re^(-1/2) scaling of wall distance. Single channel: `dist_surf * Re^(-0.5)` as dimensionless BL coordinate y/δ.
+
+| Metric | Baseline (#2213) | Seed 42 (39puv4qq) | Seed 73 (vvw7o3ax) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 11.977 | 13.138 | **12.558** | **+4.8% ✗** |
+| p_oodc | 7.643 | 8.062 | 7.808 | **7.935** | **+3.8% ✗** |
+| p_tan | 28.341 | 29.675 | 28.179 | **28.927** | **+2.1% ✗** |
+| p_re | 6.300 | 6.463 | 6.673 | **6.568** | **+4.3% ✗** |
+
+- **Analysis:** Redundant with existing DSDF + log(Re) inputs — the product is a nonlinear combination the first linear layer can already learn. Flat-plate Blasius scaling (δ ~ x/√Re) is imprecise for complex geometries, separated flows, and tandem wakes. High seed variance (10% spread on p_in) confirms the feature destabilizes training without providing useful signal.
+- **Key lesson:** Multiplicative combinations of existing inputs are unlikely to help — the model can learn these internally. BL physics is not the bottleneck.
+- **Conclusion:** CLOSED. BL-scaled wall distance is a dead end.
+
+---
+
 ### 2026-04-07 05:05 — PR #2227: Chord-Camber Distance — frieren — **CLOSED** (all metrics worse, p_in +5.5%)
 - Branch: `frieren/chord-camber-distance`
 - Hypothesis: Signed distance from chord line (LE-to-TE) for each surface node. Encodes upper/lower surface discrimination and thickness distribution. Single channel, normalized by chord.
