@@ -552,9 +552,11 @@ class SurfaceRefinementHead(nn.Module):
     """
 
     def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 128,
-                 n_layers: int = 2, p_only: bool = False):
+                 n_layers: int = 2, p_only: bool = False,
+                 domain_split_norm: bool = False):
         super().__init__()
         self.p_only = p_only
+        self.domain_split_norm = domain_split_norm
         actual_out = 1 if p_only else out_dim  # 1 for pressure-only, 3 for all fields
         layers: list[nn.Module] = []
         # Input: hidden features (n_hidden) + base predictions (out_dim)
@@ -568,17 +570,32 @@ class SurfaceRefinementHead(nn.Module):
         nn.init.zeros_(layers[-1].weight)
         nn.init.zeros_(layers[-1].bias)
         self.mlp = nn.Sequential(*layers)
+        # Domain-conditional normalization: tandem vs single-foil
+        if domain_split_norm:
+            self.domain_scale = nn.Embedding(2, hidden_dim)  # 0=single-foil, 1=tandem
+            self.domain_bias = nn.Embedding(2, hidden_dim)
+            nn.init.zeros_(self.domain_scale.weight)
+            nn.init.zeros_(self.domain_bias.weight)
 
-    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor,
+                is_tandem: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             hidden: [M, n_hidden] — hidden features for surface nodes only
             base_pred: [M, out_dim] — base predictions for surface nodes only
+            is_tandem: [M] — integer 0/1 per node (only used if domain_split_norm=True)
         Returns:
             correction: [M, out_dim] — additive correction (zero-padded for p_only)
         """
         inp = torch.cat([hidden, base_pred], dim=-1)
-        correction = self.mlp(inp)
+        x = inp
+        for i, layer in enumerate(self.mlp):
+            x = layer(x)
+            if self.domain_split_norm and is_tandem is not None and i == 2:
+                ds = self.domain_scale(is_tandem)  # [M, hidden_dim]
+                db = self.domain_bias(is_tandem)   # [M, hidden_dim]
+                x = x * (1.0 + ds) + db
+        correction = x
         if self.p_only:
             # Pad with zeros for velocity channels: [M, 1] → [M, 3]
             zeros = torch.zeros(correction.shape[0], base_pred.shape[-1] - 1,
@@ -595,9 +612,11 @@ class AftFoilRefinementHead(nn.Module):
     """
 
     def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 192,
-                 n_layers: int = 3, film: bool = False):
+                 n_layers: int = 3, film: bool = False,
+                 domain_split_norm: bool = False):
         super().__init__()
         self.film = film
+        self.domain_split_norm = domain_split_norm
         in_dim = n_hidden + out_dim
         layers: list[nn.Module] = []
         for i in range(n_layers):
@@ -615,27 +634,39 @@ class AftFoilRefinementHead(nn.Module):
             nn.init.zeros_(self.film_scale.weight)
             nn.init.zeros_(self.film_shift.weight)
             nn.init.zeros_(self.film_shift.bias)
+        # Domain-conditional normalization: tandem vs single-foil
+        if domain_split_norm:
+            self.domain_scale = nn.Embedding(2, hidden_dim)  # 0=single-foil, 1=tandem
+            self.domain_bias = nn.Embedding(2, hidden_dim)
+            nn.init.zeros_(self.domain_scale.weight)
+            nn.init.zeros_(self.domain_bias.weight)
 
     def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor,
-                cond: torch.Tensor | None = None) -> torch.Tensor:
+                cond: torch.Tensor | None = None,
+                is_tandem: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             hidden: [A, n_hidden] — hidden features for aft-foil nodes
             base_pred: [A, out_dim] — base predictions for aft-foil nodes
             cond: [A, 2] — (gap, stagger) per node (only used if film=True)
+            is_tandem: [A] — integer 0/1 per node (only used if domain_split_norm=True)
         Returns:
             correction: [A, out_dim] — additive correction
         """
         inp = torch.cat([hidden, base_pred], dim=-1)
-        # Run through layers, applying FiLM after first hidden activation
+        # Run through layers, applying FiLM/domain after first hidden activation
         x = inp
         for i, layer in enumerate(self.mlp):
             x = layer(x)
-            # Apply FiLM after first LayerNorm+GELU (i.e., after index 2)
-            if self.film and cond is not None and i == 2:
-                gamma = self.film_scale(cond)   # [A, hidden_dim]
-                beta = self.film_shift(cond)    # [A, hidden_dim]
-                x = x * (1.0 + gamma) + beta
+            if i == 2:  # after first LayerNorm+GELU
+                if self.film and cond is not None:
+                    gamma = self.film_scale(cond)   # [A, hidden_dim]
+                    beta = self.film_shift(cond)    # [A, hidden_dim]
+                    x = x * (1.0 + gamma) + beta
+                if self.domain_split_norm and is_tandem is not None:
+                    ds = self.domain_scale(is_tandem)  # [A, hidden_dim]
+                    db = self.domain_bias(is_tandem)   # [A, hidden_dim]
+                    x = x * (1.0 + ds) + db
         return x
 
 
@@ -1170,6 +1201,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    domain_split_srf_norm: bool = False     # tandem-conditional LayerNorm in SRF heads
 
 
 cfg = sp.parse(Config)
@@ -1356,6 +1388,7 @@ if cfg.surface_refine:
             hidden_dim=cfg.surface_refine_hidden,
             n_layers=cfg.surface_refine_layers,
             p_only=cfg.surface_refine_p_only,
+            domain_split_norm=cfg.domain_split_srf_norm,
         ).to(device)
     refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
     _refine_n_params = sum(p.numel() for p in refine_head.parameters())
@@ -1386,6 +1419,7 @@ if cfg.aft_foil_srf:
             hidden_dim=cfg.aft_foil_srf_hidden,
             n_layers=cfg.aft_foil_srf_layers,
             film=cfg.aft_foil_srf_film,
+            domain_split_norm=cfg.domain_split_srf_norm,
         ).to(device)
         aft_srf_head = torch.compile(aft_srf_head, mode=cfg.compile_mode)
         _aft_n_params = sum(p.numel() for p in aft_srf_head.parameters())
@@ -1916,7 +1950,11 @@ for epoch in range(MAX_EPOCHS):
                     if surf_idx.numel() > 0:
                         surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]  # [M, n_hidden]
                         surf_pred = pred[surf_idx[:, 0], surf_idx[:, 1]]      # [M, 3]
-                        correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
+                        _srf_tandem = None
+                        if cfg.domain_split_srf_norm:
+                            _is_tan_batch = (x[:, 0, 22].abs() > 0.01).long()  # [B]
+                            _srf_tandem = _is_tan_batch[surf_idx[:, 0]]  # [M]
+                        correction = refine_head(surf_hidden, surf_pred, is_tandem=_srf_tandem).float()  # [M, 3]
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
 
@@ -1949,8 +1987,12 @@ for epoch in range(MAX_EPOCHS):
                 _aft_cond = None
                 if cfg.aft_foil_srf_film:
                     _aft_cond = _raw_gap_stagger[aft_idx[:, 0]]  # [A, 2]
+                _aft_tandem = None
+                if cfg.domain_split_srf_norm:
+                    _is_tan_batch_aft = (x[:, 0, 22].abs() > 0.01).long()  # [B]
+                    _aft_tandem = _is_tan_batch_aft[aft_idx[:, 0]]  # [A] — all 1s for aft-foil
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    aft_correction = aft_srf_head(aft_hidden, aft_pred, _aft_cond).float()
+                    aft_correction = aft_srf_head(aft_hidden, aft_pred, _aft_cond, is_tandem=_aft_tandem).float()
                 pred = pred.clone()
                 pred[aft_idx[:, 0], aft_idx[:, 1]] = pred[aft_idx[:, 0], aft_idx[:, 1]] + aft_correction
 
@@ -2581,7 +2623,11 @@ for epoch in range(MAX_EPOCHS):
                             if surf_idx.numel() > 0:
                                 surf_hidden = _eval_hidden[surf_idx[:, 0], surf_idx[:, 1]]
                                 surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                                correction = eval_refine_head(surf_hidden, surf_pred).float()
+                                _v_srf_tandem = None
+                                if cfg.domain_split_srf_norm:
+                                    _v_is_tan = (x[:, 0, 22].abs() > 0.01).long()
+                                    _v_srf_tandem = _v_is_tan[surf_idx[:, 0]]
+                                correction = eval_refine_head(surf_hidden, surf_pred, is_tandem=_v_srf_tandem).float()
                                 pred_loss = pred_loss.clone()
                                 pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
@@ -2617,8 +2663,12 @@ for epoch in range(MAX_EPOCHS):
                         _ah = _eval_hidden[aft_idx[:, 0], aft_idx[:, 1]]
                         _ap = pred_loss[aft_idx[:, 0], aft_idx[:, 1]]
                         _ac = _v_gap_stagger[aft_idx[:, 0]] if cfg.aft_foil_srf_film else None
+                        _v_aft_tandem = None
+                        if cfg.domain_split_srf_norm:
+                            _v_is_tan_aft = (x[:, 0, 22].abs() > 0.01).long()
+                            _v_aft_tandem = _v_is_tan_aft[aft_idx[:, 0]]
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                            _aft_corr = eval_aft_srf_head(_ah, _ap, _ac).float()
+                            _aft_corr = eval_aft_srf_head(_ah, _ap, _ac, is_tandem=_v_aft_tandem).float()
                         pred_loss = pred_loss.clone()
                         pred_loss[aft_idx[:, 0], aft_idx[:, 1]] += _aft_corr
                         # Back-compute pred for denormalization
@@ -3080,7 +3130,11 @@ if cfg.surface_refine and best_metrics:
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                             surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]
                             surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                            correction = verify_refine(surf_hidden, surf_pred).float()
+                            _vrf_srf_tandem = None
+                            if cfg.domain_split_srf_norm:
+                                _vrf_is_tan = (x[:, 0, 22].abs() > 0.01).long()
+                                _vrf_srf_tandem = _vrf_is_tan[surf_idx[:, 0]]
+                            correction = verify_refine(surf_hidden, surf_pred, is_tandem=_vrf_srf_tandem).float()
                         pred_loss_refined = pred_loss.clone()
                         pred_loss_refined[surf_idx[:, 0], surf_idx[:, 1]] += correction
                         correction_full[surf_idx[:, 0], surf_idx[:, 1]] = correction
