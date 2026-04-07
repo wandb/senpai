@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-07 20:45 UTC
+- **Date:** 2026-04-07 23:00 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -33,7 +33,7 @@ Single-model p_tan (28.341) and p_in (11.979) both BEAT the ensemble.
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | thorfinn | #2251 | Cosine T_max=140: complete LR annealing before training ends | WIP |
-| fern | #2252 | Wider SRF heads: 384 hidden dim for more output capacity | WIP |
+| fern | #2259 | Two-Pass Iterative SRF: sequential boosting of surface corrections | WIP |
 | nezuko | #2253 | Aft-foil surface loss upweighting: 1.5x on aft-foil nodes | WIP |
 | edward | #2254 | Backbone hidden noise: Gaussian noise in TransolverBlock for OOD robustness | WIP |
 | askeladd | #2255 | Augmentation annealing: disable aug after epoch 120 for clean fine-tuning | WIP |
@@ -55,10 +55,11 @@ No new issues since last check. Prior directives still in effect:
 
 ## Just Completed Reviews (this session)
 
-### PR #2249 — Online Hard Node Mining gamma=1.0 (frieren) — CLOSED
-- All 4 metrics worse: p_oodc +7.3%, p_re +7.4%, p_in +1.1%, p_tan +1.6%
-- Root cause: baseline already has asymmetric hard-node mining (1.5× at epoch ≥30); stacking OHNM multiplicatively creates 3-5× concentration on small node subsets, hurting OOD generalization
-- **Key insight:** Never stack a second hard-node weighting on top of the existing mining. Any future OHNM must replace (not add to) the existing mechanism.
+### PR #2252 — Wider SRF Heads (384 hidden dim) (fern) — CLOSED
+- All 4 metrics worse: p_oodc +3.0%, p_tan +2.0%, p_re +2.3%, p_in +0.2%
+- Root cause: 3.3x more SRF parameters → overfitting despite EMA + cosine schedule. High seed variance (p_oodc 8.228 vs 7.517) confirms training instability.
+- **Key insight:** 192-dim SRF is well-matched to data signal. Structural changes (multi-pass) > raw capacity.
+- **Next step:** Assigned fern two-pass SRF (PR #2259) — gradient-boosting-style second correction pass.
 
 ## Current Research Focus and Themes
 
@@ -73,13 +74,14 @@ No new issues since last check. Prior directives still in effect:
 Eight experiments targeting diverse levers:
 
 1. **Schedule (T_max=140)** — Match cosine annealing to actual training length (thorfinn #2251)
-2. **Output capacity (wider SRF 384)** — Double surface refinement head width (fern #2252)
+2. ~~**Output capacity (wider SRF 384)**~~ — CLOSED (PR #2252, all metrics worse — overfitting)
 3. **Loss targeting (aft-foil upweight 1.5x)** — Direct p_tan gradient budget shift (nezuko #2253)
 4. **Backbone regularization (hidden noise σ=0.01)** — Target backbone OOD instability (edward #2254)
 5. **Training strategy (aug annealing at epoch 120)** — Clean fine-tuning phase (askeladd #2255)
 6. **Throughput (val_every=3)** — More training epochs within wall-clock budget (alphonse #2256)
 7. **Sample-level reweighting (focal gamma=0.5)** — Upweight hard samples dynamically (tanjiro #2257)
 8. **Decoupled tandem slice routing** — Separate `in_project_slice_tandem` for tandem samples, never tested on Phase 6 baseline (frieren #2258)
+9. **Two-Pass Iterative SRF** — Gradient-boosting-style second SRF pass (fern #2259) — SRF2 learns residuals of SRF1 corrections via `.detach()`, zero-init safety
 
 ### What Works (confirmed and merged)
 
@@ -99,16 +101,17 @@ Eight experiments targeting diverse levers:
 - **Feature engineering**: TE coord + wake deficit are the only features that work. LE features, wall distance, all others dead.
 - **Training hyperparameters**: LR, WD, EMA decay, aug sigma all confirmed optimal (Round 19)
 - **Output head regularization**: Spectral norm/dropout on SRF — wrong level of abstraction
+- **Wider SRF heads**: 384-dim (PR #2252) — overfitting, all metrics worse. 192-dim is optimal capacity.
 - **Optimizer variants**: SAM, Lookahead, SWA — all worse than baseline Lion+EMA+cosine
 - **Additive loss penalties**: Huber, L1+L2, any loss that conflicts with PCGrad/tandem_ramp
 
 ## Potential Next Research Directions
 
-After Round 20 completes:
+After Round 21 completes:
 
 1. **Backbone OOD regularization at scale**: If backbone hidden noise (edward, #2254) shows promise, explore aggressive variants — layer-selective noise, scheduled noise, feature-space dropout.
-2. **Prediction target transformation**: Predict pressure gradients dp/ds, vorticity, or stream function. The most impactful change has been altering the prediction task itself (pressure-first).
-3. **Multi-resolution decomposition**: Separate low-frequency (mean field) and high-frequency (local corrections) prediction paths. Related to but distinct from DCT freq loss.
-4. **Knowledge distillation from ensemble**: The 16-seed ensemble beats single-model on p_oodc (6.6 vs 7.6) and p_re (5.8 vs 6.3). Use ensemble predictions as soft targets.
-5. **Condition-aware training**: Separate optimization paths for different flow regimes (single vs tandem, low vs high Re). Beyond what PCGrad 3-way currently handles.
-6. **Contrastive backbone learning**: Auxiliary contrastive loss encouraging similar backbone representations for geometrically similar configurations.
+2. **Flow-Regime Conditioned SRF via FiLM**: Add FiLM conditioning on (AoA, Umag) to the SRF head — gives the corrector explicit flow-regime signal for different corrections at extreme AoA/Umag. Distinct from backbone `--adaln_output`. Could target p_oodc.
+3. **Prediction target transformation**: Predict pressure gradients dp/ds, vorticity, or stream function. The most impactful change has been altering the prediction task itself (pressure-first).
+4. **Multi-resolution decomposition**: Separate low-frequency (mean field) and high-frequency (local corrections) prediction paths. Related to but distinct from DCT freq loss.
+5. **Knowledge distillation from ensemble**: The 16-seed ensemble beats single-model on p_oodc (6.6 vs 7.6) and p_re (5.8 vs 6.3). Use ensemble predictions as soft targets.
+6. **Condition-aware training**: Separate optimization paths for different flow regimes (single vs tandem, low vs high Re). Beyond what PCGrad 3-way currently handles.

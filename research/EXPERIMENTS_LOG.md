@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 23:00 — PR #2252: Wider SRF Heads (384 hidden dim) — fern — **CLOSED** (all metrics worse)
+- Branch: `fern/wider-srf-384`
+- Hypothesis: Double SRF hidden dim from 192→384 to give surface refinement heads more capacity for complex corrections (leading-edge suction peaks, aft-foil wake interactions). 3.3x more SRF parameters.
+
+| Metric | Baseline (#2213) | Seed 42 (kv4zsgaa) | Seed 73 (wlnr6xv8) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 12.311 | 11.698 | **12.005** | +0.2% ✗ |
+| p_oodc | 7.643 | 8.228 | 7.517 | **7.873** | +3.0% ✗ |
+| p_tan | 28.341 | 28.344 | 29.450 | **28.897** | +2.0% ✗ |
+| p_re | 6.300 | 6.359 | 6.535 | **6.447** | +2.3% ✗ |
+
+- **Training:** 149 epochs before 180-min timeout. Peak memory ~47 GB (same as baseline).
+- **Analysis:** The 3.3x parameter increase in SRF heads (374K vs 113K params per head) overfits despite EMA + cosine regularization. High seed variance — p_oodc swings 8.228→7.517, p_tan swings 28.344→29.450 — confirms the wider heads introduce optimization instability. Seed 73 achieved p_in=11.698 (better than baseline) but this is an outlier contradicted by seed 42's 12.311.
+- **Key insight:** The baseline 192-dim SRF is well-matched to the data signal at the refinement stage. More SRF capacity causes overfitting, not better surface corrections. Future SRF improvements should come from structural changes (multi-pass, conditioning) rather than raw width increases.
+- **Conclusion:** CLOSED. Wider SRF heads are a dead end. Do not revisit SRF width increases.
+
+---
+
 ### 2026-04-07 19:58 — PR #2218: LE Coordinate Frame (3 iterations) — tanjiro — **CLOSED** (all metrics worse across all 3 variants)
 - Branch: `tanjiro/le-coord-frame`
 - Hypothesis: Add leading-edge-relative input features to complement TE coord frame. Tested 3 variants: v1 (raw LE offsets, 6ch), v2 (chord-normalized, 6ch), v3 (chordwise ratio, 2ch).
