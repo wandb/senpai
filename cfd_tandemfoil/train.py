@@ -1063,6 +1063,9 @@ class Config:
     onecycle_div_factor: float = 10.0   # onecycle only
     onecycle_final_div_factor: float = 100.0  # onecycle only
     use_lookahead: bool = True
+    lookahead: bool = False              # wrap Lion optimizer with Lookahead (default only wraps AdamW)
+    lookahead_k: int = 5                 # inner loop steps before slow weight update
+    lookahead_alpha: float = 0.5         # interpolation coefficient toward fast weights
     # Architecture flags (one per GPU)
     linear_no_attention: bool = False  # GPU0: skip Q/K/V in slice attention
     field_decoder: bool = False        # GPU1: separate vel/pres output heads
@@ -1558,6 +1561,11 @@ if aft_srf_ctx_head is not None:
     _ctx_params = list(aft_srf_ctx_head.parameters())
     base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
+
+# Wrap optimizer with Lookahead (after all param groups are added)
+if cfg.lookahead:
+    optimizer = Lookahead(base_opt, k=cfg.lookahead_k, alpha=cfg.lookahead_alpha)
+    print(f"Lookahead wrapper: k={cfg.lookahead_k}, alpha={cfg.lookahead_alpha}")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
