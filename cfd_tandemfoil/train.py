@@ -1170,6 +1170,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    spectral_norm_srf: bool = False         # spectral normalization on SRF MLP hidden layers for Lipschitz control
 
 
 cfg = sp.parse(Config)
@@ -1357,6 +1358,13 @@ if cfg.surface_refine:
             n_layers=cfg.surface_refine_layers,
             p_only=cfg.surface_refine_p_only,
         ).to(device)
+    if cfg.spectral_norm_srf:
+        # Use parametrizations.spectral_norm (deepcopy-compatible) instead of hook-based spectral_norm.
+        # Skip output layer (zero-init, σ₁≈0 would cause division issues).
+        mlp_layers = list(refine_head.mlp)
+        for i, m in enumerate(mlp_layers[:-1]):  # exclude last (output) layer
+            if isinstance(m, nn.Linear):
+                torch.nn.utils.parametrizations.spectral_norm(m)
     refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
     _refine_n_params = sum(p.numel() for p in refine_head.parameters())
     print(f"Surface refinement head: {_refine_n_params:,} params "
@@ -1387,6 +1395,13 @@ if cfg.aft_foil_srf:
             n_layers=cfg.aft_foil_srf_layers,
             film=cfg.aft_foil_srf_film,
         ).to(device)
+        if cfg.spectral_norm_srf:
+            # Use parametrizations.spectral_norm (deepcopy-compatible) instead of hook-based spectral_norm.
+            # Skip output layer (zero-init, σ₁≈0 would cause division issues).
+            mlp_layers = list(aft_srf_head.mlp)
+            for i, m in enumerate(mlp_layers[:-1]):  # exclude last (output) layer
+                if isinstance(m, nn.Linear):
+                    torch.nn.utils.parametrizations.spectral_norm(m)
         aft_srf_head = torch.compile(aft_srf_head, mode=cfg.compile_mode)
         _aft_n_params = sum(p.numel() for p in aft_srf_head.parameters())
         print(f"Aft-foil SRF head: {_aft_n_params:,} params "
