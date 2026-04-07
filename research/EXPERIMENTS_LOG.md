@@ -2,6 +2,22 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 02:45 — PR #2218 v2: LE Coordinate Frame (chord-normalized, +wake deficit) — tanjiro — **SENT BACK** (p_re -4.2% but p_in +2.1%)
+- Branch: `tanjiro/le-coord-frame` (v2 iteration)
+- Change from v1: chord-normalized LE features, rebased on current baseline with `--wake_deficit_feature`.
+
+| Metric | Baseline (#2213) | Seed 42 (rqpfsjey) | Seed 73 (v56f12x9) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 12.334 | 12.130 | **12.232** | **+2.1% ✗** |
+| p_oodc | 7.643 | 7.680 | 7.761 | **7.721** | +1.0% ✗ |
+| p_tan | 28.341 | 28.422 | 28.025 | **28.224** | **-0.4%** ✅ |
+| p_re | 6.300 | 6.077 | 5.995 | **6.036** | **-4.2%** ✅ |
+
+- Chord normalization fixed OOD catastrophe (p_oodc from +9.6% to +1.0%). p_re -4.2% is the strongest single-metric gain in several rounds. But p_in +2.1% means 6 LE channels dilute in-distribution performance.
+- **Decision:** Sent back for v3: replace 6 channels with single chordwise ratio `le_dist / (le_dist + te_dist)`. Final iteration.
+
+---
+
 ### 2026-04-07 02:30 — PR #2224: Bernoulli Consistency Loss (p + 0.5|u|² = C) — thorfinn — **CLOSED** (catastrophic failure, +94% p_in)
 - Branch: `thorfinn/bernoulli-consistency-loss`
 - Hypothesis: Soft Bernoulli constraint on surface nodes coupling pressure and velocity heads. Weight=0.01. Only seed 42 run (catastrophic, stopped early).
