@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-07 19:45 UTC
+- **Date:** 2026-04-07 20:05 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -28,7 +28,7 @@
 
 Single-model p_tan (28.341) and p_in (11.979) both BEAT the ensemble.
 
-## Student Status (2026-04-07 19:45 UTC)
+## Student Status (2026-04-07 20:05 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
@@ -37,9 +37,9 @@ Single-model p_tan (28.341) and p_in (11.979) both BEAT the ensemble.
 | nezuko | #2253 | Aft-foil surface loss upweighting: 1.5x on aft-foil nodes | WIP |
 | edward | #2254 | Backbone hidden noise: Gaussian noise in TransolverBlock for OOD robustness | WIP |
 | askeladd | #2255 | Augmentation annealing: disable aug after epoch 120 for clean fine-tuning | WIP |
-| alphonse | #2250 | Blended L1+L2 Surface Loss: MSE auxiliary (alpha=0.1) | WIP |
+| alphonse | #2256 | Val-every-3 throughput: validate every 3 epochs for ~20 more training epochs | WIP |
+| tanjiro | #2257 | Focal sample reweighting: loss^0.5 upweight on hard samples | WIP |
 | frieren | #2249 | Online Hard Node Mining: error-weighted surface loss | WIP |
-| tanjiro | #2218 | LE Coordinate Frame v3: single chordwise ratio | WIP |
 
 **Idle students:** None. All 8 GPUs occupied.
 
@@ -49,32 +49,41 @@ None currently.
 
 ## Most Recent Research Direction from Human Researcher Team
 
-No new issues. Prior directives still in effect:
+No new issues since last check. Prior directives still in effect:
 - Issue #1860: "Think bigger — radical model changes, not just incremental tweaks" (addressed Phase 5+)
 - Issue #1834: Never use raw data files besides assigned training split
 
+## Just Completed Reviews (this session)
+
+### PR #2250 — Blended L1+L2 Surface Loss (alphonse) — CLOSED
+- p_tan +4.3% worse, p_re +1.6% worse
+- L2 gradient conflicts with existing hard-node mining (PCGrad extreme + tandem_ramp)
+- **Key insight:** Additive loss penalties that overlap with PCGrad/tandem_ramp fail — double-penalizing
+
+### PR #2218 — LE Coordinate Frame v1/v2/v3 (tanjiro) — CLOSED
+- All 3 iterations failed (v1: OOD catastrophe, v2: mixed, v3: all worse)
+- **Key insight:** Feature engineering is exhausted. TE coord + wake deficit + Fourier PE capture all useful spatial info
+
 ## Current Research Focus and Themes
 
-### Round 19 Findings (completed 2026-04-07 19:30)
+### Round 19 Findings (completed 2026-04-07)
 
-**All training hyperparameters confirmed well-tuned.** Five systematic tests:
-- LR 3e-4: all metrics worse (+2-9%), Lion + 2e-4 is optimal
-- Weight decay 5e-4 (10x): p_tan improved but p_in regressed, high variance
-- EMA 0.9995: dilutes converged weights, 3/4 metrics worse
-- Aug sigma 2x: past sweet spot, 3/4 worse
-- Spectral norm SRF: **KEY INSIGHT** — OOD failure is in backbone, not output heads (p_in -2.5% but p_tan +1.8%, p_oodc +0.7%)
+**All training hyperparameters confirmed well-tuned.** LR, weight decay, EMA decay, aug sigma, spectral norm — all baseline values optimal.
 
-**Conclusion:** Hyperparameter tuning is exhausted. The baseline is a local optimum on all standard training knobs.
+**Most informative result:** Spectral norm SRF showed p_in -2.5% but p_tan +1.8%. This proved OOD failure is in the BACKBONE representation, not the output heads.
 
-### Round 20 Strategy (current, 2026-04-07 19:45)
+### Round 20 Strategy (current, 2026-04-07)
 
-Strategy shift per Plateau Protocol. Five diverse experiments targeting different aspects:
+Eight diverse experiments targeting different levels of the training pipeline:
 
-1. **Schedule optimization (T_max=140)**: The one schedule parameter never tested — match cosine annealing to actual training length.
-2. **Output capacity (wider SRF 384)**: Double the surface refinement head width. SRF is the final bottleneck for surface metrics.
-3. **Loss targeting (aft-foil upweight 1.5x)**: Direct p_tan improvement by shifting gradient budget to aft-foil nodes.
-4. **Backbone regularization (hidden noise σ=0.01)**: Directly targets the identified OOD failure mechanism — backbone feature instability. Novel approach not tried before.
-5. **Training strategy (aug annealing at epoch 120)**: Two-phase training — augmented exploration then clean fine-tuning.
+1. **Schedule (T_max=140)** — Match cosine annealing to actual training length
+2. **Output capacity (wider SRF 384)** — Double surface refinement head width
+3. **Loss targeting (aft-foil upweight 1.5x)** — Direct p_tan gradient budget shift
+4. **Backbone regularization (hidden noise σ=0.01)** — Target backbone OOD instability
+5. **Training strategy (aug annealing at epoch 120)** — Clean fine-tuning phase
+6. **Throughput (val_every=3)** — More training epochs within wall-clock budget
+7. **Sample-level reweighting (focal gamma=0.5)** — Upweight hard samples dynamically
+8. **Node-level reweighting (OHNM)** — Error-weighted surface node loss
 
 ### What Works (confirmed and merged)
 
@@ -91,18 +100,19 @@ Strategy shift per Plateau Protocol. Five diverse experiments targeting differen
 ### What's Exhausted (DO NOT REVISIT)
 
 - **Architecture replacements**: GNOT, Galerkin, Hierarchical, FactFormer, DeepONet, INR, NOBLE/CosNet
-- **Feature engineering**: 7 consecutive failures after TE coord + wake deficit. DSDF+TE+wake fully capture useful geometric info.
+- **Feature engineering**: TE coord + wake deficit are the only features that work. LE features, wall distance, all others dead.
 - **Training hyperparameters**: LR, WD, EMA decay, aug sigma all confirmed optimal (Round 19)
-- **Output head regularization**: Spectral norm/dropout on SRF — wrong level of abstraction for OOD
+- **Output head regularization**: Spectral norm/dropout on SRF — wrong level of abstraction
 - **Optimizer variants**: SAM, Lookahead, SWA — all worse than baseline Lion+EMA+cosine
+- **Additive loss penalties**: Huber, L1+L2, any loss that conflicts with PCGrad/tandem_ramp
 
 ## Potential Next Research Directions
 
 After Round 20 completes:
 
-1. **Loss reformulation at a deeper level**: Predict pressure GRADIENTS (dp/ds), Cp normalization, or auxiliary physics-consistent losses that don't conflict with the existing loss.
-2. **Backbone OOD regularization**: If backbone hidden noise (Round 20, edward) shows promise, explore it more aggressively — different σ schedules, layer-selective noise, feature-space contrastive learning.
-3. **Multi-resolution prediction**: Split prediction into low-frequency (mean field) + high-frequency (local corrections). Different heads for different frequency bands.
-4. **Sample-level curriculum/re-weighting**: Train on easy samples first or upweight hard samples. Different from node-level OHNM.
-5. **Condition-aware training**: Separate optimization for different flow regimes (single vs tandem, low vs high Re).
-6. **Researcher-agent fresh ideas**: Agent running in background, results will inform Round 21+.
+1. **Backbone OOD regularization at scale**: If backbone hidden noise (edward, #2254) shows promise, explore aggressive variants — layer-selective noise, scheduled noise, feature-space dropout.
+2. **Prediction target transformation**: Predict pressure gradients dp/ds, vorticity, or stream function. The most impactful change has been altering the prediction task itself (pressure-first).
+3. **Multi-resolution decomposition**: Separate low-frequency (mean field) and high-frequency (local corrections) prediction paths. Related to but distinct from DCT freq loss.
+4. **Knowledge distillation from ensemble**: The 16-seed ensemble beats single-model on p_oodc (6.6 vs 7.6) and p_re (5.8 vs 6.3). Use ensemble predictions as soft targets.
+5. **Condition-aware training**: Separate optimization paths for different flow regimes (single vs tandem, low vs high Re). Beyond what PCGrad 3-way currently handles.
+6. **Contrastive backbone learning**: Auxiliary contrastive loss encouraging similar backbone representations for geometrically similar configurations.

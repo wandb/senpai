@@ -2,6 +2,43 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 19:58 — PR #2218: LE Coordinate Frame (3 iterations) — tanjiro — **CLOSED** (all metrics worse across all 3 variants)
+- Branch: `tanjiro/le-coord-frame`
+- Hypothesis: Add leading-edge-relative input features to complement TE coord frame. Tested 3 variants: v1 (raw LE offsets, 6ch), v2 (chord-normalized, 6ch), v3 (chordwise ratio, 2ch).
+
+**v3 (final) results:**
+
+| Metric | Baseline (#2213) | Seed 42 (fhqdq9vr) | Seed 73 (h3nhswlh) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 12.00 | 12.52 | **12.26** | +2.3% ✗ |
+| p_oodc | 7.643 | 7.8 | 7.9 | **7.85** | +2.6% ✗ |
+| p_tan | 28.341 | 29.5 | 29.0 | **29.25** | +3.2% ✗ |
+| p_re | 6.300 | 6.4 | 6.4 | **6.40** | +1.6% ✗ |
+
+- **Analysis:** All 3 variants failed. v1 had catastrophic OOD regression (p_oodc +9.6%), v2 was mixed (p_tan/p_re improved but p_in regressed), v3 simplified to 2 channels but all 4 metrics regressed. The consistent trend: LE-based features add redundant information. TE coord frame + wake deficit + Fourier PE already capture sufficient spatial structure. LE stagnation point is geometrically predictable and already well-handled by baseline.
+- **Key insight:** Feature engineering for this model is exhausted. TE coord frame and wake deficit captured the high-value geometric information. Additional geometric features add noise rather than signal. Future gains must come from loss, architecture, or training strategy changes.
+- **Conclusion:** CLOSED. LE features are dead end in all formulations. Do not revisit spatial feature engineering.
+
+---
+
+### 2026-04-07 19:55 — PR #2250: Blended L1+L2 Surface Loss — alphonse — **CLOSED** (p_tan +4.3%, p_re +1.6%)
+- Branch: `alphonse/blended-l1-l2-loss`
+- Hypothesis: Add 10% MSE (L2) penalty on top of existing L1 surface loss. L2 creates quadratic penalty on large errors, directing more gradient to worst-predicted nodes (suction peaks, stagnation points, TE pressure recovery). Unlike Huber (#2236) which replaced L1 with L2 for large errors, this ADDS L2 on top.
+
+| Metric | Baseline (#2213) | Seed 42 (h1lj2fej) | Seed 73 (xw0xlhpc) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 12.3 | 11.6 | **11.95** | -0.2% ≈ |
+| p_oodc | 7.643 | 7.9 | 7.3 | **7.60** | -0.6% ≈ |
+| p_tan | 28.341 | 28.5 | 30.6 | **29.55** | **+4.3% ✗✗** |
+| p_re | 6.300 | 6.4 | 6.4 | **6.40** | +1.6% ✗ |
+
+- **Analysis:** L2 gradient conflicts with existing hard-node mining (PCGrad extreme + tandem_ramp + adaptive_boost). The quadratic penalty double-penalizes the hardest cases, causing over-correction on tandem transfer samples. High inter-seed variance on p_tan (28.5 vs 30.6) indicates training instability from the competing gradient signals.
+- **Student observation:** L2 was applied to all 3 channels (Ux, Uy, p) while L1 surface loss only operates on pressure — channel mismatch diluted pressure-focused learning.
+- **Key insight:** The baseline's existing asymmetric error-weighting (PCGrad extreme pct=0.15 + tandem ramp) already handles large-error emphasis effectively. Additional quadratic penalties are redundant and destabilizing. This confirms that loss-level modifications must be carefully designed to not conflict with the existing multi-objective optimization pipeline.
+- **Conclusion:** CLOSED. Blended L1+L2 is redundant with existing mechanisms. Do not revisit additive loss penalties that overlap with PCGrad/tandem_ramp.
+
+---
+
 ### 2026-04-07 19:30 — Round 19 Hyperparameter Validation Sweep — All CLOSED
 
 **Round summary:** Systematic sweep of 5 core hyperparameters to test whether the baseline training configuration is optimal. **All 5 confirmed the baseline is well-tuned.** No merges. This round conclusively establishes that further hyperparameter tuning is unlikely to yield gains — future progress must come from loss reformulation, data representation, or novel training strategies.
