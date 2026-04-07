@@ -56,7 +56,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | nezuko | #2237 | Manifold Mixup: feature-level interpolation for OOD generalization | WIP |
 | alphonse | #2240 | Deeper Backbone: 4 TransolverBlocks for increased capacity | WIP (just assigned) |
 | tanjiro | #2218 | LE Coordinate Frame v3: single chordwise ratio le/(le+te) | WIP |
-| askeladd | — | **IDLE** — assigning Lookahead optimizer | IDLE |
+| askeladd | #2241 | Lookahead Optimizer: slow-weight averaging wrapper for Lion | WIP (just assigned) |
 
 **Idle students:** None.
 
