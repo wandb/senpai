@@ -486,7 +486,11 @@ class TransolverBlock(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
                 )
 
-    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
+    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None, drop_prob=0.0):
+        # Stochastic depth: skip entire block with probability drop_prob (non-last blocks only)
+        if self.training and not self.last_layer and drop_prob > 0.0:
+            if torch.rand(1, device=fx.device).item() < drop_prob:
+                return fx  # pass through unchanged (identity skip)
         sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
         # DomainLayerNorm helper: pass is_tandem when enabled, else plain call
         dln_it = (tandem_mask.view(-1) > 0.5) if (self.domain_layernorm and tandem_mask is not None) else None
@@ -992,8 +996,13 @@ class Transolver(nn.Module):
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
-        for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+        # Stochastic depth: per-block drop probabilities passed via data dict
+        drop_probs = data.get("drop_probs") if isinstance(data, Mapping) else None
+        if drop_probs is None:
+            drop_probs = [0.0] * len(self.blocks)
+
+        for i, block in enumerate(self.blocks[:-1]):
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features, drop_prob=drop_probs[i])
 
         # Deep hidden representation (post all non-last blocks, pre output head)
         fx_deep = fx  # [B, N, n_hidden]
@@ -1170,6 +1179,9 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    stochastic_depth: bool = False          # curriculum stochastic depth: progressive block dropping
+    stochastic_depth_max_drop: float = 0.3  # max drop prob for last non-output block at epoch 0 (decays to 0)
+    stochastic_depth_warmup: int = 80       # epochs until drop prob reaches 0
 
 
 cfg = sp.parse(Config)
@@ -1647,6 +1659,19 @@ for epoch in range(MAX_EPOCHS):
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
 
+    # Stochastic depth: compute per-block drop probabilities (decay to 0 over warmup epochs)
+    if cfg.stochastic_depth and epoch < cfg.stochastic_depth_warmup:
+        decay_factor = 1.0 - (epoch / cfg.stochastic_depth_warmup)
+        n_blocks = cfg.n_layers
+        # Linear scaling: block 0 = 0, last non-output block = max_drop
+        # Note: last block (output block) always has drop_prob=0 (it's excluded in forward)
+        _sd_drop_probs = [
+            cfg.stochastic_depth_max_drop * (i / max(n_blocks - 1, 1)) * decay_factor
+            for i in range(n_blocks)
+        ]
+    else:
+        _sd_drop_probs = [0.0] * cfg.n_layers
+
     # --- Train ---
     model.train()
     if refine_head is not None:
@@ -1886,7 +1911,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x, "drop_probs": _sd_drop_probs})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -2114,7 +2139,7 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x})
+                rdrop_out = model({"x": x, "drop_probs": _sd_drop_probs})
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -2253,7 +2278,7 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                out2 = model({"x": x, "drop_probs": _sd_drop_probs})
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -2310,7 +2335,11 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _step_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.stochastic_depth and global_step % 50 == 0:
+            for _i, _dp in enumerate(_sd_drop_probs):
+                _step_log[f"stochastic_depth/drop_prob_block{_i}"] = _dp
+        wandb.log(_step_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
