@@ -50,8 +50,8 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | thorfinn | #2239 | EMA Self-Distillation: use EMA predictions as soft targets | WIP |
-| frieren | #2238 | Cosine Warm Restarts: SGDR cyclical LR for multi-basin exploration | WIP |
-| edward | #2233 | Re Input Augmentation: Gaussian noise on log(Re) for OOD robustness | WIP |
+| frieren | — | **IDLE** — assigning SAM optimizer | IDLE |
+| edward | — | **IDLE** — assigning spectral norm SRF | IDLE |
 | fern | #2234 | SWA Training: stochastic weight averaging for wider optima | WIP |
 | nezuko | #2237 | Manifold Mixup: feature-level interpolation for OOD generalization | WIP |
 | alphonse | #2240 | Deeper Backbone: 4 TransolverBlocks for increased capacity | WIP (just assigned) |
@@ -108,6 +108,8 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2238 (frieren): Cosine Warm Restarts — T_0=40 too short, third cycle cut at high LR; all metrics +8-19%
+- PR #2233 (edward): Re Input Augmentation — Re is critical signal, σ=0.1 too large; p_re +4.5% (target metric worse)
 - PR #2236 (askeladd): Huber Surface Loss — δ=0.5 too large, all nodes in L2 regime, gradient weakening; all metrics +6-50%
 - PR #2235 (alphonse): Input Feature Noise Augmentation — uniform noise corrupts geometric features; all metrics +7-14%
 - PR #2230 (thorfinn): Stochastic Depth Curriculum — 3 blocks too shallow for block dropout; all metrics +6-34%

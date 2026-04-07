@@ -2,6 +2,38 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 11:50 — PR #2238: Cosine Warm Restarts — frieren — **CLOSED** (all metrics worse, p_oodc +18.7%)
+- Branch: `frieren/cosine-warm-restarts`
+- Hypothesis: SGDR cyclical LR (T_0=40, T_mult=2) for multi-basin exploration. EMA averages across cycles for implicit ensembling.
+
+| Metric | Baseline (#2213) | Seed 42 (9lercyhb) | Seed 73 (36bky4nk) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 13.559 | 13.288 | **13.424** | **+12.1% ✗✗** |
+| p_oodc | 7.643 | 8.839 | 9.309 | **9.074** | **+18.7% ✗✗** |
+| p_tan | 28.341 | 29.992 | 31.247 | **30.620** | **+8.0% ✗** |
+| p_re | 6.300 | 7.209 | 7.286 | **7.247** | **+15.0% ✗✗** |
+
+- **Analysis:** T_0=40 too short for first cycle — model barely learns before LR reset. Third cycle (epoch 120+) cut short at high LR (~1.8e-4). Best checkpoint was epoch 120 (just before third reset destroyed progress). Lion's sign-based updates amplify reset damage. EMA decay 0.999 (half-life ~2 epochs) can't buffer the large-LR divergence. Baseline single cosine (T_max=160) is well-matched to ~150 actual epoch budget.
+- **Conclusion:** CLOSED. Warm restarts destructive with short training budget + Lion optimizer. Single cosine near-optimal.
+
+---
+
+### 2026-04-07 11:50 — PR #2233: Re Input Augmentation — edward — **CLOSED** (p_re +4.5%, target metric worse)
+- Branch: `edward/re-input-augmentation`
+- Hypothesis: Gaussian noise (σ=0.1) on log(Re) input channel during training for OOD Re robustness.
+
+| Metric | Baseline (#2213) | Seed 42 (vb5xooea) | Seed 73 (ix79j0bv) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 12.180 | 12.490 | **12.335** | **+3.0% ✗** |
+| p_oodc | 7.643 | 8.031 | 7.814 | **7.922** | **+3.7% ✗** |
+| p_tan | 28.341 | 28.300 | 28.165 | **28.232** | -0.4% (noise) |
+| p_re | 6.300 | 6.548 | 6.620 | **6.584** | **+4.5% ✗** |
+
+- **Analysis:** log(Re) is a critical conditioning signal, not a redundant feature. σ=0.1 (~±10% Re) is too large — destroys precise Re-dependent BL/pressure information. p_tan showed marginal -0.4% improvement but within seed noise. The model's existing augmentations (AoA, DSDF, gap/stagger) already provide sufficient regularization. Re-specific noise pushes past the sweet spot.
+- **Conclusion:** CLOSED. Re is a critical input, not suitable for large noise augmentation. Existing augmentations sufficient.
+
+---
+
 ### 2026-04-07 11:15 — PR #2236: Huber Surface Loss — askeladd — **CLOSED** (all metrics worse, p_in +49%, p_oodc +50%)
 - Branch: `askeladd/huber-surface-loss`
 - Hypothesis: Replace L1 (MAE) with smooth L1 (Huber, δ=0.5) for surface pressure loss. L2-like gradients for small errors → finer convergence; L1 for large errors → outlier robustness.
