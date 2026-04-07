@@ -50,7 +50,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | thorfinn | #2248 | Stronger Augmentation: 2x gap/stagger and DSDF sigma | WIP (just assigned) |
-| frieren | #2242 | SAM: Sharpness-Aware Minimization for flat minima | WIP (just assigned) |
+| frieren | — | **IDLE** — awaiting assignment | — |
 | edward | #2243 | Spectral Norm SRF: Lipschitz constraint on output heads | WIP (just assigned) |
 | fern | #2244 | Higher EMA Decay: 0.9995 for longer-memory averaging | WIP (just assigned) |
 | nezuko | #2246 | Higher Weight Decay: 5e-4 for stronger regularization | WIP (just assigned) |
@@ -58,7 +58,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | tanjiro | #2218 | LE Coordinate Frame v3: single chordwise ratio le/(le+te) | WIP |
 | askeladd | #2247 | Higher Learning Rate: 3e-4 for broader exploration | WIP (just assigned) |
 
-**Idle students:** None.
+**Idle students:** frieren.
 
 ## PRs Ready for Review
 None currently.
@@ -108,6 +108,7 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2242 (frieren): SAM Optimizer — catastrophic; 2x compute halved epochs (86 vs 145), SAM+Lion sign-based incompatible; all metrics +39-188%
 - PR #2239 (thorfinn): EMA Self-Distillation — redundant with existing EMA, circular dependency; neutral +0.2-2.7%
 - PR #2241 (askeladd): Lookahead Optimizer — triple-smoothing (Lion+Lookahead+EMA) over-constrains; all metrics +3-14%
 - PR #2237 (nezuko): Manifold Mixup — node index misalignment across meshes; physically incoherent mixed representations; all metrics +16-28%

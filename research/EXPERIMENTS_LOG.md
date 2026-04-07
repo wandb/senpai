@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 16:00 — PR #2242: SAM Optimizer — frieren — **CLOSED** (catastrophic, all metrics +39-188%)
+- Branch: `frieren/sam-optimizer`
+- Hypothesis: Sharpness-Aware Minimization (SAM, rho=0.05) wrapping Lion optimizer. Seek flatter minima for better OOD generalization.
+
+| Metric | Baseline (#2213) | Seed 42 | Seed 73 | 2-seed avg | Δ |
+|--------|-----------------|---------|---------|-----------|---|
+| p_in | 11.979 | — | — | **20.276** | **+69.3% ✗✗✗** |
+| p_oodc | 7.643 | — | — | **19.647** | **+157.1% ✗✗✗** |
+| p_tan | 28.341 | — | — | **39.364** | **+38.9% ✗✗✗** |
+| p_re | 6.300 | — | — | **18.131** | **+187.8% ✗✗✗** |
+
+- **Analysis:** Catastrophic failure across all metrics. Root causes: (1) SAM doubles forward/backward passes → only 86 epochs completed in wall-clock budget (vs 145 baseline), (2) SAM was skipped when PCGrad was active — inconsistent optimization, (3) cosine_T_max=80 too short for 86-epoch run, (4) SAM perturbs in steepest-ascent direction but Lion discards gradient magnitude (sign-based updates) — fundamental incompatibility.
+- **Key insight:** SAM is infeasible within wall-clock budget (2x compute per step). Lion's sign-based updates may also negate SAM's perturbation mechanism. Any technique that increases per-step compute is a non-starter.
+- **Conclusion:** CLOSED. Dead end — SAM incompatible with both our compute budget and optimizer.
+
+---
+
 ### 2026-04-07 15:10 — PR #2239: EMA Self-Distillation — thorfinn — **CLOSED** (neutral, p_oodc +2.7%)
 - Branch: `thorfinn/ema-self-distillation`
 - Hypothesis: Use EMA predictions as soft targets (MSE distillation loss, weight=0.1, start epoch 20).
