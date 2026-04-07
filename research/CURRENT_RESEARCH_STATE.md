@@ -49,7 +49,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| thorfinn | #2230 | Stochastic Depth Curriculum: progressive block dropping | WIP |
+| thorfinn | #2239 | EMA Self-Distillation: use EMA predictions as soft targets | WIP (just assigned) |
 | frieren | #2238 | Cosine Warm Restarts: SGDR cyclical LR for multi-basin exploration | WIP (just assigned) |
 | edward | #2233 | Re Input Augmentation: Gaussian noise on log(Re) for OOD robustness | WIP (just assigned) |
 | fern | #2234 | SWA Training: stochastic weight averaging for wider optima | WIP (just assigned) |
@@ -108,6 +108,7 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2230 (thorfinn): Stochastic Depth Curriculum — 3 blocks too shallow for block dropout; all metrics +6-34%
 - PR #2232 (frieren): Pressure Laplacian Smoothness — catastrophic, smoothness penalty destroys OOD; p_oodc +307%, p_re +291%
 - PR #2226 (nezuko): Tandem Feature Cross — global sigmoid gate too blunt, p_tan +1.3%, p_oodc -1.2% but p_re +1.6%
 - PR #2231 (askeladd): Surface Curvature Feature — catastrophic, mesh noise in finite-difference curvature; seed 42 diverged +160% p_in

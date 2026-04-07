@@ -2,6 +2,22 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 09:10 — PR #2230: Stochastic Depth Curriculum — thorfinn — **CLOSED** (all metrics worse, p_in +33.6%)
+- Branch: `thorfinn/stochastic-depth-curriculum`
+- Hypothesis: Progressive block dropping during early training. Block 1 dropped with max p=0.15, decaying to 0 by epoch 80. Block 2 (last) never dropped.
+
+| Metric | Baseline (#2213) | Seed 42 (swddfzc7) | Seed 73 (t1aww5gn) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 16.9 | 15.1 | **16.000** | **+33.6% ✗✗** |
+| p_oodc | 7.643 | 9.9 | 8.9 | **9.400** | **+23.0% ✗✗** |
+| p_tan | 28.341 | 30.4 | 29.7 | **30.050** | **+6.0% ✗** |
+| p_re | 6.300 | 8.3 | 7.5 | **7.900** | **+25.4% ✗✗** |
+
+- **Analysis:** With only 3 blocks, each is load-bearing. Stochastic depth needs deep redundant networks (100+ layers). Dropping block 1 forces a degenerate shortcut (block 0 → block 2) that conflicts with the normal 3-block pipeline. pressure_deep branch creates additional gradient dependencies. Reduced epoch count (111-128 vs 145-155) from overhead further hurts.
+- **Conclusion:** CLOSED. Block-level dropout requires deep networks. Not applicable to 3-block Transolver.
+
+---
+
 ### 2026-04-07 08:45 — PR #2232: Pressure Laplacian Smoothness — frieren — **CLOSED** (catastrophic, p_oodc +307%, p_re +291%)
 - Branch: `frieren/pressure-laplacian-smooth`
 - Hypothesis: Graph-Laplacian smoothness penalty on surface pressure. Penalizes (dp/ds)² between adjacent surface nodes. LE/TE exclusion zone (5% chord). Weight=0.01.
