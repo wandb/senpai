@@ -377,8 +377,10 @@ class TransolverBlock(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         spatial_bias_input_dim=4,
+        mhc_residuals=False,
     ):
         super().__init__()
+        self.mhc_residuals = mhc_residuals
         self.last_layer = last_layer
         self.field_decoder = field_decoder
         self.domain_velhead = domain_velhead
@@ -435,6 +437,12 @@ class TransolverBlock(nn.Module):
         self.se_fc2 = nn.Linear(hidden_dim // 4, hidden_dim)
         nn.init.zeros_(self.se_fc2.weight)
         nn.init.zeros_(self.se_fc2.bias)
+        if mhc_residuals:
+            # Learnable residual mixing: x_out = alpha * x + beta * F(x)
+            self.attn_alpha = nn.Parameter(torch.ones(1))
+            self.attn_beta = nn.Parameter(torch.ones(1))
+            self.mlp_alpha = nn.Parameter(torch.ones(1))
+            self.mlp_beta = nn.Parameter(torch.ones(1))
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
             if soft_moe:
@@ -498,12 +506,28 @@ class TransolverBlock(nn.Module):
             cond_out = self.adaln_net(condition)  # [B, H*4]
             s1, b1, s2, b2 = cond_out.chunk(4, dim=-1)  # each [B, H]
             fx_norm = _ln(self.ln_1, fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
-            fx = _ln(self.ln_1_post, self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            attn_out = self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features)
+            if self.mhc_residuals:
+                fx = _ln(self.ln_1_post, self.attn_alpha * fx + self.attn_beta * attn_out)
+            else:
+                fx = _ln(self.ln_1_post, attn_out + fx)
             fx_norm = _ln(self.ln_2, fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
-            fx = _ln(self.ln_2_post, self.mlp(fx_norm) + fx)
+            mlp_out = self.mlp(fx_norm)
+            if self.mhc_residuals:
+                fx = _ln(self.ln_2_post, self.mlp_alpha * fx + self.mlp_beta * mlp_out)
+            else:
+                fx = _ln(self.ln_2_post, mlp_out + fx)
         else:
-            fx = _ln(self.ln_1_post, self.attn(_ln(self.ln_1, fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
-            fx = _ln(self.ln_2_post, self.mlp(_ln(self.ln_2, fx)) + fx)
+            attn_out = self.attn(_ln(self.ln_1, fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features)
+            if self.mhc_residuals:
+                fx = _ln(self.ln_1_post, self.attn_alpha * fx + self.attn_beta * attn_out)
+            else:
+                fx = _ln(self.ln_1_post, attn_out + fx)
+            mlp_out = self.mlp(_ln(self.ln_2, fx))
+            if self.mhc_residuals:
+                fx = _ln(self.ln_2_post, self.mlp_alpha * fx + self.mlp_beta * mlp_out)
+            else:
+                fx = _ln(self.ln_2_post, mlp_out + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
@@ -794,6 +818,7 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        mhc_residuals=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -866,6 +891,7 @@ class Transolver(nn.Module):
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
                     spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
+                    mhc_residuals=mhc_residuals,
                 )
                 for idx in range(n_layers)
             ]
@@ -1170,6 +1196,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    mhc_residuals: bool = False             # learnable alpha/beta residual weights per sublayer (hyper-connection mixing)
 
 
 cfg = sp.parse(Config)
@@ -1330,6 +1357,7 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    mhc_residuals=cfg.mhc_residuals,
 )
 
 model = Transolver(**model_config).to(device)
@@ -2767,6 +2795,13 @@ for epoch in range(MAX_EPOCHS):
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
+    if cfg.mhc_residuals:
+        for i, block in enumerate(_base_model.blocks):
+            if hasattr(block, 'attn_alpha'):
+                metrics[f"block{i}/attn_alpha"] = block.attn_alpha.item()
+                metrics[f"block{i}/attn_beta"] = block.attn_beta.item()
+                metrics[f"block{i}/mlp_alpha"] = block.mlp_alpha.item()
+                metrics[f"block{i}/mlp_beta"] = block.mlp_beta.item()
     wandb.log(metrics)
 
     if torch.cuda.is_available():
