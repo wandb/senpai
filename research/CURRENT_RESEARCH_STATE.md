@@ -53,7 +53,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | frieren | #2221 | Wake Angle Feature (atan2 wake direction) | WIP |
 | edward | #2222 | mHC Learnable Residual Mixing (alpha/beta per sublayer) | WIP |
 | fern | #2223 | Surface Arc-Length PE (curvilinear position for surface nodes) | WIP |
-| nezuko | #2217 | Fore-SRF Skip: inject fore-foil mean hidden into AftSRF input | WIP |
+| nezuko | #2226 | Tandem Feature Cross: config-aware sigmoid gate on encoded features | WIP (just assigned) |
 | alphonse | #2219 | Additive Fore→Aft Cross-Attention in AftSRF | WIP |
 | tanjiro | #2218 | LE Coordinate Frame v2: chord-normalized LE + wake deficit rebase | WIP (sent back) |
 | askeladd | #2225 | Domain-Split SRF Norm: tandem-conditional LayerNorm in AftSRF | WIP (just assigned) |
@@ -108,6 +108,7 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2217 (nezuko): Fore-SRF Skip — mean-pooled fore hidden too coarse, 3/4 metrics worse, high seed variance
 - PR #2220 (askeladd): Slice Diversity Reg — forcing slice orthogonality harms all metrics +5-10%, slice collapse is beneficial
 - PR #2216 (thorfinn): GeoTransolver GALE — geometry cross-attention creates competing pathway, p_in +29%, all metrics worse
 - PR #2214 (edward): Deep Supervision — aux_loss never activated (redundant with --pressure_deep)

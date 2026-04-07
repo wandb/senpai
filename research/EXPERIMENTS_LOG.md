@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 01:45 — PR #2217: Fore-SRF Skip (fore-foil mean hidden → AftSRF) — nezuko — **CLOSED** (inconclusive, 3/4 metrics worse)
+- Branch: `nezuko/fore-srf-additive-skip`
+- Hypothesis: Inject zero-init projection of fore-foil mean surface hidden state into aft-foil hidden features before AftSRF. Gives the correction head "upstream awareness" of fore-foil circulation/wake. 147K new params (384×384 projection, zero-init).
+- **Note:** Experiment ran against old TE-only baseline (PR #2207), missing `--wake_deficit_feature`. W&B runs offline (auth issues).
+
+| Metric | Baseline (#2207) | Seed 42 (t2eoumup) | Seed 73 (o44zx3wy) | 2-seed avg | Δ vs TE-only | vs Current (#2213) |
+|--------|-----------------|--------------------|--------------------|-----------|--------------|---------------------|
+| p_in | 12.490 | 12.556 | 12.500 | **12.528** | +0.3% ✗ | +4.6% ✗ |
+| p_oodc | 7.618 | 7.324 | 7.620 | **7.472** | **-1.9%** ✅ | -2.2% ✅ |
+| p_tan | 28.521 | 29.233 | 27.865 | **28.549** | +0.1% ✗ | +0.7% ✗ |
+| p_re | 6.411 | 6.479 | 6.450 | **6.465** | +0.8% ✗ | +2.6% ✗ |
+
+- High seed variance on p_tan (29.23 vs 27.87 = 1.37 gap). p_oodc improved consistently.
+- **Analysis:** The fore-foil mean hidden carries some useful OOD condition information (p_oodc -1.9%), but mean-pooling discards spatial structure. The zero-init projection learns slowly and converges unpredictably. 3/4 metrics worse. Additive fore→aft cross-attention (#2219) is a more sophisticated version of this idea already in flight.
+- **Conclusion:** CLOSED. Fore-foil mean skip is too coarse — mean-pooling loses the spatial structure that matters (LE vs TE vs pressure side). Cross-attention (#2219) should test the same direction more rigorously.
+
+---
+
 ### 2026-04-07 01:00 — PR #2220: Slice Diversity Reg (Gram matrix orthogonality) — askeladd — **CLOSED** (all metrics regressed 5-10%)
 - Branch: `askeladd/slice-diversity-reg`
 - Hypothesis: Penalize cosine similarity between slice attention profiles via Gram matrix orthogonality loss `((G - I)^2).mean()` weighted by λ=0.005. Forces each of 96 slices to specialize in distinct spatial regions. Zero architecture change, inference-time free.
