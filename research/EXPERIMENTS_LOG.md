@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 08:45 — PR #2232: Pressure Laplacian Smoothness — frieren — **CLOSED** (catastrophic, p_oodc +307%, p_re +291%)
+- Branch: `frieren/pressure-laplacian-smooth`
+- Hypothesis: Graph-Laplacian smoothness penalty on surface pressure. Penalizes (dp/ds)² between adjacent surface nodes. LE/TE exclusion zone (5% chord). Weight=0.01.
+
+| Metric | Baseline (#2213) | Seed 42 (85qhnb0q) | Seed 73 (mtc0qkkc) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 12.466 | 12.624 | **12.545** | +4.7% ✗ |
+| p_oodc | 7.643 | 31.837 | 30.351 | **31.094** | **+307% ✗✗✗** |
+| p_tan | 28.341 | 55.121 | 55.936 | **55.529** | **+96% ✗✗✗** |
+| p_re | 6.300 | 24.822 | 24.479 | **24.651** | **+291% ✗✗✗** |
+
+- **Analysis:** Catastrophic OOD destruction. The (dp/ds)² penalty disproportionately suppresses large-gradient predictions, which are EXACTLY the correct OOD pressure distributions (higher Re → steeper gradients, camber → stronger suction peaks). Same failure mode as arc-length surface loss (#2210).
+- **Key lesson:** Surface smoothness constraints are fundamentally incompatible with OOD generalization. Three experiments now confirm: arc-length loss (#2210, +14.2%), DCT freq (merged at minimal weight 0.05), Laplacian (+307%). The model's bottleneck is NOT noise/roughness — it's the ability to produce DIVERSE pressure distributions.
+- **Conclusion:** CLOSED. Surface smoothness regularization losses are a dead end. DO NOT REVISIT.
+
+---
+
 ### 2026-04-07 08:15 — PR #2226: Tandem Feature Cross — nezuko — **CLOSED** (p_tan +1.3%, mixed results)
 - Branch: `nezuko/tandem-feature-cross`
 - Hypothesis: Config-aware sigmoid gate (4→32→66 MLP) conditioned on (gap, stagger, log_Re, AoA), applied to all 66 input feature channels. Near-identity init (bias=5.0, sigmoid≈0.993).

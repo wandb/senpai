@@ -50,7 +50,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | thorfinn | #2230 | Stochastic Depth Curriculum: progressive block dropping | WIP |
-| frieren | #2232 | Pressure Laplacian Smoothness: topology-aware surface Cp regularization | WIP (just assigned) |
+| frieren | #2238 | Cosine Warm Restarts: SGDR cyclical LR for multi-basin exploration | WIP (just assigned) |
 | edward | #2233 | Re Input Augmentation: Gaussian noise on log(Re) for OOD robustness | WIP (just assigned) |
 | fern | #2234 | SWA Training: stochastic weight averaging for wider optima | WIP (just assigned) |
 | nezuko | #2237 | Manifold Mixup: feature-level interpolation for OOD generalization | WIP (just assigned) |
@@ -108,6 +108,7 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2232 (frieren): Pressure Laplacian Smoothness — catastrophic, smoothness penalty destroys OOD; p_oodc +307%, p_re +291%
 - PR #2226 (nezuko): Tandem Feature Cross — global sigmoid gate too blunt, p_tan +1.3%, p_oodc -1.2% but p_re +1.6%
 - PR #2231 (askeladd): Surface Curvature Feature — catastrophic, mesh noise in finite-difference curvature; seed 42 diverged +160% p_in
 - PR #2229 (alphonse): Surface Normal Features — DSDF already encodes orientation; kNN noise at LE/TE; all metrics +3-7%
