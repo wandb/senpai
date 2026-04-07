@@ -56,7 +56,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | nezuko | #2226 | Tandem Feature Cross: config-aware sigmoid gate on encoded features | WIP |
 | alphonse | #2235 | Input Feature Noise Augmentation: Gaussian noise on all channels | WIP (just assigned) |
 | tanjiro | #2218 | LE Coordinate Frame v3: single chordwise ratio le/(le+te) | WIP (sent back) |
-| askeladd | #2231 | Surface Curvature Feature: local κ for surface nodes | WIP (just assigned) |
+| askeladd | #2236 | Huber Surface Loss: smooth L1 for finer gradient signal | WIP (just assigned) |
 
 **Idle students:** None.
 
@@ -71,11 +71,12 @@ No new issues. Prior directives still in effect:
 
 ## Current Research Focus and Themes
 
-**Theme 1: Explicit Physical Feature Engineering (HIGHEST PRIORITY — proven fruitful)**
-- TE coord frame (PR #2207): -5.4% p_in
-- Wake deficit feature (PR #2213): -4.1% p_in, -1.7% p_re
-- In flight: LE coord frame v3 (#2218), surface arc-length PE (#2223), chord-camber distance (#2227), Re-scaled wall dist (#2228), surface normals (#2229), surface curvature (#2231)
-- The model responds strongly to explicit aerodynamic geometry — continue exploiting this
+**Theme 1: Explicit Physical Feature Engineering (SATURATED — 7 consecutive failures)**
+- TE coord frame (PR #2207): -5.4% p_in ✅
+- Wake deficit feature (PR #2213): -4.1% p_in, -1.7% p_re ✅
+- FAILED: chord-camber (#2227), Re-walldist (#2228), arc-length PE (#2223), surface normals (#2229), domain-split SRF (#2225), curvature (#2231)
+- **Conclusion: DSDF + TE coord frame + wake deficit fully capture useful geometric information. Feature engineering is exhausted.**
+- In flight: LE coord frame v3 (#2218 tanjiro) — final feature experiment
 
 **Theme 2: Tandem-Specific Coupling and Conditioning**
 - In flight: tandem feature cross (#2226 nezuko) — config-aware sigmoid gate on encoded features
@@ -107,6 +108,7 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2231 (askeladd): Surface Curvature Feature — catastrophic, mesh noise in finite-difference curvature; seed 42 diverged +160% p_in
 - PR #2229 (alphonse): Surface Normal Features — DSDF already encodes orientation; kNN noise at LE/TE; all metrics +3-7%
 - PR #2223 (fern): Surface Arc-Length PE — redundant with TE coord frame; all metrics +3-6%
 - PR #2228 (edward): Re-Scaled WallDist — redundant with DSDF + log(Re); all metrics +2-5%

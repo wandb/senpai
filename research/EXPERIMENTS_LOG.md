@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 08:00 — PR #2231: Surface Curvature Feature — askeladd — **CLOSED** (catastrophic, seed 42 diverged +160% p_in)
+- Branch: `askeladd/surface-curvature-feature`
+- Hypothesis: Dimensionless local curvature κ×chord for surface nodes. 2 channels (kappa_fore, kappa_aft). Angle-sorted finite differences of tangent angle.
+
+| Metric | Baseline (#2213) | Seed 42 (n9ra6pql) | Seed 73 (mgeic3k0) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 47.9 | 14.4 | **31.15** | **+160% ✗✗✗** |
+| p_oodc | 7.643 | 38.7 | 9.5 | **24.10** | **+215% ✗✗✗** |
+| p_tan | 28.341 | 65.3 | 29.8 | **47.55** | **+68% ✗✗** |
+| p_re | 6.300 | 28.5 | 7.4 | **17.95** | **+185% ✗✗✗** |
+
+- **Analysis:** Catastrophic divergence on seed 42 (epoch 65). Finite-difference curvature from discrete mesh nodes amplifies mesh irregularity, especially at TE where angle sorting is ambiguous. Even seed 73 (which converged) was worse on all metrics. DSDF gradient norm already provides a more stable curvature proxy.
+- **Key lesson:** 7th consecutive feature engineering failure. Feature space is definitively saturated — DSDF + TE coord frame + wake deficit capture all useful geometric information. Further surface geometry features add noise, not signal.
+- **Conclusion:** CLOSED. Feature engineering for this model is exhausted. Shifting to loss/training modifications.
+
+---
+
 ### 2026-04-07 06:15 — PR #2229: Surface Normal Features — alphonse — **CLOSED** (all metrics worse, p_oodc +7.0%)
 - Branch: `alphonse/surface-normal-features`
 - Hypothesis: Outward-pointing unit normals (nx, ny) per surface node. 2 new channels. kNN tangent estimation (k=5) with centroid-based outward orientation.
