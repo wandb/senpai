@@ -54,7 +54,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | edward | #2233 | Re Input Augmentation: Gaussian noise on log(Re) for OOD robustness | WIP (just assigned) |
 | fern | #2234 | SWA Training: stochastic weight averaging for wider optima | WIP (just assigned) |
 | nezuko | #2226 | Tandem Feature Cross: config-aware sigmoid gate on encoded features | WIP |
-| alphonse | #2229 | Surface Normal Features: outward normal (nx,ny) per surface node | WIP |
+| alphonse | #2235 | Input Feature Noise Augmentation: Gaussian noise on all channels | WIP (just assigned) |
 | tanjiro | #2218 | LE Coordinate Frame v3: single chordwise ratio le/(le+te) | WIP (sent back) |
 | askeladd | #2231 | Surface Curvature Feature: local κ for surface nodes | WIP (just assigned) |
 
@@ -107,6 +107,7 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2229 (alphonse): Surface Normal Features — DSDF already encodes orientation; kNN noise at LE/TE; all metrics +3-7%
 - PR #2223 (fern): Surface Arc-Length PE — redundant with TE coord frame; all metrics +3-6%
 - PR #2228 (edward): Re-Scaled WallDist — redundant with DSDF + log(Re); all metrics +2-5%
 - PR #2227 (frieren): Chord-Camber Distance — geometry-frame upper/lower ≠ flow-frame suction/pressure; all metrics +0.9-5.5%

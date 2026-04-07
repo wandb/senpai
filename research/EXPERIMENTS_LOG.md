@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 06:15 — PR #2229: Surface Normal Features — alphonse — **CLOSED** (all metrics worse, p_oodc +7.0%)
+- Branch: `alphonse/surface-normal-features`
+- Hypothesis: Outward-pointing unit normals (nx, ny) per surface node. 2 new channels. kNN tangent estimation (k=5) with centroid-based outward orientation.
+
+| Metric | Baseline (#2213) | Seed 42 (lkje1j6x) | Seed 73 (0qpde0kn) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 12.833 | 12.369 | **12.601** | **+5.2% ✗** |
+| p_oodc | 7.643 | 8.431 | 7.929 | **8.180** | **+7.0% ✗** |
+| p_tan | 28.341 | 29.247 | 29.062 | **29.155** | **+2.9% ✗** |
+| p_re | 6.300 | 6.407 | 6.669 | **6.538** | **+3.8% ✗** |
+
+- **Analysis:** DSDF gradients already encode surface orientation. kNN tangent estimation breaks down at LE/TE high-curvature regions where pressure is most sensitive. Centroid-based outward orientation heuristic compounds noise. This is the 5th consecutive feature engineering failure this round.
+- **Key lesson:** Feature engineering space is saturated. DSDF + TE coord frame + wake deficit capture the geometric information the model can use. Additional surface geometry features (normals, curvature, arc-length, thickness) add noise, not signal.
+- **Conclusion:** CLOSED. Surface geometry features beyond DSDF + TE frame + wake deficit are a dead end.
+
+---
+
 ### 2026-04-07 05:45 — PR #2223: Surface Arc-Length PE — fern — **CLOSED** (p_oodc +4.7%, p_re +5.6%, p_in +3.1%, p_tan flat)
 - Branch: `fern/surface-arc-length-pe`
 - Hypothesis: Normalized arc-length s ∈ [0,1] from LE as curvilinear position encoding for surface nodes. Single channel appended to input features. Angle-based sorting from centroid for ring ordering.
