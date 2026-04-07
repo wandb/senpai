@@ -1170,6 +1170,8 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    bernoulli_loss: bool = False            # soft Bernoulli consistency auxiliary loss on surface nodes
+    bernoulli_weight: float = 0.01         # weight for Bernoulli consistency loss
 
 
 cfg = sp.parse(Config)
@@ -1226,6 +1228,56 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 1:2] = y_p[:, :, 1:2].clamp(-10, 10) * Umag
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
+
+
+def bernoulli_consistency_loss_fn(pred, sample_stds, freestream, phys_y_mean, phys_y_std,
+                                   is_surface, asinh_scale, weight):
+    """Soft Bernoulli consistency loss: Cp + (Ux/Umag)^2 + (Uy/Umag)^2 ≈ 1.0 on surface nodes.
+
+    Inverts the normalization pipeline to recover Cp-space predictions, then penalizes
+    deviation from the inviscid Bernoulli relation. Serves as a soft physics prior
+    coupling the pressure and velocity heads via gradient.
+
+    Args:
+        pred: [B, N, 3] — model predictions in normalized residual/sample_std space
+        sample_stds: [B, 1, 3] — per-sample std normalization factors
+        freestream: [B, 1, 3] or None — freestream offset in normalized space
+        phys_y_mean: [3] — phys_stats channel means
+        phys_y_std: [3] — phys_stats channel stds
+        is_surface: [B, N] bool — surface node mask
+        asinh_scale: float — asinh transform scale
+        weight: float — loss weight
+    """
+    if not is_surface.any():
+        return torch.tensor(0.0, device=pred.device)
+
+    # Invert normalization pipeline:
+    #   pred = (phys_normed - freestream) / sample_stds
+    #   phys_normed = (asinh_space - phys_mean) / phys_std
+    #   asinh_space: [Ux/Umag, Uy/Umag, asinh(Cp * scale)]
+    pred_unnorm = pred * sample_stds          # undo per-sample std [B, N, 3]
+    if freestream is not None:
+        pred_unnorm = pred_unnorm + freestream  # add residual offset back [B, N, 3]
+    # Undo phys_stats standardization
+    pred_asinh = pred_unnorm * phys_y_std + phys_y_mean  # [B, N, 3]
+
+    ux_norm = pred_asinh[..., 0]   # Ux/Umag [B, N]
+    uy_norm = pred_asinh[..., 1]   # Uy/Umag [B, N]
+    asinh_cp = pred_asinh[..., 2]  # asinh(Cp * scale) [B, N]
+
+    # Invert asinh: asinh(Cp * scale) → Cp
+    cp = torch.sinh(asinh_cp) / asinh_scale  # Cp = p/(0.5*Umag^2) [B, N]
+
+    # Bernoulli in Cp-space: Cp + (Ux/Umag)^2 + (Uy/Umag)^2 = 1.0 (inviscid)
+    # At stagnation: Cp=1.0, Ux=Uy=0 → sum=1.0 ✓
+    # At far field: Cp=0, cos^2+sin^2=1 → sum=1.0 ✓
+    # At viscous wall: Ux≈Uy≈0, so Cp should approach stagnation value — soft prior only
+    bern_residual = cp + ux_norm ** 2 + uy_norm ** 2 - 1.0  # [B, N]
+
+    # Apply only on surface nodes
+    surf_residuals = bern_residual[is_surface]  # [M]
+    return weight * (surf_residuals ** 2).mean()
+
 
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=cfg.num_workers, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
@@ -2110,6 +2162,21 @@ for epoch in range(MAX_EPOCHS):
                 _dct_loss = _dct_loss / _n_foils_dct
                 loss = loss + cfg.dct_freq_weight * _dct_loss
 
+        # Bernoulli consistency auxiliary loss on surface nodes
+        _bern_loss = torch.tensor(0.0, device=device)
+        if cfg.bernoulli_loss and model.training and cfg.asinh_pressure and not cfg.adaptive_norm and not cfg.raw_targets:
+            _bern_loss = bernoulli_consistency_loss_fn(
+                pred=pred,
+                sample_stds=sample_stds,
+                freestream=_freestream,
+                phys_y_mean=phys_stats["y_mean"].unsqueeze(0).unsqueeze(0),
+                phys_y_std=phys_stats["y_std"].unsqueeze(0).unsqueeze(0),
+                is_surface=surf_mask,
+                asinh_scale=cfg.asinh_scale,
+                weight=cfg.bernoulli_weight,
+            )
+            loss = loss + _bern_loss
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -2136,8 +2203,9 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            bern_shared = _bern_loss * 0.5 if _bern_loss.item() > 0 else 0.0
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + bern_shared
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + bern_shared
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -2182,7 +2250,8 @@ for epoch in range(MAX_EPOCHS):
                 vol_loss_g = (abs_err * vol_mask_g.unsqueeze(-1)).sum() / vol_mask_g.sum().clamp(min=1)
                 surf_loss_g = (surf_per_sample * mask_1d.float() * tandem_boost).sum() / n
                 coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                bern_shared = _bern_loss * 0.5 if _bern_loss.item() > 0 else 0.0
+                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + bern_shared
 
             loss_A = _grp_loss(~is_tandem_batch)
             # Only include non-empty groups to avoid backward() on no-grad tensors
@@ -2310,7 +2379,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _wandb_step_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.bernoulli_loss:
+            _wandb_step_log["train/bernoulli_loss"] = _bern_loss.item()
+        wandb.log(_wandb_step_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
