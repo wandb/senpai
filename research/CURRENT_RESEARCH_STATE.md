@@ -49,7 +49,7 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| thorfinn | #2239 | EMA Self-Distillation: use EMA predictions as soft targets | WIP |
+| thorfinn | — | **IDLE** — assigning stronger augmentation | IDLE |
 | frieren | #2242 | SAM: Sharpness-Aware Minimization for flat minima | WIP (just assigned) |
 | edward | #2243 | Spectral Norm SRF: Lipschitz constraint on output heads | WIP (just assigned) |
 | fern | #2244 | Higher EMA Decay: 0.9995 for longer-memory averaging | WIP (just assigned) |
@@ -108,6 +108,7 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2239 (thorfinn): EMA Self-Distillation — redundant with existing EMA, circular dependency; neutral +0.2-2.7%
 - PR #2241 (askeladd): Lookahead Optimizer — triple-smoothing (Lion+Lookahead+EMA) over-constrains; all metrics +3-14%
 - PR #2237 (nezuko): Manifold Mixup — node index misalignment across meshes; physically incoherent mixed representations; all metrics +16-28%
 - PR #2240 (alphonse): Deeper Backbone 4L — undertrained (118 vs 145 epochs), infeasible in wall-clock budget; all metrics +2-12%

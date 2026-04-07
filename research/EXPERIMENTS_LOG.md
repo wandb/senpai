@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 15:10 — PR #2239: EMA Self-Distillation — thorfinn — **CLOSED** (neutral, p_oodc +2.7%)
+- Branch: `thorfinn/ema-self-distillation`
+- Hypothesis: Use EMA predictions as soft targets (MSE distillation loss, weight=0.1, start epoch 20).
+
+| Metric | Baseline (#2213) | Seed 42 (0o8cofv5) | Seed 73 (kvs1oevx) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 12.1 | 12.0 | **12.050** | +0.6% |
+| p_oodc | 7.643 | 7.9 | 7.8 | **7.850** | +2.7% ✗ |
+| p_tan | 28.341 | 28.0 | 28.8 | **28.400** | +0.2% |
+| p_re | 6.300 | 6.2 | 6.7 | **6.450** | +2.4% ✗ |
+
+- **Analysis:** Closest to baseline of any experiment this round. Seed 42 beat on p_tan (28.0) and p_re (6.2) individually. EMA self-distillation provides valid gradient signal, but EMA (decay=0.999) is already very close to online model — circular dependency dampens regularization. Extra EMA forward pass adds ~60% per-epoch overhead (72→116s). Distill loss becomes near-zero quickly, negligible signal in late training.
+- **Key insight:** Baseline EMA + training dynamics are near-optimal. Additional smoothing/averaging has diminishing returns.
+- **Conclusion:** CLOSED. Redundant with existing EMA. Compute cost not justified for neutral result.
+
+---
+
 ### 2026-04-07 14:40 — PR #2241: Lookahead Optimizer — askeladd — **CLOSED** (all metrics worse, p_re +14.3%)
 - Branch: `askeladd/lookahead-optimizer`
 - Hypothesis: Wrap Lion with Lookahead (k=5, alpha=0.5). Slow-weight averaging every 5 steps for flatter minima.
