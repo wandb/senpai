@@ -2,6 +2,40 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-07 02:00 — PR #2222: mHC Learnable Residual Mixing (alpha/beta per sublayer) — edward — **CLOSED** (all metrics regressed 1-6%)
+- Branch: `edward/mhc-residuals`
+- Hypothesis: Replace fixed residual `x + F(x)` with learnable `alpha*x + beta*F(x)` per sublayer per block. 12 new params total. Init (1,1). Human team requested (issue #1926).
+
+| Metric | Baseline (#2213) | Seed 42 (k4xt5z1x) | Seed 73 (dh2taztr) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 13.151 | 12.193 | **12.672** | **+5.8% ✗** |
+| p_oodc | 7.643 | 7.796 | 7.691 | **7.744** | **+1.3% ✗** |
+| p_tan | 28.341 | 29.225 | 28.164 | **28.695** | **+1.2% ✗** |
+| p_re | 6.300 | 6.438 | 6.581 | **6.510** | **+3.3% ✗** |
+
+- **Key finding:** Learned alpha/beta values converged consistently: alpha≈1.9 (skip boosted), beta≈0.1-0.3 (transformation suppressed). Same pattern across ALL blocks, BOTH seeds. The optimizer chose to reduce effective model depth → underfitting.
+- **Analysis:** Unconstrained learnable mixing collapses to skip-dominant local minimum. Existing SE gating + DomainLayerNorm already provide adaptive feature calibration, making mHC redundant. No per-block differentiation emerged (hypothesis predicted early=skip, late=transform — didn't happen).
+- **Conclusion:** CLOSED. Unconstrained mHC residuals direction exhausted. The Transolver backbone's residual dynamics are already well-calibrated.
+
+---
+
+### 2026-04-07 02:00 — PR #2221: Wake Angle Feature (atan2 direction channel) — frieren — **CLOSED** (all metrics regressed 1-5%)
+- Branch: `frieren/wake-angle-feature`
+- Hypothesis: Add atan2(dy_raw, dx_raw) as 3rd wake channel alongside existing (dx/gap, dy/gap). Provides angular wake impingement direction.
+
+| Metric | Baseline (#2213) | Seed 42 (sa1xdfb7) | Seed 73 (xvdyqpd7) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in | 11.979 | 13.037 | 12.166 | **12.602** | **+5.2% ✗** |
+| p_oodc | 7.643 | 7.551 | 8.045 | **7.798** | **+2.0% ✗** |
+| p_tan | 28.341 | 29.656 | 27.714 | **28.685** | **+1.2% ✗** |
+| p_re | 6.300 | 6.482 | 6.351 | **6.417** | **+1.9% ✗** |
+
+- High seed variance on p_tan (29.66 vs 27.71 = 1.95 gap vs baseline's 0.78).
+- **Analysis:** atan2 is mathematically derivable from existing (dx/gap, dy/gap) — redundant information. The MLP can learn angle from Cartesian components. Scale mismatch ([-π, π] vs varying Cartesian) and ±π discontinuity inject noise. Wake deficit succeeded by adding genuinely NEW information (gap normalization); wake angle fails by adding REDUNDANT information.
+- **Conclusion:** CLOSED. Future wake features must provide information the model cannot derive from existing channels.
+
+---
+
 ### 2026-04-07 01:45 — PR #2217: Fore-SRF Skip (fore-foil mean hidden → AftSRF) — nezuko — **CLOSED** (inconclusive, 3/4 metrics worse)
 - Branch: `nezuko/fore-srf-additive-skip`
 - Hypothesis: Inject zero-init projection of fore-foil mean surface hidden state into aft-foil hidden features before AftSRF. Gives the correction head "upstream awareness" of fore-foil circulation/wake. 147K new params (384×384 projection, zero-init).

@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-07 01:00 UTC
+- **Date:** 2026-04-07 02:00 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training Improvements
 
@@ -50,8 +50,8 @@ Single-model p_tan (28.341) **BEATS** ensemble (29.1). p_in (11.979) also beats 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | thorfinn | #2224 | Bernoulli Consistency Loss (p + 0.5|u|² = C coupling) | WIP (just assigned) |
-| frieren | #2221 | Wake Angle Feature (atan2 wake direction) | WIP |
-| edward | #2222 | mHC Learnable Residual Mixing (alpha/beta per sublayer) | WIP |
+| frieren | #2227 | Chord-Camber Distance: signed distance from chord line | WIP (just assigned) |
+| edward | #2228 | Re-Scaled WallDist: BL thickness proxy via Re^(-1/2) | WIP (just assigned) |
 | fern | #2223 | Surface Arc-Length PE (curvilinear position for surface nodes) | WIP |
 | nezuko | #2226 | Tandem Feature Cross: config-aware sigmoid gate on encoded features | WIP (just assigned) |
 | alphonse | #2219 | Additive Fore→Aft Cross-Attention in AftSRF | WIP |
@@ -108,6 +108,8 @@ After current wave completes:
 
 ## Recent Closed Dead Ends
 
+- PR #2222 (edward): mHC Learnable Residual Mixing — skip-dominant collapse (alpha≈1.9, beta≈0.1), all metrics regressed
+- PR #2221 (frieren): Wake Angle Feature — atan2 redundant with Cartesian (dx/gap, dy/gap), all metrics regressed
 - PR #2217 (nezuko): Fore-SRF Skip — mean-pooled fore hidden too coarse, 3/4 metrics worse, high seed variance
 - PR #2220 (askeladd): Slice Diversity Reg — forcing slice orthogonality harms all metrics +5-10%, slice collapse is beneficial
 - PR #2216 (thorfinn): GeoTransolver GALE — geometry cross-attention creates competing pathway, p_in +29%, all metrics worse
