@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 16:30 — PR #2274: FNO Inter-Foil Coupling — edward — **CLOSED** ❌
+
+- Branch: `edward/fno-inter-foil-coupling`
+- Hypothesis: 1D FNO spectral convolution on gap-region volume nodes between fore-TE and aft-LE. Bins gap nodes into 32-cell regular grid, applies FFT → learned weight multiply (16 modes) → IFFT, scatters corrections back. Inserted between TransolverBlocks 0 and 1, zero-init bypass.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 13.463 | +13.2% ❌ |
+| p_oodc | 7.561  | 8.600  | +13.7% ❌ |
+| p_tan  | 28.118 | 29.400 | +4.6% ❌ |
+| p_re   | 6.364  | 6.800  | +6.9% ❌ |
+
+- W&B: 3dek688g (s42), mwkdjsh7 (s73). Epochs: 139-140. Memory: 72-83 GB (heavy due to FFT operations).
+- **Analysis:** 5th inter-foil coupling approach to fail. Transolver's existing slice attention already captures inter-foil interactions implicitly. FNO-specific issues: 1D chord-wise binning discards vertical wake structure, sparse gap activation (tandem-only batches) creates asymmetric optimization, complex-valued spectral weights suboptimal with Lion. High seed variance on p_in (14.6 vs 12.3) suggests FNO introduces learning instability.
+- **Conclusion:** CLOSED. ALL explicit inter-foil coupling mechanisms (attention, GALE, cross-DSDF, GNN, FNO) are dead ends. Added to DO NOT REVISIT.
+
+---
+
 ### 2026-04-08 16:00 — PR #2272: TTA AoA Ensemble — thorfinn — **CLOSED** ❌
 
 - Branch: `thorfinn/tta-aoa-ensemble`

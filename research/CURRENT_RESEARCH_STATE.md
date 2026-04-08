@@ -39,7 +39,7 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 | askeladd | #2276 | **BOLD: MAE Surface Pretrain — masked autoencoder initialization for backbone** | WIP (NEW) |
 | frieren | #2277 | **Tandem Difficulty Curriculum — progressive exposure by gap/stagger magnitude** | WIP (NEW) |
 | tanjiro | #2273 | **BOLD: Geometry Consistency Self-Distillation — Mean Teacher on augmented mesh** | WIP |
-| edward | #2274 | **BOLD: FNO Inter-Foil Coupling — spectral convolution in tandem gap** | WIP |
+| edward | #2281 | **Multi-Head SRF Ensemble — 3 independent SRF heads, prediction averaging** | WIP (NEW) |
 | nezuko | #2279 | **Ensemble Knowledge Distillation — soft targets from 16-seed ensemble** | WIP (NEW) |
 | alphonse | #2275 | **BOLD: NeuralFoil Synthetic Data Flooding — single-foil Cp augmentation via neural surrogate** | WIP (NEW) |
 
@@ -96,7 +96,7 @@ Acknowledged and pivoting. Round 27 will include bold architectural additions (G
 | askeladd | #2276 | **BOLD: MAE Surface Pretrain** — masked autoencoder backbone initialization | p_oodc, p_tan |
 | frieren | #2277 | **Tandem Difficulty Curriculum** — progressive exposure by gap/stagger magnitude | p_tan |
 | tanjiro | #2273 | **BOLD: Geometry Consistency Self-Distillation** — Mean Teacher on jittered mesh | p_oodc |
-| edward | #2274 | **BOLD: FNO Inter-Foil Coupling** — spectral convolution in tandem gap | p_tan |
+| edward | #2281 | **Multi-Head SRF Ensemble** — 3 independent heads on shared backbone | p_oodc, p_re |
 | nezuko | #2279 | **Ensemble Knowledge Distillation** — soft targets from 16-seed ensemble | p_oodc, p_re |
 | alphonse | #2275 | **BOLD: NeuralFoil Synthetic Data Flooding** — single-foil Cp augmentation via neural surrogate | p_in, p_oodc, p_re |
 
@@ -150,6 +150,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 - **SE(2) canonicalization**: Stats mismatch (global frame stats on canonicalized coords) + DSDF gradient inconsistency; TE coordinate frame + AoA augmentation already provide equivalent invariance
 - **Flow matching / generative surface head**: CFD pressure is near-deterministic given inputs — generative modeling adds noise to a delta function. 50/50 SRF blend corrupts precise regression predictions (+14-32%)
 - **TTA AoA rotation ensemble**: Coordinate rotation ≠ physical AoA change — creates geometry-physics inconsistency with DSDF features. Training augmentation already handles rotation robustness (+12-49%)
+- **FNO inter-foil spectral coupling**: 5th inter-foil coupling failure (attention, GALE, cross-DSDF, GNN, FNO all dead). Transolver slice attention already captures inter-foil interactions implicitly
 - **Sample-level reweighting**: Focal loss, OHNM — over-correction on top of PCGrad
 - **Optimizer variants**: SAM, Lookahead, SWA, SOAP, Muon — all worse than Lion+EMA+cosine
 
@@ -160,7 +161,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 |------|--------|--------|
 | `gnn-boundary-layer` | p_tan, p_in | **CLOSED** ❌ — all metrics +6.9% to +24.0% |
 | `cnf-surface-pressure` (flow-matching) | p_tan, p_oodc | **CLOSED** ❌ — near-deterministic problem, generative adds noise (+14-32%) |
-| `fno-inter-foil-coupling` | p_tan | **ASSIGNED to edward (#2274)** |
+| `fno-inter-foil-coupling` | p_tan | **CLOSED** ❌ — 5th inter-foil coupling failure, +4.6-13.7% |
 | `geometry-consistency-distill` | p_oodc | **ASSIGNED to tanjiro (#2273)** |
 | `se2-canonicalize` | p_oodc, p_re | **CLOSED** ❌ — stats mismatch + DSDF inconsistency, +6.6-14.3% |
 | `tta-aoa-ensemble` | p_oodc, p_re | **CLOSED** ❌ — coord rotation ≠ AoA change, +12-49% regression |
