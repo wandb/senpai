@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 20:15 — PR #2295: Surface Curvature Feature — tanjiro — **CLOSED** ❌
+
+- Branch: `tanjiro/surface-curvature-feature`
+- Hypothesis: Discrete Menger curvature at surface nodes provides local shape information (LE suction peak curvature, mid-chord recovery, TE Kutta condition). +1 input channel, log-scaled: log(1 + κ × 100).
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.742 | 12.35 | +5.2% ❌ |
+| p_oodc | 7.643  | 7.80  | +2.1% ❌ |
+| p_tan  | 27.874 | 28.65 | +2.8% ❌ |
+| p_re   | 6.419  | 6.60  | +2.8% ❌ |
+
+- W&B: kkjx104v (s42), 10dujm47 (s73). Group: surface-curvature-feature.
+- **Analysis:** Redundant with DSDF gradient features (8 SDF derivative channels already encode curvature implicitly). Explicit Menger curvature from angle-sort ordering adds numerical noise. Matches pattern: DSDF-derived geometry features (curvature, angles, chord position) are all redundant. Student suggested curvature as loss weight instead of feature — GMSE (#2298) tests this direction.
+- **Conclusion:** CLOSED. Surface curvature features added to DO NOT REVISIT. Explicit geometric shape features are fully subsumed by DSDF gradients.
+
+---
+
 ### 2026-04-08 19:00 — PR #2293: Low-Rank Pressure Loss — alphonse — **CLOSED** ❌
 
 - Branch: `alphonse/lowrank-pressure-loss`

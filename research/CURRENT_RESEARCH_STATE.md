@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-08 19:05 UTC
+- **Date:** 2026-04-08 20:15 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training & Architecture Improvements
 
@@ -40,7 +40,7 @@ Single-model beats ensemble on p_in (11.74 vs 12.1) and p_tan (27.90 vs 29.1). E
 | fern | #2294 | **Tandem Config Proximity Feature — OOD distance signal for calibration** | WIP |
 | askeladd | #2292 | **Flow-Direction Normalization — rotate coords by -AoA to streamwise frame** | WIP |
 | frieren | #2291 | **Stagnation Pressure Feature — q_inf = 0.5*Umag² as input channel** | WIP |
-| tanjiro | #2295 | **Surface Curvature Feature — discrete Menger curvature κ at surface nodes** | WIP |
+| tanjiro | #2300 | **Mirror Symmetry Augmentation — exact y-reflection to double training data** | WIP (NEW, BOLD, DATA AUG) |
 | edward | #2296 | **Log-Re Pressure Scaling — Re-normalize pressure loss for OOD-Re generalization** | WIP |
 
 ## PRs Ready for Review
@@ -84,6 +84,7 @@ Next-round assignments (when Round 29 in-flight students complete) will continue
 | nezuko | #2297 | **FV Cell-Area Loss Weighting** | 1/sqrt(cell_area) weights volume loss — FV theory, ICML 2024 |
 | thorfinn | #2298 | **GMSE Gradient-Weighted Pressure Loss** | Weight by ∇p magnitude — auto-targets LE/slot high-gradient zones |
 | alphonse | #2299 | **Potential Flow Residual Loss** | Bernoulli-consistency auxiliary: couples u,v,p via physics law. PARADIGM. |
+| tanjiro | #2300 | **Mirror Symmetry Augmentation** | Exact y-reflection doubles effective training data. DATA AUG. |
 
 ### Key Mechanistic Insights (accumulated)
 
