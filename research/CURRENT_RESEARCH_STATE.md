@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-08 13:30 UTC
+- **Date:** 2026-04-08 19:45 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training & Architecture Improvements
 
@@ -30,24 +30,28 @@
 
 Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29.1). Ensemble still leads on p_oodc and p_re.
 
-## Student Status (2026-04-08 13:30 UTC)
+## Student Status (2026-04-08 19:45 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| thorfinn | #2280 | **Snapshot Ensemble — cyclic cosine LR with prediction averaging** | WIP (NEW) |
-| fern | #2284 | **Heteroscedastic Loss — learned per-node uncertainty weighting** | WIP (NEW) |
-| askeladd | #2282 | **Point Cloud MixUp — linear interpolation data augmentation** | WIP (NEW) |
-| frieren | #2283 | **Wider SRF Head — surface_refine_hidden 192→384** | WIP (NEW) |
+| thorfinn | #2280 | **Snapshot Ensemble — cyclic cosine LR with prediction averaging** | WIP |
+| fern | #2284 | **Heteroscedastic Loss — learned per-node uncertainty weighting** | WIP |
+| askeladd | #2282 | **Point Cloud MixUp — linear interpolation data augmentation** | WIP |
+| frieren | #2283 | **Wider SRF Head — surface_refine_hidden 192→384** | WIP |
 | tanjiro | #2273 | **BOLD: Geometry Consistency Self-Distillation — Mean Teacher on augmented mesh** | WIP |
-| edward | #2281 | **Multi-Head SRF Ensemble — 3 independent SRF heads, prediction averaging** | WIP (NEW) |
-| nezuko | #2279 | **Ensemble Knowledge Distillation — soft targets from 16-seed ensemble** | WIP (NEW) |
-| alphonse | #2275 | **BOLD: NeuralFoil Synthetic Data Flooding — single-foil Cp augmentation via neural surrogate** | WIP (NEW) |
+| edward | #2281 | **Multi-Head SRF Ensemble — 3 independent SRF heads, prediction averaging** | WIP |
+| nezuko | #2279 | **Ensemble Knowledge Distillation — soft targets from 16-seed ensemble** | WIP |
+| alphonse | #2285 | **Deeper Backbone — 4 Transolver blocks (n_layers 3→4)** | WIP (NEW) |
 
 ## PRs Ready for Review
 
 None.
 
-## Latest Reviews (2026-04-08 13:30)
+## Latest Reviews (2026-04-08 19:45)
+
+### PR #2275 (alphonse, NeuralFoil Synthetic Data Flooding) — CLOSED ❌
+- All 4 metrics regressed: p_in +15.8%, p_oodc +24.9%, p_tan +3.7%, p_re +13.9%.
+- Root cause: Geometric inconsistency — synthetic samples use template mesh positions (NACA-A geometry) with NeuralFoil Cp for different NACA-B. Model sees contradictory geometry-pressure signals. 30% synthetic dilutes real data heavily.
 
 ### PR #2268 (alphonse, MoE FFN Last Block) — CLOSED ❌
 - All 4 metrics regressed: p_in +5.3%, p_oodc +6.5%, p_tan +3.3%, p_re +7.4%.
@@ -98,7 +102,7 @@ Acknowledged and pivoting. Round 27 will include bold architectural additions (G
 | tanjiro | #2273 | **BOLD: Geometry Consistency Self-Distillation** — Mean Teacher on jittered mesh | p_oodc |
 | edward | #2281 | **Multi-Head SRF Ensemble** — 3 independent heads on shared backbone | p_oodc, p_re |
 | nezuko | #2279 | **Ensemble Knowledge Distillation** — soft targets from 16-seed ensemble | p_oodc, p_re |
-| alphonse | #2275 | **BOLD: NeuralFoil Synthetic Data Flooding** — single-foil Cp augmentation via neural surrogate | p_in, p_oodc, p_re |
+| alphonse | #2285 | **Deeper Backbone** — n_layers 3→4, backbone depth capacity test | all metrics |
 
 ### Key Mechanistic Insights from Rounds 26-27
 
@@ -156,6 +160,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 - **Surface arc-length PE**: Angle-sort ordering unreliable, zero features for volume nodes confuse attention, redundant with TE coord frame (+1.4-7.7%)
 - **Sample-level reweighting**: Focal loss, OHNM — over-correction on top of PCGrad
 - **Optimizer variants**: SAM, Lookahead, SWA, SOAP, Muon — all worse than Lion+EMA+cosine
+- **NeuralFoil synthetic data flooding**: Geometric inconsistency (template mesh positions ≠ NACA encoding) corrupts geometry-pressure learning. Panel-method Cp errors near stagnation. 30% synthetic dilutes real data (+3.7-24.9%)
 
 ## Potential Next Research Directions (Round 28+)
 
@@ -168,7 +173,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 | `geometry-consistency-distill` | p_oodc | **ASSIGNED to tanjiro (#2273)** |
 | `se2-canonicalize` | p_oodc, p_re | **CLOSED** ❌ — stats mismatch + DSDF inconsistency, +6.6-14.3% |
 | `tta-aoa-ensemble` | p_oodc, p_re | **CLOSED** ❌ — coord rotation ≠ AoA change, +12-49% regression |
-| `neuralfoil-synthetic-flood` | p_in, p_oodc, p_re | **ASSIGNED to alphonse (#2275)** |
+| `neuralfoil-synthetic-flood` | p_in, p_oodc, p_re | **CLOSED** ❌ — geometric inconsistency, +3.7-24.9% |
 | `mae-surface-pretrain` | p_oodc, p_tan | **ASSIGNED to askeladd (#2276)** |
 
 ### Remaining Unassigned Ideas (for Round 29+)
@@ -177,5 +182,16 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 | 1 | `tandem-difficulty-curriculum` | p_tan | **ASSIGNED to frieren (#2277)** |
 | 2 | `surface-arclen-pe` | p_tan, p_in | **ASSIGNED to fern (#2278)** |
 
+### Round 28+ Additional Assignments
+| Slug | Target | Status |
+|------|--------|--------|
+| `snapshot-ensemble` | p_oodc, p_re | **ASSIGNED to thorfinn (#2280)** |
+| `multi-head-srf` | p_oodc, p_re | **ASSIGNED to edward (#2281)** |
+| `pointcloud-mixup` | p_oodc, p_re | **ASSIGNED to askeladd (#2282)** |
+| `wider-srf-head` | p_in, p_tan | **ASSIGNED to frieren (#2283)** |
+| `heteroscedastic-loss` | p_in, p_tan | **ASSIGNED to fern (#2284)** |
+| `ensemble-distillation` | p_oodc, p_re | **ASSIGNED to nezuko (#2279)** |
+| `deeper-backbone` | all metrics | **ASSIGNED to alphonse (#2285)** |
+
 **Assignment priority for next idle students:**
-1. New ideas from researcher-agent (run when next student becomes idle — idea queue exhausted)
+1. New ideas from researcher-agent (running in background — idea queue exhausted, generating Round 29 ideas)

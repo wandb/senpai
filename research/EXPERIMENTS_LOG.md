@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 19:30 — PR #2275: NeuralFoil Synthetic Data Flooding — alphonse — **CLOSED** ❌
+
+- Branch: `alphonse/neuralfoil-synthetic-flood`
+- Hypothesis: Generate single-foil Cp data using NeuralFoil panel-method surrogate, flood training with 30% synthetic samples (p_synthetic=0.3). 4803 synthetic samples from 20 template meshes, random NACA/AoA/Re combinations. Targets p_in, p_oodc, p_re improvement via data diversity.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 13.77 | +15.8% ❌ |
+| p_oodc | 7.561  | 9.45  | +24.9% ❌ |
+| p_tan  | 28.118 | 29.15 | +3.7% ❌ |
+| p_re   | 6.364  | 7.25  | +13.9% ❌ |
+
+- W&B: k2rhfngo (s42), sunnwbxy (s73). Epochs: 157-158. Peak VRAM: ~45GB.
+- **Analysis:** Primary failure mode is **geometric inconsistency** — synthetic samples use template mesh node positions (NACA-A geometry) but assign NeuralFoil Cp for a different NACA-B. The model sees contradictory training signals: node coordinates and derived features (SDF, DSDF, curvature) say one airfoil shape, NACA encoding says another, target pressure is for the encoded shape. This irreconcilable conflict corrupts geometry-pressure learning. Secondary factors: NeuralFoil panel-method Cp errors vs OpenFOAM near stagnation/LE, 30% synthetic dilutes real data signal heavily, only 20 template meshes for low geometric diversity.
+- **Conclusion:** CLOSED. NeuralFoil synthetic data flooding added to DO NOT REVISIT. Geometry-consistent variant (fix NACA to match template, vary only AoA/Re) would eliminate the mismatch but coverage gain is small. The fundamental lesson: synthetic data for this problem requires exact geometry-pressure consistency that panel methods on mismatched meshes cannot provide.
+
+---
+
 ### 2026-04-08 18:00 — PR #2278: Surface Arc-Length PE — fern — **CLOSED** ❌
 
 - Branch: `fern/surface-arclen-pe`
