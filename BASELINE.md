@@ -1,6 +1,21 @@
 # Baseline Metrics
 
-## Current Single-Model Baseline (Phase 6 — 2026-04-06, +Wake Deficit Feature, 2-Seed Evidence, PR #2213)
+## Current Single-Model Baseline (Phase 6 — 2026-04-08, +Cosine T_max=150, 2-Seed Evidence, PR #2251)
+
+| Metric | 2-seed avg | vs prior (Wake Deficit) | Δ |
+|--------|------------|-------------------------|---|
+| **p_in** | **11.891** | 11.979 | **-0.7%** |
+| **p_oodc** | **7.561** | 7.643 | **-1.1%** |
+| **p_tan** | **28.118** | 28.341 | **-0.8%** |
+| p_re | 6.364 | 6.300 | +1.0% (regression) |
+
+**PR #2251** (merged 2026-04-08) — Cosine T_max=150: changes `--cosine_T_max` from 160 to 150. Training consistently ends at ~149 epochs (30-min timeout), so T_max=150 ensures cosine annealing completes exactly at the training cutoff — giving the model maximum time at moderate LR for generalization while still reaching near-minimum LR at the end. The sweet spot between T_max=140 (too aggressive: helps p_in/p_oodc but hurts p_tan) and T_max=160 (schedule never completes). Delivers -0.7% p_in, -1.1% p_oodc, -0.8% p_tan. p_re regresses +1.0% (cost of tighter convergence on Reynolds generalization). W&B runs: 7jix2jkg (seed 42, p_tan=27.816, p_in=12.019), epkfhxfl (seed 73, p_tan=28.421, p_in=11.763).
+
+⚠️ **2-seed only.** For merge decisions: **p_in < 11.89**, **p_oodc < 7.56**, **p_tan < 28.12**, **p_re < 6.36**.
+
+---
+
+## Prior Single-Model Baseline (Phase 6 — 2026-04-06, +Wake Deficit Feature, 2-Seed Evidence, PR #2213)
 
 | Metric | 2-seed avg | vs prior (TE coord frame) | Δ |
 |--------|------------|--------------------------|---|
