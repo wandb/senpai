@@ -1170,6 +1170,8 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    # Phase 6: Test-time augmentation
+    tta_aoa_ensemble: bool = False          # TTA with K=5 AoA rotations at inference (eval only)
 
 
 cfg = sp.parse(Config)
@@ -1624,6 +1626,50 @@ model_dir.mkdir(parents=True)
 model_path = model_dir / "checkpoint.pt"
 with open(model_dir / "config.yaml", "w") as f:
     yaml.dump(model_config, f)
+
+import numpy as np
+
+def tta_aoa_predict(model_fn, x, aoa_deltas=(-2, -1, 0, 1, 2), sigma=1.0):
+    """Test-time augmentation: average predictions over AoA rotations.
+
+    Args:
+        model_fn: callable(x) → preds [B, N, 3] (Ux, Uy, p)
+        x: input tensor [B, N, F] — assumed to be fully preprocessed
+        aoa_deltas: AoA perturbation deltas in degrees
+        sigma: Gaussian weighting sigma in degrees
+
+    Returns: aggregated predictions [B, N, 3]
+    """
+    weights = np.exp(-0.5 * (np.array(aoa_deltas) / sigma) ** 2)
+    weights /= weights.sum()
+    preds_agg = None
+    for delta_deg, w in zip(aoa_deltas, weights):
+        d = delta_deg * (torch.pi / 180.0)
+        cos_d = torch.cos(torch.tensor(d, device=x.device, dtype=x.dtype))
+        sin_d = torch.sin(torch.tensor(d, device=x.device, dtype=x.dtype))
+        x_aug = x.clone()
+        # Rotate xy coordinates (first 2 channels of normalized input)
+        xy = x_aug[:, :, 0:2].clone()
+        x_aug[:, :, 0] = cos_d * xy[:, :, 0] - sin_d * xy[:, :, 1]
+        x_aug[:, :, 1] = sin_d * xy[:, :, 0] + cos_d * xy[:, :, 1]
+        # Also rotate DSDF gradient pairs (channels 2-9 after normalization)
+        for xi, yi in [(2, 3), (4, 5), (6, 7), (8, 9)]:
+            dx = x_aug[:, :, xi].clone()
+            dy = x_aug[:, :, yi].clone()
+            x_aug[:, :, xi] = cos_d * dx - sin_d * dy
+            x_aug[:, :, yi] = sin_d * dx + cos_d * dy
+        with torch.no_grad():
+            pred_aug = model_fn(x_aug)  # [B, N, 3]
+        # Rotate velocity predictions back to original frame
+        pred_back = pred_aug.clone()
+        pred_back[:, :, 0] = cos_d * pred_aug[:, :, 0] + sin_d * pred_aug[:, :, 1]
+        pred_back[:, :, 1] = -sin_d * pred_aug[:, :, 0] + cos_d * pred_aug[:, :, 1]
+        # Pressure (channel 2) is scalar — no rotation needed
+        if preds_agg is None:
+            preds_agg = w * pred_back
+        else:
+            preds_agg = preds_agg + w * pred_back
+    return preds_agg
 
 best_val = float("inf")
 ema_val_loss = float("inf")
@@ -2557,12 +2603,25 @@ for epoch in range(MAX_EPOCHS):
                 else:
                     y_norm_scaled = y_norm / sample_stds
 
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    _eval_out = eval_model({"x": x})
-                    pred = _eval_out["preds"]
-                    _eval_hidden = _eval_out["hidden"]
-                pred = pred.float()
-                _eval_hidden = _eval_hidden.float()
+                if cfg.tta_aoa_ensemble:
+                    # TTA: average predictions over K AoA rotations
+                    def _tta_model_fn(x_in):
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            out = eval_model({"x": x_in})
+                        return out["preds"].float()
+                    pred = tta_aoa_predict(_tta_model_fn, x)
+                    # Get hidden from the unaugmented forward for SRF heads
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _eval_out = eval_model({"x": x})
+                        _eval_hidden = _eval_out["hidden"]
+                    _eval_hidden = _eval_hidden.float()
+                else:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _eval_out = eval_model({"x": x})
+                        pred = _eval_out["preds"]
+                        _eval_hidden = _eval_out["hidden"]
+                    pred = pred.float()
+                    _eval_hidden = _eval_hidden.float()
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
                 else:
