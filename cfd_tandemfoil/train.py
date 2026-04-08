@@ -1118,6 +1118,10 @@ class Config:
     dct_freq_weight: float = 0.05 # weight for DCT freq loss
     dct_freq_gamma: float = 2.0   # frequency upweighting strength
     dct_freq_alpha: float = 1.5   # frequency exponent
+    # Phase 7: Low-rank structural prior on surface pressure error
+    lowrank_pressure_loss: bool = False  # SVD-based low-rank loss on surface pressure error
+    lowrank_lambda: float = 0.01         # weight for low-rank loss
+    lowrank_rank: int = 5                # rank cutoff (penalize singular values beyond R)
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1761,6 +1765,8 @@ for epoch in range(MAX_EPOCHS):
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
+        _raw_saf_for_lowrank = (x[:, :, 2:4].norm(dim=-1) if cfg.lowrank_pressure_loss and not cfg.dct_freq_loss else _raw_saf_for_dct)
+        _raw_tandem_for_lowrank = ((x[:, 0, 22].abs() > 0.01) if cfg.lowrank_pressure_loss and not cfg.dct_freq_loss else _raw_tandem_for_dct)
         # TE coordinate frame / wake deficit: save raw xy and saf_norm before normalization
         _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
@@ -2110,6 +2116,56 @@ for epoch in range(MAX_EPOCHS):
                 _dct_loss = _dct_loss / _n_foils_dct
                 loss = loss + cfg.dct_freq_weight * _dct_loss
 
+        # Low-rank structural prior on surface pressure error
+        # Penalizes singular values beyond rank R in the per-foil surface pressure error matrix
+        # [B, M_surf]: pred error rows. Energy in high-rank components = structural noise.
+        _lowrank_loss_val = None
+        _lowrank_sv1 = None
+        _lowrank_sv5 = None
+        if cfg.lowrank_pressure_loss and model.training:
+            # Collect per-foil surface pressure error rows across batch
+            # Each row is p_pred - p_target at surface nodes for one foil.
+            # SVD of this matrix [n_rows, M_surf_max] penalizes singular values > rank R.
+            _lowrank_loss = torch.tensor(0.0, device=device)
+            _lr_rows = []
+            for b in range(B):
+                surf_idx_b = is_surface[b].nonzero(as_tuple=True)[0]
+                if surf_idx_b.numel() < cfg.lowrank_rank + 2:
+                    continue
+                _is_tan_b = _raw_tandem_for_lowrank[b].item() if _raw_tandem_for_lowrank is not None else False
+                if _is_tan_b and _raw_saf_for_lowrank is not None:
+                    saf_vals = _raw_saf_for_lowrank[b, surf_idx_b]
+                    fore_idx = surf_idx_b[saf_vals <= 0.005]
+                    aft_idx = surf_idx_b[saf_vals > 0.005]
+                    foil_groups = [fore_idx, aft_idx]
+                else:
+                    foil_groups = [surf_idx_b]
+                for foil_surf in foil_groups:
+                    if foil_surf.numel() < cfg.lowrank_rank + 2:
+                        continue
+                    p_err_row = pred[b, foil_surf, 2] - y_norm[b, foil_surf, 2]  # [M]
+                    _lr_rows.append(p_err_row)
+
+            if len(_lr_rows) >= cfg.lowrank_rank + 1:
+                # Pad rows to common length using zero-padding (preserves autograd)
+                _max_len = max(r.shape[0] for r in _lr_rows)
+                _padded = [torch.cat([r, r.new_zeros(_max_len - r.shape[0])]) for r in _lr_rows]
+                _P = torch.stack(_padded, dim=0)  # [n_rows, max_len] — gradient-tracked
+                # SVD: S [K], K = min(n_rows, max_len)
+                try:
+                    _U, _S, _Vh = torch.linalg.svd(_P, full_matrices=False)
+                    # Clamp for gradient stability near zero singular values
+                    _S = _S.clamp(min=1e-8)
+                    R = cfg.lowrank_rank
+                    if _S.shape[0] > R:
+                        _lowrank_loss = (_S[R:] ** 2).sum()
+                    loss = loss + cfg.lowrank_lambda * _lowrank_loss
+                    _lowrank_loss_val = _lowrank_loss.item()
+                    _lowrank_sv1 = _S[0].item() if _S.shape[0] > 0 else 0.0
+                    _lowrank_sv5 = _S[4].item() if _S.shape[0] > 4 else 0.0
+                except Exception:
+                    pass  # Skip if SVD fails (degenerate batch)
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -2310,7 +2366,14 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _step_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if _lowrank_loss_val is not None:
+            _step_log["train/lowrank_loss"] = _lowrank_loss_val
+            if _lowrank_sv1 is not None:
+                _step_log["train/lowrank_sv1"] = _lowrank_sv1
+            if _lowrank_sv5 is not None:
+                _step_log["train/lowrank_sv5"] = _lowrank_sv5
+        wandb.log(_step_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
