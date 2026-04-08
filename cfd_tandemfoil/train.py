@@ -1967,27 +1967,20 @@ for epoch in range(MAX_EPOCHS):
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
-        # Per-foil pressure whitening: divide surface pressure error by per-foil std
-        # Equivalent to normalizing both pred and GT per foil — reweights loss so all foils
-        # contribute equally regardless of pressure magnitude.
+        # Per-foil pressure whitening (fore-foil only): divide fore-foil surface pressure
+        # error by fore-foil std. Aft-foil nodes keep original unwhitened errors to preserve
+        # tandem transfer signal. Re-normalizes so mean weight over surface nodes is 1.0.
         if cfg.per_foil_pressure_norm and _aft_foil_mask is not None:
             _y_pres = y_norm[:, :, 2]  # [B, N] — normalized pressure targets
             _fore_surf = surf_mask & ~_aft_foil_mask
-            _aft_surf = _aft_foil_mask  # already includes surf_mask & tandem check
             _fore_f = _fore_surf.float()
-            _aft_f = _aft_surf.float()
             _fore_cnt = _fore_f.sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1]
-            _aft_cnt = _aft_f.sum(dim=1, keepdim=True).clamp(min=1)    # [B, 1]
             _fore_mean = (_y_pres * _fore_f).sum(dim=1, keepdim=True) / _fore_cnt  # [B, 1]
-            _aft_mean = (_y_pres * _aft_f).sum(dim=1, keepdim=True) / _aft_cnt     # [B, 1]
             _fore_var = (((_y_pres - _fore_mean) ** 2) * _fore_f).sum(dim=1, keepdim=True) / _fore_cnt
-            _aft_var = (((_y_pres - _aft_mean) ** 2) * _aft_f).sum(dim=1, keepdim=True) / _aft_cnt
             _fore_std = _fore_var.sqrt().clamp(min=0.05)  # [B, 1]
-            _aft_std = _aft_var.sqrt().clamp(min=0.05)    # [B, 1]
-            # Build per-node inverse-std weight for surface pressure channel only
+            # Build per-node inverse-std weight: fore-foil gets 1/std, everything else stays 1.0
             _pfoil_w = torch.ones(B, _y_pres.shape[1], 1, device=device)
             _pfoil_w = torch.where(_fore_surf.unsqueeze(-1), (1.0 / _fore_std).unsqueeze(-1), _pfoil_w)
-            _pfoil_w = torch.where(_aft_surf.unsqueeze(-1), (1.0 / _aft_std).unsqueeze(-1), _pfoil_w)
             # Re-normalize weights so mean weight over surface nodes is 1.0 (preserves loss scale)
             _surf_w_mean = (_pfoil_w.squeeze(-1) * surf_mask.float()).sum() / surf_mask.sum().clamp(min=1)
             _pfoil_w = _pfoil_w / _surf_w_mean.clamp(min=1e-6)
@@ -2343,7 +2336,6 @@ for epoch in range(MAX_EPOCHS):
         _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
         if cfg.per_foil_pressure_norm and _aft_foil_mask is not None:
             _log_dict["train/fore_pres_std"] = _fore_std.mean().item()
-            _log_dict["train/aft_pres_std"] = _aft_std.mean().item() if _aft_surf.any() else 0.0
         wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
