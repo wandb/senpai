@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 11:00 — PR #2266: ZCA Spectral Whitening of Input Features — fern — **CLOSED** ❌
+
+- Branch: `fern/spectral-feature-whitening`
+- Hypothesis: Replace per-feature standardization with full ZCA covariance decorrelation of the 24-dim input features. ZCA matrix W_zca = U @ diag(1/sqrt(S+ε)) @ U.T precomputed once from training data.
+
+| Metric | Baseline (#2251) | Seed 42 (p5lla3ly) | Seed 73 (db3jcgz2) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in   | 11.891 | 13.071 | 12.837 | **12.954** | +8.9% ❌ |
+| p_oodc | 7.561  | 9.505  | 9.122  | **9.314**  | +23.2% ❌ |
+| p_tan  | 28.118 | 31.321 | 30.737 | **31.029** | +10.3% ❌ |
+| p_re   | 6.364  | 7.324  | 7.388  | **7.356**  | +15.6% ❌ |
+
+- **Analysis:** Severe regression on all metrics. The 24-dim input feature covariance has condition number ~7.9 billion (near-singular). ZCA inverts this matrix with ε=1e-5, amplifying noise in near-zero variance directions by ~10⁵×. The result is heavily distorted features that are worse than simple per-feature standardization. OOD degradation is worst (+23.2% p_oodc) because the training-derived whitening matrix is maximally misleading for unseen feature combinations.
+- **Conclusion:** CLOSED. ZCA/PCA whitening added to DO NOT REVISIT list. Per-feature standardization is the correct approach for this feature space.
+
+---
+
 ### 2026-04-08 10:00 — PR #2264: Asymmetric Surface Loss (suction_side_weight=1.5) — frieren — **CLOSED** ❌
 
 - Branch: `frieren/asymmetric-surface-loss`

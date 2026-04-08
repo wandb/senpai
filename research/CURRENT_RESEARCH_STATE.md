@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-08 10:00 UTC
+- **Date:** 2026-04-08 11:00 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training & Architecture Improvements
 
@@ -35,7 +35,7 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | thorfinn | #2267 | Pressure Gradient Aux Head: dp/dx, dp/dy auxiliary supervision | WIP |
-| fern | #2266 | ZCA Spectral Whitening of Input Features: decorrelate 24-dim feature covariance | WIP |
+| fern | #2270 | **BOLD: SE(2) Canonicalize — chord-aligned coordinate frame preprocessing** | WIP (NEW) |
 | askeladd | #2265 | Per-head K/V projection in Physics_Attention_Irregular_Mesh | WIP |
 | frieren | #2269 | GNN Boundary Layer: local mesh message-passing on surface/near-wall nodes | WIP (NEW) |
 | tanjiro | #2262 | Foil Role Embedding (v2): fix boundary_id + T_max=150 | WIP (sent back) |
@@ -125,6 +125,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 - **Slice routing perturbations**: Logit noise, RBF kernel, decoupled tandem — all null/negative
 - **Augmentation annealing**: Hard cutoff at epoch 120 or 140, selective AoA stop — all fail OOD
 - **Asymmetric surface loss**: Physics-based node weighting redundant given hard-node mining
+- **ZCA/PCA whitening**: Near-singular covariance (cond# ~7.9B) makes full decorrelation harmful (+8-23% regression)
 - **Sample-level reweighting**: Focal loss, OHNM — over-correction on top of PCGrad
 - **Optimizer variants**: SAM, Lookahead, SWA, SOAP, Muon — all worse than Lion+EMA+cosine
 
@@ -141,7 +142,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 ### Fresh Bold Ideas (Round 26 BOLD2 — see `RESEARCH_IDEAS_2026-04-08_BOLD2.md`)
 | Priority | Slug | Target | Key bet |
 |----------|------|--------|---------|
-| 1 | `se2-canonicalize` | p_oodc, p_re | Chord-aligned coordinate frame preprocessing — removes AoA rotational DOF, low risk |
+| 1 | `se2-canonicalize` | p_oodc, p_re | **ASSIGNED to fern (#2270)** |
 | 2 | `neuralfoil-synthetic-flood` | p_in, p_oodc, p_re | **DATA GENERATION** — 5000+ NeuralFoil synthetic Cp distributions for single-foil augmentation |
 | 3 | `tta-aoa-ensemble` | p_oodc, p_re | Inference-only K=5 AoA rotation TTA, zero training risk |
 | 4 | `mae-surface-pretrain` | p_oodc, p_tan | Self-supervised backbone initialization via masked surface node reconstruction |
