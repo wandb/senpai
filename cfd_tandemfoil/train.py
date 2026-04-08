@@ -757,6 +757,77 @@ class SurfaceRefinementContextHead(nn.Module):
         return correction
 
 
+class BoundaryLayerGNN(nn.Module):
+    """GraphSAGE-style message passing on surface and near-surface nodes.
+
+    Enriches hidden representations of surface nodes by aggregating features
+    from k nearest volume neighbors, implementing local boundary layer physics.
+    Zero-inits the last layer for safe residual start.
+    """
+    def __init__(self, n_hidden: int = 192, n_layers: int = 2, k_neighbors: int = 4):
+        super().__init__()
+        self.n_layers = n_layers
+        self.k_neighbors = k_neighbors
+        self.layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(n_hidden * 2, n_hidden),
+                nn.SiLU(),
+                nn.Linear(n_hidden, n_hidden),
+            )
+            for _ in range(n_layers)
+        ])
+        self.layer_norms = nn.ModuleList([nn.LayerNorm(n_hidden) for _ in range(n_layers)])
+        # Zero-init output of last layer for safe residual start
+        nn.init.zeros_(self.layers[-1][-1].weight)
+        nn.init.zeros_(self.layers[-1][-1].bias)
+
+    @torch.compiler.disable
+    def forward(self, hidden, is_surface, x_coords):
+        """
+        Args:
+            hidden: [B, N, C] — hidden features from backbone
+            is_surface: [B, N] — boolean surface mask
+            x_coords: [B, N, >=2] — node coordinates (first 2 dims used)
+        Returns:
+            [B, N, C] — hidden features with enriched surface nodes
+        """
+        B, N, C = hidden.shape
+        k = self.k_neighbors
+        h = hidden.clone()
+
+        for b in range(B):
+            surf_idx = is_surface[b].nonzero(as_tuple=True)[0]  # [M_s]
+            if surf_idx.numel() == 0:
+                continue
+            vol_mask_b = ~is_surface[b]
+            vol_idx = vol_mask_b.nonzero(as_tuple=True)[0]  # [M_v]
+            if vol_idx.numel() == 0:
+                continue
+
+            # Subsample volume nodes if too many for efficiency
+            if vol_idx.shape[0] > 2000:
+                vol_idx = vol_idx[::max(1, vol_idx.shape[0] // 512)][:512]
+
+            # k-NN: find k nearest volume neighbors per surface node
+            surf_coords = x_coords[b, surf_idx, :2]  # [M_s, 2]
+            vol_coords = x_coords[b, vol_idx, :2]     # [M_v, 2]
+            dists = torch.cdist(surf_coords, vol_coords)  # [M_s, M_v]
+            k_actual = min(k, vol_idx.shape[0])
+            _, knn_local = dists.topk(k_actual, dim=-1, largest=False)  # [M_s, k]
+            neighbor_idx = vol_idx[knn_local]  # [M_s, k]
+
+            # Message passing rounds
+            for layer, ln in zip(self.layers, self.layer_norms):
+                h_surf = h[b, surf_idx]            # [M_s, C]
+                h_nbr = h[b, neighbor_idx]          # [M_s, k, C]
+                h_agg = h_nbr.mean(dim=1)           # [M_s, C]
+                h_in = torch.cat([h_surf, h_agg], dim=-1)  # [M_s, 2C]
+                delta = layer(h_in)                 # [M_s, C]
+                h[b, surf_idx] = ln(h_surf + delta)
+
+        return h
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -794,9 +865,13 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        gnn_boundary_layer=False,
+        gnn_layers=2,
+        gnn_k_neighbors=4,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
+        self.gnn_boundary_layer = gnn_boundary_layer
         self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
         self.pressure_first = pressure_first
         self.ref = ref
@@ -896,6 +971,11 @@ class Transolver(nn.Module):
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
         self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
+        # GNN boundary layer: local message passing on surface/near-wall nodes
+        if gnn_boundary_layer:
+            self.gnn_bl = BoundaryLayerGNN(
+                n_hidden=n_hidden, n_layers=gnn_layers, k_neighbors=gnn_k_neighbors
+            )
 
     def initialize_weights(self):
         self.apply(self._init_weights)
@@ -994,6 +1074,11 @@ class Transolver(nn.Module):
 
         for block in self.blocks[:-1]:
             fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+
+        # GNN boundary layer: local message passing on surface/near-wall nodes
+        is_surface = data.get("is_surface") if isinstance(data, Mapping) else None
+        if self.gnn_boundary_layer and is_surface is not None:
+            fx = self.gnn_bl(fx, is_surface, x[:, :, :2])
 
         # Deep hidden representation (post all non-last blocks, pre output head)
         fx_deep = fx  # [B, N, n_hidden]
@@ -1170,6 +1255,10 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    # Phase 7: GNN boundary layer — local message-passing on surface/near-wall nodes
+    gnn_boundary_layer: bool = False       # enable GNN message-passing on surface/near-wall nodes
+    gnn_layers: int = 2                    # number of GNN message-passing rounds
+    gnn_k_neighbors: int = 4              # k nearest volume neighbors per surface node
 
 
 cfg = sp.parse(Config)
@@ -1330,6 +1419,9 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    gnn_boundary_layer=cfg.gnn_boundary_layer,
+    gnn_layers=cfg.gnn_layers,
+    gnn_k_neighbors=cfg.gnn_k_neighbors,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1412,6 +1504,9 @@ snapshot_n = 0
 snapshot_epoch_list = [int(e) for e in cfg.snapshot_epochs_str.split(",")] if cfg.snapshot_ensemble else []
 
 n_params = sum(p.numel() for p in model.parameters())
+if cfg.gnn_boundary_layer:
+    _gnn_params = sum(p.numel() for p in _base_model.gnn_bl.parameters())
+    print(f"GNN boundary layer: {_gnn_params:,} params (layers={cfg.gnn_layers}, k={cfg.gnn_k_neighbors})")
 if refine_head is not None:
     n_params += sum(p.numel() for p in refine_head.parameters())
 if aft_srf_head is not None:
@@ -1886,7 +1981,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x, "is_surface": is_surface if cfg.gnn_boundary_layer else None})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -2114,7 +2209,7 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x})
+                rdrop_out = model({"x": x, "is_surface": is_surface if cfg.gnn_boundary_layer else None})
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -2253,7 +2348,7 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                out2 = model({"x": x, "is_surface": is_surface if cfg.gnn_boundary_layer else None})
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -2558,7 +2653,7 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    _eval_out = eval_model({"x": x})
+                    _eval_out = eval_model({"x": x, "is_surface": is_surface if cfg.gnn_boundary_layer else None})
                     pred = _eval_out["preds"]
                     _eval_hidden = _eval_out["hidden"]
                 pred = pred.float()
@@ -3067,7 +3162,7 @@ if cfg.surface_refine and best_metrics:
 
                     # Model forward
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        out = verify_model({"x": x})
+                        out = verify_model({"x": x, "is_surface": is_surface if cfg.gnn_boundary_layer else None})
                         pred_raw = out["preds"].float()
                         hidden = out["hidden"].float()
 
