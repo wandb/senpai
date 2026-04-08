@@ -2,6 +2,43 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 10:00 — PR #2264: Asymmetric Surface Loss (suction_side_weight=1.5) — frieren — **CLOSED** ❌
+
+- Branch: `frieren/asymmetric-surface-loss`
+- Hypothesis: Up-weight surface loss on suction-side nodes (predicted pressure < 0) by 1.5× starting at epoch 20. Targeting aft-foil suction peak which drives p_tan errors. Physics motivation: suction-side dp/ds gradients are larger, making errors there more impactful for integrated force.
+
+| Metric | Baseline (#2251) | Seed 42 (m1ecteun) | Seed 73 (vvibd209) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in   | 11.891 | 12.079 | 12.485 | **12.282** | +3.3% ❌ |
+| p_oodc | 7.561  | 7.658  | 7.818  | **7.738**  | +2.3% ❌ |
+| p_tan  | 28.118 | 28.423 | 28.904 | **28.664** | +1.9% ❌ |
+| p_re   | 6.364  | 6.392  | 6.550  | **6.471**  | +1.7% ❌ |
+
+- **Analysis:** All 4 metrics regressed. Three root causes identified by frieren: (1) asinh transform compresses suction/pressure magnitude difference — 1.5× multiplier less discriminative in transformed space; (2) existing hard-node mining already preferentially up-weights suction-peak nodes via error signal — adding a second physics-based signal is redundant; (3) using pred < 0 to classify suction side is noisy in epochs 20-40 when predictions are unreliable. Note: original PR compared against PR #2213 baseline — against current PR #2251 baseline, regressions are +3.3%, +2.3%, +1.9%, +1.7%.
+- **Conclusion:** CLOSED. The existing hard-node mining mechanism already captures suction-side difficulty more adaptively than a static physics-based multiplier.
+
+---
+
+### 2026-04-08 10:00 — PR #2255: Augmentation Annealing — askeladd — **CLOSED** ❌
+
+- Branch: `askeladd/aug-annealing`
+- Hypothesis: Two-phase training — full aug for epochs 0-120, clean data only for 120-149. Creates exploratory phase (robustness) followed by fine-tuning phase (precision). Motivated by DeiT-III augmentation schedules and EMA benefits from clean late-training updates.
+
+**All three trials (2-seed avg vs current PR #2251 baseline):**
+
+| Trial | p_in | p_oodc | p_tan | p_re |
+|-------|------|--------|-------|------|
+| Baseline (#2251) | **11.891** | **7.561** | **28.118** | **6.364** |
+| aug_stop=120 | 11.864 | 7.854 ❌ | 28.542 ❌ | 6.406 ❌ |
+| aug_stop=140 (Trial A) | 11.940 | 7.807 ❌ | 28.462 ❌ | 6.402 ❌ |
+| selective aoa_stop=120 (Trial B) | 11.914 | 7.775 ❌ | 28.290 ❌ | 6.414 ❌ |
+
+- W&B runs (Trial B): 9sxxwm89 (s42), el7waf8w (s73); Trial A: 0gl6fx4m (s42), og34f5zb (s73)
+- **Analysis:** The hypothesis is directionally correct for p_in in isolation — clean fine-tuning genuinely helps in-distribution precision. But augmentation (even in the low-LR phase) provides essential regularization for OOD metrics (p_oodc, p_tan, p_re). All variants consistently regress OOD metrics across all cutoff strategies and selectivity levels. The trade-off is structural, not tunable. Note: student compared against PR #2213 baseline; against current PR #2251 baseline, all trials fail all metrics.
+- **Conclusion:** CLOSED. Augmentation annealing with hard cutoffs trades in-distribution for OOD — not a net improvement given the full metric set.
+
+---
+
 ### 2026-04-08 07:30 — PR #2263: Attention Logit Noise σ=0.05 — alphonse — **CLOSED** ❌
 
 - Branch: `alphonse/attn-logit-noise`

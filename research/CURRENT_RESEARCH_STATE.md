@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-08 07:30 UTC
+- **Date:** 2026-04-08 10:00 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training & Architecture Improvements
 
@@ -15,7 +15,7 @@
 | **p_tan** | **28.118** | < 28.12 |
 | p_re | 6.364 | < 6.36 |
 
-**Latest merge:** PR #2251 (thorfinn) — Cosine T_max=150. p_in -0.7%, p_oodc -1.1%, p_tan -0.8%. p_re regressed +1.0% (structural tension: lower final LR hurts Re generalization).
+**Latest merge:** PR #2251 (thorfinn) — Cosine T_max=150. p_in -0.7%, p_oodc -1.1%, p_tan -0.8%. p_re regressed +1.0%.
 
 ⚠️ **p_re = 6.364 is a regression vs PR #2213 baseline (6.300).** Future experiments should target p_re recovery.
 
@@ -30,105 +30,115 @@
 
 Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29.1). Ensemble still leads on p_oodc and p_re.
 
-## Student Status (2026-04-08 07:30 UTC)
+## Student Status (2026-04-08 10:00 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | thorfinn | #2267 | Pressure Gradient Aux Head: dp/dx, dp/dy auxiliary supervision | WIP |
 | fern | #2266 | ZCA Spectral Whitening of Input Features: decorrelate 24-dim feature covariance | WIP |
 | askeladd | #2265 | Per-head K/V projection in Physics_Attention_Irregular_Mesh | WIP |
-| frieren | #2264 | Asymmetric Surface Loss: 1.5x suction-side weighting | WIP |
+| frieren | #2269 | GNN Boundary Layer: local mesh message-passing on surface/near-wall nodes | WIP (NEW) |
 | tanjiro | #2262 | Foil Role Embedding (v2): fix boundary_id + T_max=150 | WIP (sent back) |
 | edward | #2261 | Per-Foil Target Whitening (v2): fore-foil-only + T_max=150 | WIP (sent back) |
 | nezuko | #2260 | Flow-Regime Conditioned SRF via FiLM: AoA/Umag modulation | WIP |
-| askeladd | #2255 | Augmentation Annealing: disable aug after epoch 120 | WIP |
 | alphonse | #2268 | MoE FFN Last Block: tandem-specialized FFN expert in final TransolverBlock | WIP |
 
 ## PRs Ready for Review
 
 None.
 
-## Latest Reviews (2026-04-08 07:30)
+## Latest Reviews (2026-04-08 10:00)
 
-### PR #2263 (alphonse, attn-logit-noise σ=0.05) — CLOSED ❌
-- 2-seed avg vs current baseline: p_in=+3.9%, p_oodc=-0.1%, p_tan=+1.0%, p_re=+1.3%
-- All meaningful metrics hurt. Slice routing is not the primary tandem failure driver.
+### PR #2264 (frieren, asymmetric-surface-loss) — CLOSED ❌
+- All 4 metrics regressed vs current baseline: p_in +3.3%, p_oodc +2.3%, p_tan +1.9%, p_re +1.7%
+- Root cause: asinh transform reduces suction/pressure-side separation; hard-node mining already captures suction difficulty; pred-based side classification is noisy early in training.
 
-### PR #2262 (tanjiro, foil-role-embed) — REQUEST CHANGES
-- p_oodc improved consistently both seeds. Seed 42 p_in=11.76 (below baseline 11.891). Promising.
-- Issues: wrong foil identity method (saf_norm vs boundary_id), wrong T_max (160 vs 150).
+### PR #2255 (askeladd, aug-annealing) — CLOSED ❌ (3 trials total)
+- No variant beats current baseline on any metric. Best trial (selective AoA stop): p_in=11.914, p_oodc=7.775, p_tan=28.290, p_re=6.414 — all worse than #2251.
+- Structural trade-off: clean fine-tuning helps p_in in isolation but augmentation provides essential OOD regularization even at low LR. Cannot be resolved with cutoff tuning.
 
-### PR #2261 (edward, per-foil-whiten) — REQUEST CHANGES
-- p_in=-1.6% ✅, p_oodc=-2.1% ✅, p_re=-1.0% ✅ vs current baseline. But p_tan=+2.8% ❌
-- Fix: fore-foil-only whitening (skip aft-foil to preserve tandem signal) + T_max=150.
+### PR #2263 (alphonse, attn-logit-noise) — CLOSED ❌ (prior session)
+- p_in +3.9%, p_tan +1.0%, p_re +1.3% vs baseline. Confirmed: slice routing is NOT the tandem failure driver.
 
-### PR #2251 (thorfinn, T_max=150) — MERGED ✅ (prior session)
-- p_in -0.7%, p_oodc -1.1%, p_tan -0.8%. New current baseline.
+### PR #2262 (tanjiro, foil-role-embed) — REQUEST CHANGES (sent back)
+- Consistent p_oodc improvement, seed 42 p_in=11.76 (beats baseline). Fix: use boundary_id (not saf_norm) for foil identity + T_max=150.
+
+### PR #2261 (edward, per-foil-whiten) — REQUEST CHANGES (sent back)
+- p_in=-1.6%, p_oodc=-2.1%, p_re=-1.0% vs baseline. But p_tan=+2.8%. Fix: fore-foil-only whitening (don't normalize aft-foil targets).
 
 ## Most Recent Research Direction from Human Researcher Team
 
-### Issue #1860 — ACTIVE, directive in effect
+### Issue #1860 — ACTIVE directive (Morgan McGuire)
 **"Think bigger — radical new full model changes and data aug and data generation, not incremental tweaks."**
 
-Current round targets architectural, loss-level, and physics-grounded changes — not schedule tweaks.
+Acknowledged and pivoting. Round 27 will include bold architectural additions (GNN boundary layer), data augmentation innovation (geometry consistency distillation), and novel module-level approaches. Researcher-agent running now to generate next batch of bold ideas.
 
 ## Current Research Focus and Themes
 
-### Round 26 Active Experiments (8/9 GPUs occupied, alphonse being assigned)
+### Round 27 Active Experiments (8 GPUs occupied)
 
 | Student | PR | Direction | Target |
 |---------|-----|-----------|--------|
 | thorfinn | #2267 | Physics: Pressure gradient auxiliary head (dp/dx, dp/dy) | p_tan, p_in |
-| fern | #2266 | Input rep: ZCA spectral whitening — decorrelate 24-dim features | p_oodc, generalization |
-| askeladd | #2265 | Architecture: Per-head K/V projection (remove shared-mean bottleneck) | p_tan |
-| frieren | #2264 | Loss: Asymmetric 1.5x suction-side weighting | p_tan |
-| tanjiro | #2262 | Representation: Foil role embedding (v2, boundary_id fix) | p_oodc, p_in |
+| fern | #2266 | Input rep: ZCA spectral whitening | p_oodc, generalization |
+| askeladd | #2265 | Architecture: Per-head K/V projection | p_tan |
+| frieren | #2269 | **BOLD: GNN Boundary Layer — local mesh message-passing on surface/near-wall nodes** | p_tan, p_in |
+| tanjiro | #2262 | Representation: Foil role embedding (v2) | p_oodc, p_in |
 | edward | #2261 | Normalization: Fore-foil-only target whitening (v2) | p_in, p_oodc |
 | nezuko | #2260 | Conditioning: FiLM SRF on flow regime (AoA/Umag) | p_tan, p_oodc |
-| askeladd | #2255 | Training: Aug annealing (disable after epoch 120) | p_in |
-| alphonse | #2268 | MoE FFN Last Block: tandem-specialized FFN in last TransolverBlock | WIP |
+| alphonse | #2268 | MoE FFN Last Block: tandem-specialized FFN | p_tan |
 
-### Key Insights from Round 26 Reviews
+### Key Mechanistic Insights from Round 26-27 Reviews
 
-1. **Slice routing is NOT the tandem failure driver** (attn-logit-noise confirmed negative). Input feature limitations are more likely the root cause.
-2. **Per-foil whitening works for fore-foil** — p_in (-1.6%) and p_oodc (-2.1%) improvements are real. Aft-foil must NOT be normalized (kills tandem signal via high-magnitude error de-emphasis).
-3. **Foil identity embedding is promising** — consistent p_oodc improvement across seeds, seed 42 beats baseline on p_in. V2 with correct boundary_id and T_max=150 may merge.
+1. **Slice routing is NOT the tandem failure driver** (attn-logit-noise #2263 confirmed). Input feature limitations more likely.
+2. **Hard-node mining already captures suction difficulty** (asymmetric loss #2264 confirmed). Physics-based node weighting redundant when error-based mining is active.
+3. **Augmentation is load-bearing at low LR** (aug-annealing #2255 across 3 trials). Cannot trade OOD robustness for ID precision via cutoff — the regularization effect persists throughout training.
+4. **Per-foil whitening works for fore-foil** — p_in (-1.6%) and p_oodc (-2.1%). Aft-foil must NOT be normalized.
+5. **Foil identity embedding is promising** — consistent p_oodc improvement, seed 42 beats baseline p_in.
+
+### GNN Boundary Layer — Rationale for Bold Pivot
+
+The new frieren assignment (PR #2269) is a genuine architectural departure:
+- Previous inter-foil coupling: global attention (fore-aft cross-attention, GALE) — all failed
+- GNN boundary layer: LOCAL message passing along wall nodes (2 GraphSAGE rounds, k=4 volume neighbors)
+- Motivated by B-GNNs (arXiv:2503.18638, 2025) — 85% error reduction on airfoil meshes via local GNN
+- Operates AFTER Transolver backbone, BEFORE SRF head — additive, not replacement
+- Inductive bias: boundary layer physics is local propagation, not global attention
 
 ### What Works (confirmed and merged)
 
 | Direction | PR | Impact |
 |-----------|-----|--------|
 | Cosine T_max=150 | #2251 | p_in -0.7%, p_oodc -1.1%, p_tan -0.8% |
-| TE coordinate frame | #2207 | -5.4% p_in |
-| Wake deficit feature | #2213 | -4.1% p_in, -1.7% p_re |
-| Pressure-first deep | #2155 | -4.8% p_in |
-| DCT frequency loss | #2184 | -1.5% p_re, -0.3% p_tan |
-| Gap-stagger spatial bias | #2130 | -3.0% p_tan |
+| Wake deficit feature | #2213 | p_in -4.1%, p_re -1.7% |
+| TE coordinate frame | #2207 | p_in -5.4% |
+| Pressure-first deep | #2155 | p_in -4.8% |
+| DCT frequency loss | #2184 | p_re -1.5%, p_tan -0.3% |
+| Gap-stagger spatial bias | #2130 | p_tan -3.0% |
 | PCGrad 3-way | — | OOD separation |
 | Residual prediction | #1927 | p_oodc -4.7%, p_tan -1.9% |
 
 ### What's Exhausted (DO NOT REVISIT)
 
 - **Architecture replacements**: GNOT, Galerkin, Hierarchical, FactFormer, DeepONet, INR — all 30-60% worse
-- **Cosine T_max sweep**: T_max=140, 150, 160 tried. T_max=150 is optimal. Schedule exhausted.
-- **Slice routing perturbations**: Logit noise (σ=0.05), decoupled tandem routing, RBF kernel — all null/negative
-- **Sample-level reweighting**: Focal loss γ=0.5, OHNM — over-correction on top of PCGrad
-- **Throughput hacks**: Val-every-3 — LR schedule is binding constraint
-- **Backbone hidden noise**: Too blunt, destabilizes training
+- **Cosine T_max sweep**: T_max=140, 150, 160 tried. T_max=150 is optimal.
+- **Slice routing perturbations**: Logit noise, RBF kernel, decoupled tandem — all null/negative
+- **Augmentation annealing**: Hard cutoff at epoch 120 or 140, selective AoA stop — all fail OOD
+- **Asymmetric surface loss**: Physics-based node weighting redundant given hard-node mining
+- **Sample-level reweighting**: Focal loss, OHNM — over-correction on top of PCGrad
 - **Optimizer variants**: SAM, Lookahead, SWA, SOAP, Muon — all worse than Lion+EMA+cosine
 
-## Potential Next Research Directions (Round 27)
+## Potential Next Research Directions (Round 28)
 
-See `/research/RESEARCH_IDEAS_2026-04-08_04:00.md` for full list. Key picks:
-
-Current queue (from researcher-agent output):
+Researcher-agent running now to generate fresh bold ideas per human team directive (#1860).
+From existing bold ideas file (`RESEARCH_IDEAS_2026-04-08_BOLD.md`):
 
 | Priority | Slug | Target | Key bet |
 |----------|------|--------|---------|
-| 1 | `moe-ffn-last-block` | p_tan | **ASSIGNED to alphonse (#2268)** |
-| 2 | `circulation-input-feature` | p_tan, p_in | Fore-foil circulation Γ = ∮(v·dl) as per-foil scalar input — same lineage as wake deficit (#2213) |
-| 3 | `tandem-slice-temp` | p_tan | Lower temperature for tandem samples — sharper routing for wake region specialization |
-| 4 | `global-nystrom-wake` | p_tan | 16-landmark Nyström attention between fore/aft surface nodes for long-range wake coupling |
-| 5 | `hypernetwork-re-scaling` | p_re, p_oodc | Continuous Re/gap conditioning via small hypernet — addresses structural p_re regression |
+| 1 | `gnn-boundary-layer` | p_tan, p_in | **ASSIGNED to frieren (#2269)** |
+| 2 | `cnf-surface-pressure` | p_tan, p_oodc | Flow matching head replaces SRF — AlphaFold3 analogue |
+| 3 | `fno-inter-foil-coupling` | p_tan | 1D FNO spectral convolution in tandem gap region |
+| 4 | `geometry-consistency-distill` | p_oodc | Mean Teacher consistency on volume-node-jittered augmented views |
+| 5 | `circulation-input-feature` | p_tan, p_in | Fore-foil circulation Γ as input — same lineage as wake deficit |
 
-⚠️ **Removed from queue:** `no-penetration-bc-loss` — already tried as PR #2187, failed.
+Next researcher-agent output (in progress) will update this queue.
