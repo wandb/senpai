@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 19:00 — PR #2293: Low-Rank Pressure Loss — alphonse — **CLOSED** ❌
+
+- Branch: `alphonse/lowrank-pressure-loss`
+- Hypothesis: SVD structural prior on surface pressure error matrix. Penalize energy in singular values beyond rank R=5, forcing low-rank error structure. Orthogonal to DCT frequency loss (spatial vs cross-chord correlation).
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.742 | 12.53 | +5.4% ❌ |
+| p_oodc | 7.643  | 7.80  | +3.2% ❌ |
+| p_tan  | 27.874 | 28.40 | +1.0% ❌ |
+| p_re   | 6.419  | 6.35  | -0.2% ✅ (noise) |
+
+- W&B: a4l3xwta (s42), h2rhflcx (s73). Group: lowrank-pressure-loss. Epochs: 146-147. VRAM: ~46.5GB. SVD adds ~7% overhead.
+- **Analysis:** Low-rank prior hurts because surface pressure corrections ARE inherently high-rank — they need sharp local corrections (LE suction peak, TE separation, slot interactions) that live in higher singular modes. Forcing low-rank structure suppresses these. Additionally, PCGrad interference: lowrank loss only propagated ~20% of batches (auxiliary loss not in loss_A/B/C). Student noted lowrank SV dynamics were healthy but final metrics regressed.
+- **Conclusion:** CLOSED. SVD structural priors on prediction error added to DO NOT REVISIT. Note PCGrad auxiliary-loss interaction for future experiments.
+
+---
+
 ### 2026-04-08 17:40 — PR #2290: Re-Stratified Sampling — nezuko — **MERGED** ✅
 
 - Branch: `nezuko/re-stratified-sampling`
