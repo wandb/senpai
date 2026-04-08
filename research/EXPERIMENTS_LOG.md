@@ -3592,3 +3592,41 @@ Baseline (PR #2184): p_in=13.205, p_oodc=7.816, p_tan=28.502, p_re=6.453
 - **Decision: CLOSED — clear dead end.** All four metrics regressed, OOD metrics (p_oodc +7.3%, p_re +7.4%) hurt most. Results verified against W&B and match student report exactly.
 - **Analysis:** The baseline already implements asymmetric hard-node mining (epoch ≥30: 1.5× weight for above-median-error nodes on non-tandem samples). Stacking OHNM multiplicatively creates effective node weights of 3-5× — extreme gradient concentration on a small subset that overfits to specific training-distribution hard nodes (suction peaks, stagnation patterns) while sacrificing OOD generalization. The two mechanisms interfere rather than complement.
 - **Key insight:** The baseline is already well-optimized for hard nodes via: (1) existing asymmetric mining, (2) surface refinement heads, (3) pressure-first architecture. Additional error-weighting schemes are redundant and harmful when the baseline already addresses this. Any future hard-node mining must account for and potentially replace (not stack on) the existing mechanism.
+
+---
+
+## 2026-04-08 00:30 — PR #2258: Decoupled Tandem Slice Projection (frieren) — **CLOSED** (dead end)
+
+- Branch: `frieren/adaln-decouple-tandem`
+- Hypothesis: Add a separate `in_project_slice_tandem` matrix (orthogonal init) used exclusively for tandem samples, allowing tandem-specific slice routing without contaminating single-foil routing. Zero code change — just `--adaln_decouple` flag.
+
+| Metric | Baseline (#2213) | Seed 42 (wc67srhn) | Seed 73 (mhi0x3ve) | 2-seed avg | Δ vs baseline |
+|--------|-----------------|---------------------|---------------------|------------|---------------|
+| p_in   | 11.979          | 14.007              | 12.761              | **13.384** | **+11.7% ❌** |
+| p_oodc | 7.643           | 8.668               | 8.552               | **8.610**  | **+12.7% ❌** |
+| p_tan  | 28.341          | 28.646              | 28.910              | **28.778** | **+1.5% ❌**  |
+| p_re   | 6.300           | 6.985               | 6.911               | **6.948**  | **+10.3% ❌** |
+
+- W&B: `wc67srhn` (seed 42, best epoch 139, 180 min), `mhi0x3ve` (seed 73, best epoch 140, 180 min). Both ~147 epochs.
+- **Decision: CLOSED — clear dead end.** Significant regression across all four metrics (+10-13% on p_in, p_oodc, p_re). High seed-to-seed variance on p_in (14.0 vs 12.8, ~9% spread) confirms routing instability.
+- **Analysis:** Three factors drove the failure: (1) Orthogonal-initialized tandem routing head is severely undertrained — tandem samples are ~30% of data and `tandem_ramp` reduces early tandem contribution further. (2) Orthogonal init diverges from the learned routing vocabulary, forcing the tandem head to start from scratch. (3) The existing `domain_layernorm`, `domain_velhead`, and `pcgrad_3way` already provide effective tandem/single separation at multiple levels — adding another decoupling axis at the slice routing level fragments rather than specializes.
+- **If revisited:** Warm-start by copying shared routing weights into `in_project_slice_tandem` at init. But existing separation mechanisms likely make this unnecessary.
+
+---
+
+## 2026-04-08 00:30 — PR #2255: Augmentation Annealing (askeladd) — **SENT BACK** (mixed, follow-up needed)
+
+- Branch: `askeladd/aug-annealing`
+- Hypothesis: Disable ALL data augmentation after epoch 120 to enable clean fine-tuning in the last ~28 epochs (Phase 2 training, cosine LR ~2.5e-5). Reduces augmentation noise during low-LR convergence phase.
+
+| Metric | Baseline (#2213) | Seed 42 (4d0l62ax) | Seed 73 (z87y0kow) | 2-seed avg | Δ vs baseline |
+|--------|-----------------|---------------------|---------------------|------------|---------------|
+| p_in   | 11.979          | **11.515**          | 12.212              | **11.864** | **-1.0% ✅**  |
+| p_oodc | 7.643           | 8.040               | 7.668               | **7.854**  | +2.8% ❌      |
+| p_tan  | 28.341          | 29.127              | 27.956              | **28.542** | +0.7% ❌      |
+| p_re   | 6.300           | 6.403               | 6.409               | **6.406**  | +1.7% ❌      |
+
+- W&B: `4d0l62ax` (seed 42, 148 epochs, 180 min), `z87y0kow` (seed 73, 147 epochs, 180 min).
+- **Decision: SENT BACK.** Directionally correct for p_in (-1.0%) but OOD regression (+2.8% p_oodc, +1.7% p_re) is too large. The hard cutoff at epoch 120 removes too much diversity from OOD-critical augmentations.
+- **Follow-up instructions:** (A) Try `aug_stop_epoch=140` — only ~8 clean epochs, preserves more OOD robustness; (B) Try selective annealing — only disable AoA perturbation at epoch 120 but keep gap/stagger noise and DSDF rotation active (these are the OOD-critical augs). Run both trials 2-seed each, report 2×2 table.
+- **Key insight:** Gap/stagger and DSDF rotation synthesize geometry diversity (OOD-critical), while AoA perturbation is more ID-focused (it varies in-distribution angle of attack). Selective removal should preserve OOD while allowing cleaner p_in convergence.
