@@ -20,6 +20,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     Tandem surface loss is therefore underweighted.
 """
 
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -1170,6 +1171,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    logre_pressure_scale: bool = False      # normalize surface pressure loss by log(Re) to improve OOD-Re generalization
 
 
 cfg = sp.parse(Config)
@@ -1758,6 +1760,7 @@ for epoch in range(MAX_EPOCHS):
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
+        _raw_log_re = x[:, 0, 13:14] if cfg.logre_pressure_scale else None  # log(Re) [B, 1] — save before normalization for logre scaling
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
@@ -2016,6 +2019,11 @@ for epoch in range(MAX_EPOCHS):
             hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
             surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        # Log-Re pressure scaling: de-emphasize high-Re samples whose absolute pressure deviations are naturally larger
+        if cfg.logre_pressure_scale and _raw_log_re is not None:
+            _re_actual = torch.exp(_raw_log_re.squeeze(-1))  # [B], actual Reynolds number
+            _logre_scale = torch.log(_re_actual + 1.0) / math.log(1e5 + 1.0)  # [B], ~1.0 at Re=1e5
+            surf_per_sample = surf_per_sample / _logre_scale.clamp(min=0.1)
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         if cfg.tandem_ramp:
             tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
@@ -2310,7 +2318,11 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _logre_log = {}
+        if cfg.logre_pressure_scale and _raw_log_re is not None:
+            _logre_log["train/logre_scale_mean"] = _logre_scale.mean().item()
+            _logre_log["train/logre_scale_std"] = _logre_scale.std().item()
+        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step, **_logre_log})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
