@@ -139,7 +139,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False,
+                 per_head_kv=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -154,6 +155,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.decouple_slice = decouple_slice
         self.zone_temp = zone_temp
         self.prog_slices = prog_slices
+        self.per_head_kv = per_head_kv
         if prog_slices:
             # Buffer for masking inactive slices; updated per-epoch by training loop
             self.register_buffer('slice_mask', torch.zeros(slice_num))
@@ -230,9 +232,13 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             out_slice_token = slice_token
         else:
             q_slice_token = self.to_q(slice_token)
-            slice_token_kv = slice_token.mean(dim=1, keepdim=True)
-            k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
-            v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
+            if self.per_head_kv:
+                k_slice_token = self.to_k(slice_token)
+                v_slice_token = self.to_v(slice_token)
+            else:
+                slice_token_kv = slice_token.mean(dim=1, keepdim=True)
+                k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
+                v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
             if self.learned_kernel:
                 B, H, S, D = q_slice_token.shape
                 q_exp = q_slice_token.unsqueeze(-2).expand(B, H, S, S, D)
@@ -377,6 +383,7 @@ class TransolverBlock(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         spatial_bias_input_dim=4,
+        per_head_kv=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -402,6 +409,7 @@ class TransolverBlock(nn.Module):
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
             prog_slices=prog_slices,
+            per_head_kv=per_head_kv,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -794,6 +802,7 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        per_head_kv=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -866,6 +875,7 @@ class Transolver(nn.Module):
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
                     spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
+                    per_head_kv=per_head_kv,
                 )
                 for idx in range(n_layers)
             ]
@@ -1170,6 +1180,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    per_head_kv: bool = False               # per-head K/V projection in attention (no mean collapse)
 
 
 cfg = sp.parse(Config)
@@ -1330,6 +1341,7 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    per_head_kv=cfg.per_head_kv,
 )
 
 model = Transolver(**model_config).to(device)
