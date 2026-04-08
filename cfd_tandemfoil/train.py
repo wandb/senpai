@@ -1170,6 +1170,10 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    # Point Cloud MixUp data augmentation
+    mixup: bool = False                     # enable MixUp augmentation (stacks on top of other augs)
+    mixup_alpha: float = 0.2               # Beta distribution parameter (smaller = weaker mixing)
+    mixup_prob: float = 0.5                # probability of applying MixUp per batch
 
 
 cfg = sp.parse(Config)
@@ -1754,6 +1758,20 @@ for epoch in range(MAX_EPOCHS):
                 _dsdf2_scale = _dsdf2_scale * _is_tandem_aug2.float() + (~_is_tandem_aug2).float()
                 x[:, :, 6:10] = x[:, :, 6:10] * _dsdf2_scale.view(-1, 1, 1)
 
+        # Point Cloud MixUp stage 1: mix raw inputs after augmentations, before preprocessing
+        _mixup_active = False
+        _mixup_lam = None
+        _mixup_idx = None
+        if model.training and cfg.mixup and torch.rand(1).item() < cfg.mixup_prob:
+            _mixup_active = True
+            _B_mix = x.size(0)
+            _beta = torch.distributions.Beta(torch.tensor(cfg.mixup_alpha), torch.tensor(cfg.mixup_alpha))
+            _mixup_lam = _beta.sample((_B_mix,)).to(x.device).view(_B_mix, 1, 1)
+            _mixup_idx = torch.randperm(_B_mix, device=x.device)
+            x = _mixup_lam * x + (1 - _mixup_lam) * x[_mixup_idx]
+            is_surface = is_surface | is_surface[_mixup_idx]  # union of surface nodes
+            mask = mask & mask[_mixup_idx]  # intersection of valid masks
+
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
@@ -1843,6 +1861,9 @@ for epoch in range(MAX_EPOCHS):
                 _fs_phys[:, 0, 2] = 0.0  # p/q
                 _freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]  # [B, 1, 3]
             y_norm = y_norm - _freestream  # subtract freestream (broadcasts over N)
+        # Point Cloud MixUp stage 2: mix normalized targets in transformed space
+        if _mixup_active:
+            y_norm = _mixup_lam * y_norm + (1 - _mixup_lam) * y_norm[_mixup_idx]
         if model.training and not cfg.no_target_noise:
             noise_progress = min(1.0, epoch / max(cfg.noise_anneal_epochs, 1))
             if cfg.half_target_noise:
