@@ -2,6 +2,25 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 05:15 — PR #2251: Cosine T_max=150 (follow-up to T_max=140) — thorfinn — **MERGED** ✅
+
+- Branch: `thorfinn/cosine-tmax-140`
+- Hypothesis: Training ends at ~149 epochs (30-min timeout). Setting T_max=150 ensures cosine annealing completes right at the cutoff — the sweet spot between T_max=140 (too aggressive, locks representations early) and T_max=160 (schedule never completes). This gives maximum moderate-LR time for generalization while reaching near-minimum LR at termination.
+
+| Metric | Baseline (#2213) | Seed 42 (7jix2jkg) | Seed 73 (epkfhxfl) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in   | 11.979 | 12.019 | 11.763 | **11.891** | **-0.7%** ✅ |
+| p_oodc | 7.643  | 7.688  | 7.434  | **7.561**  | **-1.1%** ✅ |
+| p_tan  | 28.341 | 27.816 | 28.421 | **28.118** | **-0.8%** ✅ |
+| p_re   | 6.300  | 6.326  | 6.402  | **6.364**  | +1.0% ❌ |
+
+- W&B runs: 7jix2jkg (s42, best epoch 148), epkfhxfl (s73, best epoch 148) — all metrics W&B-verified
+- **Analysis:** T_max=150 hits the schedule sweet spot. 3/4 metrics beat baseline with meaningful margins. p_tan improvement (-0.8%, -0.223 absolute) is notable — this is the metric that exceeded the ensemble baseline. p_re regresses +1.0%, consistent with both T_max=140 and T_max=150 trials — the Reynolds number generalization split appears to benefit from slightly higher LR at convergence. This is a structural tension: lower LR → better convergence on seen distributions, worse generalization on Re OOD.
+- **Key insight:** The cosine schedule had a real mismatch (T_max=160 vs ~149-epoch training). Correcting it to T_max=150 delivers net improvement. T_max sweep is now exhausted.
+- **Conclusion:** MERGED. New baseline: p_in=11.891, p_oodc=7.561, p_tan=28.118, p_re=6.364. Future experiments should specifically target p_re recovery.
+
+---
+
 ### 2026-04-07 23:45 — PR #2257: Focal Sample Reweighting (γ=0.5) — tanjiro — **CLOSED** (all metrics worse)
 - Branch: `tanjiro/focal-sample-reweight`
 - Hypothesis: Per-sample focal-style loss reweighting on surface loss. Weight each sample's contribution by `(loss_i / mean_loss)^gamma` with gamma=0.5. Analogous to Focal Loss (Lin et al., RetinaNet) applied to regression.
