@@ -1110,6 +1110,7 @@ class Config:
     aug: str = "none"  # none|yflip|jitter|featdrop|mixup|scale|flip_jitter|aoa_perturb|cutmix
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
+    aug_stop_epoch: int = 0         # epoch after which to disable augmentation (0 = never stop)
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
@@ -1644,6 +1645,9 @@ for epoch in range(MAX_EPOCHS):
 
     t0 = time.time()
 
+    if cfg.aug_stop_epoch > 0 and epoch == cfg.aug_stop_epoch:
+        print(f"Augmentation disabled at epoch {epoch}")
+
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
 
@@ -1668,7 +1672,8 @@ for epoch in range(MAX_EPOCHS):
         mask = mask.to(device, non_blocking=True)
 
         # --- Data augmentation (training-only, applied before normalization) ---
-        if model.training and cfg.aug != "none" and epoch >= cfg.aug_start_epoch:
+        _apply_aug = (cfg.aug != "none") and (cfg.aug_stop_epoch == 0 or epoch < cfg.aug_stop_epoch)
+        if model.training and _apply_aug and epoch >= cfg.aug_start_epoch:
             if cfg.aug in ("yflip", "flip_jitter"):
                 _flip = torch.rand(x.size(0), 1, 1, device=x.device) < 0.5
                 x[:, :, 1:2] = torch.where(_flip, -x[:, :, 1:2], x[:, :, 1:2])
@@ -1744,7 +1749,7 @@ for epoch in range(MAX_EPOCHS):
         # Foil-2 DSDF magnitude augmentation (tandem samples only, training only)
         # x layout: [pos(2), saf(2), dsdf(8), ...]; foil-2 SDF = dsdf[4:8] = x[:, :, 6:10]
         # Scaling is log-normal (preserves gradient directions, adjusts magnitude only)
-        if model.training and cfg.aug_dsdf2_sigma > 0.0:
+        if model.training and cfg.aug_dsdf2_sigma > 0.0 and _apply_aug:
             _is_tandem_aug2 = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero → tandem
             if _is_tandem_aug2.any():
                 _dsdf2_scale = torch.exp(
