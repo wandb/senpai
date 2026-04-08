@@ -137,25 +137,38 @@ class FullFieldDataset(Dataset):
 def pad_collate(batch):
     """Collate variable-length samples into padded batches.
 
+    Handles both 3-tuple (x, y, is_surface) and 4-tuple (x, y, is_surface, boundary) inputs.
+
     Returns:
-        x:          (B, N_max, 18) float32
+        x:          (B, N_max, C) float32
         y:          (B, N_max, 3)  float32
         is_surface: (B, N_max)     bool
         mask:       (B, N_max)     bool
+        boundary:   (B, N_max)     uint8  [optional, only if input has 4 elements]
     """
-    xs, ys, surfs = zip(*batch)
+    has_boundary = len(batch[0]) == 4
+    if has_boundary:
+        xs, ys, surfs, bids = zip(*batch)
+    else:
+        xs, ys, surfs = zip(*batch)
     max_n = max(x.shape[0] for x in xs)
     B = len(xs)
     x_pad = torch.zeros(B, max_n, xs[0].shape[1])
     y_pad = torch.zeros(B, max_n, ys[0].shape[1])
     surf_pad = torch.zeros(B, max_n, dtype=torch.bool)
     mask = torch.zeros(B, max_n, dtype=torch.bool)
-    for i, (x, y, sf) in enumerate(zip(xs, ys, surfs)):
-        n = x.shape[0]
-        x_pad[i, :n] = x
-        y_pad[i, :n] = y
-        surf_pad[i, :n] = sf
+    if has_boundary:
+        bid_pad = torch.zeros(B, max_n, dtype=torch.uint8)
+    for i in range(B):
+        n = xs[i].shape[0]
+        x_pad[i, :n] = xs[i]
+        y_pad[i, :n] = ys[i]
+        surf_pad[i, :n] = surfs[i]
         mask[i, :n] = True
+        if has_boundary:
+            bid_pad[i, :n] = bids[i]
+    if has_boundary:
+        return x_pad, y_pad, surf_pad, mask, bid_pad
     return x_pad, y_pad, surf_pad, mask
 
 

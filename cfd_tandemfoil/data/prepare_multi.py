@@ -37,12 +37,13 @@ X_DIM = 24  # total x feature dimension
 
 
 def preprocess_sample_multi(sample):
-    """Convert raw PyG sample to (x, y, is_surface) with full dual-foil features.
+    """Convert raw PyG sample to (x, y, is_surface, boundary) with full dual-foil features.
 
     Returns:
         x:          (N, 24) float32
         y:          (N, 3)  float32  — [Ux, Uy, p]
         is_surface: (N,)    bool     — True for both foil 1 and foil 2 surface nodes
+        boundary:   (N,)    uint8    — raw boundary IDs (5=fore upper, 6=fore lower, 7=aft)
     """
     n = sample.pos.shape[0]
 
@@ -90,7 +91,8 @@ def preprocess_sample_multi(sample):
     assert x.shape[1] == X_DIM, f"Expected {X_DIM} features, got {x.shape[1]}"
 
     y = sample.y.float()
-    return x, y, is_surface
+    boundary = sample.boundary.clone()  # raw boundary IDs per node
+    return x, y, is_surface, boundary
 
 
 class MultiFieldDataset(Dataset):

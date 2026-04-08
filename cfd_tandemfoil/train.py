@@ -1000,11 +1000,10 @@ class Transolver(nn.Module):
 
         # Foil role embeddings: add learned fore/aft identity to surface nodes
         if self.foil_role_embedding:
-            _is_surf = data.get("is_surface")  # [B, N] bool, passed from training loop
-            if _is_surf is not None:
-                _saf_norm = data["x"][:, :, 2:4].norm(dim=-1)  # [B, N]
-                _is_fore = (_is_surf & (_saf_norm <= 0.005)).float().unsqueeze(-1)  # [B, N, 1]
-                _is_aft = (_is_surf & (_saf_norm > 0.005)).float().unsqueeze(-1)   # [B, N, 1]
+            _bid = data.get("boundary_id")  # [B, N] uint8
+            if _bid is not None:
+                _is_fore = ((_bid == 5) | (_bid == 6)).float().unsqueeze(-1)  # [B, N, 1]
+                _is_aft = (_bid == 7).float().unsqueeze(-1)                   # [B, N, 1]
                 fx = fx + self.fore_embed * _is_fore + self.aft_embed * _is_aft
 
         for block in self.blocks[:-1]:
@@ -1272,7 +1271,8 @@ _phys_sq_sum = torch.zeros(3, device=device)
 _phys_n = 0.0
 _stats_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
 with torch.no_grad():
-    for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc="Phys stats", leave=False):
+    for _stats_batch in tqdm(_stats_loader, desc="Phys stats", leave=False):
+        _x, _y, _is_surf, _mask = _stats_batch[:4]
         _y, _mask = _y.to(device), _mask.to(device)
         _Um, _q = _umag_q(_y, _mask)
         _yp = _phys_norm(_y, _Um, _q)
@@ -1298,7 +1298,8 @@ if cfg.raw_targets or cfg.adaptive_norm:
     _raw_sq_sum = torch.zeros(3, device=device)
     _raw_n = 0.0
     with torch.no_grad():
-        for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc=f"{_label} stats", leave=False):
+        for _stats_batch2 in tqdm(_stats_loader, desc=f"{_label} stats", leave=False):
+            _x, _y, _is_surf, _mask = _stats_batch2[:4]
             _y, _mask = _y.to(device), _mask.to(device)
             _yt = _y.clone()
             if cfg.adaptive_norm and cfg.asinh_pressure:
@@ -1679,7 +1680,13 @@ for epoch in range(MAX_EPOCHS):
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     if cfg.grad_accum_steps > 1:
         optimizer.zero_grad()
-    for batch_idx, (x, y, is_surface, mask) in enumerate(pbar):
+    for batch_idx, batch_data in enumerate(pbar):
+        if len(batch_data) == 5:
+            x, y, is_surface, mask, boundary_id = batch_data
+            boundary_id = boundary_id.to(device, non_blocking=True)
+        else:
+            x, y, is_surface, mask = batch_data
+            boundary_id = None
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -1903,7 +1910,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x, "is_surface": is_surface})
+            out = model({"x": x, "is_surface": is_surface, "boundary_id": boundary_id})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -2131,7 +2138,7 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x, "is_surface": is_surface})
+                rdrop_out = model({"x": x, "is_surface": is_surface, "boundary_id": boundary_id})
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -2270,7 +2277,7 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x, "is_surface": is_surface})
+                out2 = model({"x": x, "is_surface": is_surface, "boundary_id": boundary_id})
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -2459,9 +2466,15 @@ for epoch in range(MAX_EPOCHS):
         n_vbatches = 0
 
         with torch.no_grad():
-            for x, y, is_surface, mask in tqdm(
+            for _vbatch in tqdm(
                 vloader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [{split_name}]", leave=False
             ):
+                if len(_vbatch) == 5:
+                    x, y, is_surface, mask, boundary_id = _vbatch
+                    boundary_id = boundary_id.to(device, non_blocking=True)
+                else:
+                    x, y, is_surface, mask = _vbatch
+                    boundary_id = None
                 x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
@@ -2575,7 +2588,7 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    _eval_out = eval_model({"x": x, "is_surface": is_surface})
+                    _eval_out = eval_model({"x": x, "is_surface": is_surface, "boundary_id": boundary_id})
                     pred = _eval_out["preds"]
                     _eval_hidden = _eval_out["hidden"]
                 pred = pred.float()
@@ -2875,11 +2888,17 @@ if best_metrics:
         for split_name, split_ds in val_splits.items():
             samples = []
             for i in range(min(n, len(split_ds))):
-                x, y_true, is_surface = split_ds[i]
+                _vis_item = split_ds[i]
+                if len(_vis_item) == 4:
+                    x, y_true, is_surface, _vis_bid = _vis_item
+                else:
+                    x, y_true, is_surface = _vis_item
+                    _vis_bid = None
                 with torch.no_grad():
                     x_dev = x.unsqueeze(0).to(device)
                     y_dev = y_true.unsqueeze(0).to(device)
                     is_surf_dev = is_surface.unsqueeze(0).to(device)
+                    _vis_bid_dev = _vis_bid.unsqueeze(0).to(device) if _vis_bid is not None else None
                     mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
@@ -2915,7 +2934,7 @@ if best_metrics:
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
-                    pred = vis_model({"x": x_n, "mask": mask, "is_surface": is_surf_dev})["preds"].float()
+                    pred = vis_model({"x": x_n, "mask": mask, "is_surface": is_surf_dev, "boundary_id": _vis_bid_dev})["preds"].float()
                     if cfg.raw_targets:
                         y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                     elif cfg.adaptive_norm:
@@ -2984,7 +3003,13 @@ if cfg.surface_refine and best_metrics:
             all_re_values = []  # Reynolds numbers for correlation check
 
             with torch.no_grad():
-                for x, y, is_surface, mask in tqdm(_ood_re_loader, desc="Verify OOD-Re", leave=False):
+                for _vr_batch in tqdm(_ood_re_loader, desc="Verify OOD-Re", leave=False):
+                    if len(_vr_batch) == 5:
+                        x, y, is_surface, mask, boundary_id = _vr_batch
+                        boundary_id = boundary_id.to(device, non_blocking=True)
+                    else:
+                        x, y, is_surface, mask = _vr_batch
+                        boundary_id = None
                     x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
                     is_surface = is_surface.to(device, non_blocking=True)
                     mask = mask.to(device, non_blocking=True)
@@ -3084,7 +3109,7 @@ if cfg.surface_refine and best_metrics:
 
                     # Model forward
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        out = verify_model({"x": x, "is_surface": is_surface})
+                        out = verify_model({"x": x, "is_surface": is_surface, "boundary_id": boundary_id})
                         pred_raw = out["preds"].float()
                         hidden = out["hidden"].float()
 
