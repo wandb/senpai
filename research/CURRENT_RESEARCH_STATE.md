@@ -193,5 +193,19 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 | `ensemble-distillation` | p_oodc, p_re | **ASSIGNED to nezuko (#2279)** |
 | `deeper-backbone` | all metrics | **ASSIGNED to alphonse (#2285)** |
 
-**Assignment priority for next idle students:**
-1. New ideas from researcher-agent (running in background — idea queue exhausted, generating Round 29 ideas)
+**Assignment priority for next idle students (Round 29 ideas — researcher-agent generated):**
+
+| Priority | Slug | Target | Key bet |
+|----------|------|--------|---------|
+| 1 | `vel-angle-mag-feature` | p_tan, p_in | Per-node local incidence angle from DSDF gradient × freestream direction. Follows proven input feature pattern. |
+| 2 | `effective-aoa-aft-feature` | p_tan, p_re | Thin-airfoil downwash: aft foil effective AoA = AoA + k*AoA/gap. Sweep k={0.05, 0.10, 0.20}. |
+| 3 | `chord-fraction-feature` | p_in, p_tan | Chord-wise position ∈[0,1] for each node. Gives SRF explicit "where on chord" signal. No ordering needed (unlike arc-length PE). |
+| 4 | `cp-target-normalization` | p_re, p_oodc | Predict Cp instead of raw p. Re-invariant target normalization. Directly targets p_re regression. |
+| 5 | `re-stratified-sampling` | p_re, p_oodc | 2× weight for extreme-Re samples via static WeightedRandomSampler. |
+| 6 | `stagnation-pressure-feature` | p_in, p_re | q_inf = 0.5*Umag² as input channel. Bernoulli baseline as feature (not loss constraint). |
+| 7 | `lowrank-pressure-loss` | p_tan, p_in | SVD penalty on surface pressure: penalize energy beyond rank-5. Orthogonal to DCT freq loss. |
+| 8 | `flowdir-anisotropic-norm` | p_oodc, p_re | Rotate (x,y) by -AoA to flow-aligned frame. Different from SE(2) failure: known rotation, DSDF untouched. |
+| 9 | `logre-pressure-scaling` | p_re | Normalize pressure residuals by log(Re). Milder than Cp normalization. |
+| 10 | `tandem-topo-feature` | p_tan | KD-tree OOD proximity feature — distance to nearest training configs in (gap, stagger, AoA, NACA) space. |
+
+Full details: `/research/RESEARCH_IDEAS_2026-04-08_ROUND29.md`
