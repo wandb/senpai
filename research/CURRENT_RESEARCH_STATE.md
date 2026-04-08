@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-08 21:30 UTC
+- **Date:** 2026-04-08 22:15 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training & Architecture Improvements
 
@@ -36,8 +36,8 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 |---------|-----|-----------|--------|
 | thorfinn | #2288 | **Chord Fraction Feature — per-node chord-wise position [0,1]** | WIP (NEW) |
 | fern | #2284 | **Heteroscedastic Loss — learned per-node uncertainty weighting** | WIP |
-| askeladd | #2282 | **Point Cloud MixUp — linear interpolation data augmentation** | WIP |
-| frieren | #2283 | **Wider SRF Head — surface_refine_hidden 192→384** | WIP |
+| askeladd | #2292 | **Flow-Direction Normalization — rotate coords by -AoA to streamwise frame** | WIP (NEW) |
+| frieren | #2291 | **Stagnation Pressure Feature — q_inf = 0.5*Umag² as input channel** | WIP (NEW) |
 | tanjiro | #2287 | **Effective AoA Aft Feature — thin-airfoil downwash correction (k sweep)** | WIP (NEW) |
 | edward | #2286 | **Velocity Angle Feature — per-node local incidence angle from DSDF gradient** | WIP (NEW) |
 | nezuko | #2290 | **Re-Stratified Sampling — 2× weight for extreme-Re training samples** | WIP (NEW) |
@@ -48,6 +48,13 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 None.
 
 ## Latest Reviews (2026-04-08 21:00)
+
+### PR #2283 (frieren, Wider SRF Head 192→384) — CLOSED ❌
+- Near-neutral, all metrics +0.4-1.7%. SRF head capacity is NOT the bottleneck.
+
+### PR #2282 (askeladd, Point Cloud MixUp) — CLOSED ❌
+- All metrics severely regressed: p_in +19.0%, p_oodc +37.5%, p_tan +6.7%, p_re +18.6%.
+- MixUp creates physically impossible interpolated geometries that violate Navier-Stokes.
 
 ### PR #2279 (nezuko, Ensemble Knowledge Distillation) — CLOSED ❌
 - All metrics catastrophically regressed: p_in +46.3%, p_oodc +46.8%, p_tan +15.5%, p_re +34.6%.
@@ -113,8 +120,8 @@ Acknowledged and pivoting. Round 27 will include bold architectural additions (G
 |---------|-----|-----------|--------|
 | thorfinn | #2288 | **Chord Fraction Feature** — per-node chord-wise position [0,1] for SRF | p_in, p_tan |
 | fern | #2284 | **Heteroscedastic Loss** — learned per-node variance for pressure loss | p_in, p_tan |
-| askeladd | #2282 | **Point Cloud MixUp** — linear interpolation data augmentation | p_oodc, p_re |
-| frieren | #2283 | **Wider SRF Head** — surface_refine_hidden 192→384, capacity increase | p_in, p_tan |
+| askeladd | #2292 | **Flow-Direction Normalization** — rotate (x,y) by -AoA to streamwise frame | p_oodc, p_re |
+| frieren | #2291 | **Stagnation Pressure Feature** — q_inf = 0.5*Umag² as input channel | p_in, p_re |
 | tanjiro | #2287 | **Effective AoA Aft Feature** — thin-airfoil downwash correction, k sweep | p_tan, p_re |
 | edward | #2286 | **Velocity Angle Feature** — per-node local incidence from DSDF gradient | p_tan, p_in |
 | nezuko | #2290 | **Re-Stratified Sampling** — 2× weight for extreme-Re training samples | p_re, p_oodc |
@@ -181,6 +188,8 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 - **Geometry consistency self-distillation**: Mean Teacher on jittered mesh. Consistency loss only active for ~7 epochs (EMA timing). Existing augmentation already provides larger perturbations (+0.1-3.8%)
 - **Snapshot ensemble (cyclic cosine)**: EMA on single continuous cosine outperforms cyclic snapshots. 50-epoch cycles too short, Lion+warm restarts cause instability (+7.8-28.9%)
 - **Ensemble knowledge distillation**: Teacher speed penalty, undertrained teachers, aggressive alpha, Fourier PE mismatch. Infrastructure cost not worth marginal benefit (+15.5-46.8%)
+- **Wider SRF head (192→384)**: SRF capacity is NOT the bottleneck — backbone representations limit what SRF can extract. 3.3× more params, no consistent improvement (+0.4-1.7%)
+- **Point cloud MixUp**: Fundamentally unsuited to physics-constrained regression — creates phantom geometries violating Navier-Stokes. Existing augmentation already handles diversity (+6.7-37.5%)
 
 ## Potential Next Research Directions (Round 28+)
 
@@ -222,9 +231,9 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 | 3 | `chord-fraction-feature` | p_in, p_tan | **ASSIGNED to thorfinn (#2288)** |
 | 4 | `cp-target-normalization` | p_re, p_oodc | **SKIPPED** — baseline already applies Cp normalization via `_phys_norm()` |
 | 5 | `re-stratified-sampling` | p_re, p_oodc | **ASSIGNED to nezuko (#2290)** |
-| 6 | `stagnation-pressure-feature` | p_in, p_re | q_inf = 0.5*Umag² as input channel. Bernoulli baseline as feature (not loss constraint). |
+| 6 | `stagnation-pressure-feature` | p_in, p_re | **ASSIGNED to frieren (#2291)** |
 | 7 | `lowrank-pressure-loss` | p_tan, p_in | SVD penalty on surface pressure: penalize energy beyond rank-5. Orthogonal to DCT freq loss. |
-| 8 | `flowdir-anisotropic-norm` | p_oodc, p_re | Rotate (x,y) by -AoA to flow-aligned frame. Different from SE(2) failure: known rotation, DSDF untouched. |
+| 8 | `flowdir-anisotropic-norm` | p_oodc, p_re | **ASSIGNED to askeladd (#2292)** |
 | 9 | `logre-pressure-scaling` | p_re | Normalize pressure residuals by log(Re). Milder than Cp normalization. |
 | 10 | `tandem-topo-feature` | p_tan | KD-tree OOD proximity feature — distance to nearest training configs in (gap, stagger, AoA, NACA) space. |
 

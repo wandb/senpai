@@ -2,6 +2,42 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 22:15 — PR #2283: Wider SRF Head (192→384) — frieren — **CLOSED** ❌
+
+- Branch: `frieren/wider-srf-head`
+- Hypothesis: Double SRF head width (surface_refine_hidden 192→384, 3.3× params). Tests whether SRF capacity is the bottleneck.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 12.030 | +1.2% ❌ |
+| p_oodc | 7.561  | 7.595  | +0.5% ❌ |
+| p_tan  | 28.118 | 28.243 | +0.4% ❌ |
+| p_re   | 6.364  | 6.470  | +1.7% ❌ |
+
+- W&B: u4g1cf44 (s42), xcg45eyk (s73). Epochs: 148-149. s42 beats baseline individually on p_oodc (-0.4%) and p_tan (-1.1%) but s73 doesn't.
+- **Analysis:** SRF head capacity is NOT the bottleneck. The backbone's 192-dim hidden states limit what the SRF can extract. 3.3× more SRF params don't help when the input representations are unchanged. Late best epochs (147-148) suggest slightly slower convergence but doesn't translate to better metrics.
+- **Conclusion:** CLOSED. Wider SRF added to DO NOT REVISIT. Backbone representations are the limiting factor, not head capacity.
+
+---
+
+### 2026-04-08 22:15 — PR #2282: Point Cloud MixUp — askeladd — **CLOSED** ❌
+
+- Branch: `askeladd/pointcloud-mixup`
+- Hypothesis: Standard MixUp (λ~Beta(0.2,0.2), prob=0.5) on paired point cloud samples. Linear interpolation of inputs and targets for OOD regularization.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 14.15 | +19.0% ❌ |
+| p_oodc | 7.561  | 10.40 | +37.5% ❌ |
+| p_tan  | 28.118 | 30.00 | +6.7% ❌ |
+| p_re   | 6.364  | 7.55  | +18.6% ❌ |
+
+- W&B: en8h216x (s42), xl5pkdwv (s73). Epochs: 143. Consistent degradation across both seeds.
+- **Analysis:** Standard MixUp is fundamentally unsuited to physics-constrained point cloud regression. Interpolating between CFD meshes creates physically impossible geometries — DSDF gradients of mixed geometry don't correspond to any real airfoil. Model learns from phantom geometries that violate Navier-Stokes. Surface mask union dilutes loss signal. Existing physics-consistent augmentation (AoA perturb, gap/stagger, DSDF2) already handles data diversity.
+- **Conclusion:** CLOSED. Point cloud MixUp added to DO NOT REVISIT. Only manifold MixUp (in hidden space) might be viable, but not worth exploring given the strong negative signal.
+
+---
+
 ### 2026-04-08 21:30 — PR #2279: Ensemble Knowledge Distillation — nezuko — **CLOSED** ❌
 
 - Branch: `nezuko/ensemble-distillation`
