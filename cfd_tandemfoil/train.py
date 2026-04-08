@@ -1170,6 +1170,8 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    zca_whitening: bool = False             # ZCA whitening of input features (replaces per-feature standardization)
+    zca_eps: float = 1e-5                   # regularization for near-zero singular values in ZCA
 
 
 cfg = sp.parse(Config)
@@ -1297,6 +1299,40 @@ if cfg.raw_targets or cfg.adaptive_norm:
     print(f"  {_label} stats — mean: {_raw_mean.tolist()}, std: {_raw_std.tolist()}")
 else:
     raw_stats = None
+
+# ZCA whitening: precompute decorrelation matrix from training data
+zca_mu = None
+zca_W = None
+if cfg.zca_whitening:
+    print("Computing ZCA whitening matrix from training data...")
+    _zca_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
+    _x_sum = None
+    _x_sq = None
+    _x_n = 0
+    with torch.no_grad():
+        for _x_b, _y_b, _is_surf_b, _mask_b in tqdm(_zca_loader, desc="ZCA stats", leave=False):
+            _x_b = _x_b.to(device).float()
+            _mask_b = _mask_b.to(device)
+            # Flatten valid nodes: [B, N, F] -> [M, F] where M = sum of valid nodes
+            _valid = _mask_b.bool()  # [B, N]
+            _x_flat = _x_b[_valid]  # [M, F]
+            if _x_sum is None:
+                _x_sum = _x_flat.sum(0)
+                _x_sq = (_x_flat.unsqueeze(-1) * _x_flat.unsqueeze(-2)).sum(0)  # [F, F]
+            else:
+                _x_sum += _x_flat.sum(0)
+                _x_sq += (_x_flat.unsqueeze(-1) * _x_flat.unsqueeze(-2)).sum(0)
+            _x_n += _x_flat.shape[0]
+    zca_mu = (_x_sum / _x_n).float()  # [F]
+    _cov = (_x_sq / _x_n - zca_mu.unsqueeze(-1) * zca_mu.unsqueeze(-2)).float()  # [F, F]
+    U, S, Vt = torch.linalg.svd(_cov)
+    zca_W = (U @ torch.diag(1.0 / (S + cfg.zca_eps).sqrt()) @ U.T).float()  # [F, F]
+    print(f"ZCA condition number (before)={S[0]/S[-1]:.1f}, smallest_sv={S[-1]:.2e}")
+    print(f"ZCA matrix shape: {zca_W.shape}, mu shape: {zca_mu.shape}")
+    wandb_zca_config = {"zca_condition_number": (S[0]/S[-1]).item(), "zca_smallest_sv": S[-1].item()}
+    del _zca_loader, _x_sum, _x_sq
+else:
+    wandb_zca_config = {}
 
 model_config = dict(
     space_dim=2,
@@ -1605,6 +1641,7 @@ run = wandb.init(
         "train_samples": len(train_ds),
         "val_samples": {k: len(v) for k, v in val_splits.items()},
         "split_manifest": cfg.manifest,
+        **wandb_zca_config,
     },
     mode=os.environ.get("WANDB_MODE", "online"),
 )
@@ -1774,7 +1811,10 @@ for epoch in range(MAX_EPOCHS):
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
-        x = (x - stats["x_mean"]) / stats["x_std"]
+        if cfg.zca_whitening:
+            x = (x - zca_mu) @ zca_W.T
+        else:
+            x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
         if cfg.foil2_dist:
@@ -2464,7 +2504,10 @@ for epoch in range(MAX_EPOCHS):
                     _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
                     _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
                     _v_gap_stagger = x[:, 0, 22:24]  # [B, 2]
-                x = (x - stats["x_mean"]) / stats["x_std"]
+                if cfg.zca_whitening:
+                    x = (x - zca_mu) @ zca_W.T
+                else:
+                    x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                 if cfg.foil2_dist:
@@ -2986,7 +3029,10 @@ if cfg.surface_refine and best_metrics:
                     _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
                     _raw_gap_wake_vv = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
-                    x = (x - stats["x_mean"]) / stats["x_std"]
+                    if cfg.zca_whitening:
+                        x = (x - zca_mu) @ zca_W.T
+                    else:
+                        x = (x - stats["x_mean"]) / stats["x_std"]
                     curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                     if cfg.foil2_dist:
                         foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
