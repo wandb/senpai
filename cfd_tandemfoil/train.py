@@ -2247,16 +2247,21 @@ for epoch in range(MAX_EPOCHS):
             loss.backward()
 
         # Geometry consistency loss: Mean Teacher self-distillation on augmented mesh views
+        # Use _orig_mod (uncompiled) and detach inputs to avoid "backward through graph a second time"
+        # error from torch.compile caching the first forward pass graph.
         if cfg.geometry_consistency and epoch > 30 and ema_model is not None:
+            _x_d = x.detach()
+            _ss_d = sample_stds.detach()
             vol_jitter_mask = (mask & ~is_surface).float().unsqueeze(-1)  # [B, N, 1]
-            jitter = torch.randn_like(x[:, :, :2]) * cfg.consistency_jitter_sigma
-            x_aug = x.clone()
+            jitter = torch.randn_like(_x_d[:, :, :2]) * cfg.consistency_jitter_sigma
+            x_aug = _x_d.clone()
             x_aug[:, :, :2] = x_aug[:, :, :2] + jitter * vol_jitter_mask
+            _model_raw = model._orig_mod if hasattr(model, '_orig_mod') else model
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                pred_aug = model({"x": x_aug})["preds"].float() / sample_stds
+                pred_aug = _model_raw({"x": x_aug})["preds"].float() / _ss_d
                 with torch.no_grad():
                     _ema_base = ema_model._orig_mod if hasattr(ema_model, '_orig_mod') else ema_model
-                    pred_ema = _ema_base({"x": x})["preds"].float() / sample_stds
+                    pred_ema = _ema_base({"x": _x_d})["preds"].float() / _ss_d
             surf_mask_3d = (mask & is_surface).float().unsqueeze(-1)  # [B, N, 1]
             n_surf = surf_mask_3d.sum().clamp(min=1)
             consistency_loss = ((pred_aug - pred_ema.detach()) ** 2 * surf_mask_3d).sum() / n_surf
