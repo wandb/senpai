@@ -1170,6 +1170,9 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    # Re-stratified sampling
+    re_stratified_sampling: bool = False    # upweight extreme-Re training samples
+    re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
 
 
 cfg = sp.parse(Config)
@@ -1229,6 +1232,21 @@ def _phys_denorm(y_p, Umag, q):
 
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=cfg.num_workers, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
+
+if cfg.re_stratified_sampling and not cfg.debug:
+    # Re-stratified sampling: upweight extreme-Re samples in the training set
+    # Extract log_Re from each training sample (x feature index 13)
+    _train_log_re = torch.tensor([train_ds[i][0][0, 13].item() for i in range(len(train_ds))])
+    _re_low = torch.quantile(_train_log_re.float(), 0.2).item()
+    _re_high = torch.quantile(_train_log_re.float(), 0.8).item()
+    _re_extreme = (_train_log_re < _re_low) | (_train_log_re > _re_high)
+    _re_weights = torch.where(_re_extreme, cfg.re_extreme_weight, 1.0).double()
+    # Multiply with existing domain weights (don't replace)
+    sample_weights = sample_weights * _re_weights
+    _n_extreme = _re_extreme.sum().item()
+    print(f"Re-stratified sampling: {_n_extreme}/{len(train_ds)} extreme-Re samples "
+          f"({_n_extreme/len(train_ds)*100:.1f}%) upweighted {cfg.re_extreme_weight}x "
+          f"(log_Re thresholds: [{_re_low:.3f}, {_re_high:.3f}])")
 
 if cfg.debug:
     # Avoid sampler/length mismatch when train_ds is truncated
@@ -1618,6 +1636,13 @@ for _sname in VAL_SPLIT_NAMES:
 wandb.define_metric("lr", step_metric="global_step")
 wandb.define_metric("epoch_time_s", step_metric="global_step")
 wandb.define_metric("val_predictions", step_metric="global_step")
+
+if cfg.re_stratified_sampling and '_train_log_re' in dir():
+    wandb.log({"re_stratification/log_re_histogram": wandb.Histogram(_train_log_re.numpy()),
+               "re_stratification/n_extreme": _n_extreme,
+               "re_stratification/pct_extreme": _n_extreme / len(train_ds) * 100,
+               "re_stratification/re_low_thresh": _re_low,
+               "re_stratification/re_high_thresh": _re_high})
 
 model_dir = Path(f"models/model-{run.id}")
 model_dir.mkdir(parents=True)
