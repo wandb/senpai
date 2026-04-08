@@ -1050,6 +1050,9 @@ class Config:
     cosine_eta_min: float = 1e-5
     ema_start_epoch: int = 140
     ema_decay: float = 0.998
+    geometry_consistency: bool = False        # Mean Teacher self-distillation on augmented mesh views
+    consistency_weight: float = 0.1           # weight for geometry consistency loss
+    consistency_jitter_sigma: float = 0.005   # jitter sigma for volume node coordinates
     temp_anneal_epoch: int = 50
     vol_ramp_epochs: int = 40
     tandem_curriculum_epochs: int = 10
@@ -1657,6 +1660,7 @@ for epoch in range(MAX_EPOCHS):
         aft_srf_ctx_head.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
+    epoch_consistency = 0.0
     n_batches = 0
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
@@ -2242,6 +2246,23 @@ for epoch in range(MAX_EPOCHS):
                 optimizer.zero_grad()
             loss.backward()
 
+        # Geometry consistency loss: Mean Teacher self-distillation on augmented mesh views
+        if cfg.geometry_consistency and epoch > 30 and ema_model is not None:
+            vol_jitter_mask = (mask & ~is_surface).float().unsqueeze(-1)  # [B, N, 1]
+            jitter = torch.randn_like(x[:, :, :2]) * cfg.consistency_jitter_sigma
+            x_aug = x.clone()
+            x_aug[:, :, :2] = x_aug[:, :, :2] + jitter * vol_jitter_mask
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                pred_aug = model({"x": x_aug})["preds"].float() / sample_stds
+                with torch.no_grad():
+                    _ema_base = ema_model._orig_mod if hasattr(ema_model, '_orig_mod') else ema_model
+                    pred_ema = _ema_base({"x": x})["preds"].float() / sample_stds
+            surf_mask_3d = (mask & is_surface).float().unsqueeze(-1)  # [B, N, 1]
+            n_surf = surf_mask_3d.sum().clamp(min=1)
+            consistency_loss = ((pred_aug - pred_ema.detach()) ** 2 * surf_mask_3d).sum() / n_surf
+            (cfg.consistency_weight * consistency_loss).backward()
+            epoch_consistency += consistency_loss.item()
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         sam_active = sam_optimizer is not None and epoch >= int(MAX_EPOCHS * 0.75)
         _should_step = (cfg.grad_accum_steps <= 1 or
@@ -2384,13 +2405,16 @@ for epoch in range(MAX_EPOCHS):
     _do_val = (epoch + 1) % cfg.val_every == 0 or epoch == 0 or epoch == MAX_EPOCHS - 1
     if not _do_val:
         dt = time.time() - t0
-        wandb.log({
+        _skip_log = {
             "train/vol_loss": epoch_vol,
             "train/surf_loss": epoch_surf,
             "epoch_time_s": dt,
             "lr": scheduler.get_last_lr()[0],
             "global_step": global_step,
-        })
+        }
+        if cfg.geometry_consistency and epoch_consistency > 0:
+            _skip_log["train/consistency_loss"] = epoch_consistency / max(n_batches, 1)
+        wandb.log(_skip_log)
         print(f"Epoch {epoch+1:3d} ({dt:.0f}s)  train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  [val skipped]")
         continue
 
@@ -2761,6 +2785,8 @@ for epoch in range(MAX_EPOCHS):
         "lr": scheduler.get_last_lr()[0],
         "epoch_time_s": dt,
     }
+    if cfg.geometry_consistency and epoch_consistency > 0:
+        metrics["train/consistency_loss"] = epoch_consistency / max(n_batches, 1)
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
