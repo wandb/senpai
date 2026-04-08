@@ -757,6 +757,95 @@ class SurfaceRefinementContextHead(nn.Module):
         return correction
 
 
+class FNOCouplingLayer(nn.Module):
+    """1D Fourier Neural Operator coupling layer for tandem gap region.
+
+    Bins gap-region nodes into a regular 1D grid along the chord direction,
+    applies spectral convolution (FFT → learned weight multiply → IFFT),
+    then scatters corrections back to the original nodes.
+    """
+
+    def __init__(self, n_hidden: int = 192, n_modes: int = 16, n_bins: int = 32):
+        super().__init__()
+        self.n_modes = n_modes
+        self.n_bins = n_bins
+        self.n_hidden = n_hidden
+        # Spectral weights: [in_channels, out_channels, modes] complex
+        # Xavier-style init scaled for complex: std = 1/sqrt(n_hidden)
+        scale = 1.0 / (n_hidden ** 0.5)
+        self.fourier_weight = nn.Parameter(
+            torch.randn(n_hidden, n_hidden, n_modes, dtype=torch.cfloat) * scale
+        )
+        # Bypass path: zero-init so layer starts as identity (residual)
+        self.bypass = nn.Linear(n_hidden, n_hidden)
+        nn.init.zeros_(self.bypass.weight)
+        nn.init.zeros_(self.bypass.bias)
+        # LayerNorm before spectral conv for stability
+        self.norm = nn.LayerNorm(n_hidden)
+
+    def forward(self, hidden, gap_mask, raw_x_coords):
+        """Apply FNO coupling to gap-region nodes.
+
+        Args:
+            hidden:       [B, N, C] — hidden features from backbone
+            gap_mask:     [B, N] bool — True for nodes in the inter-foil gap
+            raw_x_coords: [B, N] — raw x-coordinates (pre-normalization)
+
+        Returns: [B, N, C] — hidden with gap-region corrections added
+        """
+        if not gap_mask.any():
+            return hidden
+
+        B, N, C = hidden.shape
+        G = self.n_bins
+        device = hidden.device
+
+        # Normalize hidden before spectral processing
+        gap_h = self.norm(hidden)  # [B, N, C]
+
+        # Per-sample gap x-range for binning
+        # Use large/small sentinels for masked min/max
+        x_for_gap = raw_x_coords.clone()
+        x_for_gap[~gap_mask] = float('inf')
+        x_min = x_for_gap.min(dim=1, keepdim=True).values  # [B, 1]
+        x_for_gap2 = raw_x_coords.clone()
+        x_for_gap2[~gap_mask] = float('-inf')
+        x_max = x_for_gap2.max(dim=1, keepdim=True).values  # [B, 1]
+
+        # Normalize gap x-coords to [0, 1] and bin
+        x_norm = (raw_x_coords - x_min) / (x_max - x_min + 1e-6)  # [B, N]
+        bin_idx = (x_norm * (G - 1)).long().clamp(0, G - 1)  # [B, N]
+
+        # Scatter gap nodes into regular grid (average pooling per bin)
+        gap_f = gap_mask.float().unsqueeze(-1)  # [B, N, 1]
+        grid = torch.zeros(B, G, C, device=device, dtype=hidden.dtype)
+        counts = torch.zeros(B, G, 1, device=device, dtype=hidden.dtype)
+        bin_expand = bin_idx.unsqueeze(-1).expand(-1, -1, C)  # [B, N, C]
+        grid.scatter_add_(1, bin_expand, gap_h * gap_f)
+        counts.scatter_add_(1, bin_idx.unsqueeze(-1), gap_f)
+        grid = grid / counts.clamp(min=1)  # [B, G, C]
+
+        # 1D spectral convolution: FFT along chord axis
+        grid_fft = torch.fft.rfft(grid, dim=1)  # [B, G//2+1, C]
+        modes = min(self.n_modes, grid_fft.shape[1])
+        # einsum: [B, modes, C_in] x [C_in, C_out, modes] -> [B, modes, C_out]
+        out_fft = torch.zeros_like(grid_fft)
+        out_fft[:, :modes, :] = torch.einsum(
+            'bmi,iom->bmo',
+            grid_fft[:, :modes, :].to(torch.cfloat),
+            self.fourier_weight[:, :, :modes]
+        )
+        grid_out = torch.fft.irfft(out_fft, n=G, dim=1)  # [B, G, C]
+
+        # Gather corrections for each node from its bin
+        corrections = grid_out.gather(1, bin_expand)  # [B, N, C]
+
+        # Apply bypass and add residual (only to gap nodes)
+        corrections = self.bypass(corrections)  # [B, N, C]
+        result = hidden + corrections * gap_f  # zero outside gap
+        return result
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -794,6 +883,9 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        fno_inter_foil=False,
+        fno_modes=16,
+        fno_gap_bins=32,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -870,6 +962,10 @@ class Transolver(nn.Module):
                 for idx in range(n_layers)
             ]
         )
+        # FNO inter-foil coupling layer (inserted between blocks[0] and blocks[1])
+        self.fno_inter_foil = fno_inter_foil
+        if fno_inter_foil:
+            self.fno_coupling = FNOCouplingLayer(n_hidden, fno_modes, fno_gap_bins)
         # Zero-init the 2 new input columns of spatial_bias so initial routing is unchanged
         if gap_stagger_spatial_bias:
             with torch.no_grad():
@@ -885,6 +981,10 @@ class Transolver(nn.Module):
             nn.Linear(n_hidden, 1),
         )
         self.initialize_weights()
+        # Re-zero FNO bypass after initialize_weights (which applies orthogonal init to all Linear)
+        if fno_inter_foil:
+            nn.init.zeros_(self.fno_coupling.bypass.weight)
+            nn.init.zeros_(self.fno_coupling.bypass.bias)
         self.out_skip = nn.Linear(n_hidden, out_dim)
         nn.init.zeros_(self.out_skip.weight)
         nn.init.zeros_(self.out_skip.bias)
@@ -934,14 +1034,16 @@ class Transolver(nn.Module):
         x = data.get("x")
         pos = data.get("pos", pos)
         condition = data.get("condition", condition)
-        return x, pos, condition
+        gap_mask = data.get("gap_mask")    # [B, N] bool — inter-foil gap nodes
+        raw_x = data.get("raw_x")          # [B, N] raw x-coords for FNO binning
+        return x, pos, condition, gap_mask, raw_x
 
     def _validate_output_dims(self, preds):
         if sum(self.output_dims) != preds.shape[-1]:
             raise ValueError("Sum of output_dims must match preds last dimension")
 
     def forward(self, data, pos=None, condition=None):
-        x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
+        x, pos, condition, gap_mask, raw_x = self._unpack_inputs(data, pos=pos, condition=condition)
         if x is None:
             raise ValueError("Missing required input tensor: x")
         if condition is not None:
@@ -992,8 +1094,11 @@ class Transolver(nn.Module):
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
-        for block in self.blocks[:-1]:
+        for blk_idx, block in enumerate(self.blocks[:-1]):
             fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+            # FNO coupling after first block (between blocks 0 and 1)
+            if self.fno_inter_foil and blk_idx == 0 and gap_mask is not None and raw_x is not None:
+                fx = self.fno_coupling(fx, gap_mask, raw_x)
 
         # Deep hidden representation (post all non-last blocks, pre output head)
         fx_deep = fx  # [B, N, n_hidden]
@@ -1170,6 +1275,10 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    # FNO inter-foil coupling: spectral convolution in tandem gap region
+    fno_inter_foil: bool = False            # enable FNO coupling layer between TransolverBlocks 1 and 2
+    fno_modes: int = 16                     # number of Fourier modes to keep
+    fno_gap_bins: int = 32                  # number of chord-wise grid cells in gap region
 
 
 cfg = sp.parse(Config)
@@ -1330,6 +1439,9 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    fno_inter_foil=cfg.fno_inter_foil,
+    fno_modes=cfg.fno_modes,
+    fno_gap_bins=cfg.fno_gap_bins,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1774,6 +1886,31 @@ for epoch in range(MAX_EPOCHS):
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
+        # FNO inter-foil: compute gap node mask (volume nodes between fore-TE and aft-LE)
+        _fno_gap_mask = None
+        _fno_raw_x = None
+        if cfg.fno_inter_foil:
+            _fno_raw_x = x[:, :, 0]  # raw x-coords [B, N]
+            _fno_saf_norm = x[:, :, 2:4].norm(dim=-1)  # [B, N]
+            _fno_is_tandem = (x[:, 0, 22].abs() > 0.01)  # [B]
+            # Fore-foil TE: max x among fore-foil surface nodes (saf_norm <= 0.005)
+            _fore_surf = is_surface & (_fno_saf_norm <= 0.005)
+            _fore_x_masked = _fno_raw_x.clone()
+            _fore_x_masked[~_fore_surf] = float('-inf')
+            _fore_te_x_fno = _fore_x_masked.max(dim=1).values  # [B]
+            # Aft-foil LE: min x among aft-foil surface nodes (saf_norm > 0.005)
+            _aft_surf = is_surface & (_fno_saf_norm > 0.005)
+            _aft_x_masked = _fno_raw_x.clone()
+            _aft_x_masked[~_aft_surf] = float('inf')
+            _aft_le_x_fno = _aft_x_masked.min(dim=1).values  # [B]
+            # Gap mask: nodes between fore-TE and aft-LE, excluding surface, only for tandem
+            _fno_gap_mask = (
+                (_fno_raw_x > _fore_te_x_fno.unsqueeze(1)) &
+                (_fno_raw_x < _aft_le_x_fno.unsqueeze(1)) &
+                ~is_surface &
+                _fno_is_tandem.unsqueeze(1) &
+                mask  # only valid (non-padding) nodes
+            )
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1886,7 +2023,11 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            _model_input = {"x": x}
+            if cfg.fno_inter_foil and _fno_gap_mask is not None:
+                _model_input["gap_mask"] = _fno_gap_mask
+                _model_input["raw_x"] = _fno_raw_x
+            out = model(_model_input)
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -2114,7 +2255,7 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x})
+                rdrop_out = model(_model_input)
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -2310,7 +2451,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _train_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.fno_inter_foil and _fno_gap_mask is not None:
+            _train_log["train/fno_gap_nodes"] = _fno_gap_mask.sum().item() / max(_fno_gap_mask.shape[0], 1)
+        wandb.log(_train_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -2464,6 +2608,24 @@ for epoch in range(MAX_EPOCHS):
                     _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
                     _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
                     _v_gap_stagger = x[:, 0, 22:24]  # [B, 2]
+                # FNO gap mask for eval
+                _eval_fno_gap_mask = None
+                _eval_fno_raw_x = None
+                if cfg.fno_inter_foil:
+                    _eval_fno_raw_x = x[:, :, 0]
+                    _ev_saf = x[:, :, 2:4].norm(dim=-1)
+                    _ev_tandem = (x[:, 0, 22].abs() > 0.01)
+                    _ev_fore = is_surface & (_ev_saf <= 0.005)
+                    _ev_fx = x[:, :, 0].clone(); _ev_fx[~_ev_fore] = float('-inf')
+                    _ev_fore_te = _ev_fx.max(dim=1).values
+                    _ev_aft = is_surface & (_ev_saf > 0.005)
+                    _ev_ax = x[:, :, 0].clone(); _ev_ax[~_ev_aft] = float('inf')
+                    _ev_aft_le = _ev_ax.min(dim=1).values
+                    _eval_fno_gap_mask = (
+                        (x[:, :, 0] > _ev_fore_te.unsqueeze(1)) &
+                        (x[:, :, 0] < _ev_aft_le.unsqueeze(1)) &
+                        ~is_surface & _ev_tandem.unsqueeze(1) & mask
+                    )
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -2558,7 +2720,11 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    _eval_out = eval_model({"x": x})
+                    _eval_input = {"x": x}
+                    if cfg.fno_inter_foil and _eval_fno_gap_mask is not None:
+                        _eval_input["gap_mask"] = _eval_fno_gap_mask
+                        _eval_input["raw_x"] = _eval_fno_raw_x
+                    _eval_out = eval_model(_eval_input)
                     pred = _eval_out["preds"]
                     _eval_hidden = _eval_out["hidden"]
                 pred = pred.float()
@@ -2871,6 +3037,22 @@ if best_metrics:
                     _raw_xy_te_vis = x_dev[:, :, :2].clone() if _need_te_raw_vis else None
                     _raw_saf_norm_te_vis = x_dev[:, :, 2:4].norm(dim=-1) if _need_te_raw_vis else None
                     _raw_gap_wake_vis = x_dev[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
+                    # FNO gap mask for vis
+                    _vis_fno_gap_mask = None
+                    _vis_fno_raw_x = None
+                    if cfg.fno_inter_foil:
+                        _vis_fno_raw_x = x_dev[:, :, 0]
+                        _vs = x_dev[:, :, 2:4].norm(dim=-1)
+                        _vt = (x_dev[:, 0, 22].abs() > 0.01)
+                        _vf = is_surf_dev & (_vs <= 0.005)
+                        _vfx = x_dev[:, :, 0].clone(); _vfx[~_vf] = float('-inf')
+                        _va = is_surf_dev & (_vs > 0.005)
+                        _vax = x_dev[:, :, 0].clone(); _vax[~_va] = float('inf')
+                        _vis_fno_gap_mask = (
+                            (x_dev[:, :, 0] > _vfx.max(dim=1).values.unsqueeze(1)) &
+                            (x_dev[:, :, 0] < _vax.min(dim=1).values.unsqueeze(1)) &
+                            ~is_surf_dev & _vt.unsqueeze(1) & mask
+                        )
                     x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                     curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                     if cfg.te_coord_frame:
@@ -2898,7 +3080,11 @@ if best_metrics:
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
-                    pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
+                    _vis_input = {"x": x_n, "mask": mask}
+                    if cfg.fno_inter_foil and _vis_fno_gap_mask is not None:
+                        _vis_input["gap_mask"] = _vis_fno_gap_mask
+                        _vis_input["raw_x"] = _vis_fno_raw_x
+                    pred = vis_model(_vis_input)["preds"].float()
                     if cfg.raw_targets:
                         y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                     elif cfg.adaptive_norm:
@@ -2986,6 +3172,22 @@ if cfg.surface_refine and best_metrics:
                     _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
                     _raw_gap_wake_vv = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
+                    # FNO gap mask for verify
+                    _vv_fno_gap_mask = None
+                    _vv_fno_raw_x = None
+                    if cfg.fno_inter_foil:
+                        _vv_fno_raw_x = x[:, :, 0]
+                        _vvs = x[:, :, 2:4].norm(dim=-1)
+                        _vvt = (x[:, 0, 22].abs() > 0.01)
+                        _vvf = is_surface & (_vvs <= 0.005)
+                        _vvfx = x[:, :, 0].clone(); _vvfx[~_vvf] = float('-inf')
+                        _vva = is_surface & (_vvs > 0.005)
+                        _vvax = x[:, :, 0].clone(); _vvax[~_vva] = float('inf')
+                        _vv_fno_gap_mask = (
+                            (x[:, :, 0] > _vvfx.max(dim=1).values.unsqueeze(1)) &
+                            (x[:, :, 0] < _vvax.min(dim=1).values.unsqueeze(1)) &
+                            ~is_surface & _vvt.unsqueeze(1) & mask
+                        )
                     x = (x - stats["x_mean"]) / stats["x_std"]
                     curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                     if cfg.foil2_dist:
@@ -3067,7 +3269,11 @@ if cfg.surface_refine and best_metrics:
 
                     # Model forward
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        out = verify_model({"x": x})
+                        _vv_input = {"x": x}
+                        if cfg.fno_inter_foil and _vv_fno_gap_mask is not None:
+                            _vv_input["gap_mask"] = _vv_fno_gap_mask
+                            _vv_input["raw_x"] = _vv_fno_raw_x
+                        out = verify_model(_vv_input)
                         pred_raw = out["preds"].float()
                         hidden = out["hidden"].float()
 
