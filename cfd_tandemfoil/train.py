@@ -1154,6 +1154,9 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    surface_refine2: bool = False             # enable second-pass SRF (gradient boosting on residuals)
+    surface_refine2_hidden: int = 96          # hidden dim for second SRF pass
+    surface_refine2_layers: int = 2           # number of layers for second SRF pass
     # Phase 6: Asinh pressure transform
     asinh_pressure: bool = False             # transform pressure targets with asinh for dynamic range compression
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
@@ -1363,6 +1366,21 @@ if cfg.surface_refine:
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
           f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
 
+# Second-pass SRF head (gradient boosting on residuals from SRF1)
+refine_head2 = None
+if cfg.surface_refine2 and cfg.surface_refine:
+    refine_head2 = SurfaceRefinementHead(
+        n_hidden=cfg.n_hidden,
+        out_dim=3,
+        hidden_dim=cfg.surface_refine2_hidden,
+        n_layers=cfg.surface_refine2_layers,
+    ).to(device)
+    # Zero-init is already done by SurfaceRefinementHead.__init__
+    refine_head2 = torch.compile(refine_head2, mode=cfg.compile_mode)
+    _refine2_n_params = sum(p.numel() for p in refine_head2.parameters())
+    print(f"Surface refinement head 2 (two-pass): {_refine2_n_params:,} params "
+          f"(hidden={cfg.surface_refine2_hidden}, layers={cfg.surface_refine2_layers})")
+
 # Aft-foil (boundary ID=7) dedicated refinement head
 aft_srf_head = None
 aft_srf_ctx_head = None
@@ -1396,6 +1414,7 @@ if cfg.aft_foil_srf:
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
+ema_refine_head2 = None  # EMA copy of second-pass refinement head
 ema_aft_srf_head = None  # EMA copy of aft-foil SRF head
 swad_initial_val = None
 swad_prev_val = float("inf")
@@ -1414,6 +1433,8 @@ snapshot_epoch_list = [int(e) for e in cfg.snapshot_epochs_str.split(",")] if cf
 n_params = sum(p.numel() for p in model.parameters())
 if refine_head is not None:
     n_params += sum(p.numel() for p in refine_head.parameters())
+if refine_head2 is not None:
+    n_params += sum(p.numel() for p in refine_head2.parameters())
 if aft_srf_head is not None:
     n_params += sum(p.numel() for p in aft_srf_head.parameters())
 if aft_srf_ctx_head is not None:
@@ -1548,6 +1569,10 @@ if refine_head is not None:
     _refine_params = list(refine_head.parameters())
     base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
+if refine_head2 is not None:
+    _refine2_params = list(refine_head2.parameters())
+    base_opt.add_param_group({'params': _refine2_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _refine2_params):,} refinement head 2 params to optimizer")
 
 # Add aft-foil SRF head params to optimizer if enabled
 if aft_srf_head is not None:
@@ -1919,6 +1944,17 @@ for epoch in range(MAX_EPOCHS):
                         correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
+
+        # Second-pass SRF: gradient boosting on residuals from SRF1
+        if refine_head2 is not None and model.training:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                surf_idx2 = is_surface.nonzero(as_tuple=False)
+                if surf_idx2.numel() > 0:
+                    surf_hidden2 = hidden[surf_idx2[:, 0], surf_idx2[:, 1]]
+                    surf_pred2 = pred[surf_idx2[:, 0], surf_idx2[:, 1]].detach()  # detach: independent corrector
+                    correction2 = refine_head2(surf_hidden2, surf_pred2).float()
+                    pred = pred.clone()
+                    pred[surf_idx2[:, 0], surf_idx2[:, 1]] = pred[surf_idx2[:, 0], surf_idx2[:, 1]] + correction2
 
         # Aft-foil dedicated refinement head: additive correction on boundary ID=7 nodes only
         if aft_srf_ctx_head is not None and model.training and _aft_foil_mask is not None:
@@ -2292,6 +2328,15 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for second-pass refinement head
+            if refine_head2 is not None:
+                _refine2_base = refine_head2._orig_mod if hasattr(refine_head2, '_orig_mod') else refine_head2
+                if ema_refine_head2 is None:
+                    ema_refine_head2 = deepcopy(_refine2_base)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_refine_head2.parameters(), _refine2_base.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
             # EMA for aft-foil SRF head
             if aft_srf_head is not None:
                 _aft_base = aft_srf_head._orig_mod if hasattr(aft_srf_head, '_orig_mod') else aft_srf_head
@@ -2414,6 +2459,14 @@ for epoch in range(MAX_EPOCHS):
             eval_refine_head.eval()
         elif refine_head is not None:
             refine_head.eval()
+    # Select second-pass refinement head for eval (EMA if available)
+    eval_refine_head2 = refine_head2  # default: use training head
+    if refine_head2 is not None:
+        if ema_refine_head2 is not None and ema_model is not None and eval_model is ema_model:
+            eval_refine_head2 = ema_refine_head2
+            eval_refine_head2.eval()
+        elif refine_head2 is not None:
+            refine_head2.eval()
     # Select aft-foil SRF head for eval (EMA if available)
     eval_aft_srf_head = aft_srf_head
     eval_aft_srf_ctx_head = aft_srf_ctx_head
@@ -2584,6 +2637,17 @@ for epoch in range(MAX_EPOCHS):
                                 correction = eval_refine_head(surf_hidden, surf_pred).float()
                                 pred_loss = pred_loss.clone()
                                 pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
+                # Second-pass SRF during validation
+                if eval_refine_head2 is not None:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        surf_idx2 = is_surface.nonzero(as_tuple=False)
+                        if surf_idx2.numel() > 0:
+                            surf_hidden2 = _eval_hidden[surf_idx2[:, 0], surf_idx2[:, 1]]
+                            surf_pred2 = pred_loss[surf_idx2[:, 0], surf_idx2[:, 1]]
+                            correction2 = eval_refine_head2(surf_hidden2, surf_pred2).float()
+                            pred_loss = pred_loss.clone()
+                            pred_loss[surf_idx2[:, 0], surf_idx2[:, 1]] = pred_loss[surf_idx2[:, 0], surf_idx2[:, 1]] + correction2
+                if eval_refine_head is not None or eval_refine_head2 is not None:
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
                     if cfg.multiply_std:
                         pred = pred_loss / sample_stds
@@ -2794,6 +2858,11 @@ for epoch in range(MAX_EPOCHS):
                 refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
             )
             torch.save(_refine_save.state_dict(), model_dir / "refine_head.pt")
+        if refine_head2 is not None:
+            _refine2_save = ema_refine_head2 if ema_refine_head2 is not None else (
+                refine_head2._orig_mod if hasattr(refine_head2, '_orig_mod') else refine_head2
+            )
+            torch.save(_refine2_save.state_dict(), model_dir / "refine_head2.pt")
         if aft_srf_head is not None:
             _aft_save = ema_aft_srf_head if ema_aft_srf_head is not None else (
                 aft_srf_head._orig_mod if hasattr(aft_srf_head, '_orig_mod') else aft_srf_head
@@ -2954,6 +3023,13 @@ if cfg.surface_refine and best_metrics:
             refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
         )
         verify_refine.eval()
+        # Second-pass refinement head for verify
+        verify_refine2 = None
+        if refine_head2 is not None:
+            verify_refine2 = ema_refine_head2 if ema_refine_head2 is not None else (
+                refine_head2._orig_mod if hasattr(refine_head2, '_orig_mod') else refine_head2
+            )
+            verify_refine2.eval()
 
         # Run inference on val_ood_re only
         _ood_re_loader = val_loaders.get("val_ood_re")
@@ -3086,6 +3162,16 @@ if cfg.surface_refine and best_metrics:
                         correction_full[surf_idx[:, 0], surf_idx[:, 1]] = correction
                     else:
                         pred_loss_refined = pred_loss
+                    # Apply second-pass SRF in verify
+                    if verify_refine2 is not None:
+                        surf_idx2 = is_surface.nonzero(as_tuple=False)
+                        if surf_idx2.numel() > 0:
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                surf_hidden2 = hidden[surf_idx2[:, 0], surf_idx2[:, 1]]
+                                surf_pred2 = pred_loss_refined[surf_idx2[:, 0], surf_idx2[:, 1]]
+                                correction2 = verify_refine2(surf_hidden2, surf_pred2).float()
+                            pred_loss_refined = pred_loss_refined.clone()
+                            pred_loss_refined[surf_idx2[:, 0], surf_idx2[:, 1]] += correction2
 
                     # Back-compute pred with refinement
                     pred_refined = pred_loss_refined * sample_stds
@@ -3111,6 +3197,16 @@ if cfg.surface_refine and best_metrics:
                     if surf_idx.numel() > 0:
                         pred_manual = pred_manual.clone()
                         pred_manual[surf_idx[:, 0], surf_idx[:, 1]] += correction
+                    # Step 2b: add second-pass refinement correction
+                    if verify_refine2 is not None:
+                        surf_idx2b = is_surface.nonzero(as_tuple=False)
+                        if surf_idx2b.numel() > 0:
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                _sh2b = hidden[surf_idx2b[:, 0], surf_idx2b[:, 1]]
+                                _sp2b = pred_manual[surf_idx2b[:, 0], surf_idx2b[:, 1]]
+                                _c2b = verify_refine2(_sh2b, _sp2b).float()
+                            pred_manual = pred_manual.clone()
+                            pred_manual[surf_idx2b[:, 0], surf_idx2b[:, 1]] += _c2b
                     # Step 3: multiply by sample_stds to undo per-sample normalization
                     pred_manual = pred_manual * sample_stds
                     # Step 4: add freestream (residual prediction)
