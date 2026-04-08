@@ -1154,6 +1154,8 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    multi_head_srf: bool = False              # enable multi-head SRF ensemble (independent inits, avg at inference)
+    n_srf_heads: int = 3                      # number of independent SRF heads for ensemble
     # Phase 6: Asinh pressure transform
     asinh_pressure: bool = False             # transform pressure targets with asinh for dynamic range compression
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
@@ -1340,33 +1342,57 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 # Surface refinement head (separate module, not compiled with main model)
 refine_head = None
+srf_head_list = None  # Used when multi_head_srf=True: list of n_srf_heads compiled heads
 if cfg.surface_refine:
-    if cfg.surface_refine_context:
-        refine_head = SurfaceRefinementContextHead(
-            n_hidden=cfg.n_hidden,
-            out_dim=3,
-            hidden_dim=cfg.surface_refine_hidden,
-            n_layers=cfg.surface_refine_layers,
-            k_neighbors=8,
-        ).to(device)
+    def _make_refine_head():
+        if cfg.surface_refine_context:
+            h = SurfaceRefinementContextHead(
+                n_hidden=cfg.n_hidden,
+                out_dim=3,
+                hidden_dim=cfg.surface_refine_hidden,
+                n_layers=cfg.surface_refine_layers,
+                k_neighbors=8,
+            ).to(device)
+        else:
+            h = SurfaceRefinementHead(
+                n_hidden=cfg.n_hidden,
+                out_dim=3,
+                hidden_dim=cfg.surface_refine_hidden,
+                n_layers=cfg.surface_refine_layers,
+                p_only=cfg.surface_refine_p_only,
+            ).to(device)
+        return torch.compile(h, mode=cfg.compile_mode)
+
+    if cfg.multi_head_srf:
+        srf_head_list = [_make_refine_head() for _ in range(cfg.n_srf_heads)]
+        _refine_n_params = sum(p.numel() for h in srf_head_list for p in h.parameters())
+        print(f"Multi-Head SRF ({cfg.n_srf_heads}x): {_refine_n_params:,} params total "
+              f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers})")
+        refine_head = srf_head_list[0]  # keep refine_head pointing to head[0] for compatibility
     else:
-        refine_head = SurfaceRefinementHead(
-            n_hidden=cfg.n_hidden,
-            out_dim=3,
-            hidden_dim=cfg.surface_refine_hidden,
-            n_layers=cfg.surface_refine_layers,
-            p_only=cfg.surface_refine_p_only,
-        ).to(device)
-    refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
-    _refine_n_params = sum(p.numel() for p in refine_head.parameters())
-    print(f"Surface refinement head: {_refine_n_params:,} params "
-          f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
-          f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
+        refine_head = _make_refine_head()
+        _refine_n_params = sum(p.numel() for p in refine_head.parameters())
+        print(f"Surface refinement head: {_refine_n_params:,} params "
+              f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
+              f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
 
 # Aft-foil (boundary ID=7) dedicated refinement head
 aft_srf_head = None
 aft_srf_ctx_head = None
+aft_srf_head_list = None  # Used when multi_head_srf=True: list of n_srf_heads aft-foil heads
 if cfg.aft_foil_srf:
+    def _make_aft_srf_head():
+        if cfg.aft_foil_srf_context:
+            return None  # context head not supported for multi-head
+        h = AftFoilRefinementHead(
+            n_hidden=cfg.n_hidden,
+            out_dim=3,
+            hidden_dim=cfg.aft_foil_srf_hidden,
+            n_layers=cfg.aft_foil_srf_layers,
+            film=cfg.aft_foil_srf_film,
+        ).to(device)
+        return torch.compile(h, mode=cfg.compile_mode)
+
     if cfg.aft_foil_srf_context:
         aft_srf_ctx_head = AftFoilRefinementContextHead(
             n_hidden=cfg.n_hidden,
@@ -1379,15 +1405,14 @@ if cfg.aft_foil_srf:
         _aft_n_params = sum(p.numel() for p in aft_srf_ctx_head.parameters())
         print(f"Aft-foil SRF context head: {_aft_n_params:,} params "
               f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, k=8)")
+    elif cfg.multi_head_srf:
+        aft_srf_head_list = [_make_aft_srf_head() for _ in range(cfg.n_srf_heads)]
+        _aft_n_params = sum(p.numel() for h in aft_srf_head_list for p in h.parameters())
+        print(f"Multi-Head Aft-Foil SRF ({cfg.n_srf_heads}x): {_aft_n_params:,} params total "
+              f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers})")
+        aft_srf_head = aft_srf_head_list[0]  # compatibility
     else:
-        aft_srf_head = AftFoilRefinementHead(
-            n_hidden=cfg.n_hidden,
-            out_dim=3,
-            hidden_dim=cfg.aft_foil_srf_hidden,
-            n_layers=cfg.aft_foil_srf_layers,
-            film=cfg.aft_foil_srf_film,
-        ).to(device)
-        aft_srf_head = torch.compile(aft_srf_head, mode=cfg.compile_mode)
+        aft_srf_head = _make_aft_srf_head()
         _aft_n_params = sum(p.numel() for p in aft_srf_head.parameters())
         print(f"Aft-foil SRF head: {_aft_n_params:,} params "
               f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, "
@@ -1397,6 +1422,8 @@ from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
 ema_aft_srf_head = None  # EMA copy of aft-foil SRF head
+ema_srf_head_list = None    # EMA copies for multi-head SRF
+ema_aft_srf_head_list = None  # EMA copies for multi-head aft-foil SRF
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -1412,9 +1439,13 @@ snapshot_n = 0
 snapshot_epoch_list = [int(e) for e in cfg.snapshot_epochs_str.split(",")] if cfg.snapshot_ensemble else []
 
 n_params = sum(p.numel() for p in model.parameters())
-if refine_head is not None:
+if cfg.multi_head_srf and srf_head_list is not None:
+    n_params += sum(p.numel() for h in srf_head_list for p in h.parameters())
+elif refine_head is not None:
     n_params += sum(p.numel() for p in refine_head.parameters())
-if aft_srf_head is not None:
+if cfg.multi_head_srf and aft_srf_head_list is not None:
+    n_params += sum(p.numel() for h in aft_srf_head_list for p in h.parameters())
+elif aft_srf_head is not None:
     n_params += sum(p.numel() for p in aft_srf_head.parameters())
 if aft_srf_ctx_head is not None:
     n_params += sum(p.numel() for p in aft_srf_ctx_head.parameters())
@@ -1544,13 +1575,26 @@ else:
         optimizer = base_opt
 
 # Add refinement head params to optimizer if enabled
-if refine_head is not None:
+if cfg.multi_head_srf and srf_head_list is not None:
+    # Add all heads (head[0] == refine_head already, add heads 1..N)
+    for _i, _h in enumerate(srf_head_list):
+        _hp = list(_h.parameters())
+        base_opt.add_param_group({'params': _hp, 'lr': _base_lr})
+    _total_srf = sum(p.numel() for h in srf_head_list for p in h.parameters())
+    print(f"Added {_total_srf:,} multi-head SRF params to optimizer ({cfg.n_srf_heads} heads)")
+elif refine_head is not None:
     _refine_params = list(refine_head.parameters())
     base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
 
 # Add aft-foil SRF head params to optimizer if enabled
-if aft_srf_head is not None:
+if cfg.multi_head_srf and aft_srf_head_list is not None:
+    for _i, _h in enumerate(aft_srf_head_list):
+        _hp = list(_h.parameters())
+        base_opt.add_param_group({'params': _hp, 'lr': _base_lr})
+    _total_aft = sum(p.numel() for h in aft_srf_head_list for p in h.parameters())
+    print(f"Added {_total_aft:,} multi-head aft-foil SRF params to optimizer ({cfg.n_srf_heads} heads)")
+elif aft_srf_head is not None:
     _aft_params = list(aft_srf_head.parameters())
     base_opt.add_param_group({'params': _aft_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _aft_params):,} aft-foil SRF head params to optimizer")
@@ -1902,23 +1946,31 @@ for epoch in range(MAX_EPOCHS):
                 pred = pred / sample_stds
 
         # Surface refinement head: additive correction on surface nodes
+        _srf_head_disagree = None  # logged to wandb when multi_head_srf
         if refine_head is not None and model.training:
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                if cfg.surface_refine_context:
-                    # Context-aware: needs all nodes, coords, masks
-                    refine_correction = refine_head(
-                        hidden, pred, is_surface, mask, x[:, :, :2]
-                    ).float()
-                    pred = pred + refine_correction
-                else:
-                    # Standard: extract surface nodes, apply MLP, scatter back
-                    surf_idx = is_surface.nonzero(as_tuple=False)  # [M, 2] (batch, node)
-                    if surf_idx.numel() > 0:
-                        surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]  # [M, n_hidden]
-                        surf_pred = pred[surf_idx[:, 0], surf_idx[:, 1]]      # [M, 3]
+            surf_idx = is_surface.nonzero(as_tuple=False)  # [M, 2]
+            if surf_idx.numel() > 0:
+                surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]  # [M, n_hidden]
+                surf_pred = pred[surf_idx[:, 0], surf_idx[:, 1]]      # [M, 3]
+            if cfg.multi_head_srf and srf_head_list is not None and surf_idx.numel() > 0:
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _corrections = [h(surf_hidden, surf_pred).float() for h in srf_head_list]
+                _corr_stack = torch.stack(_corrections, dim=0)  # [K, M, 3]
+                correction = _corr_stack.mean(dim=0)  # [M, 3]
+                _srf_head_disagree = _corr_stack.std(dim=0).mean().item()  # scalar diversity metric
+                pred = pred.clone()
+                pred[surf_idx[:, 0], surf_idx[:, 1]] += correction
+            elif surf_idx.numel() > 0:
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    if cfg.surface_refine_context:
+                        refine_correction = refine_head(
+                            hidden, pred, is_surface, mask, x[:, :, :2]
+                        ).float()
+                        pred = pred + refine_correction
+                    else:
                         correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
                         pred = pred.clone()
-                        pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
+                        pred[surf_idx[:, 0], surf_idx[:, 1]] += correction
 
         # Aft-foil dedicated refinement head: additive correction on boundary ID=7 nodes only
         if aft_srf_ctx_head is not None and model.training and _aft_foil_mask is not None:
@@ -1949,10 +2001,15 @@ for epoch in range(MAX_EPOCHS):
                 _aft_cond = None
                 if cfg.aft_foil_srf_film:
                     _aft_cond = _raw_gap_stagger[aft_idx[:, 0]]  # [A, 2]
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    aft_correction = aft_srf_head(aft_hidden, aft_pred, _aft_cond).float()
+                if cfg.multi_head_srf and aft_srf_head_list is not None:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _aft_corrs = [h(aft_hidden, aft_pred, _aft_cond).float() for h in aft_srf_head_list]
+                    aft_correction = torch.stack(_aft_corrs, dim=0).mean(dim=0)
+                else:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        aft_correction = aft_srf_head(aft_hidden, aft_pred, _aft_cond).float()
                 pred = pred.clone()
-                pred[aft_idx[:, 0], aft_idx[:, 1]] = pred[aft_idx[:, 0], aft_idx[:, 1]] + aft_correction
+                pred[aft_idx[:, 0], aft_idx[:, 1]] += aft_correction
 
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
@@ -2283,8 +2340,17 @@ for epoch in range(MAX_EPOCHS):
                 with torch.no_grad():
                     for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
                         ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
-            # EMA for refinement head
-            if refine_head is not None:
+            # EMA for refinement head (single or multi-head)
+            if cfg.multi_head_srf and srf_head_list is not None:
+                if ema_srf_head_list is None:
+                    ema_srf_head_list = [deepcopy(h._orig_mod if hasattr(h, '_orig_mod') else h) for h in srf_head_list]
+                else:
+                    with torch.no_grad():
+                        for ema_h, h in zip(ema_srf_head_list, srf_head_list):
+                            _hb = h._orig_mod if hasattr(h, '_orig_mod') else h
+                            for ep, mp in zip(ema_h.parameters(), _hb.parameters()):
+                                ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            elif refine_head is not None:
                 _refine_base = refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
                 if ema_refine_head is None:
                     ema_refine_head = deepcopy(_refine_base)
@@ -2292,8 +2358,17 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
-            # EMA for aft-foil SRF head
-            if aft_srf_head is not None:
+            # EMA for aft-foil SRF head (single or multi-head)
+            if cfg.multi_head_srf and aft_srf_head_list is not None:
+                if ema_aft_srf_head_list is None:
+                    ema_aft_srf_head_list = [deepcopy(h._orig_mod if hasattr(h, '_orig_mod') else h) for h in aft_srf_head_list]
+                else:
+                    with torch.no_grad():
+                        for ema_h, h in zip(ema_aft_srf_head_list, aft_srf_head_list):
+                            _hb = h._orig_mod if hasattr(h, '_orig_mod') else h
+                            for ep, mp in zip(ema_h.parameters(), _hb.parameters()):
+                                ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            elif aft_srf_head is not None:
                 _aft_base = aft_srf_head._orig_mod if hasattr(aft_srf_head, '_orig_mod') else aft_srf_head
                 if ema_aft_srf_head is None:
                     ema_aft_srf_head = deepcopy(_aft_base)
@@ -2310,7 +2385,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _train_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.multi_head_srf and _srf_head_disagree is not None:
+            _train_log["train/srf_head_disagree"] = _srf_head_disagree
+        wandb.log(_train_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -2408,7 +2486,15 @@ for epoch in range(MAX_EPOCHS):
     model.eval()
     # Select the right refinement head for validation (EMA if available)
     eval_refine_head = refine_head  # default: use training head
-    if refine_head is not None:
+    eval_srf_head_list = None  # multi-head eval list
+    if cfg.multi_head_srf and srf_head_list is not None:
+        if ema_srf_head_list is not None and ema_model is not None and eval_model is ema_model:
+            eval_srf_head_list = ema_srf_head_list
+        else:
+            eval_srf_head_list = srf_head_list
+        for _h in eval_srf_head_list:
+            _h.eval()
+    elif refine_head is not None:
         if ema_refine_head is not None and ema_model is not None and eval_model is ema_model:
             eval_refine_head = ema_refine_head
             eval_refine_head.eval()
@@ -2416,8 +2502,16 @@ for epoch in range(MAX_EPOCHS):
             refine_head.eval()
     # Select aft-foil SRF head for eval (EMA if available)
     eval_aft_srf_head = aft_srf_head
+    eval_aft_srf_head_list = None  # multi-head aft-foil eval list
     eval_aft_srf_ctx_head = aft_srf_ctx_head
-    if aft_srf_head is not None:
+    if cfg.multi_head_srf and aft_srf_head_list is not None:
+        if ema_aft_srf_head_list is not None and ema_model is not None and eval_model is ema_model:
+            eval_aft_srf_head_list = ema_aft_srf_head_list
+        else:
+            eval_aft_srf_head_list = aft_srf_head_list
+        for _h in eval_aft_srf_head_list:
+            _h.eval()
+    elif aft_srf_head is not None:
         if ema_aft_srf_head is not None and ema_model is not None and eval_model is ema_model:
             eval_aft_srf_head = ema_aft_srf_head
             eval_aft_srf_head.eval()
@@ -2569,7 +2663,20 @@ for epoch in range(MAX_EPOCHS):
                     pred_loss = pred / sample_stds
 
                 # Apply surface refinement head during validation
-                if eval_refine_head is not None:
+                surf_idx = is_surface.nonzero(as_tuple=False)
+                if cfg.multi_head_srf and eval_srf_head_list is not None and surf_idx.numel() > 0:
+                    surf_hidden = _eval_hidden[surf_idx[:, 0], surf_idx[:, 1]]
+                    surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _v_corrs = [h(surf_hidden, surf_pred).float() for h in eval_srf_head_list]
+                    correction = torch.stack(_v_corrs, dim=0).mean(dim=0)
+                    pred_loss = pred_loss.clone()
+                    pred_loss[surf_idx[:, 0], surf_idx[:, 1]] += correction
+                    if cfg.multiply_std:
+                        pred = pred_loss / sample_stds
+                    else:
+                        pred = pred_loss * sample_stds
+                elif eval_refine_head is not None:
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                         if cfg.surface_refine_context:
                             refine_correction = eval_refine_head(
@@ -2577,13 +2684,12 @@ for epoch in range(MAX_EPOCHS):
                             ).float()
                             pred_loss = pred_loss + refine_correction
                         else:
-                            surf_idx = is_surface.nonzero(as_tuple=False)
                             if surf_idx.numel() > 0:
                                 surf_hidden = _eval_hidden[surf_idx[:, 0], surf_idx[:, 1]]
                                 surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
                                 correction = eval_refine_head(surf_hidden, surf_pred).float()
                                 pred_loss = pred_loss.clone()
-                                pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
+                                pred_loss[surf_idx[:, 0], surf_idx[:, 1]] += correction
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
                     if cfg.multiply_std:
                         pred = pred_loss / sample_stds
@@ -2611,21 +2717,26 @@ for epoch in range(MAX_EPOCHS):
                         pred = pred_loss / sample_stds
                     else:
                         pred = pred_loss * sample_stds
-                elif eval_aft_srf_head is not None and _eval_aft_mask is not None:
-                    aft_idx = _eval_aft_mask.nonzero(as_tuple=False)
-                    if aft_idx.numel() > 0:
-                        _ah = _eval_hidden[aft_idx[:, 0], aft_idx[:, 1]]
-                        _ap = pred_loss[aft_idx[:, 0], aft_idx[:, 1]]
-                        _ac = _v_gap_stagger[aft_idx[:, 0]] if cfg.aft_foil_srf_film else None
-                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                            _aft_corr = eval_aft_srf_head(_ah, _ap, _ac).float()
-                        pred_loss = pred_loss.clone()
-                        pred_loss[aft_idx[:, 0], aft_idx[:, 1]] += _aft_corr
-                        # Back-compute pred for denormalization
-                        if cfg.multiply_std:
-                            pred = pred_loss / sample_stds
-                        else:
-                            pred = pred_loss * sample_stds
+                elif _eval_aft_mask is not None:
+                    _eval_aft_heads = eval_aft_srf_head_list if (cfg.multi_head_srf and eval_aft_srf_head_list) else (
+                        [eval_aft_srf_head] if eval_aft_srf_head is not None else None
+                    )
+                    if _eval_aft_heads is not None:
+                        aft_idx = _eval_aft_mask.nonzero(as_tuple=False)
+                        if aft_idx.numel() > 0:
+                            _ah = _eval_hidden[aft_idx[:, 0], aft_idx[:, 1]]
+                            _ap = pred_loss[aft_idx[:, 0], aft_idx[:, 1]]
+                            _ac = _v_gap_stagger[aft_idx[:, 0]] if cfg.aft_foil_srf_film else None
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                _aft_corrs = [h(_ah, _ap, _ac).float() for h in _eval_aft_heads]
+                            _aft_corr = torch.stack(_aft_corrs, dim=0).mean(dim=0)
+                            pred_loss = pred_loss.clone()
+                            pred_loss[aft_idx[:, 0], aft_idx[:, 1]] += _aft_corr
+                            # Back-compute pred for denormalization
+                            if cfg.multiply_std:
+                                pred = pred_loss / sample_stds
+                            else:
+                                pred = pred_loss * sample_stds
 
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
@@ -2950,9 +3061,16 @@ if cfg.surface_refine and best_metrics:
         verify_model.eval()
 
         # Use EMA refinement head if available, else training head
-        verify_refine = ema_refine_head if ema_refine_head is not None else (
-            refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
-        )
+        verify_refine_list = None  # multi-head list for verify
+        if cfg.multi_head_srf and (ema_srf_head_list or srf_head_list):
+            verify_refine_list = ema_srf_head_list if ema_srf_head_list else srf_head_list
+            for _h in verify_refine_list:
+                _h.eval()
+            verify_refine = verify_refine_list[0]  # placeholder for single-head compat
+        else:
+            verify_refine = ema_refine_head if ema_refine_head is not None else (
+                refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
+            )
         verify_refine.eval()
 
         # Run inference on val_ood_re only
@@ -3077,10 +3195,15 @@ if cfg.surface_refine and best_metrics:
                     surf_idx = is_surface.nonzero(as_tuple=False)
                     correction_full = torch.zeros_like(pred_loss)
                     if surf_idx.numel() > 0:
-                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                            surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]
-                            surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                            correction = verify_refine(surf_hidden, surf_pred).float()
+                        surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]
+                        surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
+                        if cfg.multi_head_srf and verify_refine_list is not None:
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                _vr_corrs = [h(surf_hidden, surf_pred).float() for h in verify_refine_list]
+                            correction = torch.stack(_vr_corrs, dim=0).mean(dim=0)
+                        else:
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                correction = verify_refine(surf_hidden, surf_pred).float()
                         pred_loss_refined = pred_loss.clone()
                         pred_loss_refined[surf_idx[:, 0], surf_idx[:, 1]] += correction
                         correction_full[surf_idx[:, 0], surf_idx[:, 1]] = correction
