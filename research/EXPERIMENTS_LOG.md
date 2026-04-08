@@ -2,6 +2,58 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 12:00 — PR #2267: Pressure Gradient Aux Head — thorfinn — **CLOSED** ❌
+
+- Branch: `thorfinn/pressure-gradient-aux-head`
+- Hypothesis: Add auxiliary head predicting dp/dx, dp/dy from backbone hidden state via weighted LS finite differences (k=6 neighbors, 256 subsampled volume nodes). Forces encoder to learn pressure shape, not just magnitude.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 12.737 | +7.1% ❌ |
+| p_oodc | 7.561  | 8.400  | +11.1% ❌ |
+| p_tan  | 28.118 | 28.700 | +2.1% ❌ |
+| p_re   | 6.364  | 6.750  | +6.1% ❌ |
+
+- W&B: ay00ea4a (s42), yix9luwh (s73). Epochs: 139/140.
+- **Analysis:** Backbone already captures gradient information implicitly. FD gradient targets on unstructured meshes are noisy. Auxiliary loss competes with primary objectives. p_oodc worst hit (+11.1%) — gradient targets vary most across extreme configurations.
+- **Conclusion:** CLOSED. Pressure gradient auxiliary supervision added to DO NOT REVISIT.
+
+---
+
+### 2026-04-08 12:00 — PR #2262: Foil Role Embedding v2 — tanjiro — **CLOSED** ❌
+
+- Branch: `tanjiro/foil-role-embed`
+- Hypothesis: Zero-initialized learned embeddings (fore_embed, aft_embed, shape [192]) added to backbone hidden state for surface nodes. v2: boundary_id for foil identity + T_max=150.
+
+| Variant | p_in | p_oodc | p_tan | p_re |
+|---------|------|--------|-------|------|
+| Baseline | 11.891 | 7.561 | 28.118 | 6.364 |
+| v1 (saf_norm, T_max=160) | 12.03 | 7.55 ✅ | 28.40 | 6.35 |
+| v2 (boundary_id, T_max=150) | 12.16 ❌ | 7.80 ❌ | 28.55 ❌ | 6.45 ❌ |
+
+- W&B v2: 5l0r5fqv (s42), 05lf38gp (s73).
+- **Analysis:** v1's p_oodc improvement (-1.3%) was fragile — vanished when switching to correct baseline config (boundary_id + T_max=150). The saf_norm proxy accidentally captured geometric information that boundary_id's categorical labels miss. High seed variance indicates initialization-dependent effect.
+- **Conclusion:** CLOSED. Foil role embeddings on backbone hidden states added to DO NOT REVISIT.
+
+---
+
+### 2026-04-08 12:00 — PR #2261: Per-Foil Target Whitening v2 (fore-only) — edward — **CLOSED** ❌
+
+- Branch: `edward/per-foil-whiten`
+- Hypothesis: Loss-space reweighting — divide surface pressure error by per-foil std. v2: fore-foil-only whitening + T_max=150.
+
+| Variant | p_in | p_oodc | p_tan | p_re |
+|---------|------|--------|-------|------|
+| Baseline | 11.891 | 7.561 | 28.118 | 6.364 |
+| v1 both-foil (T_max=160) | 11.701 ✅ | 7.400 ✅ | 28.900 ❌ | 6.300 ✅ |
+| v2 fore-only (T_max=150) | 11.800 ✅ | 7.550 ≈ | 29.150 ❌ | 6.450 ❌ |
+
+- W&B v2: hd4uer7p (s42), nk8x87c4 (s73).
+- **Analysis:** p_oodc improvement came from aft-foil whitening (removing it in v2 killed the gain). p_tan regression came from fore-foil whitening (present in both variants). The finding that aft-foil-only whitening would logically help p_oodc without p_tan regression is noted but 3 iterations explored — closing for bolder directions.
+- **Conclusion:** CLOSED. Per-foil whitening added to DO NOT REVISIT.
+
+---
+
 ### 2026-04-08 11:15 — PR #2260: FiLM SRF Flow-Regime Conditioning — nezuko — **CLOSED** ❌
 
 - Branch: `nezuko/srf-flow-film`
