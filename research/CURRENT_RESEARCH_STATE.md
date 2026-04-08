@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-08 22:15 UTC
+- **Date:** 2026-04-09 01:00 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training & Architecture Improvements
 
@@ -38,7 +38,7 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 | fern | #2294 | **Tandem Config Proximity Feature — OOD distance signal for calibration** | WIP (NEW) |
 | askeladd | #2292 | **Flow-Direction Normalization — rotate coords by -AoA to streamwise frame** | WIP (NEW) |
 | frieren | #2291 | **Stagnation Pressure Feature — q_inf = 0.5*Umag² as input channel** | WIP (NEW) |
-| tanjiro | #2287 | **Effective AoA Aft Feature — thin-airfoil downwash correction (k sweep)** | WIP (NEW) |
+| tanjiro | #2295 | **Surface Curvature Feature — discrete Menger curvature κ at surface nodes** | WIP (NEW) |
 | edward | #2286 | **Velocity Angle Feature — per-node local incidence angle from DSDF gradient** | WIP (NEW) |
 | nezuko | #2290 | **Re-Stratified Sampling — 2× weight for extreme-Re training samples** | WIP (NEW) |
 | alphonse | #2293 | **Low-Rank Pressure Loss — SVD structural prior on surface predictions** | WIP (NEW) |
@@ -47,7 +47,11 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 
 None.
 
-## Latest Reviews (2026-04-08 21:00)
+## Latest Reviews (2026-04-09 01:00)
+
+### PR #2287 (tanjiro, Effective AoA Aft Feature) — CLOSED ❌
+- All metrics regressed: p_in +5.1%, p_oodc +4.5%, p_tan +3.1%, p_re +2.1%.
+- Thin-airfoil downwash model too simplified. Wake deficit feature already captures inter-foil coupling more accurately.
 
 ### PR #2283 (frieren, Wider SRF Head 192→384) — CLOSED ❌
 - Near-neutral, all metrics +0.4-1.7%. SRF head capacity is NOT the bottleneck.
@@ -122,7 +126,7 @@ Acknowledged and pivoting. Round 27 will include bold architectural additions (G
 | fern | #2294 | **Tandem Config Proximity** — KD-tree OOD proximity feature | p_tan |
 | askeladd | #2292 | **Flow-Direction Normalization** — rotate (x,y) by -AoA to streamwise frame | p_oodc, p_re |
 | frieren | #2291 | **Stagnation Pressure Feature** — q_inf = 0.5*Umag² as input channel | p_in, p_re |
-| tanjiro | #2287 | **Effective AoA Aft Feature** — thin-airfoil downwash correction, k sweep | p_tan, p_re |
+| tanjiro | #2295 | **Surface Curvature Feature** — discrete Menger curvature κ at surface nodes | p_tan, p_in |
 | edward | #2286 | **Velocity Angle Feature** — per-node local incidence from DSDF gradient | p_tan, p_in |
 | nezuko | #2290 | **Re-Stratified Sampling** — 2× weight for extreme-Re training samples | p_re, p_oodc |
 | alphonse | #2293 | **Low-Rank Pressure Loss** — SVD penalty beyond rank-5 on surface error | p_tan, p_in |
@@ -192,6 +196,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 - **Point cloud MixUp**: Fundamentally unsuited to physics-constrained regression — creates phantom geometries violating Navier-Stokes. Existing augmentation already handles diversity (+6.7-37.5%)
 - **Deeper backbone (4 layers)**: Training budget mismatch — 32% slower per epoch, only 121 vs 149 epochs. 3-layer is well-calibrated to 180-min budget (+4.7-29.1%)
 - **Heteroscedastic loss (Gaussian NLL)**: MSE/MAE mismatch — switches loss from well-tuned MAE to MSE. Learned log-variance suppresses gradients. Interacts poorly with hard-node mining (+41.7-76.9%)
+- **Effective AoA aft feature**: Thin-airfoil downwash model too simplified — linearized AoA + k*AoA/gap redundant with wake_deficit_feature which captures inter-foil coupling more accurately (+2.1-5.1%)
 
 ## Potential Next Research Directions (Round 28+)
 
@@ -229,7 +234,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 | Priority | Slug | Target | Key bet |
 |----------|------|--------|---------|
 | 1 | `vel-angle-mag-feature` | p_tan, p_in | **ASSIGNED to edward (#2286)** |
-| 2 | `effective-aoa-aft-feature` | p_tan, p_re | **ASSIGNED to tanjiro (#2287)** |
+| 2 | `effective-aoa-aft-feature` | p_tan, p_re | **CLOSED** ❌ — all metrics +2.1-5.1%, redundant with wake_deficit |
 | 3 | `chord-fraction-feature` | p_in, p_tan | **ASSIGNED to thorfinn (#2288)** |
 | 4 | `cp-target-normalization` | p_re, p_oodc | **SKIPPED** — baseline already applies Cp normalization via `_phys_norm()` |
 | 5 | `re-stratified-sampling` | p_re, p_oodc | **ASSIGNED to nezuko (#2290)** |

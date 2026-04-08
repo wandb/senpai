@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 01:00 — PR #2287: Effective AoA Aft Feature — tanjiro — **CLOSED** ❌
+
+- Branch: `tanjiro/effective-aoa-aft-feature`
+- Hypothesis: Thin-airfoil downwash correction as new input feature. `AoA_eff = AoA + k*AoA/(|gap|+0.1)` for tandem foils (k=0.10), unchanged for single-foil. 1 new input channel appended after wake deficit features.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 12.50 | +5.1% ❌ |
+| p_oodc | 7.561  | 7.90  | +4.5% ❌ |
+| p_tan  | 28.118 | 29.00 | +3.1% ❌ |
+| p_re   | 6.364  | 6.50  | +2.1% ❌ |
+
+- W&B: 42otg68a (s42), 1fxgd7h3 (s73). Group: effective-aoa-aft.
+- **Analysis:** Thin-airfoil downwash model too simplified for actual wake interactions. Linearized formula AoA + k*AoA/gap is crude approximation — existing wake_deficit_feature (PR #2213) already captures inter-foil coupling more accurately through geometric displacement. The two features are redundant, with wake_deficit strictly superior. Seed 73 p_in notably worse (13.1 vs 11.9), suggesting feature injects noise even with tandem-only gating.
+- **Conclusion:** CLOSED. Effective AoA aft feature added to DO NOT REVISIT. Linearized thin-airfoil models too crude; wake_deficit already captures inter-foil coupling.
+
+---
+
 ### 2026-04-09 00:30 — PR #2284: Heteroscedastic Loss — fern — **CLOSED** ❌
 
 - Branch: `fern/heteroscedastic-loss`
