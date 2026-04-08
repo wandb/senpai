@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-08 03:15 UTC
+- **Date:** 2026-04-08 04:00 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training & Architecture Improvements
 
@@ -28,7 +28,7 @@
 
 Single-model p_tan (28.341) and p_in (11.979) both BEAT the ensemble.
 
-## Student Status (2026-04-08 02:00 UTC)
+## Student Status (2026-04-08 04:00 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
