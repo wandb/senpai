@@ -1118,6 +1118,7 @@ class Config:
     dct_freq_weight: float = 0.05 # weight for DCT freq loss
     dct_freq_gamma: float = 2.0   # frequency upweighting strength
     dct_freq_alpha: float = 1.5   # frequency exponent
+    suction_side_weight: float = 1.0  # weight multiplier for suction-side surface nodes (1.0 = no effect)
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -2001,14 +2002,21 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        # Suction-side weighting: up-weight nodes where model predicts suction (p < 0)
+        _surf_pres_err = abs_err[:, :, 2:3]
+        if cfg.suction_side_weight > 1.0 and epoch >= 20:
+            with torch.no_grad():
+                is_suction = (pred[:, :, 2] < 0.0).float() * surf_mask.float()  # [B, N]
+                ss_w = 1.0 + (cfg.suction_side_weight - 1.0) * is_suction  # [B, N]
+            _surf_pres_err = _surf_pres_err * ss_w.unsqueeze(-1)
+        surf_per_sample = (_surf_pres_err * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
         running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
         # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
         if epoch >= 30:
-            surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
+            surf_pres = _surf_pres_err  # pressure errors (suction-weighted if enabled) [B, N, 1]
             surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
             surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
             thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
@@ -2310,7 +2318,11 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.suction_side_weight > 1.0 and epoch >= 20:
+            _suction_frac = is_suction.sum().item() / surf_mask.float().sum().clamp(min=1).item()
+            _log_dict["train/suction_frac"] = _suction_frac
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
