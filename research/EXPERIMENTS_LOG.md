@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 11:15 — PR #2260: FiLM SRF Flow-Regime Conditioning — nezuko — **CLOSED** ❌
+
+- Branch: `nezuko/srf-flow-film`
+- Hypothesis: Add FiLM conditioning on (AoA, log_Re) to the SurfaceRefinementHead — a small MLP produces per-sample (scale, shift) vectors applied after the first hidden layer. Zero-init for safe identity start.
+
+| Metric | Baseline (#2251) | Seed 42 (ido2g7uk) | Seed 73 (u71hhy8s) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in   | 11.891 | 12.4 | 12.2 | **12.30** | +3.4% ❌ |
+| p_oodc | 7.561  | 7.7  | 7.4  | **7.55**  | -0.1% ≈ |
+| p_tan  | 28.118 | 29.3 | 29.3 | **29.30** | +4.2% ❌ |
+| p_re   | 6.364  | 6.4  | 6.6  | **6.50**  | +2.1% ❌ |
+
+- Also used T_max=160 instead of current T_max=150 baseline.
+- **Analysis:** The backbone already conditions on (Re, AoA) via `--adaln_output`, so the SRF receives hidden features that already encode flow regime. FiLM on the SRF head is redundant — adds parameters without new information. The per-sample global modulation also conflicts with node-level SRF specialization. Marginal p_oodc improvement (-0.1%) is within noise.
+- **Conclusion:** CLOSED. SRF flow-regime conditioning added to DO NOT REVISIT — all flow information already captured by backbone adaLN.
+
+---
+
 ### 2026-04-08 11:00 — PR #2266: ZCA Spectral Whitening of Input Features — fern — **CLOSED** ❌
 
 - Branch: `fern/spectral-feature-whitening`

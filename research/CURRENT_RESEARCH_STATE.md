@@ -40,7 +40,7 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 | frieren | #2269 | GNN Boundary Layer: local mesh message-passing on surface/near-wall nodes | WIP (NEW) |
 | tanjiro | #2262 | Foil Role Embedding (v2): fix boundary_id + T_max=150 | WIP (sent back) |
 | edward | #2261 | Per-Foil Target Whitening (v2): fore-foil-only + T_max=150 | WIP (sent back) |
-| nezuko | #2260 | Flow-Regime Conditioned SRF via FiLM: AoA/Umag modulation | WIP |
+| nezuko | #2271 | **BOLD: Flow Matching Surface Head — generative pressure prediction (AlphaFold3-inspired)** | WIP (NEW) |
 | alphonse | #2268 | MoE FFN Last Block: tandem-specialized FFN expert in final TransolverBlock | WIP |
 
 ## PRs Ready for Review
@@ -126,6 +126,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 - **Augmentation annealing**: Hard cutoff at epoch 120 or 140, selective AoA stop — all fail OOD
 - **Asymmetric surface loss**: Physics-based node weighting redundant given hard-node mining
 - **ZCA/PCA whitening**: Near-singular covariance (cond# ~7.9B) makes full decorrelation harmful (+8-23% regression)
+- **SRF FiLM conditioning**: Flow-regime (Re, AoA) modulation on SRF redundant with backbone adaLN
 - **Sample-level reweighting**: Focal loss, OHNM — over-correction on top of PCGrad
 - **Optimizer variants**: SAM, Lookahead, SWA, SOAP, Muon — all worse than Lion+EMA+cosine
 
@@ -135,7 +136,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 | Priority | Slug | Target | Status |
 |----------|------|--------|--------|
 | 1 | `gnn-boundary-layer` | p_tan, p_in | **ASSIGNED to frieren (#2269)** |
-| 2 | `cnf-surface-pressure` | p_tan, p_oodc | Available — Flow matching head replaces SRF (AlphaFold3 analogue) |
+| 2 | `cnf-surface-pressure` | p_tan, p_oodc | **ASSIGNED to nezuko (#2271)** |
 | 3 | `fno-inter-foil-coupling` | p_tan | Available — 1D FNO spectral convolution in tandem gap region |
 | 4 | `geometry-consistency-distill` | p_oodc | Available — Mean Teacher on volume-node-jittered views |
 
