@@ -40,7 +40,7 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 | frieren | #2277 | **Tandem Difficulty Curriculum — progressive exposure by gap/stagger magnitude** | WIP (NEW) |
 | tanjiro | #2273 | **BOLD: Geometry Consistency Self-Distillation — Mean Teacher on augmented mesh** | WIP |
 | edward | #2274 | **BOLD: FNO Inter-Foil Coupling — spectral convolution in tandem gap** | WIP |
-| nezuko | #2271 | **BOLD: Flow Matching Surface Head — generative pressure prediction (AlphaFold3-inspired)** | WIP |
+| nezuko | #2279 | **Ensemble Knowledge Distillation — soft targets from 16-seed ensemble** | WIP (NEW) |
 | alphonse | #2275 | **BOLD: NeuralFoil Synthetic Data Flooding — single-foil Cp augmentation via neural surrogate** | WIP (NEW) |
 
 ## PRs Ready for Review
@@ -97,7 +97,7 @@ Acknowledged and pivoting. Round 27 will include bold architectural additions (G
 | frieren | #2277 | **Tandem Difficulty Curriculum** — progressive exposure by gap/stagger magnitude | p_tan |
 | tanjiro | #2273 | **BOLD: Geometry Consistency Self-Distillation** — Mean Teacher on jittered mesh | p_oodc |
 | edward | #2274 | **BOLD: FNO Inter-Foil Coupling** — spectral convolution in tandem gap | p_tan |
-| nezuko | #2271 | **BOLD: Flow Matching Surface Head** — generative pressure prediction (AlphaFold3-inspired) | p_tan, p_oodc |
+| nezuko | #2279 | **Ensemble Knowledge Distillation** — soft targets from 16-seed ensemble | p_oodc, p_re |
 | alphonse | #2275 | **BOLD: NeuralFoil Synthetic Data Flooding** — single-foil Cp augmentation via neural surrogate | p_in, p_oodc, p_re |
 
 ### Key Mechanistic Insights from Rounds 26-27
@@ -148,6 +148,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 - **Per-head K/V projections**: Shared K/V is load-bearing regularization; per-head destroys OOD generalization (+18% p_oodc)
 - **GNN boundary layer**: Local GNN message-passing disrupts backbone-to-SRF feature distribution; redundant with existing SRF heads (+20-24% regression)
 - **SE(2) canonicalization**: Stats mismatch (global frame stats on canonicalized coords) + DSDF gradient inconsistency; TE coordinate frame + AoA augmentation already provide equivalent invariance
+- **Flow matching / generative surface head**: CFD pressure is near-deterministic given inputs — generative modeling adds noise to a delta function. 50/50 SRF blend corrupts precise regression predictions (+14-32%)
 - **Sample-level reweighting**: Focal loss, OHNM — over-correction on top of PCGrad
 - **Optimizer variants**: SAM, Lookahead, SWA, SOAP, Muon — all worse than Lion+EMA+cosine
 
@@ -157,7 +158,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 | Slug | Target | Status |
 |------|--------|--------|
 | `gnn-boundary-layer` | p_tan, p_in | **CLOSED** ❌ — all metrics +6.9% to +24.0% |
-| `cnf-surface-pressure` (flow-matching) | p_tan, p_oodc | **ASSIGNED to nezuko (#2271)** |
+| `cnf-surface-pressure` (flow-matching) | p_tan, p_oodc | **CLOSED** ❌ — near-deterministic problem, generative adds noise (+14-32%) |
 | `fno-inter-foil-coupling` | p_tan | **ASSIGNED to edward (#2274)** |
 | `geometry-consistency-distill` | p_oodc | **ASSIGNED to tanjiro (#2273)** |
 | `se2-canonicalize` | p_oodc, p_re | **CLOSED** ❌ — stats mismatch + DSDF inconsistency, +6.6-14.3% |

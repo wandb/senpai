@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 15:30 — PR #2271: Flow Matching Surface Head — nezuko — **CLOSED** ❌
+
+- Branch: `nezuko/flow-matching-surface-head`
+- Hypothesis: AlphaFold3-inspired generative surface head using Conditional Flow Matching (CFM). The aft-foil pressure distribution may have multi-modal conditional distributions that a generative model could capture better than direct regression. Flow matching head operates on detached backbone hidden states, predicts surface pressure via 10-step Euler ODE, blended 50/50 with SRF prediction.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 14.95 | +25.7% ❌ |
+| p_oodc | 7.561  | 10.00 | +32.3% ❌ |
+| p_tan  | 28.118 | 32.10 | +14.2% ❌ |
+| p_re   | 6.364  | 7.65  | +20.2% ❌ |
+
+- W&B: f70htuae (s42), xo6cm5o3 (s73). Epochs: 141-143. Flow head params: 138K.
+- **Analysis:** CFD surface pressure is near-deterministic given inputs — there is no multi-modality to model. Flow matching adds stochastic noise to a delta-function distribution. 50/50 SRF blend corrupts precise SRF corrections with spatially incoherent per-node samples. Detached gradients prevent flow head from influencing backbone. K=8 sample averaging doesn't fully denoise.
+- **Conclusion:** CLOSED. Generative modeling (flow matching, diffusion, VAE) added to DO NOT REVISIT — wrong paradigm for near-deterministic CFD regression.
+
+---
+
 ### 2026-04-08 15:00 — PR #2270: SE(2) Canonicalize — fern — **CLOSED** ❌
 
 - Branch: `fern/se2-canonicalize`
