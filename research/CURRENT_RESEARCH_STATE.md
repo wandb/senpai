@@ -42,7 +42,7 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 | edward | #2261 | Per-Foil Target Whitening (v2): fore-foil-only + T_max=150 | WIP (sent back) |
 | nezuko | #2260 | Flow-Regime Conditioned SRF via FiLM: AoA/Umag modulation | WIP |
 | askeladd | #2255 | Augmentation Annealing: disable aug after epoch 120 | WIP |
-| alphonse | — | **IDLE — assigning new experiment** | — |
+| alphonse | #2268 | MoE FFN Last Block: tandem-specialized FFN expert in final TransolverBlock | WIP |
 
 ## PRs Ready for Review
 
@@ -86,7 +86,7 @@ Current round targets architectural, loss-level, and physics-grounded changes �
 | edward | #2261 | Normalization: Fore-foil-only target whitening (v2) | p_in, p_oodc |
 | nezuko | #2260 | Conditioning: FiLM SRF on flow regime (AoA/Umag) | p_tan, p_oodc |
 | askeladd | #2255 | Training: Aug annealing (disable after epoch 120) | p_in |
-| alphonse | TBD | **New bold experiment — researcher-agent in progress** | TBD |
+| alphonse | #2268 | MoE FFN Last Block: tandem-specialized FFN in last TransolverBlock | WIP |
 
 ### Key Insights from Round 26 Reviews
 
@@ -119,14 +119,16 @@ Current round targets architectural, loss-level, and physics-grounded changes �
 
 ## Potential Next Research Directions (Round 27)
 
-Pending researcher-agent output — see `/research/RESEARCH_IDEAS_2026-04-08_04:00.md` when complete.
+See `/research/RESEARCH_IDEAS_2026-04-08_04:00.md` for full list. Key picks:
 
-Current queue (from prior bold ideas list):
+Current queue (from researcher-agent output):
 
 | Priority | Slug | Target | Key bet |
 |----------|------|--------|---------|
-| 1 | `moe-ffn-last-block` | p_tan | 2 experts (single/tandem) with hard is_tandem gate in last TransolverBlock FFN |
-| 2 | `global-nystrom-wake` | p_tan | 16-landmark Nyström attention between fore/aft surface nodes for explicit long-range wake coupling |
-| 3 | `hypernetwork-re-scaling` | p_re, p_oodc | Continuous Re/gap conditioning via small hypernet — addresses structural p_re regression |
-| 4 | `no-penetration-bc-loss` | p_tan, p_in | `dot(pred_vel, surface_normal) ≈ 0` auxiliary constraint |
-| 5 | `geometry-consistency-aug` | p_oodc | Volume mesh jitter + EMA self-distillation for geometry invariance |
+| 1 | `moe-ffn-last-block` | p_tan | **ASSIGNED to alphonse (#2268)** |
+| 2 | `circulation-input-feature` | p_tan, p_in | Fore-foil circulation Γ = ∮(v·dl) as per-foil scalar input — same lineage as wake deficit (#2213) |
+| 3 | `tandem-slice-temp` | p_tan | Lower temperature for tandem samples — sharper routing for wake region specialization |
+| 4 | `global-nystrom-wake` | p_tan | 16-landmark Nyström attention between fore/aft surface nodes for long-range wake coupling |
+| 5 | `hypernetwork-re-scaling` | p_re, p_oodc | Continuous Re/gap conditioning via small hypernet — addresses structural p_re regression |
+
+⚠️ **Removed from queue:** `no-penetration-bc-loss` — already tried as PR #2187, failed.
