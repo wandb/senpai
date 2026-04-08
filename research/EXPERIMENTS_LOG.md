@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 17:00 — PR #2276: MAE Surface Pretrain — askeladd — **CLOSED** ❌
+
+- Branch: `askeladd/mae-surface-pretrain`
+- Hypothesis: Self-supervised MAE pretraining on surface node reconstruction (50% mask, 20 epochs) before CFD fine-tuning. Forces backbone to learn spatially coherent geometry embeddings independently of pressure labels. Motivated by RI-MAE (arXiv:2406.11501) showing 8-15% OOD error reduction.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 102.8 | +765% ❌ |
+| p_oodc | 7.561  | 91.2  | +1106% ❌ |
+| p_tan  | 28.118 | 124.4 | +342% ❌ |
+| p_re   | 6.364  | 71.5  | +1024% ❌ |
+
+- W&B: mxtsralg (s42), ngponq4y (s73). MAE phase: 20 epochs (~30 min). Fine-tune: 123 epochs (~150 min). Extreme seed sensitivity: s42 p_in=167 vs s73 p_in=38.
+- **Analysis:** Catastrophic failure. MAE pretraining designed for large models (ViT-B/L, 12-24 blocks). Our 3-block, 192-dim Transolver is too small — no overfitting problem for pretraining to solve. 20 MAE epochs push backbone into reconstruction-optimal basin catastrophically far from flow prediction. Hidden-level masking creates preprocessing-attention mismatch.
+- **Conclusion:** CLOSED. Self-supervised pretraining at this model scale added to DO NOT REVISIT.
+
+---
+
 ### 2026-04-08 16:30 — PR #2274: FNO Inter-Foil Coupling — edward — **CLOSED** ❌
 
 - Branch: `edward/fno-inter-foil-coupling`
