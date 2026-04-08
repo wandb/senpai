@@ -117,14 +117,27 @@ Nine experiments across mechanistic and physics-grounded angles:
 - **Throughput hacks**: Val-every-3 (PR #2256) — LR schedule is binding constraint
 - **Decoupled tandem routing**: Orthogonal init (PR #2258) — undertrained on minority class
 
-## Potential Next Research Directions (Round 25)
+## Potential Next Research Directions (Round 25) — BOLD
 
-Bold directions per Issue #1860 directive — researcher-agent generating full list:
+Per Issue #1860 directive. Full details in `/research/RESEARCH_IDEAS_2026-04-08_BOLD.md`.
 
-1. **Slice Temperature Annealing** — Start warm (τ=0.5), anneal to 0.15. Forces harder specialization late in training.
-2. **MoE FFN — Last Block Only** — 2 experts (single/tandem) with hard `is_tandem` gate. Compute-efficient domain specialization.
-3. **SRF Pressure Gradient Feature** — Feed `dp_centered = base_pred_surf - mean(base_pred_surf)` as extra SRF input. Zero-init safe.
-4. **No-Penetration Boundary Condition Loss** — `dot(pred_vel, surface_normal) ≈ 0` using DSDF gradient as normal proxy.
-5. **Hard Sample Replay Buffer** — Prioritized resampling for hard tandem cases (frequency-based, not gradient magnitude).
-6. **Global Nyström Pathway** — 16-landmark global attention in parallel to local slice. Targets long-range wake coupling.
-7. **Bold ideas from researcher-agent** — See `/research/RESEARCH_IDEAS_2026-04-08_BOLD.md` when ready
+### Priority Assignment Queue (risk-adjusted, researcher-agent generated)
+
+| Priority | Slug | Target | Risk | Key bet |
+|----------|------|--------|------|---------|
+| 1 | `spectral-feature-whitening` | p_oodc, p_tan | Low | ZCA input decorrelation — optimal gradient conditioning, free at inference |
+| 2 | `pressure-gradient-aux-head` | p_tan, p_in | Low-Med | dp/dx, dp/dy auxiliary head teaches pressure *shape*, not just values |
+| 3 | `tandem-geom-interpolation` | p_tan | Low-Med | Physics-preserving gap/stagger interpolation synthesizes new tandem configs |
+| 4 | `hypernetwork-physics-scaling` | p_oodc, p_re, p_tan | Medium | Continuous Re/gap conditioning via hypernet (extends DomainLayerNorm) |
+| 5 | `gnn-boundary-layer` | p_tan, p_in | Medium | Local GraphSAGE on surface nodes — boundary layer physics is LOCAL, not global |
+| 6 | `geometry-consistency-distill` | p_oodc, p_tan | Medium | Volume mesh jitter + EMA self-distillation → mesh-invariant representations |
+| 7 | `cnf-surface-pressure` | p_tan, p_oodc | Medium | Flow matching surface head — generative alternative to deterministic SRF |
+| 8 | `fno-inter-foil-coupling` | p_tan | Med-High | 1D spectral convolution in gap region — wake coupling is a frequency-domain phenomenon |
+
+### Earlier Round 23/24 Queue (still valid, lower priority)
+
+1. **Slice Temperature Annealing** — Start warm (τ=0.5), anneal to 0.15
+2. **MoE FFN — Last Block Only** — 2 experts (single/tandem) with hard `is_tandem` gate
+3. **SRF Pressure Gradient Feature** — `dp_centered` as extra SRF input
+4. **No-Penetration BC Loss** — `dot(pred_vel, surface_normal) ≈ 0`
+5. **Global Nyström Pathway** — 16-landmark global attention for long-range coupling
