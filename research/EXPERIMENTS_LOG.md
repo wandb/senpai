@@ -2,6 +2,42 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 13:00 — PR #2268: MoE FFN Last Block — alphonse — **CLOSED** ❌
+
+- Branch: `alphonse/moe-ffn-last-block`
+- Hypothesis: Replace the final TransolverBlock FFN with a Mixture-of-Experts (2 experts, hard dispatch) — one expert specializes on tandem nodes, the other on single-foil/volume. Routes via a learned gating MLP on hidden state. Goal: let the final FFN specialize for tandem-specific pressure patterns without interference from single-foil gradients.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 12.524 | +5.3% ❌ |
+| p_oodc | 7.561  | 8.054  | +6.5% ❌ |
+| p_tan  | 28.118 | 29.034 | +3.3% ❌ |
+| p_re   | 6.364  | 6.838  | +7.4% ❌ |
+
+- W&B: 06hnldau (s42), 8bsvpfuc (s73).
+- **Analysis:** Hard MoE dispatch with 2 experts halves effective training data per expert, starving both. The tandem-specialized expert sees only ~50% of samples — insufficient for the data-hungry Transolver backbone. Gating network adds optimization noise early in training. Student suggested residual delta approach (MoE predicts correction on top of shared FFN) but the fundamental data-per-expert problem remains in our small-dataset regime.
+- **Conclusion:** CLOSED. MoE-style routing at FFN level added to DO NOT REVISIT — requires much more data or soft mixture (which converges to weighted average, defeating purpose).
+
+---
+
+### 2026-04-08 13:00 — PR #2265: Per-Head K/V Projection — askeladd — **CLOSED** ❌
+
+- Branch: `askeladd/per-head-kv-slice`
+- Hypothesis: Replace shared K/V projections in Physics_Attention_Irregular_Mesh with per-head projections (each attention head gets its own W_K, W_V). Goal: let different heads specialize on different physics aspects (pressure vs velocity, near-wall vs far-field).
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 12.687 | +5.9% ❌ |
+| p_oodc | 7.561  | 9.022  | +18.0% ❌ |
+| p_tan  | 28.118 | 28.532 | +0.7% ❌ |
+| p_re   | 6.364  | 7.209  | +14.4% ❌ |
+
+- W&B: prl91gc2 (s42), wbjzazp4 (s73). Also used T_max=160 instead of baseline T_max=150.
+- **Analysis:** The shared-mean K/V projection acts as essential regularization — implicit weight-sharing prior that prevents overfitting. Per-head K/V removes this prior, leading to catastrophic OOD degradation (p_oodc +18.0%, p_re +14.4%). The shared K/V forces all heads to attend to the same global representation, which acts as an information bottleneck that improves generalization. Per-head queries with shared K/V would be a less destructive alternative, but gains would likely be marginal.
+- **Conclusion:** CLOSED. Per-head K/V in physics attention added to DO NOT REVISIT — shared K/V is load-bearing regularization.
+
+---
+
 ### 2026-04-08 12:00 — PR #2267: Pressure Gradient Aux Head — thorfinn — **CLOSED** ❌
 
 - Branch: `thorfinn/pressure-gradient-aux-head`

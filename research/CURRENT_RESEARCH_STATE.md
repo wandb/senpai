@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-08 11:00 UTC
+- **Date:** 2026-04-08 13:30 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training & Architecture Improvements
 
@@ -30,41 +30,53 @@
 
 Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29.1). Ensemble still leads on p_oodc and p_re.
 
-## Student Status (2026-04-08 10:00 UTC)
+## Student Status (2026-04-08 13:30 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| thorfinn | #2272 | **BOLD: TTA AoA Ensemble — inference-time rotation augmentation** | WIP (NEW) |
-| fern | #2270 | **BOLD: SE(2) Canonicalize — chord-aligned coordinate frame preprocessing** | WIP (NEW) |
-| askeladd | #2265 | Per-head K/V projection in Physics_Attention_Irregular_Mesh | WIP |
-| frieren | #2269 | GNN Boundary Layer: local mesh message-passing on surface/near-wall nodes | WIP (NEW) |
-| tanjiro | #2273 | **BOLD: Geometry Consistency Self-Distillation — Mean Teacher on augmented mesh** | WIP (NEW) |
-| edward | #2274 | **BOLD: FNO Inter-Foil Coupling — spectral convolution in tandem gap** | WIP (NEW) |
-| nezuko | #2271 | **BOLD: Flow Matching Surface Head — generative pressure prediction (AlphaFold3-inspired)** | WIP (NEW) |
-| alphonse | #2268 | MoE FFN Last Block: tandem-specialized FFN expert in final TransolverBlock | WIP |
+| thorfinn | #2272 | **BOLD: TTA AoA Ensemble — inference-time rotation augmentation** | WIP |
+| fern | #2270 | **BOLD: SE(2) Canonicalize — chord-aligned coordinate frame preprocessing** | WIP |
+| askeladd | #2276 | **BOLD: MAE Surface Pretrain — masked autoencoder initialization for backbone** | WIP (NEW) |
+| frieren | #2269 | **BOLD: GNN Boundary Layer — local mesh message-passing on surface/near-wall nodes** | WIP |
+| tanjiro | #2273 | **BOLD: Geometry Consistency Self-Distillation — Mean Teacher on augmented mesh** | WIP |
+| edward | #2274 | **BOLD: FNO Inter-Foil Coupling — spectral convolution in tandem gap** | WIP |
+| nezuko | #2271 | **BOLD: Flow Matching Surface Head — generative pressure prediction (AlphaFold3-inspired)** | WIP |
+| alphonse | #2275 | **BOLD: NeuralFoil Synthetic Data Flooding — single-foil Cp augmentation via neural surrogate** | WIP (NEW) |
 
 ## PRs Ready for Review
 
 None.
 
-## Latest Reviews (2026-04-08 10:00)
+## Latest Reviews (2026-04-08 13:30)
+
+### PR #2268 (alphonse, MoE FFN Last Block) — CLOSED ❌
+- All 4 metrics regressed: p_in +5.3%, p_oodc +6.5%, p_tan +3.3%, p_re +7.4%.
+- Root cause: Hard MoE dispatch halves effective data per expert — starves both experts in small-dataset regime.
+
+### PR #2265 (askeladd, Per-head K/V Projection) — CLOSED ❌
+- All 4 metrics regressed: p_in +5.9%, p_oodc +18.0%, p_tan +0.7%, p_re +14.4%.
+- Root cause: Shared K/V is load-bearing regularization. Per-head K/V destroys OOD generalization.
+
+### PR #2267 (thorfinn, pressure-gradient-aux-head) — CLOSED ❌
+- All 4 metrics regressed: p_in +7.1%, p_oodc +11.1%, p_tan +2.1%, p_re +6.1%.
+
+### PR #2262 (tanjiro, foil-role-embed) — CLOSED ❌ (3 iterations)
+- Foil role embeddings fragile, not robust to config changes.
+
+### PR #2261 (edward, per-foil-whiten) — CLOSED ❌ (3 iterations)
+- Per-foil whitening structurally hurts p_tan.
+
+### PR #2260 (nezuko, FiLM SRF) — CLOSED ❌
+- SRF flow-regime conditioning redundant with backbone adaLN.
+
+### PR #2266 (fern, ZCA whitening) — CLOSED ❌
+- Near-singular covariance (cond# ~7.9B) makes full decorrelation harmful.
 
 ### PR #2264 (frieren, asymmetric-surface-loss) — CLOSED ❌
-- All 4 metrics regressed vs current baseline: p_in +3.3%, p_oodc +2.3%, p_tan +1.9%, p_re +1.7%
-- Root cause: asinh transform reduces suction/pressure-side separation; hard-node mining already captures suction difficulty; pred-based side classification is noisy early in training.
+- Hard-node mining already captures suction difficulty.
 
-### PR #2255 (askeladd, aug-annealing) — CLOSED ❌ (3 trials total)
-- No variant beats current baseline on any metric. Best trial (selective AoA stop): p_in=11.914, p_oodc=7.775, p_tan=28.290, p_re=6.414 — all worse than #2251.
-- Structural trade-off: clean fine-tuning helps p_in in isolation but augmentation provides essential OOD regularization even at low LR. Cannot be resolved with cutoff tuning.
-
-### PR #2263 (alphonse, attn-logit-noise) — CLOSED ❌ (prior session)
-- p_in +3.9%, p_tan +1.0%, p_re +1.3% vs baseline. Confirmed: slice routing is NOT the tandem failure driver.
-
-### PR #2262 (tanjiro, foil-role-embed) — REQUEST CHANGES (sent back)
-- Consistent p_oodc improvement, seed 42 p_in=11.76 (beats baseline). Fix: use boundary_id (not saf_norm) for foil identity + T_max=150.
-
-### PR #2261 (edward, per-foil-whiten) — REQUEST CHANGES (sent back)
-- p_in=-1.6%, p_oodc=-2.1%, p_re=-1.0% vs baseline. But p_tan=+2.8%. Fix: fore-foil-only whitening (don't normalize aft-foil targets).
+### PR #2255 (askeladd, aug-annealing) — CLOSED ❌ (3 trials)
+- Structural trade-off: augmentation is load-bearing for OOD metrics.
 
 ## Most Recent Research Direction from Human Researcher Team
 
@@ -75,26 +87,28 @@ Acknowledged and pivoting. Round 27 will include bold architectural additions (G
 
 ## Current Research Focus and Themes
 
-### Round 27 Active Experiments (8 GPUs occupied)
+### Round 28 Active Experiments (8 GPUs occupied — ALL BOLD)
 
 | Student | PR | Direction | Target |
 |---------|-----|-----------|--------|
-| thorfinn | #2267 | Physics: Pressure gradient auxiliary head (dp/dx, dp/dy) | p_tan, p_in |
-| fern | #2266 | Input rep: ZCA spectral whitening | p_oodc, generalization |
-| askeladd | #2265 | Architecture: Per-head K/V projection | p_tan |
-| frieren | #2269 | **BOLD: GNN Boundary Layer — local mesh message-passing on surface/near-wall nodes** | p_tan, p_in |
-| tanjiro | #2262 | Representation: Foil role embedding (v2) | p_oodc, p_in |
-| edward | #2261 | Normalization: Fore-foil-only target whitening (v2) | p_in, p_oodc |
-| nezuko | #2260 | Conditioning: FiLM SRF on flow regime (AoA/Umag) | p_tan, p_oodc |
-| alphonse | #2268 | MoE FFN Last Block: tandem-specialized FFN | p_tan |
+| thorfinn | #2272 | **BOLD: TTA AoA Ensemble** — inference-time K=5 rotation averaging | p_oodc, p_re |
+| fern | #2270 | **BOLD: SE(2) Canonicalize** — chord-aligned coordinate frame preprocessing | p_oodc, p_re |
+| askeladd | #2276 | **BOLD: MAE Surface Pretrain** — masked autoencoder backbone initialization | p_oodc, p_tan |
+| frieren | #2269 | **BOLD: GNN Boundary Layer** — local mesh message-passing on surface/near-wall nodes | p_tan, p_in |
+| tanjiro | #2273 | **BOLD: Geometry Consistency Self-Distillation** — Mean Teacher on jittered mesh | p_oodc |
+| edward | #2274 | **BOLD: FNO Inter-Foil Coupling** — spectral convolution in tandem gap | p_tan |
+| nezuko | #2271 | **BOLD: Flow Matching Surface Head** — generative pressure prediction (AlphaFold3-inspired) | p_tan, p_oodc |
+| alphonse | #2275 | **BOLD: NeuralFoil Synthetic Data Flooding** — single-foil Cp augmentation via neural surrogate | p_in, p_oodc, p_re |
 
-### Key Mechanistic Insights from Round 26-27 Reviews
+### Key Mechanistic Insights from Rounds 26-27
 
 1. **Slice routing is NOT the tandem failure driver** (attn-logit-noise #2263 confirmed). Input feature limitations more likely.
 2. **Hard-node mining already captures suction difficulty** (asymmetric loss #2264 confirmed). Physics-based node weighting redundant when error-based mining is active.
-3. **Augmentation is load-bearing at low LR** (aug-annealing #2255 across 3 trials). Cannot trade OOD robustness for ID precision via cutoff — the regularization effect persists throughout training.
-4. **Per-foil whitening works for fore-foil** — p_in (-1.6%) and p_oodc (-2.1%). Aft-foil must NOT be normalized.
-5. **Foil identity embedding is promising** — consistent p_oodc improvement, seed 42 beats baseline p_in.
+3. **Augmentation is load-bearing at low LR** (aug-annealing #2255 across 3 trials). Cannot trade OOD robustness for ID precision via cutoff.
+4. **Shared K/V is essential regularization** (per-head K/V #2265 confirmed). Per-head projections cause catastrophic OOD degradation (+18% p_oodc).
+5. **MoE requires more data than we have** (MoE FFN #2268 confirmed). Hard dispatch halves effective data per expert — both experts starved.
+6. **SRF conditioning is redundant with adaLN** (FiLM SRF #2260 confirmed). Flow regime already encoded in backbone hidden states.
+7. **Full-matrix whitening harmful with near-singular covariance** (ZCA #2266 confirmed). Condition number ~7.9B makes decorrelation destructive.
 
 ### GNN Boundary Layer — Rationale for Bold Pivot
 
@@ -130,30 +144,32 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 - **Pressure gradient aux head**: FD gradients compete with primary objectives, noisy on unstructured meshes
 - **Foil role embeddings**: Fragile, not robust to config changes; saf_norm proxy artifact
 - **Per-foil target whitening**: Fore-foil whitening hurts p_tan structurally (3 iterations confirmed)
+- **MoE FFN routing**: Hard dispatch halves effective data per expert — both experts starved in small-dataset regime
+- **Per-head K/V projections**: Shared K/V is load-bearing regularization; per-head destroys OOD generalization (+18% p_oodc)
 - **Sample-level reweighting**: Focal loss, OHNM — over-correction on top of PCGrad
 - **Optimizer variants**: SAM, Lookahead, SWA, SOAP, Muon — all worse than Lion+EMA+cosine
 
 ## Potential Next Research Directions (Round 28+)
 
-### In-Flight (Round 25 BOLD ideas)
-| Priority | Slug | Target | Status |
-|----------|------|--------|--------|
-| 1 | `gnn-boundary-layer` | p_tan, p_in | **ASSIGNED to frieren (#2269)** |
-| 2 | `cnf-surface-pressure` | p_tan, p_oodc | **ASSIGNED to nezuko (#2271)** |
-| 3 | `fno-inter-foil-coupling` | p_tan | Available — 1D FNO spectral convolution in tandem gap region |
-| 4 | `geometry-consistency-distill` | p_oodc | Available — Mean Teacher on volume-node-jittered views |
+### All Round 28 BOLD Ideas — Assignment Status
+| Slug | Target | Status |
+|------|--------|--------|
+| `gnn-boundary-layer` | p_tan, p_in | **ASSIGNED to frieren (#2269)** |
+| `cnf-surface-pressure` (flow-matching) | p_tan, p_oodc | **ASSIGNED to nezuko (#2271)** |
+| `fno-inter-foil-coupling` | p_tan | **ASSIGNED to edward (#2274)** |
+| `geometry-consistency-distill` | p_oodc | **ASSIGNED to tanjiro (#2273)** |
+| `se2-canonicalize` | p_oodc, p_re | **ASSIGNED to fern (#2270)** |
+| `tta-aoa-ensemble` | p_oodc, p_re | **ASSIGNED to thorfinn (#2272)** |
+| `neuralfoil-synthetic-flood` | p_in, p_oodc, p_re | **ASSIGNED to alphonse (#2275)** |
+| `mae-surface-pretrain` | p_oodc, p_tan | **ASSIGNED to askeladd (#2276)** |
 
-### Fresh Bold Ideas (Round 26 BOLD2 — see `RESEARCH_IDEAS_2026-04-08_BOLD2.md`)
+### Remaining Unassigned Ideas (for Round 29+)
 | Priority | Slug | Target | Key bet |
 |----------|------|--------|---------|
-| 1 | `se2-canonicalize` | p_oodc, p_re | **ASSIGNED to fern (#2270)** |
-| 2 | `neuralfoil-synthetic-flood` | p_in, p_oodc, p_re | **DATA GENERATION** — 5000+ NeuralFoil synthetic Cp distributions for single-foil augmentation |
-| 3 | `tta-aoa-ensemble` | p_oodc, p_re | Inference-only K=5 AoA rotation TTA, zero training risk |
-| 4 | `mae-surface-pretrain` | p_oodc, p_tan | Self-supervised backbone initialization via masked surface node reconstruction |
-| 5 | `tandem-difficulty-curriculum` | p_tan | Progressive tandem exposure by gap/stagger difficulty |
-| 6 | `surface-arclen-pe` | p_tan, p_in | Per-foil arc-length fraction as 2-channel surface feature |
+| 1 | `tandem-difficulty-curriculum` | p_tan | Progressive tandem exposure by gap/stagger difficulty |
+| 2 | `surface-arclen-pe` | p_tan, p_in | Per-foil arc-length fraction as 2-channel surface feature |
 
 **Assignment priority for next idle students:**
-1. `se2-canonicalize` (simple preprocessing, high information value)
-2. `neuralfoil-synthetic-flood` (data generation per human directive #1860)
-3. `cnf-surface-pressure` (bold architecture: generative surface head)
+1. `tandem-difficulty-curriculum` (pure schedule change, zero architecture risk, targets p_tan directly)
+2. `surface-arclen-pe` (medium risk, depends on node ordering)
+3. New ideas from researcher-agent (run when Round 28 results start arriving)
