@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 18:00 — PR #2278: Surface Arc-Length PE — fern — **CLOSED** ❌
+
+- Branch: `fern/surface-arclen-pe`
+- Hypothesis: Add per-foil chord-wise arc-length fraction as 2-channel (sin/cos) input feature for surface nodes. Volume nodes get zeros. Natural parameterization for Cp(s) distributions. Motivated by AeroDiT, NeuralFoil.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 12.550 | +5.5% ❌ |
+| p_oodc | 7.561  | 8.145  | +7.7% ❌ |
+| p_tan  | 28.118 | 29.342 | +4.4% ❌ |
+| p_re   | 6.364  | 6.453  | +1.4% ❌ |
+
+- W&B: 9dbwtqfc (s42), no0a4utt (s73). Epochs: 144-145.
+- **Analysis:** Angle-sort contour ordering (atan2) is unreliable near TE for cambered airfoils — creates noisy arc-length fractions. Zero features for volume nodes create artificial surface/volume distinction that confuses Transolver attention. Feature is redundant with TE coordinate frame which provides chord-wise position more robustly. AoA augmentation rotation changes atan2 ordering (not rotation-invariant at sorting level).
+- **Conclusion:** CLOSED. Surface arc-length PE added to DO NOT REVISIT — TE coord frame already provides this information.
+
+---
+
 ### 2026-04-08 17:30 — PR #2277: Tandem Difficulty Curriculum — frieren — **CLOSED** ❌
 
 - Branch: `frieren/tandem-difficulty-curriculum`

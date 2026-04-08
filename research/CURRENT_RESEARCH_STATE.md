@@ -35,7 +35,7 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | thorfinn | #2280 | **Snapshot Ensemble — cyclic cosine LR with prediction averaging** | WIP (NEW) |
-| fern | #2278 | **Surface Arc-Length PE — per-foil chord-wise positional encoding** | WIP (NEW) |
+| fern | #2284 | **Heteroscedastic Loss — learned per-node uncertainty weighting** | WIP (NEW) |
 | askeladd | #2282 | **Point Cloud MixUp — linear interpolation data augmentation** | WIP (NEW) |
 | frieren | #2283 | **Wider SRF Head — surface_refine_hidden 192→384** | WIP (NEW) |
 | tanjiro | #2273 | **BOLD: Geometry Consistency Self-Distillation — Mean Teacher on augmented mesh** | WIP |
@@ -92,7 +92,7 @@ Acknowledged and pivoting. Round 27 will include bold architectural additions (G
 | Student | PR | Direction | Target |
 |---------|-----|-----------|--------|
 | thorfinn | #2280 | **Snapshot Ensemble** — cyclic cosine LR, 3-checkpoint prediction averaging | p_oodc, p_re |
-| fern | #2278 | **Surface Arc-Length PE** — per-foil chord-wise sin/cos positional encoding | p_tan, p_in |
+| fern | #2284 | **Heteroscedastic Loss** — learned per-node variance for pressure loss | p_in, p_tan |
 | askeladd | #2282 | **Point Cloud MixUp** — linear interpolation data augmentation | p_oodc, p_re |
 | frieren | #2283 | **Wider SRF Head** — surface_refine_hidden 192→384, capacity increase | p_in, p_tan |
 | tanjiro | #2273 | **BOLD: Geometry Consistency Self-Distillation** — Mean Teacher on jittered mesh | p_oodc |
@@ -153,6 +153,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 - **FNO inter-foil spectral coupling**: 5th inter-foil coupling failure (attention, GALE, cross-DSDF, GNN, FNO all dead). Transolver slice attention already captures inter-foil interactions implicitly
 - **MAE surface pretraining**: Catastrophic at small model scale (3-block, 192-dim). Pretraining pushes backbone into reconstruction basin far from flow prediction (+342-1106%)
 - **Tandem difficulty curriculum**: Double-gating with tandem_ramp. Withholding tandem diversity during critical early training hurts (+3.9-9.1%)
+- **Surface arc-length PE**: Angle-sort ordering unreliable, zero features for volume nodes confuse attention, redundant with TE coord frame (+1.4-7.7%)
 - **Sample-level reweighting**: Focal loss, OHNM — over-correction on top of PCGrad
 - **Optimizer variants**: SAM, Lookahead, SWA, SOAP, Muon — all worse than Lion+EMA+cosine
 
