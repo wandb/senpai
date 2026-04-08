@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-09 01:00 UTC
+- **Date:** 2026-04-09 01:30 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training & Architecture Improvements
 
@@ -39,7 +39,7 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 | askeladd | #2292 | **Flow-Direction Normalization — rotate coords by -AoA to streamwise frame** | WIP (NEW) |
 | frieren | #2291 | **Stagnation Pressure Feature — q_inf = 0.5*Umag² as input channel** | WIP (NEW) |
 | tanjiro | #2295 | **Surface Curvature Feature — discrete Menger curvature κ at surface nodes** | WIP (NEW) |
-| edward | #2286 | **Velocity Angle Feature — per-node local incidence angle from DSDF gradient** | WIP (NEW) |
+| edward | #2296 | **Log-Re Pressure Scaling — Re-normalize pressure loss for OOD-Re generalization** | WIP (NEW) |
 | nezuko | #2290 | **Re-Stratified Sampling — 2× weight for extreme-Re training samples** | WIP (NEW) |
 | alphonse | #2293 | **Low-Rank Pressure Loss — SVD structural prior on surface predictions** | WIP (NEW) |
 
@@ -48,6 +48,10 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 None.
 
 ## Latest Reviews (2026-04-09 01:00)
+
+### PR #2286 (edward, Velocity Angle Feature) — CLOSED ❌
+- All metrics regressed: p_in +7.1%, p_oodc +3.3%, p_tan +3.1%, p_re +2.5%.
+- Feature redundancy — model already has DSDF gradients + AoA; can compute angle internally. Volume node noise amplifies degradation.
 
 ### PR #2287 (tanjiro, Effective AoA Aft Feature) — CLOSED ❌
 - All metrics regressed: p_in +5.1%, p_oodc +4.5%, p_tan +3.1%, p_re +2.1%.
@@ -127,7 +131,7 @@ Acknowledged and pivoting. Round 27 will include bold architectural additions (G
 | askeladd | #2292 | **Flow-Direction Normalization** — rotate (x,y) by -AoA to streamwise frame | p_oodc, p_re |
 | frieren | #2291 | **Stagnation Pressure Feature** — q_inf = 0.5*Umag² as input channel | p_in, p_re |
 | tanjiro | #2295 | **Surface Curvature Feature** — discrete Menger curvature κ at surface nodes | p_tan, p_in |
-| edward | #2286 | **Velocity Angle Feature** — per-node local incidence from DSDF gradient | p_tan, p_in |
+| edward | #2296 | **Log-Re Pressure Scaling** — Re-normalize loss for OOD-Re generalization | p_re, p_oodc |
 | nezuko | #2290 | **Re-Stratified Sampling** — 2× weight for extreme-Re training samples | p_re, p_oodc |
 | alphonse | #2293 | **Low-Rank Pressure Loss** — SVD penalty beyond rank-5 on surface error | p_tan, p_in |
 
@@ -197,6 +201,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 - **Deeper backbone (4 layers)**: Training budget mismatch — 32% slower per epoch, only 121 vs 149 epochs. 3-layer is well-calibrated to 180-min budget (+4.7-29.1%)
 - **Heteroscedastic loss (Gaussian NLL)**: MSE/MAE mismatch — switches loss from well-tuned MAE to MSE. Learned log-variance suppresses gradients. Interacts poorly with hard-node mining (+41.7-76.9%)
 - **Effective AoA aft feature**: Thin-airfoil downwash model too simplified — linearized AoA + k*AoA/gap redundant with wake_deficit_feature which captures inter-foil coupling more accurately (+2.1-5.1%)
+- **Velocity angle feature (DSDF gradient × AoA)**: Feature redundancy — model can compute angle from existing DSDF + AoA inputs internally. Volume node noise for ~85-90% non-surface nodes amplifies degradation (+2.5-7.1%)
 
 ## Potential Next Research Directions (Round 28+)
 
@@ -233,7 +238,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 
 | Priority | Slug | Target | Key bet |
 |----------|------|--------|---------|
-| 1 | `vel-angle-mag-feature` | p_tan, p_in | **ASSIGNED to edward (#2286)** |
+| 1 | `vel-angle-mag-feature` | p_tan, p_in | **CLOSED** ❌ — all metrics +2.5-7.1%, DSDF-angle redundant with existing inputs |
 | 2 | `effective-aoa-aft-feature` | p_tan, p_re | **CLOSED** ❌ — all metrics +2.1-5.1%, redundant with wake_deficit |
 | 3 | `chord-fraction-feature` | p_in, p_tan | **ASSIGNED to thorfinn (#2288)** |
 | 4 | `cp-target-normalization` | p_re, p_oodc | **SKIPPED** — baseline already applies Cp normalization via `_phys_norm()` |
@@ -241,7 +246,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 | 6 | `stagnation-pressure-feature` | p_in, p_re | **ASSIGNED to frieren (#2291)** |
 | 7 | `lowrank-pressure-loss` | p_tan, p_in | **ASSIGNED to alphonse (#2293)** |
 | 8 | `flowdir-anisotropic-norm` | p_oodc, p_re | **ASSIGNED to askeladd (#2292)** |
-| 9 | `logre-pressure-scaling` | p_re | Normalize pressure residuals by log(Re). Milder than Cp normalization. |
+| 9 | `logre-pressure-scaling` | p_re, p_oodc | **ASSIGNED to edward (#2296)** |
 | 10 | `tandem-topo-feature` | p_tan | **ASSIGNED to fern (#2294)** |
 
 Full details: `/research/RESEARCH_IDEAS_2026-04-08_ROUND29.md`

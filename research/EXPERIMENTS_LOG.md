@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 01:30 — PR #2286: Velocity Angle Feature — edward — **CLOSED** ❌
+
+- Branch: `edward/vel-angle-mag-feature`
+- Hypothesis: Per-node local incidence angle from DSDF gradient channels × freestream direction. 2 new channels: cos(θ) and sin(θ) of angle between DSDF surface-normal proxy and AoA vector.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 12.740 | +7.1% ❌ |
+| p_oodc | 7.561  | 7.814  | +3.3% ❌ |
+| p_tan  | 28.118 | 28.985 | +3.1% ❌ |
+| p_re   | 6.364  | 6.521  | +2.5% ❌ |
+
+- W&B: y531sbw6 (s42), hqgcd5gr (s73). Group: vel-angle-mag-feature. Epochs: 146-148. VRAM: ~46GB.
+- **Analysis:** Feature redundancy — model already receives DSDF gradient channels AND AoA separately; 3 TransolverBlocks can compute the angle internally. Volume node noise: ~85-90% of nodes have non-surface DSDF gradients, injecting meaningless angle signals. Core issue: unlike wake_deficit (encodes geometric displacement not in raw inputs) or TE_coord_frame (new reference frame), this feature is fully computable from existing inputs.
+- **Conclusion:** CLOSED. Velocity angle feature added to DO NOT REVISIT. DSDF-derived angle features are redundant given model's ability to compose existing channels.
+
+---
+
 ### 2026-04-09 01:00 — PR #2287: Effective AoA Aft Feature — tanjiro — **CLOSED** ❌
 
 - Branch: `tanjiro/effective-aoa-aft-feature`
