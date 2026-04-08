@@ -4,14 +4,14 @@
 
 | Metric | 2-seed avg | vs prior (Cosine T_max=150) | Δ |
 |--------|------------|----------------------------|---|
-| **p_in** | **11.74** | 11.891 | **-1.3%** ✅ |
-| p_oodc | 7.65 | 7.561 | +1.2% (minor regression) |
-| **p_tan** | **27.90** | 28.118 | **-0.8%** ✅ |
-| p_re | 6.40 | 6.364 | +0.6% (minor regression) |
+| **p_in** | **11.742** | 11.891 | **-1.3%** ✅ |
+| p_oodc | 7.643 | 7.561 | +1.1% (minor regression) |
+| **p_tan** | **27.874** | 28.118 | **-0.9%** ✅ |
+| p_re | 6.419 | 6.364 | +0.9% (minor regression) |
 
 **PR #2290** (merged 2026-04-08) — Re-Stratified Sampling: 2× weight for top/bottom 20th percentile of log-Re training samples via WeightedRandomSampler (530/1322 = 40.1% of samples upweighted). Weights multiplied with existing domain-balanced sampler. Improves p_in -1.3% and p_tan -0.8%; minor p_oodc and p_re regressions (+1.2%, +0.6%) within noise range. Net aggregate surface MAE improved by -0.24 points (-0.45%). W&B runs: k5qwvce4 (seed 42, p_in=11.60, p_tan=27.7), 7oa5xfhi (seed 73, p_in=11.88, p_tan=28.1).
 
-⚠️ **2-seed only.** For merge decisions: **p_in < 11.74**, p_oodc < 7.65, **p_tan < 27.90**, p_re < 6.40.
+⚠️ **2-seed only.** For merge decisions: **p_in < 11.74**, p_oodc < 7.64, **p_tan < 27.87**, p_re < 6.42.
 
 ---
 
