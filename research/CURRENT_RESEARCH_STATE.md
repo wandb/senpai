@@ -128,17 +128,27 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 - **Sample-level reweighting**: Focal loss, OHNM — over-correction on top of PCGrad
 - **Optimizer variants**: SAM, Lookahead, SWA, SOAP, Muon — all worse than Lion+EMA+cosine
 
-## Potential Next Research Directions (Round 28)
+## Potential Next Research Directions (Round 28+)
 
-Researcher-agent running now to generate fresh bold ideas per human team directive (#1860).
-From existing bold ideas file (`RESEARCH_IDEAS_2026-04-08_BOLD.md`):
+### In-Flight (Round 25 BOLD ideas)
+| Priority | Slug | Target | Status |
+|----------|------|--------|--------|
+| 1 | `gnn-boundary-layer` | p_tan, p_in | **ASSIGNED to frieren (#2269)** |
+| 2 | `cnf-surface-pressure` | p_tan, p_oodc | Available — Flow matching head replaces SRF (AlphaFold3 analogue) |
+| 3 | `fno-inter-foil-coupling` | p_tan | Available — 1D FNO spectral convolution in tandem gap region |
+| 4 | `geometry-consistency-distill` | p_oodc | Available — Mean Teacher on volume-node-jittered views |
 
+### Fresh Bold Ideas (Round 26 BOLD2 — see `RESEARCH_IDEAS_2026-04-08_BOLD2.md`)
 | Priority | Slug | Target | Key bet |
 |----------|------|--------|---------|
-| 1 | `gnn-boundary-layer` | p_tan, p_in | **ASSIGNED to frieren (#2269)** |
-| 2 | `cnf-surface-pressure` | p_tan, p_oodc | Flow matching head replaces SRF — AlphaFold3 analogue |
-| 3 | `fno-inter-foil-coupling` | p_tan | 1D FNO spectral convolution in tandem gap region |
-| 4 | `geometry-consistency-distill` | p_oodc | Mean Teacher consistency on volume-node-jittered augmented views |
-| 5 | `circulation-input-feature` | p_tan, p_in | Fore-foil circulation Γ as input — same lineage as wake deficit |
+| 1 | `se2-canonicalize` | p_oodc, p_re | Chord-aligned coordinate frame preprocessing — removes AoA rotational DOF, low risk |
+| 2 | `neuralfoil-synthetic-flood` | p_in, p_oodc, p_re | **DATA GENERATION** — 5000+ NeuralFoil synthetic Cp distributions for single-foil augmentation |
+| 3 | `tta-aoa-ensemble` | p_oodc, p_re | Inference-only K=5 AoA rotation TTA, zero training risk |
+| 4 | `mae-surface-pretrain` | p_oodc, p_tan | Self-supervised backbone initialization via masked surface node reconstruction |
+| 5 | `tandem-difficulty-curriculum` | p_tan | Progressive tandem exposure by gap/stagger difficulty |
+| 6 | `surface-arclen-pe` | p_tan, p_in | Per-foil arc-length fraction as 2-channel surface feature |
 
-Next researcher-agent output (in progress) will update this queue.
+**Assignment priority for next idle students:**
+1. `se2-canonicalize` (simple preprocessing, high information value)
+2. `neuralfoil-synthetic-flood` (data generation per human directive #1860)
+3. `cnf-surface-pressure` (bold architecture: generative surface head)
