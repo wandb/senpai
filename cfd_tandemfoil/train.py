@@ -1170,6 +1170,8 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    tandem_proximity_feature: bool = False  # config-space distance to nearest training tandem configs (+1 input channel)
+    proximity_k: int = 5                   # number of nearest neighbors for proximity feature
 
 
 cfg = sp.parse(Config)
@@ -1188,6 +1190,51 @@ train_ds, val_splits, stats, sample_weights = load_data(
     cfg.manifest, cfg.stats_file, debug=cfg.debug,
 )
 stats = {k: v.to(device) for k, v in stats.items()}
+
+# Tandem configuration proximity feature: KD-tree over training (gap, stagger, AoA)
+_prox_configs_norm = None
+_prox_mean = None
+_prox_std = None
+if cfg.tandem_proximity_feature:
+    print("Building tandem config proximity index...")
+    _prox_loader = DataLoader(train_ds, batch_size=64, shuffle=False,
+                              collate_fn=pad_collate, num_workers=4, pin_memory=False)
+    _prox_configs = []
+    for _px, _, _, _ in _prox_loader:
+        # Extract (gap, stagger, AoA) per sample — they're constant across nodes
+        _prox_configs.append(torch.stack([_px[:, 0, 22], _px[:, 0, 23], _px[:, 0, 14]], dim=1))
+    _prox_configs = torch.cat(_prox_configs, dim=0)  # [N_train, 3]
+    _prox_mean = _prox_configs.mean(dim=0)
+    _prox_std = _prox_configs.std(dim=0).clamp(min=1e-6)
+    _prox_configs_norm = ((_prox_configs - _prox_mean) / _prox_std).to(device)
+    _prox_mean = _prox_mean.to(device)
+    _prox_std = _prox_std.to(device)
+    print(f"  Config proximity: {len(_prox_configs)} training configs, K={cfg.proximity_k}")
+    del _prox_loader, _prox_configs
+
+
+def _compute_proximity(x_raw, N_nodes):
+    """Compute tandem config proximity feature for a batch.
+
+    Returns [B, N, 1] tensor with log1p(avg distance to K nearest training configs).
+    Single-foil samples get proximity=0.
+    """
+    B = x_raw.shape[0]
+    gap = x_raw[:, 0, 22]       # [B]
+    stagger = x_raw[:, 0, 23]   # [B]
+    aoa = x_raw[:, 0, 14]       # [B]
+    batch_config = torch.stack([gap, stagger, aoa], dim=1)  # [B, 3]
+    batch_config_norm = (batch_config - _prox_mean) / _prox_std  # [B, 3]
+    # Brute-force KNN: cdist gives [B, N_train]
+    dists = torch.cdist(batch_config_norm.unsqueeze(0),
+                        _prox_configs_norm.unsqueeze(0)).squeeze(0)  # [B, N_train]
+    topk_dists, _ = dists.topk(cfg.proximity_k, largest=False)  # [B, K]
+    proximity = topk_dists.mean(dim=1)  # [B]
+    # Single-foil samples: proximity = 0
+    is_tandem = (gap.abs() > 0.01)
+    proximity = proximity * is_tandem.float()
+    # log1p for reasonable scale, broadcast to all nodes
+    return torch.log1p(proximity)[:, None, None].expand(B, N_nodes, 1)
 
 
 def _umag_q(y, mask):
@@ -1300,7 +1347,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + (1 if cfg.tandem_proximity_feature else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], [+proximity], +32 fourier PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1774,6 +1821,10 @@ for epoch in range(MAX_EPOCHS):
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
+        # Tandem proximity feature: compute before standardization
+        _prox_feat = None
+        if cfg.tandem_proximity_feature:
+            _prox_feat = _compute_proximity(x, x.shape[1])
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1794,6 +1845,8 @@ for epoch in range(MAX_EPOCHS):
                 wake_feats = compute_wake_deficit_features(
                     _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
                 x = torch.cat([x, wake_feats], dim=-1)
+        if _prox_feat is not None:
+            x = torch.cat([x, _prox_feat], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2464,6 +2517,9 @@ for epoch in range(MAX_EPOCHS):
                     _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
                     _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
                     _v_gap_stagger = x[:, 0, 22:24]  # [B, 2]
+                _prox_feat_v = None
+                if cfg.tandem_proximity_feature:
+                    _prox_feat_v = _compute_proximity(x, x.shape[1])
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -2484,6 +2540,8 @@ for epoch in range(MAX_EPOCHS):
                         wake_feats = compute_wake_deficit_features(
                             _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
                         x = torch.cat([x, wake_feats], dim=-1)
+                if _prox_feat_v is not None:
+                    x = torch.cat([x, _prox_feat_v], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2986,6 +3044,9 @@ if cfg.surface_refine and best_metrics:
                     _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
                     _raw_gap_wake_vv = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
+                    _prox_feat_vv = None
+                    if cfg.tandem_proximity_feature:
+                        _prox_feat_vv = _compute_proximity(x, x.shape[1])
                     x = (x - stats["x_mean"]) / stats["x_std"]
                     curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                     if cfg.foil2_dist:
@@ -3006,6 +3067,8 @@ if cfg.surface_refine and best_metrics:
                             wake_feats_vv = compute_wake_deficit_features(
                                 _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake_vv)
                             x = torch.cat([x, wake_feats_vv], dim=-1)
+                    if _prox_feat_vv is not None:
+                        x = torch.cat([x, _prox_feat_vv], dim=-1)
                     raw_xy = x[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
                     xy_max = raw_xy.amax(dim=1, keepdim=True)
