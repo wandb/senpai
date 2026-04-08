@@ -2,6 +2,22 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 04:40 — PR #2300: Mirror Symmetry Augmentation — tanjiro — **CLOSED** ❌
+
+- Branch: `tanjiro/mirror-symmetry-augmentation`
+- Hypothesis: Exact y-reflection (y→-y, AoA→-AoA) doubles effective training data via incompressible NS symmetry. P(mirror)=0.5 per sample.
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.742 | 14.05 | +19.7% ❌ |
+| p_oodc | 7.643  | 8.40  | +9.9% ❌ |
+| p_tan  | 27.874 | 29.35 | +5.3% ❌ |
+| p_re   | 6.419  | 6.75  | +5.2% ❌ |
+
+- W&B: mcnuxpqk (s42), 8jm0fb3z (s73). Group: mirror-symmetry-augmentation.
+- **Analysis:** Massive p_in regression (+19.7%). Mesh asymmetry breaks the theoretical y-reflection symmetry — node density, BL refinement, and wake topology are directional. Reflected samples create inconsistent mesh-to-flow pairings that act as noise. Dead end for this dataset. Student's diagnosis was thorough and correct.
+- **Key insight:** Added to DO NOT REVISIT — discrete symmetry augmentation is invalid when the mesh itself is asymmetric.
+
 ### 2026-04-08 22:20 — PR #2299: Potential Flow Residual Loss — alphonse — **SENT BACK** (iteration 2)
 
 - Branch: `alphonse/potential-flow-residual`
