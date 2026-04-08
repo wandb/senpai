@@ -18,6 +18,8 @@ dependencies = [
     "weave",
     "tqdm",
     "matplotlib",
+    "neuralfoil",
+    "aerosandbox",
 ]
 
 [tool.setuptools.packages.find]

@@ -39,8 +39,28 @@ import simple_parsing as sp
 
 from data.utils import visualize
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
+from torch.utils.data import ConcatDataset, Dataset as TorchDataset
 
 torch.set_float32_matmul_precision('high')
+
+
+class SyntheticNeuralFoilDataset(TorchDataset):
+    """Dataset of pre-generated NeuralFoil synthetic single-foil samples.
+
+    Each sample is a .pt file with keys: x (N,24), y (N,3), is_surface (N,).
+    Stagger channel (x[:,23]=99) acts as a synthetic marker detected in the training loop.
+    """
+    def __init__(self, data_dir: str):
+        self.files = sorted(Path(data_dir).glob("sample_*.pt"))
+        if not self.files:
+            raise ValueError(f"No sample_*.pt files found in {data_dir}")
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        data = torch.load(self.files[idx], map_location="cpu", weights_only=True)
+        return data["x"], data["y"], data["is_surface"]
 
 
 # ---------------------------------------------------------------------------
@@ -1170,6 +1190,9 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    # Phase 7: NeuralFoil synthetic data flooding
+    neuralfoil_synthetic_path: str = ""    # path to directory of synthetic sample_*.pt files
+    p_synthetic: float = 0.0              # probability of sampling a synthetic slot per epoch step
 
 
 cfg = sp.parse(Config)
@@ -1235,12 +1258,25 @@ if cfg.debug:
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
                               shuffle=True, **loader_kwargs)
 else:
+    _base_ds = train_ds
+    _base_weights = sample_weights
+    if cfg.neuralfoil_synthetic_path and cfg.p_synthetic > 0:
+        _syn_ds = SyntheticNeuralFoilDataset(cfg.neuralfoil_synthetic_path)
+        _base_ds = ConcatDataset([train_ds, _syn_ds])
+        # Weight synthetic samples so P(synthetic slot) ≈ p_synthetic
+        N_real = len(train_ds)
+        N_syn = len(_syn_ds)
+        _avg_w = float(sample_weights.mean())
+        _w_syn = (cfg.p_synthetic / max(1 - cfg.p_synthetic, 1e-8)) * (N_real / max(N_syn, 1)) * _avg_w
+        _syn_weights = torch.full((N_syn,), _w_syn, dtype=sample_weights.dtype)
+        _base_weights = torch.cat([sample_weights, _syn_weights])
+        print(f"NeuralFoil synthetic: {N_syn} samples loaded, w_syn={_w_syn:.4f} (p_synthetic={cfg.p_synthetic})")
     sampler = WeightedRandomSampler(
-        weights=sample_weights,
+        weights=_base_weights,
         num_samples=len(train_ds),
         replacement=True,
     )
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
+    train_loader = DataLoader(_base_ds, batch_size=cfg.batch_size,
                               sampler=sampler, **loader_kwargs)
 
 val_loaders = {
@@ -1667,6 +1703,14 @@ for epoch in range(MAX_EPOCHS):
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
 
+        # --- Detect and clear synthetic marker (NeuralFoil samples: stagger sentinel = 99.0) ---
+        if cfg.p_synthetic > 0:
+            _is_synthetic = (x[:, 0, 23] > 50.0)  # [B] bool, raw x before normalization
+            if _is_synthetic.any():
+                x[:, :, 23] = x[:, :, 23].masked_fill(_is_synthetic.unsqueeze(1), 0.0)
+        else:
+            _is_synthetic = None
+
         # --- Data augmentation (training-only, applied before normalization) ---
         if model.training and cfg.aug != "none" and epoch >= cfg.aug_start_epoch:
             if cfg.aug in ("yflip", "flip_jitter"):
@@ -1986,6 +2030,10 @@ for epoch in range(MAX_EPOCHS):
                 vol_mask_train[vol_indices[perm, 0], vol_indices[perm, 1]] = True
         else:
             vol_mask_train = vol_mask
+
+        # Mask all volume nodes for synthetic samples (surface-only supervision)
+        if _is_synthetic is not None and _is_synthetic.any():
+            vol_mask_train = vol_mask_train & ~_is_synthetic.unsqueeze(1)
 
         if cfg.boundary_aware:
             vol_dist = dist_feat[:, :, 0]  # [B, N], log1p-scaled dist-to-surface
@@ -2310,7 +2358,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if _is_synthetic is not None and _is_synthetic.any():
+            _log_dict["train/n_synthetic_in_batch"] = _is_synthetic.float().sum().item()
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
