@@ -587,6 +587,36 @@ class SurfaceRefinementHead(nn.Module):
         return correction
 
 
+class VarianceHead(nn.Module):
+    """Predicts per-node log-variance for heteroscedastic loss on surface pressure.
+
+    Zero-initialized so training starts as standard MSE (log_var=0 → sigma=1).
+    """
+
+    def __init__(self, n_hidden: int, out_dim: int = 3, hidden_dim: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_hidden + out_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),  # predicts log(sigma^2) for pressure
+        )
+        # Zero-init: log_var=0 → exp(-log_var)=1 → standard MSE at start
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            hidden: [M, n_hidden] — hidden features for surface nodes
+            base_pred: [M, out_dim] — base predictions for surface nodes
+        Returns:
+            log_var: [M, 1] — predicted log-variance, clamped for stability
+        """
+        inp = torch.cat([hidden, base_pred], dim=-1)
+        log_var = self.net(inp)
+        return log_var.clamp(-6, 6)  # sigma in [~0.05, ~20]
+
+
 class AftFoilRefinementHead(nn.Module):
     """Dedicated refinement head for aft-foil (boundary ID=7) surface nodes.
 
@@ -1170,6 +1200,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    heteroscedastic_loss: bool = False      # learned per-node log-variance for surface pressure (Gaussian NLL)
 
 
 cfg = sp.parse(Config)
@@ -1393,10 +1424,23 @@ if cfg.aft_foil_srf:
               f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, "
               f"film={cfg.aft_foil_srf_film})")
 
+# Variance head for heteroscedastic loss (per-node log-variance on surface pressure)
+variance_head = None
+if cfg.heteroscedastic_loss:
+    variance_head = VarianceHead(
+        n_hidden=cfg.n_hidden,
+        out_dim=3,
+        hidden_dim=64,
+    ).to(device)
+    variance_head = torch.compile(variance_head, mode=cfg.compile_mode)
+    _var_n_params = sum(p.numel() for p in variance_head.parameters())
+    print(f"Variance head (heteroscedastic): {_var_n_params:,} params")
+
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
 ema_aft_srf_head = None  # EMA copy of aft-foil SRF head
+ema_variance_head = None  # EMA copy of variance head
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -1418,6 +1462,8 @@ if aft_srf_head is not None:
     n_params += sum(p.numel() for p in aft_srf_head.parameters())
 if aft_srf_ctx_head is not None:
     n_params += sum(p.numel() for p in aft_srf_ctx_head.parameters())
+if variance_head is not None:
+    n_params += sum(p.numel() for p in variance_head.parameters())
 
 
 class SAM:
@@ -1558,6 +1604,12 @@ if aft_srf_ctx_head is not None:
     _ctx_params = list(aft_srf_ctx_head.parameters())
     base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
+
+# Add variance head params to optimizer if enabled
+if variance_head is not None:
+    _var_params = list(variance_head.parameters())
+    base_opt.add_param_group({'params': _var_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _var_params):,} variance head params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
@@ -1954,6 +2006,19 @@ for epoch in range(MAX_EPOCHS):
                 pred = pred.clone()
                 pred[aft_idx[:, 0], aft_idx[:, 1]] = pred[aft_idx[:, 0], aft_idx[:, 1]] + aft_correction
 
+        # Heteroscedastic loss: predict per-node log-variance for surface pressure
+        _surf_log_var = None
+        if variance_head is not None and model.training:
+            surf_idx_var = is_surface.nonzero(as_tuple=False)  # [M, 2]
+            if surf_idx_var.numel() > 0:
+                surf_hidden_var = hidden[surf_idx_var[:, 0], surf_idx_var[:, 1]]
+                surf_pred_var = pred[surf_idx_var[:, 0], surf_idx_var[:, 1]]
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    log_var_surf = variance_head(surf_hidden_var, surf_pred_var).float()  # [M, 1]
+                # Scatter into full [B, N, 1] tensor for loss computation
+                _surf_log_var = torch.zeros(pred.shape[0], pred.shape[1], 1, device=device)
+                _surf_log_var[surf_idx_var[:, 0], surf_idx_var[:, 1]] = log_var_surf
+
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         if cfg.tandem_ramp:
@@ -2015,7 +2080,16 @@ for epoch in range(MAX_EPOCHS):
             thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
             hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
-            surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            if _surf_log_var is not None:
+                # Heteroscedastic NLL: 0.5 * (exp(-log_var) * sq_err + log_var) per surface node
+                _hetero_per_node = 0.5 * (torch.exp(-_surf_log_var) * sq_err[:, :, 2:3] + _surf_log_var)
+                surf_per_sample = (_hetero_per_node * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            else:
+                surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        elif _surf_log_var is not None:
+            # Heteroscedastic NLL without hard-node mining (before epoch 30)
+            _hetero_per_node = 0.5 * (torch.exp(-_surf_log_var) * sq_err[:, :, 2:3] + _surf_log_var)
+            surf_per_sample = (_hetero_per_node * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         if cfg.tandem_ramp:
             tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
@@ -2309,8 +2383,25 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for variance head (heteroscedastic loss)
+            if variance_head is not None:
+                _var_base = variance_head._orig_mod if hasattr(variance_head, '_orig_mod') else variance_head
+                if ema_variance_head is None:
+                    ema_variance_head = deepcopy(_var_base)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_variance_head.parameters(), _var_base.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        # Log heteroscedastic variance stats
+        _hetero_log = {}
+        if _surf_log_var is not None:
+            _sv = _surf_log_var[surf_mask.unsqueeze(-1).expand_as(_surf_log_var)]
+            _hetero_log = {
+                "train/hetero_log_var_mean": _sv.mean().item(),
+                "train/hetero_log_var_std": _sv.std().item(),
+            }
+        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step, **_hetero_log})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
