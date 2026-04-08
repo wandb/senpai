@@ -1173,6 +1173,8 @@ class Config:
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
+    # FV cell-area loss weighting
+    fv_area_loss_weight: bool = False      # weight vol loss by 1/sqrt(cell area) for mesh-aware loss
 
 
 cfg = sp.parse(Config)
@@ -1230,6 +1232,22 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
 
+def _precompute_area_weights_single(pos_np, k=6):
+    """Compute per-node area weights for a single sample using scipy cKDTree (O(N log N))."""
+    import numpy as np
+    from scipy.spatial import cKDTree
+    n = pos_np.shape[0]
+    if n < k + 1:
+        return np.ones(n, dtype=np.float32)
+    tree = cKDTree(pos_np)
+    dists, _ = tree.query(pos_np, k=k + 1)  # [n, k+1] — includes self at dist=0
+    knn_dists = dists[:, 1:]  # [n, k] — exclude self
+    mean_dist_sq = (knn_dists ** 2).mean(axis=1)  # [n]
+    area_weight = 1.0 / np.sqrt(np.maximum(mean_dist_sq, 1e-16))
+    area_weight = area_weight / (area_weight.mean() + 1e-16)
+    return area_weight.astype(np.float32)
+
+
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=cfg.num_workers, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
 
@@ -1248,18 +1266,70 @@ if cfg.re_stratified_sampling and not cfg.debug:
           f"({_n_extreme/len(train_ds)*100:.1f}%) upweighted {cfg.re_extreme_weight}x "
           f"(log_Re thresholds: [{_re_low:.3f}, {_re_high:.3f}])")
 
+# --- Precompute FV cell-area weights and wrap dataset if enabled ---
+if cfg.fv_area_loss_weight:
+    import numpy as np
+    from multiprocessing import Pool
+    _t0 = time.time()
+    _positions_list = [train_ds[i][0][:, :2].numpy() for i in range(len(train_ds))]
+    with Pool(min(16, len(_positions_list))) as pool:
+        _aw_list = pool.map(_precompute_area_weights_single, _positions_list)
+    _fv_area_cache = {i: torch.from_numpy(aw) for i, aw in enumerate(_aw_list)}
+    _t1 = time.time()
+    _all_aw = torch.cat(list(_fv_area_cache.values()))
+    print(f"[FV area weights] Precomputed {len(_fv_area_cache)} samples in {_t1-_t0:.1f}s — "
+          f"min={_all_aw.min():.4f} max={_all_aw.max():.4f} mean={_all_aw.mean():.4f} std={_all_aw.std():.4f}")
+
+    class _FVAreaDataset:
+        """Wraps base dataset to include precomputed area weights as 4th element."""
+        def __init__(self, base_ds, aw_dict):
+            self.base = base_ds
+            self.aw = aw_dict
+        def __len__(self):
+            return len(self.base)
+        def __getitem__(self, idx):
+            x, y, surf = self.base[idx]
+            return x, y, surf, self.aw.get(idx, torch.ones(x.shape[0]))
+
+    def _pad_collate_fv(batch):
+        """pad_collate variant that also pads area weights."""
+        xs, ys, surfs, aws = zip(*batch)
+        max_n = max(x.shape[0] for x in xs)
+        B = len(xs)
+        x_pad = torch.zeros(B, max_n, xs[0].shape[1])
+        y_pad = torch.zeros(B, max_n, ys[0].shape[1])
+        surf_pad = torch.zeros(B, max_n, dtype=torch.bool)
+        mask_pad = torch.zeros(B, max_n, dtype=torch.bool)
+        aw_pad = torch.zeros(B, max_n)
+        for i, (x, y, sf, aw) in enumerate(zip(xs, ys, surfs, aws)):
+            n = x.shape[0]
+            x_pad[i, :n] = x
+            y_pad[i, :n] = y
+            surf_pad[i, :n] = sf
+            mask_pad[i, :n] = True
+            aw_pad[i, :n] = aw
+        return x_pad, y_pad, surf_pad, mask_pad, aw_pad
+
+    _train_ds_wrapped = _FVAreaDataset(train_ds, _fv_area_cache)
+    _train_collate = _pad_collate_fv
+    _train_loader_kwargs = dict(collate_fn=_train_collate, num_workers=cfg.num_workers,
+                                pin_memory=True, persistent_workers=True, prefetch_factor=2)
+else:
+    _train_ds_wrapped = train_ds
+    _train_loader_kwargs = loader_kwargs
+
 if cfg.debug:
     # Avoid sampler/length mismatch when train_ds is truncated
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
-                              shuffle=True, **loader_kwargs)
+    train_loader = DataLoader(_train_ds_wrapped, batch_size=cfg.batch_size,
+                              shuffle=True, **_train_loader_kwargs)
 else:
     sampler = WeightedRandomSampler(
         weights=sample_weights,
         num_samples=len(train_ds),
         replacement=True,
     )
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
-                              sampler=sampler, **loader_kwargs)
+    train_loader = DataLoader(_train_ds_wrapped, batch_size=cfg.batch_size,
+                              sampler=sampler, **_train_loader_kwargs)
 
 val_loaders = {
     name: DataLoader(subset, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
@@ -1644,6 +1714,14 @@ if cfg.re_stratified_sampling and '_train_log_re' in dir():
                "re_stratification/re_low_thresh": _re_low,
                "re_stratification/re_high_thresh": _re_high})
 
+if cfg.fv_area_loss_weight and '_all_aw' in dir():
+    wandb.log({"fv_area/precompute_time_s": _t1 - _t0,
+               "fv_area/weight_min": _all_aw.min().item(),
+               "fv_area/weight_max": _all_aw.max().item(),
+               "fv_area/weight_mean": _all_aw.mean().item(),
+               "fv_area/weight_std": _all_aw.std().item(),
+               "fv_area/weight_histogram": wandb.Histogram(_all_aw.numpy())})
+
 model_dir = Path(f"models/model-{run.id}")
 model_dir.mkdir(parents=True)
 model_path = model_dir / "checkpoint.pt"
@@ -1687,7 +1765,17 @@ for epoch in range(MAX_EPOCHS):
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     if cfg.grad_accum_steps > 1:
         optimizer.zero_grad()
-    for batch_idx, (x, y, is_surface, mask) in enumerate(pbar):
+    for batch_idx, batch_data in enumerate(pbar):
+        if cfg.fv_area_loss_weight:
+            x, y, is_surface, mask, _area_weights = batch_data
+            _area_weights = _area_weights.to(device, non_blocking=True)
+            if epoch == 0 and batch_idx == 0:
+                _aw_valid = _area_weights[mask]
+                print(f"[FV area weights batch] min={_aw_valid.min():.4f} max={_aw_valid.max():.4f} "
+                      f"mean={_aw_valid.mean():.4f} std={_aw_valid.std():.4f}")
+        else:
+            x, y, is_surface, mask = batch_data
+            _area_weights = None
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -2012,19 +2100,23 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_mask_train = vol_mask
 
+        # Combine node weights: start with vol_mask, optionally add boundary_aware and FV area weighting
         if cfg.boundary_aware:
             vol_dist = dist_feat[:, :, 0]  # [B, N], log1p-scaled dist-to-surface
             valid_dists = vol_dist.masked_select(vol_mask_train)
             if valid_dists.numel() > 10:
                 threshold = valid_dists.quantile(0.1)
                 near_wall = vol_mask_train & (vol_dist < threshold)
-                node_weight = (1.0 + near_wall.float()).unsqueeze(-1)  # 2x near-wall, 1x else
-                vol_loss = (abs_err * node_weight * vol_mask_train.float().unsqueeze(-1)).sum() / \
-                           (node_weight.squeeze(-1) * vol_mask_train.float()).sum().clamp(min=1)
+                node_weight = (1.0 + near_wall.float())  # 2x near-wall, 1x else [B, N]
             else:
-                vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+                node_weight = vol_mask_train.float()
         else:
-            vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+            node_weight = vol_mask_train.float()
+        # Apply FV cell-area weighting (multiply with existing node weights)
+        if _area_weights is not None:
+            node_weight = node_weight * _area_weights  # [B, N]
+        vol_loss = (abs_err * (node_weight * vol_mask_train.float()).unsqueeze(-1)).sum() / \
+                   (node_weight * vol_mask_train.float()).sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
         surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
@@ -2156,8 +2248,10 @@ for epoch in range(MAX_EPOCHS):
             n_b = is_ood_pcgrad.float().sum().clamp(min=1)
             vol_mask_a = vol_mask_train & is_indist_pcgrad.unsqueeze(1)
             vol_mask_b = vol_mask_train & is_ood_pcgrad.unsqueeze(1)
-            vol_loss_a = (abs_err * vol_mask_a.unsqueeze(-1)).sum() / vol_mask_a.sum().clamp(min=1)
-            vol_loss_b = (abs_err * vol_mask_b.unsqueeze(-1)).sum() / vol_mask_b.sum().clamp(min=1)
+            _w_a = vol_mask_a.float() * (_area_weights if _area_weights is not None else 1.0)
+            _w_b = vol_mask_b.float() * (_area_weights if _area_weights is not None else 1.0)
+            vol_loss_a = (abs_err * _w_a.unsqueeze(-1)).sum() / _w_a.sum().clamp(min=1)
+            vol_loss_b = (abs_err * _w_b.unsqueeze(-1)).sum() / _w_b.sum().clamp(min=1)
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
@@ -2204,7 +2298,8 @@ for epoch in range(MAX_EPOCHS):
             def _grp_loss(mask_1d):
                 n = mask_1d.float().sum().clamp(min=1)
                 vol_mask_g = vol_mask_train & mask_1d.unsqueeze(1)
-                vol_loss_g = (abs_err * vol_mask_g.unsqueeze(-1)).sum() / vol_mask_g.sum().clamp(min=1)
+                _w_g = vol_mask_g.float() * (_area_weights if _area_weights is not None else 1.0)
+                vol_loss_g = (abs_err * _w_g.unsqueeze(-1)).sum() / _w_g.sum().clamp(min=1)
                 surf_loss_g = (surf_per_sample * mask_1d.float() * tandem_boost).sum() / n
                 coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
                 return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
@@ -2283,7 +2378,8 @@ for epoch in range(MAX_EPOCHS):
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
             abs_err2 = (pred2 - y_norm).abs()
-            vol_loss2 = (abs_err2 * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+            _w_sam = vol_mask_train.float() * (_area_weights if _area_weights is not None else 1.0)
+            vol_loss2 = (abs_err2 * _w_sam.unsqueeze(-1)).sum() / _w_sam.sum().clamp(min=1)
             surf_ps2 = (abs_err2[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
             surf_loss2 = (surf_ps2 * tandem_boost).mean()
             re_loss2 = F.mse_loss(re_pred2, log_re_target)
