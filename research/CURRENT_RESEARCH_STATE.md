@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-08 20:45 UTC
+- **Date:** 2026-04-08 21:00 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training & Architecture Improvements
 
@@ -34,7 +34,7 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| thorfinn | #2280 | **Snapshot Ensemble — cyclic cosine LR with prediction averaging** | WIP |
+| thorfinn | #2288 | **Chord Fraction Feature — per-node chord-wise position [0,1]** | WIP (NEW) |
 | fern | #2284 | **Heteroscedastic Loss — learned per-node uncertainty weighting** | WIP |
 | askeladd | #2282 | **Point Cloud MixUp — linear interpolation data augmentation** | WIP |
 | frieren | #2283 | **Wider SRF Head — surface_refine_hidden 192→384** | WIP |
@@ -47,7 +47,11 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 
 None.
 
-## Latest Reviews (2026-04-08 20:45)
+## Latest Reviews (2026-04-08 21:00)
+
+### PR #2280 (thorfinn, Snapshot Ensemble) — CLOSED ❌
+- All metrics massively regressed: p_in +15.6%, p_oodc +28.9%, p_tan +7.8%, p_re +25.7%.
+- Root cause: EMA on single continuous cosine outperforms cyclic snapshot ensemble. 50-epoch cycles too short. Lion + warm restarts caused instability.
 
 ### PR #2281 (edward, Multi-Head SRF Ensemble) — CLOSED ❌
 - All metrics regressed or flat: p_in +2.2%, p_tan +2.2%, p_oodc +0.5%, p_re -0.2% (noise).
@@ -103,7 +107,7 @@ Acknowledged and pivoting. Round 27 will include bold architectural additions (G
 
 | Student | PR | Direction | Target |
 |---------|-----|-----------|--------|
-| thorfinn | #2280 | **Snapshot Ensemble** — cyclic cosine LR, 3-checkpoint prediction averaging | p_oodc, p_re |
+| thorfinn | #2288 | **Chord Fraction Feature** — per-node chord-wise position [0,1] for SRF | p_in, p_tan |
 | fern | #2284 | **Heteroscedastic Loss** — learned per-node variance for pressure loss | p_in, p_tan |
 | askeladd | #2282 | **Point Cloud MixUp** — linear interpolation data augmentation | p_oodc, p_re |
 | frieren | #2283 | **Wider SRF Head** — surface_refine_hidden 192→384, capacity increase | p_in, p_tan |
@@ -171,6 +175,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 - **NeuralFoil synthetic data flooding**: Geometric inconsistency (template mesh positions ≠ NACA encoding) corrupts geometry-pressure learning. Panel-method Cp errors near stagnation. 30% synthetic dilutes real data (+3.7-24.9%)
 - **Multi-head SRF ensemble**: Head-level diversity insufficient — backbone diversity is the real ensemble mechanism. 3 heads converge to similar solutions from shared features (+0.5-2.2%)
 - **Geometry consistency self-distillation**: Mean Teacher on jittered mesh. Consistency loss only active for ~7 epochs (EMA timing). Existing augmentation already provides larger perturbations (+0.1-3.8%)
+- **Snapshot ensemble (cyclic cosine)**: EMA on single continuous cosine outperforms cyclic snapshots. 50-epoch cycles too short, Lion+warm restarts cause instability (+7.8-28.9%)
 
 ## Potential Next Research Directions (Round 28+)
 
@@ -209,7 +214,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 |----------|------|--------|---------|
 | 1 | `vel-angle-mag-feature` | p_tan, p_in | **ASSIGNED to edward (#2286)** |
 | 2 | `effective-aoa-aft-feature` | p_tan, p_re | **ASSIGNED to tanjiro (#2287)** |
-| 3 | `chord-fraction-feature` | p_in, p_tan | Chord-wise position ∈[0,1] for each node. Gives SRF explicit "where on chord" signal. No ordering needed (unlike arc-length PE). |
+| 3 | `chord-fraction-feature` | p_in, p_tan | **ASSIGNED to thorfinn (#2288)** |
 | 4 | `cp-target-normalization` | p_re, p_oodc | Predict Cp instead of raw p. Re-invariant target normalization. Directly targets p_re regression. |
 | 5 | `re-stratified-sampling` | p_re, p_oodc | 2× weight for extreme-Re samples via static WeightedRandomSampler. |
 | 6 | `stagnation-pressure-feature` | p_in, p_re | q_inf = 0.5*Umag² as input channel. Bernoulli baseline as feature (not loss constraint). |

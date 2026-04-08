@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 21:00 — PR #2280: Snapshot Ensemble — thorfinn — **CLOSED** ❌
+
+- Branch: `thorfinn/snapshot-ensemble`
+- Hypothesis: Cyclic cosine LR (3 cycles × 50 epochs), save checkpoints at cycle troughs, average predictions from 2-3 snapshots at inference. Free ensemble at single-model training cost.
+
+| Metric | Baseline (#2251) | 2-snap ensemble avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 13.75 | +15.6% ❌ |
+| p_oodc | 7.561  | 9.75  | +28.9% ❌ |
+| p_tan  | 28.118 | 30.30 | +7.8% ❌ |
+| p_re   | 6.364  | 8.00  | +25.7% ❌ |
+
+- W&B: qn86sjuj (s42), 4j90tr3a (s73). Epochs: 135. Only 2 of 3 snapshots reached (timeout).
+- **Analysis:** EMA on continuous cosine dramatically outperforms cyclic snapshots. The baseline's EMA (decay=0.999) effectively averages the last ~30 epochs of monotonic descent — superior variance reduction without fragmenting the training trajectory. Each 50-epoch cycle is too short for convergence. Lion + warm restarts caused instability (training spike at epoch 65-66). The 2-snapshot ensemble did improve over individual snapshots, confirming averaging works, but individual snapshot quality was too far below baseline.
+- **Conclusion:** CLOSED. Snapshot ensemble added to DO NOT REVISIT. EMA on single trajectory > cyclic snapshot ensemble. The 16-seed multi-init ensemble remains the only viable ensemble approach.
+
+---
+
 ### 2026-04-08 20:45 — PR #2281: Multi-Head SRF Ensemble — edward — **CLOSED** ❌
 
 - Branch: `edward/multi-head-srf`
