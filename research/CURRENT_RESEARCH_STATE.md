@@ -35,7 +35,7 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | thorfinn | #2288 | **Chord Fraction Feature — per-node chord-wise position [0,1]** | WIP (NEW) |
-| fern | #2284 | **Heteroscedastic Loss — learned per-node uncertainty weighting** | WIP |
+| fern | #2294 | **Tandem Config Proximity Feature — OOD distance signal for calibration** | WIP (NEW) |
 | askeladd | #2292 | **Flow-Direction Normalization — rotate coords by -AoA to streamwise frame** | WIP (NEW) |
 | frieren | #2291 | **Stagnation Pressure Feature — q_inf = 0.5*Umag² as input channel** | WIP (NEW) |
 | tanjiro | #2287 | **Effective AoA Aft Feature — thin-airfoil downwash correction (k sweep)** | WIP (NEW) |
@@ -119,7 +119,7 @@ Acknowledged and pivoting. Round 27 will include bold architectural additions (G
 | Student | PR | Direction | Target |
 |---------|-----|-----------|--------|
 | thorfinn | #2288 | **Chord Fraction Feature** — per-node chord-wise position [0,1] for SRF | p_in, p_tan |
-| fern | #2284 | **Heteroscedastic Loss** — learned per-node variance for pressure loss | p_in, p_tan |
+| fern | #2294 | **Tandem Config Proximity** — KD-tree OOD proximity feature | p_tan |
 | askeladd | #2292 | **Flow-Direction Normalization** — rotate (x,y) by -AoA to streamwise frame | p_oodc, p_re |
 | frieren | #2291 | **Stagnation Pressure Feature** — q_inf = 0.5*Umag² as input channel | p_in, p_re |
 | tanjiro | #2287 | **Effective AoA Aft Feature** — thin-airfoil downwash correction, k sweep | p_tan, p_re |
@@ -191,6 +191,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 - **Wider SRF head (192→384)**: SRF capacity is NOT the bottleneck — backbone representations limit what SRF can extract. 3.3× more params, no consistent improvement (+0.4-1.7%)
 - **Point cloud MixUp**: Fundamentally unsuited to physics-constrained regression — creates phantom geometries violating Navier-Stokes. Existing augmentation already handles diversity (+6.7-37.5%)
 - **Deeper backbone (4 layers)**: Training budget mismatch — 32% slower per epoch, only 121 vs 149 epochs. 3-layer is well-calibrated to 180-min budget (+4.7-29.1%)
+- **Heteroscedastic loss (Gaussian NLL)**: MSE/MAE mismatch — switches loss from well-tuned MAE to MSE. Learned log-variance suppresses gradients. Interacts poorly with hard-node mining (+41.7-76.9%)
 
 ## Potential Next Research Directions (Round 28+)
 
@@ -236,6 +237,6 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 | 7 | `lowrank-pressure-loss` | p_tan, p_in | **ASSIGNED to alphonse (#2293)** |
 | 8 | `flowdir-anisotropic-norm` | p_oodc, p_re | **ASSIGNED to askeladd (#2292)** |
 | 9 | `logre-pressure-scaling` | p_re | Normalize pressure residuals by log(Re). Milder than Cp normalization. |
-| 10 | `tandem-topo-feature` | p_tan | KD-tree OOD proximity feature — distance to nearest training configs in (gap, stagger, AoA, NACA) space. |
+| 10 | `tandem-topo-feature` | p_tan | **ASSIGNED to fern (#2294)** |
 
 Full details: `/research/RESEARCH_IDEAS_2026-04-08_ROUND29.md`

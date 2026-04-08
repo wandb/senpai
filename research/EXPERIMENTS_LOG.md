@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 00:30 — PR #2284: Heteroscedastic Loss — fern — **CLOSED** ❌
+
+- Branch: `fern/heteroscedastic-loss`
+- Hypothesis: Learned per-node log-variance via VarianceHead (~12.6K params). Gaussian NLL replaces MAE for surface pressure: loss = 0.5*(exp(-log_var)*sq_err + log_var). Zero-init for identity start.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 17.192 | +44.6% ❌ |
+| p_oodc | 7.561  | 13.377 | +76.9% ❌ |
+| p_tan  | 28.118 | 39.835 | +41.7% ❌ |
+| p_re   | 6.364  | 9.460  | +48.7% ❌ |
+
+- W&B: w86d32q6 (s42), 3w3rbjlu (s73). Epochs: 147. VRAM: ~46GB.
+- **Analysis:** Gaussian NLL is MSE-based, switching loss landscape from well-tuned MAE. Learned log-variance went very negative (~-2.9) — model became overconfident everywhere, REDUCING gradient signal for pressure. Interaction with hard-node mining compounds the problem. S73 especially unstable.
+- **Conclusion:** CLOSED. Heteroscedastic loss (Gaussian NLL) added to DO NOT REVISIT. Any learned-variance approach risks gradient suppression on top of existing hard-node mining + PCGrad.
+
+---
+
 ### 2026-04-08 23:30 — PR #2285: Deeper Backbone (4 Transolver Blocks) — alphonse — **CLOSED** ❌
 
 - Branch: `alphonse/deeper-backbone`
