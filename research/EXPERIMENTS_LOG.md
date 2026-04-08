@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 21:40 — PR #2297: FV Cell-Area Loss Weighting — nezuko — **CLOSED** ❌
+
+- Branch: `nezuko/fv-cell-area-loss-weight`
+- Hypothesis: Weight volume loss by 1/sqrt(cell_area) to emphasize boundary-layer nodes. FV theory (ICML 2024).
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.742 | 11.85 | +0.9% ❌ |
+| p_oodc | 7.643  | 7.90  | +3.3% ❌ |
+| p_tan  | 27.874 | 28.75 | +3.0% ❌ |
+| p_re   | 6.419  | 6.55  | +2.3% ❌ |
+
+- W&B: e12wkmrf (s42), 9a9vbbkz (s73). Area weight stats: min=0.0003, max=10.88, std=1.83.
+- **Analysis:** Transolver's physics attention + Fourier PE already adapts to mesh non-uniformity. Extreme weight variance (36000× ratio) reduces effective batch size. Volume loss already well-regularized by PCGrad + SRF + boundary-aware paths.
+- **Conclusion:** CLOSED. FV area loss weighting redundant with existing mesh-adaptive mechanisms. Added to DO NOT REVISIT.
+
+---
+
 ### 2026-04-08 21:15 — PR #2292: Flow-Direction Normalization — askeladd — **CLOSED** ❌
 
 - Branch: `askeladd/flowdir-anisotropic-norm`

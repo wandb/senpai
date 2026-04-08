@@ -34,7 +34,7 @@ Single-model beats ensemble on p_in (11.74 vs 12.1) and p_tan (27.90 vs 29.1). E
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| nezuko | #2297 | **FV Cell-Area Loss Weighting — 1/sqrt(cell_area) weight on vol loss** | WIP (BOLD) |
+| nezuko | #2305 | **DID Streamwise Feature — per-node position along flow direction (FVF)** | WIP (NEW, PHYSICS) |
 | thorfinn | #2298 | **GMSE Gradient-Weighted Pressure Loss — weight by local ∇p magnitude** | WIP (BOLD) |
 | alphonse | #2299 | **Potential Flow Residual Loss — Bernoulli-consistency auxiliary signal** | WIP (NEW, BOLD, PARADIGM) |
 | fern | #2302 | **Circulation Lift Feature — Kutta-Joukowski Γ as global input signal** | WIP (NEW, PHYSICS) |
