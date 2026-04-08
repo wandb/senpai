@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 16:00 — PR #2272: TTA AoA Ensemble — thorfinn — **CLOSED** ❌
+
+- Branch: `thorfinn/tta-aoa-ensemble`
+- Hypothesis: Test-time augmentation via K=5 AoA rotations (±1°, ±2°, 0°) with Gaussian-weighted averaging and velocity back-rotation. Inference-only — zero training risk. Targets p_oodc/p_re by reducing prediction variance on OOD samples.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 17.709 | +48.9% ❌ |
+| p_oodc | 7.561  | 10.800 | +42.8% ❌ |
+| p_tan  | 28.118 | 31.550 | +12.2% ❌ |
+| p_re   | 6.364  | 8.250  | +29.6% ❌ |
+
+- W&B: u88mll5s (s42), utqr7hjn (s73). Epochs: 96-101 (slower due to 5x forward passes, +38% epoch time).
+- **Analysis:** Coordinate rotation ≠ physical AoA change. AoA changes alter the entire flow field (boundary layers, separation, pressure) — simple (x,y) rotation doesn't replicate this. Since AoA is encoded in DSDF features, rotation creates geometry-physics inconsistency. Averaging 5 inconsistent predictions degrades all metrics. Training augmentation (aoa_perturb) already provides rotation robustness. Also triggered verification NaN bug (TTA wrapper incompatible with denorm verification code path).
+- **Conclusion:** CLOSED. TTA coordinate rotation added to DO NOT REVISIT — only valid when transformation matches physical symmetry, which it doesn't for CFD AoA.
+
+---
+
 ### 2026-04-08 15:30 — PR #2271: Flow Matching Surface Head — nezuko — **CLOSED** ❌
 
 - Branch: `nezuko/flow-matching-surface-head`

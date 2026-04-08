@@ -34,7 +34,7 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| thorfinn | #2272 | **BOLD: TTA AoA Ensemble — inference-time rotation augmentation** | WIP |
+| thorfinn | #2280 | **Snapshot Ensemble — cyclic cosine LR with prediction averaging** | WIP (NEW) |
 | fern | #2278 | **Surface Arc-Length PE — per-foil chord-wise positional encoding** | WIP (NEW) |
 | askeladd | #2276 | **BOLD: MAE Surface Pretrain — masked autoencoder initialization for backbone** | WIP (NEW) |
 | frieren | #2277 | **Tandem Difficulty Curriculum — progressive exposure by gap/stagger magnitude** | WIP (NEW) |
@@ -91,7 +91,7 @@ Acknowledged and pivoting. Round 27 will include bold architectural additions (G
 
 | Student | PR | Direction | Target |
 |---------|-----|-----------|--------|
-| thorfinn | #2272 | **BOLD: TTA AoA Ensemble** — inference-time K=5 rotation averaging | p_oodc, p_re |
+| thorfinn | #2280 | **Snapshot Ensemble** — cyclic cosine LR, 3-checkpoint prediction averaging | p_oodc, p_re |
 | fern | #2278 | **Surface Arc-Length PE** — per-foil chord-wise sin/cos positional encoding | p_tan, p_in |
 | askeladd | #2276 | **BOLD: MAE Surface Pretrain** — masked autoencoder backbone initialization | p_oodc, p_tan |
 | frieren | #2277 | **Tandem Difficulty Curriculum** — progressive exposure by gap/stagger magnitude | p_tan |
@@ -149,6 +149,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 - **GNN boundary layer**: Local GNN message-passing disrupts backbone-to-SRF feature distribution; redundant with existing SRF heads (+20-24% regression)
 - **SE(2) canonicalization**: Stats mismatch (global frame stats on canonicalized coords) + DSDF gradient inconsistency; TE coordinate frame + AoA augmentation already provide equivalent invariance
 - **Flow matching / generative surface head**: CFD pressure is near-deterministic given inputs — generative modeling adds noise to a delta function. 50/50 SRF blend corrupts precise regression predictions (+14-32%)
+- **TTA AoA rotation ensemble**: Coordinate rotation ≠ physical AoA change — creates geometry-physics inconsistency with DSDF features. Training augmentation already handles rotation robustness (+12-49%)
 - **Sample-level reweighting**: Focal loss, OHNM — over-correction on top of PCGrad
 - **Optimizer variants**: SAM, Lookahead, SWA, SOAP, Muon — all worse than Lion+EMA+cosine
 
@@ -162,7 +163,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 | `fno-inter-foil-coupling` | p_tan | **ASSIGNED to edward (#2274)** |
 | `geometry-consistency-distill` | p_oodc | **ASSIGNED to tanjiro (#2273)** |
 | `se2-canonicalize` | p_oodc, p_re | **CLOSED** ❌ — stats mismatch + DSDF inconsistency, +6.6-14.3% |
-| `tta-aoa-ensemble` | p_oodc, p_re | **ASSIGNED to thorfinn (#2272)** |
+| `tta-aoa-ensemble` | p_oodc, p_re | **CLOSED** ❌ — coord rotation ≠ AoA change, +12-49% regression |
 | `neuralfoil-synthetic-flood` | p_in, p_oodc, p_re | **ASSIGNED to alphonse (#2275)** |
 | `mae-surface-pretrain` | p_oodc, p_tan | **ASSIGNED to askeladd (#2276)** |
 
