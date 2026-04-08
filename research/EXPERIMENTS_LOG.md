@@ -2,6 +2,42 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 17:40 — PR #2290: Re-Stratified Sampling — nezuko — **MERGED** ✅
+
+- Branch: `nezuko/re-stratified-sampling`
+- Hypothesis: 2× weight for top/bottom 20th percentile of log-Re training samples via WeightedRandomSampler (40.1% upweighted). Multiplied with existing domain-balanced sampler weights. Targets OOD-Re generalization by increasing gradient signal from extreme-Re boundary samples.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 11.74 | **-1.3% ✅** |
+| p_oodc | 7.561  | 7.65  | +1.2% ❌ |
+| p_tan  | 28.118 | 27.90 | **-0.8% ✅** |
+| p_re   | 6.364  | 6.40  | +0.6% ❌ |
+
+- W&B: k5qwvce4 (s42, p_in=11.60, p_tan=27.7, p_re=6.3), 7oa5xfhi (s73, p_in=11.88, p_tan=28.1, p_re=6.5). Group: re-stratified-sampling. Epochs: 147 each. VRAM: ~46GB.
+- **Analysis:** Mixed result — p_in and p_tan improved (targeting surface MAE directly), p_oodc and p_re regressed slightly. Net aggregate surface pressure sum: 53.69 vs 53.93 baseline (-0.24 pts, -0.45%). Re-stratification helps in-distribution and tandem metrics but doesn't solve the OOD-Re generalization problem as expected. The p_re gap likely requires architectural changes not just sampling. log-Re thresholds: [14.097, 15.235].
+- **Conclusion:** MERGED as winner (net positive). New baseline: p_in=11.74, p_tan=27.90. Note p_oodc=7.65 and p_re=6.40 are minor regressions from prior baseline — future experiments should target recovery of these.
+
+---
+
+### 2026-04-08 17:30 — PR #2288: Chord Fraction Feature — thorfinn — **CLOSED** ❌
+
+- Branch: `thorfinn/chord-fraction-feature`
+- Hypothesis: Per-node chord-fraction ∈ [0,1] (0=LE, 1=TE) as explicit 1D coordinate for SRF head. Computed as dot product of (node - LE) onto chord unit vector, normalized by chord length.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 12.447 | +4.7% ❌ |
+| p_oodc | 7.561  | 7.901  | +4.5% ❌ |
+| p_tan  | 28.118 | 28.553 | +1.5% ❌ |
+| p_re   | 6.364  | 6.757  | +6.2% ❌ |
+
+- W&B: w1k5t4nz (s42), u2f68seg (s73). Epochs: 145-146. VRAM: ~46-47GB.
+- **Analysis:** Clear dead end — all 4 metrics worse. Chord fraction is redundant: the model already has DSDF features + TE coordinate frame channels (dx/dy to TE) from which it can infer chord-wise position. The extra channel may create confusion or noise. Matches the pattern from Surface Arc-Length PE (#2278, closed): explicit chord-position encodings are not useful when TE-relative features are already present.
+- **Conclusion:** CLOSED. Chord-position features (in any form) added to DO NOT REVISIT list.
+
+---
+
 ### 2026-04-09 01:30 — PR #2286: Velocity Angle Feature — edward — **CLOSED** ❌
 
 - Branch: `edward/vel-angle-mag-feature`

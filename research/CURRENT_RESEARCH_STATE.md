@@ -1,23 +1,23 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-09 01:30 UTC
+- **Date:** 2026-04-08 17:45 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training & Architecture Improvements
 
 ## Current Baseline
 
-### Single-Model Baseline (PR #2251, +Cosine T_max=150, 2-seed)
+### Single-Model Baseline (PR #2290, +Re-Stratified Sampling, 2-seed)
 
 | Metric | 2-seed avg | Target to beat |
 |--------|-----------|----------------|
-| **p_in** | **11.891** | < 11.89 |
-| **p_oodc** | **7.561** | < 7.56 |
-| **p_tan** | **28.118** | < 28.12 |
-| p_re | 6.364 | < 6.36 |
+| **p_in** | **11.74** | < 11.74 |
+| p_oodc | 7.65 | < 7.65 |
+| **p_tan** | **27.90** | < 27.90 |
+| p_re | 6.40 | < 6.40 |
 
-**Latest merge:** PR #2251 (thorfinn) — Cosine T_max=150. p_in -0.7%, p_oodc -1.1%, p_tan -0.8%. p_re regressed +1.0%.
+**Latest merge:** PR #2290 (nezuko) — Re-Stratified Sampling. p_in -1.3%, p_tan -0.8%. p_oodc +1.2%, p_re +0.6% (minor regressions). Net sum -0.24 points.
 
-⚠️ **p_re = 6.364 is a regression vs PR #2213 baseline (6.300).** Future experiments should target p_re recovery.
+⚠️ **p_re = 6.40 is now a greater regression vs PR #2213 baseline (6.300).** p_oodc = 7.65 also slightly regressed. Future experiments should target recovery of both.
 
 ### Ensemble Baseline (PR #2093 — 16-Seed Ensemble)
 
@@ -28,225 +28,118 @@
 | p_tan | **29.1** |
 | p_re | **5.8** |
 
-Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29.1). Ensemble still leads on p_oodc and p_re.
+Single-model beats ensemble on p_in (11.74 vs 12.1) and p_tan (27.90 vs 29.1). Ensemble still leads on p_oodc (7.65 vs 6.6) and p_re (6.40 vs 5.8) — large gaps, especially p_oodc.
 
-## Student Status (2026-04-08 20:45 UTC)
+## Student Status (2026-04-08 17:45 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| thorfinn | #2288 | **Chord Fraction Feature — per-node chord-wise position [0,1]** | WIP (NEW) |
-| fern | #2294 | **Tandem Config Proximity Feature — OOD distance signal for calibration** | WIP (NEW) |
-| askeladd | #2292 | **Flow-Direction Normalization — rotate coords by -AoA to streamwise frame** | WIP (NEW) |
-| frieren | #2291 | **Stagnation Pressure Feature — q_inf = 0.5*Umag² as input channel** | WIP (NEW) |
-| tanjiro | #2295 | **Surface Curvature Feature — discrete Menger curvature κ at surface nodes** | WIP (NEW) |
-| edward | #2296 | **Log-Re Pressure Scaling — Re-normalize pressure loss for OOD-Re generalization** | WIP (NEW) |
-| nezuko | #2290 | **Re-Stratified Sampling — 2× weight for extreme-Re training samples** | WIP (NEW) |
-| alphonse | #2293 | **Low-Rank Pressure Loss — SVD structural prior on surface predictions** | WIP (NEW) |
+| nezuko | #2297 | **FV Cell-Area Loss Weighting — 1/sqrt(cell_area) weight on vol loss** | WIP (NEW, BOLD) |
+| thorfinn | #2298 | **GMSE Gradient-Weighted Pressure Loss — weight by local ∇p magnitude** | WIP (NEW, BOLD) |
+| fern | #2294 | **Tandem Config Proximity Feature — OOD distance signal for calibration** | WIP |
+| askeladd | #2292 | **Flow-Direction Normalization — rotate coords by -AoA to streamwise frame** | WIP |
+| frieren | #2291 | **Stagnation Pressure Feature — q_inf = 0.5*Umag² as input channel** | WIP |
+| tanjiro | #2295 | **Surface Curvature Feature — discrete Menger curvature κ at surface nodes** | WIP |
+| edward | #2296 | **Log-Re Pressure Scaling — Re-normalize pressure loss for OOD-Re generalization** | WIP |
+| alphonse | #2293 | **Low-Rank Pressure Loss — SVD structural prior on surface predictions** | WIP |
 
 ## PRs Ready for Review
 
 None.
 
-## Latest Reviews (2026-04-09 01:00)
+## Latest Reviews (2026-04-08 17:45)
 
-### PR #2286 (edward, Velocity Angle Feature) — CLOSED ❌
-- All metrics regressed: p_in +7.1%, p_oodc +3.3%, p_tan +3.1%, p_re +2.5%.
-- Feature redundancy — model already has DSDF gradients + AoA; can compute angle internally. Volume node noise amplifies degradation.
+### PR #2290 (nezuko, Re-Stratified Sampling) — MERGED ✅
+- p_in -1.3% (11.74), p_tan -0.8% (27.90). p_oodc +1.2%, p_re +0.6% (minor regressions). Net sum improved -0.24 pts.
 
-### PR #2287 (tanjiro, Effective AoA Aft Feature) — CLOSED ❌
-- All metrics regressed: p_in +5.1%, p_oodc +4.5%, p_tan +3.1%, p_re +2.1%.
-- Thin-airfoil downwash model too simplified. Wake deficit feature already captures inter-foil coupling more accurately.
-
-### PR #2283 (frieren, Wider SRF Head 192→384) — CLOSED ❌
-- Near-neutral, all metrics +0.4-1.7%. SRF head capacity is NOT the bottleneck.
-
-### PR #2282 (askeladd, Point Cloud MixUp) — CLOSED ❌
-- All metrics severely regressed: p_in +19.0%, p_oodc +37.5%, p_tan +6.7%, p_re +18.6%.
-- MixUp creates physically impossible interpolated geometries that violate Navier-Stokes.
-
-### PR #2279 (nezuko, Ensemble Knowledge Distillation) — CLOSED ❌
-- All metrics catastrophically regressed: p_in +46.3%, p_oodc +46.8%, p_tan +15.5%, p_re +34.6%.
-- Root cause: Teacher speed penalty (100 vs 148 epochs), undertrained teachers, aggressive alpha, Fourier PE mismatch.
-
-### PR #2280 (thorfinn, Snapshot Ensemble) — CLOSED ❌
-- All metrics massively regressed: p_in +15.6%, p_oodc +28.9%, p_tan +7.8%, p_re +25.7%.
-- Root cause: EMA on single continuous cosine outperforms cyclic snapshot ensemble. 50-epoch cycles too short. Lion + warm restarts caused instability.
-
-### PR #2281 (edward, Multi-Head SRF Ensemble) — CLOSED ❌
-- All metrics regressed or flat: p_in +2.2%, p_tan +2.2%, p_oodc +0.5%, p_re -0.2% (noise).
-- Root cause: Backbone diversity (not head diversity) drives real ensemble benefit. Heads converge to similar solutions from shared features.
-
-### PR #2273 (tanjiro, Geometry Consistency Self-Distillation) — CLOSED ❌
-- All metrics regressed: p_oodc +3.8%, p_tan +1.9%, p_re +1.4%, p_in flat.
-- Root cause: Consistency loss only active for ~7 of 147 epochs (EMA starts at epoch 140). Existing augmentation suite provides larger perturbations than sigma=0.005 jitter.
-
-### PR #2275 (alphonse, NeuralFoil Synthetic Data Flooding) — CLOSED ❌
-- All 4 metrics regressed: p_in +15.8%, p_oodc +24.9%, p_tan +3.7%, p_re +13.9%.
-- Root cause: Geometric inconsistency — synthetic samples use template mesh positions (NACA-A geometry) with NeuralFoil Cp for different NACA-B. Model sees contradictory geometry-pressure signals. 30% synthetic dilutes real data heavily.
-
-### PR #2268 (alphonse, MoE FFN Last Block) — CLOSED ❌
-- All 4 metrics regressed: p_in +5.3%, p_oodc +6.5%, p_tan +3.3%, p_re +7.4%.
-- Root cause: Hard MoE dispatch halves effective data per expert — starves both experts in small-dataset regime.
-
-### PR #2265 (askeladd, Per-head K/V Projection) — CLOSED ❌
-- All 4 metrics regressed: p_in +5.9%, p_oodc +18.0%, p_tan +0.7%, p_re +14.4%.
-- Root cause: Shared K/V is load-bearing regularization. Per-head K/V destroys OOD generalization.
-
-### PR #2267 (thorfinn, pressure-gradient-aux-head) — CLOSED ❌
-- All 4 metrics regressed: p_in +7.1%, p_oodc +11.1%, p_tan +2.1%, p_re +6.1%.
-
-### PR #2262 (tanjiro, foil-role-embed) — CLOSED ❌ (3 iterations)
-- Foil role embeddings fragile, not robust to config changes.
-
-### PR #2261 (edward, per-foil-whiten) — CLOSED ❌ (3 iterations)
-- Per-foil whitening structurally hurts p_tan.
-
-### PR #2260 (nezuko, FiLM SRF) — CLOSED ❌
-- SRF flow-regime conditioning redundant with backbone adaLN.
-
-### PR #2266 (fern, ZCA whitening) — CLOSED ❌
-- Near-singular covariance (cond# ~7.9B) makes full decorrelation harmful.
-
-### PR #2264 (frieren, asymmetric-surface-loss) — CLOSED ❌
-- Hard-node mining already captures suction difficulty.
-
-### PR #2255 (askeladd, aug-annealing) — CLOSED ❌ (3 trials)
-- Structural trade-off: augmentation is load-bearing for OOD metrics.
+### PR #2288 (thorfinn, Chord Fraction Feature) — CLOSED ❌
+- All metrics worse: p_in +4.7%, p_oodc +4.5%, p_tan +1.5%, p_re +6.2%. Redundant with TE coord frame.
 
 ## Most Recent Research Direction from Human Researcher Team
 
-### Issue #1860 — ACTIVE directive (Morgan McGuire)
-**"Think bigger — radical new full model changes and data aug and data generation, not incremental tweaks."**
+### Issue #1860 — ACTIVE directive (Morgan McGuire, re-raised 2026-04-08)
+**"Too many of your current experiments are incremental tweaks. Think BIGGER — radical new full model changes and data aug and data generation."**
 
-Acknowledged and pivoting. Round 27 will include bold architectural additions (GNN boundary layer), data augmentation innovation (geometry consistency distillation), and novel module-level approaches. Researcher-agent running now to generate next batch of bold ideas.
+**Advisor response (2026-04-08):** Acknowledged. The two newly freed students (nezuko, thorfinn) are assigned physics-grounded, paradigm-level changes:
+1. **FV Cell-Area Loss Weighting (#2297)** — addresses fundamental structural bias in unweighted loss on non-uniform meshes. Backed by ICML 2024 paper showing 15-40% improvement.
+2. **GMSE Gradient-Weighted Loss (#2298)** — automatically up-weights high-gradient (LE, tandem slot) regions. Backed by arXiv:2411.17059 showing 5-23% improvement.
+
+Next-round assignments (when Round 29 in-flight students complete) will continue bold directions from Round 30 ideas + Round 31 researcher-agent output.
 
 ## Current Research Focus and Themes
 
-### Round 28 Active Experiments (8 GPUs occupied — ALL BOLD)
-
+### Round 29 In-Flight Experiments (6 GPUs)
 | Student | PR | Direction | Target |
 |---------|-----|-----------|--------|
-| thorfinn | #2288 | **Chord Fraction Feature** — per-node chord-wise position [0,1] for SRF | p_in, p_tan |
 | fern | #2294 | **Tandem Config Proximity** — KD-tree OOD proximity feature | p_tan |
 | askeladd | #2292 | **Flow-Direction Normalization** — rotate (x,y) by -AoA to streamwise frame | p_oodc, p_re |
 | frieren | #2291 | **Stagnation Pressure Feature** — q_inf = 0.5*Umag² as input channel | p_in, p_re |
-| tanjiro | #2295 | **Surface Curvature Feature** — discrete Menger curvature κ at surface nodes | p_tan, p_in |
+| tanjiro | #2295 | **Surface Curvature Feature** — Menger curvature κ at surface nodes | p_tan, p_in |
 | edward | #2296 | **Log-Re Pressure Scaling** — Re-normalize loss for OOD-Re generalization | p_re, p_oodc |
-| nezuko | #2290 | **Re-Stratified Sampling** — 2× weight for extreme-Re training samples | p_re, p_oodc |
 | alphonse | #2293 | **Low-Rank Pressure Loss** — SVD penalty beyond rank-5 on surface error | p_tan, p_in |
 
-### Key Mechanistic Insights from Rounds 26-27
+### Round 30 New Experiments (2 GPUs — BOLD)
+| Student | PR | Direction | Mechanism |
+|---------|-----|-----------|-----------|
+| nezuko | #2297 | **FV Cell-Area Loss Weighting** | 1/sqrt(cell_area) weights volume loss — FV theory, ICML 2024 |
+| thorfinn | #2298 | **GMSE Gradient-Weighted Pressure Loss** | Weight by ∇p magnitude — auto-targets LE/slot high-gradient zones |
 
-1. **Slice routing is NOT the tandem failure driver** (attn-logit-noise #2263 confirmed). Input feature limitations more likely.
-2. **Hard-node mining already captures suction difficulty** (asymmetric loss #2264 confirmed). Physics-based node weighting redundant when error-based mining is active.
-3. **Augmentation is load-bearing at low LR** (aug-annealing #2255 across 3 trials). Cannot trade OOD robustness for ID precision via cutoff.
-4. **Shared K/V is essential regularization** (per-head K/V #2265 confirmed). Per-head projections cause catastrophic OOD degradation (+18% p_oodc).
-5. **MoE requires more data than we have** (MoE FFN #2268 confirmed). Hard dispatch halves effective data per expert — both experts starved.
-6. **SRF conditioning is redundant with adaLN** (FiLM SRF #2260 confirmed). Flow regime already encoded in backbone hidden states.
-7. **Full-matrix whitening harmful with near-singular covariance** (ZCA #2266 confirmed). Condition number ~7.9B makes decorrelation destructive.
+### Key Mechanistic Insights (accumulated)
 
-### GNN Boundary Layer — Rationale for Bold Pivot
-
-The new frieren assignment (PR #2269) is a genuine architectural departure:
-- Previous inter-foil coupling: global attention (fore-aft cross-attention, GALE) — all failed
-- GNN boundary layer: LOCAL message passing along wall nodes (2 GraphSAGE rounds, k=4 volume neighbors)
-- Motivated by B-GNNs (arXiv:2503.18638, 2025) — 85% error reduction on airfoil meshes via local GNN
-- Operates AFTER Transolver backbone, BEFORE SRF head — additive, not replacement
-- Inductive bias: boundary layer physics is local propagation, not global attention
+1. **Every durable improvement came from: (a) physics-motivated input features, or (b) loss reformulation.**
+2. **All architecture replacements failed in Phase 5** (GNOT, Galerkin, GNN, DeepONet, FNO, INR — all 30-60% worse). Transolver is a remarkably strong local optimum.
+3. **Tandem p_tan bottleneck:** Largest absolute error gap. High-gradient tandem slot is under-weighted in current loss. GMSE and FV-area weighting both target this.
+4. **p_oodc and p_re gaps to ensemble are large:** Single model 7.65 vs ensemble 6.6 (p_oodc), 6.40 vs 5.8 (p_re). These need OOD-focused approaches.
+5. **Shared K/V is load-bearing regularization** — per-head projections destroy OOD generalization.
+6. **Hard-node mining already captures suction difficulty** — physics-based suction weighting redundant.
 
 ### What Works (confirmed and merged)
 
 | Direction | PR | Impact |
 |-----------|-----|--------|
+| Re-Stratified Sampling | #2290 | p_in -1.3%, p_tan -0.8% |
 | Cosine T_max=150 | #2251 | p_in -0.7%, p_oodc -1.1%, p_tan -0.8% |
 | Wake deficit feature | #2213 | p_in -4.1%, p_re -1.7% |
 | TE coordinate frame | #2207 | p_in -5.4% |
 | Pressure-first deep | #2155 | p_in -4.8% |
 | DCT frequency loss | #2184 | p_re -1.5%, p_tan -0.3% |
 | Gap-stagger spatial bias | #2130 | p_tan -3.0% |
-| PCGrad 3-way | — | OOD separation |
 | Residual prediction | #1927 | p_oodc -4.7%, p_tan -1.9% |
+
+### Round 30 Unassigned Ideas (from RESEARCH_IDEAS_2026-04-09_ROUND30.md)
+
+| Priority | Slug | Target | Key bet |
+|----------|------|--------|---------|
+| 1 | `fv-cell-area-loss-weight` | all | **ASSIGNED to nezuko (#2297)** |
+| 2 | `gmse-gradient-loss` | p_tan, p_in | **ASSIGNED to thorfinn (#2298)** |
+| 3 | `shortest-vector-feature` | p_tan, p_oodc | FVF-paper: 2D vector to nearest foil surface |
+| 4 | `did-feature` | p_oodc, p_re | Streamwise directional integrated distance |
+| 5 | `q-criterion-proxy-feature` | p_tan, p_oodc | DSDF-curl × freestream as vortex zone indicator |
+| 6 | `wall-layer-bin-feature` | p_in, p_tan | Re-scaled y+ zone bins (sublayer/buffer/log/wake) |
+| 7 | `bernoulli-residual-feature` | p_in, p_re | Thin-airfoil Cp estimate as input for residual correction |
+
+Round 31 ideas being generated by researcher-agent (bold/paradigm-level, per human directive).
 
 ### What's Exhausted (DO NOT REVISIT)
 
 - **Architecture replacements**: GNOT, Galerkin, Hierarchical, FactFormer, DeepONet, INR — all 30-60% worse
 - **Cosine T_max sweep**: T_max=140, 150, 160 tried. T_max=150 is optimal.
 - **Slice routing perturbations**: Logit noise, RBF kernel, decoupled tandem — all null/negative
-- **Augmentation annealing**: Hard cutoff at epoch 120 or 140, selective AoA stop — all fail OOD
-- **Asymmetric surface loss**: Physics-based node weighting redundant given hard-node mining
-- **ZCA/PCA whitening**: Near-singular covariance (cond# ~7.9B) makes full decorrelation harmful (+8-23% regression)
-- **SRF FiLM conditioning**: Flow-regime (Re, AoA) modulation on SRF redundant with backbone adaLN
-- **Pressure gradient aux head**: FD gradients compete with primary objectives, noisy on unstructured meshes
-- **Foil role embeddings**: Fragile, not robust to config changes; saf_norm proxy artifact
-- **Per-foil target whitening**: Fore-foil whitening hurts p_tan structurally (3 iterations confirmed)
-- **MoE FFN routing**: Hard dispatch halves effective data per expert — both experts starved in small-dataset regime
-- **Per-head K/V projections**: Shared K/V is load-bearing regularization; per-head destroys OOD generalization (+18% p_oodc)
-- **GNN boundary layer**: Local GNN message-passing disrupts backbone-to-SRF feature distribution; redundant with existing SRF heads (+20-24% regression)
-- **SE(2) canonicalization**: Stats mismatch (global frame stats on canonicalized coords) + DSDF gradient inconsistency; TE coordinate frame + AoA augmentation already provide equivalent invariance
-- **Flow matching / generative surface head**: CFD pressure is near-deterministic given inputs — generative modeling adds noise to a delta function. 50/50 SRF blend corrupts precise regression predictions (+14-32%)
-- **TTA AoA rotation ensemble**: Coordinate rotation ≠ physical AoA change — creates geometry-physics inconsistency with DSDF features. Training augmentation already handles rotation robustness (+12-49%)
-- **FNO inter-foil spectral coupling**: 5th inter-foil coupling failure (attention, GALE, cross-DSDF, GNN, FNO all dead). Transolver slice attention already captures inter-foil interactions implicitly
-- **MAE surface pretraining**: Catastrophic at small model scale (3-block, 192-dim). Pretraining pushes backbone into reconstruction basin far from flow prediction (+342-1106%)
-- **Tandem difficulty curriculum**: Double-gating with tandem_ramp. Withholding tandem diversity during critical early training hurts (+3.9-9.1%)
-- **Surface arc-length PE**: Angle-sort ordering unreliable, zero features for volume nodes confuse attention, redundant with TE coord frame (+1.4-7.7%)
-- **Sample-level reweighting**: Focal loss, OHNM — over-correction on top of PCGrad
+- **Chord-position features**: Chord fraction, surface arc-length PE — all redundant with TE coord frame
+- **Augmentation annealing**: All forms hurt OOD metrics
+- **Asymmetric surface loss**: Hard-node mining already captures suction difficulty
+- **ZCA/PCA whitening**: Near-singular covariance (cond# ~7.9B) makes full decorrelation harmful
+- **SRF FiLM/flow-regime conditioning**: Redundant with backbone adaLN
+- **Pressure gradient aux head**: FD gradients on unstructured mesh too noisy
+- **Foil role embeddings**: Fragile, not robust to config changes
+- **Per-foil target whitening**: Structurally hurts p_tan
+- **MoE FFN routing**: Hard dispatch starves experts in small-dataset regime
+- **Per-head K/V projections**: Shared K/V is load-bearing OOD regularization
+- **GNN boundary layer**: Disrupts backbone-to-SRF feature distribution
+- **SE(2) canonicalization**: Stats mismatch + DSDF inconsistency
+- **All ensemble/distillation approaches**: Head-level diversity insufficient; snapshot cyclic fails
+- **Synthetic data (NeuralFoil)**: Geometric inconsistency corrupts geometry-pressure learning
 - **Optimizer variants**: SAM, Lookahead, SWA, SOAP, Muon — all worse than Lion+EMA+cosine
-- **NeuralFoil synthetic data flooding**: Geometric inconsistency (template mesh positions ≠ NACA encoding) corrupts geometry-pressure learning. Panel-method Cp errors near stagnation. 30% synthetic dilutes real data (+3.7-24.9%)
-- **Multi-head SRF ensemble**: Head-level diversity insufficient — backbone diversity is the real ensemble mechanism. 3 heads converge to similar solutions from shared features (+0.5-2.2%)
-- **Geometry consistency self-distillation**: Mean Teacher on jittered mesh. Consistency loss only active for ~7 epochs (EMA timing). Existing augmentation already provides larger perturbations (+0.1-3.8%)
-- **Snapshot ensemble (cyclic cosine)**: EMA on single continuous cosine outperforms cyclic snapshots. 50-epoch cycles too short, Lion+warm restarts cause instability (+7.8-28.9%)
-- **Ensemble knowledge distillation**: Teacher speed penalty, undertrained teachers, aggressive alpha, Fourier PE mismatch. Infrastructure cost not worth marginal benefit (+15.5-46.8%)
-- **Wider SRF head (192→384)**: SRF capacity is NOT the bottleneck — backbone representations limit what SRF can extract. 3.3× more params, no consistent improvement (+0.4-1.7%)
-- **Point cloud MixUp**: Fundamentally unsuited to physics-constrained regression — creates phantom geometries violating Navier-Stokes. Existing augmentation already handles diversity (+6.7-37.5%)
-- **Deeper backbone (4 layers)**: Training budget mismatch — 32% slower per epoch, only 121 vs 149 epochs. 3-layer is well-calibrated to 180-min budget (+4.7-29.1%)
-- **Heteroscedastic loss (Gaussian NLL)**: MSE/MAE mismatch — switches loss from well-tuned MAE to MSE. Learned log-variance suppresses gradients. Interacts poorly with hard-node mining (+41.7-76.9%)
-- **Effective AoA aft feature**: Thin-airfoil downwash model too simplified — linearized AoA + k*AoA/gap redundant with wake_deficit_feature which captures inter-foil coupling more accurately (+2.1-5.1%)
-- **Velocity angle feature (DSDF gradient × AoA)**: Feature redundancy — model can compute angle from existing DSDF + AoA inputs internally. Volume node noise for ~85-90% non-surface nodes amplifies degradation (+2.5-7.1%)
-
-## Potential Next Research Directions (Round 28+)
-
-### All Round 28 BOLD Ideas — Assignment Status
-| Slug | Target | Status |
-|------|--------|--------|
-| `gnn-boundary-layer` | p_tan, p_in | **CLOSED** ❌ — all metrics +6.9% to +24.0% |
-| `cnf-surface-pressure` (flow-matching) | p_tan, p_oodc | **CLOSED** ❌ — near-deterministic problem, generative adds noise (+14-32%) |
-| `fno-inter-foil-coupling` | p_tan | **CLOSED** ❌ — 5th inter-foil coupling failure, +4.6-13.7% |
-| `geometry-consistency-distill` | p_oodc | **ASSIGNED to tanjiro (#2273)** |
-| `se2-canonicalize` | p_oodc, p_re | **CLOSED** ❌ — stats mismatch + DSDF inconsistency, +6.6-14.3% |
-| `tta-aoa-ensemble` | p_oodc, p_re | **CLOSED** ❌ — coord rotation ≠ AoA change, +12-49% regression |
-| `neuralfoil-synthetic-flood` | p_in, p_oodc, p_re | **CLOSED** ❌ — geometric inconsistency, +3.7-24.9% |
-| `mae-surface-pretrain` | p_oodc, p_tan | **ASSIGNED to askeladd (#2276)** |
-
-### Remaining Unassigned Ideas (for Round 29+)
-| Priority | Slug | Target | Key bet |
-|----------|------|--------|---------|
-| 1 | `tandem-difficulty-curriculum` | p_tan | **ASSIGNED to frieren (#2277)** |
-| 2 | `surface-arclen-pe` | p_tan, p_in | **ASSIGNED to fern (#2278)** |
-
-### Round 28+ Additional Assignments
-| Slug | Target | Status |
-|------|--------|--------|
-| `snapshot-ensemble` | p_oodc, p_re | **ASSIGNED to thorfinn (#2280)** |
-| `multi-head-srf` | p_oodc, p_re | **ASSIGNED to edward (#2281)** |
-| `pointcloud-mixup` | p_oodc, p_re | **ASSIGNED to askeladd (#2282)** |
-| `wider-srf-head` | p_in, p_tan | **ASSIGNED to frieren (#2283)** |
-| `heteroscedastic-loss` | p_in, p_tan | **ASSIGNED to fern (#2284)** |
-| `ensemble-distillation` | p_oodc, p_re | **ASSIGNED to nezuko (#2279)** |
-| `deeper-backbone` | all metrics | **ASSIGNED to alphonse (#2285)** |
-
-**Assignment priority for next idle students (Round 29 ideas — researcher-agent generated):**
-
-| Priority | Slug | Target | Key bet |
-|----------|------|--------|---------|
-| 1 | `vel-angle-mag-feature` | p_tan, p_in | **CLOSED** ❌ — all metrics +2.5-7.1%, DSDF-angle redundant with existing inputs |
-| 2 | `effective-aoa-aft-feature` | p_tan, p_re | **CLOSED** ❌ — all metrics +2.1-5.1%, redundant with wake_deficit |
-| 3 | `chord-fraction-feature` | p_in, p_tan | **ASSIGNED to thorfinn (#2288)** |
-| 4 | `cp-target-normalization` | p_re, p_oodc | **SKIPPED** — baseline already applies Cp normalization via `_phys_norm()` |
-| 5 | `re-stratified-sampling` | p_re, p_oodc | **ASSIGNED to nezuko (#2290)** |
-| 6 | `stagnation-pressure-feature` | p_in, p_re | **ASSIGNED to frieren (#2291)** |
-| 7 | `lowrank-pressure-loss` | p_tan, p_in | **ASSIGNED to alphonse (#2293)** |
-| 8 | `flowdir-anisotropic-norm` | p_oodc, p_re | **ASSIGNED to askeladd (#2292)** |
-| 9 | `logre-pressure-scaling` | p_re, p_oodc | **ASSIGNED to edward (#2296)** |
-| 10 | `tandem-topo-feature` | p_tan | **ASSIGNED to fern (#2294)** |
-
-Full details: `/research/RESEARCH_IDEAS_2026-04-08_ROUND29.md`
+- **Inter-foil coupling approaches** (attention, GALE, cross-DSDF, GNN, FNO): 5 failures confirmed
+- **Generative/flow-matching surface**: Near-deterministic problem, adds noise to delta function
+- **DSDF-derived angle features**: Redundant with model's ability to compose existing inputs
