@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 22:20 — PR #2299: Potential Flow Residual Loss — alphonse — **SENT BACK** (iteration 2)
+
+- Branch: `alphonse/potential-flow-residual`
+- Hypothesis: Bernoulli-consistency auxiliary loss coupling velocity and pressure predictions. p_bernoulli = 0.5*(U_inf² - |u_pred|²), penalize |p_pred - p_bernoulli| as auxiliary signal. Weight=0.1.
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.742 | 11.90 | +1.3% ❌ |
+| p_oodc | 7.643  | 7.65  | +0.1% (flat) |
+| p_tan  | 27.874 | 28.50 | +2.2% ❌ |
+| **p_re** | **6.419** | **6.30** | **-1.9% ✅ BEST p_re since PR #2213** |
+
+- W&B: lhksu0k1 (s42), r25k1nd5 (s73). Group: potential-flow-residual.
+- **Analysis:** p_re improvement is significant — Bernoulli physics coupling provides useful regularization for Re-extrapolation where inviscid approximation generalizes better. p_in/p_tan regressions from too-aggressive weight (0.1) and noisy surface-node Bernoulli residuals. **Sent back** for iteration with: (1) lower weight 0.03, (2) volume nodes only, (3) ground-truth velocities for Bernoulli baseline.
+- **Status:** SENT BACK for iteration 2. Most promising paradigm-level direction found so far.
+
+---
+
 ### 2026-04-08 21:40 — PR #2297: FV Cell-Area Loss Weighting — nezuko — **CLOSED** ❌
 
 - Branch: `nezuko/fv-cell-area-loss-weight`
