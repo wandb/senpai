@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 14:00 — PR #2269: GNN Boundary Layer — frieren — **CLOSED** ❌
+
+- Branch: `frieren/gnn-boundary-layer`
+- Hypothesis: Add 2 rounds of GraphSAGE message passing among surface and near-surface nodes (k=4 volume neighbors) after Transolver backbone, before SRF head. Local message-passing respects boundary layer locality — fundamentally different from prior global inter-foil coupling approaches. Motivated by B-GNNs (arXiv:2503.18638) showing 85% error reduction on airfoil meshes.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 14.284 | +20.1% ❌ |
+| p_oodc | 7.561  | 9.375  | +24.0% ❌ |
+| p_tan  | 28.118 | 30.053 | +6.9% ❌ |
+| p_re   | 6.364  | 7.862  | +23.5% ❌ |
+
+- W&B: 6du84780 (s42), izedn36s (s73). Epochs: 121-122 (hit 180-min timeout, ~14% slower due to per-batch k-NN). GNN params: 222K extra.
+- **Analysis:** The GNN inserts an untrained bottleneck between the well-tuned Transolver backbone and SRF heads, disrupting the feature distribution. Even with zero-init last layer, trained updates shift what the SRF heads expect. The GNN also competes with existing SRF heads which already perform local surface correction — redundant. The k-NN volume neighbors contribute context that global slice attention already captures. Epoch time +14% from per-batch k-NN computation without proportional benefit.
+- **Conclusion:** CLOSED. GNN boundary layer added to DO NOT REVISIT — the Transolver's global slice attention + SRF pipeline already captures local boundary layer physics effectively. Explicit GNN local propagation is redundant and disruptive.
+
+---
+
 ### 2026-04-08 13:00 — PR #2268: MoE FFN Last Block — alphonse — **CLOSED** ❌
 
 - Branch: `alphonse/moe-ffn-last-block`

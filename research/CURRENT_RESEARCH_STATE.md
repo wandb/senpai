@@ -37,7 +37,7 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 | thorfinn | #2272 | **BOLD: TTA AoA Ensemble — inference-time rotation augmentation** | WIP |
 | fern | #2270 | **BOLD: SE(2) Canonicalize — chord-aligned coordinate frame preprocessing** | WIP |
 | askeladd | #2276 | **BOLD: MAE Surface Pretrain — masked autoencoder initialization for backbone** | WIP (NEW) |
-| frieren | #2269 | **BOLD: GNN Boundary Layer — local mesh message-passing on surface/near-wall nodes** | WIP |
+| frieren | #2277 | **Tandem Difficulty Curriculum — progressive exposure by gap/stagger magnitude** | WIP (NEW) |
 | tanjiro | #2273 | **BOLD: Geometry Consistency Self-Distillation — Mean Teacher on augmented mesh** | WIP |
 | edward | #2274 | **BOLD: FNO Inter-Foil Coupling — spectral convolution in tandem gap** | WIP |
 | nezuko | #2271 | **BOLD: Flow Matching Surface Head — generative pressure prediction (AlphaFold3-inspired)** | WIP |
@@ -94,7 +94,7 @@ Acknowledged and pivoting. Round 27 will include bold architectural additions (G
 | thorfinn | #2272 | **BOLD: TTA AoA Ensemble** — inference-time K=5 rotation averaging | p_oodc, p_re |
 | fern | #2270 | **BOLD: SE(2) Canonicalize** — chord-aligned coordinate frame preprocessing | p_oodc, p_re |
 | askeladd | #2276 | **BOLD: MAE Surface Pretrain** — masked autoencoder backbone initialization | p_oodc, p_tan |
-| frieren | #2269 | **BOLD: GNN Boundary Layer** — local mesh message-passing on surface/near-wall nodes | p_tan, p_in |
+| frieren | #2277 | **Tandem Difficulty Curriculum** — progressive exposure by gap/stagger magnitude | p_tan |
 | tanjiro | #2273 | **BOLD: Geometry Consistency Self-Distillation** — Mean Teacher on jittered mesh | p_oodc |
 | edward | #2274 | **BOLD: FNO Inter-Foil Coupling** — spectral convolution in tandem gap | p_tan |
 | nezuko | #2271 | **BOLD: Flow Matching Surface Head** — generative pressure prediction (AlphaFold3-inspired) | p_tan, p_oodc |
@@ -146,6 +146,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 - **Per-foil target whitening**: Fore-foil whitening hurts p_tan structurally (3 iterations confirmed)
 - **MoE FFN routing**: Hard dispatch halves effective data per expert — both experts starved in small-dataset regime
 - **Per-head K/V projections**: Shared K/V is load-bearing regularization; per-head destroys OOD generalization (+18% p_oodc)
+- **GNN boundary layer**: Local GNN message-passing disrupts backbone-to-SRF feature distribution; redundant with existing SRF heads (+20-24% regression)
 - **Sample-level reweighting**: Focal loss, OHNM — over-correction on top of PCGrad
 - **Optimizer variants**: SAM, Lookahead, SWA, SOAP, Muon — all worse than Lion+EMA+cosine
 
@@ -154,7 +155,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 ### All Round 28 BOLD Ideas — Assignment Status
 | Slug | Target | Status |
 |------|--------|--------|
-| `gnn-boundary-layer` | p_tan, p_in | **ASSIGNED to frieren (#2269)** |
+| `gnn-boundary-layer` | p_tan, p_in | **CLOSED** ❌ — all metrics +6.9% to +24.0% |
 | `cnf-surface-pressure` (flow-matching) | p_tan, p_oodc | **ASSIGNED to nezuko (#2271)** |
 | `fno-inter-foil-coupling` | p_tan | **ASSIGNED to edward (#2274)** |
 | `geometry-consistency-distill` | p_oodc | **ASSIGNED to tanjiro (#2273)** |
@@ -166,10 +167,9 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 ### Remaining Unassigned Ideas (for Round 29+)
 | Priority | Slug | Target | Key bet |
 |----------|------|--------|---------|
-| 1 | `tandem-difficulty-curriculum` | p_tan | Progressive tandem exposure by gap/stagger difficulty |
+| 1 | `tandem-difficulty-curriculum` | p_tan | **ASSIGNED to frieren (#2277)** |
 | 2 | `surface-arclen-pe` | p_tan, p_in | Per-foil arc-length fraction as 2-channel surface feature |
 
 **Assignment priority for next idle students:**
-1. `tandem-difficulty-curriculum` (pure schedule change, zero architecture risk, targets p_tan directly)
-2. `surface-arclen-pe` (medium risk, depends on node ordering)
-3. New ideas from researcher-agent (run when Round 28 results start arriving)
+1. `surface-arclen-pe` (medium risk, depends on node ordering)
+2. New ideas from researcher-agent (run when Round 28 results start arriving)
