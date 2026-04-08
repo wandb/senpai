@@ -1111,6 +1111,7 @@ class Config:
     aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
     aug_start_epoch: int = 0        # delay augmentation onset until this epoch
     aug_stop_epoch: int = 0         # epoch after which to disable augmentation (0 = never stop)
+    aug_aoa_stop_epoch: int = 0     # epoch after which to disable AoA perturbation only (0 = never stop)
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
@@ -1647,6 +1648,8 @@ for epoch in range(MAX_EPOCHS):
 
     if cfg.aug_stop_epoch > 0 and epoch == cfg.aug_stop_epoch:
         print(f"Augmentation disabled at epoch {epoch}")
+    if cfg.aug_aoa_stop_epoch > 0 and epoch == cfg.aug_aoa_stop_epoch:
+        print(f"AoA perturbation disabled at epoch {epoch}")
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
@@ -1699,7 +1702,8 @@ for epoch in range(MAX_EPOCHS):
                 _lo = 1.0 - cfg.aug_scale_range
                 _scale = torch.rand(x.size(0), 1, 1, device=x.device) * (2 * cfg.aug_scale_range) + _lo
                 x[:, :, :2] = x[:, :, :2] * _scale
-            if cfg.aug == "aoa_perturb":
+            _aoa_active = (cfg.aug_aoa_stop_epoch == 0 or epoch < cfg.aug_aoa_stop_epoch)
+            if cfg.aug == "aoa_perturb" and _aoa_active:
                 _angle_deg = torch.rand(x.size(0), device=x.device) * 2.0 - 1.0
                 _angle_rad = _angle_deg * (torch.pi / 180.0)
                 _cos_a = torch.cos(_angle_rad).view(-1, 1, 1)
