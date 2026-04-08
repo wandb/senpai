@@ -587,6 +587,74 @@ class SurfaceRefinementHead(nn.Module):
         return correction
 
 
+class FlowMatchingSurfaceHead(nn.Module):
+    """Conditional flow matching for surface prediction.
+    Learns a velocity field v(x_t, t, h) that maps noise -> target surface values.
+    Training: flow matching objective (no ODE simulation).
+    Inference: Euler ODE from noise to prediction.
+    """
+
+    def __init__(self, n_hidden: int = 192, out_dim: int = 3,
+                 t_embed_dim: int = 16, hidden_dim: int = 256):
+        super().__init__()
+        self.out_dim = out_dim
+        self.t_embed_dim = t_embed_dim
+        # Time embedding: sinusoidal -> MLP
+        self.t_mlp = nn.Sequential(
+            nn.Linear(t_embed_dim, 64),
+            nn.SiLU(),
+            nn.Linear(64, 64),
+        )
+        # Velocity predictor: [h + x_t + t_emb] -> v
+        self.net = nn.Sequential(
+            nn.Linear(n_hidden + out_dim + 64, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def time_embed(self, t: torch.Tensor) -> torch.Tensor:
+        """Sinusoidal time embedding. t: [M] in [0,1]"""
+        freqs = torch.exp(torch.linspace(0, -4, self.t_embed_dim // 2, device=t.device))
+        args = t.unsqueeze(-1) * freqs.unsqueeze(0) * 2 * 3.14159
+        return self.t_mlp(torch.cat([args.sin(), args.cos()], dim=-1))  # [M, 64]
+
+    def forward(self, h: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """h: [M, n_hidden], x_t: [M, out_dim], t: [M] -> v: [M, out_dim]"""
+        t_emb = self.time_embed(t)
+        inp = torch.cat([h, x_t, t_emb], dim=-1)
+        return self.net(inp)
+
+    @torch.no_grad()
+    def sample(self, h: torch.Tensor, n_steps: int = 10) -> torch.Tensor:
+        """Euler ODE from noise to prediction. h: [M, n_hidden] -> x_1: [M, out_dim]"""
+        M = h.shape[0]
+        x = torch.randn(M, self.out_dim, device=h.device, dtype=h.dtype)
+        dt = 1.0 / n_steps
+        for i in range(n_steps):
+            t = torch.full((M,), i * dt, device=h.device, dtype=h.dtype)
+            v = self.forward(h, x, t)
+            x = x + v * dt
+        return x
+
+
+def flow_matching_loss(head: FlowMatchingSurfaceHead, h_surf: torch.Tensor,
+                       y_surf: torch.Tensor) -> torch.Tensor:
+    """Conditional flow matching training loss.
+    h_surf: [M, n_hidden], y_surf: [M, out_dim] -> scalar loss"""
+    M = h_surf.shape[0]
+    t = torch.rand(M, device=h_surf.device, dtype=h_surf.dtype)
+    x_0 = torch.randn_like(y_surf)
+    t_expand = t.unsqueeze(-1)
+    x_t = (1 - t_expand) * x_0 + t_expand * y_surf
+    v_target = y_surf - x_0
+    v_pred = head(h_surf, x_t, t)
+    return F.mse_loss(v_pred, v_target)
+
+
 class AftFoilRefinementHead(nn.Module):
     """Dedicated refinement head for aft-foil (boundary ID=7) surface nodes.
 
@@ -1165,6 +1233,11 @@ class Config:
     aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
     aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
     aft_foil_srf_context: bool = False       # KNN volume context for aft-foil SRF (wake pressure recovery)
+    # Flow matching surface head
+    flow_matching_surface: bool = False      # enable flow matching for surface prediction
+    flow_matching_n_samples: int = 8         # inference samples (averaged)
+    flow_matching_weight: float = 0.5        # weight of flow matching loss vs standard loss
+    flow_matching_t_embed_dim: int = 16      # time embedding dimension
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
@@ -1393,6 +1466,17 @@ if cfg.aft_foil_srf:
               f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, "
               f"film={cfg.aft_foil_srf_film})")
 
+flow_surface_head = None
+if cfg.flow_matching_surface:
+    flow_surface_head = FlowMatchingSurfaceHead(
+        n_hidden=cfg.n_hidden, out_dim=3,
+        t_embed_dim=cfg.flow_matching_t_embed_dim,
+    ).to(device)
+    flow_surface_head = torch.compile(flow_surface_head, mode=cfg.compile_mode)
+    _fm_n_params = sum(p.numel() for p in flow_surface_head.parameters())
+    print(f"Flow matching surface head: {_fm_n_params:,} params "
+          f"(t_embed={cfg.flow_matching_t_embed_dim}, weight={cfg.flow_matching_weight})")
+
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
@@ -1418,6 +1502,8 @@ if aft_srf_head is not None:
     n_params += sum(p.numel() for p in aft_srf_head.parameters())
 if aft_srf_ctx_head is not None:
     n_params += sum(p.numel() for p in aft_srf_ctx_head.parameters())
+if flow_surface_head is not None:
+    n_params += sum(p.numel() for p in flow_surface_head.parameters())
 
 
 class SAM:
@@ -1558,6 +1644,10 @@ if aft_srf_ctx_head is not None:
     _ctx_params = list(aft_srf_ctx_head.parameters())
     base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
+if flow_surface_head is not None:
+    _fm_params = list(flow_surface_head.parameters())
+    base_opt.add_param_group({'params': _fm_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _fm_params):,} flow matching head params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
@@ -1655,6 +1745,8 @@ for epoch in range(MAX_EPOCHS):
         aft_srf_head.train()
     if aft_srf_ctx_head is not None:
         aft_srf_ctx_head.train()
+    if flow_surface_head is not None:
+        flow_surface_head.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
@@ -2110,6 +2202,17 @@ for epoch in range(MAX_EPOCHS):
                 _dct_loss = _dct_loss / _n_foils_dct
                 loss = loss + cfg.dct_freq_weight * _dct_loss
 
+        # Flow matching surface loss
+        _fm_loss = torch.tensor(0.0, device=device)
+        if flow_surface_head is not None and model.training:
+            _fm_surf_idx = surf_mask.nonzero(as_tuple=False)  # [M, 2]
+            if _fm_surf_idx.numel() > 0:
+                _fm_h = hidden[_fm_surf_idx[:, 0], _fm_surf_idx[:, 1]].detach()
+                _fm_y = y_norm[_fm_surf_idx[:, 0], _fm_surf_idx[:, 1]]
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _fm_loss = flow_matching_loss(flow_surface_head, _fm_h, _fm_y)
+                loss = loss + cfg.flow_matching_weight * _fm_loss
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -2310,7 +2413,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _train_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if flow_surface_head is not None:
+            _train_log["train/fm_loss"] = _fm_loss.item()
+        wandb.log(_train_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -2622,6 +2728,26 @@ for epoch in range(MAX_EPOCHS):
                         pred_loss = pred_loss.clone()
                         pred_loss[aft_idx[:, 0], aft_idx[:, 1]] += _aft_corr
                         # Back-compute pred for denormalization
+                        if cfg.multiply_std:
+                            pred = pred_loss / sample_stds
+                        else:
+                            pred = pred_loss * sample_stds
+
+                # Flow matching inference: average N samples, blend with SRF prediction
+                if flow_surface_head is not None:
+                    _fm_surf_idx_v = is_surface.nonzero(as_tuple=False)
+                    if _fm_surf_idx_v.numel() > 0:
+                        _fm_h_v = _eval_hidden[_fm_surf_idx_v[:, 0], _fm_surf_idx_v[:, 1]]
+                        _fm_preds = []
+                        _fm_base = flow_surface_head._orig_mod if hasattr(flow_surface_head, '_orig_mod') else flow_surface_head
+                        for _ in range(cfg.flow_matching_n_samples):
+                            _fm_sample = _fm_base.sample(_fm_h_v.float(), n_steps=10)
+                            _fm_preds.append(_fm_sample)
+                        _fm_avg = torch.stack(_fm_preds).mean(0).float()  # [M, 3]
+                        # Blend 50/50 with existing SRF prediction
+                        pred_loss = pred_loss.clone()
+                        _existing = pred_loss[_fm_surf_idx_v[:, 0], _fm_surf_idx_v[:, 1]]
+                        pred_loss[_fm_surf_idx_v[:, 0], _fm_surf_idx_v[:, 1]] = 0.5 * _existing + 0.5 * _fm_avg
                         if cfg.multiply_std:
                             pred = pred_loss / sample_stds
                         else:
