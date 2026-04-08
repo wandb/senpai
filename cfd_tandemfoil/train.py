@@ -1170,6 +1170,8 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    # Flow-direction normalization: rotate (x,y) coords by -AoA into streamwise frame
+    flowdir_norm: bool = False              # rotate input coords and velocity targets by -AoA
 
 
 cfg = sp.parse(Config)
@@ -1667,6 +1669,18 @@ for epoch in range(MAX_EPOCHS):
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
 
+        # --- Flow-direction normalization: rotate (x,y) and (Ux,Uy) by -AoA ---
+        if cfg.flowdir_norm:
+            _fd_aoa = x[:, 0, 14]  # AoA0_rad [B]
+            _fd_cos = torch.cos(-_fd_aoa).view(-1, 1, 1)
+            _fd_sin = torch.sin(-_fd_aoa).view(-1, 1, 1)
+            _fd_xc, _fd_yc = x[:, :, 0:1].clone(), x[:, :, 1:2].clone()
+            x[:, :, 0:1] = _fd_cos * _fd_xc - _fd_sin * _fd_yc
+            x[:, :, 1:2] = _fd_sin * _fd_xc + _fd_cos * _fd_yc
+            _fd_Ux, _fd_Uy = y[:, :, 0:1].clone(), y[:, :, 1:2].clone()
+            y[:, :, 0:1] = _fd_cos * _fd_Ux - _fd_sin * _fd_Uy
+            y[:, :, 1:2] = _fd_sin * _fd_Ux + _fd_cos * _fd_Uy
+
         # --- Data augmentation (training-only, applied before normalization) ---
         if model.training and cfg.aug != "none" and epoch >= cfg.aug_start_epoch:
             if cfg.aug in ("yflip", "flip_jitter"):
@@ -1831,15 +1845,23 @@ for epoch in range(MAX_EPOCHS):
             if cfg.adaptive_norm:
                 # Freestream in raw space: (Umag*cos(AoA), Umag*sin(AoA), 0)
                 _fs_raw = torch.zeros(y_norm.shape[0], 1, 3, device=device)
-                _fs_raw[:, 0, 0] = Umag.squeeze() * torch.cos(_aoa.squeeze(-1))
-                _fs_raw[:, 0, 1] = Umag.squeeze() * torch.sin(_aoa.squeeze(-1))
+                if cfg.flowdir_norm:
+                    _fs_raw[:, 0, 0] = Umag.squeeze()  # Umag * cos(0) in flow-aligned frame
+                    _fs_raw[:, 0, 1] = 0.0              # Umag * sin(0) in flow-aligned frame
+                else:
+                    _fs_raw[:, 0, 0] = Umag.squeeze() * torch.cos(_aoa.squeeze(-1))
+                    _fs_raw[:, 0, 1] = Umag.squeeze() * torch.sin(_aoa.squeeze(-1))
                 _fs_raw[:, 0, 2] = 0.0
                 _freestream = (_fs_raw - raw_stats["y_mean"]) / raw_stats["y_std"]
             else:
                 # Freestream in Cp-normalized space: (cos(AoA), sin(AoA), 0)
                 _fs_phys = torch.zeros(y_norm.shape[0], 1, 3, device=device)
-                _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))  # Ux/Umag
-                _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))  # Uy/Umag
+                if cfg.flowdir_norm:
+                    _fs_phys[:, 0, 0] = 1.0  # cos(0) in flow-aligned frame
+                    _fs_phys[:, 0, 1] = 0.0  # sin(0) in flow-aligned frame
+                else:
+                    _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))  # Ux/Umag
+                    _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))  # Uy/Umag
                 _fs_phys[:, 0, 2] = 0.0  # p/q
                 _freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]  # [B, 1, 3]
             y_norm = y_norm - _freestream  # subtract freestream (broadcasts over N)
@@ -2449,6 +2471,19 @@ for epoch in range(MAX_EPOCHS):
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
 
+                # --- Flow-direction normalization: rotate (x,y) and (Ux,Uy) by -AoA ---
+                _fd_aoa_val = None
+                if cfg.flowdir_norm:
+                    _fd_aoa_val = x[:, 0, 14]  # AoA0_rad [B]
+                    _fd_cos = torch.cos(-_fd_aoa_val).view(-1, 1, 1)
+                    _fd_sin = torch.sin(-_fd_aoa_val).view(-1, 1, 1)
+                    _fd_xc, _fd_yc = x[:, :, 0:1].clone(), x[:, :, 1:2].clone()
+                    x[:, :, 0:1] = _fd_cos * _fd_xc - _fd_sin * _fd_yc
+                    x[:, :, 1:2] = _fd_sin * _fd_xc + _fd_cos * _fd_yc
+                    _fd_Ux, _fd_Uy = y[:, :, 0:1].clone(), y[:, :, 1:2].clone()
+                    y[:, :, 0:1] = _fd_cos * _fd_Ux - _fd_sin * _fd_Uy
+                    y[:, :, 1:2] = _fd_sin * _fd_Ux + _fd_cos * _fd_Uy
+
                 raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
@@ -2518,14 +2553,22 @@ for epoch in range(MAX_EPOCHS):
                     _aoa = _raw_aoa
                     if cfg.adaptive_norm:
                         _fs_raw = torch.zeros(y_norm.shape[0], 1, 3, device=device)
-                        _fs_raw[:, 0, 0] = Umag.squeeze() * torch.cos(_aoa.squeeze(-1))
-                        _fs_raw[:, 0, 1] = Umag.squeeze() * torch.sin(_aoa.squeeze(-1))
+                        if cfg.flowdir_norm:
+                            _fs_raw[:, 0, 0] = Umag.squeeze()
+                            _fs_raw[:, 0, 1] = 0.0
+                        else:
+                            _fs_raw[:, 0, 0] = Umag.squeeze() * torch.cos(_aoa.squeeze(-1))
+                            _fs_raw[:, 0, 1] = Umag.squeeze() * torch.sin(_aoa.squeeze(-1))
                         _fs_raw[:, 0, 2] = 0.0
                         _v_freestream = (_fs_raw - raw_stats["y_mean"]) / raw_stats["y_std"]
                     else:
                         _fs_phys = torch.zeros(y_norm.shape[0], 1, 3, device=device)
-                        _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))
-                        _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))
+                        if cfg.flowdir_norm:
+                            _fs_phys[:, 0, 0] = 1.0
+                            _fs_phys[:, 0, 1] = 0.0
+                        else:
+                            _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))
+                            _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))
                         _v_freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
                     y_norm = y_norm - _v_freestream
 
@@ -2672,6 +2715,18 @@ for epoch in range(MAX_EPOCHS):
                         pred_orig = _pd
                     else:
                         pred_orig = _phys_denorm(pred_phys, Umag, q)
+                # Inverse rotation for flowdir_norm: rotate predictions and targets back to original frame
+                if cfg.flowdir_norm and _fd_aoa_val is not None:
+                    _fd_cos_inv = torch.cos(_fd_aoa_val).view(-1, 1, 1)
+                    _fd_sin_inv = torch.sin(_fd_aoa_val).view(-1, 1, 1)
+                    _Ux_p, _Uy_p = pred_orig[:, :, 0:1].clone(), pred_orig[:, :, 1:2].clone()
+                    pred_orig = pred_orig.clone()
+                    pred_orig[:, :, 0:1] = _fd_cos_inv * _Ux_p - _fd_sin_inv * _Uy_p
+                    pred_orig[:, :, 1:2] = _fd_sin_inv * _Ux_p + _fd_cos_inv * _Uy_p
+                    _Ux_y, _Uy_y = y[:, :, 0:1].clone(), y[:, :, 1:2].clone()
+                    y[:, :, 0:1] = _fd_cos_inv * _Ux_y - _fd_sin_inv * _Uy_y
+                    y[:, :, 1:2] = _fd_sin_inv * _Ux_y + _fd_cos_inv * _Uy_y
+
                 y_clamped = y.clamp(-1e6, 1e6)
                 err = (pred_orig - y_clamped).abs()
                 finite = err.isfinite()
@@ -2864,6 +2919,15 @@ if best_metrics:
                     y_dev = y_true.unsqueeze(0).to(device)
                     is_surf_dev = is_surface.unsqueeze(0).to(device)
                     mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
+                    # Flow-direction normalization for visualization
+                    _fd_aoa_vis = None
+                    if cfg.flowdir_norm:
+                        _fd_aoa_vis = x_dev[:, 0, 14]
+                        _fd_cos = torch.cos(-_fd_aoa_vis).view(-1, 1, 1)
+                        _fd_sin = torch.sin(-_fd_aoa_vis).view(-1, 1, 1)
+                        _xc, _yc = x_dev[:, :, 0:1].clone(), x_dev[:, :, 1:2].clone()
+                        x_dev[:, :, 0:1] = _fd_cos * _xc - _fd_sin * _yc
+                        x_dev[:, :, 1:2] = _fd_sin * _xc + _fd_cos * _yc
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
@@ -2923,6 +2987,13 @@ if best_metrics:
                             y_pred = _pd.squeeze(0).cpu()
                         else:
                             y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
+                    # Inverse rotation for flowdir_norm visualization
+                    if cfg.flowdir_norm and _fd_aoa_vis is not None:
+                        _cos_inv = torch.cos(_fd_aoa_vis).item()
+                        _sin_inv = torch.sin(_fd_aoa_vis).item()
+                        _Ux_v, _Uy_v = y_pred[:, 0].clone(), y_pred[:, 1].clone()
+                        y_pred[:, 0] = _cos_inv * _Ux_v - _sin_inv * _Uy_v
+                        y_pred[:, 1] = _sin_inv * _Ux_v + _cos_inv * _Uy_v
                 samples.append((x[:, :2], y_true, y_pred, is_surface))
             images = visualize(samples, out_dir=plot_dir / split_name)
             if images:
@@ -2976,6 +3047,19 @@ if cfg.surface_refine and best_metrics:
                     # Save Re values (raw, before normalization)
                     _re_raw = x[:, 0, 13].cpu()  # Re feature
                     all_re_values.append(_re_raw)
+
+                    # Flow-direction normalization for verification
+                    _fd_aoa_vv = None
+                    if cfg.flowdir_norm:
+                        _fd_aoa_vv = x[:, 0, 14]
+                        _fd_cos = torch.cos(-_fd_aoa_vv).view(-1, 1, 1)
+                        _fd_sin = torch.sin(-_fd_aoa_vv).view(-1, 1, 1)
+                        _xc, _yc = x[:, :, 0:1].clone(), x[:, :, 1:2].clone()
+                        x[:, :, 0:1] = _fd_cos * _xc - _fd_sin * _yc
+                        x[:, :, 1:2] = _fd_sin * _xc + _fd_cos * _yc
+                        _Ux_vv, _Uy_vv = y[:, :, 0:1].clone(), y[:, :, 1:2].clone()
+                        y[:, :, 0:1] = _fd_cos * _Ux_vv - _fd_sin * _Uy_vv
+                        y[:, :, 1:2] = _fd_sin * _Ux_vv + _fd_cos * _Uy_vv
 
                     # Preprocess (same as val loop)
                     raw_dsdf = x[:, :, 2:10]
@@ -3035,14 +3119,22 @@ if cfg.surface_refine and best_metrics:
                         _aoa = _raw_aoa
                         if cfg.adaptive_norm:
                             _fs_raw = torch.zeros(B, 1, 3, device=device)
-                            _fs_raw[:, 0, 0] = Umag.squeeze() * torch.cos(_aoa.squeeze(-1))
-                            _fs_raw[:, 0, 1] = Umag.squeeze() * torch.sin(_aoa.squeeze(-1))
+                            if cfg.flowdir_norm:
+                                _fs_raw[:, 0, 0] = Umag.squeeze()
+                                _fs_raw[:, 0, 1] = 0.0
+                            else:
+                                _fs_raw[:, 0, 0] = Umag.squeeze() * torch.cos(_aoa.squeeze(-1))
+                                _fs_raw[:, 0, 1] = Umag.squeeze() * torch.sin(_aoa.squeeze(-1))
                             _fs_raw[:, 0, 2] = 0.0
                             _v_freestream = (_fs_raw - raw_stats["y_mean"]) / raw_stats["y_std"]
                         else:
                             _fs_phys = torch.zeros(B, 1, 3, device=device)
-                            _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))
-                            _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))
+                            if cfg.flowdir_norm:
+                                _fs_phys[:, 0, 0] = 1.0
+                                _fs_phys[:, 0, 1] = 0.0
+                            else:
+                                _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))
+                                _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))
                             _fs_phys[:, 0, 2] = 0.0
                             _v_freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
                         y_norm = y_norm - _v_freestream
@@ -3142,6 +3234,18 @@ if cfg.surface_refine and best_metrics:
                         pred_norefine_phys = pred_norefine_phys.clone()
                         pred_norefine_phys[:, :, 2:3] = torch.sinh(pred_norefine_phys[:, :, 2:3]) / cfg.asinh_scale
                     pred_norefine_orig = pred_norefine_phys if cfg.adaptive_norm else _phys_denorm(pred_norefine_phys, Umag, q)
+
+                    # Inverse rotation for flowdir_norm in verification
+                    if cfg.flowdir_norm and _fd_aoa_vv is not None:
+                        _fd_cos_inv = torch.cos(_fd_aoa_vv).view(-1, 1, 1)
+                        _fd_sin_inv = torch.sin(_fd_aoa_vv).view(-1, 1, 1)
+                        for _pred_t in [pred_orig_A, pred_manual_orig, pred_norefine_orig]:
+                            _Ux_t, _Uy_t = _pred_t[:, :, 0:1].clone(), _pred_t[:, :, 1:2].clone()
+                            _pred_t[:, :, 0:1] = _fd_cos_inv * _Ux_t - _fd_sin_inv * _Uy_t
+                            _pred_t[:, :, 1:2] = _fd_sin_inv * _Ux_t + _fd_cos_inv * _Uy_t
+                        _Ux_y, _Uy_y = y[:, :, 0:1].clone(), y[:, :, 1:2].clone()
+                        y[:, :, 0:1] = _fd_cos_inv * _Ux_y - _fd_sin_inv * _Uy_y
+                        y[:, :, 1:2] = _fd_sin_inv * _Ux_y + _fd_cos_inv * _Uy_y
 
                     # Compute surface pressure MAE for all paths
                     surf_mask = mask & is_surface
