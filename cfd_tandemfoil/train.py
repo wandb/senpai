@@ -1170,6 +1170,12 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    # Ensemble knowledge distillation
+    ensemble_distill: bool = False           # enable knowledge distillation from ensemble teacher
+    ensemble_teacher_dir: str = ""           # dir containing teacher checkpoint subdirs (model-<runid>/)
+    distill_alpha: float = 0.3               # initial distillation weight
+    distill_alpha_max: float = 0.5           # peak distillation weight (at 40% of training)
+    distill_pressure_only: bool = True       # distill only pressure channel
 
 
 cfg = sp.parse(Config)
@@ -1635,6 +1641,38 @@ prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
 running_nontandem_loss = 0.05
+
+# --- Load ensemble teacher models for distillation ---
+_teacher_models = []
+_teacher_refine_heads = []
+if cfg.ensemble_distill and cfg.ensemble_teacher_dir:
+    _teacher_dir = Path(cfg.ensemble_teacher_dir)
+    _teacher_subdirs = sorted([d for d in _teacher_dir.iterdir() if d.is_dir() and (d / "checkpoint.pt").exists()])
+    print(f"Loading {len(_teacher_subdirs)} teacher models from {_teacher_dir}...")
+    for _td in _teacher_subdirs:
+        _tm = Transolver(**model_config).to(device)
+        _tm._pressure_separate = cfg.pressure_separate_last_block
+        _tm.load_state_dict(torch.load(_td / "checkpoint.pt", map_location=device, weights_only=True))
+        _tm.eval()
+        for p in _tm.parameters():
+            p.requires_grad_(False)
+        _teacher_models.append(_tm)
+        # Load teacher refinement head if it exists
+        _trh = None
+        if cfg.surface_refine and (_td / "refine_head.pt").exists():
+            _trh = SurfaceRefinementHead(
+                n_hidden=cfg.n_hidden, out_dim=3,
+                hidden_dim=cfg.surface_refine_hidden,
+                n_layers=cfg.surface_refine_layers,
+                p_only=cfg.surface_refine_p_only,
+            ).to(device)
+            _trh.load_state_dict(torch.load(_td / "refine_head.pt", map_location=device, weights_only=True))
+            _trh.eval()
+            for p in _trh.parameters():
+                p.requires_grad_(False)
+        _teacher_refine_heads.append(_trh)
+        print(f"  Loaded teacher: {_td.name}")
+    print(f"Teacher ensemble size: {len(_teacher_models)}")
 
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
@@ -2120,6 +2158,54 @@ for epoch in range(MAX_EPOCHS):
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
 
+        # Ensemble knowledge distillation
+        _distill_loss = torch.tensor(0.0, device=device)
+        if cfg.ensemble_distill and len(_teacher_models) > 0 and model.training:
+            # Alpha schedule: ramp from distill_alpha to distill_alpha_max at 40% of expected epochs,
+            # then decay to 0.1 by 80%. Use cosine_T_max as expected epoch count.
+            _expected_epochs = cfg.cosine_T_max if cfg.cosine_T_max > 0 else 150
+            _frac = epoch / max(_expected_epochs, 1)
+            if _frac < 0.4:
+                _alpha = cfg.distill_alpha + (cfg.distill_alpha_max - cfg.distill_alpha) * (_frac / 0.4)
+            elif _frac < 0.8:
+                _alpha = cfg.distill_alpha_max - (cfg.distill_alpha_max - 0.1) * ((_frac - 0.4) / 0.4)
+            else:
+                _alpha = 0.1
+            # Stochastic teacher selection: pick 1 random teacher per batch
+            # (equivalent to full ensemble mean in expectation, but 4x faster)
+            with torch.no_grad():
+                _ti = torch.randint(len(_teacher_models), (1,)).item()
+                _tm = _teacher_models[_ti]
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _tout = _tm({"x": x})
+                _tpred = _tout["preds"].float()
+                _thidden = _tout["hidden"].float()
+                if not cfg.no_perstd and not cfg.raw_targets and not cfg.adaptive_norm:
+                    if cfg.multiply_std:
+                        _tpred = _tpred * sample_stds
+                    else:
+                        _tpred = _tpred / sample_stds
+                # Apply teacher SRF if available
+                _trh = _teacher_refine_heads[_ti] if _ti < len(_teacher_refine_heads) else None
+                if _trh is not None:
+                    _tsurf_idx = is_surface.nonzero(as_tuple=False)
+                    if _tsurf_idx.numel() > 0:
+                        _tsh = _thidden[_tsurf_idx[:, 0], _tsurf_idx[:, 1]]
+                        _tsp = _tpred[_tsurf_idx[:, 0], _tsurf_idx[:, 1]]
+                        _tcorr = _trh(_tsh, _tsp).float()
+                        _tpred = _tpred.clone()
+                        _tpred[_tsurf_idx[:, 0], _tsurf_idx[:, 1]] += _tcorr
+                _teacher_mean = _tpred  # single teacher (stochastic ensemble)
+            # Distillation loss: MSE between student and teacher on surface nodes
+            if cfg.distill_pressure_only:
+                _d_pred = pred[:, :, 2:3]
+                _d_teacher = _teacher_mean[:, :, 2:3]
+            else:
+                _d_pred = pred
+                _d_teacher = _teacher_mean
+            _distill_loss = ((_d_pred - _d_teacher).pow(2) * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            loss = (1.0 - _alpha) * loss + _alpha * _distill_loss
+
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
@@ -2310,7 +2396,11 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _train_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.ensemble_distill:
+            _train_log["train/distill_loss"] = _distill_loss.item()
+            _train_log["train/distill_alpha"] = _alpha if '_alpha' in dir() else 0.0
+        wandb.log(_train_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
