@@ -1170,6 +1170,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    stagnation_feature: bool = False        # dynamic pressure q_inf = 0.5*Umag² as global input channel (+1)
 
 
 cfg = sp.parse(Config)
@@ -1300,7 +1301,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + 32 + (1 if cfg.stagnation_feature else 0),  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], +32 fourier PE, [+q_inf]
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1808,6 +1809,9 @@ for epoch in range(MAX_EPOCHS):
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
         Umag, q = _umag_q(y, mask)
+        if cfg.stagnation_feature:
+            q_inf_feat = q.expand(-1, x.shape[1], -1)  # [B, 1, 1] → [B, N, 1]
+            x = torch.cat([x, q_inf_feat], dim=-1)
         if cfg.raw_targets:
             y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
         elif cfg.adaptive_norm:
@@ -2495,6 +2499,9 @@ for epoch in range(MAX_EPOCHS):
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
                 Umag, q = _umag_q(y, mask)
+                if cfg.stagnation_feature:
+                    q_inf_feat = q.expand(-1, x.shape[1], -1)
+                    x = torch.cat([x, q_inf_feat], dim=-1)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
                 elif cfg.adaptive_norm:
@@ -2898,6 +2905,9 @@ if best_metrics:
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
+                    if cfg.stagnation_feature:
+                        q_inf_feat = q.expand(-1, x_n.shape[1], -1)
+                        x_n = torch.cat([x_n, q_inf_feat], dim=-1)
                     pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
                     if cfg.raw_targets:
                         y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
@@ -3017,6 +3027,9 @@ if cfg.surface_refine and best_metrics:
 
                     # Ground truth denormalization reference
                     Umag, q = _umag_q(y, mask)
+                    if cfg.stagnation_feature:
+                        q_inf_feat = q.expand(-1, x.shape[1], -1)
+                        x = torch.cat([x, q_inf_feat], dim=-1)
                     if cfg.adaptive_norm:
                         y_adapt = y.clone()
                         if cfg.asinh_pressure:
