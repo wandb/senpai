@@ -1170,6 +1170,10 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    # Phase 7: Tandem difficulty curriculum — progressive exposure by gap/stagger magnitude
+    tandem_curriculum: bool = False        # enable curriculum scheduling for tandem samples
+    curriculum_warmup_epochs: int = 40     # epochs using only easiest 25% of tandem samples
+    curriculum_full_epochs: int = 80       # epoch at which all tandem samples become available
 
 
 cfg = sp.parse(Config)
@@ -1188,6 +1192,67 @@ train_ds, val_splits, stats, sample_weights = load_data(
     cfg.manifest, cfg.stats_file, debug=cfg.debug,
 )
 stats = {k: v.to(device) for k, v in stats.items()}
+
+
+class TandemDifficultyScheduler:
+    """Progressive tandem sample curriculum by gap+stagger magnitude."""
+    def __init__(self, tandem_local_indices, gap_values, stagger_values,
+                 warmup_epochs=40, full_epochs=80):
+        import numpy as np
+        self.warmup = warmup_epochs
+        self.full = full_epochs
+        difficulty = np.abs(gap_values) + np.abs(stagger_values)
+        difficulty = (difficulty - difficulty.min()) / (difficulty.max() - difficulty.min() + 1e-6)
+        self.sorted_indices = tandem_local_indices[np.argsort(difficulty)]
+        self.n_tandem = len(tandem_local_indices)
+        self.difficulty = difficulty
+
+    def get_available_indices(self, epoch):
+        """Return tandem indices (into train_ds) available at this epoch."""
+        if epoch < self.warmup:
+            n_avail = max(1, self.n_tandem // 4)
+        elif epoch < self.full:
+            frac = (epoch - self.warmup) / (self.full - self.warmup)
+            n_avail = int(self.n_tandem * (0.25 + 0.75 * frac))
+        else:
+            n_avail = self.n_tandem
+        return set(self.sorted_indices[:n_avail].tolist())
+
+
+# Build curriculum scheduler if enabled
+_curriculum_scheduler = None
+_base_sample_weights = None
+if cfg.tandem_curriculum:
+    import numpy as np
+    print("Scanning training set for tandem difficulty curriculum...")
+    _gap_vals = []
+    _stagger_vals = []
+    _is_tandem_arr = []
+    for i in tqdm(range(len(train_ds)), desc="Curriculum scan", leave=False):
+        _x_i = train_ds[i][0]  # x tensor only
+        _gap_i = _x_i[0, 21].item()
+        _gap_vals.append(_x_i[0, 22].item())  # gap value for difficulty
+        _stagger_vals.append(_x_i[0, 23].item())  # stagger value for difficulty
+        _is_tandem_arr.append(abs(_gap_i) > 0.01)
+    _gap_vals = np.array(_gap_vals)
+    _stagger_vals = np.array(_stagger_vals)
+    _is_tandem_arr = np.array(_is_tandem_arr)
+    _tandem_local_idx = np.where(_is_tandem_arr)[0]
+    if len(_tandem_local_idx) > 0:
+        _curriculum_scheduler = TandemDifficultyScheduler(
+            _tandem_local_idx,
+            _gap_vals[_tandem_local_idx],
+            _stagger_vals[_tandem_local_idx],
+            warmup_epochs=cfg.curriculum_warmup_epochs,
+            full_epochs=cfg.curriculum_full_epochs,
+        )
+        _base_sample_weights = sample_weights.clone()
+        print(f"  Tandem curriculum: {len(_tandem_local_idx)} tandem samples out of {len(train_ds)}")
+        print(f"  Warmup: epochs 0-{cfg.curriculum_warmup_epochs} (easiest 25%)")
+        print(f"  Ramp: epochs {cfg.curriculum_warmup_epochs}-{cfg.curriculum_full_epochs} (25%→100%)")
+    else:
+        print("  WARNING: No tandem samples found — curriculum disabled")
+        cfg.tandem_curriculum = False
 
 
 def _umag_q(y, mask):
@@ -1643,6 +1708,20 @@ for epoch in range(MAX_EPOCHS):
         break
 
     t0 = time.time()
+
+    # Tandem difficulty curriculum: update sampler weights to exclude hard tandem samples
+    if _curriculum_scheduler is not None and not cfg.debug:
+        _avail = _curriculum_scheduler.get_available_indices(epoch)
+        _new_weights = _base_sample_weights.clone()
+        _n_excluded = 0
+        for _i in range(len(_new_weights)):
+            if _is_tandem_arr[_i] and _i not in _avail:
+                _new_weights[_i] = 0.0
+                _n_excluded += 1
+        sampler.weights = _new_weights
+        _n_avail_tandem = len(_avail)
+        if epoch % 10 == 0:
+            print(f"  Curriculum: epoch {epoch}, {_n_avail_tandem}/{_curriculum_scheduler.n_tandem} tandem samples available ({_n_excluded} excluded)")
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
@@ -2767,6 +2846,10 @@ for epoch in range(MAX_EPOCHS):
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
+    if _curriculum_scheduler is not None:
+        _avail_curr = _curriculum_scheduler.get_available_indices(epoch)
+        metrics["curriculum/n_tandem_available"] = len(_avail_curr)
+        metrics["curriculum/frac_tandem_available"] = len(_avail_curr) / max(1, _curriculum_scheduler.n_tandem)
     wandb.log(metrics)
 
     if torch.cuda.is_available():
