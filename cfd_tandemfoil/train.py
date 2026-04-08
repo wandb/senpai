@@ -757,6 +757,63 @@ class SurfaceRefinementContextHead(nn.Module):
         return correction
 
 
+class PressureGradientHead(nn.Module):
+    """Auxiliary head: predict (dp/dx, dp/dy) from backbone hidden state."""
+    def __init__(self, n_hidden=192):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_hidden, 64),
+            nn.SiLU(),
+            nn.Linear(64, 2),  # (dp/dx, dp/dy)
+        )
+        # Zero-init last layer for safe initialization
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, h):
+        return self.net(h)  # [N_vol, 2]
+
+
+def compute_pressure_gradient_targets(query_pos, all_pos, p_gt_all, k=6):
+    """Compute (dp/dx, dp/dy) via weighted least-squares finite differences.
+
+    Finds k nearest neighbors of each query node among ALL nodes, then
+    estimates gradients via weighted least-squares.
+
+    Args:
+        query_pos:  [M, 2] — (x, y) coordinates of query nodes
+        all_pos:    [N, 2] — (x, y) coordinates of all nodes (for neighbor lookup)
+        p_gt_all:   [N]    — GT pressure for all nodes
+        k:          number of neighbors
+
+    Returns: [M, 2] — (dp/dx, dp/dy) at each query node
+    """
+    # cdist is [M, N] — fast when M << N
+    dists = torch.cdist(query_pos, all_pos)  # [M, N]
+    topk = dists.topk(k + 1, largest=False)
+    # First neighbor might be self (dist≈0) — skip it
+    nbr_idx = topk.indices[:, 1:]    # [M, k]
+    nbr_dists = topk.values[:, 1:]   # [M, k]
+
+    dx = all_pos[nbr_idx, 0] - query_pos[:, 0:1]  # [M, k]
+    dy = all_pos[nbr_idx, 1] - query_pos[:, 1:2]
+    # Query node pressures via nearest match (index 0 = self)
+    query_p = p_gt_all[topk.indices[:, 0]]  # [M]
+    dp = p_gt_all[nbr_idx] - query_p.unsqueeze(1)
+
+    w = 1.0 / (nbr_dists + 1e-6)  # inverse-distance weights
+    Axx = (w * dx * dx).sum(1)
+    Axy = (w * dx * dy).sum(1)
+    Ayy = (w * dy * dy).sum(1)
+    bx = (w * dx * dp).sum(1)
+    by = (w * dy * dp).sum(1)
+
+    det = Axx * Ayy - Axy * Axy + 1e-8
+    grad_x = (Ayy * bx - Axy * by) / det
+    grad_y = (Axx * by - Axy * bx) / det
+    return torch.stack([grad_x, grad_y], dim=-1)  # [M, 2]
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -1170,6 +1227,9 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    # Phase 6: Pressure gradient auxiliary head
+    pressure_gradient_aux: bool = False     # auxiliary head predicting (dp/dx, dp/dy) from backbone hidden state
+    grad_weight: float = 0.05              # weight for pressure gradient auxiliary loss
 
 
 cfg = sp.parse(Config)
@@ -1393,10 +1453,19 @@ if cfg.aft_foil_srf:
               f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, "
               f"film={cfg.aft_foil_srf_film})")
 
+# Pressure gradient auxiliary head
+pgrad_head = None
+if cfg.pressure_gradient_aux:
+    pgrad_head = PressureGradientHead(n_hidden=cfg.n_hidden).to(device)
+    pgrad_head = torch.compile(pgrad_head, mode=cfg.compile_mode)
+    _pgrad_n_params = sum(p.numel() for p in pgrad_head.parameters())
+    print(f"Pressure gradient aux head: {_pgrad_n_params:,} params")
+
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
 ema_aft_srf_head = None  # EMA copy of aft-foil SRF head
+ema_pgrad_head = None  # EMA copy of pressure gradient head
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -1418,6 +1487,8 @@ if aft_srf_head is not None:
     n_params += sum(p.numel() for p in aft_srf_head.parameters())
 if aft_srf_ctx_head is not None:
     n_params += sum(p.numel() for p in aft_srf_ctx_head.parameters())
+if pgrad_head is not None:
+    n_params += sum(p.numel() for p in pgrad_head.parameters())
 
 
 class SAM:
@@ -1559,6 +1630,12 @@ if aft_srf_ctx_head is not None:
     base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
 
+# Add pressure gradient head params to optimizer if enabled
+if pgrad_head is not None:
+    _pgrad_params = list(pgrad_head.parameters())
+    base_opt.add_param_group({'params': _pgrad_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _pgrad_params):,} pressure gradient head params to optimizer")
+
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
     _warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
@@ -1655,6 +1732,8 @@ for epoch in range(MAX_EPOCHS):
         aft_srf_head.train()
     if aft_srf_ctx_head is not None:
         aft_srf_ctx_head.train()
+    if pgrad_head is not None:
+        pgrad_head.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
@@ -2110,6 +2189,48 @@ for epoch in range(MAX_EPOCHS):
                 _dct_loss = _dct_loss / _n_foils_dct
                 loss = loss + cfg.dct_freq_weight * _dct_loss
 
+        # Pressure gradient auxiliary loss on volume nodes
+        _pgrad_loss = torch.tensor(0.0, device=device)
+        if cfg.pressure_gradient_aux and pgrad_head is not None and model.training:
+            _pgrad_loss_sum = torch.tensor(0.0, device=device)
+            _pgrad_count = 0
+            _PGRAD_SUBSAMPLE = 256  # subsample volume nodes for speed (cdist is M*N not N*N)
+            # Use raw positions (before standardization) for physical gradient computation
+            _pgrad_raw_pos = _raw_xy_te if _raw_xy_te is not None else x[:, :, :2]
+            for b in range(B):
+                vol_idx_b = vol_mask[b].nonzero(as_tuple=True)[0]
+                if vol_idx_b.numel() < 16:
+                    continue
+                # Subsample query nodes for speed; use ALL nodes as neighbor pool
+                if vol_idx_b.numel() > _PGRAD_SUBSAMPLE:
+                    _perm = torch.randperm(vol_idx_b.numel(), device=device)[:_PGRAD_SUBSAMPLE]
+                    query_idx = vol_idx_b[_perm]
+                else:
+                    query_idx = vol_idx_b
+                valid_b = mask[b].nonzero(as_tuple=True)[0]  # all valid nodes
+                all_pos_b = _pgrad_raw_pos[b, valid_b]  # [N_valid, 2]
+                p_gt_all_b = y_norm[b, valid_b, 2]       # [N_valid]
+                query_pos_b = _pgrad_raw_pos[b, query_idx]  # [M, 2]
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    grad_target = compute_pressure_gradient_targets(
+                        query_pos_b, all_pos_b, p_gt_all_b, k=6)
+                    grad_target = torch.asinh(grad_target.float() * cfg.asinh_scale)
+                    h_query = hidden[b, query_idx]  # [M, n_hidden]
+                    grad_pred = pgrad_head(h_query)  # [M, 2]
+                grad_pred = grad_pred.float()
+                grad_target = grad_target.float()
+                # Clip extreme gradient targets for robustness
+                grad_target = grad_target.clamp(-10, 10)
+                _pgrad_loss_sum = _pgrad_loss_sum + F.l1_loss(grad_pred, grad_target.detach())
+                _pgrad_count += 1
+            if _pgrad_count > 0:
+                _pgrad_loss = _pgrad_loss_sum / _pgrad_count
+                loss = loss + cfg.grad_weight * _pgrad_loss
+                wandb.log({
+                    "train/pgrad_loss": _pgrad_loss.item(),
+                    "global_step": global_step,
+                })
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -2136,8 +2257,9 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            _pgrad_shared = cfg.grad_weight * _pgrad_loss * 0.5 if cfg.pressure_gradient_aux else 0.0
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + _pgrad_shared
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + _pgrad_shared
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -2182,7 +2304,8 @@ for epoch in range(MAX_EPOCHS):
                 vol_loss_g = (abs_err * vol_mask_g.unsqueeze(-1)).sum() / vol_mask_g.sum().clamp(min=1)
                 surf_loss_g = (surf_per_sample * mask_1d.float() * tandem_boost).sum() / n
                 coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                _pg_shared = cfg.grad_weight * _pgrad_loss * 0.5 if cfg.pressure_gradient_aux else 0.0
+                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + _pg_shared
 
             loss_A = _grp_loss(~is_tandem_batch)
             # Only include non-empty groups to avoid backward() on no-grad tensors
@@ -2308,6 +2431,15 @@ for epoch in range(MAX_EPOCHS):
                 else:
                     with torch.no_grad():
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for pressure gradient head
+            if pgrad_head is not None:
+                _pgrad_base = pgrad_head._orig_mod if hasattr(pgrad_head, '_orig_mod') else pgrad_head
+                if ema_pgrad_head is None:
+                    ema_pgrad_head = deepcopy(_pgrad_base)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_pgrad_head.parameters(), _pgrad_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
