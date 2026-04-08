@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-08 02:00 UTC
+- **Date:** 2026-04-08 03:15 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training & Architecture Improvements
 
@@ -33,7 +33,7 @@ Single-model p_tan (28.341) and p_in (11.979) both BEAT the ensemble.
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | thorfinn | #2251 | Cosine T_max=150 — re-clarified: must run new T_max=150 seeds (not repost T_max=140 results) | WIP |
-| fern | #2259 | Two-Pass Iterative SRF: sequential boosting of surface corrections | WIP |
+| fern | #2266 | ZCA Spectral Whitening of Input Features: decorrelate 24-dim feature covariance | WIP |
 | nezuko | #2260 | Flow-Regime Conditioned SRF via FiLM: AoA/Umag modulation on surface head | WIP |
 | edward | #2261 | Per-Foil Target Whitening: standardize pressure targets per foil | WIP |
 | askeladd | #2255 | Aug annealing v2 — trial A (aug_stop_epoch=140) + trial B (selective AoA-only) | WIP |
@@ -48,6 +48,13 @@ Single-model p_tan (28.341) and p_in (11.979) both BEAT the ensemble.
 ## PRs Ready for Review
 
 None currently.
+
+## Latest Reviews (2026-04-08 ~03:15)
+
+### PR #2259 — Two-Pass Iterative SRF (fern) — CLOSED
+- All 4 metrics worse: p_in +2.8%, p_oodc +4.0%, p_tan +0.4%, p_re +3.6%
+- **Root cause:** Two-pass SRF introduces optimization interference despite `.detach()` safety. Massive seed variance on p_oodc confirms instability.
+- **SRF modifications are now exhausted** (wider #2252, two-pass #2259 both failed). 192-dim 3-layer SRF is at a local optimum.
 
 ## Round 24 Reviews Completed (2026-04-08 ~00:45)
 
@@ -84,7 +91,7 @@ Nine experiments across mechanistic and physics-grounded angles:
 4. **Foil role embedding** — Explicit fore/aft identity for backbone (tanjiro #2262) ← representation
 5. **Per-foil target whitening** — Tandem transfer normalization (edward #2261) ← normalization
 6. **Flow-regime SRF conditioning (FiLM)** — Explicit AoA/Umag on SRF (nezuko #2260) ← conditioning
-7. **Two-pass SRF** — Gradient-boosting correction (fern #2259) ← architecture
+7. **ZCA spectral whitening** — Decorrelate 24-dim input features (fern #2266) ← representation
 8. **Aug annealing v2** — Selective/late cutoff (askeladd #2255) ← training curriculum
 9. **Cosine T_max=150** — Schedule optimization (thorfinn #2251) ← schedule
 
@@ -109,6 +116,7 @@ Nine experiments across mechanistic and physics-grounded angles:
 - **Training hyperparameters**: LR, WD, EMA decay, aug sigma all confirmed optimal (Round 19)
 - **Output head regularization**: Spectral norm/dropout on SRF — wrong level of abstraction
 - **Wider SRF heads**: 384-dim overfitting. 192-dim is optimal.
+- **Two-pass SRF**: Sequential boosting (#2259) — optimization interference despite `.detach()`. SRF architecture is fully exhausted.
 - **Optimizer variants**: SAM, Lookahead, SWA, SOAP, Muon — all worse than Lion+EMA+cosine
 - **Additive loss penalties**: Huber, L1+L2, OHNM — conflicts with PCGrad/tandem_ramp
 - **Node-level loss weighting**: Aft-foil 1.5x upweight (PR #2253), OHNM (PR #2249) — redundant

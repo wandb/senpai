@@ -3630,3 +3630,22 @@ Baseline (PR #2184): p_in=13.205, p_oodc=7.816, p_tan=28.502, p_re=6.453
 - **Decision: SENT BACK.** Directionally correct for p_in (-1.0%) but OOD regression (+2.8% p_oodc, +1.7% p_re) is too large. The hard cutoff at epoch 120 removes too much diversity from OOD-critical augmentations.
 - **Follow-up instructions:** (A) Try `aug_stop_epoch=140` — only ~8 clean epochs, preserves more OOD robustness; (B) Try selective annealing — only disable AoA perturbation at epoch 120 but keep gap/stagger noise and DSDF rotation active (these are the OOD-critical augs). Run both trials 2-seed each, report 2×2 table.
 - **Key insight:** Gap/stagger and DSDF rotation synthesize geometry diversity (OOD-critical), while AoA perturbation is more ID-focused (it varies in-distribution angle of attack). Selective removal should preserve OOD while allowing cleaner p_in convergence.
+
+---
+
+## 2026-04-08 03:15 — PR #2259: Two-Pass Iterative SRF (fern) — **CLOSED** (negative result)
+
+- Branch: `fern/srf-two-pass`
+- Hypothesis: Apply gradient-boosting logic to the surface refinement pathway. A second, smaller SRF head (hidden=96, layers=2, ~28K params) operates on the already-corrected SRF1 output with `.detach()` to prevent gradient backflow. Zero-init ensures no regression at epoch 0.
+
+| Metric | Baseline (#2213) | Seed 42 (xgzt2sz0) | Seed 73 (6hzyktgn) | 2-seed avg | Δ vs baseline |
+|--------|-----------------|---------------------|---------------------|------------|---------------|
+| p_in   | 11.979          | 12.543              | 12.096              | **12.319** | +2.8% ❌      |
+| p_oodc | 7.643           | 8.369               | 7.523               | **7.946**  | +4.0% ❌      |
+| p_tan  | 28.341          | 28.829              | 28.053              | **28.441** | +0.4% ❌      |
+| p_re   | 6.300           | 6.672               | 6.382               | **6.527**  | +3.6% ❌      |
+
+- W&B: `xgzt2sz0` (seed 42, best epoch 146, 180 min), `6hzyktgn` (seed 73, best epoch 146, 180 min). Both ~147 epochs.
+- **Decision: CLOSED — dead end.** All metrics regressed, with massive seed variance on p_oodc (8.369 vs 7.523). Despite zero-init safety, the two-pass pathway degrades optimization dynamics.
+- **Analysis:** Even with `.detach()` preventing direct gradient flow from SRF2→SRF1, the combined loss signal (SRF1+SRF2 output) changes what SRF1 learns. SRF1 converges to a suboptimal correction because its loss target includes SRF2's (initially zero) contribution. As SRF2 learns nonzero corrections, the loss landscape for SRF1 shifts — creating optimization instability. The massive p_oodc seed variance confirms this instability.
+- **Key conclusion: SRF architecture modifications are exhausted.** Both wider SRF (#2252, 384-dim → overfitting) and sequential SRF (#2259, two-pass → optimization interference) degraded all metrics. The 3-layer 192-dim single-pass SRF is at a local optimum for this task. Future improvements must target backbone, loss, or input representation — not the surface refinement pathway.
