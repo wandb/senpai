@@ -1133,8 +1133,9 @@ class Config:
     two_phase_switch_epoch: int = 100  # epoch at which to switch phases
     two_phase_lr_1: float = 3e-4       # phase 1 LR (overrides cfg.lr when active)
     two_phase_lr_2: float = 1e-4       # phase 2 LR
-    snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
-    snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    snapshot_ensemble: bool = False    # cyclic cosine LR + prediction averaging at inference
+    snapshot_n_cycles: int = 3         # number of cosine cycles (each ~50 epochs)
+    snapshot_lr_min: float = 1e-6      # minimum LR at each cycle trough
     # Phase 4: throughput optimization
     val_every: int = 1                  # validate every N epochs (1 = every epoch)
     disable_pcgrad: bool = False        # skip PCGrad dual-backward, use simple combined loss
@@ -1407,9 +1408,8 @@ swa_n = 0
 swa_cyclic_model = None
 swa_cyclic_n = 0
 swa_cyclic_scheduler = None
-snapshot_avg_model = None
-snapshot_n = 0
-snapshot_epoch_list = [int(e) for e in cfg.snapshot_epochs_str.split(",")] if cfg.snapshot_ensemble else []
+snapshot_saved_paths = []  # list of (cycle_idx, base_path) for saved snapshot checkpoints
+snapshot_cycle_length = 50  # epochs per cycle (Huang et al., ICLR 2017)
 
 n_params = sum(p.numel() for p in model.parameters())
 if refine_head is not None:
@@ -1577,6 +1577,12 @@ elif cfg.scheduler_type == "onecycle":
         pct_start=cfg.onecycle_pct_start,
         div_factor=cfg.onecycle_div_factor,
         final_div_factor=cfg.onecycle_final_div_factor,
+    )
+elif cfg.snapshot_ensemble:
+    # Cyclic cosine LR: each cycle goes from lr_max → lr_min, then warm-restarts
+    # No warmup — start at full LR for maximum cycle utilization (Huang et al., ICLR 2017)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        base_opt, T_0=snapshot_cycle_length, T_mult=1, eta_min=cfg.snapshot_lr_min
     )
 else:  # sequential (default)
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
@@ -2367,18 +2373,23 @@ for epoch in range(MAX_EPOCHS):
     epoch_surf /= n_batches
     prev_vol_loss = epoch_vol
     prev_surf_loss = epoch_surf
-    # Snapshot ensemble: save running average at specified epochs
-    if cfg.snapshot_ensemble and (epoch + 1) in snapshot_epoch_list:
-        snap = {k: v.cpu().clone() for k, v in _base_model.state_dict().items()}
-        snapshot_n += 1
-        if snapshot_avg_model is None:
-            snapshot_avg_model = deepcopy(_base_model)
-            snapshot_avg_model.load_state_dict(snap)
-        else:
-            with torch.no_grad():
-                sa = snapshot_avg_model.state_dict()
-                for k in snap:
-                    sa[k].mul_((snapshot_n - 1) / snapshot_n).add_(snap[k].to(device) / snapshot_n)
+    # Snapshot ensemble: save checkpoint at each cycle trough (LR minimum)
+    if cfg.snapshot_ensemble and (epoch + 1) % snapshot_cycle_length == 0:
+        _cycle_idx = (epoch + 1) // snapshot_cycle_length
+        _snap_base = model_dir / f"snapshot_{_cycle_idx}"
+        _snap_model = _base_model._orig_mod if hasattr(_base_model, '_orig_mod') else _base_model
+        torch.save(_snap_model.state_dict(), f"{_snap_base}_model.pt")
+        if refine_head is not None:
+            _rh = refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
+            torch.save(_rh.state_dict(), f"{_snap_base}_refine.pt")
+        if aft_srf_head is not None:
+            _ah = aft_srf_head._orig_mod if hasattr(aft_srf_head, '_orig_mod') else aft_srf_head
+            torch.save(_ah.state_dict(), f"{_snap_base}_aft_srf.pt")
+        if aft_srf_ctx_head is not None:
+            _ch = aft_srf_ctx_head._orig_mod if hasattr(aft_srf_ctx_head, '_orig_mod') else aft_srf_ctx_head
+            torch.save(_ch.state_dict(), f"{_snap_base}_aft_ctx.pt")
+        snapshot_saved_paths.append((_cycle_idx, str(_snap_base)))
+        wandb.log({"snapshot/cycle_saved": _cycle_idx, "snapshot/save_epoch": epoch + 1})
 
     # --- Validate across all splits ---
     _do_val = (epoch + 1) % cfg.val_every == 0 or epoch == 0 or epoch == MAX_EPOCHS - 1
@@ -2396,8 +2407,8 @@ for epoch in range(MAX_EPOCHS):
 
     if cfg.swa_cyclic and swa_cyclic_model is not None:
         eval_model = swa_cyclic_model
-    elif cfg.snapshot_ensemble and snapshot_avg_model is not None:
-        eval_model = snapshot_avg_model
+    elif cfg.snapshot_ensemble:
+        eval_model = _base_model  # use current model for per-epoch tracking; ensemble eval at end
     elif cfg.swa and swa_model is not None:
         eval_model = swa_model
     elif ema_model is not None:
@@ -2836,12 +2847,233 @@ wandb.summary.update({"total_epochs": epoch + 1, "total_time_min": total_time})
 if best_metrics:
     wandb.summary.update({"best_" + k: v for k, v in best_metrics.items()})
 
+# --- Snapshot Ensemble: post-training prediction averaging ---
+if cfg.snapshot_ensemble and len(snapshot_saved_paths) >= 2:
+    print(f"\n{'='*70}")
+    print(f"SNAPSHOT ENSEMBLE EVALUATION ({len(snapshot_saved_paths)} snapshots)")
+    print(f"{'='*70}")
+    # Load all snapshot state dicts
+    _snap_models = []
+    _snap_refine_heads = []
+    _snap_aft_heads = []
+    _snap_aft_ctx_heads = []
+    for _cidx, _spath in snapshot_saved_paths:
+        _sd = torch.load(f"{_spath}_model.pt", map_location=device, weights_only=True)
+        _snap_models.append(_sd)
+        if refine_head is not None and Path(f"{_spath}_refine.pt").exists():
+            _snap_refine_heads.append(torch.load(f"{_spath}_refine.pt", map_location=device, weights_only=True))
+        if aft_srf_head is not None and Path(f"{_spath}_aft_srf.pt").exists():
+            _snap_aft_heads.append(torch.load(f"{_spath}_aft_srf.pt", map_location=device, weights_only=True))
+        if aft_srf_ctx_head is not None and Path(f"{_spath}_aft_ctx.pt").exists():
+            _snap_aft_ctx_heads.append(torch.load(f"{_spath}_aft_ctx.pt", map_location=device, weights_only=True))
+        print(f"  Loaded snapshot cycle {_cidx} from {_spath}")
+
+    _base_unwrapped = _base_model._orig_mod if hasattr(_base_model, '_orig_mod') else _base_model
+    _refine_unwrapped = (refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head) if refine_head is not None else None
+    _aft_unwrapped = (aft_srf_head._orig_mod if hasattr(aft_srf_head, '_orig_mod') else aft_srf_head) if aft_srf_head is not None else None
+    _ctx_unwrapped = (aft_srf_ctx_head._orig_mod if hasattr(aft_srf_ctx_head, '_orig_mod') else aft_srf_ctx_head) if aft_srf_ctx_head is not None else None
+
+    # Evaluate ensemble and individual snapshots
+    for _eval_mode in ["ensemble"] + [f"snapshot_{c}" for c, _ in snapshot_saved_paths]:
+        _ens_metrics = {}
+        for split_name, vloader in val_loaders.items():
+            mae_surf = torch.zeros(3, device=device)
+            mae_vol = torch.zeros(3, device=device)
+            n_surf = torch.zeros(3, device=device)
+            n_vol = torch.zeros(3, device=device)
+
+            with torch.no_grad():
+                for x, y, is_surface, mask in tqdm(
+                    vloader, desc=f"{_eval_mode} [{split_name}]", leave=False
+                ):
+                    x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                    is_surface = is_surface.to(device, non_blocking=True)
+                    mask = mask.to(device, non_blocking=True)
+                    raw_dsdf = x[:, :, 2:10]
+                    dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+                    dist_feat = torch.log1p(dist_surf * 10.0)
+                    _raw_aoa = x[:, 0, 14:15]
+                    _need_te = cfg.te_coord_frame or cfg.wake_deficit_feature
+                    _raw_xy_te = x[:, :, :2].clone() if _need_te else None
+                    _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te else None
+                    _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
+                    _snap_aft_mask = None
+                    if aft_srf_head is not None or aft_srf_ctx_head is not None:
+                        _v_saf_norm = x[:, :, 2:4].norm(dim=-1)
+                        _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
+                        _snap_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
+                        _v_gap_stagger = x[:, 0, 22:24]
+                    x_input = (x - stats["x_mean"]) / stats["x_std"]
+                    curv = x_input[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                    if cfg.te_coord_frame:
+                        te_feats, _fte_x, _fte_y = compute_te_features(_raw_xy_te, is_surface, _raw_saf_norm_te)
+                        x_input = torch.cat([x_input, curv, dist_feat, te_feats], dim=-1)
+                        if cfg.wake_deficit_feature:
+                            wake_feats = compute_wake_deficit_features(
+                                _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake,
+                                fore_te_x=_fte_x, fore_te_y=_fte_y)
+                            x_input = torch.cat([x_input, wake_feats], dim=-1)
+                    else:
+                        x_input = torch.cat([x_input, curv, dist_feat], dim=-1)
+                        if cfg.wake_deficit_feature:
+                            wake_feats = compute_wake_deficit_features(
+                                _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
+                            x_input = torch.cat([x_input, wake_feats], dim=-1)
+                    raw_xy = x_input[:, :, :2]
+                    xy_min = raw_xy.amin(dim=1, keepdim=True)
+                    xy_max = raw_xy.amax(dim=1, keepdim=True)
+                    xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                    freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                    xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                    fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                    x_input = torch.cat([x_input, fourier_pe], dim=-1)
+                    Umag, q = _umag_q(y, mask)
+                    # Normalize targets
+                    if cfg.asinh_pressure:
+                        y_phys = _phys_norm(y, Umag, q).clone()
+                        y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
+                    else:
+                        y_phys = _phys_norm(y, Umag, q)
+                    y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                    _v_freestream = None
+                    if cfg.residual_prediction:
+                        _aoa = _raw_aoa
+                        _fs_phys = torch.zeros(y_norm.shape[0], 1, 3, device=device)
+                        _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))
+                        _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))
+                        _v_freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                        y_norm = y_norm - _v_freestream
+                    # Per-sample std
+                    raw_gap = x_input[:, 0, 21] if x_input.shape[-1] > 21 else torch.zeros(x_input.shape[0], device=device)
+                    is_tandem = raw_gap.abs() > 0.5
+                    B = y_norm.shape[0]
+                    sample_stds = torch.ones(B, 1, 3, device=device)
+                    if not cfg.no_perstd and cfg.high_p_clamp:
+                        channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
+                        tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
+                        for b in range(B):
+                            valid = mask[b]
+                            if is_tandem[b]:
+                                sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
+                            else:
+                                sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+
+                    # Determine which snapshot indices to use
+                    if _eval_mode == "ensemble":
+                        _snap_indices = list(range(len(_snap_models)))
+                    else:
+                        _snap_idx = int(_eval_mode.split("_")[1]) - 1  # snapshot_1 → index 0
+                        _snap_indices = [_snap_idx]
+
+                    pred_ensemble = None
+                    hidden_last = None
+                    for _si in _snap_indices:
+                        _base_unwrapped.load_state_dict(_snap_models[_si])
+                        _base_unwrapped.eval()
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            _out = _base_unwrapped({"x": x_input})
+                        _pred = _out["preds"].float()
+                        _hidden = _out["hidden"].float()
+
+                        # Apply SRF heads for this snapshot
+                        if _si < len(_snap_refine_heads) and _refine_unwrapped is not None:
+                            _refine_unwrapped.load_state_dict(_snap_refine_heads[_si])
+                            _refine_unwrapped.eval()
+                            _pred_scaled = _pred / sample_stds
+                            surf_idx = is_surface.nonzero(as_tuple=False)
+                            if surf_idx.numel() > 0:
+                                sh = _hidden[surf_idx[:, 0], surf_idx[:, 1]]
+                                sp = _pred_scaled[surf_idx[:, 0], surf_idx[:, 1]]
+                                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                    corr = _refine_unwrapped(sh, sp).float()
+                                _pred_scaled = _pred_scaled.clone()
+                                _pred_scaled[surf_idx[:, 0], surf_idx[:, 1]] += corr
+                            _pred = _pred_scaled * sample_stds
+
+                        # Apply aft-foil SRF
+                        if _si < len(_snap_aft_ctx_heads) and _ctx_unwrapped is not None and _snap_aft_mask is not None:
+                            _ctx_unwrapped.load_state_dict(_snap_aft_ctx_heads[_si])
+                            _ctx_unwrapped.eval()
+                            _pred_s = _pred / sample_stds
+                            _vol_mask_s = mask & ~is_surface
+                            _coords_s = x_input[:, :, :2]
+                            _pred_s = _pred_s.clone()
+                            for b in range(x_input.shape[0]):
+                                _aft_b = _snap_aft_mask[b].nonzero(as_tuple=True)[0]
+                                _vol_b = _vol_mask_s[b].nonzero(as_tuple=True)[0]
+                                if _aft_b.numel() == 0 or _vol_b.numel() == 0:
+                                    continue
+                                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                    _corr = _ctx_unwrapped(
+                                        _hidden[b, _aft_b], _coords_s[b, _aft_b],
+                                        _hidden[b, _vol_b], _coords_s[b, _vol_b],
+                                        _pred_s[b, _aft_b],
+                                    ).float()
+                                _pred_s[b, _aft_b] += _corr
+                            _pred = _pred_s * sample_stds
+                        elif _si < len(_snap_aft_heads) and _aft_unwrapped is not None and _snap_aft_mask is not None:
+                            _aft_unwrapped.load_state_dict(_snap_aft_heads[_si])
+                            _aft_unwrapped.eval()
+                            _pred_s = _pred / sample_stds
+                            aft_idx = _snap_aft_mask.nonzero(as_tuple=False)
+                            if aft_idx.numel() > 0:
+                                _ah = _hidden[aft_idx[:, 0], aft_idx[:, 1]]
+                                _ap = _pred_s[aft_idx[:, 0], aft_idx[:, 1]]
+                                _ac = _v_gap_stagger[aft_idx[:, 0]] if cfg.aft_foil_srf_film else None
+                                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                    _aft_corr = _aft_unwrapped(_ah, _ap, _ac).float()
+                                _pred_s = _pred_s.clone()
+                                _pred_s[aft_idx[:, 0], aft_idx[:, 1]] += _aft_corr
+                            _pred = _pred_s * sample_stds
+
+                        if pred_ensemble is None:
+                            pred_ensemble = _pred / len(_snap_indices)
+                        else:
+                            pred_ensemble += _pred / len(_snap_indices)
+                        hidden_last = _hidden
+
+                    # Denormalize averaged prediction
+                    pred = pred_ensemble
+                    if cfg.residual_prediction and _v_freestream is not None:
+                        pred = pred + _v_freestream
+                    pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                    if cfg.asinh_pressure:
+                        pred_phys = pred_phys.clone()
+                        pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
+                    pred_orig = _phys_denorm(pred_phys, Umag, q)
+                    y_clamped = y.clamp(-1e6, 1e6)
+                    err = (pred_orig - y_clamped).abs()
+                    finite = err.isfinite()
+                    err = err.where(finite, torch.zeros_like(err))
+                    vol_mask = mask & ~is_surface
+                    surf_mask = mask & is_surface
+                    mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                    mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                    n_surf += (surf_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+                    n_vol += (vol_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+
+            mae_surf /= n_surf.clamp(min=1)
+            mae_vol /= n_vol.clamp(min=1)
+            _ens_metrics[split_name] = {
+                "mae_surf_p": mae_surf[2].item(),
+                "mae_surf_Ux": mae_surf[0].item(),
+                "mae_surf_Uy": mae_surf[1].item(),
+                "mae_vol_p": mae_vol[2].item(),
+            }
+            print(f"  {_eval_mode} {split_name:30s} mae_surf_p={mae_surf[2].item():.1f}")
+
+        # Log to wandb
+        for sn, sm in _ens_metrics.items():
+            for mk, mv in sm.items():
+                wandb.summary[f"{_eval_mode}/{sn}/{mk}"] = mv
+    print(f"{'='*70}")
+
     print("\nGenerating flow field plots...")
     try:
         if cfg.swa_cyclic and swa_cyclic_model is not None:
             vis_model = swa_cyclic_model
-        elif cfg.snapshot_ensemble and snapshot_avg_model is not None:
-            vis_model = snapshot_avg_model
+        elif cfg.snapshot_ensemble:
+            vis_model = _base_model
         elif cfg.swa and swa_model is not None:
             vis_model = swa_model
         elif ema_model is not None:
