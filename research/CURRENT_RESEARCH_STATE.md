@@ -37,7 +37,7 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 | thorfinn | #2280 | **Snapshot Ensemble — cyclic cosine LR with prediction averaging** | WIP (NEW) |
 | fern | #2278 | **Surface Arc-Length PE — per-foil chord-wise positional encoding** | WIP (NEW) |
 | askeladd | #2282 | **Point Cloud MixUp — linear interpolation data augmentation** | WIP (NEW) |
-| frieren | #2277 | **Tandem Difficulty Curriculum — progressive exposure by gap/stagger magnitude** | WIP (NEW) |
+| frieren | #2283 | **Wider SRF Head — surface_refine_hidden 192→384** | WIP (NEW) |
 | tanjiro | #2273 | **BOLD: Geometry Consistency Self-Distillation — Mean Teacher on augmented mesh** | WIP |
 | edward | #2281 | **Multi-Head SRF Ensemble — 3 independent SRF heads, prediction averaging** | WIP (NEW) |
 | nezuko | #2279 | **Ensemble Knowledge Distillation — soft targets from 16-seed ensemble** | WIP (NEW) |
@@ -94,7 +94,7 @@ Acknowledged and pivoting. Round 27 will include bold architectural additions (G
 | thorfinn | #2280 | **Snapshot Ensemble** — cyclic cosine LR, 3-checkpoint prediction averaging | p_oodc, p_re |
 | fern | #2278 | **Surface Arc-Length PE** — per-foil chord-wise sin/cos positional encoding | p_tan, p_in |
 | askeladd | #2282 | **Point Cloud MixUp** — linear interpolation data augmentation | p_oodc, p_re |
-| frieren | #2277 | **Tandem Difficulty Curriculum** — progressive exposure by gap/stagger magnitude | p_tan |
+| frieren | #2283 | **Wider SRF Head** — surface_refine_hidden 192→384, capacity increase | p_in, p_tan |
 | tanjiro | #2273 | **BOLD: Geometry Consistency Self-Distillation** — Mean Teacher on jittered mesh | p_oodc |
 | edward | #2281 | **Multi-Head SRF Ensemble** — 3 independent heads on shared backbone | p_oodc, p_re |
 | nezuko | #2279 | **Ensemble Knowledge Distillation** — soft targets from 16-seed ensemble | p_oodc, p_re |
@@ -152,6 +152,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 - **TTA AoA rotation ensemble**: Coordinate rotation ≠ physical AoA change — creates geometry-physics inconsistency with DSDF features. Training augmentation already handles rotation robustness (+12-49%)
 - **FNO inter-foil spectral coupling**: 5th inter-foil coupling failure (attention, GALE, cross-DSDF, GNN, FNO all dead). Transolver slice attention already captures inter-foil interactions implicitly
 - **MAE surface pretraining**: Catastrophic at small model scale (3-block, 192-dim). Pretraining pushes backbone into reconstruction basin far from flow prediction (+342-1106%)
+- **Tandem difficulty curriculum**: Double-gating with tandem_ramp. Withholding tandem diversity during critical early training hurts (+3.9-9.1%)
 - **Sample-level reweighting**: Focal loss, OHNM — over-correction on top of PCGrad
 - **Optimizer variants**: SAM, Lookahead, SWA, SOAP, Muon — all worse than Lion+EMA+cosine
 

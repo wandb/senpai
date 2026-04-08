@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 17:30 — PR #2277: Tandem Difficulty Curriculum — frieren — **CLOSED** ❌
+
+- Branch: `frieren/tandem-difficulty-curriculum`
+- Hypothesis: Progressive tandem exposure by gap/stagger magnitude — easiest 25% for epochs 0-40, linear ramp to 100% by epoch 80. Pure training schedule change, orthogonal to existing tandem_ramp loss weighting.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 12.358 | +3.9% ❌ |
+| p_oodc | 7.561  | 8.246  | +9.1% ❌ |
+| p_tan  | 28.118 | 30.564 | +8.7% ❌ |
+| p_re   | 6.364  | 6.699  | +5.3% ❌ |
+
+- W&B: g8jwdot4 (s42), cztl9tw2 (s73). Epochs: 155 (best at 154 — late convergence). 756 tandem samples available, Q1=189.
+- **Analysis:** Double-gating: curriculum restricts which samples + tandem_ramp restricts loss weight = severely under-trained tandem pathway. Withholding 75% of tandem samples during epochs 0-40 removes critical diversity when model is most receptive. Late best_epoch (154 vs baseline ~120-130) confirms model was catching up on late-introduced hard samples. Gap/stagger magnitude doesn't align with actual learning difficulty.
+- **Conclusion:** CLOSED. Tandem difficulty curriculum added to DO NOT REVISIT — existing uniform sampling + tandem_ramp is already well-tuned.
+
+---
+
 ### 2026-04-08 17:00 — PR #2276: MAE Surface Pretrain — askeladd — **CLOSED** ❌
 
 - Branch: `askeladd/mae-surface-pretrain`
