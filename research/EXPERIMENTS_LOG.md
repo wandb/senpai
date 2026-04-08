@@ -2,6 +2,62 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 07:30 — PR #2263: Attention Logit Noise σ=0.05 — alphonse — **CLOSED** ❌
+
+- Branch: `alphonse/attn-logit-noise`
+- Hypothesis: Add Gaussian noise N(0, σ²) to cross-slice attention logits (pre-softmax, shape [B, H, S, S]) during training in all 3 TransolverBlocks. Analogous to DropAttention (Zehui Lin et al., 2019) — forces robust attention patterns, targets OOD slice routing failures on tandem wake nodes.
+
+| Metric | Baseline (#2251) | Seed 42 (lozjp7jd) | Seed 73 (bcgmj504) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in   | 11.891 | 12.284 | 12.435 | **12.36** | +3.9% ❌ |
+| p_oodc | 7.561  | 7.6    | 7.5    | **7.55**  | -0.1% ≈ |
+| p_tan  | 28.118 | 28.6   | 28.2   | **28.40** | +1.0% ❌ |
+| p_re   | 6.364  | 6.5    | 6.4    | **6.45**  | +1.3% ❌ |
+
+- W&B runs: lozjp7jd (s42, 147 epochs), bcgmj504 (s73, 148 epochs)
+- **Analysis:** Clear negative result. The noise disrupted fine-grained in-distribution slice routing (p_in +3.9%) without providing meaningful OOD benefit. Two problems: (1) attn_scale is a learned parameter starting at ~10.0, so σ=0.05 is only ~0.5% relative noise — too small to regularize, large enough to add gradient noise; (2) slice routing is already well-regularized by PCGrad, tandem_ramp, and slice_residual_scale. Stacking another routing perturbation is redundant. The hypothesis that tandem failures come from incorrect slice routing appears incorrect — it's more likely about input feature limitations than attention routing.
+- **Conclusion:** CLOSED. Attention logit noise is a dead end. The mechanistic analysis (tandem failures ≠ routing failures) is valuable context for future experiments.
+
+---
+
+### 2026-04-08 07:30 — PR #2262: Foil Role Embedding — tanjiro — **REQUEST CHANGES** (sent back)
+
+- Branch: `tanjiro/foil-role-embed`
+- Hypothesis: Two zero-initialized learned embeddings `fore_embed` and `aft_embed` (shape [192]) added to backbone hidden state for surface nodes after preprocess(). Analogous to BERT token-type embeddings — gives the model explicit aerodynamic identity for fore vs aft foil nodes. 384 new parameters total, zero-init ensures backward-compatible initialization.
+
+| Metric | Baseline (#2251) | Seed 42 (un5qyg2x) | Seed 73 (1p6xzy9p) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in   | 11.891 | 11.76  | 12.29  | **12.03** | +1.2% ❌ |
+| p_oodc | 7.561  | 7.6    | 7.5    | **7.55**  | -0.1% ≈ |
+| p_tan  | 28.118 | 28.6   | 28.2   | **28.40** | +1.0% ❌ |
+| p_re   | 6.364  | 6.2    | 6.5    | **6.35**  | -0.2% ≈ |
+
+- W&B runs: un5qyg2x (s42, 147 epochs), 1p6xzy9p (s73, 145 epochs)
+- **Analysis:** Mixed result obscured by two bugs: (1) Student used `saf_norm <= 0.005` instead of `boundary_id` for foil identity — potentially incorrect assignment for some nodes; (2) ran with `--cosine_T_max 160` from old baseline instead of T_max=150 (current baseline). Seed 42 alone is very promising: p_in=11.76 (-1.1% vs current baseline), p_oodc=7.6, p_re=6.2 — all better. High seed variance (p_in 11.76 vs 12.29) suggests T_max mismatch may be contributing. p_oodc improved consistently across both seeds.
+- **Action:** Fix boundary_id usage, update to T_max=150 baseline config, re-run both seeds.
+- **Conclusion:** SENT BACK. Promising direction — consistent p_oodc improvement and seed 42 beats baseline on p_in and p_re. Not closing.
+
+---
+
+### 2026-04-08 07:30 — PR #2261: Per-Foil Target Whitening — edward — **REQUEST CHANGES** (sent back)
+
+- Branch: `edward/per-foil-whiten`
+- Hypothesis: Normalize surface pressure prediction target per-foil (per boundary ID group) to zero mean / unit variance before computing the loss. Forces the model to predict the SHAPE of each foil's pressure distribution. Inspired by instance normalization making CNNs style-invariant — removes absolute pressure level from the prediction task, expected to help tandem OOD transfer.
+
+| Metric | Baseline (#2251) | Seed 42 (8owjm49w) | Seed 73 (q6r01wa6) | 2-seed avg | Δ |
+|--------|-----------------|--------------------|--------------------|-----------|---|
+| p_in   | 11.891 | 11.613 | 11.790 | **11.701** | **-1.6%** ✅ |
+| p_oodc | 7.561  | 7.6    | 7.2    | **7.400**  | **-2.1%** ✅ |
+| p_tan  | 28.118 | 28.5   | 29.3   | **28.900** | +2.8% ❌ |
+| p_re   | 6.364  | 6.3    | 6.3    | **6.300**  | **-1.0%** ✅ |
+
+- W&B runs: 8owjm49w (s42, 148 epochs), q6r01wa6 (s73, 147 epochs)
+- **Analysis:** Excellent p_in/p_oodc/p_re improvements (3/4 metrics beat current baseline) but p_tan regressed badly (+2.8%). Root cause: per-foil whitening on the AFT foil normalizes its large-magnitude pressure errors to unit variance, de-emphasizing the very errors that teach the model tandem wake physics. The aft-foil operates in the wake of the fore foil with high-magnitude, high-gradient pressure fields — normalizing these is directly counter-productive for p_tan. Note: student also ran with T_max=160 (old baseline), not T_max=150.
+- **Action:** Apply whitening ONLY to fore-foil nodes (bid == 5 or 6), skip aft-foil. Update to T_max=150 baseline config. Re-run both seeds.
+- **Conclusion:** SENT BACK. The p_in (-1.6%) and p_oodc (-2.1%) gains are real and valuable — worth pursuing with the aft-foil exclusion fix.
+
+---
+
 ### 2026-04-08 05:15 — PR #2251: Cosine T_max=150 (follow-up to T_max=140) — thorfinn — **MERGED** ✅
 
 - Branch: `thorfinn/cosine-tmax-140`
