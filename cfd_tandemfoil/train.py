@@ -1170,6 +1170,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    per_foil_pressure_norm: bool = False    # per-foil target whitening for surface pressure loss
 
 
 cfg = sp.parse(Config)
@@ -1769,10 +1770,11 @@ for epoch in range(MAX_EPOCHS):
         # Aft-foil mask: boundary ID=7 nodes identified by saf norm > 0.005
         # saf is at raw x[:,:,2:4]; foil-1 surface has saf≈0, foil-2 has saf>>0
         _aft_foil_mask = None
-        if aft_srf_head is not None:
+        if aft_srf_head is not None or cfg.per_foil_pressure_norm:
             _raw_saf_norm = x[:, :, 2:4].norm(dim=-1)  # [B, N]
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
+        if aft_srf_head is not None:
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
@@ -1964,6 +1966,34 @@ for epoch in range(MAX_EPOCHS):
             abs_err = abs_err * sample_mask
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
+
+        # Per-foil pressure whitening: divide surface pressure error by per-foil std
+        # Equivalent to normalizing both pred and GT per foil — reweights loss so all foils
+        # contribute equally regardless of pressure magnitude.
+        if cfg.per_foil_pressure_norm and _aft_foil_mask is not None:
+            _y_pres = y_norm[:, :, 2]  # [B, N] — normalized pressure targets
+            _fore_surf = surf_mask & ~_aft_foil_mask
+            _aft_surf = _aft_foil_mask  # already includes surf_mask & tandem check
+            _fore_f = _fore_surf.float()
+            _aft_f = _aft_surf.float()
+            _fore_cnt = _fore_f.sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1]
+            _aft_cnt = _aft_f.sum(dim=1, keepdim=True).clamp(min=1)    # [B, 1]
+            _fore_mean = (_y_pres * _fore_f).sum(dim=1, keepdim=True) / _fore_cnt  # [B, 1]
+            _aft_mean = (_y_pres * _aft_f).sum(dim=1, keepdim=True) / _aft_cnt     # [B, 1]
+            _fore_var = (((_y_pres - _fore_mean) ** 2) * _fore_f).sum(dim=1, keepdim=True) / _fore_cnt
+            _aft_var = (((_y_pres - _aft_mean) ** 2) * _aft_f).sum(dim=1, keepdim=True) / _aft_cnt
+            _fore_std = _fore_var.sqrt().clamp(min=0.05)  # [B, 1]
+            _aft_std = _aft_var.sqrt().clamp(min=0.05)    # [B, 1]
+            # Build per-node inverse-std weight for surface pressure channel only
+            _pfoil_w = torch.ones(B, _y_pres.shape[1], 1, device=device)
+            _pfoil_w = torch.where(_fore_surf.unsqueeze(-1), (1.0 / _fore_std).unsqueeze(-1), _pfoil_w)
+            _pfoil_w = torch.where(_aft_surf.unsqueeze(-1), (1.0 / _aft_std).unsqueeze(-1), _pfoil_w)
+            # Re-normalize weights so mean weight over surface nodes is 1.0 (preserves loss scale)
+            _surf_w_mean = (_pfoil_w.squeeze(-1) * surf_mask.float()).sum() / surf_mask.sum().clamp(min=1)
+            _pfoil_w = _pfoil_w / _surf_w_mean.clamp(min=1e-6)
+            # Apply only to pressure channel (index 2)
+            abs_err = abs_err.clone()
+            abs_err[:, :, 2:3] = abs_err[:, :, 2:3] * _pfoil_w
 
         # Progressive resolution: subsample volume nodes in loss early in training
         # Ramps from 10% → 100% of volume nodes over first 40 epochs
@@ -2310,7 +2340,11 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.per_foil_pressure_norm and _aft_foil_mask is not None:
+            _log_dict["train/fore_pres_std"] = _fore_std.mean().item()
+            _log_dict["train/aft_pres_std"] = _aft_std.mean().item() if _aft_surf.any() else 0.0
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
