@@ -552,9 +552,10 @@ class SurfaceRefinementHead(nn.Module):
     """
 
     def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 128,
-                 n_layers: int = 2, p_only: bool = False):
+                 n_layers: int = 2, p_only: bool = False, flow_film: bool = False):
         super().__init__()
         self.p_only = p_only
+        self.flow_film = flow_film
         actual_out = 1 if p_only else out_dim  # 1 for pressure-only, 3 for all fields
         layers: list[nn.Module] = []
         # Input: hidden features (n_hidden) + base predictions (out_dim)
@@ -568,17 +569,35 @@ class SurfaceRefinementHead(nn.Module):
         nn.init.zeros_(layers[-1].weight)
         nn.init.zeros_(layers[-1].bias)
         self.mlp = nn.Sequential(*layers)
+        # FiLM conditioning on (log_Re, AoA) — applied after first GELU (index 2)
+        if flow_film:
+            self.flow_film_net = nn.Sequential(
+                nn.Linear(2, 64), nn.SiLU(),
+                nn.Linear(64, hidden_dim * 2),
+            )
+            nn.init.zeros_(self.flow_film_net[-1].weight)
+            nn.init.zeros_(self.flow_film_net[-1].bias)
 
-    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor,
+                flow_cond: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             hidden: [M, n_hidden] — hidden features for surface nodes only
             base_pred: [M, out_dim] — base predictions for surface nodes only
+            flow_cond: [M, 2] — (log_Re, AoA) per node (only used if flow_film=True)
         Returns:
             correction: [M, out_dim] — additive correction (zero-padded for p_only)
         """
         inp = torch.cat([hidden, base_pred], dim=-1)
-        correction = self.mlp(inp)
+        x = inp
+        for i, layer in enumerate(self.mlp):
+            x = layer(x)
+            # Apply FiLM after first hidden activation (index 2 = after GELU)
+            if self.flow_film and flow_cond is not None and i == 2:
+                film_params = self.flow_film_net(flow_cond)  # [M, hidden_dim*2]
+                scale, shift = film_params.chunk(2, dim=-1)
+                x = x * (1.0 + scale) + shift
+        correction = x
         if self.p_only:
             # Pad with zeros for velocity channels: [M, 1] → [M, 3]
             zeros = torch.zeros(correction.shape[0], base_pred.shape[-1] - 1,
@@ -595,9 +614,10 @@ class AftFoilRefinementHead(nn.Module):
     """
 
     def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 192,
-                 n_layers: int = 3, film: bool = False):
+                 n_layers: int = 3, film: bool = False, flow_film: bool = False):
         super().__init__()
         self.film = film
+        self.flow_film = flow_film
         in_dim = n_hidden + out_dim
         layers: list[nn.Module] = []
         for i in range(n_layers):
@@ -615,14 +635,24 @@ class AftFoilRefinementHead(nn.Module):
             nn.init.zeros_(self.film_scale.weight)
             nn.init.zeros_(self.film_shift.weight)
             nn.init.zeros_(self.film_shift.bias)
+        # FiLM conditioning on (log_Re, AoA) — applied after first GELU (index 2)
+        if flow_film:
+            self.flow_film_net = nn.Sequential(
+                nn.Linear(2, 64), nn.SiLU(),
+                nn.Linear(64, hidden_dim * 2),
+            )
+            nn.init.zeros_(self.flow_film_net[-1].weight)
+            nn.init.zeros_(self.flow_film_net[-1].bias)
 
     def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor,
-                cond: torch.Tensor | None = None) -> torch.Tensor:
+                cond: torch.Tensor | None = None,
+                flow_cond: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             hidden: [A, n_hidden] — hidden features for aft-foil nodes
             base_pred: [A, out_dim] — base predictions for aft-foil nodes
             cond: [A, 2] — (gap, stagger) per node (only used if film=True)
+            flow_cond: [A, 2] — (log_Re, AoA) per node (only used if flow_film=True)
         Returns:
             correction: [A, out_dim] — additive correction
         """
@@ -631,11 +661,16 @@ class AftFoilRefinementHead(nn.Module):
         x = inp
         for i, layer in enumerate(self.mlp):
             x = layer(x)
-            # Apply FiLM after first LayerNorm+GELU (i.e., after index 2)
-            if self.film and cond is not None and i == 2:
-                gamma = self.film_scale(cond)   # [A, hidden_dim]
-                beta = self.film_shift(cond)    # [A, hidden_dim]
-                x = x * (1.0 + gamma) + beta
+            # Apply geometry FiLM then flow FiLM after first GELU (index 2)
+            if i == 2:
+                if self.film and cond is not None:
+                    gamma = self.film_scale(cond)   # [A, hidden_dim]
+                    beta = self.film_shift(cond)    # [A, hidden_dim]
+                    x = x * (1.0 + gamma) + beta
+                if self.flow_film and flow_cond is not None:
+                    film_params = self.flow_film_net(flow_cond)  # [A, hidden_dim*2]
+                    scale, shift = film_params.chunk(2, dim=-1)
+                    x = x * (1.0 + scale) + shift
         return x
 
 
@@ -1165,6 +1200,7 @@ class Config:
     aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
     aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
     aft_foil_srf_context: bool = False       # KNN volume context for aft-foil SRF (wake pressure recovery)
+    srf_flow_film: bool = False              # FiLM conditioning on (log_Re, AoA) for SRF and aft-SRF heads
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
@@ -1356,6 +1392,7 @@ if cfg.surface_refine:
             hidden_dim=cfg.surface_refine_hidden,
             n_layers=cfg.surface_refine_layers,
             p_only=cfg.surface_refine_p_only,
+            flow_film=cfg.srf_flow_film,
         ).to(device)
     refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
     _refine_n_params = sum(p.numel() for p in refine_head.parameters())
@@ -1386,6 +1423,7 @@ if cfg.aft_foil_srf:
             hidden_dim=cfg.aft_foil_srf_hidden,
             n_layers=cfg.aft_foil_srf_layers,
             film=cfg.aft_foil_srf_film,
+            flow_film=cfg.srf_flow_film,
         ).to(device)
         aft_srf_head = torch.compile(aft_srf_head, mode=cfg.compile_mode)
         _aft_n_params = sum(p.numel() for p in aft_srf_head.parameters())
@@ -1916,7 +1954,8 @@ for epoch in range(MAX_EPOCHS):
                     if surf_idx.numel() > 0:
                         surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]  # [M, n_hidden]
                         surf_pred = pred[surf_idx[:, 0], surf_idx[:, 1]]      # [M, 3]
-                        correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
+                        _srf_flow_cond = x[surf_idx[:, 0], 0, 13:15] if cfg.srf_flow_film else None
+                        correction = refine_head(surf_hidden, surf_pred, flow_cond=_srf_flow_cond).float()
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
 
@@ -1949,8 +1988,9 @@ for epoch in range(MAX_EPOCHS):
                 _aft_cond = None
                 if cfg.aft_foil_srf_film:
                     _aft_cond = _raw_gap_stagger[aft_idx[:, 0]]  # [A, 2]
+                _aft_flow_cond = x[aft_idx[:, 0], 0, 13:15] if cfg.srf_flow_film else None
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    aft_correction = aft_srf_head(aft_hidden, aft_pred, _aft_cond).float()
+                    aft_correction = aft_srf_head(aft_hidden, aft_pred, _aft_cond, _aft_flow_cond).float()
                 pred = pred.clone()
                 pred[aft_idx[:, 0], aft_idx[:, 1]] = pred[aft_idx[:, 0], aft_idx[:, 1]] + aft_correction
 
@@ -2581,7 +2621,8 @@ for epoch in range(MAX_EPOCHS):
                             if surf_idx.numel() > 0:
                                 surf_hidden = _eval_hidden[surf_idx[:, 0], surf_idx[:, 1]]
                                 surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                                correction = eval_refine_head(surf_hidden, surf_pred).float()
+                                _srf_flow_cond = x[surf_idx[:, 0], 0, 13:15] if cfg.srf_flow_film else None
+                                correction = eval_refine_head(surf_hidden, surf_pred, flow_cond=_srf_flow_cond).float()
                                 pred_loss = pred_loss.clone()
                                 pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
@@ -2617,8 +2658,9 @@ for epoch in range(MAX_EPOCHS):
                         _ah = _eval_hidden[aft_idx[:, 0], aft_idx[:, 1]]
                         _ap = pred_loss[aft_idx[:, 0], aft_idx[:, 1]]
                         _ac = _v_gap_stagger[aft_idx[:, 0]] if cfg.aft_foil_srf_film else None
+                        _afc = x[aft_idx[:, 0], 0, 13:15] if cfg.srf_flow_film else None
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                            _aft_corr = eval_aft_srf_head(_ah, _ap, _ac).float()
+                            _aft_corr = eval_aft_srf_head(_ah, _ap, _ac, _afc).float()
                         pred_loss = pred_loss.clone()
                         pred_loss[aft_idx[:, 0], aft_idx[:, 1]] += _aft_corr
                         # Back-compute pred for denormalization
@@ -3080,7 +3122,8 @@ if cfg.surface_refine and best_metrics:
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                             surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]
                             surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                            correction = verify_refine(surf_hidden, surf_pred).float()
+                            _vrf_flow_cond = x[surf_idx[:, 0], 0, 13:15] if cfg.srf_flow_film else None
+                            correction = verify_refine(surf_hidden, surf_pred, flow_cond=_vrf_flow_cond).float()
                         pred_loss_refined = pred_loss.clone()
                         pred_loss_refined[surf_idx[:, 0], surf_idx[:, 1]] += correction
                         correction_full[surf_idx[:, 0], surf_idx[:, 1]] = correction
