@@ -347,6 +347,90 @@ def compute_wake_deficit_features(raw_xy, is_surface, saf_norm, gap_raw, fore_te
     return torch.stack([dx_norm, dy_norm], dim=-1)  # [B, N, 2]
 
 
+def get_foil1_le_te(xy, is_surface, saf_norm):
+    """Get leading edge (min-x) and trailing edge (max-x) of foil-1 surface nodes.
+
+    Uses SAF norm to distinguish foil-1 (saf_norm <= 0.005) from foil-2.
+    Falls back to all surface nodes for single-foil samples.
+
+    Args:
+        xy: [B, N, 2] node coordinates
+        is_surface: [B, N] bool
+        saf_norm: [B, N] norm of SAF channels
+
+    Returns:
+        le: [B, 2], te: [B, 2]
+    """
+    INF = 1e6
+    fore_surf = is_surface & (saf_norm <= 0.005)
+    # Fallback: if no fore surface nodes, use all surface nodes
+    no_fore = ~fore_surf.any(dim=1, keepdim=True)
+    fore_surf = fore_surf | (no_fore & is_surface)
+
+    x_coords = xy[:, :, 0]
+    y_coords = xy[:, :, 1]
+    B = xy.shape[0]
+    b_idx = torch.arange(B, device=xy.device)
+
+    # LE = min-x among fore surface nodes
+    x_for_min = x_coords.clone()
+    x_for_min[~fore_surf] = INF
+    le_idx = x_for_min.argmin(dim=1)
+    le = torch.stack([x_coords[b_idx, le_idx], y_coords[b_idx, le_idx]], dim=-1)
+
+    # TE = max-x among fore surface nodes
+    x_for_max = x_coords.clone()
+    x_for_max[~fore_surf] = -INF
+    te_idx = x_for_max.argmax(dim=1)
+    te = torch.stack([x_coords[b_idx, te_idx], y_coords[b_idx, te_idx]], dim=-1)
+
+    return le, te
+
+
+def canonicalize_se2(coords_xy, foil1_le, foil1_te):
+    """Rotate and translate node coordinates to chord-aligned canonical frame.
+
+    Args:
+        coords_xy: [B, N, 2] node coordinates in global frame
+        foil1_le: [B, 2] leading edge of foil 1
+        foil1_te: [B, 2] trailing edge of foil 1
+
+    Returns:
+        coords_canon: [B, N, 2] in canonical frame (chord along +x, LE at origin)
+        cos_a: [B] cosine of rotation angle
+        sin_a: [B] sine of rotation angle
+    """
+    chord_vec = foil1_te - foil1_le  # [B, 2]
+    chord_len = torch.norm(chord_vec, dim=-1, keepdim=True).clamp(min=1e-6)
+    chord_unit = chord_vec / chord_len  # [B, 2]
+
+    cos_a = chord_unit[:, 0]  # [B]
+    sin_a = chord_unit[:, 1]  # [B]
+
+    # Translate: LE to origin
+    coords_t = coords_xy - foil1_le.unsqueeze(1)  # [B, N, 2]
+
+    # Rotate: chord → +x axis
+    x_rot = cos_a.unsqueeze(1) * coords_t[:, :, 0] + sin_a.unsqueeze(1) * coords_t[:, :, 1]
+    y_rot = -sin_a.unsqueeze(1) * coords_t[:, :, 0] + cos_a.unsqueeze(1) * coords_t[:, :, 1]
+
+    return torch.stack([x_rot, y_rot], dim=-1), cos_a, sin_a
+
+
+def rotate_velocity_to_canon(Ux, Uy, cos_a, sin_a):
+    """Rotate velocity vectors into canonical frame. Pressure is scalar (unchanged)."""
+    Ux_c = cos_a.unsqueeze(1) * Ux + sin_a.unsqueeze(1) * Uy
+    Uy_c = -sin_a.unsqueeze(1) * Ux + cos_a.unsqueeze(1) * Uy
+    return Ux_c, Uy_c
+
+
+def rotate_velocity_to_global(Ux_c, Uy_c, cos_a, sin_a):
+    """Rotate velocity vectors from canonical frame back to global frame."""
+    Ux = cos_a.unsqueeze(1) * Ux_c - sin_a.unsqueeze(1) * Uy_c
+    Uy = sin_a.unsqueeze(1) * Ux_c + cos_a.unsqueeze(1) * Uy_c
+    return Ux, Uy
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -1170,6 +1254,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    se2_canonicalize: bool = False          # rotate input coords to chord-aligned canonical frame
 
 
 cfg = sp.parse(Config)
@@ -1774,6 +1859,19 @@ for epoch in range(MAX_EPOCHS):
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
+        # SE(2) canonicalization: rotate coords to chord-aligned frame
+        _se2_cos = _se2_sin = None
+        if cfg.se2_canonicalize:
+            _saf_se2 = x[:, :, 2:4].norm(dim=-1)
+            _se2_le, _se2_te = get_foil1_le_te(x[:, :, :2], is_surface, _saf_se2)
+            _canon_xy, _se2_cos, _se2_sin = canonicalize_se2(x[:, :, :2], _se2_le, _se2_te)
+            x = x.clone()
+            x[:, :, :2] = _canon_xy
+            # Rotate velocity targets into canonical frame
+            y = y.clone()
+            _Ux_c, _Uy_c = rotate_velocity_to_canon(y[:, :, 0], y[:, :, 1], _se2_cos, _se2_sin)
+            y[:, :, 0] = _Ux_c
+            y[:, :, 1] = _Uy_c
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1828,6 +1926,10 @@ for epoch in range(MAX_EPOCHS):
         _freestream = None
         if cfg.residual_prediction:
             _aoa = _raw_aoa  # [B, 1]
+            if cfg.se2_canonicalize and _se2_cos is not None:
+                # Adjust AoA for canonical frame: subtract chord angle
+                _chord_angle = torch.atan2(_se2_sin, _se2_cos).unsqueeze(-1)  # [B, 1]
+                _aoa = _aoa - _chord_angle
             if cfg.adaptive_norm:
                 # Freestream in raw space: (Umag*cos(AoA), Umag*sin(AoA), 0)
                 _fs_raw = torch.zeros(y_norm.shape[0], 1, 3, device=device)
@@ -2464,6 +2566,20 @@ for epoch in range(MAX_EPOCHS):
                     _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
                     _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
                     _v_gap_stagger = x[:, 0, 22:24]  # [B, 2]
+                # SE(2) canonicalization (validation)
+                _se2_cos_v = _se2_sin_v = None
+                y_global = y  # save global-frame targets for MAE reporting
+                if cfg.se2_canonicalize:
+                    _saf_se2_v = x[:, :, 2:4].norm(dim=-1)
+                    _se2_le_v, _se2_te_v = get_foil1_le_te(x[:, :, :2], is_surface, _saf_se2_v)
+                    _canon_xy_v, _se2_cos_v, _se2_sin_v = canonicalize_se2(x[:, :, :2], _se2_le_v, _se2_te_v)
+                    x = x.clone()
+                    x[:, :, :2] = _canon_xy_v
+                    # Rotate velocity targets into canonical frame
+                    y = y.clone()
+                    _Ux_cv, _Uy_cv = rotate_velocity_to_canon(y[:, :, 0], y[:, :, 1], _se2_cos_v, _se2_sin_v)
+                    y[:, :, 0] = _Ux_cv
+                    y[:, :, 1] = _Uy_cv
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -2516,6 +2632,9 @@ for epoch in range(MAX_EPOCHS):
                 _v_freestream = None
                 if cfg.residual_prediction:
                     _aoa = _raw_aoa
+                    if cfg.se2_canonicalize and _se2_cos_v is not None:
+                        _chord_angle_v = torch.atan2(_se2_sin_v, _se2_cos_v).unsqueeze(-1)
+                        _aoa = _aoa - _chord_angle_v
                     if cfg.adaptive_norm:
                         _fs_raw = torch.zeros(y_norm.shape[0], 1, 3, device=device)
                         _fs_raw[:, 0, 0] = Umag.squeeze() * torch.cos(_aoa.squeeze(-1))
@@ -2672,7 +2791,14 @@ for epoch in range(MAX_EPOCHS):
                         pred_orig = _pd
                     else:
                         pred_orig = _phys_denorm(pred_phys, Umag, q)
-                y_clamped = y.clamp(-1e6, 1e6)
+                # Rotate predictions back to global frame for MAE reporting
+                if cfg.se2_canonicalize and _se2_cos_v is not None:
+                    pred_orig = pred_orig.clone()
+                    _Ux_g, _Uy_g = rotate_velocity_to_global(
+                        pred_orig[:, :, 0], pred_orig[:, :, 1], _se2_cos_v, _se2_sin_v)
+                    pred_orig[:, :, 0] = _Ux_g
+                    pred_orig[:, :, 1] = _Uy_g
+                y_clamped = y_global.clamp(-1e6, 1e6)
                 err = (pred_orig - y_clamped).abs()
                 finite = err.isfinite()
                 err = err.where(finite, torch.zeros_like(err))
@@ -2986,6 +3112,19 @@ if cfg.surface_refine and best_metrics:
                     _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
                     _raw_gap_wake_vv = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
+                    # SE(2) canonicalization (verify)
+                    _se2_cos_vv = _se2_sin_vv = None
+                    y_global_vv = y  # save global-frame targets
+                    if cfg.se2_canonicalize:
+                        _saf_se2_vv = x[:, :, 2:4].norm(dim=-1)
+                        _se2_le_vv, _se2_te_vv = get_foil1_le_te(x[:, :, :2], is_surface, _saf_se2_vv)
+                        _canon_xy_vv, _se2_cos_vv, _se2_sin_vv = canonicalize_se2(x[:, :, :2], _se2_le_vv, _se2_te_vv)
+                        x = x.clone()
+                        x[:, :, :2] = _canon_xy_vv
+                        y = y.clone()
+                        _Ux_cvv, _Uy_cvv = rotate_velocity_to_canon(y[:, :, 0], y[:, :, 1], _se2_cos_vv, _se2_sin_vv)
+                        y[:, :, 0] = _Ux_cvv
+                        y[:, :, 1] = _Uy_cvv
                     x = (x - stats["x_mean"]) / stats["x_std"]
                     curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                     if cfg.foil2_dist:
@@ -3033,6 +3172,9 @@ if cfg.surface_refine and best_metrics:
                     _v_freestream = None
                     if cfg.residual_prediction:
                         _aoa = _raw_aoa
+                        if cfg.se2_canonicalize and _se2_cos_vv is not None:
+                            _chord_angle_vv = torch.atan2(_se2_sin_vv, _se2_cos_vv).unsqueeze(-1)
+                            _aoa = _aoa - _chord_angle_vv
                         if cfg.adaptive_norm:
                             _fs_raw = torch.zeros(B, 1, 3, device=device)
                             _fs_raw[:, 0, 0] = Umag.squeeze() * torch.cos(_aoa.squeeze(-1))
@@ -3143,9 +3285,17 @@ if cfg.surface_refine and best_metrics:
                         pred_norefine_phys[:, :, 2:3] = torch.sinh(pred_norefine_phys[:, :, 2:3]) / cfg.asinh_scale
                     pred_norefine_orig = pred_norefine_phys if cfg.adaptive_norm else _phys_denorm(pred_norefine_phys, Umag, q)
 
+                    # Rotate predictions back to global frame for verify
+                    if cfg.se2_canonicalize and _se2_cos_vv is not None:
+                        for _vp in [pred_orig_A, pred_manual_orig, pred_norefine_orig]:
+                            _Ux_vg, _Uy_vg = rotate_velocity_to_global(
+                                _vp[:, :, 0], _vp[:, :, 1], _se2_cos_vv, _se2_sin_vv)
+                            _vp[:, :, 0] = _Ux_vg
+                            _vp[:, :, 1] = _Uy_vg
+
                     # Compute surface pressure MAE for all paths
                     surf_mask = mask & is_surface
-                    y_clamped = y.clamp(-1e6, 1e6)
+                    y_clamped = y_global_vv.clamp(-1e6, 1e6)
 
                     err_A = (pred_orig_A - y_clamped).abs()
                     err_B = (pred_manual_orig - y_clamped).abs()
