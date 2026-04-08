@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 21:30 — PR #2279: Ensemble Knowledge Distillation — nezuko — **CLOSED** ❌
+
+- Branch: `nezuko/ensemble-distillation`
+- Hypothesis: Distill from 4-seed teacher ensemble into single student. Stochastic teacher selection (1 random teacher per batch). Pressure-only distillation on surface nodes. Alpha schedule: 0.3→0.5→0.1.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 17.40 | +46.3% ❌ |
+| p_oodc | 7.561  | 11.10 | +46.8% ❌ |
+| p_tan  | 28.118 | 32.50 | +15.5% ❌ |
+| p_re   | 6.364  | 8.60  | +34.6% ❌ |
+
+- W&B: yt4fm4p9 (s42), 4ayrtjrk (s73). Teachers: c4pc9zhb, sa1phc3g, 6x4pn6rk, rr78e1bb. Epochs: 99-100 (speed penalty).
+- **Analysis:** Multiple compounding failures: (1) Teacher forward pass slowed training ~5→3 it/s → only 100 epochs vs 148 baseline (32% fewer updates). (2) Teachers undertrained (~60 epochs, not full 148+). (3) Alpha=0.5 too aggressive — half the loss from bad teacher predictions. (4) Fourier PE mismatch — teachers receive student's preprocessed input with different positional encodings. (5) 4-seed ensemble insufficient diversity for meaningful "dark knowledge."
+- **Conclusion:** CLOSED. Ensemble distillation requires precomputed predictions, fully-trained teachers, and very low alpha. Infrastructure cost not worth marginal expected benefit. Added to DO NOT REVISIT.
+
+---
+
 ### 2026-04-08 21:00 — PR #2280: Snapshot Ensemble — thorfinn — **CLOSED** ❌
 
 - Branch: `thorfinn/snapshot-ensemble`

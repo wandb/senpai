@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-08 21:00 UTC
+- **Date:** 2026-04-08 21:30 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training & Architecture Improvements
 
@@ -40,7 +40,7 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 | frieren | #2283 | **Wider SRF Head — surface_refine_hidden 192→384** | WIP |
 | tanjiro | #2287 | **Effective AoA Aft Feature — thin-airfoil downwash correction (k sweep)** | WIP (NEW) |
 | edward | #2286 | **Velocity Angle Feature — per-node local incidence angle from DSDF gradient** | WIP (NEW) |
-| nezuko | #2279 | **Ensemble Knowledge Distillation — soft targets from 16-seed ensemble** | WIP |
+| nezuko | #2289 | **Cp Target Normalization — Re-invariant pressure coefficient targets** | WIP (NEW) |
 | alphonse | #2285 | **Deeper Backbone — 4 Transolver blocks (n_layers 3→4)** | WIP |
 
 ## PRs Ready for Review
@@ -48,6 +48,10 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 None.
 
 ## Latest Reviews (2026-04-08 21:00)
+
+### PR #2279 (nezuko, Ensemble Knowledge Distillation) — CLOSED ❌
+- All metrics catastrophically regressed: p_in +46.3%, p_oodc +46.8%, p_tan +15.5%, p_re +34.6%.
+- Root cause: Teacher speed penalty (100 vs 148 epochs), undertrained teachers, aggressive alpha, Fourier PE mismatch.
 
 ### PR #2280 (thorfinn, Snapshot Ensemble) — CLOSED ❌
 - All metrics massively regressed: p_in +15.6%, p_oodc +28.9%, p_tan +7.8%, p_re +25.7%.
@@ -113,7 +117,7 @@ Acknowledged and pivoting. Round 27 will include bold architectural additions (G
 | frieren | #2283 | **Wider SRF Head** — surface_refine_hidden 192→384, capacity increase | p_in, p_tan |
 | tanjiro | #2287 | **Effective AoA Aft Feature** — thin-airfoil downwash correction, k sweep | p_tan, p_re |
 | edward | #2286 | **Velocity Angle Feature** — per-node local incidence from DSDF gradient | p_tan, p_in |
-| nezuko | #2279 | **Ensemble Knowledge Distillation** — soft targets from 16-seed ensemble | p_oodc, p_re |
+| nezuko | #2289 | **Cp Target Normalization** — predict Cp instead of raw p for Re-invariance | p_re, p_oodc |
 | alphonse | #2285 | **Deeper Backbone** — n_layers 3→4, backbone depth capacity test | all metrics |
 
 ### Key Mechanistic Insights from Rounds 26-27
@@ -176,6 +180,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 - **Multi-head SRF ensemble**: Head-level diversity insufficient — backbone diversity is the real ensemble mechanism. 3 heads converge to similar solutions from shared features (+0.5-2.2%)
 - **Geometry consistency self-distillation**: Mean Teacher on jittered mesh. Consistency loss only active for ~7 epochs (EMA timing). Existing augmentation already provides larger perturbations (+0.1-3.8%)
 - **Snapshot ensemble (cyclic cosine)**: EMA on single continuous cosine outperforms cyclic snapshots. 50-epoch cycles too short, Lion+warm restarts cause instability (+7.8-28.9%)
+- **Ensemble knowledge distillation**: Teacher speed penalty, undertrained teachers, aggressive alpha, Fourier PE mismatch. Infrastructure cost not worth marginal benefit (+15.5-46.8%)
 
 ## Potential Next Research Directions (Round 28+)
 
@@ -215,7 +220,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 | 1 | `vel-angle-mag-feature` | p_tan, p_in | **ASSIGNED to edward (#2286)** |
 | 2 | `effective-aoa-aft-feature` | p_tan, p_re | **ASSIGNED to tanjiro (#2287)** |
 | 3 | `chord-fraction-feature` | p_in, p_tan | **ASSIGNED to thorfinn (#2288)** |
-| 4 | `cp-target-normalization` | p_re, p_oodc | Predict Cp instead of raw p. Re-invariant target normalization. Directly targets p_re regression. |
+| 4 | `cp-target-normalization` | p_re, p_oodc | **ASSIGNED to nezuko (#2289)** |
 | 5 | `re-stratified-sampling` | p_re, p_oodc | 2× weight for extreme-Re samples via static WeightedRandomSampler. |
 | 6 | `stagnation-pressure-feature` | p_in, p_re | q_inf = 0.5*Umag² as input channel. Bernoulli baseline as feature (not loss constraint). |
 | 7 | `lowrank-pressure-loss` | p_tan, p_in | SVD penalty on surface pressure: penalize energy beyond rank-5. Orthogonal to DCT freq loss. |
