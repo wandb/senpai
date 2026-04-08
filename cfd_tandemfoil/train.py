@@ -139,7 +139,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False,
+                 attn_logit_noise_std=0.0):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -154,6 +155,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.decouple_slice = decouple_slice
         self.zone_temp = zone_temp
         self.prog_slices = prog_slices
+        self.attn_logit_noise_std = attn_logit_noise_std
         if prog_slices:
             # Buffer for masking inactive slices; updated per-epoch by training loop
             self.register_buffer('slice_mask', torch.zeros(slice_num))
@@ -239,11 +241,15 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
                 k_exp = k_slice_token.unsqueeze(-3).expand(B, H, S, S, D)
                 qk_cat = torch.cat([q_exp, k_exp], dim=-1)
                 attn_logits = self.kernel_mlp(qk_cat).squeeze(-1)
+                if self.training and self.attn_logit_noise_std > 0:
+                    attn_logits = attn_logits + torch.randn_like(attn_logits) * self.attn_logit_noise_std
                 attn_weights = F.softmax(attn_logits, dim=-1)
             else:
                 q_norm = F.normalize(q_slice_token, dim=-1)
                 k_norm = F.normalize(k_slice_token, dim=-1)
                 attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
+                if self.training and self.attn_logit_noise_std > 0:
+                    attn_logits = attn_logits + torch.randn_like(attn_logits) * self.attn_logit_noise_std
                 attn_weights = F.softmax(attn_logits, dim=-1)
             out_slice_token = torch.matmul(attn_weights, v_slice_token)
             out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
@@ -377,6 +383,7 @@ class TransolverBlock(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         spatial_bias_input_dim=4,
+        attn_logit_noise_std=0.0,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -402,6 +409,7 @@ class TransolverBlock(nn.Module):
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
             prog_slices=prog_slices,
+            attn_logit_noise_std=attn_logit_noise_std,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -794,6 +802,7 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        attn_logit_noise_std=0.0,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -866,6 +875,7 @@ class Transolver(nn.Module):
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
                     spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
+                    attn_logit_noise_std=attn_logit_noise_std,
                 )
                 for idx in range(n_layers)
             ]
@@ -1170,6 +1180,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    attn_logit_noise_std: float = 0.0       # std dev of Gaussian noise added to cross-slice attn logits during training
 
 
 cfg = sp.parse(Config)
@@ -1330,6 +1341,7 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    attn_logit_noise_std=cfg.attn_logit_noise_std,
 )
 
 model = Transolver(**model_config).to(device)
