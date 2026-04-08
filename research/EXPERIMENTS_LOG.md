@@ -2,6 +2,42 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 20:45 — PR #2281: Multi-Head SRF Ensemble — edward — **CLOSED** ❌
+
+- Branch: `edward/multi-head-srf`
+- Hypothesis: 3 independently initialized SRF heads (both fore-foil and aft-foil) on shared backbone, predictions averaged. Should create implicit ensemble diversity at the surface prediction level, improving OOD metrics.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 12.155 | +2.2% ❌ |
+| p_oodc | 7.561  | 7.600  | +0.5% ❌ |
+| p_tan  | 28.118 | 28.750 | +2.2% ❌ |
+| p_re   | 6.364  | 6.350  | -0.2% (noise) |
+
+- W&B: fhnoamhe (s42), qv7sht3o (s73). Epochs: 142-144. Peak VRAM: ~45-60GB.
+- **Analysis:** Backbone diversity (not head diversity) is the real ensemble mechanism. All 3 heads converge to similar solutions because they receive gradients from identical backbone features. Averaged corrections dilute sharp surface predictions. The 16-seed ensemble works because different seeds produce different backbone representations — multi-head SRF keeps the backbone identical. High inter-seed variance (s42 p_in=11.688, s73 p_in=12.622) confirms the approach doesn't stabilize predictions as intended.
+- **Conclusion:** CLOSED. Multi-head SRF added to DO NOT REVISIT. Head-level ensemble provides no benefit when backbone is shared.
+
+---
+
+### 2026-04-08 20:45 — PR #2273: Geometry Consistency Self-Distillation — tanjiro — **CLOSED** ❌
+
+- Branch: `tanjiro/geometry-consistency-distill`
+- Hypothesis: Mean Teacher self-distillation on augmented mesh views. Jitter volume node coordinates (sigma=0.005), compare surface predictions vs EMA teacher on original input. Encourages prediction consistency under geometric perturbation.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 11.900 | +0.1% ❌ |
+| p_oodc | 7.561  | 7.850  | +3.8% ❌ |
+| p_tan  | 28.118 | 28.650 | +1.9% ❌ |
+| p_re   | 6.364  | 6.450  | +1.4% ❌ |
+
+- W&B: sqtyll2f (s42), vvee33ng (s73). v1 crashed (torch.compile graph reuse), v2 fixed with detach + _orig_mod.
+- **Analysis:** Consistency loss only active for ~7 of 147 epochs (EMA starts at epoch 140). Insufficient training time to test the hypothesis properly. Even at seed level, no consistent signal — s42 shows p_in improvement but p_oodc regression, s73 the opposite. The existing augmentation suite (AoA perturb, full DSDF rotation, gap-stagger sigma) already provides much larger geometric perturbations than sigma=0.005 jitter.
+- **Conclusion:** CLOSED. Geometry consistency self-distillation with current EMA timing is ineffective. The torch.compile fix (detach + _orig_mod for auxiliary forward passes) is a useful engineering pattern.
+
+---
+
 ### 2026-04-08 19:30 — PR #2275: NeuralFoil Synthetic Data Flooding — alphonse — **CLOSED** ❌
 
 - Branch: `alphonse/neuralfoil-synthetic-flood`

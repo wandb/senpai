@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-08 19:45 UTC
+- **Date:** 2026-04-08 20:45 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training & Architecture Improvements
 
@@ -30,7 +30,7 @@
 
 Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29.1). Ensemble still leads on p_oodc and p_re.
 
-## Student Status (2026-04-08 19:45 UTC)
+## Student Status (2026-04-08 20:45 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
@@ -38,16 +38,24 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 | fern | #2284 | **Heteroscedastic Loss — learned per-node uncertainty weighting** | WIP |
 | askeladd | #2282 | **Point Cloud MixUp — linear interpolation data augmentation** | WIP |
 | frieren | #2283 | **Wider SRF Head — surface_refine_hidden 192→384** | WIP |
-| tanjiro | #2273 | **BOLD: Geometry Consistency Self-Distillation — Mean Teacher on augmented mesh** | WIP |
-| edward | #2281 | **Multi-Head SRF Ensemble — 3 independent SRF heads, prediction averaging** | WIP |
+| tanjiro | #2287 | **Effective AoA Aft Feature — thin-airfoil downwash correction (k sweep)** | WIP (NEW) |
+| edward | #2286 | **Velocity Angle Feature — per-node local incidence angle from DSDF gradient** | WIP (NEW) |
 | nezuko | #2279 | **Ensemble Knowledge Distillation — soft targets from 16-seed ensemble** | WIP |
-| alphonse | #2285 | **Deeper Backbone — 4 Transolver blocks (n_layers 3→4)** | WIP (NEW) |
+| alphonse | #2285 | **Deeper Backbone — 4 Transolver blocks (n_layers 3→4)** | WIP |
 
 ## PRs Ready for Review
 
 None.
 
-## Latest Reviews (2026-04-08 19:45)
+## Latest Reviews (2026-04-08 20:45)
+
+### PR #2281 (edward, Multi-Head SRF Ensemble) — CLOSED ❌
+- All metrics regressed or flat: p_in +2.2%, p_tan +2.2%, p_oodc +0.5%, p_re -0.2% (noise).
+- Root cause: Backbone diversity (not head diversity) drives real ensemble benefit. Heads converge to similar solutions from shared features.
+
+### PR #2273 (tanjiro, Geometry Consistency Self-Distillation) — CLOSED ❌
+- All metrics regressed: p_oodc +3.8%, p_tan +1.9%, p_re +1.4%, p_in flat.
+- Root cause: Consistency loss only active for ~7 of 147 epochs (EMA starts at epoch 140). Existing augmentation suite provides larger perturbations than sigma=0.005 jitter.
 
 ### PR #2275 (alphonse, NeuralFoil Synthetic Data Flooding) — CLOSED ❌
 - All 4 metrics regressed: p_in +15.8%, p_oodc +24.9%, p_tan +3.7%, p_re +13.9%.
@@ -99,8 +107,8 @@ Acknowledged and pivoting. Round 27 will include bold architectural additions (G
 | fern | #2284 | **Heteroscedastic Loss** — learned per-node variance for pressure loss | p_in, p_tan |
 | askeladd | #2282 | **Point Cloud MixUp** — linear interpolation data augmentation | p_oodc, p_re |
 | frieren | #2283 | **Wider SRF Head** — surface_refine_hidden 192→384, capacity increase | p_in, p_tan |
-| tanjiro | #2273 | **BOLD: Geometry Consistency Self-Distillation** — Mean Teacher on jittered mesh | p_oodc |
-| edward | #2281 | **Multi-Head SRF Ensemble** — 3 independent heads on shared backbone | p_oodc, p_re |
+| tanjiro | #2287 | **Effective AoA Aft Feature** — thin-airfoil downwash correction, k sweep | p_tan, p_re |
+| edward | #2286 | **Velocity Angle Feature** — per-node local incidence from DSDF gradient | p_tan, p_in |
 | nezuko | #2279 | **Ensemble Knowledge Distillation** — soft targets from 16-seed ensemble | p_oodc, p_re |
 | alphonse | #2285 | **Deeper Backbone** — n_layers 3→4, backbone depth capacity test | all metrics |
 
@@ -161,6 +169,8 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 - **Sample-level reweighting**: Focal loss, OHNM — over-correction on top of PCGrad
 - **Optimizer variants**: SAM, Lookahead, SWA, SOAP, Muon — all worse than Lion+EMA+cosine
 - **NeuralFoil synthetic data flooding**: Geometric inconsistency (template mesh positions ≠ NACA encoding) corrupts geometry-pressure learning. Panel-method Cp errors near stagnation. 30% synthetic dilutes real data (+3.7-24.9%)
+- **Multi-head SRF ensemble**: Head-level diversity insufficient — backbone diversity is the real ensemble mechanism. 3 heads converge to similar solutions from shared features (+0.5-2.2%)
+- **Geometry consistency self-distillation**: Mean Teacher on jittered mesh. Consistency loss only active for ~7 epochs (EMA timing). Existing augmentation already provides larger perturbations (+0.1-3.8%)
 
 ## Potential Next Research Directions (Round 28+)
 
@@ -197,8 +207,8 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 
 | Priority | Slug | Target | Key bet |
 |----------|------|--------|---------|
-| 1 | `vel-angle-mag-feature` | p_tan, p_in | Per-node local incidence angle from DSDF gradient × freestream direction. Follows proven input feature pattern. |
-| 2 | `effective-aoa-aft-feature` | p_tan, p_re | Thin-airfoil downwash: aft foil effective AoA = AoA + k*AoA/gap. Sweep k={0.05, 0.10, 0.20}. |
+| 1 | `vel-angle-mag-feature` | p_tan, p_in | **ASSIGNED to edward (#2286)** |
+| 2 | `effective-aoa-aft-feature` | p_tan, p_re | **ASSIGNED to tanjiro (#2287)** |
 | 3 | `chord-fraction-feature` | p_in, p_tan | Chord-wise position ∈[0,1] for each node. Gives SRF explicit "where on chord" signal. No ordering needed (unlike arc-length PE). |
 | 4 | `cp-target-normalization` | p_re, p_oodc | Predict Cp instead of raw p. Re-invariant target normalization. Directly targets p_re regression. |
 | 5 | `re-stratified-sampling` | p_re, p_oodc | 2× weight for extreme-Re samples via static WeightedRandomSampler. |
