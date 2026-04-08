@@ -794,9 +794,11 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        foil_role_embedding=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
+        self.foil_role_embedding = foil_role_embedding
         self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
         self.pressure_first = pressure_first
         self.ref = ref
@@ -819,6 +821,10 @@ class Transolver(nn.Module):
             self.log_sigma_surf_ux = nn.Parameter(torch.zeros(1))
             self.log_sigma_surf_uy = nn.Parameter(torch.zeros(1))
             self.log_sigma_surf_p = nn.Parameter(torch.zeros(1))
+
+        if foil_role_embedding:
+            self.fore_embed = nn.Parameter(torch.zeros(n_hidden))
+            self.aft_embed = nn.Parameter(torch.zeros(n_hidden))
 
         if self.unified_pos:
             self.preprocess = MLP(
@@ -991,6 +997,15 @@ class Transolver(nn.Module):
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
+
+        # Foil role embeddings: add learned fore/aft identity to surface nodes
+        if self.foil_role_embedding:
+            _is_surf = data.get("is_surface")  # [B, N] bool, passed from training loop
+            if _is_surf is not None:
+                _saf_norm = data["x"][:, :, 2:4].norm(dim=-1)  # [B, N]
+                _is_fore = (_is_surf & (_saf_norm <= 0.005)).float().unsqueeze(-1)  # [B, N, 1]
+                _is_aft = (_is_surf & (_saf_norm > 0.005)).float().unsqueeze(-1)   # [B, N, 1]
+                fx = fx + self.fore_embed * _is_fore + self.aft_embed * _is_aft
 
         for block in self.blocks[:-1]:
             fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
@@ -1165,6 +1180,7 @@ class Config:
     aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
     aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
     aft_foil_srf_context: bool = False       # KNN volume context for aft-foil SRF (wake pressure recovery)
+    foil_role_embedding: bool = False        # learned fore/aft foil role embeddings for surface nodes
     # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
     pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
@@ -1330,6 +1346,7 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    foil_role_embedding=cfg.foil_role_embedding,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1886,7 +1903,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x, "is_surface": is_surface})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -2114,7 +2131,7 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x})
+                rdrop_out = model({"x": x, "is_surface": is_surface})
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -2253,7 +2270,7 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                out2 = model({"x": x, "is_surface": is_surface})
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -2558,7 +2575,7 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    _eval_out = eval_model({"x": x})
+                    _eval_out = eval_model({"x": x, "is_surface": is_surface})
                     pred = _eval_out["preds"]
                     _eval_hidden = _eval_out["hidden"]
                 pred = pred.float()
@@ -2898,7 +2915,7 @@ if best_metrics:
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
-                    pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
+                    pred = vis_model({"x": x_n, "mask": mask, "is_surface": is_surf_dev})["preds"].float()
                     if cfg.raw_targets:
                         y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                     elif cfg.adaptive_norm:
@@ -3067,7 +3084,7 @@ if cfg.surface_refine and best_metrics:
 
                     # Model forward
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        out = verify_model({"x": x})
+                        out = verify_model({"x": x, "is_surface": is_surface})
                         pred_raw = out["preds"].float()
                         hidden = out["hidden"].float()
 
