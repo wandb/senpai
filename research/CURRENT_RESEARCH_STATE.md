@@ -35,7 +35,7 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
 | thorfinn | #2272 | **BOLD: TTA AoA Ensemble — inference-time rotation augmentation** | WIP |
-| fern | #2270 | **BOLD: SE(2) Canonicalize — chord-aligned coordinate frame preprocessing** | WIP |
+| fern | #2278 | **Surface Arc-Length PE — per-foil chord-wise positional encoding** | WIP (NEW) |
 | askeladd | #2276 | **BOLD: MAE Surface Pretrain — masked autoencoder initialization for backbone** | WIP (NEW) |
 | frieren | #2277 | **Tandem Difficulty Curriculum — progressive exposure by gap/stagger magnitude** | WIP (NEW) |
 | tanjiro | #2273 | **BOLD: Geometry Consistency Self-Distillation — Mean Teacher on augmented mesh** | WIP |
@@ -92,7 +92,7 @@ Acknowledged and pivoting. Round 27 will include bold architectural additions (G
 | Student | PR | Direction | Target |
 |---------|-----|-----------|--------|
 | thorfinn | #2272 | **BOLD: TTA AoA Ensemble** — inference-time K=5 rotation averaging | p_oodc, p_re |
-| fern | #2270 | **BOLD: SE(2) Canonicalize** — chord-aligned coordinate frame preprocessing | p_oodc, p_re |
+| fern | #2278 | **Surface Arc-Length PE** — per-foil chord-wise sin/cos positional encoding | p_tan, p_in |
 | askeladd | #2276 | **BOLD: MAE Surface Pretrain** — masked autoencoder backbone initialization | p_oodc, p_tan |
 | frieren | #2277 | **Tandem Difficulty Curriculum** — progressive exposure by gap/stagger magnitude | p_tan |
 | tanjiro | #2273 | **BOLD: Geometry Consistency Self-Distillation** — Mean Teacher on jittered mesh | p_oodc |
@@ -147,6 +147,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 - **MoE FFN routing**: Hard dispatch halves effective data per expert — both experts starved in small-dataset regime
 - **Per-head K/V projections**: Shared K/V is load-bearing regularization; per-head destroys OOD generalization (+18% p_oodc)
 - **GNN boundary layer**: Local GNN message-passing disrupts backbone-to-SRF feature distribution; redundant with existing SRF heads (+20-24% regression)
+- **SE(2) canonicalization**: Stats mismatch (global frame stats on canonicalized coords) + DSDF gradient inconsistency; TE coordinate frame + AoA augmentation already provide equivalent invariance
 - **Sample-level reweighting**: Focal loss, OHNM — over-correction on top of PCGrad
 - **Optimizer variants**: SAM, Lookahead, SWA, SOAP, Muon — all worse than Lion+EMA+cosine
 
@@ -159,7 +160,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 | `cnf-surface-pressure` (flow-matching) | p_tan, p_oodc | **ASSIGNED to nezuko (#2271)** |
 | `fno-inter-foil-coupling` | p_tan | **ASSIGNED to edward (#2274)** |
 | `geometry-consistency-distill` | p_oodc | **ASSIGNED to tanjiro (#2273)** |
-| `se2-canonicalize` | p_oodc, p_re | **ASSIGNED to fern (#2270)** |
+| `se2-canonicalize` | p_oodc, p_re | **CLOSED** ❌ — stats mismatch + DSDF inconsistency, +6.6-14.3% |
 | `tta-aoa-ensemble` | p_oodc, p_re | **ASSIGNED to thorfinn (#2272)** |
 | `neuralfoil-synthetic-flood` | p_in, p_oodc, p_re | **ASSIGNED to alphonse (#2275)** |
 | `mae-surface-pretrain` | p_oodc, p_tan | **ASSIGNED to askeladd (#2276)** |
@@ -168,8 +169,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 | Priority | Slug | Target | Key bet |
 |----------|------|--------|---------|
 | 1 | `tandem-difficulty-curriculum` | p_tan | **ASSIGNED to frieren (#2277)** |
-| 2 | `surface-arclen-pe` | p_tan, p_in | Per-foil arc-length fraction as 2-channel surface feature |
+| 2 | `surface-arclen-pe` | p_tan, p_in | **ASSIGNED to fern (#2278)** |
 
 **Assignment priority for next idle students:**
-1. `surface-arclen-pe` (medium risk, depends on node ordering)
-2. New ideas from researcher-agent (run when Round 28 results start arriving)
+1. New ideas from researcher-agent (run when next student becomes idle — idea queue exhausted)

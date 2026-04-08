@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 15:00 — PR #2270: SE(2) Canonicalize — fern — **CLOSED** ❌
+
+- Branch: `fern/se2-canonicalize`
+- Hypothesis: Rotate all input coordinates to a chord-aligned canonical frame (LE at origin, chord along +x) before feeding to model. Deterministic preprocessing step targeting OOD robustness by factoring out AoA variation. Motivated by Kaba et al. (2023) canonicalization functions.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 12.673 | +6.6% ❌ |
+| p_oodc | 7.561  | 8.645  | +14.3% ❌ |
+| p_tan  | 28.118 | 28.660 | +1.9% ❌ |
+| p_re   | 6.364  | 6.496  | +2.1% ❌ |
+
+- W&B: nms96yx6 (s42), vqr6ifpl (s73). Epochs: 148-149.
+- **Analysis:** Three compounding issues: (1) Per-feature statistics computed in global frame are systematically wrong after canonicalization — persistent bias in input channels. (2) DSDF gradient channels (2-9) not rotated to match canonicalized coordinates — contradictory spatial signals. (3) TE coordinate frame + AoA perturbation augmentation already provide the rotation invariance that SE(2) canonicalization targets, making the approaches redundant. p_oodc worst hit (+14.3%) because stats mismatch is most pronounced for unusual geometries.
+- **Conclusion:** CLOSED. SE(2) canonicalization added to DO NOT REVISIT — existing TE coordinate frame + AoA augmentation provide equivalent invariance without the inconsistency problems.
+
+---
+
 ### 2026-04-08 14:00 — PR #2269: GNN Boundary Layer — frieren — **CLOSED** ❌
 
 - Branch: `frieren/gnn-boundary-layer`
