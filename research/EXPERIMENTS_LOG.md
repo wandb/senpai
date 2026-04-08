@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 20:45 — PR #2294: Tandem Config Proximity Feature — fern — **CLOSED** ❌
+
+- Branch: `fern/tandem-topo-feature`
+- Hypothesis: KD-tree OOD distance in (gap, stagger, AoA) config space as input feature. Tells model when it's far from training data for uncertainty/calibration.
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.742 | 12.234 | +4.2% ❌ |
+| p_oodc | 7.643  | 8.075  | +5.6% ❌ |
+| p_tan  | 27.874 | 29.124 | +4.5% ❌ |
+| p_re   | 6.419  | 6.648  | +3.6% ❌ |
+
+- W&B: i7wis0px (s42), s4jj94ad (s73). Group: tandem-topo-feature.
+- **Analysis:** Fundamental conceptual flaw: during training ALL samples have proximity ≈ 0 (they ARE the training distribution), so the model cannot learn proximity→prediction relationships. At test time the feature activates for OOD samples but the model has never seen non-zero values. OOD calibration must come from loss/architecture changes, not explicit OOD-distance input features.
+- **Conclusion:** CLOSED. OOD-distance input features added to DO NOT REVISIT.
+
+---
+
 ### 2026-04-08 20:30 — PR #2296: Log-Re Pressure Scaling — edward — **CLOSED** ❌
 
 - Branch: `edward/logre-pressure-scaling`
