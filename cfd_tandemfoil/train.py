@@ -1113,6 +1113,7 @@ class Config:
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
+    mirror_augmentation: bool = False   # exact y-reflection symmetry augmentation (p=0.5 per sample)
     gap_stagger_spatial_bias: bool = False  # condition spatial bias MLP on gap/stagger (tandem geometry-aware routing)
     dct_freq_loss: bool = False   # DCT frequency-weighted auxiliary loss on surface pressure
     dct_freq_weight: float = 0.05 # weight for DCT freq loss
@@ -1778,6 +1779,15 @@ for epoch in range(MAX_EPOCHS):
                 # Identity for non-tandem samples
                 _dsdf2_scale = _dsdf2_scale * _is_tandem_aug2.float() + (~_is_tandem_aug2).float()
                 x[:, :, 6:10] = x[:, :, 6:10] * _dsdf2_scale.view(-1, 1, 1)
+
+        # Exact y-reflection symmetry augmentation (applied after all other augs)
+        if model.training and cfg.mirror_augmentation:
+            _mirror = (torch.rand(x.size(0), device=x.device) < 0.5).view(-1, 1, 1)  # [B, 1, 1]
+            # Negate y-signed input channels: pos_y(1), saf_y(3), dsdf_y(5,7,9,11), AoA0(14), AoA1(18), stagger(23)
+            for _ch in [1, 3, 5, 7, 9, 11, 14, 18, 23]:
+                x[:, :, _ch:_ch+1] = torch.where(_mirror, -x[:, :, _ch:_ch+1], x[:, :, _ch:_ch+1])
+            # Negate Uy target
+            y[:, :, 1:2] = torch.where(_mirror, -y[:, :, 1:2], y[:, :, 1:2])
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
