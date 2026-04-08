@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 23:30 — PR #2285: Deeper Backbone (4 Transolver Blocks) — alphonse — **CLOSED** ❌
+
+- Branch: `alphonse/deeper-backbone`
+- Hypothesis: Increase backbone depth from 3 to 4 TransolverBlocks for more physics reasoning steps.
+
+| Metric | Baseline (#2251) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.891 | 15.35 | +29.1% ❌ |
+| p_oodc | 7.561  | 9.00  | +19.0% ❌ |
+| p_tan  | 28.118 | 29.45 | +4.7% ❌ |
+| p_re   | 6.364  | 7.15  | +12.4% ❌ |
+
+- W&B: tmityb5d (s42), spcn43ml (s73). Epochs: 120-121 (vs 149 baseline). VRAM: 54.8GB (+22%). Per-epoch: ~90s (+32%).
+- **Analysis:** Training budget mismatch is the primary failure mode. 4-layer model runs 32% slower, completing only ~121 epochs vs 149 baseline. With cosine_T_max=150, model is cut off at ~80% of schedule — LR never reaches minimum. The 3-layer backbone is well-calibrated to the 180-min budget. High seed variance on p_in (14.0 vs 16.7) confirms underconvergence.
+- **Conclusion:** CLOSED. Deeper backbone added to DO NOT REVISIT (within current training budget). Backbone depth is training-budget-limited, not capacity-limited.
+
+---
+
 ### 2026-04-08 22:15 — PR #2283: Wider SRF Head (192→384) — frieren — **CLOSED** ❌
 
 - Branch: `frieren/wider-srf-head`

@@ -41,7 +41,7 @@ Single-model now beats ensemble on p_in (11.891 vs 12.1) and p_tan (28.118 vs 29
 | tanjiro | #2287 | **Effective AoA Aft Feature — thin-airfoil downwash correction (k sweep)** | WIP (NEW) |
 | edward | #2286 | **Velocity Angle Feature — per-node local incidence angle from DSDF gradient** | WIP (NEW) |
 | nezuko | #2290 | **Re-Stratified Sampling — 2× weight for extreme-Re training samples** | WIP (NEW) |
-| alphonse | #2285 | **Deeper Backbone — 4 Transolver blocks (n_layers 3→4)** | WIP |
+| alphonse | #2293 | **Low-Rank Pressure Loss — SVD structural prior on surface predictions** | WIP (NEW) |
 
 ## PRs Ready for Review
 
@@ -125,7 +125,7 @@ Acknowledged and pivoting. Round 27 will include bold architectural additions (G
 | tanjiro | #2287 | **Effective AoA Aft Feature** — thin-airfoil downwash correction, k sweep | p_tan, p_re |
 | edward | #2286 | **Velocity Angle Feature** — per-node local incidence from DSDF gradient | p_tan, p_in |
 | nezuko | #2290 | **Re-Stratified Sampling** — 2× weight for extreme-Re training samples | p_re, p_oodc |
-| alphonse | #2285 | **Deeper Backbone** — n_layers 3→4, backbone depth capacity test | all metrics |
+| alphonse | #2293 | **Low-Rank Pressure Loss** — SVD penalty beyond rank-5 on surface error | p_tan, p_in |
 
 ### Key Mechanistic Insights from Rounds 26-27
 
@@ -190,6 +190,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 - **Ensemble knowledge distillation**: Teacher speed penalty, undertrained teachers, aggressive alpha, Fourier PE mismatch. Infrastructure cost not worth marginal benefit (+15.5-46.8%)
 - **Wider SRF head (192→384)**: SRF capacity is NOT the bottleneck — backbone representations limit what SRF can extract. 3.3× more params, no consistent improvement (+0.4-1.7%)
 - **Point cloud MixUp**: Fundamentally unsuited to physics-constrained regression — creates phantom geometries violating Navier-Stokes. Existing augmentation already handles diversity (+6.7-37.5%)
+- **Deeper backbone (4 layers)**: Training budget mismatch — 32% slower per epoch, only 121 vs 149 epochs. 3-layer is well-calibrated to 180-min budget (+4.7-29.1%)
 
 ## Potential Next Research Directions (Round 28+)
 
@@ -232,7 +233,7 @@ The new frieren assignment (PR #2269) is a genuine architectural departure:
 | 4 | `cp-target-normalization` | p_re, p_oodc | **SKIPPED** — baseline already applies Cp normalization via `_phys_norm()` |
 | 5 | `re-stratified-sampling` | p_re, p_oodc | **ASSIGNED to nezuko (#2290)** |
 | 6 | `stagnation-pressure-feature` | p_in, p_re | **ASSIGNED to frieren (#2291)** |
-| 7 | `lowrank-pressure-loss` | p_tan, p_in | SVD penalty on surface pressure: penalize energy beyond rank-5. Orthogonal to DCT freq loss. |
+| 7 | `lowrank-pressure-loss` | p_tan, p_in | **ASSIGNED to alphonse (#2293)** |
 | 8 | `flowdir-anisotropic-norm` | p_oodc, p_re | **ASSIGNED to askeladd (#2292)** |
 | 9 | `logre-pressure-scaling` | p_re | Normalize pressure residuals by log(Re). Milder than Cp normalization. |
 | 10 | `tandem-topo-feature` | p_tan | KD-tree OOD proximity feature — distance to nearest training configs in (gap, stagger, AoA, NACA) space. |
