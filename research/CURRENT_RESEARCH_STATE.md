@@ -38,8 +38,8 @@ Single-model beats ensemble on p_in (11.74 vs 12.1) and p_tan (27.90 vs 29.1). E
 | thorfinn | #2298 | **GMSE Gradient-Weighted Pressure Loss — weight by local ∇p magnitude** | WIP (BOLD) |
 | alphonse | #2299 | **Potential Flow Residual Loss — Bernoulli-consistency auxiliary signal** | WIP (NEW, BOLD, PARADIGM) |
 | fern | #2302 | **Circulation Lift Feature — Kutta-Joukowski Γ as global input signal** | WIP (NEW, PHYSICS) |
-| askeladd | #2292 | **Flow-Direction Normalization — rotate coords by -AoA to streamwise frame** | WIP |
-| frieren | #2291 | **Stagnation Pressure Feature — q_inf = 0.5*Umag² as input channel** | WIP |
+| askeladd | #2303 | **Wake Centerline SDF — wake-structure proximity features for tandem** | WIP (NEW, PHYSICS) |
+| frieren | #2304 | **Shortest Vector Feature — 2D displacement to nearest foil surface (FVF)** | WIP (NEW, PHYSICS) |
 | tanjiro | #2300 | **Mirror Symmetry Augmentation — exact y-reflection to double training data** | WIP (NEW, BOLD, DATA AUG) |
 | edward | #2301 | **Continuity PDE Loss — mass-conservation ∇·u=0 penalty** | WIP (NEW, BOLD, PARADIGM) |
 

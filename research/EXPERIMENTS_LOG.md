@@ -2,6 +2,42 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 21:15 — PR #2292: Flow-Direction Normalization — askeladd — **CLOSED** ❌
+
+- Branch: `askeladd/flowdir-anisotropic-norm`
+- Hypothesis: Rotate input (x,y) coords and velocity by -AoA to align with streamwise frame. Coordinate-only change, no architecture modification.
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.742 | 12.630 | +7.6% ❌ |
+| p_oodc | 7.643  | 7.832  | +2.5% ❌ |
+| p_tan  | 27.874 | 29.197 | +4.7% ❌ |
+| p_re   | 6.419  | 6.407  | -0.2% (noise) |
+
+- W&B: vjao8dvz (s42), qbhm9itk (s73). VRAM: ~68GB (elevated from rotation ops).
+- **Analysis:** (1) Stats mismatch — standardization computed on un-rotated data, (2) DSDF frame inconsistency — coords rotated but DSDF gradients not, (3) Redundant with existing aoa_perturb augmentation. Matches SE(2) canonicalization failure pattern (#2271).
+- **Conclusion:** CLOSED. Coordinate rotation without full feature transform creates frame inconsistencies. Added to DO NOT REVISIT.
+
+---
+
+### 2026-04-08 21:15 — PR #2291: Stagnation Pressure Feature — frieren — **CLOSED** ❌
+
+- Branch: `frieren/stagnation-pressure-feature`
+- Hypothesis: Dynamic pressure q_inf = 0.5*Umag² as input channel. Provides explicit energy-scale signal for Re-dependent pressure.
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.742 | 37.35 | +218% ❌ (CATASTROPHIC) |
+| p_oodc | 7.643  | 33.50 | +338% ❌ |
+| p_tan  | 27.874 | 56.10 | +101% ❌ |
+| p_re   | 6.419  | 23.20 | +261% ❌ |
+
+- W&B: 7iz07fx6 (s42), py14l7mk (s73). s73 had loss spike at epoch 80, never recovered.
+- **Analysis:** Un-normalized q_inf (range 0.5 to 5000+) appended to standardized features caused gradient explosions. Feature also redundant — Umag already in inputs, q_inf = 0.5*Umag² is trivially computable.
+- **Conclusion:** CLOSED. Un-normalized derived features are destructive. Added to DO NOT REVISIT.
+
+---
+
 ### 2026-04-08 20:45 — PR #2294: Tandem Config Proximity Feature — fern — **CLOSED** ❌
 
 - Branch: `fern/tandem-topo-feature`
