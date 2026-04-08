@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-08 20:30 — PR #2296: Log-Re Pressure Scaling — edward — **CLOSED** ❌
+
+- Branch: `edward/logre-pressure-scaling`
+- Hypothesis: Normalize surface pressure loss by log(Re) to make target distribution Re-invariant. Loss-only change targeting p_re OOD generalization.
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|-----------|---|
+| p_in   | 11.742 | 12.059 | +2.7% ❌ |
+| p_oodc | 7.643  | 7.662  | +0.2% ❌ |
+| p_tan  | 27.874 | 28.700 | +3.0% ❌ |
+| p_re   | 6.419  | 6.435  | +0.2% ❌ |
+
+- W&B: dmmemfb6 (s42), o4cnahak (s73). Group: logre-pressure-scaling. Epochs: 148-149.
+- **Analysis:** Core problem: log-Re scale has near-zero variance across batch (std/mean ≈ 1%), making it effectively a constant multiplier. Conflicts with PCGrad 3-way which already handles Re-based gradient balancing. asinh + residual prediction + Cp normalization already provide adequate Re normalization.
+- **Conclusion:** CLOSED. Re-dependent loss normalization added to DO NOT REVISIT. Existing pipeline already handles Re scaling via asinh + residual prediction + PCGrad.
+
+---
+
 ### 2026-04-08 20:15 — PR #2295: Surface Curvature Feature — tanjiro — **CLOSED** ❌
 
 - Branch: `tanjiro/surface-curvature-feature`
