@@ -347,6 +347,68 @@ def compute_wake_deficit_features(raw_xy, is_surface, saf_norm, gap_raw, fore_te
     return torch.stack([dx_norm, dy_norm], dim=-1)  # [B, N, 2]
 
 
+def compute_surface_arclen_features(raw_xy, is_surface, saf_norm):
+    """Compute per-foil arc-length sin/cos features for surface nodes.
+
+    For each foil's surface nodes:
+    1. Sort by angle from centroid to get contour order
+    2. Compute cumulative arc-length fraction s in [0, 1]
+    3. Return sin(2*pi*s), cos(2*pi*s)
+
+    Volume nodes get zeros. Handles single-foil and tandem (2 foils).
+
+    Args:
+        raw_xy: [B, N, 2] raw coordinates (before normalization)
+        is_surface: [B, N] bool
+        saf_norm: [B, N] SAF channel norm — foil-1: <=0.005, foil-2: >0.005
+
+    Returns:
+        arclen_feats: [B, N, 2] sin/cos arc-length features
+    """
+    B, N, _ = raw_xy.shape
+    arclen_feats = torch.zeros(B, N, 2, device=raw_xy.device, dtype=raw_xy.dtype)
+
+    for b in range(B):
+        for foil_id in [1, 2]:
+            if foil_id == 1:
+                foil_mask = is_surface[b] & (saf_norm[b] <= 0.005)
+            else:
+                foil_mask = is_surface[b] & (saf_norm[b] > 0.005)
+
+            if foil_mask.sum() < 3:
+                continue
+
+            idx = foil_mask.nonzero(as_tuple=True)[0]  # [M_s]
+            xy = raw_xy[b, idx]  # [M_s, 2]
+
+            # Sort by angle from centroid to get contour order
+            cx, cy = xy[:, 0].mean(), xy[:, 1].mean()
+            angles = torch.atan2(xy[:, 1] - cy, xy[:, 0] - cx)
+            sort_order = angles.argsort()
+            xy_sorted = xy[sort_order]  # [M_s, 2]
+
+            # Cumulative arc-length along sorted contour
+            diffs = torch.diff(xy_sorted, dim=0)  # [M_s-1, 2]
+            seg_lens = torch.norm(diffs, dim=-1)  # [M_s-1]
+            # Add closing segment (last -> first for wraparound)
+            close_len = torch.norm(xy_sorted[-1] - xy_sorted[0]).unsqueeze(0)
+            all_lens = torch.cat([torch.zeros(1, device=raw_xy.device), seg_lens])
+            cum_len = torch.cumsum(all_lens, dim=0)  # [M_s]
+            total_len = (cum_len[-1] + close_len).clamp(min=1e-6)
+            s_frac = cum_len / total_len  # [M_s] in [0, 1)
+
+            # sin/cos embedding
+            s_sin = torch.sin(2 * torch.pi * s_frac)
+            s_cos = torch.cos(2 * torch.pi * s_frac)
+
+            # Unsort back to original node order
+            unsort_order = sort_order.argsort()
+            arclen_feats[b, idx, 0] = s_sin[unsort_order]
+            arclen_feats[b, idx, 1] = s_cos[unsort_order]
+
+    return arclen_feats
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -1170,6 +1232,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    surface_arclen_pe: bool = False         # per-foil arc-length sin/cos features for surface nodes (+2 channels)
 
 
 cfg = sp.parse(Config)
@@ -1300,7 +1363,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + (2 if cfg.surface_arclen_pe else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], [+arclen], +32 fourier PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1761,8 +1824,8 @@ for epoch in range(MAX_EPOCHS):
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
-        # TE coordinate frame / wake deficit: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature
+        # TE coordinate frame / wake deficit / arc-length: save raw xy and saf_norm before normalization
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.surface_arclen_pe
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
@@ -1794,6 +1857,11 @@ for epoch in range(MAX_EPOCHS):
                 wake_feats = compute_wake_deficit_features(
                     _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
                 x = torch.cat([x, wake_feats], dim=-1)
+        # Surface arc-length PE: sin/cos of per-foil arc-length fraction
+        if cfg.surface_arclen_pe:
+            arclen_feats = compute_surface_arclen_features(
+                _raw_xy_te, is_surface, _raw_saf_norm_te)
+            x = torch.cat([x, arclen_feats], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2453,7 +2521,7 @@ for epoch in range(MAX_EPOCHS):
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
-                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature
+                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.surface_arclen_pe
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
                 _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -2484,6 +2552,11 @@ for epoch in range(MAX_EPOCHS):
                         wake_feats = compute_wake_deficit_features(
                             _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
                         x = torch.cat([x, wake_feats], dim=-1)
+                # Surface arc-length PE (validation)
+                if cfg.surface_arclen_pe:
+                    arclen_feats = compute_surface_arclen_features(
+                        _raw_xy_te, is_surface, _raw_saf_norm_te)
+                    x = torch.cat([x, arclen_feats], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2982,7 +3055,7 @@ if cfg.surface_refine and best_metrics:
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
-                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature
+                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.surface_arclen_pe
                     _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
                     _raw_gap_wake_vv = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -3006,6 +3079,11 @@ if cfg.surface_refine and best_metrics:
                             wake_feats_vv = compute_wake_deficit_features(
                                 _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake_vv)
                             x = torch.cat([x, wake_feats_vv], dim=-1)
+                    # Surface arc-length PE (verify)
+                    if cfg.surface_arclen_pe:
+                        arclen_feats_vv = compute_surface_arclen_features(
+                            _raw_xy_te, is_surface, _raw_saf_norm_te)
+                        x = torch.cat([x, arclen_feats_vv], dim=-1)
                     raw_xy = x[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
                     xy_max = raw_xy.amax(dim=1, keepdim=True)
