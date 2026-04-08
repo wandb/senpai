@@ -377,6 +377,7 @@ class TransolverBlock(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         spatial_bias_input_dim=4,
+        moe_ffn=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -389,6 +390,7 @@ class TransolverBlock(nn.Module):
         self.adaln_all = adaln_all
         self.film_cond = film_cond
         self.domain_layernorm = domain_layernorm
+        self.moe_ffn = moe_ffn
         _LN = (lambda d: DomainLayerNorm(d, zeroinit=dln_zeroinit)) if domain_layernorm else nn.LayerNorm
         self.ln_1 = _LN(hidden_dim)
         self.attn = Physics_Attention_Irregular_Mesh(
@@ -422,6 +424,8 @@ class TransolverBlock(nn.Module):
             nn.init.zeros_(self.film_net[-1].bias)
         self.ln_2 = _LN(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        if moe_ffn:
+            self.mlp_tandem = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
         self.spatial_bias = nn.Sequential(
             nn.Linear(spatial_bias_input_dim, 64), nn.GELU(),
             nn.Linear(64, 64), nn.GELU(),
@@ -500,10 +504,25 @@ class TransolverBlock(nn.Module):
             fx_norm = _ln(self.ln_1, fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
             fx = _ln(self.ln_1_post, self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
             fx_norm = _ln(self.ln_2, fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
-            fx = _ln(self.ln_2_post, self.mlp(fx_norm) + fx)
+            if self.moe_ffn and tandem_mask is not None:
+                is_tan = (tandem_mask.view(-1) > 0.5)  # [B]
+                out_s = self.mlp(fx_norm)
+                out_t = self.mlp_tandem(fx_norm)
+                out = torch.where(is_tan[:, None, None].expand_as(out_s), out_t, out_s)
+                fx = _ln(self.ln_2_post, out + fx)
+            else:
+                fx = _ln(self.ln_2_post, self.mlp(fx_norm) + fx)
         else:
             fx = _ln(self.ln_1_post, self.attn(_ln(self.ln_1, fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
-            fx = _ln(self.ln_2_post, self.mlp(_ln(self.ln_2, fx)) + fx)
+            if self.moe_ffn and tandem_mask is not None:
+                fx_ln = _ln(self.ln_2, fx)
+                is_tan = (tandem_mask.view(-1) > 0.5)  # [B]
+                out_s = self.mlp(fx_ln)
+                out_t = self.mlp_tandem(fx_ln)
+                out = torch.where(is_tan[:, None, None].expand_as(out_s), out_t, out_s)
+                fx = _ln(self.ln_2_post, out + fx)
+            else:
+                fx = _ln(self.ln_2_post, self.mlp(_ln(self.ln_2, fx)) + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
@@ -794,6 +813,7 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        moe_ffn=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -866,6 +886,7 @@ class Transolver(nn.Module):
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
                     spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
+                    moe_ffn=moe_ffn if (idx == n_layers - 1) else False,
                 )
                 for idx in range(n_layers)
             ]
@@ -1170,6 +1191,8 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    # Phase 7: MoE FFN — tandem-specialized FFN expert in last TransolverBlock
+    moe_ffn: bool = False                  # enable tandem expert FFN in last block (dispatch on tandem_mask)
 
 
 cfg = sp.parse(Config)
@@ -1330,6 +1353,7 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    moe_ffn=cfg.moe_ffn,
 )
 
 model = Transolver(**model_config).to(device)
