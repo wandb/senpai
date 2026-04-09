@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 12:15 — PR #2322: Test-Time Norm Adaptation — nezuko — **CLOSED** ❌
+
+- Branch: `nezuko/test-time-norm-adaptation`
+- Hypothesis: Adapt LayerNorm params at inference via gradient steps minimizing prediction variance (entropy proxy).
+- W&B runs: `32swzy6c` (s42, 78 epochs), `krolbg0z` (s73, 79 epochs)
+- W&B group: `test-time-norm-adaptation`
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 23.221 | **+97.8%** ❌ catastrophic |
+| p_oodc | 7.643 | 14.288 | **+87.0%** ❌ catastrophic |
+| p_tan | 27.874 | 34.752 | **+24.7%** ❌ |
+| p_re | 6.419 | 11.032 | **+71.9%** ❌ catastrophic |
+
+**Analysis:** Variance minimization as TTA self-supervised signal converges to constant-pressure predictions (trivial minimum). Unlike TENT's entropy minimization on classification, variance minimization on regression outputs has no meaningful optimum. Additionally, TTA overhead (3 grad steps per val batch) halved training throughput to ~78 epochs vs ~147 baseline. **TTA with variance proxy is fundamentally broken for regression.**
+
+---
+
 ### 2026-04-09 10:30 — PR #2317: FV Cell Area Loss Weight — edward — **CLOSED** ❌
 
 - Branch: `edward/fv-cell-area-loss-weight`
