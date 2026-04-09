@@ -1173,6 +1173,9 @@ class Config:
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
+    # GradNorm adaptive loss weighting
+    gradnorm: bool = False                  # use GradNorm to dynamically balance surface/volume loss weights
+    gradnorm_alpha: float = 0.12            # GradNorm asymmetry parameter
 
 
 cfg = sp.parse(Config)
@@ -1608,6 +1611,21 @@ else:  # sequential (default)
         milestones=[cfg.warmup_total_iters]
     )
 step_scheduler_per_batch = (cfg.scheduler_type == "onecycle")
+
+# --- GradNorm adaptive weighting ---
+import math as _math
+_gradnorm_log_w_surf = None
+_gradnorm_log_w_vol = None
+_gradnorm_optimizer = None
+_gradnorm_initial_surf = None
+_gradnorm_initial_vol = None
+if cfg.gradnorm:
+    # Initialize at current static weights: surf=20, vol=1
+    _gradnorm_log_w_surf = nn.Parameter(torch.tensor(_math.log(20.0), device=device))
+    _gradnorm_log_w_vol = nn.Parameter(torch.tensor(_math.log(1.0), device=device))
+    _gradnorm_optimizer = torch.optim.Adam([_gradnorm_log_w_surf, _gradnorm_log_w_vol], lr=0.01)
+    print(f"  [GradNorm] Initialized: w_surf={torch.exp(_gradnorm_log_w_surf).item():.2f}, "
+          f"w_vol={torch.exp(_gradnorm_log_w_vol).item():.2f}, alpha={cfg.gradnorm_alpha}")
 
 # --- wandb ---
 run = wandb.init(
@@ -2059,6 +2077,10 @@ for epoch in range(MAX_EPOCHS):
                     surf_ux_loss * torch.exp(-2 * bm.log_sigma_surf_ux) / 2 + bm.log_sigma_surf_ux +
                     surf_uy_loss * torch.exp(-2 * bm.log_sigma_surf_uy) / 2 + bm.log_sigma_surf_uy +
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
+        elif cfg.gradnorm:
+            _gn_w_surf = torch.exp(_gradnorm_log_w_surf)
+            _gn_w_vol = torch.exp(_gradnorm_log_w_vol)
+            loss = _gn_w_vol * vol_loss + _gn_w_surf * surf_loss
         else:
             loss = vol_loss + surf_weight * surf_loss
 
@@ -2161,8 +2183,9 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            _sw = torch.exp(_gradnorm_log_w_surf) if cfg.gradnorm else surf_weight
+            loss_a = vol_loss_a + _sw * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            loss_b = vol_loss_b + _sw * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -2207,7 +2230,8 @@ for epoch in range(MAX_EPOCHS):
                 vol_loss_g = (abs_err * vol_mask_g.unsqueeze(-1)).sum() / vol_mask_g.sum().clamp(min=1)
                 surf_loss_g = (surf_per_sample * mask_1d.float() * tandem_boost).sum() / n
                 coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                _sw_g = torch.exp(_gradnorm_log_w_surf) if cfg.gradnorm else surf_weight
+                return vol_loss_g + _sw_g * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
 
             loss_A = _grp_loss(~is_tandem_batch)
             # Only include non-empty groups to avoid backward() on no-grad tensors
@@ -2265,7 +2289,50 @@ for epoch in range(MAX_EPOCHS):
         else:
             if cfg.grad_accum_steps <= 1:
                 optimizer.zero_grad()
-            loss.backward()
+            # GradNorm needs the graph alive after backward so it can call autograd.grad
+            loss.backward(retain_graph=cfg.gradnorm)
+
+        # GradNorm weight update (after backward, before optimizer.step)
+        # Uses create_graph=False to avoid double-backward through torch.compile.
+        # Gradients of grad-norms w.r.t. log-weights are computed analytically:
+        #   G_s = w_s * ||grad_f(surf_loss)||, so dG_s/d(log_w_s) = G_s (since d(w_s)/d(log_w_s)=w_s)
+        if cfg.gradnorm and not use_pcgrad:
+            _shared_layer = _base_model.blocks[-1].mlp
+            _shared_params = list(_shared_layer.parameters())
+            _gn_w_s = torch.exp(_gradnorm_log_w_surf)
+            _gn_w_v = torch.exp(_gradnorm_log_w_vol)
+            # Compute gradient norms without create_graph (no double-backward needed).
+            # We detach the scalar weights so autograd.grad only traces through the task losses.
+            _grad_surf = torch.autograd.grad(_gn_w_s.detach() * surf_loss, _shared_params,
+                                              retain_graph=True, create_graph=False)
+            _grad_vol = torch.autograd.grad(_gn_w_v.detach() * vol_loss, _shared_params,
+                                             retain_graph=False, create_graph=False)
+            _gn_s = torch.cat([g.flatten() for g in _grad_surf]).norm().detach()
+            _gn_v = torch.cat([g.flatten() for g in _grad_vol]).norm().detach()
+            # Inverse training rate targets
+            if _gradnorm_initial_surf is None:
+                _gradnorm_initial_surf = surf_loss.detach().clone()
+                _gradnorm_initial_vol = vol_loss.detach().clone()
+            _r_s = surf_loss.detach() / (_gradnorm_initial_surf + 1e-8)
+            _r_v = vol_loss.detach() / (_gradnorm_initial_vol + 1e-8)
+            _r_mean = (_r_s + _r_v) / 2
+            _gn_avg = (_gn_s + _gn_v) / 2
+            _target_gn_s = (_gn_avg * (_r_s / _r_mean) ** cfg.gradnorm_alpha).detach()
+            _target_gn_v = (_gn_avg * (_r_v / _r_mean) ** cfg.gradnorm_alpha).detach()
+            # Analytical gradient: dL/d(log_w_s) = sign(G_s - T_s) * G_s (since dG_s/d(log_w_s)=G_s)
+            # Use a proxy scalar that gives identical gradients through autograd
+            # G_s = w_s * base_norm_s, so d(G_s)/d(log_w_s) = G_s; build proxy via log_w params
+            _proxy_gn_s = _gn_w_s * (_gn_s / _gn_w_s.detach())   # = _gn_s but grad flows to log_w_s
+            _proxy_gn_v = _gn_w_v * (_gn_v / _gn_w_v.detach())   # = _gn_v but grad flows to log_w_v
+            _gn_loss = F.l1_loss(_proxy_gn_s, _target_gn_s) + F.l1_loss(_proxy_gn_v, _target_gn_v)
+            _gradnorm_optimizer.zero_grad()
+            _gn_loss.backward()
+            _gradnorm_optimizer.step()
+            # Renormalize weights to sum to original total (21.0)
+            with torch.no_grad():
+                _total_w = torch.exp(_gradnorm_log_w_surf) + torch.exp(_gradnorm_log_w_vol)
+                _gradnorm_log_w_surf.data -= torch.log(_total_w / 21.0)
+                _gradnorm_log_w_vol.data -= torch.log(_total_w / 21.0)
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         sam_active = sam_optimizer is not None and epoch >= int(MAX_EPOCHS * 0.75)
@@ -2288,7 +2355,8 @@ for epoch in range(MAX_EPOCHS):
             surf_loss2 = (surf_ps2 * tandem_boost).mean()
             re_loss2 = F.mse_loss(re_pred2, log_re_target)
             aoa_loss2 = F.mse_loss(aoa_pred2, aoa_target)
-            loss2 = vol_loss2 + surf_weight * surf_loss2 + 0.01 * re_loss2 + 0.01 * aoa_loss2
+            _sw2 = torch.exp(_gradnorm_log_w_surf).detach() if cfg.gradnorm else surf_weight
+            loss2 = vol_loss2 + _sw2 * surf_loss2 + 0.01 * re_loss2 + 0.01 * aoa_loss2
             loss2.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             sam_optimizer.restore()
@@ -2335,7 +2403,11 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _step_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.gradnorm:
+            _step_log["gradnorm/w_surf"] = torch.exp(_gradnorm_log_w_surf).item()
+            _step_log["gradnorm/w_vol"] = torch.exp(_gradnorm_log_w_vol).item()
+        wandb.log(_step_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
