@@ -1791,9 +1791,11 @@ for epoch in range(MAX_EPOCHS):
             _mix_idx = torch.randperm(_B_mx, device=x.device)
             x = _lam * x + (1 - _lam) * x[_mix_idx]
             y = _lam * y + (1 - _lam) * y[_mix_idx]
-            # Use intersection of masks so padded regions remain masked
+            # Use intersection of padding masks so padded regions remain masked.
+            # Do NOT intersect is_surface — surface nodes sit at different array positions
+            # across samples, so the intersection would be near-empty and kill surface
+            # supervision. Keep sample A's is_surface (lambda >= 0.5 so A dominates).
             mask = mask & mask[_mix_idx]
-            is_surface = is_surface & is_surface[_mix_idx]
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
