@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-09 05:30 UTC
+- **Date:** 2026-04-09 06:05 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training & Architecture Improvements
 
@@ -30,18 +30,20 @@
 
 Single-model beats ensemble on p_in (11.74 vs 12.1) and p_tan (27.90 vs 29.1). Ensemble still leads on p_oodc (7.65 vs 6.6) and p_re (6.40 vs 5.8) — large gaps, especially p_oodc.
 
-## Student Status (2026-04-08 19:05 UTC)
+## Student Status (2026-04-09 06:05 UTC)
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| nezuko | #2314 | **SE Channel Attention on Slice Tokens** | WIP (NEW, ROUND32, ARCH) |
-| thorfinn | #2298 | **GMSE Gradient-Weighted Pressure Loss — weight by local ∇p magnitude** | WIP (BOLD) |
-| alphonse | #2318 | **EMA Teacher Soft-Label Distillation — Mean Teacher for OOD** | WIP (NEW, ROUND33) |
-| fern | #2311 | **Condition Token Injection — dedicated flow-condition embedding pathway** | WIP (NEW, ROUND32) |
-| askeladd | #2308 | **Auxiliary AoA Head — explicit AoA decoding (analogous to Re head PR #780)** | WIP (NEW, ROUND32) |
-| frieren | #2316 | **Stochastic Depth — randomly drop TransolverBlocks during training** | WIP (NEW, ROUND33, REGULARIZATION) |
-| tanjiro | #2315 | **Tandem Curriculum Ramp — smooth linear ramp instead of hard cutoff** | WIP (NEW, ROUND32, TRAINING) |
-| edward | #2317 | **FV Cell Area Loss Weight — geometry-aware node weighting** | WIP (NEW, ROUND33, LOSS) |
+| askeladd | #2308 | **Aux AoA Head v2 (weight=0.02)** | TRAINING (2 seeds, started 05:39 UTC) |
+| fern | #2311 | **Condition Token v2 (no log_Re)** | TRAINING (2 seeds, started 05:41 UTC) |
+| nezuko | #2314 | **SE Channel Attention on Slice Tokens** | TRAINING (2 seeds, started 05:42 UTC) |
+| tanjiro | #2315 | **Tandem Curriculum Ramp** | DEBUGGING (debug run in progress) |
+| frieren | #2316 | **Stochastic Depth** | DEBUGGING (1 crash, advisor guidance sent) |
+| edward | #2317 | **FV Cell Area Loss Weight** | TRAINING (2 seeds, started 05:48 UTC, after 4 crashes fixed) |
+| alphonse | #2318 | **EMA Teacher Soft-Label Distillation** | DEBUGGING (2 crashes, advisor guidance sent) |
+| thorfinn | #2319 | **Panel-Method Cp Feature (inviscid Cp as input)** | NEW (reassigned from closed #2298 GMSE) |
+
+**GMSE (#2298) CLOSED** — too complex to implement (no W&B runs after multiple pod restarts). Reassigned thorfinn → #2319 panel-method-cp-feature.
 
 ## PRs Ready for Review
 
@@ -174,3 +176,4 @@ Next-round assignments (when Round 29 in-flight students complete) will continue
 - **Shortest vector feature (FVF paper)**: Redundant with DSDF 8-ch. ALL geometry input features are now exhausted as a direction
 - **Multi-scale intermediate skips (FPN)**: 3 TransolverBlocks too shallow for multi-scale aggregation. Zero-init chicken-and-egg with Lion optimizer. Existing preprocess skip sufficient
 - **GradNorm adaptive weighting**: Surface/volume loss scales differ by orders of magnitude → weight collapse (w_vol → 0). Also 2.5× compute overhead from retain_graph. Same root cause as failed PR #736
+- **GMSE gradient-weighted loss**: Computing local pressure gradients on unstructured mesh too complex to implement in student session model. Zero W&B runs after multiple attempts. Architecture-level gradient computation on non-uniform meshes requires specialized tools not available in train.py-only constraint
