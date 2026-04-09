@@ -1083,6 +1083,7 @@ class Config:
     adaln_zone_temp: bool = False      # zone-aware temperature modulation
     # Phase 2 R5: tandem warm-in combinations
     tandem_ramp: bool = False          # gradual tandem surface loss warm-in (0→1 over epochs 10-50)
+    tandem_curriculum_ramp: bool = False  # shorter ramp: 0→1 over epochs 10-30 (steeper reintroduction)
     foil2_dist: bool = False           # explicit foil-2 distance feature (from secondary dsdf)
     slice_num: int = 48                # slice count (default 48, GPU6: 96)
     # Phase 3: training dynamics experiments
@@ -1981,7 +1982,7 @@ for epoch in range(MAX_EPOCHS):
 
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
-        if cfg.tandem_ramp:
+        if cfg.tandem_ramp or cfg.tandem_curriculum_ramp:
             pass  # no hard curriculum; tandem_weight applied via tandem_boost below
         elif epoch < cfg.tandem_curriculum_epochs:
             is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
@@ -2042,8 +2043,9 @@ for epoch in range(MAX_EPOCHS):
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
             surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
-        if cfg.tandem_ramp:
-            tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
+        if cfg.tandem_ramp or cfg.tandem_curriculum_ramp:
+            _ramp_len = 20.0 if cfg.tandem_curriculum_ramp else 40.0
+            tandem_weight = min(1.0, max(0.0, (epoch - 10) / _ramp_len))
             tandem_boost = torch.where(is_tandem_batch,
                                        torch.tensor(adaptive_boost * tandem_weight, device=device),
                                        torch.ones(B, device=device))
@@ -2409,13 +2411,17 @@ for epoch in range(MAX_EPOCHS):
     _do_val = (epoch + 1) % cfg.val_every == 0 or epoch == 0 or epoch == MAX_EPOCHS - 1
     if not _do_val:
         dt = time.time() - t0
-        wandb.log({
+        _skip_log = {
             "train/vol_loss": epoch_vol,
             "train/surf_loss": epoch_surf,
             "epoch_time_s": dt,
             "lr": scheduler.get_last_lr()[0],
             "global_step": global_step,
-        })
+        }
+        if cfg.tandem_ramp or cfg.tandem_curriculum_ramp:
+            _ramp_len = 20.0 if cfg.tandem_curriculum_ramp else 40.0
+            _skip_log["train/tandem_ramp_weight"] = min(1.0, max(0.0, (epoch - 10) / _ramp_len))
+        wandb.log(_skip_log)
         print(f"Epoch {epoch+1:3d} ({dt:.0f}s)  train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  [val skipped]")
         continue
 
