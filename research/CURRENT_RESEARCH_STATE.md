@@ -34,7 +34,7 @@ Single-model beats ensemble on p_in (11.74 vs 12.1) and p_tan (27.90 vs 29.1). E
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| nezuko | #2310 | **Asymmetric Quantile (Pinball) Loss on Pressure** | WIP (NEW, ROUND32, LOSS) |
+| nezuko | #2314 | **SE Channel Attention on Slice Tokens** | WIP (NEW, ROUND32, ARCH) |
 | thorfinn | #2298 | **GMSE Gradient-Weighted Pressure Loss — weight by local ∇p magnitude** | WIP (BOLD) |
 | alphonse | #2312 | **GradNorm Adaptive Loss Weighting — auto-balance surface/volume losses** | WIP (NEW, ROUND32, LOSS) |
 | fern | #2311 | **Condition Token Injection — dedicated flow-condition embedding pathway** | WIP (NEW, ROUND32) |
@@ -83,7 +83,7 @@ Next-round assignments (when Round 29 in-flight students complete) will continue
 ### Round 31-32 In-Flight Experiments (8 GPUs)
 | Student | PR | Direction | Target |
 |---------|-----|-----------|--------|
-| nezuko | #2310 | **Asymmetric Quantile Loss** — pinball loss tau=0.65 on surface pressure channel | p_in, p_tan |
+| nezuko | #2314 | **SE on Slice Tokens** — Squeeze-Excite recalibration inside PhysicsAttention | all |
 | thorfinn | #2298 | **GMSE Gradient-Weighted Pressure Loss** — weight by ∇p magnitude | p_tan, p_in |
 | alphonse | #2312 | **GradNorm Adaptive Loss Weighting** — gradient-norm-based surface/vol balancing | all |
 | fern | #2311 | **Condition Token Injection** — additive condition MLP embedding (Unisolver-inspired) | p_oodc, p_re |
@@ -169,3 +169,4 @@ Next-round assignments (when Round 29 in-flight students complete) will continue
 - **Circulation lift feature (Kutta-Joukowski Γ)**: Γ ≈ Re×sin(2α) is redundant with existing inputs; extrapolates worse under distribution shift (p_oodc +6.1%, p_re +3.2%)
 - **Bernoulli residual loss**: 2 iterations, never beats baseline on p_in/p_tan. Interferes with main L1 supervision despite p_re gain in v1
 - **Continuity PDE loss (∇·u=0)**: Redundant with joint Ux/Uy supervision. SPH approximation too noisy. All metrics regressed
+- **Asymmetric quantile/pinball loss**: Diverges catastrophically — multiplicative instability with adaptive weight stack (surf×tandem×hard-node×PCGrad)

@@ -2,6 +2,22 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 07:45 — PR #2310: Asymmetric Quantile (Pinball) Loss — nezuko — **CLOSED** ❌
+
+- Branch: `nezuko/asymmetric-quantile-cp-loss`
+- Hypothesis: Pinball loss tau=0.65 on surface pressure channel penalizes underprediction more than overprediction, targeting suction-side accuracy.
+- W&B runs: `hpwasesr` (s42), `75eihl1t` (s73)
+
+| Result | Details |
+|--------|---------|
+| **DIVERGED** | Both seeds diverged catastrophically at epoch 26-27. S73 reached p_in=94.7 at epoch 49. |
+
+**Analysis:** Multiplicative instability. The pinball asymmetry (tau=0.65) interacts with the adaptive weight stack: surf_weight × tandem_ramp × hard_node_mining × PCGrad creates ~31× effective asymmetry on hard tandem surface nodes at epoch 30+. Training cannot recover from this gradient explosion. Different seeds diverge at different severities (S42 mild, S73 catastrophic), confirming gradient-based instability.
+
+**Insight:** The existing adaptive loss weighting stack is near the stability boundary. Any additional asymmetric loss component is incompatible without major simplification. Added to exhausted list.
+
+---
+
 ### 2026-04-09 06:50 — PR #2299: Potential Flow Residual Loss (v2) — alphonse — **CLOSED** ❌
 
 - Branch: `alphonse/potential-flow-residual`
