@@ -34,7 +34,7 @@ Single-model beats ensemble on p_in (11.74 vs 12.1) and p_tan (27.90 vs 29.1). E
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| nezuko | #2309 | **GQA 2 K/V Groups — middle ground between MQA and MHA** | WIP (NEW, ROUND32) |
+| nezuko | #2310 | **Asymmetric Quantile (Pinball) Loss on Pressure** | WIP (NEW, ROUND32, LOSS) |
 | thorfinn | #2298 | **GMSE Gradient-Weighted Pressure Loss — weight by local ∇p magnitude** | WIP (BOLD) |
 | alphonse | #2299 | **Potential Flow Residual Loss — Bernoulli-consistency auxiliary signal** | WIP (NEW, BOLD, PARADIGM) |
 | fern | #2302 | **Circulation Lift Feature — Kutta-Joukowski Γ as global input signal** | WIP (NEW, PHYSICS) |
@@ -80,7 +80,7 @@ Next-round assignments (when Round 29 in-flight students complete) will continue
 ### Round 31-32 In-Flight Experiments (8 GPUs)
 | Student | PR | Direction | Target |
 |---------|-----|-----------|--------|
-| nezuko | #2309 | **GQA 2 K/V Groups** — 2-group Grouped Query Attention (MQA→GQA refinement) | all |
+| nezuko | #2310 | **Asymmetric Quantile Loss** — pinball loss tau=0.65 on surface pressure channel | p_in, p_tan |
 | thorfinn | #2298 | **GMSE Gradient-Weighted Pressure Loss** — weight by ∇p magnitude | p_tan, p_in |
 | alphonse | #2299 | **Potential Flow Residual Loss** (iter 2) — Bernoulli coupling w=0.03, vol-only | p_re, p_in |
 | fern | #2302 | **Circulation Lift Feature** — Kutta-Joukowski Γ = π·c·Umag·sin(2α) | p_in, p_tan |
@@ -162,3 +162,4 @@ Next-round assignments (when Round 29 in-flight students complete) will continue
 - **DSDF-derived angle features**: Redundant with model's ability to compose existing inputs
 - **DID streamwise position feature**: Redundant with existing (x,y) + AoA + 8 DSDF channels. AoA-dependent projection creates unhelpful entanglement
 - **Wake centerline SDF features**: Redundant with wake_deficit_feature (PR #2213). Fixed spreading model too rigid; 4 zero channels for single-foil create optimization tension
+- **GQA K/V groups**: n_head=3, making GQA-2 impossible (3%2≠0). GQA-3=MHA, already confirmed harmful
