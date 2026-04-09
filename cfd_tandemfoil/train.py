@@ -347,6 +347,70 @@ def compute_wake_deficit_features(raw_xy, is_surface, saf_norm, gap_raw, fore_te
     return torch.stack([dx_norm, dy_norm], dim=-1)  # [B, N, 2]
 
 
+def compute_bl_proxy_features(pos, surf_mask, mask):
+    """Compute boundary layer proxy features per node.
+
+    Two features encode boundary layer structure from mesh geometry:
+      1. Wall-normal distance ratio: dist_to_nearest_surface / chord_length
+      2. Surface proximity: exp(-dist / (2 * median_surface_spacing))
+
+    Args:
+        pos:       [B, N, 2] raw node positions (before normalization)
+        surf_mask: [B, N] bool — True for surface nodes
+        mask:      [B, N] bool — True for real (non-padded) nodes
+
+    Returns:
+        bl_feats: [B, N, 2] float32
+    """
+    B, N, _ = pos.shape
+    bl_feats = torch.zeros(B, N, 2, device=pos.device, dtype=pos.dtype)
+
+    for b in range(B):
+        valid = mask[b]
+        surf = surf_mask[b] & valid
+        n_surf = surf.sum().item()
+        if n_surf == 0:
+            continue
+
+        pos_b = pos[b]  # [N, 2]
+        surf_pos = pos_b[surf]  # [N_surf, 2]
+
+        # Distance from each node to nearest surface node
+        # Chunk to limit peak memory: process 2048 nodes at a time
+        min_dist = torch.empty(N, device=pos.device, dtype=pos.dtype)
+        chunk_size = 2048
+        for c_start in range(0, N, chunk_size):
+            c_end = min(c_start + chunk_size, N)
+            chunk_pos = pos_b[c_start:c_end]  # [chunk, 2]
+            dists = torch.cdist(chunk_pos.unsqueeze(0), surf_pos.unsqueeze(0)).squeeze(0)  # [chunk, N_surf]
+            min_dist[c_start:c_end] = dists.min(dim=-1).values
+
+        # Chord length = extent of surface nodes in x
+        chord = (surf_pos[:, 0].max() - surf_pos[:, 0].min()).clamp(min=1e-6)
+
+        # Feature 1: wall-normal distance ratio (log1p for range compression)
+        wall_dist_ratio = torch.log1p(min_dist / chord)
+
+        # Feature 2: surface proximity with adaptive sigma
+        # sigma = median of nearest-neighbor distances among surface nodes
+        if n_surf > 1:
+            # Only compute NN distances (not full pairwise) for efficiency
+            surf_nn_dists = torch.cdist(surf_pos.unsqueeze(0), surf_pos.unsqueeze(0)).squeeze(0)
+            surf_nn_dists.fill_diagonal_(float('inf'))
+            median_spacing = surf_nn_dists.min(dim=-1).values.median()
+        else:
+            median_spacing = chord * 0.01
+
+        surface_proximity = torch.exp(-min_dist / (2 * median_spacing.clamp(min=1e-8)))
+
+        bl_feats[b, :, 0] = wall_dist_ratio
+        bl_feats[b, :, 1] = surface_proximity
+        # Zero out padding nodes
+        bl_feats[b, ~valid] = 0.0
+
+    return bl_feats
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -1173,6 +1237,8 @@ class Config:
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
+    # Boundary layer proxy features
+    bl_proxy_feature: bool = False         # add wall-normal distance ratio + surface proximity features (+2 input channels)
 
 
 cfg = sp.parse(Config)
@@ -1318,7 +1384,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + (2 if cfg.bl_proxy_feature else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], [+bl_proxy], +32 fourier PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1786,9 +1852,10 @@ for epoch in range(MAX_EPOCHS):
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
-        # TE coordinate frame / wake deficit: save raw xy and saf_norm before normalization
+        # TE coordinate frame / wake deficit / BL proxy: save raw xy and saf_norm before normalization
         _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature
-        _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
+        _need_raw_xy = _need_te_raw or cfg.bl_proxy_feature
+        _raw_xy_te = x[:, :, :2].clone() if _need_raw_xy else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
         # Aft-foil mask: boundary ID=7 nodes identified by saf norm > 0.005
@@ -1819,6 +1886,10 @@ for epoch in range(MAX_EPOCHS):
                 wake_feats = compute_wake_deficit_features(
                     _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
                 x = torch.cat([x, wake_feats], dim=-1)
+        # Boundary layer proxy features (computed from raw positions)
+        if cfg.bl_proxy_feature:
+            bl_feats = compute_bl_proxy_features(_raw_xy_te, is_surface, mask)
+            x = torch.cat([x, bl_feats], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2479,7 +2550,8 @@ for epoch in range(MAX_EPOCHS):
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
                 _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature
-                _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
+                _need_raw_xy_v = _need_te_raw_v or cfg.bl_proxy_feature
+                _raw_xy_te = x[:, :, :2].clone() if _need_raw_xy_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
                 _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
                 # Aft-foil mask for eval (same logic as training)
@@ -2509,6 +2581,10 @@ for epoch in range(MAX_EPOCHS):
                         wake_feats = compute_wake_deficit_features(
                             _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
                         x = torch.cat([x, wake_feats], dim=-1)
+                # Boundary layer proxy features (computed from raw positions)
+                if cfg.bl_proxy_feature:
+                    bl_feats = compute_bl_proxy_features(_raw_xy_te, is_surface, mask)
+                    x = torch.cat([x, bl_feats], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2893,7 +2969,8 @@ if best_metrics:
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _need_te_raw_vis = cfg.te_coord_frame or cfg.wake_deficit_feature
-                    _raw_xy_te_vis = x_dev[:, :, :2].clone() if _need_te_raw_vis else None
+                    _need_raw_xy_vis = _need_te_raw_vis or cfg.bl_proxy_feature
+                    _raw_xy_te_vis = x_dev[:, :, :2].clone() if _need_raw_xy_vis else None
                     _raw_saf_norm_te_vis = x_dev[:, :, 2:4].norm(dim=-1) if _need_te_raw_vis else None
                     _raw_gap_wake_vis = x_dev[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
                     x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
@@ -2913,6 +2990,10 @@ if best_metrics:
                             wake_feats_vis = compute_wake_deficit_features(
                                 _raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis, _raw_gap_wake_vis)
                             x_n = torch.cat([x_n, wake_feats_vis], dim=-1)
+                    # Boundary layer proxy features
+                    if cfg.bl_proxy_feature:
+                        bl_feats_vis = compute_bl_proxy_features(_raw_xy_te_vis, is_surf_dev, mask)
+                        x_n = torch.cat([x_n, bl_feats_vis], dim=-1)
                     # Fourier PE (must match training loop)
                     raw_xy = x_n[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
@@ -3008,7 +3089,8 @@ if cfg.surface_refine and best_metrics:
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
                     _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature
-                    _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
+                    _need_raw_xy_vv = _need_te_raw_vv or cfg.bl_proxy_feature
+                    _raw_xy_te = x[:, :, :2].clone() if _need_raw_xy_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
                     _raw_gap_wake_vv = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
                     x = (x - stats["x_mean"]) / stats["x_std"]
@@ -3031,6 +3113,10 @@ if cfg.surface_refine and best_metrics:
                             wake_feats_vv = compute_wake_deficit_features(
                                 _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake_vv)
                             x = torch.cat([x, wake_feats_vv], dim=-1)
+                    # Boundary layer proxy features
+                    if cfg.bl_proxy_feature:
+                        bl_feats_vv = compute_bl_proxy_features(_raw_xy_te, is_surface, mask)
+                        x = torch.cat([x, bl_feats_vv], dim=-1)
                     raw_xy = x[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
                     xy_max = raw_xy.amax(dim=1, keepdim=True)
