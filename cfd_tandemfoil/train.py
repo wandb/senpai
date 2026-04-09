@@ -832,6 +832,127 @@ class SurfaceRefinementContextHead(nn.Module):
         return correction
 
 
+class SRFHypernetwork(nn.Module):
+    """Hypernetwork that generates LoRA weight perturbations for SRF layers.
+
+    Takes a per-sample condition vector (AoA, Re, gap, stagger, DSDF stats,
+    tandem flag) and produces low-rank (A, B) matrix pairs for each linear
+    layer in the SRF head. Applied as: out = layer(x) + scale * (x @ B^T @ A^T)
+    where scale = alpha / rank (standard LoRA scaling).
+
+    layer_dims: list of (d_out, d_in) for each LoRA-perturbed linear layer.
+      The first hidden layer of SRF has d_in = n_hidden + out_dim (not d_hidden),
+      so this must be specified explicitly to avoid shape mismatches.
+    """
+
+    def __init__(self, d_cond: int = 8, rank: int = 8,
+                 layer_dims: list[tuple[int, int]] | None = None,
+                 d_hidden: int = 128, n_srf_layers: int = 2, alpha: float = 1.0):
+        super().__init__()
+        self.rank = rank
+        self.scale = alpha / rank
+
+        # Build per-layer (d_out, d_in) list
+        if layer_dims is not None:
+            self.layer_dims = layer_dims
+        else:
+            # Fallback: assume all layers are square d_hidden x d_hidden
+            self.layer_dims = [(d_hidden, d_hidden)] * n_srf_layers
+
+        # Condition encoder: 2-layer MLP
+        self.encoder = nn.Sequential(
+            nn.Linear(d_cond, 64),
+            nn.SiLU(),
+            nn.Linear(64, 64),
+            nn.SiLU(),
+        )
+
+        # For each SRF linear layer, generate A=[d_out, rank] and B=[rank, d_in]
+        # Total params per layer: (d_out + d_in) * rank
+        n_lora_params_total = sum((d_out + d_in) * rank for d_out, d_in in self.layer_dims)
+        self.lora_gen = nn.Linear(64, n_lora_params_total)
+
+        # Zero-init so perturbation starts at zero (identity behavior at init)
+        nn.init.zeros_(self.lora_gen.weight)
+        nn.init.zeros_(self.lora_gen.bias)
+
+    def forward(self, cond: torch.Tensor) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Args:
+            cond: [B, d_cond] — per-sample condition vector
+        Returns:
+            list of (A, B) tuples for each SRF layer
+            A: [B, d_out, rank], B: [B, rank, d_in]
+        """
+        h = self.encoder(cond)  # [B, 64]
+        lora_params = self.lora_gen(h)  # [B, n_lora_params_total]
+
+        deltas = []
+        offset = 0
+        for d_out, d_in in self.layer_dims:
+            A = lora_params[:, offset:offset + d_out * self.rank]
+            A = A.view(-1, d_out, self.rank)
+            offset += d_out * self.rank
+
+            B = lora_params[:, offset:offset + self.rank * d_in]
+            B = B.view(-1, self.rank, d_in)
+            offset += self.rank * d_in
+
+            deltas.append((A * self.scale, B))
+        return deltas
+
+
+def apply_srf_with_lora(srf_head: 'SurfaceRefinementHead',
+                        hidden: torch.Tensor, base_pred: torch.Tensor,
+                        lora_deltas: list[tuple[torch.Tensor, torch.Tensor]],
+                        batch_indices: torch.Tensor) -> torch.Tensor:
+    """Apply SRF head with per-sample LoRA perturbations.
+
+    The SRF MLP has structure: [Linear, LayerNorm, GELU] * n_layers + [Linear_out].
+    We apply LoRA to each hidden Linear layer (not the final output linear).
+
+    Args:
+        srf_head: the SurfaceRefinementHead module
+        hidden: [M, n_hidden] — hidden features for surface nodes
+        base_pred: [M, out_dim] — base predictions for surface nodes
+        lora_deltas: list of (A, B) from hypernetwork, each [B, d_hidden, rank] / [B, rank, d_hidden]
+        batch_indices: [M] — which batch element each surface node belongs to
+    Returns:
+        correction: [M, out_dim] — additive correction
+    """
+    # Get the underlying sequential module (handle torch.compile wrapping)
+    mlp = srf_head._orig_mod.mlp if hasattr(srf_head, '_orig_mod') else srf_head.mlp
+    p_only = srf_head._orig_mod.p_only if hasattr(srf_head, '_orig_mod') else srf_head.p_only
+
+    inp = torch.cat([hidden, base_pred], dim=-1)
+    x = inp
+    lora_idx = 0
+    for i, layer in enumerate(mlp):
+        if isinstance(layer, nn.Linear):
+            base_out = layer(x)
+            if lora_idx < len(lora_deltas):
+                A, B = lora_deltas[lora_idx]  # A: [B, d_out, rank], B: [B, rank, d_in]
+                # Gather per-node LoRA matrices using batch_indices
+                A_per_node = A[batch_indices]  # [M, d_out, rank]
+                B_per_node = B[batch_indices]  # [M, rank, d_in]
+                # LoRA: x @ B^T @ A^T = [M, d_out]
+                lora_out = torch.einsum('mi,mri->mr', x, B_per_node)  # [M, rank]
+                lora_out = torch.einsum('mr,mdr->md', lora_out, A_per_node)  # [M, d_out]
+                x = base_out + lora_out
+                lora_idx += 1
+            else:
+                x = base_out  # final output linear — no LoRA
+        else:
+            x = layer(x)  # LayerNorm, GELU
+
+    correction = x
+    if p_only:
+        zeros = torch.zeros(correction.shape[0], base_pred.shape[-1] - 1,
+                            device=correction.device, dtype=correction.dtype)
+        correction = torch.cat([zeros, correction], dim=-1)
+    return correction
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -1253,6 +1374,10 @@ class Config:
     cp_panel: bool = False                 # append thin-airfoil inviscid Cp to input features
     cp_panel_tandem_only: bool = False     # zero Cp feature for single-foil samples (tandem benefit only)
     cp_panel_scale: float = 1.0            # scale factor for panel Cp feature (0.1 = weak hint)
+    # Hypernetwork SRF: per-geometry LoRA weight perturbations for the SRF head
+    srf_hypernetwork: bool = False         # enable hypernetwork-generated LoRA for SRF
+    srf_hyper_rank: int = 8               # LoRA rank for hypernetwork weight perturbations
+    srf_hyper_alpha: float = 1.0          # LoRA scaling factor (scale = alpha / rank)
 
 
 cfg = sp.parse(Config)
@@ -1461,6 +1586,29 @@ if cfg.surface_refine:
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
           f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
 
+# Hypernetwork for SRF: generates per-geometry LoRA weight perturbations
+srf_hypernet = None
+ema_srf_hypernet = None
+if cfg.srf_hypernetwork and cfg.surface_refine and not cfg.surface_refine_context:
+    # Compute per-layer (d_out, d_in) for the SRF MLP hidden linear layers.
+    # SRF MLP structure: Linear(n_hidden+out_dim, d_hidden), [Linear(d_hidden, d_hidden)] * (n_layers-1)
+    # We apply LoRA to each hidden linear (not the final output linear).
+    _srf_d_hidden = cfg.surface_refine_hidden
+    _srf_first_in = cfg.n_hidden + 3  # n_hidden + out_dim (out_dim=3 always)
+    _srf_layer_dims = [(_srf_d_hidden, _srf_first_in)] + \
+                      [(_srf_d_hidden, _srf_d_hidden)] * (cfg.surface_refine_layers - 1)
+    srf_hypernet = SRFHypernetwork(
+        d_cond=8,
+        rank=cfg.srf_hyper_rank,
+        layer_dims=_srf_layer_dims,
+        alpha=cfg.srf_hyper_alpha,
+    ).to(device)
+    srf_hypernet = torch.compile(srf_hypernet, mode=cfg.compile_mode)
+    _hyper_n_params = sum(p.numel() for p in srf_hypernet.parameters())
+    print(f"SRF Hypernetwork: {_hyper_n_params:,} params "
+          f"(rank={cfg.srf_hyper_rank}, alpha={cfg.srf_hyper_alpha}, "
+          f"cond_dim=8, srf_layers={cfg.surface_refine_layers})")
+
 # Aft-foil (boundary ID=7) dedicated refinement head
 aft_srf_head = None
 aft_srf_ctx_head = None
@@ -1516,6 +1664,8 @@ if aft_srf_head is not None:
     n_params += sum(p.numel() for p in aft_srf_head.parameters())
 if aft_srf_ctx_head is not None:
     n_params += sum(p.numel() for p in aft_srf_ctx_head.parameters())
+if srf_hypernet is not None:
+    n_params += sum(p.numel() for p in srf_hypernet.parameters())
 
 
 class SAM:
@@ -1657,6 +1807,12 @@ if aft_srf_ctx_head is not None:
     base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
 
+# Add hypernetwork params to optimizer if enabled
+if srf_hypernet is not None:
+    _hyper_params = list(srf_hypernet.parameters())
+    base_opt.add_param_group({'params': _hyper_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _hyper_params):,} SRF hypernetwork params to optimizer")
+
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
     _warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
@@ -1760,6 +1916,8 @@ for epoch in range(MAX_EPOCHS):
         aft_srf_head.train()
     if aft_srf_ctx_head is not None:
         aft_srf_ctx_head.train()
+    if srf_hypernet is not None:
+        srf_hypernet.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
@@ -1880,6 +2038,28 @@ for epoch in range(MAX_EPOCHS):
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
+        # Hypernetwork condition vector: extract before normalization
+        _hyper_cond = None
+        if srf_hypernet is not None:
+            # Build per-sample condition: [aoa, log_re, gap, stagger, dsdf1_mean, dsdf2_mean, chord_est, is_tandem]
+            _h_aoa = x[:, 0, 14]           # AoA0_rad [B]
+            _h_re = x[:, 0, 13]            # log(Re) [B]
+            _h_gap = x[:, 0, 22]           # gap [B]
+            _h_stagger = x[:, 0, 23]       # stagger [B]
+            # DSDF stats: mean absolute value of dsdf channels per surface node
+            _surf_float = is_surface.float().unsqueeze(-1)  # [B, N, 1]
+            _n_surf = is_surface.float().sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1]
+            _dsdf1_mean = (x[:, :, 2:6].abs() * _surf_float).sum(dim=1).mean(dim=-1) / _n_surf.squeeze()  # [B]
+            _dsdf2_mean = (x[:, :, 6:10].abs() * _surf_float).sum(dim=1).mean(dim=-1) / _n_surf.squeeze()  # [B]
+            # Chord estimate: range of x-coords for surface nodes
+            _surf_x = x[:, :, 0].clone()
+            _surf_x_max = _surf_x.masked_fill(~is_surface, float('-inf')).max(dim=1).values
+            _surf_x_min = _surf_x.masked_fill(~is_surface, float('inf')).min(dim=1).values
+            _chord_est = (_surf_x_max - _surf_x_min).nan_to_num(0.0)  # [B]
+            _chord_est = _chord_est.masked_fill(_surf_x_max == float('-inf'), 0.0)
+            _h_tandem = _is_tandem_raw       # [B]
+            _hyper_cond = torch.stack([_h_aoa, _h_re, _h_gap, _h_stagger,
+                                       _dsdf1_mean, _dsdf2_mean, _chord_est, _h_tandem], dim=-1)  # [B, 8]
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -2031,7 +2211,13 @@ for epoch in range(MAX_EPOCHS):
                     if surf_idx.numel() > 0:
                         surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]  # [M, n_hidden]
                         surf_pred = pred[surf_idx[:, 0], surf_idx[:, 1]]      # [M, 3]
-                        correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
+                        if srf_hypernet is not None and _hyper_cond is not None:
+                            lora_deltas = srf_hypernet(_hyper_cond)
+                            correction = apply_srf_with_lora(
+                                refine_head, surf_hidden, surf_pred,
+                                lora_deltas, surf_idx[:, 0]).float()
+                        else:
+                            correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
 
@@ -2424,6 +2610,15 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for SRF hypernetwork
+            if srf_hypernet is not None:
+                _hyper_base = srf_hypernet._orig_mod if hasattr(srf_hypernet, '_orig_mod') else srf_hypernet
+                if ema_srf_hypernet is None:
+                    ema_srf_hypernet = deepcopy(_hyper_base)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_srf_hypernet.parameters(), _hyper_base.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -2544,6 +2739,15 @@ for epoch in range(MAX_EPOCHS):
             eval_aft_srf_ctx_head.eval()
         else:
             aft_srf_ctx_head.eval()
+    # Select SRF hypernetwork for eval (EMA if available)
+    eval_srf_hypernet = srf_hypernet
+    if srf_hypernet is not None:
+        if ema_srf_hypernet is not None and ema_model is not None and eval_model is ema_model:
+            eval_srf_hypernet = ema_srf_hypernet
+            eval_srf_hypernet.eval()
+        else:
+            _hyper_base_eval = srf_hypernet._orig_mod if hasattr(srf_hypernet, '_orig_mod') else srf_hypernet
+            _hyper_base_eval.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -2580,6 +2784,25 @@ for epoch in range(MAX_EPOCHS):
                     _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
                     _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
                     _v_gap_stagger = x[:, 0, 22:24]  # [B, 2]
+                # Hypernetwork condition vector for eval
+                _eval_hyper_cond = None
+                if eval_srf_hypernet is not None:
+                    _h_aoa = x[:, 0, 14]
+                    _h_re = x[:, 0, 13]
+                    _h_gap = x[:, 0, 22]
+                    _h_stagger = x[:, 0, 23]
+                    _surf_float = is_surface.float().unsqueeze(-1)
+                    _n_surf = is_surface.float().sum(dim=1, keepdim=True).clamp(min=1)
+                    _dsdf1_mean = (x[:, :, 2:6].abs() * _surf_float).sum(dim=1).mean(dim=-1) / _n_surf.squeeze()
+                    _dsdf2_mean = (x[:, :, 6:10].abs() * _surf_float).sum(dim=1).mean(dim=-1) / _n_surf.squeeze()
+                    _surf_x = x[:, :, 0].clone()
+                    _surf_x_max = _surf_x.masked_fill(~is_surface, float('-inf')).max(dim=1).values
+                    _surf_x_min = _surf_x.masked_fill(~is_surface, float('inf')).min(dim=1).values
+                    _chord_est = (_surf_x_max - _surf_x_min).nan_to_num(0.0)
+                    _chord_est = _chord_est.masked_fill(_surf_x_max == float('-inf'), 0.0)
+                    _eval_hyper_cond = torch.stack([_h_aoa, _h_re, _h_gap, _h_stagger,
+                                                     _dsdf1_mean, _dsdf2_mean, _chord_est,
+                                                     _is_tandem_raw], dim=-1)
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -2706,7 +2929,14 @@ for epoch in range(MAX_EPOCHS):
                             if surf_idx.numel() > 0:
                                 surf_hidden = _eval_hidden[surf_idx[:, 0], surf_idx[:, 1]]
                                 surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                                correction = eval_refine_head(surf_hidden, surf_pred).float()
+                                if eval_srf_hypernet is not None and _eval_hyper_cond is not None:
+                                    with torch.no_grad():
+                                        _eval_lora = eval_srf_hypernet(_eval_hyper_cond)
+                                    correction = apply_srf_with_lora(
+                                        eval_refine_head, surf_hidden, surf_pred,
+                                        _eval_lora, surf_idx[:, 0]).float()
+                                else:
+                                    correction = eval_refine_head(surf_hidden, surf_pred).float()
                                 pred_loss = pred_loss.clone()
                                 pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
@@ -2929,6 +3159,11 @@ for epoch in range(MAX_EPOCHS):
                 aft_srf_ctx_head._orig_mod if hasattr(aft_srf_ctx_head, '_orig_mod') else aft_srf_ctx_head
             )
             torch.save(_ctx_save.state_dict(), model_dir / "aft_srf_ctx_head.pt")
+        if srf_hypernet is not None:
+            _hyper_save = ema_srf_hypernet if ema_srf_hypernet is not None else (
+                srf_hypernet._orig_mod if hasattr(srf_hypernet, '_orig_mod') else srf_hypernet
+            )
+            torch.save(_hyper_save.state_dict(), model_dir / "srf_hypernet.pt")
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
@@ -3226,7 +3461,35 @@ if cfg.surface_refine and best_metrics:
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                             surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]
                             surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                            correction = verify_refine(surf_hidden, surf_pred).float()
+                            # Use hypernetwork LoRA if enabled
+                            if srf_hypernet is not None:
+                                _v_hyper = ema_srf_hypernet if ema_srf_hypernet is not None else (
+                                    srf_hypernet._orig_mod if hasattr(srf_hypernet, '_orig_mod') else srf_hypernet)
+                                # Build condition from pre-normalized features
+                                # x may have extra cp_panel features beyond the original 24 — slice to match stats
+                                _n_orig = stats["x_std"].shape[-1]
+                                _vx_raw = (x[:, :, :_n_orig] * stats["x_std"] + stats["x_mean"])  # undo normalization
+                                _vh_aoa = _vx_raw[:, 0, 14]
+                                _vh_re = _vx_raw[:, 0, 13]
+                                _vh_gap = _vx_raw[:, 0, 22]
+                                _vh_stagger = _vx_raw[:, 0, 23]
+                                _v_sf = is_surface.float().unsqueeze(-1)
+                                _v_ns = is_surface.float().sum(dim=1, keepdim=True).clamp(min=1)
+                                _vd1 = (_vx_raw[:, :, 2:6].abs() * _v_sf).sum(dim=1).mean(dim=-1) / _v_ns.squeeze()
+                                _vd2 = (_vx_raw[:, :, 6:10].abs() * _v_sf).sum(dim=1).mean(dim=-1) / _v_ns.squeeze()
+                                _vsx = _vx_raw[:, :, 0].clone()
+                                _vsx_max = _vsx.masked_fill(~is_surface, float('-inf')).max(dim=1).values
+                                _vsx_min = _vsx.masked_fill(~is_surface, float('inf')).min(dim=1).values
+                                _vc = (_vsx_max - _vsx_min).nan_to_num(0.0)
+                                _vc = _vc.masked_fill(_vsx_max == float('-inf'), 0.0)
+                                _vt = (x[:, 0, 22].abs() > 0.01).float()
+                                _v_cond = torch.stack([_vh_aoa, _vh_re, _vh_gap, _vh_stagger, _vd1, _vd2, _vc, _vt], dim=-1)
+                                _v_lora = _v_hyper(_v_cond)
+                                correction = apply_srf_with_lora(
+                                    verify_refine, surf_hidden, surf_pred,
+                                    _v_lora, surf_idx[:, 0]).float()
+                            else:
+                                correction = verify_refine(surf_hidden, surf_pred).float()
                         pred_loss_refined = pred_loss.clone()
                         pred_loss_refined[surf_idx[:, 0], surf_idx[:, 1]] += correction
                         correction_full[surf_idx[:, 0], surf_idx[:, 1]] = correction
