@@ -2,6 +2,25 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 06:15 — PR #2302: Circulation Lift Feature — fern — **CLOSED** ❌
+
+- Branch: `fern/circulation-lift-feature`
+- Hypothesis: Kutta-Joukowski Γ = π·c·Umag·sin(2α) as global input feature. Expected to anchor pressure predictions with physics-based lift estimate, especially for tandem configs.
+- W&B runs: `wvk6ygz3` (s42), `pmcwx79e` (s73)
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 11.679 | -0.5% |
+| p_oodc | 7.643 | 8.113 | **+6.1%** ❌ |
+| p_tan | 27.874 | 27.895 | +0.1% |
+| p_re | 6.419 | 6.622 | **+3.2%** ❌ |
+
+**Analysis:** Net negative. Γ ≈ Re × sin(2α) is a deterministic function of existing inputs — redundant. The multiplicative form extrapolates worse under distribution shift, causing large OOD regressions. High seed variance on p_oodc (7.764 vs 8.462 → 9% spread) suggests optimization instability.
+
+**Insight:** Input feature space is well-saturated. Deterministic functions of existing inputs add no new information and can hurt OOD generalization. Confirms pattern from DID, wake centerline SDF: input features must encode truly novel geometry/physics not derivable from existing inputs.
+
+---
+
 ### 2026-04-09 06:00 — PR #2305: DID Streamwise Feature — nezuko — **CLOSED** ❌
 
 - Branch: `nezuko/did-streamwise-feature`

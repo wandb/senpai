@@ -37,7 +37,7 @@ Single-model beats ensemble on p_in (11.74 vs 12.1) and p_tan (27.90 vs 29.1). E
 | nezuko | #2310 | **Asymmetric Quantile (Pinball) Loss on Pressure** | WIP (NEW, ROUND32, LOSS) |
 | thorfinn | #2298 | **GMSE Gradient-Weighted Pressure Loss — weight by local ∇p magnitude** | WIP (BOLD) |
 | alphonse | #2299 | **Potential Flow Residual Loss — Bernoulli-consistency auxiliary signal** | WIP (NEW, BOLD, PARADIGM) |
-| fern | #2302 | **Circulation Lift Feature — Kutta-Joukowski Γ as global input signal** | WIP (NEW, PHYSICS) |
+| fern | #2311 | **Condition Token Injection — dedicated flow-condition embedding pathway** | WIP (NEW, ROUND32) |
 | askeladd | #2308 | **Auxiliary AoA Head — explicit AoA decoding (analogous to Re head PR #780)** | WIP (NEW, ROUND32) |
 | frieren | #2304 | **Shortest Vector Feature — 2D displacement to nearest foil surface (FVF)** | WIP (NEW, PHYSICS) |
 | tanjiro | #2307 | **Q-Criterion Proxy Feature — vortex zone indicator (DSDF×freestream cross-product)** | WIP (NEW, PHYSICS) |
@@ -48,6 +48,9 @@ Single-model beats ensemble on p_in (11.74 vs 12.1) and p_tan (27.90 vs 29.1). E
 None.
 
 ## Latest Reviews (2026-04-09 04:45)
+
+### PR #2302 (fern, Circulation Lift Feature) — CLOSED ❌ (2026-04-09)
+- p_oodc +6.1%, p_re +3.2%. Γ ≈ Re×sin(2α) is a deterministic function of existing inputs — redundant. OOD regressions from misleading extrapolation.
 
 ### PR #2305 (nezuko, DID Streamwise Feature) — CLOSED ❌ (2026-04-09)
 - All metrics worse: p_in +5.2%, p_oodc +2.1%, p_tan +2.2%, p_re +0.5%. Streamwise position redundant with existing (x,y) + AoA + DSDF.
@@ -83,7 +86,7 @@ Next-round assignments (when Round 29 in-flight students complete) will continue
 | nezuko | #2310 | **Asymmetric Quantile Loss** — pinball loss tau=0.65 on surface pressure channel | p_in, p_tan |
 | thorfinn | #2298 | **GMSE Gradient-Weighted Pressure Loss** — weight by ∇p magnitude | p_tan, p_in |
 | alphonse | #2299 | **Potential Flow Residual Loss** (iter 2) — Bernoulli coupling w=0.03, vol-only | p_re, p_in |
-| fern | #2302 | **Circulation Lift Feature** — Kutta-Joukowski Γ = π·c·Umag·sin(2α) | p_in, p_tan |
+| fern | #2311 | **Condition Token Injection** — additive condition MLP embedding (Unisolver-inspired) | p_oodc, p_re |
 | askeladd | #2308 | **Auxiliary AoA Head** — explicit AoA decoding, penultimate block pool | p_tan, p_oodc |
 | frieren | #2304 | **Shortest Vector Feature** — 2D displacement to nearest foil surface (FVF) | p_tan, p_oodc |
 | tanjiro | #2307 | **Q-Criterion Proxy Feature** — vortex zone indicator (DSDF×freestream cross-product) | p_tan, p_oodc |
@@ -163,3 +166,4 @@ Next-round assignments (when Round 29 in-flight students complete) will continue
 - **DID streamwise position feature**: Redundant with existing (x,y) + AoA + 8 DSDF channels. AoA-dependent projection creates unhelpful entanglement
 - **Wake centerline SDF features**: Redundant with wake_deficit_feature (PR #2213). Fixed spreading model too rigid; 4 zero channels for single-foil create optimization tension
 - **GQA K/V groups**: n_head=3, making GQA-2 impossible (3%2≠0). GQA-3=MHA, already confirmed harmful
+- **Circulation lift feature (Kutta-Joukowski Γ)**: Γ ≈ Re×sin(2α) is redundant with existing inputs; extrapolates worse under distribution shift (p_oodc +6.1%, p_re +3.2%)
