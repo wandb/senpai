@@ -40,7 +40,7 @@ Single-model beats ensemble on p_in (11.74 vs 12.1) and p_tan (27.90 vs 29.1). E
 | fern | #2311 | **Condition Token Injection — dedicated flow-condition embedding pathway** | WIP (NEW, ROUND32) |
 | askeladd | #2308 | **Auxiliary AoA Head — explicit AoA decoding (analogous to Re head PR #780)** | WIP (NEW, ROUND32) |
 | frieren | #2304 | **Shortest Vector Feature — 2D displacement to nearest foil surface (FVF)** | WIP (NEW, PHYSICS) |
-| tanjiro | #2307 | **Q-Criterion Proxy Feature — vortex zone indicator (DSDF×freestream cross-product)** | WIP (NEW, PHYSICS) |
+| tanjiro | #2315 | **Tandem Curriculum Ramp — smooth linear ramp instead of hard cutoff** | WIP (NEW, ROUND32, TRAINING) |
 | edward | #2313 | **Multi-Scale Intermediate Skips — FPN-style output from all TransolverBlocks** | WIP (NEW, ROUND32, ARCH) |
 
 ## PRs Ready for Review
@@ -89,7 +89,7 @@ Next-round assignments (when Round 29 in-flight students complete) will continue
 | fern | #2311 | **Condition Token Injection** — additive condition MLP embedding (Unisolver-inspired) | p_oodc, p_re |
 | askeladd | #2308 | **Auxiliary AoA Head** — explicit AoA decoding, penultimate block pool | p_tan, p_oodc |
 | frieren | #2304 | **Shortest Vector Feature** — 2D displacement to nearest foil surface (FVF) | p_tan, p_oodc |
-| tanjiro | #2307 | **Q-Criterion Proxy Feature** — vortex zone indicator (DSDF×freestream cross-product) | p_tan, p_oodc |
+| tanjiro | #2315 | **Tandem Curriculum Ramp** — smooth epoch 10-30 ramp instead of hard cutoff | p_tan |
 | edward | #2313 | **Multi-Scale Intermediate Skips** — FPN-style aggregation from TransolverBlocks | all |
 
 ### Key Mechanistic Insights (accumulated)

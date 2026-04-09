@@ -2,6 +2,25 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 08:00 — PR #2307: Q-Criterion Proxy Feature — tanjiro — **CLOSED** ❌
+
+- Branch: `tanjiro/q-criterion-proxy-feature`
+- Hypothesis: DSDF gradient × freestream direction cross-product as vortex zone indicator, weighted by surface proximity decay exp(-dsdf*3.0). 2 channels (foil-1, foil-2).
+- W&B runs: `ila03wkz` (s42), `6xij9aap` (s73)
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 12.05 | **+2.6%** ❌ |
+| p_oodc | 7.643 | 7.80 | **+2.1%** ❌ |
+| p_tan | 27.874 | 28.00 | +0.5% ❌ |
+| p_re | 6.419 | 6.45 | +0.5% ❌ |
+
+**Analysis:** All metrics slightly worse on average. High seed variance (p_tan: 27.5 vs 28.5 across seeds) — single-seed results don't replicate. The hand-crafted cross-product is not a robust vortex encoding. Seed 42 p_tan=27.5 was the best single-seed tandem result seen but unreliable.
+
+**9th consecutive failure since PR #2290.** Plateau confirmed.
+
+---
+
 ### 2026-04-09 07:45 — PR #2310: Asymmetric Quantile (Pinball) Loss — nezuko — **CLOSED** ❌
 
 - Branch: `nezuko/asymmetric-quantile-cp-loss`
