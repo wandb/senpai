@@ -653,6 +653,62 @@ class SurfaceRefinementHead(nn.Module):
         return correction
 
 
+def sort_by_arc_angle(surf_feats: torch.Tensor, surf_xy: torch.Tensor):
+    """Sort surface node features by polar angle from their centroid.
+
+    Provides arc-length-like ordering: LE → upper surface → TE → lower surface → LE.
+
+    Args:
+        surf_feats: [N_surf, D] — features for surface nodes of one foil
+        surf_xy:    [N_surf, 2] — XY coordinates of those surface nodes
+    Returns:
+        sorted_feats: [N_surf, D]
+        inverse_idx:  [N_surf] — index to unsort back to original order
+    """
+    centroid = surf_xy.mean(dim=0, keepdim=True)  # [1, 2]
+    angles = torch.atan2(surf_xy[:, 1] - centroid[:, 1],
+                         surf_xy[:, 0] - centroid[:, 0])  # [N_surf]
+    sort_idx = angles.argsort(dim=0)       # [N_surf]
+    inverse_idx = sort_idx.argsort(dim=0)  # to unsort later
+    sorted_feats = surf_feats[sort_idx]    # [N_surf, D]
+    return sorted_feats, inverse_idx
+
+
+class GRUSurfaceDecoder(nn.Module):
+    """Bidirectional GRU decoder for surface nodes in arc-length order.
+
+    Replaces the MLP-based SurfaceRefinementHead. Processes surface nodes
+    sequentially using a bidirectional GRU, allowing information to propagate
+    along the airfoil surface (stagnation → suction peak → TE recovery).
+
+    Zero-initialized output projection for safe residual initialization.
+    """
+
+    def __init__(self, d_in: int, d_hidden: int = 192, d_out: int = 3, n_layers: int = 2):
+        super().__init__()
+        self.gru = nn.GRU(
+            input_size=d_in,
+            hidden_size=d_hidden,
+            num_layers=n_layers,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.proj = nn.Linear(d_hidden * 2, d_out)
+        # Zero-init output projection so refinement starts as identity
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x_sorted: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x_sorted: [1, N_surf, D] — surface node features sorted by arc-length
+        Returns:
+            correction: [1, N_surf, d_out] — additive correction
+        """
+        out, _ = self.gru(x_sorted)     # [1, N_surf, 2*d_hidden]
+        return self.proj(out)            # [1, N_surf, d_out]
+
+
 class AftFoilRefinementHead(nn.Module):
     """Dedicated refinement head for aft-foil (boundary ID=7) surface nodes.
 
@@ -1220,6 +1276,9 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    srf_gru: bool = False                     # replace SRF MLP with bidirectional GRU (arc-length ordered)
+    srf_gru_hidden: int = 192                 # GRU hidden dimension
+    srf_gru_layers: int = 2                   # number of GRU layers
     # Phase 6: Asinh pressure transform
     asinh_pressure: bool = False             # transform pressure targets with asinh for dynamic range compression
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
@@ -1451,6 +1510,26 @@ if cfg.surface_refine:
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
           f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
 
+# GRU-based surface refinement (replaces MLP SRF when srf_gru=True)
+gru_srf_fore = None
+gru_srf_aft = None
+if cfg.srf_gru:
+    assert cfg.surface_refine, "--srf_gru requires --surface_refine"
+    _gru_d_in = cfg.n_hidden + 3  # hidden features + base predictions
+    gru_srf_fore = GRUSurfaceDecoder(
+        d_in=_gru_d_in, d_hidden=cfg.srf_gru_hidden,
+        d_out=3, n_layers=cfg.srf_gru_layers,
+    ).to(device)
+    gru_srf_aft = GRUSurfaceDecoder(
+        d_in=_gru_d_in, d_hidden=cfg.srf_gru_hidden,
+        d_out=3, n_layers=cfg.srf_gru_layers,
+    ).to(device)
+    # Don't compile GRUs — variable-length sequences cause recompilation
+    _gru_fore_params = sum(p.numel() for p in gru_srf_fore.parameters())
+    _gru_aft_params = sum(p.numel() for p in gru_srf_aft.parameters())
+    print(f"GRU SRF: fore={_gru_fore_params:,} params, aft={_gru_aft_params:,} params "
+          f"(hidden={cfg.srf_gru_hidden}, layers={cfg.srf_gru_layers})")
+
 # Aft-foil (boundary ID=7) dedicated refinement head
 aft_srf_head = None
 aft_srf_ctx_head = None
@@ -1485,6 +1564,8 @@ from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
 ema_aft_srf_head = None  # EMA copy of aft-foil SRF head
+ema_gru_srf_fore = None  # EMA copy of GRU SRF fore head
+ema_gru_srf_aft = None   # EMA copy of GRU SRF aft head
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -1506,6 +1587,10 @@ if aft_srf_head is not None:
     n_params += sum(p.numel() for p in aft_srf_head.parameters())
 if aft_srf_ctx_head is not None:
     n_params += sum(p.numel() for p in aft_srf_ctx_head.parameters())
+if gru_srf_fore is not None:
+    n_params += sum(p.numel() for p in gru_srf_fore.parameters())
+if gru_srf_aft is not None:
+    n_params += sum(p.numel() for p in gru_srf_aft.parameters())
 
 
 class SAM:
@@ -1647,6 +1732,16 @@ if aft_srf_ctx_head is not None:
     base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
 
+# Add GRU SRF params to optimizer if enabled
+if gru_srf_fore is not None:
+    _gru_fore_p = list(gru_srf_fore.parameters())
+    base_opt.add_param_group({'params': _gru_fore_p, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _gru_fore_p):,} GRU SRF fore params to optimizer")
+if gru_srf_aft is not None:
+    _gru_aft_p = list(gru_srf_aft.parameters())
+    base_opt.add_param_group({'params': _gru_aft_p, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _gru_aft_p):,} GRU SRF aft params to optimizer")
+
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
     _warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
@@ -1750,6 +1845,9 @@ for epoch in range(MAX_EPOCHS):
         aft_srf_head.train()
     if aft_srf_ctx_head is not None:
         aft_srf_ctx_head.train()
+    if gru_srf_fore is not None:
+        gru_srf_fore.train()
+        gru_srf_aft.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
@@ -1858,7 +1956,7 @@ for epoch in range(MAX_EPOCHS):
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
         # TE coordinate frame / wake deficit / cp_panel: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.srf_gru
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
@@ -2005,7 +2103,44 @@ for epoch in range(MAX_EPOCHS):
                 pred = pred / sample_stds
 
         # Surface refinement head: additive correction on surface nodes
-        if refine_head is not None and model.training:
+        if cfg.srf_gru and gru_srf_fore is not None and model.training:
+            # GRU-based SRF: sort by arc-length, run GRU per foil, unsort
+            # Use pre-normalization tensors saved earlier
+            _raw_saf_norm_gru = _raw_saf_norm_te  # [B, N]
+            _raw_xy_gru = _raw_xy_te              # [B, N, 2]
+            _is_tandem_gru = _is_tandem_raw.bool()  # [B]
+            pred = pred.clone()
+            for b in range(x.shape[0]):
+                # Fore-foil surface nodes: saf_norm ≈ 0 (or all surface nodes if single-foil)
+                _fore_mask_b = is_surface[b] & mask[b]
+                if _is_tandem_gru[b]:
+                    _fore_mask_b = _fore_mask_b & (_raw_saf_norm_gru[b] <= 0.005)
+                _fore_idx = _fore_mask_b.nonzero(as_tuple=True)[0]
+                if _fore_idx.numel() > 0:
+                    _f_hidden = hidden[b, _fore_idx]  # [Nf, n_hidden]
+                    _f_pred = pred[b, _fore_idx]      # [Nf, 3]
+                    _f_inp = torch.cat([_f_hidden, _f_pred], dim=-1)  # [Nf, n_hidden+3]
+                    _f_xy = _raw_xy_gru[b, _fore_idx]  # [Nf, 2]
+                    _f_sorted, _f_inv = sort_by_arc_angle(_f_inp, _f_xy)
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _f_corr = gru_srf_fore(_f_sorted.unsqueeze(0)).squeeze(0).float()  # [Nf, 3]
+                    _f_corr = _f_corr[_f_inv]  # unsort
+                    pred[b, _fore_idx] = pred[b, _fore_idx] + _f_corr
+                # Aft-foil surface nodes: saf_norm > 0.005 (tandem only)
+                if _is_tandem_gru[b]:
+                    _aft_mask_b = is_surface[b] & mask[b] & (_raw_saf_norm_gru[b] > 0.005)
+                    _aft_idx = _aft_mask_b.nonzero(as_tuple=True)[0]
+                    if _aft_idx.numel() > 0:
+                        _a_hidden = hidden[b, _aft_idx]
+                        _a_pred = pred[b, _aft_idx]
+                        _a_inp = torch.cat([_a_hidden, _a_pred], dim=-1)
+                        _a_xy = _raw_xy_gru[b, _aft_idx]
+                        _a_sorted, _a_inv = sort_by_arc_angle(_a_inp, _a_xy)
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            _a_corr = gru_srf_aft(_a_sorted.unsqueeze(0)).squeeze(0).float()
+                        _a_corr = _a_corr[_a_inv]
+                        pred[b, _aft_idx] = pred[b, _aft_idx] + _a_corr
+        elif refine_head is not None and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 if cfg.surface_refine_context:
                     # Context-aware: needs all nodes, coords, masks
@@ -2412,6 +2547,21 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for GRU SRF heads
+            if gru_srf_fore is not None:
+                if ema_gru_srf_fore is None:
+                    ema_gru_srf_fore = deepcopy(gru_srf_fore)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_gru_srf_fore.parameters(), gru_srf_fore.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            if gru_srf_aft is not None:
+                if ema_gru_srf_aft is None:
+                    ema_gru_srf_aft = deepcopy(gru_srf_aft)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_gru_srf_aft.parameters(), gru_srf_aft.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -2532,6 +2682,18 @@ for epoch in range(MAX_EPOCHS):
             eval_aft_srf_ctx_head.eval()
         else:
             aft_srf_ctx_head.eval()
+    # Select GRU SRF heads for eval (EMA if available)
+    eval_gru_fore = gru_srf_fore
+    eval_gru_aft = gru_srf_aft
+    if gru_srf_fore is not None:
+        if ema_gru_srf_fore is not None and ema_model is not None and eval_model is ema_model:
+            eval_gru_fore = ema_gru_srf_fore
+            eval_gru_fore.eval()
+            eval_gru_aft = ema_gru_srf_aft
+            eval_gru_aft.eval()
+        else:
+            gru_srf_fore.eval()
+            gru_srf_aft.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -2557,7 +2719,7 @@ for epoch in range(MAX_EPOCHS):
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
                 _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
-                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel
+                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.srf_gru
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
                 _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -2680,7 +2842,45 @@ for epoch in range(MAX_EPOCHS):
                     pred_loss = pred / sample_stds
 
                 # Apply surface refinement head during validation
-                if eval_refine_head is not None:
+                if cfg.srf_gru and eval_gru_fore is not None:
+                    # GRU-based SRF for validation (use pre-normalization tensors)
+                    _v_saf_gru = _raw_saf_norm_te  # [B, N]
+                    _v_xy_gru = _raw_xy_te          # [B, N, 2]
+                    _v_is_tandem_gru = _is_tandem_raw.bool()  # [B]
+                    pred_loss = pred_loss.clone()
+                    for b in range(x.shape[0]):
+                        _fore_mask_b = is_surface[b] & mask[b]
+                        if _v_is_tandem_gru[b]:
+                            _fore_mask_b = _fore_mask_b & (_v_saf_gru[b] <= 0.005)
+                        _fore_idx = _fore_mask_b.nonzero(as_tuple=True)[0]
+                        if _fore_idx.numel() > 0:
+                            _f_hidden = _eval_hidden[b, _fore_idx]
+                            _f_pred = pred_loss[b, _fore_idx]
+                            _f_inp = torch.cat([_f_hidden, _f_pred], dim=-1)
+                            _f_xy = _v_xy_gru[b, _fore_idx]
+                            _f_sorted, _f_inv = sort_by_arc_angle(_f_inp, _f_xy)
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                _f_corr = eval_gru_fore(_f_sorted.unsqueeze(0)).squeeze(0).float()
+                            _f_corr = _f_corr[_f_inv]
+                            pred_loss[b, _fore_idx] = pred_loss[b, _fore_idx] + _f_corr
+                        if _v_is_tandem_gru[b]:
+                            _aft_mask_b = is_surface[b] & mask[b] & (_v_saf_gru[b] > 0.005)
+                            _aft_idx = _aft_mask_b.nonzero(as_tuple=True)[0]
+                            if _aft_idx.numel() > 0:
+                                _a_hidden = _eval_hidden[b, _aft_idx]
+                                _a_pred = pred_loss[b, _aft_idx]
+                                _a_inp = torch.cat([_a_hidden, _a_pred], dim=-1)
+                                _a_xy = _v_xy_gru[b, _aft_idx]
+                                _a_sorted, _a_inv = sort_by_arc_angle(_a_inp, _a_xy)
+                                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                    _a_corr = eval_gru_aft(_a_sorted.unsqueeze(0)).squeeze(0).float()
+                                _a_corr = _a_corr[_a_inv]
+                                pred_loss[b, _aft_idx] = pred_loss[b, _aft_idx] + _a_corr
+                    if cfg.multiply_std:
+                        pred = pred_loss / sample_stds
+                    else:
+                        pred = pred_loss * sample_stds
+                elif eval_refine_head is not None:
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                         if cfg.surface_refine_context:
                             refine_correction = eval_refine_head(
@@ -2915,6 +3115,11 @@ for epoch in range(MAX_EPOCHS):
                 aft_srf_ctx_head._orig_mod if hasattr(aft_srf_ctx_head, '_orig_mod') else aft_srf_ctx_head
             )
             torch.save(_ctx_save.state_dict(), model_dir / "aft_srf_ctx_head.pt")
+        if gru_srf_fore is not None:
+            _gru_fore_save = ema_gru_srf_fore if ema_gru_srf_fore is not None else gru_srf_fore
+            _gru_aft_save = ema_gru_srf_aft if ema_gru_srf_aft is not None else gru_srf_aft
+            torch.save(_gru_fore_save.state_dict(), model_dir / "gru_srf_fore.pt")
+            torch.save(_gru_aft_save.state_dict(), model_dir / "gru_srf_aft.pt")
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
@@ -3103,7 +3308,7 @@ if cfg.surface_refine and best_metrics:
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
                     _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
-                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel
+                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.srf_gru
                     _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
                     _raw_gap_wake_vv = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -3202,18 +3407,52 @@ if cfg.surface_refine and best_metrics:
                     # === PATH A: Pipeline denormalization (same as val loop) ===
                     pred_loss = pred_raw / sample_stds
                     # Apply refinement
-                    surf_idx = is_surface.nonzero(as_tuple=False)
                     correction_full = torch.zeros_like(pred_loss)
-                    if surf_idx.numel() > 0:
-                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                            surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]
-                            surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                            correction = verify_refine(surf_hidden, surf_pred).float()
+                    if cfg.srf_gru and gru_srf_fore is not None:
+                        # GRU-based verification
+                        _vv_gru_fore = ema_gru_srf_fore if ema_gru_srf_fore is not None else gru_srf_fore
+                        _vv_gru_aft = ema_gru_srf_aft if ema_gru_srf_aft is not None else gru_srf_aft
+                        _vv_gru_fore.eval(); _vv_gru_aft.eval()
+                        _vv_saf = _raw_saf_norm_te if _raw_saf_norm_te is not None else x[:, :, 2:4].norm(dim=-1)
+                        _vv_xy = _raw_xy_te if _raw_xy_te is not None else x[:, :, :2]
+                        _vv_tandem = (x[:, 0, 22].abs() > 0.01)
                         pred_loss_refined = pred_loss.clone()
-                        pred_loss_refined[surf_idx[:, 0], surf_idx[:, 1]] += correction
-                        correction_full[surf_idx[:, 0], surf_idx[:, 1]] = correction
+                        for b in range(B):
+                            _fm = is_surface[b] & mask[b]
+                            if _vv_tandem[b]:
+                                _fm = _fm & (_vv_saf[b] <= 0.005)
+                            _fi = _fm.nonzero(as_tuple=True)[0]
+                            if _fi.numel() > 0:
+                                _inp = torch.cat([hidden[b, _fi], pred_loss[b, _fi]], dim=-1)
+                                _s, _inv = sort_by_arc_angle(_inp, _vv_xy[b, _fi])
+                                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                    _c = _vv_gru_fore(_s.unsqueeze(0)).squeeze(0).float()
+                                _c = _c[_inv]
+                                pred_loss_refined[b, _fi] += _c
+                                correction_full[b, _fi] = _c
+                            if _vv_tandem[b]:
+                                _am = is_surface[b] & mask[b] & (_vv_saf[b] > 0.005)
+                                _ai = _am.nonzero(as_tuple=True)[0]
+                                if _ai.numel() > 0:
+                                    _inp = torch.cat([hidden[b, _ai], pred_loss[b, _ai]], dim=-1)
+                                    _s, _inv = sort_by_arc_angle(_inp, _vv_xy[b, _ai])
+                                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                        _c = _vv_gru_aft(_s.unsqueeze(0)).squeeze(0).float()
+                                    _c = _c[_inv]
+                                    pred_loss_refined[b, _ai] += _c
+                                    correction_full[b, _ai] = _c
                     else:
-                        pred_loss_refined = pred_loss
+                        surf_idx = is_surface.nonzero(as_tuple=False)
+                        if surf_idx.numel() > 0:
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]
+                                surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
+                                correction = verify_refine(surf_hidden, surf_pred).float()
+                            pred_loss_refined = pred_loss.clone()
+                            pred_loss_refined[surf_idx[:, 0], surf_idx[:, 1]] += correction
+                            correction_full[surf_idx[:, 0], surf_idx[:, 1]] = correction
+                        else:
+                            pred_loss_refined = pred_loss
 
                     # Back-compute pred with refinement
                     pred_refined = pred_loss_refined * sample_stds
@@ -3236,9 +3475,7 @@ if cfg.surface_refine and best_metrics:
                     # Step 1: raw model output → divide by sample_stds
                     pred_manual = pred_raw / sample_stds
                     # Step 2: add refinement correction (same as above)
-                    if surf_idx.numel() > 0:
-                        pred_manual = pred_manual.clone()
-                        pred_manual[surf_idx[:, 0], surf_idx[:, 1]] += correction
+                    pred_manual = pred_manual + correction_full
                     # Step 3: multiply by sample_stds to undo per-sample normalization
                     pred_manual = pred_manual * sample_stds
                     # Step 4: add freestream (residual prediction)
