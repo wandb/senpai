@@ -2795,6 +2795,9 @@ for epoch in range(MAX_EPOCHS):
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
+    if cfg.tandem_ramp or cfg.tandem_curriculum_ramp:
+        _ramp_len = 20.0 if cfg.tandem_curriculum_ramp else 40.0
+        metrics["train/tandem_ramp_weight"] = min(1.0, max(0.0, (epoch - 10) / _ramp_len))
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
