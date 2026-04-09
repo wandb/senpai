@@ -1,6 +1,21 @@
 # Baseline Metrics
 
-## Current Single-Model Baseline (Phase 6 — 2026-04-08, +Re-Stratified Sampling, 2-Seed Evidence, PR #2290)
+## Current Single-Model Baseline (Phase 6 — 2026-04-09, +Panel Cp ×0.1, 2-Seed Evidence, PR #2319)
+
+| Metric | 2-seed avg | vs prior (Re-Stratified) | Δ |
+|--------|------------|--------------------------|---|
+| **p_in** | **11.709** | 11.742 | **-0.3%** ✅ |
+| **p_oodc** | **7.544** | 7.643 | **-1.3%** ✅ |
+| **p_tan** | **27.402** | 27.874 | **-1.7%** ✅ |
+| p_re | 6.481 | 6.419 | +1.0% (minor regression) |
+
+**PR #2319** (merged 2026-04-09) — Panel-Method Cp Feature (tandem-only, ×0.1): Adds precomputed inviscid Cp from thin-airfoil panel method as an input feature, active only for tandem samples and scaled by 0.1. Three iterations: v1 (all samples, strong Cp → p_in +5.2%), v2 (tandem-only zero for single → p_in +4.5%), v3 (×0.1 scaling → fixed p_in). The weak scaling prevents Cp from dominating the shared backbone representation while preserving the physics hint for tandem pressure prediction. Flags: `--cp_panel --cp_panel_tandem_only --cp_panel_scale 0.1`. W&B runs: h6fqcry4 (seed 42, p_in=11.411, p_tan=28.076), cuhoscp9 (seed 73, p_in=12.006, p_tan=26.728).
+
+⚠️ **2-seed only.** For merge decisions: **p_in < 11.71**, **p_oodc < 7.54**, **p_tan < 27.40**, p_re < 6.48.
+
+---
+
+## Prior Single-Model Baseline (Phase 6 — 2026-04-08, +Re-Stratified Sampling, 2-Seed Evidence, PR #2290)
 
 | Metric | 2-seed avg | vs prior (Cosine T_max=150) | Δ |
 |--------|------------|----------------------------|---|
@@ -11,7 +26,7 @@
 
 **PR #2290** (merged 2026-04-08) — Re-Stratified Sampling: 2× weight for top/bottom 20th percentile of log-Re training samples via WeightedRandomSampler (530/1322 = 40.1% of samples upweighted). Weights multiplied with existing domain-balanced sampler. Improves p_in -1.3% and p_tan -0.8%; minor p_oodc and p_re regressions (+1.2%, +0.6%) within noise range. Net aggregate surface MAE improved by -0.24 points (-0.45%). W&B runs: k5qwvce4 (seed 42, p_in=11.60, p_tan=27.7), 7oa5xfhi (seed 73, p_in=11.88, p_tan=28.1).
 
-⚠️ **2-seed only.** For merge decisions: **p_in < 11.74**, p_oodc < 7.64, **p_tan < 27.87**, p_re < 6.42.
+⚠️ **2-seed only (superseded by PR #2319).** For merge decisions: **p_in < 11.74**, p_oodc < 7.64, **p_tan < 27.87**, p_re < 6.42.
 
 ---
 
