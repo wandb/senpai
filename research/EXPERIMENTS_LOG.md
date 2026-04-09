@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 12:50 — PR #2324: Inviscid Cp Residual Target — frieren — **CLOSED** ❌
+
+- Branch: `frieren/inviscid-cp-residual`
+- Hypothesis: Change target from raw pressure to p_viscous - p_inviscid (thin-airfoil), model learns viscous correction only.
+- W&B runs: `s70r4u60` (s42), `i45sp737` (s73)
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 14.815 | **+26.2%** ❌ |
+| p_oodc | 7.643 | 12.665 | **+65.7%** ❌ catastrophic |
+| p_tan | 27.874 | 30.465 | **+9.3%** ❌ |
+| p_re | 6.419 | 9.500 | **+48.0%** ❌ catastrophic |
+
+**Analysis:** Thin-airfoil Cp approximation is too crude — assumes flat-plate geometry, ignores thickness/camber, has LE singularities. Errors in inviscid estimate propagate into residual target, making learning harder. Contrast with panel Cp as *input feature* (thorfinn, p_tan -3.4%): adding inviscid info as a feature hint helps, but restructuring the target around it is harmful. **Inviscid residual target approach is a dead end.**
+
+---
+
 ### 2026-04-09 12:40 — PR #2323: MoE Output Routing — alphonse — **CLOSED** ❌
 
 - Branch: `alphonse/moe-output-routing`
