@@ -1173,6 +1173,9 @@ class Config:
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
+    # Auxiliary AoA prediction head
+    aux_aoa_head: bool = False             # enable configurable AoA auxiliary head (L1 loss, analogous to Re head)
+    aoa_aux_weight: float = 0.05           # weight for auxiliary AoA loss when aux_aoa_head is enabled
 
 
 cfg = sp.parse(Config)
@@ -2095,8 +2098,12 @@ for epoch in range(MAX_EPOCHS):
         re_loss = F.mse_loss(re_pred, log_re_target)
         loss = loss + 0.01 * re_loss
         aoa_target = x[:, 0, 14:15]  # AoA0_rad from normalized input
-        aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
-        loss = loss + 0.01 * aoa_loss
+        if cfg.aux_aoa_head:
+            aoa_loss = F.l1_loss(aoa_pred.float(), aoa_target)
+            loss = loss + cfg.aoa_aux_weight * aoa_loss
+        else:
+            aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
+            loss = loss + 0.01 * aoa_loss
 
         # DCT frequency-weighted auxiliary loss on surface pressure
         if cfg.dct_freq_loss and model.training:
@@ -2161,8 +2168,9 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            _aoa_w2 = cfg.aoa_aux_weight * 0.5 if cfg.aux_aoa_head else 0.005
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + _aoa_w2 * aoa_loss
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + _aoa_w2 * aoa_loss
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -2207,7 +2215,8 @@ for epoch in range(MAX_EPOCHS):
                 vol_loss_g = (abs_err * vol_mask_g.unsqueeze(-1)).sum() / vol_mask_g.sum().clamp(min=1)
                 surf_loss_g = (surf_per_sample * mask_1d.float() * tandem_boost).sum() / n
                 coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                _aoa_w3 = cfg.aoa_aux_weight * 0.5 if cfg.aux_aoa_head else 0.005
+                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + _aoa_w3 * aoa_loss
 
             loss_A = _grp_loss(~is_tandem_batch)
             # Only include non-empty groups to avoid backward() on no-grad tensors
@@ -2287,8 +2296,12 @@ for epoch in range(MAX_EPOCHS):
             surf_ps2 = (abs_err2[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
             surf_loss2 = (surf_ps2 * tandem_boost).mean()
             re_loss2 = F.mse_loss(re_pred2, log_re_target)
-            aoa_loss2 = F.mse_loss(aoa_pred2, aoa_target)
-            loss2 = vol_loss2 + surf_weight * surf_loss2 + 0.01 * re_loss2 + 0.01 * aoa_loss2
+            if cfg.aux_aoa_head:
+                aoa_loss2 = F.l1_loss(aoa_pred2, aoa_target)
+                loss2 = vol_loss2 + surf_weight * surf_loss2 + 0.01 * re_loss2 + cfg.aoa_aux_weight * aoa_loss2
+            else:
+                aoa_loss2 = F.mse_loss(aoa_pred2, aoa_target)
+                loss2 = vol_loss2 + surf_weight * surf_loss2 + 0.01 * re_loss2 + 0.01 * aoa_loss2
             loss2.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             sam_optimizer.restore()
@@ -2335,7 +2348,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.aux_aoa_head:
+            _log_dict["train/aoa_aux_loss"] = aoa_loss.item()
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
