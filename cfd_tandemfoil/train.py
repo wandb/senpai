@@ -347,6 +347,64 @@ def compute_wake_deficit_features(raw_xy, is_surface, saf_norm, gap_raw, fore_te
     return torch.stack([dx_norm, dy_norm], dim=-1)  # [B, N, 2]
 
 
+def compute_did_feature(pos, is_surface, saf_norm, aoa_rad):
+    """Directional Integrated Distance (DID) per-node streamwise position.
+
+    Encodes each node's position along the freestream direction relative to each
+    foil's centroid. Two channels: DID relative to fore-foil centroid (all samples)
+    and DID relative to aft-foil centroid (tandem samples only, 0 for single-foil).
+
+    From Lam et al. ICML 2024 (arXiv:2402.02367): DID improved AirfRANS velocity
+    prediction ~12% over DSDF-only, by providing explicit streamwise position encoding.
+
+    Args:
+        pos:         [B, N, 2] raw (pre-standardization) node positions
+        is_surface:  [B, N] bool
+        saf_norm:    [B, N] saf channel norm (fore-foil: <=0.005, aft: >0.005)
+        aoa_rad:     [B, 1] angle of attack in radians
+
+    Returns: [B, N, 2] = [did_fore, did_aft] normalized to [-1, 1] per sample
+             did_aft is zero for single-foil samples
+    """
+    B, N, _ = pos.shape
+    x_coords, y_coords = pos[:, :, 0], pos[:, :, 1]
+
+    # Freestream direction [B, 2]
+    freestream = torch.stack([torch.cos(aoa_rad.squeeze(-1)),
+                               torch.sin(aoa_rad.squeeze(-1))], dim=-1)
+
+    # Fore-foil centroid (saf_norm <= 0.005 surface nodes)
+    fore_surf = is_surface & (saf_norm <= 0.005)
+    n_fore = fore_surf.float().sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1]
+    cx_fore = (x_coords * fore_surf.float()).sum(dim=1, keepdim=True) / n_fore  # [B, 1]
+    cy_fore = (y_coords * fore_surf.float()).sum(dim=1, keepdim=True) / n_fore  # [B, 1]
+
+    # Aft-foil centroid (saf_norm > 0.005 surface nodes; zero for single-foil)
+    aft_surf = is_surface & (saf_norm > 0.005)
+    is_tandem = aft_surf.any(dim=1).float()[:, None]  # [B, 1]
+    n_aft = aft_surf.float().sum(dim=1, keepdim=True).clamp(min=1)
+    cx_aft = (x_coords * aft_surf.float()).sum(dim=1, keepdim=True) / n_aft
+    cy_aft = (y_coords * aft_surf.float()).sum(dim=1, keepdim=True) / n_aft
+
+    # DID = projection of (pos - centroid) onto freestream direction
+    # [B, N, 2] rel positions
+    rel_fore = torch.stack([x_coords - cx_fore, y_coords - cy_fore], dim=-1)  # [B, N, 2]
+    rel_aft = torch.stack([x_coords - cx_aft, y_coords - cy_aft], dim=-1)
+
+    did_fore = (rel_fore * freestream.unsqueeze(1)).sum(dim=-1)  # [B, N]
+    did_aft = (rel_aft * freestream.unsqueeze(1)).sum(dim=-1) * is_tandem  # [B, N]
+
+    # Normalize each to [-1, 1] per sample (divide by max absolute value)
+    did_fore_max = did_fore.abs().amax(dim=1, keepdim=True).clamp(min=1e-6)
+    did_fore_norm = did_fore / did_fore_max
+
+    # For aft: only normalize non-tandem samples; for single-foil, stays zero
+    did_aft_max = (did_aft.abs() * is_tandem).amax(dim=1, keepdim=True).clamp(min=1e-6)
+    did_aft_norm = (did_aft / did_aft_max) * is_tandem
+
+    return torch.stack([did_fore_norm, did_aft_norm], dim=-1)  # [B, N, 2]
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -1173,6 +1231,8 @@ class Config:
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
+    # DID streamwise feature
+    did_feature: bool = False              # Directional Integrated Distance: per-node streamwise position (FVF/ICML 2024) (+2 channels)
 
 
 cfg = sp.parse(Config)
@@ -1318,7 +1378,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + (2 if cfg.did_feature else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], [+did], +32 fourier PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1786,8 +1846,8 @@ for epoch in range(MAX_EPOCHS):
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
-        # TE coordinate frame / wake deficit: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature
+        # TE coordinate frame / wake deficit / DID: save raw xy and saf_norm before normalization
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.did_feature
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
@@ -1819,6 +1879,13 @@ for epoch in range(MAX_EPOCHS):
                 wake_feats = compute_wake_deficit_features(
                     _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
                 x = torch.cat([x, wake_feats], dim=-1)
+        # DID: directional integrated distance — per-node streamwise position (FVF ICML 2024)
+        if cfg.did_feature:
+            did_feats = compute_did_feature(_raw_xy_te, is_surface, _raw_saf_norm_te, _raw_aoa)
+            if epoch == 0 and batch_idx == 0 and model.training:
+                print(f"[DID sanity] fore: min={did_feats[:,:,0].min():.3f} max={did_feats[:,:,0].max():.3f} "
+                      f"| aft: min={did_feats[:,:,1].min():.3f} max={did_feats[:,:,1].max():.3f}")
+            x = torch.cat([x, did_feats], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2478,7 +2545,7 @@ for epoch in range(MAX_EPOCHS):
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
-                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature
+                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.did_feature
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
                 _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -2509,6 +2576,9 @@ for epoch in range(MAX_EPOCHS):
                         wake_feats = compute_wake_deficit_features(
                             _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
                         x = torch.cat([x, wake_feats], dim=-1)
+                if cfg.did_feature:
+                    did_feats = compute_did_feature(_raw_xy_te, is_surface, _raw_saf_norm_te, _raw_aoa)
+                    x = torch.cat([x, did_feats], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
