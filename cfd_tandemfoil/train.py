@@ -20,6 +20,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     Tandem surface loss is therefore underweighted.
 """
 
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -345,6 +346,51 @@ def compute_wake_deficit_features(raw_xy, is_surface, saf_norm, gap_raw, fore_te
     dy_norm = dy_norm * is_tandem
 
     return torch.stack([dx_norm, dy_norm], dim=-1)  # [B, N, 2]
+
+
+def compute_continuity_residual(u_pred, pos_raw, vol_mask, n_sample=512, k=6):
+    """SPH-style meshfree div(u)=0 residual on subsampled interior nodes.
+
+    Approximates ∇·u at each sampled interior node via:
+        div_i ≈ (1/k) * Σ_j [(r_ij · Δu_ij) / |r_ij|²]
+    where j are k nearest interior neighbors.
+
+    Args:
+        u_pred:   [B, N, 3] predicted fields (channels 0:2 = Ux, Uy)
+        pos_raw:  [B, N, 2] raw (unnormalized) x,y positions
+        vol_mask: [B, N] bool — True for interior (volume) nodes
+        n_sample: max interior nodes to subsample per batch element
+        k:        number of nearest neighbors for divergence estimate
+
+    Returns:
+        scalar mean-squared divergence residual
+    """
+    losses = []
+    for b in range(u_pred.shape[0]):
+        int_idx = vol_mask[b].nonzero(as_tuple=True)[0]
+        n_int = int_idx.shape[0]
+        if n_int < k + 1:
+            continue
+        n_s = min(n_sample, n_int)
+        perm = torch.randperm(n_int, device=u_pred.device)[:n_s]
+        s_idx = int_idx[perm]
+        pos_s = pos_raw[b, s_idx]      # [n_s, 2]
+        u_s = u_pred[b, s_idx, :2]     # [n_s, 2]
+        with torch.no_grad():
+            dists = torch.cdist(pos_s, pos_s)  # [n_s, n_s]
+            _, nb_idx = dists.topk(k + 1, largest=False, dim=1)
+            nb_idx = nb_idx[:, 1:]             # [n_s, k] — exclude self
+        pos_nb = pos_s[nb_idx]         # [n_s, k, 2]
+        u_nb = u_s[nb_idx]             # [n_s, k, 2]
+        dr = pos_nb - pos_s.unsqueeze(1)       # [n_s, k, 2]
+        du = u_nb - u_s.unsqueeze(1)           # [n_s, k, 2]
+        dr_sq = (dr ** 2).sum(-1, keepdim=True).clamp(min=1e-8)  # [n_s, k, 1]
+        flux = (dr * du).sum(-1, keepdim=True) / dr_sq           # [n_s, k, 1]
+        div = flux.sum(1).squeeze(-1) / k                         # [n_s]
+        losses.append(div.pow(2).mean())
+    if not losses:
+        return u_pred.new_tensor(0.0)
+    return torch.stack(losses).mean()
 
 
 class TransolverBlock(nn.Module):
@@ -1170,6 +1216,9 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    # Continuity PDE loss: meshfree div(u)=0 penalty on interior nodes
+    continuity_loss: bool = False           # enable SPH-style continuity residual penalty
+    continuity_weight: float = 1e-3        # weight for continuity residual term
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
@@ -1791,6 +1840,7 @@ for epoch in range(MAX_EPOCHS):
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
+        _raw_xy_for_cont = x[:, :, 0:2].clone() if cfg.continuity_loss else None  # raw positions for continuity loss
         # Aft-foil mask: boundary ID=7 nodes identified by saf norm > 0.005
         # saf is at raw x[:,:,2:4]; foil-1 surface has saf≈0, foil-2 has saf>>0
         _aft_foil_mask = None
@@ -2050,6 +2100,13 @@ for epoch in range(MAX_EPOCHS):
         else:
             tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
+
+        # Continuity PDE loss: meshfree div(u)=0 penalty on interior nodes
+        _cont_loss = None
+        if cfg.continuity_loss and _raw_xy_for_cont is not None and model.training:
+            _cont_loss = compute_continuity_residual(
+                pred, _raw_xy_for_cont, vol_mask, n_sample=512, k=6)
+
         if cfg.uncertainty_loss:
             bm = _base_model
             surf_ux_loss = (abs_err[:, :, 0:1] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
@@ -2061,6 +2118,8 @@ for epoch in range(MAX_EPOCHS):
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
         else:
             loss = vol_loss + surf_weight * surf_loss
+            if _cont_loss is not None:
+                loss = loss + cfg.continuity_weight * _cont_loss
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
@@ -2207,7 +2266,8 @@ for epoch in range(MAX_EPOCHS):
                 vol_loss_g = (abs_err * vol_mask_g.unsqueeze(-1)).sum() / vol_mask_g.sum().clamp(min=1)
                 surf_loss_g = (surf_per_sample * mask_1d.float() * tandem_boost).sum() / n
                 coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                cont_shared = cfg.continuity_weight * _cont_loss * 0.5 if _cont_loss is not None else 0.0
+                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + cont_shared + 0.005 * re_loss + 0.005 * aoa_loss
 
             loss_A = _grp_loss(~is_tandem_batch)
             # Only include non-empty groups to avoid backward() on no-grad tensors
@@ -2335,7 +2395,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _cont_log = {}
+        if cfg.continuity_loss and _cont_loss is not None:
+            _cont_log["train/continuity_loss"] = _cont_loss.item()
+        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step, **_cont_log})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
