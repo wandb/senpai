@@ -1120,7 +1120,7 @@ class Config:
     dct_freq_alpha: float = 1.5   # frequency exponent
     # Phase 7: Bernoulli potential flow residual loss
     bernoulli_residual_loss: bool = False  # auxiliary L1 loss on viscous correction (delta from Bernoulli)
-    bernoulli_weight: float = 0.1          # weight for Bernoulli residual loss
+    bernoulli_weight: float = 0.03         # weight for Bernoulli residual loss
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -2147,12 +2147,12 @@ for epoch in range(MAX_EPOCHS):
         if cfg.bernoulli_residual_loss and model.training and not cfg.raw_targets:
             _phys_mean = phys_stats["y_mean"]  # [3]: [mean_ux, mean_uy, mean_cp_asinh]
             _phys_std = phys_stats["y_std"]    # [3]
-            # Denormalize velocity channels from pred to get Ux/Umag and Uy/Umag
-            # pred[i] = (y_phys[i] - phys_mean[i]) / phys_std[i] / sample_stds[0,i] - freestream[0,i]
-            # So y_phys[i] = (pred[i] + freestream[i]) * sample_stds[i] * phys_std[i] + phys_mean[i]
+            # Denormalize GROUND-TRUTH velocity channels to get Ux/Umag and Uy/Umag
+            # Using y_norm (target) instead of pred to eliminate noise from velocity prediction quality
+            # y_phys[i] = (y_norm[i] + freestream[i]) * sample_stds[i] * phys_std[i] + phys_mean[i]
             _fs = _freestream if _freestream is not None else torch.zeros(B, 1, 3, device=device)
-            _ux_phys = (pred[:, :, 0:1] + _fs[:, :, 0:1]) * sample_stds[:, :, 0:1] * _phys_std[0] + _phys_mean[0]
-            _uy_phys = (pred[:, :, 1:2] + _fs[:, :, 1:2]) * sample_stds[:, :, 1:2] * _phys_std[1] + _phys_mean[1]
+            _ux_phys = (y_norm[:, :, 0:1] + _fs[:, :, 0:1]) * sample_stds[:, :, 0:1] * _phys_std[0] + _phys_mean[0]
+            _uy_phys = (y_norm[:, :, 1:2] + _fs[:, :, 1:2]) * sample_stds[:, :, 1:2] * _phys_std[1] + _phys_mean[1]
             # Bernoulli Cp: Cp_B = 1 - (Ux/Umag)^2 - (Uy/Umag)^2
             _cp_bernoulli = 1.0 - _ux_phys ** 2 - _uy_phys ** 2  # [B, N, 1]
             # Apply asinh transform + global standardization → same space as pred[:,:,2]
@@ -2162,16 +2162,16 @@ for epoch in range(MAX_EPOCHS):
             _p_b_det = _p_b_norm.squeeze(-1).detach()  # [B, N]
             _delta_pred = pred[:, :, 2] - _p_b_det
             _delta_target = y_norm[:, :, 2] - _p_b_det
-            # L1 loss over surface nodes only (where viscous effects dominate)
-            _bern_surf = surf_mask.float()
-            _bernoulli_shared = (_bern_surf * (_delta_pred - _delta_target).abs()).sum() / _bern_surf.sum().clamp(min=1)
+            # L1 loss over volume nodes only (Bernoulli breaks down at surface/boundary layer)
+            _bern_vol = (~surf_mask).float()
+            _bernoulli_shared = (_bern_vol * (_delta_pred - _delta_target).abs()).sum() / _bern_vol.sum().clamp(min=1)
             loss = loss + cfg.bernoulli_weight * _bernoulli_shared
             _bernoulli_loss_val = _bernoulli_shared.item()
             # First batch sanity: log Bernoulli correction magnitude
             if global_step == 0:
-                _cp_b_mean = _cp_bernoulli[surf_mask].mean().item()
-                _delta_tgt_mean = (_bern_surf * _delta_target.abs()).sum().item() / _bern_surf.sum().clamp(min=1).item()
-                print(f"  [Bernoulli sanity] Cp_B mean (surface): {_cp_b_mean:.4f}, "
+                _cp_b_mean = _cp_bernoulli[~surf_mask].mean().item()
+                _delta_tgt_mean = (_bern_vol * _delta_target.abs()).sum().item() / _bern_vol.sum().clamp(min=1).item()
+                print(f"  [Bernoulli sanity] Cp_B mean (volume): {_cp_b_mean:.4f}, "
                       f"mean |delta_p_target|: {_delta_tgt_mean:.4f}, "
                       f"bernoulli_loss: {_bernoulli_loss_val:.4f}")
 
