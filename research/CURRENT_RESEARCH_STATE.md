@@ -34,7 +34,7 @@ Single-model beats ensemble on p_in (11.74 vs 12.1) and p_tan (27.90 vs 29.1). E
 
 | Student | PR | Experiment | Status |
 |---------|-----|-----------|--------|
-| nezuko | #2305 | **DID Streamwise Feature — per-node position along flow direction (FVF)** | WIP (NEW, PHYSICS) |
+| nezuko | #2309 | **GQA 2 K/V Groups — middle ground between MQA and MHA** | WIP (NEW, ROUND32) |
 | thorfinn | #2298 | **GMSE Gradient-Weighted Pressure Loss — weight by local ∇p magnitude** | WIP (BOLD) |
 | alphonse | #2299 | **Potential Flow Residual Loss — Bernoulli-consistency auxiliary signal** | WIP (NEW, BOLD, PARADIGM) |
 | fern | #2302 | **Circulation Lift Feature — Kutta-Joukowski Γ as global input signal** | WIP (NEW, PHYSICS) |
@@ -48,6 +48,9 @@ Single-model beats ensemble on p_in (11.74 vs 12.1) and p_tan (27.90 vs 29.1). E
 None.
 
 ## Latest Reviews (2026-04-09 04:45)
+
+### PR #2305 (nezuko, DID Streamwise Feature) — CLOSED ❌ (2026-04-09)
+- All metrics worse: p_in +5.2%, p_oodc +2.1%, p_tan +2.2%, p_re +0.5%. Streamwise position redundant with existing (x,y) + AoA + DSDF.
 
 ### PR #2303 (askeladd, Wake Centerline SDF) — CLOSED ❌ (2026-04-09)
 - p_in +4.7%, p_tan +3.6% (regressions). p_re -2.0%, p_oodc -0.4%. Net negative. Redundant with wake_deficit_feature (PR #2213). Fixed turbulent spreading model too rigid.
@@ -77,7 +80,7 @@ Next-round assignments (when Round 29 in-flight students complete) will continue
 ### Round 31-32 In-Flight Experiments (8 GPUs)
 | Student | PR | Direction | Target |
 |---------|-----|-----------|--------|
-| nezuko | #2305 | **DID Streamwise Feature** — per-node streamwise position (AoA dot product) | p_oodc, p_re |
+| nezuko | #2309 | **GQA 2 K/V Groups** — 2-group Grouped Query Attention (MQA→GQA refinement) | all |
 | thorfinn | #2298 | **GMSE Gradient-Weighted Pressure Loss** — weight by ∇p magnitude | p_tan, p_in |
 | alphonse | #2299 | **Potential Flow Residual Loss** (iter 2) — Bernoulli coupling w=0.03, vol-only | p_re, p_in |
 | fern | #2302 | **Circulation Lift Feature** — Kutta-Joukowski Γ = π·c·Umag·sin(2α) | p_in, p_tan |
@@ -157,3 +160,5 @@ Next-round assignments (when Round 29 in-flight students complete) will continue
 - **Inter-foil coupling approaches** (attention, GALE, cross-DSDF, GNN, FNO): 5 failures confirmed
 - **Generative/flow-matching surface**: Near-deterministic problem, adds noise to delta function
 - **DSDF-derived angle features**: Redundant with model's ability to compose existing inputs
+- **DID streamwise position feature**: Redundant with existing (x,y) + AoA + 8 DSDF channels. AoA-dependent projection creates unhelpful entanglement
+- **Wake centerline SDF features**: Redundant with wake_deficit_feature (PR #2213). Fixed spreading model too rigid; 4 zero channels for single-foil create optimization tension

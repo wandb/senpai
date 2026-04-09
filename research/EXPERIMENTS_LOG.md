@@ -2,6 +2,25 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 06:00 — PR #2305: DID Streamwise Feature — nezuko — **CLOSED** ❌
+
+- Branch: `nezuko/did-streamwise-feature`
+- Hypothesis: Encode per-node streamwise position relative to each foil centroid (projected onto freestream direction, normalized to [-1,1]). Expected to help p_oodc and p_re by giving the model explicit flow-direction awareness.
+- W&B runs: `gbapf7i6` (s42), `80b90lg9` (s73)
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 12.35 | **+5.2%** ❌ |
+| p_oodc | 7.643 | 7.80 | **+2.1%** ❌ |
+| p_tan | 27.874 | 28.50 | **+2.2%** ❌ |
+| p_re | 6.419 | 6.45 | **+0.5%** ❌ |
+
+**Analysis:** All metrics regressed. Streamwise position projection is redundant — derivable from existing (x, y) + AoA + 8 DSDF channels. The AoA-dependent projection creates unhelpful geometry-condition entanglement. Note: this is NOT the paper's actual DID (8-channel angular ray-casting); the existing 8 DSDF channels likely already approximate that signal.
+
+**Insight:** Added to exhausted list: streamwise position features are redundant with existing geometric inputs. DSDF-derived features continue to show no benefit.
+
+---
+
 ### 2026-04-09 05:25 — PR #2303: Wake Centerline SDF — askeladd — **CLOSED** ❌
 
 - Branch: `askeladd/wake-centerline-sdf`
