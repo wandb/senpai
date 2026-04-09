@@ -2,6 +2,40 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 20:45 — PR #2336: Panel Cp + AoA Curriculum Combo — askeladd — **CLOSED** ❌
+
+- Branch: `askeladd/panel-cp-plus-curriculum`
+- Hypothesis: Panel Cp (tandem-only ×0.1) + AoA Curriculum (warmup=20) should stack improvements.
+- W&B runs: `0vv815dd` (s42), `xn59kd8e` (s73)
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.709 | 12.064 | **+3.0%** ❌ |
+| p_oodc | 7.544 | 7.622 | **+1.0%** ❌ |
+| p_tan | 27.402 | 28.487 | **+4.0%** ❌ |
+| p_re | 6.481 | 6.593 | **+1.7%** ❌ |
+
+**Analysis:** Features don't stack — they conflict. Curriculum warmup deprives Cp feature of signal during early training. AoA curriculum produces conflicting gradients with Cp feature (curriculum wants easy/low-AoA; Cp most informative at high AoA). AoA curriculum now exhausted in all forms.
+
+---
+
+### 2026-04-09 20:45 — PR #2334: Checkpoint Soup — frieren — **CLOSED** ❌
+
+- Branch: `frieren/checkpoint-soup`
+- Hypothesis: Averaging checkpoints at epochs 100, 125, and best should smooth predictions.
+- W&B runs: `v5af1m2c` (s42), `pooovezz` (s73)
+
+| Metric | Pre-soup avg | Post-soup avg | Δ post vs baseline |
+|--------|-------------|---------------|-------------------|
+| p_in | 11.65 | 12.30 | **+5.0%** ❌ |
+| p_oodc | 7.70 | 8.00 | **+6.0%** ❌ |
+| p_tan | 28.90 | 28.75 | **+4.9%** ❌ |
+| p_re | 6.40 | 6.75 | **+4.2%** ❌ |
+
+**Analysis:** Same-run checkpoint averaging drags performance toward undertrained states. Original Model Soups works with different hyperparameters, not different epochs. Weight averaging from a single training run is exhausted.
+
+---
+
 ### 2026-04-09 19:55 — PR #2328 v2: AoA Curriculum warmup=20 — fern — **CLOSED** ❌
 
 - Branch: `fern/aoa-curriculum-training`
