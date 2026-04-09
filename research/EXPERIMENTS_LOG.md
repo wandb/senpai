@@ -2,6 +2,25 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 10:00 — PR #2319: Panel-Method Cp Feature — thorfinn — **SENT BACK** 🔄
+
+- Branch: `thorfinn/panel-method-cp-feature`
+- Hypothesis: Thin-airfoil inviscid Cp as physics-informed input feature. Model receives inviscid pressure estimate and learns the viscous correction.
+- W&B runs: `mdu27rbi` (s42), `dazdtjfn` (s73)
+- W&B group: `panel-cp-feature`
+
+| Metric | Baseline (#2290) | Seed 42 | Seed 73 | 2-seed avg | Δ |
+|--------|-----------------|---------|---------|------------|---|
+| p_in | 11.742 | 12.565 | 12.143 | 12.354 | **+5.2%** ❌ |
+| p_oodc | 7.643 | 7.749 | 7.403 | 7.576 | **-0.9%** ✅ |
+| p_tan | 27.874 | 27.124 | 26.712 | 26.918 | **-3.4%** ✅ |
+| p_re | 6.419 | 6.536 | 6.406 | 6.471 | **+0.8%** ❌ |
+| val_loss | ~0.37 | 0.602 | 0.587 | 0.595 | **+60%** ❌ |
+
+**Analysis:** First experiment in Phase 6 to significantly improve p_tan (-3.4%). The inviscid Cp feature provides a physics-informed prior that is especially valuable for tandem configs where wake interference makes the prediction harder. However, p_in regresses +5.2% — the model may over-rely on the panel Cp for in-dist samples. The 60% val_loss increase signals convergence issues. Sent back with instructions to try tandem-only application (zero for single-foil) or scaled feature (×0.1). Very promising direction worth iterating on.
+
+---
+
 ### 2026-04-09 09:47 — PR #2315: Tandem Curriculum Ramp (fixed) — tanjiro — **CLOSED** ❌
 
 - Branch: `tanjiro/tandem-curriculum-ramp`
