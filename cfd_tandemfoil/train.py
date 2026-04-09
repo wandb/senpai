@@ -895,10 +895,11 @@ class Transolver(nn.Module):
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
         if condition_token:
-            # Dedicated conditioning MLP: [log_Re, AoA0, AoA1, gap, stagger] → n_hidden
+            # Dedicated conditioning MLP: [AoA0, AoA1, gap, stagger] → n_hidden
+            # Re excluded: Re conditioning comes via adaLN; including it here hurts p_re OOD
             # Zero-init last layer so model starts as a no-op (identical to baseline)
             self.cond_token_mlp = nn.Sequential(
-                nn.Linear(5, 64),
+                nn.Linear(4, 64),
                 nn.SiLU(),
                 nn.Linear(64, n_hidden),
             )
@@ -1006,14 +1007,14 @@ class Transolver(nn.Module):
 
         if self.condition_token:
             # Extract global condition scalars (stable indices in the model's input x)
-            # x[:, 0, 13]: log_Re, 14: AoA0, 18: AoA1, 22: gap, 23: stagger
+            # Re excluded — adaLN handles Re conditioning; including it here hurts p_re OOD
+            # x[:, 0, 14]: AoA0, 18: AoA1, 22: gap, 23: stagger
             cond_scalars = torch.stack([
-                x[:, 0, 13],  # log_Re
                 x[:, 0, 14],  # AoA_fore
                 x[:, 0, 18],  # AoA_aft (0 for single-foil)
                 x[:, 0, 22],  # gap
                 x[:, 0, 23],  # stagger
-            ], dim=-1)  # [B, 5]
+            ], dim=-1)  # [B, 4]
             cond_embed = self.cond_token_mlp(cond_scalars)  # [B, n_hidden]
             fx = fx + cond_embed.unsqueeze(1)  # broadcast to all nodes
 
@@ -1195,7 +1196,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
-    condition_token: bool = False           # dedicated condition embedding (Re, AoA, gap, stagger) injected before first block
+    condition_token: bool = False           # dedicated condition embedding (AoA, gap, stagger) injected before first block
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
