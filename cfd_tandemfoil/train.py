@@ -757,6 +757,23 @@ class SurfaceRefinementContextHead(nn.Module):
         return correction
 
 
+def _stochastic_depth_forward(block, fx, drop_prob, training, **kwargs):
+    """Apply stochastic depth to a TransolverBlock.
+
+    During training, randomly skip the block with probability `drop_prob`.
+    When kept, scale the residual delta by 1/(1-drop_prob) to maintain expected value.
+    At eval time, always run the block normally.
+    """
+    if not training or drop_prob == 0.0:
+        return block(fx, **kwargs)
+    if torch.rand(1).item() < drop_prob:
+        return fx  # skip block entirely (identity via residual)
+    fx_out = block(fx, **kwargs)
+    # Scale delta to compensate for randomly dropped blocks
+    delta = fx_out - fx
+    return fx + delta / (1.0 - drop_prob)
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -794,10 +811,14 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        stochastic_depth=False,
+        sd_max_rate=0.1,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
+        self.stochastic_depth = stochastic_depth
+        self.sd_max_rate = sd_max_rate
         self.pressure_first = pressure_first
         self.ref = ref
         self.unified_pos = unified_pos
@@ -992,8 +1013,16 @@ class Transolver(nn.Module):
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
-        for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+        n_total = len(self.blocks)
+        for idx, block in enumerate(self.blocks[:-1]):
+            if self.stochastic_depth:
+                drop_prob = self.sd_max_rate * (idx / max(n_total - 1, 1))
+                fx = _stochastic_depth_forward(
+                    block, fx, drop_prob, self.training,
+                    raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features,
+                )
+            else:
+                fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
 
         # Deep hidden representation (post all non-last blocks, pre output head)
         fx_deep = fx  # [B, N, n_hidden]
@@ -1173,6 +1202,9 @@ class Config:
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
+    # Stochastic depth: randomly drop entire TransolverBlocks during training (Huang et al., ECCV 2016)
+    stochastic_depth: bool = False         # enable stochastic depth regularization
+    sd_max_rate: float = 0.1              # max drop probability (for last non-output block; linearly increases from 0)
 
 
 cfg = sp.parse(Config)
@@ -1348,6 +1380,8 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    stochastic_depth=cfg.stochastic_depth,
+    sd_max_rate=cfg.sd_max_rate,
 )
 
 model = Transolver(**model_config).to(device)
