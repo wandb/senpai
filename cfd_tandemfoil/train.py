@@ -543,6 +543,84 @@ class TransolverBlock(nn.Module):
         return fx
 
 
+class KANLayer(nn.Module):
+    """B-spline Kolmogorov-Arnold Network layer with residual linear.
+
+    Replaces fixed activations with learnable spline functions on edges.
+    Reference: Liu et al., KAN (ICLR 2025, arXiv:2404.19756)
+    """
+    def __init__(self, in_features: int, out_features: int, grid_size: int = 5,
+                 spline_order: int = 3, zero_init: bool = False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.grid_size = grid_size
+        self.spline_order = spline_order
+
+        # Grid of knots (fixed, not learned) — uniform on [-2, 2]
+        n_knots = grid_size + 2 * spline_order + 1
+        grid = torch.linspace(-2.0, 2.0, n_knots)
+        self.register_buffer('grid', grid)
+
+        # B-spline coefficients (learned) — [out, in, grid_size + spline_order]
+        n_bases = grid_size + spline_order
+        self.coeff = nn.Parameter(torch.empty(out_features, in_features, n_bases))
+
+        # Residual linear path (stability — same as original KAN paper)
+        self.residual = nn.Linear(in_features, out_features)
+
+        if zero_init:
+            # Match the zero-init pattern of the existing refinement heads
+            nn.init.zeros_(self.coeff)
+            nn.init.zeros_(self.residual.weight)
+            nn.init.zeros_(self.residual.bias)
+        else:
+            nn.init.trunc_normal_(self.coeff, std=0.02)
+            nn.init.kaiming_normal_(self.residual.weight, mode='fan_in')
+            nn.init.zeros_(self.residual.bias)
+
+    def b_splines(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute B-spline basis functions using de Boor recursion.
+
+        Args:
+            x: [N, in_features] — input values (clamped to grid range)
+        Returns:
+            bases: [N, in_features, n_bases] — B-spline basis values
+        """
+        # Clamp inputs to grid range to avoid NaN from out-of-range splines
+        x = x.clamp(-2.0, 2.0)
+        x = x.unsqueeze(-1)  # [N, in, 1]
+        grid = self.grid      # [n_knots]
+
+        # Order-0 B-spline: indicator functions
+        bases = ((x >= grid[:-1]) & (x < grid[1:])).to(x.dtype)
+
+        # Recursive de Boor formula for higher orders
+        for k in range(1, self.spline_order + 1):
+            denom_left = grid[k:-1] - grid[:-(k + 1)]
+            denom_right = grid[k + 1:] - grid[1:-k]
+            left = (x - grid[:-(k + 1)]) / denom_left.clamp(min=1e-8)
+            right = (grid[k + 1:] - x) / denom_right.clamp(min=1e-8)
+            bases = left * bases[..., :-1] + right * bases[..., 1:]
+
+        return bases  # [N, in, n_bases]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [*, in_features] -> [*, out_features]"""
+        orig_shape = x.shape
+        x_flat = x.reshape(-1, self.in_features)  # [N, in]
+
+        # B-spline term: sum over input features and basis functions
+        spline_bases = self.b_splines(x_flat)  # [N, in, n_bases]
+        spline_out = torch.einsum('nig,oig->no', spline_bases, self.coeff)  # [N, out]
+
+        # Residual linear term
+        residual_out = self.residual(x_flat)  # [N, out]
+
+        out = spline_out + residual_out
+        return out.reshape(*orig_shape[:-1], self.out_features)
+
+
 class SurfaceRefinementHead(nn.Module):
     """Lightweight MLP that predicts additive corrections for surface nodes.
 
@@ -552,7 +630,9 @@ class SurfaceRefinementHead(nn.Module):
     """
 
     def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 128,
-                 n_layers: int = 2, p_only: bool = False):
+                 n_layers: int = 2, p_only: bool = False,
+                 kan_decoder: bool = False, kan_grid_size: int = 5,
+                 kan_spline_order: int = 3):
         super().__init__()
         self.p_only = p_only
         actual_out = 1 if p_only else out_dim  # 1 for pressure-only, 3 for all fields
@@ -563,10 +643,17 @@ class SurfaceRefinementHead(nn.Module):
             layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
             layers.append(nn.LayerNorm(hidden_dim))
             layers.append(nn.GELU())
-        layers.append(nn.Linear(hidden_dim, actual_out))
-        # Zero-init last layer so refinement starts as identity
-        nn.init.zeros_(layers[-1].weight)
-        nn.init.zeros_(layers[-1].bias)
+        # Final output layer: KAN or standard linear
+        if kan_decoder:
+            layers.append(KANLayer(hidden_dim, actual_out,
+                                   grid_size=kan_grid_size,
+                                   spline_order=kan_spline_order,
+                                   zero_init=True))
+        else:
+            layers.append(nn.Linear(hidden_dim, actual_out))
+            # Zero-init last layer so refinement starts as identity
+            nn.init.zeros_(layers[-1].weight)
+            nn.init.zeros_(layers[-1].bias)
         self.mlp = nn.Sequential(*layers)
 
     def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor) -> torch.Tensor:
@@ -595,7 +682,9 @@ class AftFoilRefinementHead(nn.Module):
     """
 
     def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 192,
-                 n_layers: int = 3, film: bool = False):
+                 n_layers: int = 3, film: bool = False,
+                 kan_decoder: bool = False, kan_grid_size: int = 5,
+                 kan_spline_order: int = 3):
         super().__init__()
         self.film = film
         in_dim = n_hidden + out_dim
@@ -604,9 +693,15 @@ class AftFoilRefinementHead(nn.Module):
             layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
             layers.append(nn.LayerNorm(hidden_dim))
             layers.append(nn.GELU())
-        layers.append(nn.Linear(hidden_dim, out_dim))
-        nn.init.zeros_(layers[-1].weight)
-        nn.init.zeros_(layers[-1].bias)
+        if kan_decoder:
+            layers.append(KANLayer(hidden_dim, out_dim,
+                                   grid_size=kan_grid_size,
+                                   spline_order=kan_spline_order,
+                                   zero_init=True))
+        else:
+            layers.append(nn.Linear(hidden_dim, out_dim))
+            nn.init.zeros_(layers[-1].weight)
+            nn.init.zeros_(layers[-1].bias)
         self.mlp = nn.Sequential(*layers)
         # FiLM modulation from gap/stagger (2-dim condition)
         if film:
@@ -1170,6 +1265,10 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    # KAN decoder: replace final linear in SRF heads with B-spline KAN layer
+    kan_decoder: bool = False              # use KANLayer in SurfaceRefinementHead output
+    kan_grid_size: int = 5                 # B-spline grid size (number of intervals)
+    kan_spline_order: int = 3              # B-spline polynomial order
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
@@ -1374,12 +1473,16 @@ if cfg.surface_refine:
             hidden_dim=cfg.surface_refine_hidden,
             n_layers=cfg.surface_refine_layers,
             p_only=cfg.surface_refine_p_only,
+            kan_decoder=cfg.kan_decoder,
+            kan_grid_size=cfg.kan_grid_size,
+            kan_spline_order=cfg.kan_spline_order,
         ).to(device)
     refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
     _refine_n_params = sum(p.numel() for p in refine_head.parameters())
     print(f"Surface refinement head: {_refine_n_params:,} params "
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
-          f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
+          f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context}"
+          f"{', kan=True, grid=' + str(cfg.kan_grid_size) + ', order=' + str(cfg.kan_spline_order) if cfg.kan_decoder else ''})")
 
 # Aft-foil (boundary ID=7) dedicated refinement head
 aft_srf_head = None
@@ -1404,12 +1507,16 @@ if cfg.aft_foil_srf:
             hidden_dim=cfg.aft_foil_srf_hidden,
             n_layers=cfg.aft_foil_srf_layers,
             film=cfg.aft_foil_srf_film,
+            kan_decoder=cfg.kan_decoder,
+            kan_grid_size=cfg.kan_grid_size,
+            kan_spline_order=cfg.kan_spline_order,
         ).to(device)
         aft_srf_head = torch.compile(aft_srf_head, mode=cfg.compile_mode)
         _aft_n_params = sum(p.numel() for p in aft_srf_head.parameters())
         print(f"Aft-foil SRF head: {_aft_n_params:,} params "
               f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, "
-              f"film={cfg.aft_foil_srf_film})")
+              f"film={cfg.aft_foil_srf_film}"
+              f"{', kan=True' if cfg.kan_decoder else ''})")
 
 from copy import deepcopy
 ema_model = None
