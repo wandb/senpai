@@ -1242,6 +1242,7 @@ class Config:
     # Panel-method Cp feature: inviscid Cp as physics-grounded input (+1 input channel)
     cp_panel: bool = False                 # append thin-airfoil inviscid Cp to input features
     cp_panel_tandem_only: bool = False     # zero Cp feature for single-foil samples (tandem benefit only)
+    cp_panel_scale: float = 1.0            # scale factor for panel Cp feature (0.1 = weak hint)
 
 
 cfg = sp.parse(Config)
@@ -1903,6 +1904,8 @@ for epoch in range(MAX_EPOCHS):
             cp_feat = compute_cp_panel(_raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te)
             if cfg.cp_panel_tandem_only:
                 cp_feat = cp_feat * _is_tandem_raw[:, None, None]
+            if cfg.cp_panel_scale != 1.0:
+                cp_feat = cp_feat * cfg.cp_panel_scale
             x = torch.cat([x, cp_feat], dim=-1)
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
@@ -2599,6 +2602,8 @@ for epoch in range(MAX_EPOCHS):
                     cp_feat = compute_cp_panel(_raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te)
                     if cfg.cp_panel_tandem_only:
                         cp_feat = cp_feat * _is_tandem_raw[:, None, None]
+                    if cfg.cp_panel_scale != 1.0:
+                        cp_feat = cp_feat * cfg.cp_panel_scale
                     x = torch.cat([x, cp_feat], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
@@ -3009,6 +3014,8 @@ if best_metrics:
                         cp_feat = compute_cp_panel(_raw_xy_te_vis, _raw_aoa_vis, is_surf_dev, _raw_saf_norm_te_vis)
                         if cfg.cp_panel_tandem_only:
                             cp_feat = cp_feat * _is_tandem_raw_vis[:, None, None]
+                        if cfg.cp_panel_scale != 1.0:
+                            cp_feat = cp_feat * cfg.cp_panel_scale
                         x_n = torch.cat([x_n, cp_feat], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
                     pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
@@ -3132,6 +3139,8 @@ if cfg.surface_refine and best_metrics:
                         cp_feat = compute_cp_panel(_raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te)
                         if cfg.cp_panel_tandem_only:
                             cp_feat = cp_feat * _is_tandem_raw[:, None, None]
+                        if cfg.cp_panel_scale != 1.0:
+                            cp_feat = cp_feat * cfg.cp_panel_scale
                         x = torch.cat([x, cp_feat], dim=-1)
 
                     # Ground truth denormalization reference
