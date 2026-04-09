@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 12:40 — PR #2323: MoE Output Routing — alphonse — **CLOSED** ❌
+
+- Branch: `alphonse/moe-output-routing`
+- Hypothesis: Soft expert blending (3 experts) conditioned on [Re, AoA, is_tandem, gap] for regime-specific output specialization.
+- W&B runs: `skps8wwb` (s42, 135 epochs), `60qrwzfe` (s73, 134 epochs)
+- W&B group: `moe-output-routing`
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 13.250 | **+12.8%** ❌ |
+| p_oodc | 7.643 | 8.900 | **+16.4%** ❌ |
+| p_tan | 27.874 | 30.850 | **+10.7%** ❌ |
+| p_re | 6.419 | 6.900 | **+7.5%** ❌ |
+
+**Analysis:** All metrics significantly worse. MoE adds compute overhead (10% fewer epochs: 134 vs ~147), but the regression magnitude exceeds what fewer epochs explains. The model already handles regime diversity through 3 mechanisms (domain_velhead, pcgrad_3way, re_stratified_sampling) — a 4th creates conflicting signals. Seed variance is high (s73 p_tan=32.4 vs s42=29.3), confirming gate routing instability. **Output-level MoE is not viable for our architecture/dataset size.**
+
+---
+
 ### 2026-04-09 12:33 — PR #2320: Spectral Arc-Length Loss — askeladd — **CLOSED** ❌
 
 - Branch: `askeladd/spectral-arc-length-loss`
