@@ -2,6 +2,40 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 09:11 — PR #2316: Stochastic Depth — frieren — **CLOSED** ❌
+
+- Branch: `frieren/stochastic-depth`
+- Hypothesis: Randomly drop TransolverBlocks during training (drop_rate=0.05-0.1) for OOD regularization.
+- W&B runs: `ihynmqsn` (s42, 140 epochs), `t1zmm019` (s73, 141 epochs)
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 12.86 | **+9.5%** ❌ |
+| p_oodc | 7.643 | 7.97 | **+4.3%** ❌ |
+| p_tan | 27.874 | 29.39 | **+5.4%** ❌ |
+| p_re | 6.419 | 6.72 | **+4.7%** ❌ |
+
+**Analysis:** Model too small (3 blocks) for stochastic depth. Each block carries essential information — no redundancy to exploit. Consistent degradation across both seeds. **Stochastic depth requires deeper architectures (50+ layers).**
+
+---
+
+### 2026-04-09 09:11 — PR #2318: EMA Teacher Soft-Label Distillation — alphonse — **CLOSED** ❌
+
+- Branch: `alphonse/ema-teacher-distillation`
+- Hypothesis: EMA teacher provides soft targets for consistency regularization.
+- W&B runs: `qs77hnh9` (s42), `3z1zh7rf` (s73)
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 16.550 | **+40.9%** ❌ catastrophic |
+| p_oodc | 7.643 | 10.800 | **+41.3%** ❌ catastrophic |
+| p_tan | 27.874 | 29.750 | **+6.7%** ❌ |
+| p_re | 6.419 | 8.550 | **+33.2%** ❌ catastrophic |
+
+**Analysis:** Teacher forward pass adds 50% compute overhead → only 98 epochs (vs baseline 149). 34% fewer epochs = insufficient convergence. Any distillation approach must have < 10% compute overhead within our 180-min budget. **Distillation from scratch is unviable with tight training budgets.**
+
+---
+
 ### 2026-04-09 09:00 — PR #2314: SE Channel Attention on Slice Tokens — nezuko — **CLOSED** ❌
 
 - Branch: `nezuko/se-slice-token-attention`
