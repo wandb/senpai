@@ -1048,6 +1048,7 @@ class Config:
     warmup_start_factor: float = 0.2
     cosine_T_max: int = 230
     cosine_eta_min: float = 1e-5
+    warmup_epochs: int = 0  # linear warmup epochs with near-zero start (0=use default warmup)
     ema_start_epoch: int = 140
     ema_decay: float = 0.998
     temp_anneal_epoch: int = 50
@@ -1597,15 +1598,26 @@ elif cfg.scheduler_type == "onecycle":
         final_div_factor=cfg.onecycle_final_div_factor,
     )
 else:  # sequential (default)
+    if cfg.warmup_epochs > 0:
+        # Near-zero start warmup (PR #2326): start at lr*1e-3, ramp to full lr
+        _wu_iters = cfg.warmup_epochs
+        _wu_start = 1e-3
+        _cos_T = cfg.cosine_T_max - cfg.warmup_epochs  # budget-adjusted
+        print(f"[warmup_epochs={cfg.warmup_epochs}] LinearLR(start_factor={_wu_start}) "
+              f"-> CosineAnnealingLR(T_max={_cos_T})")
+    else:
+        _wu_iters = cfg.warmup_total_iters
+        _wu_start = cfg.warmup_start_factor
+        _cos_T = cfg.cosine_T_max
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-        base_opt, start_factor=cfg.warmup_start_factor, total_iters=cfg.warmup_total_iters
+        base_opt, start_factor=_wu_start, total_iters=_wu_iters
     )
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        base_opt, T_max=cfg.cosine_T_max, eta_min=cfg.cosine_eta_min
+        base_opt, T_max=_cos_T, eta_min=cfg.cosine_eta_min
     )
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         base_opt, schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[cfg.warmup_total_iters]
+        milestones=[_wu_iters]
     )
 step_scheduler_per_batch = (cfg.scheduler_type == "onecycle")
 
