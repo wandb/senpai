@@ -794,10 +794,12 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        condition_token=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
+        self.condition_token = condition_token
         self.pressure_first = pressure_first
         self.ref = ref
         self.unified_pos = unified_pos
@@ -892,6 +894,16 @@ class Transolver(nn.Module):
         nn.init.constant_(self.skip_gate[0].bias, -2.0)  # starts nearly closed
         self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
         self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
+        if condition_token:
+            # Dedicated conditioning MLP: [log_Re, AoA0, AoA1, gap, stagger] → n_hidden
+            # Zero-init last layer so model starts as a no-op (identical to baseline)
+            self.cond_token_mlp = nn.Sequential(
+                nn.Linear(5, 64),
+                nn.SiLU(),
+                nn.Linear(64, n_hidden),
+            )
+            nn.init.zeros_(self.cond_token_mlp[-1].weight)
+            nn.init.zeros_(self.cond_token_mlp[-1].bias)
         self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
         self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
@@ -991,6 +1003,19 @@ class Transolver(nn.Module):
         fx = self.preprocess(x)
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
+
+        if self.condition_token:
+            # Extract global condition scalars (stable indices in the model's input x)
+            # x[:, 0, 13]: log_Re, 14: AoA0, 18: AoA1, 22: gap, 23: stagger
+            cond_scalars = torch.stack([
+                x[:, 0, 13],  # log_Re
+                x[:, 0, 14],  # AoA_fore
+                x[:, 0, 18],  # AoA_aft (0 for single-foil)
+                x[:, 0, 22],  # gap
+                x[:, 0, 23],  # stagger
+            ], dim=-1)  # [B, 5]
+            cond_embed = self.cond_token_mlp(cond_scalars)  # [B, n_hidden]
+            fx = fx + cond_embed.unsqueeze(1)  # broadcast to all nodes
 
         for block in self.blocks[:-1]:
             fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
@@ -1170,6 +1195,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    condition_token: bool = False           # dedicated condition embedding (Re, AoA, gap, stagger) injected before first block
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
@@ -1348,6 +1374,7 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    condition_token=cfg.condition_token,
 )
 
 model = Transolver(**model_config).to(device)
@@ -2409,12 +2436,17 @@ for epoch in range(MAX_EPOCHS):
     _do_val = (epoch + 1) % cfg.val_every == 0 or epoch == 0 or epoch == MAX_EPOCHS - 1
     if not _do_val:
         dt = time.time() - t0
+        _cond_log = {}
+        if cfg.condition_token:
+            _cond_w = _base_model.cond_token_mlp[-1].weight.data
+            _cond_log["condition_token/weight_norm"] = _cond_w.norm().item()
         wandb.log({
             "train/vol_loss": epoch_vol,
             "train/surf_loss": epoch_surf,
             "epoch_time_s": dt,
             "lr": scheduler.get_last_lr()[0],
             "global_step": global_step,
+            **_cond_log,
         })
         print(f"Epoch {epoch+1:3d} ({dt:.0f}s)  train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  [val skipped]")
         continue
@@ -2792,6 +2824,9 @@ for epoch in range(MAX_EPOCHS):
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
+    if cfg.condition_token:
+        _cond_w = _base_model.cond_token_mlp[-1].weight.data
+        metrics["condition_token/weight_norm"] = _cond_w.norm().item()
     wandb.log(metrics)
 
     if torch.cuda.is_available():
