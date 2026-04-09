@@ -1173,9 +1173,21 @@ class Config:
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
+    # Checkpoint soup: average multiple EMA checkpoints for better OOD generalization
+    checkpoint_soup: bool = False           # enable checkpoint soup (save + average EMA snapshots)
+    soup_epochs: str = "100,125"            # comma-separated 1-indexed epochs to save EMA snapshots
 
 
 cfg = sp.parse(Config)
+
+# Checkpoint soup: ensure EMA starts early enough to cover all soup epochs
+if cfg.checkpoint_soup:
+    _soup_epoch_list = [int(e) for e in cfg.soup_epochs.split(',')]
+    _earliest_soup = min(_soup_epoch_list)
+    if cfg.ema_start_epoch >= _earliest_soup:
+        cfg.ema_start_epoch = max(0, _earliest_soup - 6)
+        print(f"Checkpoint soup: adjusted ema_start_epoch to {cfg.ema_start_epoch} "
+              f"(warmup before first soup epoch {_earliest_soup})")
 
 if cfg.seed >= 0:
     torch.manual_seed(cfg.seed)
@@ -2405,6 +2417,19 @@ for epoch in range(MAX_EPOCHS):
                 for k in snap:
                     sa[k].mul_((snapshot_n - 1) / snapshot_n).add_(snap[k].to(device) / snapshot_n)
 
+    # Checkpoint soup: save EMA snapshots at specified epochs
+    if cfg.checkpoint_soup and ema_model is not None:
+        _soup_epoch_list = [int(e) for e in cfg.soup_epochs.split(',')]
+        if (epoch + 1) in _soup_epoch_list:
+            _soup_ckpt = {'model': {k: v.cpu().clone() for k, v in ema_model.state_dict().items()}}
+            if ema_refine_head is not None:
+                _soup_ckpt['refine_head'] = {k: v.cpu().clone() for k, v in ema_refine_head.state_dict().items()}
+            if ema_aft_srf_head is not None:
+                _soup_ckpt['aft_srf_head'] = {k: v.cpu().clone() for k, v in ema_aft_srf_head.state_dict().items()}
+            _soup_path = model_dir / f"soup_epoch{epoch + 1}.pt"
+            torch.save(_soup_ckpt, _soup_path)
+            print(f"  Soup: saved EMA checkpoint at epoch {epoch + 1} -> {_soup_path}")
+
     # --- Validate across all splits ---
     _do_val = (epoch + 1) % cfg.val_every == 0 or epoch == 0 or epoch == MAX_EPOCHS - 1
     if not _do_val:
@@ -2861,6 +2886,346 @@ wandb.summary.update({"total_epochs": epoch + 1, "total_time_min": total_time})
 if best_metrics:
     wandb.summary.update({"best_" + k: v for k, v in best_metrics.items()})
 
+# ---------------------------------------------------------------------------
+# Checkpoint soup: post-training weight averaging and evaluation
+# ---------------------------------------------------------------------------
+if cfg.checkpoint_soup and best_metrics:
+    print("\n" + "=" * 70)
+    print("CHECKPOINT SOUP: Averaging EMA checkpoints")
+    print("=" * 70)
+
+    _soup_epoch_list = [int(e) for e in cfg.soup_epochs.split(',')]
+    soup_state_dicts = []
+    for _sep in _soup_epoch_list:
+        _spath = model_dir / f"soup_epoch{_sep}.pt"
+        if _spath.exists():
+            soup_state_dicts.append(torch.load(_spath, map_location=device, weights_only=False))
+            print(f"  Loaded soup checkpoint: epoch {_sep}")
+        else:
+            print(f"  WARNING: soup checkpoint missing for epoch {_sep}")
+
+    # Add the best model checkpoint as the final soup ingredient
+    _best_sd = {'model': torch.load(model_path, map_location=device, weights_only=True)}
+    if (model_dir / "refine_head.pt").exists():
+        _best_sd['refine_head'] = torch.load(model_dir / "refine_head.pt", map_location=device, weights_only=True)
+    if (model_dir / "aft_srf_head.pt").exists():
+        _best_sd['aft_srf_head'] = torch.load(model_dir / "aft_srf_head.pt", map_location=device, weights_only=True)
+    soup_state_dicts.append(_best_sd)
+    print(f"  Loaded best model checkpoint (epoch {best_metrics['epoch']})")
+
+    _n_soup = len(soup_state_dicts)
+    print(f"  Averaging {_n_soup} checkpoints...")
+
+    # Average model weights
+    _avg_model_sd = {}
+    for _k in soup_state_dicts[0]['model']:
+        _avg_model_sd[_k] = sum(_sd['model'][_k].float() for _sd in soup_state_dicts) / _n_soup
+
+    # Average refinement head weights
+    _avg_refine_sd = None
+    if all('refine_head' in _sd for _sd in soup_state_dicts):
+        _avg_refine_sd = {}
+        for _k in soup_state_dicts[0]['refine_head']:
+            _avg_refine_sd[_k] = sum(_sd['refine_head'][_k].float() for _sd in soup_state_dicts) / _n_soup
+
+    # Average aft-foil SRF head weights
+    _avg_aft_sd = None
+    if all('aft_srf_head' in _sd for _sd in soup_state_dicts):
+        _avg_aft_sd = {}
+        for _k in soup_state_dicts[0]['aft_srf_head']:
+            _avg_aft_sd[_k] = sum(_sd['aft_srf_head'][_k].float() for _sd in soup_state_dicts) / _n_soup
+
+    # Load averaged weights into models for evaluation
+    _soup_model = deepcopy(_base_model)
+    _avg_model_sd = {k.removeprefix("_orig_mod."): v for k, v in _avg_model_sd.items()}
+    _soup_model.load_state_dict(_avg_model_sd)
+    _soup_model.eval()
+
+    _soup_refine = None
+    if _avg_refine_sd is not None and refine_head is not None:
+        _soup_refine = deepcopy(refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head)
+        _soup_refine.load_state_dict(_avg_refine_sd)
+        _soup_refine.eval()
+
+    _soup_aft_srf = None
+    _soup_aft_ctx = None
+    if _avg_aft_sd is not None:
+        if aft_srf_ctx_head is not None:
+            _soup_aft_ctx = deepcopy(aft_srf_ctx_head._orig_mod if hasattr(aft_srf_ctx_head, '_orig_mod') else aft_srf_ctx_head)
+            _soup_aft_ctx.load_state_dict(_avg_aft_sd)
+            _soup_aft_ctx.eval()
+        elif aft_srf_head is not None:
+            _soup_aft_srf = deepcopy(aft_srf_head._orig_mod if hasattr(aft_srf_head, '_orig_mod') else aft_srf_head)
+            _soup_aft_srf.load_state_dict(_avg_aft_sd)
+            _soup_aft_srf.eval()
+
+    # Run soup validation across all splits
+    print("  Running soup validation...")
+    soup_metrics_all = {}
+    for split_name, vloader in val_loaders.items():
+        _s_mae_surf = torch.zeros(3, device=device)
+        _s_mae_vol = torch.zeros(3, device=device)
+        _s_n_surf = torch.zeros(3, device=device)
+        _s_n_vol = torch.zeros(3, device=device)
+
+        with torch.no_grad():
+            for x, y, is_surface, mask in tqdm(vloader, desc=f"Soup [{split_name}]", leave=False):
+                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                is_surface = is_surface.to(device, non_blocking=True)
+                mask = mask.to(device, non_blocking=True)
+
+                raw_dsdf = x[:, :, 2:10]
+                dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+                dist_feat = torch.log1p(dist_surf * 10.0)
+                _raw_aoa = x[:, 0, 14:15]
+                _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature
+                _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
+                _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
+                _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
+
+                # Aft-foil mask
+                _s_aft_mask = None
+                if _soup_aft_srf is not None or _soup_aft_ctx is not None:
+                    _v_saf_norm = x[:, :, 2:4].norm(dim=-1)
+                    _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
+                    _s_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
+                    _v_gap_stagger = x[:, 0, 22:24]
+
+                x = (x - stats["x_mean"]) / stats["x_std"]
+                curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                if cfg.foil2_dist:
+                    foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                    x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
+                elif cfg.te_coord_frame:
+                    te_feats, _fore_te_x, _fore_te_y = compute_te_features(_raw_xy_te, is_surface, _raw_saf_norm_te)
+                    x = torch.cat([x, curv, dist_feat, te_feats], dim=-1)
+                    if cfg.wake_deficit_feature:
+                        wake_feats = compute_wake_deficit_features(
+                            _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake,
+                            fore_te_x=_fore_te_x, fore_te_y=_fore_te_y)
+                        x = torch.cat([x, wake_feats], dim=-1)
+                else:
+                    x = torch.cat([x, curv, dist_feat], dim=-1)
+                    if cfg.wake_deficit_feature:
+                        wake_feats = compute_wake_deficit_features(
+                            _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
+                        x = torch.cat([x, wake_feats], dim=-1)
+
+                raw_xy = x[:, :, :2]
+                xy_min = raw_xy.amin(dim=1, keepdim=True)
+                xy_max = raw_xy.amax(dim=1, keepdim=True)
+                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                freqs = torch.cat([_soup_model.fourier_freqs_fixed.to(device), _soup_model.fourier_freqs_learned.abs()])
+                xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                x = torch.cat([x, fourier_pe], dim=-1)
+
+                Umag, q = _umag_q(y, mask)
+                if cfg.raw_targets:
+                    y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
+                elif cfg.adaptive_norm:
+                    y_adapt = y.clone()
+                    if cfg.asinh_pressure:
+                        y_adapt[:, :, 2:3] = torch.asinh(y_adapt[:, :, 2:3] * cfg.asinh_scale)
+                    y_norm = (y_adapt - raw_stats["y_mean"]) / raw_stats["y_std"]
+                else:
+                    y_phys = _phys_norm(y, Umag, q)
+                    if cfg.log_pressure:
+                        y_phys = y_phys.clone()
+                        y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
+                    if cfg.asinh_pressure:
+                        y_phys = y_phys.clone()
+                        y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
+                    y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+
+                # Residual prediction
+                _v_freestream = None
+                if cfg.residual_prediction:
+                    _aoa = _raw_aoa
+                    if cfg.adaptive_norm:
+                        _fs_raw = torch.zeros(y_norm.shape[0], 1, 3, device=device)
+                        _fs_raw[:, 0, 0] = Umag.squeeze() * torch.cos(_aoa.squeeze(-1))
+                        _fs_raw[:, 0, 1] = Umag.squeeze() * torch.sin(_aoa.squeeze(-1))
+                        _fs_raw[:, 0, 2] = 0.0
+                        _v_freestream = (_fs_raw - raw_stats["y_mean"]) / raw_stats["y_std"]
+                    else:
+                        _fs_phys = torch.zeros(y_norm.shape[0], 1, 3, device=device)
+                        _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))
+                        _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))
+                        _v_freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                    y_norm = y_norm - _v_freestream
+
+                # Per-sample std normalization
+                raw_gap = x[:, 0, 21]
+                is_tandem = raw_gap.abs() > 0.5
+                B = y_norm.shape[0]
+                sample_stds = torch.ones(B, 1, 3, device=device)
+                if not cfg.no_perstd and not cfg.raw_targets and not cfg.adaptive_norm:
+                    if cfg.unified_clamps:
+                        channel_clamps = tandem_clamps = torch.tensor([0.2, 0.2, 0.7], device=device)
+                    elif cfg.high_p_clamp:
+                        channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
+                        tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
+                    else:
+                        channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
+                        tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+                    for b in range(B):
+                        valid = mask[b]
+                        if cfg.no_perstd_p:
+                            vc = (tandem_clamps[:2] if is_tandem[b] else channel_clamps[:2])
+                            sample_stds[b, 0, :2] = y_norm[b, valid, :2].std(dim=0).clamp(min=vc)
+                        elif is_tandem[b]:
+                            sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
+                        else:
+                            sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+                if cfg.multiply_std:
+                    y_norm_scaled = y_norm * sample_stds
+                else:
+                    y_norm_scaled = y_norm / sample_stds
+
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _soup_out = _soup_model({"x": x})
+                    pred = _soup_out["preds"]
+                    _soup_hidden = _soup_out["hidden"]
+                pred = pred.float()
+                _soup_hidden = _soup_hidden.float()
+                if cfg.multiply_std:
+                    pred_loss = pred * sample_stds
+                else:
+                    pred_loss = pred / sample_stds
+
+                # Surface refinement head
+                if _soup_refine is not None:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        if cfg.surface_refine_context:
+                            refine_correction = _soup_refine(
+                                _soup_hidden, pred_loss, is_surface, mask, x[:, :, :2]
+                            ).float()
+                            pred_loss = pred_loss + refine_correction
+                        else:
+                            surf_idx = is_surface.nonzero(as_tuple=False)
+                            if surf_idx.numel() > 0:
+                                surf_hidden = _soup_hidden[surf_idx[:, 0], surf_idx[:, 1]]
+                                surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
+                                correction = _soup_refine(surf_hidden, surf_pred).float()
+                                pred_loss = pred_loss.clone()
+                                pred_loss[surf_idx[:, 0], surf_idx[:, 1]] += correction
+                    if cfg.multiply_std:
+                        pred = pred_loss / sample_stds
+                    else:
+                        pred = pred_loss * sample_stds
+
+                # Aft-foil SRF head
+                if _soup_aft_ctx is not None and _s_aft_mask is not None:
+                    _vol_mask_s = mask & ~is_surface
+                    _coords_s = x[:, :, :2]
+                    pred_loss = pred_loss.clone()
+                    for b in range(x.shape[0]):
+                        _aft_b = _s_aft_mask[b].nonzero(as_tuple=True)[0]
+                        _vol_b = _vol_mask_s[b].nonzero(as_tuple=True)[0]
+                        if _aft_b.numel() == 0 or _vol_b.numel() == 0:
+                            continue
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            _corr = _soup_aft_ctx(
+                                _soup_hidden[b, _aft_b], _coords_s[b, _aft_b],
+                                _soup_hidden[b, _vol_b], _coords_s[b, _vol_b],
+                                pred_loss[b, _aft_b],
+                            ).float()
+                        pred_loss[b, _aft_b] += _corr
+                    if cfg.multiply_std:
+                        pred = pred_loss / sample_stds
+                    else:
+                        pred = pred_loss * sample_stds
+                elif _soup_aft_srf is not None and _s_aft_mask is not None:
+                    aft_idx = _s_aft_mask.nonzero(as_tuple=False)
+                    if aft_idx.numel() > 0:
+                        _ah = _soup_hidden[aft_idx[:, 0], aft_idx[:, 1]]
+                        _ap = pred_loss[aft_idx[:, 0], aft_idx[:, 1]]
+                        _ac = _v_gap_stagger[aft_idx[:, 0]] if cfg.aft_foil_srf_film else None
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            _aft_corr = _soup_aft_srf(_ah, _ap, _ac).float()
+                        pred_loss = pred_loss.clone()
+                        pred_loss[aft_idx[:, 0], aft_idx[:, 1]] += _aft_corr
+                        if cfg.multiply_std:
+                            pred = pred_loss / sample_stds
+                        else:
+                            pred = pred_loss * sample_stds
+
+                # Add freestream back for residual prediction
+                if cfg.residual_prediction and _v_freestream is not None:
+                    pred = pred + _v_freestream
+
+                # Denormalize predictions
+                if cfg.raw_targets:
+                    pred_orig = pred * raw_stats["y_std"] + raw_stats["y_mean"]
+                elif cfg.adaptive_norm:
+                    pred_adapt = pred * raw_stats["y_std"] + raw_stats["y_mean"]
+                    if cfg.asinh_pressure:
+                        pred_adapt = pred_adapt.clone()
+                        pred_adapt[:, :, 2:3] = torch.sinh(pred_adapt[:, :, 2:3]) / cfg.asinh_scale
+                    pred_orig = pred_adapt
+                else:
+                    pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                    if cfg.log_pressure:
+                        pred_phys = pred_phys.clone()
+                        pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
+                    if cfg.asinh_pressure:
+                        pred_phys = pred_phys.clone()
+                        pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
+                    if cfg.tight_denorm_clamps:
+                        _pd = pred_phys.clone()
+                        _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
+                        _pd[:, :, 1:2] = pred_phys[:, :, 1:2].clamp(-5, 5) * Umag
+                        _pd[:, :, 2:3] = pred_phys[:, :, 2:3].clamp(-10, 10) * q
+                        pred_orig = _pd
+                    else:
+                        pred_orig = _phys_denorm(pred_phys, Umag, q)
+
+                y_clamped = y.clamp(-1e6, 1e6)
+                err = (pred_orig - y_clamped).abs()
+                finite = err.isfinite()
+                err = err.where(finite, torch.zeros_like(err))
+                vol_mask = mask & ~is_surface
+                surf_mask = mask & is_surface
+                _s_mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                _s_mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
+                _s_n_surf += (surf_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+                _s_n_vol += (vol_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+
+        _s_mae_surf /= _s_n_surf.clamp(min=1)
+        _s_mae_vol /= _s_n_vol.clamp(min=1)
+        soup_metrics_all[f"soup/{split_name}/mae_surf_Ux"] = _s_mae_surf[0].item()
+        soup_metrics_all[f"soup/{split_name}/mae_surf_Uy"] = _s_mae_surf[1].item()
+        soup_metrics_all[f"soup/{split_name}/mae_surf_p"] = _s_mae_surf[2].item()
+        soup_metrics_all[f"soup/{split_name}/mae_vol_Ux"] = _s_mae_vol[0].item()
+        soup_metrics_all[f"soup/{split_name}/mae_vol_Uy"] = _s_mae_vol[1].item()
+        soup_metrics_all[f"soup/{split_name}/mae_vol_p"] = _s_mae_vol[2].item()
+
+    wandb.log(soup_metrics_all)
+    wandb.summary.update(soup_metrics_all)
+
+    print("\n--- Checkpoint Soup Results ---")
+    print(f"{'Split':30s}  {'Pre-soup p':>12s}  {'Soup p':>12s}  {'Δ':>8s}")
+    for split_name in VAL_SPLIT_NAMES:
+        _pre_key = f"best_{split_name}/mae_surf_p"
+        _soup_key = f"soup/{split_name}/mae_surf_p"
+        if _pre_key in best_metrics and _soup_key in soup_metrics_all:
+            _pre = best_metrics[_pre_key]
+            _soup = soup_metrics_all[_soup_key]
+            _delta_pct = (_soup - _pre) / _pre * 100
+            print(f"  {split_name:30s}  {_pre:12.1f}  {_soup:12.1f}  {_delta_pct:+7.1f}%")
+
+    # Clean up soup model to free memory
+    del _soup_model, soup_state_dicts
+    if _soup_refine is not None:
+        del _soup_refine
+    if _soup_aft_srf is not None:
+        del _soup_aft_srf
+    if _soup_aft_ctx is not None:
+        del _soup_aft_ctx
+    torch.cuda.empty_cache()
+
+if best_metrics:
     print("\nGenerating flow field plots...")
     try:
         if cfg.swa_cyclic and swa_cyclic_model is not None:
