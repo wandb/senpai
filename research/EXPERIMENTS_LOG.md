@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 10:00 — PR #2312: GradNorm Adaptive Loss Weighting — alphonse — **CLOSED** ❌
+
+- Branch: `alphonse/gradnorm-adaptive-weighting`
+- Hypothesis: GradNorm (Chen et al., ICML 2018) to auto-balance surface/volume loss weights by equalizing gradient norms.
+- W&B runs: `ldzd7679` (s42), `emycidtd` (s73)
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 23.30 | **+98%** ❌ catastrophic |
+| p_oodc | 7.643 | 13.90 | **+82%** ❌ catastrophic |
+| p_tan | 27.874 | 33.70 | **+21%** ❌ |
+| p_re | 6.419 | 11.35 | **+77%** ❌ catastrophic |
+
+**Analysis:** Catastrophic failure from two compounding issues: (1) GradNorm overhead → 2.5× slower per step → only 72 epochs (vs 148 baseline), (2) weight collapse: w_vol → 0.05 within 15 min because surface/volume gradient norms differ by orders of magnitude. GradNorm's normalization constraint creates zero-sum collapse.
+
+---
+
 ### 2026-04-09 09:50 — PR #2313: Multi-Scale Intermediate Skips — edward — **CLOSED** ❌
 
 - Branch: `edward/multi-scale-intermediate-skips`

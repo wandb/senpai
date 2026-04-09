@@ -36,7 +36,7 @@ Single-model beats ensemble on p_in (11.74 vs 12.1) and p_tan (27.90 vs 29.1). E
 |---------|-----|-----------|--------|
 | nezuko | #2314 | **SE Channel Attention on Slice Tokens** | WIP (NEW, ROUND32, ARCH) |
 | thorfinn | #2298 | **GMSE Gradient-Weighted Pressure Loss — weight by local ∇p magnitude** | WIP (BOLD) |
-| alphonse | #2312 | **GradNorm Adaptive Loss Weighting — auto-balance surface/volume losses** | WIP (NEW, ROUND32, LOSS) |
+| alphonse | #2318 | **EMA Teacher Soft-Label Distillation — Mean Teacher for OOD** | WIP (NEW, ROUND33) |
 | fern | #2311 | **Condition Token Injection — dedicated flow-condition embedding pathway** | WIP (NEW, ROUND32) |
 | askeladd | #2308 | **Auxiliary AoA Head — explicit AoA decoding (analogous to Re head PR #780)** | WIP (NEW, ROUND32) |
 | frieren | #2316 | **Stochastic Depth — randomly drop TransolverBlocks during training** | WIP (NEW, ROUND33, REGULARIZATION) |
@@ -85,7 +85,7 @@ Next-round assignments (when Round 29 in-flight students complete) will continue
 |---------|-----|-----------|--------|
 | nezuko | #2314 | **SE on Slice Tokens** — Squeeze-Excite recalibration inside PhysicsAttention | all |
 | thorfinn | #2298 | **GMSE Gradient-Weighted Pressure Loss** — weight by ∇p magnitude | p_tan, p_in |
-| alphonse | #2312 | **GradNorm Adaptive Loss Weighting** — gradient-norm-based surface/vol balancing | all |
+| alphonse | #2318 | **EMA Teacher Distillation** — slow-decay EMA soft targets for consistency regularization | p_oodc, p_re |
 | fern | #2311 | **Condition Token Injection** — additive condition MLP embedding (Unisolver-inspired) | p_oodc, p_re |
 | askeladd | #2308 | **Auxiliary AoA Head** — explicit AoA decoding, penultimate block pool | p_tan, p_oodc |
 | frieren | #2316 | **Stochastic Depth** — block-level dropout for OOD regularization | p_oodc, p_re |
@@ -173,3 +173,4 @@ Next-round assignments (when Round 29 in-flight students complete) will continue
 - **Q-criterion proxy feature**: High seed variance, no metric improved on average. Hand-crafted DSDF×freestream cross-product is not a robust vortex encoding
 - **Shortest vector feature (FVF paper)**: Redundant with DSDF 8-ch. ALL geometry input features are now exhausted as a direction
 - **Multi-scale intermediate skips (FPN)**: 3 TransolverBlocks too shallow for multi-scale aggregation. Zero-init chicken-and-egg with Lion optimizer. Existing preprocess skip sufficient
+- **GradNorm adaptive weighting**: Surface/volume loss scales differ by orders of magnitude → weight collapse (w_vol → 0). Also 2.5× compute overhead from retain_graph. Same root cause as failed PR #736
