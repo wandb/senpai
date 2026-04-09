@@ -1118,6 +1118,9 @@ class Config:
     dct_freq_weight: float = 0.05 # weight for DCT freq loss
     dct_freq_gamma: float = 2.0   # frequency upweighting strength
     dct_freq_alpha: float = 1.5   # frequency exponent
+    spectral_arc_loss: bool = False   # Spectral FFT loss on arc-length-sorted surface pressure
+    spectral_arc_weight: float = 0.1  # weight for spectral arc-length loss
+    spectral_arc_gamma: float = 1.0   # frequency weighting exponent (0.5=mild, 1=linear, 2=aggressive)
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1786,6 +1789,10 @@ for epoch in range(MAX_EPOCHS):
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
+        # Spectral arc-length loss: save raw xy and saf_norm before normalization
+        _raw_xy_for_spectral = x[:, :, :2].clone() if cfg.spectral_arc_loss else None
+        _raw_saf_for_spectral = x[:, :, 2:4].norm(dim=-1) if cfg.spectral_arc_loss else None
+        _raw_tandem_for_spectral = (x[:, 0, 22].abs() > 0.01) if cfg.spectral_arc_loss else None
         # TE coordinate frame / wake deficit: save raw xy and saf_norm before normalization
         _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
@@ -2135,6 +2142,46 @@ for epoch in range(MAX_EPOCHS):
                 _dct_loss = _dct_loss / _n_foils_dct
                 loss = loss + cfg.dct_freq_weight * _dct_loss
 
+        # Spectral arc-length loss: FFT on arc-length-sorted surface pressure
+        _spectral_arc_val = torch.tensor(0.0, device=device)
+        if cfg.spectral_arc_loss and model.training:
+            _n_foils_spectral = 0
+            for b in range(B):
+                surf_idx_b = is_surface[b].nonzero(as_tuple=True)[0]
+                if surf_idx_b.numel() < 8:
+                    continue
+                _is_tan_b = _raw_tandem_for_spectral[b].item()
+                if _is_tan_b:
+                    saf_vals = _raw_saf_for_spectral[b, surf_idx_b]
+                    foil_groups = [surf_idx_b[saf_vals <= 0.005], surf_idx_b[saf_vals > 0.005]]
+                else:
+                    foil_groups = [surf_idx_b]
+                for foil_surf in foil_groups:
+                    if foil_surf.numel() < 8:
+                        continue
+                    # Sort by angle from centroid for physically meaningful arc-length ordering
+                    xy = _raw_xy_for_spectral[b, foil_surf]  # [M, 2]
+                    centroid = xy.mean(dim=0)
+                    angles = torch.atan2(xy[:, 1] - centroid[1], xy[:, 0] - centroid[0])
+                    angle_order = angles.argsort()
+                    sorted_idx = foil_surf[angle_order]
+                    # Pressure channel (channel 2 in output)
+                    p_pred = pred[b, sorted_idx, 2]
+                    p_gt = y_norm[b, sorted_idx, 2]
+                    # FFT with ortho normalization
+                    pred_fft = torch.fft.rfft(p_pred, norm='ortho')
+                    true_fft = torch.fft.rfft(p_gt, norm='ortho')
+                    freqs = torch.arange(pred_fft.shape[0], device=device, dtype=torch.float32)
+                    weights = (freqs + 1.0) ** cfg.spectral_arc_gamma
+                    weights = weights / weights.mean()
+                    _spectral_arc_val = _spectral_arc_val + ((pred_fft - true_fft).abs() * weights).mean()
+                    _n_foils_spectral += 1
+            if _n_foils_spectral > 0:
+                _spectral_arc_val = _spectral_arc_val / _n_foils_spectral
+                loss = loss + cfg.spectral_arc_weight * _spectral_arc_val
+        # Shared spectral aux term for PCGrad paths
+        _spectral_shared = cfg.spectral_arc_weight * _spectral_arc_val if cfg.spectral_arc_loss else 0.0
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -2161,8 +2208,8 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + _spectral_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + _spectral_shared + 0.005 * re_loss + 0.005 * aoa_loss
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -2207,7 +2254,7 @@ for epoch in range(MAX_EPOCHS):
                 vol_loss_g = (abs_err * vol_mask_g.unsqueeze(-1)).sum() / vol_mask_g.sum().clamp(min=1)
                 surf_loss_g = (surf_per_sample * mask_1d.float() * tandem_boost).sum() / n
                 coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + _spectral_shared + 0.005 * re_loss + 0.005 * aoa_loss
 
             loss_A = _grp_loss(~is_tandem_batch)
             # Only include non-empty groups to avoid backward() on no-grad tensors
@@ -2335,7 +2382,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.spectral_arc_loss:
+            _log_dict["train/spectral_arc_loss"] = _spectral_arc_val.item()
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
