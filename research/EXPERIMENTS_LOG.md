@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 09:47 — PR #2315: Tandem Curriculum Ramp (fixed) — tanjiro — **CLOSED** ❌
+
+- Branch: `tanjiro/tandem-curriculum-ramp`
+- Hypothesis: Smooth linear ramp (0→1 over epochs 10-30) for tandem sample loss weight, instead of hard introduction.
+- W&B runs: `993g849g` (s42, 147 epochs), `p6gsbyy2` (s73, 148 epochs)
+- W&B group: `tandem-curriculum-ramp`
+
+| Metric | Baseline (#2290) | Seed 42 | Seed 73 | 2-seed avg | Δ |
+|--------|-----------------|---------|---------|------------|---|
+| p_in | 11.742 | 11.340 | 11.650 | 11.495 | **-2.1%** ✅ |
+| p_oodc | 7.643 | 8.106 | 7.622 | 7.864 | **+2.9%** ❌ |
+| p_tan | 27.874 | 28.631 | 27.937 | 28.284 | **+1.5%** ❌ |
+| p_re | 6.419 | 6.549 | 6.470 | 6.510 | **+1.4%** ❌ |
+
+**Analysis:** The curriculum ramp helps in-distribution generalization (p_in -2.1%) but fundamentally trades OOD performance: delayed exposure to full tandem weights reduces the model's ability to learn diverse tandem/OOD representations early. The p_oodc regression (+2.9%) is the largest. Seed variance is notable (p_tan varies 27.9-28.6, p_oodc varies 7.6-8.1). Note: initial runs were catastrophic (val_loss=0.89, p_in=50) due to a SENPAI_TIMEOUT_MINUTES env var bug — student fixed and re-ran correctly. **Curriculum ramp approach has inherent tradeoff between p_in and OOD metrics.**
+
+---
+
 ### 2026-04-09 09:11 — PR #2316: Stochastic Depth — frieren — **CLOSED** ❌
 
 - Branch: `frieren/stochastic-depth`
