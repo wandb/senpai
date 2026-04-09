@@ -2,6 +2,40 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 23:10 — PR #2338: GRU Sequential Surface Decoder — thorfinn — **CLOSED** ❌
+
+- Branch: `thorfinn/gru-sequential-surface-decoder`
+- Hypothesis: Bidirectional GRU on arc-length-sorted surface nodes propagates stagnation→suction peak causal context.
+- W&B runs: `z87dvheq` (s42), `5hsewpb3` (s73)
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.709 | 31.611 | **+170%** ❌ |
+| p_oodc | 7.544 | 23.178 | **+207%** ❌ |
+| p_tan | 27.402 | 41.961 | **+53%** ❌ |
+| p_re | 6.481 | 19.203 | **+196%** ❌ |
+
+**Analysis:** GRU is 4x slower per epoch (277s vs 68s) due to per-sample loop for variable-length surface nodes. Only 39 epochs vs 160 — never converges. Sequential hypothesis not falsified but implementation is not viable without batched/padded GRU or 1D conv alternative.
+
+---
+
+### 2026-04-09 23:10 — PR #2337: Arc-Length Surface PE — edward — **CLOSED** ❌
+
+- Branch: `edward/arc-length-surface-pe`
+- Hypothesis: Fourier positional encoding of arc-length position for surface nodes before SRF head.
+- W&B runs: `hwcuejfy` (s42), `7gkkb29d` (s73)
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.709 | 12.36 | **+5.6%** ❌ |
+| p_oodc | 7.544 | 7.50 | -0.6% ≈ |
+| p_tan | 27.402 | 28.03 | **+2.3%** ❌ |
+| p_re | 6.481 | 6.24 | **-3.8%** ✅ |
+
+**Analysis:** p_re -3.8% is notable but p_in +5.6% is a dealbreaker. Root cause (per student): polar centroid computation mixes fore+aft surface nodes in tandem, producing meaningless angles. Existing 2D Fourier PE already encodes position. The PE concept needs per-foil centroid computation to be viable.
+
+---
+
 ### 2026-04-09 20:45 — PR #2336: Panel Cp + AoA Curriculum Combo — askeladd — **CLOSED** ❌
 
 - Branch: `askeladd/panel-cp-plus-curriculum`
