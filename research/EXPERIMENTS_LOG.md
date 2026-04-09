@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 13:37 — PR #2325: KAN Surface Decoder — tanjiro — **CLOSED** ❌
+
+- Branch: `tanjiro/kan-surface-decoder`
+- Hypothesis: Replace final Linear in SurfaceRefinementHead with KAN (B-spline activations, grid_size=5, spline_order=3).
+- W&B runs: `4er1cvls` (s42, 147 epochs), `0qc824o5` (s73, 146 epochs)
+- W&B group: `kan-surface-decoder`
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 12.675 | **+7.9%** ❌ |
+| p_oodc | 7.643 | 8.420 | **+10.2%** ❌ |
+| p_tan | 27.874 | 29.105 | **+4.4%** ❌ |
+| p_re | 6.419 | 7.060 | **+10.0%** ❌ |
+
+**Analysis:** KAN spline activations add parametric overhead (4,608 spline coefficients) to a simple 192→3 projection. By the time features reach the output layer, the hidden layers have already processed them — the linear projection is well-suited. Spline parameters don't get enough gradient signal and likely introduce optimization noise. **The output head is not the bottleneck for surface pressure accuracy.**
+
+---
+
 ### 2026-04-09 12:50 — PR #2324: Inviscid Cp Residual Target — frieren — **CLOSED** ❌
 
 - Branch: `frieren/inviscid-cp-residual`
