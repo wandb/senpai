@@ -1173,6 +1173,9 @@ class Config:
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
+    # Sample-level mixup augmentation
+    mixup: bool = False                    # enable sample-level mixup (interpolate batch pairs)
+    mixup_alpha: float = 0.2              # Beta distribution parameter for mixup lambda
 
 
 cfg = sp.parse(Config)
@@ -1778,6 +1781,19 @@ for epoch in range(MAX_EPOCHS):
                 # Identity for non-tandem samples
                 _dsdf2_scale = _dsdf2_scale * _is_tandem_aug2.float() + (~_is_tandem_aug2).float()
                 x[:, :, 6:10] = x[:, :, 6:10] * _dsdf2_scale.view(-1, 1, 1)
+
+        # Sample-level mixup augmentation (applied after other aug, before normalization)
+        if cfg.mixup and model.training:
+            _alpha = torch.tensor(cfg.mixup_alpha)
+            _lam = float(torch.distributions.Beta(_alpha, _alpha).sample())
+            _lam = max(_lam, 1 - _lam)  # ensure lambda >= 0.5 (closer to original sample)
+            _B_mx = x.size(0)
+            _mix_idx = torch.randperm(_B_mx, device=x.device)
+            x = _lam * x + (1 - _lam) * x[_mix_idx]
+            y = _lam * y + (1 - _lam) * y[_mix_idx]
+            # Use intersection of masks so padded regions remain masked
+            mask = mask & mask[_mix_idx]
+            is_surface = is_surface & is_surface[_mix_idx]
 
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
