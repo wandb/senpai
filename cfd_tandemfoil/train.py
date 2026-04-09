@@ -1170,6 +1170,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    circulation_feature: bool = False       # Kutta-Joukowski Γ_approx as global input (+2 channels: fore + aft)
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
@@ -1318,7 +1319,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + (2 if cfg.circulation_feature else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], [+circulation], +32 fourier PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1799,6 +1800,22 @@ for epoch in range(MAX_EPOCHS):
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
+        # Circulation feature: compute from raw AoA and Re before standardization
+        _circ_feat = None
+        if cfg.circulation_feature:
+            _raw_log_re = x[:, 0, 13]      # [B] log(Re)
+            _raw_aoa0 = x[:, 0, 14]        # [B] AoA0 in radians
+            _raw_aoa1 = x[:, 0, 18]        # [B] AoA1 in radians (0 for single-foil)
+            _raw_re = torch.exp(_raw_log_re)  # [B] Re ∝ Umag
+            # Γ_approx ∝ Re * sin(2α) — thin airfoil theory
+            _gamma1 = _raw_re * torch.sin(2 * _raw_aoa0)  # [B] fore-foil circulation
+            _gamma2 = _raw_re * torch.sin(2 * _raw_aoa1)  # [B] aft-foil (0 for single)
+            # Normalize to O(1) range: divide by typical Re (~1e6) and scale
+            _gamma1_norm = _gamma1 / _raw_re.clamp(min=1).mean() * torch.pi  # ~O(1) for typical AoA
+            _gamma2_norm = _gamma2 / _raw_re.clamp(min=1).mean() * torch.pi
+            N = x.shape[1]
+            _circ_feat = torch.stack([_gamma1_norm, _gamma2_norm], dim=-1)  # [B, 2]
+            _circ_feat = _circ_feat[:, None, :].expand(-1, N, -1)  # [B, N, 2]
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1819,6 +1836,8 @@ for epoch in range(MAX_EPOCHS):
                 wake_feats = compute_wake_deficit_features(
                     _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
                 x = torch.cat([x, wake_feats], dim=-1)
+        if _circ_feat is not None:
+            x = torch.cat([x, _circ_feat], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2489,6 +2508,17 @@ for epoch in range(MAX_EPOCHS):
                     _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
                     _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
                     _v_gap_stagger = x[:, 0, 22:24]  # [B, 2]
+                _circ_feat_v = None
+                if cfg.circulation_feature:
+                    _v_log_re = x[:, 0, 13]
+                    _v_aoa0 = x[:, 0, 14]
+                    _v_aoa1 = x[:, 0, 18]
+                    _v_re = torch.exp(_v_log_re)
+                    _vg1 = _v_re * torch.sin(2 * _v_aoa0)
+                    _vg2 = _v_re * torch.sin(2 * _v_aoa1)
+                    _vg1_norm = _vg1 / _v_re.clamp(min=1).mean() * torch.pi
+                    _vg2_norm = _vg2 / _v_re.clamp(min=1).mean() * torch.pi
+                    _circ_feat_v = torch.stack([_vg1_norm, _vg2_norm], dim=-1)[:, None, :].expand(-1, x.shape[1], -1)
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -2509,6 +2539,8 @@ for epoch in range(MAX_EPOCHS):
                         wake_feats = compute_wake_deficit_features(
                             _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
                         x = torch.cat([x, wake_feats], dim=-1)
+                if _circ_feat_v is not None:
+                    x = torch.cat([x, _circ_feat_v], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2896,6 +2928,18 @@ if best_metrics:
                     _raw_xy_te_vis = x_dev[:, :, :2].clone() if _need_te_raw_vis else None
                     _raw_saf_norm_te_vis = x_dev[:, :, 2:4].norm(dim=-1) if _need_te_raw_vis else None
                     _raw_gap_wake_vis = x_dev[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
+                    # Circulation feature (before standardization)
+                    _circ_feat_vis = None
+                    if cfg.circulation_feature:
+                        _vis_log_re = x_dev[:, 0, 13]
+                        _vis_aoa0 = x_dev[:, 0, 14]
+                        _vis_aoa1 = x_dev[:, 0, 18]
+                        _vis_re = torch.exp(_vis_log_re)
+                        _vg1 = _vis_re * torch.sin(2 * _vis_aoa0)
+                        _vg2 = _vis_re * torch.sin(2 * _vis_aoa1)
+                        _vg1_norm = _vg1 / _vis_re.clamp(min=1).mean() * torch.pi
+                        _vg2_norm = _vg2 / _vis_re.clamp(min=1).mean() * torch.pi
+                        _circ_feat_vis = torch.stack([_vg1_norm, _vg2_norm], dim=-1)[:, None, :].expand(-1, x_dev.shape[1], -1)
                     x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                     curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                     if cfg.te_coord_frame:
@@ -2913,6 +2957,8 @@ if best_metrics:
                             wake_feats_vis = compute_wake_deficit_features(
                                 _raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis, _raw_gap_wake_vis)
                             x_n = torch.cat([x_n, wake_feats_vis], dim=-1)
+                    if _circ_feat_vis is not None:
+                        x_n = torch.cat([x_n, _circ_feat_vis], dim=-1)
                     # Fourier PE (must match training loop)
                     raw_xy = x_n[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
@@ -3011,6 +3057,18 @@ if cfg.surface_refine and best_metrics:
                     _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
                     _raw_gap_wake_vv = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
+                    # Circulation feature (before standardization)
+                    _circ_feat_vv = None
+                    if cfg.circulation_feature:
+                        _vv_log_re = x[:, 0, 13]
+                        _vv_aoa0 = x[:, 0, 14]
+                        _vv_aoa1 = x[:, 0, 18]
+                        _vv_re = torch.exp(_vv_log_re)
+                        _vvg1 = _vv_re * torch.sin(2 * _vv_aoa0)
+                        _vvg2 = _vv_re * torch.sin(2 * _vv_aoa1)
+                        _vvg1_norm = _vvg1 / _vv_re.clamp(min=1).mean() * torch.pi
+                        _vvg2_norm = _vvg2 / _vv_re.clamp(min=1).mean() * torch.pi
+                        _circ_feat_vv = torch.stack([_vvg1_norm, _vvg2_norm], dim=-1)[:, None, :].expand(-1, x.shape[1], -1)
                     x = (x - stats["x_mean"]) / stats["x_std"]
                     curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                     if cfg.foil2_dist:
@@ -3031,6 +3089,8 @@ if cfg.surface_refine and best_metrics:
                             wake_feats_vv = compute_wake_deficit_features(
                                 _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake_vv)
                             x = torch.cat([x, wake_feats_vv], dim=-1)
+                    if _circ_feat_vv is not None:
+                        x = torch.cat([x, _circ_feat_vv], dim=-1)
                     raw_xy = x[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
                     xy_max = raw_xy.amax(dim=1, keepdim=True)
