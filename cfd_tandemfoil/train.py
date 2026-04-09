@@ -1173,6 +1173,8 @@ class Config:
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
+    # Target noise regularization: relative Gaussian noise on raw targets
+    target_noise: float = 0.0              # std of relative Gaussian noise added to raw targets (0=disabled)
 
 
 cfg = sp.parse(Config)
@@ -1832,6 +1834,10 @@ for epoch in range(MAX_EPOCHS):
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
+        # Relative target noise regularization (applied to raw targets before normalization)
+        if cfg.target_noise > 0 and model.training:
+            noise_std = cfg.target_noise * y.abs().clamp(min=0.01)
+            y = y + torch.randn_like(y) * noise_std
         Umag, q = _umag_q(y, mask)
         if cfg.raw_targets:
             y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
