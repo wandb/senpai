@@ -2,6 +2,25 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 05:25 — PR #2303: Wake Centerline SDF — askeladd — **CLOSED** ❌
+
+- Branch: `askeladd/wake-centerline-sdf`
+- Hypothesis: Explicit wake centerline proximity features (d_perp, d_parallel, d_to_edge, inside_wake) — 4 channels encoding position relative to the fore-foil wake structure. Expected to help p_tan by encoding the tandem wake interaction geometry.
+- W&B runs: `agl3vast` (s42), `whbwg013` (s73)
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 12.299 | **+4.7%** ❌ |
+| p_oodc | 7.643 | 7.614 | -0.4% |
+| p_re | 6.419 | 6.292 | **-2.0%** ✓ |
+| p_tan | 27.874 | 28.869 | **+3.6%** ❌ |
+
+**Analysis:** Net-negative. The p_re improvement is interesting (wake geometric priors help OOD-Re) but the p_in (+4.7%) and p_tan (+3.6%) regressions are too large. Root cause: redundancy with existing wake_deficit_feature (PR #2213) — both encode wake proximity but with different parameterizations, creating conflicting gradient signals. The crude turbulent spreading model (width = 0.1·√(x/c)) is too rigid for varying Re/AoA conditions. The 4 zero-valued channels for single-foil samples (~87% of data) create optimization tension.
+
+**Insight:** Wake proximity is already well-captured by wake_deficit_feature. Additional wake structure encodings are redundant. The p_re gain suggests geometric wake priors generalize to new Re, but this is better targeted through other means.
+
+---
+
 ### 2026-04-09 04:40 — PR #2300: Mirror Symmetry Augmentation — tanjiro — **CLOSED** ❌
 
 - Branch: `tanjiro/mirror-symmetry-augmentation`
