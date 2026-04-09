@@ -2,6 +2,42 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 15:34 — PR #2327: Sample Mixup Augmentation — nezuko — **SENT BACK** 🔄
+
+- Branch: `nezuko/node-mixup-augmentation`
+- Hypothesis: Interpolate training samples (λ*x_i + (1-λ)*x_j) for OOD robustness.
+- W&B runs: `c5w6ibmc` (s42, 147 epochs), `ad3m87an` (s73, 148 epochs)
+- W&B group: `node-mixup-augmentation`
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 17.635 | **+50.2%** ❌ catastrophic |
+| p_oodc | 7.643 | 14.145 | **+85.1%** ❌ catastrophic |
+| p_tan | 27.874 | 37.905 | **+36.0%** ❌ |
+| p_re | 6.419 | 10.055 | **+56.6%** ❌ catastrophic |
+
+**Analysis:** Surface mask intersection produced near-empty masks — surface nodes are at different array positions between samples. Model received zero surface supervision. Root cause is implementation bug, not conceptual failure. Sent back with fix: keep sample A's surface mask instead of intersection.
+
+---
+
+### 2026-04-09 15:34 — PR #2326: Linear Warmup + Cosine Decay — edward — **CLOSED** ❌
+
+- Branch: `edward/warmup-cosine-schedule`
+- Hypothesis: 5-epoch linear warmup (lr×1e-3 → lr) before cosine decay stabilizes early Lion training.
+- W&B runs: `8541n7vm` (s42, 144 epochs), `cdasibts` (s73, 146 epochs)
+- W&B group: `warmup-cosine-schedule`
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 11.750 | **+0.1%** ≈ |
+| p_oodc | 7.643 | 8.185 | **+7.1%** ❌ |
+| p_tan | 27.874 | 28.180 | **+1.1%** ❌ |
+| p_re | 6.419 | 6.890 | **+7.3%** ❌ |
+
+**Analysis:** Warmup wastes 3-5 epochs (~3% of 147-epoch budget) and compresses cosine phase. Lion's sign-based updates are less sensitive to initial LR than Adam, so warmup provides minimal benefit. **Warmup with Lion+cosine is not viable at our training scale.**
+
+---
+
 ### 2026-04-09 13:42 — PR #2319: Panel-Method Cp Feature v2 (tandem-only) — thorfinn — **SENT BACK** 🔄
 
 - Branch: `thorfinn/panel-method-cp-feature`
