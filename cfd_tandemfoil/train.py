@@ -757,6 +757,52 @@ class SurfaceRefinementContextHead(nn.Module):
         return correction
 
 
+class RegimeMoE(nn.Module):
+    """Flow-regime Mixture-of-Experts output head.
+
+    Soft-gates n_experts output MLPs using 4 global flow regime features
+    [re_norm, aoa_norm, is_tandem, gap_norm]. Each expert maps hidden → out_dim.
+    Output is zero-initialized (additive correction behavior at init).
+
+    The gate is conditioned on global flow conditions, not per-node features,
+    so routing is consistent across all nodes in a sample.
+    """
+
+    def __init__(self, hidden_dim: int, n_experts: int = 3, out_dim: int = 3, regime_dim: int = 4):
+        super().__init__()
+        self.n_experts = n_experts
+        # Gate: global regime features → expert weights
+        self.gate = nn.Linear(regime_dim, n_experts)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.zeros_(self.gate.bias)
+        # Experts: each is a 2-layer MLP hidden → hidden → out_dim
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
+                nn.Linear(hidden_dim, out_dim)
+            )
+            for _ in range(n_experts)
+        ])
+        # Zero-init last linear of each expert (additive correction starts at 0)
+        for expert in self.experts:
+            nn.init.zeros_(expert[-1].weight)
+            nn.init.zeros_(expert[-1].bias)
+
+    def forward(self, h: torch.Tensor, regime_feats: torch.Tensor):
+        """
+        Args:
+            h: [B, N, hidden_dim] — node hidden representations (pre-output-head)
+            regime_feats: [B, 4] — global regime features per sample
+        Returns:
+            blended: [B, N, out_dim] — soft-blended expert outputs
+            weights: [B, n_experts] — gate weights (for load-balance logging)
+        """
+        weights = F.softmax(self.gate(regime_feats), dim=-1)  # [B, n_experts]
+        expert_outs = torch.stack([e(h) for e in self.experts], dim=-1)  # [B, N, out_dim, n_experts]
+        blended = (expert_outs * weights[:, None, None, :]).sum(-1)  # [B, N, out_dim]
+        return blended, weights
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -1173,6 +1219,10 @@ class Config:
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
+    # Flow-regime MoE output head
+    moe_output: bool = False               # replace output head with regime-conditioned MoE
+    moe_n_experts: int = 3                 # number of MoE experts (default 3: single, tandem-normal, tandem-extreme)
+    moe_balance_weight: float = 0.01       # load-balancing auxiliary loss weight (entropy maximization)
 
 
 cfg = sp.parse(Config)
@@ -1411,6 +1461,18 @@ if cfg.aft_foil_srf:
               f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, "
               f"film={cfg.aft_foil_srf_film})")
 
+# Flow-regime MoE output head
+moe_head = None
+if cfg.moe_output:
+    moe_head = RegimeMoE(
+        hidden_dim=model_config["n_hidden"],
+        n_experts=cfg.moe_n_experts,
+        out_dim=3,
+        regime_dim=4,
+    ).to(device)
+    _moe_n_params = sum(p.numel() for p in moe_head.parameters())
+    print(f"RegimeMoE head: {_moe_n_params:,} params (n_experts={cfg.moe_n_experts})")
+
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
@@ -1576,6 +1638,12 @@ if aft_srf_ctx_head is not None:
     _ctx_params = list(aft_srf_ctx_head.parameters())
     base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
+
+# Add MoE head params to optimizer if enabled
+if moe_head is not None:
+    _moe_params = list(moe_head.parameters())
+    base_opt.add_param_group({'params': _moe_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _moe_params):,} RegimeMoE head params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
@@ -1979,6 +2047,23 @@ for epoch in range(MAX_EPOCHS):
                 pred = pred.clone()
                 pred[aft_idx[:, 0], aft_idx[:, 1]] = pred[aft_idx[:, 0], aft_idx[:, 1]] + aft_correction
 
+        # Flow-regime MoE output head: additive correction on top of base predictions
+        _moe_weights = None
+        if moe_head is not None and model.training:
+            # Extract regime features (after normalization)
+            _is_tandem_moe = (x[:, 0, 21].abs() > 0.01).float()  # [B] — matches existing tandem detection
+            _gap_moe = x[:, 0, 22] * _is_tandem_moe  # gap (zeroed for single-foil)
+            _regime_feats = torch.stack([
+                x[:, 0, 13],      # log(Re) normalized
+                x[:, 0, 14],      # AoA0 normalized
+                _is_tandem_moe,   # is_tandem
+                _gap_moe,         # gap magnitude (0 for single-foil)
+            ], dim=-1)  # [B, 4]
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                _moe_correction, _moe_weights = moe_head(hidden.half(), _regime_feats)
+            _moe_correction = _moe_correction.float()
+            pred = pred + _moe_correction
+
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         if cfg.tandem_ramp:
@@ -2097,6 +2182,20 @@ for epoch in range(MAX_EPOCHS):
         aoa_target = x[:, 0, 14:15]  # AoA0_rad from normalized input
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
+
+        # MoE load-balancing: maximize gate entropy to prevent expert collapse
+        if _moe_weights is not None and model.training:
+            # Entropy of gate distribution: higher = more balanced routing
+            _gate_entropy = -(_moe_weights * _moe_weights.log().clamp(min=-10)).sum(-1).mean()
+            _balance_loss = -cfg.moe_balance_weight * _gate_entropy  # negative = maximize
+            loss = loss + _balance_loss
+            if global_step % 20 == 0:
+                wandb.log({
+                    "moe/gate_entropy": _gate_entropy.item(),
+                    "moe/balance_loss": _balance_loss.item(),
+                    "moe/weights_mean": _moe_weights.mean(0).detach().cpu().tolist(),
+                    "global_step": global_step,
+                })
 
         # DCT frequency-weighted auxiliary loss on surface pressure
         if cfg.dct_freq_loss and model.training:
@@ -2651,6 +2750,22 @@ for epoch in range(MAX_EPOCHS):
                             pred = pred_loss / sample_stds
                         else:
                             pred = pred_loss * sample_stds
+
+                # Apply MoE output head during validation
+                if moe_head is not None:
+                    _is_tandem_moe_v = (x[:, 0, 21].abs() > 0.01).float()
+                    _gap_moe_v = x[:, 0, 22] * _is_tandem_moe_v
+                    _regime_feats_v = torch.stack([
+                        x[:, 0, 13], x[:, 0, 14], _is_tandem_moe_v, _gap_moe_v
+                    ], dim=-1)
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _moe_corr_v, _ = moe_head(_eval_hidden.half(), _regime_feats_v)
+                    _moe_corr_v = _moe_corr_v.float()
+                    pred_loss = pred_loss + _moe_corr_v
+                    if cfg.multiply_std:
+                        pred = pred_loss / sample_stds
+                    else:
+                        pred = pred_loss * sample_stds
 
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
