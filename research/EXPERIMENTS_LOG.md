@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 09:50 — PR #2313: Multi-Scale Intermediate Skips — edward — **CLOSED** ❌
+
+- Branch: `edward/multi-scale-intermediate-skips`
+- Hypothesis: FPN-style skip connections from all TransolverBlocks to output head. Zero-init heads + learnable scales.
+- W&B runs: `3imchppo` (s42), `i2exxwpa` (s73)
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 12.35 | **+5.2%** ❌ |
+| p_oodc | 7.643 | 7.90 | **+3.4%** ❌ |
+| p_tan | 27.874 | 29.10 | **+4.4%** ❌ |
+| p_re | 6.419 | 6.50 | **+1.2%** ❌ |
+
+**Analysis:** All metrics worse. 3 TransolverBlocks too shallow for FPN-style multi-scale aggregation. Zero-init creates chicken-and-egg problem with Lion optimizer. Existing preprocess skip already provides cross-block residual. Only 143 epochs (4 fewer than baseline).
+
+---
+
 ### 2026-04-09 08:30 — PR #2304: Shortest Vector Feature — frieren — **CLOSED** ❌
 
 - Branch: `frieren/shortest-vector-feature`
