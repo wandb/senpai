@@ -36,12 +36,12 @@ Single-model beats ensemble on p_in (11.74 vs 12.1) and p_tan (27.90 vs 29.1). E
 |---------|-----|-----------|--------|
 | nezuko | #2310 | **Asymmetric Quantile (Pinball) Loss on Pressure** | WIP (NEW, ROUND32, LOSS) |
 | thorfinn | #2298 | **GMSE Gradient-Weighted Pressure Loss — weight by local ∇p magnitude** | WIP (BOLD) |
-| alphonse | #2299 | **Potential Flow Residual Loss — Bernoulli-consistency auxiliary signal** | WIP (NEW, BOLD, PARADIGM) |
+| alphonse | #2312 | **GradNorm Adaptive Loss Weighting — auto-balance surface/volume losses** | WIP (NEW, ROUND32, LOSS) |
 | fern | #2311 | **Condition Token Injection — dedicated flow-condition embedding pathway** | WIP (NEW, ROUND32) |
 | askeladd | #2308 | **Auxiliary AoA Head — explicit AoA decoding (analogous to Re head PR #780)** | WIP (NEW, ROUND32) |
 | frieren | #2304 | **Shortest Vector Feature — 2D displacement to nearest foil surface (FVF)** | WIP (NEW, PHYSICS) |
 | tanjiro | #2307 | **Q-Criterion Proxy Feature — vortex zone indicator (DSDF×freestream cross-product)** | WIP (NEW, PHYSICS) |
-| edward | #2301 | **Continuity PDE Loss — mass-conservation ∇·u=0 penalty** | WIP (NEW, BOLD, PARADIGM) |
+| edward | #2313 | **Multi-Scale Intermediate Skips — FPN-style output from all TransolverBlocks** | WIP (NEW, ROUND32, ARCH) |
 
 ## PRs Ready for Review
 
@@ -85,12 +85,12 @@ Next-round assignments (when Round 29 in-flight students complete) will continue
 |---------|-----|-----------|--------|
 | nezuko | #2310 | **Asymmetric Quantile Loss** — pinball loss tau=0.65 on surface pressure channel | p_in, p_tan |
 | thorfinn | #2298 | **GMSE Gradient-Weighted Pressure Loss** — weight by ∇p magnitude | p_tan, p_in |
-| alphonse | #2299 | **Potential Flow Residual Loss** (iter 2) — Bernoulli coupling w=0.03, vol-only | p_re, p_in |
+| alphonse | #2312 | **GradNorm Adaptive Loss Weighting** — gradient-norm-based surface/vol balancing | all |
 | fern | #2311 | **Condition Token Injection** — additive condition MLP embedding (Unisolver-inspired) | p_oodc, p_re |
 | askeladd | #2308 | **Auxiliary AoA Head** — explicit AoA decoding, penultimate block pool | p_tan, p_oodc |
 | frieren | #2304 | **Shortest Vector Feature** — 2D displacement to nearest foil surface (FVF) | p_tan, p_oodc |
 | tanjiro | #2307 | **Q-Criterion Proxy Feature** — vortex zone indicator (DSDF×freestream cross-product) | p_tan, p_oodc |
-| edward | #2301 | **Continuity PDE Loss** — ∇·u=0 penalty, interior nodes only | p_oodc, p_re |
+| edward | #2313 | **Multi-Scale Intermediate Skips** — FPN-style aggregation from TransolverBlocks | all |
 
 ### Key Mechanistic Insights (accumulated)
 
@@ -167,3 +167,5 @@ Next-round assignments (when Round 29 in-flight students complete) will continue
 - **Wake centerline SDF features**: Redundant with wake_deficit_feature (PR #2213). Fixed spreading model too rigid; 4 zero channels for single-foil create optimization tension
 - **GQA K/V groups**: n_head=3, making GQA-2 impossible (3%2≠0). GQA-3=MHA, already confirmed harmful
 - **Circulation lift feature (Kutta-Joukowski Γ)**: Γ ≈ Re×sin(2α) is redundant with existing inputs; extrapolates worse under distribution shift (p_oodc +6.1%, p_re +3.2%)
+- **Bernoulli residual loss**: 2 iterations, never beats baseline on p_in/p_tan. Interferes with main L1 supervision despite p_re gain in v1
+- **Continuity PDE loss (∇·u=0)**: Redundant with joint Ux/Uy supervision. SPH approximation too noisy. All metrics regressed

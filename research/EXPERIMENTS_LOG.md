@@ -2,6 +2,42 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 06:50 — PR #2299: Potential Flow Residual Loss (v2) — alphonse — **CLOSED** ❌
+
+- Branch: `alphonse/potential-flow-residual`
+- Hypothesis: Bernoulli-consistency auxiliary loss. v1: weight=0.1, surface nodes, pred velocities. v2: weight=0.03, volume-only, GT velocities.
+- W&B runs: v1: `lhksu0k1`/`r25k1nd5`; v2: `aguyyx0e`/`go4ly0kq`
+
+| Metric | Baseline | v1 avg | v2 avg | v1 Δ | v2 Δ |
+|--------|----------|--------|--------|------|------|
+| p_in | 11.742 | 11.90 | 11.95 | +1.3% | +1.8% |
+| p_oodc | 7.643 | 7.65 | 7.60 | +0.1% | -0.6% |
+| p_tan | 27.874 | 28.50 | 28.45 | +2.2% | +2.1% |
+| p_re | 6.419 | **6.30** | 6.50 | **-1.9%** | +1.3% |
+
+**Analysis:** v1 achieved genuine p_re improvement (-1.9%) through implicit velocity-pressure coupling (Bernoulli on predicted velocities creates consistency gradient). But p_in/p_tan always regress. v2 removed the coupling by using GT velocities → lost p_re benefit. PDE residual losses interfere with main L1 supervision.
+
+**Insight:** Physics-informed PDE losses on this architecture/dataset are fundamentally limited — the constraints are either redundant with supervision or too noisy on unstructured meshes.
+
+---
+
+### 2026-04-09 06:50 — PR #2301: Continuity PDE Loss — edward — **CLOSED** ❌
+
+- Branch: `edward/continuity-pde-loss`
+- Hypothesis: ∇·u=0 mass conservation penalty on interior nodes. SPH-style KNN divergence estimator (512 subsampled nodes, k=6).
+- W&B runs: `4xi7s413` (s42), `cweu2lbk` (s73)
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 12.15 | **+3.5%** ❌ |
+| p_oodc | 7.643 | 7.90 | **+3.4%** ❌ |
+| p_tan | 27.874 | 28.40 | **+1.9%** ❌ |
+| p_re | 6.419 | 6.55 | **+2.0%** ❌ |
+
+**Analysis:** All metrics worse. The model already approximately satisfies ∇·u=0 from joint Ux/Uy supervision. SPH approximation on normalized velocities is both physically inexact and gradient-noisy. Continuity constraint is redundant.
+
+---
+
 ### 2026-04-09 06:15 — PR #2302: Circulation Lift Feature — fern — **CLOSED** ❌
 
 - Branch: `fern/circulation-lift-feature`
