@@ -1173,6 +1173,11 @@ class Config:
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
+    # EMA teacher distillation (Mean Teacher)
+    ema_teacher_distill: bool = False       # add soft-label distillation from slow-decay EMA teacher
+    teacher_weight: float = 0.1            # weight for teacher distillation loss
+    teacher_decay: float = 0.9995          # EMA decay for teacher model (slower than eval EMA)
+    teacher_warmup: int = 20               # disable teacher loss for first N epochs
 
 
 cfg = sp.parse(Config)
@@ -1415,6 +1420,41 @@ from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
 ema_aft_srf_head = None  # EMA copy of aft-foil SRF head
+
+# EMA Teacher for distillation (Mean Teacher)
+teacher_model = None
+teacher_refine_head = None
+teacher_aft_srf_head = None
+teacher_aft_srf_ctx_head = None
+if cfg.ema_teacher_distill:
+    teacher_model = deepcopy(_base_model)
+    teacher_model.eval()
+    for p in teacher_model.parameters():
+        p.requires_grad = False
+    if refine_head is not None:
+        _refine_base_t = refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
+        teacher_refine_head = deepcopy(_refine_base_t)
+        teacher_refine_head.eval()
+        for p in teacher_refine_head.parameters():
+            p.requires_grad = False
+    if aft_srf_head is not None:
+        _aft_base_t = aft_srf_head._orig_mod if hasattr(aft_srf_head, '_orig_mod') else aft_srf_head
+        teacher_aft_srf_head = deepcopy(_aft_base_t)
+        teacher_aft_srf_head.eval()
+        for p in teacher_aft_srf_head.parameters():
+            p.requires_grad = False
+    if aft_srf_ctx_head is not None:
+        _ctx_base_t = aft_srf_ctx_head._orig_mod if hasattr(aft_srf_ctx_head, '_orig_mod') else aft_srf_ctx_head
+        teacher_aft_srf_ctx_head = deepcopy(_ctx_base_t)
+        teacher_aft_srf_ctx_head.eval()
+        for p in teacher_aft_srf_ctx_head.parameters():
+            p.requires_grad = False
+    print(f"EMA Teacher initialized (decay={cfg.teacher_decay}, warmup={cfg.teacher_warmup} epochs, weight={cfg.teacher_weight})")
+
+    @torch.no_grad()
+    def update_teacher_ema(teacher, student, decay=0.9995):
+        for tp, sp in zip(teacher.parameters(), student.parameters()):
+            tp.data.mul_(decay).add_(sp.data, alpha=1 - decay)
 swad_initial_val = None
 swad_prev_val = float("inf")
 swad_checkpoints: list = []
@@ -2145,6 +2185,73 @@ for epoch in range(MAX_EPOCHS):
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
 
+        # EMA Teacher distillation loss
+        _teacher_loss = torch.tensor(0.0, device=device)
+        if cfg.ema_teacher_distill and model.training and epoch >= cfg.teacher_warmup:
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    t_out = teacher_model({"x": x})
+                    teacher_pred = t_out["preds"].float()
+                    teacher_hidden = t_out["hidden"].float()
+                # Apply same per-sample std normalization to teacher predictions
+                if not cfg.no_perstd and not cfg.raw_targets and not cfg.adaptive_norm:
+                    if cfg.multiply_std:
+                        teacher_pred = teacher_pred * sample_stds
+                    else:
+                        teacher_pred = teacher_pred / sample_stds
+                # Surface refinement on teacher predictions
+                if teacher_refine_head is not None:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        if cfg.surface_refine_context:
+                            t_refine_corr = teacher_refine_head(
+                                teacher_hidden, teacher_pred, is_surface, mask, x[:, :, :2]
+                            ).float()
+                            teacher_pred = teacher_pred + t_refine_corr
+                        else:
+                            t_surf_idx = is_surface.nonzero(as_tuple=False)
+                            if t_surf_idx.numel() > 0:
+                                t_surf_h = teacher_hidden[t_surf_idx[:, 0], t_surf_idx[:, 1]]
+                                t_surf_p = teacher_pred[t_surf_idx[:, 0], t_surf_idx[:, 1]]
+                                t_corr = teacher_refine_head(t_surf_h, t_surf_p).float()
+                                teacher_pred = teacher_pred.clone()
+                                teacher_pred[t_surf_idx[:, 0], t_surf_idx[:, 1]] = teacher_pred[t_surf_idx[:, 0], t_surf_idx[:, 1]] + t_corr
+                # Aft-foil refinement on teacher predictions
+                if teacher_aft_srf_ctx_head is not None and _aft_foil_mask is not None:
+                    _vol_mask_t = mask & ~is_surface
+                    _coords_t = x[:, :, :2]
+                    teacher_pred = teacher_pred.clone()
+                    for b in range(x.shape[0]):
+                        _aft_b_t = _aft_foil_mask[b].nonzero(as_tuple=True)[0]
+                        _vol_b_t = _vol_mask_t[b].nonzero(as_tuple=True)[0]
+                        if _aft_b_t.numel() == 0 or _vol_b_t.numel() == 0:
+                            continue
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            _t_corr = teacher_aft_srf_ctx_head(
+                                teacher_hidden[b, _aft_b_t], _coords_t[b, _aft_b_t],
+                                teacher_hidden[b, _vol_b_t], _coords_t[b, _vol_b_t],
+                                teacher_pred[b, _aft_b_t],
+                            ).float()
+                        teacher_pred[b, _aft_b_t] = teacher_pred[b, _aft_b_t] + _t_corr
+                elif teacher_aft_srf_head is not None and _aft_foil_mask is not None:
+                    t_aft_idx = _aft_foil_mask.nonzero(as_tuple=False)
+                    if t_aft_idx.numel() > 0:
+                        t_aft_h = teacher_hidden[t_aft_idx[:, 0], t_aft_idx[:, 1]]
+                        t_aft_p = teacher_pred[t_aft_idx[:, 0], t_aft_idx[:, 1]]
+                        _t_aft_cond = None
+                        if cfg.aft_foil_srf_film:
+                            _t_aft_cond = _raw_gap_stagger[t_aft_idx[:, 0]]
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            t_aft_corr = teacher_aft_srf_head(t_aft_h, t_aft_p, _t_aft_cond).float()
+                        teacher_pred = teacher_pred.clone()
+                        teacher_pred[t_aft_idx[:, 0], t_aft_idx[:, 1]] = teacher_pred[t_aft_idx[:, 0], t_aft_idx[:, 1]] + t_aft_corr
+            # L1 distillation loss: student should match teacher (all nodes)
+            valid_mask_t = mask.float().unsqueeze(-1)  # [B, N, 1]
+            _teacher_loss = (F.l1_loss(pred, teacher_pred.detach(), reduction='none') * valid_mask_t).sum() / valid_mask_t.sum().clamp(min=1)
+            _teacher_loss = _teacher_loss * cfg.teacher_weight
+            loss = loss + _teacher_loss
+            if global_step % 20 == 0:
+                wandb.log({"loss/teacher_distill": _teacher_loss.item(), "global_step": global_step})
+
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
@@ -2334,6 +2441,18 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+        # Update teacher EMA (every step, from epoch 0 — needs to accumulate before warmup ends)
+        if cfg.ema_teacher_distill:
+            update_teacher_ema(teacher_model, _base_model, decay=cfg.teacher_decay)
+            if teacher_refine_head is not None:
+                _refine_base_tu = refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
+                update_teacher_ema(teacher_refine_head, _refine_base_tu, decay=cfg.teacher_decay)
+            if teacher_aft_srf_head is not None:
+                _aft_base_tu = aft_srf_head._orig_mod if hasattr(aft_srf_head, '_orig_mod') else aft_srf_head
+                update_teacher_ema(teacher_aft_srf_head, _aft_base_tu, decay=cfg.teacher_decay)
+            if teacher_aft_srf_ctx_head is not None:
+                _ctx_base_tu = aft_srf_ctx_head._orig_mod if hasattr(aft_srf_ctx_head, '_orig_mod') else aft_srf_ctx_head
+                update_teacher_ema(teacher_aft_srf_ctx_head, _ctx_base_tu, decay=cfg.teacher_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
