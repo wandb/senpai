@@ -1173,6 +1173,9 @@ class Config:
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
+    # AoA curriculum learning
+    aoa_curriculum: bool = False            # curriculum: start with low-AoA (easy) samples, ramp to full
+    aoa_curriculum_warmup: int = 40         # epochs over which to ramp from easy to full distribution
 
 
 cfg = sp.parse(Config)
@@ -1247,6 +1250,16 @@ if cfg.re_stratified_sampling and not cfg.debug:
     print(f"Re-stratified sampling: {_n_extreme}/{len(train_ds)} extreme-Re samples "
           f"({_n_extreme/len(train_ds)*100:.1f}%) upweighted {cfg.re_extreme_weight}x "
           f"(log_Re thresholds: [{_re_low:.3f}, {_re_high:.3f}])")
+
+# AoA curriculum: compute difficulty rank for each training sample
+_aoa_rank = None
+_base_sample_weights = None
+if cfg.aoa_curriculum and not cfg.debug:
+    _train_aoa_abs = torch.tensor([abs(train_ds[i][0][0, 14].item()) for i in range(len(train_ds))])
+    _aoa_rank = _train_aoa_abs.argsort().argsort().float() / len(train_ds)  # 0=easiest, 1=hardest
+    _base_sample_weights = sample_weights.clone()
+    print(f"AoA curriculum: warmup={cfg.aoa_curriculum_warmup} epochs, "
+          f"|AoA| range=[{_train_aoa_abs.min():.3f}, {_train_aoa_abs.max():.3f}] rad")
 
 if cfg.debug:
     # Avoid sampler/length mismatch when train_ds is truncated
@@ -1668,6 +1681,20 @@ for epoch in range(MAX_EPOCHS):
         break
 
     t0 = time.time()
+
+    # AoA curriculum: update sampler weights based on epoch progress
+    _curriculum_progress = None
+    if _aoa_rank is not None and not cfg.debug:
+        if epoch < cfg.aoa_curriculum_warmup:
+            _curriculum_progress = epoch / cfg.aoa_curriculum_warmup
+            temperature = 0.1 + 0.9 * _curriculum_progress  # 0.1 -> 1.0
+            curriculum_weights = torch.sigmoid((temperature - _aoa_rank) / 0.1)
+            curriculum_weights = curriculum_weights / curriculum_weights.mean()  # normalize to mean=1
+            sampler.weights = _base_sample_weights * curriculum_weights.double()
+        else:
+            _curriculum_progress = 1.0
+            if epoch == cfg.aoa_curriculum_warmup:
+                sampler.weights = _base_sample_weights  # revert to base weights (uniform)
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
@@ -2409,13 +2436,16 @@ for epoch in range(MAX_EPOCHS):
     _do_val = (epoch + 1) % cfg.val_every == 0 or epoch == 0 or epoch == MAX_EPOCHS - 1
     if not _do_val:
         dt = time.time() - t0
-        wandb.log({
+        _skip_log = {
             "train/vol_loss": epoch_vol,
             "train/surf_loss": epoch_surf,
             "epoch_time_s": dt,
             "lr": scheduler.get_last_lr()[0],
             "global_step": global_step,
-        })
+        }
+        if _curriculum_progress is not None:
+            _skip_log["curriculum/progress"] = _curriculum_progress
+        wandb.log(_skip_log)
         print(f"Epoch {epoch+1:3d} ({dt:.0f}s)  train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  [val skipped]")
         continue
 
@@ -2789,6 +2819,8 @@ for epoch in range(MAX_EPOCHS):
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
+    if _curriculum_progress is not None:
+        metrics["curriculum/progress"] = _curriculum_progress
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
