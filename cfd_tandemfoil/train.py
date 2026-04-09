@@ -1241,6 +1241,7 @@ class Config:
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
     # Panel-method Cp feature: inviscid Cp as physics-grounded input (+1 input channel)
     cp_panel: bool = False                 # append thin-airfoil inviscid Cp to input features
+    cp_panel_tandem_only: bool = False     # zero Cp feature for single-foil samples (tandem benefit only)
 
 
 cfg = sp.parse(Config)
@@ -1851,6 +1852,7 @@ for epoch in range(MAX_EPOCHS):
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
+        _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B] tandem flag from raw gap
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
@@ -1899,6 +1901,8 @@ for epoch in range(MAX_EPOCHS):
         x = torch.cat([x, fourier_pe], dim=-1)
         if cfg.cp_panel:
             cp_feat = compute_cp_panel(_raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te)
+            if cfg.cp_panel_tandem_only:
+                cp_feat = cp_feat * _is_tandem_raw[:, None, None]
             x = torch.cat([x, cp_feat], dim=-1)
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
@@ -2549,6 +2553,7 @@ for epoch in range(MAX_EPOCHS):
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
+                _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
                 _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
@@ -2592,6 +2597,8 @@ for epoch in range(MAX_EPOCHS):
                 x = torch.cat([x, fourier_pe], dim=-1)
                 if cfg.cp_panel:
                     cp_feat = compute_cp_panel(_raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te)
+                    if cfg.cp_panel_tandem_only:
+                        cp_feat = cp_feat * _is_tandem_raw[:, None, None]
                     x = torch.cat([x, cp_feat], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
@@ -2970,6 +2977,7 @@ if best_metrics:
                     _raw_xy_te_vis = x_dev[:, :, :2].clone() if _need_te_raw_vis else None
                     _raw_saf_norm_te_vis = x_dev[:, :, 2:4].norm(dim=-1) if _need_te_raw_vis else None
                     _raw_aoa_vis = x_dev[:, 0, 14:15]  # AoA0_rad [B, 1]
+                    _is_tandem_raw_vis = (x_dev[:, 0, 22].abs() > 0.01).float()  # [B]
                     _raw_gap_wake_vis = x_dev[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
                     x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                     curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
@@ -2999,6 +3007,8 @@ if best_metrics:
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
                     if cfg.cp_panel:
                         cp_feat = compute_cp_panel(_raw_xy_te_vis, _raw_aoa_vis, is_surf_dev, _raw_saf_norm_te_vis)
+                        if cfg.cp_panel_tandem_only:
+                            cp_feat = cp_feat * _is_tandem_raw_vis[:, None, None]
                         x_n = torch.cat([x_n, cp_feat], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
                     pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
@@ -3085,6 +3095,7 @@ if cfg.surface_refine and best_metrics:
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
+                    _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
                     _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel
                     _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
@@ -3119,6 +3130,8 @@ if cfg.surface_refine and best_metrics:
                     x = torch.cat([x, fourier_pe], dim=-1)
                     if cfg.cp_panel:
                         cp_feat = compute_cp_panel(_raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te)
+                        if cfg.cp_panel_tandem_only:
+                            cp_feat = cp_feat * _is_tandem_raw[:, None, None]
                         x = torch.cat([x, cp_feat], dim=-1)
 
                     # Ground truth denormalization reference
