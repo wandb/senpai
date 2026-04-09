@@ -303,6 +303,65 @@ def compute_te_features(raw_xy, is_surface, saf_norm):
     return torch.stack([dx_fore, dy_fore, r_fore, dx_aft, dy_aft, r_aft], dim=-1), fore_te_x, fore_te_y
 
 
+@torch.compiler.disable
+def compute_shortest_vector(raw_xy, is_surface, saf_norm, is_tandem):
+    """Compute 2D displacement vector from each node to nearest foil surface point.
+
+    Based on the Shortest Vector (SV) representation from Lam et al. (ICML 2024).
+    For tandem configs, computes distance to BOTH foils and picks the nearest.
+
+    Args:
+        raw_xy:     [B, N, 2] node positions (raw, before normalization)
+        is_surface: [B, N] bool — surface node mask (both foils)
+        saf_norm:   [B, N] float — signed arc-length field norm (foil1 ≈ 0, foil2 > 0.005)
+        is_tandem:  [B] bool — whether each sample is tandem
+
+    Returns:
+        sv: [B, N, 2] shortest displacement vector to nearest surface point
+    """
+    B, N, _ = raw_xy.shape
+    sv = torch.zeros(B, N, 2, device=raw_xy.device, dtype=raw_xy.dtype)
+
+    for b in range(B):
+        pos = raw_xy[b]  # [N, 2]
+        surf_mask = is_surface[b]  # [N]
+        if surf_mask.sum() == 0:
+            continue
+
+        if is_tandem[b]:
+            # Split surface into foil1 (saf_norm ≤ 0.005) and foil2 (saf_norm > 0.005)
+            foil1_mask = surf_mask & (saf_norm[b] <= 0.005)
+            foil2_mask = surf_mask & (saf_norm[b] > 0.005)
+
+            surf_pos_list = []
+            if foil1_mask.any():
+                surf_pos_list.append(pos[foil1_mask])  # [S1, 2]
+            if foil2_mask.any():
+                surf_pos_list.append(pos[foil2_mask])  # [S2, 2]
+
+            if len(surf_pos_list) == 0:
+                continue
+            all_surf = torch.cat(surf_pos_list, dim=0)  # [S1+S2, 2]
+        else:
+            all_surf = pos[surf_mask]  # [S, 2]
+
+        # Subsample surface points if too many (for memory efficiency)
+        max_surf = 512
+        if all_surf.shape[0] > max_surf:
+            idx = torch.randperm(all_surf.shape[0], device=all_surf.device)[:max_surf]
+            all_surf = all_surf[idx]
+
+        # Compute displacement from every node to every surface point
+        diffs = all_surf.unsqueeze(0) - pos.unsqueeze(1)  # [N, S, 2]
+        dists = diffs.norm(dim=-1)  # [N, S]
+        nearest_idx = dists.argmin(dim=-1)  # [N]
+
+        # Gather displacement vectors to nearest surface point
+        sv[b] = diffs[torch.arange(N, device=pos.device), nearest_idx]  # [N, 2]
+
+    return sv
+
+
 def compute_wake_deficit_features(raw_xy, is_surface, saf_norm, gap_raw, fore_te_x=None, fore_te_y=None):
     """Compute gap-normalized fore-TE offset features for wake coupling.
 
@@ -1170,6 +1229,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    shortest_vector_feature: bool = False   # 2D displacement vector to nearest foil surface (+2 input channels)
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
@@ -1318,7 +1378,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + (2 if cfg.shortest_vector_feature else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], [+sv], +32 fourier PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1786,8 +1846,8 @@ for epoch in range(MAX_EPOCHS):
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
-        # TE coordinate frame / wake deficit: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature
+        # TE coordinate frame / wake deficit / shortest vector: save raw xy and saf_norm before normalization
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.shortest_vector_feature
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
@@ -1799,6 +1859,11 @@ for epoch in range(MAX_EPOCHS):
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
+        # Shortest vector feature: compute BEFORE normalization using raw positions
+        _sv_feats = None
+        if cfg.shortest_vector_feature:
+            _sv_is_tandem = (x[:, 0, 22].abs() > 0.01)
+            _sv_feats = compute_shortest_vector(_raw_xy_te, is_surface, _raw_saf_norm_te, _sv_is_tandem)
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -1819,6 +1884,8 @@ for epoch in range(MAX_EPOCHS):
                 wake_feats = compute_wake_deficit_features(
                     _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
                 x = torch.cat([x, wake_feats], dim=-1)
+        if _sv_feats is not None:
+            x = torch.cat([x, _sv_feats], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2478,10 +2545,14 @@ for epoch in range(MAX_EPOCHS):
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
-                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature
+                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.shortest_vector_feature
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
                 _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
+                _sv_feats = None
+                if cfg.shortest_vector_feature:
+                    _sv_is_tandem = (x[:, 0, 22].abs() > 0.01)
+                    _sv_feats = compute_shortest_vector(_raw_xy_te, is_surface, _raw_saf_norm_te, _sv_is_tandem)
                 # Aft-foil mask for eval (same logic as training)
                 _eval_aft_mask = None
                 if eval_aft_srf_head is not None:
@@ -2509,6 +2580,8 @@ for epoch in range(MAX_EPOCHS):
                         wake_feats = compute_wake_deficit_features(
                             _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
                         x = torch.cat([x, wake_feats], dim=-1)
+                if _sv_feats is not None:
+                    x = torch.cat([x, _sv_feats], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2892,10 +2965,14 @@ if best_metrics:
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
-                    _need_te_raw_vis = cfg.te_coord_frame or cfg.wake_deficit_feature
+                    _need_te_raw_vis = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.shortest_vector_feature
                     _raw_xy_te_vis = x_dev[:, :, :2].clone() if _need_te_raw_vis else None
                     _raw_saf_norm_te_vis = x_dev[:, :, 2:4].norm(dim=-1) if _need_te_raw_vis else None
                     _raw_gap_wake_vis = x_dev[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
+                    _sv_feats_vis = None
+                    if cfg.shortest_vector_feature:
+                        _sv_is_tandem_vis = (x_dev[:, 0, 22].abs() > 0.01)
+                        _sv_feats_vis = compute_shortest_vector(_raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis, _sv_is_tandem_vis)
                     x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                     curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                     if cfg.te_coord_frame:
@@ -2913,6 +2990,8 @@ if best_metrics:
                             wake_feats_vis = compute_wake_deficit_features(
                                 _raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis, _raw_gap_wake_vis)
                             x_n = torch.cat([x_n, wake_feats_vis], dim=-1)
+                    if _sv_feats_vis is not None:
+                        x_n = torch.cat([x_n, _sv_feats_vis], dim=-1)
                     # Fourier PE (must match training loop)
                     raw_xy = x_n[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
@@ -3007,10 +3086,14 @@ if cfg.surface_refine and best_metrics:
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
-                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature
+                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.shortest_vector_feature
                     _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
                     _raw_gap_wake_vv = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
+                    _sv_feats_vv = None
+                    if cfg.shortest_vector_feature:
+                        _sv_is_tandem_vv = (x[:, 0, 22].abs() > 0.01)
+                        _sv_feats_vv = compute_shortest_vector(_raw_xy_te, is_surface, _raw_saf_norm_te, _sv_is_tandem_vv)
                     x = (x - stats["x_mean"]) / stats["x_std"]
                     curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
                     if cfg.foil2_dist:
@@ -3031,6 +3114,8 @@ if cfg.surface_refine and best_metrics:
                             wake_feats_vv = compute_wake_deficit_features(
                                 _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake_vv)
                             x = torch.cat([x, wake_feats_vv], dim=-1)
+                    if _sv_feats_vv is not None:
+                        x = torch.cat([x, _sv_feats_vv], dim=-1)
                     raw_xy = x[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
                     xy_max = raw_xy.amax(dim=1, keepdim=True)
