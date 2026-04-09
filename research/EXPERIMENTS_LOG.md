@@ -2,6 +2,42 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 12:33 — PR #2320: Spectral Arc-Length Loss — askeladd — **CLOSED** ❌
+
+- Branch: `askeladd/spectral-arc-length-loss`
+- Hypothesis: FFT on arc-length-sorted surface pressure nodes with frequency^gamma weighting.
+- W&B runs: `z9fvhp17` (s42, 144 epochs), `ro4kwbp0` (s73, 146 epochs)
+- W&B group: `spectral-arc-length-loss`
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 11.610 | **-1.1%** ≈ |
+| p_oodc | 7.643 | 7.742 | **+1.3%** ❌ |
+| p_tan | 27.874 | 28.179 | **+1.1%** ❌ |
+| p_re | 6.419 | 6.494 | **+1.2%** ❌ |
+
+**Analysis:** Essentially neutral — small p_in improvement offset by slight regressions elsewhere. Redundant with existing DCT frequency loss: both target spectral information on surface pressure. Arc-length ordering via angle-from-centroid is only an approximation. **Spectral loss approaches add nothing beyond existing DCT freq loss.**
+
+---
+
+### 2026-04-09 12:33 — PR #2321: Sobolev Gradient Loss — fern — **CLOSED** ❌
+
+- Branch: `fern/sobolev-gradient-loss`
+- Hypothesis: Finite-difference dCp/ds derivative supervision on arc-length-sorted surface nodes.
+- W&B runs: `xiig87m2` (s42, 144 epochs), `mjx9nn19` (s73, 145 epochs)
+- W&B group: `sobolev-gradient-loss`
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 12.353 | **+5.2%** ❌ |
+| p_oodc | 7.643 | 7.838 | **+2.6%** ❌ |
+| p_tan | 27.874 | 30.526 | **+9.5%** ❌ |
+| p_re | 6.419 | 6.421 | **+0.03%** ≈ |
+
+**Analysis:** Severe p_tan regression (+9.5%). Noisy finite-difference gradients on non-uniform mesh create harmful loss signal. Conflicts with existing DCT frequency loss (both target spectral/derivative information). The ds normalization amplifies noise from variable node spacing. **Surface derivative losses are not viable on our non-uniform meshes.**
+
+---
+
 ### 2026-04-09 12:15 — PR #2322: Test-Time Norm Adaptation — nezuko — **CLOSED** ❌
 
 - Branch: `nezuko/test-time-norm-adaptation`
