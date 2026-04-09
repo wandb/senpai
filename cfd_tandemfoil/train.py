@@ -139,7 +139,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
 
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
                  linear_no_attention=False, learned_kernel=False,
-                 decouple_slice=False, zone_temp=False, prog_slices=False):
+                 decouple_slice=False, zone_temp=False, prog_slices=False,
+                 se_slice_token=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -154,6 +155,12 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.decouple_slice = decouple_slice
         self.zone_temp = zone_temp
         self.prog_slices = prog_slices
+        self.se_slice = se_slice_token
+        if se_slice_token:
+            bottleneck = max(dim_head // 4, 8)
+            self.se_slice_fc1 = nn.Linear(dim_head, bottleneck)
+            self.se_slice_fc2 = nn.Linear(bottleneck, dim_head, bias=False)
+            nn.init.zeros_(self.se_slice_fc2.weight)  # Zero-init: starts as identity
         if prog_slices:
             # Buffer for masking inactive slices; updated per-epoch by training loop
             self.register_buffer('slice_mask', torch.zeros(slice_num))
@@ -225,6 +232,13 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
+
+        # SE recalibration on slice tokens
+        if self.se_slice:
+            # slice_token shape: [bsz, heads, n_slices, dim_head]
+            se_in = slice_token.mean(dim=2)  # Pool over slices → [bsz, heads, dim_head]
+            se_gate = torch.sigmoid(self.se_slice_fc2(F.gelu(self.se_slice_fc1(se_in))))  # [bsz, heads, dim_head]
+            slice_token = slice_token * se_gate.unsqueeze(2)  # [bsz, heads, n_slices, dim_head]
 
         if self.linear_no_attention:
             out_slice_token = slice_token
@@ -377,6 +391,7 @@ class TransolverBlock(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         spatial_bias_input_dim=4,
+        se_slice_token=False,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -402,6 +417,7 @@ class TransolverBlock(nn.Module):
             decouple_slice=decouple_slice,
             zone_temp=zone_temp,
             prog_slices=prog_slices,
+            se_slice_token=se_slice_token,
         )
         if adaln_all:
             # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
@@ -794,6 +810,7 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        se_slice_token=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
@@ -866,6 +883,7 @@ class Transolver(nn.Module):
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
                     spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
+                    se_slice_token=se_slice_token,
                 )
                 for idx in range(n_layers)
             ]
@@ -1173,6 +1191,8 @@ class Config:
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
+    # SE channel attention on slice tokens inside PhysicsAttention
+    se_slice_token: bool = False           # apply SE recalibration to slice tokens
 
 
 cfg = sp.parse(Config)
@@ -1348,6 +1368,7 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    se_slice_token=cfg.se_slice_token,
 )
 
 model = Transolver(**model_config).to(device)
@@ -2792,6 +2813,18 @@ for epoch in range(MAX_EPOCHS):
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
+    # Log SE slice token gate stats
+    if cfg.se_slice_token:
+        _se_weights = []
+        for blk in _base_model.blocks:
+            if hasattr(blk.attn, 'se_slice_fc2'):
+                w = blk.attn.se_slice_fc2.weight.detach()
+                _se_weights.append(w)
+        if _se_weights:
+            _all_w = torch.cat([w.flatten() for w in _se_weights])
+            metrics["se_slice/weight_mean"] = _all_w.mean().item()
+            metrics["se_slice/weight_std"] = _all_w.std().item()
+            metrics["se_slice/weight_absmax"] = _all_w.abs().max().item()
     wandb.log(metrics)
 
     if torch.cuda.is_available():
