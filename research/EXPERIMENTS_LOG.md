@@ -2,6 +2,57 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 19:55 — PR #2328 v2: AoA Curriculum warmup=20 — fern — **CLOSED** ❌
+
+- Branch: `fern/aoa-curriculum-training`
+- Hypothesis: Shorter warmup=20 (vs v1 warmup=40) preserves p_oodc improvement while reducing p_tan regression.
+- W&B runs: fern/aoa-curriculum-w20 (s42, s73) — second set after pod restart
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.709 | 11.793 | **+0.7%** ❌ |
+| p_oodc | 7.544 | 7.604 | **+0.8%** ❌ |
+| p_tan | 27.402 | 29.008 | **+5.9%** ❌ |
+| p_re | 6.481 | 6.559 | **+1.2%** ❌ |
+
+**Analysis:** v2 regresses even p_oodc (which was -5.1% in v1). Shorter warmup didn't help — the fundamental tradeoff between curriculum benefit and tandem training signal loss is unresolvable. Curriculum approaches are exhausted for this architecture.
+
+---
+
+### 2026-04-09 19:55 — PR #2327 v2: Sample Mixup (fixed mask, α=0.2) — nezuko — **CLOSED** ❌
+
+- Branch: `nezuko/node-mixup-augmentation`
+- Hypothesis: Fixed surface mask (use sample A's mask instead of intersection) resolves the near-empty mask problem from v1.
+- W&B runs: nezuko/mixup-v2-a0.2 (s42, s73)
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.709 | 16.356 | **+39.7%** ❌ |
+| p_oodc | 7.544 | 13.891 | **+84.1%** ❌ |
+| p_tan | 27.402 | 34.542 | **+26.1%** ❌ |
+| p_re | 6.481 | 9.970 | **+53.8%** ❌ |
+
+**Analysis:** Catastrophic. Even with fixed surface mask, interpolating different airfoil geometry+flow pairs produces physically meaningless training samples. The model can't learn from interpolated data where geometry, flow topology, and surface mesh are all mixed. Sample mixup is fundamentally incompatible with CFD surrogate tasks.
+
+---
+
+### 2026-04-09 19:55 — PR #2335: Gradient Accumulation 2x — alphonse — **CLOSED** ❌
+
+- Branch: `alphonse/gradient-accumulation-2x`
+- Hypothesis: Doubling effective batch size via 2-step gradient accumulation smooths optimization and may improve generalization.
+- W&B runs: `xfx7x5d8` (s42), `vgasoa4b` (s73)
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.709 | 12.874 | **+10.0%** ❌ |
+| p_oodc | 7.544 | 8.457 | **+12.1%** ❌ |
+| p_tan | 27.402 | 29.495 | **+7.6%** ❌ |
+| p_re | 6.481 | 7.565 | **+16.7%** ❌ |
+
+**Analysis:** All metrics regressed 8-17%. The current batch size is well-tuned — more frequent gradient updates are better than larger effective batches. The model benefits from noisy small-batch gradients for regularization. Gradient accumulation is exhausted.
+
+---
+
 ### 2026-04-09 18:42 — PR #2319 v3: Panel-Method Cp Feature (×0.1 scale) — thorfinn — **MERGED** ✅
 
 - Branch: `thorfinn/panel-method-cp-feature`
