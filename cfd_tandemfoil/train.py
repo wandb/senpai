@@ -1173,6 +1173,9 @@ class Config:
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
+    # Test-Time Normalization Adaptation (TTA)
+    tta_steps: int = 0                     # TTA gradient steps per val batch (0=disabled)
+    tta_lr: float = 1e-3                   # learning rate for TTA optimizer
 
 
 cfg = sp.parse(Config)
@@ -1655,6 +1658,63 @@ ema_val_loss = float("inf")
 ema_decay_val = 0.9
 best_metrics = {}
 global_step = 0
+def predict_with_tta(tta_model, x_batch, tta_steps, tta_lr):
+    """Test-time normalization adaptation: briefly fine-tune LayerNorm params, then predict.
+
+    Collects all LayerNorm/DomainLayerNorm weight/bias tensors, saves them, runs
+    tta_steps gradient steps minimizing prediction variance on the pressure channel
+    (a self-supervised signal — a well-adapted model should be confident/low-variance),
+    produces a prediction, then restores original params.
+
+    Returns: pred dict (same structure as eval_model({"x": x}))
+    """
+    # Collect LayerNorm parameters (scale and bias only, ndim <= 1)
+    # Works for both nn.LayerNorm (.weight/.bias) and DomainLayerNorm (.ln_single/.ln_tandem)
+    _tta_params = []
+    _tta_base = tta_model._orig_mod if hasattr(tta_model, '_orig_mod') else tta_model
+    for name, param in _tta_base.named_parameters():
+        lower = name.lower()
+        if any(k in lower for k in ['ln_', 'layernorm', 'layer_norm', 'norm']) and \
+                param.requires_grad and param.ndim <= 1:
+            _tta_params.append(param)
+
+    if not _tta_params or tta_steps <= 0:
+        tta_model.eval()
+        with torch.no_grad():
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                return tta_model({"x": x_batch})
+
+    # Save original values
+    _orig_vals = [p.data.clone() for p in _tta_params]
+
+    # TTA: minimize prediction variance on the pressure channel (index 2)
+    # Use enable_grad() to ensure gradients flow even if called inside torch.no_grad() context
+    tta_model.train()
+    _tta_opt = torch.optim.Adam(_tta_params, lr=tta_lr)
+    with torch.enable_grad():
+        for _ in range(tta_steps):
+            _tta_opt.zero_grad()
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                _out = tta_model({"x": x_batch})
+            _pred = _out["preds"].float()
+            # Variance across nodes for pressure channel — low variance = confident predictions
+            _tta_loss = _pred[:, :, 2].var(dim=1).mean()
+            _tta_loss.backward()
+            _tta_opt.step()
+
+    # Final prediction after adaptation
+    tta_model.eval()
+    with torch.no_grad():
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            _adapted_out = tta_model({"x": x_batch})
+
+    # Restore original params (don't contaminate across batches)
+    for param, orig in zip(_tta_params, _orig_vals):
+        param.data.copy_(orig)
+
+    return _adapted_out
+
+
 train_start = time.time()
 prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
@@ -2582,12 +2642,13 @@ for epoch in range(MAX_EPOCHS):
                 else:
                     y_norm_scaled = y_norm / sample_stds
 
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    _eval_out = eval_model({"x": x})
-                    pred = _eval_out["preds"]
-                    _eval_hidden = _eval_out["hidden"]
-                pred = pred.float()
-                _eval_hidden = _eval_hidden.float()
+                if cfg.tta_steps > 0:
+                    _eval_out = predict_with_tta(eval_model, x, cfg.tta_steps, cfg.tta_lr)
+                else:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _eval_out = eval_model({"x": x})
+                pred = _eval_out["preds"].float()
+                _eval_hidden = _eval_out["hidden"].float()
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
                 else:
