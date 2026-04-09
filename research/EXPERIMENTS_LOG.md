@@ -2,6 +2,25 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 10:30 — PR #2317: FV Cell Area Loss Weight — edward — **CLOSED** ❌
+
+- Branch: `edward/fv-cell-area-loss-weight`
+- Hypothesis: Weight per-node loss by FV cell area (kNN density) to correct structural bias toward far-field nodes.
+- W&B runs: v1 (`smvfk2sr`, `gdnkzmz3`), v2 (`d0tu6ax4`, `j5ya1mqg`), v3 (crashed), v4 (`noe8afzw`, `7eb4um80` — still running when closed)
+- 4 iterations attempted, all catastrophic
+
+| Version | p_in (best seed) | val_loss (best) | Status |
+|---------|-----------------|-----------------|--------|
+| v1 | 870-930 | 6.9-11.3 | Catastrophic |
+| v2 | 856-866 | 6.5-9.9 | Catastrophic |
+| v3 | — | — | Crashed |
+| v4 | Running | Running | Closed |
+| **Baseline** | **11.74** | **~0.37** | — |
+
+**Analysis:** FV cell area weighting completely destabilized training — p_in values 70-80× worse than baseline across all attempts. The extreme range of cell areas (surface cells 100-1000× smaller than far-field) after normalization creates catastrophic weight variation that overwhelms the tuned loss landscape. The paper (Hao et al., 2024) used a fundamentally different architecture where area weighting was integrated from scratch. **FV cell area weighting is incompatible with our loss pipeline.**
+
+---
+
 ### 2026-04-09 10:00 — PR #2319: Panel-Method Cp Feature — thorfinn — **SENT BACK** 🔄
 
 - Branch: `thorfinn/panel-method-cp-feature`
