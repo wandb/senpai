@@ -2,6 +2,57 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 09:00 — PR #2314: SE Channel Attention on Slice Tokens — nezuko — **CLOSED** ❌
+
+- Branch: `nezuko/se-slice-token-attention`
+- Hypothesis: Squeeze-Excite channel recalibration on slice token embeddings inside PhysicsAttention. Learn channel-wise importance weights conditioned on global context.
+- W&B runs: `kswkgdcn` (s42, 146 epochs), `hukdqxtc` (s73)
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 11.827 | **+0.72%** ❌ |
+| p_oodc | 7.643 | 7.621 | **-0.29%** ✅ (noise) |
+| p_tan | 27.874 | 28.748 | **+3.14%** ❌ |
+| p_re | 6.419 | 6.390 | **-0.45%** ✅ (noise) |
+
+**Analysis:** SE recalibration on slice tokens adds expressiveness to attention but hurts tandem transfer (+3.14%). This is consistent with the pattern across all recent attention mechanism modifications — the shared K/V attention is already well-tuned OOD regularization; additional recalibration competes with this inductive bias. Small p_oodc/p_re gains are within noise. **Direction closed: attention modifications consistently hurt p_tan.**
+
+---
+
+### 2026-04-09 09:00 — PR #2311: Condition Token Injection v2 (no log_Re) — fern — **CLOSED** ❌
+
+- Branch: `fern/condition-token-injection`
+- Hypothesis: Global condition MLP embedding (AoA, Re, gap, stagger) injected additively into backbone — v2 removes log_Re to fix p_re regression from v1.
+- W&B runs: `ae46ko5c` (s42), `f62xdnfx` (s73) [Round 2]
+
+| Metric | Baseline (#2290) | Round 1 (w/ logRe) | Round 2 (no logRe) | Δ R2 |
+|--------|-----------------|--------------------|--------------------|------|
+| p_in | 11.742 | 11.745 | 11.675 | **-0.58%** ✅ |
+| p_oodc | 7.643 | 7.505 | 7.683 | **+0.52%** ❌ |
+| p_tan | 27.874 | 28.002 | 28.881 | **+3.61%** ❌ |
+| p_re | 6.419 | 6.491 | 6.522 | **+1.60%** ❌ |
+
+**Analysis:** Round 1 showed p_oodc -1.8% but p_re +1.1%. Removing log_Re (Round 2) killed the p_oodc gain and catastrophically worsened p_tan (+3.6%). Key insight: the condition token provides useful OOD-condition interpolation signal but hurts tandem extrapolation regardless of configuration. The log_Re was helping OOD-condition, not hurting it. Structural tension: condition token enables interpolation shortcuts that hurt generalization. **Direction closed.**
+
+---
+
+### 2026-04-09 09:00 — PR #2308: Auxiliary AoA Prediction Head v2 (w=0.02) — askeladd — **CLOSED** ❌
+
+- Branch: `askeladd/aux-aoa-prediction-head`
+- Hypothesis: Auxiliary AoA decoding head from penultimate block pool. v1 (w=0.05) showed p_in -1.5% but p_tan +3.7%. v2 reduced weight to 0.02.
+- W&B runs v1: `zn3hpljc` (s42), `23k1dzfh` (s73); v2: `vkruyms8` (s42), `sef8tsoe` (s73)
+
+| Metric | Baseline (#2290) | v1 (w=0.05) | v2 (w=0.02) |
+|--------|-----------------|-------------|-------------|
+| p_in | 11.742 | **11.562 (-1.5%)** ✅ | 12.115 (+3.2%) ❌ |
+| p_oodc | 7.643 | 7.712 (+0.9%) | 7.597 (-0.6%) |
+| p_tan | 27.874 | 28.896 (+3.7%) ❌ | 28.229 (+1.3%) ❌ |
+| p_re | 6.419 | 6.473 (+0.8%) | 6.421 (0.0%) |
+
+**Analysis:** v1 showed genuine p_in improvement but unacceptable p_tan regression. Reducing weight (v2) removed the p_in gain while p_tan regression persisted. AoA head competes with pressure supervision — the nominal AoA target ignores downwash and is structurally wrong for tandem. Two weight values tested, neither beats baseline. **Direction exhausted: auxiliary regression heads consistently hurt p_tan.**
+
+---
+
 ### 2026-04-09 10:00 — PR #2312: GradNorm Adaptive Loss Weighting — alphonse — **CLOSED** ❌
 
 - Branch: `alphonse/gradnorm-adaptive-weighting`
