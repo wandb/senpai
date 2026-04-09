@@ -2,6 +2,40 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 16:05 — PR #2331: Local Reynolds Feature — frieren — **CLOSED** ❌
+
+- Branch: `frieren/local-reynolds-feature`
+- Hypothesis: Re_x = Re × chord_fraction per surface node as physics-informed input feature.
+- W&B runs: `z21pbxdo` (s42), `g7355k1g` (s73)
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 12.366 | **+5.3%** ❌ |
+| p_oodc | 7.643 | 7.592 | **-0.7%** ≈ |
+| p_tan | 27.874 | 28.045 | **+0.6%** ≈ |
+| p_re | 6.419 | 6.591 | **+2.7%** ❌ |
+
+**Analysis:** Marginal p_oodc improvement swamped by p_in +5.3% regression. Local Re_x is essentially Re × chord_position — redundant with TE coordinate frame features. Transformers can compute this multiplicative interaction internally.
+
+---
+
+### 2026-04-09 16:05 — PR #2330: Boundary Layer Proxy Feature — alphonse — **CLOSED** ❌
+
+- Branch: `alphonse/boundary-layer-proxy-feature`
+- Hypothesis: Wall-normal distance and surface proximity as input features encoding BL state.
+- W&B runs: `ve85sqfu` (s42), `6na7zafa` (s73)
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 14.500 | **+23.5%** ❌ |
+| p_oodc | 7.643 | 9.089 | **+18.9%** ❌ |
+| p_tan | 27.874 | 29.473 | **+5.7%** ❌ |
+| p_re | 6.419 | 7.384 | **+15.0%** ❌ |
+
+**Analysis:** Severe regression. BL proxy features are redundant with DSDF (which already encodes distance-from-surface). torch.cdist computation likely caused significant slowdown, reducing effective epochs. DSDF is a better encoding of the same information.
+
+---
+
 ### 2026-04-09 15:52 — PR #2328: AoA Curriculum Training — fern — **SENT BACK** 🔄
 
 - Branch: `fern/aoa-curriculum-training`
