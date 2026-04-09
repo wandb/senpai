@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 13:42 — PR #2319: Panel-Method Cp Feature v2 (tandem-only) — thorfinn — **SENT BACK** 🔄
+
+- Branch: `thorfinn/panel-method-cp-feature`
+- Hypothesis: v2 — apply panel Cp feature only to tandem samples (zero for single-foil).
+- W&B runs: `1gi5x4oc` (s42), `z03994yc` (s73)
+- W&B group: `panel-method-cp-feature`
+
+| Metric | v1 avg | v2 (tandem-only) avg | Baseline (#2290) | v2 Δ |
+|--------|--------|---------------------|-----------------|------|
+| p_in | 12.354 | 12.265 | 11.742 | +4.5% ❌ |
+| p_oodc | 7.576 | **7.426** | 7.643 | **-2.8%** ✅ |
+| p_tan | 26.918 | **27.063** | 27.874 | **-2.9%** ✅ |
+| p_re | 6.471 | 6.432 | 6.419 | +0.2% ≈ |
+
+**Analysis:** Tandem-only dramatically improved p_oodc (-2.8% vs -0.9% in v1) while maintaining p_tan improvement and flattening p_re. The p_in regression reduced from +5.2% to +4.5% but remains the blocker. Sent back for v3: scale the panel Cp by 0.1 for tandem samples to further reduce its influence on shared representation.
+
+---
+
 ### 2026-04-09 13:37 — PR #2325: KAN Surface Decoder — tanjiro — **CLOSED** ❌
 
 - Branch: `tanjiro/kan-surface-decoder`
