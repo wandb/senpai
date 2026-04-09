@@ -794,10 +794,12 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        multi_scale_skip=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
+        self.multi_scale_skip = multi_scale_skip
         self.pressure_first = pressure_first
         self.ref = ref
         self.unified_pos = unified_pos
@@ -885,6 +887,17 @@ class Transolver(nn.Module):
             nn.Linear(n_hidden, 1),
         )
         self.initialize_weights()
+        # Multi-scale skip connections: FPN-style projections from intermediate blocks to output
+        if multi_scale_skip:
+            n_intermediate = max(n_layers - 1, 1)  # blocks[:-1]
+            self.skip_heads = nn.ModuleList([
+                nn.Linear(n_hidden, out_dim, bias=False) for _ in range(n_intermediate)
+            ])
+            self.skip_scales = nn.ParameterList([
+                nn.Parameter(torch.zeros(1)) for _ in range(n_intermediate)
+            ])
+            for head in self.skip_heads:
+                nn.init.zeros_(head.weight)
         self.out_skip = nn.Linear(n_hidden, out_dim)
         nn.init.zeros_(self.out_skip.weight)
         nn.init.zeros_(self.out_skip.bias)
@@ -992,8 +1005,11 @@ class Transolver(nn.Module):
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
+        _block_outputs = [] if self.multi_scale_skip else None
         for block in self.blocks[:-1]:
             fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+            if _block_outputs is not None:
+                _block_outputs.append(fx)
 
         # Deep hidden representation (post all non-last blocks, pre output head)
         fx_deep = fx  # [B, N, n_hidden]
@@ -1018,6 +1034,12 @@ class Transolver(nn.Module):
 
         gate = self.skip_gate(fx_pre)
         fx = fx + gate * self.out_skip(fx_pre)
+        # Multi-scale skip: add zero-init projections from intermediate block outputs
+        if self.multi_scale_skip and _block_outputs is not None:
+            for i, (block_out, head, scale) in enumerate(
+                zip(_block_outputs, self.skip_heads, self.skip_scales)
+            ):
+                fx = fx + head(block_out) * scale  # scale starts at 0.0
         self._validate_output_dims(fx)
         return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred, "hidden": fx_deep}
 
@@ -1170,6 +1192,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    multi_scale_skip: bool = False         # FPN-style skip connections from intermediate blocks to output
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
@@ -1348,6 +1371,7 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    multi_scale_skip=cfg.multi_scale_skip,
 )
 
 model = Transolver(**model_config).to(device)
@@ -2335,7 +2359,11 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _skip_log = {}
+        if cfg.multi_scale_skip:
+            for i, s in enumerate(_base_model.skip_scales):
+                _skip_log[f"skip_scale_{i}"] = s.item()
+        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step, **_skip_log})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
