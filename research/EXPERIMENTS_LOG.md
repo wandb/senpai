@@ -2,6 +2,24 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 15:52 — PR #2328: AoA Curriculum Training — fern — **SENT BACK** 🔄
+
+- Branch: `fern/aoa-curriculum-training`
+- Hypothesis: Train on low-AoA (easy) samples first, ramp to full distribution over 40 epochs.
+- W&B runs: `bhgjjq1c` (s42, 145 epochs), `wp2tbh73` (s73, 146 epochs)
+- W&B group: `aoa-curriculum-training`
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 11.687 | **-0.5%** ✅ |
+| p_oodc | 7.643 | **7.252** | **-5.1%** ✅✅ |
+| p_tan | 27.874 | 28.859 | **+3.5%** ❌ |
+| p_re | 6.419 | 6.500 | **+1.3%** ❌ |
+
+**Analysis:** Largest p_oodc improvement in Phase 6 (-5.1%). Curriculum learning clearly helps OOD-condition generalization by building robust pressure representations early. But 40-epoch warmup deprives tandem/high-AoA samples, regressing p_tan. Sent back for warmup=20 to balance p_oodc benefit vs p_tan damage.
+
+---
+
 ### 2026-04-09 15:34 — PR #2327: Sample Mixup Augmentation — nezuko — **SENT BACK** 🔄
 
 - Branch: `nezuko/node-mixup-augmentation`
