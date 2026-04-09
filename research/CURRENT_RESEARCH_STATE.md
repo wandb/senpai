@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-09 12:55 UTC
+- **Date:** 2026-04-09 16:50 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training & Architecture Improvements
 
@@ -24,55 +24,77 @@
 | p_tan | **29.1** |
 | p_re | **5.8** |
 
-## Student Status (2026-04-09 12:55 UTC)
+## Student Status (2026-04-09 16:50 UTC)
 
-| Student | PR | Experiment | Status |
-|---------|-----|-----------|--------|
-| tanjiro | #2325 | **KAN Surface Decoder** | TRAINING (2 seeds, started 10:02, ETA ~13:02) |
-| thorfinn | #2319 | **Panel-Method Cp Feature v2 (tandem-only)** | TRAINING (2 seeds, started 10:39, ETA ~13:39) |
-| edward | #2326 | **Warmup + Cosine Schedule** | IMPLEMENTING |
-| nezuko | #2327 | **Sample Mixup Augmentation** | NEWLY ASSIGNED |
-| fern | #2328 | **AoA Curriculum Training** | NEWLY ASSIGNED |
-| askeladd | #2329 | **Log1p Pressure Target Transform** | NEWLY ASSIGNED |
-| alphonse | #2330 | **Boundary Layer Proxy Feature** | NEWLY ASSIGNED |
-| frieren | #2331 | **Local Reynolds Number Feature** | NEWLY ASSIGNED |
+| Student | PR | Experiment | Status | Notes |
+|---------|-----|-----------|--------|-------|
+| thorfinn | #2319 v3 | **Panel Cp ×0.1 tandem-only** | TRAINING (started 15:24, ETA ~18:24) | Most promising — p_tan/p_oodc gains, testing p_in fix |
+| edward | #2333 | **Wider SRF head 256** | TRAINING (started 15:39, ETA ~18:39) | |
+| tanjiro | #2332 | **Target Noise Regularization** | RESTARTING (pod restarted 16:42) | Val metrics neutral, will re-run |
+| fern | #2328 v2 | **AoA Curriculum warmup=20** | RESTARTING (pod restarted 16:44) | Old runs killed, re-implementing |
+| nezuko | #2327 v2 | **Sample Mixup (fixed mask)** | RESTARTING (pod restarted 16:44) | Old runs killed (~1hr lost), re-implementing |
+| frieren | #2334 | **Checkpoint Soup** | RESTARTING (pod restarted 16:44) | Was doing debug runs, re-implementing |
+| alphonse | #2335 | **Gradient Accumulation 2x** | RESTARTING (pod restarted 16:44) | Newly assigned, will implement fresh |
+| askeladd | #2336 | **Panel Cp + AoA Curriculum Combo** | RESTARTING (pod restarted 16:44) | Newly assigned, will implement fresh |
 
-## Round 34 Results Summary — 7 experiments reviewed
+**NOTE:** 6 pods restarted at 16:42-16:44 to fix stale label issue. Some active training runs were interrupted. All students should re-pick up their correct assignments from fresh pod starts.
 
-**Critical finding: Only one experiment showed ANY improvement — Panel-Method Cp Feature (p_tan -3.4%).**
+## Round 35/36 Results So Far
 
+### Completed/Reviewed
 | PR | Experiment | p_in | p_oodc | p_tan | p_re | Verdict |
 |----|-----------|------|--------|-------|------|---------|
-| #2315 | Tandem Curriculum Ramp | -2.1% | +2.7% | +1.3% | +1.3% | **Closed** (trades p_in for OOD) |
-| #2319 | Panel-Method Cp Feature | +5.2% | -0.9% | **-3.4%** | +0.8% | **Sent back** (iterate: tandem-only) |
-| #2317 | FV Cell Area Loss Weight | 70x worse | — | — | — | **Closed** (catastrophic, 4 iterations) |
-| #2322 | TTA Norm Adaptation | +98% | +87% | +25% | +72% | **Closed** (variance min → constant pred) |
-| #2320 | Spectral Arc-Length Loss | -1.1% | +1.3% | +1.1% | +1.2% | **Closed** (neutral, redundant w/ DCT) |
-| #2321 | Sobolev Gradient Loss | +5.2% | +2.6% | +9.5% | 0% | **Closed** (noisy FD on non-uniform mesh) |
-| #2323 | MoE Output Routing | +12.8% | +16.4% | +10.7% | +7.5% | **Closed** (conflicting signals, gate instability) |
-| #2324 | Inviscid Cp Residual Target | +26% | +66% | +9.3% | +48% | **Closed** (crude thin-airfoil target) |
+| #2325 | KAN Surface Decoder | +4-10% | +1-3% | +6-10% | +1-3% | **Closed** |
+| #2326 | Warmup + Cosine | +1% | +7% | -1% | +1.7% | **Closed** (p_oodc regression) |
+| #2329 | Log1p Pressure Target | +1.5% | -2.7% | +3.4% | +1% | **Closed** (p_tan regression) |
+| #2330 | BL Proxy Feature | +23% | — | — | — | **Closed** (catastrophic) |
+| #2331 | Local Re Feature | +5.3% | -0.7% | +0.6% | +2.7% | **Closed** |
+| #2332 | Target Noise σ=0.01 | -0.15% | -0.16% | +0.33% | -0.30% | **Preliminary** (neutral, val only) |
 
-## Key Insights from Round 34
+### In Progress (awaiting results)
+| PR | Experiment | Expected Completion |
+|----|-----------|-------------------|
+| #2319 v3 | Panel Cp ×0.1 tandem-only | ~18:24 UTC |
+| #2333 | Wider SRF head (192→256) | ~18:39 UTC |
+| #2328 v2 | AoA Curriculum warmup=20 | ~20:00 UTC (after restart) |
+| #2327 v2 | Mixup fixed surface mask | ~20:00 UTC (after restart) |
+| #2334 | Checkpoint Soup | ~20:30 UTC (after restart) |
+| #2335 | Gradient Accumulation 2x | ~20:30 UTC (after restart) |
+| #2336 | Panel Cp + AoA Curriculum Combo | ~20:30 UTC (after restart) |
 
-1. **Panel Cp as INPUT feature works; as TARGET reformulation fails.** Thorfinn's feature approach improved p_tan -3.4%; frieren's target approach regressed +66% p_oodc. The model benefits from physics hints but needs to learn raw pressure directly.
-2. **Surface-derivative losses fail on non-uniform meshes.** Both Sobolev gradient (p_tan +9.5%) and spectral arc-length (neutral, redundant with DCT) added no value. Our existing DCT frequency loss already captures spectral information.
-3. **Additional regime-handling mechanisms hurt.** MoE output routing (+10-16%) conflicts with existing domain_velhead + pcgrad_3way + re_stratified_sampling. The model already handles regime diversity sufficiently.
-4. **TTA variance minimization is fundamentally broken for regression.** No viable self-supervised signal exists for cheap test-time adaptation.
-5. **The strongest signal remains physics-informed input features.** Every durable win came from features (wake deficit, TE coord frame, gap-stagger spatial bias) or loss reformulation (DCT, residual prediction).
+## Key Insights from Phase 6
+
+1. **Panel Cp as INPUT feature is the only p_tan winner.** v2 tandem-only: p_oodc -2.8%, p_tan -2.9% but p_in +4.5%. v3 tests ×0.1 scaling to fix p_in.
+2. **AoA Curriculum shows strongest p_oodc signal** (-5.1%), but p_tan +3.5%. v2 tests shorter warmup=20.
+3. **Physics-informed input features remain the strongest lever.** Every durable win came from features or loss reformulation.
+4. **Architecture output modifications are safe; backbone changes are dangerous.** Surface refine head changes are OK; attention/block changes regress p_tan.
+5. **Target/loss reformulations have mixed results.** Asinh pressure works; log1p does not. DCT loss works; spectral/Sobolev do not.
+6. **Training procedure changes show diminishing returns.** Lion+EMA+cosine is hard to beat. Warmup, noise, and curriculum provide marginal benefits at best.
 
 ## Most Recent Research Direction from Human Researcher Team
 
 ### Issue #1860 — ACTIVE directive (Morgan McGuire, re-raised 2026-04-08)
 **"Too many experiments are incremental tweaks. Think BIGGER."**
+- Need radical new model changes, data augmentation, data generation
+- Not just training schedule tweaks or hyperparameter tuning
 
-## Current Research Focus (Round 35)
+## Current Research Focus (Round 36)
 
 ### Themes
-1. **Physics-informed input features** (alphonse #2330 BL proxy, frieren #2331 local Re) — follows the proven pattern
-2. **Target/loss reformulation** (askeladd #2329 log1p pressure) — changes how the model sees pressure
-3. **Training procedure** (edward #2326 warmup, fern #2328 AoA curriculum, nezuko #2327 mixup) — improves optimization/generalization
-4. **Architecture output** (tanjiro #2325 KAN decoder) — modifies only the safe output head
-5. **Iterating on success** (thorfinn #2319 v2 tandem-only panel Cp) — refining the only p_tan winner
+1. **Iterate on promising results** — Panel Cp ×0.1 (thorfinn v3), AoA curriculum warmup=20 (fern v2)
+2. **Combination testing** — Panel Cp + AoA Curriculum together (askeladd #2336)
+3. **Training efficiency** — Gradient accumulation (alphonse), checkpoint soup (frieren)
+4. **Data augmentation** — Sample mixup with fixed surface mask (nezuko)
+5. **Architecture output** — Wider SRF head (edward)
+
+### What's Needed Next (per Issue #1860)
+- **Bold new architectures** — Graph neural networks, neural operators (FNO/DeepONet), point cloud transformers
+- **Advanced data augmentation** — Physics-informed augmentations preserving flow constraints
+- **Data generation** — Synthetic training data from fast solvers (XFOIL, panel methods)
+- **Pre-training** — Train on cheap proxy data, fine-tune on expensive CFD
+- **Knowledge distillation** — From ensemble to single model
+- **Novel loss techniques** — SAM, SWA, loss flooding
+- **Mathematical reformulations** — Fourier features, harmonic analysis, Green's functions
 
 ### What's Exhausted (DO NOT REVISIT)
 
@@ -81,11 +103,9 @@
 - All optimizer variants (Lion+EMA+cosine is optimal)
 - Chord-position features, inter-foil coupling, DID/wake SDF features
 - Mirror augmentation, synthetic data, per-foil whitening
-- Tandem curriculum ramp (trades p_in for OOD)
-- FV cell area loss (destroys optimization)
-- TTA with variance proxy (broken for regression)
-- Spectral arc-length loss (redundant with DCT freq loss)
-- Sobolev gradient loss (noisy on non-uniform mesh)
-- MoE output routing (conflicting signals with existing mechanisms)
-- Inviscid Cp residual target (thin-airfoil too crude for target)
-- Surface-derivative losses on non-uniform meshes (general conclusion)
+- Tandem curriculum ramp, FV cell area loss, TTA variance proxy
+- Spectral arc-length loss, Sobolev gradient loss, MoE output routing
+- Inviscid Cp residual target, KAN surface decoder, warmup with Lion
+- Log1p pressure target, BL proxy feature, local Re feature
+- Surface-derivative losses on non-uniform meshes
+- Target noise regularization (neutral)

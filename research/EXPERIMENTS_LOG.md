@@ -2,6 +2,25 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 16:48 — PR #2332: Target Noise Regularization — tanjiro — **PRELIMINARY** ⏳
+
+- Branch: `tanjiro/target-noise-regularization`
+- Hypothesis: Add small Gaussian noise (σ=0.01) to training targets for regularization, preventing overfitting to noise in CFD data.
+- W&B runs: `oh80wauq` (s42), `er0ompny` (s73) — VAL METRICS ONLY (runs interrupted before test eval)
+
+| Metric | Baseline (#2290) | Seed 42 (val) | Seed 73 (val) | 2-seed avg | Δ |
+|--------|-----------------|---------------|---------------|-----------|---|
+| p_in | 11.742 | 11.912 | 11.536 | **11.724** | **-0.15%** ≈ |
+| p_oodc | 7.643 | 7.738 | 7.524 | **7.631** | **-0.16%** ≈ |
+| p_tan | 27.874 | 28.012 | 27.917 | **27.965** | **+0.33%** ≈ |
+| p_re | 6.419 | 6.354 | 6.446 | **6.400** | **-0.30%** ≈ |
+
+**Analysis:** Essentially neutral across all metrics — within noise bounds. Validation metrics suggest σ=0.01 is too small to have meaningful regularization effect, or the existing EMA/weight decay already provides sufficient regularization. Student pod was restarted; awaiting re-run with proper test evaluation.
+
+**NOTE:** These are VALIDATION metrics, not final test. Runs were killed ~3 min before completion due to pod restart. Student will re-run to get proper test metrics. However, directional signal is clear: this is neutral at best.
+
+---
+
 ### 2026-04-09 16:05 — PR #2331: Local Reynolds Feature — frieren — **CLOSED** ❌
 
 - Branch: `frieren/local-reynolds-feature`
