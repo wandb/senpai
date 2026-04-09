@@ -347,6 +347,78 @@ def compute_wake_deficit_features(raw_xy, is_surface, saf_norm, gap_raw, fore_te
     return torch.stack([dx_norm, dy_norm], dim=-1)  # [B, N, 2]
 
 
+def compute_wake_centerline_features(raw_xy, is_surface, saf_norm, aoa_rad, fore_te_x=None, fore_te_y=None, chord=1.0):
+    """Wake centerline SDF features for tandem configurations.
+
+    Encodes each node's signed perpendicular and parallel distances relative to
+    the fore-foil wake centerline (the ray from TE along the freestream direction),
+    plus distance to the wake edge and inside-wake indicator.
+
+    Args:
+        raw_xy:     [B, N, 2] raw x, y coordinates
+        is_surface: [B, N] bool
+        saf_norm:   [B, N] norm of saf channels (fore-foil: <= 0.005)
+        aoa_rad:    [B] AoA in radians
+        fore_te_x:  [B] pre-computed fore TE x (if None, recomputed)
+        fore_te_y:  [B] pre-computed fore TE y (if None, recomputed)
+        chord:      reference chord length for normalization
+
+    Returns: [B, N, 4] = (d_perp/c, d_parallel/c, d_to_edge/c, inside_wake)
+             zeroed for single-foil samples
+    """
+    x_coords = raw_xy[:, :, 0]  # [B, N]
+    y_coords = raw_xy[:, :, 1]  # [B, N]
+
+    if fore_te_x is None or fore_te_y is None:
+        INF = 1e6
+        fore_surf = is_surface & (saf_norm <= 0.005)
+        fore_x_masked = x_coords * fore_surf.float() - INF * (~fore_surf).float()
+        fore_te_idx = fore_x_masked.topk(1, dim=1)[1].squeeze(1)
+        fore_te_x = x_coords.gather(1, fore_te_idx.unsqueeze(1)).squeeze(1)
+        fore_te_y = y_coords.gather(1, fore_te_idx.unsqueeze(1)).squeeze(1)
+
+    # Is tandem?
+    aft_surf = is_surface & (saf_norm > 0.005)
+    is_tandem = aft_surf.any(dim=1).float()  # [B]
+
+    # Wake propagates in freestream direction from fore TE
+    wake_dir_x = torch.cos(aoa_rad)  # [B]
+    wake_dir_y = torch.sin(aoa_rad)  # [B]
+    # Perpendicular direction (90° CCW from wake_dir)
+    perp_dir_x = -wake_dir_y  # [B]
+    perp_dir_y = wake_dir_x   # [B]
+
+    # Vector from fore TE to each node
+    r_x = x_coords - fore_te_x.unsqueeze(1)  # [B, N]
+    r_y = y_coords - fore_te_y.unsqueeze(1)  # [B, N]
+
+    # Parallel distance downstream of TE (clamped at 0 — only downstream wake)
+    d_parallel = (r_x * wake_dir_x.unsqueeze(1) + r_y * wake_dir_y.unsqueeze(1)).clamp(min=0)  # [B, N]
+
+    # Signed perpendicular distance to wake centerline
+    d_perp = r_x * perp_dir_x.unsqueeze(1) + r_y * perp_dir_y.unsqueeze(1)  # [B, N]
+
+    # Wake width: classic turbulent spreading ~0.1 * sqrt(x/c)
+    wake_width = 0.1 * torch.sqrt(d_parallel / chord + 1e-3)  # [B, N]
+
+    # Distance to wake edge (positive = outside, negative = inside)
+    d_to_edge = (d_perp.abs() - wake_width) / chord  # [B, N]
+
+    # Binary inside-wake indicator
+    inside_wake = (d_perp.abs() < wake_width).float()  # [B, N]
+
+    # Stack and zero out for single-foil samples
+    feats = torch.stack([
+        d_perp / chord,
+        d_parallel / chord,
+        d_to_edge,
+        inside_wake,
+    ], dim=-1)  # [B, N, 4]
+    feats = feats * is_tandem[:, None, None]
+
+    return feats
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -1170,6 +1242,7 @@ class Config:
     pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
     te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
     wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    wake_centerline_feature: bool = False   # wake centerline SDF features for tandem (+4 input channels)
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
@@ -1318,7 +1391,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], +32 fourier PE
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + (4 if cfg.wake_centerline_feature else 0) + 32,  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], [+wake_cl], +32 fourier PE
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1786,8 +1859,8 @@ for epoch in range(MAX_EPOCHS):
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
-        # TE coordinate frame / wake deficit: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature
+        # TE coordinate frame / wake deficit / wake centerline: save raw xy and saf_norm before normalization
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.wake_centerline_feature
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
@@ -1813,12 +1886,22 @@ for epoch in range(MAX_EPOCHS):
                     _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake,
                     fore_te_x=_fore_te_x, fore_te_y=_fore_te_y)
                 x = torch.cat([x, wake_feats], dim=-1)
+            if cfg.wake_centerline_feature:
+                wc_feats = compute_wake_centerline_features(
+                    _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_aoa.squeeze(1),
+                    fore_te_x=_fore_te_x, fore_te_y=_fore_te_y)
+                x = torch.cat([x, wc_feats], dim=-1)
         else:
+            _fore_te_x, _fore_te_y = None, None
             x = torch.cat([x, curv, dist_feat], dim=-1)
             if cfg.wake_deficit_feature:
                 wake_feats = compute_wake_deficit_features(
                     _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
                 x = torch.cat([x, wake_feats], dim=-1)
+            if cfg.wake_centerline_feature:
+                wc_feats = compute_wake_centerline_features(
+                    _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_aoa.squeeze(1))
+                x = torch.cat([x, wc_feats], dim=-1)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2478,7 +2561,7 @@ for epoch in range(MAX_EPOCHS):
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
-                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature
+                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.wake_centerline_feature
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
                 _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -2503,12 +2586,22 @@ for epoch in range(MAX_EPOCHS):
                             _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake,
                             fore_te_x=_fore_te_x, fore_te_y=_fore_te_y)
                         x = torch.cat([x, wake_feats], dim=-1)
+                    if cfg.wake_centerline_feature:
+                        wc_feats = compute_wake_centerline_features(
+                            _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_aoa.squeeze(1),
+                            fore_te_x=_fore_te_x, fore_te_y=_fore_te_y)
+                        x = torch.cat([x, wc_feats], dim=-1)
                 else:
+                    _fore_te_x, _fore_te_y = None, None
                     x = torch.cat([x, curv, dist_feat], dim=-1)
                     if cfg.wake_deficit_feature:
                         wake_feats = compute_wake_deficit_features(
                             _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake)
                         x = torch.cat([x, wake_feats], dim=-1)
+                    if cfg.wake_centerline_feature:
+                        wc_feats = compute_wake_centerline_features(
+                            _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_aoa.squeeze(1))
+                        x = torch.cat([x, wc_feats], dim=-1)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2892,10 +2985,11 @@ if best_metrics:
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
-                    _need_te_raw_vis = cfg.te_coord_frame or cfg.wake_deficit_feature
+                    _need_te_raw_vis = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.wake_centerline_feature
                     _raw_xy_te_vis = x_dev[:, :, :2].clone() if _need_te_raw_vis else None
                     _raw_saf_norm_te_vis = x_dev[:, :, 2:4].norm(dim=-1) if _need_te_raw_vis else None
                     _raw_gap_wake_vis = x_dev[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
+                    _raw_aoa_vis = x_dev[:, 0, 14]  # AoA0_rad [B]
                     x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                     curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                     if cfg.te_coord_frame:
@@ -2907,12 +3001,21 @@ if best_metrics:
                                 _raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis, _raw_gap_wake_vis,
                                 fore_te_x=_fore_te_x_vis, fore_te_y=_fore_te_y_vis)
                             x_n = torch.cat([x_n, wake_feats_vis], dim=-1)
+                        if cfg.wake_centerline_feature:
+                            wc_feats_vis = compute_wake_centerline_features(
+                                _raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis, _raw_aoa_vis,
+                                fore_te_x=_fore_te_x_vis, fore_te_y=_fore_te_y_vis)
+                            x_n = torch.cat([x_n, wc_feats_vis], dim=-1)
                     else:
                         x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
                         if cfg.wake_deficit_feature:
                             wake_feats_vis = compute_wake_deficit_features(
                                 _raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis, _raw_gap_wake_vis)
                             x_n = torch.cat([x_n, wake_feats_vis], dim=-1)
+                        if cfg.wake_centerline_feature:
+                            wc_feats_vis = compute_wake_centerline_features(
+                                _raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis, _raw_aoa_vis)
+                            x_n = torch.cat([x_n, wc_feats_vis], dim=-1)
                     # Fourier PE (must match training loop)
                     raw_xy = x_n[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
@@ -3007,7 +3110,7 @@ if cfg.surface_refine and best_metrics:
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
-                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature
+                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.wake_centerline_feature
                     _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
                     _raw_gap_wake_vv = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -3025,12 +3128,22 @@ if cfg.surface_refine and best_metrics:
                                 _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake_vv,
                                 fore_te_x=_fore_te_x_vv, fore_te_y=_fore_te_y_vv)
                             x = torch.cat([x, wake_feats_vv], dim=-1)
+                        if cfg.wake_centerline_feature:
+                            wc_feats_vv = compute_wake_centerline_features(
+                                _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_aoa.squeeze(1),
+                                fore_te_x=_fore_te_x_vv, fore_te_y=_fore_te_y_vv)
+                            x = torch.cat([x, wc_feats_vv], dim=-1)
                     else:
+                        _fore_te_x_vv, _fore_te_y_vv = None, None
                         x = torch.cat([x, curv, dist_feat], dim=-1)
                         if cfg.wake_deficit_feature:
                             wake_feats_vv = compute_wake_deficit_features(
                                 _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake_vv)
                             x = torch.cat([x, wake_feats_vv], dim=-1)
+                        if cfg.wake_centerline_feature:
+                            wc_feats_vv = compute_wake_centerline_features(
+                                _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_aoa.squeeze(1))
+                            x = torch.cat([x, wc_feats_vv], dim=-1)
                     raw_xy = x[:, :, :2]
                     xy_min = raw_xy.amin(dim=1, keepdim=True)
                     xy_max = raw_xy.amax(dim=1, keepdim=True)
