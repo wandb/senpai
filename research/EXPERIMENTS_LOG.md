@@ -2,6 +2,25 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 08:30 — PR #2304: Shortest Vector Feature — frieren — **CLOSED** ❌
+
+- Branch: `frieren/shortest-vector-feature`
+- Hypothesis: 2D displacement vector to nearest foil surface point as per FVF paper (Lam et al., ICML 2024). Expected to give model explicit surface proximity with directional information.
+- W&B runs: `42rldvb9` (s42), `j1xftj9h` (s73)
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 12.10 | **+3.1%** ❌ |
+| p_oodc | 7.643 | 8.05 | **+5.4%** ❌ |
+| p_tan | 27.874 | 28.55 | **+2.4%** ❌ |
+| p_re | 6.419 | 6.70 | **+4.4%** ❌ |
+
+**Analysis:** All metrics consistently worse across both seeds. DSDF (8 channels) + TE coords + wake deficit already provide comprehensive geometry encoding. SV adds nothing new. Only 139 epochs reached (vs 147 baseline) due to per-epoch SV computation overhead — fewer epochs compounds the regression.
+
+**10th consecutive failure.** Geometry/physics input features are EXHAUSTED as a direction. The model's input representation is saturated.
+
+---
+
 ### 2026-04-09 08:00 — PR #2307: Q-Criterion Proxy Feature — tanjiro — **CLOSED** ❌
 
 - Branch: `tanjiro/q-criterion-proxy-feature`

@@ -39,7 +39,7 @@ Single-model beats ensemble on p_in (11.74 vs 12.1) and p_tan (27.90 vs 29.1). E
 | alphonse | #2312 | **GradNorm Adaptive Loss Weighting — auto-balance surface/volume losses** | WIP (NEW, ROUND32, LOSS) |
 | fern | #2311 | **Condition Token Injection — dedicated flow-condition embedding pathway** | WIP (NEW, ROUND32) |
 | askeladd | #2308 | **Auxiliary AoA Head — explicit AoA decoding (analogous to Re head PR #780)** | WIP (NEW, ROUND32) |
-| frieren | #2304 | **Shortest Vector Feature — 2D displacement to nearest foil surface (FVF)** | WIP (NEW, PHYSICS) |
+| frieren | #2316 | **Stochastic Depth — randomly drop TransolverBlocks during training** | WIP (NEW, ROUND33, REGULARIZATION) |
 | tanjiro | #2315 | **Tandem Curriculum Ramp — smooth linear ramp instead of hard cutoff** | WIP (NEW, ROUND32, TRAINING) |
 | edward | #2313 | **Multi-Scale Intermediate Skips — FPN-style output from all TransolverBlocks** | WIP (NEW, ROUND32, ARCH) |
 
@@ -88,7 +88,7 @@ Next-round assignments (when Round 29 in-flight students complete) will continue
 | alphonse | #2312 | **GradNorm Adaptive Loss Weighting** — gradient-norm-based surface/vol balancing | all |
 | fern | #2311 | **Condition Token Injection** — additive condition MLP embedding (Unisolver-inspired) | p_oodc, p_re |
 | askeladd | #2308 | **Auxiliary AoA Head** — explicit AoA decoding, penultimate block pool | p_tan, p_oodc |
-| frieren | #2304 | **Shortest Vector Feature** — 2D displacement to nearest foil surface (FVF) | p_tan, p_oodc |
+| frieren | #2316 | **Stochastic Depth** — block-level dropout for OOD regularization | p_oodc, p_re |
 | tanjiro | #2315 | **Tandem Curriculum Ramp** — smooth epoch 10-30 ramp instead of hard cutoff | p_tan |
 | edward | #2313 | **Multi-Scale Intermediate Skips** — FPN-style aggregation from TransolverBlocks | all |
 
@@ -170,3 +170,5 @@ Next-round assignments (when Round 29 in-flight students complete) will continue
 - **Bernoulli residual loss**: 2 iterations, never beats baseline on p_in/p_tan. Interferes with main L1 supervision despite p_re gain in v1
 - **Continuity PDE loss (∇·u=0)**: Redundant with joint Ux/Uy supervision. SPH approximation too noisy. All metrics regressed
 - **Asymmetric quantile/pinball loss**: Diverges catastrophically — multiplicative instability with adaptive weight stack (surf×tandem×hard-node×PCGrad)
+- **Q-criterion proxy feature**: High seed variance, no metric improved on average. Hand-crafted DSDF×freestream cross-product is not a robust vortex encoding
+- **Shortest vector feature (FVF paper)**: Redundant with DSDF 8-ch. ALL geometry input features are now exhausted as a direction
