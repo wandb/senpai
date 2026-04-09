@@ -2265,7 +2265,7 @@ for epoch in range(MAX_EPOCHS):
         else:
             if cfg.grad_accum_steps <= 1:
                 optimizer.zero_grad()
-            loss.backward()
+            (loss / cfg.grad_accum_steps).backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         sam_active = sam_optimizer is not None and epoch >= int(MAX_EPOCHS * 0.75)
@@ -2301,7 +2301,7 @@ for epoch in range(MAX_EPOCHS):
                 scheduler.step()
             except ValueError:
                 pass
-        if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa and not cfg.swa_cyclic and not cfg.snapshot_ensemble:
+        if (use_pcgrad or _should_step) and epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa and not cfg.swa_cyclic and not cfg.snapshot_ensemble:
             if ema_model is None:
                 ema_model = deepcopy(_base_model)
             else:
