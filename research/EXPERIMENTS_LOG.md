@@ -2,6 +2,41 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-09 18:42 — PR #2319 v3: Panel-Method Cp Feature (×0.1 scale) — thorfinn — **MERGED** ✅
+
+- Branch: `thorfinn/panel-method-cp-feature`
+- Hypothesis: Inviscid Cp from thin-airfoil panel method as input feature. v3 tests scaling by 0.1 (gentle hint) after v1/v2 showed p_in regression from full-strength signal.
+- W&B runs: `h6fqcry4` (s42), `cuhoscp9` (s73)
+- Reproduce: `python train.py ... --cp_panel --cp_panel_tandem_only --cp_panel_scale 0.1`
+
+| Metric | Baseline (#2290) | v3 avg | Δ |
+|--------|-----------------|--------|---|
+| p_in | 11.742 | **11.709** | **-0.3%** ✅ |
+| p_oodc | 7.643 | **7.544** | **-1.3%** ✅ |
+| p_tan | 27.874 | **27.402** | **-1.7%** ✅ |
+| p_re | 6.419 | 6.481 | +1.0% ≈ |
+
+**Analysis:** Three-iteration convergence path: v1 (all samples, full Cp → p_in +5.2%) → v2 (tandem-only → still +4.5%) → v3 (×0.1 scale → p_in -0.3%, fixed). The scaling reveals that Panel Cp works best as a weak physics prior — too strong and it disrupts the shared backbone representation for single-foil samples. Final result: simultaneous improvement on 3/4 metrics. **New baseline: p_in=11.709, p_oodc=7.544, p_tan=27.402, p_re=6.481.**
+
+---
+
+### 2026-04-09 18:42 — PR #2333: Wider SRF Head (192→256) — edward — **CLOSED** ❌
+
+- Branch: `edward/wider-surface-head`
+- Hypothesis: Increasing SRF hidden dim from 192 to 256 provides more capacity for surface pressure prediction.
+- W&B runs: `3ex38gxd` (s42), `22uz9576` (s73)
+
+| Metric | Baseline (#2290) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.742 | 12.013 | **+2.3%** ❌ |
+| p_oodc | 7.643 | 7.817 | **+2.3%** ❌ |
+| p_tan | 27.874 | 28.973 | **+3.9%** ❌ |
+| p_re | 6.419 | 6.459 | +0.6% ≈ |
+
+**Analysis:** All metrics regressed 2-4%. The current SRF hidden size of 192 is well-tuned. Adding more parameters leads to overfitting rather than improved capacity — the SRF already has enough capacity for the surface prediction task. Wider is not better here.
+
+---
+
 ### 2026-04-09 16:48 — PR #2332: Target Noise Regularization — tanjiro — **PRELIMINARY** ⏳
 
 - Branch: `tanjiro/target-noise-regularization`
