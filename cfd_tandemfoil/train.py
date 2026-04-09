@@ -1118,6 +1118,8 @@ class Config:
     dct_freq_weight: float = 0.05 # weight for DCT freq loss
     dct_freq_gamma: float = 2.0   # frequency upweighting strength
     dct_freq_alpha: float = 1.5   # frequency exponent
+    sobolev_grad_loss: bool = False   # Sobolev-style arc-length gradient loss on surface pressure
+    sobolev_grad_weight: float = 0.1  # weight for Sobolev gradient loss
     # Phase 3 R10: DomainLayerNorm compounds
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
@@ -1786,6 +1788,10 @@ for epoch in range(MAX_EPOCHS):
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
+        _need_sob = cfg.sobolev_grad_loss
+        _raw_xy_for_sob = x[:, :, :2].clone() if _need_sob else None  # save raw x,y before normalization
+        _raw_saf_for_sob = x[:, :, 2:4].norm(dim=-1) if _need_sob else None
+        _raw_tandem_for_sob = (x[:, 0, 22].abs() > 0.01) if _need_sob else None
         # TE coordinate frame / wake deficit: save raw xy and saf_norm before normalization
         _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
@@ -2135,6 +2141,45 @@ for epoch in range(MAX_EPOCHS):
                 _dct_loss = _dct_loss / _n_foils_dct
                 loss = loss + cfg.dct_freq_weight * _dct_loss
 
+        # Sobolev gradient loss: arc-length derivative supervision on surface pressure
+        _sobolev_loss_val = None
+        if cfg.sobolev_grad_loss and model.training:
+            _sobolev_loss = torch.tensor(0.0, device=device)
+            _n_foils_sob = 0
+            for b in range(B):
+                surf_idx_b = is_surface[b].nonzero(as_tuple=True)[0]
+                if surf_idx_b.numel() < 4:
+                    continue
+                _is_tan_b = _raw_tandem_for_sob[b].item()
+                if _is_tan_b:
+                    saf_vals = _raw_saf_for_sob[b, surf_idx_b]
+                    foil_groups = [surf_idx_b[saf_vals <= 0.005], surf_idx_b[saf_vals > 0.005]]
+                else:
+                    foil_groups = [surf_idx_b]
+                for foil_surf in foil_groups:
+                    if foil_surf.numel() < 4:
+                        continue
+                    # Sort by angle from centroid for proper closed-contour ordering
+                    xy = _raw_xy_for_sob[b, foil_surf]  # [M, 2]
+                    cx, cy = xy[:, 0].mean(), xy[:, 1].mean()
+                    angles = torch.atan2(xy[:, 1] - cy, xy[:, 0] - cx)
+                    sort_order = angles.argsort()
+                    sorted_idx = foil_surf[sort_order]
+                    xy_sorted = xy[sort_order]  # [M, 2]
+                    # Arc-length spacing between consecutive nodes
+                    ds = (xy_sorted[1:] - xy_sorted[:-1]).norm(dim=-1).clamp(min=1e-6)  # [M-1]
+                    # Pressure channel (channel 2) finite differences
+                    p_pred = pred[b, sorted_idx, 2]  # [M]
+                    p_gt = y_norm[b, sorted_idx, 2]  # [M]
+                    pred_grad = (p_pred[1:] - p_pred[:-1]) / ds
+                    true_grad = (p_gt[1:] - p_gt[:-1]) / ds
+                    _sobolev_loss = _sobolev_loss + (pred_grad - true_grad).abs().mean()
+                    _n_foils_sob += 1
+            if _n_foils_sob > 0:
+                _sobolev_loss = _sobolev_loss / _n_foils_sob
+                _sobolev_loss_val = _sobolev_loss
+                loss = loss + cfg.sobolev_grad_weight * _sobolev_loss
+
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
@@ -2161,8 +2206,9 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            _sob_shared = cfg.sobolev_grad_weight * _sobolev_loss_val if _sobolev_loss_val is not None else 0.0
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + _sob_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + _sob_shared + 0.005 * re_loss + 0.005 * aoa_loss
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -2207,7 +2253,8 @@ for epoch in range(MAX_EPOCHS):
                 vol_loss_g = (abs_err * vol_mask_g.unsqueeze(-1)).sum() / vol_mask_g.sum().clamp(min=1)
                 surf_loss_g = (surf_per_sample * mask_1d.float() * tandem_boost).sum() / n
                 coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                _sob_shared = cfg.sobolev_grad_weight * _sobolev_loss_val if _sobolev_loss_val is not None else 0.0
+                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + _sob_shared + 0.005 * re_loss + 0.005 * aoa_loss
 
             loss_A = _grp_loss(~is_tandem_batch)
             # Only include non-empty groups to avoid backward() on no-grad tensors
@@ -2335,7 +2382,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _train_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if _sobolev_loss_val is not None:
+            _train_log["train/sobolev_grad_loss"] = _sobolev_loss_val.item()
+        wandb.log(_train_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
