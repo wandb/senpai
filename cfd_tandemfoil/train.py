@@ -347,6 +347,66 @@ def compute_wake_deficit_features(raw_xy, is_surface, saf_norm, gap_raw, fore_te
     return torch.stack([dx_norm, dy_norm], dim=-1)  # [B, N, 2]
 
 
+def compute_inviscid_cp(raw_xy, is_surface, raw_aoa, raw_saf_norm=None):
+    """Compute thin-airfoil inviscid Cp for surface nodes.
+
+    Uses classical flat-plate thin-airfoil theory:
+        Cp = -side * 2α * sqrt((1-ξ)/ξ)
+    where ξ is chordwise position normalized to [0,1] (LE→TE) and side = ±1
+    for upper/lower surface. This gives the standard LE suction peak that decays
+    to zero at the TE (Kutta condition). Handles tandem foils by processing each
+    foil separately with the isolated-foil formula.
+
+    Args:
+        raw_xy:       [B, N, 2] raw (pre-normalization) x, y coordinates
+        is_surface:   [B, N] bool surface mask
+        raw_aoa:      [B] AoA0 in radians
+        raw_saf_norm: [B, N] norm of saf channels (foil-1: ≤0.005, foil-2: >0.005)
+
+    Returns: [B, N, 1] inviscid Cp estimate (zero for non-surface/volume nodes)
+    """
+    B, N, _ = raw_xy.shape
+    cp_inv = torch.zeros(B, N, 1, device=raw_xy.device, dtype=raw_xy.dtype)
+
+    for b in range(B):
+        aoa = raw_aoa[b]
+        # Split surface nodes into per-foil groups
+        if raw_saf_norm is not None:
+            foil1_mask = is_surface[b] & (raw_saf_norm[b] <= 0.005)
+            foil2_mask = is_surface[b] & (raw_saf_norm[b] > 0.005)
+            foil_masks = [foil1_mask]
+            if foil2_mask.any():
+                foil_masks.append(foil2_mask)
+        else:
+            foil_masks = [is_surface[b]]
+
+        for fmask in foil_masks:
+            if fmask.sum() < 4:
+                continue
+            x_coords = raw_xy[b, fmask, 0]
+            y_coords = raw_xy[b, fmask, 1]
+
+            # Chordwise position ξ ∈ [0,1] from LE (min x) to TE (max x)
+            x_min = x_coords.min()
+            x_max = x_coords.max()
+            chord = x_max - x_min
+            if chord < 1e-6:
+                continue
+            xi = ((x_coords - x_min) / chord).clamp(0.005, 1.0)
+
+            # Upper/lower surface: side > 0 → upper (suction at +AoA)
+            y_mean = y_coords.mean()
+            side = torch.sign(y_coords - y_mean)
+            side = torch.where(side == 0, torch.ones_like(side), side)
+
+            # Classical thin-airfoil Cp: -side * 2α * sqrt((1-ξ)/ξ)
+            # LE suction peak (xi→0), Kutta condition at TE (xi→1 → Cp→0)
+            cp = -side * 2.0 * aoa * torch.sqrt((1.0 - xi) / xi)
+            cp_inv[b, fmask, 0] = cp.clamp(-6.0, 6.0)
+
+    return cp_inv
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -1173,6 +1233,8 @@ class Config:
     # Re-stratified sampling
     re_stratified_sampling: bool = False    # upweight extreme-Re training samples
     re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
+    # Phase 6: Inviscid Cp residual prediction
+    inviscid_residual: bool = False        # predict viscous residual (p - p_inviscid) instead of raw p
 
 
 cfg = sp.parse(Config)
@@ -1278,6 +1340,13 @@ with torch.no_grad():
         _y, _mask = _y.to(device), _mask.to(device)
         _Um, _q = _umag_q(_y, _mask)
         _yp = _phys_norm(_y, _Um, _q)
+        if cfg.inviscid_residual:
+            _x_dev = _x.to(device)
+            _cp_inv_s = compute_inviscid_cp(
+                _x_dev[:, :, :2], _is_surf.to(device), _x_dev[:, 0, 14],
+                _x_dev[:, :, 2:4].norm(dim=-1))
+            _yp = _yp.clone()
+            _yp[:, :, 2:3] = _yp[:, :, 2:3] - _cp_inv_s
         if cfg.log_pressure:
             _yp = _yp.clone()
             _yp[:, :, 2:3] = _yp[:, :, 2:3].abs().add(1).log() * _yp[:, :, 2:3].sign()
@@ -1786,8 +1855,8 @@ for epoch in range(MAX_EPOCHS):
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
-        # TE coordinate frame / wake deficit: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature
+        # TE coordinate frame / wake deficit / inviscid residual: save raw xy and saf_norm before normalization
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.inviscid_residual
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
@@ -1842,6 +1911,11 @@ for epoch in range(MAX_EPOCHS):
             y_norm = (y_adapt - raw_stats["y_mean"]) / raw_stats["y_std"]
         else:
             y_phys = _phys_norm(y, Umag, q)
+            if cfg.inviscid_residual:
+                _cp_inv_train = compute_inviscid_cp(
+                    _raw_xy_te, is_surface, _raw_aoa.squeeze(-1), _raw_saf_norm_te)
+                y_phys = y_phys.clone()
+                y_phys[:, :, 2:3] = y_phys[:, :, 2:3] - _cp_inv_train
             if cfg.log_pressure:
                 y_phys = y_phys.clone()
                 y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
@@ -2478,7 +2552,7 @@ for epoch in range(MAX_EPOCHS):
                 dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
-                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature
+                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.inviscid_residual
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
                 _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -2529,6 +2603,13 @@ for epoch in range(MAX_EPOCHS):
                     y_norm = (y_adapt - raw_stats["y_mean"]) / raw_stats["y_std"]
                 else:
                     y_phys = _phys_norm(y, Umag, q)
+                    # Inviscid Cp residual: subtract analytical inviscid Cp from pressure targets
+                    _cp_inv_val = None
+                    if cfg.inviscid_residual:
+                        _cp_inv_val = compute_inviscid_cp(
+                            _raw_xy_te, is_surface, _raw_aoa.squeeze(-1), _raw_saf_norm_te)
+                        y_phys = y_phys.clone()
+                        y_phys[:, :, 2:3] = y_phys[:, :, 2:3] - _cp_inv_val
                     if cfg.log_pressure:
                         y_phys = y_phys.clone()
                         y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
@@ -2689,6 +2770,10 @@ for epoch in range(MAX_EPOCHS):
                     if cfg.asinh_pressure:
                         pred_phys = pred_phys.clone()
                         pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
+                    # Add inviscid Cp back (reverse of training subtraction)
+                    if cfg.inviscid_residual and _cp_inv_val is not None:
+                        pred_phys = pred_phys.clone()
+                        pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3] + _cp_inv_val
                     if cfg.tight_denorm_clamps:
                         _pd = pred_phys.clone()
                         _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
@@ -2892,7 +2977,7 @@ if best_metrics:
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
-                    _need_te_raw_vis = cfg.te_coord_frame or cfg.wake_deficit_feature
+                    _need_te_raw_vis = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.inviscid_residual
                     _raw_xy_te_vis = x_dev[:, :, :2].clone() if _need_te_raw_vis else None
                     _raw_saf_norm_te_vis = x_dev[:, :, 2:4].norm(dim=-1) if _need_te_raw_vis else None
                     _raw_gap_wake_vis = x_dev[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -2940,6 +3025,13 @@ if best_metrics:
                         if cfg.asinh_pressure:
                             pred_phys = pred_phys.clone()
                             pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
+                        # Add inviscid Cp back for vis denormalization
+                        if cfg.inviscid_residual and _raw_xy_te_vis is not None:
+                            _cp_inv_vis = compute_inviscid_cp(
+                                _raw_xy_te_vis, is_surf_dev, x_dev[:, 0, 14:15].squeeze(-1),
+                                _raw_saf_norm_te_vis)
+                            pred_phys = pred_phys.clone()
+                            pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3] + _cp_inv_vis
                         if cfg.tight_denorm_clamps:
                             _pd = pred_phys.clone()
                             _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
@@ -3007,7 +3099,7 @@ if cfg.surface_refine and best_metrics:
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
-                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature
+                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.inviscid_residual
                     _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
                     _raw_gap_wake_vv = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -3125,6 +3217,11 @@ if cfg.surface_refine and best_metrics:
                     if cfg.asinh_pressure:
                         pred_phys_A = pred_phys_A.clone()
                         pred_phys_A[:, :, 2:3] = torch.sinh(pred_phys_A[:, :, 2:3]) / cfg.asinh_scale
+                    if cfg.inviscid_residual and _raw_xy_te is not None:
+                        _cp_inv_vv = compute_inviscid_cp(
+                            _raw_xy_te, is_surface, _raw_aoa.squeeze(-1), _raw_saf_norm_te)
+                        pred_phys_A = pred_phys_A.clone()
+                        pred_phys_A[:, :, 2:3] = pred_phys_A[:, :, 2:3] + _cp_inv_vv
                     # Physics denorm (skip for adaptive_norm — already in raw space)
                     pred_orig_A = pred_phys_A if cfg.adaptive_norm else _phys_denorm(pred_phys_A, Umag, q)
 
@@ -3146,6 +3243,9 @@ if cfg.surface_refine and best_metrics:
                     if cfg.asinh_pressure:
                         pred_manual_phys = pred_manual_phys.clone()
                         pred_manual_phys[:, :, 2:3] = torch.sinh(pred_manual_phys[:, :, 2:3]) / cfg.asinh_scale
+                    if cfg.inviscid_residual and _raw_xy_te is not None:
+                        pred_manual_phys = pred_manual_phys.clone()
+                        pred_manual_phys[:, :, 2:3] = pred_manual_phys[:, :, 2:3] + _cp_inv_vv
                     # Step 6: undo physics norm: Ux*Umag, Uy*Umag, p*q
                     if cfg.adaptive_norm:
                         pred_manual_orig = pred_manual_phys
