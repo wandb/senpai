@@ -609,6 +609,25 @@ class TransolverBlock(nn.Module):
         return fx
 
 
+def compute_surface_arc_pe(xy: torch.Tensor, n_freqs: int) -> torch.Tensor:
+    """Fourier positional encoding over polar angle from centroid for surface nodes.
+
+    Args:
+        xy: [M, 2] raw (x, y) coordinates of surface nodes (physical space)
+        n_freqs: number of sin/cos frequency pairs
+
+    Returns:
+        pe: [M, 2*n_freqs] Fourier features in [sin(2π·t·k), cos(2π·t·k)] for k=1..n_freqs
+            where t ∈ [0, 1] is polar angle normalized from (-π, π) → (0, 1)
+    """
+    centroid = xy.mean(dim=0, keepdim=True)  # [1, 2]
+    angle = torch.atan2(xy[:, 1] - centroid[:, 1], xy[:, 0] - centroid[:, 0])  # [M], in (-π, π)
+    t = (angle + torch.pi) / (2.0 * torch.pi)  # [M], in [0, 1]
+    freqs = torch.arange(1, n_freqs + 1, device=xy.device, dtype=xy.dtype)  # [n_freqs]
+    angles = 2.0 * torch.pi * t.unsqueeze(-1) * freqs.unsqueeze(0)  # [M, n_freqs]
+    return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)  # [M, 2*n_freqs]
+
+
 class SurfaceRefinementHead(nn.Module):
     """Lightweight MLP that predicts additive corrections for surface nodes.
 
@@ -1220,6 +1239,8 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    surface_arc_pe: bool = False              # add Fourier arc-length PE (polar angle) to SRF head inputs
+    surface_arc_pe_freqs: int = 8            # number of Fourier frequencies for arc-length PE
     # Phase 6: Asinh pressure transform
     asinh_pressure: bool = False             # transform pressure targets with asinh for dynamic range compression
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
@@ -1481,6 +1502,25 @@ if cfg.aft_foil_srf:
               f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, "
               f"film={cfg.aft_foil_srf_film})")
 
+# Arc-length positional encoding projections for SRF heads
+arc_pe_proj = None       # fore-foil / main SRF PE projection
+aft_arc_pe_proj = None   # aft-foil SRF PE projection
+ema_arc_pe_proj = None
+ema_aft_arc_pe_proj = None
+if cfg.surface_arc_pe:
+    _pe_dim = 2 * cfg.surface_arc_pe_freqs
+    if refine_head is not None:
+        arc_pe_proj = nn.Linear(_pe_dim, cfg.n_hidden).to(device)
+        nn.init.normal_(arc_pe_proj.weight, std=0.01)
+        nn.init.zeros_(arc_pe_proj.bias)
+    if aft_srf_head is not None or aft_srf_ctx_head is not None:
+        aft_arc_pe_proj = nn.Linear(_pe_dim, cfg.n_hidden).to(device)
+        nn.init.normal_(aft_arc_pe_proj.weight, std=0.01)
+        nn.init.zeros_(aft_arc_pe_proj.bias)
+    print(f"Surface arc-length PE: {cfg.surface_arc_pe_freqs} freqs "
+          f"(fore={'yes' if arc_pe_proj is not None else 'no'}, "
+          f"aft={'yes' if aft_arc_pe_proj is not None else 'no'})")
+
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
@@ -1506,6 +1546,10 @@ if aft_srf_head is not None:
     n_params += sum(p.numel() for p in aft_srf_head.parameters())
 if aft_srf_ctx_head is not None:
     n_params += sum(p.numel() for p in aft_srf_ctx_head.parameters())
+if arc_pe_proj is not None:
+    n_params += sum(p.numel() for p in arc_pe_proj.parameters())
+if aft_arc_pe_proj is not None:
+    n_params += sum(p.numel() for p in aft_arc_pe_proj.parameters())
 
 
 class SAM:
@@ -1647,6 +1691,12 @@ if aft_srf_ctx_head is not None:
     base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
 
+# Add arc-length PE projection params to optimizer
+if arc_pe_proj is not None:
+    base_opt.add_param_group({'params': list(arc_pe_proj.parameters()), 'lr': _base_lr})
+if aft_arc_pe_proj is not None:
+    base_opt.add_param_group({'params': list(aft_arc_pe_proj.parameters()), 'lr': _base_lr})
+
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
     _warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
@@ -1750,6 +1800,10 @@ for epoch in range(MAX_EPOCHS):
         aft_srf_head.train()
     if aft_srf_ctx_head is not None:
         aft_srf_ctx_head.train()
+    if arc_pe_proj is not None:
+        arc_pe_proj.train()
+    if aft_arc_pe_proj is not None:
+        aft_arc_pe_proj.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
@@ -1858,7 +1912,7 @@ for epoch in range(MAX_EPOCHS):
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
         # TE coordinate frame / wake deficit / cp_panel: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.surface_arc_pe
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
@@ -2019,6 +2073,10 @@ for epoch in range(MAX_EPOCHS):
                     if surf_idx.numel() > 0:
                         surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]  # [M, n_hidden]
                         surf_pred = pred[surf_idx[:, 0], surf_idx[:, 1]]      # [M, 3]
+                        if arc_pe_proj is not None and _raw_xy_te is not None:
+                            _surf_xy = _raw_xy_te[surf_idx[:, 0], surf_idx[:, 1]]  # [M, 2]
+                            _pe = compute_surface_arc_pe(_surf_xy, cfg.surface_arc_pe_freqs)
+                            surf_hidden = surf_hidden + arc_pe_proj(_pe.to(surf_hidden.dtype))
                         correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
@@ -2048,6 +2106,10 @@ for epoch in range(MAX_EPOCHS):
             if aft_idx.numel() > 0:
                 aft_hidden = hidden[aft_idx[:, 0], aft_idx[:, 1]]  # [A, n_hidden]
                 aft_pred = pred[aft_idx[:, 0], aft_idx[:, 1]]      # [A, 3]
+                if aft_arc_pe_proj is not None and _raw_xy_te is not None:
+                    _aft_xy = _raw_xy_te[aft_idx[:, 0], aft_idx[:, 1]]  # [A, 2]
+                    _aft_pe = compute_surface_arc_pe(_aft_xy, cfg.surface_arc_pe_freqs)
+                    aft_hidden = aft_hidden + aft_arc_pe_proj(_aft_pe.to(aft_hidden.dtype))
                 # FiLM conditioning: expand gap/stagger per aft-foil node
                 _aft_cond = None
                 if cfg.aft_foil_srf_film:
@@ -2412,6 +2474,21 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for arc-length PE projections
+            if arc_pe_proj is not None:
+                if ema_arc_pe_proj is None:
+                    ema_arc_pe_proj = deepcopy(arc_pe_proj)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_arc_pe_proj.parameters(), arc_pe_proj.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            if aft_arc_pe_proj is not None:
+                if ema_aft_arc_pe_proj is None:
+                    ema_aft_arc_pe_proj = deepcopy(aft_arc_pe_proj)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_aft_arc_pe_proj.parameters(), aft_arc_pe_proj.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -2532,6 +2609,17 @@ for epoch in range(MAX_EPOCHS):
             eval_aft_srf_ctx_head.eval()
         else:
             aft_srf_ctx_head.eval()
+    # Select arc-length PE projections for eval (EMA if available)
+    eval_arc_pe_proj = arc_pe_proj
+    eval_aft_arc_pe_proj = aft_arc_pe_proj
+    if arc_pe_proj is not None:
+        if ema_arc_pe_proj is not None and ema_model is not None and eval_model is ema_model:
+            eval_arc_pe_proj = ema_arc_pe_proj
+        eval_arc_pe_proj.eval()
+    if aft_arc_pe_proj is not None:
+        if ema_aft_arc_pe_proj is not None and ema_model is not None and eval_model is ema_model:
+            eval_aft_arc_pe_proj = ema_aft_arc_pe_proj
+        eval_aft_arc_pe_proj.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -2557,7 +2645,7 @@ for epoch in range(MAX_EPOCHS):
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
                 _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
-                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel
+                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.surface_arc_pe
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
                 _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -2692,6 +2780,10 @@ for epoch in range(MAX_EPOCHS):
                             if surf_idx.numel() > 0:
                                 surf_hidden = _eval_hidden[surf_idx[:, 0], surf_idx[:, 1]]
                                 surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
+                                if eval_arc_pe_proj is not None and _raw_xy_te is not None:
+                                    _surf_xy = _raw_xy_te[surf_idx[:, 0], surf_idx[:, 1]]
+                                    _pe = compute_surface_arc_pe(_surf_xy, cfg.surface_arc_pe_freqs)
+                                    surf_hidden = surf_hidden + eval_arc_pe_proj(_pe.to(surf_hidden.dtype))
                                 correction = eval_refine_head(surf_hidden, surf_pred).float()
                                 pred_loss = pred_loss.clone()
                                 pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
@@ -2727,6 +2819,10 @@ for epoch in range(MAX_EPOCHS):
                     if aft_idx.numel() > 0:
                         _ah = _eval_hidden[aft_idx[:, 0], aft_idx[:, 1]]
                         _ap = pred_loss[aft_idx[:, 0], aft_idx[:, 1]]
+                        if eval_aft_arc_pe_proj is not None and _raw_xy_te is not None:
+                            _aft_xy = _raw_xy_te[aft_idx[:, 0], aft_idx[:, 1]]
+                            _aft_pe = compute_surface_arc_pe(_aft_xy, cfg.surface_arc_pe_freqs)
+                            _ah = _ah + eval_aft_arc_pe_proj(_aft_pe.to(_ah.dtype))
                         _ac = _v_gap_stagger[aft_idx[:, 0]] if cfg.aft_foil_srf_film else None
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                             _aft_corr = eval_aft_srf_head(_ah, _ap, _ac).float()
@@ -2915,6 +3011,12 @@ for epoch in range(MAX_EPOCHS):
                 aft_srf_ctx_head._orig_mod if hasattr(aft_srf_ctx_head, '_orig_mod') else aft_srf_ctx_head
             )
             torch.save(_ctx_save.state_dict(), model_dir / "aft_srf_ctx_head.pt")
+        if arc_pe_proj is not None:
+            _pe_save = ema_arc_pe_proj if ema_arc_pe_proj is not None else arc_pe_proj
+            torch.save(_pe_save.state_dict(), model_dir / "arc_pe_proj.pt")
+        if aft_arc_pe_proj is not None:
+            _aft_pe_save = ema_aft_arc_pe_proj if ema_aft_arc_pe_proj is not None else aft_arc_pe_proj
+            torch.save(_aft_pe_save.state_dict(), model_dir / "aft_arc_pe_proj.pt")
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
