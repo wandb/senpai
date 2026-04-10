@@ -2,6 +2,70 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-10 04:10 — PR #2346: Focal L1 Surface Loss (gamma=1.0) — tanjiro — **CLOSED** ❌
+
+- Branch: `tanjiro/focal-l1-surface-loss`
+- W&B runs: `a5gi6gnr` (s42), `8vq8enj8` (s73)
+
+| Metric | Baseline | 2-seed avg | Δ |
+|--------|----------|------------|---|
+| p_in | 11.709 | 12.44 | **+6.2%** ❌ |
+| p_oodc | 7.544 | 8.40 | **+11.3%** ❌ |
+| p_tan | 27.402 | 27.15 | -0.9% ≈ |
+| p_re | 6.481 | 6.85 | **+5.7%** ❌ |
+
+**Analysis:** Focal weighting from epoch 0 destabilized early learning and composed redundantly with existing hard-node mining. The baseline's multi-layered difficulty targeting already handles hard nodes effectively.
+
+---
+
+### 2026-04-10 04:10 — PR #2347: Sample Difficulty Curriculum (β=2.0) — nezuko — **CLOSED** ❌
+
+- Branch: `nezuko/sample-difficulty-curriculum`
+- W&B runs: `qyao6jov` (s42), `wfuyfg03` (s73)
+
+| Metric | Baseline | 2-seed avg | Δ |
+|--------|----------|------------|---|
+| p_in | 11.709 | 12.20 | **+4.2%** ❌ |
+| p_oodc | 7.544 | 7.50 | -0.6% ≈ |
+| p_tan | 27.402 | 27.30 | -0.4% ≈ |
+| p_re | 6.481 | 6.50 | +0.3% ≈ |
+
+**Analysis:** Neutral. Curriculum weight differentiation was modest (std ~0.04). Existing hard-node mining + PCGrad + tandem boost + Re-stratification leaves no room for additional curriculum.
+
+---
+
+### 2026-04-10 04:10 — PR #2348: Gumbel MoE SRF (K=4) — askeladd — **CLOSED** ❌
+
+- Branch: `askeladd/gumbel-moe-srf`
+- W&B runs: `jmzq4sft` (s42), `xgh8j9mz` (s73)
+
+| Metric | Baseline | 2-seed avg | Δ |
+|--------|----------|------------|---|
+| p_in | 11.709 | 12.05 | +2.9% ❌ |
+| p_oodc | 7.544 | 7.55 | +0.1% ≈ |
+| p_tan | 27.402 | 27.60 | +0.7% ≈ |
+| p_re | 6.481 | 6.40 | -1.2% ✅ |
+
+**Analysis:** Neutral. Per-node expert routing doesn't meaningfully improve over single SRF MLP. Load balancing loss may force equal utilization when unequal is physically appropriate.
+
+---
+
+### 2026-04-10 04:10 — PR #2349: Diffusion Surface Decoder (T=8, DDIM 5-step) — frieren — **CLOSED** ❌
+
+- Branch: `frieren/diffusion-surface-decoder`
+- W&B runs: `ct49a9ik` (s42), `je9ghuzn` (s73)
+
+| Metric | Baseline | 2-seed avg | Δ |
+|--------|----------|------------|---|
+| p_in | 11.709 | 182.35 | **+1457%** ❌ |
+| p_oodc | 7.544 | 87.45 | **+1059%** ❌ |
+| p_tan | 27.402 | 188.25 | **+587%** ❌ |
+| p_re | 6.481 | 80.90 | **+1148%** ❌ |
+
+**Analysis:** Catastrophic. Per-node diffusion is fundamentally limited: no spatial coherence between nodes, moving residual target, detached conditioning blocks gradient flow, 2.3× training slowdown. Stochastic surface decoders are exhausted.
+
+---
+
 ### 2026-04-10 03:40 — PR #2341 v2: Hypernetwork SRF (rank=2, alpha=0.5) — alphonse — **SENT BACK** 🔄
 
 - Branch: `alphonse/hypernetwork-srf-weights`
