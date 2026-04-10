@@ -29,7 +29,7 @@ cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_ou
 | alphonse | #2368 | **Sobolev Surface Gradient Loss** | Loss formulation | WIP — implementing |
 | ~~frieren~~ | ~~#2365~~ | ~~FFD Geometry Augmentation~~ | ~~Data generation~~ | CLOSED — p_in +9.4%, p_tan +6.2% |
 | tanjiro | #2366 | **MoE Domain-Expert FFN** | Architecture (routing) | WIP — implementing |
-| askeladd | #2367 | **Biot-Savart Attention Bias** | Physics-informed attention | WIP — implementing |
+| ~~askeladd~~ | ~~#2367~~ | ~~Biot-Savart Attention Bias~~ | ~~Physics-informed attention~~ | CLOSED — p_oodc -1.1% but p_tan +2.7% |
 
 ### Round 41 Bold Experiments (just assigned)
 | Student | PR | Experiment | Type | Status |
@@ -37,6 +37,7 @@ cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_ou
 | thorfinn | #2369 | **Cross-Foil Autoregressive Decoding** | Architecture (causal AR) | WIP — just assigned |
 | nezuko | #2370 | **Surface-Intrinsic B-GNN** | Architecture (pure surface GNN) | WIP — just assigned |
 | frieren | #2371 | **1D Surface FNO Decoder** | Architecture (spectral surface) | WIP — just assigned |
+| askeladd | #2372 | **Surface-Node Cross-Attention** | Architecture (global surface attn) | WIP — just assigned |
 
 ## This Session's Actions
 
@@ -44,6 +45,7 @@ cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_ou
 - **PR #2351 (thorfinn):** Log-Re-Conditioned Panel Cp — 2-seed avg fails baseline on 3/4 metrics (p_in +1.7%, p_tan +0.5%, p_re +1.6%); only p_oodc -0.6%. High seed variance. Physics-feature era is exhausted.
 - **PR #2359 (nezuko):** Spectral Regularization on FFN Weights — all configurations 10-20% worse across all metrics. Clear dead end; spectral norm restricts expressivity without physics-motivated benefit.
 - **PR #2365 (frieren):** FFD Geometry Augmentation — p_in +9.4%, p_tan +6.2%. Label mismatch: deformed geometry with original pressure labels corrupts training.
+- **PR #2367 (askeladd):** Biot-Savart Attention Bias — p_oodc -1.1% but p_tan +2.7%. BS physics redundant with existing vortex_panel_velocity feature; slice architecture has no pairwise bias injection point.
 
 ### New Assignments
 - **thorfinn #2369:** Cross-Foil Autoregressive Decoding — predict fore foil pressure first, condition aft foil decoding on fore predictions via cross-attention (stop-gradient). Zero-init output ensures identity at epoch 0. Targets p_tan (tandem causality).

@@ -2,6 +2,22 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-10 15:15 — PR #2367: Biot-Savart Cross-Foil Attention Bias — askeladd — **CLOSED** ❌
+
+- Branch: `askeladd/biot-savart-attention-bias`
+- Hypothesis: Inject Biot-Savart coupling magnitudes into the Transolver's spatial_bias MLP to physics-inform slice routing. Cross-foil induced velocity as attention structure rather than input features.
+
+**W&B runs:** nuddpz73 (seed 42), i5d2fpfr (seed 73)
+
+| Metric | S42 | S73 | 2-Seed Avg | Baseline | Δ |
+|--------|-----|-----|------------|----------|---|
+| p_in | 12.159 | 11.842 | 12.001 | 11.872 | +1.1% ❌ |
+| p_oodc | 7.354 | 7.397 | **7.376** | 7.459 | **-1.1% ✅** |
+| p_tan | 26.857 | 27.216 | 27.037 | 26.319 | +2.7% ❌ |
+| p_re | 6.442 | 6.231 | 6.337 | 6.229 | +1.7% ❌ |
+
+**Analysis:** Student adapted original [N,N] pairwise bias design to slice-attention architecture (spatial_bias MLP extension, 4→6 input channels). Despite correct engineering, the physics signal is redundant with existing --vortex_panel_velocity feature (4 input channels of full induced velocity vectors). The 2-channel L2 norm summary provided to spatial_bias is less informative. p_tan regression (+2.7%) confirms the attention routing was disrupted. Conclusion: Biot-Savart physics is best delivered as input features (PR #2357, merged), not as attention structure. Askeladd reassigned to Surface-Node Cross-Attention (#2372).
+
 ### 2026-04-10 15:00 — PR #2365: FFD Geometry Augmentation — frieren — **CLOSED** ❌
 
 - Branch: `frieren/ffd-geometry-augmentation`
