@@ -1102,8 +1102,8 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-MAX_TIMEOUT = 180.0  # minutes
-MAX_EPOCHS = 500
+MAX_TIMEOUT = float(os.environ.get("SENPAI_TIMEOUT_MINUTES", "30.0"))  # minutes
+MAX_EPOCHS = 500  # wall-clock timeout is the binding constraint
 
 
 @dataclass
@@ -1253,6 +1253,13 @@ class Config:
     cp_panel: bool = False                 # append thin-airfoil inviscid Cp to input features
     cp_panel_tandem_only: bool = False     # zero Cp feature for single-foil samples (tandem benefit only)
     cp_panel_scale: float = 1.0            # scale factor for panel Cp feature (0.1 = weak hint)
+    # Transfer learning / self-pretraining (DPOT backbone or denoising self-pretrain)
+    pretrained_backbone: str = ""          # path to pretrained checkpoint (empty = train from scratch)
+    backbone_freeze_epochs: int = 0        # freeze backbone for N fine-tuning epochs (0 = no freeze)
+    backbone_lr_ratio: float = 0.1         # backbone LR = main LR * this ratio (for transfer learning)
+    denoise_pretrain_epochs: int = 0       # self-pretrain backbone with denoising for N epochs before fine-tuning
+    denoise_noise_std: float = 0.3         # noise std for denoising pretraining input corruption
+    denoise_mask_ratio: float = 0.3        # fraction of input channels to mask during denoising pretrain
 
 
 cfg = sp.parse(Config)
@@ -1432,6 +1439,27 @@ model_config = dict(
 
 model = Transolver(**model_config).to(device)
 model._pressure_separate = cfg.pressure_separate_last_block
+
+# --- Load pretrained backbone weights (if provided) ---
+_pretrain_loaded = False
+if cfg.pretrained_backbone:
+    ckpt = torch.load(cfg.pretrained_backbone, map_location="cpu")
+    # Handle nested state dicts (e.g. DPOT stores under 'model' key)
+    if isinstance(ckpt, dict) and 'model' in ckpt:
+        ckpt = ckpt['model']
+    model_state = model.state_dict()
+    loaded = 0
+    skipped = 0
+    for k, v in ckpt.items():
+        if k in model_state and v.shape == model_state[k].shape:
+            model_state[k] = v
+            loaded += 1
+        else:
+            skipped += 1
+    model.load_state_dict(model_state)
+    _pretrain_loaded = True
+    print(f"Loaded {loaded} pretrained parameters from {cfg.pretrained_backbone} (skipped {skipped})")
+
 torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
 model = torch.compile(model, mode=cfg.compile_mode)
 _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
@@ -1622,10 +1650,152 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
+# --- Denoising self-pretraining phase ---
+_process_start = time.time()  # track total wall-clock time including pretrain
+_use_transfer_lr = _pretrain_loaded or cfg.denoise_pretrain_epochs > 0
+if cfg.denoise_pretrain_epochs > 0 and not _pretrain_loaded:
+    print(f"\n=== Denoising self-pretraining for {cfg.denoise_pretrain_epochs} epochs ===")
+    _denoise_input_dim = model_config['fun_dim'] + model_config['space_dim']
+    _denoise_head = nn.Sequential(
+        nn.Linear(cfg.n_hidden, cfg.n_hidden), nn.GELU(),
+        nn.Linear(cfg.n_hidden, _denoise_input_dim),
+    ).to(device)
+    _denoise_head = torch.compile(_denoise_head, mode=cfg.compile_mode)
+    _denoise_opt = Lion(
+        list(model.parameters()) + list(_denoise_head.parameters()),
+        lr=cfg.lr, weight_decay=cfg.weight_decay
+    ) if cfg.use_lion else torch.optim.AdamW(
+        list(model.parameters()) + list(_denoise_head.parameters()),
+        lr=cfg.lr, weight_decay=cfg.weight_decay
+    )
+    _denoise_start = time.time()
+    for _de in range(cfg.denoise_pretrain_epochs):
+        _de_elapsed = (time.time() - _denoise_start) / 60.0
+        if _de_elapsed >= MAX_TIMEOUT * 0.25:  # cap pretrain at 25% of total budget
+            print(f"Pretrain time budget exhausted ({_de_elapsed:.1f} min). Stopping at epoch {_de}.")
+            break
+        model.train()
+        _de_loss_sum = 0.0
+        _de_n = 0
+        for x, y, is_surface, mask in tqdm(train_loader, desc=f"Pretrain {_de+1}/{cfg.denoise_pretrain_epochs}", leave=False):
+            x = x.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
+            is_surface = is_surface.to(device, non_blocking=True)
+            # Preprocessing: same as main training (standardize, add features)
+            raw_dsdf = x[:, :, 2:10]
+            dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+            dist_feat = torch.log1p(dist_surf * 10.0)
+            _raw_aoa_pt = x[:, 0, 14:15]
+            _need_te_raw_pt = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel
+            _raw_xy_pt = x[:, :, :2].clone() if _need_te_raw_pt else None
+            _raw_saf_norm_pt = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_pt else None
+            _raw_gap_pt = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
+            x = (x - stats["x_mean"]) / stats["x_std"]
+            curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+            if cfg.te_coord_frame:
+                te_feats, _fte_x, _fte_y = compute_te_features(_raw_xy_pt, is_surface, _raw_saf_norm_pt)
+                x = torch.cat([x, curv, dist_feat, te_feats], dim=-1)
+                if cfg.wake_deficit_feature:
+                    wake_feats = compute_wake_deficit_features(
+                        _raw_xy_pt, is_surface, _raw_saf_norm_pt, _raw_gap_pt,
+                        fore_te_x=_fte_x, fore_te_y=_fte_y, include_angle=cfg.wake_angle_feature)
+                    x = torch.cat([x, wake_feats], dim=-1)
+            else:
+                x = torch.cat([x, curv, dist_feat], dim=-1)
+                if cfg.wake_deficit_feature:
+                    wake_feats = compute_wake_deficit_features(
+                        _raw_xy_pt, is_surface, _raw_saf_norm_pt, _raw_gap_pt,
+                        include_angle=cfg.wake_angle_feature)
+                    x = torch.cat([x, wake_feats], dim=-1)
+            raw_xy = x[:, :, :2]
+            xy_min = raw_xy.amin(dim=1, keepdim=True)
+            xy_max = raw_xy.amax(dim=1, keepdim=True)
+            xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+            freqs = torch.cat([_base_model.fourier_freqs_fixed.to(device), _base_model.fourier_freqs_learned.abs()])
+            xy_scaled = xy_norm.unsqueeze(-1) * freqs
+            fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+            x = torch.cat([x, fourier_pe], dim=-1)
+            if cfg.cp_panel:
+                cp_feat = compute_cp_panel(_raw_xy_pt, _raw_aoa_pt, is_surface, _raw_saf_norm_pt)
+                if cfg.cp_panel_tandem_only:
+                    _is_tan_pt = (x[:, 0, 21].abs() > 0.01).float()
+                    cp_feat = cp_feat * _is_tan_pt[:, None, None]
+                if cfg.cp_panel_scale != 1.0:
+                    cp_feat = cp_feat * cfg.cp_panel_scale
+                x = torch.cat([x, cp_feat], dim=-1)
+            # Save clean input as reconstruction target (first _denoise_input_dim channels)
+            x_clean = x[:, :, :_denoise_input_dim].clone().detach()
+            # Corrupt input: add noise + channel masking
+            noise = torch.randn_like(x) * cfg.denoise_noise_std
+            x_noisy = x + noise
+            # Channel masking: zero out random channels
+            if cfg.denoise_mask_ratio > 0:
+                B_pt, N_pt, C_pt = x_noisy.shape
+                n_mask = max(1, int(C_pt * cfg.denoise_mask_ratio))
+                mask_channels = torch.stack([
+                    torch.randperm(C_pt, device=device)[:n_mask] for _ in range(B_pt)
+                ])  # [B, n_mask]
+                for b in range(B_pt):
+                    x_noisy[b, :, mask_channels[b]] = 0.0
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out = model({"x": x_noisy})
+                hidden = out["hidden"].float()  # [B, N, n_hidden]
+                recon = _denoise_head(hidden)  # [B, N, denoise_input_dim]
+            recon = recon.float()
+            # Reconstruction loss on valid nodes only
+            mask_f = mask.float().unsqueeze(-1)
+            de_loss = ((recon - x_clean) ** 2 * mask_f).sum() / mask_f.sum().clamp(min=1)
+            _denoise_opt.zero_grad()
+            de_loss.backward()
+            torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(_denoise_head.parameters()), 1.0)
+            _denoise_opt.step()
+            _de_loss_sum += de_loss.item()
+            _de_n += 1
+        _de_avg = _de_loss_sum / max(_de_n, 1)
+        print(f"  Pretrain epoch {_de+1}: loss={_de_avg:.4f}")
+    # Cleanup pretrain resources
+    del _denoise_head, _denoise_opt
+    torch.cuda.empty_cache()
+    _pretrain_loaded = True
+    print(f"=== Denoising pretraining complete ({(time.time() - _denoise_start)/60:.1f} min) ===\n")
+
+# --- Optimizer setup ---
+# When using transfer learning, split params into backbone (lower LR) and head (full LR)
+_backbone_param_names = set()
+if _use_transfer_lr:
+    for n, p in _base_model.named_parameters():
+        if n.startswith('preprocess') or (n.startswith('blocks.') and not n.startswith(f'blocks.{model_config["n_layers"]-1}')):
+            _backbone_param_names.add(n)
+    _n_backbone = sum(p.numel() for n, p in _base_model.named_parameters() if n in _backbone_param_names)
+    _n_head = sum(p.numel() for n, p in _base_model.named_parameters() if n not in _backbone_param_names)
+    print(f"Transfer LR: backbone={_n_backbone:,} params @ {cfg.backbone_lr_ratio}x LR, head={_n_head:,} params @ 1.0x LR")
+
 attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
-if cfg.use_lion:
+
+if _use_transfer_lr:
+    # Discriminative learning rates: backbone at backbone_lr_ratio, head at full lr
+    # Override the default attn/other split with backbone/head split
+    _bm = _base_model
+    backbone_params = [p for n, p in _bm.named_parameters() if n in _backbone_param_names]
+    head_params = [p for n, p in _bm.named_parameters() if n not in _backbone_param_names]
+    if cfg.use_lion:
+        base_opt = Lion([
+            {'params': backbone_params, 'lr': _base_lr * cfg.backbone_lr_ratio},
+            {'params': head_params, 'lr': _base_lr},
+        ], weight_decay=cfg.weight_decay)
+        optimizer = base_opt
+    else:
+        base_opt = torch.optim.AdamW([
+            {'params': backbone_params, 'lr': _base_lr * cfg.backbone_lr_ratio},
+            {'params': head_params, 'lr': _base_lr},
+        ], weight_decay=cfg.weight_decay)
+        if cfg.use_lookahead:
+            optimizer = Lookahead(base_opt, k=10, alpha=0.8)
+        else:
+            optimizer = base_opt
+elif cfg.use_lion:
     base_opt = Lion([
         {'params': attn_params, 'lr': _base_lr * 0.5},
         {'params': other_params, 'lr': _base_lr}
@@ -1735,7 +1905,7 @@ ema_val_loss = float("inf")
 ema_decay_val = 0.9
 best_metrics = {}
 global_step = 0
-train_start = time.time()
+train_start = _process_start if cfg.denoise_pretrain_epochs > 0 else time.time()
 prev_vol_loss = 1.0
 prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
 running_tandem_loss = 0.05
@@ -1748,6 +1918,18 @@ for epoch in range(MAX_EPOCHS):
         break
 
     t0 = time.time()
+
+    # --- Backbone freeze/unfreeze for transfer learning ---
+    if _use_transfer_lr and cfg.backbone_freeze_epochs > 0:
+        if epoch < cfg.backbone_freeze_epochs:
+            for n, p in _base_model.named_parameters():
+                if n in _backbone_param_names:
+                    p.requires_grad_(False)
+        elif epoch == cfg.backbone_freeze_epochs:
+            for n, p in _base_model.named_parameters():
+                if n in _backbone_param_names:
+                    p.requires_grad_(True)
+            print(f"Unfreezing backbone at epoch {epoch}")
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
