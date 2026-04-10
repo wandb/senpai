@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-10 12:30 UTC
+- **Date:** 2026-04-10 11:00 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training & Architecture Improvements
 
@@ -20,18 +20,23 @@ Reproduce:
 cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_output --use_lion --lr 2e-4 --slice_num 96 --cosine_T_max 150 --pcgrad_3way --pressure_first --pressure_deep --residual_prediction --surface_refine --te_coord_frame --wake_deficit_feature --re_stratified_sampling --n_layers 3 --cp_panel --cp_panel_tandem_only --cp_panel_scale 0.1 --wake_angle_feature
 ```
 
-## Student Status (2026-04-10 12:30 UTC)
+## Student Status (2026-04-10 11:00 UTC)
 
+### Round 40 Bold Experiments (newly assigned)
 | Student | PR | Experiment | Status | Notes |
 |---------|-----|-----------|--------|-------|
-| alphonse | #2341 v4 | **Hypernetwork SRF v2 + wake_angle** | WIP | v2 beat 3/4 metrics, v4 validates on new baseline |
-| thorfinn | #2351 | **Log-Re-Conditioned Panel Cp** | WIP | Targets p_re regression from Panel Cp |
-| edward | #2356 | **Joukowski Camber-Corrected Cp** | WIP | Geometry-aware panel physics |
-| fern | #2340 v2 | **Cl/Cd Auxiliary Loss (tandem-only)** | WIP | p_tan -2.9% in v1, v2 adds tandem-only + wake_angle |
-| askeladd | #2357 | **Vortex-Panel Induced Velocity** | WIP | Per-node inviscid physics oracle |
+| edward | #2362 | **Viscous Residual Prediction** | WIP | Predict delta_p = p_CFD - p_panel (reformulation) |
+| fern | #2363 | **Global Cl/Cd SRF Conditioning** | WIP | Two-pass: predict → integrate Cl/Cd → condition SRF via AdaLN |
+| alphonse | #2364 | **DPOT Pretrained Backbone** | WIP | Transfer learning from pretrained neural operator |
+
+### Round 39 (finishing)
+| Student | PR | Experiment | Status | Notes |
+|---------|-----|-----------|--------|-------|
+| thorfinn | #2351 | **Log-Re-Conditioned Panel Cp** | WIP | Awaiting results |
+| askeladd | #2357 | **Vortex-Panel Induced Velocity** | WIP | Training started ~08:22 UTC |
 | tanjiro | #2358 | **Surface-Normal SRF Frame** | WIP | Training started ~08:09 UTC |
-| nezuko | #2359 | **Spectral Regularization** | WIP | λ sweep {1e-5, 1e-4, 1e-3} |
-| frieren | #2360 | **Input Consistency Regularization** | WIP | R-Drop style dropout-robust predictions |
+| nezuko | #2359 | **Spectral Regularization** | WIP | Awaiting results |
+| frieren | #2360 | **Input Consistency Regularization** | WIP | Awaiting results |
 
 ## Human Researcher Directive (Issue #1860)
 
