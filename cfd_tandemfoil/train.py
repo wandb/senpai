@@ -981,10 +981,12 @@ class Transolver(nn.Module):
         gap_stagger_spatial_bias=False,
         surface_cross_attn=False,
         surface_cross_attn_heads=4,
+        surface_cross_attn_tandem_only=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
+        self.surface_cross_attn_tandem_only = surface_cross_attn_tandem_only
         self.surface_cross_attn = (
             SurfaceCrossAttention(n_hidden, num_heads=surface_cross_attn_heads)
             if surface_cross_attn else None
@@ -1210,10 +1212,13 @@ class Transolver(nn.Module):
                 h_surf = torch.stack(h_surf_list, dim=0)      # [B, max_surf, D]
                 key_padding_mask = torch.stack(pad_masks, dim=0)  # [B, max_surf]
                 h_surf_updated = self.surface_cross_attn(h_surf, key_padding_mask=key_padding_mask)
+                # Tandem-conditional: only scatter back for tandem samples when tandem_only=True
+                is_tandem_bool = (x[:, 0, 21].abs() > 0.01)  # [B]
                 fx = fx.clone()
                 for b in range(B):
                     n_s = n_surf[b].item()
-                    fx[b, is_surf_mask[b]] = h_surf_updated[b, :n_s]
+                    if not self.surface_cross_attn_tandem_only or is_tandem_bool[b]:
+                        fx[b, is_surf_mask[b]] = h_surf_updated[b, :n_s]
                 fx_deep = fx  # update deep repr with enriched surface states
 
         # Auxiliary Re prediction from pre-output-head hidden representation
@@ -1403,6 +1408,8 @@ class Config:
     # Phase 7: Surface cross-attention — global all-to-all attention on surface nodes
     surface_cross_attn: bool = False           # enable global surface-only cross-attention post-backbone
     surface_cross_attn_heads: int = 4          # number of attention heads for surface cross-attention
+    surface_cross_attn_tandem_only: bool = False  # apply SCA only to tandem samples; skip single-foil
+    surface_cross_attn_lr_scale: float = 1.0   # LR multiplier for SCA params (1.0 = same as base lr)
 
 
 cfg = sp.parse(Config)
@@ -1580,6 +1587,7 @@ model_config = dict(
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
     surface_cross_attn=cfg.surface_cross_attn,
     surface_cross_attn_heads=cfg.surface_cross_attn_heads,
+    surface_cross_attn_tandem_only=cfg.surface_cross_attn_tandem_only,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1774,20 +1782,27 @@ class Lookahead:
         return self.base_optimizer.param_groups
 
 
-attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
-other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+_attn_keys = ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias']
+# Separate SCA params into their own group when lr_scale != 1.0
+_use_sca_lr = cfg.surface_cross_attn and cfg.surface_cross_attn_lr_scale != 1.0
+sca_params = [p for n, p in model.named_parameters() if 'surface_cross_attn' in n] if _use_sca_lr else []
+_sca_ids = {id(p) for p in sca_params}
+attn_params = [p for n, p in model.named_parameters() if any(k in n for k in _attn_keys) and id(p) not in _sca_ids]
+other_params = [p for n, p in model.named_parameters() if not any(k in n for k in _attn_keys) and id(p) not in _sca_ids]
 _base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
+_param_groups = [
+    {'params': attn_params, 'lr': _base_lr * 0.5},
+    {'params': other_params, 'lr': _base_lr},
+]
+if sca_params:
+    _sca_lr = _base_lr * cfg.surface_cross_attn_lr_scale
+    _param_groups.append({'params': sca_params, 'lr': _sca_lr})
+    print(f"SCA params: {sum(p.numel() for p in sca_params):,} params at lr={_sca_lr:.2e} ({cfg.surface_cross_attn_lr_scale}x)")
 if cfg.use_lion:
-    base_opt = Lion([
-        {'params': attn_params, 'lr': _base_lr * 0.5},
-        {'params': other_params, 'lr': _base_lr}
-    ], weight_decay=cfg.weight_decay)
+    base_opt = Lion(_param_groups, weight_decay=cfg.weight_decay)
     optimizer = base_opt  # Lion has its own momentum; skip Lookahead
 else:
-    base_opt = torch.optim.AdamW([
-        {'params': attn_params, 'lr': _base_lr * 0.5},
-        {'params': other_params, 'lr': _base_lr}
-    ], weight_decay=cfg.weight_decay)
+    base_opt = torch.optim.AdamW(_param_groups, weight_decay=cfg.weight_decay)
     if cfg.use_lookahead:
         optimizer = Lookahead(base_opt, k=10, alpha=0.8)
     else:
