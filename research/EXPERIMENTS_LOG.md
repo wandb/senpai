@@ -2,6 +2,47 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-10 16:00 — PR #2362: Viscous Residual Prediction — edward — **CLOSED** ❌
+
+- Branch: `edward/viscous-residual-target`
+- Hypothesis: Reformulate the prediction target as Δp = p_CFD − p_panel (viscous residual), forcing the model to learn only the viscous correction on top of the inviscid baseline. Analogous to multigrid preconditioning — predict a simpler residual rather than the full field.
+
+**W&B runs:** hiu2225x (seed 42, correct implementation), cgjvmyrk (seed 73, buggy val loop — unreliable)
+
+| Metric | S42 (hiu2225x) | Current Baseline (#2357) | Δ |
+|--------|----------------|--------------------------|---|
+| p_in | 12.59 | 11.872 | +6.0% ❌ |
+| p_oodc | 9.1 | 7.459 | +22.0% ❌ |
+| p_tan | 27.3 | 26.319 | +3.7% ❌ |
+| p_re | 7.1 | 6.229 | +14.0% ❌ |
+
+**Analysis:** Catastrophic failure across all metrics. Root cause: flat-plate panel Cp is too inaccurate for OOD/tandem conditions where wake interference makes the inviscid estimate wildly wrong. Subtracting a poor baseline makes the residual MORE variable and harder to predict — the opposite of the intended effect. Additionally, `phys_stats` normalization was computed from original pressures, not residuals, causing a distribution mismatch on normalized residual targets.
+
+Student found a real implementation bug: the val loop's `y_norm` construction did not subtract `panel_cp` residual before computing `val_loss`, inflating OOD split losses for checkpoint selection.
+
+**Lesson:** Residual prediction against a physics baseline requires that baseline to be accurate enough that the residual is SIMPLER than the original target. Panel-method Cp does not meet this bar for tandem foils. Future residual approaches need a more accurate baseline (e.g., the model's own first-pass prediction — but two-pass is incompatible with 30-min timeout). This approach is exhausted.
+
+**Edward reassigned** to PR #2374: Hard Kutta TE Constraint (physics-enforced pressure continuity at trailing edges).
+
+---
+
+### 2026-04-10 15:30 — PR #2366: MoE Domain-Expert FFN — tanjiro — **CLOSED** ❌
+
+- Branch: `tanjiro/domain-moe-ffn`
+- Hypothesis: Deterministic tandem/single routing to specialized LoRA delta FFN experts (rank=32). Binary domain split gives each TransolverBlock a dedicated tandem-specific FFN pathway.
+
+**W&B runs:** r9eani96 (seed 42), 2t9rcxe2 (seed 73)
+**Note:** Student ran on OLD baseline (missing --vortex_panel_velocity flags).
+
+| Metric | S42 | S73 | 2-Seed Avg | Current Baseline | Δ vs Current |
+|--------|-----|-----|------------|----------|---|
+| p_in | 12.302 | 12.250 | 12.276 | 11.872 | +3.4% ❌ |
+| p_oodc | 7.699 | 7.370 | 7.535 | 7.459 | +1.0% ❌ |
+| p_tan | 27.047 | 26.777 | 26.912 | 26.319 | +2.3% ❌ |
+| p_re | 6.567 | 6.633 | 6.600 | 6.229 | +6.0% ❌ |
+
+**Analysis:** LoRA rank 32 (r/d=0.167) degrades shared representations. Tandem-specific delta gets sparse gradient updates (~15-20% of data is tandem). The 16% epoch time overhead (148 vs ~160 epochs) compounds the regression. The p_tan -1.1% improvement on old baseline shows SOME tandem specialization, but shared feature degradation is too severe. Binary domain routing via LoRA is not viable for this architecture. Tanjiro reassigned to Multi-Scale Slice Attention (#2373).
+
 ### 2026-04-10 15:15 — PR #2367: Biot-Savart Cross-Foil Attention Bias — askeladd — **CLOSED** ❌
 
 - Branch: `askeladd/biot-savart-attention-bias`
