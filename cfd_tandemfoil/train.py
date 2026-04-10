@@ -1243,6 +1243,9 @@ class Config:
     cp_panel: bool = False                 # append thin-airfoil inviscid Cp to input features
     cp_panel_tandem_only: bool = False     # zero Cp feature for single-foil samples (tandem benefit only)
     cp_panel_scale: float = 1.0            # scale factor for panel Cp feature (0.1 = weak hint)
+    # Jacobian smoothness regularization: penalize output sensitivity to AoA/Re perturbations
+    jacobian_smooth: bool = False          # enable Jacobian smoothness penalty
+    jacobian_weight: float = 1e-4          # weight for Jacobian loss term
 
 
 cfg = sp.parse(Config)
@@ -2004,6 +2007,25 @@ for epoch in range(MAX_EPOCHS):
             else:
                 pred = pred / sample_stds
 
+        # Jacobian smoothness regularization: penalize output sensitivity to AoA/Re
+        # Alternates AoA (idx=14) and Re (idx=13) perturbations to limit memory
+        jac_loss = torch.tensor(0.0, device=device)
+        if cfg.jacobian_smooth and model.training and batch_idx % 2 == 0:
+            delta = 0.01
+            pred_orig = pred.detach()  # target for Jacobian MSE (detach saves backward memory)
+
+            # Alternate between AoA and Re perturbation each Jacobian batch
+            feat_idx = 14 if (batch_idx // 2) % 2 == 0 else 13  # AoA=14, Re=13
+            x_pert = x.clone()
+            x_pert[:, :, feat_idx] = x_pert[:, :, feat_idx] + delta
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                pred_pert = model({"x": x_pert})["preds"].float()
+            if cfg.multiply_std:
+                pred_pert = pred_pert * sample_stds
+            else:
+                pred_pert = pred_pert / sample_stds
+            jac_loss = F.mse_loss(pred_pert, pred_orig) / (delta ** 2)
+
         # Surface refinement head: additive correction on surface nodes
         if refine_head is not None and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -2223,6 +2245,12 @@ for epoch in range(MAX_EPOCHS):
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
 
+        # Jacobian smoothness: add to main loss
+        _jac_shared = 0.0
+        if cfg.jacobian_smooth:
+            loss = loss + cfg.jacobian_weight * jac_loss
+            _jac_shared = cfg.jacobian_weight * jac_loss * 0.5  # halved for PCGrad groups
+
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
@@ -2239,8 +2267,8 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + _jac_shared
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + _jac_shared
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -2285,7 +2313,7 @@ for epoch in range(MAX_EPOCHS):
                 vol_loss_g = (abs_err * vol_mask_g.unsqueeze(-1)).sum() / vol_mask_g.sum().clamp(min=1)
                 surf_loss_g = (surf_per_sample * mask_1d.float() * tandem_boost).sum() / n
                 coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + _jac_shared
 
             loss_A = _grp_loss(~is_tandem_batch)
             # Only include non-empty groups to avoid backward() on no-grad tensors
@@ -2413,7 +2441,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.jacobian_smooth:
+            _log_dict["train/jacobian_loss"] = jac_loss.item()
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
