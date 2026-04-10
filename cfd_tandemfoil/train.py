@@ -940,11 +940,15 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        multi_scale_slice=False,
+        slice_num_coarse=48,
+        slice_num_fine=192,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
         self.pressure_first = pressure_first
+        self.multi_scale_slice = multi_scale_slice
         self.ref = ref
         self.unified_pos = unified_pos
         self.adaln_output = adaln_output
@@ -982,45 +986,78 @@ class Transolver(nn.Module):
         self.space_dim = space_dim
         self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
         nn.init.eye_(self.feature_cross.weight)  # start as identity
-        self.blocks = nn.ModuleList(
-            [
-                TransolverBlock(
-                    num_heads=n_head,
-                    hidden_dim=n_hidden,
-                    dropout=dropout,
-                    act=act,
-                    mlp_ratio=mlp_ratio,
-                    out_dim=out_dim,
-                    slice_num=slice_num,
-                    last_layer=(idx == n_layers - 1),
-                    linear_no_attention=linear_no_attention,
-                    learned_kernel=learned_kernel,
-                    field_decoder=field_decoder if (idx == n_layers - 1) else False,
-                    adaln_output=adaln_output if (idx == n_layers - 1) else False,
-                    soft_moe=soft_moe if (idx == n_layers - 1) else False,
-                    adaln_all=adaln_all_blocks,
-                    adaln_cond_dim=4 if adaln_4cond else 2,
-                    adaln_zero_init=not adaln_nozero,
-                    film_cond=film_cond,
-                    decouple_slice=adaln_decouple,
-                    zone_temp=adaln_zone_temp,
-                    domain_layernorm=domain_layernorm,
-                    dln_zeroinit=dln_zeroinit,
-                    domain_velhead=domain_velhead if (idx == n_layers - 1) else False,
-                    prog_slices=prog_slices,
-                    pressure_first=pressure_first if (idx == n_layers - 1) else False,
-                    pressure_no_detach=pressure_no_detach,
-                    pressure_deep=pressure_deep,
-                    spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
-                )
+
+        # Helper to build TransolverBlock kwargs shared across all block types
+        _spatial_bias_dim = 6 if gap_stagger_spatial_bias else 4
+        def _block_kwargs(s_num, last):
+            return dict(
+                num_heads=n_head,
+                hidden_dim=n_hidden,
+                dropout=dropout,
+                act=act,
+                mlp_ratio=mlp_ratio,
+                out_dim=out_dim,
+                slice_num=s_num,
+                last_layer=last,
+                linear_no_attention=linear_no_attention,
+                learned_kernel=learned_kernel,
+                field_decoder=field_decoder if last else False,
+                adaln_output=adaln_output if last else False,
+                soft_moe=soft_moe if last else False,
+                adaln_all=adaln_all_blocks,
+                adaln_cond_dim=4 if adaln_4cond else 2,
+                adaln_zero_init=not adaln_nozero,
+                film_cond=film_cond,
+                decouple_slice=adaln_decouple,
+                zone_temp=adaln_zone_temp,
+                domain_layernorm=domain_layernorm,
+                dln_zeroinit=dln_zeroinit,
+                domain_velhead=domain_velhead if last else False,
+                prog_slices=prog_slices,
+                pressure_first=pressure_first if last else False,
+                pressure_no_detach=pressure_no_detach,
+                pressure_deep=pressure_deep,
+                spatial_bias_input_dim=_spatial_bias_dim,
+            )
+
+        if multi_scale_slice:
+            # Coarse branch: n_layers non-last blocks at coarse resolution (global context)
+            self.blocks_coarse = nn.ModuleList([
+                TransolverBlock(**_block_kwargs(slice_num_coarse, False))
+                for _ in range(n_layers)
+            ])
+            # Fine branch: n_layers non-last blocks at fine resolution (local LE/TE detail)
+            self.blocks_fine = nn.ModuleList([
+                TransolverBlock(**_block_kwargs(slice_num_fine, False))
+                for _ in range(n_layers)
+            ])
+            # Fusion: concat coarse + fine, project back to hidden_dim
+            self.scale_fusion = nn.Sequential(
+                nn.Linear(n_hidden * 2, n_hidden),
+                nn.GELU(),
+                nn.Linear(n_hidden, n_hidden),
+            )
+            # Output head: single block at standard slice_num
+            self.blocks = nn.ModuleList([
+                TransolverBlock(**_block_kwargs(slice_num, True))
+            ])
+        else:
+            # Standard single-resolution blocks
+            self.blocks = nn.ModuleList([
+                TransolverBlock(**_block_kwargs(slice_num, idx == n_layers - 1))
                 for idx in range(n_layers)
-            ]
-        )
+            ])
+
         # Zero-init the 2 new input columns of spatial_bias so initial routing is unchanged
         if gap_stagger_spatial_bias:
             with torch.no_grad():
                 for block in self.blocks:
                     block.spatial_bias[0].weight[:, 4:].zero_()
+                if multi_scale_slice:
+                    for block in self.blocks_coarse:
+                        block.spatial_bias[0].weight[:, 4:].zero_()
+                    for block in self.blocks_fine:
+                        block.spatial_bias[0].weight[:, 4:].zero_()
         # Separate pressure pathway (pressure_separate_last_block):
         # Independent MLP + pres_head that processes shared hidden features
         self._pressure_separate = False  # set from Config after construction
@@ -1138,10 +1175,22 @@ class Transolver(nn.Module):
         fx_pre = fx  # save for skip
         fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
 
-        for block in self.blocks[:-1]:
-            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+        if self.multi_scale_slice:
+            # Coarse branch: 48 slices — large receptive field for global inter-foil coupling
+            h_coarse = fx
+            for block in self.blocks_coarse:
+                h_coarse = block(h_coarse, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+            # Fine branch: 192 slices — small receptive field for LE suction peak / TE separation
+            h_fine = fx
+            for block in self.blocks_fine:
+                h_fine = block(h_fine, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+            # Fuse: concat coarse + fine, project back to hidden_dim [B, N, 2*H] → [B, N, H]
+            fx = self.scale_fusion(torch.cat([h_coarse, h_fine], dim=-1))
+        else:
+            for block in self.blocks[:-1]:
+                fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
 
-        # Deep hidden representation (post all non-last blocks, pre output head)
+        # Deep hidden representation (post backbone, pre output head)
         fx_deep = fx  # [B, N, n_hidden]
 
         # Auxiliary Re prediction from pre-output-head hidden representation
@@ -1173,8 +1222,8 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-MAX_TIMEOUT = 180.0  # minutes
-MAX_EPOCHS = 500
+MAX_TIMEOUT = float(os.environ.get("SENPAI_TIMEOUT_MINUTES", 180.0))  # minutes
+MAX_EPOCHS = int(os.environ.get("SENPAI_MAX_EPOCHS", 500))
 
 
 @dataclass
@@ -1328,6 +1377,10 @@ class Config:
     vortex_panel_velocity: bool = False    # append (u_fore, v_fore, u_aft, v_aft) induced velocity
     vortex_panel_scale: float = 0.1        # scale factor for vortex velocity channels
     vortex_panel_n: int = 64              # number of panels to subsample per foil
+    # Multi-scale slice attention: coarse + fine parallel TransolverBlock stacks (FPN-style)
+    multi_scale_slice: bool = False        # enable dual-resolution slice attention branches
+    slice_num_coarse: int = 48             # coarse branch slice count (global context, inter-foil coupling)
+    slice_num_fine: int = 192             # fine branch slice count (local resolution, LE suction peak)
 
 
 cfg = sp.parse(Config)
@@ -1503,6 +1556,9 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    multi_scale_slice=cfg.multi_scale_slice,
+    slice_num_coarse=cfg.slice_num_coarse,
+    slice_num_fine=cfg.slice_num_fine,
 )
 
 model = Transolver(**model_config).to(device)
