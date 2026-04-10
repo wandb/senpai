@@ -1243,6 +1243,10 @@ class Config:
     cp_panel: bool = False                 # append thin-airfoil inviscid Cp to input features
     cp_panel_tandem_only: bool = False     # zero Cp feature for single-foil samples (tandem benefit only)
     cp_panel_scale: float = 1.0            # scale factor for panel Cp feature (0.1 = weak hint)
+    # Sample difficulty curriculum: oversample hard training samples
+    sample_curriculum: bool = False        # enable loss-based sample oversampling
+    curriculum_beta: float = 2.0           # hard sample oversampling factor
+    curriculum_warmup: int = 10            # epochs before curriculum activates
 
 
 cfg = sp.parse(Config)
@@ -1300,6 +1304,22 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
 
+class _IndexedDataset(torch.utils.data.Dataset):
+    """Wraps a dataset to also return the sample index."""
+    def __init__(self, ds):
+        self.ds = ds
+    def __len__(self):
+        return len(self.ds)
+    def __getitem__(self, idx):
+        return (*self.ds[idx], idx)
+
+def _collate_with_idx(batch):
+    """Wraps pad_collate to extract and return sample indices."""
+    indices = torch.tensor([b[-1] for b in batch], dtype=torch.long)
+    data = [b[:-1] for b in batch]
+    x, y, surf, mask = pad_collate(data)
+    return x, y, surf, mask, indices
+
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=cfg.num_workers, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
 
@@ -1318,18 +1338,33 @@ if cfg.re_stratified_sampling and not cfg.debug:
           f"({_n_extreme/len(train_ds)*100:.1f}%) upweighted {cfg.re_extreme_weight}x "
           f"(log_Re thresholds: [{_re_low:.3f}, {_re_high:.3f}])")
 
-if cfg.debug:
+_base_sample_weights = sample_weights.clone()  # save for curriculum multiplication
+
+if cfg.debug and not cfg.sample_curriculum:
     # Avoid sampler/length mismatch when train_ds is truncated
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
                               shuffle=True, **loader_kwargs)
+    sampler = None
 else:
     sampler = WeightedRandomSampler(
         weights=sample_weights,
         num_samples=len(train_ds),
         replacement=True,
     )
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
-                              sampler=sampler, **loader_kwargs)
+    if cfg.sample_curriculum:
+        # Use indexed dataset + custom collate to track per-sample loss
+        _indexed_train_ds = _IndexedDataset(train_ds)
+        _curriculum_loader_kwargs = dict(collate_fn=_collate_with_idx, num_workers=cfg.num_workers,
+                                         pin_memory=True, persistent_workers=True, prefetch_factor=2)
+        train_loader = DataLoader(_indexed_train_ds, batch_size=cfg.batch_size,
+                                  sampler=sampler, **_curriculum_loader_kwargs)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
+                                  sampler=sampler, **loader_kwargs)
+
+# Per-sample loss tracker for curriculum
+_curriculum_losses = torch.zeros(len(train_ds), dtype=torch.float32)
+_curriculum_counts = torch.zeros(len(train_ds), dtype=torch.float32)
 
 val_loaders = {
     name: DataLoader(subset, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
@@ -1754,10 +1789,28 @@ for epoch in range(MAX_EPOCHS):
     epoch_surf = 0.0
     n_batches = 0
 
+    # Sample difficulty curriculum: update sampler weights at epoch start
+    if cfg.sample_curriculum and sampler is not None and epoch >= cfg.curriculum_warmup:
+        valid = _curriculum_counts > 0
+        curriculum_weights = torch.ones(len(train_ds), dtype=torch.float64)
+        if valid.any():
+            ln = _curriculum_losses[valid].double()
+            ln_norm = (ln - ln.min()) / (ln.max() - ln.min() + 1e-8)
+            curriculum_weights[valid] = 1.0 + (cfg.curriculum_beta - 1.0) * ln_norm
+        sampler.weights = _base_sample_weights * curriculum_weights
+        if epoch == cfg.curriculum_warmup or (epoch % 10 == 0):
+            print(f"  Curriculum weights: mean={curriculum_weights.mean():.3f}, "
+                  f"std={curriculum_weights.std():.3f}, max={curriculum_weights.max():.3f}")
+
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
     if cfg.grad_accum_steps > 1:
         optimizer.zero_grad()
-    for batch_idx, (x, y, is_surface, mask) in enumerate(pbar):
+    for batch_idx, batch_data in enumerate(pbar):
+        if cfg.sample_curriculum and len(batch_data) == 5:
+            x, y, is_surface, mask, _batch_sample_idx = batch_data
+        else:
+            x, y, is_surface, mask = batch_data
+            _batch_sample_idx = None
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -2128,6 +2181,18 @@ for epoch in range(MAX_EPOCHS):
         else:
             tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
         surf_loss = (surf_per_sample * tandem_boost).mean()
+
+        # Update per-sample loss tracker for curriculum (vectorized)
+        if cfg.sample_curriculum and _batch_sample_idx is not None:
+            _psl = surf_per_sample.detach().cpu().float()
+            _idx = _batch_sample_idx.long()
+            _alpha = 0.3
+            _is_new = _curriculum_counts[_idx] == 0
+            _curriculum_losses[_idx] = torch.where(
+                _is_new, _psl,
+                (1 - _alpha) * _curriculum_losses[_idx] + _alpha * _psl)
+            _curriculum_counts[_idx] += 1
+
         if cfg.uncertainty_loss:
             bm = _base_model
             surf_ux_loss = (abs_err[:, :, 0:1] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
@@ -2413,7 +2478,12 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _train_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.sample_curriculum and epoch >= cfg.curriculum_warmup and sampler is not None:
+            _cw = sampler.weights / _base_sample_weights.clamp(min=1e-12)
+            _train_log["train/curriculum_weight_std"] = _cw.std().item()
+            _train_log["train/curriculum_weight_max"] = _cw.max().item()
+        wandb.log(_train_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
