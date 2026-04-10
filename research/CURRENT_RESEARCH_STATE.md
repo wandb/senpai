@@ -64,14 +64,15 @@ Data augmentation: FFD geometry augmentation (label mismatch fatal), re-scaling 
 
 ## Next Research Priorities (Round 42+)
 
-Researcher-agent running now (2026-04-10 16:00 UTC) — see `RESEARCH_IDEAS_2026-04-10_ROUND42.md` when complete.
+Researcher-agent completed (2026-04-10 16:15 UTC). Full details in `RESEARCH_IDEAS_2026-04-10_ROUND42.md`.
 
-**Pre-identified Tier 1 candidates from Round 42 ideas list:**
-1. **Panel Method as Cheap Data Oracle** — generate 5000+ synthetic tandem configs using panel solver as auxiliary training data (self-consistent labels). Infrastructure exists (`--cp_panel`). AIAA 2024 shows 10²× improvement from inviscid pretraining.
-2. **Mamba/SSM Surface Sequence Model** — replace SRF attention with Mamba SSM on arc-length-ordered surface nodes. O(n) cost enables 6-8 layer surface decoder. (NOTE: Mamba broke torch.compile in Phase 5 — student should test compile compatibility first and have LRU fallback.)
-3. **Neural Process for Pressure Fields** — ANP with context = (surface_coord, cp_panel), predicts CFD pressure as conditional distribution. Novel: no prior CFD application. Targets p_oodc OOD generalization directly.
+**Ranked by expected p_tan impact (assign in this order as students become idle):**
 
-**Tier 2:**
-4. Koopman Operator Lifting (linearize tandem interference in latent space)
-5. SE(2)-Equivariant Architecture (orientation-invariant features)
-6. Contrastive Geometry Pretraining (UIUC+NACA airfoil library)
+### Tier 1 — Assign first
+1. **Panel Method as Cheap Data Oracle** — generate 3000-5000 synthetic tandem configs using existing panel solver; train as auxiliary data at 0.1× weight. Self-consistent labels (unlike FFD which had label mismatch). Springer Nature 2025 shows 10²× MSE reduction from inviscid pretraining. Expected: p_tan -5 to -10%. **CONFIDENCE: HIGH.**
+2. **Mamba/SSM Surface Sequence Model** — replace SRF MLP with Mamba SSM on arc-length-ordered surface nodes. Sequential inductive bias for pressure propagation. Run SRF in eager mode (torch.compile breaks Mamba), wrap only backbone. Expected: p_tan -3 to -8%. **CONFIDENCE: MEDIUM-HIGH.**
+
+### Tier 2 — High ceiling, moderate risk
+3. **SE(2)-Equivariant Geometry Encoding** — add rotation-invariant relative angle/distance features from surface nodes to both foil centroids. Pure feature engineering, no new libraries. Targets OOD tandem geometry generalization. Expected: p_tan -2 to -5%.
+4. **Attentive Neural Process Decoder** — fore-foil nodes as cross-foil context, aft-foil nodes as queries via ANP decoder. Targets both p_tan (interference) and p_oodc (OOD generalization) simultaneously. Expected: p_tan -4 to -8%.
+5. **Contrastive Geometry Pretraining** — pretrain geometry encoder on 1600+ UIUC airfoil shapes with InfoNCE contrastive loss. Enriches geometry embeddings beyond the limited training set. Expected: p_tan -3 to -6%.
