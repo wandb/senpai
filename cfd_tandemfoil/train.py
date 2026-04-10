@@ -903,6 +903,85 @@ class SurfaceRefinementContextHead(nn.Module):
         return correction
 
 
+class SurfaceBGNN(nn.Module):
+    """Surface-intrinsic Boundary GNN: message passing along airfoil boundary.
+
+    Processes surface nodes only using arc-length k-NN connectivity.
+    Outputs additive corrections to surface predictions.
+    Input: backbone hidden embeddings + base predictions at surface nodes.
+    """
+    def __init__(self, in_dim, hidden_dim=192, n_layers=4, n_edge_feats=3, out_dim=3):
+        super().__init__()
+        self.n_layers = n_layers
+        inp_dim = in_dim + out_dim  # hidden + base_pred concatenated
+        self.msg_mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(inp_dim * 2 + n_edge_feats, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, inp_dim),
+            ) for _ in range(n_layers)
+        ])
+        self.upd_mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(inp_dim * 2, inp_dim),
+                nn.GELU(),
+                nn.Linear(inp_dim, inp_dim),
+            ) for _ in range(n_layers)
+        ])
+        self.layer_norms = nn.ModuleList([nn.LayerNorm(inp_dim) for _ in range(n_layers)])
+        self.out_proj = nn.Linear(inp_dim, out_dim)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, h_surf, base_pred_surf, coords_surf, k, cp_surf=None):
+        """
+        h_surf:        [M, in_dim]  backbone hidden at surface nodes
+        base_pred_surf: [M, 3]     base predictions at surface nodes
+        coords_surf:   [M, 2]      (x, y) coordinates of surface nodes
+        k:             int         number of nearest neighbors
+        cp_surf:       [M, 1]      optional panel Cp feature
+        Returns: [M, 3] additive correction
+        """
+        M = h_surf.shape[0]
+        if M == 0:
+            return torch.zeros(0, base_pred_surf.shape[-1], device=h_surf.device)
+        k = min(k, M - 1)
+        if k <= 0:
+            return torch.zeros(M, base_pred_surf.shape[-1], device=h_surf.device)
+
+        # Build edge_index via k-NN on coordinates
+        dists = torch.cdist(coords_surf, coords_surf)  # [M, M]
+        # Zero out diagonal to exclude self-loops (add large value instead of fill_diagonal_)
+        eye_mask = torch.eye(M, device=dists.device, dtype=torch.bool)
+        dists = dists + eye_mask.float() * 1e9
+        _, neighbors = dists.topk(k, dim=1, largest=False)  # [M, k]
+        src = torch.arange(M, device=h_surf.device).unsqueeze(1).expand(-1, k).reshape(-1)
+        dst = neighbors.reshape(-1)  # [M*k]
+
+        # Edge features: [dx, dy, dist] + optional cp
+        d_xy = coords_surf[dst] - coords_surf[src]  # [E, 2]
+        d_norm = torch.linalg.vector_norm(d_xy, dim=-1, keepdim=True)  # [E, 1]
+        edge_attr = torch.cat([d_xy, d_norm], dim=1)  # [E, 3]
+        if cp_surf is not None:
+            edge_attr = torch.cat([edge_attr, cp_surf[src], cp_surf[dst]], dim=1)  # [E, 5]
+
+        # Node features: concatenate hidden + base_pred
+        h = torch.cat([h_surf, base_pred_surf], dim=-1)  # [M, in_dim+3]
+
+        for i in range(self.n_layers):
+            msg_input = torch.cat([h[src], h[dst], edge_attr], dim=1)
+            msgs = self.msg_mlps[i](msg_input)  # [E, inp_dim]
+            agg = torch.zeros(M, msgs.shape[-1], device=h.device, dtype=msgs.dtype)
+            agg.scatter_add_(0, dst.unsqueeze(1).expand_as(msgs), msgs)
+            count = torch.zeros(M, device=h.device).scatter_add_(
+                0, dst, torch.ones(len(dst), device=h.device))
+            agg = agg / (count.unsqueeze(1) + 1e-6)
+            upd_input = torch.cat([h.to(agg.dtype), agg], dim=1)
+            h = self.layer_norms[i](h.to(agg.dtype) + self.upd_mlps[i](upd_input))
+
+        return self.out_proj(h)  # [M, 3]
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -1328,6 +1407,10 @@ class Config:
     vortex_panel_velocity: bool = False    # append (u_fore, v_fore, u_aft, v_aft) induced velocity
     vortex_panel_scale: float = 0.1        # scale factor for vortex velocity channels
     vortex_panel_n: int = 64              # number of panels to subsample per foil
+    # Surface-intrinsic Boundary GNN: replaces SRF head with boundary message passing
+    surface_bgnn: bool = False             # enable surface-intrinsic B-GNN decoder (replaces surface_refine)
+    surface_bgnn_layers: int = 4           # number of B-GNN message passing rounds
+    surface_bgnn_k: int = 8               # k-NN neighbors on surface for B-GNN
 
 
 cfg = sp.parse(Config)
@@ -1566,6 +1649,21 @@ if cfg.aft_foil_srf:
               f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, "
               f"film={cfg.aft_foil_srf_film})")
 
+bgnn_head = None
+if cfg.surface_bgnn:
+    _n_edge_feats = 5 if cfg.cp_panel else 3  # [dx, dy, dist] + optional [cp_src, cp_dst]
+    bgnn_head = SurfaceBGNN(
+        in_dim=cfg.n_hidden,
+        hidden_dim=cfg.n_hidden,
+        n_layers=cfg.surface_bgnn_layers,
+        n_edge_feats=_n_edge_feats,
+        out_dim=3,
+    ).to(device)
+    bgnn_head = torch.compile(bgnn_head, mode=cfg.compile_mode)
+    _bgnn_n_params = sum(p.numel() for p in bgnn_head.parameters())
+    print(f"Surface B-GNN head: {_bgnn_n_params:,} params "
+          f"(hidden={cfg.n_hidden}, layers={cfg.surface_bgnn_layers}, k={cfg.surface_bgnn_k})")
+
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
@@ -1722,6 +1820,12 @@ if refine_head is not None:
     base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
 
+# Add B-GNN head params to optimizer if enabled
+if bgnn_head is not None:
+    _bgnn_params = list(bgnn_head.parameters())
+    base_opt.add_param_group({'params': _bgnn_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _bgnn_params):,} B-GNN head params to optimizer")
+
 # Add aft-foil SRF head params to optimizer if enabled
 if aft_srf_head is not None:
     _aft_params = list(aft_srf_head.parameters())
@@ -1835,6 +1939,8 @@ for epoch in range(MAX_EPOCHS):
         aft_srf_head.train()
     if aft_srf_ctx_head is not None:
         aft_srf_ctx_head.train()
+    if bgnn_head is not None:
+        bgnn_head.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
@@ -1994,6 +2100,9 @@ for epoch in range(MAX_EPOCHS):
             if cfg.cp_panel_scale != 1.0:
                 cp_feat = cp_feat * cfg.cp_panel_scale
             x = torch.cat([x, cp_feat], dim=-1)
+            _cp_feat_bgnn = cp_feat  # save for B-GNN edge features
+        else:
+            _cp_feat_bgnn = None
         if cfg.vortex_panel_velocity:
             vp_feat = compute_vortex_panel_velocity(
                 _raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te, n_panels=cfg.vortex_panel_n)
@@ -2115,6 +2224,31 @@ for epoch in range(MAX_EPOCHS):
                         correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
+
+        # Surface B-GNN: per-sample message passing along airfoil boundary
+        if bgnn_head is not None and model.training:
+            bgnn_out_norms = []
+            pred = pred.clone()
+            for b in range(x.shape[0]):
+                _surf_b = is_surface[b].nonzero(as_tuple=True)[0]  # [M_b] indices
+                if _surf_b.numel() < 2:
+                    continue
+                _h_b = hidden[b, _surf_b]           # [M_b, n_hidden]
+                _pred_b = pred[b, _surf_b]           # [M_b, 3]
+                _coords_b = x[b, _surf_b, :2]        # [M_b, 2] standardized coords
+                _cp_b = _cp_feat_bgnn[b, _surf_b] if _cp_feat_bgnn is not None else None
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _corr_b = bgnn_head(
+                        _h_b, _pred_b, _coords_b,
+                        cfg.surface_bgnn_k, _cp_b if _cp_b is not None else None
+                    ).float()
+                pred[b, _surf_b] = pred[b, _surf_b] + _corr_b
+                bgnn_out_norms.append(_corr_b.norm().item())
+            if bgnn_out_norms:
+                wandb.log({
+                    'train/bgnn_out_norm': sum(bgnn_out_norms) / len(bgnn_out_norms),
+                    'global_step': global_step,
+                })
 
         # Aft-foil dedicated refinement head: additive correction on boundary ID=7 nodes only
         if aft_srf_ctx_head is not None and model.training and _aft_foil_mask is not None:
@@ -2610,6 +2744,9 @@ for epoch in range(MAX_EPOCHS):
             eval_refine_head.eval()
         elif refine_head is not None:
             refine_head.eval()
+    # Set B-GNN to eval mode for validation
+    if bgnn_head is not None:
+        bgnn_head.eval()
     # Select aft-foil SRF head for eval (EMA if available)
     eval_aft_srf_head = aft_srf_head
     eval_aft_srf_ctx_head = aft_srf_ctx_head
@@ -2700,6 +2837,9 @@ for epoch in range(MAX_EPOCHS):
                     if cfg.cp_panel_scale != 1.0:
                         cp_feat = cp_feat * cfg.cp_panel_scale
                     x = torch.cat([x, cp_feat], dim=-1)
+                    _cp_feat_bgnn_v = cp_feat
+                else:
+                    _cp_feat_bgnn_v = None
                 if cfg.vortex_panel_velocity:
                     vp_feat = compute_vortex_panel_velocity(
                         _raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te, n_panels=cfg.vortex_panel_n)
@@ -2797,6 +2937,29 @@ for epoch in range(MAX_EPOCHS):
                                 pred_loss = pred_loss.clone()
                                 pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
+                    if cfg.multiply_std:
+                        pred = pred_loss / sample_stds
+                    else:
+                        pred = pred_loss * sample_stds
+
+                # Apply B-GNN head during validation
+                if bgnn_head is not None:
+                    _eval_bgnn_head = bgnn_head._orig_mod if hasattr(bgnn_head, '_orig_mod') else bgnn_head
+                    pred_loss = pred_loss.clone()
+                    for b in range(x.shape[0]):
+                        _surf_b = is_surface[b].nonzero(as_tuple=True)[0]
+                        if _surf_b.numel() < 2:
+                            continue
+                        _h_b = _eval_hidden[b, _surf_b]
+                        _pred_b = pred_loss[b, _surf_b]
+                        _coords_b = x[b, _surf_b, :2]
+                        _cp_b = _cp_feat_bgnn_v[b, _surf_b] if _cp_feat_bgnn_v is not None else None
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            _corr_b = _eval_bgnn_head(
+                                _h_b, _pred_b, _coords_b,
+                                cfg.surface_bgnn_k, _cp_b if _cp_b is not None else None
+                            ).float()
+                        pred_loss[b, _surf_b] = pred_loss[b, _surf_b] + _corr_b
                     if cfg.multiply_std:
                         pred = pred_loss / sample_stds
                     else:
