@@ -422,6 +422,71 @@ def compute_cp_panel(raw_xy, aoa_rad, is_surface, saf_norm):
     return cp_panel.unsqueeze(-1)  # [B, N, 1]
 
 
+def compute_surface_normal_frame(raw_xy: torch.Tensor, is_surface: torch.Tensor,
+                                 saf_norm: torch.Tensor, saf_thresh: float = 0.005) -> torch.Tensor:
+    """Compute local tangent/normal frame features for surface nodes.
+
+    For each surface node, sorts the foil-specific contour by angle from centroid,
+    computes the surface tangent/normal from adjacent nodes (central difference),
+    and projects the node's position relative to centroid into the local frame.
+
+    Args:
+        raw_xy:     [B, N, 2]  raw (chord-normalised) (x, y) positions
+        is_surface: [B, N]     boolean mask — surface nodes only
+        saf_norm:   [B, N]     gradient-field norm to separate fore (≤thresh) / aft (>thresh)
+        saf_thresh: threshold for fore vs aft foil split
+
+    Returns:
+        frame_feats: [B, N, 2]  (pos_tangential, pos_normal) — 0 for non-surface nodes
+    """
+    B, N, _ = raw_xy.shape
+    device = raw_xy.device
+    frame_feats = torch.zeros(B, N, 2, device=device, dtype=raw_xy.dtype)
+
+    for b in range(B):
+        surf_b = is_surface[b]  # [N]
+        if surf_b.sum() == 0:
+            continue
+        fore_mask = surf_b & (saf_norm[b] <= saf_thresh)
+        aft_mask  = surf_b & (saf_norm[b] >  saf_thresh)
+
+        for group_mask in [fore_mask, aft_mask]:
+            group_idx = group_mask.nonzero(as_tuple=True)[0]  # [M]
+            M = group_idx.numel()
+            if M < 3:
+                continue
+
+            pos = raw_xy[b, group_idx]  # [M, 2]
+            cx, cy = pos[:, 0].mean(), pos[:, 1].mean()
+            centroid = torch.stack([cx, cy])  # [2]
+
+            # Sort by angle from centroid to get ordered contour
+            angles = torch.atan2(pos[:, 1] - cy, pos[:, 0] - cx)  # [M]
+            sort_order = angles.argsort()
+            sorted_pos = pos[sort_order]  # [M, 2]
+
+            # Tangent via central difference around the closed contour
+            tangent = torch.roll(sorted_pos, -1, dims=0) - torch.roll(sorted_pos, 1, dims=0)
+            tangent = tangent / tangent.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
+            # Normal = tangent rotated 90°; ensure it points inward (toward centroid)
+            normal = torch.stack([-tangent[:, 1], tangent[:, 0]], dim=-1)
+            to_centroid = centroid.unsqueeze(0) - sorted_pos  # [M, 2]
+            if (normal * to_centroid).sum(dim=-1).mean() < 0:
+                normal = -normal
+
+            # Project position relative to centroid into local frame
+            rel_pos = sorted_pos - centroid.unsqueeze(0)  # [M, 2]
+            pos_t = (rel_pos * tangent).sum(dim=-1)   # [M] arc-length-like
+            pos_n = (rel_pos * normal).sum(dim=-1)    # [M] thickness-like
+
+            # Unsort back to original node ordering
+            unsort = sort_order.argsort()
+            frame_feats[b, group_idx] = torch.stack([pos_t[unsort], pos_n[unsort]], dim=-1)
+
+    return frame_feats  # [B, N, 2]
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -627,13 +692,13 @@ class SurfaceRefinementHead(nn.Module):
     """
 
     def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 128,
-                 n_layers: int = 2, p_only: bool = False):
+                 n_layers: int = 2, p_only: bool = False, extra_input_dim: int = 0):
         super().__init__()
         self.p_only = p_only
         actual_out = 1 if p_only else out_dim  # 1 for pressure-only, 3 for all fields
         layers: list[nn.Module] = []
-        # Input: hidden features (n_hidden) + base predictions (out_dim)
-        in_dim = n_hidden + out_dim
+        # Input: hidden features (n_hidden) + base predictions (out_dim) + optional extra
+        in_dim = n_hidden + out_dim + extra_input_dim
         for i in range(n_layers):
             layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
             layers.append(nn.LayerNorm(hidden_dim))
@@ -644,15 +709,20 @@ class SurfaceRefinementHead(nn.Module):
         nn.init.zeros_(layers[-1].bias)
         self.mlp = nn.Sequential(*layers)
 
-    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor,
+                extra_input: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
-            hidden: [M, n_hidden] — hidden features for surface nodes only
-            base_pred: [M, out_dim] — base predictions for surface nodes only
+            hidden:      [M, n_hidden] — hidden features for surface nodes only
+            base_pred:   [M, out_dim]  — base predictions for surface nodes only
+            extra_input: [M, extra_input_dim] — optional additional features (e.g. local frame)
         Returns:
             correction: [M, out_dim] — additive correction (zero-padded for p_only)
         """
-        inp = torch.cat([hidden, base_pred], dim=-1)
+        parts = [hidden, base_pred]
+        if extra_input is not None:
+            parts.append(extra_input)
+        inp = torch.cat(parts, dim=-1)
         correction = self.mlp(inp)
         if self.p_only:
             # Pad with zeros for velocity channels: [M, 1] → [M, 3]
@@ -1229,6 +1299,7 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    srf_normal_frame: bool = False            # append local tangent/normal frame coords to SRF input (+2 channels)
     # Phase 6: Asinh pressure transform
     asinh_pressure: bool = False             # transform pressure targets with asinh for dynamic range compression
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
@@ -1454,6 +1525,7 @@ if cfg.surface_refine:
             hidden_dim=cfg.surface_refine_hidden,
             n_layers=cfg.surface_refine_layers,
             p_only=cfg.surface_refine_p_only,
+            extra_input_dim=2 if cfg.srf_normal_frame else 0,
         ).to(device)
     refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
     _refine_n_params = sum(p.numel() for p in refine_head.parameters())
@@ -1868,7 +1940,7 @@ for epoch in range(MAX_EPOCHS):
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
         # TE coordinate frame / wake deficit / cp_panel: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.srf_normal_frame
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
@@ -2017,6 +2089,10 @@ for epoch in range(MAX_EPOCHS):
                 pred = pred / sample_stds
 
         # Surface refinement head: additive correction on surface nodes
+        # Precompute local tangent/normal frame features if requested
+        _srf_frame_feats = None
+        if cfg.srf_normal_frame and _raw_xy_te is not None and _raw_saf_norm_te is not None:
+            _srf_frame_feats = compute_surface_normal_frame(_raw_xy_te, is_surface, _raw_saf_norm_te)
         if refine_head is not None and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 if cfg.surface_refine_context:
@@ -2031,7 +2107,10 @@ for epoch in range(MAX_EPOCHS):
                     if surf_idx.numel() > 0:
                         surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]  # [M, n_hidden]
                         surf_pred = pred[surf_idx[:, 0], surf_idx[:, 1]]      # [M, 3]
-                        correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
+                        _surf_extra = None
+                        if _srf_frame_feats is not None:
+                            _surf_extra = _srf_frame_feats[surf_idx[:, 0], surf_idx[:, 1]]
+                        correction = refine_head(surf_hidden, surf_pred, _surf_extra).float()  # [M, 3]
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
 
@@ -2569,7 +2648,7 @@ for epoch in range(MAX_EPOCHS):
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
                 _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
-                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel
+                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.srf_normal_frame
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
                 _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -2706,7 +2785,11 @@ for epoch in range(MAX_EPOCHS):
                             if surf_idx.numel() > 0:
                                 surf_hidden = _eval_hidden[surf_idx[:, 0], surf_idx[:, 1]]
                                 surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                                correction = eval_refine_head(surf_hidden, surf_pred).float()
+                                _v_surf_extra = None
+                                if cfg.srf_normal_frame and _raw_xy_te is not None and _raw_saf_norm_te is not None:
+                                    _v_frame_feats = compute_surface_normal_frame(_raw_xy_te, is_surface, _raw_saf_norm_te)
+                                    _v_surf_extra = _v_frame_feats[surf_idx[:, 0], surf_idx[:, 1]]
+                                correction = eval_refine_head(surf_hidden, surf_pred, _v_surf_extra).float()
                                 pred_loss = pred_loss.clone()
                                 pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
@@ -3119,7 +3202,7 @@ if cfg.surface_refine and best_metrics:
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
                     _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
-                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel
+                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.srf_normal_frame
                     _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
                     _raw_gap_wake_vv = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -3223,10 +3306,14 @@ if cfg.surface_refine and best_metrics:
                     surf_idx = is_surface.nonzero(as_tuple=False)
                     correction_full = torch.zeros_like(pred_loss)
                     if surf_idx.numel() > 0:
+                        _vv_surf_extra = None
+                        if cfg.srf_normal_frame and _raw_xy_te is not None and _raw_saf_norm_te is not None:
+                            _vv_frame_feats = compute_surface_normal_frame(_raw_xy_te, is_surface, _raw_saf_norm_te)
+                            _vv_surf_extra = _vv_frame_feats[surf_idx[:, 0], surf_idx[:, 1]]
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                             surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]
                             surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                            correction = verify_refine(surf_hidden, surf_pred).float()
+                            correction = verify_refine(surf_hidden, surf_pred, _vv_surf_extra).float()
                         pred_loss_refined = pred_loss.clone()
                         pred_loss_refined[surf_idx[:, 0], surf_idx[:, 1]] += correction
                         correction_full[surf_idx[:, 0], surf_idx[:, 1]] = correction
