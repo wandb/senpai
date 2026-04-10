@@ -1,107 +1,85 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-10 11:00 UTC
+- **Date:** 2026-04-10 12:30 UTC
 - **Advisor branch:** noam
-- **Phase:** Phase 6 — Beyond Ensemble: Training & Architecture Improvements
+- **Phase:** Phase 6 — Bold Round 40
 
 ## Current Baseline
 
-### Single-Model Baseline (PR #2350 Wake Angle Feature, 2-seed avg)
+### Single-Model Baseline (PR #2357 Vortex-Panel Induced Velocity, 2-seed avg)
 
 | Metric | 2-seed avg | Target to beat |
 |--------|-----------|----------------|
-| **p_in** | **11.90** | < 11.90 |
-| **p_oodc** | **7.35** | < 7.35 |
-| **p_tan** | **27.20** | < 27.20 |
-| **p_re** | **6.40** | < 6.40 |
+| **p_in** | **11.872** | < 11.872 |
+| p_oodc | 7.459 | < 7.459 |
+| **p_tan** | **26.319** | < 26.319 |
+| **p_re** | **6.229** | < 6.229 |
 
 Reproduce:
 ```
-cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_output --use_lion --lr 2e-4 --slice_num 96 --cosine_T_max 150 --pcgrad_3way --pressure_first --pressure_deep --residual_prediction --surface_refine --te_coord_frame --wake_deficit_feature --re_stratified_sampling --n_layers 3 --cp_panel --cp_panel_tandem_only --cp_panel_scale 0.1 --wake_angle_feature
+cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_output --use_lion --lr 2e-4 --slice_num 96 --cosine_T_max 150 --pcgrad_3way --pressure_first --pressure_deep --residual_prediction --surface_refine --te_coord_frame --wake_deficit_feature --re_stratified_sampling --n_layers 3 --cp_panel --cp_panel_tandem_only --cp_panel_scale 0.1 --wake_angle_feature --vortex_panel_velocity --vortex_panel_scale 0.1 --vortex_panel_n 64
 ```
 
-## Student Status (2026-04-10 11:00 UTC)
+## Student Status (2026-04-10 12:30 UTC)
 
-### Round 40 Bold Experiments (newly assigned)
-| Student | PR | Experiment | Status | Notes |
-|---------|-----|-----------|--------|-------|
-| edward | #2362 | **Viscous Residual Prediction** | WIP | Predict delta_p = p_CFD - p_panel (reformulation) |
-| fern | #2363 | **Global Cl/Cd SRF Conditioning** | WIP | Two-pass: predict → integrate Cl/Cd → condition SRF via AdaLN |
-| alphonse | #2364 | **DPOT Pretrained Backbone** | WIP | Transfer learning from pretrained neural operator |
+### Round 40 Bold Experiments
+| Student | PR | Experiment | Type | Status |
+|---------|-----|-----------|------|--------|
+| edward | #2362 | **Viscous Residual Prediction** | Prediction reformulation | WIP — implementing |
+| fern | #2363 | **Global Cl/Cd SRF Conditioning** | Architecture (two-pass) | WIP — implementing |
+| alphonse | #2364 | **DPOT Pretrained Backbone** | Transfer learning | WIP — implementing |
+| frieren | #2365 | **FFD Geometry Augmentation** | Data generation | WIP — implementing |
+| tanjiro | #2366 | **MoE Domain-Expert FFN** | Architecture (routing) | WIP — implementing |
+| askeladd | #2367 | **Biot-Savart Attention Bias** | Physics-informed attention | WIP — implementing |
 
-### Round 39 (finishing)
-| Student | PR | Experiment | Status | Notes |
-|---------|-----|-----------|--------|-------|
-| thorfinn | #2351 | **Log-Re-Conditioned Panel Cp** | WIP | Awaiting results |
-| askeladd | #2357 | **Vortex-Panel Induced Velocity** | WIP | Training started ~08:22 UTC |
-| tanjiro | #2358 | **Surface-Normal SRF Frame** | WIP | Training started ~08:09 UTC |
-| nezuko | #2359 | **Spectral Regularization** | WIP | Awaiting results |
-| frieren | #2360 | **Input Consistency Regularization** | WIP | Awaiting results |
+### Round 39 (still finishing)
+| Student | PR | Experiment | Status |
+|---------|-----|-----------|--------|
+| thorfinn | #2351 | **Log-Re-Conditioned Panel Cp** | WIP — awaiting results |
+| nezuko | #2359 | **Spectral Regularization** | WIP — awaiting results |
+
+## This Session's Results
+
+### Merged
+- **PR #2357 (askeladd):** Vortex-Panel Induced Velocity — p_tan **-3.2%**, p_re **-2.7%**, p_in -0.2%. Biot-Savart physics oracle at every mesh node.
+
+### Closed (Round 39 incremental experiments)
+- **PR #2356 (edward):** Joukowski Camber Cp — all worse (+2.3% p_in). A0 correction too small.
+- **PR #2340 (fern):** Cl/Cd Aux Loss v2 — p_tan -2.4% but p_in +2.9%. Integral loss disrupts shared weights.
+- **PR #2341 (alphonse):** Hypernetwork SRF v4 — only 2/4 beat new baseline. Wake angle subsumes the signal.
+- **PR #2360 (frieren):** R-Drop Consistency — catastrophic +54% p_in. 2× forward pass incompatible with timeout.
+- **PR #2358 (tanjiro):** SRF Normal Frame — p_oodc +4.1%. Redundant with TE coord frame.
 
 ## Human Researcher Directive (Issue #1860)
 
-**Morgan McGuire:** "Too many incremental tweaks — go for radical new full model changes, data aug, and data generation. THINK BIGGER."
+**Morgan McGuire:** "Think bigger — radical new model changes, data aug, data generation."
 
-**Status:** Acknowledged and actioned. Current WIP experiments are the FINAL incremental round. Round 40 will be dedicated entirely to bold, paradigm-level changes. Researcher-agent has generated 10 bold ideas (see `/research/RESEARCH_IDEAS_2026-04-10_BOLD.md`).
-
-## Round 39 Results (PRs closed 2026-04-10)
-
-| PR | Experiment | Result | Verdict |
-|----|-----------|--------|---------|
-| #2352 (tanjiro) | SRF FiLM Conditioning | p_oodc +2.7% vs new baseline | Closed |
-| #2353 (nezuko) | Learnable Cp Scale | +6-42% all metrics | Closed |
-| #2354 (askeladd) | Pressure Recovery Ratio | p_in +5.9%, p_tan flat | Closed |
-| #2355 (frieren) | Two-Stage SRF | p_in +2.5%, p_oodc -1.9%, net negative | Closed |
-
-## Most Promising Active Experiments
-
-1. **Hypernetwork SRF v4** (alphonse #2341): v2 config (rank=2, α=0.5) + wake_angle_feature. v2 beat 3/4 metrics (p_oodc -2.7%, p_re -2.8%, p_tan -1.0%). Merge candidate if v4 confirms on new baseline.
-2. **Cl/Cd Auxiliary Loss v2** (fern #2340): p_tan -2.9% in v1. v2 applies tandem-only + rebased on wake_angle baseline. Strong tandem signal.
-
-## Round 40 Plan — BOLD EXPERIMENTS
-
-Per Morgan's directive, Round 40 will assign ONLY paradigm-level changes. No more physics feature tweaks.
-
-### Top Priority Assignments (first 5 idle students)
-
-| Priority | Hypothesis | Type | Target |
-|----------|-----------|------|--------|
-| 1 | **Viscous Residual Prediction** — predict delta_p = p_CFD - p_panel instead of raw pressure | Prediction reformulation | p_tan, p_in |
-| 2 | **DPOT Pretraining** — load pretrained Transolver backbone, discriminative LR fine-tune | Transfer learning | p_re, p_oodc |
-| 3 | **LoRA from Pretrained Operator** — frozen DPOT backbone + rank-8 LoRA adapters | Transfer learning | p_re, p_oodc |
-| 4 | **Biot-Savart Cross-Foil Attention Bias** — physics-derived attention structure for tandem coupling | Architecture + physics | p_tan, p_oodc |
-| 5 | **Surface-Only Boundary GNN** — replace Transolver+SRF with graph Transformer on surface nodes | Radical architecture | p_in, p_oodc |
-
-### Secondary Assignments (students 6-8)
-
-| Priority | Hypothesis | Type | Target |
-|----------|-----------|------|--------|
-| 6 | **Global Cl/Cd SRF Conditioning** — two-pass: predict → integrate Cl/Cd → condition SRF | Architecture | p_tan, p_in |
-| 7 | **MoE Domain-Expert FFN** — deterministic tandem/single routing with LoRA-style delta experts | Architecture | p_tan |
-| 8 | **FFD Geometry Augmentation** — Free-Form Deformation + NeuralFoil synthetic data | Data generation | p_in, p_oodc |
-
-Full details: `/research/RESEARCH_IDEAS_2026-04-10_BOLD.md`
+**Status:** ACTIONED. 6 of 8 students now on bold Round 40 experiments covering:
+- Prediction reformulation (viscous residual)
+- Transfer learning (DPOT pretrained backbone)
+- Data generation (FFD geometry augmentation)
+- Physics-informed attention (Biot-Savart attention bias)
+- Architecture (MoE domain routing, Cl/Cd two-pass conditioning)
 
 ## Key Insights (Updated)
 
-1. **Physics-informed input features are exhausted.** Panel Cp, wake deficit, wake angle, TE coord frame — all merged. Every further feature tweak has been neutral or worse. The feature mining era is over.
-2. **The backbone is a strong local optimum.** All 6 alternative architectures tried (GNOT, Galerkin, HPT, FactFormer, DeepONet, SIREN) were dramatically worse. BUT these were trained from scratch — **pretrained** backbones (DPOT) have not been tried.
-3. **Prediction reformulation is the highest-impact untried lever.** Viscous residual prediction changes the fundamental learning problem. Panel Cp is already in the model — using it as the prediction baseline is a zero-cost reformulation.
-4. **Transfer learning is completely unexplored.** No pretrained checkpoints have been used in any of 1966+ experiments. This is the largest gap in our experimental coverage.
-5. **Data augmentation beyond simple noise has never been tried.** FFD geometry augmentation with NeuralFoil Cp is a principled approach to expanding the training distribution.
+1. **Physics-informed input features remain the strongest lever.** Vortex-panel velocity merged with p_tan -3.2%, continuing the pattern of wake deficit, wake angle, panel Cp. The model thrives on explicitly computed physics as input.
+2. **The physics feature era is now exhausted.** Panel Cp, wake deficit, wake angle, vortex-panel velocity — all merged. Log-Re Cp, Joukowski Cp, surface normals, pressure recovery all failed. No more surface-level physics features to add.
+3. **Transfer learning, data augmentation, and prediction reformulation are COMPLETELY UNEXPLORED.** These are the biggest gaps in 1966+ experiments.
+4. **2× forward pass approaches are incompatible** with the 30-min training timeout. R-Drop/consistency regularization cannot work in this setting.
+5. **Integral loss terms (Cl/Cd) structurally conflict with per-node MAE** via PCGrad. The information is useful but must be delivered as conditioning, not loss.
 
 ## What's Exhausted (DO NOT REVISIT)
 
-Architecture (from scratch):
-- GNOT, Galerkin, HPT, FactFormer, DeepONet, SIREN — all dramatically worse
-- FiLM SRF, two-stage SRF, GRU decoder, diffusion decoder, Gumbel MoE SRF
-- Per-head KV attention, foil role embeddings, per-foil target whitening, SWA
+Architecture (from scratch): GNOT, Galerkin, HPT, FactFormer, DeepONet, SIREN
+Architecture (tweaks): FiLM SRF, two-stage SRF, GRU decoder, diffusion decoder, Gumbel MoE, hypernetwork SRF, per-head KV, foil role embed, SRF normal frame
+Loss/training: Focal L1, curriculum, quantile reg, Jacobian smooth, asymmetric loss, R-Drop, attention noise, aug annealing, spectral reg
+Physics features: Panel Cp ✅, wake deficit ✅, wake angle ✅, vortex-panel ✅ (all MERGED). Pressure recovery, learnable Cp, arc-length, log-Re Cp, Joukowski Cp (all failed).
 
-Loss/training:
-- Focal L1, curriculum, quantile regression, Jacobian smoothness, asymmetric surface loss
-- Aug annealing, batch size tuning, spectral reg, R-Drop, attention logit noise
+## Next Research Priorities
 
-Physics features:
-- Pressure recovery ratio, learnable Cp scale, arc-length encoding
-- SRF FiLM conditioning, surface-normal SRF frame, vortex-panel velocity, log-Re Cp, Joukowski Cp
-- Panel Cp, wake deficit, wake angle, TE coord frame (all MERGED)
+When Round 40 results come in, remaining unassigned bold ideas for Round 41:
+1. **LoRA from Pretrained Operator** (run alongside DPOT — frozen backbone + LoRA adapters)
+2. **Surface-Only Boundary GNN** (radical architecture: graph Transformer on surface nodes only)
+3. **DSDF-Weighted Physics Features** (distance-to-surface adaptive feature scaling)
+4. **Multiphysics Pretraining** (The Well dataset)
