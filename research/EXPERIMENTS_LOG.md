@@ -2,6 +2,21 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-10 09:35 — PR #2356: Joukowski Camber-Corrected Cp — edward — **CLOSED** ❌
+
+- Branch: `edward/joukowski-camber-cp`
+- Hypothesis: Replace flat-plate AoA in panel Cp formula with Joukowski-corrected effective AoA (A0 = α − (1/π)∫dyc/dx dθ), making Cp geometry-aware
+- W&B runs: `sys3eddk` (seed 42), `mnsm24ft` (seed 73)
+
+| Metric | S42 | S73 | 2-Seed Avg | Baseline | Δ |
+|--------|-----|-----|------------|----------|---|
+| p_in | 12.34 | 12.00 | 12.17 | 11.90 | +2.3% ❌ |
+| p_oodc | 7.50 | 7.20 | 7.35 | 7.35 | 0.0% — |
+| p_tan | 27.2 | 27.3 | 27.25 | 27.20 | +0.2% ❌ |
+| p_re | 6.5 | 6.5 | 6.50 | 6.40 | +1.6% ❌ |
+
+**Analysis:** The A0 camber correction is ~0.26° for NACA 2412 — far too small relative to the dataset AoA range (±15°) to provide useful signal. The model already learns camber effects from NACA geometry channels (15-17) in the input. Making the Cp feature geometry-aware via A0 added noise rather than information. Confirms that incremental Cp feature refinements are exhausted. Edward reassigned to bold Round 40 experiment: Viscous Residual Prediction (#2362).
+
 ### 2026-04-10 09:15 — PR #2352: SRF FiLM Conditioning — tanjiro — **CLOSED** ❌
 
 - Branch: `tanjiro/srf-film-conditioning`
