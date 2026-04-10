@@ -2,6 +2,40 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-10 14:30 — PR #2351: Log-Re-Conditioned Panel Cp — thorfinn — **CLOSED** ❌
+
+- Branch: `thorfinn/log-re-conditioned-cp`
+- Hypothesis: Add a tiny Re→scale MLP (FiLM conditioning) to the panel Cp feature, allowing the model to downweight inviscid Cp at low Re (viscous effects dominate) and upweight at high Re. Targets the p_re regression introduced by Panel Cp (PR #2319).
+
+**W&B runs:** joyoucec (seed 42), r0zyimb1 (seed 73)
+
+| Metric | S42 (joyoucec) | S73 (r0zyimb1) | 2-Seed Avg | Baseline | Δ |
+|--------|----------------|----------------|------------|----------|---|
+| p_in | **11.755** ✅ | 12.398 ❌ | 12.077 | 11.872 | +1.7% ❌ |
+| p_oodc | 7.511 ❌ | **7.314** ✅ | 7.413 | 7.459 | **-0.6%** ✅ |
+| p_tan | **26.208** ✅ | 26.686 ❌ | 26.447 | 26.319 | +0.5% ❌ |
+| p_re | 6.336 ❌ | 6.319 ❌ | 6.328 | 6.229 | +1.6% ❌ |
+
+**Analysis:** High seed variance (s42 p_in=11.755 vs s73 p_in=12.398, spread=0.643) indicates the Re-conditioning is not stable — the tiny Re→scale MLP is learning to approximate identity at most Re values rather than a physics-grounded correction. 2-seed average only beats baseline on p_oodc (-0.6%). p_in, p_tan, p_re all regress. The physics-feature era is exhausted; this was a Round 39 experiment caught by the Round 40 bold pivot.
+
+### 2026-04-10 14:30 — PR #2359: Spectral Regularization on FFN Weights — nezuko — **CLOSED** ❌
+
+- Branch: `nezuko/spectral-regularization`
+- Hypothesis: Apply spectral norm regularization (SVD-based Lipschitz constraint) to Transolver FFN weight matrices at lambda values [1e-5, 1e-4, 1e-3] to improve OOD generalization.
+
+**W&B runs:** pkyq6yjb (λ=1e-5, s42), 8csaxd3y (λ=1e-4, s42), xoq9qttf (λ=1e-3, s42), d1okigoy (best-s73), dbejfzdb (best-s42)
+
+| Config | p_in | p_oodc | p_tan | p_re | Δ p_in |
+|--------|------|--------|-------|------|--------|
+| λ=1e-5 s42 | 12.982 | 7.993 | 27.625 | 6.948 | +9.3% ❌ |
+| λ=1e-4 s42 | 13.810 | 8.206 | 27.990 | 6.944 | +16.3% ❌ |
+| λ=1e-3 s42 | 13.859 | 8.482 | 28.075 | 7.090 | +16.7% ❌ |
+| best-s42 | 14.276 | 8.580 | 28.231 | 7.265 | +20.2% ❌ |
+| best-s73 | 13.982 | 7.978 | 27.620 | 6.893 | +17.7% ❌ |
+| **Baseline** | **11.872** | **7.459** | **26.319** | **6.229** | — |
+
+**Analysis:** All configurations 10-20% worse across all metrics. Spectral norm constraints restrict FFN expressivity without providing useful inductive bias for surface pressure prediction on unstructured CFD meshes. OOD generalization in this domain is governed by physical validity of learned representations (addressed by physics input features), not Lipschitz continuity of weight matrices. The constraint tightens the model's expressiveness without any compensating benefit. Clear dead end.
+
 ### 2026-04-10 13:40 — PR #2364: DPOT Pretrained Backbone — alphonse — **CLOSED** ❌
 
 - Branch: `alphonse/dpot-pretrained-backbone`
