@@ -823,6 +823,147 @@ class SurfaceRefinementContextHead(nn.Module):
         return correction
 
 
+def surface_to_grid(surf_feats, surf_xy, n_grid=256):
+    """Interpolate irregular surface node features onto uniform arc-length grid.
+
+    Args:
+        surf_feats: [M, D] — features for surface nodes (single sample, single foil)
+        surf_xy: [M, 2] — xy coordinates
+        n_grid: number of uniform grid points
+
+    Returns:
+        grid_feats: [D, n_grid] — interpolated features on uniform arc-length grid
+        sort_idx: [M] — indices that sort nodes by angle (for unsorting later)
+        arc: [M] — normalized arc-length for each sorted node
+    """
+    # Sort by angle from centroid
+    centroid = surf_xy.mean(dim=0, keepdim=True)  # [1, 2]
+    angles = torch.atan2(surf_xy[:, 1] - centroid[:, 1],
+                         surf_xy[:, 0] - centroid[:, 0])  # [M]
+    sort_idx = angles.argsort(dim=0)  # [M]
+
+    sorted_xy = surf_xy[sort_idx]  # [M, 2]
+    sorted_feats = surf_feats[sort_idx]  # [M, D]
+
+    # Cumulative arc-length
+    diffs = sorted_xy[1:] - sorted_xy[:-1]  # [M-1, 2]
+    seg_len = diffs.norm(dim=-1)  # [M-1]
+    arc = torch.zeros(surf_xy.shape[0], device=surf_xy.device, dtype=surf_xy.dtype)
+    arc[1:] = torch.cumsum(seg_len, dim=0)
+    arc = arc / (arc[-1:] + 1e-8)  # normalize to [0, 1]
+
+    # Interpolate to uniform grid
+    grid_coords = torch.linspace(0, 1, n_grid, device=arc.device, dtype=arc.dtype)  # [n_grid]
+    idx = torch.searchsorted(arc, grid_coords)
+    idx = idx.clamp(1, arc.shape[0] - 1)
+
+    arc_lo = arc[idx - 1]
+    arc_hi = arc[idx]
+    alpha = ((grid_coords - arc_lo) / (arc_hi - arc_lo + 1e-8)).clamp(0, 1).unsqueeze(-1)  # [n_grid, 1]
+
+    feat_lo = sorted_feats[idx - 1]  # [n_grid, D]
+    feat_hi = sorted_feats[idx]      # [n_grid, D]
+    grid_feats = feat_lo * (1 - alpha) + feat_hi * alpha  # [n_grid, D]
+
+    return grid_feats.permute(1, 0), sort_idx, arc  # [D, n_grid], [M], [M]
+
+
+def grid_to_nodes(grid_pred, arc, n_grid=256):
+    """Interpolate grid predictions back to original (sorted) node positions.
+
+    Args:
+        grid_pred: [C, n_grid] — predictions on uniform grid
+        arc: [M] — normalized arc-length for each sorted node
+        n_grid: number of grid points
+
+    Returns:
+        node_pred: [M, C] — predictions at original node positions
+    """
+    grid_coords = torch.linspace(0, 1, n_grid, device=arc.device, dtype=arc.dtype)
+    # Find grid interval for each node
+    idx = torch.searchsorted(grid_coords, arc)
+    idx = idx.clamp(1, n_grid - 1)
+
+    gc_lo = grid_coords[idx - 1]
+    gc_hi = grid_coords[idx]
+    alpha = ((arc - gc_lo) / (gc_hi - gc_lo + 1e-8)).clamp(0, 1).unsqueeze(0)  # [1, M]
+
+    pred_lo = grid_pred[:, idx - 1]  # [C, M]
+    pred_hi = grid_pred[:, idx]      # [C, M]
+    node_pred = pred_lo * (1 - alpha) + pred_hi * alpha  # [C, M]
+
+    return node_pred.permute(1, 0)  # [M, C]
+
+
+class ArcConvDecoder(nn.Module):
+    """1D depthwise-separable conv decoder on canonical arc-length grid.
+
+    Maps surface node features to a uniform 1D grid via arc-length interpolation,
+    applies depthwise-separable convolutions for translation-equivariant processing,
+    then interpolates back. Zero-initialized output for safe initialization.
+    """
+
+    def __init__(self, d_in, d_out=3, n_grid=256, kernel_size=9):
+        super().__init__()
+        self.n_grid = n_grid
+        self.d_out = d_out
+        # 3-layer depthwise-separable 1D conv
+        self.conv = nn.Sequential(
+            # Layer 1: depthwise + pointwise
+            nn.Conv1d(d_in, d_in, kernel_size, padding=kernel_size // 2, groups=d_in),
+            nn.SiLU(),
+            nn.Conv1d(d_in, d_in, 1),  # pointwise
+            nn.SiLU(),
+            # Layer 2: depthwise + pointwise
+            nn.Conv1d(d_in, d_in, kernel_size, padding=kernel_size // 2, groups=d_in),
+            nn.SiLU(),
+            nn.Conv1d(d_in, d_in, 1),
+            nn.SiLU(),
+            # Output projection
+            nn.Conv1d(d_in, d_out, 1),
+        )
+        # Zero-init last conv layer for safe initialization (identity at start)
+        nn.init.zeros_(self.conv[-1].weight)
+        nn.init.zeros_(self.conv[-1].bias)
+
+    def forward(self, surf_hidden, surf_pred, surf_xy):
+        """Process surface nodes through arc-length grid convolution.
+
+        Args:
+            surf_hidden: [M, n_hidden] — hidden features for surface nodes
+            surf_pred: [M, out_dim] — base predictions for surface nodes
+            surf_xy: [M, 2] — xy coordinates of surface nodes
+
+        Returns:
+            correction: [M, out_dim] — additive correction
+        """
+        if surf_hidden.shape[0] < 4:
+            # Too few nodes for meaningful arc-length processing
+            return torch.zeros(surf_hidden.shape[0], self.d_out,
+                               device=surf_hidden.device, dtype=surf_hidden.dtype)
+
+        # Concatenate hidden features and predictions as input
+        inp = torch.cat([surf_hidden, surf_pred], dim=-1)  # [M, n_hidden + out_dim]
+
+        # Map to grid
+        grid_feats, sort_idx, arc = surface_to_grid(inp, surf_xy, self.n_grid)  # [D, n_grid]
+
+        # Apply convolutions
+        grid_feats = grid_feats.unsqueeze(0)  # [1, D, n_grid]
+        grid_out = self.conv(grid_feats)      # [1, d_out, n_grid]
+        grid_out = grid_out.squeeze(0)        # [d_out, n_grid]
+
+        # Map back to sorted node positions
+        sorted_correction = grid_to_nodes(grid_out, arc, self.n_grid)  # [M, d_out]
+
+        # Unsort: sort_idx maps original → sorted, so we need the inverse
+        unsort_idx = torch.empty_like(sort_idx)
+        unsort_idx[sort_idx] = torch.arange(sort_idx.shape[0], device=sort_idx.device)
+        correction = sorted_correction[unsort_idx]  # [M, d_out]
+
+        return correction
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -1243,6 +1384,10 @@ class Config:
     cp_panel: bool = False                 # append thin-airfoil inviscid Cp to input features
     cp_panel_tandem_only: bool = False     # zero Cp feature for single-foil samples (tandem benefit only)
     cp_panel_scale: float = 1.0            # scale factor for panel Cp feature (0.1 = weak hint)
+    # Arc-length 1D conv decoder: replaces SRF MLP with spatially-aware conv on arc-length grid
+    srf_arc_conv: bool = False             # enable arc-length conv decoder for surface refinement
+    srf_arc_conv_points: int = 256         # number of uniform grid points on arc-length
+    srf_arc_conv_kernel: int = 9           # kernel size for depthwise conv layers
 
 
 cfg = sp.parse(Config)
@@ -1481,6 +1626,30 @@ if cfg.aft_foil_srf:
               f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, "
               f"film={cfg.aft_foil_srf_film})")
 
+# Arc-length 1D conv decoder: replaces SRF MLP with spatially-aware conv
+arc_conv_fore = None
+arc_conv_aft = None
+ema_arc_conv_fore = None
+ema_arc_conv_aft = None
+if cfg.srf_arc_conv:
+    _arc_d_in = cfg.n_hidden + 3  # hidden features + base predictions
+    arc_conv_fore = ArcConvDecoder(
+        d_in=_arc_d_in, d_out=3,
+        n_grid=cfg.srf_arc_conv_points,
+        kernel_size=cfg.srf_arc_conv_kernel,
+    ).to(device)
+    arc_conv_aft = ArcConvDecoder(
+        d_in=_arc_d_in, d_out=3,
+        n_grid=cfg.srf_arc_conv_points,
+        kernel_size=cfg.srf_arc_conv_kernel,
+    ).to(device)
+    # Don't compile — the dynamic control flow (surface_to_grid with searchsorted/scatter)
+    # doesn't benefit from torch.compile and can cause graph breaks
+    _fore_n = sum(p.numel() for p in arc_conv_fore.parameters())
+    _aft_n = sum(p.numel() for p in arc_conv_aft.parameters())
+    print(f"Arc-conv fore head: {_fore_n:,} params | aft head: {_aft_n:,} params "
+          f"(grid={cfg.srf_arc_conv_points}, kernel={cfg.srf_arc_conv_kernel})")
+
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
@@ -1506,6 +1675,10 @@ if aft_srf_head is not None:
     n_params += sum(p.numel() for p in aft_srf_head.parameters())
 if aft_srf_ctx_head is not None:
     n_params += sum(p.numel() for p in aft_srf_ctx_head.parameters())
+if arc_conv_fore is not None:
+    n_params += sum(p.numel() for p in arc_conv_fore.parameters())
+if arc_conv_aft is not None:
+    n_params += sum(p.numel() for p in arc_conv_aft.parameters())
 
 
 class SAM:
@@ -1647,6 +1820,16 @@ if aft_srf_ctx_head is not None:
     base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
 
+# Add arc-conv decoder params to optimizer
+if arc_conv_fore is not None:
+    _arc_fore_params = list(arc_conv_fore.parameters())
+    base_opt.add_param_group({'params': _arc_fore_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _arc_fore_params):,} arc-conv fore params to optimizer")
+if arc_conv_aft is not None:
+    _arc_aft_params = list(arc_conv_aft.parameters())
+    base_opt.add_param_group({'params': _arc_aft_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _arc_aft_params):,} arc-conv aft params to optimizer")
+
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
     _warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
@@ -1750,6 +1933,10 @@ for epoch in range(MAX_EPOCHS):
         aft_srf_head.train()
     if aft_srf_ctx_head is not None:
         aft_srf_ctx_head.train()
+    if arc_conv_fore is not None:
+        arc_conv_fore.train()
+    if arc_conv_aft is not None:
+        arc_conv_aft.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
@@ -1857,19 +2044,23 @@ for epoch in range(MAX_EPOCHS):
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
-        # TE coordinate frame / wake deficit / cp_panel: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel
+        # TE coordinate frame / wake deficit / cp_panel / arc-conv: save raw xy and saf_norm before normalization
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.srf_arc_conv
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
         # Aft-foil mask: boundary ID=7 nodes identified by saf norm > 0.005
         # saf is at raw x[:,:,2:4]; foil-1 surface has saf≈0, foil-2 has saf>>0
         _aft_foil_mask = None
-        if aft_srf_head is not None:
+        _fore_foil_mask = None
+        if aft_srf_head is not None or cfg.srf_arc_conv:
             _raw_saf_norm = x[:, :, 2:4].norm(dim=-1)  # [B, N]
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
+        if cfg.srf_arc_conv:
+            # Fore-foil mask: surface nodes with saf_norm <= 0.005 (both single + tandem)
+            _fore_foil_mask = is_surface & (_raw_saf_norm <= 0.005)
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
         curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -2056,6 +2247,30 @@ for epoch in range(MAX_EPOCHS):
                     aft_correction = aft_srf_head(aft_hidden, aft_pred, _aft_cond).float()
                 pred = pred.clone()
                 pred[aft_idx[:, 0], aft_idx[:, 1]] = pred[aft_idx[:, 0], aft_idx[:, 1]] + aft_correction
+
+        # Arc-length 1D conv decoder: replace SRF MLP with spatially-aware conv
+        if arc_conv_fore is not None and model.training:
+            pred = pred.clone()
+            _arc_xy = _raw_xy_te  # raw XY coordinates (before normalization)
+            for b in range(x.shape[0]):
+                # Fore-foil nodes
+                _fore_b = _fore_foil_mask[b].nonzero(as_tuple=True)[0]
+                if _fore_b.numel() >= 4:
+                    _fh = hidden[b, _fore_b]   # [M_f, n_hidden]
+                    _fp = pred[b, _fore_b]     # [M_f, 3]
+                    _fxy = _arc_xy[b, _fore_b] # [M_f, 2]
+                    _fc = arc_conv_fore(_fh, _fp, _fxy).float()  # [M_f, 3]
+                    pred[b, _fore_b] = pred[b, _fore_b] + _fc
+
+                # Aft-foil nodes (only for tandem samples)
+                if _aft_foil_mask is not None:
+                    _aft_b = _aft_foil_mask[b].nonzero(as_tuple=True)[0]
+                    if _aft_b.numel() >= 4:
+                        _ah = hidden[b, _aft_b]   # [M_a, n_hidden]
+                        _ap = pred[b, _aft_b]     # [M_a, 3]
+                        _axy = _arc_xy[b, _aft_b] # [M_a, 2]
+                        _ac = arc_conv_aft(_ah, _ap, _axy).float()  # [M_a, 3]
+                        pred[b, _aft_b] = pred[b, _aft_b] + _ac
 
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
@@ -2412,6 +2627,21 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for arc-conv decoders
+            if arc_conv_fore is not None:
+                if ema_arc_conv_fore is None:
+                    ema_arc_conv_fore = deepcopy(arc_conv_fore)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_arc_conv_fore.parameters(), arc_conv_fore.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            if arc_conv_aft is not None:
+                if ema_arc_conv_aft is None:
+                    ema_arc_conv_aft = deepcopy(arc_conv_aft)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_arc_conv_aft.parameters(), arc_conv_aft.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -2532,6 +2762,21 @@ for epoch in range(MAX_EPOCHS):
             eval_aft_srf_ctx_head.eval()
         else:
             aft_srf_ctx_head.eval()
+    # Select arc-conv decoders for eval (EMA if available)
+    eval_arc_conv_fore = arc_conv_fore
+    eval_arc_conv_aft = arc_conv_aft
+    if arc_conv_fore is not None:
+        if ema_arc_conv_fore is not None and ema_model is not None and eval_model is ema_model:
+            eval_arc_conv_fore = ema_arc_conv_fore
+            eval_arc_conv_fore.eval()
+        else:
+            arc_conv_fore.eval()
+    if arc_conv_aft is not None:
+        if ema_arc_conv_aft is not None and ema_model is not None and eval_model is ema_model:
+            eval_arc_conv_aft = ema_arc_conv_aft
+            eval_arc_conv_aft.eval()
+        else:
+            arc_conv_aft.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -2557,17 +2802,20 @@ for epoch in range(MAX_EPOCHS):
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
                 _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
-                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel
+                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.srf_arc_conv
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
                 _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
                 # Aft-foil mask for eval (same logic as training)
                 _eval_aft_mask = None
-                if eval_aft_srf_head is not None:
+                _eval_fore_mask = None
+                if eval_aft_srf_head is not None or cfg.srf_arc_conv:
                     _v_saf_norm = x[:, :, 2:4].norm(dim=-1)
                     _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
                     _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
                     _v_gap_stagger = x[:, 0, 22:24]  # [B, 2]
+                if cfg.srf_arc_conv:
+                    _eval_fore_mask = is_surface & (_v_saf_norm <= 0.005)
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -2737,6 +2985,34 @@ for epoch in range(MAX_EPOCHS):
                             pred = pred_loss / sample_stds
                         else:
                             pred = pred_loss * sample_stds
+
+                # Apply arc-conv decoder during validation
+                if eval_arc_conv_fore is not None:
+                    _arc_xy_v = _raw_xy_te  # raw XY coords
+                    pred_loss = pred_loss.clone()
+                    for b in range(x.shape[0]):
+                        # Fore-foil
+                        _fore_b = _eval_fore_mask[b].nonzero(as_tuple=True)[0]
+                        if _fore_b.numel() >= 4:
+                            _fh = _eval_hidden[b, _fore_b]
+                            _fp = pred_loss[b, _fore_b]
+                            _fxy = _arc_xy_v[b, _fore_b]
+                            _fc = eval_arc_conv_fore(_fh, _fp, _fxy).float()
+                            pred_loss[b, _fore_b] = pred_loss[b, _fore_b] + _fc
+                        # Aft-foil
+                        if _eval_aft_mask is not None:
+                            _aft_b = _eval_aft_mask[b].nonzero(as_tuple=True)[0]
+                            if _aft_b.numel() >= 4:
+                                _ah = _eval_hidden[b, _aft_b]
+                                _ap = pred_loss[b, _aft_b]
+                                _axy = _arc_xy_v[b, _aft_b]
+                                _ac = eval_arc_conv_aft(_ah, _ap, _axy).float()
+                                pred_loss[b, _aft_b] = pred_loss[b, _aft_b] + _ac
+                    # Back-compute pred for denormalization
+                    if cfg.multiply_std:
+                        pred = pred_loss / sample_stds
+                    else:
+                        pred = pred_loss * sample_stds
 
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
@@ -2915,6 +3191,12 @@ for epoch in range(MAX_EPOCHS):
                 aft_srf_ctx_head._orig_mod if hasattr(aft_srf_ctx_head, '_orig_mod') else aft_srf_ctx_head
             )
             torch.save(_ctx_save.state_dict(), model_dir / "aft_srf_ctx_head.pt")
+        if arc_conv_fore is not None:
+            _fore_save = ema_arc_conv_fore if ema_arc_conv_fore is not None else arc_conv_fore
+            torch.save(_fore_save.state_dict(), model_dir / "arc_conv_fore.pt")
+        if arc_conv_aft is not None:
+            _aft_save = ema_arc_conv_aft if ema_arc_conv_aft is not None else arc_conv_aft
+            torch.save(_aft_save.state_dict(), model_dir / "arc_conv_aft.pt")
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
