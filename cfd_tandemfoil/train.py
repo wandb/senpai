@@ -903,6 +903,45 @@ class SurfaceRefinementContextHead(nn.Module):
         return correction
 
 
+class SurfaceCrossAttention(nn.Module):
+    """Global all-to-all attention over surface nodes only.
+
+    Applied to the hidden representation before the final output head.
+    Enables direct surface-to-surface communication, including fore-TE to aft-LE
+    wake coupling in tandem configurations.
+    Zero-init on output projections ensures safe startup (identity-like behaviour).
+    """
+
+    def __init__(self, embed_dim, num_heads=4):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim=embed_dim, num_heads=num_heads, batch_first=True
+        )
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.GELU(),
+            nn.Linear(embed_dim * 2, embed_dim),
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+        # Zero-init output projections so initial routing is unchanged
+        nn.init.zeros_(self.ffn[-1].weight)
+        nn.init.zeros_(self.ffn[-1].bias)
+        nn.init.zeros_(self.attn.out_proj.weight)
+        nn.init.zeros_(self.attn.out_proj.bias)
+
+    def forward(self, h_surf, key_padding_mask=None):
+        """
+        h_surf:           [B, S, D] — surface node embeddings, padded to max S
+        key_padding_mask: [B, S] bool — True for padded (non-surface) positions
+        Returns:          [B, S, D] — updated surface embeddings
+        """
+        h_attn, _ = self.attn(h_surf, h_surf, h_surf, key_padding_mask=key_padding_mask)
+        h_surf = self.norm1(h_surf + h_attn)
+        h_surf = self.norm2(h_surf + self.ffn(h_surf))
+        return h_surf
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -940,10 +979,16 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        surface_cross_attn=False,
+        surface_cross_attn_heads=4,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
+        self.surface_cross_attn = (
+            SurfaceCrossAttention(n_hidden, num_heads=surface_cross_attn_heads)
+            if surface_cross_attn else None
+        )
         self.pressure_first = pressure_first
         self.ref = ref
         self.unified_pos = unified_pos
@@ -1144,6 +1189,33 @@ class Transolver(nn.Module):
         # Deep hidden representation (post all non-last blocks, pre output head)
         fx_deep = fx  # [B, N, n_hidden]
 
+        # Surface cross-attention: enrich hidden states at surface nodes before last block
+        is_surf_mask = data.get("is_surface", None) if isinstance(data, Mapping) else None
+        if self.surface_cross_attn is not None and is_surf_mask is not None:
+            B, N, D = fx.shape
+            n_surf = is_surf_mask.sum(dim=1)  # [B]
+            max_surf = n_surf.max().item()
+            if max_surf > 0:
+                h_surf_list = []
+                pad_masks = []
+                for b in range(B):
+                    h_s = fx[b, is_surf_mask[b]]  # [S_b, D]
+                    pad_len = max_surf - h_s.shape[0]
+                    if pad_len > 0:
+                        h_s = F.pad(h_s, (0, 0, 0, pad_len))
+                    h_surf_list.append(h_s)
+                    key_pad = torch.zeros(max_surf, dtype=torch.bool, device=fx.device)
+                    key_pad[n_surf[b]:] = True
+                    pad_masks.append(key_pad)
+                h_surf = torch.stack(h_surf_list, dim=0)      # [B, max_surf, D]
+                key_padding_mask = torch.stack(pad_masks, dim=0)  # [B, max_surf]
+                h_surf_updated = self.surface_cross_attn(h_surf, key_padding_mask=key_padding_mask)
+                fx = fx.clone()
+                for b in range(B):
+                    n_s = n_surf[b].item()
+                    fx[b, is_surf_mask[b]] = h_surf_updated[b, :n_s]
+                fx_deep = fx  # update deep repr with enriched surface states
+
         # Auxiliary Re prediction from pre-output-head hidden representation
         re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
         aoa_pred = self.aoa_head(fx.mean(dim=1))
@@ -1328,6 +1400,9 @@ class Config:
     vortex_panel_velocity: bool = False    # append (u_fore, v_fore, u_aft, v_aft) induced velocity
     vortex_panel_scale: float = 0.1        # scale factor for vortex velocity channels
     vortex_panel_n: int = 64              # number of panels to subsample per foil
+    # Phase 7: Surface cross-attention — global all-to-all attention on surface nodes
+    surface_cross_attn: bool = False           # enable global surface-only cross-attention post-backbone
+    surface_cross_attn_heads: int = 4          # number of attention heads for surface cross-attention
 
 
 cfg = sp.parse(Config)
@@ -1503,6 +1578,8 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    surface_cross_attn=cfg.surface_cross_attn,
+    surface_cross_attn_heads=cfg.surface_cross_attn_heads,
 )
 
 model = Transolver(**model_config).to(device)
@@ -2082,7 +2159,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x, "is_surface": is_surface})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -2310,7 +2387,7 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x})
+                rdrop_out = model({"x": x, "is_surface": is_surface})
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -2449,7 +2526,7 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                out2 = model({"x": x, "is_surface": is_surface})
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -2506,7 +2583,13 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _wandb_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.surface_cross_attn:
+            _sca = _base_model.surface_cross_attn
+            if _sca is not None:
+                _wandb_log["train/surf_xattn_ffn_out_norm"] = _sca.ffn[-1].weight.norm().item()
+                _wandb_log["train/surf_xattn_attn_out_norm"] = _sca.attn.out_proj.weight.norm().item()
+        wandb.log(_wandb_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -2770,7 +2853,7 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    _eval_out = eval_model({"x": x})
+                    _eval_out = eval_model({"x": x, "is_surface": is_surface})
                     pred = _eval_out["preds"]
                     _eval_hidden = _eval_out["hidden"]
                 pred = pred.float()
@@ -3127,7 +3210,7 @@ if best_metrics:
                             vp_feat = vp_feat * cfg.vortex_panel_scale
                         x_n = torch.cat([x_n, vp_feat], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
-                    pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
+                    pred = vis_model({"x": x_n, "mask": mask, "is_surface": is_surf_dev})["preds"].float()
                     if cfg.raw_targets:
                         y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                     elif cfg.adaptive_norm:
@@ -3312,7 +3395,7 @@ if cfg.surface_refine and best_metrics:
 
                     # Model forward
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        out = verify_model({"x": x})
+                        out = verify_model({"x": x, "is_surface": is_surface})
                         pred_raw = out["preds"].float()
                         hidden = out["hidden"].float()
 
