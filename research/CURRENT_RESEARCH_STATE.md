@@ -1,5 +1,5 @@
 # SENPAI Research State
-- **Date:** 2026-04-10 16:00 UTC
+- **Date:** 2026-04-10 17:00 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Bold Round 40/41/42
 
@@ -19,7 +19,7 @@ Reproduce:
 cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_output --use_lion --lr 2e-4 --slice_num 96 --cosine_T_max 150 --pcgrad_3way --pressure_first --pressure_deep --residual_prediction --surface_refine --te_coord_frame --wake_deficit_feature --re_stratified_sampling --n_layers 3 --cp_panel --cp_panel_tandem_only --cp_panel_scale 0.1 --wake_angle_feature --vortex_panel_velocity --vortex_panel_scale 0.1 --vortex_panel_n 64
 ```
 
-## Student Status (2026-04-10 16:00 UTC)
+## Student Status (2026-04-10 17:00 UTC)
 
 ### Round 41/42 Bold Experiments (all WIP)
 | Student | PR | Experiment | Type | Status |
@@ -43,7 +43,7 @@ None — all 8 GPUs occupied.
 
 **Morgan McGuire:** "Think bigger — radical new model changes, data aug, data generation."
 
-**Status:** FULLY ACTIONED. Round 41 is 100% architectural and physics-constraint experiments. Researcher-agent generating Round 42 bold ideas now (background).
+**Status:** FULLY ACTIONED. Round 41/42 is 100% architectural and physics-constraint experiments. Fresh status posted on issue #1860 (2026-04-10 17:00 UTC). Round 42 ideas doc ready for assignment when students become idle.
 
 ## Key Insights (Updated)
 
