@@ -1154,6 +1154,7 @@ class Config:
     # Phase 3: training dynamics experiments
     swa: bool = False             # GPU 0/6: uniform SWA weight averaging
     swa_start_epoch: int = 200   # epoch to start SWA (GPU 0: 200, GPU 6: 160)
+    swa_lr: float = 1e-4         # constant LR during SWA phase (default: 0.5x base lr)
     grad_accum_steps: int = 1    # GPU 2: gradient accumulation (step every N batches)
     half_target_noise: bool = False  # GPU 3: reduce target noise by 50%
     no_target_noise: bool = False    # Phase 4: completely disable target noise injection
@@ -1246,6 +1247,11 @@ class Config:
 
 
 cfg = sp.parse(Config)
+
+# SWA: compute effective swa_start_epoch as 75% of cosine_T_max when --swa is used
+# This overrides the legacy default (200) with a schedule-relative start.
+if cfg.swa:
+    cfg.swa_start_epoch = int(0.75 * cfg.cosine_T_max)
 
 if cfg.seed >= 0:
     torch.manual_seed(cfg.seed)
@@ -2440,6 +2446,13 @@ for epoch in range(MAX_EPOCHS):
                         for k in snap:
                             cs[k].mul_(swa_cyclic_n / (swa_cyclic_n + 1)).add_(snap[k].to(device) / (swa_cyclic_n + 1))
                     swa_cyclic_n += 1
+        elif cfg.swa and epoch >= cfg.swa_start_epoch:
+            # SWA phase: hold constant LR (switch once on entry, then no-op scheduler steps)
+            if swa_model is None:
+                # First SWA epoch: switch all param groups to constant swa_lr
+                for pg in base_opt.param_groups:
+                    pg['lr'] = cfg.swa_lr
+            # Don't step cosine scheduler — LR stays constant during SWA phase
         else:
             scheduler.step()
     # Two-phase LR: at switch epoch, reset optimizer LR and replace scheduler
@@ -2848,6 +2861,7 @@ for epoch in range(MAX_EPOCHS):
         if swa_model is None:
             swa_model = deepcopy(_base_model)
             swa_n = 1
+            print(f"SWA: started averaging at epoch {epoch + 1} (swa_start={cfg.swa_start_epoch}, lr={cfg.swa_lr})")
         else:
             with torch.no_grad():
                 for sp, mp in zip(swa_model.parameters(), _base_model.parameters()):
@@ -2869,12 +2883,15 @@ for epoch in range(MAX_EPOCHS):
         "val/loss": val_loss_3split,
         "val/loss_3split": val_loss_3split,
         "val/loss_4split": val_loss_4split,
-        "lr": scheduler.get_last_lr()[0],
+        "lr": cfg.swa_lr if (cfg.swa and swa_n > 0) else scheduler.get_last_lr()[0],
         "epoch_time_s": dt,
     }
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
+    if cfg.swa:
+        metrics["swa/n_checkpoints"] = swa_n
+        metrics["swa/active"] = int(epoch >= cfg.swa_start_epoch)
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
