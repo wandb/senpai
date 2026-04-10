@@ -1,5 +1,22 @@
 # SENPAI Research Results
 
+## 2026-04-10 22:05 — PR #2363: Global Cl/Cd SRF Conditioning — fern — **CLOSED** ❌
+- Branch: fern/clcd-srf-conditioning
+- **Hypothesis:** Two-pass architecture: first pass generates coarse pressure, compute Cl/Cd via numerical integration (with .detach()), inject as AdaLN conditioning into SRF for refined second-pass prediction.
+- **Results:**
+
+| Metric | s42 (e3a56wk5) | s73 (d5cn0xux) | 2-seed avg | Baseline | Delta |
+|--------|----------------|----------------|------------|----------|-------|
+| p_in | 12.586 | 11.862 | 12.22 | 11.872 | +3.0% |
+| p_oodc | 7.470 | 7.258 | 7.36 | 7.459 | -1.3% |
+| p_tan | 32.678 | 33.169 | 32.92 | 26.319 | **+25.1%** |
+| p_re | 6.245 | 6.309 | 6.28 | 6.229 | +0.8% |
+
+- W&B: e3a56wk5 (s42, ep155), d5cn0xux (s73, ep154). Group: clcd-srf-conditioning
+- **Verdict: CLOSED — dead end.** p_tan catastrophic (+25.1%). Root causes: (1) tandem node interleaving in global x-sort corrupts Cl/Cd for tandem configs, (2) 2 scalar integrals are strictly less information than the full coarse prediction already available to SRF, (3) noisy AdaLN conditioning from still-learning model. Prior crashed runs (4 total) confirmed implementation fragility.
+
+---
+
 ## 2026-04-10 21:50 — PR #2369: Cross-Foil AR Decoding — thorfinn — **CLOSED** ❌
 - Branch: thorfinn/cross-foil-autoregressive-decoding
 - **Hypothesis:** Add causal fore→aft cross-attention in SRF: aft-foil surface queries attend to detached fore-foil pressure predictions via 1-head 64-dim cross-attention (29K params). Explicit causal conditioning for tandem interference.
