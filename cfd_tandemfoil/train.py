@@ -356,17 +356,23 @@ def compute_wake_deficit_features(raw_xy, is_surface, saf_norm, gap_raw, fore_te
     return torch.stack(channels, dim=-1)  # [B, N, 2] or [B, N, 3]
 
 
-def compute_cp_panel(raw_xy, aoa_rad, is_surface, saf_norm):
-    """Compute inviscid flat-plate Cp per node as a physics-grounded input feature.
+def compute_cp_panel(raw_xy, aoa_rad, is_surface, saf_norm, naca0_raw=None, naca1_raw=None):
+    """Compute inviscid Cp per node as a physics-grounded input feature.
 
-    Uses thin-airfoil theory: Cp = ∓2·sin(α) / sqrt(t·(1-t)) where t is
+    Uses thin-airfoil theory: Cp = ∓2·sin(A0) / sqrt(t·(1-t)) where t is
     chord-normalized position and sign depends on upper/lower surface.
+
+    When naca0_raw/naca1_raw are provided, A0 = alpha - (1/pi)*integral(dyc/dx dtheta)
+    is the camber-corrected effective AoA (Joukowski correction). Otherwise A0 = alpha
+    (flat-plate approximation).
 
     Args:
         raw_xy:     [B, N, 2] raw (pre-standardization) x, y coordinates
         aoa_rad:    [B, 1] angle of attack in radians
         is_surface: [B, N] bool mask for surface nodes
         saf_norm:   [B, N] saf channel norm (fore-foil: <= 0.005)
+        naca0_raw:  [B, 3] raw NACA0 (m, p, t) for fore foil (parse_naca storage: digit/9)
+        naca1_raw:  [B, 3] raw NACA1 (m, p, t) for aft foil (parse_naca storage: digit/9)
 
     Returns: [B, N, 1] inviscid Cp, zero for volume nodes
     """
@@ -411,9 +417,35 @@ def compute_cp_panel(raw_xy, aoa_rad, is_surface, saf_norm):
     y_ref = torch.where(aft_surf, aft_y_mean, fore_y_mean)
     side_sign = torch.sign(y_coords - y_ref)
 
-    # Cp = -side_sign * 2 * sin(|AoA|) / denom
     aoa = aoa_rad.squeeze(-1)  # [B]
-    cp_panel = -side_sign * 2.0 * torch.sin(aoa.abs().unsqueeze(1)) / denom
+
+    if naca0_raw is not None and naca1_raw is not None:
+        # Joukowski camber correction: A0 = alpha - (1/pi)*integral(dyc/dx dtheta)
+        # parse_naca stores digit/9 for m and p; recover physical values:
+        #   actual_m = stored * 9/100 = stored * 0.09
+        #   actual_p = stored * 9/10  = stored * 0.9
+        m0 = (naca0_raw[:, 0] * 0.09).clamp(0.0, 0.09)   # [B] max camber fraction
+        p0 = (naca0_raw[:, 1] * 0.9).clamp(0.05, 0.95)   # [B] camber position
+        m1 = (naca1_raw[:, 0] * 0.09).clamp(0.0, 0.09)   # [B]
+        p1 = (naca1_raw[:, 1] * 0.9).clamp(0.05, 0.95)   # [B]
+
+        def _a0_integral(m, p):
+            """Compute (1/pi)*integral_0^pi (dyc/dx) dtheta for NACA 4-digit camber."""
+            theta_p = torch.acos((1.0 - 2.0 * p).clamp(-1 + 1e-6, 1 - 1e-6))  # [B]
+            sin_tp = torch.sin(theta_p)                                           # [B]
+            part1 = (2 * m / (p.pow(2) + 1e-8)) * ((p - 0.5) * theta_p + sin_tp * 0.5)
+            part2 = (2 * m / ((1.0 - p).pow(2) + 1e-8)) * ((p - 0.5) * (torch.pi - theta_p) - sin_tp * 0.5)
+            integral = (part1 + part2) / torch.pi
+            return torch.where(m > 1e-6, integral, torch.zeros_like(integral))
+
+        A0_fore = aoa - _a0_integral(m0, p0)  # [B]
+        A0_aft = aoa - _a0_integral(m1, p1)   # [B]
+        # Dispatch per foil: aft-surface nodes use aft camber correction
+        effective_aoa = torch.where(aft_surf, A0_aft[:, None], A0_fore[:, None])  # [B, N]
+        cp_panel = -side_sign * 2.0 * torch.sin(effective_aoa.abs()) / denom
+    else:
+        # Flat-plate: Cp = -side_sign * 2 * sin(|alpha|) / sqrt(t*(1-t))
+        cp_panel = -side_sign * 2.0 * torch.sin(aoa.abs().unsqueeze(1)) / denom
 
     # Zero for volume nodes, clamp to physical range
     cp_panel = cp_panel * is_surface.float()
@@ -1253,6 +1285,7 @@ class Config:
     cp_panel: bool = False                 # append thin-airfoil inviscid Cp to input features
     cp_panel_tandem_only: bool = False     # zero Cp feature for single-foil samples (tandem benefit only)
     cp_panel_scale: float = 1.0            # scale factor for panel Cp feature (0.1 = weak hint)
+    cp_joukowski: bool = False             # camber-corrected Cp via thin-airfoil A0 (requires --cp_panel)
 
 
 cfg = sp.parse(Config)
@@ -1867,6 +1900,9 @@ for epoch in range(MAX_EPOCHS):
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
+        # Save raw NACA params (before normalization) for Joukowski camber correction
+        _raw_naca0 = x[:, 0, 15:18].clone() if cfg.cp_joukowski else None  # [B, 3]: m, p, t for fore foil
+        _raw_naca1 = x[:, 0, 19:22].clone() if cfg.cp_joukowski else None  # [B, 3]: m, p, t for aft foil
         # TE coordinate frame / wake deficit / cp_panel: save raw xy and saf_norm before normalization
         _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
@@ -1913,7 +1949,8 @@ for epoch in range(MAX_EPOCHS):
         fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
         x = torch.cat([x, fourier_pe], dim=-1)
         if cfg.cp_panel:
-            cp_feat = compute_cp_panel(_raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te)
+            cp_feat = compute_cp_panel(_raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te,
+                                       naca0_raw=_raw_naca0, naca1_raw=_raw_naca1)
             if cfg.cp_panel_tandem_only:
                 cp_feat = cp_feat * _is_tandem_raw[:, None, None]
             if cfg.cp_panel_scale != 1.0:
@@ -2569,6 +2606,8 @@ for epoch in range(MAX_EPOCHS):
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
                 _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
+                _raw_naca0 = x[:, 0, 15:18].clone() if cfg.cp_joukowski else None
+                _raw_naca1 = x[:, 0, 19:22].clone() if cfg.cp_joukowski else None
                 _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
@@ -2613,7 +2652,8 @@ for epoch in range(MAX_EPOCHS):
                 fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
                 x = torch.cat([x, fourier_pe], dim=-1)
                 if cfg.cp_panel:
-                    cp_feat = compute_cp_panel(_raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te)
+                    cp_feat = compute_cp_panel(_raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te,
+                                               naca0_raw=_raw_naca0, naca1_raw=_raw_naca1)
                     if cfg.cp_panel_tandem_only:
                         cp_feat = cp_feat * _is_tandem_raw[:, None, None]
                     if cfg.cp_panel_scale != 1.0:
@@ -2997,6 +3037,8 @@ if best_metrics:
                     _raw_saf_norm_te_vis = x_dev[:, :, 2:4].norm(dim=-1) if _need_te_raw_vis else None
                     _raw_aoa_vis = x_dev[:, 0, 14:15]  # AoA0_rad [B, 1]
                     _is_tandem_raw_vis = (x_dev[:, 0, 22].abs() > 0.01).float()  # [B]
+                    _raw_naca0_vis = x_dev[:, 0, 15:18].clone() if cfg.cp_joukowski else None
+                    _raw_naca1_vis = x_dev[:, 0, 19:22].clone() if cfg.cp_joukowski else None
                     _raw_gap_wake_vis = x_dev[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
                     x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                     curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
@@ -3027,7 +3069,8 @@ if best_metrics:
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x_n = torch.cat([x_n, fourier_pe], dim=-1)
                     if cfg.cp_panel:
-                        cp_feat = compute_cp_panel(_raw_xy_te_vis, _raw_aoa_vis, is_surf_dev, _raw_saf_norm_te_vis)
+                        cp_feat = compute_cp_panel(_raw_xy_te_vis, _raw_aoa_vis, is_surf_dev, _raw_saf_norm_te_vis,
+                                                   naca0_raw=_raw_naca0_vis, naca1_raw=_raw_naca1_vis)
                         if cfg.cp_panel_tandem_only:
                             cp_feat = cp_feat * _is_tandem_raw_vis[:, None, None]
                         if cfg.cp_panel_scale != 1.0:
@@ -3119,6 +3162,8 @@ if cfg.surface_refine and best_metrics:
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
                     _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
+                    _raw_naca0 = x[:, 0, 15:18].clone() if cfg.cp_joukowski else None
+                    _raw_naca1 = x[:, 0, 19:22].clone() if cfg.cp_joukowski else None
                     _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel
                     _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
@@ -3154,7 +3199,8 @@ if cfg.surface_refine and best_metrics:
                     fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
                     x = torch.cat([x, fourier_pe], dim=-1)
                     if cfg.cp_panel:
-                        cp_feat = compute_cp_panel(_raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te)
+                        cp_feat = compute_cp_panel(_raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te,
+                                                   naca0_raw=_raw_naca0, naca1_raw=_raw_naca1)
                         if cfg.cp_panel_tandem_only:
                             cp_feat = cp_feat * _is_tandem_raw[:, None, None]
                         if cfg.cp_panel_scale != 1.0:
