@@ -452,6 +452,8 @@ class TransolverBlock(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         spatial_bias_input_dim=4,
+        domain_moe=False,
+        domain_moe_rank=32,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -464,6 +466,7 @@ class TransolverBlock(nn.Module):
         self.adaln_all = adaln_all
         self.film_cond = film_cond
         self.domain_layernorm = domain_layernorm
+        self.domain_moe = domain_moe
         _LN = (lambda d: DomainLayerNorm(d, zeroinit=dln_zeroinit)) if domain_layernorm else nn.LayerNorm
         self.ln_1 = _LN(hidden_dim)
         self.attn = Physics_Attention_Irregular_Mesh(
@@ -497,6 +500,17 @@ class TransolverBlock(nn.Module):
             nn.init.zeros_(self.film_net[-1].bias)
         self.ln_2 = _LN(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        if domain_moe:
+            ffn_dim = hidden_dim * mlp_ratio
+            # LoRA-style delta for fc1 (hidden_dim → ffn_dim)
+            self.tandem_lora_A1 = nn.Linear(hidden_dim, domain_moe_rank, bias=False)
+            self.tandem_lora_B1 = nn.Linear(domain_moe_rank, ffn_dim, bias=False)
+            # LoRA-style delta for fc2 (ffn_dim → hidden_dim)
+            self.tandem_lora_A2 = nn.Linear(ffn_dim, domain_moe_rank, bias=False)
+            self.tandem_lora_B2 = nn.Linear(domain_moe_rank, hidden_dim, bias=False)
+            # Zero-init B matrices so delta starts at zero (identity behavior)
+            nn.init.zeros_(self.tandem_lora_B1.weight)
+            nn.init.zeros_(self.tandem_lora_B2.weight)
         self.spatial_bias = nn.Sequential(
             nn.Linear(spatial_bias_input_dim, 64), nn.GELU(),
             nn.Linear(64, 64), nn.GELU(),
@@ -575,10 +589,24 @@ class TransolverBlock(nn.Module):
             fx_norm = _ln(self.ln_1, fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
             fx = _ln(self.ln_1_post, self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
             fx_norm = _ln(self.ln_2, fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
-            fx = _ln(self.ln_2_post, self.mlp(fx_norm) + fx)
+            mlp_out = self.mlp(fx_norm)
+            if self.domain_moe and tandem_mask is not None:
+                # LoRA delta: decomposed fc1 + fc2 corrections, masked to tandem samples
+                _tm = tandem_mask.view(-1, 1, 1)  # [B, 1, 1]
+                delta1 = self.tandem_lora_B1(F.gelu(self.tandem_lora_A1(fx_norm)))
+                delta2 = self.tandem_lora_B2(F.gelu(self.tandem_lora_A2(delta1)))
+                mlp_out = mlp_out + delta2 * _tm
+            fx = _ln(self.ln_2_post, mlp_out + fx)
         else:
             fx = _ln(self.ln_1_post, self.attn(_ln(self.ln_1, fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
-            fx = _ln(self.ln_2_post, self.mlp(_ln(self.ln_2, fx)) + fx)
+            fx_ln2 = _ln(self.ln_2, fx)
+            mlp_out = self.mlp(fx_ln2)
+            if self.domain_moe and tandem_mask is not None:
+                _tm = tandem_mask.view(-1, 1, 1)  # [B, 1, 1]
+                delta1 = self.tandem_lora_B1(F.gelu(self.tandem_lora_A1(fx_ln2)))
+                delta2 = self.tandem_lora_B2(F.gelu(self.tandem_lora_A2(delta1)))
+                mlp_out = mlp_out + delta2 * _tm
+            fx = _ln(self.ln_2_post, mlp_out + fx)
         se = fx.mean(dim=1, keepdim=True)
         se = F.gelu(self.se_fc1(se))
         se = torch.sigmoid(self.se_fc2(se))
@@ -864,6 +892,8 @@ class Transolver(nn.Module):
         domain_layernorm=False,
         dln_zeroinit=False,
         domain_velhead=False,
+        domain_moe=False,
+        domain_moe_rank=32,
         prog_slices=False,
         pressure_first=False,
         pressure_no_detach=False,
@@ -941,6 +971,8 @@ class Transolver(nn.Module):
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
                     spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
+                    domain_moe=domain_moe,
+                    domain_moe_rank=domain_moe_rank,
                 )
                 for idx in range(n_layers)
             ]
@@ -1197,6 +1229,8 @@ class Config:
     domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
     dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
     domain_velhead: bool = False       # domain-specific output heads for single vs tandem
+    domain_moe: bool = False           # domain-conditioned MoE: LoRA delta expert for tandem FFN
+    domain_moe_rank: int = 32          # rank of LoRA-style delta expert
     prog_slices: bool = False          # progressive slice warmup
     prog_slices_end: int = 128         # max slice count for prog_slices
     prog_slices_epochs: int = 100      # epochs to ramp slice_num → prog_slices_end
@@ -1423,6 +1457,8 @@ model_config = dict(
     domain_layernorm=cfg.domain_layernorm,
     dln_zeroinit=cfg.dln_zeroinit,
     domain_velhead=cfg.domain_velhead,
+    domain_moe=cfg.domain_moe,
+    domain_moe_rank=cfg.domain_moe_rank,
     prog_slices=cfg.prog_slices,
     pressure_first=cfg.pressure_first,
     pressure_no_detach=cfg.pressure_no_detach,
