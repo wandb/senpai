@@ -1,5 +1,39 @@
 # SENPAI Research Results
 
+## 2026-04-10 19:15 — PR #2373: Multi-Scale Slice Attention: coarse+fine parallel resolution
+- Branch: tanjiro/multi-scale-slice-attention
+- **Hypothesis:** Add parallel coarse+fine resolution streams to the slice attention mechanism. Coarse tokens capture global physics, fine tokens preserve local detail.
+- **Results:**
+
+| Metric | s42 | s73 | 2-seed avg | Baseline | Delta |
+|--------|-----|-----|------------|----------|-------|
+| p_in | 12.181 | 12.048 | 12.114 | 11.872 | +2.0% |
+| p_oodc | 7.650 | 7.591 | 7.620 | 7.459 | +2.2% |
+| p_tan | 28.130 | 27.401 | 27.766 | 26.319 | +5.5% |
+| p_re | 6.871 | 6.598 | 6.735 | 6.229 | +8.1% |
+
+- W&B: c8m7l12s (s42), ktfhbueu (s73). Group: multi-scale-slice
+- **Verdict: CLOSED — dead end.** All metrics above baseline. Epoch time 103s (vs 68s baseline) consumed 50% more compute, only reaching ~105 epochs vs 155. The multi-scale overhead is incompatible with the training budget. p_in +2.0% is closest to baseline among bold experiments, but p_tan +5.5% and p_re +8.1% are significant regressions.
+
+---
+
+## 2026-04-10 18:35 — PR #2372: Surface-Node Cross-Attention: global surface-only attention post-backbone
+- Branch: askeladd/surface-cross-attention
+- **Hypothesis:** Add global all-to-all attention over surface nodes post-backbone, before SRF. 4-head cross-attention with FFN. Forces explicit inter-foil surface coupling.
+- **Results (v1):**
+
+| Metric | s42 | s73 | 2-seed avg | Baseline | Delta |
+|--------|-----|-----|------------|----------|-------|
+| p_in | 12.454 | 13.469 | 12.962 | 11.872 | +9.2% |
+| p_oodc | 7.364 | 7.522 | 7.443 | 7.459 | -0.2% |
+| p_tan | 25.338 | 25.346 | 25.342 | 26.319 | **-3.7%** |
+| p_re | 6.416 | 6.392 | 6.404 | 6.229 | +2.8% |
+
+- W&B: y2lh9uxl (s42), ktn0ospw (s73). Group: surface-cross-attention
+- **Verdict: SENT BACK for v2.** p_tan -3.7% is the strongest tandem improvement from any bold experiment. p_oodc also improved (-0.2%). But p_in +9.2% is too large. Sent back with instructions: (A) tandem-only SCA (skip for single-foil), (B) tandem-only + 0.1x lr for SCA, (C) full + 0.1x lr. v2 configs running.
+
+---
+
 ## 2026-04-10 18:00 — PR #2370: Surface-Intrinsic B-GNN: pure-PyTorch boundary GNN decoder
 - Branch: nezuko/surface-intrinsic-bgnn
 - **Hypothesis:** Replace SRF head with a surface-intrinsic boundary GNN (4 layers, k=8, hidden=192, 914K params) using arc-length k-NN connectivity. Surface-only local message passing should capture boundary layer physics better than global attention.
