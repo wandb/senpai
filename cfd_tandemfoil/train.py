@@ -422,6 +422,54 @@ def compute_cp_panel(raw_xy, aoa_rad, is_surface, saf_norm):
     return cp_panel.unsqueeze(-1)  # [B, N, 1]
 
 
+def _apply_ffd(xy: torch.Tensor, amplitude: float = 0.01,
+               n_control_x: int = 4, n_control_y: int = 2) -> torch.Tensor:
+    """Apply 2D Free-Form Deformation to surface node coordinates.
+
+    Uses Bernstein basis polynomials over a n_control_x × n_control_y grid.
+    LE and TE control columns are pinned to zero displacement to preserve
+    the chord attachment points.
+
+    Args:
+        xy: [N, 2] surface node coordinates (raw, pre-normalization)
+        amplitude: max displacement as fraction of chord length
+        n_control_x: control points along chord (x) direction
+        n_control_y: control points in normal (y) direction
+    Returns:
+        xy_deformed: [N, 2] deformed coordinates
+    """
+    import math
+    x_min, x_max = xy[:, 0].min(), xy[:, 0].max()
+    y_min, y_max = xy[:, 1].min(), xy[:, 1].max()
+    chord = (x_max - x_min).clamp(min=1e-6)
+    thickness = (y_max - y_min).clamp(min=1e-6)
+
+    # Parametric coords in [0, 1] over bounding box
+    s = (xy[:, 0] - x_min) / chord      # [N] chord direction
+    t = (xy[:, 1] - y_min) / thickness  # [N] normal direction
+
+    # Random control point displacements [nx, ny, 2]
+    delta = torch.randn(n_control_x, n_control_y, 2, device=xy.device, dtype=xy.dtype)
+    delta = delta * amplitude * chord
+    # Pin leading edge (x=0) and trailing edge (x=1) columns
+    delta[0, :, :] = 0.0   # LE: no displacement at x_min
+    delta[-1, :, :] = 0.0  # TE: no displacement at x_max
+
+    # Bernstein basis: B_i^n(s) = C(n,i) * s^i * (1-s)^(n-i)
+    nx, ny = n_control_x, n_control_y
+    displacement = torch.zeros_like(xy)
+    for i in range(nx):
+        c_i = math.comb(nx - 1, i)
+        Bx = c_i * s.pow(i) * (1.0 - s).pow(nx - 1 - i)  # [N]
+        for j in range(ny):
+            c_j = math.comb(ny - 1, j)
+            By = c_j * t.pow(j) * (1.0 - t).pow(ny - 1 - j)  # [N]
+            weight = (Bx * By).unsqueeze(-1)  # [N, 1]
+            displacement = displacement + weight * delta[i, j]  # [N, 2]
+
+    return xy + displacement
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -1253,6 +1301,11 @@ class Config:
     cp_panel: bool = False                 # append thin-airfoil inviscid Cp to input features
     cp_panel_tandem_only: bool = False     # zero Cp feature for single-foil samples (tandem benefit only)
     cp_panel_scale: float = 1.0            # scale factor for panel Cp feature (0.1 = weak hint)
+    # FFD geometry augmentation: synthetic airfoil shape diversity via Free-Form Deformation
+    ffd_augmentation: bool = False         # enable FFD geometry augmentation at train time
+    ffd_amplitude: float = 0.01           # max displacement as fraction of chord length
+    ffd_prob: float = 0.5                 # probability of applying FFD per training batch
+    ffd_loss_weight: float = 0.3          # loss weight multiplier for FFD-augmented batches
 
 
 cfg = sp.parse(Config)
@@ -1859,6 +1912,22 @@ for epoch in range(MAX_EPOCHS):
                 _dsdf2_scale = _dsdf2_scale * _is_tandem_aug2.float() + (~_is_tandem_aug2).float()
                 x[:, :, 6:10] = x[:, :, 6:10] * _dsdf2_scale.view(-1, 1, 1)
 
+        # FFD geometry augmentation: deform surface node coordinates before feature computation
+        _ffd_augmented = False
+        if cfg.ffd_augmentation and model.training and torch.rand(1).item() < cfg.ffd_prob:
+            _is_single_foil = (x[:, 0, 22].abs() <= 0.01)  # gap≈0 → single-foil sample
+            if _is_single_foil.any():
+                x = x.clone()
+                for _b in range(x.shape[0]):
+                    if _is_single_foil[_b]:
+                        _surf_b = is_surface[_b]  # [N] bool
+                        if _surf_b.any():
+                            x[_b, _surf_b, :2] = _apply_ffd(
+                                x[_b, _surf_b, :2],
+                                amplitude=cfg.ffd_amplitude,
+                            )
+                _ffd_augmented = True
+
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
@@ -2071,6 +2140,10 @@ for epoch in range(MAX_EPOCHS):
 
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
+        # FFD loss weighting: reduce supervision signal for deformed-geometry batches
+        if _ffd_augmented:
+            abs_err = abs_err * cfg.ffd_loss_weight
+            sq_err = sq_err * cfg.ffd_loss_weight
         if cfg.tandem_ramp:
             pass  # no hard curriculum; tandem_weight applied via tandem_boost below
         elif epoch < cfg.tandem_curriculum_epochs:
@@ -2234,6 +2307,10 @@ for epoch in range(MAX_EPOCHS):
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
+
+        # FFD augmentation: log augmentation rate
+        if cfg.ffd_augmentation and global_step % 50 == 0:
+            wandb.log({"train/ffd_augmented": float(_ffd_augmented), "global_step": global_step})
 
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
