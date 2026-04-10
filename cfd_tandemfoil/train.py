@@ -2282,6 +2282,8 @@ for epoch in range(MAX_EPOCHS):
         # Cl/Cd integral auxiliary loss: differentiable aerodynamic force supervision
         # Computes lift/drag coefficients via panel-method surface integral for each foil
         # and applies Huber loss between predicted and GT Cl/Cd.
+        # Only applied to tandem samples — single-foil per-node MAE is already well-calibrated
+        # and the integral signal primarily benefits tandem aft-foil pressure balance.
         if cfg.cl_cd_loss and model.training and _raw_xy_te is not None:
             _cl_cd_loss = torch.tensor(0.0, device=device)
             _n_foils_clcd = 0
@@ -2291,11 +2293,10 @@ for epoch in range(MAX_EPOCHS):
                 if surf_idx_b.numel() < 8:
                     continue
                 _is_tan_b = _is_tandem_clcd[b].item()
-                if _is_tan_b:
-                    saf_vals_b = _raw_saf_norm_te[b, surf_idx_b]
-                    foil_groups_clcd = [surf_idx_b[saf_vals_b <= 0.005], surf_idx_b[saf_vals_b > 0.005]]
-                else:
-                    foil_groups_clcd = [surf_idx_b]
+                if not _is_tan_b:
+                    continue  # Skip single-foil samples — Cl/Cd loss only for tandem
+                saf_vals_b = _raw_saf_norm_te[b, surf_idx_b]
+                foil_groups_clcd = [surf_idx_b[saf_vals_b <= 0.005], surf_idx_b[saf_vals_b > 0.005]]
                 for foil_idx in foil_groups_clcd:
                     if foil_idx.numel() < 8:
                         continue
