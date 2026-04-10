@@ -1253,6 +1253,9 @@ class Config:
     cp_panel: bool = False                 # append thin-airfoil inviscid Cp to input features
     cp_panel_tandem_only: bool = False     # zero Cp feature for single-foil samples (tandem benefit only)
     cp_panel_scale: float = 1.0            # scale factor for panel Cp feature (0.1 = weak hint)
+    # Spectral regularization: penalise sigma_max(W)^2 for each FFN/MLP weight matrix
+    spectral_reg: bool = False
+    spectral_reg_lambda: float = 1e-4
 
 
 cfg = sp.parse(Config)
@@ -2235,6 +2238,15 @@ for epoch in range(MAX_EPOCHS):
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
 
+        # Spectral regularization: penalise sigma_max(W)^2 for each FFN/MLP weight matrix
+        if cfg.spectral_reg:
+            _spec_loss = torch.zeros(1, device=device)
+            for _sn, _sp in model.named_parameters():
+                if 'weight' in _sn and _sp.ndim == 2 and ('mlp' in _sn or 'ffn' in _sn):
+                    _spec_loss = _spec_loss + torch.linalg.matrix_norm(_sp, ord=2) ** 2
+        else:
+            _spec_loss = None
+
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
@@ -2357,6 +2369,10 @@ for epoch in range(MAX_EPOCHS):
                 optimizer.zero_grad()
             loss.backward()
 
+        # Spectral regularization: add sigma_max^2 gradient on top of whatever path was used
+        if _spec_loss is not None:
+            (cfg.spectral_reg_lambda * _spec_loss).backward()
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         sam_active = sam_optimizer is not None and epoch >= int(MAX_EPOCHS * 0.75)
         _should_step = (cfg.grad_accum_steps <= 1 or
@@ -2425,7 +2441,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _wlog_base = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if _spec_loss is not None:
+            _wlog_base["train/spec_loss"] = _spec_loss.item()
+        wandb.log(_wlog_base)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
