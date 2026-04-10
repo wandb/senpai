@@ -1378,7 +1378,6 @@ class Config:
     srf_hypernetwork: bool = False         # enable hypernetwork-generated LoRA for SRF
     srf_hyper_rank: int = 8               # LoRA rank for hypernetwork weight perturbations
     srf_hyper_alpha: float = 1.0          # LoRA scaling factor (scale = alpha / rank)
-    srf_hyper_tandem_only: bool = False   # apply LoRA only for tandem samples (zero out for single-foil)
 
 
 cfg = sp.parse(Config)
@@ -2214,9 +2213,6 @@ for epoch in range(MAX_EPOCHS):
                         surf_pred = pred[surf_idx[:, 0], surf_idx[:, 1]]      # [M, 3]
                         if srf_hypernet is not None and _hyper_cond is not None:
                             lora_deltas = srf_hypernet(_hyper_cond)
-                            if cfg.srf_hyper_tandem_only:
-                                _tandem_mask = _is_tandem_raw.view(-1, 1, 1)
-                                lora_deltas = [(A * _tandem_mask, B) for A, B in lora_deltas]
                             correction = apply_srf_with_lora(
                                 refine_head, surf_hidden, surf_pred,
                                 lora_deltas, surf_idx[:, 0]).float()
@@ -2936,9 +2932,6 @@ for epoch in range(MAX_EPOCHS):
                                 if eval_srf_hypernet is not None and _eval_hyper_cond is not None:
                                     with torch.no_grad():
                                         _eval_lora = eval_srf_hypernet(_eval_hyper_cond)
-                                    if cfg.srf_hyper_tandem_only:
-                                        _tandem_mask = _is_tandem_raw.view(-1, 1, 1)
-                                        _eval_lora = [(A * _tandem_mask, B) for A, B in _eval_lora]
                                     correction = apply_srf_with_lora(
                                         eval_refine_head, surf_hidden, surf_pred,
                                         _eval_lora, surf_idx[:, 0]).float()
@@ -3492,9 +3485,6 @@ if cfg.surface_refine and best_metrics:
                                 _vt = (x[:, 0, 22].abs() > 0.01).float()
                                 _v_cond = torch.stack([_vh_aoa, _vh_re, _vh_gap, _vh_stagger, _vd1, _vd2, _vc, _vt], dim=-1)
                                 _v_lora = _v_hyper(_v_cond)
-                                if cfg.srf_hyper_tandem_only:
-                                    _vt_mask = _vt.view(-1, 1, 1)
-                                    _v_lora = [(A * _vt_mask, B) for A, B in _v_lora]
                                 correction = apply_srf_with_lora(
                                     verify_refine, surf_hidden, surf_pred,
                                     _v_lora, surf_idx[:, 0]).float()
