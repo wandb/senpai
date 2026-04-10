@@ -1,7 +1,7 @@
 # SENPAI Research State
-- **Date:** 2026-04-10 14:45 UTC
+- **Date:** 2026-04-10 15:20 UTC
 - **Advisor branch:** noam
-- **Phase:** Phase 6 — Bold Round 40/41
+- **Phase:** Phase 6 — Bold Round 40/41 (all 8 students WIP)
 
 ## Current Baseline
 
@@ -28,7 +28,7 @@ cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_ou
 | fern | #2363 | **Global Cl/Cd SRF Conditioning** | Architecture (two-pass) | WIP — implementing |
 | alphonse | #2368 | **Sobolev Surface Gradient Loss** | Loss formulation | WIP — implementing |
 | ~~frieren~~ | ~~#2365~~ | ~~FFD Geometry Augmentation~~ | ~~Data generation~~ | CLOSED — p_in +9.4%, p_tan +6.2% |
-| tanjiro | #2366 | **MoE Domain-Expert FFN** | Architecture (routing) | WIP — implementing |
+| ~~tanjiro~~ | ~~#2366~~ | ~~MoE Domain-Expert FFN~~ | ~~Architecture (routing)~~ | CLOSED — all metrics regress vs current baseline |
 | ~~askeladd~~ | ~~#2367~~ | ~~Biot-Savart Attention Bias~~ | ~~Physics-informed attention~~ | CLOSED — p_oodc -1.1% but p_tan +2.7% |
 
 ### Round 41 Bold Experiments (just assigned)
@@ -56,12 +56,9 @@ cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_ou
 
 **Morgan McGuire:** "Think bigger — radical new model changes, data aug, data generation."
 
-**Status:** ACTIONED and sustained. All 8 students on genuinely bold experiments:
-- Prediction reformulation (viscous residual)
-- Data generation (FFD geometry augmentation)
-- Physics-informed attention (Biot-Savart attention bias)
-- Architecture (MoE domain routing, Cl/Cd two-pass conditioning, AR decoding, surface B-GNN)
-- Loss formulation (Sobolev surface gradient loss)
+**Status:** FULLY ACTIONED. Round 41 is 100% architectural and loss-formulation experiments — full decoder replacements (B-GNN, FNO), causal AR decoding, task reformulation (viscous residual), integral force conditioning. None are incremental tweaks.
+
+Researcher-agent launched (2026-04-10 15:20) to generate Round 42 bold ideas: neural processes, Koopman operators, flow matching, data synthesis beyond fixed dataset. Results → `/research/RESEARCH_IDEAS_2026-04-10_15:20.md`.
 
 ## Key Insights (Updated)
 
@@ -79,12 +76,14 @@ Loss/training: Focal L1, curriculum, quantile reg, Jacobian smooth, asymmetric l
 Physics features: Panel Cp ✅, wake deficit ✅, wake angle ✅, vortex-panel ✅ (all MERGED). Log-Re Cp, Joukowski Cp, Viscous Residual Baseline Cp, arc-length input (all failed)
 Transfer learning: DPOT external checkpoint (AFNO incompatible), self-pretraining denoising (no inductive bias)
 
-## Next Research Priorities (Round 41+)
+## Next Research Priorities (Round 42+)
 
-When Round 40 results come in, remaining bold ideas:
-1. **Cross-Foil AR Decoding** — thorfinn #2369 ← IN PROGRESS
-2. **Surface-Intrinsic B-GNN** — nezuko #2370 ← IN PROGRESS
-3. **1D-FNO on arc-length surface curve** — interpolate surface nodes to uniform arc-length grid, apply 1D FNO, interpolate back
-4. **Neural Process for pressure fields** — meta-learning approach: condition on context points (surface coords + panel Cp) to predict pressure at query points
-5. **Contrastive geometry pretraining** — self-supervised pretraining with airfoil geometry augmentations (FFD, AoA) as positive pairs
-6. **Koopman operator for surface dynamics** — lift surface pressure distribution to Koopman eigenfunction space for linear dynamics
+Researcher-agent generating new ideas. Known candidates:
+1. **Neural Process for pressure fields** — condition on context points (surface coords + panel Cp) to predict pressure at query points, handles distributional shift by design
+2. **Koopman operator for surface dynamics** — lift surface pressure distribution to Koopman eigenfunction space for linear dynamics in latent space
+3. **Flow matching / diffusion on pressure field** — score-based generative model operating on node-pressure vectors, samples from learned pressure distribution
+4. **Contrastive geometry pretraining** — self-supervised pretraining with airfoil geometry augmentations (FFD, AoA) as positive pairs; targets OOD generalization
+5. **Panel method as cheap data oracle** — use inviscid panel solver at 10× more configurations (5000+ synthetic samples) as auxiliary training data
+6. **Mamba/SSM surface sequence model** — replace attention with selective state-space model over arc-length-ordered surface nodes; O(n) vs O(n²)
+7. **Hard Bernoulli/Kutta constraint layer** — output layer that enforces Kutta condition at TE and Bernoulli relation at stagnation point as hard constraints
+8. **Full operator learning (global FNO/DeepONet)** — replace Transolver backbone entirely with global FNO or DeepONet mapping geometry→pressure field
