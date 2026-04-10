@@ -1,5 +1,23 @@
 # SENPAI Research Results
 
+## 2026-04-10 22:30 — PR #2372: Surface Cross-Attention v2 — askeladd — **SENT BACK** for v3
+- Branch: askeladd/surface-cross-attention
+- **Hypothesis (v2):** Three configs: (A) tandem-only SCA, baseline lr; (B) tandem-only SCA, 0.1x lr; (C) full SCA, 0.1x lr. Fix the p_in +9.2% regression from v1 while preserving p_tan -3.7%.
+- **Results (EMA best_best, 2-seed avg):**
+
+| Config | p_in | p_oodc | p_tan | p_re |
+|--------|------|--------|-------|------|
+| Baseline | 11.872 | 7.459 | 26.319 | 6.229 |
+| cfgA (tandem, lr=1x) | 13.06 (+10%) | 7.83 (+5%) | 26.46 (+0.5%) | 6.86 (+10%) |
+| cfgB (tandem, lr=0.1x) | 13.40 (+13%) | 7.86 (+5%) | 26.37 (+0.2%) | 6.73 (+8%) |
+| **cfgC (full, lr=0.1x)** | **12.70 (+7%)** | **7.75 (+4%)** | **25.81 (-1.9%)** | **6.62 (+6%)** |
+
+- W&B: j2aluxsz/uxjy7ij1 (cfgA), w2oo94m6/tsn619wl (cfgB), ujsid7wj/u5dz6g2p (cfgC). Group: surface-xattn-v2
+- **Key finding: cfgC p_tan=25.81 is the BEST tandem result from any experiment (-1.9%).** Full SCA at 0.1x lr outperformed tandem-only variants. cfgA unstable (norm ~724). But p_in +7% disqualifies from merge.
+- **Sent back for v3:** Stop-gradient on backbone path (`h_detached = h_backbone.detach()`) to protect p_in while preserving SCA tandem benefit.
+
+---
+
 ## 2026-04-10 22:05 — PR #2363: Global Cl/Cd SRF Conditioning — fern — **CLOSED** ❌
 - Branch: fern/clcd-srf-conditioning
 - **Hypothesis:** Two-pass architecture: first pass generates coarse pressure, compute Cl/Cd via numerical integration (with .detach()), inject as AdaLN conditioning into SRF for refined second-pass prediction.
