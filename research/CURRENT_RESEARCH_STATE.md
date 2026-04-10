@@ -19,13 +19,13 @@ Reproduce:
 cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_output --use_lion --lr 2e-4 --slice_num 96 --cosine_T_max 150 --pcgrad_3way --pressure_first --pressure_deep --residual_prediction --surface_refine --te_coord_frame --wake_deficit_feature --re_stratified_sampling --n_layers 3 --cp_panel --cp_panel_tandem_only --cp_panel_scale 0.1 --wake_angle_feature --vortex_panel_velocity --vortex_panel_scale 0.1 --vortex_panel_n 64
 ```
 
-## Student Status (2026-04-10 14:45 UTC)
+## Student Status (2026-04-10 15:25 UTC)
 
 ### Round 40 Bold Experiments (still WIP)
 | Student | PR | Experiment | Type | Status |
 |---------|-----|-----------|------|--------|
-| edward | #2362 | **Viscous Residual Prediction** | Prediction reformulation | WIP — implementing |
-| fern | #2363 | **Global Cl/Cd SRF Conditioning** | Architecture (two-pass) | WIP — implementing |
+| edward | #2362 | **Viscous Residual Prediction** | Prediction reformulation | WIP — initial results BAD (p_oodc +23.8%), rebasing onto latest noam |
+| fern | #2363 | **Global Cl/Cd SRF Conditioning** | Architecture (two-pass) | WIP — rebasing onto latest noam |
 | alphonse | #2368 | **Sobolev Surface Gradient Loss** | Loss formulation | WIP — implementing |
 | ~~frieren~~ | ~~#2365~~ | ~~FFD Geometry Augmentation~~ | ~~Data generation~~ | CLOSED — p_in +9.4%, p_tan +6.2% |
 | ~~tanjiro~~ | ~~#2366~~ | ~~MoE Domain-Expert FFN~~ | ~~Architecture (routing)~~ | CLOSED — all metrics regress vs current baseline |
@@ -39,18 +39,19 @@ cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_ou
 | frieren | #2371 | **1D Surface FNO Decoder** | Architecture (spectral surface) | WIP — just assigned |
 | askeladd | #2372 | **Surface-Node Cross-Attention** | Architecture (global surface attn) | WIP — just assigned |
 
-## This Session's Actions
+## This Session's Actions (2026-04-10 15:25 UTC)
 
-### Closed (Round 39 stragglers)
-- **PR #2351 (thorfinn):** Log-Re-Conditioned Panel Cp — 2-seed avg fails baseline on 3/4 metrics (p_in +1.7%, p_tan +0.5%, p_re +1.6%); only p_oodc -0.6%. High seed variance. Physics-feature era is exhausted.
-- **PR #2359 (nezuko):** Spectral Regularization on FFN Weights — all configurations 10-20% worse across all metrics. Clear dead end; spectral norm restricts expressivity without physics-motivated benefit.
-- **PR #2365 (frieren):** FFD Geometry Augmentation — p_in +9.4%, p_tan +6.2%. Label mismatch: deformed geometry with original pressure labels corrupts training.
-- **PR #2367 (askeladd):** Biot-Savart Attention Bias — p_oodc -1.1% but p_tan +2.7%. BS physics redundant with existing vortex_panel_velocity feature; slice architecture has no pairwise bias injection point.
+### PR Check
+- **PR #2362 (edward):** Initial results posted — all metrics regress badly (p_oodc +23.8%). Student found val-loop bug, rebasing onto latest noam. Watch for updated results.
+- **Other 7 PRs:** Students still implementing, no results yet.
 
-### New Assignments
-- **thorfinn #2369:** Cross-Foil Autoregressive Decoding — predict fore foil pressure first, condition aft foil decoding on fore predictions via cross-attention (stop-gradient). Zero-init output ensures identity at epoch 0. Targets p_tan (tandem causality).
-- **nezuko #2370:** Surface-Intrinsic B-GNN — replace SRF head with a pure-PyTorch boundary GNN operating on surface-only k-NN connectivity (arc-length), implementing 4 rounds of message passing with edge features [dx, dy, dist, cp_panel_src, cp_panel_dst]. Based on Jena et al. arXiv:2503.18638.
-- **frieren #2371:** 1D Surface FNO Decoder — replace SRF head with a 1D Fourier Neural Operator. Arc-length parameterized surface → uniform 128-point grid → spectral convolutions (16 modes, 4 layers) → interpolate back. Captures multi-scale Cp structure in frequency domain.
+### Researcher-Agent Output
+- Generated 8 bold Round 42 ideas → `RESEARCH_IDEAS_2026-04-10_15:20.md`
+- Top candidates: Panel Data Oracle, Mamba SSM decoder, Hard Kutta constraint, Neural Process, SE(2)-Equivariance
+
+### Prior Session Actions (Round 40/41 setup)
+- Closed Round 39 stragglers: #2351 (log-Re Cp), #2359 (spectral reg), #2365 (FFD augmentation), #2367 (Biot-Savart attn bias)
+- Assigned Round 41: #2369 (AR decoding), #2370 (surface B-GNN), #2371 (1D FNO decoder), #2372 (surface cross-attn), #2373 (multi-scale slice attn)
 
 ## Human Researcher Directive (Issue #1860)
 
@@ -78,12 +79,18 @@ Transfer learning: DPOT external checkpoint (AFNO incompatible), self-pretrainin
 
 ## Next Research Priorities (Round 42+)
 
-Researcher-agent generating new ideas. Known candidates:
-1. **Neural Process for pressure fields** — condition on context points (surface coords + panel Cp) to predict pressure at query points, handles distributional shift by design
-2. **Koopman operator for surface dynamics** — lift surface pressure distribution to Koopman eigenfunction space for linear dynamics in latent space
-3. **Flow matching / diffusion on pressure field** — score-based generative model operating on node-pressure vectors, samples from learned pressure distribution
-4. **Contrastive geometry pretraining** — self-supervised pretraining with airfoil geometry augmentations (FFD, AoA) as positive pairs; targets OOD generalization
-5. **Panel method as cheap data oracle** — use inviscid panel solver at 10× more configurations (5000+ synthetic samples) as auxiliary training data
-6. **Mamba/SSM surface sequence model** — replace attention with selective state-space model over arc-length-ordered surface nodes; O(n) vs O(n²)
-7. **Hard Bernoulli/Kutta constraint layer** — output layer that enforces Kutta condition at TE and Bernoulli relation at stagnation point as hard constraints
-8. **Full operator learning (global FNO/DeepONet)** — replace Transolver backbone entirely with global FNO or DeepONet mapping geometry→pressure field
+Researcher-agent completed (see `RESEARCH_IDEAS_2026-04-10_15:20.md` for full details). **Ranked by expected impact:**
+
+### Tier 1 — Assign first (highest impact, lowest risk)
+1. **Panel Method as Cheap Data Oracle** — generate 5000+ synthetic tandem configs using panel solver; train as auxiliary data at 0.1× loss weight. Infrastructure already exists (`--cp_panel`). Literature: 10² MSE reduction from inviscid pretraining (Springer Nature 2025). Target: p_tan -10–20%.
+2. **Mamba/SSM Surface Sequence Model** — replace SRF attention with Mamba SSM; O(n) enables 6–8 layer surface decoder. Mamba Neural Operator (2025) outperforms Transformers on PDE benchmarks. Target: p_in, p_tan -5–10%.
+3. **Hard Bernoulli/Kutta Constraint Layer** — hard-enforce Kutta condition at TE (2 lines of differentiable code, parameter-free). Soft Bernoulli coupling as 0.1× loss. Lowest implementation risk. Target: p_tan -5–8%.
+
+### Tier 2 — High ceiling, moderate risk
+4. **Neural Process for Pressure Fields** — ANP with context = (surface_coord, cp_panel), target = CFD pressure. No prior CFD application — genuinely novel. Target: p_oodc -10–15%.
+5. **SE(2)-Equivariant Architecture** — replace (x,y) coords with SE(2)-invariant features (distance to centroid, curvature) + equivariant vectors (normals). Forces orientation generalization. Target: p_oodc -8–12%.
+6. **Contrastive Geometry Pretraining** — pretrain on UIUC+NACA airfoil library (1500+ geometries) with SimCLR/BYOL. Target: p_oodc -8–12%.
+
+### Tier 3 — Schedule after Round 41 closes
+7. **Koopman Operator Lifting** — Koopman autoencoder where tandem interference is linear in latent space. Target: p_tan -8–12%.
+8. **Flow Matching on Pressure Field** — conditional flow matching from noise→pressure, captures multi-modal tandem wake states. **Wait for PR #2371 (FNO) to close first.** Target: p_tan -10–15%.
