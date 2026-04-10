@@ -885,6 +885,8 @@ class Transolver(nn.Module):
             self.log_sigma_surf_ux = nn.Parameter(torch.zeros(1))
             self.log_sigma_surf_uy = nn.Parameter(torch.zeros(1))
             self.log_sigma_surf_p = nn.Parameter(torch.zeros(1))
+        # Learnable Cp scale: sigmoid(param) * 0.2, init sigmoid(0)*0.2 = 0.1
+        self.cp_learnable_scale_param = nn.Parameter(torch.tensor(0.0))
 
         if self.unified_pos:
             self.preprocess = MLP(
@@ -1243,6 +1245,7 @@ class Config:
     cp_panel: bool = False                 # append thin-airfoil inviscid Cp to input features
     cp_panel_tandem_only: bool = False     # zero Cp feature for single-foil samples (tandem benefit only)
     cp_panel_scale: float = 1.0            # scale factor for panel Cp feature (0.1 = weak hint)
+    cp_panel_learnable_scale: bool = False  # learnable Cp scale replacing fixed cp_panel_scale
 
 
 cfg = sp.parse(Config)
@@ -1904,7 +1907,9 @@ for epoch in range(MAX_EPOCHS):
             cp_feat = compute_cp_panel(_raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te)
             if cfg.cp_panel_tandem_only:
                 cp_feat = cp_feat * _is_tandem_raw[:, None, None]
-            if cfg.cp_panel_scale != 1.0:
+            if cfg.cp_panel_learnable_scale:
+                cp_feat = cp_feat * (torch.sigmoid(_base_model.cp_learnable_scale_param) * 0.2)
+            elif cfg.cp_panel_scale != 1.0:
                 cp_feat = cp_feat * cfg.cp_panel_scale
             x = torch.cat([x, cp_feat], dim=-1)
         if model.training and epoch < cfg.noise_anneal_epochs:
@@ -2413,7 +2418,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _wlog = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.cp_panel_learnable_scale:
+            _wlog["train/cp_learned_scale"] = (torch.sigmoid(_base_model.cp_learnable_scale_param) * 0.2).item()
+        wandb.log(_wlog)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
