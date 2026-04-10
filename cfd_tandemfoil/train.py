@@ -493,6 +493,39 @@ def compute_vortex_panel_velocity(raw_xy, aoa_rad, is_surface, saf_norm, n_panel
     return out  # [B, N, 4]
 
 
+def sobolev_surface_grad_loss(p_pred, p_true, xy, k_neighbors=4):
+    """Compute L1 loss on spatial pressure gradients for surface nodes.
+
+    Uses finite-difference approximation via K nearest neighbors.
+
+    Args:
+        p_pred: [N, 1] predicted pressure for surface nodes
+        p_true: [N, 1] ground-truth pressure for surface nodes
+        xy: [N, 2] 2D coordinates of surface nodes
+        k_neighbors: number of nearest neighbors for finite difference
+
+    Returns:
+        scalar loss
+    """
+    N = p_pred.shape[0]
+    if N < k_neighbors + 1:
+        return p_pred.new_zeros(1).squeeze()
+    dist = torch.cdist(xy, xy)  # [N, N]
+    k = min(k_neighbors + 1, N)
+    dist_knn, idx_knn = dist.topk(k, largest=False, dim=1)
+    dist_knn = dist_knn[:, 1:]   # [N, k] — exclude self
+    idx_knn = idx_knn[:, 1:]     # [N, k]
+    actual_k = dist_knn.shape[1]
+    p_i_pred = p_pred.unsqueeze(1).expand(-1, actual_k, -1)  # [N, k, 1]
+    p_j_pred = p_pred[idx_knn]                                 # [N, k, 1]
+    p_i_true = p_true.unsqueeze(1).expand(-1, actual_k, -1)
+    p_j_true = p_true[idx_knn]
+    denom = dist_knn.unsqueeze(-1).clamp(min=1e-6)  # [N, k, 1]
+    grad_pred = (p_i_pred - p_j_pred) / denom  # [N, k, 1]
+    grad_true = (p_i_true - p_j_true) / denom
+    return (grad_pred - grad_true).abs().mean()
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -1173,8 +1206,8 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-MAX_TIMEOUT = 180.0  # minutes
-MAX_EPOCHS = 500
+MAX_TIMEOUT = float(os.environ.get("SENPAI_TIMEOUT_MINUTES", "180.0"))  # minutes
+MAX_EPOCHS = int(os.environ.get("SENPAI_MAX_EPOCHS", "500"))
 
 
 @dataclass
@@ -1328,6 +1361,10 @@ class Config:
     vortex_panel_velocity: bool = False    # append (u_fore, v_fore, u_aft, v_aft) induced velocity
     vortex_panel_scale: float = 0.1        # scale factor for vortex velocity channels
     vortex_panel_n: int = 64              # number of panels to subsample per foil
+    # Sobolev surface gradient loss: penalize dp/ds mismatch for sharp aerodynamic features
+    sobolev_surface_loss: bool = False     # add spatial gradient matching loss on surface pressure
+    sobolev_weight: float = 0.1           # weight for Sobolev gradient loss term
+    sobolev_k: int = 4                    # number of nearest neighbors for finite-difference gradients
 
 
 cfg = sp.parse(Config)
@@ -1837,6 +1874,7 @@ for epoch in range(MAX_EPOCHS):
         aft_srf_ctx_head.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
+    epoch_sobolev = 0.0
     n_batches = 0
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
@@ -2233,6 +2271,24 @@ for epoch in range(MAX_EPOCHS):
         else:
             loss = vol_loss + surf_weight * surf_loss
 
+        # Sobolev surface gradient loss: penalize dp/ds mismatch
+        _sobolev_loss = torch.tensor(0.0, device=device)
+        if cfg.sobolev_surface_loss and model.training:
+            _sob_n = 0
+            for b in range(B):
+                surf_idx_b = surf_mask[b].nonzero(as_tuple=True)[0]
+                if surf_idx_b.numel() < cfg.sobolev_k + 1:
+                    continue
+                xy_surf = x[b, surf_idx_b, :2]             # [M, 2] — standardized coordinates
+                p_pred_surf = pred[b, surf_idx_b, 2:3]     # [M, 1] — pressure channel
+                p_true_surf = y_norm[b, surf_idx_b, 2:3]   # [M, 1]
+                _sobolev_loss = _sobolev_loss + sobolev_surface_grad_loss(
+                    p_pred_surf, p_true_surf, xy_surf, k_neighbors=cfg.sobolev_k)
+                _sob_n += 1
+            if _sob_n > 0:
+                _sobolev_loss = _sobolev_loss / _sob_n
+                loss = loss + cfg.sobolev_weight * _sobolev_loss
+
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
         coarse_pool_size = 64
@@ -2510,6 +2566,8 @@ for epoch in range(MAX_EPOCHS):
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
+        if cfg.sobolev_surface_loss:
+            epoch_sobolev += _sobolev_loss.item()
         n_batches += 1
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
@@ -2580,13 +2638,16 @@ for epoch in range(MAX_EPOCHS):
     _do_val = (epoch + 1) % cfg.val_every == 0 or epoch == 0 or epoch == MAX_EPOCHS - 1
     if not _do_val:
         dt = time.time() - t0
-        wandb.log({
+        _skip_val_metrics = {
             "train/vol_loss": epoch_vol,
             "train/surf_loss": epoch_surf,
             "epoch_time_s": dt,
             "lr": scheduler.get_last_lr()[0],
             "global_step": global_step,
-        })
+        }
+        if cfg.sobolev_surface_loss:
+            _skip_val_metrics["train/sobolev_loss"] = epoch_sobolev / max(n_batches, 1)
+        wandb.log(_skip_val_metrics)
         print(f"Epoch {epoch+1:3d} ({dt:.0f}s)  train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  [val skipped]")
         continue
 
@@ -2976,6 +3037,8 @@ for epoch in range(MAX_EPOCHS):
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
+    if cfg.sobolev_surface_loss:
+        metrics["train/sobolev_loss"] = epoch_sobolev / max(n_batches, 1)
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
