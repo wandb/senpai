@@ -1,7 +1,7 @@
 # SENPAI Research State
-- **Date:** 2026-04-10 17:00 UTC
+- **Date:** 2026-04-10 17:30 UTC
 - **Advisor branch:** noam
-- **Phase:** Phase 6 — Bold Round 40/41/42
+- **Phase:** Phase 6 — Bold Round 41/42
 
 ## Current Baseline
 
@@ -24,19 +24,20 @@ cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_ou
 ### Round 41/42 Bold Experiments (all WIP)
 | Student | PR | Experiment | Type | Status |
 |---------|-----|-----------|------|--------|
-| edward | #2374 | **Hard Kutta TE Constraint** | Physics constraint | WIP — just assigned (replaces #2362 which failed) |
-| fern | #2363 | **Global Cl/Cd SRF Conditioning** | Architecture (two-pass) | WIP — rebasing onto latest noam |
-| alphonse | #2368 | **Sobolev Surface Gradient Loss** | Loss formulation (dp/ds) | WIP — implementing |
-| thorfinn | #2369 | **Cross-Foil Autoregressive Decoding** | Architecture (causal AR) | WIP |
-| nezuko | #2370 | **Surface-Intrinsic B-GNN** | Architecture (pure surface GNN) | WIP |
-| frieren | #2371 | **1D Surface FNO Decoder** | Architecture (spectral surface) | WIP |
-| askeladd | #2372 | **Surface-Node Cross-Attention** | Architecture (global surface attn) | WIP |
-| tanjiro | #2373 | **Multi-Scale Slice Attention** | Architecture (coarse+fine) | WIP |
+| edward | #2374 | **Hard Kutta TE Constraint** | Physics constraint | WIP — ~60% trained, no improvement yet (expected mid-training) |
+| fern | #2363 | **Global Cl/Cd SRF Conditioning** | Architecture (two-pass) | WIP — training |
+| alphonse | #2375 | **Panel Data Oracle** | Multi-fidelity data | NEW — just assigned (#2368 Sobolev closed/diverged) |
+| thorfinn | #2369 | **Cross-Foil Autoregressive Decoding** | Architecture (causal AR) | WIP — implementing, no training started yet ⚠️ |
+| nezuko | #2370 | **Surface-Intrinsic B-GNN** | Architecture (pure surface GNN) | WIP — ~60% trained |
+| frieren | #2371 | **1D Surface FNO Decoder** | Architecture (spectral surface) | WIP — ~47% trained |
+| askeladd | #2372 | **Surface-Node Cross-Attention** | Architecture (global surface attn) | WIP — ~37% trained |
+| tanjiro | #2373 | **Multi-Scale Slice Attention** | Architecture (coarse+fine) | WIP — ~27% trained |
 
 ### Idle students
 None — all 8 GPUs occupied.
 
 ### Recently closed (this session)
+- **#2368 (alphonse, Sobolev Surface Gradient Loss):** CLOSED. All 6 configurations diverged (2-10× above baseline at 83%). Sobolev dp/ds penalty conflicts with PCGrad 3-way optimizer — competing gradients destabilize training at all weights (0.05-0.2). Auxiliary gradient supervision incompatible with current PCGrad setup.
 - **#2362 (edward, Viscous Residual Prediction):** CLOSED. All metrics catastrophic (+22% p_oodc). Flat-plate panel Cp too inaccurate to serve as residual baseline — residuals are MORE variable, not less. Viscous residual approach is exhausted.
 
 ## Human Researcher Directive (Issue #1860)
@@ -61,6 +62,7 @@ Loss/training: Focal L1, curriculum, quantile reg, Jacobian smooth, asymmetric l
 Physics features: Panel Cp ✅, wake deficit ✅, wake angle ✅, vortex-panel ✅ (all MERGED). Log-Re Cp, Joukowski Cp, viscous residual baseline (all failed)
 Transfer learning: DPOT external checkpoint (AFNO incompatible), self-pretraining denoising (no inductive bias)
 Data augmentation: FFD geometry augmentation (label mismatch fatal), re-scaling augmentation
+Loss/gradient: Sobolev surface gradient dp/ds loss (conflicts with PCGrad 3-way at all weights 0.05-0.2)
 
 ## Next Research Priorities (Round 42+)
 
@@ -69,8 +71,8 @@ Researcher-agent completed (2026-04-10 16:15 UTC). Full details in `RESEARCH_IDE
 **Ranked by expected p_tan impact (assign in this order as students become idle):**
 
 ### Tier 1 — Assign first
-1. **Panel Method as Cheap Data Oracle** — generate 3000-5000 synthetic tandem configs using existing panel solver; train as auxiliary data at 0.1× weight. Self-consistent labels (unlike FFD which had label mismatch). Springer Nature 2025 shows 10²× MSE reduction from inviscid pretraining. Expected: p_tan -5 to -10%. **CONFIDENCE: HIGH.**
-2. **Mamba/SSM Surface Sequence Model** — replace SRF MLP with Mamba SSM on arc-length-ordered surface nodes. Sequential inductive bias for pressure propagation. Run SRF in eager mode (torch.compile breaks Mamba), wrap only backbone. Expected: p_tan -3 to -8%. **CONFIDENCE: MEDIUM-HIGH.**
+1. **Panel Method as Cheap Data Oracle** — ✅ ASSIGNED to alphonse (#2375). Multi-fidelity training with synthetic tandem samples using panel solver. Self-consistent inviscid labels at 0.1× weight. Expected: p_tan -5 to -10%. **CONFIDENCE: HIGH.**
+2. **Mamba/SSM Surface Sequence Model** — replace SRF MLP with Mamba SSM on arc-length-ordered surface nodes. Sequential inductive bias for pressure propagation. Run SRF in eager mode (torch.compile breaks Mamba), wrap only backbone. Expected: p_tan -3 to -8%. **CONFIDENCE: MEDIUM-HIGH.** ← **Next assignment for next idle student.**
 
 ### Tier 2 — High ceiling, moderate risk
 3. **SE(2)-Equivariant Geometry Encoding** — add rotation-invariant relative angle/distance features from surface nodes to both foil centroids. Pure feature engineering, no new libraries. Targets OOD tandem geometry generalization. Expected: p_tan -2 to -5%.

@@ -2,6 +2,32 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-10 17:15 — PR #2368: Sobolev Surface Gradient Loss — alphonse — **CLOSED** ❌
+
+- Branch: `alphonse/sobolev-surface-gradient`
+- Hypothesis: Supervise the tangential pressure derivative dp/ds at surface nodes, forcing gradient fidelity at LE suction peaks and the tandem slot. Six configurations tested: weights 0.05, 0.1, 0.2 × seeds 42, 73.
+
+**W&B runs:** 9vxyjjtf (w=0.05, s73), kh0qy65w (w=0.05, s42), n5gbzg9u (w=0.1, s42), uzpt5t9l (w=0.2, s73), powpr2io (w=0.2, s42), w5o9bx8n (w=0.1, s73 — catastrophic)
+
+| Config | p_in | p_oodc | p_tan | p_re | Status |
+|--------|------|--------|-------|------|--------|
+| w=0.05, s73 | 41.3 | 27.4 | 58.4 | 20.9 | 2-3× above baseline |
+| w=0.05, s42 | 48.6 | 33.4 | 67.0 | 27.7 | 3-4× above baseline |
+| w=0.1, s42 | 51.7 | 38.5 | 68.0 | 34.3 | 3-5× above baseline |
+| w=0.2, s73 | 52.2 | 30.8 | 63.6 | 25.8 | 3-5× above baseline |
+| w=0.2, s42 | 61.3 | 34.6 | 68.0 | 32.3 | 3-5× above baseline |
+| w=0.1, s73 | 154.6 | 118.8 | 135.0 | 103.6 | Catastrophic divergence |
+
+Baseline: p_in=11.872, p_oodc=7.459, p_tan=26.319, p_re=6.229
+
+**Analysis:** Sobolev gradient-matching penalty conflicts with PCGrad 3-way multi-task loss optimizer. The competing gradient directions between the Sobolev term and the existing surface/volume/pressure-first losses destabilize convergence at ALL weight values. Even the lightest weight (0.05) produced metrics 2-3× above baseline at 83% training with no recovery trajectory. The run w=0.1, s73 diverged catastrophically (154× baseline). Root cause: PCGrad already resolves gradient conflicts between 3 task heads — adding a 4th derivative-matching term creates irreconcilable gradient conflicts.
+
+**Lesson:** Auxiliary gradient supervision is fundamentally incompatible with PCGrad 3-way setup. The idea of surface gradient matching is sound in principle but would require replacing PCGrad rather than adding to it. Future gradient-supervision ideas need to use a different loss balancing strategy.
+
+**Alphonse reassigned** to PR #2375: Panel Data Oracle (multi-fidelity training with synthetic tandem samples).
+
+---
+
 ### 2026-04-10 16:00 — PR #2362: Viscous Residual Prediction — edward — **CLOSED** ❌
 
 - Branch: `edward/viscous-residual-target`
