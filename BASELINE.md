@@ -1,6 +1,23 @@
 # Baseline Metrics
 
-## Current Single-Model Baseline (Phase 6 — 2026-04-09, +Panel Cp ×0.1, 2-Seed Evidence, PR #2319)
+## Current Single-Model Baseline (Phase 6 — 2026-04-10, +Wake Angle Feature, 2-Seed Evidence, PR #2350)
+
+| Metric | 2-seed avg | vs prior (Panel Cp ×0.1) | Δ |
+|--------|------------|--------------------------|---|
+| p_in | 11.90 | 11.709 | +1.6% (minor regression within 2-seed noise) |
+| **p_oodc** | **7.35** | 7.544 | **-2.6%** ✅ |
+| **p_tan** | **27.20** | 27.402 | **-0.7%** ✅ |
+| **p_re** | **6.40** | 6.481 | **-1.2%** ✅ |
+
+**PR #2350** (merged 2026-04-10) — Wake Angle Feature: adds atan2(dy_gap, dx_gap)/π as a 3rd channel to the wake deficit feature (alongside the existing dx/gap, dy/gap Cartesian channels). The signed polar angle from the fore-foil trailing edge encodes whether each node is upstream/downstream/lateral of the wake centerline — information that the Cartesian channels encode only implicitly. Active only for tandem samples (zero for single-foil), consistent with wake_deficit_feature. Improves OOD metrics significantly (p_oodc -2.6%, p_re -1.2%) and p_tan -0.7%; p_in +1.6% is within 2-seed noise (s73=11.62 beats baseline). W&B runs: 0gkeylyz (seed 42, p_in=12.17), sksq5fp5 (seed 73, p_in=11.62).
+
+Reproduce: `cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_output --use_lion --lr 2e-4 --slice_num 96 --cosine_T_max 150 --pcgrad_3way --pressure_first --pressure_deep --residual_prediction --surface_refine --te_coord_frame --wake_deficit_feature --re_stratified_sampling --n_layers 3 --cp_panel --cp_panel_tandem_only --cp_panel_scale 0.1 --wake_angle_feature`
+
+⚠️ **2-seed only.** For merge decisions: p_in < 11.90, **p_oodc < 7.35**, **p_tan < 27.20**, **p_re < 6.40**.
+
+---
+
+## Prior Single-Model Baseline (Phase 6 — 2026-04-09, +Panel Cp ×0.1, 2-Seed Evidence, PR #2319)
 
 | Metric | 2-seed avg | vs prior (Re-Stratified) | Δ |
 |--------|------------|--------------------------|---|
