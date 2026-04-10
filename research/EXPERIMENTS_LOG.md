@@ -2,6 +2,22 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-10 10:25 — PR #2341: Hypernetwork SRF v4 (rank=2, α=0.5, +wake_angle) — alphonse — **CLOSED** ❌
+
+- Branch: `alphonse/hypernetwork-srf-weights`
+- Hypothesis: Per-geometry LoRA-adapted SRF head via hypernetwork conditioning on AoA/Re/gap/stagger
+- 4 iterations: v1 (r=8, α=1.0), v2 (r=2, α=0.5), v3 (tandem-only mask), v4 (v2 + wake_angle rebase)
+- W&B runs v4: `zx56clg7` (seed 42), `eapo12gx` (seed 73)
+
+| Metric | v2 (old baseline) | v4 (new baseline) | Baseline | v4 Δ |
+|--------|-------------------|-------------------|----------|------|
+| p_in | +1.5% | 12.020 | 11.90 | +1.0% ❌ |
+| p_oodc | **-2.7%** | 7.488 | 7.35 | +1.9% ❌ |
+| p_tan | -1.0% | **26.910** | 27.20 | **-1.1%** ✅ |
+| p_re | **-2.8%** | 6.369 | 6.40 | **-0.5%** ✅ |
+
+**Analysis:** v2 beat 3/4 metrics against the OLD baseline (no wake angle). On the NEW baseline (with wake angle PR #2350), only 2/4 beat. The wake angle feature already provides efficient per-geometry conditioning that subsumes the hypernetwork's OOD adaptation signal. The persistent p_tan -1.1% is real but narrow, and 76K extra params aren't justified. Alphonse reassigned to bold Round 40: DPOT Pretrained Backbone (#2364).
+
 ### 2026-04-10 09:50 — PR #2340: Cl/Cd Auxiliary Loss v2 (tandem-only) — fern — **CLOSED** ❌
 
 - Branch: `fern/cl-cd-auxiliary-loss`
