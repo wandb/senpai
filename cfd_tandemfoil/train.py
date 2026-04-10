@@ -653,6 +653,78 @@ class SurfaceRefinementHead(nn.Module):
         return correction
 
 
+class GumbelMoESRF(nn.Module):
+    """Mixture-of-Experts SRF with hard Gumbel-Softmax routing.
+
+    Each surface node is routed to one of K experts via Gumbel top-1.
+    Different experts can specialize in different physical regimes
+    (boundary layer, wake, leading edge, trailing edge).
+    """
+
+    def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 192,
+                 K: int = 4, p_only: bool = False):
+        super().__init__()
+        self.K = K
+        self.p_only = p_only
+        actual_out = 1 if p_only else out_dim
+        in_dim = n_hidden + out_dim
+        self.input_proj = nn.Linear(in_dim, hidden_dim)
+        self.router = nn.Linear(hidden_dim, K)
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            for _ in range(K)
+        ])
+        self.output_proj = nn.Linear(hidden_dim, actual_out)
+        # Zero-init output for safe initialization (starts as identity)
+        nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
+
+    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor,
+                tau: float = 1.0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            hidden: [M, n_hidden] — hidden features for surface nodes
+            base_pred: [M, out_dim] — base predictions for surface nodes
+            tau: Gumbel temperature (annealed during training)
+        Returns:
+            correction: [M, out_dim] — additive correction
+            lb_loss: scalar — load balancing loss
+            expert_frac: [K] — fraction of nodes per expert
+        """
+        inp = torch.cat([hidden, base_pred], dim=-1)
+        h = self.input_proj(inp)
+        logits = self.router(h.detach())  # detach: router doesn't affect features
+
+        if self.training:
+            gumbel = -torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8)
+            soft = F.softmax((logits + gumbel) / tau, dim=-1)
+            hard = F.one_hot(soft.argmax(-1), self.K).float()
+            routing = hard - soft.detach() + soft  # straight-through estimator
+        else:
+            routing = F.one_hot(logits.argmax(-1), self.K).float()
+
+        expert_out = torch.stack([e(h) for e in self.experts], dim=-2)  # [M, K, hidden]
+        h_expert = (expert_out * routing.unsqueeze(-1)).sum(-2)  # [M, hidden]
+        correction = self.output_proj(h_expert)
+
+        if self.p_only:
+            zeros = torch.zeros(correction.shape[0], base_pred.shape[-1] - 1,
+                                device=correction.device, dtype=correction.dtype)
+            correction = torch.cat([zeros, correction], dim=-1)
+
+        # Load balancing loss (Switch Transformer style)
+        f = routing.mean(dim=0)  # fraction routed per expert [K]
+        p = F.softmax(logits, dim=-1).mean(dim=0)  # avg router prob per expert [K]
+        lb_loss = self.K * (f * p).sum()
+
+        return correction, lb_loss, f
+
+
 class AftFoilRefinementHead(nn.Module):
     """Dedicated refinement head for aft-foil (boundary ID=7) surface nodes.
 
@@ -1243,6 +1315,10 @@ class Config:
     cp_panel: bool = False                 # append thin-airfoil inviscid Cp to input features
     cp_panel_tandem_only: bool = False     # zero Cp feature for single-foil samples (tandem benefit only)
     cp_panel_scale: float = 1.0            # scale factor for panel Cp feature (0.1 = weak hint)
+    # Gumbel MoE surface refinement: per-node expert routing in SRF
+    gumbel_moe_srf: bool = False           # replace SRF MLP with Gumbel-routed MoE
+    gumbel_k: int = 4                      # number of SRF experts
+    gumbel_lb_weight: float = 0.01         # load balancing loss weight
 
 
 cfg = sp.parse(Config)
@@ -1429,7 +1505,15 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 # Surface refinement head (separate module, not compiled with main model)
 refine_head = None
 if cfg.surface_refine:
-    if cfg.surface_refine_context:
+    if cfg.gumbel_moe_srf:
+        refine_head = GumbelMoESRF(
+            n_hidden=cfg.n_hidden,
+            out_dim=3,
+            hidden_dim=cfg.surface_refine_hidden,
+            K=cfg.gumbel_k,
+            p_only=cfg.surface_refine_p_only,
+        ).to(device)
+    elif cfg.surface_refine_context:
         refine_head = SurfaceRefinementContextHead(
             n_hidden=cfg.n_hidden,
             out_dim=3,
@@ -1447,9 +1531,11 @@ if cfg.surface_refine:
         ).to(device)
     refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
     _refine_n_params = sum(p.numel() for p in refine_head.parameters())
-    print(f"Surface refinement head: {_refine_n_params:,} params "
-          f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
-          f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
+    _srf_type = "GumbelMoE" if cfg.gumbel_moe_srf else ("context" if cfg.surface_refine_context else "standard")
+    print(f"Surface refinement head ({_srf_type}): {_refine_n_params:,} params "
+          f"(hidden={cfg.surface_refine_hidden}, "
+          + (f"K={cfg.gumbel_k}" if cfg.gumbel_moe_srf else f"layers={cfg.surface_refine_layers}")
+          + f", p_only={cfg.surface_refine_p_only})")
 
 # Aft-foil (boundary ID=7) dedicated refinement head
 aft_srf_head = None
@@ -2005,6 +2091,8 @@ for epoch in range(MAX_EPOCHS):
                 pred = pred / sample_stds
 
         # Surface refinement head: additive correction on surface nodes
+        _moe_lb_loss = torch.tensor(0.0, device=device)
+        _moe_expert_frac = None
         if refine_head is not None and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 if cfg.surface_refine_context:
@@ -2019,7 +2107,13 @@ for epoch in range(MAX_EPOCHS):
                     if surf_idx.numel() > 0:
                         surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]  # [M, n_hidden]
                         surf_pred = pred[surf_idx[:, 0], surf_idx[:, 1]]      # [M, 3]
-                        correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
+                        if cfg.gumbel_moe_srf:
+                            _moe_tau = max(0.1, 1.0 * (0.1 ** (epoch / MAX_EPOCHS)))
+                            correction, _moe_lb_loss, _moe_expert_frac = refine_head(
+                                surf_hidden, surf_pred, tau=_moe_tau)
+                            correction = correction.float()
+                        else:
+                            correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
 
@@ -2223,6 +2317,12 @@ for epoch in range(MAX_EPOCHS):
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
 
+        # Gumbel MoE load balancing loss
+        _moe_lb_shared = 0.0
+        if cfg.gumbel_moe_srf and model.training:
+            loss = loss + cfg.gumbel_lb_weight * _moe_lb_loss
+            _moe_lb_shared = cfg.gumbel_lb_weight * _moe_lb_loss * 0.5
+
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
         is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
@@ -2239,8 +2339,8 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + _moe_lb_shared
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + _moe_lb_shared
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -2285,7 +2385,7 @@ for epoch in range(MAX_EPOCHS):
                 vol_loss_g = (abs_err * vol_mask_g.unsqueeze(-1)).sum() / vol_mask_g.sum().clamp(min=1)
                 surf_loss_g = (surf_per_sample * mask_1d.float() * tandem_boost).sum() / n
                 coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + _moe_lb_shared
 
             loss_A = _grp_loss(~is_tandem_batch)
             # Only include non-empty groups to avoid backward() on no-grad tensors
@@ -2413,7 +2513,14 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.gumbel_moe_srf:
+            _log_dict["train/moe_lb_loss"] = _moe_lb_loss.item() if isinstance(_moe_lb_loss, torch.Tensor) else _moe_lb_loss
+            _log_dict["train/moe_tau"] = max(0.1, 1.0 * (0.1 ** (epoch / MAX_EPOCHS)))
+            if _moe_expert_frac is not None:
+                for k_i in range(cfg.gumbel_k):
+                    _log_dict[f"train/moe_expert_{k_i}_frac"] = _moe_expert_frac[k_i].item()
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -2692,7 +2799,11 @@ for epoch in range(MAX_EPOCHS):
                             if surf_idx.numel() > 0:
                                 surf_hidden = _eval_hidden[surf_idx[:, 0], surf_idx[:, 1]]
                                 surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                                correction = eval_refine_head(surf_hidden, surf_pred).float()
+                                if cfg.gumbel_moe_srf:
+                                    correction, _, _ = eval_refine_head(surf_hidden, surf_pred, tau=0.1)
+                                    correction = correction.float()
+                                else:
+                                    correction = eval_refine_head(surf_hidden, surf_pred).float()
                                 pred_loss = pred_loss.clone()
                                 pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
@@ -3208,7 +3319,11 @@ if cfg.surface_refine and best_metrics:
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                             surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]
                             surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                            correction = verify_refine(surf_hidden, surf_pred).float()
+                            if cfg.gumbel_moe_srf:
+                                correction, _, _ = verify_refine(surf_hidden, surf_pred, tau=0.1)
+                                correction = correction.float()
+                            else:
+                                correction = verify_refine(surf_hidden, surf_pred).float()
                         pred_loss_refined = pred_loss.clone()
                         pred_loss_refined[surf_idx[:, 0], surf_idx[:, 1]] += correction
                         correction_full[surf_idx[:, 0], surf_idx[:, 1]] = correction
