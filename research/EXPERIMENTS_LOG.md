@@ -2,6 +2,69 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-10 09:15 — PR #2352: SRF FiLM Conditioning — tanjiro — **CLOSED** ❌
+
+- Branch: `tanjiro/srf-film-conditioning`
+- Hypothesis: FiLM conditioning on SRF head with Re/AoA to adapt surface corrections per flow regime
+- Ran against OLD baseline (no --wake_angle_feature)
+
+| Metric | Old Baseline | Result | Δ vs Old | New Baseline | Δ vs New |
+|--------|-------------|--------|----------|-------------|----------|
+| p_in | 11.709 | 11.875 | +1.4% | 11.90 | -0.2% ✅ |
+| p_oodc | 7.544 | 7.55 | +0.1% | 7.35 | +2.7% ❌ |
+| p_tan | 27.402 | 27.15 | -0.9% | 27.20 | -0.2% ≈ |
+| p_re | 6.481 | 6.40 | -1.2% | 6.40 | 0% = |
+
+**Analysis:** Mixed results. Against the new baseline (post-wake-angle), only p_in marginally improves; p_oodc significantly worse. The FiLM conditioning adds complexity without consistent gains. The backbone already receives Re via input features, making SRF-level Re conditioning redundant. The improvement pattern suggests FiLM captures some of what wake_angle already provides. Closed — architecture changes to SRF continue to underperform vs physics features.
+
+---
+
+### 2026-04-10 09:15 — PR #2353: Learnable Per-Domain Cp Scale — nezuko — **CLOSED** ❌
+
+- Branch: `nezuko/learnable-cp-scale`
+- Hypothesis: Replace fixed cp_panel_scale=0.1 with learned per-domain scalar, jointly optimized
+
+| Metric | Baseline | Result | Δ |
+|--------|---------|--------|---|
+| p_in | 11.90 | ~12.6 | +6% ❌ |
+| p_oodc | 7.35 | ~10.4 | +42% ❌ |
+| p_tan | 27.20 | ~30.8 | +13% ❌ |
+| p_re | 6.40 | ~7.2 | +12% ❌ |
+
+**Analysis:** Catastrophic failure. The learned scale converged near 0.09 (close to the hand-tuned 0.1), but the optimization dynamics during early training were destructive — PCGrad fights between Cp loss gradients and main surface loss. Making physics feature scales learnable is dangerous when gradient-based multi-task balancing is active. Fixed scaling at 0.1 remains optimal. Key lesson: learnable parameters that interact with PCGrad need careful initialization and possibly gradient detachment.
+
+---
+
+### 2026-04-10 09:15 — PR #2354: Pressure Recovery Ratio Feature — askeladd — **CLOSED** ❌
+
+- Branch: `askeladd/pressure-recovery-feature`
+- Hypothesis: Inter-foil gap position ratio as input feature to encode pressure recovery stage
+
+| Metric | Baseline | Result | Δ |
+|--------|---------|--------|---|
+| p_in | 11.90 | ~12.6 | +5.9% ❌ |
+| p_tan | 27.20 | ~27.2 | flat ≈ |
+
+**Analysis:** p_in regression with no p_tan improvement. The pressure recovery ratio (normalized x-position in inter-foil gap) is linearly derivable from existing coordinate features — the model can already compute this from (x, gap, stagger). Unlike physics features (Cp, wake deficit) which encode information the model cannot learn from raw geometry, this ratio adds redundant information. Confirms: useful physics features must encode non-trivial physical computation, not just geometric ratios.
+
+---
+
+### 2026-04-10 09:15 — PR #2355: Two-Stage SRF — frieren — **CLOSED** ❌
+
+- Branch: `frieren/two-stage-srf`
+- Hypothesis: Sequential velocity-first then pressure SRF, exploiting Bernoulli coupling
+
+| Metric | Baseline | Result | Δ |
+|--------|---------|--------|---|
+| p_in | 11.90 | ~12.2 | +2.5% ❌ |
+| p_oodc | 7.35 | ~7.21 | -1.9% ✅ |
+| p_tan | 27.20 | ~27.74 | +2.0% ❌ |
+| p_re | 6.40 | ~6.37 | -0.5% ✅ |
+
+**Analysis:** Mixed, net negative. Velocity-first staging helps OOD metrics (p_oodc, p_re) but hurts in-distribution (p_in, p_tan). Splitting stages reduces effective training time per output and the current joint SRF with PCGrad already handles multi-task balancing. The Bernoulli coupling intuition is sound but the implementation adds more complexity than benefit. SRF architecture modifications continue the pattern of being neutral-to-harmful vs the well-tuned baseline.
+
+---
+
 ### 2026-04-10 06:30 — PR #2350: Wake Angle Feature — edward — **MERGED** ✅
 
 - Branch: `edward/wake-angle-feature`
