@@ -2,6 +2,21 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-10 11:25 — PR #2358: Surface-Normal Local Frame for SRF — tanjiro — **CLOSED** ❌
+
+- Branch: `tanjiro/surface-normal-srf-frame`
+- Hypothesis: Local tangent/normal frame features as SRF input for boundary-layer-aware predictions
+- W&B runs: `qkj6b78q` (seed 42, 158 epochs), `y96zev0i` (seed 73, 157 epochs)
+
+| Metric | S42 | S73 | 2-Seed Avg | Baseline | Δ |
+|--------|-----|-----|------------|----------|---|
+| p_in | 12.13 | 11.76 | 11.95 | 11.90 | +0.4% ❌ |
+| p_oodc | 7.89 | 7.41 | 7.65 | 7.35 | +4.1% ❌ |
+| p_tan | 27.21 | 26.82 | 27.02 | 27.20 | -0.7% ✅ |
+| p_re | 6.51 | 6.26 | 6.38 | 6.40 | -0.3% ✅ |
+
+**Analysis:** 2/4 metrics beat baseline but p_oodc +4.1% too large. Frame features partially redundant with TE coord frame. Noisy finite-difference normals and +9% epoch overhead not justified. Tanjiro reassigned to bold Round 40: MoE Domain-Expert FFN (#2366).
+
 ### 2026-04-10 11:20 — PR #2360: Input Consistency Regularization (R-Drop) — frieren — **CLOSED** ❌
 
 - Branch: `frieren/input-consistency-regularization`
