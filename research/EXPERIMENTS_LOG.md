@@ -2,6 +2,92 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-10 00:45 — PR #2341: Hypernetwork SRF (rank=8, alpha=1.0) — alphonse — **SENT BACK** 🔄
+
+- Branch: `alphonse/hypernetwork-srf-weights`
+- Hypothesis: Per-geometry LoRA-adapted SRF decoder generates custom weight perturbations based on condition vector (AoA, Re, gap, stagger, DSDF stats, chord, tandem flag).
+- W&B runs: `xu4a7g76` (s42, best epoch 155), `z7vnr3u2` (s73, best epoch 156)
+
+| Metric | Baseline (#2319) | Seed 42 | Seed 73 | 2-seed avg | Δ |
+|--------|-----------------|---------|---------|------------|---|
+| p_in | 11.709 | 12.003 | 12.060 | 12.032 | **+2.8%** ❌ |
+| p_oodc | 7.544 | 7.636 | 7.533 | 7.585 | +0.5% ❌ |
+| p_tan | 27.402 | 26.099 | 27.015 | 26.557 | **-3.1%** ✅ |
+| p_re | 6.481 | 6.595 | 6.422 | 6.508 | +0.4% ❌ |
+
+**Analysis:** Strongest p_tan improvement seen (-3.1%, s42 hit 26.099). The per-geometry LoRA correctly captures that tandem fore/aft foils need different decoders. However rank-8 is too expressive for the small 2-layer 128-dim SRF, causing overfitting on non-tandem splits. Sent back for v2: rank=2, alpha=0.5 to constrain perturbation magnitude (same principle as Panel Cp ×0.1 scaling).
+
+---
+
+### 2026-04-10 00:45 — PR #2343: Arc-Length 1D Conv Decoder — frieren — **CLOSED** ❌
+
+- Branch: `frieren/arc-length-conv-decoder`
+- Hypothesis: Map surface nodes to canonical arc-length grid, apply 1D depthwise-separable conv for translation-equivariant decoding.
+- W&B runs: `h9e2woq3` (s42, 144 epochs), `dj590mup` (s73, 143 epochs)
+
+| Metric | Baseline (#2319) | Seed 42 | Seed 73 | 2-seed avg | Δ |
+|--------|-----------------|---------|---------|------------|---|
+| p_in | 11.709 | 12.1 | 12.3 | 12.20 | **+4.2%** ❌ |
+| p_oodc | 7.544 | 7.7 | 7.5 | 7.60 | +0.7% ❌ |
+| p_tan | 27.402 | 27.3 | 26.9 | 27.10 | -1.1% ≈ |
+| p_re | 6.481 | 6.7 | 6.6 | 6.65 | **+2.6%** ❌ |
+
+**Analysis:** 6× training slowdown (75s/epoch vs 12s) from per-sample arc-length sorting/interpolation. The 256-point grid smooths out fine-grained suction peaks. Translation equivariance is not the right inductive bias — suction peaks correlate with known geometry (LE position, curvature), not arbitrary arc positions.
+
+---
+
+### 2026-04-10 00:45 — PR #2332: Target Noise Regularization (sigma=0.01) — tanjiro — **CLOSED** ❌
+
+- Branch: `tanjiro/target-noise-regularization`
+- Hypothesis: Relative Gaussian noise on raw targets acts as implicit Bayesian regularization for OOD robustness.
+- W&B runs: `a68uozh3` (s42), `ik8t4w8i` (s73)
+- Note: Student used different base config from current baseline (includes tandem_ramp, domain_layernorm, etc.)
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ vs baseline |
+|--------|-----------------|------------|---------------|
+| p_in | 11.709 | 11.672 | -0.3% ≈ |
+| p_oodc | 7.544 | 7.469 | -1.0% ≈ |
+| p_tan | 27.402 | 28.508 | **+4.0%** ❌ |
+| p_re | 6.481 | 6.306 | -2.7% ✅ |
+
+**Analysis:** Mixed results, but crucially run on a different base config making comparison unreliable. p_tan regression +4% is disqualifying. Target noise proportional to |target| injects disproportionate noise into high-pressure tandem regions. Direction exhausted.
+
+---
+
+### 2026-04-10 00:45 — PR #2339: Quantile Regression Decoder — nezuko — **CLOSED** ❌
+
+- Branch: `nezuko/quantile-regression-decoder`
+- Hypothesis: Pinball loss for q10/q50/q90 forces gradient attention toward hard-to-predict regions.
+- W&B runs: `slz2ynxv` (s42), `1wg8q2qm` (s73)
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.709 | 30.65 | **+162%** ❌ |
+| p_oodc | 7.544 | 17.15 | **+127%** ❌ |
+| p_tan | 27.402 | 52.65 | **+92%** ❌ |
+| p_re | 6.481 | 12.85 | **+98%** ❌ |
+
+**Analysis:** Catastrophic failure. Root cause: pinball loss has ~0.5× gradient magnitude vs L1, effectively halving surface pressure gradient contribution. 3-channel output also diluted capacity across q10/q50/q90. The existing hard-node mining already targets high-error nodes without these downsides.
+
+---
+
+### 2026-04-10 00:45 — PR #2342: Jacobian Smoothness Regularization — askeladd — **CLOSED** ❌
+
+- Branch: `askeladd/jacobian-smoothness-reg`
+- Hypothesis: Penalize Jacobian of output w.r.t. AoA/Re for smoother condition-space response → OOD generalization.
+- W&B runs: `9o0kc6ob` (s42, best epoch 116), `ob1v5gm8` (s73, best epoch 117)
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.709 | 15.7 | **+34.1%** ❌ |
+| p_oodc | 7.544 | 9.7 | **+28.6%** ❌ |
+| p_tan | 27.402 | 28.9 | +5.5% ❌ |
+| p_re | 6.481 | 7.85 | **+21.1%** ❌ |
+
+**Analysis:** Significant regression. Two factors: (1) extra forward pass reduced epochs from ~149 to ~117 (cosine schedule never completed); (2) smoothness penalty fundamentally conflicts with CFD physics — the model NEEDS to be sensitive to AoA/Re to predict separation and stall. Penalizing sensitivity prevents learning sharp pressure gradients at flow transition points.
+
+---
+
 ### 2026-04-09 23:10 — PR #2338: GRU Sequential Surface Decoder — thorfinn — **CLOSED** ❌
 
 - Branch: `thorfinn/gru-sequential-surface-decoder`

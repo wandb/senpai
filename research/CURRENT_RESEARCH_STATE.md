@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-09 18:50 UTC
+- **Date:** 2026-04-10 00:50 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Beyond Ensemble: Training & Architecture Improvements
 
@@ -27,54 +27,63 @@ W&B runs: h6fqcry4 (s42), cuhoscp9 (s73)
 | p_tan | **29.1** |
 | p_re | **5.8** |
 
-## Student Status (2026-04-09 18:50 UTC)
+## Student Status (2026-04-10 00:50 UTC)
 
 | Student | PR | Experiment | Status | Notes |
 |---------|-----|-----------|--------|-------|
-| thorfinn | #2338 | **GRU Sequential Surface Decoder** | NEWLY ASSIGNED | Bold: arc-length-ordered recurrent SRF |
-| edward | #2337 | **Arc-Length Surface PE** | NEWLY ASSIGNED | Fourier PE for surface nodes before SRF |
-| fern | #2328 v2 | **AoA Curriculum warmup=20** | TRAINING (ETA ~19:48) | p_oodc -5.1% in v1, testing shorter warmup |
-| nezuko | #2327 v2 | **Sample Mixup (fixed mask, α=0.2)** | TRAINING (ETA ~19:48) | Fixed surface mask bug |
-| alphonse | #2335 | **Gradient Accumulation 2x** | TRAINING (ETA ~19:49) | |
-| askeladd | #2336 | **Panel Cp + AoA Curriculum Combo** | TRAINING (ETA ~19:58) | Combination test |
-| frieren | #2334 | **Checkpoint Soup** | TRAINING (ETA ~20:00) | Weight averaging |
-| tanjiro | #2332 | **Target Noise Regularization** | IMPLEMENTING | Re-running after pod restart |
+| tanjiro | #2346 | **Focal L1 Surface Loss** | NEWLY ASSIGNED | Upweight hard surface nodes with focal gamma |
+| nezuko | #2347 | **Sample Difficulty Curriculum** | NEWLY ASSIGNED | Oversample hard training samples |
+| askeladd | #2348 | **Gumbel MoE SRF** | NEWLY ASSIGNED | Per-node expert routing K=4 in SRF |
+| frieren | #2349 | **Diffusion Surface Decoder** | NEWLY ASSIGNED | DDPM/DDIM iterative denoising refinement |
+| alphonse | #2341 v2 | **Hypernetwork SRF (rank=2, α=0.5)** | SENT BACK | v1 showed p_tan -3.1%, iterating with lower rank |
+| thorfinn | #2344 | **SWA Weight Averaging** | TRAINING | Stochastic weight averaging |
+| edward | #2345 | **Condition-Space Interpolation** | TRAINING | Same-geometry augmentation |
+| fern | #2340 | **Cl/Cd Auxiliary Loss** | TRAINING | Integral aerodynamic force supervision |
 
-## Recent Results (Round 35/36)
+## Recent Results (Round 36/37)
 
-### Completed This Session
+### Round 37 Review (2026-04-10 00:45)
 | PR | Experiment | Result | Verdict |
 |----|-----------|--------|---------|
-| #2319 v3 | Panel Cp ×0.1 tandem-only | p_in -0.3%, p_oodc -1.3%, p_tan -1.7% | **MERGED** ✅ |
-| #2333 | Wider SRF head (256) | +2-4% all metrics | **Closed** ❌ |
-| #2325 | KAN Surface Decoder | +4-10% | Closed ❌ |
-| #2326 | Warmup + Cosine | p_oodc +7% | Closed ❌ |
-| #2329 | Log1p Pressure | p_tan +3.4% | Closed ❌ |
-| #2330 | BL Proxy Feature | +23% all | Closed ❌ |
-| #2331 | Local Re Feature | p_in +5.3% | Closed ❌ |
+| #2341 | Hypernetwork SRF (rank=8) | p_tan -3.1% ✅, p_in +2.8% ❌ | **Sent back** 🔄 |
+| #2343 | Arc-Length 1D Conv | p_in +4.2%, 6× slower | Closed ❌ |
+| #2332 | Target Noise (σ=0.01) | p_tan +4%, diff base config | Closed ❌ |
+| #2339 | Quantile Regression | +92-162% ALL metrics | Closed ❌ |
+| #2342 | Jacobian Smoothness | +21-34% ALL metrics | Closed ❌ |
+
+### Round 36 Review (2026-04-09 23:10)
+| PR | Experiment | Result | Verdict |
+|----|-----------|--------|---------|
+| #2338 | GRU Sequential Decoder | +53-207% (4× slower) | Closed ❌ |
+| #2337 | Arc-Length Surface PE | p_in +5.6%, centroid bug | Closed ❌ |
 
 ## Key Insights from Phase 6
 
-1. **Panel Cp as INPUT feature is now merged.** ×0.1 scaling prevents backbone disruption while preserving physics hint.
-2. **AoA Curriculum shows strongest p_oodc signal** (-5.1%), but p_tan +3.5%. v2 tests shorter warmup=20.
-3. **Architecture output modifications safe; backbone changes dangerous.** SRF changes are OK; attention/block changes regress p_tan.
-4. **Bigger SRF capacity doesn't help.** 192 hidden is already sufficient; wider/KAN/flow-matching all failed.
+1. **Panel Cp as INPUT feature is now merged.** ×0.1 scaling prevents backbone disruption.
+2. **Hypernetwork SRF shows strongest p_tan signal** (-3.1% at rank=8). Iterating with rank=2 to reduce p_in overfitting.
+3. **Architecture output modifications safe; backbone changes dangerous.** SRF changes OK; attention/block changes regress p_tan.
+4. **Bigger SRF capacity doesn't help.** 192 hidden is sufficient; wider/KAN/GRU/conv all failed.
 5. **Physics-informed input features remain the strongest lever.** Every durable win came from features.
+6. **Sequential surface decoders are not viable** — per-sample loops kill throughput (GRU 4×, conv 6× slower).
+7. **Loss magnitude matters critically** — quantile regression's 0.5× gradient magnitude caused catastrophic failure. Any loss change must preserve gradient magnitude.
+8. **Jacobian smoothness conflicts with CFD physics** — the model needs sensitivity to AoA/Re, not smoothness.
 
-## Current Research Focus (Round 36)
+## Current Research Focus (Round 37)
 
-### Bold Architecture Ideas (per Issue #1860 "Think BIGGER")
-1. **Sequential surface decoder** (thorfinn #2338 GRU) — arc-length-ordered recurrence for causal pressure propagation
-2. **Surface positional encoding** (edward #2337 arc-PE) — explicit node location context for SRF
-3. **Combination** (askeladd #2336) — Panel Cp + AoA Curriculum stacking
+### Promising Directions Being Tested
+1. **Hypernetwork SRF v2** (alphonse) — rank=2, α=0.5 to capture p_tan -3.1% without p_in regression
+2. **Focal L1 Surface Loss** (tanjiro) — upweight hard nodes at suction peaks/separation
+3. **Sample Difficulty Curriculum** (nezuko) — oversample training samples with highest loss
+4. **Gumbel MoE SRF** (askeladd) — per-node expert routing for regime specialization
+5. **Diffusion Surface Decoder** (frieren) — DDPM/DDIM iterative refinement on SRF residuals
+6. **SWA Weight Averaging** (thorfinn) — flatter minima for generalization
+7. **Condition-Space Interpolation** (edward) — same-geometry augmentation
+8. **Cl/Cd Auxiliary Loss** (fern) — integral force constraint
 
-### Next Experiments to Assign (after current round completes)
-Priority order from Round 36 research ideas:
-1. **Idea 11: Quantile Regression Decoder** — 20 lines, pinball loss; strong Kaggle track record
-2. **Idea 3: Cl/Cd Auxiliary Loss** — global integral constraint, orthogonal to DCT loss
-3. **Idea 2: Hypernetwork SRF Weights** — per-geometry LoRA adaptation of SRF decoder
-4. **Idea 8: Panel Residual GNN** — VortexNet-style: predict CFD-panel residual via GNN
-5. **Idea 4: Jacobian Smoothness Reg** — smooth condition-space response for OOD generalization
+### Strategy Tiers
+- **Tier 1 (Loss/Data):** Focal L1, sample curriculum, Cl/Cd loss — simple, targeted
+- **Tier 2 (SRF Architecture):** Hypernetwork v2, Gumbel MoE, diffusion decoder — bold changes
+- **Tier 3 (Training Strategy):** SWA, condition interp — regularization/augmentation
 
 ### What's Exhausted (DO NOT REVISIT)
 
@@ -88,5 +97,15 @@ Priority order from Round 36 research ideas:
 - Inviscid Cp residual target, KAN surface decoder, warmup with Lion
 - Log1p pressure target, BL proxy feature, local Re feature
 - Surface-derivative losses on non-uniform meshes
-- Target noise regularization (neutral)
+- Target noise regularization (p_tan regression)
 - Wider SRF head (192→256) — overfits
+- GRU/Mamba sequential decoder — per-sample loop too slow
+- Arc-length surface PE — centroid issue in tandem
+- Arc-length 1D conv decoder — 6× slower, smooths suction peaks
+- Quantile regression — halves gradient magnitude, catastrophic
+- Jacobian smoothness — conflicts with CFD physics sensitivity needs
+- Gradient accumulation 2x — neutral
+- AoA curriculum (all forms) — p_tan regression
+- Sample mixup — surface mask issues
+- Checkpoint soup — neutral
+- Panel Cp + AoA curriculum combo — no synergy
