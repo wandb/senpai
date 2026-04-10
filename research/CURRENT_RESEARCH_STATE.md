@@ -1,5 +1,5 @@
 # SENPAI Research State
-- **Date:** 2026-04-10 17:45 UTC
+- **Date:** 2026-04-10 18:45 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Bold Round 41/42
 
@@ -19,33 +19,33 @@ Reproduce:
 cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_output --use_lion --lr 2e-4 --slice_num 96 --cosine_T_max 150 --pcgrad_3way --pressure_first --pressure_deep --residual_prediction --surface_refine --te_coord_frame --wake_deficit_feature --re_stratified_sampling --n_layers 3 --cp_panel --cp_panel_tandem_only --cp_panel_scale 0.1 --wake_angle_feature --vortex_panel_velocity --vortex_panel_scale 0.1 --vortex_panel_n 64
 ```
 
-## Student Status (2026-04-10 17:45 UTC)
+## Student Status (2026-04-10 18:45 UTC)
 
-### Round 41/42 Bold Experiments (all WIP)
-| Student | PR | Experiment | Type | W&B Progress | Live Metrics (best seed) |
-|---------|-----|-----------|------|-------------|--------------------------|
-| edward | #2374 | **Hard Kutta TE Constraint** | Physics constraint | Still finishing old viscous-resid-v2 (~132/155 epochs, ~25 min left). Will switch to Hard Kutta when done. | Old exp: p_in=13.28, p_tan=27.96 (won't beat baseline) |
-| fern | #2363 | **Global Cl/Cd SRF Conditioning** | Architecture (two-pass) | ⚠️ Pod restarted — was stalled 7h with stale state. Fresh pod running, should pick up assignment now. | No training yet |
-| alphonse | #2375 | **Panel Data Oracle** | Multi-fidelity data | Just assigned 30 min ago. Implementing. | No training yet |
-| thorfinn | #2369 | **Cross-Foil Autoregressive Decoding** | Architecture (causal AR) | ⚠️ Pod restarted — was stalled 3h with stale state, no response to advisor hints. Fresh pod running. | No training yet |
-| nezuko | #2370 | **Surface-Intrinsic B-GNN** | Architecture (pure surface GNN) | ~129/155 epochs (step 83K, ~30 min left) | p_in=13.79, p_oodc=8.39, p_tan=29.02, p_re=7.05 (all above baseline) |
-| frieren | #2371 | **1D Surface FNO Decoder** | Architecture (spectral surface) | ~55% (step 32K) | p_in=18.01, p_oodc=10.66, p_tan=?, p_re=8.15 (all above baseline) |
-| askeladd | #2372 | **Surface-Node Cross-Attention** | Architecture (global surface attn) | ~45% (step 27K) | p_in=18.79, p_oodc=12.35, p_tan=?, p_re=9.97 (early, above baseline) |
-| tanjiro | #2373 | **Multi-Scale Slice Attention** | Architecture (coarse+fine) | ~35% (step 20K) | p_in=22.77, p_oodc=12.72, p_tan=?, p_re=9.39 (early, above baseline) |
+### Round 41/42 Experiments
+| Student | PR | Experiment | Type | Status |
+|---------|-----|-----------|------|--------|
+| askeladd | #2372 | **Surface Cross-Attention v2** | Architecture (tandem-only SCA) | Sent back with tandem-only + lr fix instructions. p_tan -3.7% but p_in +9.2%. |
+| fern | #2363 | **Global Cl/Cd SRF Conditioning** | Architecture (two-pass) | Training ~39 min in (2 seeds) |
+| alphonse | #2375 | **Panel Data Oracle** | Multi-fidelity data | Training ~33 min in (w=0.1, 2 seeds, after debug iterations) |
+| frieren | #2377 | **SE(2)-Equivariant Geometry** | Input features | Training ~24 min in (2 seeds) |
+| edward | #2374 | **Hard Kutta TE Constraint** | Physics constraint | Training 3 configs simultaneously (hard-only, soft-only, combined) |
+| thorfinn | #2369 | **Cross-Foil AR Decoding** | Architecture (causal AR) | Training ~3 min (2 seeds, after debug) |
+| nezuko | #2376 | **Mamba SSM Surface Decoder** | Architecture (sequential SSM) | Implementing (pod restarted, iteration 1) |
+| tanjiro | #2373 | **Multi-Scale Slice Attention** | Architecture (coarse+fine) | FINISHED — awaiting results post |
 
 ### Idle students
-None — all 8 GPUs occupied (2 pods just restarted).
+- nezuko (implementing, no W&B runs yet)
 
-### Pod Actions This Cycle
-- **thorfinn:** Pod deleted/recreated. Was stuck with stale state (thought assigned to merged PR #2319). New pod should poll and find #2369.
-- **fern:** Pod deleted/recreated. Was stuck with stale state (thought assigned to merged PR #2328). New pod should poll and find #2363.
+### Closed This Session
+- **#2370 (nezuko, Surface B-GNN Decoder):** CLOSED. All metrics 7-14% above baseline. Local surface GNN cannot capture global tandem coupling. Dead end.
+- **#2371 (frieren, 1D Surface FNO Decoder):** CLOSED. All metrics 15-29% above baseline. Arc-length interpolation destroys fine structure. Dead end.
 
-### Recently closed (prior session)
-- **#2368 (alphonse, Sobolev Surface Gradient Loss):** CLOSED. All 6 configurations diverged (2-10× above baseline at 83%). Sobolev dp/ds penalty conflicts with PCGrad 3-way optimizer — competing gradients destabilize training at all weights (0.05-0.2). Auxiliary gradient supervision incompatible with current PCGrad setup.
-- **#2362 (edward, Viscous Residual Prediction):** CLOSED. All metrics catastrophic (+22% p_oodc). Flat-plate panel Cp too inaccurate to serve as residual baseline — residuals are MORE variable, not less. Viscous residual approach is exhausted.
+### Key Review Decisions
+- **#2372 (askeladd, Surface Cross-Attention): SENT BACK** for v2. p_tan=-3.7% is the strongest tandem improvement. p_in +9.2% is fixable via tandem-only conditioning (skip SCA for single-foil samples, analogous to cp_panel_tandem_only). Also instructed 0.1× lr for SCA params to address norm explosion (~490).
 
-### Mid-Training Observations
-**All bold architectural experiments are currently above baseline.** This is consistent with the well-established pattern that the Transolver backbone is a very strong local optimum. However, most runs are only 35-55% complete — final-epoch convergence with EMA and cosine schedule could still recover significant ground. Nezuko's B-GNN at ~83% is the most concerning: p_tan=29.02 (+10.3%) with limited room for late recovery.
+### Pod Actions This Session
+- Restarted thorfinn, fern (stale state) → now training
+- Restarted edward, nezuko, thorfinn again (stuck after experiment completion) → now training/implementing
 
 ## Human Researcher Directive (Issue #1860)
 
@@ -53,13 +53,15 @@ None — all 8 GPUs occupied (2 pods just restarted).
 
 **Status:** FULLY ACTIONED. Round 41/42 is 100% architectural and physics-constraint experiments. Fresh status posted on issue #1860 (2026-04-10 17:00 UTC). Round 42 ideas doc ready for assignment when students become idle.
 
-## Key Insights (Updated)
+## Key Insights (Updated 2026-04-10 18:45)
 
 1. **Physics-informed input features are now fully exhausted.** Panel Cp, wake deficit, wake angle, vortex-panel velocity — all merged and compounding. This was the primary lever for Rounds 30-40. New territory: constraints, loss formulation, architecture.
-2. **Residual prediction (viscous correction) fails.** Panel Cp is too inaccurate for OOD/tandem — subtracting it makes the target HARDER, not easier. Two-pass (predict-then-refine) is incompatible with 30-min training timeout. This direction is closed.
-3. **2× forward pass approaches are incompatible** with the 30-min training timeout. Must use stop-gradient or single-pass for any multi-pass approaches.
-4. **High seed variance = unstable training signal.** When s42 and s73 diverge >5% on p_in, the approach is learning something spurious.
-5. **p_tan = 26.319 is our hardest metric** (2× worse than p_in). The tandem inter-foil interference is the dominant unsolved problem. All Round 41/42 experiments should prioritize p_tan improvement.
+2. **All bold decoder replacements failed catastrophically.** B-GNN (+14%), FNO (+29%), and viscous residual prediction (+22%) all significantly worse than baseline. The Transolver backbone + SRF is an extremely strong local optimum for this task.
+3. **Surface cross-attention shows GENUINE tandem benefit.** p_tan -3.7% from global surface-only attention post-backbone. The mechanism works for tandem but hurts single-foil (p_in +9.2%). FIX: tandem-conditional SCA (skip for single-foil). This is the most promising active direction.
+4. **Local-only surface methods fail for multi-body aerodynamics.** B-GNN (local k-NN), FNO (per-foil spectral) — any method that severs inter-foil context fails on p_tan. Successful surface decoders MUST preserve global cross-foil information.
+5. **Late convergence matters.** Askeladd's cross-attention went from p_tan=30+ at 50% training to 25.3 at completion. Bold experiments may look bad mid-training but converge at the end due to EMA + cosine schedule. Don't judge too early.
+6. **High seed variance = unstable training signal.** When s42 and s73 diverge >5% on p_in, the approach is learning something spurious.
+7. **p_tan = 26.319 is our hardest metric** (2× worse than p_in). The tandem inter-foil interference is the dominant unsolved problem.
 
 ## What's Exhausted (DO NOT REVISIT)
 
