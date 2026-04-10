@@ -1,5 +1,5 @@
 # SENPAI Research State
-- **Date:** 2026-04-10 18:45 UTC
+- **Date:** 2026-04-10 19:20 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Bold Round 41/42
 
@@ -31,7 +31,7 @@ cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_ou
 | edward | #2374 | **Hard Kutta TE Constraint** | Physics constraint | Training 3 configs simultaneously (hard-only, soft-only, combined) |
 | thorfinn | #2369 | **Cross-Foil AR Decoding** | Architecture (causal AR) | Training ~3 min (2 seeds, after debug) |
 | nezuko | #2376 | **Mamba SSM Surface Decoder** | Architecture (sequential SSM) | Implementing (pod restarted, iteration 1) |
-| tanjiro | #2373 | **Multi-Scale Slice Attention** | Architecture (coarse+fine) | FINISHED — awaiting results post |
+| tanjiro | #2378 | **Contrastive Geometry Pretraining** | Data (UIUC airfoil library) | NEW — just assigned. Pretrain geometry encoder on 2000+ airfoil shapes. |
 
 ### Idle students
 - nezuko (implementing, no W&B runs yet)
@@ -39,6 +39,7 @@ cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_ou
 ### Closed This Session
 - **#2370 (nezuko, Surface B-GNN Decoder):** CLOSED. All metrics 7-14% above baseline. Local surface GNN cannot capture global tandem coupling. Dead end.
 - **#2371 (frieren, 1D Surface FNO Decoder):** CLOSED. All metrics 15-29% above baseline. Arc-length interpolation destroys fine structure. Dead end.
+- **#2373 (tanjiro, Multi-Scale Slice Attention):** CLOSED. All metrics above baseline (+2-8%). Epoch time 103s (vs 68s) — 50% overhead incompatible with training budget.
 
 ### Key Review Decisions
 - **#2372 (askeladd, Surface Cross-Attention): SENT BACK** for v2. p_tan=-3.7% is the strongest tandem improvement. p_in +9.2% is fixable via tandem-only conditioning (skip SCA for single-foil samples, analogous to cp_panel_tandem_only). Also instructed 0.1× lr for SCA params to address norm explosion (~490).
