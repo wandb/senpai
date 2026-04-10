@@ -2,6 +2,22 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-10 15:00 — PR #2365: FFD Geometry Augmentation — frieren — **CLOSED** ❌
+
+- Branch: `frieren/ffd-geometry-augmentation`
+- Hypothesis: Apply random Free-Form Deformation to training airfoil geometries (amplitude=0.01 chord, prob=0.5) to create novel synthetic shapes during training, with FFD-augmented samples weighted at 0.3× loss. Forces model to learn shape-invariant representations.
+
+**W&B runs:** 5g9kvdnu (seed 42), ckq0rk09 (seed 73)
+
+| Metric | S42 (5g9kvdnu) | S73 (ckq0rk09) | 2-Seed Avg | Baseline | Δ |
+|--------|----------------|----------------|------------|----------|---|
+| p_in | 13.256 | 12.723 | 12.990 | 11.872 | **+9.4% ❌** |
+| p_oodc | 7.476 | 7.429 | 7.453 | 7.459 | -0.1% (flat) |
+| p_tan | 28.340 | 27.583 | 27.962 | 26.319 | **+6.2% ❌** |
+| p_re | 6.538 | 6.374 | 6.456 | 6.229 | +3.6% ❌ |
+
+**Analysis:** Fundamental label mismatch: deformed geometry receives original (non-deformed) pressure labels. Even with 0.3× loss weight and 50% augmentation probability, ~50% of training batches have systematically incorrect supervision. The model can't learn a correct geometry-to-pressure mapping when geometry-pressure pairs are mismatched. p_in +9.4% confirms in-distribution corrupted. Data generation via geometry perturbation requires physically consistent labels for perturbed shapes. Frieren reassigned to 1D Surface FNO Decoder (#2371).
+
 ### 2026-04-10 14:30 — PR #2351: Log-Re-Conditioned Panel Cp — thorfinn — **CLOSED** ❌
 
 - Branch: `thorfinn/log-re-conditioned-cp`
