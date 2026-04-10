@@ -20,6 +20,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     Tandem surface loss is therefore underweighted.
 """
 
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -823,6 +824,111 @@ class SurfaceRefinementContextHead(nn.Module):
         return correction
 
 
+class DiffusionSurfaceDecoder(nn.Module):
+    """Score-based diffusion decoder for surface node predictions.
+
+    Operates as an AUXILIARY refinement on top of an existing SRF head.
+    Learns to predict the residual (ground_truth - srf_pred) via DDPM
+    training and DDIM deterministic inference.
+
+    Architecture: MLP score network conditioned on backbone features,
+    noisy residual, and sinusoidal time embedding.
+    Zero-initialized output for safe initialization.
+    """
+
+    def __init__(self, d_cond: int, d_output: int = 3, T: int = 8):
+        super().__init__()
+        self.T = T
+        self.d_output = d_output
+
+        # Linear beta schedule
+        betas = torch.linspace(1e-4, 0.02, T)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        self.register_buffer('betas', betas)
+        self.register_buffer('alphas_cumprod', alphas_cumprod)
+
+        # Time embedding: sinusoidal → 2-layer MLP → 128d
+        self.time_embed = nn.Sequential(
+            nn.Linear(64, 128),
+            nn.SiLU(),
+            nn.Linear(128, 128),
+        )
+
+        # Score network: [cond + noisy_residual + time_emb] → noise_pred
+        d_in = d_cond + d_output + 128
+        self.score_net = nn.Sequential(
+            nn.Linear(d_in, 192), nn.SiLU(),
+            nn.Linear(192, 192), nn.SiLU(),
+            nn.Linear(192, d_output),
+        )
+        # Zero-init output for safe initialization
+        nn.init.zeros_(self.score_net[-1].weight)
+        nn.init.zeros_(self.score_net[-1].bias)
+
+    def sinusoidal_embedding(self, t: torch.Tensor, dim: int = 64) -> torch.Tensor:
+        """Sinusoidal time embedding. t: [B] float → [B, dim]."""
+        half = dim // 2
+        freqs = torch.exp(-math.log(10000) * torch.arange(half, device=t.device) / half)
+        args = t.unsqueeze(-1) * freqs.unsqueeze(0)  # [B, half]
+        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # [B, dim]
+
+    def forward_train(self, cond: torch.Tensor, target_residual: torch.Tensor) -> torch.Tensor:
+        """DDPM training: predict noise added to target residual.
+
+        Args:
+            cond: [M, d_cond] — backbone features for surface nodes
+            target_residual: [M, d_output] — target = ground_truth - srf_pred
+
+        Returns:
+            loss: scalar MSE between predicted and actual noise
+        """
+        M = target_residual.shape[0]
+        # Sample random timestep per node
+        t = torch.randint(0, self.T, (M,), device=target_residual.device)
+        noise = torch.randn_like(target_residual)
+        ac = self.alphas_cumprod[t].unsqueeze(-1)  # [M, 1]
+        noisy = ac.sqrt() * target_residual + (1.0 - ac).sqrt() * noise  # [M, d_output]
+
+        t_emb = self.time_embed(self.sinusoidal_embedding(t.float()))  # [M, 128]
+        noise_pred = self.score_net(torch.cat([cond, noisy, t_emb], dim=-1))  # [M, d_output]
+        return F.mse_loss(noise_pred, noise)
+
+    def forward_inference(self, cond: torch.Tensor, steps: int = 5) -> torch.Tensor:
+        """DDIM deterministic inference: denoise from Gaussian noise.
+
+        Args:
+            cond: [M, d_cond] — backbone features for surface nodes
+            steps: number of DDIM denoising steps
+
+        Returns:
+            x0: [M, d_output] — predicted residual
+        """
+        M = cond.shape[0]
+        x = torch.randn(M, self.d_output, device=cond.device, dtype=cond.dtype)
+        T = self.T
+
+        # Linearly spaced time steps from T-1 down to 0
+        t_seq = torch.linspace(T - 1, 0, steps, device=cond.device).long()
+
+        for i, ti in enumerate(t_seq):
+            t = torch.full((M,), ti.item(), device=cond.device, dtype=torch.long)
+            t_emb = self.time_embed(self.sinusoidal_embedding(t.float()))  # [M, 128]
+            noise_pred = self.score_net(torch.cat([cond, x, t_emb], dim=-1))  # [M, d_output]
+
+            ac = self.alphas_cumprod[ti]
+            # Predict x0 from current noisy x and predicted noise
+            x0 = (x - (1.0 - ac).sqrt() * noise_pred) / (ac.sqrt() + 1e-8)
+            x0 = x0.clamp(-10.0, 10.0)  # numerical stability
+
+            if i < steps - 1:
+                # Step to next (lower) noise level
+                ac_next = self.alphas_cumprod[t_seq[i + 1]]
+                x = ac_next.sqrt() * x0 + (1.0 - ac_next).sqrt() * noise_pred
+
+        return x0
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -1243,6 +1349,11 @@ class Config:
     cp_panel: bool = False                 # append thin-airfoil inviscid Cp to input features
     cp_panel_tandem_only: bool = False     # zero Cp feature for single-foil samples (tandem benefit only)
     cp_panel_scale: float = 1.0            # scale factor for panel Cp feature (0.1 = weak hint)
+    # Diffusion surface decoder: auxiliary DDPM-style refinement on SRF residuals
+    srf_diffusion: bool = False            # enable diffusion surface decoder (auxiliary on SRF)
+    diffusion_T: int = 8                   # number of diffusion noise steps
+    diffusion_inference_steps: int = 5     # number of DDIM denoising steps at inference
+    diffusion_loss_weight: float = 1.0     # weight for diffusion denoising loss
 
 
 cfg = sp.parse(Config)
@@ -1481,6 +1592,23 @@ if cfg.aft_foil_srf:
               f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, "
               f"film={cfg.aft_foil_srf_film})")
 
+# Diffusion surface decoder (auxiliary refinement on SRF residuals)
+diffusion_head = None
+ema_diffusion_head = None
+if cfg.srf_diffusion:
+    if not cfg.surface_refine:
+        print("WARNING: --srf_diffusion requires --surface_refine to be enabled. Disabling.")
+        cfg.srf_diffusion = False
+    else:
+        diffusion_head = DiffusionSurfaceDecoder(
+            d_cond=cfg.n_hidden,
+            d_output=3,
+            T=cfg.diffusion_T,
+        ).to(device)
+        _diff_n = sum(p.numel() for p in diffusion_head.parameters())
+        print(f"Diffusion surface decoder: {_diff_n:,} params "
+              f"(T={cfg.diffusion_T}, inference_steps={cfg.diffusion_inference_steps})")
+
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
@@ -1506,6 +1634,8 @@ if aft_srf_head is not None:
     n_params += sum(p.numel() for p in aft_srf_head.parameters())
 if aft_srf_ctx_head is not None:
     n_params += sum(p.numel() for p in aft_srf_ctx_head.parameters())
+if diffusion_head is not None:
+    n_params += sum(p.numel() for p in diffusion_head.parameters())
 
 
 class SAM:
@@ -1647,6 +1777,12 @@ if aft_srf_ctx_head is not None:
     base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
 
+# Add diffusion head params to optimizer
+if diffusion_head is not None:
+    _diff_params = list(diffusion_head.parameters())
+    base_opt.add_param_group({'params': _diff_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _diff_params):,} diffusion head params to optimizer")
+
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
     _warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
@@ -1750,6 +1886,8 @@ for epoch in range(MAX_EPOCHS):
         aft_srf_head.train()
     if aft_srf_ctx_head is not None:
         aft_srf_ctx_head.train()
+    if diffusion_head is not None:
+        diffusion_head.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
@@ -2057,6 +2195,21 @@ for epoch in range(MAX_EPOCHS):
                 pred = pred.clone()
                 pred[aft_idx[:, 0], aft_idx[:, 1]] = pred[aft_idx[:, 0], aft_idx[:, 1]] + aft_correction
 
+        # Diffusion auxiliary loss: predict residual (y_norm - pred) for surface nodes
+        _diff_loss = None
+        if diffusion_head is not None and model.training:
+            surf_idx_diff = is_surface.nonzero(as_tuple=False)  # [M, 2]
+            if surf_idx_diff.numel() > 0:
+                surf_hidden_diff = hidden[surf_idx_diff[:, 0], surf_idx_diff[:, 1]].detach()  # [M, n_hidden]
+                surf_target_diff = y_norm[surf_idx_diff[:, 0], surf_idx_diff[:, 1]]           # [M, 3]
+                surf_pred_diff = pred[surf_idx_diff[:, 0], surf_idx_diff[:, 1]].detach()      # [M, 3]
+                surf_residual = surf_target_diff - surf_pred_diff                             # [M, 3]
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _diff_loss = diffusion_head.forward_train(
+                        surf_hidden_diff.to(torch.bfloat16),
+                        surf_residual.to(torch.bfloat16),
+                    ).float()
+
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         if cfg.tandem_ramp:
@@ -2139,6 +2292,11 @@ for epoch in range(MAX_EPOCHS):
                     surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
         else:
             loss = vol_loss + surf_weight * surf_loss
+
+        # Add diffusion auxiliary loss
+        if _diff_loss is not None:
+            loss = loss + cfg.diffusion_loss_weight * _diff_loss
+            wandb.log({"train/diffusion_loss": _diff_loss.item(), "global_step": global_step})
 
         # Multi-scale loss: coarse spatial pooling
         _coarse_loss = None
@@ -2412,6 +2570,14 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for diffusion head
+            if diffusion_head is not None:
+                if ema_diffusion_head is None:
+                    ema_diffusion_head = deepcopy(diffusion_head)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_diffusion_head.parameters(), diffusion_head.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
         wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
@@ -2532,6 +2698,14 @@ for epoch in range(MAX_EPOCHS):
             eval_aft_srf_ctx_head.eval()
         else:
             aft_srf_ctx_head.eval()
+    # Select diffusion head for eval (EMA if available)
+    eval_diffusion_head = diffusion_head
+    if diffusion_head is not None:
+        if ema_diffusion_head is not None and ema_model is not None and eval_model is ema_model:
+            eval_diffusion_head = ema_diffusion_head
+            eval_diffusion_head.eval()
+        else:
+            diffusion_head.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -2738,6 +2912,26 @@ for epoch in range(MAX_EPOCHS):
                         else:
                             pred = pred_loss * sample_stds
 
+                # Apply diffusion decoder at inference: add predicted residual to SRF output
+                if eval_diffusion_head is not None:
+                    surf_idx_eval = is_surface.nonzero(as_tuple=False)  # [M, 2]
+                    if surf_idx_eval.numel() > 0:
+                        surf_hidden_eval = _eval_hidden[surf_idx_eval[:, 0], surf_idx_eval[:, 1]]  # [M, n_hidden]
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            diff_residual = eval_diffusion_head.forward_inference(
+                                surf_hidden_eval.to(torch.bfloat16),
+                                steps=cfg.diffusion_inference_steps,
+                            ).float()
+                        pred_loss = pred_loss.clone()
+                        pred_loss[surf_idx_eval[:, 0], surf_idx_eval[:, 1]] = (
+                            pred_loss[surf_idx_eval[:, 0], surf_idx_eval[:, 1]] + diff_residual
+                        )
+                        # Back-compute pred for denormalization
+                        if cfg.multiply_std:
+                            pred = pred_loss / sample_stds
+                        else:
+                            pred = pred_loss * sample_stds
+
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
                 abs_err = abs_err.nan_to_num(0.0)
@@ -2915,6 +3109,9 @@ for epoch in range(MAX_EPOCHS):
                 aft_srf_ctx_head._orig_mod if hasattr(aft_srf_ctx_head, '_orig_mod') else aft_srf_ctx_head
             )
             torch.save(_ctx_save.state_dict(), model_dir / "aft_srf_ctx_head.pt")
+        if diffusion_head is not None:
+            _diff_save = ema_diffusion_head if ema_diffusion_head is not None else diffusion_head
+            torch.save(_diff_save.state_dict(), model_dir / "diffusion_head.pt")
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
