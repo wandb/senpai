@@ -1243,6 +1243,9 @@ class Config:
     cp_panel: bool = False                 # append thin-airfoil inviscid Cp to input features
     cp_panel_tandem_only: bool = False     # zero Cp feature for single-foil samples (tandem benefit only)
     cp_panel_scale: float = 1.0            # scale factor for panel Cp feature (0.1 = weak hint)
+    # Focal L1 surface loss: upweight high-error surface nodes
+    focal_l1: bool = False                 # enable focal-style L1 surface loss
+    focal_gamma: float = 1.0              # exponent for focal weighting (higher = more focus on hard nodes)
 
 
 cfg = sp.parse(Config)
@@ -2119,6 +2122,14 @@ for epoch in range(MAX_EPOCHS):
             hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
             surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        # Focal L1: upweight high-error surface nodes (composes with hard-node mining)
+        if cfg.focal_l1:
+            _surf_pres = abs_err[:, :, 2:3]  # [B, N, 1]
+            _mean_err = (_surf_pres.detach() * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1).float() + 1e-8
+            _focal_w = (_surf_pres.detach() / _mean_err).pow(cfg.focal_gamma).clamp(min=0.5, max=5.0)
+            if epoch >= 30:
+                _focal_w = _focal_w * hard_weights  # compose with hard-node mining
+            surf_per_sample = (_surf_pres * _focal_w * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         if cfg.tandem_ramp:
             tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
@@ -2413,7 +2424,11 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _step_metrics = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.focal_l1:
+            _step_metrics["train/focal_w_mean"] = _focal_w.mean().item()
+            _step_metrics["train/focal_w_max"] = _focal_w.max().item()
+        wandb.log(_step_metrics)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
