@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-10 03:40 — PR #2341 v2: Hypernetwork SRF (rank=2, alpha=0.5) — alphonse — **SENT BACK** 🔄
+
+- Branch: `alphonse/hypernetwork-srf-weights`
+- Hypothesis: Constrained LoRA (rank=2 vs rank=8, alpha=0.5 vs 1.0) should reduce overfitting while preserving tandem-specific adaptation.
+- W&B runs: `6my21fxu` (s42, best epoch 156), `oickpnsk` (s73, best epoch 157)
+
+| Metric | Baseline | v1 (r=8,α=1) | v2 (r=2,α=0.5) | v2 Δ vs baseline |
+|--------|----------|--------------|----------------|------------------|
+| p_in | 11.709 | 12.032 (+2.8%) | 11.885 | **+1.5%** ❌ |
+| p_oodc | 7.544 | 7.585 (+0.5%) | 7.343 | **-2.7%** ✅ |
+| p_tan | 27.402 | 26.557 (-3.1%) | 27.123 | **-1.0%** ✅ |
+| p_re | 6.481 | 6.508 (+0.4%) | 6.302 | **-2.8%** ✅ |
+
+**Analysis:** Rank reduction from 8→2 dramatically improved generalization. 3/4 metrics now beat baseline. Aggregate surface MAE -0.9% better. p_oodc -2.7% and p_re -2.8% are the biggest improvements we've seen on these metrics. The remaining p_in +1.5% regression is driven by s73 (12.091) while s42 (11.679) beats baseline. Sent back for v3: tandem-only hypernetwork (zero LoRA for single-foil) to protect p_in.
+
+---
+
 ### 2026-04-10 02:30 — PR #2345: Condition-Space Interpolation — edward — **CLOSED** ❌
 
 - Branch: `edward/condition-interp-augmentation`
