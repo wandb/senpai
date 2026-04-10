@@ -2,6 +2,358 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-10 06:30 — PR #2350: Wake Angle Feature — edward — **MERGED** ✅
+
+- Branch: `edward/wake-angle-feature`
+- W&B runs: `0gkeylyz` (s42), `sksq5fp5` (s73)
+
+| Metric | Prior Baseline | 2-seed avg | Δ |
+|--------|---------------|------------|---|
+| p_in | 11.709 | 11.90 | +1.6% (noise) |
+| p_oodc | 7.544 | 7.35 | **-2.6%** ✅ |
+| p_tan | 27.402 | 27.20 | **-0.7%** ✅ |
+| p_re | 6.481 | 6.40 | **-1.2%** ✅ |
+
+**Analysis:** atan2(dy_gap, dx_gap)/π as 3rd wake channel. 15 LoC. Polar angle encodes wake sector (upstream/downstream/lateral) that Cartesian (dx,dy) encode only implicitly. p_in regression within 2-seed noise (s73=11.62 beats baseline). OOD metrics strongly improved.
+
+---
+
+### 2026-04-10 06:30 — PR #2340: Cl/Cd Auxiliary Loss (w=0.01) — fern — **SENT BACK** 🔄
+
+- Branch: `fern/cl-cd-auxiliary-loss`
+- W&B runs: `9wtwk9b7` (s42), `lzzed57d` (s73)
+
+| Metric | Prior Baseline | 2-seed avg | Δ |
+|--------|---------------|------------|---|
+| p_in | 11.709 | 11.900 | +1.6% ❌ |
+| p_oodc | 7.544 | 7.550 | +0.1% ≈ |
+| p_tan | 27.402 | 26.600 | **-2.9%** ✅ |
+| p_re | 6.481 | 6.500 | +0.3% ≈ |
+
+**Analysis:** p_tan -2.9% is the strongest tandem improvement signal. Integral Cl/Cd constraint forces pressure to sum to correct lift/drag per-foil — especially powerful for tandem where aft foil operates in fore wake. p_in regression from applying Cl/Cd to single-foil where per-node MAE already optimal. Sent back for v2: tandem-only Cl/Cd + wake_angle_feature (new baseline).
+
+---
+
+### 2026-04-10 04:10 — PR #2346: Focal L1 Surface Loss (gamma=1.0) — tanjiro — **CLOSED** ❌
+
+- Branch: `tanjiro/focal-l1-surface-loss`
+- W&B runs: `a5gi6gnr` (s42), `8vq8enj8` (s73)
+
+| Metric | Baseline | 2-seed avg | Δ |
+|--------|----------|------------|---|
+| p_in | 11.709 | 12.44 | **+6.2%** ❌ |
+| p_oodc | 7.544 | 8.40 | **+11.3%** ❌ |
+| p_tan | 27.402 | 27.15 | -0.9% ≈ |
+| p_re | 6.481 | 6.85 | **+5.7%** ❌ |
+
+**Analysis:** Focal weighting from epoch 0 destabilized early learning and composed redundantly with existing hard-node mining. The baseline's multi-layered difficulty targeting already handles hard nodes effectively.
+
+---
+
+### 2026-04-10 04:10 — PR #2347: Sample Difficulty Curriculum (β=2.0) — nezuko — **CLOSED** ❌
+
+- Branch: `nezuko/sample-difficulty-curriculum`
+- W&B runs: `qyao6jov` (s42), `wfuyfg03` (s73)
+
+| Metric | Baseline | 2-seed avg | Δ |
+|--------|----------|------------|---|
+| p_in | 11.709 | 12.20 | **+4.2%** ❌ |
+| p_oodc | 7.544 | 7.50 | -0.6% ≈ |
+| p_tan | 27.402 | 27.30 | -0.4% ≈ |
+| p_re | 6.481 | 6.50 | +0.3% ≈ |
+
+**Analysis:** Neutral. Curriculum weight differentiation was modest (std ~0.04). Existing hard-node mining + PCGrad + tandem boost + Re-stratification leaves no room for additional curriculum.
+
+---
+
+### 2026-04-10 04:10 — PR #2348: Gumbel MoE SRF (K=4) — askeladd — **CLOSED** ❌
+
+- Branch: `askeladd/gumbel-moe-srf`
+- W&B runs: `jmzq4sft` (s42), `xgh8j9mz` (s73)
+
+| Metric | Baseline | 2-seed avg | Δ |
+|--------|----------|------------|---|
+| p_in | 11.709 | 12.05 | +2.9% ❌ |
+| p_oodc | 7.544 | 7.55 | +0.1% ≈ |
+| p_tan | 27.402 | 27.60 | +0.7% ≈ |
+| p_re | 6.481 | 6.40 | -1.2% ✅ |
+
+**Analysis:** Neutral. Per-node expert routing doesn't meaningfully improve over single SRF MLP. Load balancing loss may force equal utilization when unequal is physically appropriate.
+
+---
+
+### 2026-04-10 04:10 — PR #2349: Diffusion Surface Decoder (T=8, DDIM 5-step) — frieren — **CLOSED** ❌
+
+- Branch: `frieren/diffusion-surface-decoder`
+- W&B runs: `ct49a9ik` (s42), `je9ghuzn` (s73)
+
+| Metric | Baseline | 2-seed avg | Δ |
+|--------|----------|------------|---|
+| p_in | 11.709 | 182.35 | **+1457%** ❌ |
+| p_oodc | 7.544 | 87.45 | **+1059%** ❌ |
+| p_tan | 27.402 | 188.25 | **+587%** ❌ |
+| p_re | 6.481 | 80.90 | **+1148%** ❌ |
+
+**Analysis:** Catastrophic. Per-node diffusion is fundamentally limited: no spatial coherence between nodes, moving residual target, detached conditioning blocks gradient flow, 2.3× training slowdown. Stochastic surface decoders are exhausted.
+
+---
+
+### 2026-04-10 03:40 — PR #2341 v2: Hypernetwork SRF (rank=2, alpha=0.5) — alphonse — **SENT BACK** 🔄
+
+- Branch: `alphonse/hypernetwork-srf-weights`
+- Hypothesis: Constrained LoRA (rank=2 vs rank=8, alpha=0.5 vs 1.0) should reduce overfitting while preserving tandem-specific adaptation.
+- W&B runs: `6my21fxu` (s42, best epoch 156), `oickpnsk` (s73, best epoch 157)
+
+| Metric | Baseline | v1 (r=8,α=1) | v2 (r=2,α=0.5) | v2 Δ vs baseline |
+|--------|----------|--------------|----------------|------------------|
+| p_in | 11.709 | 12.032 (+2.8%) | 11.885 | **+1.5%** ❌ |
+| p_oodc | 7.544 | 7.585 (+0.5%) | 7.343 | **-2.7%** ✅ |
+| p_tan | 27.402 | 26.557 (-3.1%) | 27.123 | **-1.0%** ✅ |
+| p_re | 6.481 | 6.508 (+0.4%) | 6.302 | **-2.8%** ✅ |
+
+**Analysis:** Rank reduction from 8→2 dramatically improved generalization. 3/4 metrics now beat baseline. Aggregate surface MAE -0.9% better. p_oodc -2.7% and p_re -2.8% are the biggest improvements we've seen on these metrics. The remaining p_in +1.5% regression is driven by s73 (12.091) while s42 (11.679) beats baseline. Sent back for v3: tandem-only hypernetwork (zero LoRA for single-foil) to protect p_in.
+
+---
+
+### 2026-04-10 02:30 — PR #2345: Condition-Space Interpolation — edward — **CLOSED** ❌
+
+- Branch: `edward/condition-interp-augmentation`
+- Hypothesis: Augment training by interpolating flow fields between same-geometry samples at different AoA/Re conditions.
+- W&B runs: `bota4ckq` (s42), `65eo5fnu` (s73)
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.709 | 13.80 | **+17.9%** ❌ |
+| p_oodc | 7.544 | 7.90 | **+4.7%** ❌ |
+| p_tan | 27.402 | 27.85 | +1.7% ❌ |
+| p_re | 6.481 | 6.95 | **+7.3%** ❌ |
+
+**Analysis:** DSDF cosine similarity is an unreliable geometry proxy — different geometries matched spuriously, creating physically invalid interpolated labels. 67GB VRAM (vs 40GB baseline) from appended interp samples. Interp weight 0.3 too high for approximate pseudo-labels. EMA already captures the benefits of weight averaging.
+
+---
+
+### 2026-04-10 02:30 — PR #2344: SWA Weight Averaging — thorfinn — **CLOSED** ❌
+
+- Branch: `thorfinn/swa-weight-averaging`
+- Hypothesis: Stochastic Weight Averaging at epoch 112+ finds flatter minima for better OOD generalization.
+- W&B runs: `5iq5phdh` (s42), `yu5sst2e` (s73)
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.709 | 16.62 | **+41.9%** ❌ |
+| p_oodc | 7.544 | 8.10 | **+7.4%** ❌ |
+| p_tan | 27.402 | 31.85 | **+16.2%** ❌ |
+| p_re | 6.481 | 7.00 | **+8.0%** ❌ |
+
+**Analysis:** Constant LR=1e-4 at epoch 112 disrupts critical cosine convergence phase. Stacking uniform SWA on exponential EMA (decay=0.999) causes destructive interference — two averaging strategies with conflicting temporal biases. Large seed variance (s42 p_in=14.8 vs s73=18.4) confirms instability from high-variance exploration. EMA already captures weight averaging benefits for this architecture.
+
+---
+
+### 2026-04-10 00:45 — PR #2341: Hypernetwork SRF (rank=8, alpha=1.0) — alphonse — **SENT BACK** 🔄
+
+- Branch: `alphonse/hypernetwork-srf-weights`
+- Hypothesis: Per-geometry LoRA-adapted SRF decoder generates custom weight perturbations based on condition vector (AoA, Re, gap, stagger, DSDF stats, chord, tandem flag).
+- W&B runs: `xu4a7g76` (s42, best epoch 155), `z7vnr3u2` (s73, best epoch 156)
+
+| Metric | Baseline (#2319) | Seed 42 | Seed 73 | 2-seed avg | Δ |
+|--------|-----------------|---------|---------|------------|---|
+| p_in | 11.709 | 12.003 | 12.060 | 12.032 | **+2.8%** ❌ |
+| p_oodc | 7.544 | 7.636 | 7.533 | 7.585 | +0.5% ❌ |
+| p_tan | 27.402 | 26.099 | 27.015 | 26.557 | **-3.1%** ✅ |
+| p_re | 6.481 | 6.595 | 6.422 | 6.508 | +0.4% ❌ |
+
+**Analysis:** Strongest p_tan improvement seen (-3.1%, s42 hit 26.099). The per-geometry LoRA correctly captures that tandem fore/aft foils need different decoders. However rank-8 is too expressive for the small 2-layer 128-dim SRF, causing overfitting on non-tandem splits. Sent back for v2: rank=2, alpha=0.5 to constrain perturbation magnitude (same principle as Panel Cp ×0.1 scaling).
+
+---
+
+### 2026-04-10 00:45 — PR #2343: Arc-Length 1D Conv Decoder — frieren — **CLOSED** ❌
+
+- Branch: `frieren/arc-length-conv-decoder`
+- Hypothesis: Map surface nodes to canonical arc-length grid, apply 1D depthwise-separable conv for translation-equivariant decoding.
+- W&B runs: `h9e2woq3` (s42, 144 epochs), `dj590mup` (s73, 143 epochs)
+
+| Metric | Baseline (#2319) | Seed 42 | Seed 73 | 2-seed avg | Δ |
+|--------|-----------------|---------|---------|------------|---|
+| p_in | 11.709 | 12.1 | 12.3 | 12.20 | **+4.2%** ❌ |
+| p_oodc | 7.544 | 7.7 | 7.5 | 7.60 | +0.7% ❌ |
+| p_tan | 27.402 | 27.3 | 26.9 | 27.10 | -1.1% ≈ |
+| p_re | 6.481 | 6.7 | 6.6 | 6.65 | **+2.6%** ❌ |
+
+**Analysis:** 6× training slowdown (75s/epoch vs 12s) from per-sample arc-length sorting/interpolation. The 256-point grid smooths out fine-grained suction peaks. Translation equivariance is not the right inductive bias — suction peaks correlate with known geometry (LE position, curvature), not arbitrary arc positions.
+
+---
+
+### 2026-04-10 00:45 — PR #2332: Target Noise Regularization (sigma=0.01) — tanjiro — **CLOSED** ❌
+
+- Branch: `tanjiro/target-noise-regularization`
+- Hypothesis: Relative Gaussian noise on raw targets acts as implicit Bayesian regularization for OOD robustness.
+- W&B runs: `a68uozh3` (s42), `ik8t4w8i` (s73)
+- Note: Student used different base config from current baseline (includes tandem_ramp, domain_layernorm, etc.)
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ vs baseline |
+|--------|-----------------|------------|---------------|
+| p_in | 11.709 | 11.672 | -0.3% ≈ |
+| p_oodc | 7.544 | 7.469 | -1.0% ≈ |
+| p_tan | 27.402 | 28.508 | **+4.0%** ❌ |
+| p_re | 6.481 | 6.306 | -2.7% ✅ |
+
+**Analysis:** Mixed results, but crucially run on a different base config making comparison unreliable. p_tan regression +4% is disqualifying. Target noise proportional to |target| injects disproportionate noise into high-pressure tandem regions. Direction exhausted.
+
+---
+
+### 2026-04-10 00:45 — PR #2339: Quantile Regression Decoder — nezuko — **CLOSED** ❌
+
+- Branch: `nezuko/quantile-regression-decoder`
+- Hypothesis: Pinball loss for q10/q50/q90 forces gradient attention toward hard-to-predict regions.
+- W&B runs: `slz2ynxv` (s42), `1wg8q2qm` (s73)
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.709 | 30.65 | **+162%** ❌ |
+| p_oodc | 7.544 | 17.15 | **+127%** ❌ |
+| p_tan | 27.402 | 52.65 | **+92%** ❌ |
+| p_re | 6.481 | 12.85 | **+98%** ❌ |
+
+**Analysis:** Catastrophic failure. Root cause: pinball loss has ~0.5× gradient magnitude vs L1, effectively halving surface pressure gradient contribution. 3-channel output also diluted capacity across q10/q50/q90. The existing hard-node mining already targets high-error nodes without these downsides.
+
+---
+
+### 2026-04-10 00:45 — PR #2342: Jacobian Smoothness Regularization — askeladd — **CLOSED** ❌
+
+- Branch: `askeladd/jacobian-smoothness-reg`
+- Hypothesis: Penalize Jacobian of output w.r.t. AoA/Re for smoother condition-space response → OOD generalization.
+- W&B runs: `9o0kc6ob` (s42, best epoch 116), `ob1v5gm8` (s73, best epoch 117)
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.709 | 15.7 | **+34.1%** ❌ |
+| p_oodc | 7.544 | 9.7 | **+28.6%** ❌ |
+| p_tan | 27.402 | 28.9 | +5.5% ❌ |
+| p_re | 6.481 | 7.85 | **+21.1%** ❌ |
+
+**Analysis:** Significant regression. Two factors: (1) extra forward pass reduced epochs from ~149 to ~117 (cosine schedule never completed); (2) smoothness penalty fundamentally conflicts with CFD physics — the model NEEDS to be sensitive to AoA/Re to predict separation and stall. Penalizing sensitivity prevents learning sharp pressure gradients at flow transition points.
+
+---
+
+### 2026-04-09 23:10 — PR #2338: GRU Sequential Surface Decoder — thorfinn — **CLOSED** ❌
+
+- Branch: `thorfinn/gru-sequential-surface-decoder`
+- Hypothesis: Bidirectional GRU on arc-length-sorted surface nodes propagates stagnation→suction peak causal context.
+- W&B runs: `z87dvheq` (s42), `5hsewpb3` (s73)
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.709 | 31.611 | **+170%** ❌ |
+| p_oodc | 7.544 | 23.178 | **+207%** ❌ |
+| p_tan | 27.402 | 41.961 | **+53%** ❌ |
+| p_re | 6.481 | 19.203 | **+196%** ❌ |
+
+**Analysis:** GRU is 4x slower per epoch (277s vs 68s) due to per-sample loop for variable-length surface nodes. Only 39 epochs vs 160 — never converges. Sequential hypothesis not falsified but implementation is not viable without batched/padded GRU or 1D conv alternative.
+
+---
+
+### 2026-04-09 23:10 — PR #2337: Arc-Length Surface PE — edward — **CLOSED** ❌
+
+- Branch: `edward/arc-length-surface-pe`
+- Hypothesis: Fourier positional encoding of arc-length position for surface nodes before SRF head.
+- W&B runs: `hwcuejfy` (s42), `7gkkb29d` (s73)
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.709 | 12.36 | **+5.6%** ❌ |
+| p_oodc | 7.544 | 7.50 | -0.6% ≈ |
+| p_tan | 27.402 | 28.03 | **+2.3%** ❌ |
+| p_re | 6.481 | 6.24 | **-3.8%** ✅ |
+
+**Analysis:** p_re -3.8% is notable but p_in +5.6% is a dealbreaker. Root cause (per student): polar centroid computation mixes fore+aft surface nodes in tandem, producing meaningless angles. Existing 2D Fourier PE already encodes position. The PE concept needs per-foil centroid computation to be viable.
+
+---
+
+### 2026-04-09 20:45 — PR #2336: Panel Cp + AoA Curriculum Combo — askeladd — **CLOSED** ❌
+
+- Branch: `askeladd/panel-cp-plus-curriculum`
+- Hypothesis: Panel Cp (tandem-only ×0.1) + AoA Curriculum (warmup=20) should stack improvements.
+- W&B runs: `0vv815dd` (s42), `xn59kd8e` (s73)
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.709 | 12.064 | **+3.0%** ❌ |
+| p_oodc | 7.544 | 7.622 | **+1.0%** ❌ |
+| p_tan | 27.402 | 28.487 | **+4.0%** ❌ |
+| p_re | 6.481 | 6.593 | **+1.7%** ❌ |
+
+**Analysis:** Features don't stack — they conflict. Curriculum warmup deprives Cp feature of signal during early training. AoA curriculum produces conflicting gradients with Cp feature (curriculum wants easy/low-AoA; Cp most informative at high AoA). AoA curriculum now exhausted in all forms.
+
+---
+
+### 2026-04-09 20:45 — PR #2334: Checkpoint Soup — frieren — **CLOSED** ❌
+
+- Branch: `frieren/checkpoint-soup`
+- Hypothesis: Averaging checkpoints at epochs 100, 125, and best should smooth predictions.
+- W&B runs: `v5af1m2c` (s42), `pooovezz` (s73)
+
+| Metric | Pre-soup avg | Post-soup avg | Δ post vs baseline |
+|--------|-------------|---------------|-------------------|
+| p_in | 11.65 | 12.30 | **+5.0%** ❌ |
+| p_oodc | 7.70 | 8.00 | **+6.0%** ❌ |
+| p_tan | 28.90 | 28.75 | **+4.9%** ❌ |
+| p_re | 6.40 | 6.75 | **+4.2%** ❌ |
+
+**Analysis:** Same-run checkpoint averaging drags performance toward undertrained states. Original Model Soups works with different hyperparameters, not different epochs. Weight averaging from a single training run is exhausted.
+
+---
+
+### 2026-04-09 19:55 — PR #2328 v2: AoA Curriculum warmup=20 — fern — **CLOSED** ❌
+
+- Branch: `fern/aoa-curriculum-training`
+- Hypothesis: Shorter warmup=20 (vs v1 warmup=40) preserves p_oodc improvement while reducing p_tan regression.
+- W&B runs: fern/aoa-curriculum-w20 (s42, s73) — second set after pod restart
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.709 | 11.793 | **+0.7%** ❌ |
+| p_oodc | 7.544 | 7.604 | **+0.8%** ❌ |
+| p_tan | 27.402 | 29.008 | **+5.9%** ❌ |
+| p_re | 6.481 | 6.559 | **+1.2%** ❌ |
+
+**Analysis:** v2 regresses even p_oodc (which was -5.1% in v1). Shorter warmup didn't help — the fundamental tradeoff between curriculum benefit and tandem training signal loss is unresolvable. Curriculum approaches are exhausted for this architecture.
+
+---
+
+### 2026-04-09 19:55 — PR #2327 v2: Sample Mixup (fixed mask, α=0.2) — nezuko — **CLOSED** ❌
+
+- Branch: `nezuko/node-mixup-augmentation`
+- Hypothesis: Fixed surface mask (use sample A's mask instead of intersection) resolves the near-empty mask problem from v1.
+- W&B runs: nezuko/mixup-v2-a0.2 (s42, s73)
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.709 | 16.356 | **+39.7%** ❌ |
+| p_oodc | 7.544 | 13.891 | **+84.1%** ❌ |
+| p_tan | 27.402 | 34.542 | **+26.1%** ❌ |
+| p_re | 6.481 | 9.970 | **+53.8%** ❌ |
+
+**Analysis:** Catastrophic. Even with fixed surface mask, interpolating different airfoil geometry+flow pairs produces physically meaningless training samples. The model can't learn from interpolated data where geometry, flow topology, and surface mesh are all mixed. Sample mixup is fundamentally incompatible with CFD surrogate tasks.
+
+---
+
+### 2026-04-09 19:55 — PR #2335: Gradient Accumulation 2x — alphonse — **CLOSED** ❌
+
+- Branch: `alphonse/gradient-accumulation-2x`
+- Hypothesis: Doubling effective batch size via 2-step gradient accumulation smooths optimization and may improve generalization.
+- W&B runs: `xfx7x5d8` (s42), `vgasoa4b` (s73)
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.709 | 12.874 | **+10.0%** ❌ |
+| p_oodc | 7.544 | 8.457 | **+12.1%** ❌ |
+| p_tan | 27.402 | 29.495 | **+7.6%** ❌ |
+| p_re | 6.481 | 7.565 | **+16.7%** ❌ |
+
+**Analysis:** All metrics regressed 8-17%. The current batch size is well-tuned — more frequent gradient updates are better than larger effective batches. The model benefits from noisy small-batch gradients for regularization. Gradient accumulation is exhausted.
+
+---
+
 ### 2026-04-09 18:42 — PR #2319 v3: Panel-Method Cp Feature (×0.1 scale) — thorfinn — **MERGED** ✅
 
 - Branch: `thorfinn/panel-method-cp-feature`
