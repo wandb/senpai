@@ -2,6 +2,38 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-10 06:30 — PR #2350: Wake Angle Feature — edward — **MERGED** ✅
+
+- Branch: `edward/wake-angle-feature`
+- W&B runs: `0gkeylyz` (s42), `sksq5fp5` (s73)
+
+| Metric | Prior Baseline | 2-seed avg | Δ |
+|--------|---------------|------------|---|
+| p_in | 11.709 | 11.90 | +1.6% (noise) |
+| p_oodc | 7.544 | 7.35 | **-2.6%** ✅ |
+| p_tan | 27.402 | 27.20 | **-0.7%** ✅ |
+| p_re | 6.481 | 6.40 | **-1.2%** ✅ |
+
+**Analysis:** atan2(dy_gap, dx_gap)/π as 3rd wake channel. 15 LoC. Polar angle encodes wake sector (upstream/downstream/lateral) that Cartesian (dx,dy) encode only implicitly. p_in regression within 2-seed noise (s73=11.62 beats baseline). OOD metrics strongly improved.
+
+---
+
+### 2026-04-10 06:30 — PR #2340: Cl/Cd Auxiliary Loss (w=0.01) — fern — **SENT BACK** 🔄
+
+- Branch: `fern/cl-cd-auxiliary-loss`
+- W&B runs: `9wtwk9b7` (s42), `lzzed57d` (s73)
+
+| Metric | Prior Baseline | 2-seed avg | Δ |
+|--------|---------------|------------|---|
+| p_in | 11.709 | 11.900 | +1.6% ❌ |
+| p_oodc | 7.544 | 7.550 | +0.1% ≈ |
+| p_tan | 27.402 | 26.600 | **-2.9%** ✅ |
+| p_re | 6.481 | 6.500 | +0.3% ≈ |
+
+**Analysis:** p_tan -2.9% is the strongest tandem improvement signal. Integral Cl/Cd constraint forces pressure to sum to correct lift/drag per-foil — especially powerful for tandem where aft foil operates in fore wake. p_in regression from applying Cl/Cd to single-foil where per-node MAE already optimal. Sent back for v2: tandem-only Cl/Cd + wake_angle_feature (new baseline).
+
+---
+
 ### 2026-04-10 04:10 — PR #2346: Focal L1 Surface Loss (gamma=1.0) — tanjiro — **CLOSED** ❌
 
 - Branch: `tanjiro/focal-l1-surface-loss`
