@@ -1,6 +1,23 @@
 # Baseline Metrics
 
-## Current Single-Model Baseline (Phase 6 — 2026-04-10, +Wake Angle Feature, 2-Seed Evidence, PR #2350)
+## Current Single-Model Baseline (Phase 6 — 2026-04-10, +Vortex-Panel Induced Velocity, 2-Seed Evidence, PR #2357)
+
+| Metric | 2-seed avg | vs prior (Wake Angle) | Δ |
+|--------|------------|----------------------|---|
+| **p_in** | **11.872** | 11.90 | **-0.2%** ✅ |
+| p_oodc | 7.459 | 7.35 | +1.5% (minor regression) |
+| **p_tan** | **26.319** | 27.20 | **-3.2%** ✅ |
+| **p_re** | **6.229** | 6.40 | **-2.7%** ✅ |
+
+**PR #2357** (merged 2026-04-10) — Vortex-Panel Induced Velocity: adds 4 input channels (u_fore, v_fore, u_aft, v_aft) encoding the 2D Biot-Savart induced velocity from each foil's vortex panel distribution at every mesh node. Flat-plate vortex strength Γ=sin(AoA)/N_panels, N=64 panels, scale=0.1. Provides volume-wide physics context about inter-foil wake coupling beyond what surface-only panel Cp captures. Improves p_tan -3.2% (strongest tandem gain in recent rounds), p_re -2.7%, p_in -0.2%; p_oodc +1.5% regression at extreme AoA conditions where flat-plate theory breaks down. W&B runs: aycq1m8m (seed 42, best epoch 155), 9sk276v6 (seed 73, best epoch 156).
+
+Reproduce: `cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_output --use_lion --lr 2e-4 --slice_num 96 --cosine_T_max 150 --pcgrad_3way --pressure_first --pressure_deep --residual_prediction --surface_refine --te_coord_frame --wake_deficit_feature --re_stratified_sampling --n_layers 3 --cp_panel --cp_panel_tandem_only --cp_panel_scale 0.1 --wake_angle_feature --vortex_panel_velocity --vortex_panel_scale 0.1 --vortex_panel_n 64`
+
+⚠️ **2-seed only.** For merge decisions: **p_in < 11.872**, p_oodc < 7.459, **p_tan < 26.319**, **p_re < 6.229**.
+
+---
+
+## Prior Single-Model Baseline (Phase 6 — 2026-04-10, +Wake Angle Feature, 2-Seed Evidence, PR #2350)
 
 | Metric | 2-seed avg | vs prior (Panel Cp ×0.1) | Δ |
 |--------|------------|--------------------------|---|
