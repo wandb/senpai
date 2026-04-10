@@ -618,9 +618,11 @@ class SurfaceRefinementHead(nn.Module):
     """
 
     def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 128,
-                 n_layers: int = 2, p_only: bool = False):
+                 n_layers: int = 2, p_only: bool = False, film: bool = False):
         super().__init__()
         self.p_only = p_only
+        self.film = film
+        self.hidden_dim = hidden_dim
         actual_out = 1 if p_only else out_dim  # 1 for pressure-only, 3 for all fields
         layers: list[nn.Module] = []
         # Input: hidden features (n_hidden) + base predictions (out_dim)
@@ -633,18 +635,37 @@ class SurfaceRefinementHead(nn.Module):
         # Zero-init last layer so refinement starts as identity
         nn.init.zeros_(layers[-1].weight)
         nn.init.zeros_(layers[-1].bias)
-        self.mlp = nn.Sequential(*layers)
+        self.mlp = nn.ModuleList(layers)
+        # FiLM conditioning on [log(Re), AoA]: γ·h + β applied after first GELU
+        if film:
+            self.film_net = nn.Sequential(
+                nn.Linear(2, 32), nn.GELU(), nn.Linear(32, hidden_dim * 2)
+            )
+            # Zero-init output so FiLM starts as identity (γ=1, β=0)
+            nn.init.zeros_(self.film_net[-1].weight)
+            nn.init.zeros_(self.film_net[-1].bias)
+            self.film_net[-1].bias.data[:hidden_dim] = 1.0  # γ starts at 1
 
-    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor,
+                cond: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             hidden: [M, n_hidden] — hidden features for surface nodes only
             base_pred: [M, out_dim] — base predictions for surface nodes only
+            cond: [M, 2] — (log_Re, AoA) per surface node (only used if film=True)
         Returns:
             correction: [M, out_dim] — additive correction (zero-padded for p_only)
         """
-        inp = torch.cat([hidden, base_pred], dim=-1)
-        correction = self.mlp(inp)
+        x = torch.cat([hidden, base_pred], dim=-1)
+        for i, layer in enumerate(self.mlp):
+            x = layer(x)
+            # Apply FiLM after first GELU (index 2: Linear→LayerNorm→GELU)
+            if self.film and cond is not None and i == 2:
+                film_params = self.film_net(cond)           # [M, hidden_dim * 2]
+                gamma = film_params[:, :self.hidden_dim]    # [M, H]
+                beta = film_params[:, self.hidden_dim:]     # [M, H]
+                x = gamma * x + beta
+        correction = x
         if self.p_only:
             # Pad with zeros for velocity channels: [M, 1] → [M, 3]
             zeros = torch.zeros(correction.shape[0], base_pred.shape[-1] - 1,
@@ -1220,6 +1241,7 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    srf_film: bool = False                   # FiLM conditioning on log(Re)/AoA for surface refinement head
     # Phase 6: Asinh pressure transform
     asinh_pressure: bool = False             # transform pressure targets with asinh for dynamic range compression
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
@@ -1444,6 +1466,7 @@ if cfg.surface_refine:
             hidden_dim=cfg.surface_refine_hidden,
             n_layers=cfg.surface_refine_layers,
             p_only=cfg.surface_refine_p_only,
+            film=cfg.srf_film,
         ).to(device)
     refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
     _refine_n_params = sum(p.numel() for p in refine_head.parameters())
@@ -2019,7 +2042,12 @@ for epoch in range(MAX_EPOCHS):
                     if surf_idx.numel() > 0:
                         surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]  # [M, n_hidden]
                         surf_pred = pred[surf_idx[:, 0], surf_idx[:, 1]]      # [M, 3]
-                        correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
+                        _srf_cond = None
+                        if cfg.srf_film:
+                            # [B, 2]: log(Re) and AoA per sample, expanded to per-surface-node
+                            _batch_cond = torch.stack([x[:, 0, 13], x[:, 0, 14]], dim=-1)  # [B, 2]
+                            _srf_cond = _batch_cond[surf_idx[:, 0]]  # [M, 2]
+                        correction = refine_head(surf_hidden, surf_pred, _srf_cond).float()  # [M, 3]
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
 
@@ -2692,7 +2720,11 @@ for epoch in range(MAX_EPOCHS):
                             if surf_idx.numel() > 0:
                                 surf_hidden = _eval_hidden[surf_idx[:, 0], surf_idx[:, 1]]
                                 surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                                correction = eval_refine_head(surf_hidden, surf_pred).float()
+                                _srf_cond_val = None
+                                if cfg.srf_film:
+                                    _batch_cond_val = torch.stack([x[:, 0, 13], x[:, 0, 14]], dim=-1)
+                                    _srf_cond_val = _batch_cond_val[surf_idx[:, 0]]
+                                correction = eval_refine_head(surf_hidden, surf_pred, _srf_cond_val).float()
                                 pred_loss = pred_loss.clone()
                                 pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
@@ -3208,7 +3240,11 @@ if cfg.surface_refine and best_metrics:
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                             surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]
                             surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                            correction = verify_refine(surf_hidden, surf_pred).float()
+                            _srf_cond_vv = None
+                            if cfg.srf_film:
+                                _batch_cond_vv = torch.stack([x[:, 0, 13], x[:, 0, 14]], dim=-1)
+                                _srf_cond_vv = _batch_cond_vv[surf_idx[:, 0]]
+                            correction = verify_refine(surf_hidden, surf_pred, _srf_cond_vv).float()
                         pred_loss_refined = pred_loss.clone()
                         pred_loss_refined[surf_idx[:, 0], surf_idx[:, 1]] += correction
                         correction_full[surf_idx[:, 0], surf_idx[:, 1]] = correction
