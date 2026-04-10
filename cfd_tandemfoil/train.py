@@ -689,6 +689,179 @@ class TransolverBlock(nn.Module):
         return fx
 
 
+# ─── 1D Surface FNO Decoder ───────────────────────────────────────────────────
+
+def _parameterize_surface(xy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sort surface nodes by angle from centroid, compute cumulative arc-length.
+
+    Args:
+        xy: [N, 2] surface node coordinates (raw, not normalized)
+    Returns:
+        arc: [N] arc-length fractions in [0, 1] (at sorted node positions)
+        sort_idx: [N] indices that sort nodes by angle from centroid
+    """
+    centroid = xy.mean(dim=0)
+    angles = torch.atan2(xy[:, 1] - centroid[1], xy[:, 0] - centroid[0])
+    sort_idx = angles.argsort()
+    sorted_xy = xy[sort_idx]
+    diffs = sorted_xy[1:] - sorted_xy[:-1]
+    seg_len = diffs.norm(dim=-1)
+    arc = torch.cat([torch.zeros(1, device=xy.device, dtype=xy.dtype),
+                     seg_len.cumsum(0)])
+    arc = arc / (arc[-1] + 1e-8)
+    return arc, sort_idx
+
+
+def _interpolate_to_grid(features: torch.Tensor, arc: torch.Tensor, n_grid: int) -> torch.Tensor:
+    """Linearly interpolate node features to a uniform arc-length grid.
+
+    Args:
+        features: [N, D] features at sorted surface nodes
+        arc: [N] monotone arc-length fractions in [0, 1]
+        n_grid: number of uniform grid points
+    Returns:
+        grid_feat: [n_grid, D]
+    """
+    grid_s = torch.linspace(0, 1, n_grid, device=features.device, dtype=features.dtype)
+    idx = torch.searchsorted(arc.contiguous(), grid_s.contiguous()).clamp(1, len(arc) - 1)
+    s0, s1 = arc[idx - 1], arc[idx]
+    w = ((grid_s - s0) / (s1 - s0 + 1e-8)).clamp(0.0, 1.0).unsqueeze(1)
+    return (1.0 - w) * features[idx - 1] + w * features[idx]
+
+
+def _interpolate_from_grid(grid_out: torch.Tensor, arc: torch.Tensor,
+                            sort_idx: torch.Tensor, n_grid: int) -> torch.Tensor:
+    """Interpolate FNO output on uniform grid back to original (unsorted) node positions.
+
+    Args:
+        grid_out: [n_grid, D] FNO output on uniform grid
+        arc: [N] arc-length fractions at sorted surface nodes
+        sort_idx: [N] indices used to sort nodes (used for inverse permutation)
+        n_grid: number of uniform grid points
+    Returns:
+        node_out: [N, D] at original node ordering
+    """
+    grid_s = torch.linspace(0, 1, n_grid, device=grid_out.device, dtype=grid_out.dtype)
+    idx = torch.searchsorted(grid_s.contiguous(), arc.contiguous()).clamp(1, n_grid - 1)
+    s0, s1 = grid_s[idx - 1], grid_s[idx]
+    w = ((arc - s0) / (s1 - s0 + 1e-8)).clamp(0.0, 1.0).unsqueeze(1)
+    sorted_out = (1.0 - w) * grid_out[idx - 1] + w * grid_out[idx]
+    inv_idx = torch.argsort(sort_idx)
+    return sorted_out[inv_idx]
+
+
+class SpectralConv1d(nn.Module):
+    """1D Fourier layer: learnable spectral multiplication in frequency domain."""
+
+    def __init__(self, in_channels: int, out_channels: int, modes: int):
+        super().__init__()
+        self.modes = modes
+        self.out_channels = out_channels
+        scale = 0.02 / (in_channels * out_channels) ** 0.5
+        self.weights_re = nn.Parameter(torch.randn(in_channels, out_channels, modes) * scale)
+        self.weights_im = nn.Parameter(torch.randn(in_channels, out_channels, modes) * scale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, N]
+        B, C, N = x.shape
+        x_ft = torch.fft.rfft(x.float(), dim=-1)          # [B, C, N//2+1]
+        n_modes = min(self.modes, x_ft.shape[-1])
+        w_c = torch.complex(self.weights_re[:, :, :n_modes], self.weights_im[:, :, :n_modes])
+        out_ft = torch.zeros(B, self.out_channels, x_ft.shape[-1],
+                             dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :n_modes] = torch.einsum('bim,iom->bom', x_ft[:, :, :n_modes], w_c)
+        return torch.fft.irfft(out_ft, n=N, dim=-1).to(x.dtype)  # [B, C_out, N]
+
+
+class FNOLayer1d(nn.Module):
+    """FNO residual block: spectral conv + pointwise conv + LayerNorm + GELU."""
+
+    def __init__(self, width: int, modes: int):
+        super().__init__()
+        self.spectral = SpectralConv1d(width, width, modes)
+        self.pointwise = nn.Conv1d(width, width, kernel_size=1)
+        self.norm = nn.LayerNorm(width)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, N]
+        h = F.gelu(self.spectral(x) + self.pointwise(x))
+        # LayerNorm over channel dim: permute to [B, N, C], norm, permute back
+        h_normed = self.norm(h.permute(0, 2, 1)).permute(0, 2, 1)
+        return x + h_normed
+
+
+class SurfaceFNO(nn.Module):
+    """1D FNO decoder for surface predictions, operating on arc-length parameterized grid.
+
+    Takes backbone hidden features at surface nodes, interpolates to a uniform
+    arc-length grid, applies spectral FNO layers, interpolates back, and returns
+    additive corrections for each surface node's (Ux, Uy, p) prediction.
+    """
+
+    def __init__(self, in_dim: int, width: int = 64, modes: int = 16,
+                 n_layers: int = 4, out_dim: int = 3):
+        super().__init__()
+        self.lift = nn.Linear(in_dim, width)
+        self.layers = nn.ModuleList([FNOLayer1d(width, modes) for _ in range(n_layers)])
+        self.proj = nn.Linear(width, out_dim)
+        # Zero-init for stable startup — starts as identity (no correction)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, h_surf_grid: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            h_surf_grid: [n_grid, in_dim] — backbone embeddings on uniform arc-length grid
+        Returns:
+            corrections: [n_grid, out_dim] — additive corrections on grid
+        """
+        x = self.lift(h_surf_grid)      # [n_grid, width]
+        x = x.unsqueeze(0).permute(0, 2, 1)   # [1, width, n_grid]
+        for layer in self.layers:
+            x = layer(x)
+        x = x.permute(0, 2, 1).squeeze(0)     # [n_grid, width]
+        return self.proj(x)             # [n_grid, out_dim]
+
+
+def _apply_surface_fno(surface_fno: nn.Module, pred: torch.Tensor,
+                       hidden: torch.Tensor, is_surface: torch.Tensor,
+                       mask: torch.Tensor, raw_xy: torch.Tensor,
+                       raw_saf_norm: torch.Tensor, n_grid: int) -> torch.Tensor:
+    """Apply SurfaceFNO to compute additive surface corrections per sample.
+
+    For each sample: splits fore/aft foils, parameterizes arc-length, runs FNO,
+    interpolates corrections back, and returns updated pred.
+    """
+    pred = pred.clone()
+    B = pred.shape[0]
+    for b in range(B):
+        surf_b = is_surface[b] & mask[b]
+        if surf_b.sum() < 3:
+            continue
+        saf_b = raw_saf_norm[b]
+        xy_b = raw_xy[b]
+        h_b = hidden[b]
+        is_tan = (saf_b[surf_b].max() > 0.005)
+        foil_masks = []
+        if is_tan:
+            fore_mask = surf_b & (saf_b <= 0.005)
+            aft_mask = surf_b & (saf_b > 0.005)
+            foil_masks = [fore_mask, aft_mask]
+        else:
+            foil_masks = [surf_b]
+        for fm in foil_masks:
+            if fm.sum() < 3:
+                continue
+            xy_f = xy_b[fm]
+            h_f = h_b[fm]
+            arc, sort_idx = _parameterize_surface(xy_f)
+            grid_feat = _interpolate_to_grid(h_f[sort_idx].float(), arc, n_grid)
+            corr_grid = surface_fno(grid_feat).to(pred.dtype)
+            node_corr = _interpolate_from_grid(corr_grid, arc, sort_idx, n_grid)
+            pred[b, fm] = pred[b, fm] + node_corr
+    return pred
+
+
 class SurfaceRefinementHead(nn.Module):
     """Lightweight MLP that predicts additive corrections for surface nodes.
 
@@ -1300,6 +1473,12 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: 1D Surface FNO decoder (replaces surface_refine)
+    surface_fno: bool = False              # enable 1D FNO decoder on arc-length surface grid
+    surface_fno_modes: int = 16           # number of Fourier modes to retain
+    surface_fno_width: int = 64           # FNO hidden channel width
+    surface_fno_layers: int = 4           # number of FNO layers
+    surface_fno_grid: int = 128           # uniform arc-length grid resolution
     # Phase 6: Asinh pressure transform
     asinh_pressure: bool = False             # transform pressure targets with asinh for dynamic range compression
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
@@ -1536,6 +1715,21 @@ if cfg.surface_refine:
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
           f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
 
+# Surface FNO decoder (replaces surface_refine when --surface_fno is active)
+surface_fno = None
+if cfg.surface_fno:
+    surface_fno = SurfaceFNO(
+        in_dim=cfg.n_hidden,
+        width=cfg.surface_fno_width,
+        modes=cfg.surface_fno_modes,
+        n_layers=cfg.surface_fno_layers,
+        out_dim=3,
+    ).to(device)
+    _fno_n_params = sum(p.numel() for p in surface_fno.parameters())
+    print(f"Surface FNO head: {_fno_n_params:,} params "
+          f"(width={cfg.surface_fno_width}, modes={cfg.surface_fno_modes}, "
+          f"layers={cfg.surface_fno_layers}, grid={cfg.surface_fno_grid})")
+
 # Aft-foil (boundary ID=7) dedicated refinement head
 aft_srf_head = None
 aft_srf_ctx_head = None
@@ -1569,6 +1763,7 @@ if cfg.aft_foil_srf:
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
+ema_surface_fno = None  # EMA copy of surface FNO head
 ema_aft_srf_head = None  # EMA copy of aft-foil SRF head
 swad_initial_val = None
 swad_prev_val = float("inf")
@@ -1587,6 +1782,8 @@ snapshot_epoch_list = [int(e) for e in cfg.snapshot_epochs_str.split(",")] if cf
 n_params = sum(p.numel() for p in model.parameters())
 if refine_head is not None:
     n_params += sum(p.numel() for p in refine_head.parameters())
+if surface_fno is not None:
+    n_params += sum(p.numel() for p in surface_fno.parameters())
 if aft_srf_head is not None:
     n_params += sum(p.numel() for p in aft_srf_head.parameters())
 if aft_srf_ctx_head is not None:
@@ -1722,6 +1919,12 @@ if refine_head is not None:
     base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
 
+# Add surface FNO head params to optimizer if enabled
+if surface_fno is not None:
+    _fno_params = list(surface_fno.parameters())
+    base_opt.add_param_group({'params': _fno_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _fno_params):,} surface FNO params to optimizer")
+
 # Add aft-foil SRF head params to optimizer if enabled
 if aft_srf_head is not None:
     _aft_params = list(aft_srf_head.parameters())
@@ -1831,6 +2034,8 @@ for epoch in range(MAX_EPOCHS):
     model.train()
     if refine_head is not None:
         refine_head.train()
+    if surface_fno is not None:
+        surface_fno.train()
     if aft_srf_head is not None:
         aft_srf_head.train()
     if aft_srf_ctx_head is not None:
@@ -1943,7 +2148,7 @@ for epoch in range(MAX_EPOCHS):
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
         # TE coordinate frame / wake deficit / cp_panel / vortex_panel: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity or cfg.surface_fno
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
@@ -2115,6 +2320,26 @@ for epoch in range(MAX_EPOCHS):
                         correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
+
+        # Surface FNO: arc-length spectral decoder, additive correction on surface nodes
+        if surface_fno is not None and model.training and _raw_xy_te is not None:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                pred_before_fno = pred.detach()
+                pred = _apply_surface_fno(
+                    surface_fno, pred, hidden.float(), is_surface, mask,
+                    _raw_xy_te, _raw_saf_norm_te, cfg.surface_fno_grid
+                )
+            # Log FNO diagnostics every 50 gradient steps
+            if global_step % 50 == 0:
+                _fno_corr_norm = (pred.detach() - pred_before_fno)[is_surface & mask].norm().item()
+                _fno_modes_energy = sum(
+                    (layer.spectral.weights_re.detach() ** 2 + layer.spectral.weights_im.detach() ** 2).sum().item()
+                    for layer in surface_fno.layers
+                )
+                wandb.log({
+                    "train/fno_correction_norm": _fno_corr_norm,
+                    "train/fno_modes_energy": _fno_modes_energy,
+                }, step=global_step, commit=False)
 
         # Aft-foil dedicated refinement head: additive correction on boundary ID=7 nodes only
         if aft_srf_ctx_head is not None and model.training and _aft_foil_mask is not None:
@@ -2488,6 +2713,15 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for surface FNO head
+            if surface_fno is not None:
+                _fno_base = surface_fno
+                if ema_surface_fno is None:
+                    ema_surface_fno = deepcopy(_fno_base)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_surface_fno.parameters(), _fno_base.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
             # EMA for aft-foil SRF head
             if aft_srf_head is not None:
                 _aft_base = aft_srf_head._orig_mod if hasattr(aft_srf_head, '_orig_mod') else aft_srf_head
@@ -2506,7 +2740,16 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if surface_fno is not None and ema_surface_fno is not None:
+            # Log FNO spectral weight energy (proxy for how much spectral content is learned)
+            _fno_energy = sum(
+                (p.detach() ** 2).sum().item()
+                for p in ema_surface_fno.parameters()
+                if p.requires_grad
+            )
+            _log_dict["train/fno_weight_energy"] = _fno_energy
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -2610,6 +2853,14 @@ for epoch in range(MAX_EPOCHS):
             eval_refine_head.eval()
         elif refine_head is not None:
             refine_head.eval()
+    # Select surface FNO for eval (EMA if available)
+    eval_surface_fno = surface_fno
+    if surface_fno is not None:
+        if ema_surface_fno is not None and ema_model is not None and eval_model is ema_model:
+            eval_surface_fno = ema_surface_fno
+            eval_surface_fno.eval()
+        else:
+            surface_fno.eval()
     # Select aft-foil SRF head for eval (EMA if available)
     eval_aft_srf_head = aft_srf_head
     eval_aft_srf_ctx_head = aft_srf_ctx_head
@@ -2650,7 +2901,7 @@ for epoch in range(MAX_EPOCHS):
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
                 _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
-                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity or cfg.surface_fno
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
                 _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -2797,6 +3048,19 @@ for epoch in range(MAX_EPOCHS):
                                 pred_loss = pred_loss.clone()
                                 pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
+                    if cfg.multiply_std:
+                        pred = pred_loss / sample_stds
+                    else:
+                        pred = pred_loss * sample_stds
+
+                # Apply surface FNO during validation
+                if eval_surface_fno is not None and _raw_xy_te is not None:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        pred_loss = _apply_surface_fno(
+                            eval_surface_fno, pred_loss, _eval_hidden.float(),
+                            is_surface, mask, _raw_xy_te, _raw_saf_norm_te,
+                            cfg.surface_fno_grid
+                        )
                     if cfg.multiply_std:
                         pred = pred_loss / sample_stds
                     else:
@@ -3006,6 +3270,9 @@ for epoch in range(MAX_EPOCHS):
                 refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
             )
             torch.save(_refine_save.state_dict(), model_dir / "refine_head.pt")
+        if surface_fno is not None:
+            _fno_save = ema_surface_fno if ema_surface_fno is not None else surface_fno
+            torch.save(_fno_save.state_dict(), model_dir / "surface_fno.pt")
         if aft_srf_head is not None:
             _aft_save = ema_aft_srf_head if ema_aft_srf_head is not None else (
                 aft_srf_head._orig_mod if hasattr(aft_srf_head, '_orig_mod') else aft_srf_head
