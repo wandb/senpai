@@ -2,6 +2,40 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-10 02:30 — PR #2345: Condition-Space Interpolation — edward — **CLOSED** ❌
+
+- Branch: `edward/condition-interp-augmentation`
+- Hypothesis: Augment training by interpolating flow fields between same-geometry samples at different AoA/Re conditions.
+- W&B runs: `bota4ckq` (s42), `65eo5fnu` (s73)
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.709 | 13.80 | **+17.9%** ❌ |
+| p_oodc | 7.544 | 7.90 | **+4.7%** ❌ |
+| p_tan | 27.402 | 27.85 | +1.7% ❌ |
+| p_re | 6.481 | 6.95 | **+7.3%** ❌ |
+
+**Analysis:** DSDF cosine similarity is an unreliable geometry proxy — different geometries matched spuriously, creating physically invalid interpolated labels. 67GB VRAM (vs 40GB baseline) from appended interp samples. Interp weight 0.3 too high for approximate pseudo-labels. EMA already captures the benefits of weight averaging.
+
+---
+
+### 2026-04-10 02:30 — PR #2344: SWA Weight Averaging — thorfinn — **CLOSED** ❌
+
+- Branch: `thorfinn/swa-weight-averaging`
+- Hypothesis: Stochastic Weight Averaging at epoch 112+ finds flatter minima for better OOD generalization.
+- W&B runs: `5iq5phdh` (s42), `yu5sst2e` (s73)
+
+| Metric | Baseline (#2319) | 2-seed avg | Δ |
+|--------|-----------------|------------|---|
+| p_in | 11.709 | 16.62 | **+41.9%** ❌ |
+| p_oodc | 7.544 | 8.10 | **+7.4%** ❌ |
+| p_tan | 27.402 | 31.85 | **+16.2%** ❌ |
+| p_re | 6.481 | 7.00 | **+8.0%** ❌ |
+
+**Analysis:** Constant LR=1e-4 at epoch 112 disrupts critical cosine convergence phase. Stacking uniform SWA on exponential EMA (decay=0.999) causes destructive interference — two averaging strategies with conflicting temporal biases. Large seed variance (s42 p_in=14.8 vs s73=18.4) confirms instability from high-variance exploration. EMA already captures weight averaging benefits for this architecture.
+
+---
+
 ### 2026-04-10 00:45 — PR #2341: Hypernetwork SRF (rank=8, alpha=1.0) — alphonse — **SENT BACK** 🔄
 
 - Branch: `alphonse/hypernetwork-srf-weights`
