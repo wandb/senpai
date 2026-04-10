@@ -493,6 +493,77 @@ def compute_vortex_panel_velocity(raw_xy, aoa_rad, is_surface, saf_norm, n_panel
     return out  # [B, N, 4]
 
 
+def integrate_clcd_from_coords(surface_pressure, raw_xy, is_surface, saf_norm):
+    """Numerically integrate surface pressure to get Cl, Cd per sample.
+
+    Approximates surface normals and arc lengths from node coordinates using
+    finite differences. Handles both fore and aft foils in tandem configs.
+
+    Args:
+        surface_pressure: [B, N, 1] predicted pressure (in normalized space)
+        raw_xy:           [B, N, 2] raw (pre-standardization) x, y coordinates
+        is_surface:       [B, N] bool mask for surface nodes
+        saf_norm:         [B, N] saf channel norm (fore: ≤ 0.005, aft: > 0.005)
+
+    Returns:
+        clcd: [B, 2] tensor of [Cl, Cd] per sample
+    """
+    B, N, _ = surface_pressure.shape
+    device = surface_pressure.device
+
+    p = surface_pressure.squeeze(-1)  # [B, N]
+    x_coords = raw_xy[:, :, 0]  # [B, N]
+    y_coords = raw_xy[:, :, 1]  # [B, N]
+
+    # Use surface mask for zeroing (keeps shapes static for torch.compile)
+    surf_float = is_surface.float()  # [B, N]
+
+    # Approximate normals and arc lengths via central finite differences on sorted surface coords
+    # For compile compatibility, we use a vectorized approach:
+    # Shift surface coords and compute finite-difference tangents
+    # Then normal = perpendicular to tangent, arc_length = |tangent|/2
+
+    # Sort surface nodes by x-coordinate within each sample (for ordered traversal)
+    # Use a large sentinel for non-surface nodes to push them to the end
+    INF = 1e6
+    x_sort_key = x_coords * surf_float + INF * (1 - surf_float)
+    sort_idx = x_sort_key.argsort(dim=1)  # [B, N]
+
+    # Gather sorted coordinates
+    x_sorted = x_coords.gather(1, sort_idx)  # [B, N]
+    y_sorted = y_coords.gather(1, sort_idx)  # [B, N]
+    p_sorted = p.gather(1, sort_idx)         # [B, N]
+    surf_sorted = surf_float.gather(1, sort_idx)  # [B, N]
+
+    # Central finite differences: tangent[i] = (pos[i+1] - pos[i-1])
+    # Use roll for vectorized computation (circular, but sentinel nodes at end won't matter)
+    dx_fwd = torch.roll(x_sorted, -1, dims=1) - x_sorted
+    dy_fwd = torch.roll(y_sorted, -1, dims=1) - y_sorted
+    dx_bwd = x_sorted - torch.roll(x_sorted, 1, dims=1)
+    dy_bwd = y_sorted - torch.roll(y_sorted, 1, dims=1)
+
+    # Average forward and backward differences for central diff
+    tx = (dx_fwd + dx_bwd) * 0.5
+    ty = (dy_fwd + dy_bwd) * 0.5
+
+    # Arc length: |tangent|
+    ds = (tx ** 2 + ty ** 2).sqrt().clamp(min=1e-8)
+
+    # Outward normal: perpendicular to tangent, normalized
+    # For a closed airfoil traversed in sorted x order, the outward normal
+    # is (-ty, tx) / |tangent| (pointing away from interior)
+    nx = -ty / ds
+    ny = tx / ds
+
+    # Cl = -∫ Cp * ny * ds, Cd = -∫ Cp * nx * ds
+    # Only integrate over actual surface nodes
+    p_ds = p_sorted * ds * surf_sorted
+    Cl = -(p_ds * ny).sum(dim=1, keepdim=True)  # [B, 1]
+    Cd = -(p_ds * nx).sum(dim=1, keepdim=True)  # [B, 1]
+
+    return torch.cat([Cl, Cd], dim=-1)  # [B, 2]
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -695,36 +766,80 @@ class SurfaceRefinementHead(nn.Module):
     Takes the Transolver hidden features (and optionally the base predictions)
     for surface nodes only, and outputs a residual correction that is added
     to the main model's predictions at surface locations.
+
+    Optionally supports Cl/Cd conditioning via AdaLN: predicted aerodynamic
+    integrals are encoded and used to modulate hidden activations via
+    scale/shift (Adaptive Layer Normalization).
     """
 
     def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 128,
-                 n_layers: int = 2, p_only: bool = False):
+                 n_layers: int = 2, p_only: bool = False,
+                 clcd_conditioning: bool = False):
         super().__init__()
         self.p_only = p_only
+        self.clcd_conditioning = clcd_conditioning
         actual_out = 1 if p_only else out_dim  # 1 for pressure-only, 3 for all fields
-        layers: list[nn.Module] = []
-        # Input: hidden features (n_hidden) + base predictions (out_dim)
+        # Build layers manually so we can apply AdaLN between LayerNorm and GELU
         in_dim = n_hidden + out_dim
-        for i in range(n_layers):
-            layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
-            layers.append(nn.LayerNorm(hidden_dim))
-            layers.append(nn.GELU())
-        layers.append(nn.Linear(hidden_dim, actual_out))
-        # Zero-init last layer so refinement starts as identity
-        nn.init.zeros_(layers[-1].weight)
-        nn.init.zeros_(layers[-1].bias)
-        self.mlp = nn.Sequential(*layers)
+        self.hidden_dim = hidden_dim
+        self.n_layers = n_layers
 
-    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor) -> torch.Tensor:
+        self.linears = nn.ModuleList()
+        self.layer_norms = nn.ModuleList()
+        for i in range(n_layers):
+            self.linears.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
+            self.layer_norms.append(nn.LayerNorm(hidden_dim))
+        self.output_linear = nn.Linear(hidden_dim, actual_out)
+        # Zero-init last layer so refinement starts as identity
+        nn.init.zeros_(self.output_linear.weight)
+        nn.init.zeros_(self.output_linear.bias)
+
+        # Cl/Cd AdaLN conditioning modules
+        if clcd_conditioning:
+            self.clcd_encoder = nn.Sequential(
+                nn.Linear(2, 64),
+                nn.GELU(),
+                nn.Linear(64, 64),
+            )
+            # One AdaLN modulation (scale + shift) per hidden layer
+            self.clcd_adaln = nn.ModuleList([
+                nn.Linear(64, hidden_dim * 2)
+                for _ in range(n_layers)
+            ])
+            # Zero-init AdaLN projections so conditioning starts as identity
+            for adaln_layer in self.clcd_adaln:
+                nn.init.zeros_(adaln_layer.weight)
+                nn.init.zeros_(adaln_layer.bias)
+
+    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor,
+                clcd: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             hidden: [M, n_hidden] — hidden features for surface nodes only
             base_pred: [M, out_dim] — base predictions for surface nodes only
+            clcd: [M, 2] — predicted Cl/Cd per node (expanded from per-sample),
+                  only used when clcd_conditioning=True
         Returns:
             correction: [M, out_dim] — additive correction (zero-padded for p_only)
         """
-        inp = torch.cat([hidden, base_pred], dim=-1)
-        correction = self.mlp(inp)
+        h = torch.cat([hidden, base_pred], dim=-1)
+
+        # Encode Cl/Cd once if conditioning is enabled
+        clcd_vec = None
+        if self.clcd_conditioning and clcd is not None:
+            clcd_vec = self.clcd_encoder(clcd)  # [M, 64]
+
+        for i in range(self.n_layers):
+            h = self.linears[i](h)
+            h = self.layer_norms[i](h)
+            # Apply AdaLN modulation after LayerNorm
+            if self.clcd_conditioning and clcd_vec is not None:
+                scale_shift = self.clcd_adaln[i](clcd_vec)  # [M, hidden_dim * 2]
+                scale, shift = scale_shift.chunk(2, dim=-1)  # each [M, hidden_dim]
+                h = h * (1 + scale) + shift
+            h = F.gelu(h)
+
+        correction = self.output_linear(h)
         if self.p_only:
             # Pad with zeros for velocity channels: [M, 1] → [M, 3]
             zeros = torch.zeros(correction.shape[0], base_pred.shape[-1] - 1,
@@ -1328,6 +1443,9 @@ class Config:
     vortex_panel_velocity: bool = False    # append (u_fore, v_fore, u_aft, v_aft) induced velocity
     vortex_panel_scale: float = 0.1        # scale factor for vortex velocity channels
     vortex_panel_n: int = 64              # number of panels to subsample per foil
+    # Cl/Cd SRF conditioning: two-pass architecture with integral force feedback
+    clcd_srf_conditioning: bool = False    # condition SRF head on predicted Cl/Cd via AdaLN
+    clcd_aux_weight: float = 0.0           # optional auxiliary Cl/Cd supervision weight (0 = no aux loss)
 
 
 cfg = sp.parse(Config)
@@ -1529,12 +1647,14 @@ if cfg.surface_refine:
             hidden_dim=cfg.surface_refine_hidden,
             n_layers=cfg.surface_refine_layers,
             p_only=cfg.surface_refine_p_only,
+            clcd_conditioning=cfg.clcd_srf_conditioning,
         ).to(device)
     refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
     _refine_n_params = sum(p.numel() for p in refine_head.parameters())
     print(f"Surface refinement head: {_refine_n_params:,} params "
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
-          f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
+          f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context}, "
+          f"clcd_cond={cfg.clcd_srf_conditioning})")
 
 # Aft-foil (boundary ID=7) dedicated refinement head
 aft_srf_head = None
@@ -1942,8 +2062,8 @@ for epoch in range(MAX_EPOCHS):
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
-        # TE coordinate frame / wake deficit / cp_panel / vortex_panel: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+        # TE coordinate frame / wake deficit / cp_panel / vortex_panel / clcd: save raw xy and saf_norm before normalization
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity or cfg.clcd_srf_conditioning
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
@@ -2098,7 +2218,20 @@ for epoch in range(MAX_EPOCHS):
                 pred = pred / sample_stds
 
         # Surface refinement head: additive correction on surface nodes
+        # Two-pass architecture when clcd_srf_conditioning is enabled:
+        #   Pass 1: backbone → coarse prediction (already done above)
+        #   Cl/Cd integration: numerically integrate coarse surface pressure → [Cl, Cd]
+        #   Pass 2: SRF head receives Cl/Cd conditioning via AdaLN → refined prediction
+        _clcd_pred = None
         if refine_head is not None and model.training:
+            # Compute Cl/Cd from coarse pressure if conditioning is enabled
+            if cfg.clcd_srf_conditioning:
+                _clcd_pred = integrate_clcd_from_coords(
+                    pred[:, :, 2:3].detach(),  # coarse pressure (detached: avoid gradient conflict)
+                    _raw_xy_te if _raw_xy_te is not None else x[:, :, :2],
+                    is_surface,
+                    _raw_saf_norm_te if _raw_saf_norm_te is not None else x[:, :, 2:4].norm(dim=-1),
+                )  # [B, 2]
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 if cfg.surface_refine_context:
                     # Context-aware: needs all nodes, coords, masks
@@ -2112,7 +2245,11 @@ for epoch in range(MAX_EPOCHS):
                     if surf_idx.numel() > 0:
                         surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]  # [M, n_hidden]
                         surf_pred = pred[surf_idx[:, 0], surf_idx[:, 1]]      # [M, 3]
-                        correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
+                        # Expand per-sample Cl/Cd to per-surface-node for AdaLN
+                        _clcd_per_node = None
+                        if cfg.clcd_srf_conditioning and _clcd_pred is not None:
+                            _clcd_per_node = _clcd_pred[surf_idx[:, 0]]  # [M, 2]
+                        correction = refine_head(surf_hidden, surf_pred, clcd=_clcd_per_node).float()  # [M, 3]
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
 
@@ -2269,6 +2406,18 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # Cl/Cd auxiliary supervision: MSE between predicted and GT-derived Cl/Cd
+        _clcd_aux_loss = torch.tensor(0.0, device=device)
+        if cfg.clcd_srf_conditioning and cfg.clcd_aux_weight > 0 and _clcd_pred is not None and model.training:
+            _clcd_gt = integrate_clcd_from_coords(
+                y_norm[:, :, 2:3],  # ground-truth pressure in normalized space
+                _raw_xy_te if _raw_xy_te is not None else x[:, :, :2],
+                is_surface,
+                _raw_saf_norm_te if _raw_saf_norm_te is not None else x[:, :, 2:4].norm(dim=-1),
+            )  # [B, 2]
+            _clcd_aux_loss = F.mse_loss(_clcd_pred, _clcd_gt.detach())
+            loss = loss + cfg.clcd_aux_weight * _clcd_aux_loss
+
         # DCT frequency-weighted auxiliary loss on surface pressure
         if cfg.dct_freq_loss and model.training:
             _dct_loss = torch.tensor(0.0, device=device)
@@ -2332,8 +2481,11 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            _pcgrad2_aux = 0.005 * re_loss + 0.005 * aoa_loss
+            if cfg.clcd_srf_conditioning and cfg.clcd_aux_weight > 0:
+                _pcgrad2_aux = _pcgrad2_aux + cfg.clcd_aux_weight * _clcd_aux_loss
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + _pcgrad2_aux
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + _pcgrad2_aux
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -2378,7 +2530,10 @@ for epoch in range(MAX_EPOCHS):
                 vol_loss_g = (abs_err * vol_mask_g.unsqueeze(-1)).sum() / vol_mask_g.sum().clamp(min=1)
                 surf_loss_g = (surf_per_sample * mask_1d.float() * tandem_boost).sum() / n
                 coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                _shared_aux = 0.005 * re_loss + 0.005 * aoa_loss
+                if cfg.clcd_srf_conditioning and cfg.clcd_aux_weight > 0:
+                    _shared_aux = _shared_aux + cfg.clcd_aux_weight * _clcd_aux_loss
+                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + _shared_aux
 
             loss_A = _grp_loss(~is_tandem_batch)
             # Only include non-empty groups to avoid backward() on no-grad tensors
@@ -2506,7 +2661,13 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _train_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.clcd_srf_conditioning and _clcd_pred is not None:
+            _train_log["train/clcd_Cl_mean"] = _clcd_pred[:, 0].mean().item()
+            _train_log["train/clcd_Cd_mean"] = _clcd_pred[:, 1].mean().item()
+            if cfg.clcd_aux_weight > 0:
+                _train_log["train/clcd_aux_loss"] = _clcd_aux_loss.item()
+        wandb.log(_train_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -2650,7 +2811,7 @@ for epoch in range(MAX_EPOCHS):
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
                 _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
-                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity or cfg.clcd_srf_conditioning
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
                 _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -2781,7 +2942,16 @@ for epoch in range(MAX_EPOCHS):
                     pred_loss = pred / sample_stds
 
                 # Apply surface refinement head during validation
+                _clcd_pred_v = None
                 if eval_refine_head is not None:
+                    # Compute Cl/Cd from coarse pressure if conditioning is enabled
+                    if cfg.clcd_srf_conditioning:
+                        _clcd_pred_v = integrate_clcd_from_coords(
+                            pred_loss[:, :, 2:3].detach(),
+                            _raw_xy_te if _raw_xy_te is not None else x[:, :, :2],
+                            is_surface,
+                            _raw_saf_norm_te if _raw_saf_norm_te is not None else x[:, :, 2:4].norm(dim=-1),
+                        )  # [B, 2]
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                         if cfg.surface_refine_context:
                             refine_correction = eval_refine_head(
@@ -2793,7 +2963,10 @@ for epoch in range(MAX_EPOCHS):
                             if surf_idx.numel() > 0:
                                 surf_hidden = _eval_hidden[surf_idx[:, 0], surf_idx[:, 1]]
                                 surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                                correction = eval_refine_head(surf_hidden, surf_pred).float()
+                                _clcd_per_node_v = None
+                                if cfg.clcd_srf_conditioning and _clcd_pred_v is not None:
+                                    _clcd_per_node_v = _clcd_pred_v[surf_idx[:, 0]]  # [M, 2]
+                                correction = eval_refine_head(surf_hidden, surf_pred, clcd=_clcd_per_node_v).float()
                                 pred_loss = pred_loss.clone()
                                 pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
