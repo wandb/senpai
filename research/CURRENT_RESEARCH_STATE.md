@@ -1,5 +1,5 @@
 # SENPAI Research State
-- **Date:** 2026-04-10 17:30 UTC
+- **Date:** 2026-04-10 17:45 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Bold Round 41/42
 
@@ -19,26 +19,33 @@ Reproduce:
 cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_output --use_lion --lr 2e-4 --slice_num 96 --cosine_T_max 150 --pcgrad_3way --pressure_first --pressure_deep --residual_prediction --surface_refine --te_coord_frame --wake_deficit_feature --re_stratified_sampling --n_layers 3 --cp_panel --cp_panel_tandem_only --cp_panel_scale 0.1 --wake_angle_feature --vortex_panel_velocity --vortex_panel_scale 0.1 --vortex_panel_n 64
 ```
 
-## Student Status (2026-04-10 17:00 UTC)
+## Student Status (2026-04-10 17:45 UTC)
 
 ### Round 41/42 Bold Experiments (all WIP)
-| Student | PR | Experiment | Type | Status |
-|---------|-----|-----------|------|--------|
-| edward | #2374 | **Hard Kutta TE Constraint** | Physics constraint | WIP — ~60% trained, no improvement yet (expected mid-training) |
-| fern | #2363 | **Global Cl/Cd SRF Conditioning** | Architecture (two-pass) | WIP — training |
-| alphonse | #2375 | **Panel Data Oracle** | Multi-fidelity data | NEW — just assigned (#2368 Sobolev closed/diverged) |
-| thorfinn | #2369 | **Cross-Foil Autoregressive Decoding** | Architecture (causal AR) | WIP — implementing, no training started yet ⚠️ |
-| nezuko | #2370 | **Surface-Intrinsic B-GNN** | Architecture (pure surface GNN) | WIP — ~60% trained |
-| frieren | #2371 | **1D Surface FNO Decoder** | Architecture (spectral surface) | WIP — ~47% trained |
-| askeladd | #2372 | **Surface-Node Cross-Attention** | Architecture (global surface attn) | WIP — ~37% trained |
-| tanjiro | #2373 | **Multi-Scale Slice Attention** | Architecture (coarse+fine) | WIP — ~27% trained |
+| Student | PR | Experiment | Type | W&B Progress | Live Metrics (best seed) |
+|---------|-----|-----------|------|-------------|--------------------------|
+| edward | #2374 | **Hard Kutta TE Constraint** | Physics constraint | Still finishing old viscous-resid-v2 (~132/155 epochs, ~25 min left). Will switch to Hard Kutta when done. | Old exp: p_in=13.28, p_tan=27.96 (won't beat baseline) |
+| fern | #2363 | **Global Cl/Cd SRF Conditioning** | Architecture (two-pass) | ⚠️ Pod restarted — was stalled 7h with stale state. Fresh pod running, should pick up assignment now. | No training yet |
+| alphonse | #2375 | **Panel Data Oracle** | Multi-fidelity data | Just assigned 30 min ago. Implementing. | No training yet |
+| thorfinn | #2369 | **Cross-Foil Autoregressive Decoding** | Architecture (causal AR) | ⚠️ Pod restarted — was stalled 3h with stale state, no response to advisor hints. Fresh pod running. | No training yet |
+| nezuko | #2370 | **Surface-Intrinsic B-GNN** | Architecture (pure surface GNN) | ~129/155 epochs (step 83K, ~30 min left) | p_in=13.79, p_oodc=8.39, p_tan=29.02, p_re=7.05 (all above baseline) |
+| frieren | #2371 | **1D Surface FNO Decoder** | Architecture (spectral surface) | ~55% (step 32K) | p_in=18.01, p_oodc=10.66, p_tan=?, p_re=8.15 (all above baseline) |
+| askeladd | #2372 | **Surface-Node Cross-Attention** | Architecture (global surface attn) | ~45% (step 27K) | p_in=18.79, p_oodc=12.35, p_tan=?, p_re=9.97 (early, above baseline) |
+| tanjiro | #2373 | **Multi-Scale Slice Attention** | Architecture (coarse+fine) | ~35% (step 20K) | p_in=22.77, p_oodc=12.72, p_tan=?, p_re=9.39 (early, above baseline) |
 
 ### Idle students
-None — all 8 GPUs occupied.
+None — all 8 GPUs occupied (2 pods just restarted).
 
-### Recently closed (this session)
+### Pod Actions This Cycle
+- **thorfinn:** Pod deleted/recreated. Was stuck with stale state (thought assigned to merged PR #2319). New pod should poll and find #2369.
+- **fern:** Pod deleted/recreated. Was stuck with stale state (thought assigned to merged PR #2328). New pod should poll and find #2363.
+
+### Recently closed (prior session)
 - **#2368 (alphonse, Sobolev Surface Gradient Loss):** CLOSED. All 6 configurations diverged (2-10× above baseline at 83%). Sobolev dp/ds penalty conflicts with PCGrad 3-way optimizer — competing gradients destabilize training at all weights (0.05-0.2). Auxiliary gradient supervision incompatible with current PCGrad setup.
 - **#2362 (edward, Viscous Residual Prediction):** CLOSED. All metrics catastrophic (+22% p_oodc). Flat-plate panel Cp too inaccurate to serve as residual baseline — residuals are MORE variable, not less. Viscous residual approach is exhausted.
+
+### Mid-Training Observations
+**All bold architectural experiments are currently above baseline.** This is consistent with the well-established pattern that the Transolver backbone is a very strong local optimum. However, most runs are only 35-55% complete — final-epoch convergence with EMA and cosine schedule could still recover significant ground. Nezuko's B-GNN at ~83% is the most concerning: p_tan=29.02 (+10.3%) with limited room for late recovery.
 
 ## Human Researcher Directive (Issue #1860)
 
