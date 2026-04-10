@@ -1,5 +1,22 @@
 # SENPAI Research Results
 
+## 2026-04-10 18:00 — PR #2370: Surface-Intrinsic B-GNN: pure-PyTorch boundary GNN decoder
+- Branch: nezuko/surface-intrinsic-bgnn
+- **Hypothesis:** Replace SRF head with a surface-intrinsic boundary GNN (4 layers, k=8, hidden=192, 914K params) using arc-length k-NN connectivity. Surface-only local message passing should capture boundary layer physics better than global attention.
+- **Results:**
+
+| Metric | s42 | s73 | 2-seed avg | Baseline | Delta |
+|--------|-----|-----|------------|----------|-------|
+| p_in | 12.874 | 14.252 | 13.563 | 11.872 | +14.3% |
+| p_oodc | 7.906 | 8.110 | 8.008 | 7.459 | +7.4% |
+| p_tan | 29.023 | 30.956 | 29.990 | 26.319 | +13.9% |
+| p_re | 6.740 | 6.775 | 6.757 | 6.229 | +8.5% |
+
+- W&B: 9qchz43s (s42), rv9dd3b5 (s73). Group: surface-bgnn
+- **Verdict: CLOSED — dead end.** All metrics significantly worse. Local surface GNN cannot capture global tandem inter-foil coupling. Large correction norms (62-93) indicate B-GNN fighting backbone rather than refining. High seed variance (p_in: 12.9-14.3) shows unstable optimization from 914K params competing for gradient signal. Core learning: any decoder replacement must preserve global cross-foil context.
+
+---
+
 ## Phase 6 Experiments (2026-04-01 onwards)
 
 ### 2026-04-10 17:15 — PR #2368: Sobolev Surface Gradient Loss — alphonse — **CLOSED** ❌
