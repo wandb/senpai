@@ -493,6 +493,19 @@ def compute_vortex_panel_velocity(raw_xy, aoa_rad, is_surface, saf_norm, n_panel
     return out  # [B, N, 4]
 
 
+def compute_biot_savart_coupling(raw_xy, aoa_rad, is_surface, saf_norm, n_panels=64):
+    """Compute per-node Biot-Savart coupling magnitudes for use as spatial attention bias.
+
+    Returns: [B, N, 2] = (fore_foil_coupling_mag, aft_foil_coupling_mag)
+             fore_mag is the L2 norm of induced velocity from fore-foil panels at each node.
+             aft_mag is the L2 norm of induced velocity from aft-foil panels (0 for single-foil).
+    """
+    vp = compute_vortex_panel_velocity(raw_xy, aoa_rad, is_surface, saf_norm, n_panels=n_panels)
+    fore_mag = vp[:, :, :2].norm(dim=-1)  # [B, N]
+    aft_mag  = vp[:, :, 2:].norm(dim=-1)  # [B, N]
+    return torch.stack([fore_mag, aft_mag], dim=-1)  # [B, N, 2]
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -940,10 +953,12 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        biot_savart_attn_bias=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
+        self.biot_savart_attn_bias = biot_savart_attn_bias
         self.pressure_first = pressure_first
         self.ref = ref
         self.unified_pos = unified_pos
@@ -1011,7 +1026,7 @@ class Transolver(nn.Module):
                     pressure_first=pressure_first if (idx == n_layers - 1) else False,
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
-                    spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
+                    spatial_bias_input_dim=(6 if gap_stagger_spatial_bias else 4) + (2 if biot_savart_attn_bias else 0),
                 )
                 for idx in range(n_layers)
             ]
@@ -1020,7 +1035,13 @@ class Transolver(nn.Module):
         if gap_stagger_spatial_bias:
             with torch.no_grad():
                 for block in self.blocks:
-                    block.spatial_bias[0].weight[:, 4:].zero_()
+                    block.spatial_bias[0].weight[:, 4:6].zero_()
+        # Zero-init the BS coupling columns so they start with zero influence on routing
+        if biot_savart_attn_bias:
+            base_dim = 6 if gap_stagger_spatial_bias else 4
+            with torch.no_grad():
+                for block in self.blocks:
+                    block.spatial_bias[0].weight[:, base_dim:base_dim + 2].zero_()
         # Separate pressure pathway (pressure_separate_last_block):
         # Independent MLP + pres_head that processes shared hidden features
         self._pressure_separate = False  # set from Config after construction
@@ -1088,6 +1109,7 @@ class Transolver(nn.Module):
 
     def forward(self, data, pos=None, condition=None):
         x, pos, condition = self._unpack_inputs(data, pos=pos, condition=condition)
+        bs_feat = data.get("bs_feat", None) if isinstance(data, Mapping) else None
         if x is None:
             raise ValueError("Missing required input tensor: x")
         if condition is not None:
@@ -1130,6 +1152,9 @@ class Transolver(nn.Module):
             raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26], gap_stagger], dim=-1)  # [B, N, 6]
         else:
             raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)  # x, y, curvature, dist
+        # Append Biot-Savart coupling magnitudes to raw_xy for spatial bias injection
+        if bs_feat is not None:
+            raw_xy = torch.cat([raw_xy, bs_feat], dim=-1)  # [B, N, +2]
 
         # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
         is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
@@ -1328,6 +1353,9 @@ class Config:
     vortex_panel_velocity: bool = False    # append (u_fore, v_fore, u_aft, v_aft) induced velocity
     vortex_panel_scale: float = 0.1        # scale factor for vortex velocity channels
     vortex_panel_n: int = 64              # number of panels to subsample per foil
+    # Biot-Savart attention bias: per-node coupling magnitudes injected as spatial slice-assignment bias
+    biot_savart_attn_bias: bool = False    # inject Biot-Savart (fore,aft) coupling mags as spatial bias
+    biot_savart_bias_scale: float = 1.0    # scale for BS spatial bias channels
 
 
 cfg = sp.parse(Config)
@@ -1503,6 +1531,7 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    biot_savart_attn_bias=cfg.biot_savart_attn_bias,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1942,8 +1971,8 @@ for epoch in range(MAX_EPOCHS):
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
-        # TE coordinate frame / wake deficit / cp_panel / vortex_panel: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+        # TE coordinate frame / wake deficit / cp_panel / vortex_panel / biot_savart_attn_bias: save raw xy before normalization
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity or cfg.biot_savart_attn_bias
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
@@ -2000,6 +2029,13 @@ for epoch in range(MAX_EPOCHS):
             if cfg.vortex_panel_scale != 1.0:
                 vp_feat = vp_feat * cfg.vortex_panel_scale
             x = torch.cat([x, vp_feat], dim=-1)
+        # Biot-Savart spatial attention bias: compute coupling magnitudes [B, N, 2]
+        _bs_coup = None
+        if cfg.biot_savart_attn_bias:
+            _bs_coup = compute_biot_savart_coupling(
+                _raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te, n_panels=cfg.vortex_panel_n)
+            if cfg.biot_savart_bias_scale != 1.0:
+                _bs_coup = _bs_coup * cfg.biot_savart_bias_scale
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -2082,7 +2118,7 @@ for epoch in range(MAX_EPOCHS):
                 y_norm = y_norm / sample_stds
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model({"x": x})
+            out = model({"x": x, "bs_feat": _bs_coup})
             pred = out["preds"]
             re_pred = out["re_pred"]
             aoa_pred = out["aoa_pred"]
@@ -2310,7 +2346,7 @@ for epoch in range(MAX_EPOCHS):
         rdrop_loss = torch.tensor(0.0, device=device)
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                rdrop_out = model({"x": x})
+                rdrop_out = model({"x": x, "bs_feat": _bs_coup})
                 rdrop_pred = rdrop_out["preds"].float() / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
@@ -2449,7 +2485,7 @@ for epoch in range(MAX_EPOCHS):
             sam_optimizer.zero_grad()
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out2 = model({"x": x})
+                out2 = model({"x": x, "bs_feat": _bs_coup})
                 pred2 = out2["preds"].float() / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
@@ -2650,7 +2686,7 @@ for epoch in range(MAX_EPOCHS):
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
                 _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
-                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity or cfg.biot_savart_attn_bias
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
                 _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -2706,6 +2742,12 @@ for epoch in range(MAX_EPOCHS):
                     if cfg.vortex_panel_scale != 1.0:
                         vp_feat = vp_feat * cfg.vortex_panel_scale
                     x = torch.cat([x, vp_feat], dim=-1)
+                _bs_coup_v = None
+                if cfg.biot_savart_attn_bias:
+                    _bs_coup_v = compute_biot_savart_coupling(
+                        _raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te, n_panels=cfg.vortex_panel_n)
+                    if cfg.biot_savart_bias_scale != 1.0:
+                        _bs_coup_v = _bs_coup_v * cfg.biot_savart_bias_scale
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
@@ -2770,7 +2812,7 @@ for epoch in range(MAX_EPOCHS):
                     y_norm_scaled = y_norm / sample_stds
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    _eval_out = eval_model({"x": x})
+                    _eval_out = eval_model({"x": x, "bs_feat": _bs_coup_v})
                     pred = _eval_out["preds"]
                     _eval_hidden = _eval_out["hidden"]
                 pred = pred.float()
@@ -3079,7 +3121,7 @@ if best_metrics:
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
-                    _need_te_raw_vis = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+                    _need_te_raw_vis = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity or cfg.biot_savart_attn_bias
                     _raw_xy_te_vis = x_dev[:, :, :2].clone() if _need_te_raw_vis else None
                     _raw_saf_norm_te_vis = x_dev[:, :, 2:4].norm(dim=-1) if _need_te_raw_vis else None
                     _raw_aoa_vis = x_dev[:, 0, 14:15]  # AoA0_rad [B, 1]
@@ -3126,8 +3168,14 @@ if best_metrics:
                         if cfg.vortex_panel_scale != 1.0:
                             vp_feat = vp_feat * cfg.vortex_panel_scale
                         x_n = torch.cat([x_n, vp_feat], dim=-1)
+                    _bs_coup_vis = None
+                    if cfg.biot_savart_attn_bias:
+                        _bs_coup_vis = compute_biot_savart_coupling(
+                            _raw_xy_te_vis, _raw_aoa_vis, is_surf_dev, _raw_saf_norm_te_vis, n_panels=cfg.vortex_panel_n)
+                        if cfg.biot_savart_bias_scale != 1.0:
+                            _bs_coup_vis = _bs_coup_vis * cfg.biot_savart_bias_scale
                     Umag, q = _umag_q(y_dev, mask)
-                    pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
+                    pred = vis_model({"x": x_n, "mask": mask, "bs_feat": _bs_coup_vis})["preds"].float()
                     if cfg.raw_targets:
                         y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                     elif cfg.adaptive_norm:
@@ -3212,7 +3260,7 @@ if cfg.surface_refine and best_metrics:
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
                     _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
-                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity or cfg.biot_savart_attn_bias
                     _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
                     _raw_gap_wake_vv = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -3259,6 +3307,12 @@ if cfg.surface_refine and best_metrics:
                         if cfg.vortex_panel_scale != 1.0:
                             vp_feat = vp_feat * cfg.vortex_panel_scale
                         x = torch.cat([x, vp_feat], dim=-1)
+                    _bs_coup_vv = None
+                    if cfg.biot_savart_attn_bias:
+                        _bs_coup_vv = compute_biot_savart_coupling(
+                            _raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te, n_panels=cfg.vortex_panel_n)
+                        if cfg.biot_savart_bias_scale != 1.0:
+                            _bs_coup_vv = _bs_coup_vv * cfg.biot_savart_bias_scale
 
                     # Ground truth denormalization reference
                     Umag, q = _umag_q(y, mask)
@@ -3312,7 +3366,7 @@ if cfg.surface_refine and best_metrics:
 
                     # Model forward
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        out = verify_model({"x": x})
+                        out = verify_model({"x": x, "bs_feat": _bs_coup_vv})
                         pred_raw = out["preds"].float()
                         hidden = out["hidden"].float()
 
