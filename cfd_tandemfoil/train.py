@@ -1169,6 +1169,8 @@ class Config:
     use_lion: bool = False        # GPU 4: Lion optimizer instead of AdamW
     rdrop: bool = False           # GPU 7: R-drop regularization
     rdrop_alpha: float = 1.0     # R-drop consistency loss weight
+    rdrop_consistency: bool = False  # surface-only R-drop with one-sided detach and feature noise fallback
+    rdrop_weight: float = 0.1    # weight for surface consistency loss
     # Phase 3 R3: normalization/prediction-space experiments
     no_perstd: bool = False           # GPU 0: remove per-sample std norm entirely
     no_perstd_p: bool = False         # GPU 1: remove per-sample std for pressure only
@@ -1405,7 +1407,7 @@ model_config = dict(
     n_head=3,
     slice_num=cfg.prog_slices_end if cfg.prog_slices else cfg.slice_num,
     mlp_ratio=2,
-    dropout=0.05 if cfg.rdrop else 0.0,
+    dropout=0.05 if (cfg.rdrop or cfg.rdrop_consistency) else 0.0,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
     linear_no_attention=cfg.linear_no_attention,
@@ -2234,6 +2236,35 @@ for epoch in range(MAX_EPOCHS):
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
+
+        # R-Drop surface consistency: second forward pass on surface nodes only, one-sided detach
+        consistency_loss = torch.tensor(0.0, device=device)
+        if cfg.rdrop_consistency and model.training:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                rdrop_c_out = model({"x": x})
+                rdrop_c_pred = rdrop_c_out["preds"].float() / sample_stds
+            # Apply same SRF correction to second pass predictions
+            if refine_head is not None:
+                surf_idx_c = is_surface.nonzero(as_tuple=False)
+                if surf_idx_c.numel() > 0:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _sh_c = rdrop_c_out["hidden"].float()[surf_idx_c[:, 0], surf_idx_c[:, 1]]
+                        _sp_c = rdrop_c_pred[surf_idx_c[:, 0], surf_idx_c[:, 1]]
+                        _corr_c = refine_head(_sh_c, _sp_c).float()
+                    rdrop_c_pred = rdrop_c_pred.clone()
+                    rdrop_c_pred[surf_idx_c[:, 0], surf_idx_c[:, 1]] += _corr_c
+            # Surface-only MSE with one-sided detach (pred is target, rdrop_c_pred gets gradient)
+            surf_mask = is_surface & mask  # [B, N]
+            if surf_mask.any():
+                surf_p1 = pred[surf_mask].detach()       # stop gradient on first pass
+                surf_p2 = rdrop_c_pred[surf_mask]        # gradient flows through second pass
+                consistency_loss = F.mse_loss(surf_p2, surf_p1)
+                loss = loss + cfg.rdrop_weight * consistency_loss
+                if global_step % 50 == 0:
+                    wandb.log({
+                        "train/consistency_loss": consistency_loss.item(),
+                        "global_step": global_step,
+                    })
 
         # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
         # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
