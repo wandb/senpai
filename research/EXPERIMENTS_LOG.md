@@ -1,5 +1,40 @@
 # SENPAI Research Results
 
+## 2026-04-10 21:30 — PR #2375: Panel Data Oracle — alphonse — **CLOSED** ❌
+- Branch: alphonse/panel-data-oracle
+- **Hypothesis:** Use the existing vortex-panel solver to generate synthetic inviscid tandem training samples as cheap auxiliary supervision (w=0.1, every 5 batches). Multi-fidelity training: CFD labels at full weight + panel labels at 0.1× weight.
+- **Results:**
+
+| Metric | s42 (be3lhvxd) | s73 (z84fzmyt) | 2-seed avg | Baseline | Delta |
+|--------|----------------|----------------|------------|----------|-------|
+| p_in | 14.528 | 14.616 | 14.57 | 11.872 | +22.7% |
+| p_oodc | 9.707 | 8.985 | 9.35 | 7.459 | +25.3% |
+| p_tan | 47.701 | 35.195 | 41.45 | 26.319 | **+57.5%** |
+| p_re | 7.811 | 7.255 | 7.53 | 6.229 | +20.9% |
+
+- W&B: be3lhvxd (s42), z84fzmyt (s73). Group: panel-oracle
+- **Verdict: CLOSED — catastrophic failure.** All metrics 20-57% above baseline. The inviscid panel labels are systematically wrong for viscous-dominated tandem interference (separation, wake merging). Even at w=0.1 with every-5-batch application, panel oracle labels poisoned the tandem predictions. p_tan +57.5% is the worst regression of any Round 42 experiment. Multi-fidelity training with inviscid labels is fundamentally flawed for this task.
+- **Positive:** Student discovered MAX_TIMEOUT/MAX_EPOCHS env var bug and torch.compile OOM fix for uncompiled model forward passes.
+
+---
+
+## 2026-04-10 21:15 — PR #2377: SE(2)-Equivariant Geometry Encoding — frieren — **MERGED** (by human)
+- Branch: frieren/se2-equivariant-geometry
+- **Hypothesis:** Add SE(2)-invariant geometry features: rotation-invariant relative angle/distance from surface nodes to both foil centroids. Pure input feature addition.
+- **Results:**
+
+| Metric | s42 (8o6g5fvm) | s73 (18au6z1e) | 2-seed avg | Baseline | Delta |
+|--------|----------------|----------------|------------|----------|-------|
+| p_in | 12.513 | 11.777 | 12.15 | 11.872 | +2.3% |
+| p_oodc | 7.358 | 7.421 | 7.39 | 7.459 | **-0.9%** |
+| p_tan | 27.057 | 27.010 | 27.03 | 26.319 | +2.7% |
+| p_re | 6.224 | 6.300 | 6.26 | 6.229 | +0.5% |
+
+- W&B: 8o6g5fvm (s42), 18au6z1e (s73)
+- **Verdict: MERGED by human researcher.** Neutral overall — only p_oodc improved (-0.9%, both seeds beat baseline). p_in and p_tan regressed slightly. Notable: s73 achieved p_in=11.777 (new single-seed p_in best). The SE(2) features may provide subtle OOD generalization benefits not captured by aggregate metrics. Merged by tcapelle.
+
+---
+
 ## 2026-04-10 19:15 — PR #2373: Multi-Scale Slice Attention: coarse+fine parallel resolution
 - Branch: tanjiro/multi-scale-slice-attention
 - **Hypothesis:** Add parallel coarse+fine resolution streams to the slice attention mechanism. Coarse tokens capture global physics, fine tokens preserve local detail.
