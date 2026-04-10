@@ -1,5 +1,22 @@
 # SENPAI Research Results
 
+## 2026-04-10 21:50 — PR #2369: Cross-Foil AR Decoding — thorfinn — **CLOSED** ❌
+- Branch: thorfinn/cross-foil-autoregressive-decoding
+- **Hypothesis:** Add causal fore→aft cross-attention in SRF: aft-foil surface queries attend to detached fore-foil pressure predictions via 1-head 64-dim cross-attention (29K params). Explicit causal conditioning for tandem interference.
+- **Results:**
+
+| Metric | s42 (x9st3ryb) | s73 (w7c2bmrb) | 2-seed avg | Baseline | Delta |
+|--------|----------------|----------------|------------|----------|-------|
+| p_in | 12.1 | 12.4 | 12.25 | 11.872 | +3.2% |
+| p_oodc | 7.6 | 7.2 | 7.40 | 7.459 | -0.8% |
+| p_tan | 26.3 | 27.2 | 26.75 | 26.319 | +1.6% |
+| p_re | 6.7 | 6.3 | 6.50 | 6.229 | +4.4% |
+
+- W&B: x9st3ryb (s42, ep148), w7c2bmrb (s73, ep147). Group: cross-foil-ar
+- **Verdict: CLOSED.** Only p_oodc marginally improved (-0.8%). The 1-head/64-dim cross-attention on scalar pressure was too constrained. The backbone already captures fore-aft coupling via wake features. p_re +4.4% regression significant. Student's suggestion to operate at hidden level (not prediction level) is being tested by frieren's ANP decoder (#2379).
+
+---
+
 ## 2026-04-10 21:30 — PR #2375: Panel Data Oracle — alphonse — **CLOSED** ❌
 - Branch: alphonse/panel-data-oracle
 - **Hypothesis:** Use the existing vortex-panel solver to generate synthetic inviscid tandem training samples as cheap auxiliary supervision (w=0.1, every 5 batches). Multi-fidelity training: CFD labels at full weight + panel labels at 0.1× weight.
