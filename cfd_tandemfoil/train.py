@@ -443,6 +443,7 @@ class TransolverBlock(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         spatial_bias_input_dim=4,
+        n_q_pressure=1,
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -450,6 +451,7 @@ class TransolverBlock(nn.Module):
         self.domain_velhead = domain_velhead
         self.pressure_first = pressure_first
         self.pressure_no_detach = pressure_no_detach
+        self.n_q_pressure = n_q_pressure
         self.adaln_output = adaln_output
         self.soft_moe = soft_moe
         self.adaln_all = adaln_all
@@ -517,11 +519,11 @@ class TransolverBlock(nn.Module):
                     self.pres_head = nn.Sequential(
                         nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(),
                         nn.Linear(hidden_dim * 2, hidden_dim), nn.GELU(),
-                        nn.Linear(hidden_dim, 1),
+                        nn.Linear(hidden_dim, n_q_pressure),
                     )
                 else:
                     self.pres_head = nn.Sequential(
-                        nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(), nn.Linear(hidden_dim * 2, 1)
+                        nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(), nn.Linear(hidden_dim * 2, n_q_pressure)
                     )
                 # Velocity head conditioned on predicted pressure: input is hidden_dim + 1
                 self.vel_head_conditioned = nn.Sequential(
@@ -540,7 +542,7 @@ class TransolverBlock(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2)
                 )
                 self.pres_head = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(), nn.Linear(hidden_dim * 2, 1)
+                    nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(), nn.Linear(hidden_dim * 2, n_q_pressure)
                 )
             elif adaln_output:
                 self.cond_net = nn.Sequential(nn.Linear(2, hidden_dim * 2), nn.GELU())
@@ -584,12 +586,17 @@ class TransolverBlock(nn.Module):
                 gate = self.gate_net(fx_ln)  # [B, N, 2]
                 return gate[:, :, 0:1] * self.expert1(fx_ln) + gate[:, :, 1:2] * self.expert2(fx_ln)
             elif self.pressure_first:
-                # Pressure-first: predict p, then condition v on p
-                p_pred = self.pres_head(fx_ln)  # [B, N, 1]
-                p_cond = p_pred if self.pressure_no_detach else p_pred.detach()
+                # Pressure-first: predict p (possibly multi-quantile), then condition v on q50
+                p_pred = self.pres_head(fx_ln)  # [B, N, n_q_pressure]
+                if self.n_q_pressure > 1:
+                    q50_idx = self.n_q_pressure // 2  # 1 for [q10, q50, q90]
+                    p_for_vel = p_pred[:, :, q50_idx:q50_idx + 1]  # [B, N, 1]
+                else:
+                    p_for_vel = p_pred
+                p_cond = p_for_vel if self.pressure_no_detach else p_for_vel.detach()
                 vel_input = torch.cat([fx_ln, p_cond], dim=-1)  # [B, N, H+1]
                 v_pred = self.vel_head_conditioned(vel_input)  # [B, N, 2]
-                return torch.cat([v_pred, p_pred], dim=-1)
+                return torch.cat([v_pred, p_pred], dim=-1)  # [B, N, 2+n_q_pressure]
             elif self.domain_velhead:
                 out_s = self.velhead_single(fx_ln)
                 out_t = self.velhead_tandem(fx_ln)
@@ -860,10 +867,12 @@ class Transolver(nn.Module):
         pressure_no_detach=False,
         pressure_deep=False,
         gap_stagger_spatial_bias=False,
+        n_q_pressure=1,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
+        self.n_q_pressure = n_q_pressure
         self.pressure_first = pressure_first
         self.ref = ref
         self.unified_pos = unified_pos
@@ -932,6 +941,7 @@ class Transolver(nn.Module):
                     pressure_no_detach=pressure_no_detach,
                     pressure_deep=pressure_deep,
                     spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
+                    n_q_pressure=n_q_pressure if (idx == n_layers - 1) else 1,
                 )
                 for idx in range(n_layers)
             ]
@@ -1243,6 +1253,8 @@ class Config:
     cp_panel: bool = False                 # append thin-airfoil inviscid Cp to input features
     cp_panel_tandem_only: bool = False     # zero Cp feature for single-foil samples (tandem benefit only)
     cp_panel_scale: float = 1.0            # scale factor for panel Cp feature (0.1 = weak hint)
+    # Quantile regression: pinball loss for pressure (q10/q50/q90)
+    quantile_loss: bool = False            # use pinball loss for surface pressure
 
 
 cfg = sp.parse(Config)
@@ -1386,18 +1398,28 @@ if cfg.raw_targets or cfg.adaptive_norm:
 else:
     raw_stats = None
 
+# Quantile regression setup
+_Q_TAUS = [0.1, 0.5, 0.9]  # quantile levels
+_n_q = len(_Q_TAUS) if cfg.quantile_loss else 1
+_q50_idx = 2 + _n_q // 2 if cfg.quantile_loss else 2  # pressure q50 index in pred
+_q50_local = _n_q // 2  # q50 index within quantile channels
+_out_dim = 2 + _n_q  # total output channels
+_Q_WEIGHTS = [0.3, 0.4, 0.3]  # pinball loss weights for q10, q50, q90
+if cfg.quantile_loss:
+    print(f"Quantile regression: n_q={_n_q}, taus={_Q_TAUS}, weights={_Q_WEIGHTS}, q50_idx={_q50_idx}")
+
 model_config = dict(
     space_dim=2,
     fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + 32 + (1 if cfg.cp_panel else 0),  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], +32 fourier PE, [+cp_panel]
-    out_dim=3,
+    out_dim=_out_dim,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
     n_head=3,
     slice_num=cfg.prog_slices_end if cfg.prog_slices else cfg.slice_num,
     mlp_ratio=2,
     dropout=0.05 if cfg.rdrop else 0.0,
-    output_fields=["Ux", "Uy", "p"],
-    output_dims=[1, 1, 1],
+    output_fields=["Ux", "Uy"] + (["p"] if _n_q == 1 else [f"p_q{int(t*100)}" for t in _Q_TAUS]),
+    output_dims=[1, 1] + [1] * _n_q,
     linear_no_attention=cfg.linear_no_attention,
     learned_kernel=cfg.learned_kernel,
     field_decoder=cfg.field_decoder,
@@ -1418,6 +1440,7 @@ model_config = dict(
     pressure_no_detach=cfg.pressure_no_detach,
     pressure_deep=cfg.pressure_deep,
     gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
+    n_q_pressure=_n_q,
 )
 
 model = Transolver(**model_config).to(device)
@@ -1998,11 +2021,22 @@ for epoch in range(MAX_EPOCHS):
         re_pred = re_pred.float()
         aoa_pred = aoa_pred.float()
         hidden = hidden.float()
+        # Quantile regression: save quantile pressure channels, collapse pred to 3 channels
+        _pred_q_scaled = None
+        if cfg.quantile_loss:
+            _pred_q_raw = pred[:, :, 2:]  # [B, N, n_q] — all pressure quantile channels
+            pred = torch.cat([pred[:, :, :2], pred[:, :, _q50_idx:_q50_idx + 1]], dim=-1)  # [B, N, 3]
         if model.training and not cfg.no_perstd and not cfg.raw_targets and not cfg.adaptive_norm:
             if cfg.multiply_std:
                 pred = pred * sample_stds
             else:
                 pred = pred / sample_stds
+            # Scale quantile channels with pressure std
+            if cfg.quantile_loss:
+                _p_std = sample_stds[:, :, 2:3]
+                _pred_q_scaled = _pred_q_raw * _p_std if cfg.multiply_std else _pred_q_raw / _p_std
+        elif cfg.quantile_loss:
+            _pred_q_scaled = _pred_q_raw
 
         # Surface refinement head: additive correction on surface nodes
         if refine_head is not None and model.training:
@@ -2104,21 +2138,41 @@ for epoch in range(MAX_EPOCHS):
         else:
             vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
         is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
-        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        if cfg.quantile_loss and _pred_q_scaled is not None:
+            # Pinball loss for surface pressure across all quantiles
+            _p_target = y_norm[:, :, 2:3]  # [B, N, 1]
+            _pinball_per_node = torch.zeros_like(_p_target)  # [B, N, 1]
+            for _qi, (_tau, _w) in enumerate(zip(_Q_TAUS, _Q_WEIGHTS)):
+                _p_qi = _pred_q_scaled[:, :, _qi:_qi + 1]  # [B, N, 1]
+                _error = _p_target - _p_qi
+                _pinball_per_node = _pinball_per_node + _w * torch.max(_tau * _error, (_tau - 1) * _error)
+            surf_per_sample = (_pinball_per_node * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        else:
+            surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
         nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
         running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
         running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
         # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
         if epoch >= 30:
-            surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
+            surf_pres = abs_err[:, :, 2:3]  # q50 pressure errors for thresholding [B, N, 1]
             surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
             surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
             thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
             thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
             hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
             hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
-            surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            if cfg.quantile_loss and _pred_q_scaled is not None:
+                # Use pinball loss with hard-node weights
+                _p_target_h = y_norm[:, :, 2:3]
+                _pinball_hard = torch.zeros_like(_p_target_h)
+                for _qi, (_tau, _w) in enumerate(zip(_Q_TAUS, _Q_WEIGHTS)):
+                    _p_qi = _pred_q_scaled[:, :, _qi:_qi + 1]
+                    _error = _p_target_h - _p_qi
+                    _pinball_hard = _pinball_hard + _w * torch.max(_tau * _error, (_tau - 1) * _error)
+                surf_per_sample = (_pinball_hard * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            else:
+                surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
         adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
         if cfg.tandem_ramp:
             tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
@@ -2218,7 +2272,10 @@ for epoch in range(MAX_EPOCHS):
         if cfg.rdrop and model.training:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 rdrop_out = model({"x": x})
-                rdrop_pred = rdrop_out["preds"].float() / sample_stds
+                rdrop_pred = rdrop_out["preds"].float()
+                if cfg.quantile_loss:
+                    rdrop_pred = torch.cat([rdrop_pred[:, :, :2], rdrop_pred[:, :, _q50_idx:_q50_idx + 1]], dim=-1)
+                rdrop_pred = rdrop_pred / sample_stds
             valid_mask = mask.float().unsqueeze(-1)
             rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + cfg.rdrop_alpha * rdrop_loss
@@ -2357,7 +2414,10 @@ for epoch in range(MAX_EPOCHS):
             # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 out2 = model({"x": x})
-                pred2 = out2["preds"].float() / sample_stds
+                pred2 = out2["preds"].float()
+                if cfg.quantile_loss:
+                    pred2 = torch.cat([pred2[:, :, :2], pred2[:, :, _q50_idx:_q50_idx + 1]], dim=-1)
+                pred2 = pred2 / sample_stds
                 re_pred2 = out2["re_pred"].float()
                 aoa_pred2 = out2["aoa_pred"].float()
             abs_err2 = (pred2 - y_norm).abs()
@@ -2413,7 +2473,13 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _train_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.quantile_loss and _pred_q_scaled is not None:
+            # Log quantile spread (q90-q10) as uncertainty on surface nodes
+            _q_spread = (_pred_q_scaled[:, :, -1:] - _pred_q_scaled[:, :, :1]).abs()  # [B, N, 1]
+            _q_spread_surf = (_q_spread * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            _train_log["train/quantile_spread_surf"] = _q_spread_surf.item()
+        wandb.log(_train_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -2674,6 +2740,9 @@ for epoch in range(MAX_EPOCHS):
                     _eval_hidden = _eval_out["hidden"]
                 pred = pred.float()
                 _eval_hidden = _eval_hidden.float()
+                # Collapse quantile channels to q50 for eval
+                if cfg.quantile_loss:
+                    pred = torch.cat([pred[:, :, :2], pred[:, :, _q50_idx:_q50_idx + 1]], dim=-1)
                 if cfg.multiply_std:
                     pred_loss = pred * sample_stds
                 else:
@@ -3019,6 +3088,8 @@ if best_metrics:
                         x_n = torch.cat([x_n, cp_feat], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
                     pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
+                    if cfg.quantile_loss:
+                        pred = torch.cat([pred[:, :, :2], pred[:, :, _q50_idx:_q50_idx + 1]], dim=-1)
                     if cfg.raw_targets:
                         y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
                     elif cfg.adaptive_norm:
@@ -3198,6 +3269,10 @@ if cfg.surface_refine and best_metrics:
                         out = verify_model({"x": x})
                         pred_raw = out["preds"].float()
                         hidden = out["hidden"].float()
+
+                    # Collapse quantile channels for verification
+                    if cfg.quantile_loss:
+                        pred_raw = torch.cat([pred_raw[:, :, :2], pred_raw[:, :, _q50_idx:_q50_idx + 1]], dim=-1)
 
                     # === PATH A: Pipeline denormalization (same as val loop) ===
                     pred_loss = pred_raw / sample_stds
