@@ -493,6 +493,65 @@ def compute_vortex_panel_velocity(raw_xy, aoa_rad, is_surface, saf_norm, n_panel
     return out  # [B, N, 4]
 
 
+def compute_se2_features(raw_xy: torch.Tensor, is_surface: torch.Tensor,
+                         saf_norm: torch.Tensor) -> torch.Tensor:
+    """Compute SE(2)-invariant relative geometry features.
+
+    For each mesh node, computes angle and distance to fore/aft foil centroids,
+    plus the inter-foil stagger direction. Returns 8 features per node:
+      [cos_θ_fore, sin_θ_fore, r_fore,
+       cos_θ_aft,  sin_θ_aft,  r_aft,
+       cos_stagger, sin_stagger]
+
+    Single-foil samples: aft-related features (channels 3-7) are zeroed.
+    """
+    B, N, _ = raw_xy.shape
+    feat = torch.zeros(B, N, 8, device=raw_xy.device, dtype=raw_xy.dtype)
+
+    for b in range(B):
+        xy = raw_xy[b]  # [N, 2]
+        surf = is_surface[b]  # [N]
+        saf = saf_norm[b]  # [N]
+
+        fore_mask = surf & (saf <= 0.005)
+        aft_mask = surf & (saf > 0.005)
+        has_aft = aft_mask.any()
+
+        # Fore centroid (always present)
+        if fore_mask.any():
+            fore_c = xy[fore_mask].mean(dim=0)
+        else:
+            fore_c = xy[surf].mean(dim=0) if surf.any() else xy.mean(dim=0)
+
+        # Relative vector from each node to fore centroid
+        dx_f = xy[:, 0] - fore_c[0]
+        dy_f = xy[:, 1] - fore_c[1]
+        r_f = (dx_f ** 2 + dy_f ** 2).sqrt() + 1e-8
+        feat[b, :, 0] = dx_f / r_f   # cos θ_fore
+        feat[b, :, 1] = dy_f / r_f   # sin θ_fore
+        feat[b, :, 2] = r_f * 0.1    # scaled distance to fore
+
+        if has_aft:
+            aft_c = xy[aft_mask].mean(dim=0)
+
+            # Relative vector from each node to aft centroid
+            dx_a = xy[:, 0] - aft_c[0]
+            dy_a = xy[:, 1] - aft_c[1]
+            r_a = (dx_a ** 2 + dy_a ** 2).sqrt() + 1e-8
+            feat[b, :, 3] = dx_a / r_a   # cos θ_aft
+            feat[b, :, 4] = dy_a / r_a   # sin θ_aft
+            feat[b, :, 5] = r_a * 0.1    # scaled distance to aft
+
+            # Inter-foil stagger: direction from fore to aft centroid
+            foil_vec = aft_c - fore_c
+            foil_dist = foil_vec.norm() + 1e-8
+            feat[b, :, 6] = foil_vec[0] / foil_dist  # cos stagger
+            feat[b, :, 7] = foil_vec[1] / foil_dist  # sin stagger
+        # else: channels 3-7 stay zero for single-foil
+
+    return feat  # [B, N, 8]
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -1328,6 +1387,8 @@ class Config:
     vortex_panel_velocity: bool = False    # append (u_fore, v_fore, u_aft, v_aft) induced velocity
     vortex_panel_scale: float = 0.1        # scale factor for vortex velocity channels
     vortex_panel_n: int = 64              # number of panels to subsample per foil
+    # SE(2)-invariant relative geometry encoding: angles + distances to foil centroids (+8 input channels)
+    se2_geometry: bool = False             # add rotation-invariant relative geometry features
 
 
 cfg = sp.parse(Config)
@@ -1473,7 +1534,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + (1 if cfg.wake_angle_feature else 0) + 32 + (1 if cfg.cp_panel else 0) + (4 if cfg.vortex_panel_velocity else 0),  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], [+wake_angle], +32 fourier PE, [+cp_panel], [+vortex_panel]
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + (1 if cfg.wake_angle_feature else 0) + 32 + (1 if cfg.cp_panel else 0) + (4 if cfg.vortex_panel_velocity else 0) + (8 if cfg.se2_geometry else 0),  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], [+wake_angle], +32 fourier PE, [+cp_panel], [+vortex_panel], [+se2_geometry]
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1943,7 +2004,7 @@ for epoch in range(MAX_EPOCHS):
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
         # TE coordinate frame / wake deficit / cp_panel / vortex_panel: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity or cfg.se2_geometry
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
@@ -2000,6 +2061,9 @@ for epoch in range(MAX_EPOCHS):
             if cfg.vortex_panel_scale != 1.0:
                 vp_feat = vp_feat * cfg.vortex_panel_scale
             x = torch.cat([x, vp_feat], dim=-1)
+        if cfg.se2_geometry:
+            se2_feat = compute_se2_features(_raw_xy_te, is_surface, _raw_saf_norm_te)
+            x = torch.cat([x, se2_feat], dim=-1)
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -2650,7 +2714,7 @@ for epoch in range(MAX_EPOCHS):
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
                 _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
-                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity or cfg.se2_geometry
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
                 _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -2706,6 +2770,9 @@ for epoch in range(MAX_EPOCHS):
                     if cfg.vortex_panel_scale != 1.0:
                         vp_feat = vp_feat * cfg.vortex_panel_scale
                     x = torch.cat([x, vp_feat], dim=-1)
+                if cfg.se2_geometry:
+                    se2_feat = compute_se2_features(_raw_xy_te, is_surface, _raw_saf_norm_te)
+                    x = torch.cat([x, se2_feat], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
@@ -3079,7 +3146,7 @@ if best_metrics:
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
-                    _need_te_raw_vis = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+                    _need_te_raw_vis = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity or cfg.se2_geometry
                     _raw_xy_te_vis = x_dev[:, :, :2].clone() if _need_te_raw_vis else None
                     _raw_saf_norm_te_vis = x_dev[:, :, 2:4].norm(dim=-1) if _need_te_raw_vis else None
                     _raw_aoa_vis = x_dev[:, 0, 14:15]  # AoA0_rad [B, 1]
@@ -3126,6 +3193,9 @@ if best_metrics:
                         if cfg.vortex_panel_scale != 1.0:
                             vp_feat = vp_feat * cfg.vortex_panel_scale
                         x_n = torch.cat([x_n, vp_feat], dim=-1)
+                    if cfg.se2_geometry:
+                        se2_feat = compute_se2_features(_raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis)
+                        x_n = torch.cat([x_n, se2_feat], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
                     pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
                     if cfg.raw_targets:
@@ -3212,7 +3282,7 @@ if cfg.surface_refine and best_metrics:
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
                     _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
-                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity or cfg.se2_geometry
                     _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
                     _raw_gap_wake_vv = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -3259,6 +3329,9 @@ if cfg.surface_refine and best_metrics:
                         if cfg.vortex_panel_scale != 1.0:
                             vp_feat = vp_feat * cfg.vortex_panel_scale
                         x = torch.cat([x, vp_feat], dim=-1)
+                    if cfg.se2_geometry:
+                        se2_feat = compute_se2_features(_raw_xy_te, is_surface, _raw_saf_norm_te)
+                        x = torch.cat([x, se2_feat], dim=-1)
 
                     # Ground truth denormalization reference
                     Umag, q = _umag_q(y, mask)
