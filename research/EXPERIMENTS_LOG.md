@@ -2,6 +2,21 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-10 11:35 — PR #2357: Vortex-Panel Induced Velocity — askeladd — **MERGED** ✅
+
+- Branch: `askeladd/vortex-panel-induced-velocity`
+- Hypothesis: 4 Biot-Savart induced velocity channels (u_fore, v_fore, u_aft, v_aft) encoding inter-foil wake coupling at every mesh node
+- W&B runs: `aycq1m8m` (seed 42), `9sk276v6` (seed 73)
+
+| Metric | S42 | S73 | 2-Seed Avg | Prior Baseline | Δ |
+|--------|-----|-----|------------|----------------|---|
+| p_in | 11.755 | 11.988 | 11.872 | 11.90 | -0.2% ✅ |
+| p_oodc | 7.495 | 7.423 | 7.459 | 7.35 | +1.5% (minor regression) |
+| p_tan | 26.221 | 26.417 | **26.319** | 27.20 | **-3.2%** ✅ |
+| p_re | 6.178 | 6.280 | **6.229** | 6.40 | **-2.7%** ✅ |
+
+**Result:** MERGED. 3/4 metrics improved. p_tan -3.2% is the strongest tandem gain in recent rounds. The Biot-Savart kernel provides volume-wide inter-foil physics context beyond surface-only panel Cp. p_oodc +1.5% minor regression at extreme AoA where flat-plate vortex model breaks down — acceptable tradeoff. Askeladd reassigned to bold Round 40 experiment.
+
 ### 2026-04-10 11:25 — PR #2358: Surface-Normal Local Frame for SRF — tanjiro — **CLOSED** ❌
 
 - Branch: `tanjiro/surface-normal-srf-frame`
