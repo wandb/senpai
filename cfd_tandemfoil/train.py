@@ -1179,6 +1179,8 @@ class Config:
     aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
     aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
     aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
+    condition_interp: bool = False          # same-geometry condition-space interpolation augmentation
+    condition_interp_weight: float = 0.3   # loss weight for interpolated samples
     gap_stagger_spatial_bias: bool = False  # condition spatial bias MLP on gap/stagger (tandem geometry-aware routing)
     dct_freq_loss: bool = False   # DCT frequency-weighted auxiliary loss on surface pressure
     dct_freq_weight: float = 0.05 # weight for DCT freq loss
@@ -1849,6 +1851,51 @@ for epoch in range(MAX_EPOCHS):
                 _dsdf2_scale = _dsdf2_scale * _is_tandem_aug2.float() + (~_is_tandem_aug2).float()
                 x[:, :, 6:10] = x[:, :, 6:10] * _dsdf2_scale.view(-1, 1, 1)
 
+        # Same-geometry condition-space interpolation augmentation
+        # Appends interpolated samples from same-geometry pairs (different AoA/Re)
+        _cond_interp_mask = None  # boolean [B_total] — True for interpolated samples
+        if model.training and cfg.condition_interp:
+            _B_ci = x.size(0)
+            # Identify same-geometry pairs: cosine sim on first-node DSDF features (indices 2:10)
+            _dsdf_ref = x[:, 0, 2:10]  # [B, 8]
+            _dsdf_norm = _dsdf_ref / (_dsdf_ref.norm(dim=-1, keepdim=True) + 1e-8)
+            _sim = _dsdf_norm @ _dsdf_norm.T  # [B, B]
+            # Same geometry (sim > 0.98) and different AoA (delta > 0.01 rad ≈ 0.57 deg)
+            _aoa_ref = x[:, 0, 14]  # [B], AoA feature (raw)
+            _aoa_diff = (_aoa_ref.unsqueeze(0) - _aoa_ref.unsqueeze(1)).abs()  # [B, B]
+            # Only non-tandem samples (single foil) for cleaner interpolation
+            _is_not_tandem = (x[:, 0, 22].abs() < 0.01)  # [B]
+            _valid_mask = _is_not_tandem.unsqueeze(0) & _is_not_tandem.unsqueeze(1)
+            _pair_mask = (_sim > 0.98) & (_aoa_diff > 0.01) & _valid_mask
+            # Exclude diagonal
+            _eye = torch.eye(_B_ci, dtype=torch.bool, device=x.device)
+            _pair_mask = _pair_mask & ~_eye
+            _pair_idx = _pair_mask.nonzero(as_tuple=False)  # [P, 2]
+            if _pair_idx.size(0) > 0:
+                # Sample up to 4 pairs
+                _n_pairs = min(4, _pair_idx.size(0))
+                _sel = torch.randperm(_pair_idx.size(0), device=x.device)[:_n_pairs]
+                _pairs = _pair_idx[_sel]  # [K, 2]
+                _lam = torch.rand(_n_pairs, 1, 1, device=x.device) * 0.4 + 0.3  # [0.3, 0.7]
+                _xi, _xj = x[_pairs[:, 0]], x[_pairs[:, 1]]
+                _yi, _yj = y[_pairs[:, 0]], y[_pairs[:, 1]]
+                _si, _sj = is_surface[_pairs[:, 0]], is_surface[_pairs[:, 1]]
+                _mi, _mj = mask[_pairs[:, 0]], mask[_pairs[:, 1]]
+                # Blend all features (geometry channels are identical by DSDF selection)
+                _x_interp = _lam * _xi + (1 - _lam) * _xj
+                _y_interp = _lam * _yi + (1 - _lam) * _yj
+                _s_interp = _si & _sj  # intersection of surface masks
+                _m_interp = _mi & _mj  # intersection of node masks
+                # Append interpolated samples to batch
+                x = torch.cat([x, _x_interp], dim=0)
+                y = torch.cat([y, _y_interp], dim=0)
+                is_surface = torch.cat([is_surface, _s_interp], dim=0)
+                mask = torch.cat([mask, _m_interp], dim=0)
+                _cond_interp_mask = torch.cat([
+                    torch.zeros(_B_ci, dtype=torch.bool, device=x.device),
+                    torch.ones(_n_pairs, dtype=torch.bool, device=x.device)
+                ], dim=0)
+
         raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
         dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
@@ -2065,6 +2112,12 @@ for epoch in range(MAX_EPOCHS):
             is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
             sample_mask = (~is_tandem_curr).float()[:, None, None]
             abs_err = abs_err * sample_mask
+        # Apply condition_interp_weight to interpolated samples (scale down their contribution)
+        if _cond_interp_mask is not None and _cond_interp_mask.any():
+            _ci_weight = torch.where(_cond_interp_mask,
+                                     torch.full_like(_cond_interp_mask, cfg.condition_interp_weight, dtype=abs_err.dtype),
+                                     torch.ones(len(_cond_interp_mask), dtype=abs_err.dtype, device=abs_err.device))
+            abs_err = abs_err * _ci_weight[:, None, None]
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
 
