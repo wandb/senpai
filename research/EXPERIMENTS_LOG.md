@@ -2,6 +2,23 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-10 13:40 — PR #2364: DPOT Pretrained Backbone — alphonse — **CLOSED** ❌
+
+- Branch: `alphonse/dpot-pretrained-backbone`
+- Hypothesis: Pretrain Transolver backbone on DPOT PDE datasets, fine-tune on tandem foil; fallback to self-pretraining with denoising when checkpoint incompatible
+
+**Results (self-pretraining fallback, backbone_lr_ratio sweep):**
+
+| Config | p_in | p_oodc | p_tan | p_re |
+|--------|------|--------|-------|------|
+| ratio=0.01 (s42) | ~16.8 | ~10.6 | ~37.2 | ~8.9 |
+| ratio=0.1 (s42) | ~17.3 | ~11.1 | ~38.4 | ~9.2 |
+| ratio=0.5 (s42) | ~16.2 | ~10.2 | ~36.1 | ~8.7 |
+| Baseline | 11.872 | 7.459 | 26.319 | 6.229 |
+| Δ (best) | +36% ❌ | +37% ❌ | +37% ❌ | +40% ❌ |
+
+**Analysis:** Three root causes of failure: (1) DPOT uses AFNO architecture (FNO-style global mixing), not TransolverBlock (attention-based slicing) — direct checkpoint loading impossible. (2) Self-pretraining denoising objective on the same dataset provides no useful inductive bias — the model just memorizes noise patterns. (3) The backbone is only ~1M parameters — too small to benefit from pretraining at BERT/GPT scale. All backbone_lr_ratio configs (0.01, 0.1, 0.5) are consistently 36-40% worse. Transfer learning from external checkpoints and self-pretraining on domain data are both eliminated as approaches. Alphonse reassigned to Sobolev Surface Gradient Loss (#2368).
+
 ### 2026-04-10 11:35 — PR #2357: Vortex-Panel Induced Velocity — askeladd — **MERGED** ✅
 
 - Branch: `askeladd/vortex-panel-induced-velocity`
