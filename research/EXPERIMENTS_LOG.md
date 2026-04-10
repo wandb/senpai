@@ -17,6 +17,23 @@
 
 ---
 
+## 2026-04-10 18:10 — PR #2371: 1D Surface FNO Decoder: spectral pressure prediction on arc-length
+- Branch: frieren/surface-fno-decoder
+- **Hypothesis:** Replace SRF head with 1D Fourier Neural Operator on arc-length-ordered surface nodes. FNO modes=16, width=64, layers=4, grid=128. Spectral decomposition should capture smooth-but-sharp pressure distributions.
+- **Results:**
+
+| Metric | s42 | s73 | 2-seed avg | Baseline | Delta |
+|--------|-----|-----|------------|----------|-------|
+| p_in | 14.50 | 14.17 | 14.34 | 11.872 | +20.8% |
+| p_oodc | 8.85 | 8.59 | 8.72 | 7.459 | +16.9% |
+| p_tan | 34.36 | 33.49 | 33.92 | 26.319 | +28.9% |
+| p_re | 6.98 | 7.30 | 7.14 | 6.229 | +14.6% |
+
+- W&B: 40gf9jfw (s42), fdzyjdc9 (s73). Group: surface-fno
+- **Verdict: CLOSED — dead end.** All metrics 15-29% worse. Arc-length interpolation to uniform 128-point grid destroys LE/TE fine structure. Per-foil 1D processing severs tandem coupling. Only 122 epochs (hit 180-min timeout) vs 155 baseline. Spectral decomposition is wrong inductive bias for sharp surface pressure features.
+
+---
+
 ## Phase 6 Experiments (2026-04-01 onwards)
 
 ### 2026-04-10 17:15 — PR #2368: Sobolev Surface Gradient Loss — alphonse — **CLOSED** ❌
