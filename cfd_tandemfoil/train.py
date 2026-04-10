@@ -653,6 +653,57 @@ class SurfaceRefinementHead(nn.Module):
         return correction
 
 
+class TwoStageSRF(nn.Module):
+    """Two-stage surface refinement: velocity first, then pressure conditioned on velocity.
+
+    Stage 1: backbone features + base pred → velocity corrections (ΔUx, ΔUy)
+    Stage 2: backbone features + base pred + velocity corrections → pressure correction (Δp)
+    Velocity is detached before feeding to Stage 2 so gradients don't flow back.
+    """
+
+    def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 192,
+                 n_layers: int = 3):
+        super().__init__()
+        in_dim = n_hidden + out_dim  # same input as standard SRF: hidden + base_pred
+
+        # Stage 1: predict velocity corrections (ΔUx, ΔUy)
+        vel_layers: list[nn.Module] = []
+        for i in range(n_layers):
+            vel_layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
+            vel_layers.append(nn.LayerNorm(hidden_dim))
+            vel_layers.append(nn.GELU())
+        vel_layers.append(nn.Linear(hidden_dim, 2))  # output: ΔUx, ΔUy
+        nn.init.zeros_(vel_layers[-1].weight)
+        nn.init.zeros_(vel_layers[-1].bias)
+        self.vel_head = nn.Sequential(*vel_layers)
+
+        # Stage 2: predict pressure correction (Δp), conditioned on velocity corrections
+        p_in_dim = in_dim + 2  # original input + velocity corrections
+        p_layers: list[nn.Module] = []
+        for i in range(n_layers):
+            p_layers.append(nn.Linear(p_in_dim if i == 0 else hidden_dim, hidden_dim))
+            p_layers.append(nn.LayerNorm(hidden_dim))
+            p_layers.append(nn.GELU())
+        p_layers.append(nn.Linear(hidden_dim, 1))  # output: Δp
+        nn.init.zeros_(p_layers[-1].weight)
+        nn.init.zeros_(p_layers[-1].bias)
+        self.p_head = nn.Sequential(*p_layers)
+
+    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            hidden: [M, n_hidden] — hidden features for surface nodes
+            base_pred: [M, out_dim] — base predictions for surface nodes
+        Returns:
+            correction: [M, out_dim] — additive correction (ΔUx, ΔUy, Δp)
+        """
+        inp = torch.cat([hidden, base_pred], dim=-1)
+        vel = self.vel_head(inp)  # [M, 2]
+        # Detach vel so Stage 2 doesn't backprop through Stage 1
+        p = self.p_head(torch.cat([inp, vel.detach()], dim=-1))  # [M, 1]
+        return torch.cat([vel, p], dim=-1)  # [M, 3]
+
+
 class AftFoilRefinementHead(nn.Module):
     """Dedicated refinement head for aft-foil (boundary ID=7) surface nodes.
 
@@ -1220,6 +1271,7 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    srf_two_stage: bool = False              # two-stage SRF: velocity first, then pressure conditioned on velocity
     # Phase 6: Asinh pressure transform
     asinh_pressure: bool = False             # transform pressure targets with asinh for dynamic range compression
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
@@ -1429,7 +1481,14 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 # Surface refinement head (separate module, not compiled with main model)
 refine_head = None
 if cfg.surface_refine:
-    if cfg.surface_refine_context:
+    if cfg.srf_two_stage:
+        refine_head = TwoStageSRF(
+            n_hidden=cfg.n_hidden,
+            out_dim=3,
+            hidden_dim=cfg.surface_refine_hidden,
+            n_layers=cfg.surface_refine_layers,
+        ).to(device)
+    elif cfg.surface_refine_context:
         refine_head = SurfaceRefinementContextHead(
             n_hidden=cfg.n_hidden,
             out_dim=3,
@@ -1447,7 +1506,8 @@ if cfg.surface_refine:
         ).to(device)
     refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
     _refine_n_params = sum(p.numel() for p in refine_head.parameters())
-    print(f"Surface refinement head: {_refine_n_params:,} params "
+    _srf_type = "TwoStageSRF" if cfg.srf_two_stage else ("context" if cfg.surface_refine_context else "standard")
+    print(f"Surface refinement head ({_srf_type}): {_refine_n_params:,} params "
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
           f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
 
@@ -1455,7 +1515,18 @@ if cfg.surface_refine:
 aft_srf_head = None
 aft_srf_ctx_head = None
 if cfg.aft_foil_srf:
-    if cfg.aft_foil_srf_context:
+    if cfg.srf_two_stage:
+        aft_srf_head = TwoStageSRF(
+            n_hidden=cfg.n_hidden,
+            out_dim=3,
+            hidden_dim=cfg.aft_foil_srf_hidden,
+            n_layers=cfg.aft_foil_srf_layers,
+        ).to(device)
+        aft_srf_head = torch.compile(aft_srf_head, mode=cfg.compile_mode)
+        _aft_n_params = sum(p.numel() for p in aft_srf_head.parameters())
+        print(f"Aft-foil SRF head (TwoStageSRF): {_aft_n_params:,} params "
+              f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers})")
+    elif cfg.aft_foil_srf_context:
         aft_srf_ctx_head = AftFoilRefinementContextHead(
             n_hidden=cfg.n_hidden,
             out_dim=3,
@@ -2022,6 +2093,14 @@ for epoch in range(MAX_EPOCHS):
                         correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
+                        # Log two-stage SRF correction magnitudes
+                        if cfg.srf_two_stage and global_step % 50 == 0:
+                            with torch.no_grad():
+                                wandb.log({
+                                    "train/srf_vel_corr_mag": correction[:, :2].abs().mean().item(),
+                                    "train/srf_p_corr_mag": correction[:, 2].abs().mean().item(),
+                                    "global_step": global_step,
+                                })
 
         # Aft-foil dedicated refinement head: additive correction on boundary ID=7 nodes only
         if aft_srf_ctx_head is not None and model.training and _aft_foil_mask is not None:
@@ -2050,10 +2129,13 @@ for epoch in range(MAX_EPOCHS):
                 aft_pred = pred[aft_idx[:, 0], aft_idx[:, 1]]      # [A, 3]
                 # FiLM conditioning: expand gap/stagger per aft-foil node
                 _aft_cond = None
-                if cfg.aft_foil_srf_film:
+                if cfg.aft_foil_srf_film and not cfg.srf_two_stage:
                     _aft_cond = _raw_gap_stagger[aft_idx[:, 0]]  # [A, 2]
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    aft_correction = aft_srf_head(aft_hidden, aft_pred, _aft_cond).float()
+                    if cfg.srf_two_stage:
+                        aft_correction = aft_srf_head(aft_hidden, aft_pred).float()
+                    else:
+                        aft_correction = aft_srf_head(aft_hidden, aft_pred, _aft_cond).float()
                 pred = pred.clone()
                 pred[aft_idx[:, 0], aft_idx[:, 1]] = pred[aft_idx[:, 0], aft_idx[:, 1]] + aft_correction
 
@@ -2727,9 +2809,12 @@ for epoch in range(MAX_EPOCHS):
                     if aft_idx.numel() > 0:
                         _ah = _eval_hidden[aft_idx[:, 0], aft_idx[:, 1]]
                         _ap = pred_loss[aft_idx[:, 0], aft_idx[:, 1]]
-                        _ac = _v_gap_stagger[aft_idx[:, 0]] if cfg.aft_foil_srf_film else None
+                        _ac = _v_gap_stagger[aft_idx[:, 0]] if (cfg.aft_foil_srf_film and not cfg.srf_two_stage) else None
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                            _aft_corr = eval_aft_srf_head(_ah, _ap, _ac).float()
+                            if cfg.srf_two_stage:
+                                _aft_corr = eval_aft_srf_head(_ah, _ap).float()
+                            else:
+                                _aft_corr = eval_aft_srf_head(_ah, _ap, _ac).float()
                         pred_loss = pred_loss.clone()
                         pred_loss[aft_idx[:, 0], aft_idx[:, 1]] += _aft_corr
                         # Back-compute pred for denormalization
