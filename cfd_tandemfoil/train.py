@@ -347,6 +347,37 @@ def compute_wake_deficit_features(raw_xy, is_surface, saf_norm, gap_raw, fore_te
     return torch.stack([dx_norm, dy_norm], dim=-1)  # [B, N, 2]
 
 
+def compute_pressure_recovery_ratio(raw_xy, is_surface, saf_norm):
+    """Compute inter-foil gap recovery ratio per node.
+
+    r = (x_node - fore_TE_x) / (aft_LE_x - fore_TE_x), clamped to [0, 1].
+    Zero for single-foil samples. Encodes where each node sits in the
+    fore-TE → aft-LE pressure recovery zone.
+
+    Returns: [B, N, 1]
+    """
+    x_coords = raw_xy[:, :, 0]  # [B, N]
+    INF = 1e6
+    # Fore-foil TE: max x among surface nodes with saf_norm <= 0.005
+    fore_surf = is_surface & (saf_norm <= 0.005)
+    fore_x_m = x_coords * fore_surf.float() - INF * (~fore_surf).float()
+    fore_te_x = fore_x_m.max(dim=1).values  # [B]
+    # Aft-foil LE: min x among surface nodes with saf_norm > 0.005
+    aft_surf = is_surface & (saf_norm > 0.005)
+    has_aft = aft_surf.any(dim=1)  # [B]
+    # For min: mask non-aft nodes to +INF; for single-foil, mask everything safe
+    aft_x_m = x_coords.clone()
+    aft_x_m[~aft_surf] = INF
+    aft_le_x = aft_x_m.min(dim=1).values  # [B]
+    # Gap length
+    gap_len = (aft_le_x - fore_te_x).clamp(min=1e-6)  # [B]
+    # Recovery ratio
+    recovery_r = ((x_coords - fore_te_x[:, None]) / gap_len[:, None]).clamp(0.0, 1.0)
+    # Zero for single-foil samples
+    recovery_r = recovery_r * has_aft.float()[:, None]
+    return recovery_r.unsqueeze(-1)  # [B, N, 1]
+
+
 def compute_cp_panel(raw_xy, aoa_rad, is_surface, saf_norm):
     """Compute inviscid flat-plate Cp per node as a physics-grounded input feature.
 
@@ -1243,6 +1274,8 @@ class Config:
     cp_panel: bool = False                 # append thin-airfoil inviscid Cp to input features
     cp_panel_tandem_only: bool = False     # zero Cp feature for single-foil samples (tandem benefit only)
     cp_panel_scale: float = 1.0            # scale factor for panel Cp feature (0.1 = weak hint)
+    # Pressure recovery ratio feature: inter-foil gap position for tandem samples
+    pressure_recovery_feature: bool = False  # append recovery ratio r ∈ [0,1] (+1 input channel)
 
 
 cfg = sp.parse(Config)
@@ -1388,7 +1421,7 @@ else:
 
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + 32 + (1 if cfg.cp_panel else 0),  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], +32 fourier PE, [+cp_panel]
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + 32 + (1 if cfg.cp_panel else 0) + (1 if cfg.pressure_recovery_feature else 0),  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], +32 fourier PE, [+cp_panel], [+recovery_ratio]
     out_dim=3,
     n_hidden=cfg.n_hidden,
     n_layers=cfg.n_layers,
@@ -1858,7 +1891,7 @@ for epoch in range(MAX_EPOCHS):
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
         # TE coordinate frame / wake deficit / cp_panel: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.pressure_recovery_feature
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
@@ -1907,6 +1940,9 @@ for epoch in range(MAX_EPOCHS):
             if cfg.cp_panel_scale != 1.0:
                 cp_feat = cp_feat * cfg.cp_panel_scale
             x = torch.cat([x, cp_feat], dim=-1)
+        if cfg.pressure_recovery_feature:
+            recovery_feat = compute_pressure_recovery_ratio(_raw_xy_te, is_surface, _raw_saf_norm_te)
+            x = torch.cat([x, recovery_feat], dim=-1)
         if model.training and epoch < cfg.noise_anneal_epochs:
             noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
             x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
@@ -2557,7 +2593,7 @@ for epoch in range(MAX_EPOCHS):
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
                 _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
-                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel
+                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.pressure_recovery_feature
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
                 _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -2605,6 +2641,9 @@ for epoch in range(MAX_EPOCHS):
                     if cfg.cp_panel_scale != 1.0:
                         cp_feat = cp_feat * cfg.cp_panel_scale
                     x = torch.cat([x, cp_feat], dim=-1)
+                if cfg.pressure_recovery_feature:
+                    recovery_feat = compute_pressure_recovery_ratio(_raw_xy_te, is_surface, _raw_saf_norm_te)
+                    x = torch.cat([x, recovery_feat], dim=-1)
                 Umag, q = _umag_q(y, mask)
                 if cfg.raw_targets:
                     y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
@@ -2978,7 +3017,7 @@ if best_metrics:
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
-                    _need_te_raw_vis = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel
+                    _need_te_raw_vis = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.pressure_recovery_feature
                     _raw_xy_te_vis = x_dev[:, :, :2].clone() if _need_te_raw_vis else None
                     _raw_saf_norm_te_vis = x_dev[:, :, 2:4].norm(dim=-1) if _need_te_raw_vis else None
                     _raw_aoa_vis = x_dev[:, 0, 14:15]  # AoA0_rad [B, 1]
@@ -3017,6 +3056,9 @@ if best_metrics:
                         if cfg.cp_panel_scale != 1.0:
                             cp_feat = cp_feat * cfg.cp_panel_scale
                         x_n = torch.cat([x_n, cp_feat], dim=-1)
+                    if cfg.pressure_recovery_feature:
+                        recovery_feat = compute_pressure_recovery_ratio(_raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis)
+                        x_n = torch.cat([x_n, recovery_feat], dim=-1)
                     Umag, q = _umag_q(y_dev, mask)
                     pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
                     if cfg.raw_targets:
@@ -3103,7 +3145,7 @@ if cfg.surface_refine and best_metrics:
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
                     _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
-                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel
+                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.pressure_recovery_feature
                     _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
                     _raw_gap_wake_vv = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -3142,6 +3184,9 @@ if cfg.surface_refine and best_metrics:
                         if cfg.cp_panel_scale != 1.0:
                             cp_feat = cp_feat * cfg.cp_panel_scale
                         x = torch.cat([x, cp_feat], dim=-1)
+                    if cfg.pressure_recovery_feature:
+                        recovery_feat = compute_pressure_recovery_ratio(_raw_xy_te, is_surface, _raw_saf_norm_te)
+                        x = torch.cat([x, recovery_feat], dim=-1)
 
                     # Ground truth denormalization reference
                     Umag, q = _umag_q(y, mask)
