@@ -25,6 +25,7 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1173,8 +1174,8 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-MAX_TIMEOUT = 180.0  # minutes
-MAX_EPOCHS = 500
+MAX_TIMEOUT = float(os.environ.get("SENPAI_TIMEOUT_MINUTES", 180.0))  # minutes
+MAX_EPOCHS = int(os.environ.get("SENPAI_MAX_EPOCHS", 500))
 
 
 @dataclass
@@ -1328,6 +1329,12 @@ class Config:
     vortex_panel_velocity: bool = False    # append (u_fore, v_fore, u_aft, v_aft) induced velocity
     vortex_panel_scale: float = 0.1        # scale factor for vortex velocity channels
     vortex_panel_n: int = 64              # number of panels to subsample per foil
+    # Contrastive geometry pretraining: pretrain geometry encoder on NACA airfoil library
+    contrastive_pretrain: bool = False    # enable contrastive geometry pretraining before main training
+    pretrain_minutes: float = 30.0            # minutes to spend on contrastive pretraining phase
+    pretrain_temp: float = 0.07          # InfoNCE temperature (SimCLR default)
+    pretrain_batch_size: int = 64        # batch size for pretraining
+    pretrain_n_airfoils: int = 500       # NACA 4-digit family size to generate
 
 
 cfg = sp.parse(Config)
@@ -1384,6 +1391,126 @@ def _phys_denorm(y_p, Umag, q):
     y[:, :, 1:2] = y_p[:, :, 1:2].clamp(-10, 10) * Umag
     y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
+
+
+# ---------------------------------------------------------------------------
+# Contrastive geometry pretraining helpers
+# ---------------------------------------------------------------------------
+
+def _naca4_profile(m, p, t, n=129):
+    """Generate NACA 4-digit airfoil contour."""
+    x = np.linspace(0.0, 1.0, n)
+    yt = (t / 0.2) * (0.2969 * np.sqrt(x.clip(1e-8)) - 0.126 * x
+                      - 0.3516 * x**2 + 0.2843 * x**3 - 0.1015 * x**4)
+    if m < 1e-4:
+        yc = np.zeros_like(x); dyc = np.zeros_like(x)
+    else:
+        mask = x <= p
+        yc = np.where(mask, m/(p**2+1e-12)*(2*p*x-x**2), m/((1-p)**2+1e-12)*(1-2*p+2*p*x-x**2))
+        dyc = np.where(mask, 2*m/(p**2+1e-12)*(p-x), 2*m/((1-p)**2+1e-12)*(p-x))
+    theta = np.arctan(dyc)
+    xu = x - yt*np.sin(theta); yu = yc + yt*np.cos(theta)
+    xl = x + yt*np.sin(theta); yl = yc - yt*np.cos(theta)
+    upper = np.stack([xu[::-1], yu[::-1]], axis=-1)
+    lower = np.stack([xl, yl], axis=-1)
+    return np.concatenate([upper[:-1], lower[1:]], axis=0).astype(np.float32)
+
+
+def generate_naca_coords(n_airfoils=500, n_points=256):
+    rng = np.random.default_rng(42)
+    per_side = n_points // 2 + 1
+    airfoils = []
+    attempts = 0
+    while len(airfoils) < n_airfoils and attempts < n_airfoils * 5:
+        attempts += 1
+        m = rng.uniform(0.0, 0.09); p = rng.uniform(0.1, 0.9); t = rng.uniform(0.06, 0.24)
+        try:
+            coords = _naca4_profile(m, p, t, n=per_side)
+            if coords.shape[0] != n_points or not np.isfinite(coords).all():
+                continue
+            coords[:, 0] = coords[:, 0] - 0.5
+            airfoils.append(coords)
+        except Exception:
+            continue
+    while len(airfoils) < n_airfoils:
+        airfoils.append(airfoils[rng.integers(len(airfoils))])
+    return np.array(airfoils[:n_airfoils], dtype=np.float32)
+
+
+def augment_geometry(coords2d, jitter_std=0.005, rotate_deg=5.0):
+    B = coords2d.shape[0]
+    aug = coords2d + torch.randn_like(coords2d) * jitter_std
+    angles = (torch.rand(B, device=coords2d.device) * 2 - 1) * rotate_deg * (np.pi / 180)
+    cos_a, sin_a = angles.cos(), angles.sin()
+    R = torch.stack([torch.stack([cos_a, -sin_a], dim=-1), torch.stack([sin_a, cos_a], dim=-1)], dim=1)
+    return torch.bmm(aug, R.transpose(1, 2))
+
+
+class GeometryContrastiveLoss(nn.Module):
+    def __init__(self, embed_dim=192, proj_dim=128, temp=0.07):
+        super().__init__()
+        self.projector = nn.Sequential(nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Linear(embed_dim, proj_dim))
+        self.temp = temp
+
+    def forward(self, z1, z2):
+        p1 = F.normalize(self.projector(z1), dim=-1)
+        p2 = F.normalize(self.projector(z2), dim=-1)
+        logits_12 = (p1 @ p2.T) / self.temp
+        labels = torch.arange(len(p1), device=p1.device)
+        return (F.cross_entropy(logits_12, labels) + F.cross_entropy(logits_12.T, labels)) * 0.5
+
+
+def pretrain_geometry(model, airfoil_data, minutes, temp=0.07, batch_size=64, device="cuda"):
+    """Contrastively pretrain geometry encoder (preprocess + first block) on NACA airfoil library."""
+    geom_params = list(model.preprocess.parameters())
+    if hasattr(model, 'blocks') and len(model.blocks) > 0:
+        geom_params += list(model.blocks[0].parameters())
+    contrastive = GeometryContrastiveLoss(embed_dim=model.n_hidden, proj_dim=128, temp=temp).to(device)
+    optimizer = torch.optim.Adam(geom_params + list(contrastive.parameters()), lr=1e-3)
+    # Determine input dimensions from model — use first Linear in preprocess for robustness
+    geom_input_dim = next(m for m in model.preprocess.modules() if isinstance(m, nn.Linear)).weight.shape[1]
+    raw_xy_dim = 4  # default spatial_bias_input_dim
+    if hasattr(model, 'blocks') and len(model.blocks) > 0:
+        sb = model.blocks[0].spatial_bias
+        if isinstance(sb, nn.Sequential) and len(sb) > 0 and hasattr(sb[0], 'weight'):
+            raw_xy_dim = sb[0].weight.shape[1]
+    n_points = airfoil_data.shape[1]
+    airfoil_t = torch.tensor(airfoil_data, dtype=torch.float32)
+    model.preprocess.train()
+    if hasattr(model, 'blocks') and len(model.blocks) > 0:
+        model.blocks[0].train()
+    start = time.time(); step = 0; rng = np.random.default_rng(0)
+    print(f"[Contrastive pretrain] Starting: {len(airfoil_data)} airfoils, {minutes:.1f} min budget, τ={temp}")
+    while (time.time() - start) / 60 < minutes:
+        idx = rng.choice(len(airfoil_data), size=batch_size, replace=True)
+        batch_raw = airfoil_t[idx].to(device)
+        aug1_xy = augment_geometry(batch_raw)
+        aug2_xy = augment_geometry(batch_raw)
+        B = batch_size
+        inp1 = torch.zeros(B, n_points, geom_input_dim, device=device)
+        inp2 = torch.zeros(B, n_points, geom_input_dim, device=device)
+        inp1[:, :, :2] = aug1_xy; inp2[:, :, :2] = aug2_xy
+        raw_xy1 = torch.zeros(B, n_points, raw_xy_dim, device=device)
+        raw_xy2 = torch.zeros(B, n_points, raw_xy_dim, device=device)
+        raw_xy1[:, :, :2] = aug1_xy; raw_xy2[:, :, :2] = aug2_xy
+        h1 = model.preprocess(inp1)
+        h2 = model.preprocess(inp2)
+        if hasattr(model, 'blocks') and len(model.blocks) > 0:
+            h1 = model.blocks[0](h1, raw_xy=raw_xy1)
+            h2 = model.blocks[0](h2, raw_xy=raw_xy2)
+        z1 = h1.mean(dim=1); z2 = h2.mean(dim=1)
+        loss = contrastive(z1, z2)
+        optimizer.zero_grad(); loss.backward()
+        torch.nn.utils.clip_grad_norm_(geom_params + list(contrastive.parameters()), 1.0)
+        optimizer.step(); step += 1
+        if step % 50 == 0:
+            elapsed = (time.time() - start) / 60
+            wandb.log({'pretrain/contrastive_loss': loss.item(), 'pretrain/step': step,
+                       'pretrain/elapsed_min': elapsed})
+    elapsed = (time.time() - start) / 60
+    print(f"[Contrastive pretrain] Done: {step} steps in {elapsed:.1f} min")
+    wandb.log({'pretrain/total_steps': step, 'pretrain/total_min': elapsed})
+
 
 loader_kwargs = dict(collate_fn=pad_collate, num_workers=cfg.num_workers, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
@@ -1791,6 +1918,8 @@ for _sname in VAL_SPLIT_NAMES:
 wandb.define_metric("lr", step_metric="global_step")
 wandb.define_metric("epoch_time_s", step_metric="global_step")
 wandb.define_metric("val_predictions", step_metric="global_step")
+wandb.define_metric("pretrain/step")
+wandb.define_metric("pretrain/*", step_metric="pretrain/step")
 
 if cfg.re_stratified_sampling and '_train_log_re' in dir():
     wandb.log({"re_stratification/log_re_histogram": wandb.Histogram(_train_log_re.numpy()),
@@ -1804,6 +1933,17 @@ model_dir.mkdir(parents=True)
 model_path = model_dir / "checkpoint.pt"
 with open(model_dir / "config.yaml", "w") as f:
     yaml.dump(model_config, f)
+
+# Contrastive geometry pretraining (Phase 1)
+if cfg.contrastive_pretrain:
+    _pretrain_minutes = min(cfg.pretrain_minutes, MAX_TIMEOUT * 0.25)
+    print(f"[Phase 1] Contrastive geometry pretraining for {_pretrain_minutes:.1f} min")
+    _airfoil_data = generate_naca_coords(n_airfoils=cfg.pretrain_n_airfoils, n_points=256)
+    wandb.config.update({"pretrain_actual_minutes": _pretrain_minutes}, allow_val_change=True)
+    pretrain_geometry(_base_model, _airfoil_data, minutes=_pretrain_minutes,
+                      temp=cfg.pretrain_temp, batch_size=cfg.pretrain_batch_size, device=device)
+    # Freeze geometry encoder for first few warm-up epochs if desired (not done here — fine-tune freely)
+    print(f"[Phase 2] Starting standard fine-tuning")
 
 best_val = float("inf")
 ema_val_loss = float("inf")
