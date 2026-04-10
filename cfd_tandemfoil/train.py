@@ -413,6 +413,57 @@ def compute_cp_panel(raw_xy, aoa_rad, is_surface, saf_norm):
     return cp_panel.unsqueeze(-1)  # [B, N, 1]
 
 
+def compute_cl_cd(surf_p, surf_xy):
+    """Compute lift and drag coefficients via panel-method surface integral.
+
+    Uses central-difference tangent vectors to estimate outward normals and arc-length
+    elements at each surface node. Nodes are sorted by angle around centroid before
+    computing tangents to handle unordered meshes and avoid large tangent discontinuities
+    at sharp trailing edges.
+
+    Args:
+        surf_p:  [M] surface pressure values (normalized) for a single foil's surface
+        surf_xy: [M, 2] surface node XY coordinates (raw, physical) for the same foil
+
+    Returns:
+        cl: scalar — normalized lift coefficient proxy
+        cd: scalar — normalized drag coefficient proxy
+    """
+    M = surf_p.shape[0]
+    if M < 3:
+        zero = surf_p.sum() * 0.0  # differentiable zero
+        return zero, zero
+
+    # Sort nodes by angle around centroid to ensure consistent ordering
+    centroid = surf_xy.mean(dim=0)  # [2]
+    angles = torch.atan2(surf_xy[:, 1] - centroid[1], surf_xy[:, 0] - centroid[0])  # [M]
+    sort_idx = angles.argsort()
+    surf_xy_s = surf_xy[sort_idx]  # [M, 2]
+    surf_p_s = surf_p[sort_idx]    # [M]
+
+    # Central-difference tangent vectors (circular boundary)
+    next_idx = torch.arange(M, device=surf_xy.device)
+    next_idx = torch.roll(next_idx, -1)
+    prev_idx = torch.roll(torch.arange(M, device=surf_xy.device), 1)
+    tangent = surf_xy_s[next_idx] - surf_xy_s[prev_idx]  # [M, 2] central diff
+
+    # Outward normal: 90-degree CCW rotation of tangent (for CCW-ordered contour gives inward,
+    # but sign cancels in Cl/Cd ratio; we use consistent sign convention throughout)
+    normal = torch.stack([-tangent[:, 1], tangent[:, 0]], dim=-1)  # [M, 2]
+    normal = normal / (normal.norm(dim=-1, keepdim=True) + 1e-8)   # unit normals
+
+    # Arc-length element: half-sum of distances to neighbors
+    ds = tangent.norm(dim=-1)  # [M] — magnitude of central-difference span (≈ 2*ds_i)
+
+    # Chord length along x-axis
+    chord = surf_xy_s[:, 0].max() - surf_xy_s[:, 0].min() + 1e-8
+
+    # Cl, Cd integrals: (2/c) Σ p_i * n_y_i * ds_i  and  (2/c) Σ p_i * n_x_i * ds_i
+    cl = 2.0 * (surf_p_s * normal[:, 1] * ds).sum() / chord
+    cd = 2.0 * (surf_p_s * normal[:, 0] * ds).sum() / chord
+    return cl, cd
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -1243,6 +1294,9 @@ class Config:
     cp_panel: bool = False                 # append thin-airfoil inviscid Cp to input features
     cp_panel_tandem_only: bool = False     # zero Cp feature for single-foil samples (tandem benefit only)
     cp_panel_scale: float = 1.0            # scale factor for panel Cp feature (0.1 = weak hint)
+    # Cl/Cd auxiliary loss: integral aerodynamic force supervision
+    cl_cd_loss: bool = False               # enable differentiable Cl/Cd integral auxiliary loss
+    cl_cd_weight: float = 0.01            # weight for Cl/Cd loss term
 
 
 cfg = sp.parse(Config)
@@ -1857,8 +1911,8 @@ for epoch in range(MAX_EPOCHS):
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
-        # TE coordinate frame / wake deficit / cp_panel: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel
+        # TE coordinate frame / wake deficit / cp_panel / cl_cd_loss: save raw xy and saf_norm before normalization
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.cl_cd_loss
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
@@ -2212,6 +2266,45 @@ for epoch in range(MAX_EPOCHS):
             if _n_foils_dct > 0:
                 _dct_loss = _dct_loss / _n_foils_dct
                 loss = loss + cfg.dct_freq_weight * _dct_loss
+
+        # Cl/Cd integral auxiliary loss: differentiable aerodynamic force supervision
+        # Computes lift/drag coefficients via panel-method surface integral for each foil
+        # and applies Huber loss between predicted and GT Cl/Cd.
+        if cfg.cl_cd_loss and model.training and _raw_xy_te is not None:
+            _cl_cd_loss = torch.tensor(0.0, device=device)
+            _n_foils_clcd = 0
+            _is_tandem_clcd = (x[:, 0, 21].abs() > 0.01)  # tandem flag from normalized gap channel
+            for b in range(B):
+                surf_idx_b = is_surface[b].nonzero(as_tuple=True)[0]
+                if surf_idx_b.numel() < 8:
+                    continue
+                _is_tan_b = _is_tandem_clcd[b].item()
+                if _is_tan_b:
+                    saf_vals_b = _raw_saf_norm_te[b, surf_idx_b]
+                    foil_groups_clcd = [surf_idx_b[saf_vals_b <= 0.005], surf_idx_b[saf_vals_b > 0.005]]
+                else:
+                    foil_groups_clcd = [surf_idx_b]
+                for foil_idx in foil_groups_clcd:
+                    if foil_idx.numel() < 8:
+                        continue
+                    # Raw physical XY coordinates for this foil's surface nodes
+                    surf_xy_b = _raw_xy_te[b, foil_idx]  # [M, 2]
+                    # Normalized pressure predictions and ground truth (channel 2)
+                    p_pred_b = pred[b, foil_idx, 2]  # [M]
+                    p_gt_b = y_norm[b, foil_idx, 2]  # [M]
+                    # Compute Cl/Cd for predicted and GT pressure fields
+                    cl_pred_b, cd_pred_b = compute_cl_cd(p_pred_b, surf_xy_b)
+                    cl_gt_b, cd_gt_b = compute_cl_cd(p_gt_b, surf_xy_b)
+                    # Huber loss on Cl and Cd (GT detached — target is fixed reference)
+                    _cl_cd_loss = _cl_cd_loss + (
+                        F.huber_loss(cl_pred_b.unsqueeze(0), cl_gt_b.detach().unsqueeze(0), delta=0.1) +
+                        F.huber_loss(cd_pred_b.unsqueeze(0), cd_gt_b.detach().unsqueeze(0), delta=0.1)
+                    )
+                    _n_foils_clcd += 1
+            if _n_foils_clcd > 0:
+                _cl_cd_loss = _cl_cd_loss / _n_foils_clcd
+                loss = loss + cfg.cl_cd_weight * _cl_cd_loss
+                wandb.log({"train/cl_cd_loss": _cl_cd_loss.item(), "global_step": global_step})
 
         # R-drop: second forward pass with different dropout mask for consistency
         rdrop_loss = torch.tensor(0.0, device=device)
