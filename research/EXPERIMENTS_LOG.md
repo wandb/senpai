@@ -2,6 +2,21 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-10 11:20 — PR #2360: Input Consistency Regularization (R-Drop) — frieren — **CLOSED** ❌
+
+- Branch: `frieren/input-consistency-regularization`
+- Hypothesis: Two forward passes with dropout → consistency loss → dropout-robust predictions
+- W&B runs: `ccs1r0ro` (seed 42), `t78zyan8` (seed 73)
+
+| Metric | S42 | S73 | 2-Seed Avg | Baseline | Δ |
+|--------|-----|-----|------------|----------|---|
+| p_in | 18.1 | 18.6 | 18.35 | 11.90 | +54% ❌ |
+| p_oodc | 10.9 | 11.9 | 11.40 | 7.35 | +55% ❌ |
+| p_tan | 30.2 | 30.5 | 30.35 | 27.20 | +12% ❌ |
+| p_re | 8.9 | 9.7 | 9.30 | 6.40 | +45% ❌ |
+
+**Analysis:** Catastrophic failure. 2× forward pass (115s/epoch vs 67s baseline) + OOM batch_size=3 → only 94 epochs vs ~160 baseline. Model doesn't converge. Additionally, 5% dropout is too weak for meaningful stochasticity. R-Drop is fundamentally incompatible with the 30-min training timeout. Frieren reassigned to bold Round 40: FFD Geometry Augmentation (#2365).
+
 ### 2026-04-10 10:25 — PR #2341: Hypernetwork SRF v4 (rank=2, α=0.5, +wake_angle) — alphonse — **CLOSED** ❌
 
 - Branch: `alphonse/hypernetwork-srf-weights`
