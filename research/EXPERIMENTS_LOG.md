@@ -2,6 +2,21 @@
 
 ## Phase 6 Experiments (2026-04-01 onwards)
 
+### 2026-04-10 09:50 — PR #2340: Cl/Cd Auxiliary Loss v2 (tandem-only) — fern — **CLOSED** ❌
+
+- Branch: `fern/cl-cd-auxiliary-loss`
+- Hypothesis: Integral Cl/Cd supervision via trapezoidal integration of surface pressure, applied only to tandem samples with weight 0.01
+- W&B runs: `al2wd9bl` (seed 42), `u3uqcdi6` (seed 73)
+
+| Metric | S42 | S73 | 2-Seed Avg | Baseline | Δ |
+|--------|-----|-----|------------|----------|---|
+| p_in | 12.50 | 12.00 | 12.25 | 11.90 | +2.9% ❌ |
+| p_oodc | 7.70 | 7.20 | 7.45 | 7.35 | +1.4% ❌ |
+| p_tan | 26.50 | 26.60 | 26.55 | 27.20 | -2.4% ✅ |
+| p_re | 6.50 | 6.20 | 6.35 | 6.40 | -0.8% ✅ |
+
+**Analysis (2 iterations total):** v1 (all samples): p_tan -2.9% but p_in +1.6%. v2 (tandem-only): p_tan -2.4% but p_in +2.9%. The integral Cl/Cd gradient structurally disrupts shared model weights for non-tandem predictions. Neither tandem-only masking nor weight tuning resolves the competing gradient signal. The Cl/Cd information is validated as useful for tandem prediction — but needs to be delivered as a conditioning input, not a loss term. Fern reassigned to bold Round 40: Global Cl/Cd SRF Conditioning (#2363).
+
 ### 2026-04-10 09:35 — PR #2356: Joukowski Camber-Corrected Cp — edward — **CLOSED** ❌
 
 - Branch: `edward/joukowski-camber-cp`
