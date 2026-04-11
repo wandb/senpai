@@ -27,19 +27,24 @@ cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_ou
 | tanjiro | #2385 | **HyPINO Hypernetwork SRF** | Architecture (hypernetwork) | Mid-training, slower convergence than PirateNet |
 | nezuko | #2386 | **Stagnation Point Constraint** | Physics constraint | Mid-training: underperforming PirateNet at same stage |
 | fern | #2387 | **Bernoulli Velocity-Pressure Constraint** | Physics constraint | ⚠️ Ux MAE anomalously high (16-21 vs typical 4-7) — possible constraint bug |
-| askeladd | #2388 | **Multi-Scale Hierarchical Slice Attention** | Architecture (cross-scale) | Implementing — no W&B runs yet |
-| edward | #2374 | **Hard Kutta TE Constraint v2** | Physics constraint | Implementing v2 (K=2, tandem-only, lower weight) |
-| thorfinn | #2389 | **Arc-Length Positional Encoding** | Architecture (PE) | Implementing — no W&B runs yet |
+| askeladd | **#2391** | **Local Re_x Boundary Layer Feature** | Physics feature (P0) | NEW — arc-length Re_x for p_re recovery, on ANP baseline |
+| edward | #2374 | **Hard Kutta TE Constraint v2** | Physics constraint | Implementing v2 (K=2, tandem-only, lower weight) — pre-ANP code |
+| thorfinn | **#2392** | **DeltaPhi Residual Prediction** | Prediction target (P0) | NEW — predict viscous correction over panel prior, on ANP baseline |
+
+### ⚠️ Note: Pre-ANP experiments
+alphonse (#2384), tanjiro (#2385), nezuko (#2386), fern (#2387), edward (#2374) are running AGAINST THE OLD BASELINE (pre-ANP code, no `--anp_srf`). Their results will be informative for ideas but NOT for merge decisions against the new ANP baseline. When they finish, close and reassign to Round 45 P0/P1 ideas ON the ANP baseline.
 
 ### Recent Merges / Closures
 | PR | Student | Experiment | Result | Action |
 |----|---------|-----------|--------|--------|
 | ✅ **#2379** | frieren | **ANP Cross-Foil Decoder** | **p_tan -59%, p_in -70%, p_oodc -48%, p_re +16%** | **MERGED — new baseline** |
+| ❌ #2388 | askeladd | Multi-Scale Hierarchical | Not started | CLOSED — redundant post-ANP, redirected to Local Re_x |
+| ❌ #2389 | thorfinn | Arc-Length PE | Not started | CLOSED — redirected to DeltaPhi Residual |
 
 ## Human Researcher Directive (Issue #1860)
 
 **Morgan McGuire:** "Too many incremental tweaks — think bigger. Radical new model changes, data aug, data generation."
-**Status:** Acknowledged and actioned. Round 44 has 4 architecture changes + 3 physics constraints. Researcher-agent running to generate Round 45 ideas focused on: (1) synthetic data generation, (2) geometry augmentation, (3) full model replacements. Next idle students will receive genuinely bold assignments, not incremental tweaks.
+**Status:** ACTIONED. ANP breakthrough (p_tan -59%) is exactly the "think bigger" result Morgan wanted. Round 45 ideas generated (12 bold paradigm-shifting ideas in RESEARCH_IDEAS_2026-04-11_ROUND45.md). Two students (askeladd, thorfinn) redirected to P0 ideas on ANP baseline. When remaining pre-ANP experiments finish, students will be reassigned to P0/P1 ideas from the Round 45 slate.
 
 ## Key Insights (Updated 2026-04-11 02:45)
 
@@ -64,19 +69,18 @@ Optimizers: Muon/Gram-NS
 
 ## Next Research Priorities
 
-### Immediate (Round 45 — post-ANP follow-ups)
-1. **Frieren #2390: ANP Re-Conditional Gate** — fix p_re regression while preserving p_tan gains
-2. **Researcher-agent results** (running) — will generate Round 45 bold ideas: synthetic data generation, geometry augmentation, full model changes
+### NOW Active — Round 45 Bold Ideas (on ANP baseline)
+1. **Frieren #2390: ANP Re-Conditional Gate** — fix p_re via Re-proximity gate on cross-attention
+2. **Askeladd: Local Re_x Feature** — arc-length BL Reynolds number, targets p_re (B-GNN paper)
+3. **Thorfinn: DeltaPhi Residual Prediction** — predict viscous correction over panel-method prior (NeurIPS 2025)
 
-### When round 44 finishes (next idle students)
-From researcher-agent RESEARCH_IDEAS (2026-04-11 run):
-- **ANP depth/width sweep** — 8 heads × 384 dim (currently 4×48)
-- **ANP + physics constraints** — combine ANP baseline with Kutta/stagnation/Bernoulli
-- **Tandem Gap/Stagger Mixup Augmentation** — interpolate between configurations during training
-- **Synthetic data generation** via panel method at 10× more configurations
-- **Geometry augmentation** — AoA perturbation ±2°, chord scaling, symmetric flip
-- **GeoMPNN Surface Graph** — fresh geometric graph approach
-- **Bold ideas from researcher-agent** (pending — focused on data generation and full model changes)
+### When pre-ANP experiments finish (assign P0/P1 on ANP baseline)
+**P0:** alphonse → PIDA Chord-Scaling Aug | edward → PIDA Chord-Scaling Aug
+**P1:** fern → DDPM Diffusion Head | tanjiro → AB-UPT Anchor Tokens | nezuko → Displacement Thickness δ*
+**P2 (reserve):** Flow Matching CNF, Low-Fidelity DANN, Spectral GNN, NS-Residual Constraint
 
 ### ⚠️ Watch: fern Bernoulli Constraint (#2387)
-Ux surface MAE anomalously high (16-21 vs typical 4-7). Possible bug in Bernoulli constraint implementation affecting velocity predictions. Monitor — may need to close if not self-correcting.
+Ux MAE anomalously high (16-21 vs typical 4-7). Possible constraint bug. Likely close and reassign to DDPM head.
+
+### ⚠️ ALL future experiments MUST include `--anp_srf`
+The ANP is now part of the baseline. Experiments without it test against an obsolete configuration.
