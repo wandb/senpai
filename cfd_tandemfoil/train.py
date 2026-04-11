@@ -40,6 +40,8 @@ import simple_parsing as sp
 from data.utils import visualize
 from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
 
+torch.set_float32_matmul_precision('high')
+
 
 # ---------------------------------------------------------------------------
 # Transolver model (inlined so students can
@@ -56,6 +58,36 @@ ACTIVATION = {
     "ELU": nn.ELU,
     "silu": nn.SiLU,
 }
+
+
+class GatedMLP(nn.Module):
+    def __init__(self, n_input, n_hidden, n_output, act='gelu'):
+        super().__init__()
+        act_fn = ACTIVATION[act]
+        self.gate_proj = nn.Linear(n_input, n_hidden)
+        self.up_proj = nn.Linear(n_input, n_hidden)
+        self.down_proj = nn.Linear(n_hidden, n_output)
+        self.act = act_fn()
+    def forward(self, x):
+        return self.down_proj(torch.sigmoid(self.gate_proj(x)) * self.act(self.up_proj(x)))
+
+
+class GatedMLP2(nn.Module):
+    """GatedMLP with a residual second gated layer."""
+    def __init__(self, n_input, n_hidden, n_output, act='gelu'):
+        super().__init__()
+        act_fn = ACTIVATION[act]
+        self.gate1 = nn.Linear(n_input, n_hidden)
+        self.up1 = nn.Linear(n_input, n_hidden)
+        self.gate2 = nn.Linear(n_hidden, n_hidden)
+        self.up2 = nn.Linear(n_hidden, n_hidden)
+        self.down = nn.Linear(n_hidden, n_output)
+        self.act = act_fn()
+
+    def forward(self, x):
+        h = torch.sigmoid(self.gate1(x)) * self.act(self.up1(x))
+        h = h + torch.sigmoid(self.gate2(h)) * self.act(self.up2(h))
+        return self.down(h)
 
 
 class MLP(nn.Module):
@@ -84,10 +116,30 @@ class MLP(nn.Module):
         return x
 
 
+class DomainLayerNorm(nn.Module):
+    """Domain-specific LayerNorm: separate weight/bias for single-foil vs tandem (Phase 3 R10)."""
+    def __init__(self, dim, zeroinit=False):
+        super().__init__()
+        self.ln_single = nn.LayerNorm(dim)
+        self.ln_tandem = nn.LayerNorm(dim)
+        if not zeroinit:
+            self.ln_tandem.weight.data.copy_(self.ln_single.weight.data)
+            self.ln_tandem.bias.data.copy_(self.ln_single.bias.data)
+        # zeroinit: tandem defaults to weight=1, bias=0 (LayerNorm default) — identical to copy
+
+    def forward(self, x, is_tandem=None):
+        if is_tandem is None:
+            return self.ln_single(x)
+        mask_t = is_tandem.view(-1, 1, 1).expand_as(x)
+        return torch.where(mask_t, self.ln_tandem(x), self.ln_single(x))
+
+
 class Physics_Attention_Irregular_Mesh(nn.Module):
     """Physics attention for irregular meshes in 1D/2D/3D space."""
 
-    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, slice_num=64,
+                 linear_no_attention=False, learned_kernel=False,
+                 decouple_slice=False, zone_temp=False, prog_slices=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -96,20 +148,45 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
         self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
+        self.tandem_temp_offset = nn.Parameter(torch.zeros(1, heads, 1, 1))
+        self.linear_no_attention = linear_no_attention
+        self.learned_kernel = learned_kernel
+        self.decouple_slice = decouple_slice
+        self.zone_temp = zone_temp
+        self.prog_slices = prog_slices
+        if prog_slices:
+            # Buffer for masking inactive slices; updated per-epoch by training loop
+            self.register_buffer('slice_mask', torch.zeros(slice_num))
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
         self.in_project_slice = nn.Linear(dim_head, slice_num)
         torch.nn.init.orthogonal_(self.in_project_slice.weight)
+        if decouple_slice:
+            # Separate slice projection for tandem samples
+            self.in_project_slice_tandem = nn.Linear(dim_head, slice_num)
+            torch.nn.init.orthogonal_(self.in_project_slice_tandem.weight)
+        if zone_temp:
+            # Zone-aware temperature: learned offset from [is_tandem, gap_mag, re_feat]
+            self.zone_temp_proj = nn.Linear(3, heads)
+            nn.init.zeros_(self.zone_temp_proj.weight)
+            nn.init.zeros_(self.zone_temp_proj.bias)
         self.to_q = nn.Linear(dim_head, dim_head, bias=False)
         self.to_k = nn.Linear(dim_head, dim_head, bias=False)
         self.to_v = nn.Linear(dim_head, dim_head, bias=False)
+        self.slice_residual_scale = nn.Parameter(torch.tensor(0.1))
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout),
         )
+        self.attn_scale = nn.Parameter(torch.ones(1, self.heads, 1, 1) * 10.0)
+        if learned_kernel:
+            self.kernel_mlp = nn.Sequential(
+                nn.Linear(2 * dim_head, dim_head), nn.GELU(),
+                nn.Linear(dim_head, 1),
+            )
 
-    def forward(self, x):
+    def forward(self, x, spatial_bias=None, tandem_mask=None, zone_features=None):
         bsz, num_points, _ = x.shape
 
         fx_mid = (
@@ -124,26 +201,296 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             .permute(0, 2, 1, 3)
             .contiguous()
         )
-        slice_weights = self.softmax(self.in_project_slice(x_mid) / self.temperature)
+        temp = self.temperature
+        if self.zone_temp and zone_features is not None:
+            # zone_features: [B, 3] → per-head offset [B, heads] → [B, heads, 1, 1]
+            zone_offset = self.zone_temp_proj(zone_features).reshape(bsz, self.heads, 1, 1)
+            temp = temp + zone_offset
+        if tandem_mask is not None:
+            temp = (temp + self.tandem_temp_offset * tandem_mask).clamp(min=1e-4)
+        temp = temp.clamp(min=1e-4)
+        if self.decouple_slice and tandem_mask is not None:
+            std_logits = self.in_project_slice(x_mid) / temp
+            tan_logits = self.in_project_slice_tandem(x_mid) / temp
+            is_tan = (tandem_mask > 0.5)  # [B, 1, 1, 1]
+            slice_logits = torch.where(is_tan.expand_as(std_logits), tan_logits, std_logits)
+        else:
+            slice_logits = self.in_project_slice(x_mid) / temp
+        if spatial_bias is not None:
+            slice_logits = slice_logits + 0.1 * spatial_bias.unsqueeze(1)
+        if self.prog_slices:
+            # Apply slice mask: 0 for active slices, -1e9 for inactive (updated each epoch)
+            slice_logits = slice_logits + self.slice_mask
+        slice_weights = self.softmax(slice_logits)
         slice_norm = slice_weights.sum(2)
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
 
-        q_slice_token = self.to_q(slice_token)
-        k_slice_token = self.to_k(slice_token)
-        v_slice_token = self.to_v(slice_token)
-        dropout_p = self.dropout.p if self.training else 0.0
-        out_slice_token = F.scaled_dot_product_attention(
-            q_slice_token,
-            k_slice_token,
-            v_slice_token,
-            dropout_p=dropout_p,
-            is_causal=False,
-        )
+        if self.linear_no_attention:
+            out_slice_token = slice_token
+        else:
+            q_slice_token = self.to_q(slice_token)
+            slice_token_kv = slice_token.mean(dim=1, keepdim=True)
+            k_slice_token = self.to_k(slice_token_kv).expand(-1, self.heads, -1, -1)
+            v_slice_token = self.to_v(slice_token_kv).expand(-1, self.heads, -1, -1)
+            if self.learned_kernel:
+                B, H, S, D = q_slice_token.shape
+                q_exp = q_slice_token.unsqueeze(-2).expand(B, H, S, S, D)
+                k_exp = k_slice_token.unsqueeze(-3).expand(B, H, S, S, D)
+                qk_cat = torch.cat([q_exp, k_exp], dim=-1)
+                attn_logits = self.kernel_mlp(qk_cat).squeeze(-1)
+                attn_weights = F.softmax(attn_logits, dim=-1)
+            else:
+                q_norm = F.normalize(q_slice_token, dim=-1)
+                k_norm = F.normalize(k_slice_token, dim=-1)
+                attn_logits = torch.matmul(q_norm, k_norm.transpose(-2, -1)) * self.attn_scale
+                attn_weights = F.softmax(attn_logits, dim=-1)
+            out_slice_token = torch.matmul(attn_weights, v_slice_token)
+            out_slice_token = out_slice_token + self.slice_residual_scale * slice_token
 
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
         out_x = rearrange(out_x, "b h n d -> b n (h d)")
         return self.to_out(out_x)
+
+
+def compute_te_features(raw_xy, is_surface, saf_norm):
+    """Compute trailing-edge-relative coordinate features.
+
+    Finds the trailing edge (max x-coord among surface nodes) for each foil
+    and computes per-node offsets (dx, dy, radius) from each TE.
+
+    Args:
+        raw_xy:     [B, N, 2] raw (pre-standardization) x, y coordinates
+        is_surface: [B, N] bool
+        saf_norm:   [B, N] norm of raw saf channels (x[:,:,2:4] before normalization)
+                    ≤ 0.005 → foil-1 surface, > 0.005 → foil-2 surface
+
+    Returns: ([B, N, 6], fore_te_x [B], fore_te_y [B])
+             features = [dx_fore, dy_fore, r_fore, dx_aft, dy_aft, r_aft]
+             aft features are zero for single-foil samples
+    """
+    x_coords = raw_xy[:, :, 0]  # [B, N]
+    y_coords = raw_xy[:, :, 1]  # [B, N]
+    INF = 1e6
+
+    # Fore-foil surface (foil-1): saf_norm <= 0.005
+    fore_surf = is_surface & (saf_norm <= 0.005)
+    fore_x_masked = x_coords * fore_surf.float() - INF * (~fore_surf).float()
+    fore_te_idx = fore_x_masked.topk(1, dim=1)[1].squeeze(1)      # [B]
+    fore_te_x = x_coords.gather(1, fore_te_idx.unsqueeze(1)).squeeze(1)  # [B]
+    fore_te_y = y_coords.gather(1, fore_te_idx.unsqueeze(1)).squeeze(1)  # [B]
+
+    # Aft-foil surface (foil-2): saf_norm > 0.005
+    aft_surf = is_surface & (saf_norm > 0.005)
+    is_tandem = aft_surf.any(dim=1).float()[:, None]               # [B, 1]
+    # Safe fallback: use fore_surf when no aft-foil nodes to avoid all-False topk
+    aft_surf_safe = aft_surf | (~aft_surf.any(dim=1, keepdim=True))
+    aft_x_masked = x_coords * aft_surf.float() - INF * (~aft_surf_safe).float()
+    aft_te_idx = aft_x_masked.topk(1, dim=1)[1].squeeze(1)
+    aft_te_x = x_coords.gather(1, aft_te_idx.unsqueeze(1)).squeeze(1) * is_tandem.squeeze(1)
+    aft_te_y = y_coords.gather(1, aft_te_idx.unsqueeze(1)).squeeze(1) * is_tandem.squeeze(1)
+
+    # Per-node offsets from fore TE
+    dx_fore = x_coords - fore_te_x[:, None]
+    dy_fore = y_coords - fore_te_y[:, None]
+    r_fore = (dx_fore ** 2 + dy_fore ** 2).sqrt().clamp(min=1e-6)
+
+    # Per-node offsets from aft TE (zero for single-foil)
+    dx_aft = (x_coords - aft_te_x[:, None]) * is_tandem
+    dy_aft = (y_coords - aft_te_y[:, None]) * is_tandem
+    r_aft = (dx_aft ** 2 + dy_aft ** 2).sqrt().clamp(min=1e-6) * is_tandem
+
+    return torch.stack([dx_fore, dy_fore, r_fore, dx_aft, dy_aft, r_aft], dim=-1), fore_te_x, fore_te_y
+
+
+def compute_wake_deficit_features(raw_xy, is_surface, saf_norm, gap_raw, fore_te_x=None, fore_te_y=None, include_angle=False):
+    """Compute gap-normalized fore-TE offset features for wake coupling.
+
+    Encodes each node's position relative to the fore-foil trailing edge,
+    normalized by the inter-foil gap. This gives dimensionless wake-relative
+    position: (dx/gap, dy/gap) → "how deep into the fore-foil wake am I?"
+
+    Args:
+        raw_xy:        [B, N, 2] raw x, y coordinates
+        is_surface:    [B, N] bool
+        saf_norm:      [B, N] saf channel norm (fore-foil: <= 0.005)
+        gap_raw:       [B] raw gap values (x[:,:,22].mean(dim=1))
+        fore_te_x:     [B] pre-computed fore TE x (if None, recomputes from raw_xy)
+        fore_te_y:     [B] pre-computed fore TE y (if None, recomputes from raw_xy)
+        include_angle: if True, append atan2(dy, dx)/pi as 3rd channel
+
+    Returns: [B, N, 2] = [dx/gap, dy/gap], or [B, N, 3] if include_angle=True,
+             zeroed for single-foil samples
+    """
+    x_coords = raw_xy[:, :, 0]  # [B, N]
+    y_coords = raw_xy[:, :, 1]  # [B, N]
+
+    if fore_te_x is None or fore_te_y is None:
+        INF = 1e6
+        fore_surf = is_surface & (saf_norm <= 0.005)
+        fore_x_masked = x_coords * fore_surf.float() - INF * (~fore_surf).float()
+        fore_te_idx = fore_x_masked.topk(1, dim=1)[1].squeeze(1)
+        fore_te_x = x_coords.gather(1, fore_te_idx.unsqueeze(1)).squeeze(1)
+        fore_te_y = y_coords.gather(1, fore_te_idx.unsqueeze(1)).squeeze(1)
+
+    # Gap-safe division: clamp to avoid div-by-zero on single-foil samples
+    gap_safe = gap_raw.clamp(min=0.05)  # [B]
+
+    # Gap-normalized offsets from fore-foil TE
+    dx_norm = (x_coords - fore_te_x[:, None]) / gap_safe[:, None]  # [B, N]
+    dy_norm = (y_coords - fore_te_y[:, None]) / gap_safe[:, None]  # [B, N]
+
+    # Zero out for single-foil samples (gap ≈ 0 means no tandem)
+    aft_surf = is_surface & (saf_norm > 0.005)
+    is_tandem = aft_surf.any(dim=1).float()[:, None]  # [B, 1]
+    dx_norm = dx_norm * is_tandem
+    dy_norm = dy_norm * is_tandem
+
+    channels = [dx_norm, dy_norm]
+    if include_angle:
+        # Signed polar angle of each node relative to the fore-TE, normalized to [-1, 1]
+        wake_angle = torch.atan2(dy_norm, dx_norm + 1e-8) / torch.pi  # [B, N]
+        wake_angle = wake_angle * is_tandem  # zero for single-foil
+        channels.append(wake_angle)
+
+    return torch.stack(channels, dim=-1)  # [B, N, 2] or [B, N, 3]
+
+
+def compute_cp_panel(raw_xy, aoa_rad, is_surface, saf_norm):
+    """Compute inviscid flat-plate Cp per node as a physics-grounded input feature.
+
+    Uses thin-airfoil theory: Cp = ∓2·sin(α) / sqrt(t·(1-t)) where t is
+    chord-normalized position and sign depends on upper/lower surface.
+
+    Args:
+        raw_xy:     [B, N, 2] raw (pre-standardization) x, y coordinates
+        aoa_rad:    [B, 1] angle of attack in radians
+        is_surface: [B, N] bool mask for surface nodes
+        saf_norm:   [B, N] saf channel norm (fore-foil: <= 0.005)
+
+    Returns: [B, N, 1] inviscid Cp, zero for volume nodes
+    """
+    x_coords = raw_xy[:, :, 0]  # [B, N]
+    y_coords = raw_xy[:, :, 1]  # [B, N]
+
+    # Fore-foil (foil-1) surface: saf_norm <= 0.005
+    fore_surf = is_surface & (saf_norm <= 0.005)
+    # Aft-foil (foil-2) surface: saf_norm > 0.005
+    aft_surf = is_surface & (saf_norm > 0.005)
+
+    # Chord-normalize x separately for each foil
+    INF = 1e6
+    # Fore foil chord normalization
+    fore_x = x_coords.clone()
+    fore_x[~fore_surf] = INF
+    fore_x_min = fore_x.min(dim=1, keepdim=True).values.clamp(max=INF - 1)
+    fore_x[~fore_surf] = -INF
+    fore_x_max = fore_x.max(dim=1, keepdim=True).values.clamp(min=-INF + 1)
+    fore_chord = (fore_x_max - fore_x_min).clamp(min=1e-6)
+    t_fore = ((x_coords - fore_x_min) / fore_chord).clamp(0.02, 0.98)
+
+    # Aft foil chord normalization (if present)
+    aft_x = x_coords.clone()
+    aft_x[~aft_surf] = INF
+    aft_x_min = aft_x.min(dim=1, keepdim=True).values.clamp(max=INF - 1)
+    aft_x[~aft_surf] = -INF
+    aft_x_max = aft_x.max(dim=1, keepdim=True).values.clamp(min=-INF + 1)
+    aft_chord = (aft_x_max - aft_x_min).clamp(min=1e-6)
+    t_aft = ((x_coords - aft_x_min) / aft_chord).clamp(0.02, 0.98)
+
+    # Use aft-foil t for aft-foil nodes, fore-foil t for fore-foil nodes
+    t = torch.where(aft_surf, t_aft, t_fore)
+
+    # Thin-airfoil Cp denominator: sqrt(t * (1-t))
+    denom = torch.sqrt(t * (1.0 - t)).clamp(min=1e-4)
+
+    # Side sign: upper (+y relative to foil centroid) = suction, lower = pressure
+    # Compute per-foil: y relative to foil centroid
+    fore_y_mean = (y_coords * fore_surf.float()).sum(dim=1, keepdim=True) / fore_surf.float().sum(dim=1, keepdim=True).clamp(min=1)
+    aft_y_mean = (y_coords * aft_surf.float()).sum(dim=1, keepdim=True) / aft_surf.float().sum(dim=1, keepdim=True).clamp(min=1)
+    y_ref = torch.where(aft_surf, aft_y_mean, fore_y_mean)
+    side_sign = torch.sign(y_coords - y_ref)
+
+    # Cp = -side_sign * 2 * sin(|AoA|) / denom
+    aoa = aoa_rad.squeeze(-1)  # [B]
+    cp_panel = -side_sign * 2.0 * torch.sin(aoa.abs().unsqueeze(1)) / denom
+
+    # Zero for volume nodes, clamp to physical range
+    cp_panel = cp_panel * is_surface.float()
+    cp_panel = cp_panel.clamp(-4.0, 2.0)
+
+    return cp_panel.unsqueeze(-1)  # [B, N, 1]
+
+
+def compute_vortex_panel_velocity(raw_xy, aoa_rad, is_surface, saf_norm, n_panels=64):
+    """Compute Biot-Savart induced velocity from flat-plate vortex panel representation.
+
+    Distributes N discrete vortex elements uniformly along each foil surface with
+    flat-plate vortex strength Γ = sin(AoA) / N_panels, then sums induced velocity
+    at every mesh node via the 2D Biot-Savart kernel:
+      u_induced = Σ Γ_i/(2π) · Δy_i/r_i²
+      v_induced = Σ -Γ_i/(2π) · Δx_i/r_i²
+
+    Args:
+        raw_xy:     [B, N, 2] raw (pre-standardization) x, y coordinates
+        aoa_rad:    [B, 1] angle of attack in radians (AoA0)
+        is_surface: [B, N] bool mask for surface nodes
+        saf_norm:   [B, N] saf channel norm (fore-foil: <= 0.005, aft-foil: > 0.005)
+        n_panels:   int, panels to subsample per foil (default 64)
+
+    Returns: [B, N, 4] = (u_fore, v_fore, u_aft, v_aft);
+             u_aft, v_aft are zero for single-foil samples
+    """
+    B, N, _ = raw_xy.shape
+    TWO_PI = 2.0 * torch.pi
+
+    fore_surf = is_surface & (saf_norm <= 0.005)  # [B, N]
+    aft_surf = is_surface & (saf_norm > 0.005)    # [B, N]
+    is_tandem = aft_surf.any(dim=1)               # [B]
+
+    # Flat-plate vortex strength: Γ = sin(AoA), divided equally among panels
+    gamma = aoa_rad.sin()  # [B, 1]
+
+    out = torch.zeros(B, N, 4, device=raw_xy.device, dtype=raw_xy.dtype)
+
+    for b in range(B):
+        # Fore foil panels
+        fore_idx = fore_surf[b].nonzero(as_tuple=False).view(-1)  # [M_fore]
+        if fore_idx.numel() > 0:
+            if fore_idx.numel() > n_panels:
+                step = fore_idx.numel() // n_panels
+                panel_idx = fore_idx[::step][:n_panels]
+            else:
+                panel_idx = fore_idx
+            n_p = panel_idx.numel()
+            p_xy = raw_xy[b, panel_idx, :]  # [n_p, 2]
+            # [N, n_p] displacement from each query node to each panel
+            dx = raw_xy[b, :, 0].unsqueeze(1) - p_xy[:, 0].unsqueeze(0)
+            dy = raw_xy[b, :, 1].unsqueeze(1) - p_xy[:, 1].unsqueeze(0)
+            r2 = dx.pow(2) + dy.pow(2) + 1e-8
+            g = gamma[b, 0].item() / n_p  # Γ per panel
+            out[b, :, 0] = (g / TWO_PI) * (dy / r2).sum(dim=1)   # u_fore
+            out[b, :, 1] = -(g / TWO_PI) * (dx / r2).sum(dim=1)  # v_fore
+
+        # Aft foil panels (tandem only)
+        if is_tandem[b]:
+            aft_idx = aft_surf[b].nonzero(as_tuple=False).view(-1)  # [M_aft]
+            if aft_idx.numel() > 0:
+                if aft_idx.numel() > n_panels:
+                    step = aft_idx.numel() // n_panels
+                    panel_idx = aft_idx[::step][:n_panels]
+                else:
+                    panel_idx = aft_idx
+                n_p = panel_idx.numel()
+                p_xy = raw_xy[b, panel_idx, :]  # [n_p, 2]
+                dx = raw_xy[b, :, 0].unsqueeze(1) - p_xy[:, 0].unsqueeze(0)
+                dy = raw_xy[b, :, 1].unsqueeze(1) - p_xy[:, 1].unsqueeze(0)
+                r2 = dx.pow(2) + dy.pow(2) + 1e-8
+                g = gamma[b, 0].item() / n_p
+                out[b, :, 2] = (g / TWO_PI) * (dy / r2).sum(dim=1)   # u_aft
+                out[b, :, 3] = -(g / TWO_PI) * (dx / r2).sum(dim=1)  # v_aft
+
+    return out  # [B, N, 4]
 
 
 class TransolverBlock(nn.Module):
@@ -157,33 +504,403 @@ class TransolverBlock(nn.Module):
         last_layer=False,
         out_dim=1,
         slice_num=32,
+        linear_no_attention=False,
+        learned_kernel=False,
+        field_decoder=False,
+        adaln_output=False,
+        soft_moe=False,
+        adaln_all=False,
+        adaln_cond_dim=2,
+        adaln_zero_init=True,
+        film_cond=False,
+        decouple_slice=False,
+        zone_temp=False,
+        domain_layernorm=False,
+        dln_zeroinit=False,
+        domain_velhead=False,
+        prog_slices=False,
+        pressure_first=False,
+        pressure_no_detach=False,
+        pressure_deep=False,
+        spatial_bias_input_dim=4,
     ):
         super().__init__()
         self.last_layer = last_layer
-        self.ln_1 = nn.LayerNorm(hidden_dim)
+        self.field_decoder = field_decoder
+        self.domain_velhead = domain_velhead
+        self.pressure_first = pressure_first
+        self.pressure_no_detach = pressure_no_detach
+        self.adaln_output = adaln_output
+        self.soft_moe = soft_moe
+        self.adaln_all = adaln_all
+        self.film_cond = film_cond
+        self.domain_layernorm = domain_layernorm
+        _LN = (lambda d: DomainLayerNorm(d, zeroinit=dln_zeroinit)) if domain_layernorm else nn.LayerNorm
+        self.ln_1 = _LN(hidden_dim)
         self.attn = Physics_Attention_Irregular_Mesh(
             hidden_dim,
             heads=num_heads,
             dim_head=hidden_dim // num_heads,
             dropout=dropout,
             slice_num=slice_num,
+            linear_no_attention=linear_no_attention,
+            learned_kernel=learned_kernel,
+            decouple_slice=decouple_slice,
+            zone_temp=zone_temp,
+            prog_slices=prog_slices,
         )
-        self.ln_2 = nn.LayerNorm(hidden_dim)
+        if adaln_all:
+            # AdaLN-Zero: cond → (scale1, bias1, scale2, bias2) for ln_1 and ln_2
+            self.adaln_net = nn.Sequential(
+                nn.Linear(adaln_cond_dim, 128), nn.SiLU(),
+                nn.Linear(128, hidden_dim * 4),
+            )
+            if adaln_zero_init:
+                nn.init.zeros_(self.adaln_net[-1].weight)
+                nn.init.zeros_(self.adaln_net[-1].bias)
+        if film_cond:
+            # FiLM: cond → (gamma, beta) applied after SE layer
+            self.film_net = nn.Sequential(
+                nn.Linear(2, 64), nn.SiLU(),
+                nn.Linear(64, hidden_dim * 2),
+            )
+            nn.init.zeros_(self.film_net[-1].weight)
+            nn.init.zeros_(self.film_net[-1].bias)
+        self.ln_2 = _LN(hidden_dim)
         self.mlp = MLP(hidden_dim, hidden_dim * mlp_ratio, hidden_dim, n_layers=0, res=False, act=act)
+        self.spatial_bias = nn.Sequential(
+            nn.Linear(spatial_bias_input_dim, 64), nn.GELU(),
+            nn.Linear(64, 64), nn.GELU(),
+            nn.Linear(64, slice_num),
+        )
+        nn.init.zeros_(self.spatial_bias[-1].weight)
+        nn.init.zeros_(self.spatial_bias[-1].bias)
+        self.ln_1_post = _LN(hidden_dim)
+        self.ln_2_post = _LN(hidden_dim)
+        self.se_fc1 = nn.Linear(hidden_dim, hidden_dim // 4)
+        self.se_fc2 = nn.Linear(hidden_dim // 4, hidden_dim)
+        nn.init.zeros_(self.se_fc2.weight)
+        nn.init.zeros_(self.se_fc2.bias)
         if self.last_layer:
             self.ln_3 = nn.LayerNorm(hidden_dim)
-            self.mlp2 = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, out_dim),
-            )
+            if soft_moe:
+                self.gate_net = nn.Sequential(nn.Linear(hidden_dim, 2), nn.Softmax(dim=-1))
+                self.expert1 = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+                self.expert2 = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+            elif pressure_first:
+                # Pressure-first: predict p, then condition v on p (takes priority over domain_velhead/field_decoder)
+                if pressure_deep:
+                    self.pres_head = nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(),
+                        nn.Linear(hidden_dim * 2, hidden_dim), nn.GELU(),
+                        nn.Linear(hidden_dim, 1),
+                    )
+                else:
+                    self.pres_head = nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(), nn.Linear(hidden_dim * 2, 1)
+                    )
+                # Velocity head conditioned on predicted pressure: input is hidden_dim + 1
+                self.vel_head_conditioned = nn.Sequential(
+                    nn.Linear(hidden_dim + 1, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2)
+                )
+            elif domain_velhead:
+                # Domain-specific output heads: separate for single-foil vs tandem
+                self.velhead_single = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+                self.velhead_tandem = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+            elif field_decoder:
+                self.vel_head = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2)
+                )
+                self.pres_head = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(), nn.Linear(hidden_dim * 2, 1)
+                )
+            elif adaln_output:
+                self.cond_net = nn.Sequential(nn.Linear(2, hidden_dim * 2), nn.GELU())
+                self.mlp2 = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
+            else:
+                self.mlp2 = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim)
+                )
 
-    def forward(self, fx):
-        fx = self.attn(self.ln_1(fx)) + fx
-        fx = self.mlp(self.ln_2(fx)) + fx
+    def forward(self, fx, raw_xy=None, tandem_mask=None, condition=None, zone_features=None):
+        sb = self.spatial_bias(raw_xy) if raw_xy is not None else None
+        # DomainLayerNorm helper: pass is_tandem when enabled, else plain call
+        dln_it = (tandem_mask.view(-1) > 0.5) if (self.domain_layernorm and tandem_mask is not None) else None
+        if self.domain_layernorm:
+            def _ln(m, x): return m(x, is_tandem=dln_it)
+        else:
+            def _ln(m, x): return m(x)
+        if self.adaln_all and condition is not None:
+            cond_out = self.adaln_net(condition)  # [B, H*4]
+            s1, b1, s2, b2 = cond_out.chunk(4, dim=-1)  # each [B, H]
+            fx_norm = _ln(self.ln_1, fx) * (1 + s1.unsqueeze(1)) + b1.unsqueeze(1)
+            fx = _ln(self.ln_1_post, self.attn(fx_norm, spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            fx_norm = _ln(self.ln_2, fx) * (1 + s2.unsqueeze(1)) + b2.unsqueeze(1)
+            fx = _ln(self.ln_2_post, self.mlp(fx_norm) + fx)
+        else:
+            fx = _ln(self.ln_1_post, self.attn(_ln(self.ln_1, fx), spatial_bias=sb, tandem_mask=tandem_mask, zone_features=zone_features) + fx)
+            fx = _ln(self.ln_2_post, self.mlp(_ln(self.ln_2, fx)) + fx)
+        se = fx.mean(dim=1, keepdim=True)
+        se = F.gelu(self.se_fc1(se))
+        se = torch.sigmoid(self.se_fc2(se))
+        fx = fx * se
+        if self.film_cond and condition is not None:
+            film_out = self.film_net(condition)  # [B, H*2]
+            gamma, beta = film_out.chunk(2, dim=-1)  # each [B, H]
+            fx = gamma.unsqueeze(1) * fx + beta.unsqueeze(1)
         if self.last_layer:
-            return self.mlp2(self.ln_3(fx))
+            fx_ln = self.ln_3(fx)
+            if self.soft_moe:
+                gate = self.gate_net(fx_ln)  # [B, N, 2]
+                return gate[:, :, 0:1] * self.expert1(fx_ln) + gate[:, :, 1:2] * self.expert2(fx_ln)
+            elif self.pressure_first:
+                # Pressure-first: predict p, then condition v on p
+                p_pred = self.pres_head(fx_ln)  # [B, N, 1]
+                p_cond = p_pred if self.pressure_no_detach else p_pred.detach()
+                vel_input = torch.cat([fx_ln, p_cond], dim=-1)  # [B, N, H+1]
+                v_pred = self.vel_head_conditioned(vel_input)  # [B, N, 2]
+                return torch.cat([v_pred, p_pred], dim=-1)
+            elif self.domain_velhead:
+                out_s = self.velhead_single(fx_ln)
+                out_t = self.velhead_tandem(fx_ln)
+                if tandem_mask is not None:
+                    is_tan = (tandem_mask.view(-1) > 0.5).view(-1, 1, 1)
+                    return torch.where(is_tan.expand_as(out_s), out_t, out_s)
+                return out_s
+            elif self.field_decoder:
+                return torch.cat([self.vel_head(fx_ln), self.pres_head(fx_ln)], dim=-1)
+            elif self.adaln_output and condition is not None:
+                cond = self.cond_net(condition)  # [B, 2*H]
+                scale, shift = cond.chunk(2, dim=-1)  # [B, H]
+                fx_ln = fx_ln * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+                return self.mlp2(fx_ln)
+            else:
+                return self.mlp2(fx_ln)
         return fx
+
+
+class SurfaceRefinementHead(nn.Module):
+    """Lightweight MLP that predicts additive corrections for surface nodes.
+
+    Takes the Transolver hidden features (and optionally the base predictions)
+    for surface nodes only, and outputs a residual correction that is added
+    to the main model's predictions at surface locations.
+    """
+
+    def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 128,
+                 n_layers: int = 2, p_only: bool = False):
+        super().__init__()
+        self.p_only = p_only
+        actual_out = 1 if p_only else out_dim  # 1 for pressure-only, 3 for all fields
+        layers: list[nn.Module] = []
+        # Input: hidden features (n_hidden) + base predictions (out_dim)
+        in_dim = n_hidden + out_dim
+        for i in range(n_layers):
+            layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
+            layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.GELU())
+        layers.append(nn.Linear(hidden_dim, actual_out))
+        # Zero-init last layer so refinement starts as identity
+        nn.init.zeros_(layers[-1].weight)
+        nn.init.zeros_(layers[-1].bias)
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            hidden: [M, n_hidden] — hidden features for surface nodes only
+            base_pred: [M, out_dim] — base predictions for surface nodes only
+        Returns:
+            correction: [M, out_dim] — additive correction (zero-padded for p_only)
+        """
+        inp = torch.cat([hidden, base_pred], dim=-1)
+        correction = self.mlp(inp)
+        if self.p_only:
+            # Pad with zeros for velocity channels: [M, 1] → [M, 3]
+            zeros = torch.zeros(correction.shape[0], base_pred.shape[-1] - 1,
+                                device=correction.device, dtype=correction.dtype)
+            correction = torch.cat([zeros, correction], dim=-1)
+        return correction
+
+
+class AftFoilRefinementHead(nn.Module):
+    """Dedicated refinement head for aft-foil (boundary ID=7) surface nodes.
+
+    Optionally applies FiLM conditioning from gap/stagger geometry features.
+    Zero-initialized output layer for safe initialization (identity at start).
+    """
+
+    def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 192,
+                 n_layers: int = 3, film: bool = False):
+        super().__init__()
+        self.film = film
+        in_dim = n_hidden + out_dim
+        layers: list[nn.Module] = []
+        for i in range(n_layers):
+            layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
+            layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.GELU())
+        layers.append(nn.Linear(hidden_dim, out_dim))
+        nn.init.zeros_(layers[-1].weight)
+        nn.init.zeros_(layers[-1].bias)
+        self.mlp = nn.Sequential(*layers)
+        # FiLM modulation from gap/stagger (2-dim condition)
+        if film:
+            self.film_scale = nn.Linear(2, hidden_dim, bias=False)
+            self.film_shift = nn.Linear(2, hidden_dim)
+            nn.init.zeros_(self.film_scale.weight)
+            nn.init.zeros_(self.film_shift.weight)
+            nn.init.zeros_(self.film_shift.bias)
+
+    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor,
+                cond: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Args:
+            hidden: [A, n_hidden] — hidden features for aft-foil nodes
+            base_pred: [A, out_dim] — base predictions for aft-foil nodes
+            cond: [A, 2] — (gap, stagger) per node (only used if film=True)
+        Returns:
+            correction: [A, out_dim] — additive correction
+        """
+        inp = torch.cat([hidden, base_pred], dim=-1)
+        # Run through layers, applying FiLM after first hidden activation
+        x = inp
+        for i, layer in enumerate(self.mlp):
+            x = layer(x)
+            # Apply FiLM after first LayerNorm+GELU (i.e., after index 2)
+            if self.film and cond is not None and i == 2:
+                gamma = self.film_scale(cond)   # [A, hidden_dim]
+                beta = self.film_shift(cond)    # [A, hidden_dim]
+                x = x * (1.0 + gamma) + beta
+        return x
+
+
+class AftFoilRefinementContextHead(nn.Module):
+    """Aft-foil refinement head with KNN volume context for wake pressure recovery.
+
+    For each aft-foil surface node, aggregates hidden states from K nearest
+    volume neighbors, giving the correction head access to upstream wake
+    information. Zero-initialized output for safe initialization.
+    """
+
+    def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 192,
+                 n_layers: int = 3, k_neighbors: int = 8):
+        super().__init__()
+        self.k = k_neighbors
+        # Input: aft surface hidden + volume KNN context + base pred
+        in_dim = n_hidden + n_hidden + out_dim
+        layers: list[nn.Module] = []
+        for i in range(n_layers):
+            layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
+            layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.GELU())
+        layers.append(nn.Linear(hidden_dim, out_dim))
+        nn.init.zeros_(layers[-1].weight)
+        nn.init.zeros_(layers[-1].bias)
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, aft_hidden: torch.Tensor, aft_positions: torch.Tensor,
+                vol_hidden: torch.Tensor, vol_positions: torch.Tensor,
+                aft_base_pred: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            aft_hidden: [A, n_hidden] — hidden features for aft-foil surface nodes
+            aft_positions: [A, 2] — xy coords of aft-foil surface nodes
+            vol_hidden: [V, n_hidden] — hidden features of volume (non-surface) nodes
+            vol_positions: [V, 2] — xy coords of volume nodes
+            aft_base_pred: [A, out_dim] — base predictions for aft-foil nodes
+        Returns:
+            correction: [A, out_dim] — additive correction
+        """
+        k = min(self.k, vol_hidden.shape[0])
+        dists = torch.cdist(aft_positions, vol_positions)  # [A, V]
+        _, nn_idx = dists.topk(k, dim=-1, largest=False)  # [A, k]
+        vol_context = vol_hidden[nn_idx].mean(dim=1)  # [A, n_hidden]
+        inp = torch.cat([aft_hidden, vol_context, aft_base_pred], dim=-1)
+        return self.mlp(inp)
+
+
+class SurfaceRefinementContextHead(nn.Module):
+    """Surface refinement head that incorporates nearest-volume context.
+
+    For each surface node, aggregates features from nearby volume nodes
+    (via mean of K-nearest neighbors) and concatenates with surface features
+    before predicting the correction.
+    """
+
+    def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 128,
+                 n_layers: int = 2, k_neighbors: int = 8):
+        super().__init__()
+        self.k_neighbors = k_neighbors
+        # Input: surface hidden (n_hidden) + volume context (n_hidden) + base pred (out_dim)
+        in_dim = n_hidden * 2 + out_dim
+        layers: list[nn.Module] = []
+        for i in range(n_layers):
+            layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
+            layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.GELU())
+        layers.append(nn.Linear(hidden_dim, out_dim))
+        nn.init.zeros_(layers[-1].weight)
+        nn.init.zeros_(layers[-1].bias)
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, hidden_all: torch.Tensor, base_pred_surf: torch.Tensor,
+                is_surface: torch.Tensor, mask: torch.Tensor,
+                coords: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            hidden_all: [B, N, n_hidden] — all node hidden features
+            base_pred_surf: [B, N, out_dim] — base predictions (all nodes)
+            is_surface: [B, N] — boolean mask for surface nodes
+            mask: [B, N] — valid node mask
+            coords: [B, N, 2] — node xy coordinates
+        Returns:
+            correction: [B, N, out_dim] — additive correction (zero for non-surface)
+        """
+        B, N, H = hidden_all.shape
+        out_dim = base_pred_surf.shape[-1]
+        correction = torch.zeros_like(base_pred_surf)
+
+        vol_mask = mask & ~is_surface  # [B, N]
+
+        for b in range(B):
+            surf_idx = is_surface[b].nonzero(as_tuple=True)[0]  # [M_s]
+            vol_idx = vol_mask[b].nonzero(as_tuple=True)[0]    # [M_v]
+
+            if surf_idx.numel() == 0 or vol_idx.numel() == 0:
+                continue
+
+            surf_coords = coords[b, surf_idx]  # [M_s, 2]
+            vol_coords = coords[b, vol_idx]    # [M_v, 2]
+
+            # K-nearest volume neighbors for each surface node
+            # dists: [M_s, M_v]
+            dists = torch.cdist(surf_coords, vol_coords)  # [M_s, M_v]
+            k = min(self.k_neighbors, vol_idx.numel())
+            _, nn_idx = dists.topk(k, dim=-1, largest=False)  # [M_s, k]
+
+            vol_hidden = hidden_all[b, vol_idx]  # [M_v, H]
+            nn_feats = vol_hidden[nn_idx]  # [M_s, k, H]
+            vol_context = nn_feats.mean(dim=1)  # [M_s, H]
+
+            surf_hidden = hidden_all[b, surf_idx]  # [M_s, H]
+            surf_pred = base_pred_surf[b, surf_idx]  # [M_s, out_dim]
+
+            inp = torch.cat([surf_hidden, vol_context, surf_pred], dim=-1)
+            corr = self.mlp(inp).to(correction.dtype)  # [M_s, out_dim]
+            correction[b, surf_idx] = corr
+
+        return correction
 
 
 class Transolver(nn.Module):
@@ -203,11 +920,38 @@ class Transolver(nn.Module):
         unified_pos=False,
         output_fields: list[str] | None = None,
         output_dims: list[int] | None = None,
+        linear_no_attention=False,
+        learned_kernel=False,
+        field_decoder=False,
+        adaln_output=False,
+        soft_moe=False,
+        uncertainty_loss=False,
+        adaln_all_blocks=False,
+        adaln_4cond=False,
+        adaln_nozero=False,
+        film_cond=False,
+        adaln_decouple=False,
+        adaln_zone_temp=False,
+        domain_layernorm=False,
+        dln_zeroinit=False,
+        domain_velhead=False,
+        prog_slices=False,
+        pressure_first=False,
+        pressure_no_detach=False,
+        pressure_deep=False,
+        gap_stagger_spatial_bias=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
+        self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
+        self.pressure_first = pressure_first
         self.ref = ref
         self.unified_pos = unified_pos
+        self.adaln_output = adaln_output
+        self.adaln_all_blocks = adaln_all_blocks
+        self.adaln_4cond = adaln_4cond
+        self.film_cond = film_cond
+        self.adaln_zone_temp = adaln_zone_temp
         if output_fields is None or output_dims is None:
             raise ValueError("output_fields and output_dims must be provided")
         if len(output_fields) != len(output_dims):
@@ -216,6 +960,11 @@ class Transolver(nn.Module):
             raise ValueError("out_dim must equal sum(output_dims)")
         self.output_fields = output_fields
         self.output_dims = output_dims
+        if uncertainty_loss:
+            self.log_sigma_vol = nn.Parameter(torch.zeros(1))
+            self.log_sigma_surf_ux = nn.Parameter(torch.zeros(1))
+            self.log_sigma_surf_uy = nn.Parameter(torch.zeros(1))
+            self.log_sigma_surf_p = nn.Parameter(torch.zeros(1))
 
         if self.unified_pos:
             self.preprocess = MLP(
@@ -227,10 +976,12 @@ class Transolver(nn.Module):
                 act=act,
             )
         else:
-            self.preprocess = MLP(fun_dim + space_dim, n_hidden * 2, n_hidden, n_layers=0, res=False, act=act)
+            self.preprocess = GatedMLP2(fun_dim + space_dim, n_hidden * 2, n_hidden)
 
         self.n_hidden = n_hidden
         self.space_dim = space_dim
+        self.feature_cross = nn.Linear(fun_dim + space_dim, fun_dim + space_dim, bias=False)
+        nn.init.eye_(self.feature_cross.weight)  # start as identity
         self.blocks = nn.ModuleList(
             [
                 TransolverBlock(
@@ -242,19 +993,65 @@ class Transolver(nn.Module):
                     out_dim=out_dim,
                     slice_num=slice_num,
                     last_layer=(idx == n_layers - 1),
+                    linear_no_attention=linear_no_attention,
+                    learned_kernel=learned_kernel,
+                    field_decoder=field_decoder if (idx == n_layers - 1) else False,
+                    adaln_output=adaln_output if (idx == n_layers - 1) else False,
+                    soft_moe=soft_moe if (idx == n_layers - 1) else False,
+                    adaln_all=adaln_all_blocks,
+                    adaln_cond_dim=4 if adaln_4cond else 2,
+                    adaln_zero_init=not adaln_nozero,
+                    film_cond=film_cond,
+                    decouple_slice=adaln_decouple,
+                    zone_temp=adaln_zone_temp,
+                    domain_layernorm=domain_layernorm,
+                    dln_zeroinit=dln_zeroinit,
+                    domain_velhead=domain_velhead if (idx == n_layers - 1) else False,
+                    prog_slices=prog_slices,
+                    pressure_first=pressure_first if (idx == n_layers - 1) else False,
+                    pressure_no_detach=pressure_no_detach,
+                    pressure_deep=pressure_deep,
+                    spatial_bias_input_dim=6 if gap_stagger_spatial_bias else 4,
                 )
                 for idx in range(n_layers)
             ]
         )
+        # Zero-init the 2 new input columns of spatial_bias so initial routing is unchanged
+        if gap_stagger_spatial_bias:
+            with torch.no_grad():
+                for block in self.blocks:
+                    block.spatial_bias[0].weight[:, 4:].zero_()
+        # Separate pressure pathway (pressure_separate_last_block):
+        # Independent MLP + pres_head that processes shared hidden features
+        self._pressure_separate = False  # set from Config after construction
+        self.pressure_sep_mlp = nn.Sequential(
+            nn.LayerNorm(n_hidden),
+            nn.Linear(n_hidden, n_hidden * 2), nn.GELU(),
+            nn.Linear(n_hidden * 2, n_hidden), nn.GELU(),
+            nn.Linear(n_hidden, 1),
+        )
         self.initialize_weights()
-        self.placeholder = nn.Parameter((1 / n_hidden) * torch.rand(n_hidden, dtype=torch.float))
+        self.out_skip = nn.Linear(n_hidden, out_dim)
+        nn.init.zeros_(self.out_skip.weight)
+        nn.init.zeros_(self.out_skip.bias)
+        self.skip_gate = nn.Sequential(nn.Linear(n_hidden, 1), nn.Sigmoid())
+        nn.init.constant_(self.skip_gate[0].bias, -2.0)  # starts nearly closed
+        self.placeholder_scale = nn.Parameter(torch.ones(n_hidden))
+        self.placeholder_shift = nn.Parameter(torch.zeros(n_hidden))
+        self.re_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.aoa_head = nn.Sequential(nn.Linear(n_hidden, 32), nn.GELU(), nn.Linear(32, 1))
+        self.fourier_freqs_fixed = torch.tensor([0.5, 2.0, 8.0, 32.0])  # non-learnable
+        self.fourier_freqs_learned = nn.Parameter(torch.tensor([1.0, 3.0, 6.0, 16.0]))
 
     def initialize_weights(self):
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            trunc_normal_(module.weight, std=0.02)
+            if module.weight.dim() >= 2:
+                nn.init.orthogonal_(module.weight, gain=1.0)
+            else:
+                nn.init.normal_(module.weight, std=0.01)
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
         elif isinstance(module, (nn.LayerNorm, nn.BatchNorm1d)):
@@ -296,19 +1093,79 @@ class Transolver(nn.Module):
         if condition is not None:
             raise ValueError("Transolver does not support conditioning inputs")
 
+        # Compute internal condition before feature_cross (indices are stable here)
+        use_cond = self.adaln_all_blocks or self.film_cond
+        if use_cond:
+            cond_2 = x[:, 0, 13:15]  # Re, AoA [B, 2]
+            if self.adaln_4cond:
+                gap_feat = x[:, 0, 21:22]  # gap feature [B, 1]
+                # surf_frac: fraction of nodes near a surface (curvature at index 24)
+                surf_frac = (x[:, :, 24].abs() > 0.01).float().mean(dim=1, keepdim=True)  # [B, 1]
+                block_condition = torch.cat([cond_2, gap_feat, surf_frac], dim=-1)  # [B, 4]
+            else:
+                block_condition = cond_2  # [B, 2]
+        else:
+            block_condition = None
+
+        # Compute zone features for zone-aware temperature
+        if self.adaln_zone_temp:
+            is_tandem_scalar = (x[:, 0, 21].abs() > 0.01).float()  # [B]
+            gap_mag = x[:, 0, 21].abs()  # [B]
+            re_feat = x[:, 0, 13]  # [B]
+            zone_features = torch.stack([is_tandem_scalar, gap_mag, re_feat], dim=-1)  # [B, 3]
+        else:
+            zone_features = None
+
         if self.unified_pos:
             if pos is None:
                 raise ValueError("Missing required input tensor: pos")
             new_pos = self.get_grid(pos)
             x = torch.cat((x, new_pos), dim=-1)
 
-        fx = self.preprocess(x)
-        fx = fx + self.placeholder[None, None, :]
+        x_cross = x * self.feature_cross(x)
+        x = x + 0.1 * x_cross  # residual with small scale
+        if self.gap_stagger_spatial_bias:
+            # Gap (idx 22) and stagger (idx 23) are global per-sample scalars; broadcast to all nodes
+            gap_stagger = x[:, 0:1, 22:24].expand(-1, x.shape[1], -1)  # [B, N, 2]
+            raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26], gap_stagger], dim=-1)  # [B, N, 6]
+        else:
+            raw_xy = torch.cat([x[:, :, :2], x[:, :, 24:26]], dim=-1)  # x, y, curvature, dist
 
-        for block in self.blocks:
-            fx = block(fx)
+        # Detect tandem samples via gap feature (index 21); shape [B,1,1,1] for broadcasting
+        is_tandem = (x[:, 0, 21].abs() > 0.01).float()[:, None, None, None]
+
+        fx = self.preprocess(x)
+        fx_pre = fx  # save for skip
+        fx = fx * self.placeholder_scale[None, None, :] + self.placeholder_shift[None, None, :]
+
+        for block in self.blocks[:-1]:
+            fx = block(fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=block_condition, zone_features=zone_features)
+
+        # Deep hidden representation (post all non-last blocks, pre output head)
+        fx_deep = fx  # [B, N, n_hidden]
+
+        # Auxiliary Re prediction from pre-output-head hidden representation
+        re_pred = self.re_head(fx.mean(dim=1))  # [B, 1]
+        aoa_pred = self.aoa_head(fx.mean(dim=1))
+
+        # Last block: use adaln_all condition if enabled, else fallback to adaln_output
+        last_condition = block_condition if use_cond else (x[:, 0, 13:15] if self.adaln_output else None)
+
+        if self._pressure_separate and self.pressure_first:
+            # Separate pressure pathway: independent MLP processes pre-last features
+            fx_for_pressure = fx  # save for separate pressure branch
+            p_sep = self.pressure_sep_mlp(fx_for_pressure)  # [B, N, 1]
+            # Main last block produces vel only (pressure_first still active but p comes from separate branch)
+            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+            # Override: replace the pressure channel from the last block with the separate branch's output
+            fx = torch.cat([fx[:, :, :2], p_sep], dim=-1)
+        else:
+            fx = self.blocks[-1](fx, raw_xy=raw_xy, tandem_mask=is_tandem, condition=last_condition, zone_features=zone_features)
+
+        gate = self.skip_gate(fx_pre)
+        fx = fx + gate * self.out_skip(fx_pre)
         self._validate_output_dims(fx)
-        return {"preds": fx}
+        return {"preds": fx, "re_pred": re_pred, "aoa_pred": aoa_pred, "hidden": fx_deep}
 
 
 # ---------------------------------------------------------------------------
@@ -316,25 +1173,168 @@ class Transolver(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-MAX_TIMEOUT = float(os.environ.get("SENPAI_TIMEOUT_MINUTES", "30.0"))  # minutes
-MAX_EPOCHS = int(os.environ.get("SENPAI_MAX_EPOCHS", "50"))
+MAX_TIMEOUT = 180.0  # minutes
+MAX_EPOCHS = 500
 
 
 @dataclass
 class Config:
-    lr: float = 5e-4
-    weight_decay: float = 1e-4
+    lr: float = 1.5e-3
+    weight_decay: float = 0.0
     batch_size: int = 4
-    surf_weight: float = 10.0
+    surf_weight: float = 20.0
     manifest: str = "data/split_manifest.json"
     stats_file: str = "data/split_stats.json"
     wandb_group: str | None = None
     wandb_name: str | None = None
     agent: str | None = None
     debug: bool = False
+    # Schedule params (tuned for 3-hour / 500-epoch runs)
+    warmup_total_iters: int = 20
+    warmup_start_factor: float = 0.2
+    cosine_T_max: int = 230
+    cosine_eta_min: float = 1e-5
+    ema_start_epoch: int = 140
+    ema_decay: float = 0.998
+    temp_anneal_epoch: int = 50
+    vol_ramp_epochs: int = 40
+    tandem_curriculum_epochs: int = 10
+    noise_anneal_epochs: int = 60
+    scheduler_type: str = "sequential"  # "sequential", "warm_restarts", "onecycle"
+    cosine_T_0: int = 50       # warm_restarts only
+    cosine_T_mult: int = 2     # warm_restarts only
+    onecycle_max_lr: float = 3e-3        # onecycle only
+    onecycle_epochs: int = 200           # onecycle only
+    onecycle_pct_start: float = 0.15    # onecycle only
+    onecycle_div_factor: float = 10.0   # onecycle only
+    onecycle_final_div_factor: float = 100.0  # onecycle only
+    use_lookahead: bool = True
+    # Architecture flags (one per GPU)
+    linear_no_attention: bool = False  # GPU0: skip Q/K/V in slice attention
+    field_decoder: bool = False        # GPU1: separate vel/pres output heads
+    learned_kernel: bool = False       # GPU2: MLP attention kernel
+    uncertainty_loss: bool = False     # GPU3: Kendall uncertainty weighting
+    swad: bool = False                 # GPU4: SWAD weight averaging
+    boundary_aware: bool = False       # GPU5: upweight near-wall volume nodes
+    adaln_output: bool = False         # GPU6: AdaLN on output head
+    soft_moe: bool = False             # GPU7: Soft MoE output
+    # Phase 2 R4: AdaLN-Zero all blocks
+    n_hidden: int = 192                # model width (override default)
+    adaln_all_blocks: bool = False     # AdaLN-Zero on ALL TransolverBlocks
+    adaln_4cond: bool = False          # use 4-dim condition (Re, AoA, gap, surf_frac)
+    adaln_decouple: bool = False       # decoupled slice assignment for tandem
+    adaln_nozero: bool = False         # ablation: no zero-init on adaln projection
+    adaln_sam: bool = False            # SAM optimizer in last 25% of training
+    film_cond: bool = False            # FiLM conditioning (simpler alternative to AdaLN)
+    adaln_zone_temp: bool = False      # zone-aware temperature modulation
+    # Phase 2 R5: tandem warm-in combinations
+    tandem_ramp: bool = False          # gradual tandem surface loss warm-in (0→1 over epochs 10-50)
+    foil2_dist: bool = False           # explicit foil-2 distance feature (from secondary dsdf)
+    slice_num: int = 48                # slice count (default 48, GPU6: 96)
+    # Phase 3: training dynamics experiments
+    swa: bool = False             # GPU 0/6: uniform SWA weight averaging
+    swa_start_epoch: int = 200   # epoch to start SWA (GPU 0: 200, GPU 6: 160)
+    grad_accum_steps: int = 1    # GPU 2: gradient accumulation (step every N batches)
+    half_target_noise: bool = False  # GPU 3: reduce target noise by 50%
+    no_target_noise: bool = False    # Phase 4: completely disable target noise injection
+    use_lion: bool = False        # GPU 4: Lion optimizer instead of AdamW
+    rdrop: bool = False           # GPU 7: R-drop regularization
+    rdrop_alpha: float = 1.0     # R-drop consistency loss weight
+    # Phase 3 R3: normalization/prediction-space experiments
+    no_perstd: bool = False           # GPU 0: remove per-sample std norm entirely
+    no_perstd_p: bool = False         # GPU 1: remove per-sample std for pressure only
+    unified_clamps: bool = False      # GPU 2: unified clamps (0.2, 0.2, 0.7) for all
+    high_p_clamp: bool = False        # GPU 3: higher pressure clamp (2.0)
+    multiply_std: bool = False        # GPU 4: multiply instead of divide per-sample std
+    raw_targets: bool = False         # GPU 5: skip physics norm, raw target space
+    tight_denorm_clamps: bool = False  # GPU 6: tighter denorm clamps [-5,5]/[-10,10]
+    log_pressure: bool = False        # GPU 7: log-transform Cp pressure channel
+    # Phase 3: compound experiments
+    seed: int = -1                     # random seed (-1 = no seeding)
+    n_layers: int = 2                  # number of TransolverBlocks (default 2)
+    # Phase 3: data augmentation (training-only)
+    aug: str = "none"  # none|yflip|jitter|featdrop|mixup|scale|flip_jitter|aoa_perturb|cutmix
+    aug_scale_range: float = 0.05   # half-range for scale augmentation (default ±5%)
+    aug_start_epoch: int = 0        # delay augmentation onset until this epoch
+    aug_full_dsdf_rot: bool = False  # also rotate DSDF gradient pairs in aoa_perturb
+    aug_gap_stagger_sigma: float = 0.0  # std of Gaussian noise added to gap/stagger features (0=disabled)
+    aug_dsdf2_sigma: float = 0.0        # log-normal scale for foil-2 DSDF magnitude aug (0=disabled, tandem only)
+    gap_stagger_spatial_bias: bool = False  # condition spatial bias MLP on gap/stagger (tandem geometry-aware routing)
+    dct_freq_loss: bool = False   # DCT frequency-weighted auxiliary loss on surface pressure
+    dct_freq_weight: float = 0.05 # weight for DCT freq loss
+    dct_freq_gamma: float = 2.0   # frequency upweighting strength
+    dct_freq_alpha: float = 1.5   # frequency exponent
+    # Phase 3 R10: DomainLayerNorm compounds
+    domain_layernorm: bool = False     # domain-specific LayerNorm for single vs tandem
+    dln_zeroinit: bool = False         # zero-init tandem LN weights (else copy from single)
+    domain_velhead: bool = False       # domain-specific output heads for single vs tandem
+    prog_slices: bool = False          # progressive slice warmup
+    prog_slices_end: int = 128         # max slice count for prog_slices
+    prog_slices_epochs: int = 100      # epochs to ramp slice_num → prog_slices_end
+    # Phase 3 R11: SWA / snapshot ensemble / EMA tuning
+    swa_cyclic: bool = False           # GPU 0/1: SWA with cyclic LR warm restarts
+    swa_cyclic_T: int = 40             # warm-restart cycle period in epochs
+    swa_cyclic_start: int = 100        # epoch to switch from cosine to cyclic schedule
+    two_phase_lr: bool = False         # GPU 5: lr=3e-4 for phase1, then lr=1e-4
+    two_phase_switch_epoch: int = 100  # epoch at which to switch phases
+    two_phase_lr_1: float = 3e-4       # phase 1 LR (overrides cfg.lr when active)
+    two_phase_lr_2: float = 1e-4       # phase 2 LR
+    snapshot_ensemble: bool = False    # GPU 6: average checkpoints at fixed epochs
+    snapshot_epochs_str: str = "120,160,200"  # comma-separated snapshot epochs
+    # Phase 4: throughput optimization
+    val_every: int = 1                  # validate every N epochs (1 = every epoch)
+    disable_pcgrad: bool = False        # skip PCGrad dual-backward, use simple combined loss
+    vol_subsample_frac: float = 1.0     # fraction of volume nodes in loss after vol_ramp (0.8 = 80%)
+    compile_mode: str = "default"       # torch.compile mode: "default", "max-autotune", "reduce-overhead"
+    num_workers: int = 4                # data loader workers
+    # Phase 4: Pressure-first sequential prediction
+    pressure_first: bool = False        # predict p first, then condition v on p
+    pressure_no_detach: bool = False    # allow gradient from vel back to pres head
+    pressure_deep: bool = False         # 3-layer pressure head instead of 2
+    pressure_separate_last_block: bool = False  # separate last TransolverBlock for pressure
+    # Phase 5: Residual prediction
+    residual_prediction: bool = False   # predict residual from freestream instead of full field
+    # Phase 5: Surface refinement head — additive correction MLP on surface nodes
+    surface_refine: bool = False              # enable surface refinement head
+    surface_refine_hidden: int = 128          # hidden dimension of refinement MLP
+    surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
+    surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
+    surface_refine_context: bool = False      # use surface + nearest-volume context features
+    # Phase 6: Asinh pressure transform
+    asinh_pressure: bool = False             # transform pressure targets with asinh for dynamic range compression
+    asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
+    # Phase 6: Adaptive per-channel target normalization
+    adaptive_norm: bool = False              # use per-channel running-mean/std normalization instead of physics-based
+    # Phase 6: Dedicated aft-foil surface refinement head (boundary ID=7 nodes only)
+    aft_foil_srf: bool = False               # enable second SRF head for aft-foil (ID=7) nodes
+    aft_foil_srf_film: bool = False          # FiLM conditioning on gap/stagger for aft-foil head
+    aft_foil_srf_hidden: int = 192           # hidden dim for aft-foil refinement head
+    aft_foil_srf_layers: int = 3             # number of hidden layers for aft-foil refinement head
+    aft_foil_srf_context: bool = False       # KNN volume context for aft-foil SRF (wake pressure recovery)
+    # Phase 6: 3-way PCGrad — gradient surgery with single-foil | tandem-normal | tandem-extreme-Re
+    pcgrad_3way: bool = False               # enable 3-way gradient surgery (requires --disable_pcgrad)
+    pcgrad_extreme_pct: float = 0.15        # top/bottom Re percentile among tandem samples to label as extreme
+    te_coord_frame: bool = False            # trailing-edge-relative coordinate features (+6 input channels)
+    wake_deficit_feature: bool = False      # gap-normalized fore-TE offset for wake coupling (+2 input channels)
+    wake_angle_feature: bool = False        # add atan2(dy/gap, dx/gap)/pi as 3rd wake channel (+1 input channel)
+    # Re-stratified sampling
+    re_stratified_sampling: bool = False    # upweight extreme-Re training samples
+    re_extreme_weight: float = 2.0         # weight multiplier for extreme-Re samples (top/bottom 20th pctile)
+    # Panel-method Cp feature: inviscid Cp as physics-grounded input (+1 input channel)
+    cp_panel: bool = False                 # append thin-airfoil inviscid Cp to input features
+    cp_panel_tandem_only: bool = False     # zero Cp feature for single-foil samples (tandem benefit only)
+    cp_panel_scale: float = 1.0            # scale factor for panel Cp feature (0.1 = weak hint)
+    # Vortex-panel induced velocity: per-node Biot-Savart feature from flat-plate theory (+4 input channels)
+    vortex_panel_velocity: bool = False    # append (u_fore, v_fore, u_aft, v_aft) induced velocity
+    vortex_panel_scale: float = 0.1        # scale factor for vortex velocity channels
+    vortex_panel_n: int = 64              # number of panels to subsample per foil
 
 
 cfg = sp.parse(Config)
+
+if cfg.seed >= 0:
+    torch.manual_seed(cfg.seed)
+    torch.cuda.manual_seed_all(cfg.seed)
 
 if cfg.debug:
     MAX_EPOCHS = 3
@@ -380,13 +1380,28 @@ def _phys_norm(y, Umag, q):
 def _phys_denorm(y_p, Umag, q):
     """Reverse physics normalization: Ux/Umag→Ux, Uy/Umag→Uy, Cp→p."""
     y = y_p.clone()
-    y[:, :, 0:1] = y_p[:, :, 0:1].clamp(-50, 50) * Umag
-    y[:, :, 1:2] = y_p[:, :, 1:2].clamp(-50, 50) * Umag
-    y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-100, 100) * q
+    y[:, :, 0:1] = y_p[:, :, 0:1].clamp(-10, 10) * Umag
+    y[:, :, 1:2] = y_p[:, :, 1:2].clamp(-10, 10) * Umag
+    y[:, :, 2:3] = y_p[:, :, 2:3].clamp(-20, 20) * q
     return y
 
-loader_kwargs = dict(collate_fn=pad_collate, num_workers=4, pin_memory=True,
+loader_kwargs = dict(collate_fn=pad_collate, num_workers=cfg.num_workers, pin_memory=True,
                      persistent_workers=True, prefetch_factor=2)
+
+if cfg.re_stratified_sampling and not cfg.debug:
+    # Re-stratified sampling: upweight extreme-Re samples in the training set
+    # Extract log_Re from each training sample (x feature index 13)
+    _train_log_re = torch.tensor([train_ds[i][0][0, 13].item() for i in range(len(train_ds))])
+    _re_low = torch.quantile(_train_log_re.float(), 0.2).item()
+    _re_high = torch.quantile(_train_log_re.float(), 0.8).item()
+    _re_extreme = (_train_log_re < _re_low) | (_train_log_re > _re_high)
+    _re_weights = torch.where(_re_extreme, cfg.re_extreme_weight, 1.0).double()
+    # Multiply with existing domain weights (don't replace)
+    sample_weights = sample_weights * _re_weights
+    _n_extreme = _re_extreme.sum().item()
+    print(f"Re-stratified sampling: {_n_extreme}/{len(train_ds)} extreme-Re samples "
+          f"({_n_extreme/len(train_ds)*100:.1f}%) upweighted {cfg.re_extreme_weight}x "
+          f"(log_Re thresholds: [{_re_low:.3f}, {_re_high:.3f}])")
 
 if cfg.debug:
     # Avoid sampler/length mismatch when train_ds is truncated
@@ -406,24 +1421,348 @@ val_loaders = {
     for name, subset in val_splits.items()
 }
 
+# --- Physics normalization stats (computed over training set) ---
+# Compute mean/std of Cp-normalized targets so the model sees O(1) values.
+print("Computing physics normalization stats...")
+_phys_sum = torch.zeros(3, device=device)
+_phys_sq_sum = torch.zeros(3, device=device)
+_phys_n = 0.0
+_stats_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
+with torch.no_grad():
+    for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc="Phys stats", leave=False):
+        _y, _mask = _y.to(device), _mask.to(device)
+        _Um, _q = _umag_q(_y, _mask)
+        _yp = _phys_norm(_y, _Um, _q)
+        if cfg.log_pressure:
+            _yp = _yp.clone()
+            _yp[:, :, 2:3] = _yp[:, :, 2:3].abs().add(1).log() * _yp[:, :, 2:3].sign()
+        if cfg.asinh_pressure:
+            _yp = _yp.clone()
+            _yp[:, :, 2:3] = torch.asinh(_yp[:, :, 2:3] * cfg.asinh_scale)
+        _m = _mask.float().unsqueeze(-1)  # [B, N, 1]
+        _phys_sum += (_yp * _m).sum(dim=(0, 1))
+        _phys_sq_sum += (_yp ** 2 * _m).sum(dim=(0, 1))
+        _phys_n += _mask.float().sum().item()
+_pmean = (_phys_sum / _phys_n).float()
+_pstd = ((_phys_sq_sum / _phys_n - _pmean ** 2).clamp(min=0.0).sqrt()).clamp(min=1e-6).float()
+phys_stats = {"y_mean": _pmean, "y_std": _pstd}
+print(f"  Cp stats — mean: {_pmean.tolist()}, std: {_pstd.tolist()}")
+
+if cfg.raw_targets or cfg.adaptive_norm:
+    _label = "Adaptive norm" if cfg.adaptive_norm else "Raw"
+    print(f"Computing {_label} target stats (no physics normalization)...")
+    _raw_sum = torch.zeros(3, device=device)
+    _raw_sq_sum = torch.zeros(3, device=device)
+    _raw_n = 0.0
+    with torch.no_grad():
+        for _x, _y, _is_surf, _mask in tqdm(_stats_loader, desc=f"{_label} stats", leave=False):
+            _y, _mask = _y.to(device), _mask.to(device)
+            _yt = _y.clone()
+            if cfg.adaptive_norm and cfg.asinh_pressure:
+                _yt[:, :, 2:3] = torch.asinh(_yt[:, :, 2:3] * cfg.asinh_scale)
+            _m = _mask.float().unsqueeze(-1)
+            _raw_sum += (_yt * _m).sum(dim=(0, 1))
+            _raw_sq_sum += (_yt ** 2 * _m).sum(dim=(0, 1))
+            _raw_n += _mask.float().sum().item()
+    _raw_mean = (_raw_sum / _raw_n).float()
+    _raw_std = ((_raw_sq_sum / _raw_n - _raw_mean ** 2).clamp(min=0.0).sqrt()).clamp(min=1e-6).float()
+    raw_stats = {"y_mean": _raw_mean, "y_std": _raw_std}
+    print(f"  {_label} stats — mean: {_raw_mean.tolist()}, std: {_raw_std.tolist()}")
+else:
+    raw_stats = None
+
 model_config = dict(
     space_dim=2,
-    fun_dim=X_DIM - 2,  # X_DIM=24; fun_dim + space_dim must equal x.shape[-1]
+    fun_dim=X_DIM - 2 + 2 + (1 if cfg.foil2_dist else 0) + (6 if cfg.te_coord_frame else 0) + (2 if cfg.wake_deficit_feature else 0) + (1 if cfg.wake_angle_feature else 0) + 32 + (1 if cfg.cp_panel else 0) + (4 if cfg.vortex_panel_velocity else 0),  # +curv, +dist, [+foil2dist], [+te_feats], [+wake_deficit], [+wake_angle], +32 fourier PE, [+cp_panel], [+vortex_panel]
     out_dim=3,
-    n_hidden=128,
-    n_layers=5,
-    n_head=4,
-    slice_num=64,
+    n_hidden=cfg.n_hidden,
+    n_layers=cfg.n_layers,
+    n_head=3,
+    slice_num=cfg.prog_slices_end if cfg.prog_slices else cfg.slice_num,
     mlp_ratio=2,
+    dropout=0.05 if cfg.rdrop else 0.0,
     output_fields=["Ux", "Uy", "p"],
     output_dims=[1, 1, 1],
+    linear_no_attention=cfg.linear_no_attention,
+    learned_kernel=cfg.learned_kernel,
+    field_decoder=cfg.field_decoder,
+    adaln_output=cfg.adaln_output,
+    soft_moe=cfg.soft_moe,
+    uncertainty_loss=cfg.uncertainty_loss,
+    adaln_all_blocks=cfg.adaln_all_blocks,
+    adaln_4cond=cfg.adaln_4cond,
+    adaln_nozero=cfg.adaln_nozero,
+    film_cond=cfg.film_cond,
+    adaln_decouple=cfg.adaln_decouple,
+    adaln_zone_temp=cfg.adaln_zone_temp,
+    domain_layernorm=cfg.domain_layernorm,
+    dln_zeroinit=cfg.dln_zeroinit,
+    domain_velhead=cfg.domain_velhead,
+    prog_slices=cfg.prog_slices,
+    pressure_first=cfg.pressure_first,
+    pressure_no_detach=cfg.pressure_no_detach,
+    pressure_deep=cfg.pressure_deep,
+    gap_stagger_spatial_bias=cfg.gap_stagger_spatial_bias,
 )
 
 model = Transolver(**model_config).to(device)
+model._pressure_separate = cfg.pressure_separate_last_block
+torch._functorch.config.donated_buffer = False  # required for retain_graph=True in PCGrad
+model = torch.compile(model, mode=cfg.compile_mode)
+_base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+
+# Surface refinement head (separate module, not compiled with main model)
+refine_head = None
+if cfg.surface_refine:
+    if cfg.surface_refine_context:
+        refine_head = SurfaceRefinementContextHead(
+            n_hidden=cfg.n_hidden,
+            out_dim=3,
+            hidden_dim=cfg.surface_refine_hidden,
+            n_layers=cfg.surface_refine_layers,
+            k_neighbors=8,
+        ).to(device)
+    else:
+        refine_head = SurfaceRefinementHead(
+            n_hidden=cfg.n_hidden,
+            out_dim=3,
+            hidden_dim=cfg.surface_refine_hidden,
+            n_layers=cfg.surface_refine_layers,
+            p_only=cfg.surface_refine_p_only,
+        ).to(device)
+    refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
+    _refine_n_params = sum(p.numel() for p in refine_head.parameters())
+    print(f"Surface refinement head: {_refine_n_params:,} params "
+          f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
+          f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
+
+# Aft-foil (boundary ID=7) dedicated refinement head
+aft_srf_head = None
+aft_srf_ctx_head = None
+if cfg.aft_foil_srf:
+    if cfg.aft_foil_srf_context:
+        aft_srf_ctx_head = AftFoilRefinementContextHead(
+            n_hidden=cfg.n_hidden,
+            out_dim=3,
+            hidden_dim=cfg.aft_foil_srf_hidden,
+            n_layers=cfg.aft_foil_srf_layers,
+            k_neighbors=8,
+        ).to(device)
+        aft_srf_ctx_head = torch.compile(aft_srf_ctx_head, mode=cfg.compile_mode)
+        _aft_n_params = sum(p.numel() for p in aft_srf_ctx_head.parameters())
+        print(f"Aft-foil SRF context head: {_aft_n_params:,} params "
+              f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, k=8)")
+    else:
+        aft_srf_head = AftFoilRefinementHead(
+            n_hidden=cfg.n_hidden,
+            out_dim=3,
+            hidden_dim=cfg.aft_foil_srf_hidden,
+            n_layers=cfg.aft_foil_srf_layers,
+            film=cfg.aft_foil_srf_film,
+        ).to(device)
+        aft_srf_head = torch.compile(aft_srf_head, mode=cfg.compile_mode)
+        _aft_n_params = sum(p.numel() for p in aft_srf_head.parameters())
+        print(f"Aft-foil SRF head: {_aft_n_params:,} params "
+              f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, "
+              f"film={cfg.aft_foil_srf_film})")
+
+from copy import deepcopy
+ema_model = None
+ema_refine_head = None  # EMA copy of refinement head
+ema_aft_srf_head = None  # EMA copy of aft-foil SRF head
+swad_initial_val = None
+swad_prev_val = float("inf")
+swad_checkpoints: list = []
+swad_collecting = False
+swad_done = False
+swa_model = None
+swa_n = 0
+swa_cyclic_model = None
+swa_cyclic_n = 0
+swa_cyclic_scheduler = None
+snapshot_avg_model = None
+snapshot_n = 0
+snapshot_epoch_list = [int(e) for e in cfg.snapshot_epochs_str.split(",")] if cfg.snapshot_ensemble else []
 
 n_params = sum(p.numel() for p in model.parameters())
-optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
+if refine_head is not None:
+    n_params += sum(p.numel() for p in refine_head.parameters())
+if aft_srf_head is not None:
+    n_params += sum(p.numel() for p in aft_srf_head.parameters())
+if aft_srf_ctx_head is not None:
+    n_params += sum(p.numel() for p in aft_srf_ctx_head.parameters())
+
+
+class SAM:
+    """Sharpness-Aware Minimization (Foret et al., 2021).
+
+    Usage:
+        sam.perturb()          # perturb params in gradient direction
+        recompute loss/backward
+        sam.restore_and_step() # restore params, then call base_optimizer.step()
+    """
+    def __init__(self, base_optimizer, rho=0.05):
+        self.base_optimizer = base_optimizer
+        self.rho = rho
+
+    @property
+    def param_groups(self):
+        return self.base_optimizer.param_groups
+
+    def zero_grad(self):
+        self.base_optimizer.zero_grad()
+
+    def _grad_norm(self):
+        norms = [
+            p.grad.norm(2)
+            for group in self.param_groups
+            for p in group['params']
+            if p.grad is not None
+        ]
+        return torch.stack(norms).norm(2) if norms else torch.tensor(0.0)
+
+    def perturb(self):
+        scale = self.rho / (self._grad_norm() + 1e-12)
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is not None:
+                    p._sam_e_w = (p.grad * scale).detach()
+                    p.data.add_(p._sam_e_w)
+
+    def restore(self):
+        for group in self.param_groups:
+            for p in group['params']:
+                if hasattr(p, '_sam_e_w'):
+                    p.data.sub_(p._sam_e_w)
+                    del p._sam_e_w
+
+
+class Lion(torch.optim.Optimizer):
+    """Lion optimizer (Chen et al., 2023). Sign-based updates, ~2x less memory than AdamW.
+
+    Use lr ~3-10x lower than AdamW (e.g. lr=3e-4 instead of 1.5e-3).
+    """
+    def __init__(self, params, lr=3e-4, betas=(0.9, 0.99), weight_decay=0.0):
+        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if 'exp_avg' not in state:
+                    state['exp_avg'] = torch.zeros_like(p.data)
+                exp_avg = state['exp_avg']
+                b1, b2 = group['betas']
+                update = exp_avg * b1 + p.grad * (1 - b1)
+                p.data.add_(update.sign(), alpha=-group['lr'])
+                if group['weight_decay'] > 0:
+                    p.data.mul_(1 - group['lr'] * group['weight_decay'])
+                exp_avg.mul_(b2).add_(p.grad, alpha=1 - b2)
+        return loss
+
+
+class Lookahead:
+    def __init__(self, base_optimizer, k=5, alpha=0.5):
+        self.base_optimizer = base_optimizer
+        self.k = k
+        self.alpha = alpha
+        self.slow_params = [
+            [p.data.clone() for p in group['params']]
+            for group in base_optimizer.param_groups
+        ]
+        self.step_count = 0
+
+    def step(self):
+        self.base_optimizer.step()
+        self.step_count += 1
+        if self.step_count % self.k == 0:
+            for slow, group in zip(self.slow_params, self.base_optimizer.param_groups):
+                for s, p in zip(slow, group['params']):
+                    s.data.add_(self.alpha * (p.data - s.data))
+                    p.data.copy_(s.data)
+
+    def zero_grad(self):
+        self.base_optimizer.zero_grad()
+
+    @property
+    def param_groups(self):
+        return self.base_optimizer.param_groups
+
+
+attn_params = [p for n, p in model.named_parameters() if any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+other_params = [p for n, p in model.named_parameters() if not any(k in n for k in ['Wqkv', 'temperature', 'slice_weight', 'attn_scale', 'spatial_bias'])]
+_base_lr = cfg.two_phase_lr_1 if cfg.two_phase_lr else cfg.lr
+if cfg.use_lion:
+    base_opt = Lion([
+        {'params': attn_params, 'lr': _base_lr * 0.5},
+        {'params': other_params, 'lr': _base_lr}
+    ], weight_decay=cfg.weight_decay)
+    optimizer = base_opt  # Lion has its own momentum; skip Lookahead
+else:
+    base_opt = torch.optim.AdamW([
+        {'params': attn_params, 'lr': _base_lr * 0.5},
+        {'params': other_params, 'lr': _base_lr}
+    ], weight_decay=cfg.weight_decay)
+    if cfg.use_lookahead:
+        optimizer = Lookahead(base_opt, k=10, alpha=0.8)
+    else:
+        optimizer = base_opt
+
+# Add refinement head params to optimizer if enabled
+if refine_head is not None:
+    _refine_params = list(refine_head.parameters())
+    base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
+
+# Add aft-foil SRF head params to optimizer if enabled
+if aft_srf_head is not None:
+    _aft_params = list(aft_srf_head.parameters())
+    base_opt.add_param_group({'params': _aft_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _aft_params):,} aft-foil SRF head params to optimizer")
+if aft_srf_ctx_head is not None:
+    _ctx_params = list(aft_srf_ctx_head.parameters())
+    base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
+
+sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
+if cfg.scheduler_type == "warm_restarts":
+    _warmup = torch.optim.lr_scheduler.LinearLR(base_opt, start_factor=0.1, total_iters=10)
+    _restarts = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        base_opt, T_0=cfg.cosine_T_0, T_mult=cfg.cosine_T_mult, eta_min=cfg.cosine_eta_min
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        base_opt, schedulers=[_warmup, _restarts], milestones=[10]
+    )
+elif cfg.scheduler_type == "onecycle":
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        base_opt,
+        max_lr=[cfg.onecycle_max_lr * 0.5, cfg.onecycle_max_lr],
+        epochs=cfg.onecycle_epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=cfg.onecycle_pct_start,
+        div_factor=cfg.onecycle_div_factor,
+        final_div_factor=cfg.onecycle_final_div_factor,
+    )
+else:  # sequential (default)
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        base_opt, start_factor=cfg.warmup_start_factor, total_iters=cfg.warmup_total_iters
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        base_opt, T_max=cfg.cosine_T_max, eta_min=cfg.cosine_eta_min
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        base_opt, schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[cfg.warmup_total_iters]
+    )
+step_scheduler_per_batch = (cfg.scheduler_type == "onecycle")
 
 # --- wandb ---
 run = wandb.init(
@@ -453,6 +1792,13 @@ wandb.define_metric("lr", step_metric="global_step")
 wandb.define_metric("epoch_time_s", step_metric="global_step")
 wandb.define_metric("val_predictions", step_metric="global_step")
 
+if cfg.re_stratified_sampling and '_train_log_re' in dir():
+    wandb.log({"re_stratification/log_re_histogram": wandb.Histogram(_train_log_re.numpy()),
+               "re_stratification/n_extreme": _n_extreme,
+               "re_stratification/pct_extreme": _n_extreme / len(train_ds) * 100,
+               "re_stratification/re_low_thresh": _re_low,
+               "re_stratification/re_high_thresh": _re_high})
+
 model_dir = Path(f"models/model-{run.id}")
 model_dir.mkdir(parents=True)
 model_path = model_dir / "checkpoint.pt"
@@ -460,9 +1806,15 @@ with open(model_dir / "config.yaml", "w") as f:
     yaml.dump(model_config, f)
 
 best_val = float("inf")
+ema_val_loss = float("inf")
+ema_decay_val = 0.9
 best_metrics = {}
 global_step = 0
 train_start = time.time()
+prev_vol_loss = 1.0
+prev_surf_loss = 0.2  # initial ratio ~5 (clamped minimum)
+running_tandem_loss = 0.05
+running_nontandem_loss = 0.05
 
 for epoch in range(MAX_EPOCHS):
     elapsed_min = (time.time() - train_start) / 60.0
@@ -472,47 +1824,807 @@ for epoch in range(MAX_EPOCHS):
 
     t0 = time.time()
 
+    # Adaptive surface weight: loss-ratio based, clamped [5, 50]
+    surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
+
     # --- Train ---
     model.train()
+    if refine_head is not None:
+        refine_head.train()
+    if aft_srf_head is not None:
+        aft_srf_head.train()
+    if aft_srf_ctx_head is not None:
+        aft_srf_ctx_head.train()
     epoch_vol = 0.0
     epoch_surf = 0.0
     n_batches = 0
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [train]", leave=False)
-    for x, y, is_surface, mask in pbar:
+    if cfg.grad_accum_steps > 1:
+        optimizer.zero_grad()
+    for batch_idx, (x, y, is_surface, mask) in enumerate(pbar):
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         is_surface = is_surface.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
 
+        # --- Data augmentation (training-only, applied before normalization) ---
+        if model.training and cfg.aug != "none" and epoch >= cfg.aug_start_epoch:
+            if cfg.aug in ("yflip", "flip_jitter"):
+                _flip = torch.rand(x.size(0), 1, 1, device=x.device) < 0.5
+                x[:, :, 1:2] = torch.where(_flip, -x[:, :, 1:2], x[:, :, 1:2])
+                y[:, :, 1:2] = torch.where(_flip, -y[:, :, 1:2], y[:, :, 1:2])
+                for _idx in [3, 5, 7, 9]:
+                    x[:, :, _idx:_idx+1] = torch.where(_flip, -x[:, :, _idx:_idx+1], x[:, :, _idx:_idx+1])
+            if cfg.aug in ("jitter", "flip_jitter"):
+                x[:, :, :2] = x[:, :, :2] + 0.001 * torch.randn_like(x[:, :, :2])
+            if cfg.aug == "featdrop":
+                _B_aug = x.size(0)
+                for _b in range(_B_aug):
+                    _drop = torch.randperm(22, device=x.device)[:2] + 2
+                    x[_b, :, _drop] = 0.0
+            if cfg.aug == "mixup":
+                _B_aug = x.size(0)
+                _beta_dist = torch.distributions.Beta(torch.tensor(0.2), torch.tensor(0.2))
+                _lam = _beta_dist.sample((_B_aug,)).to(x.device).view(_B_aug, 1, 1)
+                _mix_idx = torch.randperm(_B_aug, device=x.device)
+                x = _lam * x + (1 - _lam) * x[_mix_idx]
+                y = _lam * y + (1 - _lam) * y[_mix_idx]
+                mask = mask & mask[_mix_idx]
+            if cfg.aug == "scale":
+                _lo = 1.0 - cfg.aug_scale_range
+                _scale = torch.rand(x.size(0), 1, 1, device=x.device) * (2 * cfg.aug_scale_range) + _lo
+                x[:, :, :2] = x[:, :, :2] * _scale
+            if cfg.aug == "aoa_perturb":
+                _angle_deg = torch.rand(x.size(0), device=x.device) * 2.0 - 1.0
+                _angle_rad = _angle_deg * (torch.pi / 180.0)
+                _cos_a = torch.cos(_angle_rad).view(-1, 1, 1)
+                _sin_a = torch.sin(_angle_rad).view(-1, 1, 1)
+                _xc, _yc = x[:, :, 0:1].clone(), x[:, :, 1:2].clone()
+                x[:, :, 0:1] = _cos_a * _xc - _sin_a * _yc
+                x[:, :, 1:2] = _sin_a * _xc + _cos_a * _yc
+                _Ux, _Uy = y[:, :, 0:1].clone(), y[:, :, 1:2].clone()
+                y[:, :, 0:1] = _cos_a * _Ux - _sin_a * _Uy
+                y[:, :, 1:2] = _sin_a * _Ux + _cos_a * _Uy
+                if cfg.aug_full_dsdf_rot:
+                    # Rotate DSDF gradient pairs (x,y components at indices 2-9)
+                    for _xi, _yi in [(2, 3), (4, 5), (6, 7), (8, 9)]:
+                        _dx = x[:, :, _xi:_xi+1].clone()
+                        _dy = x[:, :, _yi:_yi+1].clone()
+                        x[:, :, _xi:_xi+1] = _cos_a * _dx - _sin_a * _dy
+                        x[:, :, _yi:_yi+1] = _sin_a * _dx + _cos_a * _dy
+            if cfg.aug == "cutmix":
+                _B_aug = x.size(0)
+                _cut_idx = torch.randperm(_B_aug, device=x.device)
+                _x0 = x[:, :, 0]
+                _x0_lo = _x0.min(dim=1).values
+                _x0_hi = _x0.max(dim=1).values
+                _x_start = _x0_lo + torch.rand(_B_aug, device=x.device) * (_x0_hi - _x0_lo - 0.3).clamp(min=0)
+                _x_end = _x_start + 0.3
+                for _b in range(_B_aug):
+                    _in_region = (_x0[_b] >= _x_start[_b]) & (_x0[_b] <= _x_end[_b])
+                    x[_b, _in_region] = x[_cut_idx[_b], _in_region]
+                    y[_b, _in_region] = y[_cut_idx[_b], _in_region]
+                    is_surface[_b, _in_region] = is_surface[_cut_idx[_b], _in_region]
+
+            # Gap/stagger perturbation augmentation (tandem samples only)
+            if cfg.aug_gap_stagger_sigma > 0.0:
+                _is_tandem_aug = (x[:, 0, 21].abs() > 0.01)  # [B] — matches existing tandem detection
+                if _is_tandem_aug.any():
+                    _B = x.size(0)
+                    # Per-sample Gaussian noise, broadcast to all N nodes
+                    _gap_noise  = torch.randn(_B, device=x.device) * cfg.aug_gap_stagger_sigma
+                    _stag_noise = torch.randn(_B, device=x.device) * cfg.aug_gap_stagger_sigma
+                    # Zero out noise for non-tandem samples (preserve single-foil sentinel exactly)
+                    _gap_noise  = _gap_noise  * _is_tandem_aug.float()
+                    _stag_noise = _stag_noise * _is_tandem_aug.float()
+                    # Apply: broadcast [B] → [B, 1] → adds to [B, N]
+                    x[:, :, 22] = x[:, :, 22] + _gap_noise.unsqueeze(1)
+                    x[:, :, 23] = x[:, :, 23] + _stag_noise.unsqueeze(1)
+
+        # Foil-2 DSDF magnitude augmentation (tandem samples only, training only)
+        # x layout: [pos(2), saf(2), dsdf(8), ...]; foil-2 SDF = dsdf[4:8] = x[:, :, 6:10]
+        # Scaling is log-normal (preserves gradient directions, adjusts magnitude only)
+        if model.training and cfg.aug_dsdf2_sigma > 0.0:
+            _is_tandem_aug2 = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero → tandem
+            if _is_tandem_aug2.any():
+                _dsdf2_scale = torch.exp(
+                    torch.randn(x.size(0), device=x.device) * cfg.aug_dsdf2_sigma
+                )
+                # Identity for non-tandem samples
+                _dsdf2_scale = _dsdf2_scale * _is_tandem_aug2.float() + (~_is_tandem_aug2).float()
+                x[:, :, 6:10] = x[:, :, 6:10] * _dsdf2_scale.view(-1, 1, 1)
+
+        raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
+        dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+        dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+        _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
+        _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B] tandem flag from raw gap
+        _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
+        _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
+        _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
+        # TE coordinate frame / wake deficit / cp_panel / vortex_panel: save raw xy and saf_norm before normalization
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+        _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
+        _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
+        _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
+        # Aft-foil mask: boundary ID=7 nodes identified by saf norm > 0.005
+        # saf is at raw x[:,:,2:4]; foil-1 surface has saf≈0, foil-2 has saf>>0
+        _aft_foil_mask = None
+        if aft_srf_head is not None:
+            _raw_saf_norm = x[:, :, 2:4].norm(dim=-1)  # [B, N]
+            _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
+            _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
+            _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
         x = (x - stats["x_mean"]) / stats["x_std"]
-        y_norm = (y - stats["y_mean"]) / stats["y_std"]
+        # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
+        curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+        if cfg.foil2_dist:
+            foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+            x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
+        elif cfg.te_coord_frame:
+            te_feats, _fore_te_x, _fore_te_y = compute_te_features(_raw_xy_te, is_surface, _raw_saf_norm_te)
+            x = torch.cat([x, curv, dist_feat, te_feats], dim=-1)
+            if cfg.wake_deficit_feature:
+                wake_feats = compute_wake_deficit_features(
+                    _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake,
+                    fore_te_x=_fore_te_x, fore_te_y=_fore_te_y,
+                    include_angle=cfg.wake_angle_feature)
+                x = torch.cat([x, wake_feats], dim=-1)
+        else:
+            x = torch.cat([x, curv, dist_feat], dim=-1)
+            if cfg.wake_deficit_feature:
+                wake_feats = compute_wake_deficit_features(
+                    _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake,
+                    include_angle=cfg.wake_angle_feature)
+                x = torch.cat([x, wake_feats], dim=-1)
+        # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
+        raw_xy = x[:, :, :2]
+        # Normalize xy to [0,1] per-sample for consistent Fourier encoding
+        xy_min = raw_xy.amin(dim=1, keepdim=True)
+        xy_max = raw_xy.amax(dim=1, keepdim=True)
+        xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+        freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+        xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
+        fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+        x = torch.cat([x, fourier_pe], dim=-1)
+        if cfg.cp_panel:
+            cp_feat = compute_cp_panel(_raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te)
+            if cfg.cp_panel_tandem_only:
+                cp_feat = cp_feat * _is_tandem_raw[:, None, None]
+            if cfg.cp_panel_scale != 1.0:
+                cp_feat = cp_feat * cfg.cp_panel_scale
+            x = torch.cat([x, cp_feat], dim=-1)
+        if cfg.vortex_panel_velocity:
+            vp_feat = compute_vortex_panel_velocity(
+                _raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te, n_panels=cfg.vortex_panel_n)
+            if cfg.vortex_panel_scale != 1.0:
+                vp_feat = vp_feat * cfg.vortex_panel_scale
+            x = torch.cat([x, vp_feat], dim=-1)
+        if model.training and epoch < cfg.noise_anneal_epochs:
+            noise_scale = 0.05 * (1 - epoch / cfg.noise_anneal_epochs)
+            x[:, :, 2:25] = x[:, :, 2:25] + noise_scale * torch.randn_like(x[:, :, 2:25])
+        Umag, q = _umag_q(y, mask)
+        if cfg.raw_targets:
+            y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
+        elif cfg.adaptive_norm:
+            y_adapt = y.clone()
+            if cfg.asinh_pressure:
+                y_adapt[:, :, 2:3] = torch.asinh(y_adapt[:, :, 2:3] * cfg.asinh_scale)
+            y_norm = (y_adapt - raw_stats["y_mean"]) / raw_stats["y_std"]
+        else:
+            y_phys = _phys_norm(y, Umag, q)
+            if cfg.log_pressure:
+                y_phys = y_phys.clone()
+                y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
+            if cfg.asinh_pressure:
+                y_phys = y_phys.clone()
+                y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
+            y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+        # Residual prediction: subtract freestream from normalized targets
+        _freestream = None
+        if cfg.residual_prediction:
+            _aoa = _raw_aoa  # [B, 1]
+            if cfg.adaptive_norm:
+                # Freestream in raw space: (Umag*cos(AoA), Umag*sin(AoA), 0)
+                _fs_raw = torch.zeros(y_norm.shape[0], 1, 3, device=device)
+                _fs_raw[:, 0, 0] = Umag.squeeze() * torch.cos(_aoa.squeeze(-1))
+                _fs_raw[:, 0, 1] = Umag.squeeze() * torch.sin(_aoa.squeeze(-1))
+                _fs_raw[:, 0, 2] = 0.0
+                _freestream = (_fs_raw - raw_stats["y_mean"]) / raw_stats["y_std"]
+            else:
+                # Freestream in Cp-normalized space: (cos(AoA), sin(AoA), 0)
+                _fs_phys = torch.zeros(y_norm.shape[0], 1, 3, device=device)
+                _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))  # Ux/Umag
+                _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))  # Uy/Umag
+                _fs_phys[:, 0, 2] = 0.0  # p/q
+                _freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]  # [B, 1, 3]
+            y_norm = y_norm - _freestream  # subtract freestream (broadcasts over N)
+        if model.training and not cfg.no_target_noise:
+            noise_progress = min(1.0, epoch / max(cfg.noise_anneal_epochs, 1))
+            if cfg.half_target_noise:
+                vel_noise = 0.0075 * (1 - noise_progress) + 0.0015 * noise_progress
+                p_noise = 0.004 * (1 - noise_progress) + 0.0005 * noise_progress
+            else:
+                vel_noise = 0.015 * (1 - noise_progress) + 0.003 * noise_progress
+                p_noise = 0.008 * (1 - noise_progress) + 0.001 * noise_progress
+            noise_scale = torch.tensor([vel_noise, vel_noise, p_noise], device=device)
+            y_norm = y_norm + noise_scale * torch.randn_like(y_norm)
 
-        pred = model({"x": x})["preds"]
+        # Per-sample std normalization: skip tandem samples (gap feature index 21)
+        raw_gap = x[:, 0, 21]
+        is_tandem = raw_gap.abs() > 0.5
+        B = y_norm.shape[0]
+        sample_stds = torch.ones(B, 1, 3, device=device)
+        if not cfg.no_perstd and not cfg.raw_targets and not cfg.adaptive_norm:
+            if cfg.unified_clamps:
+                channel_clamps = tandem_clamps = torch.tensor([0.2, 0.2, 0.7], device=device)
+            elif cfg.high_p_clamp:
+                channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
+                tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
+            else:
+                channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
+                tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+            if model.training:
+                for b in range(B):
+                    valid = mask[b]
+                    if cfg.no_perstd_p:
+                        # Normalize velocity only; pressure keeps std=1
+                        vc = (tandem_clamps[:2] if is_tandem[b] else channel_clamps[:2])
+                        sample_stds[b, 0, :2] = y_norm[b, valid, :2].std(dim=0).clamp(min=vc)
+                    elif is_tandem[b]:
+                        sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
+                    else:
+                        sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+        if model.training and not cfg.no_perstd and not cfg.raw_targets and not cfg.adaptive_norm:
+            if cfg.multiply_std:
+                y_norm = y_norm * sample_stds
+            else:
+                y_norm = y_norm / sample_stds
+
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            out = model({"x": x})
+            pred = out["preds"]
+            re_pred = out["re_pred"]
+            aoa_pred = out["aoa_pred"]
+            hidden = out["hidden"]
+        pred = pred.float()
+        re_pred = re_pred.float()
+        aoa_pred = aoa_pred.float()
+        hidden = hidden.float()
+        if model.training and not cfg.no_perstd and not cfg.raw_targets and not cfg.adaptive_norm:
+            if cfg.multiply_std:
+                pred = pred * sample_stds
+            else:
+                pred = pred / sample_stds
+
+        # Surface refinement head: additive correction on surface nodes
+        if refine_head is not None and model.training:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                if cfg.surface_refine_context:
+                    # Context-aware: needs all nodes, coords, masks
+                    refine_correction = refine_head(
+                        hidden, pred, is_surface, mask, x[:, :, :2]
+                    ).float()
+                    pred = pred + refine_correction
+                else:
+                    # Standard: extract surface nodes, apply MLP, scatter back
+                    surf_idx = is_surface.nonzero(as_tuple=False)  # [M, 2] (batch, node)
+                    if surf_idx.numel() > 0:
+                        surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]  # [M, n_hidden]
+                        surf_pred = pred[surf_idx[:, 0], surf_idx[:, 1]]      # [M, 3]
+                        correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
+                        pred = pred.clone()
+                        pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
+
+        # Aft-foil dedicated refinement head: additive correction on boundary ID=7 nodes only
+        if aft_srf_ctx_head is not None and model.training and _aft_foil_mask is not None:
+            # Context-aware version: KNN volume context for wake pressure
+            _vol_mask = mask & ~is_surface  # [B, N] — volume (non-surface) nodes
+            _coords = x[:, :, :2]  # standardized (x, y) positions
+            pred = pred.clone()
+            for b in range(x.shape[0]):
+                _aft_b = _aft_foil_mask[b].nonzero(as_tuple=True)[0]
+                _vol_b = _vol_mask[b].nonzero(as_tuple=True)[0]
+                if _aft_b.numel() == 0 or _vol_b.numel() == 0:
+                    continue
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _corr = aft_srf_ctx_head(
+                        hidden[b, _aft_b],     # aft surface hidden
+                        _coords[b, _aft_b],    # aft surface positions
+                        hidden[b, _vol_b],     # volume hidden
+                        _coords[b, _vol_b],    # volume positions
+                        pred[b, _aft_b],       # aft base prediction
+                    ).float()
+                pred[b, _aft_b] = pred[b, _aft_b] + _corr
+        elif aft_srf_head is not None and model.training and _aft_foil_mask is not None:
+            aft_idx = _aft_foil_mask.nonzero(as_tuple=False)  # [A, 2] (batch, node)
+            if aft_idx.numel() > 0:
+                aft_hidden = hidden[aft_idx[:, 0], aft_idx[:, 1]]  # [A, n_hidden]
+                aft_pred = pred[aft_idx[:, 0], aft_idx[:, 1]]      # [A, 3]
+                # FiLM conditioning: expand gap/stagger per aft-foil node
+                _aft_cond = None
+                if cfg.aft_foil_srf_film:
+                    _aft_cond = _raw_gap_stagger[aft_idx[:, 0]]  # [A, 2]
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    aft_correction = aft_srf_head(aft_hidden, aft_pred, _aft_cond).float()
+                pred = pred.clone()
+                pred[aft_idx[:, 0], aft_idx[:, 1]] = pred[aft_idx[:, 0], aft_idx[:, 1]] + aft_correction
+
         sq_err = (pred - y_norm) ** 2
-
+        abs_err = (pred - y_norm).abs()
+        if cfg.tandem_ramp:
+            pass  # no hard curriculum; tandem_weight applied via tandem_boost below
+        elif epoch < cfg.tandem_curriculum_epochs:
+            is_tandem_curr = (x[:, :, -8:].abs().sum(dim=(1, 2)) > 0.01)
+            sample_mask = (~is_tandem_curr).float()[:, None, None]
+            abs_err = abs_err * sample_mask
         vol_mask = mask & ~is_surface
         surf_mask = mask & is_surface
-        vol_loss = (sq_err * vol_mask.unsqueeze(-1)).sum() / vol_mask.sum().clamp(min=1)
-        surf_loss = (sq_err * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
-        loss = vol_loss + cfg.surf_weight * surf_loss
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        # Progressive resolution: subsample volume nodes in loss early in training
+        # Ramps from 10% → 100% of volume nodes over first 40 epochs
+        if epoch < cfg.vol_ramp_epochs:
+            vol_keep_ratio = 0.05 + 0.95 * (epoch / cfg.vol_ramp_epochs)
+            vol_indices = vol_mask.nonzero(as_tuple=False)
+            n_vol = vol_indices.shape[0]
+            n_keep = max(int(n_vol * vol_keep_ratio), 1)
+            perm = torch.randperm(n_vol, device=vol_mask.device)[:n_keep]
+            vol_mask_train = torch.zeros_like(vol_mask)
+            if n_keep > 0:
+                vol_mask_train[vol_indices[perm, 0], vol_indices[perm, 1]] = True
+        elif cfg.vol_subsample_frac < 1.0:
+            vol_indices = vol_mask.nonzero(as_tuple=False)
+            n_vol = vol_indices.shape[0]
+            n_keep = max(int(n_vol * cfg.vol_subsample_frac), 1)
+            perm = torch.randperm(n_vol, device=vol_mask.device)[:n_keep]
+            vol_mask_train = torch.zeros_like(vol_mask)
+            if n_keep > 0:
+                vol_mask_train[vol_indices[perm, 0], vol_indices[perm, 1]] = True
+        else:
+            vol_mask_train = vol_mask
+
+        if cfg.boundary_aware:
+            vol_dist = dist_feat[:, :, 0]  # [B, N], log1p-scaled dist-to-surface
+            valid_dists = vol_dist.masked_select(vol_mask_train)
+            if valid_dists.numel() > 10:
+                threshold = valid_dists.quantile(0.1)
+                near_wall = vol_mask_train & (vol_dist < threshold)
+                node_weight = (1.0 + near_wall.float()).unsqueeze(-1)  # 2x near-wall, 1x else
+                vol_loss = (abs_err * node_weight * vol_mask_train.float().unsqueeze(-1)).sum() / \
+                           (node_weight.squeeze(-1) * vol_mask_train.float()).sum().clamp(min=1)
+            else:
+                vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+        else:
+            vol_loss = (abs_err * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+        is_tandem_batch = (x[:, 0, 21].abs() > 0.01)
+        surf_per_sample = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        tandem_err = surf_per_sample[is_tandem_batch].mean().item() if is_tandem_batch.any() else running_tandem_loss
+        nontandem_err = surf_per_sample[~is_tandem_batch].mean().item() if (~is_tandem_batch).any() else running_nontandem_loss
+        running_tandem_loss = 0.9 * running_tandem_loss + 0.1 * tandem_err
+        running_nontandem_loss = 0.9 * running_nontandem_loss + 0.1 * nontandem_err
+        # Asymmetric hard-node mining for non-tandem samples after epoch 30 (vectorized)
+        if epoch >= 30:
+            surf_pres = abs_err[:, :, 2:3]  # pressure errors [B, N, 1]
+            surf_pres_flat = surf_pres[:, :, 0]  # [B, N]
+            surf_pres_masked = surf_pres_flat.masked_fill(~surf_mask, float('nan'))
+            thresh = torch.nanmedian(surf_pres_masked, dim=1).values  # [B]
+            thresh = thresh.nan_to_num(float('inf'))  # safe: inf → no hard nodes
+            hard_mask = (~is_tandem_batch)[:, None] & surf_mask & (surf_pres_flat >= thresh[:, None])
+            hard_weights = (hard_mask.float() * 0.5 + 1.0).unsqueeze(-1)  # 1.5 hard, 1.0 else
+            surf_per_sample = (surf_pres * hard_weights * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+        adaptive_boost = max(1.0, min(4.0, running_tandem_loss / max(running_nontandem_loss, 1e-8)))
+        if cfg.tandem_ramp:
+            tandem_weight = min(1.0, max(0.0, (epoch - 10) / 40.0))
+            tandem_boost = torch.where(is_tandem_batch,
+                                       torch.tensor(adaptive_boost * tandem_weight, device=device),
+                                       torch.ones(B, device=device))
+        else:
+            tandem_boost = torch.where(is_tandem_batch, adaptive_boost, 1.0).to(device)
+        surf_loss = (surf_per_sample * tandem_boost).mean()
+        if cfg.uncertainty_loss:
+            bm = _base_model
+            surf_ux_loss = (abs_err[:, :, 0:1] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            surf_uy_loss = (abs_err[:, :, 1:2] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            surf_p_loss  = (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum() / surf_mask.sum().clamp(min=1)
+            loss = (vol_loss    * torch.exp(-2 * bm.log_sigma_vol)    / 2 + bm.log_sigma_vol +
+                    surf_ux_loss * torch.exp(-2 * bm.log_sigma_surf_ux) / 2 + bm.log_sigma_surf_ux +
+                    surf_uy_loss * torch.exp(-2 * bm.log_sigma_surf_uy) / 2 + bm.log_sigma_surf_uy +
+                    surf_p_loss  * torch.exp(-2 * bm.log_sigma_surf_p)  / 2 + bm.log_sigma_surf_p)
+        else:
+            loss = vol_loss + surf_weight * surf_loss
+
+        # Multi-scale loss: coarse spatial pooling
+        _coarse_loss = None
+        coarse_pool_size = 64
+        B, N, C = pred.shape
+        n_groups = N // coarse_pool_size
+        if n_groups > 1:
+            # Sort by x-coordinate for spatially coherent groups
+            raw_x_coord = x[:, :, 0]  # x-coordinate
+            sort_idx = raw_x_coord.argsort(dim=1)
+            pred_sorted = torch.gather(pred, 1, sort_idx.unsqueeze(-1).expand_as(pred))
+            y_sorted = torch.gather(y_norm, 1, sort_idx.unsqueeze(-1).expand_as(y_norm))
+            mask_sorted = torch.gather(mask, 1, sort_idx)
+            # Pool predictions and targets over groups of 64 nodes
+            pred_trunc = pred_sorted[:, :n_groups * coarse_pool_size]
+            y_trunc = y_sorted[:, :n_groups * coarse_pool_size]
+            mask_trunc = mask_sorted[:, :n_groups * coarse_pool_size]
+
+            mask_trunc_f = mask_trunc.float().reshape(B, n_groups, coarse_pool_size).unsqueeze(-1)  # [B, G, P, 1]
+            pred_g = pred_trunc.reshape(B, n_groups, coarse_pool_size, C)
+            y_g = y_trunc.reshape(B, n_groups, coarse_pool_size, C)
+            pred_coarse = (pred_g * mask_trunc_f).sum(dim=2) / mask_trunc_f.sum(dim=2).clamp(min=1)
+            y_coarse = (y_g * mask_trunc_f).sum(dim=2) / mask_trunc_f.sum(dim=2).clamp(min=1)
+            mask_coarse = mask_trunc.reshape(B, n_groups, coarse_pool_size).any(dim=2)
+
+            coarse_err = (pred_coarse - y_coarse).abs()
+            coarse_loss = (coarse_err * mask_coarse.unsqueeze(-1)).sum() / mask_coarse.sum().clamp(min=1)
+            _coarse_loss = coarse_loss
+            loss = loss + 1.0 * coarse_loss
+
+        log_re_target = x[:, 0, 13:14]  # log(Re) from input features (same for all nodes)
+        re_loss = F.mse_loss(re_pred, log_re_target)
+        loss = loss + 0.01 * re_loss
+        aoa_target = x[:, 0, 14:15]  # AoA0_rad from normalized input
+        aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
+        loss = loss + 0.01 * aoa_loss
+
+        # DCT frequency-weighted auxiliary loss on surface pressure
+        if cfg.dct_freq_loss and model.training:
+            _dct_loss = torch.tensor(0.0, device=device)
+            _n_foils_dct = 0
+            for b in range(B):
+                surf_idx_b = is_surface[b].nonzero(as_tuple=True)[0]
+                if surf_idx_b.numel() < 8:
+                    continue
+                _is_tan_b = _raw_tandem_for_dct[b].item()
+                if _is_tan_b:
+                    saf_vals = _raw_saf_for_dct[b, surf_idx_b]
+                    foil_groups = [surf_idx_b[saf_vals <= 0.005], surf_idx_b[saf_vals > 0.005]]
+                else:
+                    foil_groups = [surf_idx_b]
+                for foil_surf in foil_groups:
+                    if foil_surf.numel() < 8:
+                        continue
+                    # Sort by raw x-coordinate for 1D signal ordering
+                    x_coords = _raw_x_for_dct[b, foil_surf]
+                    sort_order = x_coords.argsort()
+                    sorted_idx = foil_surf[sort_order]
+                    # Extract pressure channel (channel 2 in output)
+                    p_pred = pred[b, sorted_idx, 2]  # [M]
+                    p_gt = y_norm[b, sorted_idx, 2]  # [M]
+                    # FFT-based frequency loss
+                    M = p_pred.shape[0]
+                    pred_fft = torch.fft.rfft(p_pred).abs()  # [M//2+1]
+                    gt_fft = torch.fft.rfft(p_gt).abs()
+                    # Frequency weighting: w_k = 1 + gamma * (k/M)^alpha
+                    k = torch.arange(pred_fft.shape[0], device=device, dtype=pred_fft.dtype)
+                    w = 1.0 + cfg.dct_freq_gamma * (k / M) ** cfg.dct_freq_alpha
+                    _dct_loss = _dct_loss + (w * (pred_fft - gt_fft).abs()).mean()
+                    _n_foils_dct += 1
+            if _n_foils_dct > 0:
+                _dct_loss = _dct_loss / _n_foils_dct
+                loss = loss + cfg.dct_freq_weight * _dct_loss
+
+        # R-drop: second forward pass with different dropout mask for consistency
+        rdrop_loss = torch.tensor(0.0, device=device)
+        if cfg.rdrop and model.training:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                rdrop_out = model({"x": x})
+                rdrop_pred = rdrop_out["preds"].float() / sample_stds
+            valid_mask = mask.float().unsqueeze(-1)
+            rdrop_loss = ((pred - rdrop_pred) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
+            loss = loss + cfg.rdrop_alpha * rdrop_loss
+
+        # PCGrad: in-dist (Group A) vs all-OOD (Group B) gradient projection
+        # Group B = tandem + extreme-Re (>1σ) + extreme-AoA (>1σ), Group A = rest
+        is_ood_pcgrad = is_tandem_batch | (x[:, 0, 13] > 1.0) | (x[:, 0, 14].abs() > 1.0)
+        is_indist_pcgrad = ~is_ood_pcgrad
+        use_pcgrad = (not cfg.disable_pcgrad) and is_indist_pcgrad.any() and is_ood_pcgrad.any()
+
+        if use_pcgrad:
+            n_a = is_indist_pcgrad.float().sum().clamp(min=1)
+            n_b = is_ood_pcgrad.float().sum().clamp(min=1)
+            vol_mask_a = vol_mask_train & is_indist_pcgrad.unsqueeze(1)
+            vol_mask_b = vol_mask_train & is_ood_pcgrad.unsqueeze(1)
+            vol_loss_a = (abs_err * vol_mask_a.unsqueeze(-1)).sum() / vol_mask_a.sum().clamp(min=1)
+            vol_loss_b = (abs_err * vol_mask_b.unsqueeze(-1)).sum() / vol_mask_b.sum().clamp(min=1)
+            surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
+            surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
+            coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+
+            optimizer.zero_grad()
+            loss_a.backward(retain_graph=True)
+            grads_a = [p.grad.clone() if p.grad is not None else None
+                       for p in model.parameters()]
+            optimizer.zero_grad()
+            loss_b.backward()
+
+            ga_flat = torch.cat([g.view(-1) for g in grads_a if g is not None])
+            gb_flat = torch.cat([p.grad.view(-1) for p in model.parameters() if p.grad is not None])
+            dot_ab = (ga_flat @ gb_flat).item()
+            gb_ns = float((gb_flat @ gb_flat).item()) + 1e-8
+            ga_ns = float((ga_flat @ ga_flat).item()) + 1e-8
+            for p, ga in zip(model.parameters(), grads_a):
+                gb = p.grad
+                if ga is None and gb is None:
+                    continue
+                if ga is None:
+                    pass  # keep gb
+                elif gb is None:
+                    p.grad = ga
+                elif dot_ab < 0:
+                    p.grad = ((ga - (dot_ab / gb_ns) * gb) + (gb - (dot_ab / ga_ns) * ga)) * 0.5
+                else:
+                    p.grad = (ga + gb) * 0.5
+        elif cfg.pcgrad_3way and is_tandem_batch.any() and (~is_tandem_batch).any():
+            # 3-way PCGrad: Group A=single-foil, B=tandem-normal, C=tandem-extreme-Re
+            re_vals = x[:, 0, 13]  # normalized log(Re), same for all nodes in sample
+            re_tandem = re_vals[is_tandem_batch]
+            if is_tandem_batch.sum() >= 4:
+                lo = torch.quantile(re_tandem, cfg.pcgrad_extreme_pct)
+                hi = torch.quantile(re_tandem, 1.0 - cfg.pcgrad_extreme_pct)
+                is_extreme = is_tandem_batch & ((re_vals < lo) | (re_vals > hi))
+                is_normal_tan = is_tandem_batch & ~is_extreme
+            else:
+                is_extreme = torch.zeros(B, dtype=torch.bool, device=device)
+                is_normal_tan = is_tandem_batch
+
+            def _grp_loss(mask_1d):
+                n = mask_1d.float().sum().clamp(min=1)
+                vol_mask_g = vol_mask_train & mask_1d.unsqueeze(1)
+                vol_loss_g = (abs_err * vol_mask_g.unsqueeze(-1)).sum() / vol_mask_g.sum().clamp(min=1)
+                surf_loss_g = (surf_per_sample * mask_1d.float() * tandem_boost).sum() / n
+                coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
+                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+
+            loss_A = _grp_loss(~is_tandem_batch)
+            # Only include non-empty groups to avoid backward() on no-grad tensors
+            task_losses_with_masks = [
+                (loss_A, (~is_tandem_batch)),
+                (_grp_loss(is_normal_tan), is_normal_tan),
+                (_grp_loss(is_extreme), is_extreme),
+            ]
+            task_losses = [l for l, m in task_losses_with_masks if m.any()]
+            if len(task_losses) == 0:
+                task_losses = [loss_A]  # fallback
+
+            # Compute per-task gradients with retain_graph
+            task_grads = []
+            for i, tl in enumerate(task_losses):
+                optimizer.zero_grad()
+                tl.backward(retain_graph=(i < len(task_losses) - 1))
+                task_grads.append([p.grad.clone() if p.grad is not None else None
+                                   for p in model.parameters()])
+
+            # PCGrad projection: project g_i onto normal plane of each g_j
+            def pcgrad_project(g_i, g_j):
+                dot = sum((a * b).sum() for a, b in zip(g_i, g_j) if a is not None and b is not None)
+                if dot < 0:
+                    norm_sq = sum((b * b).sum() for b in g_j if b is not None) + 1e-12
+                    return [a - (dot / norm_sq) * b if (a is not None and b is not None) else a
+                            for a, b in zip(g_i, g_j)]
+                return list(g_i)
+
+            n_tasks = len(task_grads)
+            projected = [list(g) for g in task_grads]
+            for i in range(n_tasks):
+                for j in range(n_tasks):
+                    if i != j:
+                        projected[i] = pcgrad_project(projected[i], task_grads[j])
+
+            # Sum projected gradients and write back
+            optimizer.zero_grad()
+            for param_idx, p in enumerate(model.parameters()):
+                parts = [projected[t][param_idx] for t in range(n_tasks)
+                         if projected[t][param_idx] is not None]
+                if parts:
+                    p.grad = sum(parts)
+
+            n_extreme = is_extreme.sum().item()
+            n_normal_tan = is_normal_tan.sum().item()
+            wandb.log({
+                "train/pcgrad3w_loss_A": loss_A.item(),
+                "train/pcgrad3w_n_extreme": n_extreme,
+                "train/pcgrad3w_n_normal_tan": n_normal_tan,
+                "global_step": global_step,
+            })
+            loss = sum(task_losses) / len(task_losses)  # for logging only
+            use_pcgrad = True  # downstream logic: treat as if pcgrad ran
+        else:
+            if cfg.grad_accum_steps <= 1:
+                optimizer.zero_grad()
+            loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        sam_active = sam_optimizer is not None and epoch >= int(MAX_EPOCHS * 0.75)
+        _should_step = (cfg.grad_accum_steps <= 1 or
+                        (batch_idx + 1) % cfg.grad_accum_steps == 0 or
+                        batch_idx == len(train_loader) - 1)
+        if sam_active and not use_pcgrad and _should_step:
+            # SAM first step: perturb parameters toward gradient direction
+            sam_optimizer.perturb()
+            sam_optimizer.zero_grad()
+            # Recompute forward at perturbed parameters (simplified loss, no coarse/pcgrad)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out2 = model({"x": x})
+                pred2 = out2["preds"].float() / sample_stds
+                re_pred2 = out2["re_pred"].float()
+                aoa_pred2 = out2["aoa_pred"].float()
+            abs_err2 = (pred2 - y_norm).abs()
+            vol_loss2 = (abs_err2 * vol_mask_train.unsqueeze(-1)).sum() / vol_mask_train.sum().clamp(min=1)
+            surf_ps2 = (abs_err2[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum(dim=(1, 2)) / surf_mask.sum(dim=1).clamp(min=1).float()
+            surf_loss2 = (surf_ps2 * tandem_boost).mean()
+            re_loss2 = F.mse_loss(re_pred2, log_re_target)
+            aoa_loss2 = F.mse_loss(aoa_pred2, aoa_target)
+            loss2 = vol_loss2 + surf_weight * surf_loss2 + 0.01 * re_loss2 + 0.01 * aoa_loss2
+            loss2.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            sam_optimizer.restore()
+        if use_pcgrad or _should_step:
+            optimizer.step()
+            if cfg.grad_accum_steps > 1 and not use_pcgrad:
+                optimizer.zero_grad()
+        if step_scheduler_per_batch and (use_pcgrad or _should_step):
+            try:
+                scheduler.step()
+            except ValueError:
+                pass
+        if epoch >= cfg.ema_start_epoch and not cfg.swad and not cfg.swa and not cfg.swa_cyclic and not cfg.snapshot_ensemble:
+            if ema_model is None:
+                ema_model = deepcopy(_base_model)
+            else:
+                with torch.no_grad():
+                    for ep, mp in zip(ema_model.parameters(), _base_model.parameters()):
+                        ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for refinement head
+            if refine_head is not None:
+                _refine_base = refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
+                if ema_refine_head is None:
+                    ema_refine_head = deepcopy(_refine_base)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for aft-foil SRF head
+            if aft_srf_head is not None:
+                _aft_base = aft_srf_head._orig_mod if hasattr(aft_srf_head, '_orig_mod') else aft_srf_head
+                if ema_aft_srf_head is None:
+                    ema_aft_srf_head = deepcopy(_aft_base)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_aft_srf_head.parameters(), _aft_base.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            if aft_srf_ctx_head is not None:
+                _ctx_base = aft_srf_ctx_head._orig_mod if hasattr(aft_srf_ctx_head, '_orig_mod') else aft_srf_ctx_head
+                if ema_aft_srf_head is None:
+                    ema_aft_srf_head = deepcopy(_ctx_base)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "global_step": global_step})
+        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
         n_batches += 1
         pbar.set_postfix(vol=f"{vol_loss.item():.3f}", surf=f"{surf_loss.item():.3f}")
 
-    scheduler.step()
+    if not step_scheduler_per_batch:
+        if cfg.swa_cyclic and epoch >= cfg.swa_cyclic_start:
+            if swa_cyclic_scheduler is None:
+                swa_cyclic_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    base_opt, T_0=cfg.swa_cyclic_T, eta_min=cfg.cosine_eta_min
+                )
+            swa_cyclic_scheduler.step()
+            # At cycle minimum (end of each T period), save checkpoint to running average
+            if (epoch - cfg.swa_cyclic_start + 1) % cfg.swa_cyclic_T == 0:
+                snap = {k: v.cpu().clone() for k, v in _base_model.state_dict().items()}
+                if swa_cyclic_model is None:
+                    swa_cyclic_model = deepcopy(_base_model)
+                    swa_cyclic_model.load_state_dict(snap)
+                    swa_cyclic_n = 1
+                else:
+                    with torch.no_grad():
+                        cs = swa_cyclic_model.state_dict()
+                        for k in snap:
+                            cs[k].mul_(swa_cyclic_n / (swa_cyclic_n + 1)).add_(snap[k].to(device) / (swa_cyclic_n + 1))
+                    swa_cyclic_n += 1
+        else:
+            scheduler.step()
+    # Two-phase LR: at switch epoch, reset optimizer LR and replace scheduler
+    if cfg.two_phase_lr and epoch + 1 == cfg.two_phase_switch_epoch:
+        lrs = [cfg.two_phase_lr_2 * 0.5, cfg.two_phase_lr_2]
+        for pg, new_lr in zip(base_opt.param_groups, lrs):
+            pg['lr'] = new_lr
+            pg['initial_lr'] = new_lr
+        remaining = max(1, cfg.cosine_T_max - cfg.two_phase_switch_epoch)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            base_opt, T_max=remaining, eta_min=cfg.cosine_eta_min
+        )
+    if epoch >= cfg.temp_anneal_epoch:
+        with torch.no_grad():
+            _base_model.blocks[0].attn.temperature.data.clamp_(max=0.25)
+    if cfg.prog_slices:
+        # Progressive slice warmup: ramp active slices from cfg.slice_num → prog_slices_end
+        if epoch < cfg.prog_slices_epochs:
+            active = int(cfg.slice_num + (cfg.prog_slices_end - cfg.slice_num) * epoch / cfg.prog_slices_epochs)
+        else:
+            active = cfg.prog_slices_end
+        with torch.no_grad():
+            for _blk in _base_model.blocks:
+                if hasattr(_blk.attn, 'slice_mask'):
+                    _blk.attn.slice_mask.zero_()
+                    _blk.attn.slice_mask[active:].fill_(-1e9)
     epoch_vol /= n_batches
     epoch_surf /= n_batches
+    prev_vol_loss = epoch_vol
+    prev_surf_loss = epoch_surf
+    # Snapshot ensemble: save running average at specified epochs
+    if cfg.snapshot_ensemble and (epoch + 1) in snapshot_epoch_list:
+        snap = {k: v.cpu().clone() for k, v in _base_model.state_dict().items()}
+        snapshot_n += 1
+        if snapshot_avg_model is None:
+            snapshot_avg_model = deepcopy(_base_model)
+            snapshot_avg_model.load_state_dict(snap)
+        else:
+            with torch.no_grad():
+                sa = snapshot_avg_model.state_dict()
+                for k in snap:
+                    sa[k].mul_((snapshot_n - 1) / snapshot_n).add_(snap[k].to(device) / snapshot_n)
 
     # --- Validate across all splits ---
+    _do_val = (epoch + 1) % cfg.val_every == 0 or epoch == 0 or epoch == MAX_EPOCHS - 1
+    if not _do_val:
+        dt = time.time() - t0
+        wandb.log({
+            "train/vol_loss": epoch_vol,
+            "train/surf_loss": epoch_surf,
+            "epoch_time_s": dt,
+            "lr": scheduler.get_last_lr()[0],
+            "global_step": global_step,
+        })
+        print(f"Epoch {epoch+1:3d} ({dt:.0f}s)  train[vol={epoch_vol:.4f} surf={epoch_surf:.4f}]  [val skipped]")
+        continue
+
+    if cfg.swa_cyclic and swa_cyclic_model is not None:
+        eval_model = swa_cyclic_model
+    elif cfg.snapshot_ensemble and snapshot_avg_model is not None:
+        eval_model = snapshot_avg_model
+    elif cfg.swa and swa_model is not None:
+        eval_model = swa_model
+    elif ema_model is not None:
+        eval_model = ema_model
+    else:
+        eval_model = model
+    eval_model.eval()
     model.eval()
+    # Select the right refinement head for validation (EMA if available)
+    eval_refine_head = refine_head  # default: use training head
+    if refine_head is not None:
+        if ema_refine_head is not None and ema_model is not None and eval_model is ema_model:
+            eval_refine_head = ema_refine_head
+            eval_refine_head.eval()
+        elif refine_head is not None:
+            refine_head.eval()
+    # Select aft-foil SRF head for eval (EMA if available)
+    eval_aft_srf_head = aft_srf_head
+    eval_aft_srf_ctx_head = aft_srf_ctx_head
+    if aft_srf_head is not None:
+        if ema_aft_srf_head is not None and ema_model is not None and eval_model is ema_model:
+            eval_aft_srf_head = ema_aft_srf_head
+            eval_aft_srf_head.eval()
+        elif aft_srf_head is not None:
+            aft_srf_head.eval()
+    if aft_srf_ctx_head is not None:
+        if ema_aft_srf_head is not None and ema_model is not None and eval_model is ema_model:
+            eval_aft_srf_ctx_head = ema_aft_srf_head
+            eval_aft_srf_ctx_head.eval()
+        else:
+            aft_srf_ctx_head.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -521,8 +2633,8 @@ for epoch in range(MAX_EPOCHS):
         val_surf = 0.0
         mae_surf = torch.zeros(3, device=device)
         mae_vol = torch.zeros(3, device=device)
-        n_surf = 0
-        n_vol = 0
+        n_surf = torch.zeros(3, device=device)
+        n_vol = torch.zeros(3, device=device)
         n_vbatches = 0
 
         with torch.no_grad():
@@ -533,30 +2645,261 @@ for epoch in range(MAX_EPOCHS):
                 is_surface = is_surface.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
 
+                raw_dsdf = x[:, :, 2:10]  # original dsdf before standardization
+                dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+                dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
+                _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
+                _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
+                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+                _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
+                _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
+                _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
+                # Aft-foil mask for eval (same logic as training)
+                _eval_aft_mask = None
+                if eval_aft_srf_head is not None:
+                    _v_saf_norm = x[:, :, 2:4].norm(dim=-1)
+                    _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
+                    _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
+                    _v_gap_stagger = x[:, 0, 22:24]  # [B, 2]
                 x = (x - stats["x_mean"]) / stats["x_std"]
-                y_norm = (y - stats["y_mean"]) / stats["y_std"]
+                # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
+                curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                if cfg.foil2_dist:
+                    foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                    x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
+                elif cfg.te_coord_frame:
+                    te_feats, _fore_te_x, _fore_te_y = compute_te_features(_raw_xy_te, is_surface, _raw_saf_norm_te)
+                    x = torch.cat([x, curv, dist_feat, te_feats], dim=-1)
+                    if cfg.wake_deficit_feature:
+                        wake_feats = compute_wake_deficit_features(
+                            _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake,
+                            fore_te_x=_fore_te_x, fore_te_y=_fore_te_y,
+                            include_angle=cfg.wake_angle_feature)
+                        x = torch.cat([x, wake_feats], dim=-1)
+                else:
+                    x = torch.cat([x, curv, dist_feat], dim=-1)
+                    if cfg.wake_deficit_feature:
+                        wake_feats = compute_wake_deficit_features(
+                            _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake,
+                            include_angle=cfg.wake_angle_feature)
+                        x = torch.cat([x, wake_feats], dim=-1)
+                # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
+                raw_xy = x[:, :, :2]
+                # Normalize xy to [0,1] per-sample for consistent Fourier encoding
+                xy_min = raw_xy.amin(dim=1, keepdim=True)
+                xy_max = raw_xy.amax(dim=1, keepdim=True)
+                xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                freqs = torch.cat([model.fourier_freqs_fixed.to(device), model.fourier_freqs_learned.abs()])
+                xy_scaled = xy_norm.unsqueeze(-1) * freqs  # [B, N, 2, 4]
+                fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)  # [B, N, 16]
+                x = torch.cat([x, fourier_pe], dim=-1)
+                if cfg.cp_panel:
+                    cp_feat = compute_cp_panel(_raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te)
+                    if cfg.cp_panel_tandem_only:
+                        cp_feat = cp_feat * _is_tandem_raw[:, None, None]
+                    if cfg.cp_panel_scale != 1.0:
+                        cp_feat = cp_feat * cfg.cp_panel_scale
+                    x = torch.cat([x, cp_feat], dim=-1)
+                if cfg.vortex_panel_velocity:
+                    vp_feat = compute_vortex_panel_velocity(
+                        _raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te, n_panels=cfg.vortex_panel_n)
+                    if cfg.vortex_panel_scale != 1.0:
+                        vp_feat = vp_feat * cfg.vortex_panel_scale
+                    x = torch.cat([x, vp_feat], dim=-1)
+                Umag, q = _umag_q(y, mask)
+                if cfg.raw_targets:
+                    y_norm = (y - raw_stats["y_mean"]) / raw_stats["y_std"]
+                elif cfg.adaptive_norm:
+                    y_adapt = y.clone()
+                    if cfg.asinh_pressure:
+                        y_adapt[:, :, 2:3] = torch.asinh(y_adapt[:, :, 2:3] * cfg.asinh_scale)
+                    y_norm = (y_adapt - raw_stats["y_mean"]) / raw_stats["y_std"]
+                else:
+                    y_phys = _phys_norm(y, Umag, q)
+                    if cfg.log_pressure:
+                        y_phys = y_phys.clone()
+                        y_phys[:, :, 2:3] = y_phys[:, :, 2:3].abs().add(1).log() * y_phys[:, :, 2:3].sign()
+                    if cfg.asinh_pressure:
+                        y_phys = y_phys.clone()
+                        y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
+                    y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
 
-                pred = model({"x": x})["preds"]
-                sq_err = (pred - y_norm) ** 2
+                # Residual prediction: subtract freestream in val loop
+                _v_freestream = None
+                if cfg.residual_prediction:
+                    _aoa = _raw_aoa
+                    if cfg.adaptive_norm:
+                        _fs_raw = torch.zeros(y_norm.shape[0], 1, 3, device=device)
+                        _fs_raw[:, 0, 0] = Umag.squeeze() * torch.cos(_aoa.squeeze(-1))
+                        _fs_raw[:, 0, 1] = Umag.squeeze() * torch.sin(_aoa.squeeze(-1))
+                        _fs_raw[:, 0, 2] = 0.0
+                        _v_freestream = (_fs_raw - raw_stats["y_mean"]) / raw_stats["y_std"]
+                    else:
+                        _fs_phys = torch.zeros(y_norm.shape[0], 1, 3, device=device)
+                        _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))
+                        _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))
+                        _v_freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                    y_norm = y_norm - _v_freestream
+
+                # Per-sample std normalization: skip tandem samples
+                raw_gap = x[:, 0, 21]
+                is_tandem = raw_gap.abs() > 0.5
+                B = y_norm.shape[0]
+                sample_stds = torch.ones(B, 1, 3, device=device)
+                if not cfg.no_perstd and not cfg.raw_targets and not cfg.adaptive_norm:
+                    if cfg.unified_clamps:
+                        channel_clamps = tandem_clamps = torch.tensor([0.2, 0.2, 0.7], device=device)
+                    elif cfg.high_p_clamp:
+                        channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
+                        tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
+                    else:
+                        channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
+                        tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+                    for b in range(B):
+                        valid = mask[b]
+                        if cfg.no_perstd_p:
+                            vc = (tandem_clamps[:2] if is_tandem[b] else channel_clamps[:2])
+                            sample_stds[b, 0, :2] = y_norm[b, valid, :2].std(dim=0).clamp(min=vc)
+                        elif is_tandem[b]:
+                            sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
+                        else:
+                            sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+                if cfg.multiply_std:
+                    y_norm_scaled = y_norm * sample_stds
+                else:
+                    y_norm_scaled = y_norm / sample_stds
+
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    _eval_out = eval_model({"x": x})
+                    pred = _eval_out["preds"]
+                    _eval_hidden = _eval_out["hidden"]
+                pred = pred.float()
+                _eval_hidden = _eval_hidden.float()
+                if cfg.multiply_std:
+                    pred_loss = pred * sample_stds
+                else:
+                    pred_loss = pred / sample_stds
+
+                # Apply surface refinement head during validation
+                if eval_refine_head is not None:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        if cfg.surface_refine_context:
+                            refine_correction = eval_refine_head(
+                                _eval_hidden, pred_loss, is_surface, mask, x[:, :, :2]
+                            ).float()
+                            pred_loss = pred_loss + refine_correction
+                        else:
+                            surf_idx = is_surface.nonzero(as_tuple=False)
+                            if surf_idx.numel() > 0:
+                                surf_hidden = _eval_hidden[surf_idx[:, 0], surf_idx[:, 1]]
+                                surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
+                                correction = eval_refine_head(surf_hidden, surf_pred).float()
+                                pred_loss = pred_loss.clone()
+                                pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
+                    # Back-compute refined pred so denormalization (pred_orig) includes refinement
+                    if cfg.multiply_std:
+                        pred = pred_loss / sample_stds
+                    else:
+                        pred = pred_loss * sample_stds
+
+                # Apply aft-foil SRF head during validation
+                if eval_aft_srf_ctx_head is not None and _eval_aft_mask is not None:
+                    _vol_mask_v = mask & ~is_surface
+                    _coords_v = x[:, :, :2]
+                    pred_loss = pred_loss.clone()
+                    for b in range(x.shape[0]):
+                        _aft_b = _eval_aft_mask[b].nonzero(as_tuple=True)[0]
+                        _vol_b = _vol_mask_v[b].nonzero(as_tuple=True)[0]
+                        if _aft_b.numel() == 0 or _vol_b.numel() == 0:
+                            continue
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            _corr = eval_aft_srf_ctx_head(
+                                _eval_hidden[b, _aft_b], _coords_v[b, _aft_b],
+                                _eval_hidden[b, _vol_b], _coords_v[b, _vol_b],
+                                pred_loss[b, _aft_b],
+                            ).float()
+                        pred_loss[b, _aft_b] += _corr
+                    if cfg.multiply_std:
+                        pred = pred_loss / sample_stds
+                    else:
+                        pred = pred_loss * sample_stds
+                elif eval_aft_srf_head is not None and _eval_aft_mask is not None:
+                    aft_idx = _eval_aft_mask.nonzero(as_tuple=False)
+                    if aft_idx.numel() > 0:
+                        _ah = _eval_hidden[aft_idx[:, 0], aft_idx[:, 1]]
+                        _ap = pred_loss[aft_idx[:, 0], aft_idx[:, 1]]
+                        _ac = _v_gap_stagger[aft_idx[:, 0]] if cfg.aft_foil_srf_film else None
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            _aft_corr = eval_aft_srf_head(_ah, _ap, _ac).float()
+                        pred_loss = pred_loss.clone()
+                        pred_loss[aft_idx[:, 0], aft_idx[:, 1]] += _aft_corr
+                        # Back-compute pred for denormalization
+                        if cfg.multiply_std:
+                            pred = pred_loss / sample_stds
+                        else:
+                            pred = pred_loss * sample_stds
+
+                sq_err = (pred_loss - y_norm_scaled) ** 2
+                abs_err = (pred_loss - y_norm_scaled).abs()
+                abs_err = abs_err.nan_to_num(0.0)
 
                 vol_mask = mask & ~is_surface
                 surf_mask = mask & is_surface
-                val_vol += (sq_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item()
-                val_surf += (sq_err * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item()
+                val_vol += min(
+                    (abs_err * vol_mask.unsqueeze(-1)).sum().item() / vol_mask.sum().clamp(min=1).item(),
+                    1e6
+                )
+                val_surf += min(
+                    (abs_err[:, :, 2:3] * surf_mask.unsqueeze(-1)).sum().item() / surf_mask.sum().clamp(min=1).item(),
+                    1e6
+                )
                 n_vbatches += 1
 
-                pred_orig = pred * stats["y_std"] + stats["y_mean"]
-                err = (pred_orig - y).abs()
+                # Add freestream back for residual prediction mode
+                if cfg.residual_prediction and _v_freestream is not None:
+                    pred = pred + _v_freestream  # add freestream back before denorm
+
+                # Denormalize: phys_stats → Cp space → original scale
+                if cfg.raw_targets:
+                    pred_orig = pred * raw_stats["y_std"] + raw_stats["y_mean"]
+                elif cfg.adaptive_norm:
+                    pred_adapt = pred * raw_stats["y_std"] + raw_stats["y_mean"]
+                    if cfg.asinh_pressure:
+                        pred_adapt = pred_adapt.clone()
+                        pred_adapt[:, :, 2:3] = torch.sinh(pred_adapt[:, :, 2:3]) / cfg.asinh_scale
+                    pred_orig = pred_adapt
+                else:
+                    pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                    if cfg.log_pressure:
+                        pred_phys = pred_phys.clone()
+                        pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
+                    if cfg.asinh_pressure:
+                        pred_phys = pred_phys.clone()
+                        pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
+                    if cfg.tight_denorm_clamps:
+                        _pd = pred_phys.clone()
+                        _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
+                        _pd[:, :, 1:2] = pred_phys[:, :, 1:2].clamp(-5, 5) * Umag
+                        _pd[:, :, 2:3] = pred_phys[:, :, 2:3].clamp(-10, 10) * q
+                        pred_orig = _pd
+                    else:
+                        pred_orig = _phys_denorm(pred_phys, Umag, q)
+                y_clamped = y.clamp(-1e6, 1e6)
+                err = (pred_orig - y_clamped).abs()
+                finite = err.isfinite()
+                err = err.where(finite, torch.zeros_like(err))
                 mae_surf += (err * surf_mask.unsqueeze(-1)).sum(dim=(0, 1))
                 mae_vol += (err * vol_mask.unsqueeze(-1)).sum(dim=(0, 1))
-                n_surf += surf_mask.sum().item()
-                n_vol += vol_mask.sum().item()
+                n_surf += (surf_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
+                n_vol += (vol_mask.unsqueeze(-1) * finite).sum(dim=(0, 1)).float()
 
         val_vol /= max(n_vbatches, 1)
         val_surf /= max(n_vbatches, 1)
+        val_vol = float(torch.tensor(val_vol).nan_to_num(0.0).clamp(max=1e6))
+        val_surf = float(torch.tensor(val_surf).nan_to_num(0.0).clamp(max=1e6))
         split_loss = val_vol + cfg.surf_weight * val_surf
-        mae_surf /= max(n_surf, 1)
-        mae_vol /= max(n_vol, 1)
+        mae_surf /= n_surf.clamp(min=1)
+        mae_vol /= n_vol.clamp(min=1)
 
         val_metrics_per_split[split_name] = {
             f"{split_name}/vol_loss":    val_vol,
@@ -571,8 +2914,52 @@ for epoch in range(MAX_EPOCHS):
         }
         val_loss_sum += split_loss
 
-    # val/loss = mean across all splits; used for checkpoint selection
-    mean_val_loss = val_loss_sum / len(val_loaders)
+    # 4-split val/loss (all splits) — used for checkpoint selection
+    _checkpoint_names = VAL_SPLIT_NAMES  # all 4 splits instead of _3split_names
+    _checkpoint_losses = [val_metrics_per_split[n][f"{n}/loss"] for n in _checkpoint_names
+                          if not (torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isnan() or
+                                  torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isinf())]
+    val_loss_3split = sum(_checkpoint_losses) / max(len(_checkpoint_losses), 1)
+    ema_val_loss = val_loss_3split if ema_val_loss == float("inf") else ema_decay_val * ema_val_loss + (1 - ema_decay_val) * val_loss_3split
+
+    if cfg.swad:
+        if swad_initial_val is None:
+            swad_initial_val = val_loss_3split
+        if not swad_collecting and not swad_done:
+            if val_loss_3split < swad_initial_val * 0.5:
+                swad_collecting = True
+        if swad_collecting and not swad_done:
+            if val_loss_3split > swad_prev_val:
+                swad_done = True
+                if swad_checkpoints:
+                    avg_state = {k: torch.stack([c[k].float() for c in swad_checkpoints]).mean(0).to(device)
+                                 for k in swad_checkpoints[0]}
+                    if ema_model is None:
+                        ema_model = deepcopy(_base_model)
+                    ema_model.load_state_dict(avg_state)
+            else:
+                snap = {k: v.cpu().clone() for k, v in _base_model.state_dict().items()}
+                swad_checkpoints.append(snap)
+                if len(swad_checkpoints) > 20:
+                    swad_checkpoints.pop(0)
+            swad_prev_val = val_loss_3split
+
+    # SWA: uniform weight averaging after swa_start_epoch
+    if cfg.swa and epoch >= cfg.swa_start_epoch:
+        if swa_model is None:
+            swa_model = deepcopy(_base_model)
+            swa_n = 1
+        else:
+            with torch.no_grad():
+                for sp, mp in zip(swa_model.parameters(), _base_model.parameters()):
+                    sp.data = (sp.data * swa_n + mp.data) / (swa_n + 1)
+            swa_n += 1
+
+    # 4-split val/loss (all splits including ood_re)
+    _4split_losses = [val_metrics_per_split[n][f"{n}/loss"] for n in VAL_SPLIT_NAMES
+                      if not (torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isnan() or
+                              torch.tensor(val_metrics_per_split[n][f"{n}/loss"]).isinf())]
+    val_loss_4split = sum(_4split_losses) / max(len(_4split_losses), 1)
 
     dt = time.time() - t0
 
@@ -580,13 +2967,18 @@ for epoch in range(MAX_EPOCHS):
     metrics = {
         "train/vol_loss": epoch_vol,
         "train/surf_loss": epoch_surf,
-        "val/loss": mean_val_loss,
+        "val/loss": val_loss_3split,
+        "val/loss_3split": val_loss_3split,
+        "val/loss_4split": val_loss_4split,
         "lr": scheduler.get_last_lr()[0],
         "epoch_time_s": dt,
     }
     for split_metrics in val_metrics_per_split.values():
         metrics.update(split_metrics)
     metrics["global_step"] = global_step
+    learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
+    for i, f in enumerate(learned_freqs):
+        metrics[f"fourier_freq_{i}"] = f
     wandb.log(metrics)
 
     if torch.cuda.is_available():
@@ -595,13 +2987,35 @@ for epoch in range(MAX_EPOCHS):
         peak_mem_gb = 0.0
 
     tag = ""
-    if mean_val_loss < best_val:
-        best_val = mean_val_loss
-        best_metrics = {"epoch": epoch + 1, "val_loss": mean_val_loss}
+    if ema_val_loss < best_val:
+        best_val = ema_val_loss
+        best_metrics = {"epoch": epoch + 1, "val_loss": val_loss_3split}
         for split_metrics in val_metrics_per_split.values():
             for k, v in split_metrics.items():
                 best_metrics[f"best_{k}"] = v
-        torch.save(model.state_dict(), model_path)
+        if cfg.swa and swa_model is not None:
+            save_model = swa_model
+        elif ema_model is not None:
+            save_model = ema_model
+        else:
+            save_model = _base_model
+        torch.save(save_model.state_dict(), model_path)
+        # Save refinement head checkpoint alongside main model
+        if refine_head is not None:
+            _refine_save = ema_refine_head if ema_refine_head is not None else (
+                refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
+            )
+            torch.save(_refine_save.state_dict(), model_dir / "refine_head.pt")
+        if aft_srf_head is not None:
+            _aft_save = ema_aft_srf_head if ema_aft_srf_head is not None else (
+                aft_srf_head._orig_mod if hasattr(aft_srf_head, '_orig_mod') else aft_srf_head
+            )
+            torch.save(_aft_save.state_dict(), model_dir / "aft_srf_head.pt")
+        if aft_srf_ctx_head is not None:
+            _ctx_save = ema_aft_srf_head if ema_aft_srf_head is not None else (
+                aft_srf_ctx_head._orig_mod if hasattr(aft_srf_ctx_head, '_orig_mod') else aft_srf_ctx_head
+            )
+            torch.save(_ctx_save.state_dict(), model_dir / "aft_srf_ctx_head.pt")
         tag = f" * -> {model_path}"
 
     split_summary = "  ".join(
@@ -630,16 +3044,409 @@ if best_metrics:
 else:
     print("No completed epochs (timeout too short?).")
 
+wandb.summary.update({"total_epochs": epoch + 1, "total_time_min": total_time})
 if best_metrics:
     wandb.summary.update({"best_" + k: v for k, v in best_metrics.items()})
 
     print("\nGenerating flow field plots...")
-    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-    plot_dir = Path("plots") / run.id
-    n = 1 if cfg.debug else 4
-    for split_name, split_ds in val_splits.items():
-        images = visualize(model, split_ds, stats, device, n_samples=n, out_dir=plot_dir / split_name)
-        if images:
-            wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    try:
+        if cfg.swa_cyclic and swa_cyclic_model is not None:
+            vis_model = swa_cyclic_model
+        elif cfg.snapshot_ensemble and snapshot_avg_model is not None:
+            vis_model = snapshot_avg_model
+        elif cfg.swa and swa_model is not None:
+            vis_model = swa_model
+        elif ema_model is not None:
+            vis_model = ema_model
+        else:
+            vis_model = _base_model
+        _sd = torch.load(model_path, map_location=device, weights_only=True)
+        # Strip _orig_mod. prefix from torch.compile state_dict keys if needed
+        _sd = {k.removeprefix("_orig_mod."): v for k, v in _sd.items()}
+        vis_model.load_state_dict(_sd)
+        vis_model.eval()
+        plot_dir = Path("plots") / run.id
+        n = 1 if cfg.debug else 4
+        for split_name, split_ds in val_splits.items():
+            samples = []
+            for i in range(min(n, len(split_ds))):
+                x, y_true, is_surface = split_ds[i]
+                with torch.no_grad():
+                    x_dev = x.unsqueeze(0).to(device)
+                    y_dev = y_true.unsqueeze(0).to(device)
+                    is_surf_dev = is_surface.unsqueeze(0).to(device)
+                    mask = torch.ones(1, x_dev.shape[1], dtype=torch.bool, device=device)
+                    raw_dsdf = x_dev[:, :, 2:10]
+                    dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+                    dist_feat = torch.log1p(dist_surf * 10.0)
+                    _need_te_raw_vis = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+                    _raw_xy_te_vis = x_dev[:, :, :2].clone() if _need_te_raw_vis else None
+                    _raw_saf_norm_te_vis = x_dev[:, :, 2:4].norm(dim=-1) if _need_te_raw_vis else None
+                    _raw_aoa_vis = x_dev[:, 0, 14:15]  # AoA0_rad [B, 1]
+                    _is_tandem_raw_vis = (x_dev[:, 0, 22].abs() > 0.01).float()  # [B]
+                    _raw_gap_wake_vis = x_dev[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
+                    x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
+                    curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
+                    if cfg.te_coord_frame:
+                        te_feats_vis, _fore_te_x_vis, _fore_te_y_vis = compute_te_features(
+                            _raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis)
+                        x_n = torch.cat([x_n, curv, dist_feat, te_feats_vis], dim=-1)
+                        if cfg.wake_deficit_feature:
+                            wake_feats_vis = compute_wake_deficit_features(
+                                _raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis, _raw_gap_wake_vis,
+                                fore_te_x=_fore_te_x_vis, fore_te_y=_fore_te_y_vis,
+                                include_angle=cfg.wake_angle_feature)
+                            x_n = torch.cat([x_n, wake_feats_vis], dim=-1)
+                    else:
+                        x_n = torch.cat([x_n, curv, dist_feat], dim=-1)
+                        if cfg.wake_deficit_feature:
+                            wake_feats_vis = compute_wake_deficit_features(
+                                _raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis, _raw_gap_wake_vis,
+                                include_angle=cfg.wake_angle_feature)
+                            x_n = torch.cat([x_n, wake_feats_vis], dim=-1)
+                    # Fourier PE (must match training loop)
+                    raw_xy = x_n[:, :, :2]
+                    xy_min = raw_xy.amin(dim=1, keepdim=True)
+                    xy_max = raw_xy.amax(dim=1, keepdim=True)
+                    xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                    freqs = torch.cat([vis_model.fourier_freqs_fixed.to(device), vis_model.fourier_freqs_learned.abs()])
+                    xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                    fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                    x_n = torch.cat([x_n, fourier_pe], dim=-1)
+                    if cfg.cp_panel:
+                        cp_feat = compute_cp_panel(_raw_xy_te_vis, _raw_aoa_vis, is_surf_dev, _raw_saf_norm_te_vis)
+                        if cfg.cp_panel_tandem_only:
+                            cp_feat = cp_feat * _is_tandem_raw_vis[:, None, None]
+                        if cfg.cp_panel_scale != 1.0:
+                            cp_feat = cp_feat * cfg.cp_panel_scale
+                        x_n = torch.cat([x_n, cp_feat], dim=-1)
+                    if cfg.vortex_panel_velocity:
+                        vp_feat = compute_vortex_panel_velocity(
+                            _raw_xy_te_vis, _raw_aoa_vis, is_surf_dev, _raw_saf_norm_te_vis, n_panels=cfg.vortex_panel_n)
+                        if cfg.vortex_panel_scale != 1.0:
+                            vp_feat = vp_feat * cfg.vortex_panel_scale
+                        x_n = torch.cat([x_n, vp_feat], dim=-1)
+                    Umag, q = _umag_q(y_dev, mask)
+                    pred = vis_model({"x": x_n, "mask": mask})["preds"].float()
+                    if cfg.raw_targets:
+                        y_pred = (pred * raw_stats["y_std"] + raw_stats["y_mean"]).squeeze(0).cpu()
+                    elif cfg.adaptive_norm:
+                        pred_adapt = pred * raw_stats["y_std"] + raw_stats["y_mean"]
+                        if cfg.asinh_pressure:
+                            pred_adapt = pred_adapt.clone()
+                            pred_adapt[:, :, 2:3] = torch.sinh(pred_adapt[:, :, 2:3]) / cfg.asinh_scale
+                        y_pred = pred_adapt.squeeze(0).cpu()
+                    else:
+                        pred_phys = pred * phys_stats["y_std"] + phys_stats["y_mean"]
+                        if cfg.log_pressure:
+                            pred_phys = pred_phys.clone()
+                            pred_phys[:, :, 2:3] = pred_phys[:, :, 2:3].sign() * (pred_phys[:, :, 2:3].abs().exp() - 1)
+                        if cfg.asinh_pressure:
+                            pred_phys = pred_phys.clone()
+                            pred_phys[:, :, 2:3] = torch.sinh(pred_phys[:, :, 2:3]) / cfg.asinh_scale
+                        if cfg.tight_denorm_clamps:
+                            _pd = pred_phys.clone()
+                            _pd[:, :, 0:1] = pred_phys[:, :, 0:1].clamp(-5, 5) * Umag
+                            _pd[:, :, 1:2] = pred_phys[:, :, 1:2].clamp(-5, 5) * Umag
+                            _pd[:, :, 2:3] = pred_phys[:, :, 2:3].clamp(-10, 10) * q
+                            y_pred = _pd.squeeze(0).cpu()
+                        else:
+                            y_pred = _phys_denorm(pred_phys, Umag, q).squeeze(0).cpu()
+                samples.append((x[:, :2], y_true, y_pred, is_surface))
+            images = visualize(samples, out_dir=plot_dir / split_name)
+            if images:
+                wandb.log({f"val_predictions/{split_name}": [wandb.Image(str(p)) for p in images], "global_step": global_step})
+    except Exception as e:
+        print(f"Warning: flow field visualization failed: {e}")
+        wandb.alert(title="Vis failed", text=str(e)[:200], level="WARN")
+
+# ---------------------------------------------------------------------------
+# Verification: manual denormalization check for surface refinement
+# ---------------------------------------------------------------------------
+if cfg.surface_refine and best_metrics:
+    print("\n" + "=" * 70)
+    print("VERIFICATION: Manual denormalization check on val_ood_re")
+    print("=" * 70)
+    try:
+        # Use the best eval model (EMA if available) + refinement head
+        if ema_model is not None:
+            verify_model = ema_model
+        else:
+            verify_model = _base_model
+        _verify_sd = torch.load(model_path, map_location=device, weights_only=True)
+        _verify_sd = {k.removeprefix("_orig_mod."): v for k, v in _verify_sd.items()}
+        verify_model.load_state_dict(_verify_sd)
+        verify_model.eval()
+
+        # Use EMA refinement head if available, else training head
+        verify_refine = ema_refine_head if ema_refine_head is not None else (
+            refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
+        )
+        verify_refine.eval()
+
+        # Run inference on val_ood_re only
+        _ood_re_loader = val_loaders.get("val_ood_re")
+        if _ood_re_loader is None:
+            print("WARNING: val_ood_re split not found, skipping verification")
+        else:
+            # Collect per-sample results
+            all_manual_surf_p_ae = []  # manual absolute errors for surface pressure
+            all_pipeline_surf_p_ae = []  # pipeline absolute errors (should match W&B)
+            all_correction_magnitudes = []  # refinement correction magnitudes
+            all_re_values = []  # Reynolds numbers for correlation check
+
+            with torch.no_grad():
+                for x, y, is_surface, mask in tqdm(_ood_re_loader, desc="Verify OOD-Re", leave=False):
+                    x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                    is_surface = is_surface.to(device, non_blocking=True)
+                    mask = mask.to(device, non_blocking=True)
+                    B = x.shape[0]
+
+                    # Save Re values (raw, before normalization)
+                    _re_raw = x[:, 0, 13].cpu()  # Re feature
+                    all_re_values.append(_re_raw)
+
+                    # Preprocess (same as val loop)
+                    raw_dsdf = x[:, :, 2:10]
+                    dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
+                    dist_feat = torch.log1p(dist_surf * 10.0)
+                    _raw_aoa = x[:, 0, 14:15]
+                    _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
+                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+                    _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
+                    _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
+                    _raw_gap_wake_vv = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
+                    x = (x - stats["x_mean"]) / stats["x_std"]
+                    curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
+                    if cfg.foil2_dist:
+                        foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
+                        x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
+                    elif cfg.te_coord_frame:
+                        te_feats, _fore_te_x_vv, _fore_te_y_vv = compute_te_features(
+                            _raw_xy_te, is_surface, _raw_saf_norm_te)
+                        x = torch.cat([x, curv, dist_feat, te_feats], dim=-1)
+                        if cfg.wake_deficit_feature:
+                            wake_feats_vv = compute_wake_deficit_features(
+                                _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake_vv,
+                                fore_te_x=_fore_te_x_vv, fore_te_y=_fore_te_y_vv,
+                                include_angle=cfg.wake_angle_feature)
+                            x = torch.cat([x, wake_feats_vv], dim=-1)
+                    else:
+                        x = torch.cat([x, curv, dist_feat], dim=-1)
+                        if cfg.wake_deficit_feature:
+                            wake_feats_vv = compute_wake_deficit_features(
+                                _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake_vv,
+                                include_angle=cfg.wake_angle_feature)
+                            x = torch.cat([x, wake_feats_vv], dim=-1)
+                    raw_xy = x[:, :, :2]
+                    xy_min = raw_xy.amin(dim=1, keepdim=True)
+                    xy_max = raw_xy.amax(dim=1, keepdim=True)
+                    xy_norm = (raw_xy - xy_min) / (xy_max - xy_min + 1e-8)
+                    freqs = torch.cat([verify_model.fourier_freqs_fixed.to(device), verify_model.fourier_freqs_learned.abs()])
+                    xy_scaled = xy_norm.unsqueeze(-1) * freqs
+                    fourier_pe = torch.cat([xy_scaled.sin().flatten(-2), xy_scaled.cos().flatten(-2)], dim=-1)
+                    x = torch.cat([x, fourier_pe], dim=-1)
+                    if cfg.cp_panel:
+                        cp_feat = compute_cp_panel(_raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te)
+                        if cfg.cp_panel_tandem_only:
+                            cp_feat = cp_feat * _is_tandem_raw[:, None, None]
+                        if cfg.cp_panel_scale != 1.0:
+                            cp_feat = cp_feat * cfg.cp_panel_scale
+                        x = torch.cat([x, cp_feat], dim=-1)
+                    if cfg.vortex_panel_velocity:
+                        vp_feat = compute_vortex_panel_velocity(
+                            _raw_xy_te, _raw_aoa, is_surface, _raw_saf_norm_te, n_panels=cfg.vortex_panel_n)
+                        if cfg.vortex_panel_scale != 1.0:
+                            vp_feat = vp_feat * cfg.vortex_panel_scale
+                        x = torch.cat([x, vp_feat], dim=-1)
+
+                    # Ground truth denormalization reference
+                    Umag, q = _umag_q(y, mask)
+                    if cfg.adaptive_norm:
+                        y_adapt = y.clone()
+                        if cfg.asinh_pressure:
+                            y_adapt[:, :, 2:3] = torch.asinh(y_adapt[:, :, 2:3] * cfg.asinh_scale)
+                        y_norm = (y_adapt - raw_stats["y_mean"]) / raw_stats["y_std"]
+                    else:
+                        y_phys = _phys_norm(y, Umag, q)
+                        if cfg.asinh_pressure:
+                            y_phys = y_phys.clone()
+                            y_phys[:, :, 2:3] = torch.asinh(y_phys[:, :, 2:3] * cfg.asinh_scale)
+                        y_norm = (y_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+
+                    # Residual prediction
+                    _v_freestream = None
+                    if cfg.residual_prediction:
+                        _aoa = _raw_aoa
+                        if cfg.adaptive_norm:
+                            _fs_raw = torch.zeros(B, 1, 3, device=device)
+                            _fs_raw[:, 0, 0] = Umag.squeeze() * torch.cos(_aoa.squeeze(-1))
+                            _fs_raw[:, 0, 1] = Umag.squeeze() * torch.sin(_aoa.squeeze(-1))
+                            _fs_raw[:, 0, 2] = 0.0
+                            _v_freestream = (_fs_raw - raw_stats["y_mean"]) / raw_stats["y_std"]
+                        else:
+                            _fs_phys = torch.zeros(B, 1, 3, device=device)
+                            _fs_phys[:, 0, 0] = torch.cos(_aoa.squeeze(-1))
+                            _fs_phys[:, 0, 1] = torch.sin(_aoa.squeeze(-1))
+                            _fs_phys[:, 0, 2] = 0.0
+                            _v_freestream = (_fs_phys - phys_stats["y_mean"]) / phys_stats["y_std"]
+                        y_norm = y_norm - _v_freestream
+
+                    # Per-sample std
+                    raw_gap = x[:, 0, 21]
+                    is_tandem_v = raw_gap.abs() > 0.5
+                    sample_stds = torch.ones(B, 1, 3, device=device)
+                    if not cfg.no_perstd and not cfg.raw_targets and not cfg.adaptive_norm:
+                        if cfg.high_p_clamp:
+                            channel_clamps = torch.tensor([0.1, 0.1, 2.0], device=device)
+                            tandem_clamps = torch.tensor([0.3, 0.3, 2.0], device=device)
+                        else:
+                            channel_clamps = torch.tensor([0.1, 0.1, 0.5], device=device)
+                            tandem_clamps = torch.tensor([0.3, 0.3, 1.0], device=device)
+                        for b in range(B):
+                            valid = mask[b]
+                            if is_tandem_v[b]:
+                                sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=tandem_clamps)
+                            else:
+                                sample_stds[b, 0] = y_norm[b, valid].std(dim=0).clamp(min=channel_clamps)
+
+                    # Model forward
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        out = verify_model({"x": x})
+                        pred_raw = out["preds"].float()
+                        hidden = out["hidden"].float()
+
+                    # === PATH A: Pipeline denormalization (same as val loop) ===
+                    pred_loss = pred_raw / sample_stds
+                    # Apply refinement
+                    surf_idx = is_surface.nonzero(as_tuple=False)
+                    correction_full = torch.zeros_like(pred_loss)
+                    if surf_idx.numel() > 0:
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]
+                            surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
+                            correction = verify_refine(surf_hidden, surf_pred).float()
+                        pred_loss_refined = pred_loss.clone()
+                        pred_loss_refined[surf_idx[:, 0], surf_idx[:, 1]] += correction
+                        correction_full[surf_idx[:, 0], surf_idx[:, 1]] = correction
+                    else:
+                        pred_loss_refined = pred_loss
+
+                    # Back-compute pred with refinement
+                    pred_refined = pred_loss_refined * sample_stds
+
+                    # Add freestream back
+                    if cfg.residual_prediction and _v_freestream is not None:
+                        pred_refined = pred_refined + _v_freestream
+
+                    # Z-score denorm
+                    _zs = raw_stats if cfg.adaptive_norm else phys_stats
+                    pred_phys_A = pred_refined * _zs["y_std"] + _zs["y_mean"]
+                    if cfg.asinh_pressure:
+                        pred_phys_A = pred_phys_A.clone()
+                        pred_phys_A[:, :, 2:3] = torch.sinh(pred_phys_A[:, :, 2:3]) / cfg.asinh_scale
+                    # Physics denorm (skip for adaptive_norm — already in raw space)
+                    pred_orig_A = pred_phys_A if cfg.adaptive_norm else _phys_denorm(pred_phys_A, Umag, q)
+
+                    # === PATH B: Manual denormalization from scratch ===
+                    # Start from raw model output, apply refinement, denormalize manually
+                    # Step 1: raw model output → divide by sample_stds
+                    pred_manual = pred_raw / sample_stds
+                    # Step 2: add refinement correction (same as above)
+                    if surf_idx.numel() > 0:
+                        pred_manual = pred_manual.clone()
+                        pred_manual[surf_idx[:, 0], surf_idx[:, 1]] += correction
+                    # Step 3: multiply by sample_stds to undo per-sample normalization
+                    pred_manual = pred_manual * sample_stds
+                    # Step 4: add freestream (residual prediction)
+                    if cfg.residual_prediction and _v_freestream is not None:
+                        pred_manual = pred_manual + _v_freestream
+                    # Step 5: undo z-score: pred * std + mean
+                    pred_manual_phys = pred_manual * _zs["y_std"] + _zs["y_mean"]
+                    if cfg.asinh_pressure:
+                        pred_manual_phys = pred_manual_phys.clone()
+                        pred_manual_phys[:, :, 2:3] = torch.sinh(pred_manual_phys[:, :, 2:3]) / cfg.asinh_scale
+                    # Step 6: undo physics norm: Ux*Umag, Uy*Umag, p*q
+                    if cfg.adaptive_norm:
+                        pred_manual_orig = pred_manual_phys
+                    else:
+                        pred_manual_orig = torch.zeros_like(pred_manual_phys)
+                        pred_manual_orig[:, :, 0:1] = pred_manual_phys[:, :, 0:1].clamp(-10, 10) * Umag
+                        pred_manual_orig[:, :, 1:2] = pred_manual_phys[:, :, 1:2].clamp(-10, 10) * Umag
+                        pred_manual_orig[:, :, 2:3] = pred_manual_phys[:, :, 2:3].clamp(-20, 20) * q
+
+                    # === PATH C: NO refinement (raw model only) ===
+                    pred_norefine = pred_raw * sample_stds  # undo per-sample std (divides cancel)
+                    # Wait: pred_raw is raw output. For baseline: pred / sample_stds * sample_stds = pred_raw
+                    # So no-refinement path just uses pred_raw directly
+                    pred_norefine = pred_raw.clone()
+                    if cfg.residual_prediction and _v_freestream is not None:
+                        pred_norefine = pred_norefine + _v_freestream
+                    pred_norefine_phys = pred_norefine * _zs["y_std"] + _zs["y_mean"]
+                    if cfg.asinh_pressure:
+                        pred_norefine_phys = pred_norefine_phys.clone()
+                        pred_norefine_phys[:, :, 2:3] = torch.sinh(pred_norefine_phys[:, :, 2:3]) / cfg.asinh_scale
+                    pred_norefine_orig = pred_norefine_phys if cfg.adaptive_norm else _phys_denorm(pred_norefine_phys, Umag, q)
+
+                    # Compute surface pressure MAE for all paths
+                    surf_mask = mask & is_surface
+                    y_clamped = y.clamp(-1e6, 1e6)
+
+                    err_A = (pred_orig_A - y_clamped).abs()
+                    err_B = (pred_manual_orig - y_clamped).abs()
+                    err_C = (pred_norefine_orig - y_clamped).abs()
+
+                    for b in range(B):
+                        s = surf_mask[b]
+                        if s.sum() > 0:
+                            all_pipeline_surf_p_ae.append(err_A[b, s, 2].cpu())
+                            all_manual_surf_p_ae.append(err_B[b, s, 2].cpu())
+                            # Correction magnitude per surface node
+                            all_correction_magnitudes.append(correction_full[b, s, 2].abs().cpu())
+
+            # Aggregate results
+            pipeline_mae_p = torch.cat(all_pipeline_surf_p_ae).mean().item()
+            manual_mae_p = torch.cat(all_manual_surf_p_ae).mean().item()
+            corr_mags = torch.cat(all_correction_magnitudes)
+            re_vals = torch.cat(all_re_values)
+
+            print(f"\n--- Verification Results ---")
+            print(f"Pipeline MAE surf_p (should match W&B):  {pipeline_mae_p:.2f}")
+            print(f"Manual denorm MAE surf_p:                {manual_mae_p:.2f}")
+            print(f"Difference (pipeline - manual):          {pipeline_mae_p - manual_mae_p:.4f}")
+            print(f"Match: {'YES' if abs(pipeline_mae_p - manual_mae_p) < 0.1 else 'NO — POTENTIAL BUG'}")
+            print(f"\nRefinement correction magnitude stats:")
+            print(f"  Mean: {corr_mags.mean().item():.6f}")
+            print(f"  Std:  {corr_mags.std().item():.6f}")
+            print(f"  Max:  {corr_mags.max().item():.6f}")
+            print(f"  Min:  {corr_mags.min().item():.6f}")
+
+            # Check Re correlation: compute mean correction magnitude per sample
+            _per_sample_corr = []
+            _idx = 0
+            for _re_batch in all_re_values:
+                for _r in _re_batch:
+                    # Each sample contributes variable number of surface nodes
+                    # Use a simpler per-Re-value check: all OOD-Re should have same Re
+                    _per_sample_corr.append(_r.item())
+            print(f"\nRe values in OOD-Re split (should all be same Re=4.445M):")
+            print(f"  Unique Re values: {set(round(r, 4) for r in _per_sample_corr)}")
+
+            # Log to W&B
+            wandb.summary.update({
+                "verify/pipeline_mae_surf_p": pipeline_mae_p,
+                "verify/manual_mae_surf_p": manual_mae_p,
+                "verify/mae_diff": pipeline_mae_p - manual_mae_p,
+                "verify/correction_mean": corr_mags.mean().item(),
+                "verify/correction_std": corr_mags.std().item(),
+                "verify/correction_max": corr_mags.max().item(),
+                "verify/match": abs(pipeline_mae_p - manual_mae_p) < 0.1,
+            })
+            print("Verification results logged to W&B.")
+
+    except Exception as e:
+        import traceback
+        print(f"WARNING: Verification failed: {e}")
+        traceback.print_exc()
 
 wandb.finish()
