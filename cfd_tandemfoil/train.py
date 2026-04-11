@@ -493,6 +493,68 @@ def compute_vortex_panel_velocity(raw_xy, aoa_rad, is_surface, saf_norm, n_panel
     return out  # [B, N, 4]
 
 
+@torch.no_grad()
+def compute_aux_landmark_targets(raw_xy, raw_p, is_surface, saf_norm, q):
+    """Compute per-foil stagnation point and suction peak targets for auxiliary heads.
+
+    For each foil surface, sorts nodes by angle around centroid to form an ordered
+    traversal, computes cumulative arc-length, and finds the stagnation point
+    (max pressure / max Cp) and suction peak (min pressure / min Cp) locations.
+
+    Args:
+        raw_xy:     [B, N, 2] raw (pre-normalization) x, y coordinates
+        raw_p:      [B, N] raw pressure values (ground truth)
+        is_surface: [B, N] bool mask
+        saf_norm:   [B, N] saf channel norm (fore <= 0.005, aft > 0.005)
+        q:          [B, 1, 1] dynamic pressure (0.5 * Umag^2)
+
+    Returns:
+        foil_data: list of (batch_idx, foil_node_indices, stag_arc, suction_arc, suction_cp)
+                   or empty list if no valid foils
+    """
+    B = raw_xy.shape[0]
+    device = raw_xy.device
+    foil_data = []
+
+    for b in range(B):
+        q_val = q[b, 0, 0]
+        for foil_cond in [saf_norm[b] <= 0.005, saf_norm[b] > 0.005]:
+            foil_mask = is_surface[b] & foil_cond
+            n_nodes = foil_mask.sum()
+            if n_nodes < 3:
+                continue
+            f_idx = foil_mask.nonzero(as_tuple=True)[0]
+            xy = raw_xy[b, f_idx]   # [M, 2]
+            p = raw_p[b, f_idx]     # [M]
+
+            # Sort by angle around centroid for ordered traversal
+            cx, cy = xy[:, 0].mean(), xy[:, 1].mean()
+            angles = torch.atan2(xy[:, 1] - cy, xy[:, 0] - cx)
+            sort_order = angles.argsort()
+            xy_s = xy[sort_order]
+            p_s = p[sort_order]
+
+            # Cumulative arc-length, normalized to [0, 1]
+            M = xy_s.shape[0]
+            seg_len = (xy_s[1:] - xy_s[:-1]).norm(dim=-1)
+            cum_arc = torch.zeros(M, device=device)
+            cum_arc[1:] = seg_len.cumsum(0)
+            total_arc = cum_arc[-1].clamp(min=1e-6)
+            arc_norm = cum_arc / total_arc
+
+            # Stagnation point: node with max pressure
+            stag_arc = arc_norm[p_s.argmax()]
+
+            # Suction peak: node with min pressure
+            suction_local = p_s.argmin()
+            suction_arc = arc_norm[suction_local]
+            suction_cp = p_s[suction_local] / q_val.clamp(min=1e-6)
+
+            foil_data.append((b, f_idx, stag_arc, suction_arc, suction_cp))
+
+    return foil_data
+
+
 class TransolverBlock(nn.Module):
     def __init__(
         self,
@@ -1328,6 +1390,9 @@ class Config:
     vortex_panel_velocity: bool = False    # append (u_fore, v_fore, u_aft, v_aft) induced velocity
     vortex_panel_scale: float = 0.1        # scale factor for vortex velocity channels
     vortex_panel_n: int = 64              # number of panels to subsample per foil
+    # Tandem auxiliary heads: predict stagnation point and suction peak landmarks per foil
+    tandem_aux_heads: bool = False         # auxiliary heads for aerodynamic landmarks
+    tandem_aux_weight: float = 0.05        # loss weight for each auxiliary head
 
 
 cfg = sp.parse(Config)
@@ -1566,6 +1631,20 @@ if cfg.aft_foil_srf:
               f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, "
               f"film={cfg.aft_foil_srf_film})")
 
+# Auxiliary landmark prediction heads (stagnation point + suction peak)
+aux_stag_head = None
+aux_suction_head = None
+if cfg.tandem_aux_heads:
+    aux_stag_head = nn.Sequential(
+        nn.Linear(cfg.n_hidden, 64), nn.GELU(), nn.Linear(64, 1)
+    ).to(device)
+    aux_suction_head = nn.Sequential(
+        nn.Linear(cfg.n_hidden, 64), nn.GELU(), nn.Linear(64, 2)
+    ).to(device)
+    _aux_n_params = sum(p.numel() for p in aux_stag_head.parameters()) + \
+                    sum(p.numel() for p in aux_suction_head.parameters())
+    print(f"Auxiliary landmark heads: {_aux_n_params:,} params (stagnation + suction peak)")
+
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
@@ -1591,6 +1670,10 @@ if aft_srf_head is not None:
     n_params += sum(p.numel() for p in aft_srf_head.parameters())
 if aft_srf_ctx_head is not None:
     n_params += sum(p.numel() for p in aft_srf_ctx_head.parameters())
+if aux_stag_head is not None:
+    n_params += sum(p.numel() for p in aux_stag_head.parameters())
+if aux_suction_head is not None:
+    n_params += sum(p.numel() for p in aux_suction_head.parameters())
 
 
 class SAM:
@@ -1731,6 +1814,12 @@ if aft_srf_ctx_head is not None:
     _ctx_params = list(aft_srf_ctx_head.parameters())
     base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
+
+# Add auxiliary landmark head params to optimizer if enabled
+if aux_stag_head is not None:
+    _aux_params = list(aux_stag_head.parameters()) + list(aux_suction_head.parameters())
+    base_opt.add_param_group({'params': _aux_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _aux_params):,} auxiliary landmark head params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
@@ -1942,8 +2031,8 @@ for epoch in range(MAX_EPOCHS):
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
-        # TE coordinate frame / wake deficit / cp_panel / vortex_panel: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+        # TE coordinate frame / wake deficit / cp_panel / vortex_panel / aux heads: save raw xy and saf_norm before normalization
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity or cfg.tandem_aux_heads
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
@@ -2096,6 +2185,30 @@ for epoch in range(MAX_EPOCHS):
                 pred = pred * sample_stds
             else:
                 pred = pred / sample_stds
+
+        # --- Auxiliary landmark heads: stagnation point + suction peak ---
+        _aux_stag_loss = torch.tensor(0.0, device=device)
+        _aux_suction_loss = torch.tensor(0.0, device=device)
+        if cfg.tandem_aux_heads and model.training and aux_stag_head is not None:
+            # Compute per-foil targets from ground truth (no grad needed)
+            _aux_foil_data = compute_aux_landmark_targets(
+                _raw_xy_te, y[:, :, 2], is_surface, _raw_saf_norm_te, q)
+            if _aux_foil_data:
+                # Pool hidden states per foil (WITH grad for backbone learning)
+                _foil_hiddens = []
+                _stag_targets = []
+                _suction_targets = []
+                for _b, _fidx, _sa, _sua, _suc in _aux_foil_data:
+                    _foil_hiddens.append(hidden[_b, _fidx].mean(dim=0))
+                    _stag_targets.append(_sa)
+                    _suction_targets.append(torch.stack([_sua, _suc]))
+                _foil_h = torch.stack(_foil_hiddens)  # [N_foils, n_hidden]
+                _stag_pred = aux_stag_head(_foil_h)          # [N_foils, 1]
+                _suction_pred = aux_suction_head(_foil_h)    # [N_foils, 2]
+                _stag_tgt = torch.stack(_stag_targets).unsqueeze(-1).detach()  # [N_foils, 1]
+                _suction_tgt = torch.stack(_suction_targets).detach()          # [N_foils, 2]
+                _aux_stag_loss = F.l1_loss(_stag_pred, _stag_tgt)
+                _aux_suction_loss = F.l1_loss(_suction_pred, _suction_tgt)
 
         # Surface refinement head: additive correction on surface nodes
         if refine_head is not None and model.training:
@@ -2269,6 +2382,10 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # Auxiliary landmark losses (stagnation + suction peak)
+        _aux_weight = cfg.tandem_aux_weight
+        loss = loss + _aux_weight * _aux_stag_loss + _aux_weight * _aux_suction_loss
+
         # DCT frequency-weighted auxiliary loss on surface pressure
         if cfg.dct_freq_loss and model.training:
             _dct_loss = torch.tensor(0.0, device=device)
@@ -2332,8 +2449,9 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            _aux_pcgrad = _aux_weight * _aux_stag_loss + _aux_weight * _aux_suction_loss
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + _aux_pcgrad
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + _aux_pcgrad
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -2378,7 +2496,7 @@ for epoch in range(MAX_EPOCHS):
                 vol_loss_g = (abs_err * vol_mask_g.unsqueeze(-1)).sum() / vol_mask_g.sum().clamp(min=1)
                 surf_loss_g = (surf_per_sample * mask_1d.float() * tandem_boost).sum() / n
                 coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + _aux_weight * _aux_stag_loss + _aux_weight * _aux_suction_loss
 
             loss_A = _grp_loss(~is_tandem_batch)
             # Only include non-empty groups to avoid backward() on no-grad tensors
@@ -2506,7 +2624,11 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _train_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.tandem_aux_heads:
+            _train_log["train/aux_stag_loss"] = _aux_stag_loss.item() if isinstance(_aux_stag_loss, torch.Tensor) else 0.0
+            _train_log["train/aux_suction_loss"] = _aux_suction_loss.item() if isinstance(_aux_suction_loss, torch.Tensor) else 0.0
+        wandb.log(_train_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
