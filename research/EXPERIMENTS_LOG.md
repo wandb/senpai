@@ -1,5 +1,30 @@
 # SENPAI Research Results
 
+## 2026-04-11 06:15 — PR #2386: Stagnation Point Pressure Constraint — nezuko — **CLOSED** ❌
+
+- Branch: nezuko/stagnation-constraint
+- **Hypothesis:** Soft physics constraint enforcing Cp≈1.0 at leading-edge stagnation point. Geometry-based node identification (minimum score = x·cos(AoA)+y·sin(AoA)). Weight=0.5.
+
+### Results (2-seed avg, pre-ANP baseline)
+
+| Metric | Seed 42 | Seed 73 | 2-Seed Avg | Baseline | Δ |
+|--------|---------|---------|-----------|----------|---|
+| p_in | 13.128 | 12.730 | **12.929** | 11.872 | **+8.9%** ❌ |
+| p_oodc | 8.003 | 8.091 | **8.047** | 7.459 | **+7.9%** ❌ |
+| p_tan | 28.659 | 28.446 | **28.553** | 26.319 | **+8.5%** ❌ |
+| p_re | 6.763 | 7.049 | **6.906** | 6.229 | **+10.9%** ❌ |
+
+- W&B runs: `a3s57yqu` (seed 42), `b63w3haj` (seed 73)
+- Group: `stagnation-constraint`
+
+### Analysis
+
+**Uniform 8-11% regression across ALL splits — dead end.** The fact that p_in (single-foil only) degraded equally to p_tan rules out weight tuning as the fix. Root causes: (1) geometric LE ≠ fluid stagnation point on irregular meshes, (2) normalized prediction space makes stagnation pressure targets noisy, (3) PCGrad gradient conflicts. Weight=0.5 is aggressive, but nezuko's analysis correctly identifies that identification and normalization issues are the fundamental problems. The Kutta TE approach at least had the right physics (it improved p_oodc); stagnation node ID is inherently fragile.
+
+**Lesson:** Point constraints on meshes require robust node identification. Geometry-based heuristics are insufficient when the true physical location depends on flow conditions.
+
+---
+
 ## 2026-04-11 06:00 — PR #2387: Bernoulli Velocity-Pressure Consistency — fern — **CLOSED** ❌
 
 - Branch: fern/bernoulli-constraint
