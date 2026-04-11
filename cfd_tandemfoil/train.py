@@ -20,6 +20,7 @@ KNOWN LIMITATIONS (inherited from read-only prepare.py):
     Tandem surface loss is therefore underweighted.
 """
 
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -689,6 +690,32 @@ class TransolverBlock(nn.Module):
         return fx
 
 
+class SirenLayer(nn.Module):
+    """Single SIREN layer: sin(ω₀ * Wx + b) with SIREN-specific initialization.
+
+    CRITICAL: Initialization follows Sitzmann et al. (NeurIPS 2020) exactly.
+    Without it, sin() saturates or produces near-zero gradients.
+    """
+
+    def __init__(self, d_in: int, d_out: int, omega_0: float = 30.0, is_first: bool = False):
+        super().__init__()
+        self.omega_0 = omega_0
+        self.linear = nn.Linear(d_in, d_out)
+        with torch.no_grad():
+            if is_first:
+                self.linear.weight.uniform_(-1.0 / d_in, 1.0 / d_in)
+            else:
+                self.linear.weight.uniform_(
+                    -math.sqrt(6.0 / d_in) / omega_0,
+                    math.sqrt(6.0 / d_in) / omega_0,
+                )
+            # Bias uniform in [-π, π] for variety in phase offsets
+            self.linear.bias.uniform_(-math.pi, math.pi)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sin(self.omega_0 * self.linear(x))
+
+
 class SurfaceRefinementHead(nn.Module):
     """Lightweight MLP that predicts additive corrections for surface nodes.
 
@@ -698,7 +725,8 @@ class SurfaceRefinementHead(nn.Module):
     """
 
     def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 128,
-                 n_layers: int = 2, p_only: bool = False):
+                 n_layers: int = 2, p_only: bool = False,
+                 use_siren: bool = False, siren_omega: float = 30.0):
         super().__init__()
         self.p_only = p_only
         actual_out = 1 if p_only else out_dim  # 1 for pressure-only, 3 for all fields
@@ -706,9 +734,13 @@ class SurfaceRefinementHead(nn.Module):
         # Input: hidden features (n_hidden) + base predictions (out_dim)
         in_dim = n_hidden + out_dim
         for i in range(n_layers):
-            layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
-            layers.append(nn.LayerNorm(hidden_dim))
-            layers.append(nn.GELU())
+            d_in = in_dim if i == 0 else hidden_dim
+            if use_siren:
+                layers.append(SirenLayer(d_in, hidden_dim, omega_0=siren_omega, is_first=(i == 0)))
+            else:
+                layers.append(nn.Linear(d_in, hidden_dim))
+                layers.append(nn.LayerNorm(hidden_dim))
+                layers.append(nn.GELU())
         layers.append(nn.Linear(hidden_dim, actual_out))
         # Zero-init last layer so refinement starts as identity
         nn.init.zeros_(layers[-1].weight)
@@ -1328,6 +1360,9 @@ class Config:
     vortex_panel_velocity: bool = False    # append (u_fore, v_fore, u_aft, v_aft) induced velocity
     vortex_panel_scale: float = 0.1        # scale factor for vortex velocity channels
     vortex_panel_n: int = 64              # number of panels to subsample per foil
+    # SIREN surface refinement: sinusoidal activations for high-frequency surface features
+    siren_srf: bool = False              # use SIREN (sinusoidal) activations in SRF MLP instead of GELU+LN
+    siren_omega: float = 30.0            # SIREN frequency parameter ω₀ (30=standard, 10=conservative)
 
 
 cfg = sp.parse(Config)
@@ -1529,12 +1564,15 @@ if cfg.surface_refine:
             hidden_dim=cfg.surface_refine_hidden,
             n_layers=cfg.surface_refine_layers,
             p_only=cfg.surface_refine_p_only,
+            use_siren=cfg.siren_srf,
+            siren_omega=cfg.siren_omega,
         ).to(device)
     refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
     _refine_n_params = sum(p.numel() for p in refine_head.parameters())
+    _siren_info = f", siren=ω₀={cfg.siren_omega}" if cfg.siren_srf else ""
     print(f"Surface refinement head: {_refine_n_params:,} params "
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
-          f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
+          f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context}{_siren_info})")
 
 # Aft-foil (boundary ID=7) dedicated refinement head
 aft_srf_head = None
@@ -2439,6 +2477,8 @@ for epoch in range(MAX_EPOCHS):
             loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        if refine_head is not None:
+            torch.nn.utils.clip_grad_norm_(refine_head.parameters(), max_norm=1.0)
         sam_active = sam_optimizer is not None and epoch >= int(MAX_EPOCHS * 0.75)
         _should_step = (cfg.grad_accum_steps <= 1 or
                         (batch_idx + 1) % cfg.grad_accum_steps == 0 or
@@ -2462,6 +2502,8 @@ for epoch in range(MAX_EPOCHS):
             loss2 = vol_loss2 + surf_weight * surf_loss2 + 0.01 * re_loss2 + 0.01 * aoa_loss2
             loss2.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if refine_head is not None:
+                torch.nn.utils.clip_grad_norm_(refine_head.parameters(), max_norm=1.0)
             sam_optimizer.restore()
         if use_pcgrad or _should_step:
             optimizer.step()
@@ -2506,7 +2548,14 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _step_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.siren_srf and refine_head is not None and global_step % 50 == 0:
+            _srf_base = refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
+            _srf_gnorm = sum(
+                p.grad.norm().item() ** 2 for p in _srf_base.parameters() if p.grad is not None
+            ) ** 0.5
+            _step_log["train/srf_grad_norm"] = _srf_gnorm
+        wandb.log(_step_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
