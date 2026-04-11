@@ -1328,6 +1328,10 @@ class Config:
     vortex_panel_velocity: bool = False    # append (u_fore, v_fore, u_aft, v_aft) induced velocity
     vortex_panel_scale: float = 0.1        # scale factor for vortex velocity channels
     vortex_panel_n: int = 64              # number of panels to subsample per foil
+    # Stagnation point pressure constraint: soft physics loss anchoring pressure at leading edge
+    stagnation_constraint: bool = False   # enable stagnation point pressure constraint
+    stagnation_weight: float = 0.5        # weight for stagnation constraint loss
+    stagnation_aft_weight_mult: float = 2.0  # aft-foil stagnation weight multiplier for tandem
 
 
 cfg = sp.parse(Config)
@@ -1943,7 +1947,7 @@ for epoch in range(MAX_EPOCHS):
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
         # TE coordinate frame / wake deficit / cp_panel / vortex_panel: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity or cfg.stagnation_constraint
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
@@ -2269,6 +2273,58 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        _stag_scaled = None  # initialize for PCGrad paths
+        # Stagnation point pressure constraint: |p_pred[stag] - p_target[stag]|
+        # Stagnation node = surface node with minimum (x*cos(AoA) + y*sin(AoA)) score
+        # (faces into the freestream flow — lowest velocity, highest pressure)
+        if cfg.stagnation_constraint and model.training:
+            _stag_loss = torch.tensor(0.0, device=device)
+            _n_stag = 0
+            _raw_xy_stag = _raw_xy_te  # [B, N, 2] raw (un-normalized) xy; available because te_coord_frame etc.
+            if _raw_xy_stag is not None and _raw_aoa is not None:
+                _aoa_stag = _raw_aoa.squeeze(-1)  # [B]
+                _cos_a = torch.cos(_aoa_stag)  # [B]
+                _sin_a = torch.sin(_aoa_stag)  # [B]
+                for b in range(B):
+                    surf_idx_b = is_surface[b].nonzero(as_tuple=True)[0]
+                    if surf_idx_b.numel() < 4:
+                        continue
+                    _xy_b = _raw_xy_stag[b, surf_idx_b]  # [M, 2] raw surface xy
+                    # Stagnation score: minimum faces into freestream
+                    stag_score = _xy_b[:, 0] * _cos_a[b] + _xy_b[:, 1] * _sin_a[b]  # [M]
+                    _is_tandem_b = is_tandem_batch[b].item()
+                    if _is_tandem_b:
+                        # Separate fore and aft surface nodes
+                        _saf_b = _raw_saf_norm_te[b, surf_idx_b]  # [M]
+                        fore_mask_b = (_saf_b <= 0.005)
+                        aft_mask_b = (_saf_b > 0.005)
+                        if fore_mask_b.any():
+                            _fore_local = fore_mask_b.nonzero(as_tuple=True)[0]
+                            _stag_fore_local = stag_score[_fore_local].argmin()
+                            _stag_fore_global = surf_idx_b[_fore_local[_stag_fore_local]]
+                            _err_fore = (pred[b, _stag_fore_global, 2] - y_norm[b, _stag_fore_global, 2]).abs()
+                            _stag_loss = _stag_loss + _err_fore
+                            _n_stag += 1
+                        if aft_mask_b.any():
+                            _aft_local = aft_mask_b.nonzero(as_tuple=True)[0]
+                            _stag_aft_local = stag_score[_aft_local].argmin()
+                            _stag_aft_global = surf_idx_b[_aft_local[_stag_aft_local]]
+                            _err_aft = (pred[b, _stag_aft_global, 2] - y_norm[b, _stag_aft_global, 2]).abs()
+                            _stag_loss = _stag_loss + cfg.stagnation_aft_weight_mult * _err_aft
+                            _n_stag += 1
+                    else:
+                        # Single foil: one stagnation point
+                        _stag_local = stag_score.argmin()
+                        _stag_global = surf_idx_b[_stag_local]
+                        _err = (pred[b, _stag_global, 2] - y_norm[b, _stag_global, 2]).abs()
+                        _stag_loss = _stag_loss + _err
+                        _n_stag += 1
+                if _n_stag > 0:
+                    _stag_loss = _stag_loss / _n_stag
+                    _stag_scaled = cfg.stagnation_weight * _stag_loss
+                    loss = loss + _stag_scaled
+                    wandb.log({"train/stag_loss": _stag_loss.item(), "global_step": global_step})
+
         # DCT frequency-weighted auxiliary loss on surface pressure
         if cfg.dct_freq_loss and model.training:
             _dct_loss = torch.tensor(0.0, device=device)
@@ -2332,8 +2388,9 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            _stag_shared = _stag_scaled * 0.5 if _stag_scaled is not None else 0.0
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + _stag_shared
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + _stag_shared
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -2378,7 +2435,8 @@ for epoch in range(MAX_EPOCHS):
                 vol_loss_g = (abs_err * vol_mask_g.unsqueeze(-1)).sum() / vol_mask_g.sum().clamp(min=1)
                 surf_loss_g = (surf_per_sample * mask_1d.float() * tandem_boost).sum() / n
                 coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                _stag_shared = _stag_scaled * 0.5 if _stag_scaled is not None else 0.0
+                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + _stag_shared
 
             loss_A = _grp_loss(~is_tandem_batch)
             # Only include non-empty groups to avoid backward() on no-grad tensors
