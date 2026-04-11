@@ -1328,6 +1328,9 @@ class Config:
     vortex_panel_velocity: bool = False    # append (u_fore, v_fore, u_aft, v_aft) induced velocity
     vortex_panel_scale: float = 0.1        # scale factor for vortex velocity channels
     vortex_panel_n: int = 64              # number of panels to subsample per foil
+    # Bernoulli velocity-pressure consistency constraint (soft, inviscid)
+    bernoulli_constraint: bool = False     # enforce p + 0.5*(Ux^2+Uy^2) ≈ 0.5*Umag^2 on surface nodes
+    bernoulli_weight: float = 0.1          # loss weight for Bernoulli residual
 
 
 cfg = sp.parse(Config)
@@ -2269,6 +2272,54 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # Bernoulli velocity-pressure consistency constraint (soft, inviscid, surface nodes only)
+        _bernoulli_loss = torch.tensor(0.0, device=device)
+        if cfg.bernoulli_constraint and model.training and surf_mask.any():
+            # Denormalize pred to physical space for Bernoulli computation.
+            # pred is in divided-by-sample_stds z-score space.
+            # Step 1: undo per-sample std → z-score space
+            if cfg.multiply_std:
+                pred_zs_b = pred.detach() / sample_stds.detach()  # detach stds, keep pred grad
+            else:
+                pred_zs_b = pred.detach() * sample_stds.detach()
+            # Recompute from scratch with gradients through pred only
+            # Use a fresh computation that flows grad only through model output
+            if cfg.multiply_std:
+                pred_for_bern = pred / sample_stds.detach()
+            else:
+                pred_for_bern = pred * sample_stds.detach()
+            # Step 2: undo z-score normalization → phys-norm (Cp) space
+            _pstd = phys_stats["y_std"].detach()
+            _pmean = phys_stats["y_mean"].detach()
+            pred_phys_b = pred_for_bern * _pstd + _pmean
+            # Step 3: undo asinh on pressure channel
+            if cfg.asinh_pressure:
+                _ux = pred_phys_b[:, :, 0:1]
+                _uy = pred_phys_b[:, :, 1:2]
+                _p_asinh = pred_phys_b[:, :, 2:3]
+                _p_phys = torch.sinh(_p_asinh) / cfg.asinh_scale
+                pred_phys_b = torch.cat([_ux, _uy, _p_phys], dim=-1)
+            # Step 4: undo residual prediction
+            if cfg.residual_prediction and _freestream is not None:
+                pred_phys_b = pred_phys_b + _freestream.detach()
+            # Step 5: undo physics normalization (out-of-place, no clamp to avoid blocking gradient)
+            _Umag = Umag.detach()
+            _q = q.detach()
+            _ux_phys = pred_phys_b[:, :, 0:1] * _Umag
+            _uy_phys = pred_phys_b[:, :, 1:2] * _Umag
+            _p_phys = pred_phys_b[:, :, 2:3] * _q
+            # Bernoulli residual on surface nodes: |p + 0.5*(Ux^2+Uy^2) - 0.5*Umag^2| / q_ref
+            _q_ref = 0.5 * (_Umag.squeeze(-1) ** 2)  # [B, 1]
+            _q_vel = 0.5 * (_ux_phys ** 2 + _uy_phys ** 2)  # [B, N, 1]
+            _p_total_pred = _p_phys + _q_vel  # [B, N, 1]
+            # Apply surf_mask and compute normalized residual
+            _surf_m = surf_mask.unsqueeze(-1).float()  # [B, N, 1]
+            _q_ref_bc = _q_ref.unsqueeze(-1)  # [B, 1, 1]
+            _bern_res_all = (_p_total_pred - _q_ref_bc).abs() / (_q_ref_bc + 1e-8)
+            _n_surf = _surf_m.sum().clamp(min=1)
+            _bernoulli_loss = (_bern_res_all * _surf_m).sum() / _n_surf
+            loss = loss + cfg.bernoulli_weight * _bernoulli_loss
+
         # DCT frequency-weighted auxiliary loss on surface pressure
         if cfg.dct_freq_loss and model.training:
             _dct_loss = torch.tensor(0.0, device=device)
@@ -2332,8 +2383,9 @@ for epoch in range(MAX_EPOCHS):
             surf_loss_a = (surf_per_sample * is_indist_pcgrad.float() * tandem_boost).sum() / n_a
             surf_loss_b = (surf_per_sample * is_ood_pcgrad.float() * tandem_boost).sum() / n_b
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
-            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            _bern_pcgrad = cfg.bernoulli_weight * _bernoulli_loss if cfg.bernoulli_constraint else 0.0
+            loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + _bern_pcgrad
+            loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + _bern_pcgrad
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -2378,7 +2430,8 @@ for epoch in range(MAX_EPOCHS):
                 vol_loss_g = (abs_err * vol_mask_g.unsqueeze(-1)).sum() / vol_mask_g.sum().clamp(min=1)
                 surf_loss_g = (surf_per_sample * mask_1d.float() * tandem_boost).sum() / n
                 coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                _bern_shared = cfg.bernoulli_weight * _bernoulli_loss if cfg.bernoulli_constraint else 0.0
+                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss + _bern_shared
 
             loss_A = _grp_loss(~is_tandem_batch)
             # Only include non-empty groups to avoid backward() on no-grad tensors
@@ -2506,7 +2559,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _train_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if cfg.bernoulli_constraint:
+            _train_log["train/bernoulli_loss"] = _bernoulli_loss.item() if isinstance(_bernoulli_loss, torch.Tensor) else 0.0
+        wandb.log(_train_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
