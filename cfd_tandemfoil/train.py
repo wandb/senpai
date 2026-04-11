@@ -830,6 +830,101 @@ class AftFoilRefinementContextHead(nn.Module):
         return self.mlp(inp)
 
 
+class HyperSRF(nn.Module):
+    """Hypernetwork-driven Surface Refinement Head (HyPINO-style).
+
+    A small hyper-encoder takes per-sample flow conditions [Re, AoA, gap, stagger, is_tandem]
+    and generates low-rank weight corrections (LoRA-style U@V.T) for each linear layer of
+    the SRF MLP. Base weights are shared; per-sample corrections adapt the function to
+    different tandem configurations.
+
+    Zero-init of hyper-encoder output: corrections start at 0, model begins at base weights.
+    """
+
+    def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 128,
+                 n_layers: int = 2, rank: int = 8, cond_dim: int = 5, hyper_hidden: int = 64):
+        super().__init__()
+        self.n_layers = n_layers
+        self.hidden_dim = hidden_dim
+        self.rank = rank
+        actual_out = out_dim  # always predict all channels
+        in_dim = n_hidden + out_dim
+
+        # Base SRF MLP weights (shared across all samples)
+        self.base_linears = nn.ModuleList()
+        self.base_lns = nn.ModuleList()
+        layer_in = in_dim
+        for i in range(n_layers):
+            self.base_linears.append(nn.Linear(layer_in, hidden_dim))
+            self.base_lns.append(nn.LayerNorm(hidden_dim))
+            layer_in = hidden_dim
+        self.output_linear = nn.Linear(hidden_dim, actual_out)
+        nn.init.zeros_(self.output_linear.weight)
+        nn.init.zeros_(self.output_linear.bias)
+        self.act = nn.GELU()
+
+        # Hyper-encoder: condition → low-rank U,V for each SRF layer
+        # For each of n_layers: U [hidden_dim, rank] + V [layer_in_i, rank]
+        layer_sizes = [in_dim] + [hidden_dim] * n_layers
+        # U dims: hidden_dim * rank for each layer
+        # V dims: layer_in_i * rank for each layer
+        u_total = n_layers * hidden_dim * rank
+        v_sizes = [layer_sizes[i] * rank for i in range(n_layers)]
+        v_total = sum(v_sizes)
+        self.v_offsets = [0] + list(torch.cumsum(torch.tensor(v_sizes), 0).tolist())
+
+        self.hyper_net = nn.Sequential(
+            nn.Linear(cond_dim, hyper_hidden),
+            nn.GELU(),
+            nn.Linear(hyper_hidden, u_total + v_total),
+        )
+        # CRITICAL: zero-init output so corrections start at zero
+        nn.init.zeros_(self.hyper_net[-1].weight)
+        nn.init.zeros_(self.hyper_net[-1].bias)
+
+        self.u_total = u_total
+        self.v_total = v_total
+        self.layer_sizes = layer_sizes
+
+    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor,
+                cond: torch.Tensor, batch_idx: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            hidden: [M, n_hidden] — surface node hidden features
+            base_pred: [M, out_dim] — base predictions for surface nodes
+            cond: [B, cond_dim] — per-sample conditioning (Re, AoA, gap, stagger, is_tandem)
+            batch_idx: [M] — which batch element each surface node belongs to
+        Returns:
+            correction: [M, out_dim]
+        """
+        # Generate per-sample low-rank corrections: [B, u_total + v_total]
+        hyper_out = self.hyper_net(cond)  # [B, u_total + v_total]
+        u_raw = hyper_out[:, :self.u_total]   # [B, u_total]
+        v_raw = hyper_out[:, self.u_total:]   # [B, v_total]
+
+        # Run forward pass on surface nodes
+        x = torch.cat([hidden, base_pred], dim=-1)  # [M, in_dim]
+        u_offset = 0
+        for i, (lin, ln) in enumerate(zip(self.base_linears, self.base_lns)):
+            in_i = self.layer_sizes[i]
+            # Base linear
+            h = lin(x)  # [M, hidden_dim]
+            # Low-rank correction: gather U,V for each node's sample
+            U_batch = u_raw[:, u_offset:u_offset + self.hidden_dim * self.rank].view(-1, self.hidden_dim, self.rank)  # [B, H, R]
+            V_batch = v_raw[:, self.v_offsets[i]:self.v_offsets[i+1]].view(-1, in_i, self.rank)  # [B, in_i, R]
+            U_nodes = U_batch[batch_idx]  # [M, H, R]
+            V_nodes = V_batch[batch_idx]  # [M, in_i, R]
+            # Correction: x @ V @ U.T = [M, in_i] @ [M, in_i, R] → [M, R] @ [M, R, H] → [M, H]
+            correction = torch.einsum('mi,mir->mr', x, V_nodes)  # [M, R]
+            correction = torch.einsum('mr,mhr->mh', correction, U_nodes)  # [M, H]
+            h = h + correction
+            h = ln(h)
+            h = self.act(h)
+            x = h
+            u_offset += self.hidden_dim * self.rank
+        return self.output_linear(x)
+
+
 class SurfaceRefinementContextHead(nn.Module):
     """Surface refinement head that incorporates nearest-volume context.
 
@@ -1300,6 +1395,9 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    hyper_srf: bool = False                   # replace SRF with HyPINO-style hypernetwork SRF
+    hyper_srf_rank: int = 8                   # rank of low-rank weight corrections
+    hyper_srf_hidden: int = 64               # hidden dim of hyper-encoder MLP
     # Phase 6: Asinh pressure transform
     asinh_pressure: bool = False             # transform pressure targets with asinh for dynamic range compression
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
@@ -1522,6 +1620,16 @@ if cfg.surface_refine:
             n_layers=cfg.surface_refine_layers,
             k_neighbors=8,
         ).to(device)
+    elif cfg.hyper_srf:
+        refine_head = HyperSRF(
+            n_hidden=cfg.n_hidden,
+            out_dim=3,
+            hidden_dim=cfg.surface_refine_hidden,
+            n_layers=cfg.surface_refine_layers,
+            rank=cfg.hyper_srf_rank,
+            cond_dim=5,
+            hyper_hidden=cfg.hyper_srf_hidden,
+        ).to(device)
     else:
         refine_head = SurfaceRefinementHead(
             n_hidden=cfg.n_hidden,
@@ -1534,7 +1642,8 @@ if cfg.surface_refine:
     _refine_n_params = sum(p.numel() for p in refine_head.parameters())
     print(f"Surface refinement head: {_refine_n_params:,} params "
           f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
-          f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
+          f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context}, "
+          f"hyper_srf={cfg.hyper_srf})")
 
 # Aft-foil (boundary ID=7) dedicated refinement head
 aft_srf_head = None
@@ -1939,6 +2048,22 @@ for epoch in range(MAX_EPOCHS):
         dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
         _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1] — save before normalization
         _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B] tandem flag from raw gap
+        # HyperSRF conditioning vector: normalize each feature to roughly [-1, 1]
+        # log_re: index 13, mean≈14.58, std≈0.76; aoa0_rad: index 14; gap: index 22; stagger: index 23
+        if cfg.hyper_srf and refine_head is not None:
+            _raw_log_re = x[:, 0, 13]  # [B]
+            _raw_gap = x[:, 0, 22]     # [B]
+            _raw_stagger = x[:, 0, 23] # [B]
+            _raw_aoa0 = x[:, 0, 14]   # [B]
+            _hyper_cond = torch.stack([
+                (_raw_log_re - 14.58) / 0.76,   # log_Re normalized
+                _raw_aoa0 / 0.15,                # AoA normalized (~±8.6°)
+                _raw_gap / 1.5,                  # gap normalized (typical max ~1.5)
+                _raw_stagger / 2.0,              # stagger normalized
+                _is_tandem_raw,                  # is_tandem flag (0 or 1)
+            ], dim=-1)  # [B, 5]
+        else:
+            _hyper_cond = None
         _raw_x_for_dct = x[:, :, 0].clone() if cfg.dct_freq_loss else None  # save raw x before normalization
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
@@ -2106,6 +2231,17 @@ for epoch in range(MAX_EPOCHS):
                         hidden, pred, is_surface, mask, x[:, :, :2]
                     ).float()
                     pred = pred + refine_correction
+                elif cfg.hyper_srf and _hyper_cond is not None:
+                    # HyperSRF: per-sample weight corrections from flow conditioning
+                    surf_idx = is_surface.nonzero(as_tuple=False)  # [M, 2] (batch, node)
+                    if surf_idx.numel() > 0:
+                        surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]  # [M, n_hidden]
+                        surf_pred = pred[surf_idx[:, 0], surf_idx[:, 1]]      # [M, 3]
+                        batch_idx = surf_idx[:, 0]                             # [M] — which sample each node belongs to
+                        correction = refine_head(surf_hidden, surf_pred,
+                                                 _hyper_cond, batch_idx).float()  # [M, 3]
+                        pred = pred.clone()
+                        pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
                 else:
                     # Standard: extract surface nodes, apply MLP, scatter back
                     surf_idx = is_surface.nonzero(as_tuple=False)  # [M, 2] (batch, node)
@@ -2650,6 +2786,17 @@ for epoch in range(MAX_EPOCHS):
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
                 _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
+                # HyperSRF conditioning for val loop
+                if cfg.hyper_srf and eval_refine_head is not None:
+                    _v_hyper_cond = torch.stack([
+                        (x[:, 0, 13] - 14.58) / 0.76,
+                        x[:, 0, 14] / 0.15,
+                        x[:, 0, 22] / 1.5,
+                        x[:, 0, 23] / 2.0,
+                        _is_tandem_raw,
+                    ], dim=-1)
+                else:
+                    _v_hyper_cond = None
                 _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
@@ -2788,6 +2935,16 @@ for epoch in range(MAX_EPOCHS):
                                 _eval_hidden, pred_loss, is_surface, mask, x[:, :, :2]
                             ).float()
                             pred_loss = pred_loss + refine_correction
+                        elif cfg.hyper_srf and _v_hyper_cond is not None:
+                            surf_idx = is_surface.nonzero(as_tuple=False)
+                            if surf_idx.numel() > 0:
+                                surf_hidden = _eval_hidden[surf_idx[:, 0], surf_idx[:, 1]]
+                                surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
+                                batch_idx = surf_idx[:, 0]
+                                correction = eval_refine_head(surf_hidden, surf_pred,
+                                                              _v_hyper_cond, batch_idx).float()
+                                pred_loss = pred_loss.clone()
+                                pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
                         else:
                             surf_idx = is_surface.nonzero(as_tuple=False)
                             if surf_idx.numel() > 0:
@@ -2979,6 +3136,20 @@ for epoch in range(MAX_EPOCHS):
     learned_freqs = model.fourier_freqs_learned.abs().detach().cpu().tolist()
     for i, f in enumerate(learned_freqs):
         metrics[f"fourier_freq_{i}"] = f
+    # Log HyperSRF output norm if enabled (monitors whether corrections grow large)
+    if cfg.hyper_srf and refine_head is not None:
+        try:
+            _rh = refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
+            with torch.no_grad():
+                _dummy_cond = torch.zeros(1, 5, device=device)
+                _dummy_cond[0, 4] = 1.0  # is_tandem=1 (most interesting case)
+                _hyper_out = _rh.hyper_net(_dummy_cond)
+                metrics["hyper_srf/output_norm_tandem"] = _hyper_out.norm().item()
+                _dummy_cond[0, 4] = 0.0  # is_tandem=0
+                _hyper_out0 = _rh.hyper_net(_dummy_cond)
+                metrics["hyper_srf/output_norm_single"] = _hyper_out0.norm().item()
+        except Exception:
+            pass
     wandb.log(metrics)
 
     if torch.cuda.is_available():
@@ -3212,6 +3383,17 @@ if cfg.surface_refine and best_metrics:
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
                     _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
+                    # HyperSRF conditioning for verification
+                    if cfg.hyper_srf and verify_refine is not None:
+                        _vv_hyper_cond = torch.stack([
+                            (x[:, 0, 13] - 14.58) / 0.76,
+                            x[:, 0, 14] / 0.15,
+                            x[:, 0, 22] / 1.5,
+                            x[:, 0, 23] / 2.0,
+                            _is_tandem_raw,
+                        ], dim=-1)
+                    else:
+                        _vv_hyper_cond = None
                     _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
                     _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
@@ -3325,7 +3507,11 @@ if cfg.surface_refine and best_metrics:
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                             surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]
                             surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
-                            correction = verify_refine(surf_hidden, surf_pred).float()
+                            if cfg.hyper_srf and _vv_hyper_cond is not None:
+                                correction = verify_refine(surf_hidden, surf_pred,
+                                                           _vv_hyper_cond, surf_idx[:, 0]).float()
+                            else:
+                                correction = verify_refine(surf_hidden, surf_pred).float()
                         pred_loss_refined = pred_loss.clone()
                         pred_loss_refined[surf_idx[:, 0], surf_idx[:, 1]] += correction
                         correction_full[surf_idx[:, 0], surf_idx[:, 1]] = correction
