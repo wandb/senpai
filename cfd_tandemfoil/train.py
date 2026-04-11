@@ -1335,6 +1335,7 @@ class Config:
     pretrain_temp: float = 0.07          # InfoNCE temperature (SimCLR default)
     pretrain_batch_size: int = 64        # batch size for pretraining
     pretrain_n_airfoils: int = 500       # NACA 4-digit family size to generate
+    pretrain_freeze_epochs: int = 0     # freeze geometry encoder (preprocess+blocks[0]) for N fine-tuning epochs
 
 
 cfg = sp.parse(Config)
@@ -1963,6 +1964,20 @@ for epoch in range(MAX_EPOCHS):
         break
 
     t0 = time.time()
+
+    # Geometry encoder freeze/unfreeze for contrastive pretrain warmup
+    if cfg.contrastive_pretrain and cfg.pretrain_freeze_epochs > 0:
+        _geom_params = list(_base_model.preprocess.parameters())
+        if hasattr(_base_model, 'blocks') and len(_base_model.blocks) > 0:
+            _geom_params += list(_base_model.blocks[0].parameters())
+        if epoch < cfg.pretrain_freeze_epochs:
+            for p in _geom_params:
+                p.requires_grad_(False)
+        elif epoch == cfg.pretrain_freeze_epochs:
+            for p in _geom_params:
+                p.requires_grad_(True)
+            print(f"[Contrastive pretrain] Unfreezing geometry encoder at epoch {epoch}")
+            wandb.log({'pretrain/geometry_unfrozen_epoch': epoch, 'global_step': global_step})
 
     # Adaptive surface weight: loss-ratio based, clamped [5, 50]
     surf_weight = max(5.0, min(50.0, prev_vol_loss / max(prev_surf_loss, 1e-8)))
