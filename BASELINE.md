@@ -1,6 +1,23 @@
 # Baseline Metrics
 
-## Current Single-Model Baseline (Phase 6 — 2026-04-10, +Vortex-Panel Induced Velocity, 2-Seed Evidence, PR #2357)
+## Current Single-Model Baseline (Phase 6 — 2026-04-11, +ANP Cross-Foil Decoder, 2-Seed Evidence, PR #2379)
+
+| Metric | 2-seed avg | vs prior (Vortex-Panel) | Δ |
+|--------|------------|------------------------|---|
+| **p_in** | **3.561** | 11.872 | **-70.0%** ✅ |
+| **p_oodc** | **3.847** | 7.459 | **-48.4%** ✅ |
+| **p_tan** | **10.825** | 26.319 | **-58.9%** ✅ |
+| p_re | 7.232 | 6.229 | +16.1% ❌ |
+
+**PR #2379** (merged 2026-04-11) — Attentive Neural Process (ANP) Surface Decoder: replaces the SRF MLP head with a deterministic ANP that uses cross-attention between surface nodes. For tandem samples, aft-foil queries attend to ALL nodes (fore + aft — asymmetric cross-foil attention), while fore-foil queries use self-attention only. This physically-grounded asymmetry (wake flows downstream) gives the aft foil direct access to fore-foil pressure context. The cross-attention uses 4 heads × 48 dim = 192 dim total, with a residual from backbone hidden state. Single flag `--anp_srf`. This is the **single biggest improvement in the research programme** — p_tan -59%, p_in -70%, p_oodc -48%. Only p_re regresses +16% (OOD Reynolds generalization — addressable in follow-up). W&B runs: `metqdxaq` (seed 42, 179 epochs), `jvfvrs4u` (seed 73, 176 epochs).
+
+Reproduce: `cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_output --use_lion --lr 2e-4 --slice_num 96 --cosine_T_max 150 --pcgrad_3way --pressure_first --pressure_deep --residual_prediction --surface_refine --te_coord_frame --wake_deficit_feature --re_stratified_sampling --n_layers 3 --cp_panel --cp_panel_tandem_only --cp_panel_scale 0.1 --wake_angle_feature --vortex_panel_velocity --vortex_panel_scale 0.1 --vortex_panel_n 64 --anp_srf`
+
+⚠️ **2-seed only.** For merge decisions: **p_in < 3.561**, **p_oodc < 3.847**, **p_tan < 10.825**, **p_re < 7.232**.
+
+---
+
+## Prior Single-Model Baseline (Phase 6 — 2026-04-10, +Vortex-Panel Induced Velocity, 2-Seed Evidence, PR #2357)
 
 | Metric | 2-seed avg | vs prior (Wake Angle) | Δ |
 |--------|------------|----------------------|---|

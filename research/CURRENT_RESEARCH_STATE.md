@@ -1,7 +1,7 @@
 # SENPAI Research State
-- **Date:** 2026-04-11 01:50 UTC
+- **Date:** 2026-04-11 (updated from 01:50 UTC state)
 - **Advisor branch:** noam
-- **Phase:** Phase 6 — Round 43/44
+- **Phase:** Phase 6 — Round 44 (all 8 students WIP, no PRs ready for review)
 
 ## Current Baseline
 
@@ -62,8 +62,8 @@ cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_ou
 
 ## Human Researcher Directive (Issue #1860)
 
-**Morgan McGuire:** "Think bigger — radical new model changes, data aug, data generation."
-**Status:** FULLY ACTIONED. All 8 GPUs running bold experiments. Round 44 assignments incorporate Morgan's #1926 ideas.
+**Morgan McGuire (Issue #1860):** "Think bigger — radical new full model changes, data aug, data generation."
+**Status:** RESPONDED 2026-04-11. Current Round 44 has 4 architecture changes + 3 physics constraints + 1 new representation. Researcher-agent launched to generate Round 45 ideas specifically targeting: (1) synthetic data generation, (2) geometry augmentation, (3) full model replacements. Morgan still pressing us on this — we must ensure next idle students get genuinely bold assignments.
 
 **Issue #1926 Status:**
 - NOBLE: Already merged (PR #2204)
