@@ -1,5 +1,5 @@
 # SENPAI Research State
-- **Date:** 2026-04-11 ~04:00 UTC (updated)
+- **Date:** 2026-04-11 ~10:30 UTC (updated)
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Round 45/46 (post-ANP breakthrough)
 
@@ -17,28 +17,29 @@ Reproduce:
 cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_output --use_lion --lr 2e-4 --slice_num 96 --cosine_T_max 150 --pcgrad_3way --pressure_first --pressure_deep --residual_prediction --surface_refine --te_coord_frame --wake_deficit_feature --re_stratified_sampling --n_layers 3 --cp_panel --cp_panel_tandem_only --cp_panel_scale 0.1 --wake_angle_feature --vortex_panel_velocity --vortex_panel_scale 0.1 --vortex_panel_n 64 --anp_srf
 ```
 
-## Student Status (2026-04-11 ~02:45 UTC)
+## Student Status (2026-04-11 ~10:30 UTC)
 
 ### Active Experiments
 | Student | PR | Experiment | Type | Status |
 |---------|-----|-----------|------|--------|
-| frieren | **#2390** | **ANP Re-Conditional Gate** | Architecture (ANP follow-up) | NEW — fix p_re regression via Re-proximity gate |
-| alphonse | #2384 | **PirateNet SRF** | Architecture (gated residual) | Mid-training: s73 p_in=21, s42 p_in=19 (early, normal) |
-| tanjiro | #2385 | **HyPINO Hypernetwork SRF** | Architecture (hypernetwork) | Mid-training, slower convergence than PirateNet |
-| nezuko | #2386 | **Stagnation Point Constraint** | Physics constraint | Mid-training: underperforming PirateNet at same stage |
-| fern | #2387 | **Bernoulli Velocity-Pressure Constraint** | Physics constraint | ⚠️ Ux MAE anomalously high (16-21 vs typical 4-7) — possible constraint bug |
-| askeladd | #2391 | **Local Re_x Boundary Layer Feature** | Physics feature (P0) | NEW — arc-length Re_x for p_re recovery, on ANP baseline |
-| edward | #2374 | **Hard Kutta TE Constraint v2** | Physics constraint | Implementing v2 (K=2, tandem-only, lower weight) — pre-ANP code |
-| thorfinn | #2392 | **DeltaPhi Residual Prediction** | Prediction target (P0) | NEW — predict viscous correction over panel prior, on ANP baseline |
+| frieren | **#2393** | **BL Adaptive Node Weighting** | Training (OB-GNN style) | NEW — loss reweighting: surface ×10, near-wall ×3, freestream ×1. On ANP baseline. |
+| alphonse | #2384 | **PirateNet SRF** | Architecture (gated residual) | ~50% complete (pre-ANP) |
+| tanjiro | #2385 | **HyPINO Hypernetwork SRF** | Architecture (hypernetwork) | ~43% complete (pre-ANP) |
+| nezuko | #2386 | **Stagnation Point Constraint** | Physics constraint | ~41% complete (pre-ANP) |
+| fern | #2387 | **Bernoulli Velocity-Pressure Constraint** | Physics constraint | ~40% complete (pre-ANP, ⚠️ Ux anomaly) |
+| askeladd | #2391 | **Local Re_x Boundary Layer Feature** | Physics feature (P0) | ~31% complete (on ANP baseline) |
+| edward | #2374 | **Hard Kutta TE Constraint v2** | Physics constraint | ~37% complete (pre-ANP, v2 in progress) |
+| thorfinn | #2392 | **DeltaPhi Residual Prediction** | Prediction target (P0) | ~19% complete (on ANP baseline) |
 
 ### ⚠️ Note: Pre-ANP experiments
-alphonse (#2384), tanjiro (#2385), nezuko (#2386), fern (#2387), edward (#2374) are running AGAINST THE OLD BASELINE (pre-ANP code, no `--anp_srf`). Their results will be informative for ideas but NOT for merge decisions against the new ANP baseline. When they finish, close and reassign to Round 45 P0/P1 ideas ON the ANP baseline.
+alphonse (#2384), tanjiro (#2385), nezuko (#2386), fern (#2387), edward (#2374) are running AGAINST THE OLD BASELINE (pre-ANP code, no `--anp_srf`). Their results will be informative for ideas but NOT for merge decisions against the new ANP baseline. When they finish, close and reassign to Round 46 P0/P1 ideas ON the ANP baseline.
 
 ### Recent Merges / Closures
 | PR | Student | Experiment | Result | Action |
 |----|---------|-----------|--------|--------|
 | ✅ **#2379** | frieren | **ANP Cross-Foil Decoder** | **p_tan -59%, p_in -70%, p_oodc -48%, p_re +16%** | **MERGED — new baseline** |
-| ❌ #2388 | askeladd | Multi-Scale Hierarchical | Not started | CLOSED — redundant post-ANP, redirected to Local Re_x |
+| ❌ #2390 | frieren | ANP Re-Conditional Gate | All 3 runs crashed at step 0 (7h idle) | CLOSED — reassigned to BL Adaptive Weighting |
+| ❌ #2388 | askeladd | Multi-Scale Hierarchical | Not started | CLOSED — redundant post-ANP |
 | ❌ #2389 | thorfinn | Arc-Length PE | Not started | CLOSED — redirected to DeltaPhi Residual |
 
 ## Human Researcher Directive (Issue #1860)
@@ -69,18 +70,18 @@ Optimizers: Muon/Gram-NS
 
 ## Next Research Priorities
 
-### Round 45 Active (on ANP baseline)
-1. **Frieren #2390: ANP Re-Conditional Gate** — fix p_re via Re-proximity gate on cross-attention
-2. **Askeladd #2391: Local Re_x Feature** — arc-length BL Reynolds number, targets p_re
-3. **Thorfinn #2392: DeltaPhi Residual Prediction** — predict viscous correction over panel-method prior
+### Round 45/46 Active (on ANP baseline)
+1. **Frieren #2393: BL Adaptive Node Weighting** — OB-GNN-style loss reweighting (surface ×10, near-wall ×3)
+2. **Askeladd #2391: Local Re_x Feature** — arc-length BL Reynolds number, targets p_re (~31% complete)
+3. **Thorfinn #2392: DeltaPhi Residual Prediction** — predict viscous correction over panel-method prior (~19% complete)
 
 ### When pre-ANP experiments finish → assign Round 46 bold ideas (per Morgan directive)
-**alphonse (#2384):** → **BL Adaptive Node Weighting** (OB-GNN, ML4CFD 2nd place validated)
-**edward (#2374):** → **PIDA Chord-Scaling Augmentation** (Reynolds similarity, exact physics, targets p_re)
+**alphonse (#2384):** → **PIDA Chord-Scaling Augmentation** (Reynolds similarity, exact physics, targets p_re) [BL weighting now assigned to frieren]
+**edward (#2374):** → **MARIO Hypernetwork Re-Conditioning** (ML4CFD 3rd place, targets p_re)
 **fern (#2387):** → **AeroDiT Diffusion Head** (NeurIPS 2024, 4-step DDIM with Re-CFG)
-**tanjiro (#2385):** → **MARIO Hypernetwork Re-Conditioning** (ML4CFD 3rd place, targets p_re)
+**tanjiro (#2385):** → **Flip-Symmetry Augmentation** (exact physics OOD, targets p_oodc and p_re)
 **nezuko (#2386):** → **Displacement Thickness δ* Feature** (Thwaites BL integral, targets p_re)
-**Bold reserve:** Flow Matching Head, Panel Synth Re-Aug, Flip-Symmetry Aug, GeoMPNN Bipartite MPNN, AB-UPT Anchor Tokens, Divergence-Free Constraint
+**Bold reserve:** Flow Matching Head, Panel Synth Re-Aug, GeoMPNN Bipartite MPNN, AB-UPT Anchor Tokens, Divergence-Free Constraint
 **Round 46 slate:** Generated — see `RESEARCH_IDEAS_2026-04-11_ROUND46.md`
 
 ### ⚠️ Key Flags for ALL future experiments
