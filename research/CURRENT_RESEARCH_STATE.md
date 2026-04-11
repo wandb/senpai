@@ -1,5 +1,5 @@
 # SENPAI Research State
-- **Date:** 2026-04-11 ~02:45 UTC
+- **Date:** 2026-04-11 ~03:00 UTC
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Round 44/45 (post-ANP breakthrough)
 
@@ -27,9 +27,9 @@ cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_ou
 | tanjiro | #2385 | **HyPINO Hypernetwork SRF** | Architecture (hypernetwork) | Mid-training, slower convergence than PirateNet |
 | nezuko | #2386 | **Stagnation Point Constraint** | Physics constraint | Mid-training: underperforming PirateNet at same stage |
 | fern | #2387 | **Bernoulli Velocity-Pressure Constraint** | Physics constraint | ⚠️ Ux MAE anomalously high (16-21 vs typical 4-7) — possible constraint bug |
-| askeladd | **#2391** | **Local Re_x Boundary Layer Feature** | Physics feature (P0) | NEW — arc-length Re_x for p_re recovery, on ANP baseline |
+| askeladd | #2391 | **Local Re_x Boundary Layer Feature** | Physics feature (P0) | NEW — arc-length Re_x for p_re recovery, on ANP baseline |
 | edward | #2374 | **Hard Kutta TE Constraint v2** | Physics constraint | Implementing v2 (K=2, tandem-only, lower weight) — pre-ANP code |
-| thorfinn | **#2392** | **DeltaPhi Residual Prediction** | Prediction target (P0) | NEW — predict viscous correction over panel prior, on ANP baseline |
+| thorfinn | #2392 | **DeltaPhi Residual Prediction** | Prediction target (P0) | NEW — predict viscous correction over panel prior, on ANP baseline |
 
 ### ⚠️ Note: Pre-ANP experiments
 alphonse (#2384), tanjiro (#2385), nezuko (#2386), fern (#2387), edward (#2374) are running AGAINST THE OLD BASELINE (pre-ANP code, no `--anp_srf`). Their results will be informative for ideas but NOT for merge decisions against the new ANP baseline. When they finish, close and reassign to Round 45 P0/P1 ideas ON the ANP baseline.
@@ -71,8 +71,8 @@ Optimizers: Muon/Gram-NS
 
 ### NOW Active — Round 45 Bold Ideas (on ANP baseline)
 1. **Frieren #2390: ANP Re-Conditional Gate** — fix p_re via Re-proximity gate on cross-attention
-2. **Askeladd: Local Re_x Feature** — arc-length BL Reynolds number, targets p_re (B-GNN paper)
-3. **Thorfinn: DeltaPhi Residual Prediction** — predict viscous correction over panel-method prior (NeurIPS 2025)
+2. **Askeladd #2391: Local Re_x Feature** — arc-length BL Reynolds number, targets p_re (B-GNN paper)
+3. **Thorfinn #2392: DeltaPhi Residual Prediction** — predict viscous correction over panel-method prior (NeurIPS 2025)
 
 ### When pre-ANP experiments finish (assign P0/P1 on ANP baseline)
 **P0:** alphonse → PIDA Chord-Scaling Aug | edward → PIDA Chord-Scaling Aug
