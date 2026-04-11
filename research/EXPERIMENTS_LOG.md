@@ -1,5 +1,21 @@
 # SENPAI Research Results
 
+## 2026-04-11 01:50 — PR #2383: Tandem Auxiliary Prediction Heads — fern — **CLOSED** ❌
+- Branch: fern/tandem-auxiliary-heads
+- **Hypothesis:** Add auxiliary prediction heads for stagnation point and suction peak locations to provide additional gradient signal for surface pressure learning.
+- **Results (EMA, 2-seed avg):**
+
+| Metric | s73 (t0ewyf3m) | s42 (h93n8vc9) | 2-seed avg | Baseline | Delta |
+|--------|----------------|----------------|------------|----------|-------|
+| p_in | **11.520** | 11.892 | **11.706** | 11.872 | **-1.4%** |
+| p_oodc | 7.677 | 7.910 | 7.794 | 7.459 | +4.5% |
+| p_tan | 27.487 | 27.573 | 27.530 | 26.319 | +4.6% |
+| p_re | 6.602 | 6.576 | 6.589 | 6.229 | +5.8% |
+
+- p_in beats baseline (-1.4%) but p_oodc, p_tan, p_re all regress. Net negative. The aux heads helped p_in (s73 particularly strong at 11.52) but created interference with the PCGrad balancing for OOD metrics.
+
+---
+
 ## 2026-04-11 01:20 — PR #2380: Koopman Tandem Lifting — nezuko — **CLOSED** ❌
 - Branch: nezuko/koopman-tandem-lifting
 - **Hypothesis:** Learn a linear Koopman operator in a lifted latent space to model tandem interference dynamics more effectively than the nonlinear Transolver.
