@@ -1,5 +1,5 @@
 # SENPAI Research State
-- **Date:** 2026-04-11 ~06:00 UTC (updated)
+- **Date:** 2026-04-11 ~06:20 UTC (updated)
 - **Advisor branch:** noam
 - **Phase:** Phase 6 — Round 47 (p_re fix campaign) → Round 48 BOLD pivot incoming
 
@@ -21,7 +21,7 @@ cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_ou
 
 **Morgan McGuire:** "Too many incremental tweaks. THINK BIGGER. Radical new full model changes, data aug, data generation."
 
-**Status:** ACTIONED — researcher-agent commissioned for Round 48 bold slate. Results expected within next polling cycle. Committed to Morgan in issue #1860 comment.
+**Status:** ACTIONED — Round 48 bold slate generated and committed (`RESEARCH_IDEAS_2026-04-11_ROUND48_BOLD.md`). 12 radical ideas ranked by priority. Responded to Morgan in issue #1860.
 
 **Round 47 Assessment:** Morgan is correct — Round 47 (AdaLN, context dropout, stochastic attention, Re Mixup) are all incremental ANP modifications. The Round 47 experiments target p_re via small architectural changes. Round 48 will be fundamentally different.
 
@@ -48,7 +48,15 @@ cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_ou
 | askeladd | #2391 | Local Re_x BL Feature | Physics feature | 🔄 WIP |
 | thorfinn | #2392 | DeltaPhi Residual Prediction | Predict viscous correction | 🔄 WIP |
 
-### Recent Closures/Merges
+### Pre-ANP Experiments (reviewed this cycle)
+| PR | Student | Verdict |
+|----|---------|---------|
+| ❌ #2387 | fern | Bernoulli Constraint — all metrics +10-39% worse (Bernoulli invalid at no-slip wall) |
+| ❌ #2385 | tanjiro | HyPINO Hypernetwork — null (LoRA zero-init bug → hypernetwork never updated) |
+| ❌ #2386 | nezuko | Stagnation Constraint — all metrics +8-11% worse (fragile node ID + normalization) |
+| 🔄 #2374 | edward | Kutta TE v2 — still WIP, no v2 results yet |
+
+### Prior Closures/Merges
 | PR | Student | Verdict |
 |----|---------|---------|
 | ✅ **#2379** | frieren | ANP Cross-Foil Decoder — MERGED (p_tan -59%, p_in -70%, p_oodc -48%) |
@@ -80,16 +88,23 @@ Optimizers: Muon/Gram-NS
 
 ## Next Research Priorities
 
-### Round 48 — BOLD PIVOT (researcher-agent generating now)
-Target areas per Morgan's directive:
-- Completely new model families (FNO, CNO, diffusion decoder, flow matching, score-based)
-- Synthetic data generation using vortex-panel solver at OOD Re conditions
-- PIDA chord-scaling augmentation (exact physics Reynolds similarity)
-- Angle-of-attack interpolation augmentation
-- Cp-output reformulation (predict Cp not p — forces Re-invariance)
-- DeltaCp residual over panel method (smaller target, more generalizable)
+### Round 48 — BOLD PIVOT (ready to assign when Round 47 finishes)
+Full slate: `/research/RESEARCH_IDEAS_2026-04-11_ROUND48_BOLD.md`
 
-Results file: `/research/RESEARCH_IDEAS_2026-04-11_ROUND48_BOLD.md` (generating)
+| Rank | Idea | Confidence | Target | Category |
+|------|------|-----------|--------|----------|
+| 1 | **PIDA Chord-Scaling Aug** | High | p_re | Data aug (exact Reynolds similarity physics) |
+| 2 | **Flip-Symmetry Aug** | High | p_oodc | Data aug (NeuralFoil-validated, doubles dataset) |
+| 3 | **AeroDiT Diffusion + Re-CFG** | Medium | p_re | New model family (diffusion decoder) |
+| 4 | **Tandem Wake Superposition Prior** | Med-High | p_tan | Problem reformulation (panel-initialized decoder) |
+| 5 | **Flow Matching Generative Head** | Medium | p_in | New model family (rectified flow decoder) |
+| 6 | **Displacement Thickness δ*** | Medium | p_re | Physics feature (Thwaites BL integral) |
+| 7 | **Multi-Resolution ANP Context** | Medium | p_re/p_tan | Architecture (hierarchical arc-zone tokens) |
+| 8 | **GeoMPNN Bipartite MPNN** | Medium | p_tan | New model family (ML4CFD 4th place) |
+| 9 | **Multi-Fidelity Panel Pretraining** | Med-High | p_re | Synthetic data (100k panel solutions) |
+| 10 | **Divergence-Free Constraint** | Medium | p_in | Hard physics (Helmholtz projection) |
+
+**Assignment plan:** Ideas 1+2 combined for one student (both pure data aug). Wait for #2391/#2392 results before assigning δ*/Wake Prior.
 
 ### ⚠️ Key Flags for ALL future experiments
 - MUST include `--anp_srf` (ANP is now the baseline)
