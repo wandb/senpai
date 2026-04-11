@@ -733,6 +733,47 @@ class SurfaceRefinementHead(nn.Module):
         return correction
 
 
+class RoleSpecializedSRF(nn.Module):
+    """Three role-specialized surface refinement heads: single, tandem-fore, tandem-aft.
+
+    Each head has the same architecture as SurfaceRefinementHead. Nodes are routed
+    to the appropriate head based on sample type (single vs tandem) and foil role
+    (fore vs aft, determined by saf_norm threshold).
+    """
+
+    def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 128,
+                 n_layers: int = 2, p_only: bool = False):
+        super().__init__()
+        self.single_head = SurfaceRefinementHead(n_hidden, out_dim, hidden_dim, n_layers, p_only)
+        self.tandem_fore_head = SurfaceRefinementHead(n_hidden, out_dim, hidden_dim, n_layers, p_only)
+        self.tandem_aft_head = SurfaceRefinementHead(n_hidden, out_dim, hidden_dim, n_layers, p_only)
+
+    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor,
+                foil_role: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            hidden: [M, n_hidden] — hidden features for surface nodes
+            base_pred: [M, out_dim] — base predictions for surface nodes
+            foil_role: [M] — 0=single-foil, 1=tandem-fore, 2=tandem-aft
+        Returns:
+            correction: [M, out_dim] — additive correction
+        """
+        out = torch.zeros_like(base_pred)
+        single_mask = (foil_role == 0)
+        fore_mask = (foil_role == 1)
+        aft_mask = (foil_role == 2)
+        if single_mask.any():
+            out = out.clone()
+            out[single_mask] = self.single_head(hidden[single_mask], base_pred[single_mask]).to(out.dtype)
+        if fore_mask.any():
+            out = out.clone()
+            out[fore_mask] = self.tandem_fore_head(hidden[fore_mask], base_pred[fore_mask]).to(out.dtype)
+        if aft_mask.any():
+            out = out.clone()
+            out[aft_mask] = self.tandem_aft_head(hidden[aft_mask], base_pred[aft_mask]).to(out.dtype)
+        return out
+
+
 class AftFoilRefinementHead(nn.Module):
     """Dedicated refinement head for aft-foil (boundary ID=7) surface nodes.
 
@@ -1300,6 +1341,7 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    role_specialized_srf: bool = False        # replace single SRF with 3 role-specialized heads (single/fore/aft)
     # Phase 6: Asinh pressure transform
     asinh_pressure: bool = False             # transform pressure targets with asinh for dynamic range compression
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
@@ -1513,7 +1555,21 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
 # Surface refinement head (separate module, not compiled with main model)
 refine_head = None
-if cfg.surface_refine:
+role_srf = None  # Role-specialized SRF (replaces refine_head when enabled)
+if cfg.role_specialized_srf:
+    assert cfg.surface_refine, "--role_specialized_srf requires --surface_refine"
+    role_srf = RoleSpecializedSRF(
+        n_hidden=cfg.n_hidden,
+        out_dim=3,
+        hidden_dim=cfg.surface_refine_hidden,
+        n_layers=cfg.surface_refine_layers,
+        p_only=cfg.surface_refine_p_only,
+    ).to(device)
+    role_srf = torch.compile(role_srf, mode=cfg.compile_mode)
+    _role_srf_n_params = sum(p.numel() for p in role_srf.parameters())
+    print(f"Role-specialized SRF: {_role_srf_n_params:,} params (3 heads × "
+          f"hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers})")
+elif cfg.surface_refine:
     if cfg.surface_refine_context:
         refine_head = SurfaceRefinementContextHead(
             n_hidden=cfg.n_hidden,
@@ -1569,6 +1625,7 @@ if cfg.aft_foil_srf:
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
+ema_role_srf = None  # EMA copy of role-specialized SRF
 ema_aft_srf_head = None  # EMA copy of aft-foil SRF head
 swad_initial_val = None
 swad_prev_val = float("inf")
@@ -1587,6 +1644,8 @@ snapshot_epoch_list = [int(e) for e in cfg.snapshot_epochs_str.split(",")] if cf
 n_params = sum(p.numel() for p in model.parameters())
 if refine_head is not None:
     n_params += sum(p.numel() for p in refine_head.parameters())
+if role_srf is not None:
+    n_params += sum(p.numel() for p in role_srf.parameters())
 if aft_srf_head is not None:
     n_params += sum(p.numel() for p in aft_srf_head.parameters())
 if aft_srf_ctx_head is not None:
@@ -1721,6 +1780,12 @@ if refine_head is not None:
     _refine_params = list(refine_head.parameters())
     base_opt.add_param_group({'params': _refine_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _refine_params):,} refinement head params to optimizer")
+
+# Add role-specialized SRF params to optimizer if enabled
+if role_srf is not None:
+    _role_srf_params = list(role_srf.parameters())
+    base_opt.add_param_group({'params': _role_srf_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _role_srf_params):,} role-specialized SRF params to optimizer")
 
 # Add aft-foil SRF head params to optimizer if enabled
 if aft_srf_head is not None:
@@ -1954,6 +2019,17 @@ for epoch in range(MAX_EPOCHS):
             _raw_saf_norm = x[:, :, 2:4].norm(dim=-1)  # [B, N]
             _is_tandem = (x[:, 0, 22].abs() > 0.01)  # gap feature nonzero
             _aft_foil_mask = is_surface & (_raw_saf_norm > 0.005) & _is_tandem.unsqueeze(1)
+        # Role-specialized SRF: compute per-node foil_role (0=single, 1=tandem-fore, 2=tandem-aft)
+        _foil_role = None
+        if role_srf is not None:
+            _rs_saf_norm = x[:, :, 2:4].norm(dim=-1)  # [B, N]
+            _rs_is_tandem = (x[:, 0, 22].abs() > 0.01)  # [B]
+            # Default: 0 (single-foil)
+            _foil_role = torch.zeros(x.shape[0], x.shape[1], dtype=torch.long, device=device)
+            # Tandem fore: tandem sample + foil-1 surface (saf_norm <= 0.005)
+            _foil_role[_rs_is_tandem.unsqueeze(1).expand_as(_foil_role) & (_rs_saf_norm <= 0.005)] = 1
+            # Tandem aft: tandem sample + foil-2 surface (saf_norm > 0.005)
+            _foil_role[_rs_is_tandem.unsqueeze(1).expand_as(_foil_role) & (_rs_saf_norm > 0.005)] = 2
             _raw_gap_stagger = x[:, 0, 22:24]  # [B, 2] gap and stagger (raw)
         x = (x - stats["x_mean"]) / stats["x_std"]
         # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
@@ -2115,6 +2191,29 @@ for epoch in range(MAX_EPOCHS):
                         correction = refine_head(surf_hidden, surf_pred).float()  # [M, 3]
                         pred = pred.clone()
                         pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
+
+        # Role-specialized SRF: three heads for single/tandem-fore/tandem-aft
+        if role_srf is not None and model.training and _foil_role is not None:
+            surf_idx = is_surface.nonzero(as_tuple=False)  # [M, 2] (batch, node)
+            if surf_idx.numel() > 0:
+                surf_hidden = hidden[surf_idx[:, 0], surf_idx[:, 1]]  # [M, n_hidden]
+                surf_pred = pred[surf_idx[:, 0], surf_idx[:, 1]]      # [M, 3]
+                surf_role = _foil_role[surf_idx[:, 0], surf_idx[:, 1]]  # [M]
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    correction = role_srf(surf_hidden, surf_pred, surf_role).float()
+                pred = pred.clone()
+                pred[surf_idx[:, 0], surf_idx[:, 1]] = pred[surf_idx[:, 0], surf_idx[:, 1]] + correction
+                # Log per-head node counts periodically
+                if global_step % 50 == 0:
+                    _n_single = (surf_role == 0).sum().item()
+                    _n_fore = (surf_role == 1).sum().item()
+                    _n_aft = (surf_role == 2).sum().item()
+                    wandb.log({
+                        "role_srf/n_single": _n_single,
+                        "role_srf/n_tandem_fore": _n_fore,
+                        "role_srf/n_tandem_aft": _n_aft,
+                        "global_step": global_step,
+                    })
 
         # Aft-foil dedicated refinement head: additive correction on boundary ID=7 nodes only
         if aft_srf_ctx_head is not None and model.training and _aft_foil_mask is not None:
@@ -2488,6 +2587,15 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_refine_head.parameters(), _refine_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for role-specialized SRF
+            if role_srf is not None:
+                _role_srf_base = role_srf._orig_mod if hasattr(role_srf, '_orig_mod') else role_srf
+                if ema_role_srf is None:
+                    ema_role_srf = deepcopy(_role_srf_base)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_role_srf.parameters(), _role_srf_base.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
             # EMA for aft-foil SRF head
             if aft_srf_head is not None:
                 _aft_base = aft_srf_head._orig_mod if hasattr(aft_srf_head, '_orig_mod') else aft_srf_head
@@ -2610,6 +2718,14 @@ for epoch in range(MAX_EPOCHS):
             eval_refine_head.eval()
         elif refine_head is not None:
             refine_head.eval()
+    # Select role-specialized SRF for eval (EMA if available)
+    eval_role_srf = role_srf
+    if role_srf is not None:
+        if ema_role_srf is not None and ema_model is not None and eval_model is ema_model:
+            eval_role_srf = ema_role_srf
+            eval_role_srf.eval()
+        elif role_srf is not None:
+            role_srf.eval()
     # Select aft-foil SRF head for eval (EMA if available)
     eval_aft_srf_head = aft_srf_head
     eval_aft_srf_ctx_head = aft_srf_ctx_head
@@ -2661,6 +2777,14 @@ for epoch in range(MAX_EPOCHS):
                     _v_is_tandem = (x[:, 0, 22].abs() > 0.01)
                     _eval_aft_mask = is_surface & (_v_saf_norm > 0.005) & _v_is_tandem.unsqueeze(1)
                     _v_gap_stagger = x[:, 0, 22:24]  # [B, 2]
+                # Role-specialized SRF: compute foil_role for eval
+                _eval_foil_role = None
+                if eval_role_srf is not None:
+                    _ers_saf_norm = x[:, :, 2:4].norm(dim=-1)
+                    _ers_is_tandem = (x[:, 0, 22].abs() > 0.01)
+                    _eval_foil_role = torch.zeros(x.shape[0], x.shape[1], dtype=torch.long, device=device)
+                    _eval_foil_role[_ers_is_tandem.unsqueeze(1).expand_as(_eval_foil_role) & (_ers_saf_norm <= 0.005)] = 1
+                    _eval_foil_role[_ers_is_tandem.unsqueeze(1).expand_as(_eval_foil_role) & (_ers_saf_norm > 0.005)] = 2
                 x = (x - stats["x_mean"]) / stats["x_std"]
                 # Curvature proxy: norm of first 4 dsdf channels (gradient magnitude) for surface nodes
                 curv = x[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surface.float().unsqueeze(-1)
@@ -2797,6 +2921,23 @@ for epoch in range(MAX_EPOCHS):
                                 pred_loss = pred_loss.clone()
                                 pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
                     # Back-compute refined pred so denormalization (pred_orig) includes refinement
+                    if cfg.multiply_std:
+                        pred = pred_loss / sample_stds
+                    else:
+                        pred = pred_loss * sample_stds
+
+                # Apply role-specialized SRF during validation
+                if eval_role_srf is not None and _eval_foil_role is not None:
+                    surf_idx = is_surface.nonzero(as_tuple=False)
+                    if surf_idx.numel() > 0:
+                        surf_hidden = _eval_hidden[surf_idx[:, 0], surf_idx[:, 1]]
+                        surf_pred = pred_loss[surf_idx[:, 0], surf_idx[:, 1]]
+                        surf_role = _eval_foil_role[surf_idx[:, 0], surf_idx[:, 1]]
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            correction = eval_role_srf(surf_hidden, surf_pred, surf_role).float()
+                        pred_loss = pred_loss.clone()
+                        pred_loss[surf_idx[:, 0], surf_idx[:, 1]] = pred_loss[surf_idx[:, 0], surf_idx[:, 1]] + correction
+                    # Back-compute refined pred so denormalization includes role-SRF refinement
                     if cfg.multiply_std:
                         pred = pred_loss / sample_stds
                     else:
@@ -3006,6 +3147,11 @@ for epoch in range(MAX_EPOCHS):
                 refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
             )
             torch.save(_refine_save.state_dict(), model_dir / "refine_head.pt")
+        if role_srf is not None:
+            _role_srf_save = ema_role_srf if ema_role_srf is not None else (
+                role_srf._orig_mod if hasattr(role_srf, '_orig_mod') else role_srf
+            )
+            torch.save(_role_srf_save.state_dict(), model_dir / "role_srf.pt")
         if aft_srf_head is not None:
             _aft_save = ema_aft_srf_head if ema_aft_srf_head is not None else (
                 aft_srf_head._orig_mod if hasattr(aft_srf_head, '_orig_mod') else aft_srf_head
@@ -3163,7 +3309,7 @@ if best_metrics:
 # ---------------------------------------------------------------------------
 # Verification: manual denormalization check for surface refinement
 # ---------------------------------------------------------------------------
-if cfg.surface_refine and best_metrics:
+if cfg.surface_refine and best_metrics and not cfg.role_specialized_srf:
     print("\n" + "=" * 70)
     print("VERIFICATION: Manual denormalization check on val_ood_re")
     print("=" * 70)
