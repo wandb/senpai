@@ -1,5 +1,73 @@
 # SENPAI Research Results
 
+## 2026-04-11 01:20 — PR #2380: Koopman Tandem Lifting — nezuko — **CLOSED** ❌
+- Branch: nezuko/koopman-tandem-lifting
+- **Hypothesis:** Learn a linear Koopman operator in a lifted latent space to model tandem interference dynamics more effectively than the nonlinear Transolver.
+- **Results (EMA, 2-seed avg):**
+
+| Metric | s42 (ik7k6o9l) | s73 (4col5vx2) | 2-seed avg | Baseline | Delta |
+|--------|----------------|----------------|------------|----------|-------|
+| p_in | 14.75 | 13.43 | **14.09** | 11.872 | +18.7% |
+| p_oodc | 8.18 | 7.99 | **8.09** | 7.459 | +8.4% |
+| p_tan | 30.08 | 30.28 | **30.18** | 26.319 | +14.7% |
+| p_re | 6.68 | 6.70 | **6.69** | 6.229 | +7.4% |
+
+- All metrics significantly worse. Koopman lifting could not capture nonlinear tandem interference. Added to exhausted directions.
+
+---
+
+## 2026-04-11 01:18 — PR #2378: Contrastive Geometry Pretraining v2 — tanjiro — **CLOSED** ❌
+- Branch: tanjiro/contrastive-geometry-pretrain
+- **Hypothesis (v2):** UIUC airfoil contrastive pretraining with 5-min pretrain budget, then 175 min fine-tuning. Fixed timeout bug from v1.
+- **Results (EMA, 2-seed avg):**
+
+| Metric | s42 (4pu4dgjt) | s73 (me8ta8m6) | 2-seed avg | Baseline | Delta |
+|--------|----------------|----------------|------------|----------|-------|
+| p_in | 29.65 | 35.32 | **32.49** | 11.872 | +173.7% |
+| p_oodc | 61.47 | 69.00 | **65.24** | 7.459 | +774.7% |
+| p_tan | 54.62 | 52.22 | **53.42** | 26.319 | +103.0% |
+| p_re | 34.25 | 43.68 | **38.97** | 6.229 | +525.7% |
+
+- Catastrophic failure. All metrics 2-8× worse than baseline. The 5-min contrastive pretrain poisoned the model initialization. Transfer learning/pretraining approaches are exhausted for our 180-min budget.
+
+---
+
+## 2026-04-11 00:55 — PR #2374: Hard Kutta TE Constraint — edward — **SENT BACK** for v2
+- Branch: edward/hard-kutta-te-constraint
+- **Hypothesis:** Enforce pressure continuity at trailing edges via hard constraint (averaging K=8 nearest TE-region nodes) and/or soft loss (penalizing max-min spread). Three variants tested: hard+soft, soft-only, hard-only.
+- **Results:**
+
+| Variant | Seed | p_in | p_oodc | p_tan | p_re | W&B |
+|---------|------|------|--------|-------|------|-----|
+| Hard+Soft | s42 | 12.14 | **7.24** (-2.9%) | 26.70 | **6.17** (-0.9%) | qadoavcn |
+| Hard+Soft | s73 | 12.04 | 7.49 | 27.30 | 6.69 | xu7hox1a |
+| **Hard+Soft 2-avg** | — | **12.09** (+1.9%) | **7.36** (-1.3%) | **27.00** (+2.6%) | **6.43** (+3.2%) | — |
+| Soft-only | s42 | 12.67 | 7.28 (-2.4%) | 27.87 | 6.41 | qp5l0zuz |
+| Hard-only | s42 | 12.18 | 7.26 (-2.7%) | 27.49 | **6.12** (-1.8%) | 223s9pb2 |
+| Baseline | — | 11.872 | 7.459 | 26.319 | 6.229 | — |
+
+- **Key finding:** p_oodc consistently beats baseline across ALL variants (-1.3 to -2.7%), confirming the Kutta constraint adds useful physics information. Hard-only variant also shows best p_re (6.12, -1.8%). However, p_in and p_tan regress (+1.9% and +2.6% in 2-seed avg). High seed variance on s73 washes out the strong s42 results.
+- **Root cause:** K=8 is too large — averaging across both sides of the TE over-smooths the upper/lower pressure jump. The student correctly identified this.
+- **v2 direction:** Sent back with instructions for K=2 (1 upper + 1 lower TE node), lower loss weight (0.05), tandem-only application.
+
+---
+
+## 2026-04-11 00:50 — PR #2381: Role-Specialized Surface Heads — alphonse — **DEAD END** (pending close)
+- Branch: alphonse/role-specialized-srf
+- **Hypothesis:** Three separate SRF heads (leading, trailing, interference zone) instead of a single SRF, allowing each region to specialize.
+- **Results:**
+
+| Metric | s73 (qxnrmurv) | s42 (jlo9yryu) | 2-seed avg | Baseline | Delta |
+|--------|----------------|----------------|------------|----------|-------|
+| p_in | 12.31 | 12.37 | **12.34** | 11.872 | +3.9% |
+| p_oodc | **7.18** | 7.55 | **7.36** | 7.459 | **-1.3%** |
+| p_tan | 28.64 | 27.53 | **28.09** | 26.319 | +6.7% |
+| p_re | 6.26 | 6.20 | **6.23** | 6.229 | +0.06% |
+
+- **Key finding:** p_oodc beats baseline (-1.3%) and p_re is near-baseline (+0.06%), but p_in (+3.9%) and especially p_tan (+6.7%) regress significantly. The role-specialization hypothesis failed — separate heads fragment the surface representation without adding useful information. The model is better off with a unified SRF.
+
+---
+
 ## 2026-04-10 22:30 — PR #2372: Surface Cross-Attention v2 — askeladd — **SENT BACK** for v3
 - Branch: askeladd/surface-cross-attention
 - **Hypothesis (v2):** Three configs: (A) tandem-only SCA, baseline lr; (B) tandem-only SCA, 0.1x lr; (C) full SCA, 0.1x lr. Fix the p_in +9.2% regression from v1 while preserving p_tan -3.7%.

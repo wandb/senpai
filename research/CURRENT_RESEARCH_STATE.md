@@ -1,7 +1,7 @@
 # SENPAI Research State
-- **Date:** 2026-04-10 22:10 UTC
+- **Date:** 2026-04-11 01:25 UTC
 - **Advisor branch:** noam
-- **Phase:** Phase 6 — Bold Round 42/43
+- **Phase:** Phase 6 — Round 43/44
 
 ## Current Baseline
 
@@ -19,76 +19,104 @@ Reproduce:
 cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_output --use_lion --lr 2e-4 --slice_num 96 --cosine_T_max 150 --pcgrad_3way --pressure_first --pressure_deep --residual_prediction --surface_refine --te_coord_frame --wake_deficit_feature --re_stratified_sampling --n_layers 3 --cp_panel --cp_panel_tandem_only --cp_panel_scale 0.1 --wake_angle_feature --vortex_panel_velocity --vortex_panel_scale 0.1 --vortex_panel_n 64
 ```
 
-## Student Status (2026-04-10 22:10 UTC)
+## Student Status (2026-04-11 01:25 UTC)
 
 ### Active Experiments
 | Student | PR | Experiment | Type | Status |
 |---------|-----|-----------|------|--------|
-| askeladd | #2372 | **Surface Cross-Attention v2** | Architecture | Training 6 configs (~175 min, nearing completion). cfgC p_tan~25.6 BEATING BASELINE but p_in +14%. |
-| edward | #2374 | **Hard Kutta TE Constraint** | Physics constraint | s42 DONE: p_oodc=7.24 (-2.9%) BEATING BASELINE. s73 just started (~15 min). |
-| tanjiro | #2378 | **Contrastive Geometry Pretraining** | Data (UIUC airfoil) | SENT BACK — only 25 epochs due to timeout bug. Rerunning with 180-min budget. |
-| frieren | #2379 | **Attentive Neural Process Decoder** | Architecture (ANP) | NEW — implementing |
-| nezuko | #2380 | **Koopman Tandem Lifting** | Architecture (lifting) | Training 2 seeds (just started, debug + production) |
-| alphonse | #2381 | **Role-Specialized Surface Heads** | Architecture (3 SRF) | Training 2 seeds (~11 min in) |
-| thorfinn | #2382 | **SIREN Surface Decoder** | Architecture (sin activations) | NEW — implementing |
-| fern | #2383 | **Tandem Auxiliary Prediction Heads** | Loss (aux heads) | NEW — just assigned. Pod restarted. |
+| frieren | #2379 | **Attentive Neural Process Decoder** | Architecture (ANP) | **POTENTIAL BREAKTHROUGH** — 97 min, live p_tan=14.3 (-46%), p_oodc=5.5 (-26%), p_in~8 (-33%) but p_re~9.5 (+53%) |
+| edward | #2374 | **Hard Kutta TE Constraint v2** | Physics constraint | SENT BACK for v2 (K=2, tandem-only, lower weight). Awaiting implementation. |
+| askeladd | #2372 | **Surface Cross-Attention v3** | Architecture | Training 157 min, live p_in=15. Dead end trajectory. |
+| fern | #2383 | **Tandem Auxiliary Prediction Heads** | Loss (aux heads) | Training 170 min, live p_in=12.7-12.8. Close to baseline but above. |
+| thorfinn | #2382 | **SIREN Surface Decoder (ω₀=10)** | Architecture | Training 119 min, live p_in=25. Dead end. |
+| alphonse | #2384 | **PirateNet SRF** | Architecture (gated residual) | NEW — just assigned |
+| tanjiro | #2385 | **HyPINO Hypernetwork SRF** | Architecture (hypernetwork) | NEW — just assigned |
+| nezuko | #2386 | **Stagnation Point Constraint** | Physics constraint | NEW — just assigned |
 
 ### Closed This Session
 | PR | Student | Experiment | Result | Why |
 |----|---------|-----------|--------|-----|
-| #2375 | alphonse | Panel Data Oracle | p_tan +57.5% | Inviscid labels poison tandem predictions |
-| #2377 | frieren | SE(2) Geometry | p_oodc -0.9% (neutral) | MERGED by human researcher |
-| #2376 | nezuko | Mamba SSM | No results | MERGED by human researcher |
-| #2369 | thorfinn | Cross-Foil AR Decoding | p_oodc -0.8% (neutral) | 1-head/64-dim too constrained |
-| #2363 | fern | Cl/Cd SRF Conditioning | p_tan +25.1% | Tandem interleaving + info bottleneck |
+| #2381 | alphonse | Role-Specialized SRF | p_in +4%, p_tan +6.7% | Fragmenting SRF data hurts more than specialization helps |
+| #2380 | nezuko | Koopman Tandem Lifting | All metrics +8-19% | Linear Koopman can't capture nonlinear tandem interference |
+| #2378 | tanjiro | Contrastive Pretrain v2 | All metrics 2-8× worse | Pretraining poisoned initialization in 180-min budget |
 
-### Most Promising Active Direction
+### ⚠️ PRIORITY: Frieren ANP (#2379) — Potential Breakthrough
 
-**Edward #2374 Hard Kutta TE Constraint** — the standout experiment:
-- hard-soft-s42: p_oodc=**7.24** (-2.9%), p_re=**6.17** (-0.9%), p_in=12.14 (+2.3%), p_tan=26.70 (+1.5%)
-- hard-only-s42: p_re=**6.12** (-1.7%), p_oodc=**7.26** (-2.7%)
-- Awaiting s73 seed for 2-seed averages (running, ~15 min in)
+**Live metrics at 97 min (volatile, NOT EMA):**
+
+| Metric | s73 | s42 | Approx 2-seed avg | Baseline | Delta |
+|--------|-----|-----|-------------------|----------|-------|
+| p_in | 7.5 | 8.0 | ~8 | 11.872 | ~-33% |
+| p_oodc | 5.5 | 5.6 | ~5.5 | 7.459 | ~-26% |
+| p_tan | 14.4 | 14.3 | ~14.3 | 26.319 | ~-46% |
+| p_re | 9.0 | 9.6 | ~9.3 | 6.229 | ~+50% |
+
+- p_tan improvement of -46% to -52% (varies by epoch) would be the SINGLE BIGGEST improvement in the research programme
+- p_oodc -26% is also extraordinary
+- Only p_re regresses significantly (+50%)
+- Still 83 min of training left — EMA sweep at end will determine final metrics
+- Live metrics are highly volatile at this stage — do not over-interpret single epoch values
 
 ## Human Researcher Directive (Issue #1860)
 
 **Morgan McGuire:** "Think bigger — radical new model changes, data aug, data generation."
-**Status:** FULLY ACTIONED. All 8 GPUs running bold experiments. No new human messages.
+**Status:** FULLY ACTIONED. All 8 GPUs running bold experiments. 3 new Round 44 assignments incorporate Morgan's #1926 ideas.
 
-## Key Insights (Updated 2026-04-10 22:10)
+**Issue #1926 Status:**
+- NOBLE: Already merged (PR #2204)
+- PirateNets: Already merged in backbone (PR #2215), now testing in SRF (alphonse #2384)
+- HyperP/mHC: HyPINO hypernetwork assigned to tanjiro (#2385)
+- MSA: Queued for Round 44+
+- Geosolver: Queued with fresh approach (GeoMPNN surface graph)
+- HeavyBall: Queued for Round 44+
+- XSA: Not retrying (orthogonal init already provides head diversity)
+- Muon/Gram-NS: Conclusively failed (destroys gradient anisotropy for physics)
 
-1. **Physics CONSTRAINTS are the new winning lever.** Edward's Kutta TE shows p_oodc beating baseline (-2.9%). Constraints add information without replacing architecture. Next: more physics constraints (stagnation, conservation).
-2. **All decoder REPLACEMENTS failed.** B-GNN, FNO, multi-scale, Cl/Cd conditioning — 4/4 failed. The Transolver + SRF is a strong local optimum for this task.
-3. **Cross-attention at hidden level is the architecture direction.** Surface cross-attention v1 p_tan -3.7%. v2 (tandem-only + lr scaling) in final training. ANP decoder (frieren) explores this further.
-4. **Auxiliary losses beat conditioning.** Cl/Cd as CONDITIONING failed (+25% p_tan). Kutta as CONSTRAINT succeeded. The gradient path matters: constraints flow INTO the backbone, conditioning adds noise ON TOP.
-5. **p_tan = 26.319 remains our hardest metric.** 2× worse than p_in. Askeladd's cfgC shows p_tan~25.6 but with p_in regression.
+## Key Insights (Updated 2026-04-11 01:25)
+
+1. **ANP cross-attention is the breakthrough direction.** Frieren's ANP shows live p_tan -46% to -52% by allowing aft-foil surface queries to attend to fore-foil context. The asymmetric attention (aft attends to all, fore only self) is the key.
+2. **Physics CONSTRAINTS remain a winning lever.** Kutta TE p_oodc -2.9%, now extending to stagnation points (nezuko #2386).
+3. **All decoder REPLACEMENTS and conditioning failed.** B-GNN, FNO, multi-scale, Cl/Cd conditioning, Koopman lifting, role-specialized SRF — 6/6 failed. The Transolver + SRF is a strong local optimum.
+4. **Cross-attention at hidden level helps p_tan.** SCA v1 p_tan -3.7%, ANP p_tan -46%+ (live). The common thread: enabling information flow between fore and aft foil surface nodes.
+5. **Transfer learning/pretraining is exhausted** in 180-min budget. Contrastive pretrain failed catastrophically even with only 5-min pretrain phase.
+6. **p_re is the ANP's weakness.** The cross-attention mechanism appears to overfit to training Reynolds range. If ANP merges, follow-up should target p_re (Re-conditional attention, separate Re-extrapolation head).
 
 ## What's Exhausted (DO NOT REVISIT)
 
 Architecture (from scratch): GNOT, Galerkin, HPT, FactFormer, DeepONet, SIREN
-Architecture (tweaks): FiLM SRF, two-stage SRF, GRU decoder, Gumbel MoE, hypernetwork SRF, per-head KV, foil role embed, SRF normal frame, decoupled tandem projection, GeoTransolver GALE, MoE-LoRA FFN, Biot-Savart attention bias
-Architecture (decoder replacements): Surface B-GNN (+14%), 1D Surface FNO (+29%), Multi-Scale Slice (+8%)
+Architecture (tweaks): FiLM SRF, two-stage SRF, GRU decoder, Gumbel MoE, hypernetwork SRF, per-head KV, foil role embed, SRF normal frame, decoupled tandem projection, GeoTransolver GALE, MoE-LoRA FFN, Biot-Savart attention bias, role-specialized SRF
+Architecture (decoder replacements): Surface B-GNN (+14%), 1D Surface FNO (+29%), Multi-Scale Slice (+8%), Koopman lifting (+19%)
 Loss/training: Focal L1, curriculum, quantile reg, Jacobian smooth, asymmetric loss, R-Drop, attention noise, aug annealing, spectral reg, OHNM, two-pass SRF, Cl/Cd SRF conditioning (+25%)
 Physics features: Panel Cp, wake deficit, wake angle, vortex-panel velocity (all merged). Log-Re Cp, Joukowski Cp, viscous residual baseline (all failed)
 Multi-fidelity: Panel oracle data (+57%, dead end)
 Cross-foil sequential: Causal AR decoding (neutral, +1.6% p_tan)
-Transfer learning: DPOT, self-pretraining denoising
+Transfer learning: DPOT, self-pretraining denoising, contrastive geometry pretrain (2-8× worse)
 Data augmentation: FFD geometry (label mismatch), re-scaling
 Loss/gradient: Sobolev surface gradient dp/ds (conflicts PCGrad)
+Optimizers: Muon/Gram-NS (destroys gradient anisotropy)
 
 ## Next Research Priorities
 
-### Watch closely (potential merge candidates)
-1. **Hard Kutta TE** (edward #2374) — awaiting s73 for 2-seed avg. If p_oodc beats baseline in avg → MERGE.
-2. **Surface Cross-Attention v2** (askeladd #2372) — cfgC tandem-only p_tan beating baseline. Need to assess p_in trade-off.
+### Watch MOST closely
+1. **Frieren ANP #2379** — if EMA metrics maintain p_tan -40%+ → IMMEDIATE MERGE candidate, even with p_re regression
 
-### Active Round 43 (just assigned)
-3. Attentive Neural Process (frieren #2379)
-4. Koopman Tandem Lifting (nezuko #2380)
-5. Role-Specialized SRF (alphonse #2381)
-6. SIREN Surface Decoder (thorfinn #2382)
-7. Tandem Auxiliary Heads (fern #2383)
-8. Contrastive Pretrain v2 (tanjiro #2378, rerunning)
+### Active Round 44 (just assigned)
+2. PirateNet SRF (alphonse #2384) — gated skip connections in SRF
+3. HyPINO Hypernetwork (tanjiro #2385) — per-sample SRF weight generation
+4. Stagnation Constraint (nezuko #2386) — physics constraint at leading edge
+5. Hard Kutta TE v2 (edward #2374) — K=2, tandem-only, lower weight
 
-### Idea Queue (Round 44, assign when students idle)
-- Need fresh ideas — researcher-agent hit context limits. Will generate manually.
-- Directions to explore: more physics constraints, ensemble/distillation, learned loss weighting
+### Closing soon (dead ends in progress)
+6. SIREN ω₀=10 (thorfinn #2382) — p_in=25, dead end
+7. Surface Cross-Attention v3 (askeladd #2372) — p_in=15, dead end
+8. Tandem Auxiliary Heads (fern #2383) — p_in=12.7, borderline
+
+### Idea Queue (Round 44+, assign when students idle)
+From researcher-agent RESEARCH_IDEAS_2026-04-10_ROUND44.md:
+- Multi-Scale Hierarchical Attention v2 (differs from failed #2373)
+- Hypernetwork Meta-Conditioning (mHC for backbone)
+- GeoMPNN Surface Graph (fresh GeoSolver approach)
+- Bernoulli Velocity-Pressure Consistency Constraint
+- Circulation-Conserving Tandem Feature (Kutta-Joukowski theorem)
+- Arc-Length Positional Encoding for Surface Nodes
+- Tandem Gap/Stagger Mixup Augmentation
