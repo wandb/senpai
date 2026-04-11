@@ -733,6 +733,83 @@ class SurfaceRefinementHead(nn.Module):
         return correction
 
 
+class PirateNetSRF(nn.Module):
+    """Surface refinement head using PirateNet-style multiplicative residual connections.
+
+    Based on: Wang et al. "PirateNets: Physics-informed Deep Learning with
+    Residual Adaptive Networks" (ICLR 2024, https://arxiv.org/abs/2402.00326).
+
+    Each hidden layer is a PirateNet block:
+        h_new = sigmoid(gate_u(h)) * act(linear(h)) + sigmoid(gate_v(h)) * h0
+
+    where h0 is a fixed embedding of the original SRF input (backbone hidden +
+    base pred). This skip connection lets the network preserve the physics
+    representation through the decoder at every layer.
+    """
+
+    def __init__(self, n_hidden: int, out_dim: int, hidden_dim: int = 128,
+                 n_layers: int = 2, p_only: bool = False):
+        super().__init__()
+        self.p_only = p_only
+        actual_out = 1 if p_only else out_dim
+
+        # Initial projection: concat([backbone_hidden, base_pred]) → hidden_dim
+        # This projection produces h0 — the skip connection target for all layers
+        in_dim = n_hidden + out_dim
+        self.input_proj = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
+
+        # PirateNet blocks: each layer has transform + two gates
+        self.linears = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(n_layers)])
+        self.gate_u = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(n_layers)])
+        self.gate_v = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(n_layers)])
+        self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(n_layers)])
+        self.act = nn.GELU()
+
+        # Initialize gate biases to zero → sigmoid(0)=0.5 at start (balanced gating)
+        for i in range(n_layers):
+            nn.init.zeros_(self.gate_u[i].bias)
+            nn.init.zeros_(self.gate_v[i].bias)
+
+        # Output projection: zero-init so refinement starts as identity
+        self.output_proj = nn.Linear(hidden_dim, actual_out)
+        nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
+
+    def forward(self, hidden: torch.Tensor, base_pred: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            hidden: [M, n_hidden] — backbone hidden features for surface nodes
+            base_pred: [M, out_dim] — base predictions for surface nodes
+        Returns:
+            correction: [M, out_dim] — additive correction (zero-padded for p_only)
+        """
+        inp = torch.cat([hidden, base_pred], dim=-1)
+        h0 = self.input_proj(inp)  # [M, hidden_dim] — skip target for all layers
+        h = h0
+        self._last_u_mean: list[float] = []
+        self._last_v_mean: list[float] = []
+        for i in range(len(self.linears)):
+            u = torch.sigmoid(self.gate_u[i](h))
+            v = torch.sigmoid(self.gate_v[i](h))
+            if not self.training:
+                pass  # skip tracking in eval
+            else:
+                self._last_u_mean.append(u.detach().mean().item())
+                self._last_v_mean.append(v.detach().mean().item())
+            h_new = self.act(self.norms[i](self.linears[i](h)))
+            h = u * h_new + v * h0  # PirateNet multiplicative residual
+        correction = self.output_proj(h)
+        if self.p_only:
+            zeros = torch.zeros(correction.shape[0], base_pred.shape[-1] - 1,
+                                device=correction.device, dtype=correction.dtype)
+            correction = torch.cat([zeros, correction], dim=-1)
+        return correction
+
+
 class AftFoilRefinementHead(nn.Module):
     """Dedicated refinement head for aft-foil (boundary ID=7) surface nodes.
 
@@ -1300,6 +1377,7 @@ class Config:
     surface_refine_layers: int = 2            # number of hidden layers in refinement MLP
     surface_refine_p_only: bool = False       # only refine pressure channel (not velocity)
     surface_refine_context: bool = False      # use surface + nearest-volume context features
+    piratenet_srf: bool = False               # replace SRF MLP with PirateNet multiplicative residual blocks
     # Phase 6: Asinh pressure transform
     asinh_pressure: bool = False             # transform pressure targets with asinh for dynamic range compression
     asinh_scale: float = 1.0                 # scale factor before asinh: asinh(p * scale)
@@ -1514,7 +1592,19 @@ _base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 # Surface refinement head (separate module, not compiled with main model)
 refine_head = None
 if cfg.surface_refine:
-    if cfg.surface_refine_context:
+    if cfg.piratenet_srf:
+        refine_head = PirateNetSRF(
+            n_hidden=cfg.n_hidden,
+            out_dim=3,
+            hidden_dim=cfg.surface_refine_hidden,
+            n_layers=cfg.surface_refine_layers,
+            p_only=cfg.surface_refine_p_only,
+        ).to(device)
+        refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
+        _refine_n_params = sum(p.numel() for p in refine_head.parameters())
+        print(f"PirateNet SRF: {_refine_n_params:,} params "
+              f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers})")
+    elif cfg.surface_refine_context:
         refine_head = SurfaceRefinementContextHead(
             n_hidden=cfg.n_hidden,
             out_dim=3,
@@ -1522,6 +1612,11 @@ if cfg.surface_refine:
             n_layers=cfg.surface_refine_layers,
             k_neighbors=8,
         ).to(device)
+        refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
+        _refine_n_params = sum(p.numel() for p in refine_head.parameters())
+        print(f"Surface refinement head: {_refine_n_params:,} params "
+              f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
+              f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
     else:
         refine_head = SurfaceRefinementHead(
             n_hidden=cfg.n_hidden,
@@ -1530,11 +1625,11 @@ if cfg.surface_refine:
             n_layers=cfg.surface_refine_layers,
             p_only=cfg.surface_refine_p_only,
         ).to(device)
-    refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
-    _refine_n_params = sum(p.numel() for p in refine_head.parameters())
-    print(f"Surface refinement head: {_refine_n_params:,} params "
-          f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
-          f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
+        refine_head = torch.compile(refine_head, mode=cfg.compile_mode)
+        _refine_n_params = sum(p.numel() for p in refine_head.parameters())
+        print(f"Surface refinement head: {_refine_n_params:,} params "
+              f"(hidden={cfg.surface_refine_hidden}, layers={cfg.surface_refine_layers}, "
+              f"p_only={cfg.surface_refine_p_only}, context={cfg.surface_refine_context})")
 
 # Aft-foil (boundary ID=7) dedicated refinement head
 aft_srf_head = None
@@ -2506,7 +2601,15 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _log_dict = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        # Log PirateNet gate values periodically
+        if cfg.piratenet_srf and global_step % 50 == 0 and refine_head is not None:
+            _rh_base = refine_head._orig_mod if hasattr(refine_head, '_orig_mod') else refine_head
+            if hasattr(_rh_base, '_last_u_mean') and _rh_base._last_u_mean:
+                for _li, (um, vm) in enumerate(zip(_rh_base._last_u_mean, _rh_base._last_v_mean)):
+                    _log_dict[f"piratenet/gate_u_layer{_li}"] = um
+                    _log_dict[f"piratenet/gate_v_layer{_li}"] = vm
+        wandb.log(_log_dict)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
