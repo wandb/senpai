@@ -1,7 +1,7 @@
 # SENPAI Research State
-- **Date:** 2026-04-11 ~04:30 UTC (updated)
+- **Date:** 2026-04-11 ~05:00 UTC (updated)
 - **Advisor branch:** noam
-- **Phase:** Phase 6 — Round 45/46 (post-ANP breakthrough, experiments finishing)
+- **Phase:** Phase 6 — Round 47 (post-ANP p_re fix campaign)
 
 ## Current Baseline — UPDATED (PR #2379 ANP merged)
 
@@ -17,33 +17,37 @@ Reproduce:
 cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_output --use_lion --lr 2e-4 --slice_num 96 --cosine_T_max 150 --pcgrad_3way --pressure_first --pressure_deep --residual_prediction --surface_refine --te_coord_frame --wake_deficit_feature --re_stratified_sampling --n_layers 3 --cp_panel --cp_panel_tandem_only --cp_panel_scale 0.1 --wake_angle_feature --vortex_panel_velocity --vortex_panel_scale 0.1 --vortex_panel_n 64 --anp_srf
 ```
 
-## Student Status (2026-04-11 ~04:30 UTC)
+## Student Status (2026-04-11 ~05:00 UTC)
 
-### Active Experiments
+### Active & Queued Experiments
+
+All Round 47 assignments target the **p_re regression** — the #1 priority after the ANP breakthrough.
+
 | Student | PR | Experiment | Type | Status |
 |---------|-----|-----------|------|--------|
-| frieren | **#2393** | **BL Adaptive Node Weighting** | Training (OB-GNN style) | ⚠️ Pod restarted (was stuck 6h, no runs). Should pick up #2393 now. On ANP baseline. |
-| alphonse | #2384 | **PirateNet SRF** | Architecture (gated residual) | ✅ FINISHED — neutral result vs pre-ANP. Will be idle soon. |
-| tanjiro | #2385 | **HyPINO Hypernetwork SRF** | Architecture (hypernetwork) | ~70% complete, 160 min in (pre-ANP) |
-| nezuko | #2386 | **Stagnation Point Constraint** | Physics constraint | ~70% complete, 155 min in (pre-ANP) |
-| fern | #2387 | **Bernoulli Velocity-Pressure Constraint** | Physics constraint | ~70% complete, 152 min in (pre-ANP, ⚠️ s42 bernoulli_loss worsening) |
-| askeladd | (#2391 queued) | **Running MSHA** from prior round | Architecture | ~60% complete, 126 min in (pre-ANP). #2391 Local Re_x Feature waiting (on ANP). |
-| edward | #2374 | **Hard Kutta TE Constraint v2** | Physics constraint | ~65% complete, 142 min in (pre-ANP, 3 configs) |
-| thorfinn | (#2392 queued) | **Running Arc-Length PE** from prior round | Architecture | ~45% complete, 93 min in (pre-ANP). #2392 DeltaPhi Residual waiting (on ANP). |
+| **alphonse** | **#2394** | **Cp-Space ANP Decoding** | Architecture (Re-invariant attention) | 🆕 ASSIGNED — normalize ANP to Cp space before cross-attention |
+| **tanjiro** | **#2395** | **ANP Re-Conditional AdaLN** | Architecture (AdaLN on Q/K) | 🆕 QUEUED — waiting for #2385 to finish |
+| **nezuko** | **#2396** | **ANP Context Dropout** | Regularization (NP technique) | 🆕 QUEUED — waiting for #2386 to finish |
+| **fern** | **#2397** | **Stochastic Cross-Foil Attention** | Regularization (stochastic depth) | 🆕 QUEUED — waiting for #2387 to finish |
+| **edward** | **#2398** | **Re Mixup in Cp Space** | Data aug (Re interpolation) | 🆕 QUEUED — waiting for #2374 v2 to finish |
+| frieren | #2393 | BL Adaptive Node Weighting | Loss reweighting (OB-GNN style) | 🔄 Pod restarted, picking up #2393 (on ANP baseline) |
+| askeladd | #2391 | Local Re_x BL Feature | Physics feature | 🔄 Waiting to finish #2391 queued (on ANP baseline) |
+| thorfinn | #2392 | DeltaPhi Residual Prediction | Prediction reformulation | 🔄 Running arc-pe, #2392 queued (on ANP baseline) |
 
-### ⚠️ Note: Pre-ANP experiments
-All currently training experiments EXCEPT frieren (#2393) are running WITHOUT `--anp_srf`. Their results cannot beat the ANP baseline. When they finish, evaluate the IDEAS (compare to pre-ANP baseline), then:
-- Promising ideas → reassign with `--anp_srf` to test additivity with ANP
-- Dead ends → close and assign fresh Round 47 hypotheses on ANP baseline
+### Pre-ANP experiments still running (finishing within ~60 min)
+| Student | Old PR | Experiment | Pre-ANP baseline Δ | Next Assignment |
+|---------|--------|-----------|---------------------|----------------|
+| tanjiro | #2385 | HyPINO SRF | TBD | → #2395 ANP Re-Conditional AdaLN |
+| nezuko | #2386 | Stagnation Constraint | TBD | → #2396 ANP Context Dropout |
+| fern | #2387 | Bernoulli Constraint | TBD | → #2397 Stochastic Cross-Foil Attn |
+| edward | #2374 | Kutta v2 (3 configs) | TBD | → #2398 Re Mixup in Cp Space |
 
-### Alphonse PirateNet SRF Results (just finished)
-| Metric | Seed 42 | Seed 73 | 2-seed avg | Pre-ANP Baseline | Δ |
-|--------|---------|---------|------------|------------------|---|
-| p_in | 11.784 | 11.621 | 11.70 | 11.872 | -1.4% |
-| p_oodc | 7.263 | 7.615 | 7.44 | 7.459 | -0.3% |
-| p_tan | 26.587 | 26.673 | 26.63 | 26.319 | +1.2% |
-| p_re | 6.256 | 6.341 | 6.30 | 6.229 | +1.1% |
-Verdict: Neutral — PirateNet SRF multiplicative residuals didn't help. Close and reassign.
+These will need review when they post results. Evaluate against PRE-ANP baseline (11.872/7.459/26.319/6.229). 
+
+### Recent Closures
+| PR | Student | Verdict |
+|----|---------|---------|
+| ❌ #2384 | alphonse | PirateNet SRF — neutral vs pre-ANP (p_in -1.4%, p_tan +1.2%); no --anp_srf |
 
 ### Recent Merges / Closures
 | PR | Student | Experiment | Result | Action |
@@ -84,20 +88,29 @@ Optimizers: Muon/Gram-NS
 
 ## Next Research Priorities
 
-### Round 45/46 Active (on ANP baseline)
-1. **Frieren #2393: BL Adaptive Node Weighting** — OB-GNN-style loss reweighting (surface ×10, near-wall ×3)
-2. **Askeladd #2391: Local Re_x Feature** — arc-length BL Reynolds number, targets p_re (~31% complete)
-3. **Thorfinn #2392: DeltaPhi Residual Prediction** — predict viscous correction over panel-method prior (~19% complete)
+### Round 47 Active — P_re Fix Campaign (All on ANP baseline)
+All 5 new experiments PLUS frieren, askeladd, thorfinn target the p_re regression.
 
-### When pre-ANP experiments finish → assign Round 46 bold ideas (per Morgan directive)
-**alphonse (#2384):** → **PIDA Chord-Scaling Augmentation** (Reynolds similarity, exact physics, targets p_re) [BL weighting now assigned to frieren]
-**edward (#2374):** → **MARIO Hypernetwork Re-Conditioning** (ML4CFD 3rd place, targets p_re)
-**fern (#2387):** → **AeroDiT Diffusion Head** (NeurIPS 2024, 4-step DDIM with Re-CFG)
-**tanjiro (#2385):** → **Flip-Symmetry Augmentation** (exact physics OOD, targets p_oodc and p_re)
-**nezuko (#2386):** → **Displacement Thickness δ* Feature** (Thwaites BL integral, targets p_re)
-**Bold reserve:** Flow Matching Head, Panel Synth Re-Aug, GeoMPNN Bipartite MPNN, AB-UPT Anchor Tokens, Divergence-Free Constraint
-**Round 46 slate:** Generated — see `RESEARCH_IDEAS_2026-04-11_ROUND46.md`
+| Priority | Student | PR | Idea | Target |
+|----------|---------|-----|------|--------|
+| P0 | alphonse | #2394 | **Cp-Space ANP Decoding** | p_re (Re-invariant attention) |
+| P0 | tanjiro | #2395 | **ANP Re-Conditional AdaLN** | p_re (surgical Q/K conditioning) |
+| P0 | nezuko | #2396 | **ANP Context Dropout** | p_re (NP robustness) |
+| P0 | fern | #2397 | **Stochastic Cross-Foil Attn** | p_re (ensemble effect) |
+| P0 | edward | #2398 | **Re Mixup in Cp Space** | p_re (data aug) |
+| P0 | frieren | #2393 | **BL Adaptive Node Weighting** | surface_mae all |
+| P1 | askeladd | #2391 | **Local Re_x BL Feature** | p_re |
+| P1 | thorfinn | #2392 | **DeltaPhi Residual** | p_tan |
+
+### Ideas in Reserve (next round)
+From `RESEARCH_IDEAS_2026-04-11_04:30.md`:
+- **Idea 5:** Spectral Normalization of ANP Q/K
+- **Idea 6:** Multi-Resolution ANP Context (coarse + fine)
+- **Idea 7:** Tandem Wake Superposition Prior (physics prior in ANP)
+- **Idea 9:** Boundary Layer Thickness Feature (Blasius δ, δ*)
+- **Idea 10:** Split ANP Heads (single-foil vs tandem)
 
 ### ⚠️ Key Flags for ALL future experiments
 - MUST include `--anp_srf` (ANP is now the baseline)
-- Watch fern Bernoulli (#2387): Ux MAE anomalously high — likely close and reassign to DDPM head
+- Target: p_re < 6.229 (recover pre-ANP Reynolds generalization)
+- p_re is BLOCKED by ANP cross-attention sensitivity to Re-scaled pressure magnitudes
