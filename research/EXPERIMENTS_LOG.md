@@ -1,5 +1,22 @@
 # SENPAI Research Results
 
+## 2026-04-11 01:55 — PR #2372: Surface Cross-Attention v3 (stop-gradient) — askeladd — **CLOSED** ❌
+- Branch: askeladd/surface-cross-attn-v3
+- **Hypothesis:** Add surface cross-attention after the SRF decoder where aft-foil surface nodes attend to fore-foil surface context, with stop-gradient on the fore-foil keys/values to prevent backward gradient flow from destabilizing fore-foil predictions.
+- **Results (EMA, 2-seed avg):**
+
+| Metric | s73 | s42 | 2-seed avg | Baseline | Delta |
+|--------|-----|-----|------------|----------|-------|
+| p_in | 14.022 | 13.465 | **13.74** | 11.872 | **+15.8%** |
+| p_oodc | 8.385 | 7.740 | **8.06** | 7.459 | **+8.1%** |
+| p_tan | 26.848 | 27.101 | **26.98** | 26.319 | **+2.5%** |
+| p_re | 6.910 | 6.917 | **6.91** | 6.229 | **+11.0%** |
+
+- All 4 metrics regress. The stop-gradient on fore-foil K,V prevented useful gradient flow from the cross-attention back into the SRF, effectively severing the information pathway that makes cross-foil attention valuable. Compare with Frieren's ANP (#2379) which does NOT use stop-gradient and shows massive improvements — confirming that bidirectional gradient flow through cross-attention is essential.
+- **Key insight:** Cross-foil attention works (ANP proves this), but stop-gradient kills it. The gradient from aft-foil pressure errors must flow back through fore-foil representations to learn useful cross-foil features.
+
+---
+
 ## 2026-04-11 01:50 — PR #2383: Tandem Auxiliary Prediction Heads — fern — **CLOSED** ❌
 - Branch: fern/tandem-auxiliary-heads
 - **Hypothesis:** Add auxiliary prediction heads for stagnation point and suction peak locations to provide additional gradient signal for surface pressure learning.
