@@ -1,7 +1,7 @@
 # SENPAI Research State
-- **Date:** 2026-04-11 ~10:30 UTC (updated)
+- **Date:** 2026-04-11 ~04:30 UTC (updated)
 - **Advisor branch:** noam
-- **Phase:** Phase 6 — Round 45/46 (post-ANP breakthrough)
+- **Phase:** Phase 6 — Round 45/46 (post-ANP breakthrough, experiments finishing)
 
 ## Current Baseline — UPDATED (PR #2379 ANP merged)
 
@@ -17,22 +17,33 @@ Reproduce:
 cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_output --use_lion --lr 2e-4 --slice_num 96 --cosine_T_max 150 --pcgrad_3way --pressure_first --pressure_deep --residual_prediction --surface_refine --te_coord_frame --wake_deficit_feature --re_stratified_sampling --n_layers 3 --cp_panel --cp_panel_tandem_only --cp_panel_scale 0.1 --wake_angle_feature --vortex_panel_velocity --vortex_panel_scale 0.1 --vortex_panel_n 64 --anp_srf
 ```
 
-## Student Status (2026-04-11 ~10:30 UTC)
+## Student Status (2026-04-11 ~04:30 UTC)
 
 ### Active Experiments
 | Student | PR | Experiment | Type | Status |
 |---------|-----|-----------|------|--------|
-| frieren | **#2393** | **BL Adaptive Node Weighting** | Training (OB-GNN style) | NEW — loss reweighting: surface ×10, near-wall ×3, freestream ×1. On ANP baseline. |
-| alphonse | #2384 | **PirateNet SRF** | Architecture (gated residual) | ~50% complete (pre-ANP) |
-| tanjiro | #2385 | **HyPINO Hypernetwork SRF** | Architecture (hypernetwork) | ~43% complete (pre-ANP) |
-| nezuko | #2386 | **Stagnation Point Constraint** | Physics constraint | ~41% complete (pre-ANP) |
-| fern | #2387 | **Bernoulli Velocity-Pressure Constraint** | Physics constraint | ~40% complete (pre-ANP, ⚠️ Ux anomaly) |
-| askeladd | #2391 | **Local Re_x Boundary Layer Feature** | Physics feature (P0) | ~31% complete (on ANP baseline) |
-| edward | #2374 | **Hard Kutta TE Constraint v2** | Physics constraint | ~37% complete (pre-ANP, v2 in progress) |
-| thorfinn | #2392 | **DeltaPhi Residual Prediction** | Prediction target (P0) | ~19% complete (on ANP baseline) |
+| frieren | **#2393** | **BL Adaptive Node Weighting** | Training (OB-GNN style) | ⚠️ Pod restarted (was stuck 6h, no runs). Should pick up #2393 now. On ANP baseline. |
+| alphonse | #2384 | **PirateNet SRF** | Architecture (gated residual) | ✅ FINISHED — neutral result vs pre-ANP. Will be idle soon. |
+| tanjiro | #2385 | **HyPINO Hypernetwork SRF** | Architecture (hypernetwork) | ~70% complete, 160 min in (pre-ANP) |
+| nezuko | #2386 | **Stagnation Point Constraint** | Physics constraint | ~70% complete, 155 min in (pre-ANP) |
+| fern | #2387 | **Bernoulli Velocity-Pressure Constraint** | Physics constraint | ~70% complete, 152 min in (pre-ANP, ⚠️ s42 bernoulli_loss worsening) |
+| askeladd | (#2391 queued) | **Running MSHA** from prior round | Architecture | ~60% complete, 126 min in (pre-ANP). #2391 Local Re_x Feature waiting (on ANP). |
+| edward | #2374 | **Hard Kutta TE Constraint v2** | Physics constraint | ~65% complete, 142 min in (pre-ANP, 3 configs) |
+| thorfinn | (#2392 queued) | **Running Arc-Length PE** from prior round | Architecture | ~45% complete, 93 min in (pre-ANP). #2392 DeltaPhi Residual waiting (on ANP). |
 
 ### ⚠️ Note: Pre-ANP experiments
-alphonse (#2384), tanjiro (#2385), nezuko (#2386), fern (#2387), edward (#2374) are running AGAINST THE OLD BASELINE (pre-ANP code, no `--anp_srf`). Their results will be informative for ideas but NOT for merge decisions against the new ANP baseline. When they finish, close and reassign to Round 46 P0/P1 ideas ON the ANP baseline.
+All currently training experiments EXCEPT frieren (#2393) are running WITHOUT `--anp_srf`. Their results cannot beat the ANP baseline. When they finish, evaluate the IDEAS (compare to pre-ANP baseline), then:
+- Promising ideas → reassign with `--anp_srf` to test additivity with ANP
+- Dead ends → close and assign fresh Round 47 hypotheses on ANP baseline
+
+### Alphonse PirateNet SRF Results (just finished)
+| Metric | Seed 42 | Seed 73 | 2-seed avg | Pre-ANP Baseline | Δ |
+|--------|---------|---------|------------|------------------|---|
+| p_in | 11.784 | 11.621 | 11.70 | 11.872 | -1.4% |
+| p_oodc | 7.263 | 7.615 | 7.44 | 7.459 | -0.3% |
+| p_tan | 26.587 | 26.673 | 26.63 | 26.319 | +1.2% |
+| p_re | 6.256 | 6.341 | 6.30 | 6.229 | +1.1% |
+Verdict: Neutral — PirateNet SRF multiplicative residuals didn't help. Close and reassign.
 
 ### Recent Merges / Closures
 | PR | Student | Experiment | Result | Action |
@@ -42,6 +53,9 @@ alphonse (#2384), tanjiro (#2385), nezuko (#2386), fern (#2387), edward (#2374) 
 | ❌ #2388 | askeladd | Multi-Scale Hierarchical | Not started | CLOSED — redundant post-ANP |
 | ❌ #2389 | thorfinn | Arc-Length PE | Not started | CLOSED — redirected to DeltaPhi Residual |
 
+### Pod Issues
+- **frieren** pod was stuck for ~6h (agent saw merged #2379 instead of new #2393, 0% GPU utilization). Restarted at ~04:20 UTC. New pod running.
+
 ## Human Researcher Directive (Issue #1860)
 
 **Morgan McGuire:** "Too many incremental tweaks — think bigger. Radical new model changes, data aug, data generation."
@@ -50,7 +64,7 @@ alphonse (#2384), tanjiro (#2385), nezuko (#2386), fern (#2387), edward (#2374) 
 ## Key Insights (Updated 2026-04-11 02:45)
 
 1. **ANP cross-attention is the breakthrough.** Asymmetric cross-attention where aft-foil queries attend to all fore-foil context = direct inter-foil wake physics encoding. MERGED. p_tan -59%, p_in -70%, p_oodc -48%. Biggest single improvement in programme history.
-2. **p_re is the current gap.** ANP regressed p_re +16% (7.232 vs old baseline 6.229). Cause: cross-attention aggregates fore-foil representations that are unreliable at OOD Reynolds numbers. Frieren now working on Re-conditional gate to fix this (#2390).
+2. **p_re is the current gap.** ANP regressed p_re +16% (7.232 vs old baseline 6.229). Cause: cross-attention aggregates fore-foil representations that are unreliable at OOD Reynolds numbers. Re-conditional gate (#2390) crashed — need alternative approach.
 3. **Stop-gradient kills cross-attention.** SCA v3 with stop-gradient failed; ANP without stop-gradient succeeded. Bidirectional gradient flow is essential for cross-foil learning.
 4. **Physics constraints are a viable secondary lever.** Kutta TE showed p_oodc -2.9%. Physics constraints + ANP combination could compound further gains.
 5. **The new challenge:** With p_tan now at 10.825 (was 26.319), we need to ensure other metrics also drop. p_oodc at 3.847 and p_in at 3.561 are dramatically lower. The ANP has reset the scale of the problem.
