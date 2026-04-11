@@ -1,5 +1,57 @@
 # SENPAI Research Results
 
+## 2026-04-11 06:00 — PR #2387: Bernoulli Velocity-Pressure Consistency — fern — **CLOSED** ❌
+
+- Branch: fern/bernoulli-constraint
+- **Hypothesis:** Add a soft Bernoulli constraint (p + 0.5(Ux²+Uy²) ≈ 0.5·Umag²) as an auxiliary loss to enforce velocity-pressure coupling, improving cross-output consistency.
+
+### Results (2-seed avg, pre-ANP baseline)
+
+| Metric | Seed 42 | Seed 73 | 2-Seed Avg | Baseline | Δ |
+|--------|---------|---------|-----------|----------|---|
+| p_in | 19.0 | 12.8 | **15.900** | 11.872 | **+33.9%** ❌ |
+| p_oodc | 12.6 | 8.1 | **10.350** | 7.459 | **+38.8%** ❌ |
+| p_tan | 30.5 | 27.1 | **28.800** | 26.319 | **+9.4%** ❌ |
+| p_re | 9.7 | 6.8 | **8.250** | 6.229 | **+32.4%** ❌ |
+
+- W&B runs: `jmi0w4eb` (seed 42), `76jyesmh` (seed 73)
+- Group: `bernoulli-constraint`
+
+### Analysis
+
+**Clear dead end — all metrics significantly worse.** Root cause: applying Bernoulli at surface nodes is physically incorrect. At the no-slip wall, Ux=Uy=0, so the constraint degenerates to p≈p_stagnation everywhere — which is wrong physics. Bernoulli only holds outside the boundary layer, which we can't cleanly mask. Additionally, seed 42 had training instability (val loss spikes epoch 63-65) from high-variance Bernoulli gradients through the denormalization chain. Fern's analysis was excellent — correctly identified the no-slip physics issue.
+
+**Lesson:** Physics constraints must respect boundary conditions. Wall constraints require wall-specific physics (Kutta, stagnation), not free-stream equations.
+
+---
+
+## 2026-04-11 06:00 — PR #2385: HyPINO Hypernetwork SRF — tanjiro — **CLOSED** ❌
+
+- Branch: tanjiro/hypino-srf
+- **Hypothesis:** Use a hypernetwork conditioned on tandem gap/stagger to generate LoRA-style corrections to SRF weights, enabling geometry-adaptive surface refinement.
+
+### Results (2-seed avg, pre-ANP baseline)
+
+| Metric | Seed 42 | Seed 73 | 2-Seed Avg | Baseline | Δ |
+|--------|---------|---------|-----------|----------|---|
+| p_in | 11.913 | 11.918 | **11.916** | 11.872 | **+0.4%** ≈ |
+| p_oodc | 7.309 | 7.887 | **7.598** | 7.459 | **+1.9%** ❌ |
+| p_tan | 26.771 | 27.392 | **27.082** | 26.319 | **+2.9%** ❌ |
+| p_re | 6.283 | 6.100 | **6.192** | 6.229 | **-0.6%** ≈ |
+
+- W&B runs: `ndw09tm7` (seed 42), `b9ez9x2x` (seed 73)
+- Group: `hypino-srf`
+
+### Analysis
+
+**Initialization bug rendered the experiment null.** Both U and V matrices in the LoRA-style hypernetwork were zero-initialized, creating a zero-gradient saddle point. Gradient to U ∝ V.T — zero because V=0. Neither matrix ever updated. The model was effectively standard SRF for all 154 epochs. Confirmed via W&B: hypernetwork parameters showed zero throughout training.
+
+The slight regressions in p_tan/p_oodc likely stem from additional LayerNorm layers in the HyperSRF base path.
+
+**Lesson:** LoRA-style initialization requires asymmetric init (A=random, B=zero). Tanjiro's root cause analysis was thorough. Concept could work with proper init but we're pivoting to bolder experiments.
+
+---
+
 ## 2026-04-11 02:40 — PR #2379: Attentive Neural Process Surface Decoder — frieren — **MERGED** ✅ BREAKTHROUGH
 
 - Branch: frieren/anp-surface-decoder
