@@ -265,7 +265,7 @@ def compute_te_features(raw_xy, is_surface, saf_norm):
         saf_norm:   [B, N] norm of raw saf channels (x[:,:,2:4] before normalization)
                     ≤ 0.005 → foil-1 surface, > 0.005 → foil-2 surface
 
-    Returns: ([B, N, 6], fore_te_x [B], fore_te_y [B])
+    Returns: ([B, N, 6], fore_te_x [B], fore_te_y [B], fore_te_idx [B], aft_te_idx [B])
              features = [dx_fore, dy_fore, r_fore, dx_aft, dy_aft, r_aft]
              aft features are zero for single-foil samples
     """
@@ -300,7 +300,78 @@ def compute_te_features(raw_xy, is_surface, saf_norm):
     dy_aft = (y_coords - aft_te_y[:, None]) * is_tandem
     r_aft = (dx_aft ** 2 + dy_aft ** 2).sqrt().clamp(min=1e-6) * is_tandem
 
-    return torch.stack([dx_fore, dy_fore, r_fore, dx_aft, dy_aft, r_aft], dim=-1), fore_te_x, fore_te_y
+    return torch.stack([dx_fore, dy_fore, r_fore, dx_aft, dy_aft, r_aft], dim=-1), fore_te_x, fore_te_y, fore_te_idx, aft_te_idx
+
+
+def apply_kutta_constraint(pred, raw_xy, is_surface, saf_norm, fore_te_idx, aft_te_idx, is_tandem, K, hard):
+    """Apply Kutta trailing-edge constraint to pressure predictions.
+
+    Finds K nearest surface nodes to each TE and optionally replaces their
+    pressure predictions with their mean (hard constraint). Returns the
+    smoothness loss (max-min spread)^2 for the soft penalty.
+
+    Args:
+        pred:        [B, N, 3] model predictions (Ux, Uy, p)
+        raw_xy:      [B, N, 2] raw coordinates (pre-normalization)
+        is_surface:  [B, N] bool
+        saf_norm:    [B, N] saf channel norm (fore: <= 0.005, aft: > 0.005)
+        fore_te_idx: [B] fore-foil TE node index
+        aft_te_idx:  [B] aft-foil TE node index
+        is_tandem:   [B] float (1.0 for tandem, 0.0 for single)
+        K:           int, number of nearest TE-region nodes
+        hard:        bool, apply hard constraint (replace with mean)
+
+    Returns:
+        pred:        [B, N, 3] modified predictions (if hard, else unchanged)
+        kutta_loss:  scalar, smoothness loss term
+    """
+    B, N, _ = pred.shape
+    device = pred.device
+
+    # --- Fore-foil TE region ---
+    fore_surf = is_surface & (saf_norm <= 0.005)
+    fore_te_xy = raw_xy[torch.arange(B, device=device), fore_te_idx]  # [B, 2]
+    dist_to_fore_te = ((raw_xy - fore_te_xy[:, None, :]) ** 2).sum(-1)  # [B, N]
+    dist_to_fore_te[~fore_surf] = 1e9
+    fore_te_region_idx = dist_to_fore_te.topk(K, dim=1, largest=False).indices  # [B, K]
+
+    # --- Aft-foil TE region ---
+    aft_surf = is_surface & (saf_norm > 0.005)
+    aft_te_xy = raw_xy[torch.arange(B, device=device), aft_te_idx]  # [B, 2]
+    dist_to_aft_te = ((raw_xy - aft_te_xy[:, None, :]) ** 2).sum(-1)  # [B, N]
+    dist_to_aft_te[~aft_surf] = 1e9
+    aft_te_region_idx = dist_to_aft_te.topk(K, dim=1, largest=False).indices  # [B, K]
+
+    # Extract pressure (channel 2) predictions at TE-region nodes
+    fore_te_preds = pred[:, :, 2].gather(1, fore_te_region_idx)  # [B, K]
+    aft_te_preds = pred[:, :, 2].gather(1, aft_te_region_idx)    # [B, K]
+
+    # Smoothness loss: (max - min)^2 spread at TE region
+    kutta_fore = (fore_te_preds.max(dim=1).values - fore_te_preds.min(dim=1).values) ** 2  # [B]
+    kutta_aft = (aft_te_preds.max(dim=1).values - aft_te_preds.min(dim=1).values) ** 2 * is_tandem  # [B]
+    kutta_loss = (kutta_fore + kutta_aft).mean()
+
+    # Hard constraint: replace TE-region pressure with their mean (non-in-place for autograd)
+    if hard:
+        pred_p = pred[:, :, 2]  # [B, N]
+
+        # Fore TE: build mask and replace via functional ops
+        fore_mean_val = fore_te_preds.mean(dim=1)  # [B]
+        fore_mask = torch.zeros(B, N, device=device)
+        fore_mask.scatter_(1, fore_te_region_idx, 1.0)  # ok: fore_mask not in graph
+        new_p = pred_p * (1.0 - fore_mask) + fore_mean_val[:, None] * fore_mask
+
+        # Aft TE: tandem only
+        if is_tandem.any():
+            aft_mean_val = aft_te_preds.mean(dim=1)  # [B]
+            aft_mask = torch.zeros(B, N, device=device)
+            aft_mask.scatter_(1, aft_te_region_idx, 1.0)
+            aft_mask = aft_mask * is_tandem[:, None]  # zero for single-foil
+            new_p = new_p * (1.0 - aft_mask) + aft_mean_val[:, None] * aft_mask
+
+        pred = torch.cat([pred[:, :, :2], new_p.unsqueeze(-1)], dim=-1)
+
+    return pred, kutta_loss
 
 
 def compute_wake_deficit_features(raw_xy, is_surface, saf_norm, gap_raw, fore_te_x=None, fore_te_y=None, include_angle=False):
@@ -1328,6 +1399,10 @@ class Config:
     vortex_panel_velocity: bool = False    # append (u_fore, v_fore, u_aft, v_aft) induced velocity
     vortex_panel_scale: float = 0.1        # scale factor for vortex velocity channels
     vortex_panel_n: int = 64              # number of panels to subsample per foil
+    # Kutta trailing-edge constraint: enforce pressure continuity at TE
+    kutta_loss_weight: float = 0.0       # Kutta TE smoothness loss weight (0 = disabled)
+    kutta_hard_constraint: bool = False  # Hard TE region averaging projection (replace K TE-region preds with mean)
+    kutta_region_k: int = 8             # Number of nearest TE surface nodes to enforce continuity
 
 
 cfg = sp.parse(Config)
@@ -1943,7 +2018,7 @@ for epoch in range(MAX_EPOCHS):
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
         # TE coordinate frame / wake deficit / cp_panel / vortex_panel: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity or cfg.kutta_loss_weight > 0 or cfg.kutta_hard_constraint
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
@@ -1962,7 +2037,7 @@ for epoch in range(MAX_EPOCHS):
             foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
             x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
         elif cfg.te_coord_frame:
-            te_feats, _fore_te_x, _fore_te_y = compute_te_features(_raw_xy_te, is_surface, _raw_saf_norm_te)
+            te_feats, _fore_te_x, _fore_te_y, _fore_te_idx, _aft_te_idx = compute_te_features(_raw_xy_te, is_surface, _raw_saf_norm_te)
             x = torch.cat([x, curv, dist_feat, te_feats], dim=-1)
             if cfg.wake_deficit_feature:
                 wake_feats = compute_wake_deficit_features(
@@ -1977,6 +2052,10 @@ for epoch in range(MAX_EPOCHS):
                     _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake,
                     include_angle=cfg.wake_angle_feature)
                 x = torch.cat([x, wake_feats], dim=-1)
+        # Kutta: compute TE indices if needed but te_coord_frame is not active
+        _kutta_active = cfg.kutta_loss_weight > 0 or cfg.kutta_hard_constraint
+        if _kutta_active and not cfg.te_coord_frame:
+            _, _, _, _fore_te_idx, _aft_te_idx = compute_te_features(_raw_xy_te, is_surface, _raw_saf_norm_te)
         # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
         raw_xy = x[:, :, :2]
         # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2150,6 +2229,14 @@ for epoch in range(MAX_EPOCHS):
                 pred = pred.clone()
                 pred[aft_idx[:, 0], aft_idx[:, 1]] = pred[aft_idx[:, 0], aft_idx[:, 1]] + aft_correction
 
+        # Kutta trailing-edge constraint (applied before loss computation)
+        _kutta_loss = torch.tensor(0.0, device=device)
+        if _kutta_active and model.training:
+            pred, _kutta_loss = apply_kutta_constraint(
+                pred, _raw_xy_te, is_surface, _raw_saf_norm_te,
+                _fore_te_idx, _aft_te_idx, _is_tandem_raw, cfg.kutta_region_k,
+                hard=cfg.kutta_hard_constraint)
+
         sq_err = (pred - y_norm) ** 2
         abs_err = (pred - y_norm).abs()
         if cfg.tandem_ramp:
@@ -2269,6 +2356,10 @@ for epoch in range(MAX_EPOCHS):
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
 
+        # Kutta TE smoothness loss
+        if cfg.kutta_loss_weight > 0 and model.training:
+            loss = loss + cfg.kutta_loss_weight * _kutta_loss
+
         # DCT frequency-weighted auxiliary loss on surface pressure
         if cfg.dct_freq_loss and model.training:
             _dct_loss = torch.tensor(0.0, device=device)
@@ -2334,6 +2425,9 @@ for epoch in range(MAX_EPOCHS):
             coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
             loss_a = vol_loss_a + surf_weight * surf_loss_a + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
             loss_b = vol_loss_b + surf_weight * surf_loss_b + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+            if cfg.kutta_loss_weight > 0:
+                loss_a = loss_a + cfg.kutta_loss_weight * _kutta_loss
+                loss_b = loss_b + cfg.kutta_loss_weight * _kutta_loss
 
             optimizer.zero_grad()
             loss_a.backward(retain_graph=True)
@@ -2378,7 +2472,10 @@ for epoch in range(MAX_EPOCHS):
                 vol_loss_g = (abs_err * vol_mask_g.unsqueeze(-1)).sum() / vol_mask_g.sum().clamp(min=1)
                 surf_loss_g = (surf_per_sample * mask_1d.float() * tandem_boost).sum() / n
                 coarse_shared = _coarse_loss * 0.5 if _coarse_loss is not None else 0.0
-                return vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                _gl = vol_loss_g + surf_weight * surf_loss_g + coarse_shared + 0.005 * re_loss + 0.005 * aoa_loss
+                if cfg.kutta_loss_weight > 0:
+                    _gl = _gl + cfg.kutta_loss_weight * _kutta_loss
+                return _gl
 
             loss_A = _grp_loss(~is_tandem_batch)
             # Only include non-empty groups to avoid backward() on no-grad tensors
@@ -2506,7 +2603,10 @@ for epoch in range(MAX_EPOCHS):
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        _train_log = {"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step}
+        if _kutta_active:
+            _train_log["train/kutta_loss"] = _kutta_loss.item()
+        wandb.log(_train_log)
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -2650,7 +2750,7 @@ for epoch in range(MAX_EPOCHS):
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
                 _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
-                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity or cfg.kutta_loss_weight > 0 or cfg.kutta_hard_constraint
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
                 _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -2668,7 +2768,7 @@ for epoch in range(MAX_EPOCHS):
                     foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
                     x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
                 elif cfg.te_coord_frame:
-                    te_feats, _fore_te_x, _fore_te_y = compute_te_features(_raw_xy_te, is_surface, _raw_saf_norm_te)
+                    te_feats, _fore_te_x, _fore_te_y, _fore_te_idx, _aft_te_idx = compute_te_features(_raw_xy_te, is_surface, _raw_saf_norm_te)
                     x = torch.cat([x, curv, dist_feat, te_feats], dim=-1)
                     if cfg.wake_deficit_feature:
                         wake_feats = compute_wake_deficit_features(
@@ -2683,6 +2783,10 @@ for epoch in range(MAX_EPOCHS):
                             _raw_xy_te, is_surface, _raw_saf_norm_te, _raw_gap_wake,
                             include_angle=cfg.wake_angle_feature)
                         x = torch.cat([x, wake_feats], dim=-1)
+                # Kutta: compute TE indices for validation if needed but te_coord_frame is not active
+                _kutta_active_v = cfg.kutta_hard_constraint
+                if _kutta_active_v and not cfg.te_coord_frame:
+                    _, _, _, _fore_te_idx, _aft_te_idx = compute_te_features(_raw_xy_te, is_surface, _raw_saf_norm_te)
                 # Fourier positional encoding: append sin/cos of (x,y) at 4 learnable frequencies
                 raw_xy = x[:, :, :2]
                 # Normalize xy to [0,1] per-sample for consistent Fourier encoding
@@ -2838,6 +2942,17 @@ for epoch in range(MAX_EPOCHS):
                             pred = pred_loss / sample_stds
                         else:
                             pred = pred_loss * sample_stds
+
+                # Kutta hard constraint during validation
+                if cfg.kutta_hard_constraint and _raw_xy_te is not None:
+                    pred_loss, _ = apply_kutta_constraint(
+                        pred_loss, _raw_xy_te, is_surface, _raw_saf_norm_te,
+                        _fore_te_idx, _aft_te_idx, _is_tandem_raw, cfg.kutta_region_k,
+                        hard=True)
+                    if cfg.multiply_std:
+                        pred = pred_loss / sample_stds
+                    else:
+                        pred = pred_loss * sample_stds
 
                 sq_err = (pred_loss - y_norm_scaled) ** 2
                 abs_err = (pred_loss - y_norm_scaled).abs()
@@ -3079,7 +3194,7 @@ if best_metrics:
                     raw_dsdf = x_dev[:, :, 2:10]
                     dist_surf = raw_dsdf.abs().min(dim=-1, keepdim=True).values
                     dist_feat = torch.log1p(dist_surf * 10.0)
-                    _need_te_raw_vis = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+                    _need_te_raw_vis = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity or cfg.kutta_loss_weight > 0 or cfg.kutta_hard_constraint
                     _raw_xy_te_vis = x_dev[:, :, :2].clone() if _need_te_raw_vis else None
                     _raw_saf_norm_te_vis = x_dev[:, :, 2:4].norm(dim=-1) if _need_te_raw_vis else None
                     _raw_aoa_vis = x_dev[:, 0, 14:15]  # AoA0_rad [B, 1]
@@ -3088,7 +3203,7 @@ if best_metrics:
                     x_n = (x_dev - stats["x_mean"]) / stats["x_std"]
                     curv = x_n[:, :, 2:6].norm(dim=-1, keepdim=True) * is_surf_dev.float().unsqueeze(-1)
                     if cfg.te_coord_frame:
-                        te_feats_vis, _fore_te_x_vis, _fore_te_y_vis = compute_te_features(
+                        te_feats_vis, _fore_te_x_vis, _fore_te_y_vis, _fore_te_idx_vis, _aft_te_idx_vis = compute_te_features(
                             _raw_xy_te_vis, is_surf_dev, _raw_saf_norm_te_vis)
                         x_n = torch.cat([x_n, curv, dist_feat, te_feats_vis], dim=-1)
                         if cfg.wake_deficit_feature:
@@ -3212,7 +3327,7 @@ if cfg.surface_refine and best_metrics:
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
                     _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
-                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity or cfg.kutta_loss_weight > 0 or cfg.kutta_hard_constraint
                     _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
                     _raw_gap_wake_vv = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -3222,7 +3337,7 @@ if cfg.surface_refine and best_metrics:
                         foil2_dist_feat = torch.log1p(raw_dsdf[:, :, 4:8].abs().min(dim=-1, keepdim=True).values * 10.0)
                         x = torch.cat([x, curv, dist_feat, foil2_dist_feat], dim=-1)
                     elif cfg.te_coord_frame:
-                        te_feats, _fore_te_x_vv, _fore_te_y_vv = compute_te_features(
+                        te_feats, _fore_te_x_vv, _fore_te_y_vv, _fore_te_idx_vv, _aft_te_idx_vv = compute_te_features(
                             _raw_xy_te, is_surface, _raw_saf_norm_te)
                         x = torch.cat([x, curv, dist_feat, te_feats], dim=-1)
                         if cfg.wake_deficit_feature:
