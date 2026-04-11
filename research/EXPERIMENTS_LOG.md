@@ -1,5 +1,29 @@
 # SENPAI Research Results
 
+## 2026-04-11 02:00 — PR #2382: SIREN Surface Decoder — thorfinn — **CLOSED** ❌
+- Branch: thorfinn/siren-surface-decoder
+- **Hypothesis:** Replace the SRF MLP activations with SIREN (sinusoidal representation networks) to better capture high-frequency pressure features. SIREN uses sin(ω₀·Wx+b) activations that can represent signals at arbitrary frequencies.
+- **Results:**
+
+**Config A (ω₀=30): DIVERGED**
+- Both seeds diverged at epoch 30-45. s42 best val_in_dist=1.77 at epoch 25, then rose to 16.1. s73 diverged to 2255.
+- Root cause: refine_head parameters were missing from gradient clipping. SIREN gradients scale with ω₀ (up to 30×).
+- Bug fix applied: `clip_grad_norm_(refine_head.parameters(), max_norm=1.0)` added.
+
+**Config B (ω₀=10, with grad clip fix):**
+
+| Metric | s73 (nqhlxtdd) | s42 (320u8xxu) | Baseline | Delta |
+|--------|----------------|----------------|----------|-------|
+| p_in | 17.92 | 20.80 | 11.872 | +51-75% |
+| p_oodc | 11.46 | 12.68 | 7.459 | +54-70% |
+| p_tan | 36.08 | 40.66 | 26.319 | +37-55% |
+| p_re | 8.43 | 9.21 | 6.229 | +35-48% |
+
+- All 4 metrics 35-75% worse than baseline at 156 min. SIREN activations are fundamentally incompatible with the Transolver+SRF pipeline. The sinusoidal frequency encoding creates conflicting representations with slice-based physics attention.
+- **Positive contribution:** Identified and fixed gradient clipping bug for refine_head parameters — cherry-pick worthy if other experiments need custom SRF activations.
+
+---
+
 ## 2026-04-11 01:55 — PR #2372: Surface Cross-Attention v3 (stop-gradient) — askeladd — **CLOSED** ❌
 - Branch: askeladd/surface-cross-attn-v3
 - **Hypothesis:** Add surface cross-attention after the SRF decoder where aft-foil surface nodes attend to fore-foil surface context, with stop-gradient on the fore-foil keys/values to prevent backward gradient flow from destabilizing fore-foil predictions.

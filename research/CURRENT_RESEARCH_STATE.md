@@ -24,14 +24,14 @@ cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_ou
 ### Active Experiments
 | Student | PR | Experiment | Type | Status |
 |---------|-----|-----------|------|--------|
-| frieren | #2379 | **Attentive Neural Process Decoder** | Architecture (ANP) | **POTENTIAL BREAKTHROUGH** — 127 min, s42: p_in=5.6 (-53%), p_oodc=4.4 (-40%), p_tan=11.7 (-56%), p_re=8.0 (+28%) |
+| frieren | #2379 | **Attentive Neural Process Decoder** | Architecture (ANP) | **POTENTIAL BREAKTHROUGH** — 134 min, s73: p_in=5.4 (-54%), p_oodc=4.6 (-38%), p_tan=13.3 (-49%), p_re=7.2 (+16%) |
 | alphonse | #2384 | **PirateNet SRF** | Architecture (gated residual) | Training 33 min, val_in_dist=31-37 (early) |
 | tanjiro | #2385 | **HyPINO Hypernetwork SRF** | Architecture (hypernetwork) | Training 11 min, very early warm-up |
 | nezuko | #2386 | **Stagnation Point Constraint** | Physics constraint | Training 6 min, very early |
 | fern | #2387 | **Bernoulli Velocity-Pressure Constraint** | Physics constraint | Training 3 min, very early |
 | askeladd | #2388 | **Multi-Scale Hierarchical Slice Attention** | Architecture (cross-scale) | NEW — just assigned |
 | edward | #2374 | **Hard Kutta TE Constraint v2** | Physics constraint | SENT BACK for v2 (K=2, tandem-only, lower weight). Not yet restarted. |
-| thorfinn | #2382 | **SIREN Surface Decoder (ω₀=10)** | Architecture | Running ω₀=10 after ω₀=30 diverged. Status being checked. |
+| thorfinn | #2389 | **Arc-Length Positional Encoding** | Architecture (PE) | NEW — just assigned |
 
 ### Closed This Session
 | PR | Student | Experiment | Result | Why |
@@ -41,6 +41,7 @@ cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_ou
 | #2378 | tanjiro | Contrastive Pretrain v2 | All metrics 2-8× worse | Pretraining poisoned initialization in 180-min budget |
 | #2383 | fern | Tandem Aux Heads | p_in -1.4% but 3 others regress | Aux heads interfere with PCGrad balancing |
 | #2372 | askeladd | Surface Cross-Attention v3 | All metrics +2-16% | Stop-gradient severed useful gradient flow |
+| #2382 | thorfinn | SIREN Surface Decoder | All metrics +35-75% | SIREN activations incompatible with Transolver+SRF |
 
 ### ⚠️ PRIORITY: Frieren ANP (#2379) — Potential Breakthrough
 
@@ -48,17 +49,16 @@ cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_ou
 
 | Metric | s73 (jvfvrs4u) | s42 (metqdxaq) | Approx 2-seed avg | Baseline | Delta |
 |--------|----------------|----------------|-------------------|----------|-------|
-| p_in | 6.19 | 5.63 | ~5.9 | 11.872 | ~-50% |
-| p_oodc | 4.25 | 4.45 | ~4.35 | 7.459 | ~-42% |
-| p_tan | 13.62 | 11.67 | ~12.6 | 26.319 | ~-52% |
-| p_re | 10.09 | 7.99 | ~9.0 | 6.229 | ~+45% |
+| p_in | 5.44 | 5.63 | ~5.5 | 11.872 | ~-54% |
+| p_oodc | 4.61 | 4.83 | ~4.7 | 7.459 | ~-37% |
+| p_tan | 13.30 | 13.05 | ~13.2 | 26.319 | ~-50% |
+| p_re | 7.20 | 7.95 | ~7.6 | 6.229 | ~+22% |
 
-- p_tan improvement of -52% would be the SINGLE BIGGEST improvement in the research programme
-- p_oodc -42% and p_in -50% are also extraordinary
-- Only p_re regresses significantly (+45%)
-- ~53 min of training left — EMA sweep at end will determine final metrics
-- s42 is consistently stronger than s73 across all metrics
-- Live metrics trending BETTER over time (p_tan was -46% at 97 min, now -52% at 127 min)
+- p_tan improvement of -50% would be the SINGLE BIGGEST improvement in the research programme
+- p_oodc -37% and p_in -54% are also extraordinary
+- p_re regression has IMPROVED: was +45% at 127 min, now +22% at 134 min (s73 p_re dropped from 10.09→7.20)
+- ~46 min of training left — EMA sweep at end will determine final metrics
+- Live metrics trending BETTER over time (p_tan was -46% at 97 min, -52% at 127 min, -50% at 134 min)
 
 ## Human Researcher Directive (Issue #1860)
 
@@ -86,7 +86,7 @@ cd cfd_tandemfoil && python train.py --asinh_pressure --field_decoder --adaln_ou
 
 ## What's Exhausted (DO NOT REVISIT)
 
-Architecture (from scratch): GNOT, Galerkin, HPT, FactFormer, DeepONet, SIREN
+Architecture (from scratch): GNOT, Galerkin, HPT, FactFormer, DeepONet, SIREN (ω₀=10 and ω₀=30)
 Architecture (tweaks): FiLM SRF, two-stage SRF, GRU decoder, Gumbel MoE, hypernetwork SRF, per-head KV, foil role embed, SRF normal frame, decoupled tandem projection, GeoTransolver GALE, MoE-LoRA FFN, Biot-Savart attention bias, role-specialized SRF, surface cross-attention (stop-grad)
 Architecture (decoder replacements): Surface B-GNN (+14%), 1D Surface FNO (+29%), Multi-Scale Slice (+8%), Koopman lifting (+19%)
 Loss/training: Focal L1, curriculum, quantile reg, Jacobian smooth, asymmetric loss, R-Drop, attention noise, aug annealing, spectral reg, OHNM, two-pass SRF, Cl/Cd SRF conditioning (+25%), tandem aux heads (+5%)
@@ -110,7 +110,7 @@ Optimizers: Muon/Gram-NS (destroys gradient anisotropy)
 5. Bernoulli Constraint (fern #2387) — velocity-pressure consistency, 3 min
 6. Multi-Scale Hierarchical Attention (askeladd #2388) — coarse-to-fine cross-scale, just assigned
 7. Hard Kutta TE v2 (edward #2374) — K=2, tandem-only, lower weight, awaiting restart
-8. SIREN ω₀=10 (thorfinn #2382) — status being verified
+8. Arc-Length PE (thorfinn #2389) — 1D surface topology encoding, just assigned
 
 ### Idea Queue (Round 45+, assign when students idle)
 From researcher-agent RESEARCH_IDEAS_2026-04-10_ROUND44.md:
