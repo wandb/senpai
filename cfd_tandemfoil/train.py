@@ -903,6 +903,85 @@ class SurfaceRefinementContextHead(nn.Module):
         return correction
 
 
+class KoopmanTandemLifting(nn.Module):
+    """Koopman operator lifting for tandem inter-foil interference.
+
+    Lifts backbone hidden states h ∈ R^n_hidden to a higher-dimensional
+    linear space z ∈ R^koopman_dim where the fore-foil's effect on the
+    aft-foil is approximately linear:
+
+        z_aft_corrected = z_aft + K @ mean_pool(z_fore)
+
+    where K = U @ diag(sigma) @ V^T is a low-rank learnable operator.
+    Applied only to aft-foil nodes in tandem samples; identity for fore-foil
+    and single-foil nodes. Projects back with a residual:
+
+        h_out = h + ψ(z_corrected)
+    """
+
+    def __init__(self, n_hidden: int = 192, koopman_dim: int = 256, koopman_rank: int = 32):
+        super().__init__()
+        self.koopman_dim = koopman_dim
+        self.koopman_rank = koopman_rank
+        # Lifting encoder φ: h → z
+        self.encoder = nn.Sequential(
+            nn.Linear(n_hidden, koopman_dim),
+            nn.GELU(),
+            nn.Linear(koopman_dim, koopman_dim),
+        )
+        # Low-rank Koopman operator K = U @ diag(sigma) @ V^T (~16K params for dim=256, rank=32)
+        self.K_U = nn.Parameter(torch.empty(koopman_dim, koopman_rank))
+        self.K_V = nn.Parameter(torch.empty(koopman_dim, koopman_rank))
+        self.K_sigma = nn.Parameter(torch.ones(koopman_rank))
+        # Projection decoder ψ: z → h
+        self.decoder = nn.Sequential(
+            nn.Linear(koopman_dim, n_hidden),
+            nn.GELU(),
+            nn.Linear(n_hidden, n_hidden),
+        )
+        nn.init.xavier_normal_(self.K_U)
+        nn.init.xavier_normal_(self.K_V)
+        # K_sigma initialized to ones: K starts as a full-rank random projection
+
+    def forward(self, hidden: torch.Tensor, saf_norm: torch.Tensor,
+                is_tandem_batch: torch.Tensor) -> torch.Tensor:
+        """Apply Koopman lifting correction to aft-foil nodes in tandem samples.
+
+        Args:
+            hidden: [B, N, n_hidden] backbone hidden states
+            saf_norm: [B, N] pre-normalization saf channel norm
+                      (fore-foil: <= 0.005, aft-foil: > 0.005)
+            is_tandem_batch: [B] bool, True for tandem samples
+        Returns:
+            h_out: [B, N, n_hidden] corrected hidden states
+                   (identity transformation for single-foil samples)
+        """
+        # Lift all nodes to Koopman space
+        z = self.encoder(hidden)  # [B, N, koopman_dim]
+
+        # Identify fore and aft nodes by saf_norm threshold
+        fore_mask = (saf_norm <= 0.005)  # [B, N]
+        aft_mask = (saf_norm > 0.005)    # [B, N]
+
+        # Mean-pool fore-foil lifted states per sample: [B, koopman_dim]
+        fore_count = fore_mask.float().sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1]
+        z_fore_mean = (z * fore_mask.unsqueeze(-1).float()).sum(dim=1) / fore_count  # [B, koopman_dim]
+
+        # Efficient low-rank Koopman: K @ z_fore_mean = K_U @ diag(K_sigma) @ K_V^T @ z_fore_mean
+        alpha = z_fore_mean @ self.K_V          # [B, rank]
+        alpha = alpha * self.K_sigma            # [B, rank]
+        koopman_corr = alpha @ self.K_U.T       # [B, koopman_dim]
+
+        # Apply correction only to aft-foil nodes in tandem samples (fully vectorized)
+        aft_tandem_mask = aft_mask & is_tandem_batch.unsqueeze(1)               # [B, N]
+        correction_3d = aft_tandem_mask.float().unsqueeze(-1) * koopman_corr.unsqueeze(1)  # [B, N, dim]
+        z_corrected = z + correction_3d  # [B, N, koopman_dim]
+
+        # Project back and add residual: h_out = h + ψ(z_corrected)
+        h_correction = self.decoder(z_corrected)  # [B, N, n_hidden]
+        return hidden + h_correction
+
+
 class Transolver(nn.Module):
     def __init__(
         self,
@@ -1328,6 +1407,11 @@ class Config:
     vortex_panel_velocity: bool = False    # append (u_fore, v_fore, u_aft, v_aft) induced velocity
     vortex_panel_scale: float = 0.1        # scale factor for vortex velocity channels
     vortex_panel_n: int = 64              # number of panels to subsample per foil
+    # Koopman tandem lifting: linear operator in lifted Koopman space for tandem interference
+    koopman_tandem: bool = False           # enable Koopman lifting for tandem inter-foil coupling
+    koopman_rank: int = 32               # rank of low-rank Koopman operator K_tandem
+    koopman_dim: int = 256               # dimension of lifted Koopman space
+    koopman_recon_weight: float = 0.05   # reconstruction loss weight (||ψ(φ(h)) - h||₁)
 
 
 cfg = sp.parse(Config)
@@ -1566,6 +1650,19 @@ if cfg.aft_foil_srf:
               f"(hidden={cfg.aft_foil_srf_hidden}, layers={cfg.aft_foil_srf_layers}, "
               f"film={cfg.aft_foil_srf_film})")
 
+# Koopman tandem lifting module
+koopman_head = None
+ema_koopman_head = None
+if cfg.koopman_tandem:
+    koopman_head = KoopmanTandemLifting(
+        n_hidden=cfg.n_hidden,
+        koopman_dim=cfg.koopman_dim,
+        koopman_rank=cfg.koopman_rank,
+    ).to(device)
+    _koop_n_params = sum(p.numel() for p in koopman_head.parameters())
+    print(f"Koopman tandem lifting: {_koop_n_params:,} params "
+          f"(dim={cfg.koopman_dim}, rank={cfg.koopman_rank}, recon_weight={cfg.koopman_recon_weight})")
+
 from copy import deepcopy
 ema_model = None
 ema_refine_head = None  # EMA copy of refinement head
@@ -1591,6 +1688,8 @@ if aft_srf_head is not None:
     n_params += sum(p.numel() for p in aft_srf_head.parameters())
 if aft_srf_ctx_head is not None:
     n_params += sum(p.numel() for p in aft_srf_ctx_head.parameters())
+if koopman_head is not None:
+    n_params += sum(p.numel() for p in koopman_head.parameters())
 
 
 class SAM:
@@ -1731,6 +1830,10 @@ if aft_srf_ctx_head is not None:
     _ctx_params = list(aft_srf_ctx_head.parameters())
     base_opt.add_param_group({'params': _ctx_params, 'lr': _base_lr})
     print(f"Added {sum(p.numel() for p in _ctx_params):,} aft-foil SRF context head params to optimizer")
+if koopman_head is not None:
+    _koop_params = list(koopman_head.parameters())
+    base_opt.add_param_group({'params': _koop_params, 'lr': _base_lr})
+    print(f"Added {sum(p.numel() for p in _koop_params):,} Koopman head params to optimizer")
 
 sam_optimizer = SAM(base_opt, rho=0.05) if cfg.adaln_sam else None
 if cfg.scheduler_type == "warm_restarts":
@@ -1943,7 +2046,7 @@ for epoch in range(MAX_EPOCHS):
         _raw_saf_for_dct = x[:, :, 2:4].norm(dim=-1) if cfg.dct_freq_loss else None
         _raw_tandem_for_dct = (x[:, 0, 22].abs() > 0.01) if cfg.dct_freq_loss else None
         # TE coordinate frame / wake deficit / cp_panel / vortex_panel: save raw xy and saf_norm before normalization
-        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+        _need_te_raw = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity or cfg.koopman_tandem
         _raw_xy_te = x[:, :, :2].clone() if _need_te_raw else None
         _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw else None
         _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None  # raw gap for wake deficit
@@ -2096,6 +2199,27 @@ for epoch in range(MAX_EPOCHS):
                 pred = pred * sample_stds
             else:
                 pred = pred / sample_stds
+
+        # Koopman tandem lifting: correct hidden states for aft-foil nodes in tandem samples
+        _koopman_recon_loss_det = None
+        if koopman_head is not None:
+            # _raw_saf_norm_te is available when te_coord_frame/wake_deficit/cp_panel/vortex_panel is on.
+            # Compute it separately if not already done (defensive fallback).
+            _saf_for_koopman = _raw_saf_norm_te
+            if _saf_for_koopman is None:
+                # Fallback: saf_norm from normalized x (less precise but acceptable)
+                _saf_for_koopman = (x[:, :, 2:4] * stats["x_std"][2:4] + stats["x_mean"][2:4]).norm(dim=-1)
+            _is_tan_k = (x[:, 0, 21].abs() > 0.01)  # tandem detection from normalized gap feature
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                hidden = koopman_head(hidden.to(torch.bfloat16), _saf_for_koopman, _is_tan_k)
+            hidden = hidden.float()
+            # Reconstruction loss: ||ψ(φ(h)) - h||₁ using detached hidden (separate from main graph)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                _h_det = hidden.detach()
+                _z_det = koopman_head.encoder(_h_det)
+                _h_recon = koopman_head.decoder(_z_det)
+                _koopman_recon_loss_det = (_h_recon - _h_det).abs().mean()
+            _koopman_recon_loss_det = _koopman_recon_loss_det.float()
 
         # Surface refinement head: additive correction on surface nodes
         if refine_head is not None and model.training:
@@ -2268,6 +2392,8 @@ for epoch in range(MAX_EPOCHS):
         aoa_target = x[:, 0, 14:15]  # AoA0_rad from normalized input
         aoa_loss = F.mse_loss(aoa_pred.float(), aoa_target)
         loss = loss + 0.01 * aoa_loss
+        # Note: Koopman reconstruction loss is handled via separate backward below
+        # to avoid double-backward errors when PCGrad reuses the same graph.
 
         # DCT frequency-weighted auxiliary loss on surface pressure
         if cfg.dct_freq_loss and model.training:
@@ -2359,6 +2485,9 @@ for epoch in range(MAX_EPOCHS):
                     p.grad = ((ga - (dot_ab / gb_ns) * gb) + (gb - (dot_ab / ga_ns) * ga)) * 0.5
                 else:
                     p.grad = (ga + gb) * 0.5
+            # Koopman reconstruction backward (independent graph — safe to call after loss_b)
+            if koopman_head is not None and _koopman_recon_loss_det is not None:
+                _koopman_recon_loss_det.backward()
         elif cfg.pcgrad_3way and is_tandem_batch.any() and (~is_tandem_batch).any():
             # 3-way PCGrad: Group A=single-foil, B=tandem-normal, C=tandem-extreme-Re
             re_vals = x[:, 0, 13]  # normalized log(Re), same for all nodes in sample
@@ -2422,6 +2551,10 @@ for epoch in range(MAX_EPOCHS):
                          if projected[t][param_idx] is not None]
                 if parts:
                     p.grad = sum(parts)
+            # Restore Koopman head gradients via separate reconstruction backward
+            # (PCGrad zero_grad zeroes external head params; this restores them)
+            if koopman_head is not None and _koopman_recon_loss_det is not None:
+                _koopman_recon_loss_det.backward()
 
             n_extreme = is_extreme.sum().item()
             n_normal_tan = is_normal_tan.sum().item()
@@ -2437,6 +2570,9 @@ for epoch in range(MAX_EPOCHS):
             if cfg.grad_accum_steps <= 1:
                 optimizer.zero_grad()
             loss.backward()
+            # Koopman reconstruction backward (independent graph — safe after loss.backward())
+            if koopman_head is not None and _koopman_recon_loss_det is not None:
+                _koopman_recon_loss_det.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         sam_active = sam_optimizer is not None and epoch >= int(MAX_EPOCHS * 0.75)
@@ -2505,8 +2641,27 @@ for epoch in range(MAX_EPOCHS):
                     with torch.no_grad():
                         for ep, mp in zip(ema_aft_srf_head.parameters(), _ctx_base.parameters()):
                             ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
+            # EMA for Koopman tandem lifting head
+            if koopman_head is not None:
+                if ema_koopman_head is None:
+                    ema_koopman_head = deepcopy(koopman_head)
+                else:
+                    with torch.no_grad():
+                        for ep, mp in zip(ema_koopman_head.parameters(), koopman_head.parameters()):
+                            ep.data.mul_(cfg.ema_decay).add_(mp.data, alpha=1 - cfg.ema_decay)
         global_step += 1
-        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight, "global_step": global_step})
+        # Koopman logging
+        _koop_log = {}
+        if koopman_head is not None and _koopman_recon_loss_det is not None and model.training:
+            _koop_log["train/koopman_recon_loss"] = _koopman_recon_loss_det.item()
+            # Log sigma values to monitor Koopman operator (collapse → sigma near zero)
+            with torch.no_grad():
+                _sig = koopman_head.K_sigma.abs()
+                _koop_log["train/koopman_sigma_mean"] = _sig.mean().item()
+                _koop_log["train/koopman_sigma_max"] = _sig.max().item()
+                _koop_log["train/koopman_sigma_min"] = _sig.min().item()
+        wandb.log({"train/loss": loss.item(), "train/surf_weight": surf_weight,
+                   "global_step": global_step, **_koop_log})
 
         epoch_vol += vol_loss.item()
         epoch_surf += surf_loss.item()
@@ -2625,6 +2780,14 @@ for epoch in range(MAX_EPOCHS):
             eval_aft_srf_ctx_head.eval()
         else:
             aft_srf_ctx_head.eval()
+    # Select Koopman head for eval (EMA if available)
+    eval_koopman_head = None
+    if koopman_head is not None:
+        if ema_koopman_head is not None and ema_model is not None and eval_model is ema_model:
+            eval_koopman_head = ema_koopman_head
+        else:
+            eval_koopman_head = koopman_head
+        eval_koopman_head.eval()
     val_metrics_per_split: dict[str, dict] = {}
     val_loss_sum = 0.0
 
@@ -2650,7 +2813,7 @@ for epoch in range(MAX_EPOCHS):
                 dist_feat = torch.log1p(dist_surf * 10.0)  # log-scale for better gradient flow
                 _raw_aoa = x[:, 0, 14:15]  # AoA0_rad [B, 1]
                 _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
-                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+                _need_te_raw_v = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity or cfg.koopman_tandem
                 _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_v else None
                 _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_v else None
                 _raw_gap_wake = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
@@ -2779,6 +2942,18 @@ for epoch in range(MAX_EPOCHS):
                     pred_loss = pred * sample_stds
                 else:
                     pred_loss = pred / sample_stds
+
+                # Apply Koopman lifting to eval hidden states (before SRF)
+                if eval_koopman_head is not None:
+                    _v_saf_koopman = _raw_saf_norm_te  # computed before normalization
+                    if _v_saf_koopman is None:
+                        _v_saf_koopman = (x[:, :, 2:4] * stats["x_std"][2:4] + stats["x_mean"][2:4]).norm(dim=-1)
+                    _v_is_tan_k = (x[:, 0, 21].abs() > 0.01)
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _eval_hidden = eval_koopman_head(
+                            _eval_hidden.to(torch.bfloat16), _v_saf_koopman, _v_is_tan_k
+                        )
+                    _eval_hidden = _eval_hidden.float()
 
                 # Apply surface refinement head during validation
                 if eval_refine_head is not None:
@@ -3212,7 +3387,7 @@ if cfg.surface_refine and best_metrics:
                     dist_feat = torch.log1p(dist_surf * 10.0)
                     _raw_aoa = x[:, 0, 14:15]
                     _is_tandem_raw = (x[:, 0, 22].abs() > 0.01).float()  # [B]
-                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity
+                    _need_te_raw_vv = cfg.te_coord_frame or cfg.wake_deficit_feature or cfg.cp_panel or cfg.vortex_panel_velocity or cfg.koopman_tandem
                     _raw_xy_te = x[:, :, :2].clone() if _need_te_raw_vv else None
                     _raw_saf_norm_te = x[:, :, 2:4].norm(dim=-1) if _need_te_raw_vv else None
                     _raw_gap_wake_vv = x[:, :, 22].mean(dim=1) if cfg.wake_deficit_feature else None
