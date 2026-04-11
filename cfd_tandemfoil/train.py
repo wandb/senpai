@@ -930,12 +930,23 @@ class SurfaceCrossAttention(nn.Module):
         nn.init.zeros_(self.attn.out_proj.weight)
         nn.init.zeros_(self.attn.out_proj.bias)
 
-    def forward(self, h_surf, key_padding_mask=None):
+    def forward(self, h_surf, key_padding_mask=None, detach_backbone=False):
         """
-        h_surf:           [B, S, D] — surface node embeddings, padded to max S
-        key_padding_mask: [B, S] bool — True for padded (non-surface) positions
-        Returns:          [B, S, D] — updated surface embeddings
+        h_surf:            [B, S, D] — surface node embeddings, padded to max S
+        key_padding_mask:  [B, S] bool — True for padded (non-surface) positions
+        detach_backbone:   if True, compute SCA over detached features and return
+                           original + correction (stop-gradient protects backbone)
+        Returns:           [B, S, D] — updated surface embeddings
         """
+        if detach_backbone:
+            # Stop-gradient: SCA computes a correction from detached backbone features.
+            # Gradient flows through the correction only → protects backbone from SCA.
+            h_detached = h_surf.detach()
+            h_attn, _ = self.attn(h_detached, h_detached, h_detached, key_padding_mask=key_padding_mask)
+            h_corrected = self.norm1(h_detached + h_attn)
+            h_corrected = self.norm2(h_corrected + self.ffn(h_corrected))
+            correction = h_corrected - h_detached  # pure additive correction [B, S, D]
+            return h_surf + correction  # add to original (with grad) as residual
         h_attn, _ = self.attn(h_surf, h_surf, h_surf, key_padding_mask=key_padding_mask)
         h_surf = self.norm1(h_surf + h_attn)
         h_surf = self.norm2(h_surf + self.ffn(h_surf))
@@ -982,11 +993,13 @@ class Transolver(nn.Module):
         surface_cross_attn=False,
         surface_cross_attn_heads=4,
         surface_cross_attn_tandem_only=False,
+        surface_cross_attn_detach_backbone=False,
     ):
         super().__init__()
         self.__name__ = "UniPDE_3D"
         self.gap_stagger_spatial_bias = gap_stagger_spatial_bias
         self.surface_cross_attn_tandem_only = surface_cross_attn_tandem_only
+        self.surface_cross_attn_detach_backbone = surface_cross_attn_detach_backbone
         self.surface_cross_attn = (
             SurfaceCrossAttention(n_hidden, num_heads=surface_cross_attn_heads)
             if surface_cross_attn else None
@@ -1211,7 +1224,10 @@ class Transolver(nn.Module):
                     pad_masks.append(key_pad)
                 h_surf = torch.stack(h_surf_list, dim=0)      # [B, max_surf, D]
                 key_padding_mask = torch.stack(pad_masks, dim=0)  # [B, max_surf]
-                h_surf_updated = self.surface_cross_attn(h_surf, key_padding_mask=key_padding_mask)
+                h_surf_updated = self.surface_cross_attn(
+                    h_surf, key_padding_mask=key_padding_mask,
+                    detach_backbone=self.surface_cross_attn_detach_backbone,
+                )
                 # Tandem-conditional: only scatter back for tandem samples when tandem_only=True
                 is_tandem_bool = (x[:, 0, 21].abs() > 0.01)  # [B]
                 fx = fx.clone()
@@ -1410,6 +1426,7 @@ class Config:
     surface_cross_attn_heads: int = 4          # number of attention heads for surface cross-attention
     surface_cross_attn_tandem_only: bool = False  # apply SCA only to tandem samples; skip single-foil
     surface_cross_attn_lr_scale: float = 1.0   # LR multiplier for SCA params (1.0 = same as base lr)
+    surface_cross_attn_detach_backbone: bool = False  # detach backbone features before SCA; SCA adds a residual correction
 
 
 cfg = sp.parse(Config)
@@ -1588,6 +1605,7 @@ model_config = dict(
     surface_cross_attn=cfg.surface_cross_attn,
     surface_cross_attn_heads=cfg.surface_cross_attn_heads,
     surface_cross_attn_tandem_only=cfg.surface_cross_attn_tandem_only,
+    surface_cross_attn_detach_backbone=cfg.surface_cross_attn_detach_backbone,
 )
 
 model = Transolver(**model_config).to(device)
