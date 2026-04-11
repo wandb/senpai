@@ -1,5 +1,38 @@
 # SENPAI Research Results
 
+## 2026-04-11 02:40 — PR #2379: Attentive Neural Process Surface Decoder — frieren — **MERGED** ✅ BREAKTHROUGH
+
+- Branch: frieren/anp-surface-decoder
+- **Hypothesis:** Replace the SRF MLP head with a deterministic ANP decoder using asymmetric cross-attention: aft-foil surface queries attend to ALL context nodes (fore + aft foils), while fore-foil queries use self-attention only. This physically-grounded asymmetry (wake flows downstream) creates a direct inter-foil information channel missing from the existing SRF.
+
+### Results (2-seed avg)
+
+| Metric | Seed 42 | Seed 73 | 2-Seed Avg | Baseline | Δ |
+|--------|---------|---------|-----------|----------|---|
+| p_in | 3.506 | 3.616 | **3.561** | 11.872 | **-70.0%** ✅ |
+| p_oodc | 3.899 | 3.795 | **3.847** | 7.459 | **-48.4%** ✅ |
+| p_tan | 10.577 | 11.074 | **10.825** | 26.319 | **-58.9%** ✅ |
+| p_re | 7.266 | 7.198 | 7.232 | 6.229 | **+16.1%** ❌ |
+
+- W&B runs: `metqdxaq` (seed 42, 179 epochs), `jvfvrs4u` (seed 73, 176 epochs)
+- Group: `anp-surface-decoder`
+
+### Analysis
+
+**This is the single biggest improvement in the research programme's history.** The asymmetric cross-attention mechanism — aft-foil queries attending to ALL fore-foil context nodes — directly encodes the tandem wake physics that the existing SRF could not capture. The mechanism is physically correct: downstream (aft) foil pressure depends on the upstream (fore) foil's full pressure distribution, while the fore foil is unaffected by the aft foil.
+
+The p_re regression (+16%) reflects that the cross-attention may be overfitting to the training Reynolds number distribution. The aft-foil cross-attention aggregates fore-foil representations at training-seen conditions; at OOD-Re, the fore-foil representations are less reliable, propagating error.
+
+**Follow-up priorities:**
+1. Re-conditional cross-attention: scale attention weights by Re-distance to training range
+2. Separate p_re extrapolation head: auxiliary head that handles OOD-Re correction independently
+3. ANP depth/width sweep: currently 4 heads × 48 dim — may be undertrained
+4. ANP + physics constraints: combine with Kutta TE, stagnation, Bernoulli constraints
+
+**Conclusion:** Full merge. The 3/4 improvements are so large they overwhelm the p_re regression. New baseline established.
+
+---
+
 ## 2026-04-11 02:00 — PR #2382: SIREN Surface Decoder — thorfinn — **CLOSED** ❌
 - Branch: thorfinn/siren-surface-decoder
 - **Hypothesis:** Replace the SRF MLP activations with SIREN (sinusoidal representation networks) to better capture high-frequency pressure features. SIREN uses sin(ω₀·Wx+b) activations that can represent signals at arbitrary frequencies.
