@@ -34,6 +34,17 @@ def sh(*args: str, cwd: Path = ROOT) -> str:
     return result.stdout.strip()
 
 
+def senpai_gh(*args: str) -> str:
+    return sh(
+        "bash",
+        "-lc",
+        'source "$1/plugins/senpai/scripts/senpai-gh.sh" && shift && "$@"',
+        "bash",
+        str(ROOT),
+        *args,
+    )
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -46,30 +57,9 @@ def session_id() -> str:
         or "unknown"
     )
 
-
-def pr_number() -> int:
-    return int(sh("gh", "pr", "view", "--json", "number", "--jq", ".number"))
-
-
-def require_clean_pushed_head() -> None:
-    if sh("git", "status", "--short", "--untracked-files=no"):
-        raise RuntimeError(
-            "backgrounded harness tracking requires a clean tracked worktree; commit your experiment code first"
-        )
-    try:
-        upstream_head = sh("git", "rev-parse", "@{u}")
-    except RuntimeError as exc:
-        raise RuntimeError("backgrounded harness tracking requires the PR branch to be pushed first") from exc
-    if sh("git", "rev-parse", "HEAD") != upstream_head:
-        raise RuntimeError(
-            "backgrounded harness tracking requires the current HEAD commit to already be pushed; "
-            "run `git push origin $(git branch --show-current)` first"
-        )
-
-
 def new_tag() -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dt%H%M%Sz").lower()
-    return f"senpai-inflight-pr{pr_number()}-{stamp}-{uuid.uuid4().hex[:8]}"
+    return f"senpai-inflight-pr{int(senpai_gh('current_pr_number'))}-{stamp}-{uuid.uuid4().hex[:8]}"
 
 
 def iter_entries():
@@ -88,13 +78,14 @@ def record_entry(wandb_tag: str, expected_runs: int) -> None:
     if expected_runs < 1:
         raise ValueError("expected_runs must be >= 1")
 
-    require_clean_pushed_head()
+    senpai_gh("require_clean_tracked_worktree")
+    senpai_gh("require_pushed_head")
     IN_FLIGHT_DIR.mkdir(parents=True, exist_ok=True)
     path = IN_FLIGHT_DIR / f"{uuid.uuid4().hex}.json"
     path.write_text(
         json.dumps(
             {
-                "pr": pr_number(),
+                "pr": int(senpai_gh("current_pr_number")),
                 "wandb_entity": os.environ.get("WANDB_ENTITY", "wandb-applied-ai-team"),
                 "wandb_project": os.environ.get("WANDB_PROJECT", "senpai-v1"),
                 "wandb_tag": wandb_tag,
@@ -172,25 +163,13 @@ def post_comment(pr: int, body: str) -> None:
         handle.write(body)
         path = handle.name
     try:
-        sh(
-            "bash",
-            "-lc",
-            'source "$1/plugins/senpai/scripts/senpai-gh.sh" && comment_pr_with_file "$2" "$3"',
-            "bash",
-            str(ROOT),
-            str(pr),
-            path,
-        )
+        senpai_gh("comment_pr_with_file", str(pr), path)
     finally:
         Path(path).unlink(missing_ok=True)
 
 
 def mark_ready(pr: int) -> None:
-    sh(
-        "bash",
-        "-lc",
-        f'source "{ROOT}/plugins/senpai/scripts/senpai-gh.sh" && mark_ready_for_review "{pr}"',
-    )
+    senpai_gh("mark_ready_for_review", str(pr))
 
 
 def harvest() -> None:

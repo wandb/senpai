@@ -101,6 +101,36 @@ comment_pr_with_file() {
     gh_retry gh pr comment "$num" --body-file "$body_file"
 }
 
+# Return the open PR number for the current branch.
+#   current_pr_number
+current_pr_number() {
+    gh_retry gh pr view --json number --jq '.number'
+}
+
+# Require no tracked worktree changes before continuing.
+#   require_clean_tracked_worktree
+require_clean_tracked_worktree() {
+    if git status --short --untracked-files=no | grep -q .; then
+        echo "backgrounded harness tracking requires a clean tracked worktree; commit your experiment code first" >&2
+        return 1
+    fi
+}
+
+# Require the current HEAD commit to already be pushed to the branch upstream.
+#   require_pushed_head
+require_pushed_head() {
+    local upstream_head head
+    upstream_head=$(git rev-parse "@{u}" 2>/dev/null) || {
+        echo "backgrounded harness tracking requires the PR branch to be pushed first" >&2
+        return 1
+    }
+    head=$(git rev-parse HEAD)
+    if [ "$head" != "$upstream_head" ]; then
+        echo "backgrounded harness tracking requires the current HEAD commit to already be pushed; run \`git push origin \$(git branch --show-current)\` first" >&2
+        return 1
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Compound actions — student
 # ---------------------------------------------------------------------------
