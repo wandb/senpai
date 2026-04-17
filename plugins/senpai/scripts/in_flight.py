@@ -120,14 +120,6 @@ def load_runs(entry: dict):
     return sorted(runs, key=lambda run: ((getattr(run, "name", None) or ""), getattr(run, "id", "")))
 
 
-def fmt(value, digits: int = 4) -> str:
-    if value is None:
-        return "—"
-    if isinstance(value, float):
-        return f"{value:.{digits}f}"
-    return str(value)
-
-
 def build_comment(entry: dict, runs: list) -> str:
     lines = [
         "HARNESS: Senpai in-flight harvester",
@@ -140,20 +132,19 @@ def build_comment(entry: dict, runs: list) -> str:
         f"- Launch time: {entry['launched_at']}",
         f"- Launch session: `{entry['launched_by_session']}`",
         "",
+        "The senpai harness is not interpreting experiment-specific metrics or configs here.",
+        "Review the linked W&B runs directly for task-specific results.",
+        "",
         "The senpai harness is marking this PR ready for advisor review programmatically now.",
         "",
-        "| Run | State | Seed | Steps | val/loss |",
-        "|-----|-------|------|------:|---------:|",
+        "| Run | State |",
+        "|-----|-------|",
     ]
     for run in runs:
-        summary = getattr(run, "summary", {}) or {}
-        config = getattr(run, "config", {}) or {}
         lines.append(
             f"| [{getattr(run, 'name', getattr(run, 'id', 'run'))}]({run.url})"
             f" | {getattr(run, 'state', 'unknown')}"
-            f" | {fmt(config.get('seed'), 0)}"
-            f" | {fmt(summary.get('_step'), 0)}"
-            f" | {fmt(summary.get('val/loss'))} |"
+            " |"
         )
     return "\n".join(lines)
 
