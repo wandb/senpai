@@ -329,6 +329,7 @@ class Config:
     manifest: str = "data/split_manifest.json"
     stats_file: str = "data/split_stats.json"
     wandb_group: str | None = None
+    wandb_tag: str | None = None
     wandb_name: str | None = None
     agent: str | None = None
     debug: bool = False
@@ -431,7 +432,7 @@ run = wandb.init(
     project=os.environ.get("WANDB_PROJECT", "senpai-v1"),
     group=cfg.wandb_group,
     name=cfg.wandb_name,
-    tags=[cfg.agent] if cfg.agent else [],
+    tags=[tag for tag in [cfg.agent, cfg.wandb_tag] if tag],
     config={
         **asdict(cfg),
         "model_config": model_config,

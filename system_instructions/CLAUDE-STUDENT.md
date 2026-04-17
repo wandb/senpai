@@ -72,7 +72,15 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
    cd cfd_tandemfoil && python train.py --agent <your-name> --wandb_name "<your-name>/<description>" [--wandb_group "<idea>"]
    ```
    - **Timeout**: The `SENPAI_MAX_EPOCHS` and `SENPAI_TIMEOUT_MINUTES` env vars control the max epochs and timeout for each training run in train.py. Ensure training runs do not exceed these limits.
-   - Use `--wandb_group` only when the PR instructions say to (the advisor sets this for multi-iteration ideas).
+   - Use `--wandb_group` only when the PR instructions say to. It groups related variants for humans; it is not the harness tracking key.
+   - Before using the background-tracking flow, make sure the experiment code is already committed and pushed on the PR branch. The harness will refuse to track uncommitted or unpushed code.
+   - If you background a run or batch, give every run in that batch the same unique `--wandb_tag` and record it immediately so the harness can report results if your session dies:
+     ```bash
+     TRACKING_TAG=$(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/in_flight.py" new-tag)
+     nohup python train.py ... --wandb_tag "$TRACKING_TAG" ... > /tmp/train.log 2>&1 &
+     python3 "${CLAUDE_PLUGIN_ROOT}/scripts/in_flight.py" record --wandb-tag "$TRACKING_TAG" --expected-runs <n>
+     ```
+   - Use the background-tracking flow only for backgrounded runs. If you wait for a foreground run to finish in the same session, the extra harness tracking step is unnecessary.
    - Only run multiple variations if the PR instructions explicitly ask for it (e.g. "try surface weight 5, 10, 20"). Otherwise, run the single experiment described.
    - **After each run finishes**, check for new advisor comments before continuing:
      ```bash
@@ -100,7 +108,7 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
    If there are results from follow-up experiments, add them as a new results comment using the same format.
 
 6. **Submit for review**
-   Invoke the `senpai:submit-experiment-results` skill with args `<pr-number>` to commit, push, mark ready, and swap the status label.
+   Invoke the `senpai:submit-experiment-results` skill with args `<pr-number>` to commit, push, mark ready, swap the status label, and clear any remaining harness tracking for that PR.
 
 7. **Go back to step 1** and poll for the next assignment.
 

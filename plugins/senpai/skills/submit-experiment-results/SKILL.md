@@ -7,8 +7,9 @@ name: submit-experiment-results
 description: >
   Submit experiment results for advisor review. Commits changes, pushes
   the branch, marks the PR as ready, and swaps the status label from
-  wip to review. Use this skill when you've finished running experiments
-  and posted your results comment. Triggers for: "submit for review",
+  wip to review, and clears any in-flight background-run tracking for the
+  PR. Use this skill when you've finished running experiments and posted
+  your results comment. Triggers for: "submit for review",
   "mark PR ready", "send results to advisor", "submit experiment results".
 argument-hint: "<pr-number>"
 model: claude-sonnet-4-6
@@ -48,6 +49,12 @@ git push origin "$(git branch --show-current)"
 ```bash
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 mark_ready_for_review $0
+```
+
+4. **Clear any remaining harness tracking for this PR:**
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/in_flight.py" clear --pr $0
 ```
 
 That's it. The advisor will pick it up in their next review cycle.

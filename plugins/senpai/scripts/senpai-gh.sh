@@ -102,7 +102,11 @@ close_pr_with_comment() {
 #   mark_ready_for_review <number>
 mark_ready_for_review() {
     local num="$1"
-    gh_retry gh pr ready "$num"
+    local is_draft
+    is_draft=$(gh_retry gh pr view "$num" --json isDraft --jq '.isDraft')
+    if [ "$is_draft" = "true" ]; then
+        gh_retry gh pr ready "$num"
+    fi
     swap_gh_pr_label "$num" "status:wip" "status:review"  # swap_gh_pr_label uses gh_retry internally
 }
 

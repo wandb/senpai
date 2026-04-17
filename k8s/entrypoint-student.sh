@@ -71,6 +71,11 @@ while true; do
     echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) ==="
     echo "=== GPU: $(nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null) ==="
 
+    # --- Harvest backgrounded runs whose launching session already died ---
+    if ! python3 "$SENPAI_PLUGIN/scripts/in_flight.py" harvest; then
+        echo "=== HARNESS: in-flight harvest failed; continuing student heartbeat ==="
+    fi
+
     # --- Check for work before invoking CC ---
     ASSIGNED_JSON=$(student_poll_for_work "$STUDENT_NAME")
     ASSIGNED_COUNT=$(printf '%s' "$ASSIGNED_JSON" | json_len)
