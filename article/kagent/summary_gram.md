@@ -65,7 +65,7 @@ live in the same repo.
 
 Operationally, the apr16 run consumed one launcher invocation, one kill
 invocation, and zero manual edits to any agent's branch. The outputs
-shown in this document — the leaderboard, the 185-point submission
+shown in this document — the leaderboard, the 199-point submission
 timeline, the per-agent experiment journals, and the packaged PR to the
 upstream competition — were all produced from data that already existed
 on the shared volume or in git at the end of the run.
@@ -74,14 +74,16 @@ on the shared volume or in git at the end of the run.
 
 | Rank | Agent | val/l2_error | mae_Ux | mae_Uy | mae_Uz |
 |---:|---|---:|---:|---:|---:|
-| 1 | thorfinn | **0.7488** | 0.5024 | 0.2334 | 0.3419 |
-| 2 | alphonse | 0.7800 | 0.5212 | 0.2439 | 0.3590 |
-| 3 | nezuko | 0.8768 | 0.5652 | 0.2902 | 0.4164 |
+| 1 | thorfinn | **0.7475** | 0.5017 | 0.2331 | 0.3410 |
+| 2 | alphonse | 0.7735 | 0.5165 | 0.2421 | 0.3562 |
+| 3 | nezuko | 0.8553 | 0.5492 | 0.2868 | 0.4053 |
 | 4 | tanjiro | 0.8874 | 0.5966 | 0.2690 | 0.4115 |
-| 5 | askeladd | 0.9784 | 0.6424 | 0.2977 | 0.4701 |
-| 6 | fern | 1.0246 | 0.6706 | 0.3194 | 0.4885 |
-| 7 | edward | 1.0861 | 0.7301 | 0.3250 | 0.5083 |
+| 5 | askeladd | 0.9772 | 0.6415 | 0.2976 | 0.4694 |
+| 6 | fern | 1.0225 | 0.6696 | 0.3182 | 0.4875 |
+| 7 | edward | 1.0724 | 0.7205 | 0.3208 | 0.5020 |
 | 8 | frieren | 1.7494 | 1.1624 | 0.5048 | 0.8494 |
+
+*Last updated 2026-04-17 15:06 UTC.*
 
 The reference baseline MLP shipped with the competition scores above 1.7 on
 the public validation split; five of our eight agents finish below 1.00, and
@@ -91,7 +93,7 @@ the top two below 0.80.
 
 ![Leaderboard evolution](leaderboard_evolution.png)
 
-Each translucent dot is one scored submission (185 resolved commits across
+Each translucent dot is one scored submission (199 resolved commits across
 the eight agents); coloured staircases are per-agent running bests; the black
 envelope is the overall leader. The picture breaks into three phases:
 
@@ -168,10 +170,36 @@ symmetry was *not* broken, but only pays off when combined with warm-started
 fine-tuning (thorfinn, iter7) — and then it turns into their single largest
 source of ensemble diversity.
 
+### Cautionary tale: the right diagnosis is not the right fix
+
+Not every agent broke through. Frieren finished last at 1.7494 — which
+is exactly the score of the trivial copy-baseline (predicting the last
+input frame unchanged). She diagnosed the problem herself, correctly,
+in iter9:
+
+> **CRITICAL FINDING** — copy-baseline (just predict v[-1]) gets val/l2
+> = **1.7496**, identical to all my models. The model is learning
+> delta ≈ 0. Six architectures (iter3-8) all converged to the copy
+> baseline because per-point MLPs cannot predict turbulent residuals
+> from local input alone.
+
+Frieren had committed to a residual-around-last-frame parameterisation
+in iter1 — the same winning prior alphonse and thorfinn were using —
+but without a spatial-interaction module strong enough to learn the
+turbulent component, the optimiser found that `delta = 0` approximately
+minimised the loss and the model settled there. Iterations iter9
+through iter16 did add voxel CNNs and "alphonse-style 3D U-Nets", but
+at half the grid resolution (32³ vs 64³) and with a residual connection
+that seems to have gradient-starved the new spatial branch; the floor
+barely moved. The agent reasoned accurately about her own failure mode
+for sixteen iterations and still could not escape the basin she had
+landed in. An autonomous researcher staying stuck while publishing a
+correct post-mortem is a surprisingly human failure mode.
+
 ## What the framework demonstrates
 
-- **Autonomy at useful bandwidth.** Across eight agents we resolved 185
-  scored commits in ~21 hours — roughly a submission every four minutes.
+- **Autonomy at useful bandwidth.** Across eight agents we resolved 199
+  scored commits in ~21 hours — roughly a submission every six minutes.
   Only 9 commits were lost to self-reverts (`git reset --hard HEAD~1`),
   which indicates the agents managed local state responsibly.
 - **Re-discovery of standard tricks without instruction.** Every agent in
