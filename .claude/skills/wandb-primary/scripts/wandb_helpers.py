@@ -20,12 +20,26 @@ Usage (in sandbox):
 
 from __future__ import annotations
 
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 
 # ---------------------------------------------------------------------------
 # Fast history scan (beta_scan_history with fallback)
 # ---------------------------------------------------------------------------
+
+def _scan_history_kwargs(
+    keys: list[str] | None,
+    min_step: int,
+    max_step: int | None,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    if keys is not None:
+        kwargs["keys"] = keys
+    if min_step:
+        kwargs["min_step"] = min_step
+    if max_step is not None:
+        kwargs["max_step"] = max_step
+    return kwargs
 
 def fast_scan_history(
     run: Any,
@@ -53,26 +67,46 @@ def fast_scan_history(
     Yields:
         dict rows, same shape as `scan_history`.
     """
+    fallback_kwargs = _scan_history_kwargs(keys, min_step, max_step)
     beta = getattr(run, "beta_scan_history", None)
     if beta is not None:
+        yielded = 0
         try:
-            yield from beta(
+            for row in beta(
                 keys=keys,
                 page_size=page_size,
                 min_step=min_step,
                 max_step=max_step,
-            )
+            ):
+                yielded += 1
+                yield row
             return
         except Exception:
-            pass
-    kwargs: dict[str, Any] = {}
-    if keys is not None:
-        kwargs["keys"] = keys
-    if min_step:
-        kwargs["min_step"] = min_step
-    if max_step is not None:
-        kwargs["max_step"] = max_step
-    yield from run.scan_history(**kwargs)
+            if yielded:
+                skipped = 0
+                for row in run.scan_history(**fallback_kwargs):
+                    if skipped < yielded:
+                        skipped += 1
+                        continue
+                    yield row
+                return
+    yield from run.scan_history(**fallback_kwargs)
+
+
+def discover_history_keys(
+    run: Any,
+    predicate: Callable[[str, Any], bool],
+    max_rows: int = 500,
+) -> list[str]:
+    """Find history keys that may appear only after sparse logging intervals."""
+    found: set[str] = set()
+    for i, row in enumerate(fast_scan_history(run)):
+        for key, value in row.items():
+            if predicate(key, value):
+                found.add(key)
+        if found or i + 1 >= max_rows:
+            break
+    return sorted(found)
 
 
 # ---------------------------------------------------------------------------

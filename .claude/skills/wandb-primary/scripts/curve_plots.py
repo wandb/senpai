@@ -41,7 +41,7 @@ from training_diagnostics import (  # noqa: E402
     curve_features,
     grad_histogram_features,
 )
-from wandb_helpers import fast_scan_history  # noqa: E402
+from wandb_helpers import discover_history_keys, fast_scan_history  # noqa: E402
 
 
 DEFAULT_ROOT = Path("/tmp/wandb_plots")
@@ -57,10 +57,19 @@ def _ensure_out_dir(run_id: str, out_dir: str | os.PathLike | None) -> Path:
     return root
 
 
-def _load_history(run: Any, keys: list[str], samples: int = 2000) -> pd.DataFrame:
+def _load_history(
+    run: Any,
+    keys: list[str],
+    step_key: str,
+    samples: int = 2000,
+) -> pd.DataFrame:
     """Fast downsampled history for plotting. Uses server-side bucketing."""
-    df = run.history(samples=samples, keys=keys, pandas=True)
-    if df is None or len(df) == 0:
+    df = None
+    try:
+        df = run.history(samples=samples, keys=keys, x_axis=step_key, pandas=True)
+    except Exception:
+        df = None
+    if df is None or len(df) == 0 or step_key not in df.columns:
         # Fall back to full scan (prefers beta_scan_history parquet).
         df = pd.DataFrame(list(fast_scan_history(run, keys=keys)))
     return df
@@ -153,7 +162,12 @@ def plot_single_run_overview(
     all_keys: list[str] = [step_key]
     for _, candidates, _, _ in panels:
         all_keys.extend(candidates)
-    df = _load_history(run, keys=list(dict.fromkeys(all_keys)), samples=samples)
+    df = _load_history(
+        run,
+        keys=list(dict.fromkeys(all_keys)),
+        step_key=step_key,
+        samples=samples,
+    )
     cols = set(df.columns)
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 8), sharex=True)
@@ -235,7 +249,7 @@ def plot_run_comparison(
     aligned: list[pd.Series] = []
 
     for i, run in enumerate(runs):
-        df = _load_history(run, keys=[metric, step_key], samples=samples)
+        df = _load_history(run, keys=[metric, step_key], step_key=step_key, samples=samples)
         if metric not in df.columns or step_key not in df.columns:
             continue
         df = df[[step_key, metric]].dropna()
@@ -362,6 +376,7 @@ def plot_grad_norm_by_layer(
     max_layers: int = 16,
     out_dir: str | os.PathLike | None = None,
     samples: int = 2000,
+    probe_rows: int = 500,
 ) -> Path:
     """Small-multiples of per-layer scalar grad norms.
 
@@ -369,17 +384,15 @@ def plot_grad_norm_by_layer(
     `parameters/layer1.weight_grad_norm`. Renders up to `max_layers`
     subplots on a shared x-axis.
     """
-    # Probe keys.
-    sample = []
-    for i, row in enumerate(fast_scan_history(run)):
-        sample.append(row)
-        if i + 1 >= 20:
-            break
-    layer_keys = sorted({
-        k for row in sample for k, v in row.items()
-        if k.startswith(layer_prefix)
-        and isinstance(v, (int, float)) and not isinstance(v, bool)
-    })
+    layer_keys = discover_history_keys(
+        run,
+        lambda key, value: (
+            key.startswith(layer_prefix)
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        ),
+        max_rows=probe_rows,
+    )
     if not layer_keys:
         raise ValueError(
             f"No scalar per-layer keys found with prefix `{layer_prefix}`. "
@@ -389,7 +402,7 @@ def plot_grad_norm_by_layer(
     overflow = max(0, len(layer_keys) - max_layers)
     layer_keys = layer_keys[:max_layers]
 
-    df = _load_history(run, keys=[step_key, *layer_keys], samples=samples)
+    df = _load_history(run, keys=[step_key, *layer_keys], step_key=step_key, samples=samples)
     out = _ensure_out_dir(run.id, out_dir)
 
     n = len(layer_keys)

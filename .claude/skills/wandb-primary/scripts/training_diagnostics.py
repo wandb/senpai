@@ -33,7 +33,7 @@ from typing import Any, Iterable, Literal
 import numpy as np
 import pandas as pd
 
-from wandb_helpers import fast_scan_history
+from wandb_helpers import discover_history_keys, fast_scan_history
 
 
 Direction = Literal["decreasing", "increasing", "auto"]
@@ -357,11 +357,23 @@ def lr_schedule_features(
             scores = {"linear": lin_resid, "exponential": exp_resid, "cosine": cos_resid}
             decay_shape = min(scores, key=scores.get)
 
-    # Restarts: LR goes up after the global peak by more than 10%.
+    # Restarts: after a real decay segment, LR rises meaningfully from a local
+    # trough. This catches cosine restarts that stay below the initial peak.
     restart_steps: list[float] = []
-    for i in range(peak_i + 2, n):
-        if v[i] > v[i - 1] and v[i] > peak_lr * 1.01:
+    local_trough = peak_lr
+    i = peak_i + 1
+    while i < n:
+        local_trough = min(local_trough, float(v[i - 1]))
+        if v[i] <= v[i - 1]:
+            local_trough = min(local_trough, float(v[i]))
+            i += 1
+            continue
+        if local_trough < peak_lr * 0.99 and v[i] > local_trough * 1.01:
             restart_steps.append(float(s[i]))
+            while i + 1 < n and v[i + 1] >= v[i]:
+                i += 1
+            local_trough = float(v[i])
+        i += 1
 
     return {
         "n_points": n,
@@ -464,6 +476,7 @@ def grad_histogram_features(
     run: Any,
     layer_prefix: str = "gradients/",
     step_key: str = "_step",
+    probe_rows: int = 500,
 ) -> pd.DataFrame:
     """Parse W&B-logged gradient histograms into a (layer, step) frame.
 
@@ -472,21 +485,18 @@ def grad_histogram_features(
         layer_prefix: Prefix for gradient histogram keys. Default
             `gradients/` matches wandb.watch's default layout.
         step_key: Confirmed step-axis key.
+        probe_rows: Max history rows to scan while discovering histogram keys.
 
     Returns:
         DataFrame with one row per (layer, step), columns:
         mean, mean_abs, variance, kurtosis, max_abs, pct_at_max_bin.
         Raises ValueError with a helpful message if no histogram keys found.
     """
-    # Probe a few rows to find layer keys.
-    sample = []
-    for i, row in enumerate(fast_scan_history(run)):
-        sample.append(row)
-        if i + 1 >= 20:
-            break
-    hist_keys = sorted({
-        k for row in sample for k in row.keys() if k.startswith(layer_prefix)
-    })
+    hist_keys = discover_history_keys(
+        run,
+        lambda key, _value: key.startswith(layer_prefix),
+        max_rows=probe_rows,
+    )
     if not hist_keys:
         raise ValueError(
             f"No histogram keys found with prefix `{layer_prefix}` in run "
