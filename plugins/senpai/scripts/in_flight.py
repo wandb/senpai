@@ -23,10 +23,12 @@ TERMINAL_STATES = {"crashed", "failed", "finished", "killed", "preempted"}
 
 
 def note(message: str) -> None:
+    """Write a harness status line to stderr."""
     print(message, file=sys.stderr)
 
 
 def sh(*args: str, cwd: Path = ROOT) -> str:
+    """Run a command and return stripped stdout, raising on failure."""
     result = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
@@ -35,6 +37,7 @@ def sh(*args: str, cwd: Path = ROOT) -> str:
 
 
 def senpai_gh(*args: str) -> str:
+    """Invoke a function from senpai-gh.sh and return its stdout."""
     return sh(
         "bash",
         "-lc",
@@ -46,10 +49,12 @@ def senpai_gh(*args: str) -> str:
 
 
 def now_iso() -> str:
+    """Return the current UTC timestamp in compact ISO-8601 form."""
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def session_id() -> str:
+    """Return the current session identifier if one is available."""
     return (
         os.environ.get("CLAUDE_SESSION_ID")
         or os.environ.get("CODEX_SESSION_ID")
@@ -57,12 +62,15 @@ def session_id() -> str:
         or "unknown"
     )
 
+
 def new_tag() -> str:
+    """Generate a unique harness W&B tag for the current PR."""
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dt%H%M%Sz").lower()
     return f"senpai-inflight-pr{int(senpai_gh('current_pr_number'))}-{stamp}-{uuid.uuid4().hex[:8]}"
 
 
 def iter_entries():
+    """Yield parsed in-flight tracking entries from disk."""
     if not IN_FLIGHT_DIR.exists():
         return
     for path in sorted(IN_FLIGHT_DIR.glob("*.json")):
@@ -73,6 +81,7 @@ def iter_entries():
 
 
 def record_entry(wandb_tag: str, expected_runs: int) -> None:
+    """Persist an in-flight background batch for a later session to harvest."""
     if not wandb_tag:
         raise ValueError("wandb_tag must be non-empty")
     if expected_runs < 1:
@@ -102,6 +111,7 @@ def record_entry(wandb_tag: str, expected_runs: int) -> None:
 
 
 def clear_entries(pr: int) -> None:
+    """Delete all in-flight tracking entries for a PR."""
     for path, entry in iter_entries() or ():
         if entry.get("pr") == pr:
             path.unlink(missing_ok=True)
@@ -109,6 +119,7 @@ def clear_entries(pr: int) -> None:
 
 
 def load_runs(entry: dict):
+    """Fetch W&B runs matching the tracked harness tag."""
     import wandb
 
     runs = list(
@@ -121,6 +132,7 @@ def load_runs(entry: dict):
 
 
 def build_comment(entry: dict, runs: list) -> str:
+    """Build the generic harness-authored PR comment for harvested runs."""
     lines = [
         "HARNESS: Senpai in-flight harvester",
         "",
@@ -150,6 +162,7 @@ def build_comment(entry: dict, runs: list) -> str:
 
 
 def post_comment(pr: int, body: str) -> None:
+    """Post a markdown PR comment via the shared senpai-gh retry path."""
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
         handle.write(body)
         path = handle.name
@@ -160,10 +173,12 @@ def post_comment(pr: int, body: str) -> None:
 
 
 def mark_ready(pr: int) -> None:
+    """Mark a PR ready for advisor review via the shared senpai-gh helper."""
     senpai_gh("mark_ready_for_review", str(pr))
 
 
 def harvest() -> None:
+    """Harvest any completed in-flight entries and finish their PR handoff."""
     for path, entry in iter_entries() or ():
         try:
             runs = load_runs(entry)
@@ -192,6 +207,7 @@ def harvest() -> None:
 
 
 def main() -> int:
+    """Parse CLI arguments and run the requested in-flight action."""
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
