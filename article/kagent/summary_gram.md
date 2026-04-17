@@ -20,6 +20,56 @@ The agents ran for roughly twenty-one hours without human intervention.
 | W&B project | [`wandb-applied-ai-team/kagent-v2`](https://wandb.ai/wandb-applied-ai-team/kagent-v2) |
 | Kagent PR | [`gram-competition/iclr-2026#4`](https://github.com/gram-competition/iclr-2026/pull/4) |
 
+## Experimental harness
+
+The experiment runs on a shared Kubernetes cluster with one GPU pod per
+agent and a single, smaller pod hosting the organiser. Agents and
+organiser communicate strictly through three channels: a persistent
+shared volume for data, predictions and logs; the git remote for code;
+and a W&B project for training telemetry. No network path exists between
+agents, and each agent sees only its own competition-facing working
+directory — everything organiser-side (ground truth, scoring code,
+leaderboard writer) is invisible from inside a kaggler pod.
+
+Each agent pod boots into an autonomy loop: it pulls the head of its own
+branch, starts Claude Code with a short role prompt pointing at the
+competition instructions, and lets the model drive. The model reads the
+leaderboard, the experiment journal, and its own source files; modifies
+the training script; commits; trains under a fixed per-iteration
+wall-clock budget; writes predictions to the shared volume; and loops.
+Because Claude Code runs under a permissive tool policy inside the pod,
+the agent has real hands on git, the filesystem, W&B, and the shell — no
+intermediary orchestrator chooses actions on its behalf. When the
+model's context fills up, a lightweight session-resume mechanism restarts
+the loop from the same branch; the experiment journal (which every agent
+is required to maintain) becomes the primary durable memory across those
+restarts.
+
+The organiser pod runs an independent polling loop: every few minutes it
+walks the shared volume for new prediction files, scores them against the
+hidden ground truth, updates a single markdown leaderboard, and pushes
+that leaderboard to a dedicated branch. Kagglers read the same
+leaderboard file to decide what to try next. Scoring is the only
+privileged operation in the system.
+
+The repository is organised around this separation. A competition
+directory contains a *kaggler* area with the training template, data
+loader and agent instructions, and an *organiser* area holding the
+scoring harness, data-split preparation, and the recipe for turning a
+winning agent's branch into a PR against the upstream competition repo.
+A small Kubernetes launcher renders the deployment manifests, wires in
+secrets, and starts or stops the entire cohort with a single command.
+The sparse-checkout rules on each kaggler pod ensure that the organiser
+area is never materialised inside an agent's workspace, even though both
+live in the same repo.
+
+Operationally, the apr16 run consumed one launcher invocation, one kill
+invocation, and zero manual edits to any agent's branch. The outputs
+shown in this document — the leaderboard, the 185-point submission
+timeline, the per-agent experiment journals, and the packaged PR to the
+upstream competition — were all produced from data that already existed
+on the shared volume or in git at the end of the run.
+
 ## Final leaderboard (apr16 run)
 
 | Rank | Agent | val/l2_error | mae_Ux | mae_Uy | mae_Uz |
