@@ -65,6 +65,7 @@ This skill covers everything an agent needs to work with Weights & Biases:
 | Build a DataFrame from training runs | **`wandb_helpers.runs_to_dataframe()`** |
 | Extract eval results for analysis | **`weave_helpers.eval_results_to_dicts()`** |
 | Need low-level Weave filtering (CallsFilter, Query) | **Raw Weave SDK** (`weave.init()`, `client.get_calls()`) — see `references/WEAVE_SDK.md` |
+| Judge curve shape (spikes, smoothness, slope, overfit) | **`training_diagnostics` + `curve_plots`** — use the workflow below, then load `references/TRAINING_DIAGNOSTICS.md` for the heuristics |
 
 ---
 
@@ -92,6 +93,31 @@ from wandb_helpers import (
     runs_to_dataframe,       # Convert runs to a clean pandas DataFrame
     diagnose_run,            # Quick diagnostic summary of a training run
     compare_configs,         # Side-by-side config diff between two runs
+    fast_scan_history,       # beta_scan_history (parquet) with scan_history fallback
+)
+
+# X-axis (step metric) detection — ALWAYS confirm before curve analysis
+from step_axis import (
+    list_candidate_step_keys,       # Scan history for plausible step keys
+    guess_step_key_from_workspace,  # Peek at the user's W&B workspace panels
+    format_step_candidates,         # Format candidate choices for user confirmation
+)
+
+# Curve-shape diagnostics (numerical)
+from training_diagnostics import (
+    curve_features,            # Spikes, slopes at every 5%, smoothness, plateau, divergence
+    compare_runs_curves,       # DataFrame of features across many runs
+    lr_schedule_features,      # Warmup / peak / decay shape / restarts
+    grad_norm_features,        # curve_features + kurtosis + dead-layer flag
+    grad_histogram_features,   # Per-(layer, step) stats from W&B histograms
+)
+
+# Chart rendering for LLM vision (Read the returned PNG)
+from curve_plots import (
+    plot_single_run_overview,    # 2x3 composite: train/val/lr/grad-norm/...
+    plot_run_comparison,         # Overlay up to 6 runs on one metric
+    plot_grad_histogram_heatmap, # Layer x step heatmap of grad-hist stat
+    plot_grad_norm_by_layer,     # Small-multiples of per-layer scalar norms
 )
 ```
 
@@ -101,6 +127,7 @@ Read these as needed — they contain full API surfaces and recipes:
 
 - **`references/WEAVE_SDK.md`** — Weave SDK for GenAI traces (`client.get_calls()`, `CallsFilter`, `Query`, stats). Start here for Weave queries.
 - **`references/WANDB_SDK.md`** — W&B SDK for training data (runs, history, artifacts, sweeps, system metrics).
+- **`references/TRAINING_DIAGNOSTICS.md`** — reference heuristics for reading loss / LR / grad-norm / grad-histogram charts. Load this when you are actively interpreting training curves.
 
 ---
 
@@ -305,6 +332,45 @@ report = wr.Report(
 ```
 
 Use `expr.Config("lr")`, `expr.Summary("loss")`, `expr.Tags().isin([...])` for runset filters — not dot-path strings.
+
+---
+
+## Training curve analysis workflow
+
+Use this when the user asks whether a run is healthy, why training diverged, whether a run overfit, or which run has the best training dynamics.
+
+Keep the inline workflow short and load detail on demand:
+
+1. Confirm `step_key` before doing any curve work. Never assume `_step`.
+2. Compute features with the bundled helpers instead of hand-rolling spike or slope logic.
+3. Render PNGs and inspect them visually.
+4. Load `references/TRAINING_DIAGNOSTICS.md` while you interpret the results.
+5. End with a verdict, evidence tied to step ranges, and concrete next actions.
+
+### Required sequence
+
+Use `list_candidate_step_keys()`, `guess_step_key_from_workspace()`, and `format_step_candidates()` to confirm the x-axis. If there is one obvious candidate and it matches the workspace guess, say which `step_key` you picked. Otherwise, ask the user to choose before plotting or comparing runs.
+
+For a single run, compute a compact feature table from the metrics that actually exist, then render `plot_single_run_overview(run, step_key=step_key)`. If gradient histograms or per-layer scalar norms are logged, add `plot_grad_histogram_heatmap()` or `plot_grad_norm_by_layer()`.
+
+For multi-run comparisons, use `compare_runs_curves()` for the ranking table and `plot_run_comparison()` for the overlay. Keep overlays to at most 6 runs; if there are more, rank first and then plot the shortlist.
+
+### Output shape
+
+Do not dump raw history rows or the full spike/slope payloads unless you are drilling into a specific anomaly. Summaries should stay compact.
+
+Use this response shape:
+
+```text
+Verdict: <healthy | unstable | overfit | plateaued | diverged | converged>
+Evidence:
+- <specific step range> — <what the metrics and plot show>
+- <specific step range> — <what changed and why it matters>
+Next actions:
+- <concrete hyperparameter, logging, or code change>
+```
+
+Load `references/TRAINING_DIAGNOSTICS.md` for the interpretation heuristics, especially when the numbers and the image disagree.
 
 ---
 
