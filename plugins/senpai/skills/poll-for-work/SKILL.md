@@ -15,7 +15,7 @@ effort: high
 
 # poll-for-work
 
-Check whether the advisor has assigned you an experiment PR to work on.
+Check whether the advisor has assigned you an experiment PR to work on. You can use the Claude Code `Monitor` tool here to check for assigned PRs.
 
 ## Arguments
 
