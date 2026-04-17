@@ -45,6 +45,7 @@ GitHub's `gh pr edit --remove-label X --add-label Y` silently strips **all other
 |---|---|
 | `send_pr_back_to_student_with_comment <pr#> <comment>` | Send a PR back to the student with feedback. Comment on the PR, convert back to draft, swap `status:review` → `status:wip`. |
 | `close_pr_with_comment <pr#> <reason>` | Close a dead-end PR with a comment explaining why. Comment with reason, close the PR, delete the remote branch. |
+| `comment_pr_with_file <pr#> <body-file>` | Comment on a PR using a markdown body file. Uses the shared `gh_retry` policy. |
 
 ### Student actions
 
@@ -57,11 +58,19 @@ GitHub's `gh pr edit --remove-label X --add-label Y` silently strips **all other
 | Function | What it does |
 |---|---|
 | `print_gh_repo` | Print `owner/repo` from the git remote (cached). |
+| `current_pr_number` | Print the open PR number for the current branch. |
 | `check_gh_issues <role_label>` | List open human issues for a role label + team issues, deduplicated. Returns JSON array. |
 | `list_ready_for_review_prs <branch>` | List PRs with `status:review` on a branch. Returns JSON array. |
 | `list_all_prs <branch>` | List all open PRs on a branch (any status). Returns JSON array. |
 | `student_poll_for_work <student_name>` | List WIP PRs assigned to a student. Returns JSON array. |
 | `list_idle_students <names_csv> <branch>` | Print names of students with no `status:wip` PR, one per line. |
+
+### Git state helpers
+
+| Function | What it does |
+|---|---|
+| `require_clean_tracked_worktree` | Fail if the current worktree has tracked changes. |
+| `require_pushed_head` | Fail if the current HEAD commit is not pushed to the branch upstream. |
 
 ## Usage examples
 

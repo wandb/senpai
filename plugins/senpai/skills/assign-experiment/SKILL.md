@@ -76,6 +76,6 @@ PREOF
 
 - **Read BASELINE.md** before creating the PR take the most recent metrics from the file. The student needs concrete metrics to compare against.
 - **Be specific in instructions.** The student implements exactly what you write. Vague instructions waste GPU time.
-- **Use `--wandb_group`** in instructions when a hypothesis needs multiple iterations (e.g. "try surface weight 5, 10, 20") so related runs are grouped in W&B.
+- **Use `--wandb_group`** in instructions when a hypothesis needs multiple iterations (e.g. "try surface weight 5, 10, 20") so related runs are grouped in W&B. The student's harness will add its own `--wandb_tag` when it backgrounds runs.
 - **One hypothesis per PR.** Bundling multiple changes makes it impossible to attribute what worked.
 - If the PR body is too long for `gh pr create`, put the core info in the body and add supplementary details as a follow-up comment.

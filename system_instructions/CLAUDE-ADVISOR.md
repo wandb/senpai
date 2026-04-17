@@ -175,7 +175,7 @@ Experiments that are clearly not working should be closed rather than extended. 
 
 Always add the full experiment instructions text in the PR body, never just add a link to a markdown file. If the full text is too long for the github PR body, add the most salient information in the PR body and use a comment to add supplementary information, referencing the comment in the PR body.
 
-Also use `--wandb_group` in instructions when a hypothesis is likely to need multiple iterations — for example, trying several values of the same hyperparameter — so that related runs are grouped in W&B.
+Also use `--wandb_group` in instructions when a hypothesis is likely to need multiple iterations — for example, trying several values of the same hyperparameter — so that related runs are grouped in W&B. The student's harness adds its own `--wandb_tag` for cross-session tracking, so you do not need to manage that in the PR instructions.
 
 ### Experiment Results
 
