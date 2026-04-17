@@ -20,7 +20,59 @@ Usage (in sandbox):
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterator
+
+
+# ---------------------------------------------------------------------------
+# Fast history scan (beta_scan_history with fallback)
+# ---------------------------------------------------------------------------
+
+def fast_scan_history(
+    run: Any,
+    keys: list[str] | None = None,
+    page_size: int = 1000,
+    min_step: int = 0,
+    max_step: int | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Iterate a run's full history using the fastest available method.
+
+    Prefers `run.beta_scan_history` (reads locally-cached parquet, no API
+    round-trips) and falls back to `run.scan_history` if the beta API isn't
+    present or raises. Signature matches the common subset of both.
+
+    W&B marks `beta_scan_history` as "still in development" — the fallback
+    exists so callers don't have to branch.
+
+    Args:
+        run: A W&B Run object.
+        keys: Metrics to fetch; None returns all.
+        page_size: Rows per batch (beta only).
+        min_step: Inclusive lower bound.
+        max_step: Exclusive upper bound.
+
+    Yields:
+        dict rows, same shape as `scan_history`.
+    """
+    beta = getattr(run, "beta_scan_history", None)
+    if beta is not None:
+        try:
+            yield from beta(
+                keys=keys,
+                page_size=page_size,
+                min_step=min_step,
+                max_step=max_step,
+            )
+            return
+        except Exception:
+            pass
+    kwargs: dict[str, Any] = {}
+    if keys is not None:
+        kwargs["keys"] = keys
+    if min_step:
+        kwargs["min_step"] = min_step
+    if max_step is not None:
+        kwargs["max_step"] = max_step
+    yield from run.scan_history(**kwargs)
 
 
 # ---------------------------------------------------------------------------

@@ -65,6 +65,7 @@ This skill covers everything an agent needs to work with Weights & Biases:
 | Build a DataFrame from training runs | **`wandb_helpers.runs_to_dataframe()`** |
 | Extract eval results for analysis | **`weave_helpers.eval_results_to_dicts()`** |
 | Need low-level Weave filtering (CallsFilter, Query) | **Raw Weave SDK** (`weave.init()`, `client.get_calls()`) — see `references/WEAVE_SDK.md` |
+| Judge curve shape (spikes, smoothness, slope, overfit) | **`training_diagnostics` + `curve_plots`** — see `references/TRAINING_DIAGNOSTICS.md` and the "Training curve analysis workflow" section below |
 
 ---
 
@@ -92,6 +93,31 @@ from wandb_helpers import (
     runs_to_dataframe,       # Convert runs to a clean pandas DataFrame
     diagnose_run,            # Quick diagnostic summary of a training run
     compare_configs,         # Side-by-side config diff between two runs
+    fast_scan_history,       # beta_scan_history (parquet) with scan_history fallback
+)
+
+# X-axis (step metric) detection — ALWAYS confirm before curve analysis
+from step_axis import (
+    list_candidate_step_keys,       # Scan history for plausible step keys
+    guess_step_key_from_workspace,  # Peek at the user's W&B workspace panels
+    format_step_candidates,         # Format candidates for AskUserQuestion
+)
+
+# Curve-shape diagnostics (numerical)
+from training_diagnostics import (
+    curve_features,            # Spikes, slopes at every 5%, smoothness, plateau, divergence
+    compare_runs_curves,       # DataFrame of features across many runs
+    lr_schedule_features,      # Warmup / peak / decay shape / restarts
+    grad_norm_features,        # curve_features + kurtosis + dead-layer flag
+    grad_histogram_features,   # Per-(layer, step) stats from W&B histograms
+)
+
+# Chart rendering for LLM vision (Read the returned PNG)
+from curve_plots import (
+    plot_single_run_overview,    # 2x3 composite: train/val/lr/grad-norm/...
+    plot_run_comparison,         # Overlay up to 6 runs on one metric
+    plot_grad_histogram_heatmap, # Layer x step heatmap of grad-hist stat
+    plot_grad_norm_by_layer,     # Small-multiples of per-layer scalar norms
 )
 ```
 
@@ -101,6 +127,7 @@ Read these as needed — they contain full API surfaces and recipes:
 
 - **`references/WEAVE_SDK.md`** — Weave SDK for GenAI traces (`client.get_calls()`, `CallsFilter`, `Query`, stats). Start here for Weave queries.
 - **`references/WANDB_SDK.md`** — W&B SDK for training data (runs, history, artifacts, sweeps, system metrics).
+- **`references/TRAINING_DIAGNOSTICS.md`** — researcher-intuition guide for reading loss / LR / grad-norm / grad-histogram charts. **Read before interpreting any curve**, used together with `training_diagnostics.py` features and `curve_plots.py` PNGs.
 
 ---
 
@@ -305,6 +332,127 @@ report = wr.Report(
 ```
 
 Use `expr.Config("lr")`, `expr.Summary("loss")`, `expr.Tags().isin([...])` for runset filters — not dot-path strings.
+
+---
+
+## Training curve analysis workflow
+
+This is the workflow for judging how a training run actually went — the "look at the charts" step that an experienced researcher does. Use it any time the user asks whether a run is healthy, what went wrong, which of N runs is best on more than just final metrics, or asks for an eval of a student's experiment.
+
+Pair three sources of truth: (a) numerical features from `training_diagnostics.py`, (b) PNGs from `curve_plots.py` read back via the Read tool, (c) heuristics from `references/TRAINING_DIAGNOSTICS.md`. Each catches what the others miss.
+
+### Step 1 — Confirm the x-axis step metric (MANDATORY, every session)
+
+Never assume `_step`. Different training stacks log different step keys (`global_step`, `trainer/global_step`, `epoch`, `train/step`, or custom). A wrong axis silently misaligns every single chart and feature.
+
+```python
+from step_axis import (
+    list_candidate_step_keys,
+    guess_step_key_from_workspace,
+    format_step_candidates,
+)
+
+candidates = list_candidate_step_keys(run)
+workspace_guess = guess_step_key_from_workspace(entity, project)
+options = format_step_candidates(candidates, workspace_guess)
+# `options` is [(label, description), ...] — hand it to AskUserQuestion.
+```
+
+Then **ask the user via `AskUserQuestion`**, showing the options with the workspace guess (if any) marked `(Recommended)`. Use the confirmed value as `step_key` in all subsequent calls. Shortcut: if there is exactly one candidate and it matches the workspace guess, you may proceed without asking — but say which one you picked.
+
+### Step 2 — Read the intuition guide
+
+Read `references/TRAINING_DIAGNOSTICS.md` once at the start of the task. It encodes the researcher heuristics you will apply in Step 5.
+
+### Step 3 — Extract numeric features
+
+```python
+import pandas as pd
+from training_diagnostics import (
+    curve_features, lr_schedule_features, grad_norm_features, grad_histogram_features,
+)
+
+history = list(fast_scan_history(run, keys=[step_key, "loss", "val_loss", "lr", "grad_norm"]))
+df = pd.DataFrame(history)
+
+loss_feats   = curve_features(df["loss"].dropna(), df.loc[df["loss"].notna(), step_key],
+                              direction="decreasing")
+val_feats    = curve_features(df["val_loss"].dropna(), df.loc[df["val_loss"].notna(), step_key],
+                              direction="decreasing")
+lr_feats     = lr_schedule_features(df["lr"].dropna(), df.loc[df["lr"].notna(), step_key])
+gnorm_feats  = grad_norm_features(df["grad_norm"].dropna(),
+                                  df.loc[df["grad_norm"].notna(), step_key])
+
+# If histograms logged (wandb.watch with log="gradients"):
+hist_df = grad_histogram_features(run, layer_prefix="gradients/", step_key=step_key)
+```
+
+Print a compact table of `spike_count`, `smoothness`, `final_10pct_mean`, `monotonicity_pct`, `divergence.detected`, `lr_feats.decay_shape`, `gnorm_feats.kurtosis`, `gnorm_feats.dead_flag`. Don't print the raw spike/slope lists unless you're drilling in.
+
+### Step 4 — Render plots and view them with the Read tool
+
+```python
+from curve_plots import plot_single_run_overview, plot_grad_histogram_heatmap
+
+overview = plot_single_run_overview(run, step_key=step_key)
+print(f"overview PNG: {overview}")
+
+# Only if grad histograms are logged:
+heatmap = plot_grad_histogram_heatmap(run, step_key=step_key)
+print(f"grad-hist heatmap: {heatmap}")
+```
+
+Then **use the Read tool on the printed paths** so Claude views them as images. This is the "see the curves" step — without it you're flying blind. The PNGs default to `/tmp/wandb_plots/<run-id>/`.
+
+### Step 5 — Synthesize
+
+Combine:
+- What the numbers say (final, smoothness, spikes, slopes at each 5% checkpoint, plateaus, divergence).
+- What the image looks like (use the patterns from `TRAINING_DIAGNOSTICS.md` — healthy-shape, instability, overfit, plateau vs convergence).
+- Where the three sources disagree (often the interesting part).
+
+Produce a short verdict in this shape:
+
+```
+Verdict: <healthy | unstable | overfit | plateaued | diverged | converged>
+Evidence:
+  - <specific step range> — <what the curves show>
+  - <specific step range> — ...
+Next actions:
+  - <concrete hyperparameter / logging / code change>
+```
+
+### Multi-run comparison variant
+
+```python
+from training_diagnostics import compare_runs_curves
+from curve_plots import plot_run_comparison
+
+feats_df = compare_runs_curves(runs, metric="val_loss", step_key=step_key)
+print(feats_df.sort_values("final_10pct_mean").to_string())
+if feats_df.attrs.get("warning"):
+    print(feats_df.attrs["warning"])
+
+# Cap 6 runs per overlay; above that, pick top-k first.
+best_name = feats_df["final_10pct_mean"].idxmin()
+png = plot_run_comparison(runs[:6], metric="val_loss", step_key=step_key,
+                          highlight=best_name)
+# Read the PNG, then synthesize using TRAINING_DIAGNOSTICS §8 (comparing runs).
+```
+
+### Per-layer gradient view
+
+```python
+from curve_plots import plot_grad_norm_by_layer, plot_grad_histogram_heatmap
+
+# Scalar per-layer grad norms (if logged as scalars):
+png1 = plot_grad_norm_by_layer(run, step_key=step_key, layer_prefix="parameters/")
+
+# Per-layer histogram stat (if logged as histograms via wandb.watch):
+png2 = plot_grad_histogram_heatmap(run, step_key=step_key, metric="mean_abs")
+```
+
+Read the PNGs and apply `TRAINING_DIAGNOSTICS.md` §7 (reading heatmaps): scan for banding, collapsed rows (dead layers), widening tails (instability), dark columns (no-op steps).
 
 ---
 
