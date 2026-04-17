@@ -172,7 +172,15 @@ def post_comment(pr: int, body: str) -> None:
         handle.write(body)
         path = handle.name
     try:
-        sh("gh", "pr", "comment", str(pr), "--body-file", path)
+        sh(
+            "bash",
+            "-lc",
+            'source "$1/plugins/senpai/scripts/senpai-gh.sh" && comment_pr_with_file "$2" "$3"',
+            "bash",
+            str(ROOT),
+            str(pr),
+            path,
+        )
     finally:
         Path(path).unlink(missing_ok=True)
 

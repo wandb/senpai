@@ -94,6 +94,13 @@ close_pr_with_comment() {
     gh_retry gh pr close "$num" --delete-branch
 }
 
+# Comment on a PR using a markdown body file.
+#   comment_pr_with_file <number> <body_file>
+comment_pr_with_file() {
+    local num="$1" body_file="$2"
+    gh_retry gh pr comment "$num" --body-file "$body_file"
+}
+
 # ---------------------------------------------------------------------------
 # Compound actions — student
 # ---------------------------------------------------------------------------
