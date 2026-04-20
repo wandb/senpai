@@ -27,6 +27,10 @@ Use the **DrivAerML relative-L2 contract** used by AB-UPT and continued in later
   - Evaluation is done on **unnormalized** targets and predictions.
   - The shared trainer now follows that same contract for paper-facing DrivAerML metrics and logs the validation scalar as `val_primary/surface_rel_l2_pct`, with the matching test scalar logged as `test_primary/surface_rel_l2_pct`.
   - For debugging and auditability, the trainer also logs the raw ratio before percent-scaling as `surface_rel_l2`.
+  - When point-limited DrivAerML sampling is enabled in the shared trainer:
+    - training repeats each case `ceil(N / points_per_view)` times per epoch and draws random point subsets with replacement
+    - validation/test split each case into deterministic strided point views so every point is evaluated exactly once
+    - the reported relative-L2 metric is then re-aggregated back to the exact per-case numerator/denominator over the full case, not averaged over chunk-level scores
 
 - **Field names for literature comparison**
   - Surface:
@@ -66,6 +70,19 @@ Use the **DrivAerML relative-L2 contract** used by AB-UPT and continued in later
 - AB-UPT paper: <https://openreview.net/pdf?id=nwQ8nitlTZ>
 - `milieu_cfd` common evaluator: `scripts/eval_drivaerml.py` and `nn_cfd/noether/callbacks.py`
 - Transolver-3 paper: <https://arxiv.org/abs/2602.04940>
+
+## Training schedules in related work
+
+- `AB-UPT` on DrivAerML:
+  - reported at `500` epochs, `bs=1`, Lion, mixed precision
+- `Transolver-3` industrial benchmark section:
+  - reports `500` epochs with `bs=1` for the compared industrial aerodynamic benchmarks, including DrivAerML
+- `Transolver++`:
+  - does **not** use DrivAerML; it reports `200` epochs on `DrivAerNet++`
+- original `Transolver`:
+  - does **not** use DrivAerML; the released car-design task is `ShapeNetCar` with `200` epochs in the public repo
+- `SpiderSolver`:
+  - does **not** use DrivAerML; the released public training commands cover `ShapeNetCar` (`200` epochs), `AirfRANS` (`398`), and `BloodFlow` (`500`)
 
 ## Code boundaries
 

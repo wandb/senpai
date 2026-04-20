@@ -11,6 +11,7 @@ does not depend on `milieu_cfd`, AB-UPT, or PhysicsNeMo at runtime.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 from dataclasses import dataclass
@@ -137,14 +138,37 @@ def _candidate_artifact_paths(path: Path) -> list[Path]:
     return ordered
 
 
-def _load_npy(path: Path) -> np.ndarray:
+@functools.lru_cache(maxsize=16384)
+def _resolve_artifact_path(path: Path) -> Path:
     for candidate in _candidate_artifact_paths(path):
         if candidate.exists():
-            return np.asarray(np.load(candidate), dtype=np.float32)
+            return candidate
     raise FileNotFoundError(
         "Could not resolve DrivAerML artifact "
         f"{path}; checked {[str(candidate) for candidate in _candidate_artifact_paths(path)]}"
     )
+
+
+def _artifact_exists(path: Path) -> bool:
+    return any(candidate.exists() for candidate in _candidate_artifact_paths(path))
+
+
+def _load_npy(path: Path) -> np.ndarray:
+    return np.asarray(np.load(_resolve_artifact_path(path)), dtype=np.float32)
+
+
+def _load_npy_rows(path: Path, rows: np.ndarray | None = None) -> np.ndarray:
+    if rows is None:
+        return _load_npy(path)
+    mapped = np.load(_resolve_artifact_path(path), mmap_mode="r")
+    return np.asarray(mapped[rows], dtype=np.float32)
+
+
+def _npy_row_count(path: Path) -> int:
+    arr = np.load(_resolve_artifact_path(path), mmap_mode="r")
+    if arr.ndim == 0:
+        return 1
+    return int(arr.shape[0])
 
 
 def _column(value: np.ndarray) -> np.ndarray:
@@ -152,44 +176,53 @@ def _column(value: np.ndarray) -> np.ndarray:
     return arr[:, None] if arr.ndim == 1 else arr
 
 
-def _surface_arrays(case_dir: Path) -> tuple[np.ndarray, np.ndarray]:
-    xyz = _load_npy(case_dir / "surface_xyz.npy")
-    normals = _load_npy(case_dir / "surface_normals.npy")
-    area = _column(_load_npy(case_dir / "surface_area.npy"))
-    cp = _column(_load_npy(case_dir / "surface_cp.npy"))
+def _surface_arrays(case_dir: Path, rows: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    xyz = _load_npy_rows(case_dir / "surface_xyz.npy", rows)
+    normals = _load_npy_rows(case_dir / "surface_normals.npy", rows)
+    area = _column(_load_npy_rows(case_dir / "surface_area.npy", rows))
+    cp = _column(_load_npy_rows(case_dir / "surface_cp.npy", rows))
     x = np.concatenate([xyz, normals, area], axis=1)
     return x, cp
 
 
-def _volume_arrays(case_dir: Path) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+def _volume_arrays(
+    case_dir: Path,
+    rows: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
     xyz_path = case_dir / "volume_xyz.npy"
     sdf_path = case_dir / "volume_sdf.npy"
     velocity_path = case_dir / "volume_velocity.npy"
     pressure_path = case_dir / "volume_pressure.npy"
-    if not all(path.exists() for path in [xyz_path, sdf_path, velocity_path, pressure_path]):
+    if not all(_artifact_exists(path) for path in [xyz_path, sdf_path, velocity_path, pressure_path]):
         return None, None
 
     x = np.concatenate(
         [
-            _load_npy(xyz_path),
-            _column(_load_npy(sdf_path)),
+            _load_npy_rows(xyz_path, rows),
+            _column(_load_npy_rows(sdf_path, rows)),
         ],
         axis=1,
     )
     y = np.concatenate(
         [
-            _load_npy(velocity_path),
-            _column(_load_npy(pressure_path)),
+            _load_npy_rows(velocity_path, rows),
+            _column(_load_npy_rows(pressure_path, rows)),
         ],
         axis=1,
     )
     return x, y
 
 
-def load_drivaerml_case(root: str | Path, case_id: str) -> DrivAerMLCase:
+def load_drivaerml_case(
+    root: str | Path,
+    case_id: str,
+    *,
+    surface_rows: np.ndarray | None = None,
+    volume_rows: np.ndarray | None = None,
+) -> DrivAerMLCase:
     case_dir = _case_dir(Path(root), case_id)
-    surface_x, surface_y = _surface_arrays(case_dir)
-    volume_x, volume_y = _volume_arrays(case_dir)
+    surface_x, surface_y = _surface_arrays(case_dir, rows=surface_rows)
+    volume_x, volume_y = _volume_arrays(case_dir, rows=volume_rows)
     return DrivAerMLCase(
         case_id=case_id,
         surface_x=torch.from_numpy(surface_x),
@@ -205,6 +238,22 @@ def load_drivaerml_case(root: str | Path, case_id: str) -> DrivAerMLCase:
     )
 
 
+def load_drivaerml_case_point_counts(root: str | Path, case_id: str) -> dict[str, int]:
+    case_dir = _case_dir(Path(root), case_id)
+    surface_count = _npy_row_count(case_dir / "surface_xyz.npy")
+
+    volume_xyz_path = case_dir / "volume_xyz.npy"
+    volume_count = 0
+    if _artifact_exists(volume_xyz_path):
+        volume_count = _npy_row_count(volume_xyz_path)
+
+    return {
+        "case_id": case_id,
+        "n_surface": surface_count,
+        "n_volume": volume_count,
+    }
+
+
 class DrivAerMLCaseStore:
     """Thin manifest-backed store for the processed DrivAerML PVC layout."""
 
@@ -213,6 +262,7 @@ class DrivAerMLCaseStore:
         self.manifest = _load_manifest(self.manifest_path)
         self.root = _resolve_case_root(self.manifest, override_root=root)
         self.normalizers_path = self.root / "normalizers.json"
+        self._point_count_cache: dict[str, dict[str, int]] = {}
 
     def case_ids(self, split: str, domain: str = "surface") -> list[str]:
         if domain == "surface":
@@ -221,8 +271,26 @@ class DrivAerMLCaseStore:
             return list(self.manifest["volume_splits"][split])
         raise ValueError(f"Unknown DrivAerML domain: {domain}")
 
-    def load_case(self, case_id: str) -> DrivAerMLCase:
-        return load_drivaerml_case(self.root, case_id)
+    def load_case(
+        self,
+        case_id: str,
+        *,
+        surface_rows: np.ndarray | None = None,
+        volume_rows: np.ndarray | None = None,
+    ) -> DrivAerMLCase:
+        return load_drivaerml_case(
+            self.root,
+            case_id,
+            surface_rows=surface_rows,
+            volume_rows=volume_rows,
+        )
+
+    def case_point_counts(self, case_id: str) -> dict[str, int]:
+        cached = self._point_count_cache.get(case_id)
+        if cached is None:
+            cached = load_drivaerml_case_point_counts(self.root, case_id)
+            self._point_count_cache[case_id] = cached
+        return dict(cached)
 
     def load_normalizers(self) -> dict:
         with self.normalizers_path.open() as f:

@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import math
 import os
 import time
 from dataclasses import asdict, dataclass
@@ -67,6 +68,9 @@ class TrainConfig:
     ema_decay: float = 0.999
     ema_start_step: int = 50
     num_workers: int = 0
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    prefetch_factor: int = 4
     debug: bool = False
     max_train_batches: int = 0
     max_eval_batches: int = 0
@@ -487,21 +491,29 @@ def build_loaders(config: TrainConfig, bundle: DatasetBundle) -> tuple[DataLoade
         )
         shuffle = False
 
+    loader_kwargs = {
+        "num_workers": config.num_workers,
+        "pin_memory": config.pin_memory and torch.cuda.is_available(),
+    }
+    if config.num_workers > 0:
+        loader_kwargs["persistent_workers"] = config.persistent_workers
+        loader_kwargs["prefetch_factor"] = config.prefetch_factor
+
     train_loader = DataLoader(
         bundle.train_dataset,
         batch_size=config.batch_size,
         shuffle=shuffle if train_sampler is None else False,
         sampler=train_sampler,
-        num_workers=config.num_workers,
         collate_fn=train_collate,
+        **loader_kwargs,
     )
     val_loaders = {
         name: DataLoader(
             dataset,
             batch_size=1 if config.model == "reference_abupt" else config.batch_size,
             shuffle=False,
-            num_workers=config.num_workers,
             collate_fn=eval_collate,
+            **loader_kwargs,
         )
         for name, dataset in bundle.val_datasets.items()
     }
@@ -510,8 +522,8 @@ def build_loaders(config: TrainConfig, bundle: DatasetBundle) -> tuple[DataLoade
             dataset,
             batch_size=1 if config.model == "reference_abupt" else config.batch_size,
             shuffle=False,
-            num_workers=config.num_workers,
             collate_fn=eval_collate,
+            **loader_kwargs,
         )
         for name, dataset in bundle.test_datasets.items()
     }
@@ -694,6 +706,8 @@ def evaluate_grouped(
     n_vol = torch.zeros(3, device=device)
     surf_channel_sum = None
     vol_channel_sum = None
+    drivaer_surface_case_sums: dict[str, list[float]] = {}
+    drivaer_volume_case_sums: dict[str, list[float]] = {}
 
     batches = loader if max_batches <= 0 else itertools.islice(loader, max_batches)
     for batch in batches:
@@ -771,18 +785,32 @@ def evaluate_grouped(
             pred_volume = transform.invert(outputs["volume_preds"])
 
         if dataset_name == "drivaerml":
-            if pred_surface is not None:
-                for case_idx in range(pred_surface.shape[0]):
-                    value = _case_masked_rel_l2(pred_surface[case_idx], batch.surface_y[case_idx], batch.surface_mask[case_idx])
-                    if value == value:
-                        total_surface += value
-                        count_surface += 1
+            if pred_surface is not None and batch.surface_y is not None:
+                for case_idx, case_id in enumerate(batch.case_ids):
+                    valid = batch.surface_mask[case_idx].bool()
+                    if not valid.any():
+                        continue
+                    pred_valid = pred_surface[case_idx][valid]
+                    target_valid = batch.surface_y[case_idx][valid]
+                    target_sq = float(target_valid.square().sum().detach().cpu().item())
+                    if target_sq <= 0.0:
+                        continue
+                    state = drivaer_surface_case_sums.setdefault(case_id, [0.0, 0.0])
+                    state[0] += float((pred_valid - target_valid).square().sum().detach().cpu().item())
+                    state[1] += target_sq
             if pred_volume is not None and batch.volume_mask is not None and batch.volume_y is not None:
-                for case_idx in range(pred_volume.shape[0]):
-                    value = _case_masked_rel_l2(pred_volume[case_idx], batch.volume_y[case_idx], batch.volume_mask[case_idx])
-                    if value == value:
-                        total_volume += value
-                        count_volume += 1
+                for case_idx, case_id in enumerate(batch.case_ids):
+                    valid = batch.volume_mask[case_idx].bool()
+                    if not valid.any():
+                        continue
+                    pred_valid = pred_volume[case_idx][valid]
+                    target_valid = batch.volume_y[case_idx][valid]
+                    target_sq = float(target_valid.square().sum().detach().cpu().item())
+                    if target_sq <= 0.0:
+                        continue
+                    state = drivaer_volume_case_sums.setdefault(case_id, [0.0, 0.0])
+                    state[0] += float((pred_valid - target_valid).square().sum().detach().cpu().item())
+                    state[1] += target_sq
             continue
 
         if pred_surface is not None:
@@ -812,13 +840,23 @@ def evaluate_grouped(
             metrics.update(_named_channel_metrics("volume_mse", vol_channel_sum / count_volume, AIRFRANS_FIELD_NAMES))
         return metrics
     if dataset_name == "drivaerml":
-        surface_rel_l2 = total_surface / max(count_surface, 1)
+        surface_values = [
+            math.sqrt(error_sq / target_sq)
+            for error_sq, target_sq in drivaer_surface_case_sums.values()
+            if target_sq > 0.0
+        ]
+        surface_rel_l2 = sum(surface_values) / max(len(surface_values), 1)
         metrics = {
             "surface_rel_l2": surface_rel_l2,
             "surface_rel_l2_pct": surface_rel_l2 * 100.0,
         }
-        if count_volume > 0:
-            volume_rel_l2 = total_volume / count_volume
+        volume_values = [
+            math.sqrt(error_sq / target_sq)
+            for error_sq, target_sq in drivaer_volume_case_sums.values()
+            if target_sq > 0.0
+        ]
+        if volume_values:
+            volume_rel_l2 = sum(volume_values) / len(volume_values)
             metrics["volume_rel_l2"] = volume_rel_l2
             metrics["volume_rel_l2_pct"] = volume_rel_l2 * 100.0
         return metrics

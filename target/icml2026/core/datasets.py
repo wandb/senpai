@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -32,6 +33,14 @@ DEFAULT_TANDEM_STATS = ROOT_DIR / "tandemfoil/data/split_stats.json"
 DEFAULT_AIRFRANS_MANIFEST = ROOT_DIR / "airfrans/data/split_manifest_airfrans.json"
 DEFAULT_DRIVAERML_MANIFEST = ROOT_DIR / "drivaerml/data/split_manifest_drivaerml.json"
 RUNTIME_CACHE_CASES = 16
+
+
+@dataclass(frozen=True)
+class DrivAerMLPointView:
+    case_id: str
+    view_index: int
+    view_count: int
+    sampling_mode: str
 
 
 def _read_json(path: str | Path) -> dict:
@@ -146,49 +155,107 @@ class DrivAerMLCaseDataset(Dataset):
         surface_only: bool = True,
         max_surface_points: int = 0,
         max_volume_points: int = 0,
-        subsample_seed: int = 0,
+        sampling_mode: str = "full",
     ):
         self.store = prepare_drivaerml.DrivAerMLCaseStore(manifest_path=manifest_path, root=root)
         self.case_ids = list(case_ids)
         self.surface_only = surface_only
         self.max_surface_points = max_surface_points
         self.max_volume_points = max_volume_points
-        self.subsample_seed = subsample_seed
+        self.sampling_mode = sampling_mode
         self.augment = dict(
             enable_fourier=enable_fourier,
             enable_cp_panel=False,
             enable_wake_deficit=False,
             enable_wake_angle=False,
         )
+        self.views = self._build_views()
 
     def __len__(self) -> int:
-        return len(self.case_ids)
+        return len(self.views)
 
-    def _choice(self, total: int, count: int, key: str) -> torch.Tensor | None:
+    @staticmethod
+    def _view_count(total: int, points_per_view: int) -> int:
+        if points_per_view <= 0 or total <= points_per_view:
+            return 1
+        return max(1, math.ceil(total / points_per_view))
+
+    def _build_views(self) -> list[DrivAerMLPointView]:
+        views: list[DrivAerMLPointView] = []
+        for case_id in self.case_ids:
+            counts = self.store.case_point_counts(case_id)
+            surface_views = self._view_count(counts["n_surface"], self.max_surface_points)
+            view_count = surface_views
+            if not self.surface_only:
+                volume_views = self._view_count(counts["n_volume"], self.max_volume_points)
+                view_count = max(view_count, volume_views)
+            for view_index in range(view_count):
+                views.append(
+                    DrivAerMLPointView(
+                        case_id=case_id,
+                        view_index=view_index,
+                        view_count=view_count,
+                        sampling_mode=self.sampling_mode,
+                    )
+                )
+        return views
+
+    def _random_subset_indices(self, total: int, count: int) -> torch.Tensor | None:
         if count <= 0 or count >= total:
             return None
-        generator = torch.Generator().manual_seed(self.subsample_seed + stable_hash32(key))
-        return torch.randperm(total, generator=generator)[:count].sort().values
+        return torch.randint(total, (count,), dtype=torch.long).sort().values
+
+    def _strided_partition_indices(self, total: int, count: int, view: DrivAerMLPointView) -> torch.Tensor | None:
+        if count <= 0 or count >= total:
+            return None
+        return torch.arange(view.view_index, total, view.view_count, dtype=torch.long)
+
+    def _surface_indices(self, total: int, view: DrivAerMLPointView) -> torch.Tensor | None:
+        if self.max_surface_points <= 0 or total <= self.max_surface_points:
+            return None
+        if view.sampling_mode == "train_random":
+            return self._random_subset_indices(total, self.max_surface_points)
+        if view.sampling_mode == "eval_chunk":
+            return self._strided_partition_indices(total, self.max_surface_points, view)
+        return None
+
+    def _volume_indices(self, total: int, view: DrivAerMLPointView) -> torch.Tensor | None:
+        if self.max_volume_points <= 0 or total <= self.max_volume_points:
+            return None
+        if view.sampling_mode == "train_random":
+            return self._random_subset_indices(total, self.max_volume_points)
+        if view.sampling_mode == "eval_chunk":
+            return self._strided_partition_indices(total, self.max_volume_points, view)
+        return None
 
     def __getitem__(self, idx: int) -> CaseSample:
-        case = self.store.load_case(self.case_ids[idx])
+        view = self.views[idx]
+        counts = self.store.case_point_counts(view.case_id)
+        surface_idx = self._surface_indices(counts["n_surface"], view)
+        volume_idx = None if self.surface_only else self._volume_indices(counts["n_volume"], view)
+        case = self.store.load_case(
+            view.case_id,
+            surface_rows=None if surface_idx is None else surface_idx.numpy(),
+            volume_rows=None if volume_idx is None else volume_idx.numpy(),
+        )
         metadata = dict(case.metadata)
 
-        surface_idx = self._choice(case.surface_x.shape[0], self.max_surface_points, f"{case.case_id}:surface")
-        surface_x = case.surface_x if surface_idx is None else case.surface_x.index_select(0, surface_idx)
-        surface_y = case.surface_y if surface_idx is None else case.surface_y.index_select(0, surface_idx)
-        metadata["n_surface_full"] = int(case.surface_x.shape[0])
+        surface_x = case.surface_x
+        surface_y = case.surface_y
+        metadata["n_surface_full"] = int(counts["n_surface"])
         metadata["n_surface_loaded"] = int(surface_x.shape[0])
+        metadata["surface_view_index"] = int(view.view_index)
+        metadata["surface_view_count"] = int(view.view_count)
+        metadata["surface_sampling_mode"] = view.sampling_mode
 
         volume_x = None if self.surface_only else case.volume_x
         volume_y = None if self.surface_only else case.volume_y
         if volume_x is not None and volume_y is not None:
-            volume_idx = self._choice(volume_x.shape[0], self.max_volume_points, f"{case.case_id}:volume")
-            if volume_idx is not None:
-                volume_x = volume_x.index_select(0, volume_idx)
-                volume_y = volume_y.index_select(0, volume_idx)
-            metadata["n_volume_full"] = int(case.volume_x.shape[0])  # type: ignore[union-attr]
+            metadata["n_volume_full"] = int(counts["n_volume"])
             metadata["n_volume_loaded"] = int(volume_x.shape[0])
+            metadata["volume_view_index"] = int(view.view_index)
+            metadata["volume_view_count"] = int(view.view_count)
+            metadata["volume_sampling_mode"] = view.sampling_mode
 
         sample = CaseSample(
             case_id=case.case_id,
@@ -511,6 +578,8 @@ def build_drivaerml_bundle(
     eval_volume_points: int = 0,
 ) -> DatasetBundle:
     manifest = _read_json(manifest_path)
+    train_sampling_mode = "train_random" if train_surface_points > 0 or train_volume_points > 0 else "full"
+    eval_sampling_mode = "eval_chunk" if eval_surface_points > 0 or eval_volume_points > 0 else "full"
     train_dataset = DrivAerMLCaseDataset(
         list(manifest["surface_splits"]["train"]),
         manifest_path=manifest_path,
@@ -519,7 +588,7 @@ def build_drivaerml_bundle(
         surface_only=surface_only,
         max_surface_points=train_surface_points,
         max_volume_points=train_volume_points,
-        subsample_seed=0,
+        sampling_mode=train_sampling_mode,
     )
     val_dataset = DrivAerMLCaseDataset(
         list(manifest["surface_splits"]["val"]),
@@ -529,7 +598,7 @@ def build_drivaerml_bundle(
         surface_only=surface_only,
         max_surface_points=eval_surface_points,
         max_volume_points=eval_volume_points,
-        subsample_seed=1,
+        sampling_mode=eval_sampling_mode,
     )
     test_dataset = DrivAerMLCaseDataset(
         list(manifest["surface_splits"]["test"]),
@@ -539,7 +608,7 @@ def build_drivaerml_bundle(
         surface_only=surface_only,
         max_surface_points=eval_surface_points,
         max_volume_points=eval_volume_points,
-        subsample_seed=2,
+        sampling_mode=eval_sampling_mode,
     )
     stats = prepare_drivaerml.surface_stats_from_normalizers(train_dataset.store)
     target_stats = TargetTransformStats(
@@ -568,6 +637,8 @@ def build_drivaerml_bundle(
                 "DrivAerML defaults to the packaged public surface split for the paper sprint.",
                 "Surface-first mode is the default; the volume subset stays optional.",
                 "Paper-facing evaluation follows AB-UPT's average per-case relative-L2 contract on unnormalized targets.",
+                "When DrivAerML train point limits are set, each epoch repeats a case ceil(N / points_per_view) times.",
+                "When DrivAerML eval point limits are set, val/test cover every point exactly once via strided case views.",
             ],
         ),
         target_stats=target_stats,

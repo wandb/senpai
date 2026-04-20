@@ -22,6 +22,15 @@ STUDENT_NAMES = [
     "thorfinn", "askeladd", "violet", "gilbert", "senku", "kohaku",
     "emma", "norman", "chihiro", "haku", "shoya", "shouko",
     "mitsuha", "taki", "shinji", "rei", "kaneda", "tetsuo",
+    "naruto", "sasuke", "sakura", "kakashi", "hinata", "itachi",
+    "roy", "winry", "eren", "mikasa", "armin", "levi",
+    "historia", "ymir", "zenitsu", "inosuke", "giyu", "shinobu",
+    "chrome", "gen", "ray", "asuka", "kaworu", "luffy",
+    "zoro", "nami", "sanji", "robin", "chopper", "usopp",
+    "franky", "brook", "yuji", "megumi", "nobara", "gojo",
+    "sukuna", "spike", "jet", "faye", "vash", "wolfwood",
+    "guts", "casca", "griffith", "einar", "canute", "stark",
+    "himmel", "mugen", "jin",
 ]
 
 
