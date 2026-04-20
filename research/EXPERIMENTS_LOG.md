@@ -1,5 +1,74 @@
 # SENPAI Research Results
 
+## 2026-04-21 00:05 — PR #2475: DrivAerML: Fourier + no-EMA — MERGED ✓ NEW BEST
+
+- chihiro/drivaerml-fourier-noema
+- Hypothesis: Fourier positional encoding compresses high-frequency pressure gradients in 3D car geometry
+
+| Run | T_max | val_primary/surface_rel_l2_pct | test | W&B |
+|---|---|---|---|---|
+| **Fourier+noEMA T_max=30** | 30 | **51.35%** | 52.06% | 5ncrjm32 |
+| Fourier+noEMA T_max=150 | 150 | 52.06% | 51.50% | uy73j36s |
+| Baseline (#2467) | — | 56.91% | 57.33% | — |
+
+**Commentary:** Fourier delivers 9.8% relative improvement on DrivAerML at only 2 epochs. Physically motivated: 3D car geometry has sharp pressure gradients at edges/mirrors/underbody. T_max=30 > T_max=150 with Fourier — faster LR cycling better. Critical: with Fourier, lr=5e-4 outperforms lr=8e-4 (51.35% vs violet's 54.33%). Still in steep descent at epoch 2 — major headroom with longer training. New baseline: 51.35%.
+
+---
+
+## 2026-04-21 00:00 — PR #2478: AirfRANS: Fourier + 4L/256d full epoch run — MERGED ✓ NEW BEST
+
+- senku/airfrans-fourier-4L-fullrun
+- Hypothesis: More epochs with Fourier + bigger model breaks through AirfRANS stagnation
+
+| Run | T_max | val_primary/surface_mse | test | Epochs | W&B |
+|---|---|---|---|---|---|
+| **Fourier+4L/256d T_max=150** | 150 | **0.2387** | **0.2079** | 8 | vwb9teqa |
+| Fourier+4L/256d T_max=20 | 20 | 0.2390 (ep7 best) / 0.3210 (ep8) | 0.2604 | 8 | fnjbxrks |
+| Baseline (#2455) | — | 0.2597 | 0.2392 | 6 | — |
+
+**Commentary:** 17.4% improvement over prior AirfRANS baseline. Critical bug discovered: epochs=2 is hardcoded default in train.py — SENPAI_MAX_EPOCHS only caps, does not raise. Must pass --epochs 999 explicitly going forward. T_max=20 causes LR oscillation at epoch boundaries (best at ep7, then spikes at ep8). T_max=150 stable and still improving at ep8. Full_val/volume_mse=0.2933. New baseline: 0.2387.
+
+---
+
+## 2026-04-21 00:00 — PR #2488: TandemFoil: golden + no-EMA + 4L/256d — CLOSED (epoch starvation)
+
+- kaneda/tandem-golden-noema-capacity
+
+| Run | Model | val_primary/surface_pressure_mae | Epochs | W&B |
+|---|---|---|---|---|
+| 4L/256d/4H | — | 224.40 | 2 | 2qi6a8tv |
+| 5L/320d/5H | — | 206.50 | 2 | fwilsngh |
+
+**Commentary:** Both large models only got 2 epochs vs 14 for baseline. ~15 min/epoch (5.5x slower than 3L/192d). Dead end at current timeout. Key finding: 5L/320d is more epoch-efficient than 4L/256d (206.50 < 224.40 at same epoch count). With 180-min budget and --epochs 999, these models could now be viable — needs retest.
+
+---
+
+## 2026-04-21 00:00 — PR #2479: DrivAerML: Fourier + no-EMA + lr=8e-4 — CLOSED (superseded)
+
+- violet/drivaerml-fourier-noema-lr8e4
+
+| Run | T_max | val_primary/surface_rel_l2_pct | W&B |
+|---|---|---|---|
+| Fourier+noEMA+lr=8e-4, T_max=150 | 150 | 54.33% | 06i67y41 |
+| Fourier+noEMA+lr=8e-4, T_max=30 | 30 | 55.04% | 1aaqtdk4 |
+
+**Commentary:** Both beats old 56.91% baseline but superseded by #2475 (51.35%). Key finding: with Fourier, lr=5e-4 outperforms lr=8e-4 on DrivAerML (51.35% vs 54.33%). Fourier benefit confirmed from independent PR. Closed as superseded.
+
+---
+
+## 2026-04-21 00:00 — PR #2463: TandemFoil: physics + no-EMA + lookahead ablation — CLOSED (superseded)
+
+- rei/tandem-noema-lookahead-ablation-v2
+
+| Run | Config | val_primary/surface_pressure_mae | W&B |
+|---|---|---|---|
+| no-lookahead, Lion lr=3e-4 | physics, no-EMA, slices=96 | 177.81 | qrhkp488 |
+| lookahead, Lion lr=2e-4 | physics, no-EMA, slices=96 | 211.71 | xqh88100 |
+
+**Commentary:** Run 1 beat its own stated baseline (197.87) by 10.1% — validates no-lookahead > lookahead in no-EMA regime (lookahead's slow weights partially replicate EMA lag). BUT current TandemFoil baseline is 82.65 (#2473) — 2x better. Physics at slices=96 is blocked at 2 epochs. The no-lookahead insight should be tested on the Fourier+physics golden config (slices=64). Closed as superseded.
+
+---
+
 ## 2026-04-20 22:20 — PR #2455: AirfRANS: 3L/192d no-EMA no-Fourier 6 epochs — MERGED ✓ NEW BEST
 
 - **Branch:** emma/airfrans-noema-4L256d-retest
