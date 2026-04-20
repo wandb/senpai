@@ -3,8 +3,18 @@
 ## TandemFoilSet
 
 - **Primary metric:** `val_primary/surface_pressure_mae` (= `val_eq4/surface_pressure_mae`)
-- **Current best:** 262.82 (val) / 257.51 (test)
-- **Best PR:** #2414 (tanjiro — TandemFoil core physics features: TE+Cp+asinh+residual)
+- **Current best:** 197.87 (val) / 191.70 (test)
+- **Best PR:** #2412 (frieren — TandemFoil no-EMA, Lion lr=3e-4, no physics features)
+- **Key insight:** EMA (ema_start_step=50) is catastrophically harmful at 2 epochs. All future runs must use `--no-use-ema`.
+
+### 2026-04-20 19:50 — PR #2412: TandemFoil: clean baseline no-EMA (frieren v4)
+
+- **val_primary/surface_pressure_mae:** 197.87
+- **test_primary/surface_pressure_mae:** 191.70
+- **Per-split test MAE:** single_in_dist=212.64, geom_camber_rc=172.00, geom_camber_cruise=187.39, re_rand=194.77
+- **Note:** v4 variant (no-EMA), Lion lr=3e-4, slices=96, NO physics features, use_lookahead=True. Only 2 epochs. Beats physics-features baseline (262.82) by 24.7% purely by removing EMA.
+- **W&B run:** y8f8pkkn
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 3e-4 --cosine_t_max 50 --no-use-ema`
 
 ### 2026-04-20 19:30 — PR #2414: TandemFoil: core physics features (TE+Cp+asinh+residual)
 
