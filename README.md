@@ -12,7 +12,7 @@ Autonomous ML research loop powered by Claude Code agents coordinated through Gi
 
 An **advisor** agent (no GPU) creates hypothesis PRs and assigns them to **student** agents (GPU nodes). Students implement the hypothesis, run experiments, and report results. The advisor reviews: merges winners, iterates on promising ideas, closes dead ends. All coordination happens through GitHub labels and PRs. W&B tracks metrics.
 
-The repo is **problem-agnostic** — all problem-specific code (model, training script, data pipeline, instructions) lives in a self-contained folder. `senpai.yaml` at the root points to the active problem.
+The repo is **problem-agnostic** — all problem-specific code (model, training script, data pipeline, instructions) lives in a self-contained folder under `target/`. `senpai.yaml` points to the active problem via a repo-relative path.
 
 ### Current problem: CFD surrogates
 
@@ -58,13 +58,14 @@ graph TD
 ```
 senpai/
 ├── senpai.yaml                    # Project config: active problem + all launch defaults
-├── cfd_tandemfoil/                # Problem directory (self-contained)
-│   ├── train.py                   #   Training script + model (students modify this)
-│   ├── program.md                 #   Research context, metrics, constraints
-│   ├── data/                      #   Data pipeline and benchmark splits
-│   └── instructions/              #   Role-specific Claude Code instructions
-│       ├── prompt-advisor.md      #     Task-specific Advisor prompt template
-│       └── prompt-student.md      #     Task-specific Student prompt template
+├── target/
+│   └── <problem>/                 # Active problem directory (self-contained)
+│       ├── train.py               #   Training script + model (students modify this)
+│       ├── program.md             #   Research context, metrics, constraints
+│       ├── data/                  #   Data pipeline and benchmark splits
+│       └── instructions/          #   Role-specific Claude Code instructions
+│           ├── prompt-advisor.md  #     Task-specific Advisor prompt template
+│           └── prompt-student.md  #     Task-specific Student prompt template
 ├── system_instructions/           # System-level Claude Code instructions
 │   ├── CLAUDE-ADVISOR.md          #     System-level Advisor workflow
 │   └── CLAUDE-STUDENT.md          #     System-level Student workflow
@@ -86,7 +87,7 @@ senpai/
 All project settings live in `senpai.yaml`:
 
 ```yaml
-problem: cfd_tandemfoil        # which problem folder to use
+problem: target/cfd_tandemfoil # active problem directory (repo-relative)
 repo_url: https://github.com/wandb/senpai.git
 repo_branch: main
 image: ghcr.io/wandb/senpai:latest
@@ -114,10 +115,10 @@ and push the key to the k8s secrets.
 
 ```bash
 # Train locally
-cd cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/<description>"
+cd target/cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/<description>"
 
 # Debug (3 epochs, tiny subset)
-cd cfd_tandemfoil && python train.py --debug
+cd target/cfd_tandemfoil && python train.py --debug
 
 # Deploy to k8s (reads defaults from senpai.yaml, only --tag is required)
 python k8s/launch.py --tag <research-tag> --advisor
@@ -131,12 +132,12 @@ python k8s/launch.py --tag <research-tag> --advisor --extra_instructions "Only c
 
 ## Adding a new problem
 
-1. Create a new folder (e.g. `weather_prediction/`) with:
+1. Create a new folder under `target/` (e.g. `target/weather_prediction/`) with:
    - `train.py` — training script + model
    - `program.md` — research context, metrics, constraints
    - `data/` — data pipeline
    - `instructions/` — role-specific Claude Code instructions
-2. Set `problem: weather_prediction` in `senpai.yaml`
+2. Set `problem: target/weather_prediction` in `senpai.yaml`
 3. Deploy as usual — `python k8s/launch.py --tag <tag> --advisor`
 
 ## References

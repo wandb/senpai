@@ -23,7 +23,7 @@ When asked for a large piece of work which seems vague or needs clarification, p
 
 ## Key docs
 
-- `cfd_tandemfoil/program.md` — research context, goals, metrics, file constraints
+- `target/<problem>/program.md` — active research context, goals, metrics, file constraints (default: `target/cfd_tandemfoil/program.md`)
 - `system_instructions/CLAUDE-ADVISOR.md` — advisor role workflow
 - `system_instructions/CLAUDE-STUDENT.md` — student role workflow
 

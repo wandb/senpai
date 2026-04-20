@@ -57,7 +57,7 @@ git checkout "$ADVISOR_BRANCH" && git pull origin "$ADVISOR_BRANCH"
 - **Surface MAE:** Ux=X.XXXX, Uy=X.XXXX, p=X.XXXX
 - **val/loss:** X.XXX
 - **W&B run:** <run-id>
-- **Reproduce:** `cd cfd_tandemfoil && python train.py <full command>`
+- **Reproduce:** `cd "$PROBLEM_DIR" && python train.py <full command>`
 ```
 
 4. **Commit and push the baseline update:**

@@ -32,7 +32,7 @@ Make sure you've already posted a results comment on the experiment PR with metr
 1. **Stage and commit your changes:**
 
 ```bash
-git add cfd_tandemfoil/train.py
+git add "$PROBLEM_DIR/train.py"
 # Also add any other files you modified (pyproject.toml if you added packages, etc.)
 git commit -m "<concise description of what you changed>"
 ```

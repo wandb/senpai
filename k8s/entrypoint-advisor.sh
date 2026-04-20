@@ -87,7 +87,7 @@ while true; do
     echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) ==="
 
     # Overwrite CLAUDE.md with advisor-specific one — CC's git operations may clobber it with the developer copy
-    sed '/^<!--$/,/^-->$/d' "$WORKDIR/system_instructions/CLAUDE-ADVISOR.md" > "$WORKDIR/CLAUDE.md"
+    envsubst < "$WORKDIR/system_instructions/CLAUDE-ADVISOR.md" | sed '/^<!--$/,/^-->$/d' > "$WORKDIR/CLAUDE.md"
 
     # --- Read last-check timestamp for filtering PRs and issues (empty on first run = no filtering) ---
     SINCE=""

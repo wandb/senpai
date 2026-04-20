@@ -29,7 +29,7 @@ STUDENT_NAMES = [
 class Args:
     """Launch senpai advisor and/or student agents on Kubernetes."""
     tag: str  # research tag (e.g. mar13)
-    problem: str = "cfd_tandemfoil"  # active problem directory (from senpai.yaml)
+    problem: str = "target/cfd_tandemfoil"  # active problem directory path (from senpai.yaml)
     names: str = ""  # comma-separated student names (e.g. "frieren,fern")
     n_students: int = 4  # number of students to launch (ignored if --names is provided)
     repo_url: str = "https://github.com/wandb/senpai.git"  # git repo URL

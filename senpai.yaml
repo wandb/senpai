@@ -1,8 +1,8 @@
 # senpai project configuration
 # All fields can be overridden via CLI: python k8s/launch.py --tag <tag> [--field value]
 
-# problem directory
-problem: cfd_tandemfoil
+# active problem directory (repo-relative path)
+problem: target/cfd_tandemfoil
 
 # git
 repo_url: https://github.com/wandb/senpai.git

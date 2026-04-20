@@ -54,7 +54,7 @@ gh pr create --draft \
 include links to papers or code that support the hypothesis.>
 
 ## Instructions
-<Specific changes to make to cfd_tandemfoil/train.py — be concrete.
+<Specific changes to make to $PROBLEM_DIR/train.py — be concrete.
 "Try a higher learning rate" is vague. Change lr from 5e-4 to 1e-3 and add cosine annealing with T_max=epochs" is actionable.>
 
 ## Baseline
@@ -62,7 +62,7 @@ include links to papers or code that support the hypothesis.>
 - val/loss: X.XXX
 - Surface MAE metrics: p_in | p_oodc | p_tan | p_re
 - Baseline W&B run: <run-id> (<wandb-link>)
-- Reproduce command: `cd cfd_tandemfoil && python train.py ...`>
+- Reproduce command: `cd "$PROBLEM_DIR" && python train.py ...`>
 PREOF
 )" \
     --label "$ADVISOR_BRANCH" \
