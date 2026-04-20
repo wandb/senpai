@@ -2,21 +2,25 @@
 # All fields can be overridden via CLI: python k8s/launch.py --tag <tag> [--field value]
 
 # active problem directory (repo-relative path)
-problem: target/cfd_tandemfoil
+problem: target/icml2026
 
 # git
 repo_url: https://github.com/wandb/senpai.git
-repo_branch: main
+repo_branch: kaiming
 
 # docker image
 image: ghcr.io/wandb/senpai:latest
+
+# dataset PVC mount
+pvc_claim_name: new-pvc
+pvc_mount_path: /mnt/new-pvc
 
 # W&B
 wandb_entity: wandb-applied-ai-team
 wandb_project: senpai-v1
 
 # advisor
-advisor_branch: noam
+advisor_branch: kaiming
 
 # training limits
 timeout_minutes: 30.0

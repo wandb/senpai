@@ -77,7 +77,7 @@ spec:
         - name: dshm
           mountPath: /dev/shm
         - name: dataset
-          mountPath: /mnt/new-pvc
+          mountPath: {{PVC_MOUNT_PATH}}
       volumes:
       - name: dshm
         emptyDir:
@@ -85,7 +85,7 @@ spec:
           sizeLimit: 32Gi
       - name: dataset
         persistentVolumeClaim:
-          claimName: new-pvc
+          claimName: {{PVC_CLAIM_NAME}}
       tolerations:
       - key: "nvidia.com/gpu"
         operator: "Exists"
