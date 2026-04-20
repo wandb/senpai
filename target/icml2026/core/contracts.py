@@ -118,4 +118,4 @@ class DatasetBundle:
     spec: DatasetSpec
     target_stats: TargetTransformStats
     sample_weights: torch.Tensor | None = None
-
+    test_datasets: dict[str, torch.utils.data.Dataset] = field(default_factory=dict)

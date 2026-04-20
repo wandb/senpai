@@ -105,6 +105,7 @@ class AirfRANSCaseDataset(Dataset):
         debug: bool = False,
         enable_fourier: bool = False,
         enable_cp_panel: bool = False,
+        include_nut: bool = True,
     ):
         manifest = _read_json(manifest_path)
         dataset_root = prepare_airfrans._resolve_root(manifest, override_root=root)
@@ -112,7 +113,7 @@ class AirfRANSCaseDataset(Dataset):
         self.base = prepare_airfrans.AirfRANSDataset(
             root=dataset_root,
             case_ids=case_ids,
-            include_nut=False,
+            include_nut=include_nut,
             cache_size=cache_size,
         )
         self.augment = dict(
@@ -357,6 +358,18 @@ def build_tandem_bundle(
         )
         for name in val_names
     }
+    test_datasets = {
+        name: TandemFoilCaseDataset(
+            list(manifest["splits"][name]),
+            manifest_path=manifest_path,
+            debug=debug,
+            enable_fourier=enable_fourier,
+            enable_cp_panel=enable_cp_panel,
+            enable_wake_deficit=enable_wake_deficit,
+            enable_wake_angle=enable_wake_angle,
+        )
+        for name in manifest.get("test_splits", [])
+    }
     group_sizes = {name: len(indices) for name, indices in manifest["domain_groups"].items()}
     idx_to_group = {}
     for group_name, indices in manifest["domain_groups"].items():
@@ -379,10 +392,12 @@ def build_tandem_bundle(
             volume_input_dim=augmented_dim,
             volume_output_dim=3,
             pressure_output_index=2,
+            default_metric="surface_pressure_mae",
             notes=["TandemFoilSet grouped into surface and volume tokens from the overset point cloud."],
         ),
         target_stats=_stats_from_json(stats_path),
         sample_weights=sample_weights,
+        test_datasets=test_datasets,
     )
 
 
@@ -398,6 +413,7 @@ def build_airfrans_bundle(
     manifest = _read_json(manifest_path)
     train_name = f"{task}_train"
     val_name = f"{task}_val"
+    test_name = f"{task}_test"
     train_dataset = AirfRANSCaseDataset(
         list(manifest["splits"][train_name]),
         manifest_path=manifest_path,
@@ -405,6 +421,7 @@ def build_airfrans_bundle(
         debug=debug,
         enable_fourier=enable_fourier,
         enable_cp_panel=enable_cp_panel,
+        include_nut=True,
     )
     val_dataset = AirfRANSCaseDataset(
         list(manifest["splits"][val_name]),
@@ -413,13 +430,23 @@ def build_airfrans_bundle(
         debug=debug,
         enable_fourier=enable_fourier,
         enable_cp_panel=enable_cp_panel,
+        include_nut=True,
+    )
+    test_dataset = AirfRANSCaseDataset(
+        list(manifest["splits"][test_name]),
+        manifest_path=manifest_path,
+        root=root,
+        debug=debug,
+        enable_fourier=enable_fourier,
+        enable_cp_panel=enable_cp_panel,
+        include_nut=True,
     )
     _, _, stats, _ = prepare_airfrans.load_data(
         manifest_path=manifest_path,
         task=task,
         root=root,
         debug=debug,
-        include_nut=False,
+        include_nut=True,
         cache_size=-1 if debug else 0,
     )
     base_dim = prepare_airfrans.X_DIM
@@ -427,15 +454,21 @@ def build_airfrans_bundle(
     return DatasetBundle(
         train_dataset=train_dataset,
         val_datasets={val_name: val_dataset},
+        test_datasets={test_name: test_dataset},
         spec=DatasetSpec(
             name="airfrans",
             space_dim=2,
             surface_input_dim=augmented_dim,
-            surface_output_dim=3,
+            surface_output_dim=4,
             volume_input_dim=augmented_dim,
-            volume_output_dim=3,
+            volume_output_dim=4,
             pressure_output_index=2,
-            notes=["AirfRANS uses repo-local VTK parsing and the official task split lists."],
+            default_metric="surface_mse",
+            notes=[
+                "AirfRANS uses repo-local VTK parsing and the official task split lists.",
+                "Paper-facing metrics follow the official benchmark's normalized-space Surf/Vol MSE contract.",
+                "Shared training uses the train/val split for tuning and reports final literature-facing metrics on the official task test split.",
+            ],
         ),
         target_stats=TargetTransformStats(y_mean=stats["y_mean"], y_std=stats["y_std"]),
         sample_weights=torch.ones(len(train_dataset), dtype=torch.float32),
@@ -464,6 +497,13 @@ def build_drivaerml_bundle(
         enable_fourier=enable_fourier,
         surface_only=surface_only,
     )
+    test_dataset = DrivAerMLCaseDataset(
+        list(manifest["surface_splits"]["test"]),
+        manifest_path=manifest_path,
+        root=root,
+        enable_fourier=enable_fourier,
+        surface_only=surface_only,
+    )
     stats = prepare_drivaerml.surface_stats_from_normalizers(train_dataset.store)
     target_stats = TargetTransformStats(
         y_mean=None if stats is None else stats.get("y_mean"),
@@ -477,6 +517,7 @@ def build_drivaerml_bundle(
     return DatasetBundle(
         train_dataset=train_dataset,
         val_datasets={"val_surface": val_dataset},
+        test_datasets={"test_surface": test_dataset},
         spec=DatasetSpec(
             name="drivaerml",
             space_dim=3,
@@ -485,9 +526,11 @@ def build_drivaerml_bundle(
             volume_input_dim=base_volume_dim + fourier_extra if base_volume_dim else 0,
             volume_output_dim=0 if surface_only else prepare_drivaerml.VOLUME_Y_DIM,
             pressure_output_index=0,
+            default_metric="surface_rel_l2_pct",
             notes=[
                 "DrivAerML defaults to the packaged public surface split for the paper sprint.",
                 "Surface-first mode is the default; the volume subset stays optional.",
+                "Paper-facing evaluation follows AB-UPT's average per-case relative-L2 contract on unnormalized targets.",
             ],
         ),
         target_stats=target_stats,

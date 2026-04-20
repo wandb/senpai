@@ -120,7 +120,7 @@ def _parse_case_metadata(case_id: str, freestream_velocity: np.ndarray) -> dict[
 def load_airfrans_case(
     root: str | Path,
     case_id: str,
-    include_nut: bool = False,
+    include_nut: bool = True,
     surface_sdf_tol: float = 1e-7,
     surface_u_tol: float = 1e-9,
 ) -> AirfRANSCase:
@@ -199,7 +199,7 @@ class AirfRANSDataset(Dataset):
         self,
         root: str | Path,
         case_ids: list[str],
-        include_nut: bool = False,
+        include_nut: bool = True,
         cache_size: int = 0,
     ):
         self.root = Path(root)
@@ -277,7 +277,7 @@ def load_data(
     task: str = DEFAULT_TASK,
     root: str | Path | None = None,
     debug: bool = False,
-    include_nut: bool = False,
+    include_nut: bool = True,
     cache_size: int = -1,
 ) -> tuple[Subset, dict[str, Subset], dict[str, torch.Tensor], torch.Tensor]:
     """Load one AirfRANS task into the train/val contract used by the repo."""

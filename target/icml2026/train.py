@@ -169,9 +169,9 @@ def build_optimizer(model: torch.nn.Module, config: TrainConfig):
     return optimizer
 
 
-def build_loaders(config: TrainConfig, bundle: DatasetBundle) -> tuple[DataLoader, dict[str, DataLoader]]:
+def build_loaders(config: TrainConfig, bundle: DatasetBundle) -> tuple[DataLoader, dict[str, DataLoader], dict[str, DataLoader]]:
     if config.model == "reference_abupt":
-        collate = ABUPTCollate(
+        train_collate = ABUPTCollate(
             geometry_points=config.geometry_points,
             geometry_supernodes=config.geometry_supernodes,
             surface_anchor_points=config.surface_anchor_points,
@@ -179,8 +179,17 @@ def build_loaders(config: TrainConfig, bundle: DatasetBundle) -> tuple[DataLoade
             fixed_per_case=True,
             seed=0,
         )
+        eval_collate = ABUPTCollate(
+            geometry_points=config.geometry_points,
+            geometry_supernodes=config.geometry_supernodes,
+            surface_anchor_points=None,
+            volume_anchor_points=None,
+            fixed_per_case=True,
+            seed=0,
+        )
     else:
-        collate = collate_grouped
+        train_collate = collate_grouped
+        eval_collate = collate_grouped
 
     train_sampler = None
     shuffle = True
@@ -198,25 +207,82 @@ def build_loaders(config: TrainConfig, bundle: DatasetBundle) -> tuple[DataLoade
         shuffle=shuffle if train_sampler is None else False,
         sampler=train_sampler,
         num_workers=config.num_workers,
-        collate_fn=collate,
+        collate_fn=train_collate,
     )
     val_loaders = {
         name: DataLoader(
             ds,
-            batch_size=config.batch_size,
+            batch_size=1 if config.model == "reference_abupt" else config.batch_size,
             shuffle=False,
             num_workers=config.num_workers,
-            collate_fn=collate,
+            collate_fn=eval_collate,
         )
         for name, ds in bundle.val_datasets.items()
     }
-    return train_loader, val_loaders
+    test_loaders = {
+        name: DataLoader(
+            ds,
+            batch_size=1 if config.model == "reference_abupt" else config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+            collate_fn=eval_collate,
+        )
+        for name, ds in bundle.test_datasets.items()
+    }
+    return train_loader, val_loaders, test_loaders
+
+
+def add_primary_metric_aliases(
+    bundle: DatasetBundle,
+    metrics: dict[str, float],
+    *,
+    phase: str,
+) -> dict[str, float]:
+    default_metric = bundle.spec.default_metric
+    if bundle.spec.name == "tandemfoilset":
+        eq4_key = f"{phase}_eq4/surface_pressure_mae"
+        if eq4_key in metrics:
+            metrics[f"{phase}_primary/surface_pressure_mae"] = metrics[eq4_key]
+        return metrics
+
+    suffix = f"/{default_metric}"
+    matching = [value for key, value in metrics.items() if key.endswith(suffix)]
+    if len(matching) == 1:
+        metrics[f"{phase}_primary/{default_metric}"] = matching[0]
+    return metrics
 
 
 def _masked_mae(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     diff = (pred - target).abs() * mask.unsqueeze(-1)
     denom = mask.sum().clamp(min=1).float() * pred.shape[-1]
     return diff.sum() / denom
+
+
+def _case_masked_mean(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+) -> float:
+    valid = mask.bool()
+    if not valid.any():
+        return float("nan")
+    return float(values[valid].mean().detach().cpu().item())
+
+
+def _case_masked_rel_l2(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> float:
+    valid = mask.bool()
+    if not valid.any():
+        return float("nan")
+    pred_valid = pred[valid]
+    target_valid = target[valid]
+    denom = target_valid.square().sum()
+    if float(denom.detach().cpu().item()) <= 0.0:
+        return float("nan")
+    rel = torch.sqrt((pred_valid - target_valid).square().sum() / denom)
+    return float(rel.detach().cpu().item())
 
 
 def loss_grouped(
@@ -272,30 +338,109 @@ def evaluate_grouped(
     device: torch.device,
 ) -> dict[str, float]:
     model.eval()
+    dataset_name: str | None = None
     total_surface = 0.0
     total_volume = 0.0
     count_surface = 0
     count_volume = 0
+    surf_pressure_abs_sum = 0.0
+    surf_pressure_count = 0
     for batch in loader:
         batch = batch.to(device)
+        dataset_name = batch.dataset_name
         outputs = model(
             surface_x=batch.surface_x,
             surface_mask=batch.surface_mask,
             volume_x=batch.volume_x,
             volume_mask=batch.volume_mask,
         )
+        if dataset_name == "airfrans":
+            if batch.surface_y is not None and outputs["surface_preds"] is not None:
+                target = transform.apply(batch.surface_y)
+                pred = outputs["surface_preds"]
+                case_values = (pred - target).square().mean(dim=-1)
+                for case_idx in range(case_values.shape[0]):
+                    value = _case_masked_mean(case_values[case_idx], batch.surface_mask[case_idx])
+                    if value == value:
+                        total_surface += value
+                        count_surface += 1
+            if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
+                target = transform.apply(batch.volume_y)
+                pred = outputs["volume_preds"]
+                case_values = (pred - target).square().mean(dim=-1)
+                for case_idx in range(case_values.shape[0]):
+                    value = _case_masked_mean(case_values[case_idx], batch.volume_mask[case_idx])
+                    if value == value:
+                        total_volume += value
+                        count_volume += 1
+            continue
+
+        pred_surface = None
+        pred_volume = None
         if batch.surface_y is not None and outputs["surface_preds"] is not None:
-            pred = transform.invert(outputs["surface_preds"])
-            total_surface += float(_masked_mae(pred, batch.surface_y, batch.surface_mask).cpu().item())
-            count_surface += 1
+            pred_surface = transform.invert(outputs["surface_preds"])
         if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
-            pred = transform.invert(outputs["volume_preds"])
-            total_volume += float(_masked_mae(pred, batch.volume_y, batch.volume_mask).cpu().item())
+            pred_volume = transform.invert(outputs["volume_preds"])
+
+        if dataset_name == "drivaerml":
+            if pred_surface is not None:
+                for case_idx in range(pred_surface.shape[0]):
+                    value = _case_masked_rel_l2(
+                        pred_surface[case_idx],
+                        batch.surface_y[case_idx],
+                        batch.surface_mask[case_idx],
+                    )
+                    if value == value:
+                        total_surface += value * 100.0
+                        count_surface += 1
+            if pred_volume is not None and batch.volume_mask is not None and batch.volume_y is not None:
+                for case_idx in range(pred_volume.shape[0]):
+                    value = _case_masked_rel_l2(
+                        pred_volume[case_idx],
+                        batch.volume_y[case_idx],
+                        batch.volume_mask[case_idx],
+                    )
+                    if value == value:
+                        total_volume += value * 100.0
+                        count_volume += 1
+            continue
+
+        if pred_surface is not None:
+            total_surface += float(_masked_mae(pred_surface, batch.surface_y, batch.surface_mask).cpu().item())
+            count_surface += 1
+            if transform.pressure_index is not None:
+                pressure_idx = transform.pressure_index
+                surf_pressure_abs_sum += float(
+                    (
+                        (pred_surface[..., pressure_idx] - batch.surface_y[..., pressure_idx]).abs()
+                        * batch.surface_mask
+                    ).sum().detach().cpu().item()
+                )
+                surf_pressure_count += int(batch.surface_mask.sum().detach().cpu().item())
+        if pred_volume is not None and batch.volume_mask is not None and batch.volume_y is not None:
+            total_volume += float(_masked_mae(pred_volume, batch.volume_y, batch.volume_mask).cpu().item())
             count_volume += 1
-    return {
+
+    if dataset_name == "airfrans":
+        return {
+            "surface_mse": total_surface / max(count_surface, 1),
+            "volume_mse": total_volume / max(count_volume, 1),
+        }
+    if dataset_name == "drivaerml":
+        metrics = {
+            "surface_rel_l2_pct": total_surface / max(count_surface, 1),
+        }
+        if count_volume > 0:
+            metrics["volume_rel_l2_pct"] = total_volume / max(count_volume, 1)
+        return metrics
+
+    metrics = {
         "surface_mae": total_surface / max(count_surface, 1),
         "volume_mae": total_volume / max(count_volume, 1),
     }
+    if surf_pressure_count > 0:
+        metrics["surface_pressure_mae"] = surf_pressure_abs_sum / surf_pressure_count
+    return metrics
 
 
 @torch.no_grad()
@@ -306,12 +451,14 @@ def evaluate_abupt(
     device: torch.device,
 ) -> dict[str, float]:
     model.eval()
+    dataset_name: str | None = None
     total_surface = 0.0
     total_volume = 0.0
     count_surface = 0
     count_volume = 0
     for batch in loader:
         batch = batch.to(device)
+        dataset_name = batch.dataset_name
         outputs = model(
             geometry_position=batch.geometry_position,
             geometry_supernode_idx=batch.geometry_supernode_idx,
@@ -319,14 +466,60 @@ def evaluate_abupt(
             surface_anchor_position=batch.surface_anchor_position,
             volume_anchor_position=batch.volume_anchor_position,
         )
+        if dataset_name == "airfrans":
+            if batch.surface_anchor_target is not None and outputs["surface_preds"] is not None:
+                target = transform.apply(batch.surface_anchor_target)
+                case_values = (outputs["surface_preds"] - target).square().mean(dim=-1)
+                total_surface += float(case_values.mean().detach().cpu().item())
+                count_surface += 1
+            if batch.volume_anchor_target is not None and outputs["volume_preds"] is not None:
+                target = transform.apply(batch.volume_anchor_target)
+                case_values = (outputs["volume_preds"] - target).square().mean(dim=-1)
+                total_volume += float(case_values.mean().detach().cpu().item())
+                count_volume += 1
+            continue
+
         if batch.surface_anchor_target is not None and outputs["surface_preds"] is not None:
             pred = transform.invert(outputs["surface_preds"])
-            total_surface += float((pred - batch.surface_anchor_target).abs().mean().cpu().item())
-            count_surface += 1
+            if dataset_name == "drivaerml":
+                value = _case_masked_rel_l2(
+                    pred[0],
+                    batch.surface_anchor_target[0],
+                    torch.ones(pred.shape[1], dtype=torch.bool, device=pred.device),
+                )
+                if value == value:
+                    total_surface += value * 100.0
+                    count_surface += 1
+            else:
+                total_surface += float((pred - batch.surface_anchor_target).abs().mean().cpu().item())
+                count_surface += 1
         if batch.volume_anchor_target is not None and outputs["volume_preds"] is not None:
             pred = transform.invert(outputs["volume_preds"])
-            total_volume += float((pred - batch.volume_anchor_target).abs().mean().cpu().item())
-            count_volume += 1
+            if dataset_name == "drivaerml":
+                value = _case_masked_rel_l2(
+                    pred[0],
+                    batch.volume_anchor_target[0],
+                    torch.ones(pred.shape[1], dtype=torch.bool, device=pred.device),
+                )
+                if value == value:
+                    total_volume += value * 100.0
+                    count_volume += 1
+            else:
+                total_volume += float((pred - batch.volume_anchor_target).abs().mean().cpu().item())
+                count_volume += 1
+
+    if dataset_name == "airfrans":
+        return {
+            "surface_mse": total_surface / max(count_surface, 1),
+            "volume_mse": total_volume / max(count_volume, 1),
+        }
+    if dataset_name == "drivaerml":
+        metrics = {
+            "surface_rel_l2_pct": total_surface / max(count_surface, 1),
+        }
+        if count_volume > 0:
+            metrics["volume_rel_l2_pct"] = total_volume / max(count_volume, 1)
+        return metrics
     return {
         "surface_mae": total_surface / max(count_surface, 1),
         "volume_mae": total_volume / max(count_volume, 1),
@@ -376,7 +569,13 @@ def train_one_epoch(
     return running
 
 
-def write_run_summary(path: Path, config: TrainConfig, bundle: DatasetBundle, history: list[dict[str, float]]) -> None:
+def write_run_summary(
+    path: Path,
+    config: TrainConfig,
+    bundle: DatasetBundle,
+    history: list[dict[str, float]],
+    final_test_metrics: dict[str, float] | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "config": asdict(config),
@@ -388,9 +587,11 @@ def write_run_summary(path: Path, config: TrainConfig, bundle: DatasetBundle, hi
             "volume_input_dim": bundle.spec.volume_input_dim,
             "volume_output_dim": bundle.spec.volume_output_dim,
             "pressure_output_index": bundle.spec.pressure_output_index,
+            "default_metric": bundle.spec.default_metric,
             "notes": bundle.spec.notes,
         },
         "history": history,
+        "final_test_metrics": final_test_metrics or {},
     }
     path.write_text(json.dumps(payload, indent=2))
 
@@ -410,7 +611,7 @@ def main() -> None:
         asinh_pressure=config.asinh_pressure,
         asinh_scale=config.asinh_scale,
     )
-    train_loader, val_loaders = build_loaders(config, bundle)
+    train_loader, val_loaders, test_loaders = build_loaders(config, bundle)
     model = build_model(config, bundle).to(device)
     optimizer = build_optimizer(model, config)
     ema = EMA(model, decay=config.ema_decay, start_step=config.ema_start_step) if config.use_ema else None
@@ -451,6 +652,17 @@ def main() -> None:
             else:
                 split_metrics = evaluate_grouped(model, loader, transform, device)
             eval_metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
+        if bundle.spec.name == "tandemfoilset":
+            eq4_keys = [
+                "val_single_in_dist/surface_pressure_mae",
+                "val_geom_camber_rc/surface_pressure_mae",
+                "val_geom_camber_cruise/surface_pressure_mae",
+                "val_re_rand/surface_pressure_mae",
+            ]
+            eq4_values = [eval_metrics[k] for k in eq4_keys if k in eval_metrics]
+            if len(eq4_values) == 4:
+                eval_metrics["val_eq4/surface_pressure_mae"] = sum(eq4_values) / 4.0
+        eval_metrics = add_primary_metric_aliases(bundle, eval_metrics, phase="val")
         if ema is not None:
             ema.restore(model)
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
@@ -460,7 +672,42 @@ def main() -> None:
         print(json.dumps(epoch_metrics, sort_keys=True))
 
     output_dir = Path(config.output_dir)
-    write_run_summary(output_dir / f"{config.dataset}_{config.model}_summary.json", config, bundle, history)
+    final_test_metrics: dict[str, float] = {}
+    if test_loaders:
+        eval_model = model
+        if ema is not None:
+            ema.store(model)
+            ema.copy_to(model)
+        for split_name, loader in test_loaders.items():
+            if config.model == "reference_abupt":
+                split_metrics = evaluate_abupt(model, loader, transform, device)
+            else:
+                split_metrics = evaluate_grouped(model, loader, transform, device)
+            final_test_metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
+        if bundle.spec.name == "tandemfoilset":
+            eq4_keys = [
+                "test_single_in_dist/surface_pressure_mae",
+                "test_geom_camber_rc/surface_pressure_mae",
+                "test_geom_camber_cruise/surface_pressure_mae",
+                "test_re_rand/surface_pressure_mae",
+            ]
+            eq4_values = [final_test_metrics[k] for k in eq4_keys if k in final_test_metrics]
+            if len(eq4_values) == 4:
+                final_test_metrics["test_eq4/surface_pressure_mae"] = sum(eq4_values) / 4.0
+        final_test_metrics = add_primary_metric_aliases(bundle, final_test_metrics, phase="test")
+        if ema is not None:
+            ema.restore(model)
+        if run is not None:
+            wandb.log(final_test_metrics, step=int(history[-1]["epoch"]) if history else 0)
+        print(json.dumps({"final_test_metrics": final_test_metrics}, sort_keys=True))
+
+    write_run_summary(
+        output_dir / f"{config.dataset}_{config.model}_summary.json",
+        config,
+        bundle,
+        history,
+        final_test_metrics=final_test_metrics,
+    )
     if config.save_checkpoint:
         output_dir.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), output_dir / f"{config.dataset}_{config.model}.pt")

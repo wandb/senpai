@@ -48,6 +48,31 @@ most decision-relevant metric for the selected benchmark:
 Lower is better. Prefer improvements that are robust, physically meaningful, and
 simple enough to keep maintaining under deadline pressure.
 
+## Metric Alignment Plan
+
+The code and dataset docs in this target are pinned to the literature-facing
+contracts we intend to cite in the ICML paper sprint.
+
+Alignment policy:
+
+- use the benchmark split contract actually implemented by the source paper or
+  official dataset code when one exists
+- use the benchmark metric calculation exactly, including whether evaluation is
+  done on normalized or unnormalized targets and whether aggregation is
+  per-case or global over the split
+- keep hyperparameter-tuning metrics on validation splits, but reserve
+  literature-facing comparison numbers for the matching test split
+- document any remaining irreducible discrepancy, such as the packaged
+  DrivAerML case set being smaller than the nominal public split in AB-UPT
+
+Primary harness metric aliases:
+
+- `tandemfoil`: `val_primary/surface_pressure_mae` and
+  `test_primary/surface_pressure_mae`
+- `airfrans`: `val_primary/surface_mse` and `test_primary/surface_mse`
+- `drivaerml`: `val_primary/surface_rel_l2_pct` and
+  `test_primary/surface_rel_l2_pct`
+
 ## Dataset subprograms
 
 Read the dataset-specific subprogram before making dataset-specific claims:

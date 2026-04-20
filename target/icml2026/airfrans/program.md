@@ -23,7 +23,7 @@ Use the **official AirfRANS benchmark metric family**. For literature comparison
   - `Vol MSE`
 
 - **Exact calculation**
-  - For each test case, split the mesh into:
+  - For each evaluation case, split the mesh into:
     - `Surf`: airfoil boundary nodes
     - `Vol`: non-surface internal mesh nodes
   - Compute unreduced mean squared error separately on those two sets:
@@ -34,6 +34,7 @@ Use the **official AirfRANS benchmark metric family**. For literature comparison
     - `loss_vol = loss_vol_var.mean()`
   - Finally average those case-level scalars over the evaluation split.
   - In the original AirfRANS training / scoring code, these MSEs are computed on the **normalized target tensors** produced by the official `Dataset(...)` loader using the training-set normalization coefficients, not on denormalized physical-unit fields.
+  - In the shared trainer, validation metrics are logged on `*_val` splits for model selection, while paper-facing comparison numbers come from the matching `*_test` split. The harness aliases these as `val_primary/surface_mse` and `test_primary/surface_mse`.
 
 - **Official target-field contract**
   - Apples-to-apples AirfRANS leaderboard comparisons use the four official targets:
@@ -42,10 +43,13 @@ Use the **official AirfRANS benchmark metric family**. For literature comparison
     - `p`
     - `nut`
 
-- **Important local caveat**
-  - The current repo-local sprint loader defaults to three targets: `u_x`, `u_y`, `p`.
-  - That is acceptable for smoke tests and early transfer debugging.
-  - It is **not** fully apples-to-apples with the published AirfRANS / Transolver / SpiderSolver numbers until the fourth target `nut` is enabled and the official 4-field scorer is used.
+- **Current repo sprint contract**
+  - The shared trainer now uses the four-field official target contract by default:
+    - `u_x`
+    - `u_y`
+    - `p`
+    - `nut`
+  - Paper-facing AirfRANS numbers from this target must therefore come from the four-field MSE scorer, not from any earlier three-field smoke-test path.
 
 - **Comparison contract**
   - When comparing against literature, report:
@@ -53,6 +57,7 @@ Use the **official AirfRANS benchmark metric family**. For literature comparison
     - `Surf MSE`
     - `Vol MSE`
   - Do not relabel these as MAE or relative L2.
+  - If a run is selected on validation, the final paper number must still be recomputed on the official task test split before citing it.
 
 ## Sources
 

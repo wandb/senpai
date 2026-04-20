@@ -21,14 +21,11 @@ Use the **DrivAerML relative-L2 contract** used by AB-UPT and continued in later
   - `surface pressure relative L2 (%)` on the packaged public validation / test split
 
 - **Exact calculation**
-  - Over all valid evaluated entries in the split, compute:
-  - `rel_l2 = 100 * sqrt( sum((y_hat - y)^2) / sum(y^2) )`
-  - The sums are taken **globally over all valid entries in the split**, not as per-case relative errors averaged afterward.
-  - This is the same accumulator style used by the common `milieu_cfd` / Noether DrivAerML evaluator:
-    - accumulate `sum_sq_error`
-    - accumulate `sum_sq_target`
-    - report `sqrt(sum_sq_error / sum_sq_target)`
-  - In that evaluator, the comparison tensors follow the packaged `normalizers.json` contract used by the dataset pipeline; the paper tables then report the resulting relative-L2 value in percent.
+  - For one case with target point cloud `Y` and prediction `Ŷ`, compute:
+  - `rel_l2_case = 100 * ||Ŷ - Y||_2 / ||Y||_2`
+  - AB-UPT defines the dataset score as the arithmetic mean of those per-case relative-L2 values over the evaluation split.
+  - Evaluation is done on **unnormalized** targets and predictions.
+  - The shared trainer now follows that same contract for paper-facing DrivAerML metrics and logs the validation scalar as `val_primary/surface_rel_l2_pct`, with the matching test scalar logged as `test_primary/surface_rel_l2_pct`.
 
 - **Field names for literature comparison**
   - Surface:
@@ -44,6 +41,7 @@ Use the **DrivAerML relative-L2 contract** used by AB-UPT and continued in later
   - For this repo, the paper-facing primary metric is therefore:
     - relative L2 on the packaged `surface_cp` target over the packaged public surface split
   - Volume metrics are secondary and should only be reported when a PR explicitly targets the small processed volume subset.
+  - For grouped-domain models in this target, evaluation is full-field over all available surface points in each case.
 
 - **Split contract**
   - Default split for this repo target:
@@ -52,10 +50,9 @@ Use the **DrivAerML relative-L2 contract** used by AB-UPT and continued in later
   - It is slightly smaller than the nominal public split discussed in AB-UPT because `10` processed public cases are absent from the packaged PVC.
 
 - **Important comparison note**
-  - The shared local trainer currently logs generic MAE-style diagnostics by default.
-  - Those are useful for optimization and debugging.
-  - They are **not** the paper-facing benchmark metric for DrivAerML.
-  - For literature comparison, use **relative L2 in percent**.
+  - The packaged PVC split is not identical to the nominal AB-UPT public split because `10` processed public cases are missing.
+  - That split discrepancy must be disclosed whenever we compare against AB-UPT, PhysicsNeMo, or Transolver-3 tables.
+  - The local `reference_abupt` model path now uses full surface anchors at evaluation time, but it still keeps a tractable sampled-geometry branch during training and evaluation. Treat it as an architecture comparison, not a byte-for-byte reproduction of the published AB-UPT training stack.
 
 ## Sources
 

@@ -40,6 +40,7 @@ Use the following metric definitions exactly:
     - `val_re_rand`
   - The `kagent` split document defines the balanced validation tracks and says they are summarized by equal-weight average surface MAE.
   - For this paper sprint, we pin that surface metric to the **pressure channel** because the historical `senpai` frontier and abstract use split-specific surface-pressure MAE as the paper-facing scalar.
+  - In the shared trainer this scalar is logged as `val_eq4/surface_pressure_mae`, and mirrored as `val_primary/surface_pressure_mae` for harness ranking.
 
 - **Per-split scalar**
   - For any validation split `S`, compute:
@@ -58,6 +59,10 @@ Use the following metric definitions exactly:
   - Do **not** compare raw values between the legacy `p_*` contract and the new `kagent` v2 contract without restating the split definition.
 
 Lower is better. For the paper sprint, the decision-driving quantity is **surface pressure MAE on the explicit validation tracks**, with the equal-weight 4-way average used as the benchmark summary.
+
+For held-out reporting after model selection, the trainer also computes the
+analogous `test_eq4/surface_pressure_mae` summary when the four matching test
+tracks are available in the split manifest.
 
 ## Sources
 

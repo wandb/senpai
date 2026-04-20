@@ -120,7 +120,6 @@ def render_advisor(template: str, tag: str, student_list: list[str], args: Args)
     )
     deployment = render_template(template, {
         "RESEARCH_TAG": tag,
-        "IMAGE": args.image,
         "PVC_CLAIM_NAME": args.pvc_claim_name,
         "PVC_MOUNT_PATH": args.pvc_mount_path,
     })

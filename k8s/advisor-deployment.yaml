@@ -29,7 +29,7 @@ spec:
       serviceAccountName: senpai-orchestrator
       containers:
       - name: advisor
-        image: {{IMAGE}}
+        image: ghcr.io/wandb/senpai:latest
         command: ["/bin/bash", "-c"]
         args:
         - |
