@@ -105,6 +105,21 @@ def test_tools_installed(test_pod):
         assert out, f"`{cmd}` returned empty output"
 
 
+def test_python_deps_and_icml_target_import(test_pod):
+    """The image has the Python deps needed by the new ICML target."""
+    cmd = (
+        "python - <<'PY'\n"
+        "import numpy\n"
+        "import torch\n"
+        "import torch_geometric\n"
+        "import yaml\n"
+        "print('ok')\n"
+        "PY"
+    )
+    out = kubectl_check("exec", test_pod, "--", "bash", "-c", cmd, timeout=20)
+    assert "ok" in out
+
+
 def test_weave_plugin_ready(test_pod):
     """Plugin status shows 'Ready to trace'."""
     out = kubectl_check("exec", test_pod, "--", "bash", "-c", "weave-claude-plugin status", timeout=15)

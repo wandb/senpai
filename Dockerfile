@@ -13,6 +13,12 @@ RUN curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release
 # Install uv
 RUN pip install uv
 
+# Install project Python dependencies into the image from the lockfile.
+COPY pyproject.toml uv.lock /tmp/senpai/
+RUN cd /tmp/senpai && \
+    uv export --frozen --no-dev --no-emit-project --format requirements.txt > requirements.txt && \
+    uv pip install --system -r requirements.txt
+
 # Install Claude Code + gh
 RUN curl -fsSL https://claude.ai/install.sh | bash || true && \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg 2>/dev/null && \
