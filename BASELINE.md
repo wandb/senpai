@@ -78,9 +78,17 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.2357 (val) / 0.2002 (test)
-- **Best PR:** #2482 (emma — 3L/192d + no-EMA + no-Fourier + T_max=50, 24 epochs, AdamW lr=5e-4)
-- **Key insight:** T_max=50 > T_max=150 at longer training (24 epochs). No-Fourier 3L/192d with T_max=50 beats Fourier+4L/256d with T_max=150 at 8 epochs. More cosine restarts within budget. Fourier+physics does NOT transfer to AirfRANS (asinh normalization space issue — physical-space is worse). Critical: epochs=2 is the default — must pass `--epochs 999`.
+- **Current best:** 0.2015 (val) / 0.1890 (test)
+- **Best PR:** #2538 (kohaku — Fourier+4L/256d + no-EMA + T_max=50, 14 epochs, AdamW lr=5e-4)
+- **Key insight:** Compound architecture+schedule confirmed — Fourier+4L/256d (PR #2478) and T_max=50 (PR #2482) gains are super-additive when combined. Pressure dominates composite MSE (~99.9%); Ux/Uy/nut are near-noise. Still converging at epoch 14 — further improvement expected with longer budget.
+
+### 2026-04-21 — PR #2538: AirfRANS: Fourier+4L/256d+T_max=50 (compound) — NEW BEST
+
+- **val_primary/surface_mse:** 0.2015 (-14.5% vs 0.2357)
+- **test_primary/surface_mse:** 0.1890 (-5.6% vs 0.2002)
+- **W&B run:** ty0cmdfz (winner, T_max=50, 14 epochs); 85pabaza (T_max=30, val=0.2195 — also beats baseline but dominated)
+- **Epochs:** 14 (still converging at cutoff — downward envelope clear across cosine cycles)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans_task full --optimizer adamw --lr 5e-4 --cosine_t_max 50 --no-use-ema --enable-fourier --model-layers 4 --model-hidden-dim 256 --model-heads 4 --epochs 999`
 
 ### 2026-04-21 01:00 — PR #2482: AirfRANS: no-EMA + T_max=50 + lr=5e-4 (24 epochs) — NEW BEST
 
