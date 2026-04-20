@@ -43,6 +43,12 @@ AIRFRANS_FIELD_NAMES = ("Ux", "Uy", "p", "nut")
 class TrainConfig:
     dataset: str = "tandemfoil"
     model: str = "senpai_transolver"
+    model_layers: int = 3
+    model_hidden_dim: int = 192
+    model_heads: int = 3
+    model_mlp_ratio: int = 4
+    model_slices: int = 96
+    model_dropout: float = 0.0
     agent: str = ""
     wandb_name: str = ""
     wandb_group: str = ""
@@ -387,6 +393,14 @@ def cp_panel_prior_index(config: TrainConfig, bundle: DatasetBundle) -> int | No
 
 
 def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
+    transolver_kwargs = {
+        "n_layers": config.model_layers,
+        "n_hidden": config.model_hidden_dim,
+        "dropout": config.model_dropout,
+        "n_head": config.model_heads,
+        "mlp_ratio": config.model_mlp_ratio,
+        "slice_num": config.model_slices,
+    }
     if config.model == "reference_transolver":
         return ReferenceTransolver(
             space_dim=bundle.spec.space_dim,
@@ -394,6 +408,7 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
             surface_output_dim=bundle.spec.surface_output_dim,
             volume_input_dim=bundle.spec.volume_input_dim,
             volume_output_dim=bundle.spec.volume_output_dim,
+            **transolver_kwargs,
         )
     if config.model == "senpai_transolver":
         prior_idx = cp_panel_prior_index(config, bundle)
@@ -409,6 +424,7 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
             surface_refine_layers=config.surface_refine_layers,
             surface_pressure_prior_idx=prior_idx,
             volume_pressure_prior_idx=prior_idx,
+            **transolver_kwargs,
         )
     if config.model == "reference_abupt":
         return ABUPTReference(
