@@ -58,9 +58,17 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.2387 (val) / 0.2079 (test)
-- **Best PR:** #2478 (senku — Fourier + 4L/256d + no-EMA, 8 epochs, AdamW lr=5e-4, T_max=150)
-- **Key insight:** Fourier + 4L/256d + more epochs (8 vs 6) = 17.4% improvement. Critical bug: epochs=2 is the default — must pass `--epochs 999` explicitly. T_max=20 creates LR instability at epoch boundaries; T_max=150 is correct.
+- **Current best:** 0.2357 (val) / 0.2002 (test)
+- **Best PR:** #2482 (emma — 3L/192d + no-EMA + no-Fourier + T_max=50, 24 epochs, AdamW lr=5e-4)
+- **Key insight:** T_max=50 > T_max=150 at longer training (24 epochs). No-Fourier 3L/192d with T_max=50 beats Fourier+4L/256d with T_max=150 at 8 epochs. More cosine restarts within budget. Fourier+physics does NOT transfer to AirfRANS (asinh normalization space issue — physical-space is worse). Critical: epochs=2 is the default — must pass `--epochs 999`.
+
+### 2026-04-21 01:00 — PR #2482: AirfRANS: no-EMA + T_max=50 + lr=5e-4 (24 epochs) — NEW BEST
+
+- **val_primary/surface_mse:** 0.2357 (-1.3% vs 0.2387)
+- **test_primary/surface_mse:** 0.2002 (-3.7% vs 0.2079)
+- **W&B run:** xmrkwt1y (winner, T_max=50); d057fle1 (lr=8e-4, T_max=150 — unstable final)
+- **Epochs:** 24 (180-min budget, no-Fourier so faster epochs)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans_task full --optimizer adamw --lr 5e-4 --cosine_t_max 50 --no-use-ema --epochs 999`
 
 ### 2026-04-21 00:00 — PR #2478: AirfRANS: Fourier + 4L/256d full epoch run — NEW BEST
 
