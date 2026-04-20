@@ -135,23 +135,38 @@ class TargetTransform:
         stats_std: torch.Tensor | None,
         asinh_pressure: bool = False,
         asinh_scale: float = 1.0,
+        residual_prediction: bool = False,
     ):
         self.pressure_index = pressure_index
         self.stats_mean = stats_mean
         self.stats_std = stats_std
         self.asinh_pressure = asinh_pressure
         self.asinh_scale = asinh_scale
+        self.residual_prediction = residual_prediction
 
-    def apply(self, y: torch.Tensor) -> torch.Tensor:
+    def compute_freestream_ref(self, freestream_velocity: torch.Tensor, n_output_channels: int) -> torch.Tensor:
+        ref = torch.zeros(*freestream_velocity.shape[:-1], n_output_channels, device=freestream_velocity.device, dtype=freestream_velocity.dtype)
+        ref[..., 0:2] = freestream_velocity
+        if self.asinh_pressure and self.pressure_index is not None:
+            ref[..., self.pressure_index] = torch.asinh(ref[..., self.pressure_index] * self.asinh_scale)
+        if self.stats_mean is not None and self.stats_std is not None and self.stats_mean.numel() == ref.shape[-1]:
+            ref = (ref - self.stats_mean.to(ref.device)) / self.stats_std.to(ref.device).clamp(min=1e-6)
+        return ref
+
+    def apply(self, y: torch.Tensor, freestream_ref: torch.Tensor | None = None) -> torch.Tensor:
         out = y.clone()
         if self.asinh_pressure and self.pressure_index is not None:
             out[..., self.pressure_index] = torch.asinh(out[..., self.pressure_index] * self.asinh_scale)
         if self.stats_mean is not None and self.stats_std is not None and self.stats_mean.numel() == out.shape[-1]:
             out = (out - self.stats_mean.to(out.device)) / self.stats_std.to(out.device).clamp(min=1e-6)
+        if self.residual_prediction and freestream_ref is not None:
+            out = out - freestream_ref
         return out
 
-    def invert(self, y: torch.Tensor) -> torch.Tensor:
+    def invert(self, y: torch.Tensor, freestream_ref: torch.Tensor | None = None) -> torch.Tensor:
         out = y.clone()
+        if self.residual_prediction and freestream_ref is not None:
+            out = out + freestream_ref
         if self.stats_mean is not None and self.stats_std is not None and self.stats_mean.numel() == out.shape[-1]:
             out = out * self.stats_std.to(out.device) + self.stats_mean.to(out.device)
         if self.asinh_pressure and self.pressure_index is not None:
@@ -597,6 +612,14 @@ def _named_channel_metrics(prefix: str, values: torch.Tensor, names: tuple[str, 
     return metrics
 
 
+def _airfrans_freestream_ref(batch: GroupedBatch, transform: TargetTransform) -> torch.Tensor | None:
+    if not transform.residual_prediction or batch.dataset_name != "airfrans":
+        return None
+    n_out = batch.surface_y.shape[-1] if batch.surface_y is not None else 4
+    freestream_vel = batch.surface_x[:, 0:1, 2:4]
+    return transform.compute_freestream_ref(freestream_vel, n_out)
+
+
 def loss_grouped(
     batch: GroupedBatch,
     outputs: dict[str, torch.Tensor | None],
@@ -604,13 +627,14 @@ def loss_grouped(
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.surface_x.device)
     metrics: dict[str, float] = {}
+    freestream_ref = _airfrans_freestream_ref(batch, transform)
     if batch.surface_y is not None and outputs["surface_preds"] is not None:
-        target = transform.apply(batch.surface_y)
+        target = transform.apply(batch.surface_y, freestream_ref=freestream_ref)
         surf_loss = F.mse_loss(outputs["surface_preds"][batch.surface_mask], target[batch.surface_mask])
         total = total + surf_loss
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
-        target = transform.apply(batch.volume_y)
+        target = transform.apply(batch.volume_y, freestream_ref=freestream_ref)
         vol_loss = F.mse_loss(outputs["volume_preds"][batch.volume_mask], target[batch.volume_mask])
         total = total + vol_loss
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
@@ -752,9 +776,10 @@ def evaluate_grouped(
             volume_x=batch.volume_x,
             volume_mask=batch.volume_mask,
         )
+        freestream_ref = _airfrans_freestream_ref(batch, transform) if isinstance(transform, TargetTransform) else None
         if dataset_name == "airfrans":
             if batch.surface_y is not None and outputs["surface_preds"] is not None:
-                target = transform.apply(batch.surface_y)
+                target = transform.apply(batch.surface_y, freestream_ref=freestream_ref)
                 case_values = (outputs["surface_preds"] - target).square()
                 for case_idx in range(case_values.shape[0]):
                     channel_mean = _case_masked_channel_means(case_values[case_idx], batch.surface_mask[case_idx])
@@ -765,7 +790,7 @@ def evaluate_grouped(
                             surf_channel_sum = torch.zeros(channel_mean.shape[0], device=device)
                         surf_channel_sum += channel_mean.to(device)
             if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
-                target = transform.apply(batch.volume_y)
+                target = transform.apply(batch.volume_y, freestream_ref=freestream_ref)
                 case_values = (outputs["volume_preds"] - target).square()
                 for case_idx in range(case_values.shape[0]):
                     channel_mean = _case_masked_channel_means(case_values[case_idx], batch.volume_mask[case_idx])
@@ -1135,6 +1160,7 @@ def main() -> None:
             stats_std=bundle.target_stats.y_std,
             asinh_pressure=config.asinh_pressure,
             asinh_scale=config.asinh_scale,
+            residual_prediction=config.residual_prediction,
         )
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle)
