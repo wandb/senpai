@@ -204,7 +204,7 @@ Use the researcher-agent to explore new ideas and research directions and other 
 ## Prioritization
 
 Not all ideas are equal. Prioritize:
-1. Ideas that target the **primary physically meaningful validation metric**, usually boundary or surface error and pressure fidelity.
+1. Ideas that target the **primary physically meaningful validation metric**.
 2. Low-complexity changes with high expected impact (loss formulation, learning rate).
 3. Architectural changes only after the simpler levers have been pulled.
 4. Avoid assigning the same idea to multiple students. Check what's already in-flight.
