@@ -25,6 +25,7 @@ Problem-specific benchmark details for the current target live in `data/README.m
 ## Metrics
 
 **The goal: lowest physically meaningful validation error on the most decision-relevant regions and regimes.** We track:
+- **Primary validation metric** — `<define this for the active dataset or benchmark; this is the main metric used to rank results and make merge decisions>`
 - **Boundary or surface error** — when applicable, this is usually the most important metric because it is closest to engineering use.
 - **Volume or field error** — mean absolute error over the full predicted flow field.
 - **Validation loss** — the combined objective optimized during training.
