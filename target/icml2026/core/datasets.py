@@ -144,10 +144,16 @@ class DrivAerMLCaseDataset(Dataset):
         root: str | Path | None = None,
         enable_fourier: bool = False,
         surface_only: bool = True,
+        max_surface_points: int = 0,
+        max_volume_points: int = 0,
+        subsample_seed: int = 0,
     ):
         self.store = prepare_drivaerml.DrivAerMLCaseStore(manifest_path=manifest_path, root=root)
         self.case_ids = list(case_ids)
         self.surface_only = surface_only
+        self.max_surface_points = max_surface_points
+        self.max_volume_points = max_volume_points
+        self.subsample_seed = subsample_seed
         self.augment = dict(
             enable_fourier=enable_fourier,
             enable_cp_panel=False,
@@ -158,17 +164,41 @@ class DrivAerMLCaseDataset(Dataset):
     def __len__(self) -> int:
         return len(self.case_ids)
 
+    def _choice(self, total: int, count: int, key: str) -> torch.Tensor | None:
+        if count <= 0 or count >= total:
+            return None
+        generator = torch.Generator().manual_seed(self.subsample_seed + stable_hash32(key))
+        return torch.randperm(total, generator=generator)[:count].sort().values
+
     def __getitem__(self, idx: int) -> CaseSample:
         case = self.store.load_case(self.case_ids[idx])
+        metadata = dict(case.metadata)
+
+        surface_idx = self._choice(case.surface_x.shape[0], self.max_surface_points, f"{case.case_id}:surface")
+        surface_x = case.surface_x if surface_idx is None else case.surface_x.index_select(0, surface_idx)
+        surface_y = case.surface_y if surface_idx is None else case.surface_y.index_select(0, surface_idx)
+        metadata["n_surface_full"] = int(case.surface_x.shape[0])
+        metadata["n_surface_loaded"] = int(surface_x.shape[0])
+
+        volume_x = None if self.surface_only else case.volume_x
+        volume_y = None if self.surface_only else case.volume_y
+        if volume_x is not None and volume_y is not None:
+            volume_idx = self._choice(volume_x.shape[0], self.max_volume_points, f"{case.case_id}:volume")
+            if volume_idx is not None:
+                volume_x = volume_x.index_select(0, volume_idx)
+                volume_y = volume_y.index_select(0, volume_idx)
+            metadata["n_volume_full"] = int(case.volume_x.shape[0])  # type: ignore[union-attr]
+            metadata["n_volume_loaded"] = int(volume_x.shape[0])
+
         sample = CaseSample(
             case_id=case.case_id,
             dataset_name="drivaerml",
             space_dim=3,
-            surface_x=case.surface_x,
-            surface_y=case.surface_y,
-            volume_x=None if self.surface_only else case.volume_x,
-            volume_y=None if self.surface_only else case.volume_y,
-            metadata=dict(case.metadata),
+            surface_x=surface_x,
+            surface_y=surface_y,
+            volume_x=volume_x,
+            volume_y=volume_y,
+            metadata=metadata,
         )
         return augment_case_sample(sample, **self.augment)
 
@@ -475,6 +505,10 @@ def build_drivaerml_bundle(
     root: str | Path | None = None,
     surface_only: bool = True,
     enable_fourier: bool = False,
+    train_surface_points: int = 0,
+    eval_surface_points: int = 0,
+    train_volume_points: int = 0,
+    eval_volume_points: int = 0,
 ) -> DatasetBundle:
     manifest = _read_json(manifest_path)
     train_dataset = DrivAerMLCaseDataset(
@@ -483,6 +517,9 @@ def build_drivaerml_bundle(
         root=root,
         enable_fourier=enable_fourier,
         surface_only=surface_only,
+        max_surface_points=train_surface_points,
+        max_volume_points=train_volume_points,
+        subsample_seed=0,
     )
     val_dataset = DrivAerMLCaseDataset(
         list(manifest["surface_splits"]["val"]),
@@ -490,6 +527,9 @@ def build_drivaerml_bundle(
         root=root,
         enable_fourier=enable_fourier,
         surface_only=surface_only,
+        max_surface_points=eval_surface_points,
+        max_volume_points=eval_volume_points,
+        subsample_seed=1,
     )
     test_dataset = DrivAerMLCaseDataset(
         list(manifest["surface_splits"]["test"]),
@@ -497,6 +537,9 @@ def build_drivaerml_bundle(
         root=root,
         enable_fourier=enable_fourier,
         surface_only=surface_only,
+        max_surface_points=eval_surface_points,
+        max_volume_points=eval_volume_points,
+        subsample_seed=2,
     )
     stats = prepare_drivaerml.surface_stats_from_normalizers(train_dataset.store)
     target_stats = TargetTransformStats(
@@ -544,6 +587,10 @@ def build_dataset_bundle(
     drivaerml_manifest: str | Path = DEFAULT_DRIVAERML_MANIFEST,
     drivaerml_root: str | Path | None = None,
     drivaerml_surface_only: bool = True,
+    drivaerml_train_surface_points: int = 0,
+    drivaerml_eval_surface_points: int = 0,
+    drivaerml_train_volume_points: int = 0,
+    drivaerml_eval_volume_points: int = 0,
     enable_fourier: bool = False,
     enable_te_coord_frame: bool = False,
     enable_cp_panel: bool = False,
@@ -578,5 +625,9 @@ def build_dataset_bundle(
             root=drivaerml_root,
             surface_only=drivaerml_surface_only,
             enable_fourier=enable_fourier,
+            train_surface_points=drivaerml_train_surface_points,
+            eval_surface_points=drivaerml_eval_surface_points,
+            train_volume_points=drivaerml_train_volume_points,
+            eval_volume_points=drivaerml_eval_volume_points,
         )
     raise ValueError(f"Unknown dataset: {dataset_name}")

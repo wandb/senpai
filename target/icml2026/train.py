@@ -49,6 +49,10 @@ class TrainConfig:
     model_mlp_ratio: int = 4
     model_slices: int = 96
     model_dropout: float = 0.0
+    drivaerml_train_surface_points: int = 0
+    drivaerml_eval_surface_points: int = 0
+    drivaerml_train_volume_points: int = 0
+    drivaerml_eval_volume_points: int = 0
     agent: str = ""
     wandb_name: str = ""
     wandb_group: str = ""
@@ -366,6 +370,10 @@ def build_bundle(config: TrainConfig) -> DatasetBundle:
         "debug": config.debug,
         "airfrans_task": config.airfrans_task,
         "drivaerml_surface_only": config.surface_only_drivaerml,
+        "drivaerml_train_surface_points": config.drivaerml_train_surface_points,
+        "drivaerml_eval_surface_points": config.drivaerml_eval_surface_points,
+        "drivaerml_train_volume_points": config.drivaerml_train_volume_points,
+        "drivaerml_eval_volume_points": config.drivaerml_eval_volume_points,
         "enable_fourier": config.enable_fourier,
         "enable_te_coord_frame": config.enable_te_coord_frame,
         "enable_cp_panel": config.enable_cp_panel,
