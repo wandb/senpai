@@ -104,7 +104,7 @@ swap_gh_pr_label <pr#> "status:review" "status:wip"
    You can commit this file to the advisor branch.
 
    **Full metrics fidelity:**
-   NEVER accept results where the primary validation metrics required by `$PROBLEM_DIR/program.md` are NaN or missing. In CFD surrogate work, boundary or surface error, pressure fidelity, and any problem-critical OOD metrics usually matter most when they exist.
+   NEVER accept results where the primary validation metrics required by `$PROBLEM_DIR/program.md` are NaN or missing. In CFD surrogate work, boundary or surface error, pressure fidelity, and any problem-critical OOD metrics are usually the metrics to pay attention to.
 
 3. **Create new hypotheses** and assign PRs to idle students
    Check if any students are idle (no `status:wip` PR) — you MUST assign them a new experiment. This is not optional. Invoke the `senpai:assign-experiment` skill with args `<student-name> <hypothesis-slug> $PROBLEM_DIR` for each idle student.
