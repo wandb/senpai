@@ -20,10 +20,10 @@
 - tanjiro #2441: **Physics + AdamW LR sweep** (3e-4, 5e-4, 8e-4, slices=64) — KEY EXPERIMENT
 - edward #2443: Physics + AdamW + slices sweep (48, 64, 96)
 - thorfinn #2445: Physics + AdamW + cosine T_max sweep (10, 20, 30, 50)
-- askeladd: Wake feature ablation (pending PR creation)
+- askeladd #2446: Wake feature ablation (core vs +wake_deficit vs +wake_angle vs full stack)
 - shinji #2444: **ANP cross-foil decoder** (with/without physics + AdamW) — HIGH PRIORITY
-- rei: Weight decay + EMA ablation (pending PR creation)
-- kaneda: Full physics stack + AdamW LR sweep (pending PR creation)
+- rei #2447: Weight decay (1e-5, 1e-4, 1e-3) + EMA ablation
+- kaneda #2449: Full physics stack + AdamW LR sweep (3e-4, 5e-4, 8e-4) vs core subset control
 
 ### WIP — AirfRANS Round 2
 - kohaku #2428: AdamW LR bracket (3e-4, 4e-4, 6e-4, 8e-4)
