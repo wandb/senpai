@@ -1,5 +1,81 @@
 # SENPAI Research Results
 
+## 2026-04-20 21:30 — PR #2435: TandemFoil: cosine T_max sweep at slices=64 — MERGED ✓ NEW BEST
+
+- **Branch:** gilbert/tandem-cosine-tmax-sweep
+- **Hypothesis:** Shorter cosine T_max cycles complete more LR restarts in the training budget
+
+| T_max | val_primary/surface_pressure_mae | test_primary | Epochs | W&B |
+|---|---|---|---|---|
+| **30** | **114.92** (-42% vs 197.87) | **108.16** | 11 | 3ec9m9az |
+| 10 | 117.23 | 109.89 | 11 | lx4ly3m6 |
+| 50 | 127.51 | 120.69 | 11 | uusjik96 |
+| 20 | 132.62 | 124.48 | 10 | 7p6hxl5r |
+
+**Commentary:** BREAKTHROUGH. slices=64 enables 11 epochs in 30 min (vs 2 at slices=96) — a 5.5x training multiplier that completely dominates. T_max=30 is optimal, giving ~25 cosine restarts per epoch at 750 batches/epoch. ALL runs used EMA=True yet still crushed the 197.87 no-EMA baseline. No-EMA retest at slices=64 + T_max=30 is now the highest-priority TandemFoil experiment — projected estimate ~86-90. **slices=64 + T_max=30 is the new golden config for TandemFoil.**
+
+---
+
+## 2026-04-20 21:30 — PR #2459: AirfRANS: asinh-pressure + residual-prediction + no-EMA — CLOSED (metric incompatibility)
+
+- **Branch:** senku/airfrans-noema-asinh-residual
+- **Hypothesis:** asinh-pressure + residual-prediction transfer from TandemFoil to AirfRANS
+
+| Trial | val_primary/surface_mse | Epochs | W&B |
+|---|---|---|---|
+| asinh only | 0.000104 (epoch 1) | 2 | xwbxj30u |
+| asinh + residual | 0.002809 | 2 | oyohiwf0 |
+
+**Commentary:** Results are in compressed asinh-normalized space, NOT comparable to baseline (0.3009). The asinh transform changes the target space before normalization. Student correctly identified the incompatibility. Direction is not dead but needs inverse-transform evaluation path. Student also implemented --residual-prediction for AirfRANS (code contribution).
+
+---
+
+## 2026-04-20 21:30 — PR #2449: TandemFoil: Full physics + AdamW LR sweep — CLOSED (EMA, superseded)
+
+- **Branch:** kaneda/tandem-fullphys-adamw-lr-sweep-v2
+
+| Trial | val_primary/surface_pressure_mae | Epochs | EMA | W&B |
+|---|---|---|---|---|
+| Full physics + AdamW lr=3e-4 | **235.94** | 2 | True | dsictzuq |
+| Full physics + AdamW lr=5e-4 | 237.42 | 2 | True | mwh4y0pz |
+| Full physics + AdamW lr=8e-4 | 367.42 | 1 | True | kwslbj4e |
+| Core physics + AdamW lr=5e-4 | 366.44 | 1 | True | k735vytc |
+
+**Commentary:** EMA=True, now superseded by gilbert's 114.92. Full physics + AdamW lr=3e-4 projected ~189 without EMA — was competitive with old baseline but irrelevant vs new. Only 2 epochs at slices=64 (likely parallel execution). Full physics + AdamW beats core physics at matched EMA conditions.
+
+---
+
+## 2026-04-20 21:30 — PR #2443: TandemFoil: physics+AdamW slices sweep — CLOSED (EMA, superseded)
+
+- **Branch:** edward/tandem-physics-adamw-slices-sweep
+
+| Slices | val_primary/surface_pressure_mae | Epochs | W&B |
+|---|---|---|---|
+| 32 | **244.33** | 2 | hgj1bash |
+| 64 | 251.09 | 2 | alchrjkp |
+| 48 | 367.64 | 1 | u2dkyj00 |
+| 80 | 353.37 | 1 | yb1b6oru |
+| 96 | 445.55 | 1 | elgagd4t |
+
+**Commentary:** EMA=True + broken cosine_t_max=30 (in steps not epochs). Superseded by gilbert's 114.92. Only 1-2 epochs due to parallel execution and physics feature overhead.
+
+---
+
+## 2026-04-20 21:30 — PR #2436: TandemFoil: Reynolds-stratified sampling — CLOSED (dead end)
+
+- **Branch:** chihiro/tandem-re-stratified-sampling
+
+| Variant | val_primary/surface_pressure_mae | val_re_rand | Epochs | EMA |
+|---|---|---|---|---|
+| v0: restrat + EMA 0.999 | 587.30 (diverged) | 486.13 | 2 | True |
+| v1: restrat + EMA 0.9995 | 364.48 | 290.51 | 1 | True |
+| v2: restrat + no-EMA | 343.25 | 300.90 | 1 | False |
+| v3: control (no restrat) | 345.33 | 292.04 | 1 | True |
+
+**Commentary:** All results far worse than baseline. Re-stratified sampling showed no OOD benefit (re_rand: 300.9 vs control 292.0). v0 diverged. Clear dead end.
+
+---
+
 ## 2026-04-20 21:15 — PR #2457: AirfRANS: Fourier + no-EMA + AdamW lr=5e-4 — MERGED ✓ NEW BEST
 
 - **Branch:** haku/airfrans-fourier-noema

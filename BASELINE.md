@@ -3,9 +3,18 @@
 ## TandemFoilSet
 
 - **Primary metric:** `val_primary/surface_pressure_mae` (= `val_eq4/surface_pressure_mae`)
-- **Current best:** 197.87 (val) / 191.70 (test)
-- **Best PR:** #2412 (frieren — TandemFoil no-EMA, Lion lr=3e-4, no physics features)
-- **Key insight:** EMA (ema_start_step=50) is catastrophically harmful at 2 epochs. All future runs must use `--no-use-ema`.
+- **Current best:** 114.92 (val) / 108.16 (test)
+- **Best PR:** #2435 (gilbert — cosine T_max=30, Lion lr=3e-4, slices=64, EMA=True, 11 epochs)
+- **Key insight:** slices=64 enables 11 epochs vs 2 at slices=96 — more training overwhelms resolution loss. cosine_t_max=30 is optimal. No-EMA retest should push well below 100.
+
+### 2026-04-20 21:30 — PR #2435: TandemFoil: cosine T_max=30 at slices=64 — NEW BEST
+
+- **val_primary/surface_pressure_mae:** 114.92 (-42% vs 197.87)
+- **test_primary/surface_pressure_mae:** 108.16
+- **Note:** 11 epochs in 30 min at slices=64. Still EMA=True (pre-no-EMA finding). T_max=30 > T_max=10 (117.23) > T_max=50 (127.51) > T_max=20 (132.62). All runs still improving at cutoff.
+- **W&B run:** 3ec9m9az
+- **Epochs:** 11 (30-min timeout)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 3e-4 --cosine_t_max 30 --model_slices 64`
 
 ### 2026-04-20 19:50 — PR #2412: TandemFoil: clean baseline no-EMA (frieren v4)
 
