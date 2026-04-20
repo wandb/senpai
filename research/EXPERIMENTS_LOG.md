@@ -1,5 +1,90 @@
 # SENPAI Research Results
 
+## 2026-04-20 19:30 — PR #2414: TandemFoil: core physics features (TE+Cp+asinh+residual) — MERGED ✓
+
+- **Branch:** tanjiro/tandem-physics-features
+- **Hypothesis:** Physics features (TE coord frame, Cp panel, asinh pressure, residual prediction) improve TandemFoil surface pressure prediction by giving the model physically-structured inputs.
+- **W&B run:** 1zbp5dlu
+
+| Metric | Value |
+|--------|-------|
+| val_primary/surface_pressure_mae | **262.82** (NEW BEST) |
+| test_primary/surface_pressure_mae | 257.51 |
+| test_single_in_dist | 267.26 |
+| test_geom_camber_rc | 280.59 |
+| test_geom_camber_cruise | 225.63 |
+| test_re_rand | 256.55 |
+| Epochs | 2 (30-min timeout, ~15 min/epoch) |
+| Config | Lion lr=3e-4, slices=96, physics: te_coord+cp_panel+cp_panel_tandem_only+asinh+residual+pressure_prior |
+
+**Commentary:** New TandemFoil best — beats alphonse's AdamW baseline (269.32) by 2.4%. Physics features provide physically-structured inductive bias. Two Inf values in test_geom_camber_cruise/mae_vol_p (asinh inversion overflow on volume predictions at early training) — surface metrics are unaffected. Only 2 epochs completed; model was still rapidly improving. Key gap: physics features tested only with Lion — combining with AdamW should compound the gains. Next priority: physics + AdamW LR sweep (tanjiro #2441), ANP decoder (shinji #2444), wake feature ablation (askeladd).
+
+---
+
+## 2026-04-20 19:30 — PR #2419: TandemFoil: batch_size=4 with scaled LR — CLOSED
+
+- **Branch:** askeladd/tandem-batch4-lr
+- **W&B run:** 2lc5q8ae
+
+| Metric | Value |
+|--------|-------|
+| val_primary/surface_pressure_mae | 454.96 |
+| test_primary/surface_pressure_mae | 429.53 |
+| Epochs | 2 (30-min timeout) |
+| Config | Lion lr=6e-4, batch_size=4, slices=96 |
+
+**Commentary:** batch_size=4 halves gradient steps per unit time → only 2 epochs, severely undertrained. val_mae=454.96 vs baseline 269.32 (+69%). Clear dead end: batch_size doubling destroys the epoch budget. batch_size=2 is optimal for TandemFoil within 30-min timeout.
+
+---
+
+## 2026-04-20 19:30 — PR #2418: TandemFoil: normalization tricks (asinh+residual) — CLOSED (superseded)
+
+- **Branch:** thorfinn/tandem-normalization
+- **W&B run:** svy77euk
+
+| Metric | Value |
+|--------|-------|
+| val_primary/surface_pressure_mae | 291.32 |
+| test_primary/surface_pressure_mae | 280.60 |
+| Epochs | 2 (30-min timeout) |
+| Config | Lion lr=3e-4, slices=96, asinh_pressure=True, residual_prediction=True, cosine_t_max=50 |
+
+**Commentary:** asinh+residual alone (without TE coord+Cp panel) achieves 291.32 — worse than baseline 269.32. Tanjiro's broader physics stack (#2414) includes these features AND more, and beats baseline at 262.82. The subset is superseded. Also: only 1 of requested 4 ablation variants was submitted. Inf in cruise vol_p — same numerical overflow from asinh as #2414 (early-training artifact).
+
+---
+
+## 2026-04-20 19:30 — PR #2417: TandemFoil: bigger model (4L/256d/4H/128slices) — CLOSED
+
+- **Branch:** edward/tandem-bigger-model
+- **W&B run:** fv82ma84
+
+| Metric | Value |
+|--------|-------|
+| val_primary/surface_pressure_mae | 314.52 |
+| test_primary/surface_pressure_mae | 306.34 |
+| Epochs | 2 (30-min timeout, ~27 min/epoch) |
+| Config | Lion lr=3e-4, 4L/256d/4H, slices=128 |
+
+**Commentary:** Bigger model is too slow for 30-min budget (27 min/epoch → only 2 epochs). val_mae=314.52 vs baseline 269.32 (+17%), but model was still rapidly improving. On AirfRANS, bigger model + Lion was also weak while + AdamW showed promise. Capacity scaling should be revisited with AdamW + slices=64 for fairer comparison.
+
+---
+
+## 2026-04-20 19:30 — PR #2415: TandemFoil: higher LR lr=1e-3 (Lion) — CLOSED
+
+- **Branch:** nezuko/tandem-lr-1e3
+- **W&B run:** 1gshqd87
+
+| Metric | Value |
+|--------|-------|
+| val_primary/surface_pressure_mae | 352.40 |
+| test_primary/surface_pressure_mae | 338.49 |
+| Epochs | 2 (30-min timeout) |
+| Config | Lion lr=1e-3, slices=96, cosine_t_max=150 |
+
+**Commentary:** Lion at lr=1e-3 achieves 352.40 vs baseline 269.32 (+31%). Mirrors AirfRANS pattern where Lion at any LR lost to AdamW. LR tuning within Lion is the wrong direction. The correct experiment is AdamW LR sweep (covered in tanjiro's #2441 and alphonse's #2433).
+
+---
+
 ## 2026-04-20 18:38 — PR #2416: TandemFoil: AdamW optimizer vs Lion baseline
 
 - **Branch:** alphonse/tandem-adamw

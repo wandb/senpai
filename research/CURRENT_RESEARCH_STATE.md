@@ -1,78 +1,102 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-20 18:50 UTC
+- **Date:** 2026-04-20 19:40 UTC
 - **Branch:** radford
 
 ## Student Status
 
-- **Idle:** none
-- **WIP (16):**
-  - TandemFoil: frieren #2412, fern #2413, tanjiro #2414, nezuko #2415, edward #2417, thorfinn #2418, askeladd #2419 (Round 1, still running)
-  - TandemFoil: alphonse #2433, violet #2434, gilbert #2435, chihiro #2436 (Round 2 assigned)
-  - AirfRANS: kohaku #2428, emma #2429, senku #2430, haku #2431, norman #2432 (Round 2 assigned)
-- **Review-ready:** none
+### Idle
+- None
 
-## Baselines (established this session)
+### WIP — TandemFoil Round 2 (established this round)
+- frieren #2412: clean baseline (no physics, Lion)
+- fern #2413: full physics stack (Lion) — nearly done, val≈270.74 from W&B group data
+- alphonse #2433: AdamW LR sweep at slices=64 (no physics)
+- violet #2434: slices sweep (Lion)
+- gilbert #2435: cosine T_max sweep at slices=64 (Lion)
+- chihiro #2436: RE-stratified sampling ablation (Lion)
+
+### WIP — TandemFoil Round 3 (just assigned)
+- tanjiro #2441: **Physics + AdamW LR sweep** (3e-4, 5e-4, 8e-4, slices=64) — KEY EXPERIMENT
+- edward #2443: Physics + AdamW + slices sweep (48, 64, 96)
+- thorfinn #2445: Physics + AdamW + cosine T_max sweep (10, 20, 30, 50)
+- askeladd: Wake feature ablation (pending PR creation)
+- shinji #2444: **ANP cross-foil decoder** (with/without physics + AdamW) — HIGH PRIORITY
+- rei: Weight decay + EMA ablation (pending PR creation)
+- kaneda: Full physics stack + AdamW LR sweep (pending PR creation)
+
+### WIP — AirfRANS Round 2
+- kohaku #2428: AdamW LR bracket (3e-4, 4e-4, 6e-4, 8e-4)
+- emma #2429: AdamW + capacity sweep (4L/256d)
+- senku #2430: Cosine T_max sweep (10, 20, 30, 50)
+- haku #2431: Scaffold ablation (lookahead/EMA)
+- norman #2432: OOD tasks (scarce + reynolds)
+
+### WIP — DrivAerML Round 1 (ALL NEW — just assigned)
+- shoya #2440: **AdamW vs Lion baseline** (4 LRs) — FIRST DRIVAERML RUN
+- shouko #2437: Surface points budget sweep (0/4k/8k/16k)
+- mitsuha #2442: Model capacity sweep (2L/128d, 3L/192d, 4L/256d) + large anchors
+- taki #2438: Cosine T_max sweep (10, 20, 30, 50)
+- nezuko #2439: Anchor budget sweep (4096/8000 vs 8192/16000 vs 16384/16384)
+
+## Baselines
 
 | Dataset | Metric | Value | PR |
 |---|---|---|---|
+| TandemFoil | val_primary/surface_pressure_mae | **262.82** | #2414 (tanjiro, physics features + Lion lr=3e-4) |
 | AirfRANS | val_primary/surface_mse | **0.3308** | #2423 (kohaku, AdamW lr=5e-4) |
-| TandemFoil | val_primary/surface_pressure_mae | **269.32** | #2416 (alphonse, AdamW lr=5e-4, 2ep) |
+| DrivAerML | val_primary/surface_rel_l2_pct | **no baseline yet** | — target: <3.71% |
+
+## Round 2 Key Findings (TandemFoil, closed this round)
+
+| PR | Config | val_mae | vs baseline | Outcome |
+|---|---|---|---|---|
+| #2414 | Physics features + Lion | **262.82** | -2.4% | **MERGED** (new best) |
+| #2418 | asinh+residual only + Lion | 291.32 | +8.2% | Closed (superseded) |
+| #2417 | 4L/256d bigger model + Lion | 314.52 | +17% | Closed (too slow) |
+| #2415 | Lion lr=1e-3 | 352.40 | +31% | Closed |
+| #2419 | batch_size=4 + Lion | 454.96 | +69% | Closed (too slow) |
+
+W&B group insight (from radford-tandem-round1):
+- Fern's full physics (val=270.74) is nearly tied with baseline, only 0.5% worse — may flip with more training
+- Frieren's clean baseline (val=310.96) establishes clean floor without physics
 
 ## Human Researcher Directives
-- Focus on TandemFoilSet and AirfRANS (not DrivAerML for this run)
+- Focus on all 3 benchmarks: TandemFoilSet, AirfRANS, DrivAerML
 - Tune and ablate the current stack — no new architecture invention
-- Establish strong, defensible recipes on both datasets
-- Use all 8 GPUs per student — parallel trials when possible
-
-## Round 1 Key Findings (AirfRANS)
-
-1. **AdamW crushes Lion** — 38% better (0.331 vs 0.538). Optimizer is the dominant lever.
-2. **Pressure dominates error** — surface_mse_p (~1.3) is orders of magnitude larger than Ux/Uy/nut
-3. **Deeper model (6L) diverges** — depth scaling harmful with current recipe
-4. **Bigger model + AdamW promising** (0.379) but slows epoch cycling
-5. **Surface refinement head is beneficial** — ablation confirmed
-6. **6 epochs is severely training-limited** — all runs still improving at cutoff
-
-## Round 1 Key Findings (TandemFoil)
-
-- Only alphonse's AdamW result (#2416) is in — 2 epochs, strongly improving
-- 7 remaining TandemFoil students still WIP (Round 1 in progress)
-- TandemFoil training is much slower (~15 min/epoch at slices=96 vs ~4min for AirfRANS)
-
-## Round 2 Assignments (just made)
-
-### AirfRANS (5 students)
-| Student | PR | Focus |
-|---|---|---|
-| kohaku | #2428 | AdamW LR bracket: 3e-4, 4e-4, 6e-4, 8e-4 (all slices=64) |
-| emma | #2429 | AdamW + bigger model 4L/256d at slices=64, lr=5e-4 and 8e-4 |
-| senku | #2430 | Cosine T_max sweep: 10, 20, 30, 50 (AdamW lr=5e-4, slices=64) |
-| haku | #2431 | AdamW scaffold ablation: lookahead/EMA on/off (AdamW lr=5e-4) |
-| norman | #2432 | AirfRANS OOD tasks: scarce + reynolds baselines |
-
-### TandemFoil (4 students)
-| Student | PR | Focus |
-|---|---|---|
-| alphonse | #2433 | AdamW LR sweep: 3e-4, 5e-4, 8e-4, 1e-3 (all slices=64) |
-| violet | #2434 | Slices sweep: 32, 48, 64, 96 (Lion lr=3e-4) — throughput |
-| gilbert | #2435 | Cosine T_max sweep: 10, 20, 30, 50 (Lion lr=3e-4, slices=64) |
-| chihiro | #2436 | RE-stratified sampling + EMA ablation (Lion lr=3e-4, slices=64) |
+- Use all 8 GPUs per student (2-8 parallel trials when possible)
+- DrivAerML is NOW in scope — start training immediately (done ✓)
 
 ## Current Research Themes
 
-1. **AdamW vs Lion** — AirfRANS: AdamW wins. TandemFoil: unknown (only 2 epochs seen). Round 2 will resolve.
-2. **Epoch budget is binding** — reducing slices=96→64 is a free throughput gain being tested on both datasets
-3. **Cosine schedule mismatch** — T_max=150 on 5-10 epoch runs means LR never anneals. Testing T_max=10–50.
-4. **Pressure as bottleneck** — surface_mse_p dominates AirfRANS error. No direct fix yet (future: loss weighting)
-5. **OOD generalization** — `val_re_rand` on TandemFoil and `scarce`/`reynolds` on AirfRANS are key paper metrics
+1. **Physics + AdamW compound hypothesis** — the central TandemFoil question for Round 3. Physics features won. AdamW won on AirfRANS. Their combination should compound. Tanjiro's #2441 tests this directly.
 
-## Potential Next Directions (Round 3+)
+2. **ANP cross-foil decoder** — flagged "high priority" in program.md. Tests cross-foil information sharing. Shinji's #2444 isolates its contribution vs physics+AdamW.
 
-- **AirfRANS:** Weight decay sweep (once Round 2 scaffold ablation result is in)
-- **AirfRANS:** Pressure-weighted loss (once we confirm AdamW LR sweet spot)
-- **AirfRANS:** Fourier features (enable_fourier=True)
-- **TandemFoil:** ANP surface decoder (anp_srf=True) — high priority from program.md
-- **TandemFoil:** Physics feature stack (waiting for frieren/fern/tanjiro Round 1 results)
-- **TandemFoil:** Larger AdamW model with slices=64
-- **Cross-dataset:** Test same best recipe on DrivAerML once TandemFoil+AirfRANS recipes converge
+3. **Epoch budget is binding** — 30-min timeout is the dominant constraint. slices reduction (96→64→48) trades resolution for more gradient updates. Being tested in violet's #2434 and edward's #2443.
+
+4. **Cosine schedule alignment** — T_max=150 means essentially constant LR in 2-5 epoch runs. T_max=10-30 enables meaningful annealing. Tested in gilbert's #2435 (tandemfoil) and thorfinn's #2445.
+
+5. **DrivAerML bootstrap** — zero baseline → shoya/shouko/mitsuha/taki/nezuko establishing first results across: optimizer (AdamW vs Lion), LR, point budget, model capacity, anchor tokens, cosine schedule.
+
+6. **AirfRANS gap is large** — we're at 0.3308 surface_mse vs SpiderSolver target of 0.0043. That's 77x worse. Round 2 AirfRANS experiments testing LR, capacity, schedule, scaffold ablation — key question: what specifically makes SpiderSolver so much better?
+
+## Potential Next Directions (Round 4+)
+
+### TandemFoil
+- **Physics + AdamW + ANP** (triple combination) — if shinji's ANP result is positive
+- **Larger model + AdamW + slices=64** — once capacity is manageable with fewer slices
+- **RE-stratified sampling + physics + AdamW** — combine chihiro's result with winners
+- **Loss weighting** — downweight early-training-unstable vol_p to avoid Inf issues
+
+### AirfRANS
+- **Pressure-weighted loss** — pressure channel dominates MSE by orders of magnitude; explicit weighting
+- **Fourier features** (enable_fourier=True) — may help high-frequency pressure prediction
+- **SpiderSolver gap diagnosis** — need to understand architecturally what makes SpiderSolver 77x better
+- **Larger model + AdamW + slices=64** — once AirfRANS LR and schedule are optimized (Round 2 result)
+
+### DrivAerML
+- Once shoya establishes baseline: fan out on best optimizer/LR
+- Anchor token count likely critical (nezuko's sweep) — AB-UPT uses 16384 vs our 4096
+- Full DrivAerML epoch budget: understand min epochs needed (AB-UPT trains 500 epochs!)
+- Point budget subsampling for faster epoch cycling
