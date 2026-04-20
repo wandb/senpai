@@ -23,6 +23,7 @@ When asked for a large piece of work which seems vague or needs clarification, p
 
 ## Key docs
 
+- Here `<problem>` means the active problem package name under `target/`, selected by `senpai.yaml`'s `problem` path. With the default config, `<problem>` is `cfd_tandemfoil`.
 - `target/<problem>/program.md` — active research context, goals, metrics, file constraints (default: `target/cfd_tandemfoil/program.md`)
 - `system_instructions/CLAUDE-ADVISOR.md` — advisor role workflow
 - `system_instructions/CLAUDE-STUDENT.md` — student role workflow
