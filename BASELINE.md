@@ -1,9 +1,20 @@
 # Baseline Metrics — radford branch
 
 ## TandemFoilSet
+
 - **Primary metric:** `val_primary/surface_pressure_mae` (= `val_eq4/surface_pressure_mae`)
-- **Current best:** No baseline established yet (Round 1 in progress)
-- **Best PR:** —
+- **Current best:** 269.32 (val) / 262.56 (test)
+- **Best PR:** #2416 (alphonse — TandemFoil AdamW optimizer lr=5e-4)
+
+### 2026-04-20 18:38 — PR #2416: TandemFoil: AdamW optimizer vs Lion baseline
+
+- **val_primary/surface_pressure_mae:** 269.316
+- **test_primary/surface_pressure_mae:** 262.56
+- **Per-split test MAE:** eq4=262.56, geom_camber_cruise=224.60, geom_camber_rc=270.91, re_rand=249.91, single_in_dist=304.83
+- **Note:** Only 2 epochs (30-min timeout, ~15 min/epoch). Still strongly improving. Infinity observed in test_geom_camber_cruise/mae_vol_p (early-training EMA artifact).
+- **W&B run:** r5t674uy
+- **Epochs:** 2 (30-min timeout)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer adamw --lr 5e-4 --cosine_t_max 150`
 
 ## AirfRANS
 
