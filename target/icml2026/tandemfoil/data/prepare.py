@@ -11,7 +11,9 @@ import torch
 from torch.utils.data import Dataset
 from pathlib import Path
 
-DATA_ROOT = Path("/mnt/new-pvc/datasets/tandemfoil")
+from data.split_utils import rewrite_under_pvc_mount
+
+DATA_ROOT = rewrite_under_pvc_mount("/mnt/new-pvc/datasets/tandemfoil")
 
 SURFACE_IDS = (5, 6)
 

@@ -21,11 +21,11 @@ import torch
 from torch.utils.data import Dataset, Subset
 
 try:
-    from data.split_utils import first_existing
+    from data.split_utils import expand_pvc_candidates, first_existing
     from tandemfoil.data.prepare import pad_collate  # noqa: F401 re-export
 except ModuleNotFoundError:
     sys.path.append(str(Path(__file__).resolve().parents[2]))
-    from data.split_utils import first_existing
+    from data.split_utils import expand_pvc_candidates, first_existing
     from tandemfoil.data.prepare import pad_collate  # noqa: F401 re-export
 
 DEFAULT_MANIFEST = Path(__file__).with_name("split_manifest_drivaerml.json")
@@ -58,14 +58,11 @@ def _resolve_case_root(manifest: dict, override_root: str | Path | None = None) 
             raise FileNotFoundError(f"DrivAerML root does not exist: {root}")
         return root
 
-    candidates = list(manifest.get("case_root_candidates", []))
+    candidates = expand_pvc_candidates(manifest.get("case_root_candidates", []))
     case_root = manifest.get("case_root")
     if case_root:
         candidates.append(case_root)
-        if isinstance(case_root, str) and case_root.startswith("/mnt/pvc/"):
-            candidates.append(case_root.replace("/mnt/pvc/", "/mnt/new-pvc/", 1))
-        if isinstance(case_root, str) and case_root.startswith("/mnt/new-pvc/"):
-            candidates.append(case_root.replace("/mnt/new-pvc/", "/mnt/pvc/", 1))
+        candidates = expand_pvc_candidates(candidates)
 
     if candidates:
         root = first_existing(candidates)
