@@ -1,5 +1,74 @@
 # SENPAI Research Results
 
+## 2026-04-20 19:50 — PR #2412: TandemFoil: clean baseline no-EMA (frieren v4) — MERGED ✓ NEW BEST
+
+- **Branch:** frieren/tandem-baseline-default
+- **Hypothesis:** Removing EMA in ultra-short training regime (2 epochs)
+- **W&B run:** y8f8pkkn (v4)
+
+| Metric | Value |
+|--------|-------|
+| val_primary/surface_pressure_mae | **197.87** (NEW BEST, -24.7% vs 262.82) |
+| test_primary/surface_pressure_mae | 191.70 |
+| test_single_in_dist | 212.64 |
+| test_geom_camber_rc | 172.00 |
+| test_geom_camber_cruise | 187.39 |
+| test_re_rand | 194.77 |
+| Epochs | 2 (30-min timeout) |
+| Config | Lion lr=3e-4, slices=96, **use_ema=False**, use_lookahead=True, NO physics features, cosine_t_max=50 |
+
+**Commentary:** CRITICAL FINDING. Removing EMA improved val_mae by 24.7% without any physics features. EMA with ema_start_step=50 never meaningfully activates in 2 epochs (only 2×750=1500 steps, barely above start step), and the exponential moving average of improving weights with stale early weights is actively harmful. This was independently confirmed on AirfRANS (#2431: EMA degrades 0.3914→0.5038). ALL future experiments MUST use `--no-use-ema`. Compounding this with physics features should give further gains.
+
+Secondary findings from this PR:
+- v1 (lr=2e-4, EMA=True): 264.14 — lower LR also helpful even with EMA
+- v3 (no-lookahead, EMA=True): 281.15 — lookahead is beneficial
+- v0 (baseline, EMA=True): 310.96 — confirms EMA was masking improvements all along
+- v2 (lr=5e-4, EMA=True): 446.12 — higher LR with EMA is catastrophic (1 epoch only)
+
+---
+
+## 2026-04-20 19:50 — AirfRANS Round 2 Summary (5 PRs closed — epoch starvation)
+
+Key pattern: ALL 5 AirfRANS Round 2 PRs ran at slices=64 with 4 parallel jobs → only 2 epochs completed vs baseline's 6 epochs. Results are confounded and cannot be compared to baseline.
+
+**#2428 (kohaku, LR bracket):**
+| LR | val_primary/surface_mse | Epochs |
+|---|---|---|
+| 8e-4 | 0.3278 (best) | 5 |
+| 3e-4 | 0.3414 | 5 |
+| 6e-4 | 0.3513 | 5 |
+| 4e-4 | 0.3754 | 5 |
+*Note: 5 epochs at slices=64, vs baseline 6 at slices=96. Confounded. lr=8e-4 slightly best but vol_mse regresses.*
+
+**#2429 (emma, capacity):** 4L/256d + 3L/192d at slices=64, only 2 epochs each due to 4-job parallelism. Inconclusive.
+
+**#2430 (senku, cosine T_max):** T_max=10/20/30/50 at slices=64, only 2 epochs. Best T_max=20 (val=0.4763) but confounded.
+
+**#2431 (haku, scaffold ablation):** CRITICAL FINDING — EMA is harmful on AirfRANS!
+| Config | val_primary/surface_mse |
+|---|---|
+| no-EMA + Lookahead (v2, best) | 0.3914 |
+| bare AdamW (v3) | 0.4590 |
+| full scaffold EMA+Lookahead (v0) | 0.5038 |
+| no-Lookahead (v1) | 0.5268 |
+*All at slices=64, 2 epochs. No-EMA is the key lever.*
+
+**#2432 (norman, OOD tasks):** First OOD baselines established.
+| Task | val | test |
+|---|---|---|
+| scarce | 0.3351 (AdamW) | 0.8021 |
+| reynolds | 0.5956 | 0.8999 |
+| full (confounded) | 0.5201 | 0.5041 |
+*Large val/test gap on OOD tasks confirms real generalization challenge.*
+
+**Round 2 Key Lessons:**
+1. Running 4 parallel AirfRANS jobs causes epoch starvation (I/O contention with num_workers=0)
+2. EMA is harmful on AirfRANS (and TandemFoil) in short training regimes
+3. MAX 2 parallel jobs per AirfRANS student going forward
+4. Must use slices=96 (not 64) for fair comparison to baseline
+
+---
+
 ## 2026-04-20 19:30 — PR #2414: TandemFoil: core physics features (TE+Cp+asinh+residual) — MERGED ✓
 
 - **Branch:** tanjiro/tandem-physics-features
