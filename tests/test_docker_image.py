@@ -105,6 +105,22 @@ def test_tools_installed(test_pod):
         assert out, f"`{cmd}` returned empty output"
 
 
+def test_python_runtime_imports(test_pod):
+    """The image and editable install expose the training-time Python deps."""
+    cmd = (
+        "cd /workspace/senpai && "
+        "python - <<'PY'\n"
+        "import torch\n"
+        "import torch_geometric\n"
+        "import yaml\n"
+        "import cfd_tandemfoil.icml2026.train\n"
+        "print(torch.__version__)\n"
+        "PY"
+    )
+    out = kubectl_check("exec", test_pod, "--", "bash", "-c", cmd, timeout=30)
+    assert out
+
+
 def test_weave_plugin_ready(test_pod):
     """Plugin status shows 'Ready to trace'."""
     out = kubectl_check("exec", test_pod, "--", "bash", "-c", "weave-claude-plugin status", timeout=15)

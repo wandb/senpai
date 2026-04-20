@@ -24,9 +24,10 @@ Model config: space_dim=2, fun_dim=22  →  preprocess MLP input = 24.
 
 import json
 import math
+from pathlib import Path
+
 import torch
 from torch.utils.data import Dataset, Subset
-from pathlib import Path
 
 from data.prepare import load_pickle, DATA_ROOT, parse_naca, pad_collate  # noqa: F401 (re-export pad_collate)
 
@@ -157,7 +158,7 @@ class MultiFieldDataset(Dataset):
         return result
 
 
-VAL_SPLIT_NAMES = ["val_in_dist", "val_tandem_transfer", "val_ood_cond", "val_ood_re"]
+LEGACY_VAL_SPLIT_NAMES = ["val_in_dist", "val_tandem_transfer", "val_ood_cond", "val_ood_re"]
 
 
 def _stratified_sample(indices: list, n: int) -> list:
@@ -166,6 +167,38 @@ def _stratified_sample(indices: list, n: int) -> list:
         return indices
     step = max(1, len(indices) // n)
     return indices[::step][:n]
+
+
+def _resolve_pickle_paths(manifest: dict) -> list[Path]:
+    if "pickle_paths" in manifest:
+        return [Path(p) for p in manifest["pickle_paths"]]
+
+    pickle_files = manifest.get("pickle_files")
+    if not pickle_files:
+        raise KeyError("Manifest must contain either 'pickle_paths' or 'pickle_files'")
+
+    candidates = list(manifest.get("data_root_candidates", []))
+    if not candidates:
+        candidates = [str(DATA_ROOT)]
+
+    for candidate in candidates:
+        root = Path(candidate)
+        if root.exists():
+            return [root / name for name in pickle_files]
+
+    root = Path(candidates[0])
+    return [root / name for name in pickle_files]
+
+
+def _resolve_val_split_names(manifest: dict) -> list[str]:
+    val_split_names = manifest.get("val_splits")
+    if val_split_names is None:
+        val_split_names = LEGACY_VAL_SPLIT_NAMES
+
+    missing = [name for name in val_split_names if name not in manifest["splits"]]
+    if missing:
+        raise KeyError(f"Manifest missing validation splits: {missing}")
+    return list(val_split_names)
 
 
 def load_data(
@@ -185,10 +218,11 @@ def load_data(
         manifest = json.load(f)
     with open(stats_file) as f:
         stats_data = json.load(f)
+    val_split_names = _resolve_val_split_names(manifest)
 
     cache_size = -1 if debug else 0
     ds = MultiFieldDataset(
-        [Path(p) for p in manifest["pickle_paths"]],
+        _resolve_pickle_paths(manifest),
         cache_size=cache_size,
     )
 
@@ -201,7 +235,7 @@ def load_data(
     )
 
     train_ds = Subset(ds, manifest["splits"]["train"])
-    val_splits = {name: Subset(ds, manifest["splits"][name]) for name in VAL_SPLIT_NAMES}
+    val_splits = {name: Subset(ds, manifest["splits"][name]) for name in val_split_names}
 
     if debug:
         dg = manifest["domain_groups"]
@@ -212,7 +246,7 @@ def load_data(
         )
         train_ds = Subset(ds, debug_train)
         val_splits = {k: Subset(ds, _stratified_sample(manifest["splits"][k], 2))
-                      for k in VAL_SPLIT_NAMES}
+                      for k in val_split_names}
 
     # Normalization stats (CPU tensors — caller moves to device)
     stats = {

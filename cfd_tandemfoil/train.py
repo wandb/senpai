@@ -4,12 +4,9 @@
 
 """Train Transolver with structured benchmark splits.
 
-Reads a split manifest and stats file produced by data/split.py,
-then trains with four separate val tracks:
-  val_in_dist          — raceCar_single random holdout (interpolation sanity)
-  val_tandem_transfer  — raceCar_tandem Part2 (unseen tandem front foil)
-  val_ood_cond         — cruise Part1+3 frontier 20% (extreme AoA/gap/stagger)
-  val_ood_re           — cruise Part2 Re=4.445M (fully OOD Reynolds number)
+Reads a split manifest and stats file produced by the dataset split scripts.
+Validation tracks are defined by the manifest itself so the loader can work
+with both the legacy TandemFoilSet split and the newer competition split.
 
 Run:
   python train.py --agent <name> --wandb_name "<name>/<desc>"
@@ -38,7 +35,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 import simple_parsing as sp
 
 from data.utils import visualize
-from data.prepare_multi import X_DIM, pad_collate, load_data, VAL_SPLIT_NAMES
+from data.prepare_multi import X_DIM, pad_collate, load_data
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +444,7 @@ run = wandb.init(
 wandb.define_metric("global_step")
 wandb.define_metric("train/*", step_metric="global_step")
 wandb.define_metric("val/*", step_metric="global_step")
-for _sname in VAL_SPLIT_NAMES:
+for _sname in val_splits.keys():
     wandb.define_metric(f"{_sname}/*", step_metric="global_step")
 wandb.define_metric("lr", step_metric="global_step")
 wandb.define_metric("epoch_time_s", step_metric="global_step")
@@ -606,7 +603,7 @@ for epoch in range(MAX_EPOCHS):
 
     split_summary = "  ".join(
         f"{name}={val_metrics_per_split[name][f'{name}/loss']:.4f}"
-        for name in VAL_SPLIT_NAMES
+        for name in val_splits.keys()
     )
     print(
         f"Epoch {epoch+1:3d} ({dt:.0f}s) [{peak_mem_gb:.1f}GB]  "
@@ -622,7 +619,7 @@ print(f"TRAINING COMPLETE ({total_time:.1f} min)")
 print("=" * 70)
 if best_metrics:
     print(f"Best model at epoch {best_metrics['epoch']}  (val/loss={best_metrics['val_loss']:.4f})")
-    for split_name in VAL_SPLIT_NAMES:
+    for split_name in val_splits.keys():
         k_p = f"best_{split_name}/mae_surf_p"
         k_l = f"best_{split_name}/loss"
         if k_p in best_metrics:

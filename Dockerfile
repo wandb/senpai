@@ -13,6 +13,13 @@ RUN curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release
 # Install uv
 RUN pip install uv
 
+# Preinstall Python dependencies from the repo lockfile so image-level smoke
+# tests catch missing runtime libraries before the student pods start.
+COPY pyproject.toml uv.lock /tmp/senpai/
+RUN cd /tmp/senpai && \
+    uv export --frozen --no-dev --no-emit-project --format requirements.txt -o requirements.txt && \
+    uv pip install --system -r requirements.txt
+
 # Install Claude Code + gh
 RUN curl -fsSL https://claude.ai/install.sh | bash || true && \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg 2>/dev/null && \

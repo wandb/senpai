@@ -1,6 +1,6 @@
 # data
 
-Data preparation, benchmark splits, and normalization stats for the multi-domain TandemFoilSet experiment track.
+Data preparation, benchmark splits, and repo-local dataset loaders for the CFD benchmarks used in the ICML workshop sprint.
 
 The training script lives at `cfd_tandemfoil/train.py`.
 
@@ -80,8 +80,34 @@ Features:
 |------|---------|
 | `split.py` | One-time script to regenerate the manifest and stats |
 | `prepare_multi.py` | Extended preprocessing: 24-dim x, foil-2 features, boundary ID 7 |
+| `prepare_airfrans.py` | Repo-local AirfRANS loader reading raw `.vtu` / `.vtp` directly |
+| `prepare_drivaerml.py` | Repo-local processed-array loader for DrivAerML |
+| `vtk_xml.py` | Minimal VTK XML parser used by the AirfRANS loader |
+| `smoke_test_datasets.py` | PVC smoke test for TandemFoilSet, AirfRANS, and DrivAerML |
 | `split_manifest.json` | Committed train/val indices (run `split.py` to regenerate) |
+| `split_manifest_airfrans.json` | Repo-owned AirfRANS split manifest |
+| `split_manifest_drivaerml.json` | Repo-owned DrivAerML split manifest |
 | `split_stats.json` | Committed normalization stats over training set |
+
+## Repo-owned dataset contracts
+
+The repo now owns the runtime loaders for the datasets needed in the sprint:
+
+- `TandemFoilSet`: loaded from local pickle files via `prepare.py` / `prepare_multi.py`
+- `AirfRANS`: loaded locally from the official raw VTK XML files via `prepare_airfrans.py`
+- `DrivAerML`: loaded locally from packaged `.npy` arrays plus `normalizers.json` via `prepare_drivaerml.py`
+
+This removes runtime dependence on the external reference repos that were only
+used for split audits and format comparisons.
+
+## Smoke testing on a PVC-mounted pod
+
+```bash
+uv run python -m cfd_tandemfoil.data.smoke_test_datasets
+```
+
+That script loads one small debug batch from each dataset loader and checks the
+tensor shapes and normalization stats contract against the mounted dataset root.
 
 ---
 
