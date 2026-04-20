@@ -29,7 +29,7 @@ spec:
       serviceAccountName: senpai-orchestrator
       containers:
       - name: advisor
-        image: ghcr.io/wandb/senpai:latest
+        image: {{IMAGE}}
         command: ["/bin/bash", "-c"]
         args:
         - |
@@ -71,8 +71,8 @@ spec:
             memory: "16Gi"
         volumeMounts:
         - name: dataset
-          mountPath: /mnt/new-pvc
+          mountPath: {{PVC_MOUNT_PATH}}
       volumes:
       - name: dataset
         persistentVolumeClaim:
-          claimName: new-pvc
+          claimName: {{PVC_CLAIM_NAME}}

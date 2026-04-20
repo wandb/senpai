@@ -29,15 +29,17 @@ STUDENT_NAMES = [
 class Args:
     """Launch senpai advisor and/or student agents on Kubernetes."""
     tag: str  # research tag (e.g. mar13)
-    problem: str = "target/cfd_tandemfoil"  # active problem directory path (from senpai.yaml)
+    problem: str = "target/icml2026"  # active problem directory path (from senpai.yaml)
     names: str = ""  # comma-separated student names (e.g. "frieren,fern")
     n_students: int = 4  # number of students to launch (ignored if --names is provided)
     repo_url: str = "https://github.com/wandb/senpai.git"  # git repo URL
-    repo_branch: str = "main"  # git branch to clone
+    repo_branch: str = "kaiming"  # git branch to clone
     image: str = "ghcr.io/wandb/senpai:latest"  # container image for students
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
     wandb_project: str = "senpai-v1"  # W&B project name
-    advisor_branch: str = "noam"  # branch the advisor works on (PRs target this, not main)
+    advisor_branch: str = "kaiming"  # branch the advisor works on (PRs target this, not main)
+    pvc_claim_name: str = "new-pvc"  # PVC name mounted into pods
+    pvc_mount_path: str = "/mnt/new-pvc"  # mount path for the dataset PVC inside the containers
     advisor: bool = False  # also deploy the advisor pod (default: students only)
     extra_instructions: str = ""  # extra prompt text for the advisor: a .md file path or a literal string
     timeout_minutes: float = 30.0  # training run wall-clock limit (SENPAI_TIMEOUT_MINUTES)
@@ -80,6 +82,7 @@ def render_student(template: str, student_name: str, tag: str, args: Args) -> st
             "SENPAI_TIMEOUT_MINUTES": str(args.timeout_minutes),
             "SENPAI_MAX_EPOCHS": str(args.max_epochs),
             "PROBLEM_DIR": args.problem,
+            "PVC_MOUNT_PATH": args.pvc_mount_path,
         },
     )
     deployment = render_template(template, {
@@ -87,6 +90,8 @@ def render_student(template: str, student_name: str, tag: str, args: Args) -> st
         "RESEARCH_TAG": tag,
         "IMAGE": args.image,
         "ADVISOR_BRANCH": args.advisor_branch,
+        "PVC_CLAIM_NAME": args.pvc_claim_name,
+        "PVC_MOUNT_PATH": args.pvc_mount_path,
     })
     return configmap + "\n---\n" + deployment
 
@@ -102,6 +107,7 @@ def render_advisor(template: str, tag: str, student_list: list[str], args: Args)
         "WANDB_PROJECT": args.wandb_project,
         "ADVISOR_BRANCH": args.advisor_branch,
         "PROBLEM_DIR": args.problem,
+        "PVC_MOUNT_PATH": args.pvc_mount_path,
     }
     if args.extra_instructions:
         p = Path(args.extra_instructions)
@@ -112,7 +118,12 @@ def render_advisor(template: str, tag: str, student_list: list[str], args: Args)
         labels={"app": "senpai", "role": "advisor", "research-tag": tag},
         data=data,
     )
-    deployment = render_template(template, {"RESEARCH_TAG": tag})
+    deployment = render_template(template, {
+        "RESEARCH_TAG": tag,
+        "IMAGE": args.image,
+        "PVC_CLAIM_NAME": args.pvc_claim_name,
+        "PVC_MOUNT_PATH": args.pvc_mount_path,
+    })
     return configmap + "\n---\n" + deployment
 
 

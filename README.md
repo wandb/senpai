@@ -14,9 +14,9 @@ An **advisor** agent (no GPU) creates hypothesis PRs and assigns them to **stude
 
 The repo is **problem-agnostic** — all problem-specific code (model, training script, data pipeline, instructions) lives in a self-contained folder under `target/`. `senpai.yaml` points to the active problem via a repo-relative path.
 
-### Current problem: CFD surrogates
+### Current problem: ICML 2026 CFD sprint
 
-Training a neural network surrogate for computational fluid dynamics on the [TandemFoilSet](https://openreview.net/forum?id=4Z0P4Nbosn) dataset. Given tandem-airfoil geometry and flow conditions, predict velocity (Ux, Uy) and pressure (p) at every mesh node. The model is a [Transolver](https://arxiv.org/abs/2402.02366) with physics-aware attention over irregular meshes. Key metric: surface MAE (especially pressure).
+Training neural CFD surrogates across TandemFoilSet, AirfRANS, and DrivAerML for the ICML 2026 workshop sprint. The active target is `target/icml2026`, which packages a shared trainer plus dataset-specific data pipelines under one harness problem directory.
 
 ![val/loss over time](animated_chart.gif)
 
@@ -87,13 +87,15 @@ senpai/
 All project settings live in `senpai.yaml`:
 
 ```yaml
-problem: target/cfd_tandemfoil # active problem directory (repo-relative)
+problem: target/icml2026       # active problem directory (repo-relative)
 repo_url: https://github.com/wandb/senpai.git
-repo_branch: main
+repo_branch: kaiming
 image: ghcr.io/wandb/senpai:latest
+pvc_claim_name: new-pvc
+pvc_mount_path: /mnt/new-pvc
 wandb_entity: wandb-applied-ai-team
 wandb_project: senpai-v1
-advisor_branch: noam
+advisor_branch: kaiming
 timeout_minutes: 30.0
 max_epochs: 50
 n_students: 4
@@ -115,16 +117,16 @@ and push the key to the k8s secrets.
 
 ```bash
 # Train locally
-cd target/cfd_tandemfoil && python train.py --agent <name> --wandb_name "<name>/<description>"
+cd target/icml2026 && python train.py --dataset tandemfoil --agent <name> --wandb_name "<name>/<description>"
 
 # Debug (3 epochs, tiny subset)
-cd target/cfd_tandemfoil && python train.py --debug
+cd target/icml2026 && python train.py --dataset tandemfoil --debug
 
 # Deploy to k8s (reads defaults from senpai.yaml, only --tag is required)
 python k8s/launch.py --tag <research-tag> --advisor
 
 # Override config via CLI
-python k8s/launch.py --tag <research-tag> --advisor --n_students 6 --advisor_branch "einstein"
+python k8s/launch.py --tag <research-tag> --advisor --n_students 6 --advisor_branch "einstein" --pvc_mount_path "/mnt/pai-amf1-cfd"
 
 # Pass extra instructions to the advisor
 python k8s/launch.py --tag <research-tag> --advisor --extra_instructions "Only consider optimizer changes."
