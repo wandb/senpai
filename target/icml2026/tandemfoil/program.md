@@ -24,11 +24,33 @@ stays under `data/`.
 - `data/utils.py` — visualization. **Read-only.**
 - `data/README.md` — benchmark splits, dataset assumptions, and problem-local documentation.
 
+## Reference Parity
+
+TandemFoilSet is the only dataset in this target that is currently pinned to a
+specific historical frontier recipe rather than a purely clean-sheet baseline.
+
+- historical report anchor:
+  - `PR #2319`, the best merged single-seed result in the finished-run cache
+- clean-target parity goal:
+  - `PR #2379`, the later merged two-seed baseline with the ANP cross-foil
+    decoder
+- merged lineage that this target now mirrors:
+  - `#2319 -> #2350 -> #2357 -> #2379`
+
+Pinned source refs:
+
+- transform, denorm, residual, legacy metric contract, and merged feature stack:
+  - `origin/noam@d743ba27eb1c561750f55daeefadcbe41e2b8421`
+- ANP cross-foil decoder implementation:
+  - `origin/frieren/anp-surface-decoder@7999a2e`
+
 ## Metrics
 
 **This benchmark does not have a published external leaderboard metric like AirfRANS or DrivAerML.** The source-of-truth contract is:
 - the `kagent` competition split design in `target/icml2026/tandemfoil/data/split_manifest_tandemfoilset_v2.json`
 - the historical `origin/noam` validation path that produced the paper-facing `p_*` numbers
+- the merged `#2379` TandemFoil recipe described above, with ANP code sourced
+  from `origin/frieren/anp-surface-decoder`
 
 Use the following metric definitions exactly:
 
@@ -57,12 +79,51 @@ Use the following metric definitions exactly:
   - Earlier `origin/noam` frontier numbers use the legacy names `p_in`, `p_tan`, `p_oodc`, and `p_re`.
   - Those are also **surface-pressure MAEs after denormalization**, but they were measured on an older legacy split manifest.
   - Do **not** compare raw values between the legacy `p_*` contract and the new `kagent` v2 contract without restating the split definition.
+  - The shared trainer logs these separately as:
+    - `legacy_noam/*`
+    - `icml2026_v2/*`
 
 Lower is better. For the paper sprint, the decision-driving quantity is **surface pressure MAE on the explicit validation tracks**, with the equal-weight 4-way average used as the benchmark summary.
 
 For held-out reporting after model selection, the trainer also computes the
 analogous `test_eq4/surface_pressure_mae` summary when the four matching test
 tracks are available in the split manifest.
+
+## Transform and Residual Semantics
+
+For TandemFoilSet, the clean trainer now mirrors the noam target-space contract
+instead of using the generic shared transform path:
+
+- compute per-sample `Umag` and `q` from the masked flow targets
+- apply `_phys_norm` / `_phys_denorm` equivalents in velocity and pressure
+- apply `asinh_pressure` in `C_p` space, not in raw pressure space
+- compute paper-facing errors only after full denormalization back to physical
+  units
+
+`residual_prediction` has the noam meaning here:
+
+- subtract the freestream baseline from the normalized targets before loss
+- add the freestream baseline back before denormalization and metric logging
+
+This is intentionally separate from the model-side pressure-prior addition path.
+That mechanism is retained as its own option and is no longer described as
+"residual prediction."
+
+## Frontier Mechanisms
+
+The clean target now carries the merged TandemFoil mechanisms that bridge
+`#2319` to `#2379`:
+
+- TE coordinate frame
+- wake-deficit feature
+- panel-method `C_p` feature with tandem-only scaling
+- wake-angle feature
+- vortex-panel induced-velocity feature
+- zero-init surface refinement head
+- optional ANP cross-foil surface decoder
+- noam-style TandemFoil denorm and legacy metric accumulation
+
+AirfRANS and DrivAerML do not inherit these TandemFoil-specific mechanisms.
 
 ## Sources
 

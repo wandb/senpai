@@ -31,6 +31,7 @@ DEFAULT_TANDEM_MANIFEST = ROOT_DIR / "tandemfoil/data/split_manifest_tandemfoils
 DEFAULT_TANDEM_STATS = ROOT_DIR / "tandemfoil/data/split_stats.json"
 DEFAULT_AIRFRANS_MANIFEST = ROOT_DIR / "airfrans/data/split_manifest_airfrans.json"
 DEFAULT_DRIVAERML_MANIFEST = ROOT_DIR / "drivaerml/data/split_manifest_drivaerml.json"
+RUNTIME_CACHE_CASES = 16
 
 
 def _read_json(path: str | Path) -> dict:
@@ -41,6 +42,8 @@ def _read_json(path: str | Path) -> dict:
 def _stats_from_json(stats_path: str | Path) -> TargetTransformStats:
     raw = _read_json(stats_path)
     return TargetTransformStats(
+        x_mean=torch.tensor(raw["x_mean"], dtype=torch.float32) if "x_mean" in raw else None,
+        x_std=torch.tensor(raw["x_std"], dtype=torch.float32) if "x_std" in raw else None,
         y_mean=torch.tensor(raw["y_mean"], dtype=torch.float32),
         y_std=torch.tensor(raw["y_std"], dtype=torch.float32),
     )
@@ -53,24 +56,14 @@ class TandemFoilCaseDataset(Dataset):
         manifest_path: str | Path = DEFAULT_TANDEM_MANIFEST,
         *,
         debug: bool = False,
-        enable_fourier: bool = False,
-        enable_cp_panel: bool = False,
-        enable_wake_deficit: bool = False,
-        enable_wake_angle: bool = False,
     ):
         manifest = _read_json(manifest_path)
-        cache_size = -1 if debug else 0
+        cache_size = -1 if debug else RUNTIME_CACHE_CASES
         self.base = prepare_multi.MultiFieldDataset(
             prepare_multi._resolve_pickle_paths(manifest),
             cache_size=cache_size,
         )
         self.indices = list(split_indices)
-        self.augment = dict(
-            enable_fourier=enable_fourier,
-            enable_cp_panel=enable_cp_panel,
-            enable_wake_deficit=enable_wake_deficit,
-            enable_wake_angle=enable_wake_angle,
-        )
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -92,7 +85,7 @@ class TandemFoilCaseDataset(Dataset):
             volume_y=volume_y,
             metadata={"base_idx": base_idx},
         )
-        return augment_case_sample(sample, **self.augment)
+        return sample
 
 
 class AirfRANSCaseDataset(Dataset):
@@ -109,7 +102,7 @@ class AirfRANSCaseDataset(Dataset):
     ):
         manifest = _read_json(manifest_path)
         dataset_root = prepare_airfrans._resolve_root(manifest, override_root=root)
-        cache_size = -1 if debug else 0
+        cache_size = -1 if debug else RUNTIME_CACHE_CASES
         self.base = prepare_airfrans.AirfRANSDataset(
             root=dataset_root,
             case_ids=case_ids,
@@ -330,9 +323,11 @@ def build_tandem_bundle(
     stats_path: str | Path = DEFAULT_TANDEM_STATS,
     debug: bool = False,
     enable_fourier: bool = False,
+    enable_te_coord_frame: bool = False,
     enable_cp_panel: bool = False,
     enable_wake_deficit: bool = False,
     enable_wake_angle: bool = False,
+    enable_vortex_panel_velocity: bool = False,
 ) -> DatasetBundle:
     manifest = _read_json(manifest_path)
     train_indices = list(manifest["splits"]["train"])
@@ -341,20 +336,12 @@ def build_tandem_bundle(
         train_indices,
         manifest_path=manifest_path,
         debug=debug,
-        enable_fourier=enable_fourier,
-        enable_cp_panel=enable_cp_panel,
-        enable_wake_deficit=enable_wake_deficit,
-        enable_wake_angle=enable_wake_angle,
     )
     val_datasets = {
         name: TandemFoilCaseDataset(
             list(manifest["splits"][name]),
             manifest_path=manifest_path,
             debug=debug,
-            enable_fourier=enable_fourier,
-            enable_cp_panel=enable_cp_panel,
-            enable_wake_deficit=enable_wake_deficit,
-            enable_wake_angle=enable_wake_angle,
         )
         for name in val_names
     }
@@ -363,10 +350,6 @@ def build_tandem_bundle(
             list(manifest["splits"][name]),
             manifest_path=manifest_path,
             debug=debug,
-            enable_fourier=enable_fourier,
-            enable_cp_panel=enable_cp_panel,
-            enable_wake_deficit=enable_wake_deficit,
-            enable_wake_angle=enable_wake_angle,
         )
         for name in manifest.get("test_splits", [])
     }
@@ -376,11 +359,19 @@ def build_tandem_bundle(
         for idx in indices:
             idx_to_group[idx] = group_name
     sample_weights = torch.tensor(
-        [1.0 / group_sizes[idx_to_group[idx]] for idx in train_indices],
+        [1.0 / group_sizes[idx_to_group[idx]] for idx in range(len(train_indices))],
         dtype=torch.float32,
     )
-    base_dim = prepare_multi.X_DIM
-    augmented_dim = base_dim + (16 if enable_fourier else 0) + (1 if enable_cp_panel else 0) + (2 if enable_wake_deficit else 0) + (1 if enable_wake_angle else 0)
+    base_dim = prepare_multi.X_DIM + 2
+    augmented_dim = (
+        base_dim
+        + (6 if enable_te_coord_frame else 0)
+        + (2 if enable_wake_deficit else 0)
+        + (1 if enable_wake_angle else 0)
+        + (16 if enable_fourier else 0)
+        + (1 if enable_cp_panel else 0)
+        + (4 if enable_vortex_panel_velocity else 0)
+    )
     return DatasetBundle(
         train_dataset=train_dataset,
         val_datasets=val_datasets,
@@ -393,7 +384,10 @@ def build_tandem_bundle(
             volume_output_dim=3,
             pressure_output_index=2,
             default_metric="surface_pressure_mae",
-            notes=["TandemFoilSet grouped into surface and volume tokens from the overset point cloud."],
+            notes=[
+                "TandemFoilSet grouped into surface and volume tokens from the overset point cloud.",
+                "Noam-parity TandemFoil preprocessing is applied in the shared trainer, not in the dataset loader.",
+            ],
         ),
         target_stats=_stats_from_json(stats_path),
         sample_weights=sample_weights,
@@ -447,7 +441,7 @@ def build_airfrans_bundle(
         root=root,
         debug=debug,
         include_nut=True,
-        cache_size=-1 if debug else 0,
+        cache_size=-1 if debug else RUNTIME_CACHE_CASES,
     )
     base_dim = prepare_airfrans.X_DIM
     augmented_dim = base_dim + (16 if enable_fourier else 0) + (1 if enable_cp_panel else 0)
@@ -551,9 +545,11 @@ def build_dataset_bundle(
     drivaerml_root: str | Path | None = None,
     drivaerml_surface_only: bool = True,
     enable_fourier: bool = False,
+    enable_te_coord_frame: bool = False,
     enable_cp_panel: bool = False,
     enable_wake_deficit: bool = False,
     enable_wake_angle: bool = False,
+    enable_vortex_panel_velocity: bool = False,
 ) -> DatasetBundle:
     if dataset_name in {"tandemfoil", "tandemfoilset"}:
         return build_tandem_bundle(
@@ -561,9 +557,11 @@ def build_dataset_bundle(
             stats_path=tandem_stats,
             debug=debug,
             enable_fourier=enable_fourier,
+            enable_te_coord_frame=enable_te_coord_frame,
             enable_cp_panel=enable_cp_panel,
             enable_wake_deficit=enable_wake_deficit,
             enable_wake_angle=enable_wake_angle,
+            enable_vortex_panel_velocity=enable_vortex_panel_velocity,
         )
     if dataset_name == "airfrans":
         return build_airfrans_bundle(

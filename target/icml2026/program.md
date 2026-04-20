@@ -21,6 +21,11 @@ The goal is to compare a clean shared training stack across the three datasets,
 with reference comparisons against a vanilla grouped-domain Transolver and an
 AB-UPT-style anchor model where appropriate.
 
+For TandemFoilSet specifically, this target should become the reproduction and
+extension path for the merged noam lineage through `#2379`, while AirfRANS and
+DrivAerML remain on the simpler shared path unless their own parity work is
+explicitly requested.
+
 ## Codebase
 
 - `train.py` — shared ICML sprint trainer and model selector. **Primary editable entrypoint.**
@@ -36,8 +41,10 @@ The trainer supports multiple datasets, so merge decisions should be based on th
 most decision-relevant metric for the selected benchmark:
 
 - `tandemfoil`
-  - prioritize structured validation split performance, especially tandem transfer
-  - pressure and surface fidelity matter most
+  - prioritize two metric families side by side:
+  - `legacy_noam/*` for the denormalized historical `p_*` contract
+  - `icml2026_v2/*` for the packaged `kagent` split contract
+  - pressure and surface fidelity remain the decision-driving quantities
 - `airfrans`
   - prioritize surface and volume error on the official task split
   - compare against literature-reported Transolver and newer baselines
@@ -50,8 +57,8 @@ simple enough to keep maintaining under deadline pressure.
 
 ## Metric Alignment Plan
 
-The code and dataset docs in this target are pinned to the literature-facing
-contracts we intend to cite in the ICML paper sprint.
+The code and dataset docs in this target should stay pinned to the
+literature-facing contracts we intend to cite in the ICML paper sprint.
 
 Alignment policy:
 
@@ -64,6 +71,23 @@ Alignment policy:
   literature-facing comparison numbers for the matching test split
 - document any remaining irreducible discrepancy, such as the packaged
   DrivAerML case set being smaller than the nominal public split in AB-UPT
+- pin TandemFoilSet parity work to concrete source refs rather than a floating
+  branch head:
+  - transform, metric, residual, and merged feature-stack contract:
+    `origin/noam@d743ba27eb1c561750f55daeefadcbe41e2b8421`
+  - ANP cross-foil decoder implementation source:
+    `origin/frieren/anp-surface-decoder@7999a2e`
+- keep the TandemFoil historical anchor and the clean-target parity target
+  distinct:
+  - historical best merged single-seed anchor in the report: `#2319`
+  - merged parity lineage this target should reproduce and extend:
+    `#2319 -> #2350 -> #2357 -> #2379`
+- emit both TandemFoil metric regimes explicitly instead of silently mixing
+  them:
+  - `legacy_noam/p_in`, `legacy_noam/p_oodc`, `legacy_noam/p_tan`,
+    `legacy_noam/p_re`
+  - `val_eq4/surface_pressure_mae`, `test_eq4/surface_pressure_mae`, and the
+    per-split `surface_pressure_mae` values for the v2 manifest
 
 Primary harness metric aliases:
 

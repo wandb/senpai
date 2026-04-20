@@ -12,6 +12,7 @@ does not depend on `milieu_cfd`, AB-UPT, or PhysicsNeMo at runtime.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 import sys
@@ -58,11 +59,15 @@ def _resolve_case_root(manifest: dict, override_root: str | Path | None = None) 
             raise FileNotFoundError(f"DrivAerML root does not exist: {root}")
         return root
 
-    candidates = expand_pvc_candidates(manifest.get("case_root_candidates", []))
+    candidates = list(manifest.get("case_root_candidates", []))
     case_root = manifest.get("case_root")
     if case_root:
         candidates.append(case_root)
-        candidates = expand_pvc_candidates(candidates)
+        if isinstance(case_root, str) and case_root.startswith("/mnt/pvc/"):
+            candidates.append(case_root.replace("/mnt/pvc/", "/mnt/new-pvc/", 1))
+        if isinstance(case_root, str) and case_root.startswith("/mnt/new-pvc/"):
+            candidates.append(case_root.replace("/mnt/new-pvc/", "/mnt/pvc/", 1))
+    candidates = expand_pvc_candidates(candidates)
 
     if candidates:
         root = first_existing(candidates)
@@ -84,8 +89,62 @@ def _case_dir(root: Path, case_id: str) -> Path:
     return path
 
 
+def _candidate_artifact_paths(path: Path) -> list[Path]:
+    texts: list[str] = []
+    seen: set[str] = set()
+
+    def add(text: str | Path | None) -> None:
+        if not text:
+            return
+        raw = str(text)
+        if raw in seen:
+            return
+        seen.add(raw)
+        texts.append(raw)
+
+    add(path)
+    add(path.resolve(strict=False))
+    if str(path).startswith("/mnt/pvc/"):
+        add(str(path).replace("/mnt/pvc/", "/mnt/new-pvc/", 1))
+    if str(path).startswith("/mnt/new-pvc/"):
+        add(str(path).replace("/mnt/new-pvc/", "/mnt/pvc/", 1))
+
+    if path.is_symlink():
+        raw_target = os.readlink(path)
+        add(raw_target)
+        target_path = Path(raw_target)
+        if not target_path.is_absolute():
+            target_path = (path.parent / target_path).resolve(strict=False)
+        add(target_path)
+        target_text = str(target_path)
+        if target_text.startswith("/rsyncd-munged/"):
+            stripped = target_text.removeprefix("/rsyncd-munged/").lstrip("/")
+            add("/" + stripped)
+            if stripped.startswith("mnt/pvc/"):
+                add("/" + stripped.replace("mnt/pvc/", "mnt/new-pvc/", 1))
+            if stripped.startswith("mnt/new-pvc/"):
+                add("/" + stripped.replace("mnt/new-pvc/", "mnt/pvc/", 1))
+        if target_text.startswith("/mnt/pvc/"):
+            add(target_text.replace("/mnt/pvc/", "/mnt/new-pvc/", 1))
+        if target_text.startswith("/mnt/new-pvc/"):
+            add(target_text.replace("/mnt/new-pvc/", "/mnt/pvc/", 1))
+
+    ordered: list[Path] = []
+    for candidate in expand_pvc_candidates(texts):
+        resolved = Path(candidate)
+        if resolved not in ordered:
+            ordered.append(resolved)
+    return ordered
+
+
 def _load_npy(path: Path) -> np.ndarray:
-    return np.asarray(np.load(path), dtype=np.float32)
+    for candidate in _candidate_artifact_paths(path):
+        if candidate.exists():
+            return np.asarray(np.load(candidate), dtype=np.float32)
+    raise FileNotFoundError(
+        "Could not resolve DrivAerML artifact "
+        f"{path}; checked {[str(candidate) for candidate in _candidate_artifact_paths(path)]}"
+    )
 
 
 def _column(value: np.ndarray) -> np.ndarray:

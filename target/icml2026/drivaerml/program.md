@@ -26,6 +26,7 @@ Use the **DrivAerML relative-L2 contract** used by AB-UPT and continued in later
   - AB-UPT defines the dataset score as the arithmetic mean of those per-case relative-L2 values over the evaluation split.
   - Evaluation is done on **unnormalized** targets and predictions.
   - The shared trainer now follows that same contract for paper-facing DrivAerML metrics and logs the validation scalar as `val_primary/surface_rel_l2_pct`, with the matching test scalar logged as `test_primary/surface_rel_l2_pct`.
+  - For debugging and auditability, the trainer also logs the raw ratio before percent-scaling as `surface_rel_l2`.
 
 - **Field names for literature comparison**
   - Surface:

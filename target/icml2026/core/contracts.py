@@ -25,6 +25,8 @@ class DatasetSpec:
 
 @dataclass
 class TargetTransformStats:
+    x_mean: torch.Tensor | None = None
+    x_std: torch.Tensor | None = None
     y_mean: torch.Tensor | None = None
     y_std: torch.Tensor | None = None
     geometry_center: torch.Tensor | None = None
