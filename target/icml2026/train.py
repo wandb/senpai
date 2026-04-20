@@ -1075,6 +1075,24 @@ def main() -> None:
     if max_epochs_env:
         config.epochs = min(config.epochs, int(max_epochs_env))
 
+    import core.datasets as _ds
+    _ds.RUNTIME_CACHE_CASES = 3000
+
+    if config.dataset in ("tandemfoil", "tandemfoilset"):
+        from tandemfoil.data import prepare_multi
+        _orig_init = _ds.TandemFoilCaseDataset.__init__
+        _shared_base = [None]
+
+        def _patched_init(self, split_indices, manifest_path=_ds.DEFAULT_TANDEM_MANIFEST, *, debug=False):
+            if _shared_base[0] is None:
+                _orig_init(self, split_indices, manifest_path, debug=debug)
+                _shared_base[0] = self.base
+            else:
+                self.base = _shared_base[0]
+                self.indices = list(split_indices)
+
+        _ds.TandemFoilCaseDataset.__init__ = _patched_init
+
     bundle = build_bundle(config)
     if bundle.spec.name == "tandemfoilset":
         phys_stats = compute_tandem_phys_stats(
@@ -1204,7 +1222,7 @@ def main() -> None:
         if run is not None:
             wandb.log(epoch_metrics, step=epoch)
             run.summary["epoch"] = epoch
-        print(json.dumps(epoch_metrics, sort_keys=True))
+        print(json.dumps(epoch_metrics, sort_keys=True), flush=True)
 
     final_test_metrics: dict[str, float] = {}
     if test_loaders:
@@ -1253,7 +1271,7 @@ def main() -> None:
         if run is not None:
             wandb.log(final_test_metrics, step=int(history[-1]["epoch"]) if history else 0)
             run.summary.update(final_test_metrics)
-        print(json.dumps({"final_test_metrics": final_test_metrics}, sort_keys=True))
+        print(json.dumps({"final_test_metrics": final_test_metrics}, sort_keys=True), flush=True)
 
     output_dir = Path(config.output_dir)
     write_run_summary(
