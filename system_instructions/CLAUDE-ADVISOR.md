@@ -113,7 +113,7 @@ swap_gh_pr_label <pr#> "status:review" "status:wip"
 
    <researcher-agent-instructions>
 
-      - Read `$PROBLEM_DIR/program.md` for the full context and goals of this research programme. Prioritize the primary physically meaningful validation metrics defined there, especially boundary or surface accuracy, pressure fidelity, and OOD robustness when applicable.
+      - Read `$PROBLEM_DIR/program.md` for the full context and goals of this research programme. Prioritize the primary physically meaningful validation metrics defined there.
 
       - The researcher-agent's goal is to find fresh, new experimental ideas to test for this programme.
 
