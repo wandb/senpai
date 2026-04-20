@@ -1,89 +1,104 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-20 23:30 UTC
+- **Date:** 2026-04-21 00:30 UTC
 - **Branch:** radford
 
-## THE KEY FINDINGS (UPDATED)
-
-1. **Fourier+physics is the new TandemFoil golden config** — 82.65 val (28.1% below old baseline 114.92). Synergistic: more epochs (14 vs 11) AND better per-epoch quality. Still improving at cutoff.
-2. **Epoch count is the universal dominant lever** — But Fourier+physics doesn't reduce epoch count at slices=64 (contrary to prior assumption).
-3. **EMA IS HARMFUL** — `--no-use-ema` mandatory across all datasets.
-4. **Physics features work when combined with Fourier at slices=64** — The 7x overhead bottleneck observed at slices=96 doesn't manifest at slices=64. This is a critical insight revision.
-5. **ANP decoder conclusively negative** — Never use `--anp-srf`.
-6. **Fourier alone on AirfRANS: net negative** — 6→2 epochs overhead. Fourier+physics hasn't been tested yet (kohaku running).
-7. **Optimizer: Lion for TandemFoil, AdamW for AirfRANS/DrivAerML**
-8. **DrivAerML: 1M train surface points >> 50k** — Key hardware finding. Enables much richer gradient signal. Each epoch = ~80 min (1 epoch per 30-min timeout).
-9. **DrivAerML T_max=50 is best** for step-level cosine scheduling.
-
-## Student Status
-
-### WIP — TandemFoil (Fourier+physics golden config = NEW STANDARD)
-- frieren #2490: **Fourier+physics+no-EMA + T_max sweep (10, 15, 20)** — HIGHEST PRIORITY
-- edward #2491: Fourier+physics+no-EMA + 4L/256d capacity
-- gilbert #2471: Golden + no-EMA (no Fourier, no physics) — still running
-- tanjiro #2485: Golden + no-EMA + Lion lr=2e-4/1e-4
-- shinji #2486: Golden + no-EMA + AdamW
-- kaneda #2488: Golden + no-EMA + 4L/256d (no Fourier — now superseded by edward)
-
-### WIP — AirfRANS
-- kohaku #2492: **Fourier+physics+no-EMA** — new direction from TandemFoil breakthrough
-- haku #2470: Fourier + no-EMA full epoch run
-- senku #2474: Fourier + no-EMA + 4L/256d
-- norman #2460: No-EMA + OOD tasks
-- alphonse #2469: No-EMA + cosine T_max sweep
-
-### WIP — DrivAerML
-- taki #2493: **1M train + 50k eval + tmx50 + lr=8e-4** — standardized validation
-- thorfinn #2487: Slices reduction for more epochs (64, 48, 32)
-- shoya #2466: No-EMA retest of AdamW winner
-- chihiro #2475: Fourier + no-EMA
-- mitsuha #2442: Model capacity sweep
-- nezuko #2439: Anchor token budget sweep
-- shouko #2437: Surface points budget sweep
-
-## Current Baselines
+## UPDATED BASELINES (after this review round)
 
 | Dataset | Metric | Value | PR |
 |---|---|---|---|
-| TandemFoil | val_primary/surface_pressure_mae | **82.65** | #2473 (slices=64, T_max=30, Lion lr=3e-4, no-EMA, Fourier+physics, 14 epochs) |
-| AirfRANS | val_primary/surface_mse | **0.2597** | #2455 (3L/192d, no-EMA, no-Fourier, 6 epochs) |
-| DrivAerML | val_primary/surface_rel_l2_pct | **56.91%** | #2467 (no-EMA, AdamW lr=8e-4, 2 epochs, 50k pts) |
+| TandemFoil | val_primary/surface_pressure_mae | **82.65** | #2473 (Fourier+physics+no-EMA, slices=64, T_max=30, Lion lr=3e-4, 14 epochs) |
+| AirfRANS | val_primary/surface_mse | **0.2387** | #2478 (Fourier+4L/256d+no-EMA, 8 epochs, T_max=150) ← UPDATED |
+| DrivAerML | val_primary/surface_rel_l2_pct | **51.35%** | #2475 (Fourier+no-EMA, T_max=30, AdamW lr=5e-4, 2 epochs) ← UPDATED |
 
-## Confirmed Dead Ends
+## CRITICAL FINDINGS (UPDATED)
 
-| Direction | Result | Reason |
-|---|---|---|
-| ANP decoder | +5.4% worse | Cross-foil attention harmful |
-| Physics at slices=96 | 2 epochs max, ~150-170 val | Overhead at slices=96 blocks |
-| Fourier alone on AirfRANS | 2 epochs vs 6 | 3x epoch overhead, net negative |
-| Lion on AirfRANS/DrivAerML | Significantly worse | AdamW consistently better |
-| EMA (any dataset) | -10% to +29% worse | Short training regime incompatibility |
-| 6L deep model | Divergence | Too deep for 30-min regime |
-| DrivAerML 50k→baseline | 2 epochs, 56.91% | Low surface point resolution limits learning |
+1. **Fourier proven on ALL datasets**: TandemFoil (+28% combined with physics), AirfRANS (+17.4% with 4L/256d), DrivAerML (+9.8%).
+2. **EMA IS HARMFUL** — `--no-use-ema` mandatory everywhere.
+3. **epochs=2 BUG** — CRITICAL: Must pass `--epochs 999` in ALL training commands.
+4. **180-min budget** — 60-70 epochs (TandemFoil), 18-22 epochs (AirfRANS), 12-15 epochs (DrivAerML).
+5. **Optimizer:** Lion for TandemFoil; AdamW for AirfRANS/DrivAerML.
+6. **DrivAerML LR:** With Fourier, lr=5e-4 beats lr=8e-4 (51.35% vs 54.33%).
+7. **T_max:** 30 for TandemFoil (needs retest at new scale); 150 for AirfRANS; 30 for DrivAerML+Fourier.
+8. **ANP decoder: conclusively negative** — never use.
+
+## Idle Students
+None — all 30 assigned in this round.
+
+## PRs Ready for Review
+None currently.
+
+## WIP PRs
+
+### TandemFoil
+- frieren #2490: T_max sweep (10, 15, 20) with Fourier+physics
+- edward #2491: 4L/256d + Fourier+physics capacity
+- gilbert #2471: Golden no-EMA (no Fourier, no physics)
+- tanjiro #2485: Golden + Lion LR sweep (2e-4, 1e-4)
+- shinji #2486: Golden + AdamW vs Lion
+- askeladd #2462: Physics + slices sweep (48/64/96)
+- fern #2494: Fourier+physics + T_max=300 long run
+- nezuko #2495: Fourier+physics + T_max=30/1000 long run
+- haku #2496: Fourier+physics + AdamW optimizer
+- tetsuo #NEW: Fourier+physics + Lion lr=2e-4/1e-4
+- naruto #NEW: Fourier+physics + 3L/256d width
+- sasuke #NEW: Fourier+physics + T_max=150/50
+- sakura #NEW: Fourier only (ablation)
+- kakashi #NEW: Fourier+physics + slices=48/80
+
+### AirfRANS
+- kohaku #2492: Fourier+physics+no-EMA (TandemFoil synergy)
+- emma #2482: T_max=50 + lr=8e-4
+- hinata #2497: Fourier+4L/256d LONG RUN (most critical)
+- itachi #2498: Fourier+4L/256d + T_max=360/720 alignment
+- roy #2500: Fourier+5L/256d and 4L/320d capacity
+- winry #2501: Fourier+3L/192d + LR sweep
+- eren #NEW: Fourier+4L/256d + lr=3e-4/8e-4
+- mikasa #NEW: no-Fourier long training ablation
+- armin #NEW: Fourier+4L/256d + slices=64/48
+- levi #NEW: Fourier+4L/256d + Lion optimizer
+
+### DrivAerML
+- taki #2493: 1M training points standardized rerun
+- thorfinn #2487: Slices reduction
+- shoya #2466: no-EMA retest
+- mitsuha #2442: Capacity sweep
+- shouko #2437: Surface points budget sweep
+- norman #2484: Slices reduction for more epochs
+- alphonse #2483: 4L/256d capacity
+- historia #NEW: Fourier+no-EMA LONG RUN (most critical)
+- ymir #NEW: T_max sweep (10, 20, 50) with Fourier
+- zenitsu #NEW: LR sweep (3e-4, 4e-4, 6e-4, 7e-4)
+- inosuke #NEW: 4L/256d + Fourier capacity
+- giyu #NEW: slices=64/48 throughput
+- shinobu #NEW: 100k training surface points
+- chrome #NEW: no-Fourier long run ablation
+- gen #NEW: 200k training surface points
+- ray #NEW: Lion optimizer + Fourier
+- asuka #NEW: T_max=10 long run
+- kaworu #NEW: 5L/256d capacity
+- luffy #NEW: T_max=50 long run
+- zoro #NEW: T_max=150 long run
+- nami #NEW: lr=8e-4 revisit long run
 
 ## Current Research Themes
 
-1. **TandemFoil: optimize the Fourier+physics config** — frieren (T_max sweep) and edward (capacity) are the highest priority. 82.65 was still improving at epoch 14. The right T_max and capacity could push below 70.
+1. **Long-training convergence**: 6x budget increase is the biggest opportunity. Long runs of all 3 baselines assigned as top priority.
+2. **Fourier universality**: Fourier proven on all 3 datasets. Now testing at scale — architectures, LRs, training lengths.
+3. **DrivAerML breakthrough**: 51.35% vs 3.71% target (14x gap). Long training + surface point sweep + Fourier is the main attack.
+4. **Cross-dataset recipe**: Fourier+no-EMA is the universal baseline. Key divergence: optimizer (Lion/AdamW) and T_max.
+5. **T_max recalibration**: Old T_max tuned for 14 epochs. Now testing at 60-70+ epoch scale.
 
-2. **AirfRANS: test Fourier+physics synergy** — kohaku is testing this. If the same synergy holds (more epochs with Fourier+physics than Fourier alone), this could produce a big AirfRANS breakthrough.
+## Confirmed Dead Ends
 
-3. **DrivAerML: standardize 1M surface points** — taki's standardized rerun will establish whether 1M pts beats 50k baseline at comparable eval settings. This is critical because it determines the new DrivAerML standard.
-
-4. **DrivAerML: epoch starvation** — thorfinn's slices reduction still pending. Combined with 1M surface points insight, might find a sweet spot.
-
-## Next Round Priorities
-
-### TandemFoil
-- After frieren (T_max) and edward (capacity) results: compound best T_max + best capacity + Fourier+physics
-- Consider AdamW with Fourier+physics (kohaku/shinji covered AdamW on golden config without Fourier)
-- The metric may be approaching ~60-70 range — track whether it's still improving
-
-### AirfRANS
-- If kohaku (Fourier+physics) works: immediately scale
-- 0.2597 target, external SpiderSolver is 0.0043 (60x off)
-- Consider: what physics features are available for AirfRANS? (asinh-pressure, residual-prediction)
-
-### DrivAerML
-- Target <3.71% (AB-UPT). Currently 56.91%. 15x gap.
-- 1M surface points is the most promising lever
-- If taki validates 1M pts: immediately add Fourier, capacity, and T_max tuning on top
+| Direction | Reason |
+|---|---|
+| ANP decoder | +5.4% worse |
+| EMA | -10% to +29% worse |
+| Lion on AirfRANS/DrivAerML | AdamW consistently better |
+| Physics at slices=96 | 2 epochs max |
+| 6L deep model | Diverges |
+| batch_size=4 TandemFoil | Destroys epoch budget |
+| Reynolds-stratified sampling | All worse |
+| geometry_supernodes flag | NO-OP for senpai_transolver |
+| surface_anchor_points flag | NO-OP for senpai_transolver |
