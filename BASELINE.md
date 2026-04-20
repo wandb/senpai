@@ -48,11 +48,21 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.3009 (val) / 0.2869 (test)
-- **Best PR:** #2457 (haku — AirfRANS Fourier + no-EMA + AdamW lr=5e-4)
-- **Key insight:** Fourier positional encoding + no-EMA beats 6-epoch baseline in just 2 epochs.
+- **Current best:** 0.2891 (val) / 0.2856 (test)
+- **Best PR:** #2474 (senku — Fourier + no-EMA + 4L/256d + AdamW lr=5e-4)
+- **Key insight:** Fourier + bigger model (4L/256d) synergize. Still in steep descent at epoch 2.
 
-### 2026-04-20 21:15 — PR #2457: AirfRANS: Fourier + no-EMA + AdamW lr=5e-4 — NEW BEST
+### 2026-04-20 22:00 — PR #2474: AirfRANS: Fourier + no-EMA + 4L/256d — NEW BEST
+
+- **val_primary/surface_mse:** 0.2891 (-3.9% vs 0.3009)
+- **test_primary/surface_mse:** 0.2856 (-0.5% vs 0.2869)
+- **Surface MSE breakdown (val, epoch 2):** Ux=0.000403, Uy=0.000072, p=1.1560, nut=0.000098
+- **Note:** 2 epochs only. 4L/256d/4H + Fourier + no-EMA. Steep descent (epoch 1: 0.4256 → epoch 2: 0.2891). More epochs should push much lower. lr=3e-4 variant underperformed on test.
+- **W&B run:** hxyibvbf
+- **Epochs:** 2 (30-min timeout)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans_task full --optimizer adamw --lr 5e-4 --cosine_t_max 150 --no-use-ema --enable-fourier --model-layers 4 --model-hidden-dim 256 --model-heads 4`
+
+### 2026-04-20 21:15 — PR #2457: AirfRANS: Fourier + no-EMA + AdamW lr=5e-4
 
 - **val_primary/surface_mse:** 0.3009 (-9.1% vs 0.3308)
 - **test_primary/surface_mse:** 0.2869 (-10.3% vs 0.3199)
@@ -75,9 +85,19 @@
 ## DrivAerML
 
 - **Primary metric:** `val_primary/surface_rel_l2_pct` (lower is better)
-- **Current best:** 71.35% (val)
-- **Best PR:** #2440 (shoya — DrivAerML AdamW lr=5e-4, 2 epochs)
+- **Current best:** 56.91% (val) / 57.33% (test)
+- **Best PR:** #2467 (violet — no-EMA + AdamW lr=8e-4, 2 epochs)
 - **External target:** <3.71% (AB-UPT, ~500 epochs)
+- **Key insight:** No-EMA + higher LR (8e-4) dramatically improves DrivAerML (-20% relative).
+
+### 2026-04-20 22:00 — PR #2467: DrivAerML: no-EMA + AdamW lr=8e-4 — NEW BEST
+
+- **val_primary/surface_rel_l2_pct:** 56.91% (-20% relative vs 71.35%)
+- **test_primary/surface_rel_l2_pct:** 57.33%
+- **Note:** 2 epochs. No-EMA unlocks higher LR effectiveness. lr=1e-3 also good (58.78%). AdamW lr=8e-4 + no-EMA is the new DrivAerML default.
+- **W&B run:** ip8ybl80
+- **Epochs:** 2 (30-min timeout)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset drivaerml --optimizer adamw --lr 8e-4 --cosine_t_max 150 --no-use-ema`
 
 ### 2026-04-20 21:00 — PR #2440: DrivAerML: AdamW vs Lion baseline sweep (first baseline)
 

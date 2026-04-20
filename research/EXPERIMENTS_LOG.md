@@ -1,5 +1,70 @@
 # SENPAI Research Results
 
+## 2026-04-20 22:00 — PR #2467: DrivAerML: no-EMA + AdamW lr=8e-4 — MERGED ✓ NEW BEST
+
+- **Branch:** violet/drivaerml-noema-lr-bracket
+
+| Run | LR | val_primary/surface_rel_l2_pct | test | Epochs | W&B |
+|---|---|---|---|---|---|
+| **lr=8e-4** | **8e-4** | **56.91%** (-20% relative) | 57.33% | 2 | ip8ybl80 |
+| lr=1e-3 | 1e-3 | 58.78% | 59.14% | 2 | 28udv9x7 |
+
+**Commentary:** MASSIVE DrivAerML improvement. No-EMA + lr=8e-4 crushes the 71.35% EMA baseline. EMA was suppressing the higher LR's effectiveness. lr=8e-4 is the new DrivAerML default.
+
+---
+
+## 2026-04-20 22:00 — PR #2474: AirfRANS: Fourier + no-EMA + 4L/256d — MERGED ✓ NEW BEST
+
+- **Branch:** senku/airfrans-fourier-noema-combo
+
+| Run | Config | val_primary/surface_mse | test | Epochs | W&B |
+|---|---|---|---|---|---|
+| **4L/256d** | Fourier+noEMA+4L/256d+lr=5e-4 | **0.2891** (-3.9%) | **0.2856** | 2 | hxyibvbf |
+| lr=3e-4 | Fourier+noEMA+3L/192d+lr=3e-4 | 0.2975 | 0.3052 | 2 | 1mhw0tph |
+
+**Commentary:** Fourier + 4L/256d capacity synergize. Still in steep descent at epoch 2 (0.4256→0.2891). More epochs should push much lower. lr=3e-4 variant underperformed on test.
+
+---
+
+## 2026-04-20 22:00 — PR #2471: TandemFoil: golden config + no-EMA — SENT BACK (epoch starvation)
+
+- **Branch:** gilbert/tandem-golden-noema
+
+| Run | val_primary/surface_pressure_mae | Epochs | W&B |
+|---|---|---|---|
+| lr=3e-4 | 215.94 | 2 | 457alys4 |
+| lr=2e-4 | **190.34** | 2 | xpuptoy5 |
+
+**Commentary:** Only 2 epochs at slices=64 (should be 11). Likely parallel execution causing I/O contention. lr=2e-4 improving at 12.7%/epoch — very promising. Sent back for strict sequential rerun. With 11 epochs, projected to dramatically beat 114.92 baseline.
+
+---
+
+## 2026-04-20 22:00 — PR #2472: TandemFoil: golden + physics + no-EMA — CLOSED (epoch starvation)
+
+- **Branch:** kaneda/tandem-golden-physics-noema
+
+| Run | val_primary/surface_pressure_mae | Epochs | W&B |
+|---|---|---|---|
+| Lion lr=3e-4 | 173.00 | 2 | 3fjtrbv6 |
+| **AdamW lr=3e-4** | **153.10** | 2 | dc717g1b |
+
+**Commentary:** Physics features add ~7x overhead at slices=64. Only 2 epochs. Key finding: **AdamW outperforms Lion with physics features** (153.10 vs 173.00, -11.5%) — a reversal of the no-physics optimizer preference. Physics + AdamW at 2 epochs (153.10) already beats old no-physics no-EMA baseline at 2 epochs (197.87). Path forward: slices=32 for more epochs with physics.
+
+---
+
+## 2026-04-20 22:00 — PR #2439: DrivAerML: anchor budget sweep — CLOSED (no-ops, superseded)
+
+- **Branch:** nezuko/drivaerml-anchor-budget-sweep
+
+| Trial | surface_pts/view | val_primary/surface_rel_l2_pct | Epochs | W&B |
+|---|---|---|---|---|
+| A | 500K | 72.46% | 2 | w0a1g9qo |
+| B | 1.5M | 71.37% | 2 | 37zg4voz |
+
+**Commentary:** geometry_supernodes and surface_anchor_points are NO-OPS for senpai_transolver (only work with ABUPTCollate). Student pivoted to surface point budget — more points help marginally but doesn't beat baseline. Now superseded by violet's 56.91%.
+
+---
+
 ## 2026-04-20 21:50 — PR #2460: AirfRANS OOD tasks (scarce + reynolds) with no-EMA — MERGED ✓ NEW OOD BASELINES
 
 - **Branch:** norman/airfrans-noema-ood
