@@ -551,3 +551,66 @@ Key pattern: ALL 5 AirfRANS Round 2 PRs ran at slices=64 with 4 parallel jobs �
 | Config | 4L/256d, AdamW lr=1e-3, cosine_t_max=50 |
 
 **Commentary:** Second best AirfRANS result (0.379) but loses to simpler AdamW 3L/192d at lr=5e-4 (0.331). Bigger model is slower (~6 min/epoch), fewer epochs, and the higher LR (1e-3 vs optimal 5e-4) likely suboptimal. Direction is promising but needs to be tested with lr=5e-4 and fewer slices — covered in emma's Round 2 PR #2429.
+
+---
+
+## 2026-04-20 22:45 — PR #2461: TandemFoil: physics + no-EMA + Lion LR sweep (2e-4, 3e-4) — CLOSED
+
+- **Student:** tanjiro
+- **Branch:** tanjiro/tandem-noema-physics-lion-lr-sweep-v2
+
+| Metric | Run 1 (Lion 2e-4) | Run 2 (Lion 3e-4) | Baseline |
+|---|---|---|---|
+| val_primary/surface_pressure_mae | 160.46 | ~170+ | 114.92 |
+| Epochs | 2 (slices=96) | 2 (slices=96) | 11 (slices=64) |
+
+**Commentary:** Physics + no-EMA + Lion at slices=96 still only gets 2 epochs. lr=2e-4 was the stronger LR (160.46 vs ~170+ for 3e-4), showing strong epoch-over-epoch improvement. Runs were still descending rapidly at cutoff. Cannot compete with the 11-epoch golden config at slices=64. Closed — redirected tanjiro to test Lion lr=2e-4 at slices=64 (PR #2485).
+
+---
+
+## 2026-04-20 22:45 — PR #2456: TandemFoil: triple stack (no-EMA + physics + AdamW) — CLOSED
+
+- **Student:** shinji
+- **Branch:** shinji/tandem-noema-physics-adamw
+
+| Metric | Trial 0 (AdamW 5e-4) | Trial 1 (AdamW 3e-4) | Baseline |
+|---|---|---|---|
+| val_primary/surface_pressure_mae | 207.02 | **173.85** | 114.92 |
+| test_primary/surface_pressure_mae | 189.42 | 170.13 | 108.16 |
+| val_re_rand | 169.76 | 149.66 | — |
+| W&B run | z8pxqegf | zhn2jxyv | — |
+| Epochs | 2 (slices=96) | 2 (slices=96) | 11 (slices=64) |
+
+**Commentary:** AdamW reversal with physics confirmed again — lr=3e-4 beats lr=5e-4. Trial 0 (5e-4) actually *regressed* from epoch 1 to 2 (180.28→207.02), likely cosine LR cycle instability. Trial 1 (3e-4) was improving strongly (207.85→173.85). 173.85 beats the no-physics no-EMA baseline (197.87) by 12.1%, validating that physics + AdamW is a productive direction. Cannot beat golden 11-epoch baseline. Closed — redirected shinji to test AdamW vs Lion at 11 epochs without physics (PR #2486).
+
+---
+
+## 2026-04-20 22:45 — PR #2453: TandemFoil: ANP cross-foil decoder + no-EMA + physics + AdamW — CLOSED
+
+- **Student:** thorfinn
+- **Branch:** thorfinn/tandem-noema-anp-decoder
+
+| Metric | ANP Decoder | Control (no-ANP) | Baseline |
+|---|---|---|---|
+| val_primary/surface_pressure_mae | 166.56 | **158.04** | 114.92 |
+| Epochs | 2 (slices=96) | 2 (slices=96) | 11 (slices=64) |
+
+**Commentary:** ANP decoder is conclusively negative (+5.4% vs no-ANP control). Control (physics + AdamW + no-EMA, 158.04) consistent with shinji's triple-stack result (173.85 different config). ANP should never be used going forward. Control result of 158.04 confirms AdamW+physics+no-EMA trajectory but can't beat golden config. Closed — redirected thorfinn to DrivAerML slices reduction (PR #2487).
+
+---
+
+## 2026-04-20 22:45 — PR #2477: TandemFoil: physics + no-EMA + AdamW at slices=32 — CLOSED
+
+- **Student:** kaneda
+- **Branch:** kaneda/tandem-physics-slices32-noema
+
+| Metric | Run 1 (AdamW 3e-4) | Run 2 (AdamW 5e-4) | Baseline |
+|---|---|---|---|
+| val_primary/surface_pressure_mae | 152.25 | 172.79 | 114.92 |
+| test_primary/surface_pressure_mae | 146.76 | 167.75 | 108.16 |
+| W&B run | toguophc | 920u2eqy | — |
+| Epochs | 2 (slices=32) | 2 (slices=32) | 11 (slices=64) |
+
+**Commentary:** CRITICAL FINDING — slices=32 with physics still only gets 2 epochs. The central hypothesis failed: physics overhead is per-sample, not per-slice. Halving slices twice (96→64→32) produces zero meaningful speedup on physics feature computation. The 7x overhead comes from Cp panel + TE coord frame + pressure prior — these are datapoint-level operations. Physics features need precomputed caching to be viable. Best result 152.25 (lr=3e-4) confirms lr=3e-4 > lr=5e-4 for AdamW+physics. Closed — redirected kaneda to 4L/256d capacity test at golden config (PR #2488).
+
+**Key structural finding:** Physics features are permanently blocked at ~2 epochs until precomputed caching is implemented. This is not a hyperparameter problem.
