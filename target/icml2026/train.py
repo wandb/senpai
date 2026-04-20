@@ -135,23 +135,34 @@ class TargetTransform:
         stats_std: torch.Tensor | None,
         asinh_pressure: bool = False,
         asinh_scale: float = 1.0,
+        residual_prediction: bool = False,
     ):
         self.pressure_index = pressure_index
         self.stats_mean = stats_mean
         self.stats_std = stats_std
         self.asinh_pressure = asinh_pressure
         self.asinh_scale = asinh_scale
+        self.residual_prediction = residual_prediction
 
-    def apply(self, y: torch.Tensor) -> torch.Tensor:
-        out = y.clone()
+    def _normalize_raw(self, t: torch.Tensor) -> torch.Tensor:
+        out = t
         if self.asinh_pressure and self.pressure_index is not None:
+            out = out.clone()
             out[..., self.pressure_index] = torch.asinh(out[..., self.pressure_index] * self.asinh_scale)
         if self.stats_mean is not None and self.stats_std is not None and self.stats_mean.numel() == out.shape[-1]:
             out = (out - self.stats_mean.to(out.device)) / self.stats_std.to(out.device).clamp(min=1e-6)
         return out
 
-    def invert(self, y: torch.Tensor) -> torch.Tensor:
+    def apply(self, y: torch.Tensor, freestream_raw: torch.Tensor | None = None) -> torch.Tensor:
+        out = self._normalize_raw(y)
+        if self.residual_prediction and freestream_raw is not None:
+            out = out - self._normalize_raw(freestream_raw)
+        return out
+
+    def invert(self, y: torch.Tensor, freestream_raw: torch.Tensor | None = None) -> torch.Tensor:
         out = y.clone()
+        if self.residual_prediction and freestream_raw is not None:
+            out = out + self._normalize_raw(freestream_raw)
         if self.stats_mean is not None and self.stats_std is not None and self.stats_mean.numel() == out.shape[-1]:
             out = out * self.stats_std.to(out.device) + self.stats_mean.to(out.device)
         if self.asinh_pressure and self.pressure_index is not None:
@@ -597,6 +608,12 @@ def _named_channel_metrics(prefix: str, values: torch.Tensor, names: tuple[str, 
     return metrics
 
 
+def _airfrans_freestream(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    fs = torch.zeros_like(y)
+    fs[..., 0:2] = x[..., 2:4]
+    return fs
+
+
 def loss_grouped(
     batch: GroupedBatch,
     outputs: dict[str, torch.Tensor | None],
@@ -604,13 +621,16 @@ def loss_grouped(
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.surface_x.device)
     metrics: dict[str, float] = {}
+    is_airfrans = batch.dataset_name == "airfrans"
     if batch.surface_y is not None and outputs["surface_preds"] is not None:
-        target = transform.apply(batch.surface_y)
+        fs = _airfrans_freestream(batch.surface_x, batch.surface_y) if is_airfrans and transform.residual_prediction else None
+        target = transform.apply(batch.surface_y, freestream_raw=fs)
         surf_loss = F.mse_loss(outputs["surface_preds"][batch.surface_mask], target[batch.surface_mask])
         total = total + surf_loss
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
-        target = transform.apply(batch.volume_y)
+        fs = _airfrans_freestream(batch.volume_x, batch.volume_y) if is_airfrans and transform.residual_prediction and batch.volume_x is not None else None
+        target = transform.apply(batch.volume_y, freestream_raw=fs)
         vol_loss = F.mse_loss(outputs["volume_preds"][batch.volume_mask], target[batch.volume_mask])
         total = total + vol_loss
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
@@ -706,6 +726,8 @@ def evaluate_grouped(
     n_vol = torch.zeros(3, device=device)
     surf_channel_sum = None
     vol_channel_sum = None
+    phys_surf_channel_sum = None
+    phys_count_surface = 0
     drivaer_surface_case_sums: dict[str, list[float]] = {}
     drivaer_volume_case_sums: dict[str, list[float]] = {}
 
@@ -753,8 +775,10 @@ def evaluate_grouped(
             volume_mask=batch.volume_mask,
         )
         if dataset_name == "airfrans":
+            _res_pred = isinstance(transform, TargetTransform) and transform.residual_prediction
             if batch.surface_y is not None and outputs["surface_preds"] is not None:
-                target = transform.apply(batch.surface_y)
+                fs = _airfrans_freestream(batch.surface_x, batch.surface_y) if _res_pred else None
+                target = transform.apply(batch.surface_y, freestream_raw=fs)
                 case_values = (outputs["surface_preds"] - target).square()
                 for case_idx in range(case_values.shape[0]):
                     channel_mean = _case_masked_channel_means(case_values[case_idx], batch.surface_mask[case_idx])
@@ -764,8 +788,19 @@ def evaluate_grouped(
                         if surf_channel_sum is None:
                             surf_channel_sum = torch.zeros(channel_mean.shape[0], device=device)
                         surf_channel_sum += channel_mean.to(device)
+                if isinstance(transform, TargetTransform):
+                    pred_phys = transform.invert(outputs["surface_preds"], freestream_raw=fs)
+                    phys_err = (pred_phys - batch.surface_y).square()
+                    for case_idx in range(phys_err.shape[0]):
+                        ch_mean = _case_masked_channel_means(phys_err[case_idx], batch.surface_mask[case_idx])
+                        if ch_mean is not None:
+                            phys_count_surface += 1
+                            if phys_surf_channel_sum is None:
+                                phys_surf_channel_sum = torch.zeros(ch_mean.shape[0], device=device)
+                            phys_surf_channel_sum += ch_mean.to(device)
             if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
-                target = transform.apply(batch.volume_y)
+                fs = _airfrans_freestream(batch.volume_x, batch.volume_y) if _res_pred and batch.volume_x is not None else None
+                target = transform.apply(batch.volume_y, freestream_raw=fs)
                 case_values = (outputs["volume_preds"] - target).square()
                 for case_idx in range(case_values.shape[0]):
                     channel_mean = _case_masked_channel_means(case_values[case_idx], batch.volume_mask[case_idx])
@@ -838,6 +873,10 @@ def evaluate_grouped(
             metrics.update(_named_channel_metrics("surface_mse", surf_channel_sum / count_surface, AIRFRANS_FIELD_NAMES))
         if vol_channel_sum is not None and count_volume > 0:
             metrics.update(_named_channel_metrics("volume_mse", vol_channel_sum / count_volume, AIRFRANS_FIELD_NAMES))
+        if phys_surf_channel_sum is not None and phys_count_surface > 0:
+            phys_avg = phys_surf_channel_sum / phys_count_surface
+            metrics["surface_mse_phys"] = float(phys_avg.mean().detach().cpu().item())
+            metrics.update(_named_channel_metrics("surface_mse_phys", phys_avg, AIRFRANS_FIELD_NAMES))
         return metrics
     if dataset_name == "drivaerml":
         surface_values = [
@@ -1132,6 +1171,26 @@ def main() -> None:
         _ds.TandemFoilCaseDataset.__init__ = _patched_init
 
     bundle = build_bundle(config)
+    if config.asinh_pressure and bundle.spec.name != "tandemfoilset" and bundle.spec.pressure_output_index is not None:
+        pi = bundle.spec.pressure_output_index
+        out_dim = bundle.spec.surface_output_dim
+        y_sum = torch.zeros(out_dim, dtype=torch.float64)
+        y_sq_sum = torch.zeros(out_dim, dtype=torch.float64)
+        n = 0
+        for idx in range(len(bundle.train_dataset)):
+            sample = bundle.train_dataset[idx]
+            for part in (sample.surface_y, sample.volume_y):
+                if part is None:
+                    continue
+                y = part.double()
+                y[:, pi] = torch.asinh(y[:, pi] * config.asinh_scale)
+                y_sum += y.sum(dim=0)
+                y_sq_sum += y.square().sum(dim=0)
+                n += y.shape[0]
+        y_mean = (y_sum / n).float()
+        y_std = ((y_sq_sum / n - (y_sum / n).square()).clamp(min=0.0).sqrt().clamp(min=1e-6)).float()
+        bundle.target_stats.y_mean = y_mean
+        bundle.target_stats.y_std = y_std
     if bundle.spec.name == "tandemfoilset":
         phys_stats = compute_tandem_phys_stats(
             bundle.train_dataset,
@@ -1153,6 +1212,7 @@ def main() -> None:
             stats_std=bundle.target_stats.y_std,
             asinh_pressure=config.asinh_pressure,
             asinh_scale=config.asinh_scale,
+            residual_prediction=config.residual_prediction,
         )
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle)
