@@ -10,24 +10,27 @@ Autonomous neural network research on CFD surrogates, coordinated through GitHub
 
 ## Problem
 
-We are training a neural network surrogate for CFD (computational fluid dynamics) on the TandemFoilSet dataset. The task is full-field flow prediction: given airfoil geometry and flow conditions, predict velocity (Ux, Uy) and pressure (p) at every mesh node.
+We are training machine-learning surrogates for computational fluid dynamics. The general task is full-field flow prediction: given geometry, operating conditions, and other problem-specific inputs, predict physically meaningful flow quantities such as velocity and pressure over a mesh, graph, or point cloud.
+
+Problem-specific benchmark details for the current target live in `data/README.md` and the current training code. This file should stay focused on the broader CFD surrogate research objective rather than a single dataset or geometry family.
 
 ## Codebase
 
-- `train.py` — **primary training script + model architecture**. **Modifiable.** (Contains the model inline, plus training with 4 val tracks across 7 data sources.)
+- `train.py` — **primary training script + model architecture**. **Modifiable.** (Contains the current model, training loop, losses, and validation logic for the active CFD problem.)
 - `data/prepare.py` — dataset loading and collation. **Read-only.**
-- `data/prepare_multi.py` — extended preprocessing (24-dim x, foil-2 features). **Read-only.**
+- `data/prepare_multi.py` — problem-specific preprocessing and feature engineering. **Read-only.**
 - `data/utils.py` — visualization. **Read-only.**
-- `data/README.md` — benchmark splits and dataset documentation.
+- `data/README.md` — benchmark splits, dataset assumptions, and problem-local documentation.
 
 ## Metrics
 
-**The goal: lowest validation surface MAE.** We track:
-- **Surface MAE** — mean absolute error on airfoil surface nodes (Ux, Uy, p). **Most important** — these are the quantities engineers care about.
-- **Volume MAE** — mean absolute error on volume (field) nodes.
-- **val/loss** — the combined validation loss.
+**The goal: lowest physically meaningful validation error on the most decision-relevant regions and regimes.** We track:
+- **Boundary or surface error** — when applicable, this is usually the most important metric because it is closest to engineering use.
+- **Volume or field error** — mean absolute error over the full predicted flow field.
+- **Validation loss** — the combined objective optimized during training.
+- **Pressure fidelity and problem-specific split or OOD metrics** — whichever additional metrics best capture physical usefulness for the active benchmark.
 
-Lower is better. Surface accuracy (especially pressure) matters most.
+Lower is better. When multiple metrics exist, prioritize the ones that best reflect physical usefulness and engineering decision quality: usually boundary or surface accuracy, pressure accuracy, and robustness on harder operating regimes.
 
 **VRAM**: GPUs have 96GB.
 

@@ -89,7 +89,7 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
    ## Results
 
    ```
-   - All key metrics: val_loss, Surface MAE (Ux, Uy, p), Volume MAE
+   - All key metrics required by `$PROBLEM_DIR/program.md` and the PR baseline, for example validation loss, boundary or surface error, pressure error, volume or field error, and any problem-specific OOD metrics
    - Comparison against the baseline numbers from the PR body
    - Exact train.py command used to run the experiment
    - Peak memory usage
@@ -139,5 +139,5 @@ Your PR may come back as a draft with `status:wip` and review comments. When thi
 
 - **Be honest about results.** Negative results are valuable. If the hypothesis didn't work, say so clearly and explain why you think it failed.
 - **Stay focused.** Implement what was asked. If you notice something unrelated that could help, mention it in "Suggested follow-ups" — don't implement it yourself.
-- **Surface accuracy matters most.** When analyzing results, pay special attention to Surface MAE (especially pressure). That's what the advisor cares about.
+- **Focus on the physically meaningful metrics.** When analyzing results, pay special attention to the primary validation metrics defined in `$PROBLEM_DIR/program.md`. In most CFD surrogate work, boundary or surface accuracy and pressure fidelity matter most.
 - **Simplicity wins.** If you can get the same result with less complexity, that's better. Flag unnecessary complexity in your analysis.
