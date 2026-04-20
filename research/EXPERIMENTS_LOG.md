@@ -1,5 +1,73 @@
 # SENPAI Research Results
 
+## 2026-04-21 01:00 — PR #2482: AirfRANS: T_max=50 + lr=5e-4 + no-EMA (24 epochs) — MERGED ✓ NEW BEST
+
+- emma/airfrans-noema-lr-tmax-variants
+- Hypothesis: T_max=50 with multiple cosine restarts per epoch budget improves generalization vs T_max=150
+
+| Run | Config | val_primary/surface_mse | test_primary/surface_mse | Epochs | W&B |
+|---|---|---|---|---|---|
+| **Run 1 (winner)** | T_max=50, lr=5e-4, no-EMA, no-Fourier, 3L/192d | **0.2357** | **0.2002** | 24 | xmrkwt1y |
+| Run 2 | T_max=150, lr=8e-4, no-EMA | 0.2806 (final, unstable) | 0.2297 | 24 | d057fle1 |
+| Baseline (#2478) | Fourier+4L/256d+no-EMA, T_max=150 | 0.2387 | 0.2079 | 8 | — |
+
+**Commentary:** T_max=50 delivers 1.3% val improvement over Fourier+4L/256d at 8 epochs. Surprising: no-Fourier 3L/192d with T_max=50 at 24 epochs beats the Fourier+4L/256d baseline. The key insight: T_max=50 allows ~345 cosine warm restarts at 24 epochs (vs ~38 for T_max=150 at 8 epochs). Many warm restarts help escape local minima. Run 2 (lr=8e-4, T_max=150) was unstable — best mid-run 0.2364 but diverged to 0.2806 final. New baseline: 0.2357. CRITICAL: Fourier+4L/256d+T_max=50 not yet tested — this is THE next priority.
+
+---
+
+## 2026-04-21 01:00 — PR #2492: AirfRANS: Fourier+physics+no-EMA — CLOSED (metric incompatibility)
+
+- kohaku/airfrans-fourier-physics-noema
+- Hypothesis: Fourier+physics synergy from TandemFoil transfers to AirfRANS
+
+| Run | Config | val_primary/surface_mse | Physical space surface_mse | W&B |
+|---|---|---|---|---|
+| Fourier+physics | asinh-pressure + residual-pred | 0.1147 (WRONG SPACE) | 4,749,411 | fepjfiw2 |
+| Fourier only | no physics | 0.2889 | 2,568,679 | ofv8hcza |
+
+**Commentary:** CONFIRMED NEGATIVE — Fourier+physics does NOT transfer to AirfRANS. The 0.1147 metric is in asinh-compressed space (incompatible with baseline). In physical space, Fourier+physics is 85% WORSE than Fourier-only. Root causes: (1) asinh normalization changes target space making metrics incompatible; (2) residual prediction conflicts with no-slip boundary conditions on AirfRANS surfaces. Valuable code contributions: student implemented --residual-prediction for AirfRANS and surface_mse_phys metric. Fourier-only (0.2889) doesn't beat baseline either — Fourier still caps AirfRANS at 2 epochs.
+
+---
+
+## 2026-04-21 01:00 — PR #2491: TandemFoil: 4L/256d + Fourier+physics capacity — CLOSED (epoch starvation)
+
+- edward/tandem-fourier-physics-capacity
+
+| Run | Config | val_primary/surface_pressure_mae | Epochs | W&B |
+|---|---|---|---|---|
+| 4L/256d/4H | Lion lr=3e-4 | 185.63 | 2 | pqlvn6qv |
+| 3L/192d | Lion lr=2e-4 | 158.01 | 2 | c317jc60 |
+
+**Commentary:** Epoch starvation at old 30-min timeout. Only 2 epochs for both runs. The capacity hypothesis is still scientifically valid. With 180-min budget and --epochs 999, 4L/256d should get 40+ epochs — a fair test. lr=2e-4 at 2 epochs (158.01) showed stronger early trajectory than lr=3e-4 (185.63). Reassigning edward with proper budget.
+
+---
+
+## 2026-04-21 01:00 — PR #2486: TandemFoil: golden config + AdamW vs Lion — CLOSED (dead end)
+
+- shinji/tandem-golden-noema-adamw
+
+| Run | LR | val_primary/surface_pressure_mae | Epochs | W&B |
+|---|---|---|---|---|
+| AdamW lr=3e-4 | 3e-4 | 167.94 | 11 | n3dnhol4 |
+| AdamW lr=5e-4 | 5e-4 | 160.25 | 11 | rurnfmgc |
+
+**Commentary:** CONFIRMED DEAD END. AdamW is definitively inferior to Lion on TandemFoil. Gap WIDENED with more training (from ~28% worse at 2 epochs to ~40% worse at 11 epochs). lr=5e-4 showed catastrophic divergence at epoch 3 (val=701.6). The earlier "AdamW+physics > Lion+physics" finding was likely a 2-epoch artifact. Lion is the optimizer for TandemFoil. Never revisit AdamW on TandemFoil.
+
+---
+
+## 2026-04-21 01:00 — PR #2471: TandemFoil: golden no-EMA (no Fourier/physics) — CLOSED (superseded)
+
+- gilbert/tandem-golden-noema
+
+| Run | LR | val_primary/surface_pressure_mae (best) | Epochs | W&B |
+|---|---|---|---|---|
+| Lion lr=2e-4 | 2e-4 | 112.62 (ep11 best) | 14 | 7zoua8mi |
+| Lion lr=3e-4 | 3e-4 | 111.59 (ep12 best) | 14 | xivn73t6 |
+
+**Commentary:** Neither beats 82.65 current baseline. Projected 25% EMA suppression not found — actual gain only ~2-3%. Key finding: lr=2e-4 shows monotonically smooth convergence while lr=3e-4 spikes to 263 at ep5 and 218 at ep8. T_max=30 appears too short for 14-epoch runs (LR cycles back up aggressively). The no-Fourier/no-physics lineage cannot compete with the Fourier+physics golden config. Good bug catch: epochs default=2 needs --epochs flag.
+
+---
+
 ## 2026-04-21 00:05 — PR #2475: DrivAerML: Fourier + no-EMA — MERGED ✓ NEW BEST
 
 - chihiro/drivaerml-fourier-noema
