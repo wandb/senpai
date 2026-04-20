@@ -337,29 +337,25 @@ Use `expr.Config("lr")`, `expr.Summary("loss")`, `expr.Tags().isin([...])` for r
 
 ## Training curve analysis workflow
 
-Use this when the user asks whether a run is healthy, why training diverged, whether a run overfit, or which run has the best training dynamics.
+Reach for this when the user asks whether a run is healthy, why it diverged, whether it overfit, or which of several runs has the best training dynamics.
 
-Keep the inline workflow short and load detail on demand:
+The loop is: confirm the x-axis, compute features, render a PNG, read the image, write a verdict. Numbers and pictures cross-check each other — the helpers exist so you're not hand-rolling spike detection or slope fits while also trying to interpret them.
 
-1. Confirm `step_key` before doing any curve work. Never assume `_step`.
-2. Compute features with the bundled helpers instead of hand-rolling spike or slope logic.
-3. Render PNGs and inspect them visually.
-4. Load `references/TRAINING_DIAGNOSTICS.md` while you interpret the results.
-5. End with a verdict, evidence tied to step ranges, and concrete next actions.
+### Pin the x-axis first
 
-### Required sequence
+Different training stacks log different step keys (`_step`, `global_step`, `trainer/global_step`, `epoch`, `train/step`), and picking the wrong one turns an overlay into nonsense. `list_candidate_step_keys(run)` scans the history for plausible columns; `guess_step_key_from_workspace(entity, project)` checks what the W&B workspace actually plots. If both agree on one candidate, say which you picked and move on. If they disagree or there are several plausible choices, ask the user before plotting — this is cheap and avoids silently baking `_step` into a verdict.
 
-Use `list_candidate_step_keys()`, `guess_step_key_from_workspace()`, and `format_step_candidates()` to confirm the x-axis. If there is one obvious candidate and it matches the workspace guess, say which `step_key` you picked. Otherwise, ask the user to choose before plotting or comparing runs.
+### For one run
 
-For a single run, compute a compact feature table from the metrics that actually exist, then render `plot_single_run_overview(run, step_key=step_key)`. If gradient histograms or per-layer scalar norms are logged, add `plot_grad_histogram_heatmap()` or `plot_grad_norm_by_layer()`.
+Render `plot_single_run_overview(run, step_key=step_key)`, Read the PNG, and pair it with a compact feature table from `curve_features` on the metrics that actually exist. If the run logs gradient histograms or per-layer scalar norms, add `plot_grad_histogram_heatmap()` or `plot_grad_norm_by_layer()` — they surface dead layers and vanishing-gradient signatures that the top-line grad-norm scalar hides.
 
-For multi-run comparisons, use `compare_runs_curves()` for the ranking table and `plot_run_comparison()` for the overlay. Keep overlays to at most 6 runs; if there are more, rank first and then plot the shortlist.
+### For multiple runs
 
-### Output shape
+`compare_runs_curves()` gives you the ranking table; `plot_run_comparison()` gives you the overlay. Overlays get unreadable past ~6 runs, so rank first, then plot the shortlist — the function will refuse to render more than 6 for exactly this reason.
 
-Do not dump raw history rows or the full spike/slope payloads unless you are drilling into a specific anomaly. Summaries should stay compact.
+### Write it up
 
-Use this response shape:
+Keep the summary compact. Don't dump raw history rows or full spike/slope payloads into the response unless you're drilling into a specific anomaly — the helpers already reduce those to scalars for a reason.
 
 ```text
 Verdict: <healthy | unstable | overfit | plateaued | diverged | converged>
@@ -370,7 +366,7 @@ Next actions:
 - <concrete hyperparameter, logging, or code change>
 ```
 
-Load `references/TRAINING_DIAGNOSTICS.md` for the interpretation heuristics, especially when the numbers and the image disagree.
+When the numbers and the image disagree — and they will — `references/TRAINING_DIAGNOSTICS.md` is where the resolution heuristics live. Load it while you're interpreting, not before.
 
 ---
 

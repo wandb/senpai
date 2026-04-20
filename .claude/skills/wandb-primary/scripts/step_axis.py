@@ -4,23 +4,10 @@
 
 """X-axis step-metric detection for W&B runs.
 
-Training curves are meaningless without knowing which column is the x-axis.
-Different training stacks log different step keys — `_step` (wandb default),
-`global_step` (HF Trainer), `trainer/global_step`, `epoch`, or custom names
-like `train/step`. The skill MUST confirm this with the user before any
-curve-shape or plotting work. These helpers feed that confirmation step.
-
-Usage:
-    from step_axis import (
-        list_candidate_step_keys,
-        guess_step_key_from_workspace,
-        format_step_candidates,
-    )
-
-    candidates = list_candidate_step_keys(run)
-    guess = guess_step_key_from_workspace(entity, project)
-    # Then show `format_step_candidates(candidates, guess)` to the user via
-    # AskUserQuestion and wait for confirmation.
+Different stacks log different step keys (`_step`, `global_step`,
+`trainer/global_step`, `epoch`, `train/step`, ...). Overlaying runs on the
+wrong x-axis silently corrupts a verdict, so confirm with the user before
+plotting. These helpers feed that confirmation step.
 """
 
 from __future__ import annotations
@@ -44,32 +31,16 @@ KNOWN_STEP_KEYS: tuple[str, ...] = (
 
 
 def list_candidate_step_keys(run: Any, sample_rows: int = 50) -> list[str]:
-    """Return plausible step-axis keys logged in this run's history.
+    """Return plausible step-axis keys from the first `sample_rows` of history.
 
-    Scans the first `sample_rows` rows of history (no keys filter) to learn
-    which columns the run actually logs, then keeps only those that match a
-    known step-key name OR appear numeric and monotonically non-decreasing
-    across the sample.
-
-    Ordering: known-name matches first (in `KNOWN_STEP_KEYS` order), then
-    any other monotonic-numeric candidates, sorted alphabetically.
-
-    Args:
-        run: A W&B Run object from api.run().
-        sample_rows: How many rows to inspect (default 50).
-
-    Returns:
-        List of candidate column names. Never raises; returns [] if the
-        history is empty or unreadable.
+    Keeps known step-key names (in KNOWN_STEP_KEYS order) plus any other
+    numeric monotonically-non-decreasing columns (alphabetical).
     """
-    try:
-        rows = []
-        for i, row in enumerate(fast_scan_history(run)):
-            rows.append(row)
-            if i + 1 >= sample_rows:
-                break
-    except Exception:
-        return []
+    rows = []
+    for i, row in enumerate(fast_scan_history(run)):
+        rows.append(row)
+        if i + 1 >= sample_rows:
+            break
     if not rows:
         return []
 
@@ -99,44 +70,21 @@ def list_candidate_step_keys(run: Any, sample_rows: int = 50) -> list[str]:
 
 
 def guess_step_key_from_workspace(entity: str, project: str) -> str | None:
-    """Peek at the project's most recent workspace and return the x-axis
-    its first line-plot uses. This reflects what the human actually looks
-    at in the W&B UI.
+    """Return the x-axis used by the project's W&B workspace line panels, or None.
 
-    Degrades silently: returns None if `wandb_workspaces` isn't installed,
-    if no workspace or line plot exists, or if anything else goes wrong.
-    Never raises.
-
-    Args:
-        entity: W&B entity name.
-        project: W&B project name.
-
-    Returns:
-        The x-axis metric name, or None.
+    Reflects what the human actually looks at in the UI. Returns None only if
+    `wandb_workspaces` isn't installed or the project has no line-plot panel.
     """
     try:
         import wandb_workspaces.workspaces as ws  # type: ignore
-    except Exception:
+    except ImportError:
         return None
 
-    try:
-        workspaces = ws.Workspace.list(entity=entity, project=project)
-    except Exception:
-        return None
-    if not workspaces:
-        return None
-
-    # Most recent first; the list's order depends on the SDK version, so try
-    # all of them until one yields a usable line plot.
+    workspaces = ws.Workspace.list(entity=entity, project=project)
     for wsp_ref in workspaces:
-        try:
-            wsp = wsp_ref.load() if hasattr(wsp_ref, "load") else wsp_ref
-        except Exception:
-            continue
-        sections = getattr(wsp, "sections", None) or []
-        for section in sections:
-            panels = getattr(section, "panels", None) or []
-            for panel in panels:
+        wsp = wsp_ref.load() if hasattr(wsp_ref, "load") else wsp_ref
+        for section in getattr(wsp, "sections", None) or []:
+            for panel in getattr(section, "panels", None) or []:
                 x = getattr(panel, "x", None)
                 if isinstance(x, str) and x:
                     return x
@@ -147,18 +95,9 @@ def format_step_candidates(
     candidates: list[str],
     workspace_guess: str | None,
 ) -> list[tuple[str, str]]:
-    """Format candidates as (label, description) pairs ready to hand to
-    AskUserQuestion.
+    """Format candidates as (label, description) pairs for AskUserQuestion.
 
     The workspace guess (if any) is placed first and labeled "(Recommended)".
-    Duplicate entries are dropped.
-
-    Args:
-        candidates: Output of `list_candidate_step_keys`.
-        workspace_guess: Output of `guess_step_key_from_workspace`.
-
-    Returns:
-        List of (label, description) tuples. Empty if no candidates at all.
     """
     seen: set[str] = set()
     ordered: list[str] = []
@@ -171,16 +110,15 @@ def format_step_candidates(
             seen.add(c)
 
     pairs: list[tuple[str, str]] = []
-    for i, key in enumerate(ordered):
-        is_ws_guess = key == workspace_guess
-        if is_ws_guess:
+    for key in ordered:
+        if key == workspace_guess:
             label = f"{key} (Recommended)"
             desc = "Matches the x-axis used by this project's W&B workspace panels."
         elif key in KNOWN_STEP_KEYS:
+            label = key
             desc = f"Standard step-key `{key}` logged in this run's history."
-            label = key
         else:
-            desc = f"Custom monotonic column `{key}` found in this run's history."
             label = key
+            desc = f"Custom monotonic column `{key}` found in this run's history."
         pairs.append((label, desc))
     return pairs

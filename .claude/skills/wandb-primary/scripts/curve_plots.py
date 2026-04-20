@@ -4,25 +4,10 @@
 
 """Chart rendering for LLM vision consumption.
 
-These functions produce PNGs that Claude reads back with the Read tool to
-form gestalt impressions of training runs — the visual complement to the
-numeric features in `training_diagnostics.py`.
-
-Default output directory: `/tmp/wandb_plots/<run_id>/`. Ephemeral per
-design — repo should not fill up with run artefacts.
-
-All public functions return the path to the written PNG.
-
-Usage:
-    from curve_plots import (
-        plot_single_run_overview,
-        plot_run_comparison,
-        plot_grad_histogram_heatmap,
-        plot_grad_norm_by_layer,
-    )
-
-    png = plot_single_run_overview(run, step_key="_step")
-    # Then Read the png path with the Read tool so Claude sees the image.
+Produces PNGs that Claude reads back with the Read tool — the visual
+complement to `training_diagnostics.py`'s numeric features. Default output
+directory is `/tmp/wandb_plots/<run_id>/`; public functions return the path
+to the written PNG.
 """
 
 from __future__ import annotations
@@ -57,22 +42,9 @@ def _ensure_out_dir(run_id: str, out_dir: str | os.PathLike | None) -> Path:
     return root
 
 
-def _load_history(
-    run: Any,
-    keys: list[str],
-    step_key: str,
-    samples: int = 2000,
-) -> pd.DataFrame:
-    """Fast downsampled history for plotting. Uses server-side bucketing."""
-    df = None
-    try:
-        df = run.history(samples=samples, keys=keys, x_axis=step_key, pandas=True)
-    except Exception:
-        df = None
-    if df is None or len(df) == 0 or step_key not in df.columns:
-        # Fall back to full scan (prefers beta_scan_history parquet).
-        df = pd.DataFrame(list(fast_scan_history(run, keys=keys)))
-    return df
+def _load_history(run: Any, keys: list[str], step_key: str) -> pd.DataFrame:
+    """Load run history into a DataFrame via fast_scan_history (local parquet)."""
+    return pd.DataFrame(list(fast_scan_history(run, keys=keys)))
 
 
 def _mark_spikes(ax: plt.Axes, values: np.ndarray, steps: np.ndarray, features: dict) -> None:
@@ -129,27 +101,15 @@ def plot_single_run_overview(
     step_key: str,
     metrics: list[tuple[str, list[str], str, bool]] | None = None,
     out_dir: str | os.PathLike | None = None,
-    samples: int = 2000,
 ) -> Path:
     """Render a 2x3 small-multiples composite PNG for one run.
 
-    Args:
-        run: A W&B Run object.
-        step_key: Confirmed x-axis step key.
-        metrics: Optional override list of `(title, candidate_keys, direction,
-            log_y)` tuples. If omitted, uses the default 6-panel layout
-            (train loss, val loss, lr, grad norm, accuracy, throughput),
-            auto-resolving each candidate against the run's logged keys.
-        out_dir: Override output directory. Default
-            `/tmp/wandb_plots/<run_id>/`.
-        samples: Server-side sample count passed to `run.history`.
-
-    Returns:
-        Path to the written PNG.
+    `metrics` overrides the default panels (train loss, val loss, lr,
+    grad norm, accuracy, throughput); each candidate list is auto-resolved
+    against the run's logged keys. Output defaults to `/tmp/wandb_plots/<run_id>/`.
     """
     out = _ensure_out_dir(run.id, out_dir)
 
-    # Decide the 6 panels.
     if metrics is None:
         panels: list[tuple[str, list[str], str, bool]] = [
             (title, cfg["keys"], cfg["direction"], cfg["log_y"])
@@ -158,16 +118,10 @@ def plot_single_run_overview(
     else:
         panels = metrics
 
-    # Pull all needed keys in one history call.
     all_keys: list[str] = [step_key]
     for _, candidates, _, _ in panels:
         all_keys.extend(candidates)
-    df = _load_history(
-        run,
-        keys=list(dict.fromkeys(all_keys)),
-        step_key=step_key,
-        samples=samples,
-    )
+    df = _load_history(run, keys=list(dict.fromkeys(all_keys)), step_key=step_key)
     cols = set(df.columns)
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 8), sharex=True)
@@ -211,26 +165,9 @@ def plot_run_comparison(
     out_dir: str | os.PathLike | None = None,
     max_runs: int = 6,
     highlight: str | None = None,
-    samples: int = 2000,
     log_y: bool = True,
 ) -> Path:
-    """Overlay a single metric across multiple runs.
-
-    Args:
-        runs: List of W&B Run objects. Must be <= `max_runs` unless caller
-            explicitly raises the cap.
-        metric: Metric to compare.
-        step_key: Confirmed x-axis.
-        out_dir: Override output directory. Default
-            `/tmp/wandb_plots/compare_<N>runs_<metric>/`.
-        max_runs: Hard cap on overlay density. Default 6.
-        highlight: Optional run id or name to render bold.
-        samples: history() sample count.
-        log_y: Log-scale the y-axis (sensible for losses).
-
-    Returns:
-        Path to the written PNG.
-    """
+    """Overlay `metric` across `runs`. Caps at `max_runs` because overlays past 6 stop being readable."""
     if len(runs) > max_runs:
         raise ValueError(
             f"plot_run_comparison got {len(runs)} runs but max_runs={max_runs}. "
@@ -245,11 +182,11 @@ def plot_run_comparison(
     root.mkdir(parents=True, exist_ok=True)
 
     fig, ax = plt.subplots(figsize=(11, 6))
-    colors = plt.cm.tab10.colors  # up to 10 distinct colors
+    colors = plt.cm.tab10.colors
     aligned: list[pd.Series] = []
 
     for i, run in enumerate(runs):
-        df = _load_history(run, keys=[metric, step_key], step_key=step_key, samples=samples)
+        df = _load_history(run, keys=[metric, step_key], step_key=step_key)
         if metric not in df.columns or step_key not in df.columns:
             continue
         df = df[[step_key, metric]].dropna()
@@ -299,24 +236,11 @@ def plot_grad_histogram_heatmap(
     out_dir: str | os.PathLike | None = None,
     n_step_buckets: int = 60,
 ) -> Path:
-    """Per-layer gradient-histogram stat as a heatmap (layer x step).
+    """Heatmap of a per-layer gradient-histogram stat (layer × step).
 
-    Reads histogram-logged gradients (typically from `wandb.watch`),
-    computes per-bin summary stats, and renders a heatmap where:
-      - rows = layers (ordered by name)
-      - columns = step buckets (binned for readability)
-      - color = chosen stat (`mean_abs`, `kurtosis`, `variance`, `max_abs`)
-
-    Args:
-        run: A W&B Run object.
-        layer_prefix: Prefix for histogram keys.
-        metric: Which per-histogram stat to visualize.
-        step_key: Confirmed step key.
-        out_dir: Override output directory.
-        n_step_buckets: Column count in the heatmap.
-
-    Returns:
-        Path to the written PNG.
+    Reads histogram-logged gradients (typically from `wandb.watch`). Rows
+    are layers, columns are step buckets, color is the chosen stat
+    (`mean_abs`, `kurtosis`, `variance`, `max_abs`).
     """
     df = grad_histogram_features(run, layer_prefix=layer_prefix, step_key=step_key)
     if len(df) == 0:
@@ -375,15 +299,9 @@ def plot_grad_norm_by_layer(
     layer_prefix: str = "parameters/",
     max_layers: int = 16,
     out_dir: str | os.PathLike | None = None,
-    samples: int = 2000,
     probe_rows: int = 500,
 ) -> Path:
-    """Small-multiples of per-layer scalar grad norms.
-
-    Looks for scalar (non-histogram) keys matching `layer_prefix*` — e.g.
-    `parameters/layer1.weight_grad_norm`. Renders up to `max_layers`
-    subplots on a shared x-axis.
-    """
+    """Small-multiples of per-layer scalar grad norms (keys matching `{layer_prefix}*`)."""
     layer_keys = discover_history_keys(
         run,
         lambda key, value: (
@@ -402,7 +320,7 @@ def plot_grad_norm_by_layer(
     overflow = max(0, len(layer_keys) - max_layers)
     layer_keys = layer_keys[:max_layers]
 
-    df = _load_history(run, keys=[step_key, *layer_keys], step_key=step_key, samples=samples)
+    df = _load_history(run, keys=[step_key, *layer_keys], step_key=step_key)
     out = _ensure_out_dir(run.id, out_dir)
 
     n = len(layer_keys)

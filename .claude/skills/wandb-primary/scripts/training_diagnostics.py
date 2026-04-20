@@ -2,28 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-PackageName: skills
 
-"""Curve-shape diagnostics for W&B training runs.
+"""Curve-shape diagnostics — the numerical counterpart to `curve_plots.py`.
 
-This is the numerical counterpart to `curve_plots.py`. It turns a noisy loss
-curve into a compact dict of features that mirror how an experienced ML
-researcher eyeballs a chart: spikes, smoothness, checkpoint slopes,
-plateaus, divergence. Pair these features with a PNG that Claude reads via
-vision — the two cross-check each other.
-
-No plotting, no filesystem side-effects. Only wandb scan_history access;
-caller is expected to pass a confirmed step key.
-
-Usage:
-    from training_diagnostics import (
-        curve_features,
-        compare_runs_curves,
-        lr_schedule_features,
-        grad_norm_features,
-        grad_histogram_features,
-    )
-
-    feats = curve_features(loss_series, step_series, direction="decreasing")
-    df = compare_runs_curves([run_a, run_b], metric="loss", step_key="_step")
+Turns a noisy loss curve into a compact dict of features that mirror how
+an experienced researcher eyeballs a chart: spikes, smoothness, checkpoint
+slopes, plateaus, divergence. Pair with a PNG that Claude reads via vision —
+numbers and picture cross-check each other.
 """
 
 from __future__ import annotations
@@ -52,19 +36,9 @@ def curve_features(
 ) -> dict[str, Any]:
     """Extract researcher-intuition features from a single metric curve.
 
-    Args:
-        values: Metric values, one per step.
-        steps: Step values matching `values`. If None, uses positional index.
-        n_checkpoints: Number of evenly-spaced segments to compute a slope
-                       over (default 20, i.e. every 5% of the run).
-        direction: "decreasing" (loss-like), "increasing" (accuracy-like),
-                   or "auto" — pick based on whether first half mean > second
-                   half mean.
-        spike_z: Z-score threshold for spike detection.
-
-    Returns:
-        Dict with numeric features. NaN/Inf values are dropped before stats
-        but counted separately.
+    `direction="auto"` picks decreasing or increasing based on first-half
+    vs second-half mean. `n_checkpoints=20` means one slope every 5% of
+    the run. NaN/Inf values are dropped before stats and counted separately.
     """
     v = np.asarray(list(values), dtype=float)
     s = np.arange(len(v), dtype=float) if steps is None else np.asarray(list(steps), dtype=float)
@@ -254,22 +228,12 @@ def compare_runs_curves(
     names: list[str] | None = None,
     direction: Direction = "auto",
 ) -> pd.DataFrame:
-    """Build a DataFrame of curve features across multiple runs.
+    """One row per run of scalar features from `curve_features`.
 
-    One row per run, columns are the scalar features from `curve_features`.
-    Non-scalar fields (spike list, slopes, plateaus) are omitted to keep
-    the frame compact; grab them per-run via `curve_features` if needed.
-
-    Args:
-        runs: List of W&B Run objects.
-        metric: Metric name to pull from each run's history.
-        step_key: Confirmed x-axis step key. MUST be known — never guessed.
-        names: Optional display names; defaults to run.name.
-        direction: Passed through to `curve_features`.
-
-    Returns:
-        DataFrame indexed by run name. If `len(runs) > 6`, attaches a
-        warning in `df.attrs["warning"]`; caller decides whether to proceed.
+    Non-scalar fields (spikes, slopes, plateaus) are omitted to keep the
+    frame compact; grab them per-run via `curve_features` if needed.
+    `step_key` must be confirmed — a wrong one silently corrupts the frame.
+    Attaches a warning to `df.attrs["warning"]` for >6 runs.
     """
     rows: list[dict[str, Any]] = []
     warning = None
@@ -305,11 +269,9 @@ def lr_schedule_features(
     values: Iterable[float] | pd.Series | np.ndarray,
     steps: Iterable[float] | pd.Series | np.ndarray | None = None,
 ) -> dict[str, Any]:
-    """Summarize a learning rate schedule.
+    """Summarize an LR schedule: warmup, peak, decay shape, restarts.
 
-    Detects warmup length, peak LR + step, and the shape of the decay
-    segment (linear / cosine / exponential / constant / unknown). Flags
-    any unexpected restarts (LR increases after peak).
+    Decay shape is one of linear, cosine, exponential, constant, or unknown.
     """
     v = np.asarray(list(values), dtype=float)
     s = np.arange(len(v), dtype=float) if steps is None else np.asarray(list(steps), dtype=float)
@@ -395,11 +357,11 @@ def grad_norm_features(
     values: Iterable[float] | pd.Series | np.ndarray,
     steps: Iterable[float] | pd.Series | np.ndarray | None = None,
 ) -> dict[str, Any]:
-    """Grad-norm specific features on top of generic curve_features.
+    """Grad-norm features on top of `curve_features`.
 
-    Adds tail heaviness (kurtosis — excess kurtosis; heavy-tailed updates
-    are concerning) and a `dead_flag` when grad-norm collapses near zero
-    and stays there, which usually means a layer has stopped learning.
+    Adds excess kurtosis (heavy-tailed updates are concerning) and a
+    `dead_flag` when grad-norm collapses near zero and stays there —
+    usually means a layer has stopped learning.
     """
     feats = curve_features(values, steps, direction="decreasing")
     v = np.asarray(list(values), dtype=float)
@@ -480,17 +442,9 @@ def grad_histogram_features(
 ) -> pd.DataFrame:
     """Parse W&B-logged gradient histograms into a (layer, step) frame.
 
-    Args:
-        run: A W&B Run object.
-        layer_prefix: Prefix for gradient histogram keys. Default
-            `gradients/` matches wandb.watch's default layout.
-        step_key: Confirmed step-axis key.
-        probe_rows: Max history rows to scan while discovering histogram keys.
-
-    Returns:
-        DataFrame with one row per (layer, step), columns:
-        mean, mean_abs, variance, kurtosis, max_abs, pct_at_max_bin.
-        Raises ValueError with a helpful message if no histogram keys found.
+    Default `layer_prefix="gradients/"` matches `wandb.watch`. Columns:
+    mean, mean_abs, variance, kurtosis, max_abs, pct_at_max_bin.
+    Raises ValueError if no matching histogram keys are found.
     """
     hist_keys = discover_history_keys(
         run,

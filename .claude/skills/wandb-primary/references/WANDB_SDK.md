@@ -195,7 +195,7 @@ for row in run.beta_scan_history(keys=["loss"], page_size=1000):
     ...
 ```
 
-**Behavior**: Reads the run's exported parquet via wandb-core instead of paginating the API. Significantly faster on repeat queries. W&B flags this as "still in development." Our helper `wandb_helpers.fast_scan_history(run, ...)` prefers it and falls back to `scan_history` on any error — use that rather than calling beta directly.
+**Behavior**: Reads the run's exported parquet via wandb-core instead of paginating the API — significantly faster, especially on repeat queries. W&B flags this as "still in development," but we rely on it across the curve-diagnostics helpers; `wandb_helpers.fast_scan_history(run, ...)` is the thin wrapper you should call rather than the beta method directly.
 
 ### When to use which
 

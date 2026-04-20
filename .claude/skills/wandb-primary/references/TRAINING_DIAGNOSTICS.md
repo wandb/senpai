@@ -6,9 +6,9 @@ SPDX-PackageName: skills
 
 # Training Curve Intuition — A Researcher's Reading Guide
 
-Use this as reference material while interpreting training curves. It captures the gut judgments experienced ML researchers apply when they look at loss curves, LR schedules, grad norms, and gradient histograms.
+This is the interpretation layer. The helpers in `training_diagnostics.py` and `curve_plots.py` give you numbers and pictures; this document is what experienced ML researchers do with them — the gut judgments behind reading loss curves, LR schedules, grad norms, and gradient histograms.
 
-Recommended order: confirm the real `step_key`, compute features with `training_diagnostics.py`, open the PNGs from `curve_plots.py`, then use the heuristics below to write a verdict with step-indexed evidence.
+Work through it roughly in order: pin the `step_key`, compute features, open the PNGs, then use the heuristics below to write a verdict tied to specific step ranges. When the numbers and the picture disagree, that's usually where the interesting story is.
 
 ---
 
