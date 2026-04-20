@@ -59,11 +59,37 @@ Use the **official AirfRANS benchmark metric family**. For literature comparison
   - Do not relabel these as MAE or relative L2.
   - If a run is selected on validation, the final paper number must still be recomputed on the official task test split before citing it.
 
+## Published reference targets
+
+- **Exact local contract used by this target**
+  - `train.py` defaults to `airfrans_task="full"`
+  - the paper-facing comparison numbers for the default run mode are therefore:
+    - `test_primary/surface_mse`
+    - `test_primary/volume_mse`
+
+- **Best published full-task numbers we found on the same metric family**
+  - `SpiderSolver` (NeurIPS 2025 poster, Table 1):
+    - `Surf MSE = 0.0043`
+    - `Vol MSE = 0.0017`
+  - `Transolver` (repo-corrected AirfRANS README + Table 1):
+    - `Surf MSE = 0.0080`
+    - `Vol MSE = 0.0025`
+
+- **Implication for this repo**
+  - On the default `full` task, the external target to beat is:
+    - `surface_mse < 0.0043`
+    - `volume_mse < 0.0017`
+  - If a PR uses `scarce`, `reynolds`, or `aoa`, do not compare it against the
+    `full`-task table above.
+
 ## Sources
 
 - AirfRANS dataset paper / official benchmark: <https://openreview.net/forum?id=Zp8YmiQ_bDC>
 - official AirfRANS repo metric path: `Extrality/AirfRANS` `metrics.py`
-- SpiderSolver metric note: <https://openreview.net/pdf/054dcb68b120d4b02b356ca2f357ae4fbd463354.pdf>
+- Transolver AirfRANS README correction: <https://github.com/thuml/Transolver/tree/main/Airfoil-Design-AirfRANS>
+- Transolver AirfRANS results table image: <https://raw.githubusercontent.com/thuml/Transolver/main/Airfoil-Design-AirfRANS/fig/results.png>
+- SpiderSolver repo: <https://github.com/Kai-Qi/SpiderSolver>
+- SpiderSolver poster with AirfRANS full-task table: <https://neurips.cc/media/PosterPDFs/NeurIPS%202025/116641.png>
 
 ## Code boundaries
 

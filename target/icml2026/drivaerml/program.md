@@ -65,11 +65,47 @@ Use the **DrivAerML relative-L2 contract** used by AB-UPT and continued in later
     - **architecture depth / recipe**: the paper uses the full published AB-UPT block schedule and training recipe (`500` epochs, `bs=1`, Lion with warmup+cosine, mixed precision). The local sprint trainer exposes a shared training loop and does not yet hard-pin every AB-UPT hyperparameter to those paper values
   - The metric path is now aligned for paper-facing reporting, but the model/training path remains a **benchmark-aligned approximation** rather than an exact reproduction.
 
+## Published reference targets
+
+- **Exact local contract used by this target**
+  - packaged processed split: `394 train / 34 val / 46 test`
+  - packaged target: `surface_cp`
+  - paper-facing metric:
+    - `test_primary/surface_rel_l2_pct`
+  - this is a mean per-case full-surface relative-L2 score on the percent scale
+    after chunk re-aggregation
+
+- **What we found in the literature**
+  - We did **not** find a published paper that reports the exact packaged
+    `394 / 34 / 46` `surface_cp` contract used in this repo.
+  - The closest published surface-pressure references use the nominal public
+    DrivAerML benchmark rather than the packaged PVC subset:
+    - `Transolver-3` (Table 4, random `400 train / 34 effective val / 50 test`):
+      - `p_s = 3.71`
+    - `AB-UPT` (same table):
+      - `p_s = 3.82`
+    - `Transolver++` (same table):
+      - `p_s = 4.12`
+    - `Transolver` (same table):
+      - `p_s = 4.81`
+  - A separate `NeuralCFD` benchmark table reports `Transolver` at raw
+    `L2 = 0.0388` on its own random `80/10/10` DrivAerML split with 40k sampled
+    surface points. Interpreted on the percent scale used by
+    `surface_rel_l2_pct`, that is approximately `3.88`.
+
+- **Implication for this repo**
+  - There is no exact published apples-to-apples number for our packaged split,
+    so the paper should disclose that clearly.
+  - The right external target band for `surface_rel_l2_pct` is nevertheless
+    low-single-digit surface-pressure error, with `3.71` from `Transolver-3`
+    as the strongest nominal DrivAerML reference we found.
+
 ## Sources
 
 - AB-UPT paper: <https://openreview.net/pdf?id=nwQ8nitlTZ>
 - `milieu_cfd` common evaluator: `scripts/eval_drivaerml.py` and `nn_cfd/noether/callbacks.py`
 - Transolver-3 paper: <https://arxiv.org/abs/2602.04940>
+- NeuralCFD paper: <https://arxiv.org/abs/2502.09692>
 
 ## Training schedules in related work
 
