@@ -4,7 +4,7 @@
 # SPDX-PackageName: skills
 
 name: wandb-primary
-description: Comprehensive primary skill for agents working with Weights & Biases. Covers both the W&B SDK (training runs, metrics, artifacts, sweeps) and the Weave SDK (GenAI traces, evaluations, scorers). Includes helper libraries, gotcha tables, and data analysis patterns. Use this skill whenever the user asks about W&B runs, Weave traces, evaluations, training metrics, loss curves, model comparisons, or any Weights & Biases data — even if they don't say "W&B" explicitly.
+description: Comprehensive primary skill for agents working with Weights & Biases. Covers both the W&B SDK (training runs, metrics, artifacts, sweeps) and the Weave SDK (GenAI traces, evaluations, scorers), plus a training-curve diagnostics layer (curve features, LR/grad-norm/grad-histogram analysis, vision-readable PNGs). Includes helper libraries, gotcha tables, and data analysis patterns. Use this skill whenever the user asks about W&B runs, Weave traces, evaluations, training metrics, loss curves, model comparisons, or any Weights & Biases data — even if they don't say "W&B" explicitly. Also trigger on training-diagnostics questions: "is this run healthy", "why did training diverge / blow up / NaN", "is this run overfitting", "did training converge or plateau", "compare these runs", "rank these runs", "which run is best", "read the loss curve", "analyze the learning rate schedule", "check grad norms", "look at gradient histograms", "dead layer / vanishing gradients", "spikes in loss", "training instability", "what's the right step axis / x-axis", "`_step` vs `global_step` vs `epoch`".
 ---
 
 # W&B Primary Skill
