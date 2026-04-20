@@ -10,6 +10,7 @@ import json
 import math
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -67,10 +68,12 @@ class TrainConfig:
     use_ema: bool = True
     ema_decay: float = 0.999
     ema_start_step: int = 50
-    num_workers: int = 0
+    num_workers: int = -1
     pin_memory: bool = True
     persistent_workers: bool = True
     prefetch_factor: int = 4
+    amp_mode: str = "bf16"
+    compile_model: bool = False
     debug: bool = False
     max_train_batches: int = 0
     max_eval_batches: int = 0
@@ -459,7 +462,38 @@ def build_optimizer(params, config: TrainConfig):
     return optimizer
 
 
-def build_loaders(config: TrainConfig, bundle: DatasetBundle) -> tuple[DataLoader, dict[str, DataLoader], dict[str, DataLoader]]:
+def resolve_num_workers(config: TrainConfig, dataset_name: str) -> int:
+    if config.num_workers >= 0:
+        return config.num_workers
+    if not torch.cuda.is_available():
+        return 0
+    cpu_count = os.cpu_count() or 8
+    target = 8 if dataset_name == "drivaerml" else 4
+    return min(target, cpu_count)
+
+
+def autocast_context(device: torch.device, amp_mode: str):
+    if amp_mode != "bf16" or device.type != "cuda":
+        return nullcontext()
+    supports_bf16 = getattr(torch.cuda, "is_bf16_supported", lambda: True)
+    if not supports_bf16():
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+
+def float_outputs(outputs: dict[str, torch.Tensor | None]) -> dict[str, torch.Tensor | None]:
+    return {
+        name: value.float() if isinstance(value, torch.Tensor) and value.is_floating_point() else value
+        for name, value in outputs.items()
+    }
+
+
+def build_loaders(
+    config: TrainConfig,
+    bundle: DatasetBundle,
+    *,
+    num_workers: int | None = None,
+) -> tuple[DataLoader, dict[str, DataLoader], dict[str, DataLoader]]:
     if config.model == "reference_abupt":
         train_collate = ABUPTCollate(
             geometry_points=config.geometry_points,
@@ -491,11 +525,12 @@ def build_loaders(config: TrainConfig, bundle: DatasetBundle) -> tuple[DataLoade
         )
         shuffle = False
 
+    resolved_num_workers = resolve_num_workers(config, bundle.spec.name) if num_workers is None else num_workers
     loader_kwargs = {
-        "num_workers": config.num_workers,
+        "num_workers": resolved_num_workers,
         "pin_memory": config.pin_memory and torch.cuda.is_available(),
     }
-    if config.num_workers > 0:
+    if resolved_num_workers > 0:
         loader_kwargs["persistent_workers"] = config.persistent_workers
         loader_kwargs["prefetch_factor"] = config.prefetch_factor
 
@@ -687,6 +722,7 @@ def evaluate_grouped(
     transform: TargetTransform | TandemTargetTransform,
     device: torch.device,
     *,
+    amp_mode: str = "none",
     max_batches: int = 0,
 ) -> dict[str, float]:
     model.eval()
@@ -716,13 +752,15 @@ def evaluate_grouped(
 
         if isinstance(transform, TandemTargetTransform):
             prepared = transform.prepare_batch(batch)
-            outputs = model(
-                surface_x=prepared.surface_x,
-                surface_mask=prepared.surface_mask,
-                volume_x=prepared.volume_x,
-                volume_mask=prepared.volume_mask,
-            )
-            outputs = maybe_apply_anp(outputs, prepared, anp_head)
+            with autocast_context(device, amp_mode):
+                outputs = model(
+                    surface_x=prepared.surface_x,
+                    surface_mask=prepared.surface_mask,
+                    volume_x=prepared.volume_x,
+                    volume_mask=prepared.volume_mask,
+                )
+                outputs = maybe_apply_anp(outputs, prepared, anp_head)
+            outputs = float_outputs(outputs)
             surface_pred_orig, volume_pred_orig = transform.invert_predictions(
                 prepared,
                 surface_preds=outputs["surface_preds"],
@@ -746,12 +784,14 @@ def evaluate_grouped(
                 count_volume += 1
             continue
 
-        outputs = model(
-            surface_x=batch.surface_x,
-            surface_mask=batch.surface_mask,
-            volume_x=batch.volume_x,
-            volume_mask=batch.volume_mask,
-        )
+        with autocast_context(device, amp_mode):
+            outputs = model(
+                surface_x=batch.surface_x,
+                surface_mask=batch.surface_mask,
+                volume_x=batch.volume_x,
+                volume_mask=batch.volume_mask,
+            )
+        outputs = float_outputs(outputs)
         if dataset_name == "airfrans":
             if batch.surface_y is not None and outputs["surface_preds"] is not None:
                 target = transform.apply(batch.surface_y)
@@ -886,6 +926,7 @@ def evaluate_abupt(
     transform: TargetTransform,
     device: torch.device,
     *,
+    amp_mode: str = "none",
     max_batches: int = 0,
 ) -> dict[str, float]:
     model.eval()
@@ -900,13 +941,15 @@ def evaluate_abupt(
     for batch in batches:
         batch = batch.to(device)
         dataset_name = batch.dataset_name
-        outputs = model(
-            geometry_position=batch.geometry_position,
-            geometry_supernode_idx=batch.geometry_supernode_idx,
-            geometry_batch_idx=batch.geometry_batch_idx,
-            surface_anchor_position=batch.surface_anchor_position,
-            volume_anchor_position=batch.volume_anchor_position,
-        )
+        with autocast_context(device, amp_mode):
+            outputs = model(
+                geometry_position=batch.geometry_position,
+                geometry_supernode_idx=batch.geometry_supernode_idx,
+                geometry_batch_idx=batch.geometry_batch_idx,
+                surface_anchor_position=batch.surface_anchor_position,
+                volume_anchor_position=batch.volume_anchor_position,
+            )
+        outputs = float_outputs(outputs)
         if dataset_name == "airfrans":
             if batch.surface_anchor_target is not None and outputs["surface_preds"] is not None:
                 target = transform.apply(batch.surface_anchor_target)
@@ -988,6 +1031,7 @@ def train_one_epoch(
     device: torch.device,
     model_name: str,
     *,
+    amp_mode: str = "none",
     max_batches: int = 0,
 ) -> dict[str, float]:
     model.train()
@@ -1000,34 +1044,37 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         if model_name == "reference_abupt":
             batch = batch.to(device)
-            outputs = model(
-                geometry_position=batch.geometry_position,
-                geometry_supernode_idx=batch.geometry_supernode_idx,
-                geometry_batch_idx=batch.geometry_batch_idx,
-                surface_anchor_position=batch.surface_anchor_position,
-                volume_anchor_position=batch.volume_anchor_position,
-            )
-            loss, _ = loss_abupt(batch, outputs, transform)
+            with autocast_context(device, amp_mode):
+                outputs = model(
+                    geometry_position=batch.geometry_position,
+                    geometry_supernode_idx=batch.geometry_supernode_idx,
+                    geometry_batch_idx=batch.geometry_batch_idx,
+                    surface_anchor_position=batch.surface_anchor_position,
+                    volume_anchor_position=batch.volume_anchor_position,
+                )
+                loss, _ = loss_abupt(batch, outputs, transform)
         else:
             batch = batch.to(device)
             if isinstance(transform, TandemTargetTransform):
                 prepared = transform.prepare_batch(batch)
-                outputs = model(
-                    surface_x=prepared.surface_x,
-                    surface_mask=prepared.surface_mask,
-                    volume_x=prepared.volume_x,
-                    volume_mask=prepared.volume_mask,
-                )
-                outputs = maybe_apply_anp(outputs, prepared, anp_head)
-                loss, _ = loss_grouped_tandem(prepared, outputs)
+                with autocast_context(device, amp_mode):
+                    outputs = model(
+                        surface_x=prepared.surface_x,
+                        surface_mask=prepared.surface_mask,
+                        volume_x=prepared.volume_x,
+                        volume_mask=prepared.volume_mask,
+                    )
+                    outputs = maybe_apply_anp(outputs, prepared, anp_head)
+                    loss, _ = loss_grouped_tandem(prepared, outputs)
             else:
-                outputs = model(
-                    surface_x=batch.surface_x,
-                    surface_mask=batch.surface_mask,
-                    volume_x=batch.volume_x,
-                    volume_mask=batch.volume_mask,
-                )
-                loss, _ = loss_grouped(batch, outputs, transform)
+                with autocast_context(device, amp_mode):
+                    outputs = model(
+                        surface_x=batch.surface_x,
+                        surface_mask=batch.surface_mask,
+                        volume_x=batch.volume_x,
+                        volume_mask=batch.volume_mask,
+                    )
+                    loss, _ = loss_grouped(batch, outputs, transform)
         loss.backward()
         optimizer.step()
         if scheduler is not None:
@@ -1132,11 +1179,12 @@ def main() -> None:
         _ds.TandemFoilCaseDataset.__init__ = _patched_init
 
     bundle = build_bundle(config)
+    resolved_num_workers = resolve_num_workers(config, bundle.spec.name)
     if bundle.spec.name == "tandemfoilset":
         phys_stats = compute_tandem_phys_stats(
             bundle.train_dataset,
             batch_size=config.batch_size,
-            num_workers=config.num_workers,
+            num_workers=resolved_num_workers,
             device=device,
             asinh_pressure=config.asinh_pressure,
             asinh_scale=config.asinh_scale,
@@ -1155,8 +1203,9 @@ def main() -> None:
             asinh_scale=config.asinh_scale,
         )
 
-    train_loader, val_loaders, test_loaders = build_loaders(config, bundle)
+    train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
+    forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
         anp_head = ANPSurfaceDecoder(
@@ -1195,7 +1244,7 @@ def main() -> None:
         if timeout_seconds is not None and epoch > 1 and (time.monotonic() - start_time) >= timeout_seconds:
             break
         train_metrics = train_one_epoch(
-            model=model,
+            model=forward_model,
             anp_head=anp_head,
             loader=train_loader,
             optimizer=optimizer,
@@ -1205,6 +1254,7 @@ def main() -> None:
             transform=transform,
             device=device,
             model_name=config.model,
+            amp_mode=config.amp_mode,
             max_batches=config.max_train_batches,
         )
 
@@ -1219,19 +1269,21 @@ def main() -> None:
         for split_name, loader in val_loaders.items():
             if config.model == "reference_abupt":
                 split_metrics = evaluate_abupt(
-                    model,
+                    forward_model,
                     loader,
                     transform,
                     device,
+                    amp_mode=config.amp_mode,
                     max_batches=config.max_eval_batches,
                 )
             else:
                 split_metrics = evaluate_grouped(
-                    model,
+                    forward_model,
                     anp_head,
                     loader,
                     transform,
                     device,
+                    amp_mode=config.amp_mode,
                     max_batches=config.max_eval_batches,
                 )
             eval_metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
@@ -1274,19 +1326,21 @@ def main() -> None:
         for split_name, loader in test_loaders.items():
             if config.model == "reference_abupt":
                 split_metrics = evaluate_abupt(
-                    model,
+                    forward_model,
                     loader,
                     transform,
                     device,
+                    amp_mode=config.amp_mode,
                     max_batches=config.max_eval_batches,
                 )
             else:
                 split_metrics = evaluate_grouped(
-                    model,
+                    forward_model,
                     anp_head,
                     loader,
                     transform,
                     device,
+                    amp_mode=config.amp_mode,
                     max_batches=config.max_eval_batches,
                 )
             final_test_metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
