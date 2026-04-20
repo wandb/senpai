@@ -65,7 +65,7 @@ swap_gh_pr_label <pr#> "status:review" "status:wip"
 
    Follow this sequence:
 
-   **a. Rank all review-ready PRs by the primary validation metric defined in `/BASELINE.md` and `$PROBLEM_DIR/program.md`** (lower is better). Check the W&B run for each PR — the student's reported metrics may be stale or incomplete. If there is a new best result, update the `/BASELINE.md` file with the PR numer and the new best metrics and commit it to the advisor branch.
+   **a. Rank all review-ready PRs by the primary validation metric defined in `$PROBLEM_DIR/program.md`** (lower is better). Check the W&B run for each PR — the student's reported metrics may be stale or incomplete. If there is a new best result, update the `/BASELINE.md` file with the PR numer and the new best metrics and commit it to the advisor branch.
 
    **Checking for comments:** Ensure you check all comments on the PR. If the student has asked a question, answer it as a follow-up comment identifying yourself as the advisor, then send the PR back:
    ```bash
