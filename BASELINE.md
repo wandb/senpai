@@ -58,9 +58,18 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.2597 (val) / 0.2392 (test)
-- **Best PR:** #2455 (emma — 3L/192d + no-EMA + NO Fourier + 6 epochs)
-- **Key insight:** Fourier adds 3x epoch overhead. Without Fourier, 6 epochs at 0.2597 beats Fourier at 2 epochs (0.2710). More epochs > Fourier features.
+- **Current best:** 0.2387 (val) / 0.2079 (test)
+- **Best PR:** #2478 (senku — Fourier + 4L/256d + no-EMA, 8 epochs, AdamW lr=5e-4, T_max=150)
+- **Key insight:** Fourier + 4L/256d + more epochs (8 vs 6) = 17.4% improvement. Critical bug: epochs=2 is the default — must pass `--epochs 999` explicitly. T_max=20 creates LR instability at epoch boundaries; T_max=150 is correct.
+
+### 2026-04-21 00:00 — PR #2478: AirfRANS: Fourier + 4L/256d full epoch run — NEW BEST
+
+- **val_primary/surface_mse:** 0.2387 (-17.4% vs 0.2891 prior, -8.1% vs 0.2597)
+- **test_primary/surface_mse:** 0.2079
+- **full_val/volume_mse:** 0.2933
+- **W&B run:** vwb9teqa
+- **Epochs:** 8 (180-min budget)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans_task full --optimizer adamw --lr 5e-4 --cosine_t_max 150 --no-use-ema --enable-fourier --model-layers 4 --model-hidden-dim 256 --model-heads 4 --epochs 999`
 
 ### 2026-04-20 22:20 — PR #2455: AirfRANS: 3L/192d no-EMA no-Fourier 6 epochs — NEW BEST
 
