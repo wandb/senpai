@@ -1,5 +1,19 @@
 # SENPAI Research Results
 
+## 2026-04-20 21:50 — PR #2460: AirfRANS OOD tasks (scarce + reynolds) with no-EMA — MERGED ✓ NEW OOD BASELINES
+
+- **Branch:** norman/airfrans-noema-ood
+- **Hypothesis:** No-EMA should improve OOD tasks as it improved the full task
+
+| Task | val_primary/surface_mse | test_primary | val_mse_p | Epochs | W&B |
+|---|---|---|---|---|---|
+| **scarce** | **0.2547** (-24% vs 0.3351) | 0.6368 | 1.0156 | 2 | bxrn5yye |
+| **reynolds** | **0.4059** (-32% vs 0.5956) | 0.6618 | 1.6183 | 2 | az53l5l6 |
+
+**Commentary:** Confirms no-EMA generalizes to OOD tasks. Both improved substantially vs Round 2 EMA baselines. Pressure dominates >95% of surface error in both tasks. Large val/test gap on scarce (1.02→2.54 pressure) indicates distribution shift. Only 2 epochs due to OOD dataset size (~15 min/epoch).
+
+---
+
 ## 2026-04-20 21:30 — PR #2435: TandemFoil: cosine T_max sweep at slices=64 — MERGED ✓ NEW BEST
 
 - **Branch:** gilbert/tandem-cosine-tmax-sweep
