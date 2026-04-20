@@ -89,7 +89,7 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
    ## Results
 
    ```
-   - All key metrics required by `$PROBLEM_DIR/program.md` and the PR baseline, for example validation loss, boundary or surface error, pressure error, volume or field error, and any problem-specific OOD metrics
+   - All key metrics required by `$PROBLEM_DIR/program.md` and the PR baseline.
    - Comparison against the baseline numbers from the PR body
    - Exact train.py command used to run the experiment
    - Peak memory usage
