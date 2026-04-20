@@ -114,10 +114,18 @@
 ## DrivAerML
 
 - **Primary metric:** `val_primary/surface_rel_l2_pct` (lower is better)
-- **Current best:** 56.91% (val) / 57.33% (test)
-- **Best PR:** #2467 (violet — no-EMA + AdamW lr=8e-4, 2 epochs)
+- **Current best:** 51.35% (val) / 52.06% (test)
+- **Best PR:** #2475 (chihiro — Fourier + no-EMA, T_max=30, 2 epochs)
 - **External target:** <3.71% (AB-UPT, ~500 epochs)
-- **Key insight:** No-EMA + higher LR (8e-4) dramatically improves DrivAerML (-20% relative).
+- **Key insight:** Fourier features deliver 9.8% relative improvement on DrivAerML. T_max=30 > T_max=150 with Fourier. With Fourier, lr=5e-4 outperforms lr=8e-4 (51.35% vs 54.33%).
+
+### 2026-04-21 00:05 — PR #2475: DrivAerML: Fourier + no-EMA (T_max=30) — NEW BEST
+
+- **val_primary/surface_rel_l2_pct:** 51.35% (-9.8% relative vs 56.91%)
+- **test_primary/surface_rel_l2_pct:** 52.06%
+- **W&B run:** 5ncrjm32 (winner, T_max=30); uy73j36s (T_max=150: 52.06%)
+- **Epochs:** 2 (still descending at cutoff — clear headroom)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset drivaerml --optimizer adamw --lr 5e-4 --cosine_t_max 30 --no-use-ema --enable-fourier --epochs 999 --batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
 
 ### 2026-04-20 22:00 — PR #2467: DrivAerML: no-EMA + AdamW lr=8e-4 — NEW BEST
 
