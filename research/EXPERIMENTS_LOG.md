@@ -614,3 +614,67 @@ Key pattern: ALL 5 AirfRANS Round 2 PRs ran at slices=64 with 4 parallel jobs �
 **Commentary:** CRITICAL FINDING — slices=32 with physics still only gets 2 epochs. The central hypothesis failed: physics overhead is per-sample, not per-slice. Halving slices twice (96→64→32) produces zero meaningful speedup on physics feature computation. The 7x overhead comes from Cp panel + TE coord frame + pressure prior — these are datapoint-level operations. Physics features need precomputed caching to be viable. Best result 152.25 (lr=3e-4) confirms lr=3e-4 > lr=5e-4 for AdamW+physics. Closed — redirected kaneda to 4L/256d capacity test at golden config (PR #2488).
 
 **Key structural finding:** Physics features are permanently blocked at ~2 epochs until precomputed caching is implemented. This is not a hyperparameter problem.
+
+---
+
+## 2026-04-20 23:15 — PR #2473: TandemFoil: golden + Fourier + physics + no-EMA — MERGED (NEW BEST)
+
+- **Student:** edward
+- **Branch:** edward/tandem-golden-noema-fourier (merged into radford)
+
+| Metric | Run 1 (Fourier only) | Run 2 (Fourier+physics) | Previous Baseline |
+|---|---|---|---|
+| val_primary/surface_pressure_mae | 106.61 | **82.65** | 114.92 |
+| test_primary/surface_pressure_mae | — | 80.63 | 108.16 |
+| val_single_in_dist | — | 102.40 | — |
+| val_geom_camber_cruise | — | 62.37 | — |
+| val_geom_camber_rc | — | 88.97 | — |
+| val_re_rand | — | 76.87 | — |
+| W&B run | 8a26mlm6 | nh380grv | 3ec9m9az |
+| Epochs | 14 | 14 (best=final, still improving) | 11 |
+
+**Commentary:** MAJOR BREAKTHROUGH. Fourier+physics synergy at slices=64 achieves 82.65 — a 28.1% improvement over 114.92 baseline. Run 1 (Fourier only) also beats baseline at 106.61. CRITICAL: both runs got 14 epochs (MORE than the no-Fourier/no-physics 11-epoch baseline), contradicting our earlier assumption that physics would reduce epoch count at slices=64. The Fourier+physics combination appears to be computationally efficient at slices=64. Run 2 was still descending sharply at epoch 14 (95.63→82.65 in last 2 epochs) — significant headroom remains. New TandemFoil baseline: **82.65**.
+
+**Key insight revision:** Physics features are NOT slow at slices=64 when combined with Fourier. The per-sample overhead bottleneck observed at slices=96 may not manifest at slices=64 where the base computation is faster. Fourier+physics is now the mandatory TandemFoil configuration.
+
+---
+
+## 2026-04-20 23:15 — PR #2464: TandemFoil: physics + no-EMA + T_max sweep — CLOSED
+
+- **Student:** frieren
+
+| T_max | val_primary/surface_pressure_mae | Epochs |
+|---|---|---|
+| 10 | **147.94** | 2 |
+| 20 | 168.86 | 2 |
+| 50 | 214.70 (regressed) | 2 |
+
+**Commentary:** Dead end at slices=96. 2 epochs only, 147.94 doesn't beat 82.65 (new baseline). Key finding: T_max=10 > T_max=20 >> T_max=50 for physics. T_max=50 regressed (LR still high at cutoff). OOD splits (camber, re_rand) stronger than single_in_dist. Redirected frieren to test T_max=10/15/20 on the new Fourier+physics golden config.
+
+---
+
+## 2026-04-20 23:15 — PR #2465: AirfRANS: no-EMA + AdamW lr=5e-4/8e-4 — CLOSED
+
+- **Student:** kohaku
+
+| LR | val_primary/surface_mse (epoch 6 final) | test_primary |
+|---|---|---|
+| 5e-4 | 0.3033 | 0.3010 |
+| 8e-4 | 0.3061 | **0.2610** |
+
+**Commentary:** Neither beats 0.2597 baseline. Interesting: lr=8e-4 test=0.2610 is very close. lr=8e-4 showed best-at-epoch-3 pattern (0.2781 student-reported, unverified in W&B), suggesting oscillation issue with T_max=150 at lr=8e-4. Redirected kohaku to test AirfRANS Fourier+physics synergy.
+
+---
+
+## 2026-04-20 23:15 — PR #2438: DrivAerML: T_max sweep + 1M surface points — CLOSED (invalid comparison)
+
+- **Student:** taki
+
+| T_max | val_primary (1M eval pts) | Epochs | Runtime |
+|---|---|---|---|
+| 50 | **36.05%** | 1 | ~80 min |
+| 10 | 37.07% | 1 | ~80 min |
+| 20 | 38.59% | 1 | ~80 min |
+| 30 | 41.20% | 1 | ~80 min |
+
+**Commentary:** Cannot merge — baseline used 50k eval points, this used 1M eval points (metrics not comparable). Also exceeded 30-min timeout (1 epoch = 80 min at 1M points). However, critical findings: (1) 1M training surface points provides dramatically more gradient signal than 50k; (2) T_max=50 is best DrivAerML T_max; (3) cosine scheduling is per-step, so T_max semantics are step-level (71 cycles/epoch at tmx50). Redirected taki to re-run with standardized 50k eval points for fair comparison.
