@@ -52,7 +52,13 @@ Use the **DrivAerML relative-L2 contract** used by AB-UPT and continued in later
 - **Important comparison note**
   - The packaged PVC split is not identical to the nominal AB-UPT public split because `10` processed public cases are missing.
   - That split discrepancy must be disclosed whenever we compare against AB-UPT, PhysicsNeMo, or Transolver-3 tables.
-  - The local `reference_abupt` model path now uses full surface anchors at evaluation time, but it still keeps a tractable sampled-geometry branch during training and evaluation. Treat it as an architecture comparison, not a byte-for-byte reproduction of the published AB-UPT training stack.
+  - The local `reference_abupt` model path should be treated as an **AB-UPT-style reference architecture**, not a byte-for-byte reproduction of the published AB-UPT DrivAerML setup.
+  - The main remaining differences are:
+    - **split**: this target uses the packaged processed split `394 / 34 / 46`, whereas AB-UPT reports the nominal public split `400 / 34 effective val / 50 test`
+    - **targets**: the packaged sprint path is surface-first and predicts packaged `surface_cp`, whereas AB-UPT predicts 4 surface variables and 7 volume variables on the full task
+    - **token counts**: the AB-UPT paper uses `16384` geometry supernodes, `16384` surface anchors, and `16384` volume anchors for DrivAerML; the local sprint defaults are smaller and configurable for practicality
+    - **architecture depth / recipe**: the paper uses the full published AB-UPT block schedule and training recipe (`500` epochs, `bs=1`, Lion with warmup+cosine, mixed precision). The local sprint trainer exposes a shared training loop and does not yet hard-pin every AB-UPT hyperparameter to those paper values
+  - The metric path is now aligned for paper-facing reporting, but the model/training path remains a **benchmark-aligned approximation** rather than an exact reproduction.
 
 ## Sources
 
