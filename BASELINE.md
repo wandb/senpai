@@ -3,9 +3,19 @@
 ## TandemFoilSet
 
 - **Primary metric:** `val_primary/surface_pressure_mae` (= `val_eq4/surface_pressure_mae`)
-- **Current best:** 114.92 (val) / 108.16 (test)
-- **Best PR:** #2435 (gilbert — cosine T_max=30, Lion lr=3e-4, slices=64, EMA=True, 11 epochs)
-- **Key insight:** slices=64 enables 11 epochs vs 2 at slices=96 — more training overwhelms resolution loss. cosine_t_max=30 is optimal. No-EMA retest should push well below 100.
+- **Current best:** 82.65 (val) / 80.63 (test)
+- **Best PR:** #2473 (edward — Fourier + core physics + no-EMA, slices=64, T_max=30, Lion lr=3e-4, 14 epochs)
+- **Key insight:** Fourier + physics is synergistic at slices=64 — gets 14 epochs AND better per-epoch quality. Still improving at cutoff. Single-best-config improvement: -28.1% vs 114.92.
+
+### 2026-04-20 23:15 — PR #2473: TandemFoil: golden + Fourier + physics + no-EMA — NEW BEST
+
+- **val_primary/surface_pressure_mae:** 82.65 (-28.1% vs 114.92)
+- **test_primary/surface_pressure_mae:** 80.63
+- **Per-split val MAE:** single_in_dist=102.40, geom_camber_rc=88.97, geom_camber_cruise=62.37, re_rand=76.87
+- **Note:** 14 epochs at slices=64 with Fourier + core physics + no-EMA. Best IS final epoch — still sharply improving at cutoff (95.63 → 82.65 in last 2 epochs). Run 1 (Fourier only, no physics) also beat baseline at 106.61. Fourier+physics is synergistic.
+- **W&B run:** nh380grv
+- **Epochs:** 14 (30-min timeout)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 3e-4 --cosine_t_max 30 --no-use-ema --model_slices 64 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition`
 
 ### 2026-04-20 21:30 — PR #2435: TandemFoil: cosine T_max=30 at slices=64 — NEW BEST
 
