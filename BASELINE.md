@@ -48,11 +48,21 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.2891 (val) / 0.2856 (test)
-- **Best PR:** #2474 (senku — Fourier + no-EMA + 4L/256d + AdamW lr=5e-4)
-- **Key insight:** Fourier + bigger model (4L/256d) synergize. Still in steep descent at epoch 2.
+- **Current best:** 0.2597 (val) / 0.2392 (test)
+- **Best PR:** #2455 (emma — 3L/192d + no-EMA + NO Fourier + 6 epochs)
+- **Key insight:** Fourier adds 3x epoch overhead. Without Fourier, 6 epochs at 0.2597 beats Fourier at 2 epochs (0.2710). More epochs > Fourier features.
 
-### 2026-04-20 22:00 — PR #2474: AirfRANS: Fourier + no-EMA + 4L/256d — NEW BEST
+### 2026-04-20 22:20 — PR #2455: AirfRANS: 3L/192d no-EMA no-Fourier 6 epochs — NEW BEST
+
+- **val_primary/surface_mse:** 0.2597 (-10.2% vs 0.2891)
+- **test_primary/surface_mse:** 0.2392 (-16.3% vs 0.2856)
+- **Surface MSE breakdown (test):** p=0.9556 (first time below 1.0!)
+- **Note:** 6 epochs WITHOUT Fourier. 3L/192d + no-EMA + AdamW lr=5e-4 + T_max=150. Fourier adds ~3x epoch overhead (15→5 min/epoch), so dropping it triples epoch count. Still improving at epoch 6. 4L/256d variant was worse (0.2935, 5 epochs).
+- **W&B run:** pifi0x1v
+- **Epochs:** 6 (30-min timeout)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans_task full --optimizer adamw --lr 5e-4 --cosine_t_max 150 --no-use-ema`
+
+### 2026-04-20 22:00 — PR #2474: AirfRANS: Fourier + no-EMA + 4L/256d
 
 - **val_primary/surface_mse:** 0.2891 (-3.9% vs 0.3009)
 - **test_primary/surface_mse:** 0.2856 (-0.5% vs 0.2869)

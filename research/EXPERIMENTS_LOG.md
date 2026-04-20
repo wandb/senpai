@@ -1,5 +1,59 @@
 # SENPAI Research Results
 
+## 2026-04-20 22:20 — PR #2455: AirfRANS: 3L/192d no-EMA no-Fourier 6 epochs — MERGED ✓ NEW BEST
+
+- **Branch:** emma/airfrans-noema-4L256d-retest
+
+| Run | Config | val_primary/surface_mse | test | Epochs | W&B |
+|---|---|---|---|---|---|
+| 4L/256d | no-EMA, no-Fourier | 0.2935 | 0.2706 | 5 | wptz6kat |
+| **3L/192d** | **no-EMA, no-Fourier** | **0.2597** (-10.2%) | **0.2392** | **6** | pifi0x1v |
+
+**Commentary:** BREAKTHROUGH — Fourier features add ~3x epoch overhead (5→15 min/epoch). Without Fourier, 6 epochs (0.2597) beats Fourier at 2 epochs (0.2710). Same pattern as TandemFoil: more epochs > features. 4L/256d conclusively worse than 3L/192d under time budget. Pressure finally below 1.0 (test_surface_mse_p=0.9556).
+
+---
+
+## 2026-04-20 22:20 — PR #2470: AirfRANS: Fourier full epoch run — CLOSED (superseded)
+
+- **Branch:** haku/airfrans-fourier-noema-fullrun
+
+| Run | Config | val_primary/surface_mse | Epochs | W&B |
+|---|---|---|---|---|
+| **lr=5e-4, T_max=150** | Fourier+noEMA | **0.2710** | 2 | dui0c6qg |
+| lr=3e-4, T_max=150 | Fourier+noEMA | 0.2805 | 2 | anzo6z7u |
+| lr=5e-4, T_max=20 | Fourier+noEMA | 0.4354 | 2 | sklqsht0 |
+
+**Commentary:** Best Fourier result (0.2710) beats old baseline (0.2891) but superseded by emma's no-Fourier 0.2597. CONFIRMED: AirfRANS epoch starvation is structural — 15 min/epoch with Fourier, 30-min timeout = 2 epochs max regardless of parallelism. T_max=20 catastrophically bad (LR cycles back to peak). T_max=150 correct for AirfRANS.
+
+---
+
+## 2026-04-20 22:20 — PR #2476: AirfRANS: Fourier + no-EMA on OOD tasks — MERGED ✓ REYNOLDS OOD BEST
+
+- **Branch:** norman/airfrans-fourier-noema-ood
+
+| Task | val_primary/surface_mse | vs Baseline | Epochs | W&B |
+|---|---|---|---|---|
+| **reynolds** | **0.3319** (-18.2%) | 0.4059 | 2 | m24dt4cg |
+| scarce | 0.2760 (+8.4%) | 0.2547 | 2 | vb77cptv |
+
+**Commentary:** Mixed OOD results. Reynolds: Fourier helps significantly (-18.2%). Scarce: Fourier hurts (+8.4%), possibly overfitting with limited data. New reynolds OOD baseline: 0.3319.
+
+---
+
+## 2026-04-20 22:20 — PR #2469: AirfRANS: cosine T_max sweep — CLOSED (obsolete)
+
+- **Branch:** alphonse/airfrans-noema-cosine-sweep
+
+| T_max | val_primary/surface_mse | Epochs | W&B |
+|---|---|---|---|
+| 10 | 0.3407 | 2 | bcp5ht2b |
+| 20 | 0.3840 | 2 | tnypfuoy |
+| 50 | 0.3703 | 2 | ujr87q52 |
+
+**Commentary:** No Fourier features. All worse than pre-Fourier baseline (0.3308) at only 2 epochs. Doubly obsolete vs current 0.2597. Cosine T_max hypothesis untestable at 2 epochs.
+
+---
+
 ## 2026-04-20 22:00 — PR #2467: DrivAerML: no-EMA + AdamW lr=8e-4 — MERGED ✓ NEW BEST
 
 - **Branch:** violet/drivaerml-noema-lr-bracket
