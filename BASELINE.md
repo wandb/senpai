@@ -51,3 +51,18 @@
 - **W&B run:** u95mzqso
 - **Epochs:** 6 (30-min timeout)
 - **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans_task full --optimizer adamw --lr 5e-4 --cosine_t_max 150`
+
+## DrivAerML
+
+- **Primary metric:** `val_primary/surface_rel_l2_pct` (lower is better)
+- **Current best:** 71.35% (val)
+- **Best PR:** #2440 (shoya — DrivAerML AdamW lr=5e-4, 2 epochs)
+- **External target:** <3.71% (AB-UPT, ~500 epochs)
+
+### 2026-04-20 21:00 — PR #2440: DrivAerML: AdamW vs Lion baseline sweep (first baseline)
+
+- **val_primary/surface_rel_l2_pct:** 71.35%
+- **Note:** Only 2 epochs completed (30-min timeout, ~10-11 min/epoch). AdamW lr=5e-4 best of 4 runs. Lion lr=3e-4 degraded epoch-over-epoch (74.1%→78.5%). Student resolved OOM with 50k surface-point sampling. All AdamW LRs (3e-4, 5e-4, 8e-4) converged to ~71.4-71.8%.
+- **W&B run:** kulxytfg
+- **Epochs:** 2 (30-min timeout)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset drivaerml --optimizer adamw --lr 5e-4 --cosine_t_max 150`

@@ -1,5 +1,66 @@
 # SENPAI Research Results
 
+## 2026-04-20 21:00 — PR #2440: DrivAerML: AdamW vs Lion baseline sweep — MERGED ✓ FIRST BASELINE
+
+- **Branch:** shoya/drivaerml-adamw-baseline-sweep
+- **Hypothesis:** Establish first DrivAerML baseline comparing AdamW vs Lion optimizer
+
+| Run | Config | val_primary/surface_rel_l2_pct | Epochs |
+|---|---|---|---|
+| AdamW lr=3e-4 | 3L/192d, slices=96 | 71.76% | 2 |
+| **AdamW lr=5e-4** | 3L/192d, slices=96 | **71.35%** (BEST) | 2 |
+| AdamW lr=8e-4 | 3L/192d, slices=96 | 71.76% | 2 |
+| Lion lr=3e-4 | 3L/192d, slices=96 | 78.45% (degraded) | 2 |
+
+**Commentary:** First DrivAerML baseline. AdamW clearly beats Lion (which degraded epoch-over-epoch). All AdamW LRs converge to ~71.4-71.8% — optimizer matters more than LR in this range. 71.35% vs 3.71% target = huge gap, but only 2 epochs (30-min timeout, ~10-11 min/epoch). DrivAerML cases have ~8.6M surface points; student resolved OOM with 50k-point sampling. Eval coverage thin (~3.5% of val surface per epoch). AdamW lr=5e-4 is the DrivAerML starting point going forward.
+
+---
+
+## 2026-04-20 21:00 — PR #2434: TandemFoil: slices throughput sweep — CLOSED (EMA-suppressed)
+
+- **Branch:** violet/tandem-slices-sweep
+
+| Slices | val_primary/surface_pressure_mae | Epochs | Peak VRAM |
+|---|---|---|---|
+| 32 | 288.51 | 2 | ~77 GB |
+| 48 | 452.38 | 2 | — |
+| 64 | 486.53 | 1 | — |
+| 96 | 294.21 | 2 | ~92 GB |
+
+**Commentary:** EMA=True. Slices do NOT affect throughput (all got 2 epochs regardless). slices=32 ≈ slices=96 quality with 15 GB less memory. slices=48 is anomalously bad. Data loading is the bottleneck, not slice attention.
+
+---
+
+## 2026-04-20 21:00 — PR #2433: TandemFoil: AdamW LR sweep slices=64 — CLOSED (Lion dominates)
+
+- **Branch:** alphonse/tandem-adamw-lr-sweep
+
+| LR | val_primary/surface_pressure_mae | Epochs |
+|---|---|---|
+| 3e-4 | 444.39 | 1 |
+| 5e-4 | 338.15 | 1 |
+| **8e-4** | **254.34** | 2 |
+| 1e-3 | 456.86 | 2 |
+
+**Commentary:** No-EMA (EMA=None confirmed). AdamW lr=8e-4 is optimal AdamW LR but still 22% behind Lion baseline (197.87). Lion dominates AdamW on TandemFoil — opposite of AirfRANS finding. 4 parallel jobs caused epoch starvation (v0/v1 only 1 epoch).
+
+---
+
+## 2026-04-20 21:00 — PR #2413: TandemFoil: full physics stack — CLOSED (core subset better)
+
+- **Branch:** fern/tandem-full-physics
+
+| Variant | val_primary/surface_pressure_mae | Epochs |
+|---|---|---|
+| v0: Full physics (all flags) | 270.74 | 2 |
+| v1: Full minus wake-angle | 293.44 | 2 |
+| v2: cp-panel-scale=0.5 | 285.87 | 2 |
+| v3: vortex-panel-scale=0.05 | **268.10** | 2 |
+
+**Commentary:** EMA=True. Full physics stack (best 268.10) worse than core physics subset (262.82, #2414). Wake-angle is the most impactful single feature (+22.7 when removed). Vortex-panel computation has Python for-loop bottleneck (~25 min/epoch). Core physics subset is the right path — full stack not worth the computational cost.
+
+---
+
 ## 2026-04-20 19:50 — PR #2412: TandemFoil: clean baseline no-EMA (frieren v4) — MERGED ✓ NEW BEST
 
 - **Branch:** frieren/tandem-baseline-default
