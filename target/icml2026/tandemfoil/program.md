@@ -26,14 +26,43 @@ stays under `data/`.
 
 ## Metrics
 
-**The goal: lowest physically meaningful validation error on the most decision-relevant regions and regimes.** We track:
-- **Primary validation metric** — `<define this for the active dataset or benchmark; this is the main metric used to rank results and make merge decisions>`
-- **Boundary or surface error** — when applicable, this is usually the most important metric because it is closest to engineering use.
-- **Volume or field error** — mean absolute error over the full predicted flow field.
-- **Validation loss** — the combined objective optimized during training.
-- **Pressure fidelity and problem-specific split or OOD metrics** — whichever additional metrics best capture physical usefulness for the active benchmark.
+**This benchmark does not have a published external leaderboard metric like AirfRANS or DrivAerML.** The source-of-truth contract is:
+- the `kagent` competition split design in `target/icml2026/tandemfoil/data/split_manifest_tandemfoilset_v2.json`
+- the historical `origin/noam` validation path that produced the paper-facing `p_*` numbers
 
-Lower is better. When multiple metrics exist, prioritize the ones that best reflect physical usefulness and engineering decision quality: usually boundary or surface accuracy, pressure accuracy, and robustness on harder operating regimes.
+Use the following metric definitions exactly:
+
+- **Primary merge / ranking score for this ICML sprint**
+  - Equal-weight mean of the four split-specific **surface-pressure MAEs** on:
+    - `val_single_in_dist`
+    - `val_geom_camber_rc`
+    - `val_geom_camber_cruise`
+    - `val_re_rand`
+  - The `kagent` split document defines the balanced validation tracks and says they are summarized by equal-weight average surface MAE.
+  - For this paper sprint, we pin that surface metric to the **pressure channel** because the historical `senpai` frontier and abstract use split-specific surface-pressure MAE as the paper-facing scalar.
+
+- **Per-split scalar**
+  - For any validation split `S`, compute:
+  - `surface_pressure_mae(S) = mean_{all valid surface nodes in S} |p_hat - p_true|`
+  - `p` is the pressure / `C_p` channel **after full denormalization back to the original target space**.
+  - Aggregation is **global over all valid surface nodes in the split**, not per-case then averaged.
+
+- **Secondary diagnostics**
+  - `mae_surf_Ux`, `mae_surf_Uy`, `mae_surf_p`
+  - `mae_vol_Ux`, `mae_vol_Uy`, `mae_vol_p`
+  - combined validation loss per split
+
+- **Historical note**
+  - Earlier `origin/noam` frontier numbers use the legacy names `p_in`, `p_tan`, `p_oodc`, and `p_re`.
+  - Those are also **surface-pressure MAEs after denormalization**, but they were measured on an older legacy split manifest.
+  - Do **not** compare raw values between the legacy `p_*` contract and the new `kagent` v2 contract without restating the split definition.
+
+Lower is better. For the paper sprint, the decision-driving quantity is **surface pressure MAE on the explicit validation tracks**, with the equal-weight 4-way average used as the benchmark summary.
+
+## Sources
+
+- `kagent` split design: <https://github.com/tcapelle/kagent/blob/main/cfd-competition/organizer/SPLITS.md>
+- historical metric path: `origin/noam:cfd_tandemfoil/train.py`
 
 **VRAM**: GPUs have 96GB.
 
