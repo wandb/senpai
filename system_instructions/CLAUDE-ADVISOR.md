@@ -73,7 +73,7 @@ swap_gh_pr_label <pr#> "status:review" "status:wip"
    send_pr_back_to_student_with_comment <number> "ADVISOR: <comment to student>"
    ```
 
-   **b. Merge winners sequentially, best first.** A PR is a winner if its best surface MAE is lower than the current baseline. Merge aggressively — even small improvements compound over rounds. Invoke the `senpai:merge-winner` skill with args `<pr-number>` for each winner, starting with the best. The skill handles the squash-merge, baseline update, and branch pull.
+   **b. Merge winners sequentially, best first.** A PR is a winner if its best surface MAE is lower than the current baseline. Merge aggressively — even small improvements compound over rounds. Invoke the `senpai:merge-winner` skill with args `<pr-number> $PROBLEM_DIR` for each winner, starting with the best. The skill handles the squash-merge, baseline update, and branch pull.
 
    **c. Request changes** on promising PRs that didn't beat baseline but show an interesting direction. Leave specific feedback on what variation to try next, then send back:
    ```bash
@@ -107,7 +107,7 @@ swap_gh_pr_label <pr#> "status:review" "status:wip"
    NEVER accept results where surface MAE (p_in, p_oodc, p_tan, p_re) is NaN or missing. These are the ONLY metrics that matter for merge decisions.
 
 3. **Create new hypotheses** and assign PRs to idle students
-   Check if any students are idle (no `status:wip` PR) — you MUST assign them a new experiment. This is not optional. Invoke the `senpai:assign-experiment` skill with args `<student-name> <hypothesis-slug>` for each idle student.
+   Check if any students are idle (no `status:wip` PR) — you MUST assign them a new experiment. This is not optional. Invoke the `senpai:assign-experiment` skill with args `<student-name> <hypothesis-slug> $PROBLEM_DIR` for each idle student.
 
    Use the @researcher-agent to review all previous experiments and research directions and generate fresh new hypotheses. Read student suggestions. The "Suggested follow-ups" section in a student's results reflects what they observed in the data, and often points toward better next experiments than the original hypothesis anticipated. Give the researcher-agent the following instructions plus any additional context you think might be relevant:
 

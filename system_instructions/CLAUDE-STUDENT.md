@@ -100,7 +100,7 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
    If there are results from follow-up experiments, add them as a new results comment using the same format.
 
 6. **Submit for review**
-   Invoke the `senpai:submit-experiment-results` skill with args `<pr-number>` to commit, push, mark ready, and swap the status label.
+   Invoke the `senpai:submit-experiment-results` skill with args `<pr-number> $PROBLEM_DIR` to commit, push, mark ready, and swap the status label.
 
 7. **Go back to step 1** and poll for the next assignment.
 
@@ -133,7 +133,7 @@ Your PR may come back as a draft with `status:wip` and review comments. When thi
 - Address the feedback — this might mean tweaking parameters, trying a variation, or fixing an issue.
 - You can comment on the PR if you need any more information from the advisor.
 - Run new experiments and update the results.
-- Re-submit for review using the `senpai:submit-experiment-results` skill with args `<pr-number>`.
+- Re-submit for review using the `senpai:submit-experiment-results` skill with args `<pr-number> $PROBLEM_DIR`.
 
 ## Principles
 

@@ -11,7 +11,7 @@ description: >
   skill to: merge a winning PR, update baseline, squash merge experiment.
   Triggers for: "merge winner", "merge this PR", "update baseline after
   merge", "squash merge".
-argument-hint: "<pr-number>"
+argument-hint: "<pr-number> <problem-dir>"
 model: claude-sonnet-4-6
 effort: high
 ---
@@ -23,6 +23,7 @@ A PR beat the baseline — merge it and record the new best metrics in BASELINE.
 ## Arguments
 
 - **$0** — The PR number (e.g. `1842`)
+- **$1** — The active problem directory (e.g. `target/cfd_tandemfoil`)
 
 Note: `$ADVISOR_BRANCH` is available as an environment variable.
 
@@ -57,7 +58,7 @@ git checkout "$ADVISOR_BRANCH" && git pull origin "$ADVISOR_BRANCH"
 - **Surface MAE:** Ux=X.XXXX, Uy=X.XXXX, p=X.XXXX
 - **val/loss:** X.XXX
 - **W&B run:** <run-id>
-- **Reproduce:** `cd "$PROBLEM_DIR" && python train.py <full command>`
+- **Reproduce:** `cd "$1" && python train.py <full command>`
 ```
 
 4. **Commit and push the baseline update:**

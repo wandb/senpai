@@ -10,7 +10,7 @@ description: >
   wip to review. Use this skill when you've finished running experiments
   and posted your results comment. Triggers for: "submit for review",
   "mark PR ready", "send results to advisor", "submit experiment results".
-argument-hint: "<pr-number>"
+argument-hint: "<pr-number> <problem-dir>"
 model: claude-sonnet-4-6
 effort: high
 ---
@@ -22,6 +22,7 @@ You've run the experiment, posted a results comment on the experiment PR — now
 ## Arguments
 
 - **$0** — The experiment PR number (e.g. `1842`)
+- **$1** — The active problem directory (e.g. `target/cfd_tandemfoil`)
 
 ## Before you call this
 
@@ -32,7 +33,7 @@ Make sure you've already posted a results comment on the experiment PR with metr
 1. **Stage and commit your changes:**
 
 ```bash
-git add "$PROBLEM_DIR/train.py"
+git add "$1/train.py"
 # Also add any other files you modified (pyproject.toml if you added packages, etc.)
 git commit -m "<concise description of what you changed>"
 ```

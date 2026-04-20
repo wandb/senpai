@@ -10,7 +10,7 @@ description: >
   labels, and ensures the student gets a well-structured assignment.
   Use this skill to: assign an experiment, create a hypothesis PR,
   give a student work.
-argument-hint: "<student-name> <hypothesis-slug>"
+argument-hint: "<student-name> <hypothesis-slug> <problem-dir>"
 model: claude-sonnet-4-6
 effort: high
 ---
@@ -23,6 +23,7 @@ Create a branch and draft PR that assigns a hypothesis to a student. The student
 
 - **$0** — The student to assign (e.g. `fern`)
 - **$1** — A short kebab-case slug for the hypothesis (e.g. `cosine-annealing`)
+- **$2** — The active problem directory (e.g. `target/cfd_tandemfoil`)
 
 The hypothesis details, instructions, and baseline metrics come from your own reasoning — this skill handles the git/GitHub mechanics.
 
@@ -54,7 +55,7 @@ gh pr create --draft \
 include links to papers or code that support the hypothesis.>
 
 ## Instructions
-<Specific changes to make to $PROBLEM_DIR/train.py — be concrete.
+<Specific changes to make to $2/train.py — be concrete.
 "Try a higher learning rate" is vague. Change lr from 5e-4 to 1e-3 and add cosine annealing with T_max=epochs" is actionable.>
 
 ## Baseline
@@ -62,7 +63,7 @@ include links to papers or code that support the hypothesis.>
 - val/loss: X.XXX
 - Surface MAE metrics: p_in | p_oodc | p_tan | p_re
 - Baseline W&B run: <run-id> (<wandb-link>)
-- Reproduce command: `cd "$PROBLEM_DIR" && python train.py ...`>
+- Reproduce command: `cd "$2" && python train.py ...`>
 PREOF
 )" \
     --label "$ADVISOR_BRANCH" \
@@ -75,6 +76,7 @@ PREOF
 ## Important details
 
 - **Read BASELINE.md** before creating the PR take the most recent metrics from the file. The student needs concrete metrics to compare against.
+- **Pass the active problem dir as the third argument.** Example: `senpai:assign-experiment fern cosine-annealing target/cfd_tandemfoil`.
 - **Be specific in instructions.** The student implements exactly what you write. Vague instructions waste GPU time.
 - **Use `--wandb_group`** in instructions when a hypothesis needs multiple iterations (e.g. "try surface weight 5, 10, 20") so related runs are grouped in W&B.
 - **One hypothesis per PR.** Bundling multiple changes makes it impossible to attribute what worked.
