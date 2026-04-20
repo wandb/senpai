@@ -6,7 +6,6 @@ on:
     paths:
       - Dockerfile
       - pyproject.toml
-      - uv.lock
       - .github/workflows/build.yaml
   workflow_dispatch:
 
