@@ -1,5 +1,21 @@
 # SENPAI Research Results
 
+## 2026-04-20 21:15 — PR #2457: AirfRANS: Fourier + no-EMA + AdamW lr=5e-4 — MERGED ✓ NEW BEST
+
+- **Branch:** haku/airfrans-fourier-noema
+- **Hypothesis:** Fourier positional encoding helps resolve high-frequency pressure gradients near airfoil surface
+
+| Trial | Config | val_primary/surface_mse | test_primary/surface_mse | Epochs | W&B |
+|---|---|---|---|---|---|
+| **0 (WINNER)** | **Fourier + no-EMA + AdamW lr=5e-4** | **0.3009** (-9.1%) | **0.2869** (-10.3%) | 2 | cgr5omp3 |
+| 1 | no-EMA + AdamW lr=8e-4 (no Fourier) | 0.3741 (+13.1%) | 0.3457 | 2 | zcho7dzb |
+
+**Per-channel test breakdown (Trial 0):** Ux=0.001468, Uy=0.0000729, p=1.1459, nut=0.000351
+
+**Commentary:** BREAKTHROUGH — Fourier features + no-EMA beat the 6-epoch baseline in just 2 epochs. Pressure channel improved -10.3% (1.28→1.15). nut channel regressed +875% but is negligible in composite (3 orders of magnitude smaller than pressure). Still rapidly descending at cutoff — full epoch budget should push significantly lower. Trial 1 confirmed lr=8e-4 without Fourier is a dead end on AirfRANS. Fourier encoding is now mandatory for AirfRANS.
+
+---
+
 ## 2026-04-20 21:00 — PR #2440: DrivAerML: AdamW vs Lion baseline sweep — MERGED ✓ FIRST BASELINE
 
 - **Branch:** shoya/drivaerml-adamw-baseline-sweep

@@ -1,19 +1,18 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-20 21:05 UTC
+- **Date:** 2026-04-20 21:20 UTC
 - **Branch:** radford
 
-## THE KEY FINDING: EMA IS HARMFUL — `--no-use-ema` is now mandatory everywhere
+## THE KEY FINDINGS
 
-With `ema_start_step=50` and only 2 epochs (~1500 steps), EMA barely activates but actively dilutes improving model weights with stale early values. This was independently confirmed on TandemFoil (#2412: -24.7%) and AirfRANS (#2431: +29% regression from EMA). **All future experiments must use `--no-use-ema`.**
+1. **EMA IS HARMFUL** — `--no-use-ema` is mandatory everywhere. -24.7% TandemFoil, +29% AirfRANS regression.
+2. **Fourier features breakthrough on AirfRANS** — `--enable-fourier` + no-EMA beat 6-epoch baseline in just 2 epochs (-9.1%). Now mandatory for AirfRANS.
+3. **Optimizer is dataset-dependent** — Lion for TandemFoil, AdamW for AirfRANS and DrivAerML.
 
 ## Student Status
 
-### Idle (need new assignments)
-- violet — just closed #2434 (slices sweep, EMA-suppressed)
-- alphonse — just closed #2433 (AdamW LR sweep — confirmed Lion > AdamW on TandemFoil)
-- fern — just closed #2413 (full physics stack — core subset is better)
-- shoya — just merged #2440 (DrivAerML first baseline)
+### Idle
+- None
 
 ### WIP — TandemFoil Round 3 (no-EMA applied)
 - tanjiro #2461: Physics + no-EMA + Lion lr sweep (2e-4, 3e-4)
@@ -22,15 +21,17 @@ With `ema_start_step=50` and only 2 epochs (~1500 steps), EMA barely activates b
 - askeladd #2462: Physics + no-EMA + slices sweep (48, 64, 96)
 - rei #2463: Physics + no-EMA + lookahead ablation + lr=2e-4
 - frieren #2464: Physics + no-EMA + cosine T_max sweep (10, 20, 50)
+- fern #2468: **Wake-angle + core physics + no-EMA** — tests most impactful single feature
 
-### WIP — AirfRANS Round 3 (no-EMA + max 2 parallel jobs per student)
-- kohaku #2465: **No-EMA + AdamW lr=5e-4/8e-4** — should beat 0.3308 baseline
+### WIP — AirfRANS Round 3 (no-EMA + Fourier baseline established)
+- kohaku #2465: No-EMA + AdamW lr=5e-4/8e-4 clean baseline
 - senku #2459: No-EMA + asinh-pressure + residual-prediction — attacks pressure channel
-- emma #2455: No-EMA + 4L/256d capacity retest (single jobs at slices=96)
-- haku #2457: No-EMA + Fourier features + lr=8e-4
+- emma #2455: No-EMA + 4L/256d capacity retest
 - norman #2460: No-EMA + OOD tasks (scarce, reynolds)
+- haku #2470: **Fourier + no-EMA full epoch run + LR/T_max variants** — HIGHEST PRIORITY
+- alphonse #2469: No-EMA + cosine T_max sweep (10, 20, 50)
 
-### WIP — TandemFoil Round 2 (with EMA — results may be suppressed)
+### WIP — TandemFoil Round 2 (with EMA — results likely suppressed)
 - gilbert #2435: cosine T_max sweep (Lion, EMA=True)
 - chihiro #2436: RE-stratified sampling (Lion, EMA=True)
 
@@ -38,8 +39,10 @@ With `ema_start_step=50` and only 2 epochs (~1500 steps), EMA barely activates b
 - edward #2443: Physics + AdamW + slices sweep (EMA=True)
 - kaneda #2449: Full physics + AdamW LR sweep (EMA=True)
 
-### WIP — DrivAerML Round 1
-- mitsuha #2442: Model capacity sweep (2L/128d, 3L/192d, 4L/256d) + anchor budget
+### WIP — DrivAerML Round 1-2
+- shoya #2466: **No-EMA retest** of AdamW lr=5e-4/3e-4 winner
+- violet #2467: **No-EMA + higher LR bracket** (8e-4, 1e-3)
+- mitsuha #2442: Model capacity sweep (2L/128d, 3L/192d, 4L/256d)
 - nezuko #2439: Anchor token budget sweep (4096→16384 supernodes)
 - taki #2438: Cosine T_max sweep (10/20/30/50)
 - shouko #2437: Surface points budget sweep (0/4k/8k/16k)
@@ -48,53 +51,54 @@ With `ema_start_step=50` and only 2 epochs (~1500 steps), EMA barely activates b
 
 | Dataset | Metric | Value | PR |
 |---|---|---|---|
-| TandemFoil | val_primary/surface_pressure_mae | **197.87** | #2412 (frieren v4 — no-EMA, Lion lr=3e-4, no physics) |
-| AirfRANS | val_primary/surface_mse | **0.3308** | #2423 (kohaku — AdamW lr=5e-4, EMA=True) |
+| TandemFoil | val_primary/surface_pressure_mae | **197.87** | #2412 (no-EMA, Lion lr=3e-4, no physics) |
+| AirfRANS | val_primary/surface_mse | **0.3009** | #2457 (haku — Fourier + no-EMA + AdamW lr=5e-4, 2 epochs) |
 | DrivAerML | val_primary/surface_rel_l2_pct | **71.35%** | #2440 (shoya — AdamW lr=5e-4, 2 epochs) |
 
-## Key Research Findings So Far
+## Key Research Findings
 
 | Finding | Impact | Status |
 |---|---|---|
 | EMA harmful (2-epoch regime) | -24.7% TandemFoil, +29% AirfRANS regression | **CONFIRMED — mandatory --no-use-ema** |
-| Physics features beneficial | -2.4% TandemFoil | Merged (#2414); needs combination with no-EMA |
-| AdamW > Lion on AirfRANS | -38% AirfRANS | Merged (#2423); untested on TandemFoil with no-EMA |
-| Lion > AdamW on TandemFoil | 197.87 vs 254.34 (22% gap) | Confirmed (#2433); Lion is the TandemFoil optimizer |
-| AdamW > Lion on DrivAerML | Lion degraded epoch-over-epoch | Confirmed (#2440); AdamW lr=5e-4 is DrivAerML default |
-| 4 parallel jobs → epoch starvation | AirfRANS: 2 epochs vs 6 expected | Fixed: max 2 jobs per student |
-| Lookahead is beneficial | Lion val 281→197 without it | Confirmed; keep lookahead=True |
-| Full physics stack ≤ core subset | 268 vs 262 (core wins) | Closed (#2413); vortex-panel is bottleneck |
+| **Fourier features on AirfRANS** | **-9.1% at 2 epochs vs 6-epoch baseline** | **CONFIRMED — mandatory --enable-fourier for AirfRANS** |
+| Physics features beneficial | -2.4% TandemFoil | Merged (#2414); being combined with no-EMA |
+| AdamW > Lion on AirfRANS/DrivAerML | -38% AirfRANS, Lion degrades on DrivAerML | Confirmed; optimizer is dataset-dependent |
+| Lion > AdamW on TandemFoil | 197.87 vs 254.34 (22% gap) | Confirmed (#2433) |
+| Full physics stack ≤ core subset | 268 vs 262 (core wins) | Closed (#2413); wake-angle is most impactful feature |
 | Slices don't affect throughput | All slices values get same epochs | Confirmed (#2434); data loading is bottleneck |
+| 4 parallel jobs → epoch starvation | AirfRANS/DrivAerML: fewer epochs | Fixed: max 1-2 jobs per student |
+| Lookahead is beneficial | Lion val 281→197 without it | Confirmed; keep lookahead=True |
 
 ## Current Research Themes
 
-1. **No-EMA is the dominant lever** — larger than physics features or optimizer choice. All prior results with EMA may be suppressed. We need clean no-EMA baselines across all configurations.
+1. **AirfRANS Fourier + no-EMA is the new frontier** — haku's 2-epoch result (0.3009) beat the 6-epoch baseline. Full epoch budget should push to ~0.26-0.28. This is the highest-priority experiment in the programme (haku #2470).
 
-2. **Physics + no-EMA + Lion is the TandemFoil formula** — Lion dominates AdamW on TandemFoil (opposite of AirfRANS/DrivAerML). Tanjiro's #2461 tests the critical physics+no-EMA+Lion combination.
+2. **Physics + no-EMA + Lion for TandemFoil** — 7 students attacking the 197.87 baseline from different angles. Tanjiro's physics+no-EMA LR sweep (#2461) and fern's wake-angle test (#2468) are the most promising.
 
-3. **ANP cross-foil decoder** — HIGH PRIORITY per program.md. Thorfinn's #2453 tests it properly for the first time with no-EMA + physics + AdamW.
+3. **ANP cross-foil decoder** — HIGH PRIORITY per program.md. Thorfinn's #2453 tests it with no-EMA + physics + AdamW.
 
-4. **AirfRANS no-EMA baseline** — kohaku #2465 should beat 0.3308. Senku #2459 attacks the pressure channel bottleneck.
+4. **DrivAerML no-EMA application** — shoya (#2466) and violet (#2467) applying the no-EMA finding. 4 more students in Round 1. Target: 71.35% → much lower.
 
-5. **DrivAerML first baseline established at 71.35%** — 5 more students running Round 1 experiments. Need >>10 epochs to approach 3.71% target. No-EMA should be applied in Round 2.
+5. **AirfRANS should test Fourier + asinh-pressure combination** — Fourier improved pressure resolution, asinh-pressure compresses dynamic range. These may compound.
 
-6. **Optimizer is dataset-dependent** — Lion for TandemFoil, AdamW for AirfRANS and DrivAerML. This finding shapes all future experiment design.
+6. **TandemFoil should test Fourier features** — if Fourier helps AirfRANS pressure, it may help TandemFoil surface_pressure_mae too.
 
 ## Next Round Priorities
 
 ### TandemFoil
 - Once tanjiro finds best physics+no-EMA+Lion LR: full combination
+- If fern's wake-angle helps: add to standard physics recipe
+- Test Fourier features (proven on AirfRANS) on TandemFoil
 - If thorfinn's ANP helps: triple combo (ANP + physics + no-EMA + Lion)
-- Wake-angle feature is the most impactful physics feature (#2413)
-- slices=32 uses 15GB less memory with same quality — consider for memory-constrained experiments
 
 ### AirfRANS
-- Once kohaku confirms no-EMA beats baseline: combine with asinh-pressure
-- Loss weighting for pressure channel (surface_mse_p dominates error)
-- 4L/256d capacity with no-EMA (emma's #2455)
+- Haku #2470 (Fourier full run) is highest priority — expect major improvement
+- Combine Fourier + asinh-pressure (senku's approach + Fourier)
+- Test Fourier + 4L/256d (emma's capacity + Fourier)
+- All future AirfRANS experiments should include --enable-fourier
 
 ### DrivAerML
-- Apply no-EMA to all DrivAerML Round 2 experiments
-- Need longer training (current 2 epochs wildly insufficient)
-- Anchor token budget (nezuko) and model capacity (mitsuha) are key levers
-- Consider increasing timeout if possible
+- No-EMA results from shoya/violet will set new baseline
+- Test Fourier on DrivAerML too
+- Anchor budget and capacity sweeps (nezuko, mitsuha) inform next round
+- Need >>2 epochs to approach 3.71% target

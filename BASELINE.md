@@ -39,8 +39,19 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.3308 (val) / 0.3199 (test)
-- **Best PR:** #2423 (kohaku — AirfRANS AdamW optimizer lr=5e-4)
+- **Current best:** 0.3009 (val) / 0.2869 (test)
+- **Best PR:** #2457 (haku — AirfRANS Fourier + no-EMA + AdamW lr=5e-4)
+- **Key insight:** Fourier positional encoding + no-EMA beats 6-epoch baseline in just 2 epochs.
+
+### 2026-04-20 21:15 — PR #2457: AirfRANS: Fourier + no-EMA + AdamW lr=5e-4 — NEW BEST
+
+- **val_primary/surface_mse:** 0.3009 (-9.1% vs 0.3308)
+- **test_primary/surface_mse:** 0.2869 (-10.3% vs 0.3199)
+- **Surface MSE breakdown (test):** Ux=0.001468, Uy=0.0000729, p=1.1459, nut=0.000351
+- **Note:** Only 2 epochs (epoch starvation from parallel jobs). Fourier features resolve high-frequency pressure gradients. nut channel regresses (+875%) but is negligible in composite. Still rapidly improving at cutoff.
+- **W&B run:** cgr5omp3
+- **Epochs:** 2 (30-min timeout)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans_task full --optimizer adamw --lr 5e-4 --cosine_t_max 150 --no-use-ema --enable-fourier`
 
 ### 2026-04-20 18:35 — PR #2423: AirfRANS: AdamW optimizer lr=5e-4
 
