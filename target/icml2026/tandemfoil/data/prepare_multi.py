@@ -31,9 +31,11 @@ import torch
 from torch.utils.data import Dataset, Subset
 
 try:
+    from data.split_utils import expand_pvc_candidates
     from tandemfoil.data.prepare import DATA_ROOT, load_pickle, pad_collate, parse_naca  # noqa: F401
 except ModuleNotFoundError:
     sys.path.append(str(Path(__file__).resolve().parents[2]))
+    from data.split_utils import expand_pvc_candidates
     from tandemfoil.data.prepare import DATA_ROOT, load_pickle, pad_collate, parse_naca  # noqa: F401
 
 # Includes foil 2 surface (ID 7) — fixes the SURFACE_IDS=(5,6) gap in prepare.py
@@ -182,7 +184,7 @@ def _resolve_pickle_paths(manifest: dict) -> list[Path]:
     if not pickle_files:
         raise KeyError("Manifest must contain either 'pickle_paths' or 'pickle_files'")
 
-    candidates = list(manifest.get("data_root_candidates", []))
+    candidates = expand_pvc_candidates(manifest.get("data_root_candidates", []))
     if not candidates:
         candidates = [str(DATA_ROOT)]
 

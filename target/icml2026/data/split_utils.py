@@ -7,12 +7,43 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Iterable
 
+PVC_MOUNT_ENV = "PVC_MOUNT_PATH"
+KNOWN_PVC_PREFIXES = ("/mnt/new-pvc", "/mnt/pvc")
+
+
+def pvc_mount_path() -> str | None:
+    value = os.getenv(PVC_MOUNT_ENV, "").strip()
+    return value or None
+
+
+def rewrite_under_pvc_mount(path: str | Path) -> Path:
+    text = str(path)
+    mount = pvc_mount_path()
+    if mount:
+        for prefix in KNOWN_PVC_PREFIXES:
+            if text == prefix or text.startswith(prefix + "/"):
+                return Path(mount + text[len(prefix):])
+    return Path(text)
+
+
+def expand_pvc_candidates(candidates: Iterable[str | Path]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        options = [str(candidate), str(rewrite_under_pvc_mount(candidate))]
+        for option in options:
+            if option not in seen:
+                ordered.append(option)
+                seen.add(option)
+    return ordered
+
 
 def first_existing(candidates: Iterable[str | Path]) -> Path | None:
-    for candidate in candidates:
+    for candidate in expand_pvc_candidates(candidates):
         path = Path(candidate)
         if path.exists():
             return path

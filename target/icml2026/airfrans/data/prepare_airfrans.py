@@ -28,12 +28,12 @@ from torch.utils.data import Dataset, Subset
 
 try:
     from airfrans.data.vtk_xml import read_vtk_xml
-    from data.split_utils import first_existing
+    from data.split_utils import expand_pvc_candidates, first_existing
     from tandemfoil.data.prepare import pad_collate  # noqa: F401 re-export
 except ModuleNotFoundError:
     sys.path.append(str(Path(__file__).resolve().parents[2]))
     from airfrans.data.vtk_xml import read_vtk_xml
-    from data.split_utils import first_existing
+    from data.split_utils import expand_pvc_candidates, first_existing
     from tandemfoil.data.prepare import pad_collate  # noqa: F401 re-export
 
 DEFAULT_MANIFEST = Path(__file__).with_name("split_manifest_airfrans.json")
@@ -61,7 +61,7 @@ def _resolve_root(manifest: dict, override_root: str | Path | None = None) -> Pa
             raise FileNotFoundError(f"AirfRANS root does not exist: {root}")
         return root
 
-    candidates = manifest.get("data_root_candidates", [])
+    candidates = expand_pvc_candidates(manifest.get("data_root_candidates", []))
     root = first_existing(candidates)
     if root is None:
         raise FileNotFoundError(

@@ -22,12 +22,12 @@ import json
 from pathlib import Path
 
 try:
-    from data.split_utils import ensure_disjoint, stable_tail_val_split, write_json
+    from data.split_utils import expand_pvc_candidates, ensure_disjoint, stable_tail_val_split, write_json
 except ModuleNotFoundError:
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
-    from data.split_utils import ensure_disjoint, stable_tail_val_split, write_json
+    from data.split_utils import expand_pvc_candidates, ensure_disjoint, stable_tail_val_split, write_json
 
 DEFAULT_MANIFEST_PATHS = [
     "/mnt/pvc/datasets/airfrans/Dataset/manifest.json",
@@ -43,8 +43,8 @@ TASKS = ("full", "scarce", "reynolds", "aoa")
 
 def _resolve_manifest_path(candidate: str | None) -> Path:
     if candidate:
-        return Path(candidate)
-    for path in DEFAULT_MANIFEST_PATHS:
+        return Path(expand_pvc_candidates([candidate])[0])
+    for path in expand_pvc_candidates(DEFAULT_MANIFEST_PATHS):
         p = Path(path)
         if p.exists():
             return p
@@ -137,7 +137,7 @@ def main() -> None:
     with manifest_path.open() as f:
         source_manifest = json.load(f)
 
-    root_candidates = args.data_root_candidate or DEFAULT_ROOT_CANDIDATES
+    root_candidates = expand_pvc_candidates(args.data_root_candidate or DEFAULT_ROOT_CANDIDATES)
     manifest = build_manifest(source_manifest, root_candidates, str(manifest_path))
     verify_manifest(manifest)
     write_json(args.out, manifest)

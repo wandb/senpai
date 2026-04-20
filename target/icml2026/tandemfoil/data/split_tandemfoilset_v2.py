@@ -20,12 +20,12 @@ import urllib.request
 from pathlib import Path
 
 try:
-    from data.split_utils import ensure_disjoint, write_json
+    from data.split_utils import expand_pvc_candidates, ensure_disjoint, write_json
 except ModuleNotFoundError:
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
-    from data.split_utils import ensure_disjoint, write_json
+    from data.split_utils import expand_pvc_candidates, ensure_disjoint, write_json
 
 DEFAULT_SOURCE_MANIFEST = (
     "https://raw.githubusercontent.com/tcapelle/kagent/main/"
@@ -123,7 +123,7 @@ def main() -> None:
     args = parser.parse_args()
 
     source_manifest = _load_json(args.source_manifest)
-    root_candidates = args.data_root_candidate or DEFAULT_ROOT_CANDIDATES
+    root_candidates = expand_pvc_candidates(args.data_root_candidate or DEFAULT_ROOT_CANDIDATES)
     manifest = build_manifest(source_manifest, root_candidates, args.source_manifest)
     verify_manifest(manifest)
     write_json(args.out, manifest)

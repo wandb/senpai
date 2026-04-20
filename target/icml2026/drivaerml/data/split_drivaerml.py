@@ -11,12 +11,12 @@ import csv
 from pathlib import Path
 
 try:
-    from data.split_utils import ensure_disjoint, write_json
+    from data.split_utils import expand_pvc_candidates, ensure_disjoint, rewrite_under_pvc_mount, write_json
 except ModuleNotFoundError:
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
-    from data.split_utils import ensure_disjoint, write_json
+    from data.split_utils import expand_pvc_candidates, ensure_disjoint, rewrite_under_pvc_mount, write_json
 
 DEFAULT_SURFACE_MANIFEST = "/mnt/pvc/Processed/drivaerml_processed/manifest.csv"
 DEFAULT_SURFACE_MANIFEST_FULL = "/mnt/pvc/Processed/drivaerml_processed/manifest_full_failed10_included.csv"
@@ -126,11 +126,11 @@ def main() -> None:
 
     case_root_candidates = args.case_root_candidate or DEFAULT_CASE_ROOT_CANDIDATES
     manifest = build_manifest(
-        surface_manifest_path=args.surface_manifest,
-        surface_full_manifest_path=args.surface_manifest_full,
-        volume_manifest_path=args.volume_manifest,
-        case_root=args.case_root,
-        case_root_candidates=case_root_candidates,
+        surface_manifest_path=str(rewrite_under_pvc_mount(args.surface_manifest)),
+        surface_full_manifest_path=str(rewrite_under_pvc_mount(args.surface_manifest_full)),
+        volume_manifest_path=str(rewrite_under_pvc_mount(args.volume_manifest)),
+        case_root=str(rewrite_under_pvc_mount(args.case_root)),
+        case_root_candidates=expand_pvc_candidates(case_root_candidates),
     )
     verify_manifest(manifest)
     write_json(args.out, manifest)
