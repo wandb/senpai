@@ -27,7 +27,8 @@ Check whether the advisor has assigned you an experiment PR to work on.
 
 ```bash
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
-student_poll_for_work "$0"
+student_poll_for_work "$0" "$ADVISOR_BRANCH"
+student_poll_for_work_warnings "$0" "$ADVISOR_BRANCH"
 ```
 
 2. **If PRs are returned**, for each one:
@@ -53,5 +54,7 @@ If nothing:
 ```
 NO_WORK
 ```
+
+If warnings are returned, mention them briefly. These warnings usually mean the advisor or reconciler recovered your assignment from branch metadata even though a routing label was missing.
 
 Keep the response short — the parent agent just needs to know whether to start working or keep waiting.

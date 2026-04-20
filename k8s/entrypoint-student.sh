@@ -72,19 +72,29 @@ while true; do
     echo "=== GPU: $(nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null) ==="
 
     # --- Check for work before invoking CC ---
-    ASSIGNED_JSON=$(student_poll_for_work "$STUDENT_NAME")
+    ASSIGNED_JSON=$(student_poll_for_work "$STUDENT_NAME" "$ADVISOR_BRANCH")
     ASSIGNED_COUNT=$(printf '%s' "$ASSIGNED_JSON" | json_len)
+    ASSIGNED_WARNING_JSON=$(student_poll_for_work_warnings "$STUDENT_NAME" "$ADVISOR_BRANCH")
+    ASSIGNED_WARNING_COUNT=$(printf '%s' "$ASSIGNED_WARNING_JSON" | json_len)
     ISSUE_JSON=$(check_gh_issues "student:$STUDENT_NAME")
     ISSUE_COUNT=$(printf '%s' "$ISSUE_JSON" | json_len)
 
     # --- Build triage info ---
     TRIAGE_INFO="## Student research state"
+    if [ "$ASSIGNED_WARNING_COUNT" -gt 0 ]; then
+        printf '%s' "$ASSIGNED_WARNING_JSON" | python3 -c '
+import json, sys
+for warning in json.load(sys.stdin):
+    print(f"WARNING: {warning}")
+'
+    fi
     if [ "$ASSIGNED_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ]; then
         TRIAGE_INFO+=$'\n'"- No assigned PRs or issues."
     else
         [ "$ASSIGNED_COUNT" -gt 0 ] && TRIAGE_INFO+=$'\n'"- **Assigned PRs ($ASSIGNED_COUNT):** $(printf '%s' "$ASSIGNED_JSON" | json_numbers)"
         [ "$ISSUE_COUNT" -gt 0 ]    && TRIAGE_INFO+=$'\n'"- **GitHub issues ($ISSUE_COUNT):** $(printf '%s' "$ISSUE_JSON" | json_numbers)"
     fi
+    [ "$ASSIGNED_WARNING_COUNT" -gt 0 ] && TRIAGE_INFO+=$'\n'"- **Assignment warnings ($ASSIGNED_WARNING_COUNT):** routing recovered from branch metadata; see pod log warnings above."
     echo "$TRIAGE_INFO"
 
     # --- Log triage and invoke CC ---

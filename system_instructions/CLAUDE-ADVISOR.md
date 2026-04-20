@@ -38,6 +38,9 @@ For lower-level GitHub operations (label swaps, sending PRs back, closing dead e
 ```bash
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 
+# Create an assignment PR from a prepared body file and verify routing labels
+create_assignment_pr_from_file <student> <head-branch> <title> <body-file> [base-branch]
+
 # Send a PR back to the student with feedback
 send_pr_back_to_student_with_comment <pr#> "ADVISOR: <feedback>"
 
@@ -108,6 +111,16 @@ swap_gh_pr_label <pr#> "status:review" "status:wip"
 
 3. **Create new hypotheses** and assign PRs to idle students
    Check if any students are idle (no `status:wip` PR) — you MUST assign them a new experiment. This is not optional. Invoke the `senpai:assign-experiment` skill with args `<student-name> <hypothesis-slug>` for each idle student.
+
+   Never create assignment PRs with raw `gh pr create`. Always use the assignment helper so the PR is verified with the required routing metadata:
+   - base branch = advisor branch
+   - labels include `student:<name>` and `status:wip`
+   - branch label is restored if missing
+
+   If you ever need to inspect the result manually, run:
+   ```bash
+   gh pr view <pr-number> --json number,baseRefName,headRefName,labels,isDraft
+   ```
 
    Use the @researcher-agent to review all previous experiments and research directions and generate fresh new hypotheses. Read student suggestions. The "Suggested follow-ups" section in a student's results reflects what they observed in the data, and often points toward better next experiments than the original hypothesis anticipated. Give the researcher-agent the following instructions plus any additional context you think might be relevant:
 

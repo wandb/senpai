@@ -37,6 +37,7 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
 1. **Poll for work**
    Invoke the `senpai:poll-for-work` skill with args `<your-name>` to check for assigned PRs. If nothing is assigned, wait 60 seconds and poll again.
    - Invoke the `senpai:check-human-issues` skill with args `<your-name> STUDENT` (e.g. `fern STUDENT`) to check for messages from the human research team. Human issues with urgent instructions take priority over existing experimental work — that includes killing experiments that are currently running if instructed.
+   - If the poller reports an assignment-routing warning, treat the recovered PR as real work. The system can now recover assignments from the branch name even if a routing label is missing.
 
 2. **Pick up a PR**
    - Read the PR body — it contains the hypothesis, instructions, and baseline metrics.

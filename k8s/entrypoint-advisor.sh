@@ -93,6 +93,10 @@ while true; do
     SINCE=""
     [ -f "$LAST_CHECK_FILE" ] && SINCE=$(cat "$LAST_CHECK_FILE")
 
+    # --- Repair routing metadata before computing the research state ---
+    REPAIR_JSON=$(reconcile_assignment_prs "$STUDENT_NAMES" "$ADVISOR_BRANCH")
+    REPAIR_COUNT=$(printf '%s' "$REPAIR_JSON" | json_len)
+
     # --- Check research state before invoking CC ---
     REVIEW_JSON=$(list_ready_for_review_prs "$ADVISOR_BRANCH" "$SINCE")
     REVIEW_COUNT=$(printf '%s' "$REVIEW_JSON" | json_len)
@@ -109,6 +113,7 @@ while true; do
     [ "$REVIEW_COUNT" -gt 0 ] && TRIAGE_INFO+=$'\n'"- **GitHub PRs to review ($REVIEW_COUNT):** $(printf '%s' "$REVIEW_JSON" | json_numbers)"
     [ "$ISSUE_COUNT" -gt 0 ]  && TRIAGE_INFO+=$'\n'"- **GitHub issues ($ISSUE_COUNT):** $(printf '%s' "$ISSUE_JSON" | json_numbers)"
     [ "$IDLE_COUNT" -gt 0 ]   && TRIAGE_INFO+=$'\n'"- **Idle students ($IDLE_COUNT):** $(printf '%s' "$IDLE_JSON" | json_join)"
+    [ "$REPAIR_COUNT" -gt 0 ] && TRIAGE_INFO+=$'\n'"- **Routing repairs ($REPAIR_COUNT):** restored or warned on assignment metadata before triage."
     echo "$TRIAGE_INFO"
 
     # --- Log triage state and select prompt ---

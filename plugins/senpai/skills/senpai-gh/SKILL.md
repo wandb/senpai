@@ -34,6 +34,7 @@ source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 | Function | What it does |
 |---|---|
 | `swap_gh_pr_label <pr#> <remove-label> <add-label>` | Atomically swap one label for another. Safe — won't error if the old label is already gone. |
+| `ensure_gh_pr_label <pr#> <label>` | Idempotently ensure a PR has a label. Safe to call even if the label is already present. |
 
 #### The `gh pr edit` footgun
 
@@ -43,6 +44,7 @@ GitHub's `gh pr edit --remove-label X --add-label Y` silently strips **all other
 
 | Function | What it does |
 |---|---|
+| `create_assignment_pr_from_file <student> <head-branch> <title> <body-file> [base-branch]` | Create a draft assignment PR from a prepared body file, then verify that the routing labels and base branch invariants are present. |
 | `send_pr_back_to_student_with_comment <pr#> <comment>` | Send a PR back to the student with feedback. Comment on the PR, convert back to draft, swap `status:review` → `status:wip`. |
 | `close_pr_with_comment <pr#> <reason>` | Close a dead-end PR with a comment explaining why. Comment with reason, close the PR, delete the remote branch. |
 
@@ -60,8 +62,10 @@ GitHub's `gh pr edit --remove-label X --add-label Y` silently strips **all other
 | `check_gh_issues <role_label>` | List open human issues for a role label + team issues, deduplicated. Returns JSON array. |
 | `list_ready_for_review_prs <branch>` | List PRs with `status:review` on a branch. Returns JSON array. |
 | `list_all_prs <branch>` | List all open PRs on a branch (any status). Returns JSON array. |
-| `student_poll_for_work <student_name>` | List WIP PRs assigned to a student. Returns JSON array. |
+| `student_poll_for_work <student_name> [advisor_branch]` | List WIP PRs assigned to a student. Falls back to the `<student>/<slug>` head branch prefix if the `student:*` label is missing. Returns JSON array. |
+| `student_poll_for_work_warnings <student_name> [advisor_branch]` | List assignment-routing anomalies that affect a student's work discovery. Returns JSON array of warning strings. |
 | `list_idle_students <names_csv> <branch>` | Print names of students with no `status:wip` PR, one per line. |
+| `reconcile_assignment_prs <names_csv> <branch>` | Repair missing assignment metadata on open branch PRs and return a JSON array of warning strings describing the repairs or anomalies. |
 
 ## Usage examples
 

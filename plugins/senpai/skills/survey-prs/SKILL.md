@@ -29,6 +29,9 @@ Uses `$ADVISOR_BRANCH` and `$STUDENT_NAMES` from the environment (set by the k8s
 ```bash
 source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 
+# Repair assignment metadata first so the snapshot reflects routable PRs.
+reconcile_assignment_prs "$STUDENT_NAMES" "$ADVISOR_BRANCH"
+
 # All open PRs on the branch
 list_all_prs "$ADVISOR_BRANCH"
 
@@ -39,9 +42,10 @@ list_ready_for_review_prs "$ADVISOR_BRANCH"
 list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH"
 ```
 
-2. **Categorize** each PR by its status labels:
+2. **Categorize** each PR by its status labels and inferred student ownership:
    - `status:review` — ready for advisor review
-   - `status:wip` — student is working on it (note which student from the `student:*` label)
+   - `status:wip` — student is working on it
+   - infer the student from `student:*` when present, otherwise from the `<student>/<slug>` head branch prefix
    - Draft with no status — may be newly created or stalled
 
 3. **Return a structured summary** in this format:
