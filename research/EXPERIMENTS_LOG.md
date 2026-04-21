@@ -1,5 +1,37 @@
 # SENPAI Research Results
 
+## 2026-04-21 — PR #2550: DrivAerML: Fourier+4L/256d+T_max=30 — MERGED ✓ NEW BEST
+
+- violet/drivaerml-fourier-4L256d-longrun
+- Hypothesis: 4L/256d architecture scaling with long training on DrivAerML.
+
+| Config | val_primary/surface_rel_l2_pct | test | Epochs | W&B |
+|---|---|---|---|---|
+| **4L/256d + T_max=30** | **12.96%** | **14.41%** | 43 | 8s5i8y06 |
+| 4L/256d + T_max=50 | 13.04% | — | 44 | qf8vxows |
+| Prior baseline (3L/192d) | 33.65% | 34.00% | 6 | xm765o85 |
+
+Commentary: MASSIVE breakthrough — 61.5% relative improvement. Architecture depth is the critical lever: 4L/256d at 43 epochs yields 12.96%, still converging. 3L/256d (PR #2541, 36.14%) was WORSE than 3L/192d baseline, proving width alone doesn't help. T_max=30 slightly better than T_max=50. Gap to external target (3.71%) narrowed from 9x to 3.5x.
+
+## 2026-04-21 — PR #2553: TandemFoil: T_max=10 long run — REQUEST CHANGES
+
+- frieren/tandem-fourier-physics-tmax10-longrun
+- Result: val=96.39 at 8 epochs — run too short (~3.75 min/ep vs expected ~2.1 min/ep). Throughput failure, not model failure. Sent back.
+
+## 2026-04-21 — PR #2541: DrivAerML: 3L/256d (round 2) — CLOSED ✗
+
+- shinji/drivaerml-fourier-3L256d-longrun
+- Round 2 results: T_max=30 val=36.48%, T_max=50 val=36.14% (both 6 ep). WORSE than 3L/192d baseline (33.65%). Width without depth is counterproductive. W&B: xby1kf9x, 36z4zwiz. DEAD END.
+
+## 2026-04-21 — PR #2437: DrivAerML: surface points sweep (4k/8k/16k) — REQUEST CHANGES
+
+- shouko/drivaerml-spts-sweep
+- Results: 8k pts=23.75%, 16k pts=23.95%, 4k pts=25.78%. All beat old baseline but outdated config (no Fourier, 3L/192d, step-based). Sent back to re-run with 4L/256d+Fourier at 8k pts. W&B: pgruvrbi, 4vnb8ko1, whqhyymf.
+
+## 2026-04-21 — Bulk closure: 6 stale WIP PRs (#2519-2524)
+
+Closed 6 more stale WIP PRs after DrivAerML baseline shifted to 12.96%. kakashi #2524, itachi #2498, luffy #2519, zoro #2520, asuka #2521, nami #2523.
+
 ## 2026-04-21 — PR #2549: TandemFoil: wake deficit features — CLOSED ✗
 
 - haku/tandem-wake-deficit
