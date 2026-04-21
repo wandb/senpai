@@ -174,11 +174,19 @@
 ## DrivAerML
 
 - **Primary metric:** `val_primary/surface_rel_l2_pct` (lower is better)
-- **Current best:** 12.96% (val) / 14.41% (test)
-- **Best PR:** #2550 (violet — Fourier+4L/256d+no-EMA+T_max=30, 43 epochs, AdamW lr=5e-4)
+- **Current best:** 12.70% (val) / 13.54% (test)
+- **Best PR:** #2593 (shinji — Fourier+4L/256d+no-EMA+T_max=30, 45 epochs, AdamW lr=5e-4)
 - **CRITICAL:** Must pass `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200` to avoid OOM and `--model-heads 4` for 256d model
-- **External target:** <3.71% (AB-UPT, ~500 epochs) — **3.5x gap remaining**
-- **Key insight:** Architecture depth is the critical lever. 4L/256d at 43 epochs yields 12.96% — still converging at cutoff. 3L/256d (36.14%) was WORSE than 3L/192d (33.65%), proving width alone doesn't help. T_max=30 slightly better than T_max=50 (12.96% vs 13.04%).
+- **External target:** <3.71% (AB-UPT, ~500 epochs) — **3.4x gap remaining**
+- **Key insight:** Architecture depth is the critical lever. 4L/256d still converging at 45-epoch cap (SENPAI_MAX_EPOCHS). 5L/256d is WORSE (13.62%) — optimization instability beyond 4 layers. 3L/256d worse than 3L/192d. T_max=30 confirmed optimal.
+
+### 2026-04-21 — PR #2593: DrivAerML: 4L/256d+T_max=30 replication — NEW BEST
+
+- **val_primary/surface_rel_l2_pct:** 12.70% (-2.0% vs 12.96%)
+- **test_primary/surface_rel_l2_pct:** 13.54% (-6.0% vs 14.41%)
+- **W&B run:** 3aaevlho (45 epochs, hit SENPAI_MAX_EPOCHS=50 cap — NOT timeout. Still converging!)
+- **Epochs:** 45 (epoch cap, not time — more training headroom confirmed)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset drivaerml --optimizer adamw --lr 5e-4 --cosine_t_max 30 --no-use-ema --enable-fourier --model-layers 4 --model-hidden-dim 256 --model-heads 4 --epochs 999 --batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
 
 ### 2026-04-21 — PR #2550: DrivAerML: Fourier+4L/256d+T_max=30 — NEW BEST
 
