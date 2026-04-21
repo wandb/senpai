@@ -106,6 +106,7 @@ class TrainConfig:
     surface_anchor_points: int = 8_000
     volume_anchor_points: int = 8_000
     save_checkpoint: bool = False
+    gradient_accumulation_steps: int = 1
 
 
 @dataclass
@@ -1033,15 +1034,17 @@ def train_one_epoch(
     *,
     amp_mode: str = "none",
     max_batches: int = 0,
+    gradient_accumulation_steps: int = 1,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
         anp_head.train()
     running = {"loss": 0.0}
     steps = 0
+    accum_steps = max(1, gradient_accumulation_steps)
     batches = loader if max_batches <= 0 else itertools.islice(loader, max_batches)
+    optimizer.zero_grad(set_to_none=True)
     for batch in batches:
-        optimizer.zero_grad(set_to_none=True)
         if model_name == "reference_abupt":
             batch = batch.to(device)
             with autocast_context(device, amp_mode):
@@ -1075,7 +1078,21 @@ def train_one_epoch(
                         volume_mask=batch.volume_mask,
                     )
                     loss, _ = loss_grouped(batch, outputs, transform)
-        loss.backward()
+        scaled_loss = loss / accum_steps
+        scaled_loss.backward()
+        running["loss"] += float(loss.detach().cpu().item())
+        steps += 1
+        if steps % accum_steps == 0:
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+            if ema is not None:
+                ema.update(model)
+            if anp_head is not None and anp_ema is not None:
+                anp_ema.update(anp_head)
+            optimizer.zero_grad(set_to_none=True)
+    # flush any remaining accumulated gradients
+    if steps % accum_steps != 0:
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
@@ -1083,8 +1100,7 @@ def train_one_epoch(
             ema.update(model)
         if anp_head is not None and anp_ema is not None:
             anp_ema.update(anp_head)
-        running["loss"] += float(loss.detach().cpu().item())
-        steps += 1
+        optimizer.zero_grad(set_to_none=True)
     running["loss"] /= max(steps, 1)
     running["train_steps"] = float(steps)
     if scheduler is not None:
@@ -1256,6 +1272,7 @@ def main() -> None:
             model_name=config.model,
             amp_mode=config.amp_mode,
             max_batches=config.max_train_batches,
+            gradient_accumulation_steps=config.gradient_accumulation_steps,
         )
 
         if ema is not None:
