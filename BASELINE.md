@@ -105,9 +105,17 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.01323 (val) / 0.01478 (test) at epoch 41
-- **Best PR:** #2709 (fern — Fourier+3L/192d + no-EMA + T_max=10, 41 epochs, AdamW **lr=7e-4**, **grad-clip=1.0**, **WD=1e-2**)
-- **Key insight:** GRAD-CLIP + WEIGHT DECAY compounds. WD=1e-2 without grad-clip failed (0.027) but WITH grad-clip achieves 0.01323 — 6.8% better than grad-clip alone. Clipping prevents gradient explosions so WD can contribute positive regularization. Best at final epoch (still improving!). External target: 0.0043 — **3.1x gap remaining**.
+- **Current best:** 0.01271 (val) at epoch 40
+- **Best PR:** #2732 (kohaku — Fourier+3L/192d + no-EMA + **T_max=5**, 41 epochs, AdamW **lr=7e-4**, **grad-clip=1.0**, WD=1e-4 default)
+- **Key insight:** T_max=5 produces 8 full cosine cycles in 41 epochs (vs 4 for T_max=10), enabling more frequent phase transitions and deeper basin exploration. Best at epoch 40 (cosine trough) — ep41 rebounds to 0.04259 (cosine peak). WD=1e-4 (not golden 1e-2) — improvement holds even without full WD. Golden config now: lr=7e-4 + grad-clip=1.0 + WD=1e-2 + T_max=5. External target: 0.0043 — **~3x gap remaining**.
+
+### 2026-04-21 — PR #2732: AirfRANS: T_max=5+lr=7e-4+grad-clip=1.0 — NEW BEST
+
+- **val_primary/surface_mse:** 0.01271 (-3.9% vs 0.01323)
+- **W&B run:** uh7fchiy (41 epochs, best at epoch 40 — cosine trough)
+- **Epochs:** 41 (30-min timeout)
+- **Key insight:** T_max=5 produces 8 full cosine cycles in 41 epochs (vs 4 for T_max=10). More frequent annealing cycles allow repeated phase-transition opportunities and deeper basin exploration. ep40=0.01271 (trough), ep41=0.04259 (peak rebound — volatile). WD=1e-4 (not golden 1e-2) — improvement still holds, suggesting T_max is the dominant lever. Next: combine T_max=5 with full golden WD=1e-2.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans_task full --optimizer adamw --lr 7e-4 --cosine-t-max 5 --grad-clip 1.0 --no-use-ema --enable-fourier --epochs 999`
 
 ### 2026-04-21 — PR #2709: AirfRANS: lr=7e-4+grad-clip=1.0+WD=1e-2 — NEW BEST
 
