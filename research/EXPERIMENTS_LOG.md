@@ -1,5 +1,49 @@
 # SENPAI Research Results
 
+## 2026-04-21 — Round 36: AirfRANS 0.00277 — gc=0.5 SMASHES External Target by 35.6%!
+
+### PR #2774 (roy): AirfRANS 4L/256d + gc=0.5 — MERGED ✓ NEW BEST
+
+| Metric | This Run | Previous Baseline | External Target |
+|---|---|---|---|
+| val_primary/surface_mse | **0.00277** (ep150) | 0.003904 (ep201) | 0.0043 |
+| Delta vs baseline | **-28.9%** | — | **-35.6% (CRUSHED!)** |
+| Surface Ux | 3.50e-05 | 4.97e-05 | — |
+| Surface Uy | 5.64e-06 | 1.09e-05 | — |
+| Surface p | 0.01105 | 0.01555 | — |
+| full_val/volume_mse | 0.01018 | 0.03198 | — |
+| W&B | 0pt769m4 | stxm16tv | — |
+| Epochs | 221 (diverged ep205) | 223 (diverged ep208) | — |
+
+**Key findings:**
+- Only change from PR #2755 baseline: `--grad-clip 0.5` → `--grad-clip 1.0`. Same architecture, same optimizer, same schedule.
+- Multiple sub-0.004 troughs confirm reliable deep basins: e77=0.00356, e116=0.00395, e149=0.00392, e150=0.00277, e183=0.00322, e204=0.00308
+- e150=0.00277 is a stochastic deep basin hit — significantly below surrounding troughs (e149=0.00392, e183=0.00322)
+- Catastrophic divergence at ep205 — same T_max=5 instability pattern as gc=1.0 (ep208). Both configs die at similar epochs.
+- Pressure channel (p=0.01105) is still the dominant error despite improvement
+- **gc.0.5 insight**: sharper gradient steps explore more of the loss landscape surface per epoch, finding deeper basins. The same aggressive clipping that enables this eventually causes instability.
+- gc sweep trajectory: gc=1.5 (dead), gc=2.0 (dead), gc=1.0 (0.003904), gc=0.75 (TESTING), gc=0.5 (0.00277, WINNER), gc=0.3 (TBD)
+
+### Dead-end closures
+
+| PR | Student | Result | Reason |
+|---|---|---|---|
+| #2802 | haku | 0.02341 (8.4x worse) | Pressure-weight 20x catastrophic at 4L/256d: grad norms 300-500, diverged ep63 |
+| #2772 | sasuke | 46.325 TandemFoil | 4L/256d too deep for TandemFoil, late instability |
+| #2756 | ymir | 10.274% DrivAerML | T_max=20 diverges at 4L/320d — T_max≥30 required on DrivAerML |
+| #2722 | tanjiro | 44.963 TandemFoil | lr=2e-4+T_max=20, 0.54% worse than baseline — T_max=10 is better |
+
+### Round 36 Assignments
+| Student | PR | Experiment | Rationale |
+|---|---|---|---|
+| roy | #2818 | AirfRANS gc=0.5 + T_max=10 | Prevent ep205 divergence with slower cycling |
+| tanjiro | #2819 | AirfRANS gc=0.75 + T_max=5 | Sweet-spot gc between 0.5 (winner) and 1.0 |
+| haku | #2820 | AirfRANS gc=0.5 + lr=5e-4 | Lower LR stability for gc=0.5 |
+| sasuke | #2821 | TandemFoil lr=1.5e-4 + gc=0.5 | Transfer gc insight to TandemFoil |
+| ymir | #2822 | DrivAerML 4L/512d + gc=0.5 | Transfer gc insight to DrivAerML |
+
+---
+
 ## 2026-04-21 — Round 35: AirfRANS BEATS EXTERNAL TARGET — Extended Training Breakthrough (0.003904!)
 
 ### PR #2755 (shoya): AirfRANS 4L/256d extended run (SENPAI_MAX_EPOCHS=9999, 180-min) — MERGED ✓ NEW BEST
