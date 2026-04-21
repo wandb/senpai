@@ -85,7 +85,7 @@ class UpActDownMlp(nn.Module):
 
 
 class TransolverAttention(nn.Module):
-    def __init__(self, hidden_dim: int, num_heads: int, num_slices: int, dropout: float = 0.0):
+    def __init__(self, hidden_dim: int, num_heads: int, num_slices: int, dropout: float = 0.0, multi_query: bool = False):
         super().__init__()
         if hidden_dim % num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads")
@@ -94,12 +94,18 @@ class TransolverAttention(nn.Module):
         self.dim_head = hidden_dim // num_heads
         self.num_slices = num_slices
         self.dropout = dropout
+        self.multi_query = multi_query
 
         self.temperature = nn.Parameter(torch.full((1, num_heads, 1, 1), 0.5))
         self.in_project_x = LinearProjection(hidden_dim, hidden_dim)
         self.in_project_fx = LinearProjection(hidden_dim, hidden_dim)
         self.in_project_slice = LinearProjection(self.dim_head, num_slices)
-        self.qkv = LinearProjection(self.dim_head, self.dim_head * 3, bias=False)
+        if multi_query:
+            self.to_q = LinearProjection(self.dim_head, self.dim_head, bias=False)
+            self.to_k = LinearProjection(self.dim_head, self.dim_head, bias=False)
+            self.to_v = LinearProjection(self.dim_head, self.dim_head, bias=False)
+        else:
+            self.qkv = LinearProjection(self.dim_head, self.dim_head * 3, bias=False)
         self.proj = LinearProjection(hidden_dim, hidden_dim)
         self.proj_dropout = nn.Dropout(dropout)
 
@@ -118,8 +124,13 @@ class TransolverAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
         slice_tokens, slice_weights = self.create_slices(x, attn_mask=attn_mask)
-        qkv = self.qkv(slice_tokens)
-        q, k, v = qkv.chunk(3, dim=-1)
+        if self.multi_query:
+            q = self.to_q(slice_tokens)
+            shared_kv = slice_tokens.mean(dim=1, keepdim=True)
+            k = self.to_k(shared_kv).expand(-1, self.num_heads, -1, -1)
+            v = self.to_v(shared_kv).expand(-1, self.num_heads, -1, -1)
+        else:
+            q, k, v = self.qkv(slice_tokens).chunk(3, dim=-1)
         out_slice = F.scaled_dot_product_attention(
             q,
             k,
@@ -139,6 +150,7 @@ class TransformerBlock(nn.Module):
         mlp_expansion_factor: int | float,
         num_slices: int,
         dropout: float = 0.0,
+        multi_query: bool = False,
     ):
         super().__init__()
         mlp_hidden_dim = int(math.ceil(hidden_dim * mlp_expansion_factor))
@@ -148,6 +160,7 @@ class TransformerBlock(nn.Module):
             num_heads=num_heads,
             num_slices=num_slices,
             dropout=dropout,
+            multi_query=multi_query,
         )
         self.norm2 = nn.LayerNorm(hidden_dim, eps=1e-6)
         self.mlp = UpActDownMlp(hidden_dim=hidden_dim, mlp_hidden_dim=mlp_hidden_dim)
@@ -167,6 +180,7 @@ class Transformer(nn.Module):
         mlp_expansion_factor: int | float,
         num_slices: int,
         dropout: float = 0.0,
+        multi_query: bool = False,
     ):
         super().__init__()
         self.blocks = nn.ModuleList(
@@ -177,6 +191,7 @@ class Transformer(nn.Module):
                     mlp_expansion_factor=mlp_expansion_factor,
                     num_slices=num_slices,
                     dropout=dropout,
+                    multi_query=multi_query,
                 )
                 for _ in range(depth)
             ]
@@ -205,6 +220,7 @@ class ReferenceTransolver(nn.Module):
         n_head: int = 3,
         mlp_ratio: int = 4,
         slice_num: int = 96,
+        multi_query: bool = False,
     ):
         super().__init__()
         self.space_dim = space_dim
@@ -233,6 +249,7 @@ class ReferenceTransolver(nn.Module):
             mlp_expansion_factor=mlp_ratio,
             num_slices=slice_num,
             dropout=dropout,
+            multi_query=multi_query,
         )
         self.norm = nn.LayerNorm(n_hidden, eps=1e-6)
         self.out = LinearProjection(n_hidden, surface_output_dim + volume_output_dim)

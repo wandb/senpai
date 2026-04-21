@@ -106,6 +106,7 @@ class TrainConfig:
     surface_anchor_points: int = 8_000
     volume_anchor_points: int = 8_000
     save_checkpoint: bool = False
+    multi_query: bool = False
 
 
 @dataclass
@@ -415,6 +416,7 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
         "n_head": config.model_heads,
         "mlp_ratio": config.model_mlp_ratio,
         "slice_num": config.model_slices,
+        "multi_query": config.multi_query,
     }
     if config.model == "reference_transolver":
         return ReferenceTransolver(
