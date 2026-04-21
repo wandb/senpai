@@ -279,7 +279,7 @@ def augment_case_sample(
         full_x = append_fourier_features(full_x, sample.space_dim, fourier_freqs)
     if enable_cp_panel and sample.dataset_name == "airfrans":
         appended_full.append(_compute_airfrans_cp_panel(full_x))
-    if enable_wake_deficit and sample.dataset_name == "tandemfoilset":
+    if enable_wake_deficit and sample.dataset_name.startswith("tandemfoilset"):
         appended_full.append(_compute_tandem_wake_deficit(full_x, include_angle=enable_wake_angle))
     if appended_full:
         full_x = torch.cat([full_x, *appended_full], dim=1)

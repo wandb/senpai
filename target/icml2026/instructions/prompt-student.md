@@ -11,7 +11,7 @@ You're $STUDENT_NAME, a senpai research student. The advisor assigns hypotheses 
 ## Setup
 
 - **You:** $STUDENT_NAME
-- **Datasets:** TandemFoilSet, AirfRANS, and DrivAerML. Exact roots and split contracts live under `$PROBLEM_DIR/tandemfoil/`, `$PROBLEM_DIR/airfrans/`, and `$PROBLEM_DIR/drivaerml/`.
+- **Datasets:** the main TandemFoilSet parity target, the paper-faithful TandemFoilSet high-Re target, AirfRANS, and DrivAerML. Exact roots and split contracts live under `$PROBLEM_DIR/tandemfoil/`, `$PROBLEM_DIR/tandemfoil_paper/`, `$PROBLEM_DIR/airfrans/`, and `$PROBLEM_DIR/drivaerml/`.
 - **GPUs:** 8 on this node. Use all 8 across experiment variations where it makes sense — `CUDA_VISIBLE_DEVICES` lets you pin a training to a specific GPU.
 - **Target branch:** `$ADVISOR_BRANCH`
 
@@ -25,8 +25,10 @@ cd "$PROBLEM_DIR" && python train.py --dataset <dataset> --agent $STUDENT_NAME -
 ```
 
 When the advisor assigns a cross-dataset hypothesis family, use your 8 GPUs as a
-small run matrix across TandemFoilSet, AirfRANS, and DrivAerML, then report the
-metrics together so the transfer signal is easy to interpret.
+small run matrix across the relevant benchmarks, then report the metrics
+together so the transfer signal is easy to interpret. If the hypothesis is
+about TandemFoil generalization or paper comparability, include both
+`tandemfoil/` and `tandemfoil_paper/`.
 
 Try and use sub-agents where possible, for example specialised agents like researcher-agent for research, Explore agent for checking log files or generic sub-agents for other repetitive tasks like polling for work.
 
