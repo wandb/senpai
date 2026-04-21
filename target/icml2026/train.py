@@ -30,7 +30,60 @@ from core.features import (
     compute_vortex_panel_velocity,
     compute_wake_deficit_features,
 )
-from core.optim import EMA, Lion, Lookahead
+from core.optim import Lion, Lookahead
+
+
+class EMAWithWarmup:
+    """EMA with timm-style adaptive decay warmup: min(target, (1+step)/(10+step))."""
+
+    def __init__(self, model: torch.nn.Module, decay: float = 0.9999):
+        self.decay = decay
+        self.step_counter = 0
+        self.shadow = {
+            self._clean(name): param.detach().clone()
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        }
+        self.backup: dict[str, torch.Tensor] | None = None
+
+    @staticmethod
+    def _clean(name: str) -> str:
+        return name.replace("_orig_mod.", "")
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        self.step_counter += 1
+        actual_decay = min(self.decay, (1 + self.step_counter) / (10 + self.step_counter))
+        for name, param in model.named_parameters():
+            key = self._clean(name)
+            if not param.requires_grad or key not in self.shadow:
+                continue
+            self.shadow[key].mul_(actual_decay).add_(param.detach(), alpha=1 - actual_decay)
+
+    @torch.no_grad()
+    def store(self, model: torch.nn.Module) -> None:
+        self.backup = {
+            self._clean(name): param.detach().clone()
+            for name, param in model.named_parameters()
+            if param.requires_grad and self._clean(name) in self.shadow
+        }
+
+    @torch.no_grad()
+    def copy_to(self, model: torch.nn.Module) -> None:
+        for name, param in model.named_parameters():
+            key = self._clean(name)
+            if param.requires_grad and key in self.shadow:
+                param.data.copy_(self.shadow[key])
+
+    @torch.no_grad()
+    def restore(self, model: torch.nn.Module) -> None:
+        if self.backup is None:
+            return
+        for name, param in model.named_parameters():
+            key = self._clean(name)
+            if param.requires_grad and key in self.backup:
+                param.data.copy_(self.backup[key])
+        self.backup = None
 
 
 LEGACY_VAL_ALIAS = {
@@ -67,8 +120,7 @@ class TrainConfig:
     optimizer: str = "lion"
     use_lookahead: bool = True
     use_ema: bool = True
-    ema_decay: float = 0.999
-    ema_start_step: int = 50
+    ema_decay: float = 0.9999
     num_workers: int = -1
     pin_memory: bool = True
     persistent_workers: bool = True
@@ -1042,8 +1094,8 @@ def train_one_epoch(
     loader: DataLoader,
     optimizer,
     scheduler,
-    ema: EMA | None,
-    anp_ema: EMA | None,
+    ema: EMAWithWarmup | None,
+    anp_ema: EMAWithWarmup | None,
     transform: TargetTransform | TandemTargetTransform,
     device: torch.device,
     model_name: str,
@@ -1108,6 +1160,7 @@ def train_one_epoch(
             scheduler.step()
         if ema is not None:
             ema.update(model)
+            running["ema_decay_actual"] = min(ema.decay, (1 + ema.step_counter) / (10 + ema.step_counter))
         if anp_head is not None and anp_ema is not None:
             anp_ema.update(anp_head)
         running["loss"] += float(loss.detach().cpu().item())
@@ -1256,8 +1309,8 @@ def main() -> None:
         base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
 
-    ema = EMA(model, decay=config.ema_decay, start_step=config.ema_start_step) if config.use_ema else None
-    anp_ema = EMA(anp_head, decay=config.ema_decay, start_step=config.ema_start_step) if config.use_ema and anp_head is not None else None
+    ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
+    anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
     history: list[dict[str, float]] = []
 
     run = None
