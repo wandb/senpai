@@ -1,5 +1,23 @@
 # SENPAI Research Results
 
+## 2026-04-21 19:30 — Wave 2 Review Round 3: 1 PR closed, 1 new assignment
+
+### PR Closed
+
+| PR | Student | Dataset | Best Val | Baseline | Reason |
+|---|---|---|---|---|---|
+| #2907 | wolfwood | Cross (DM/AF/TF) | DM=19.67% (best), AF=0.2654, TF=185.36 | DM=4.619%, AF=0.001236, TF=30.10 | Confounded: all runs used Lion (not AdamW) at default 3L/192d (not golden architectures). One signal: Lion+gc=1.0 at 3L/192d (19.67%) beats AdamW at same capacity (33.65%). |
+
+**Key insight:** Lion + lr=8e-4 + gc=1.0 is competitive with AdamW at equivalent architecture capacity (3L/192d). nami #2896 is testing Lion at 4L/512d.
+
+### New Assignment
+
+| PR | Student | Focus | Key Config |
+|---|---|---|---|
+| #2919 | wolfwood | DrivAerML longer cosine cycling | T_max=40/50 + gc=1.0 + WD=1e-2 (above-baseline T_max) |
+
+---
+
 ## 2026-04-21 19:00 — Wave 2 Review Round 2: 2 more PRs closed, 2 new assignments
 
 ### PRs Closed
