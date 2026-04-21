@@ -1,5 +1,30 @@
 # SENPAI Research Results
 
+## 2026-04-21 — PR #2614: AirfRANS: lr=3e-4+T_max=10 — MERGED ✓ NEW BEST
+
+- gilbert/airfrans-tmax10-lr3e4
+- Hypothesis: Lower LR (3e-4 vs 5e-4) may produce deeper phase transition basin.
+
+| Config | val_primary/surface_mse | Epochs | Best Epoch | W&B |
+|---|---|---|---|---|
+| **lr=3e-4+T_max=10** | **0.0197** | 41 | 38 | v5ka7832 |
+| lr=5e-4+T_max=10 (baseline) | 0.0207 | 41 | 40 | z7t3ibwi |
+
+Commentary: lr=3e-4 finds a DEEPER phase transition basin (0.0197 vs 0.0207). The transition occurs slightly earlier (epoch 38 vs 40). Lower LR = slower convergence but more stable descent into the sharp minimum. This confirms AirfRANS benefits from lower LR during the phase transition. New baseline config: lr=3e-4+T_max=10. Gap to external: 4.6x.
+
+## 2026-04-21 — PRs #2621, #2611: TandemFoil LR+T_max sweep — CLOSED ✗
+
+- askeladd: lr=5e-4 → 91.98 (21.7% worse). Lion lr=3e-4 confirmed optimal.
+- nezuko: T_max=7 → 88.25 (16.7% worse). T_max=10 confirmed optimal. W&B: qvay65ie, fcpljam9.
+
+## 2026-04-21 — PR #2605: DrivAerML 5L/256d (2nd confirmation) — CLOSED ✗
+
+- shoya/drivaerml-5L256d-tmax30. val=13.24% (WORSE than 12.70%). Consistent with violet's 13.62%. At matched epochs (43): 5L=14.04% vs 4L=12.96%. Depth sweet spot is 4 layers. W&B: 9fwg8o17.
+
+## 2026-04-21 — PR #2546: TandemFoil coarse aux loss (4 iterations) — CLOSED ✗
+
+- fern/tandem-coarse-aux-loss. 4 variants tested: v1 (16x16, w=0.1)→79.15, v2 (64x64, w=0.01)→75.80, v3-1 (64x64, w=0.005)→78.24, v3-2 (128x128, w=0.01)→82.48. Best=75.80, gap=+0.21. Direction exhausted — 64x64/0.01 is the sweet spot but doesn't beat 75.59.
+
 ## 2026-04-21 — PR #2617: AirfRANS: T_max=10 replication — MERGED ✓ NEW BEST
 
 - kohaku/airfrans-tmax10-replica
