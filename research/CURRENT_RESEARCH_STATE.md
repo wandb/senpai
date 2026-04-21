@@ -1,165 +1,146 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-21 (post-prune relaunch refocus)
+- **Date:** 2026-04-21 17:30 (DrivAerML Refocus Relaunch — Wave 2)
 - **Branch:** radford
-- **Fleet status:** 50 live students after the relaunch reset
-- **Queue hygiene:** 29 open PRs from retired students were closed on 2026-04-21; treat those lanes as historical only
-- **Current relaunch budget:** inherit the pod env defaults
+- **Fleet status:** 50 live students, ALL ASSIGNED (0 idle)
+- **Current relaunch budget:** inherit pod env defaults
   - `SENPAI_TIMEOUT_MINUTES=360`
   - `SENPAI_MAX_EPOCHS=999`
-  - do not hardcode `180` minute runs
-  - do not hardcode `9999` epoch caps
 
 ## Paper-Facing Snapshot
 
-| Dataset | Paper-facing metric | Current best | Target / reference | Current read |
+| Dataset | Paper-facing metric | Current best | Target / reference | Status |
 |---|---|---|---|---|
-| TandemFoil | `test_primary/surface_pressure_mae` | **33.88** from #2810 | no single packaged external scalar | strong enough that Tandem is no longer the main bottleneck |
-| AirfRANS | `test_primary/surface_mse` | **0.003** from #2824 | `0.0043` | surface test target is already beaten |
-| AirfRANS full contract | `surface_mse + volume_mse` view | surface good, volume still around **0.0076+** | `volume_mse < 0.0017` | still not clean on the full published surface+volume pair |
-| DrivAerML | `test_primary/surface_rel_l2_pct` | **6.24%–6.29%** | `3.71%` nominal reference | still the weakest benchmark and the main empirical gap |
+| TandemFoil | `test_primary/surface_pressure_mae` | **33.88** (#2810) | no single packaged external scalar | strong, no longer bottleneck |
+| AirfRANS | `test_primary/surface_mse` | **0.003** (#2824) | `0.0043` | **BEATEN** |
+| DrivAerML | `test_primary/surface_rel_l2_pct` | **6.24%** (#2691) | `3.71%` | **MAIN GAP — 1.68x** |
 
-## Steering Anchors
+## Steering Anchors (validation, for experiment decisions)
 
-These are still useful for choosing the next experiments, even though test is the paper-facing number.
-
-| Dataset | Steering metric | Current anchor |
+| Dataset | Metric | Current anchor |
 |---|---|---|
-| TandemFoil | `val_primary/surface_pressure_mae` | **30.10** from #2810 |
-| AirfRANS | `val_primary/surface_mse` | **0.001095** pending in #2823 |
-| DrivAerML | `val_primary/surface_rel_l2_pct` | **4.619%** from #2691 |
+| TandemFoil | `val_primary/surface_pressure_mae` | **30.10** (#2810) |
+| AirfRANS | `val_primary/surface_mse` | **0.001236** merged (#2828), **0.001095** pending (#2823) |
+| DrivAerML | `val_primary/surface_rel_l2_pct` | **4.619%** (#2691) |
 
 ## Main Scientific Goal
 
-The goal is **not** three unrelated benchmark-specific wins.
-
-The goal is a shared recipe whose core changes more or less work across:
-
-- `target/icml2026/tandemfoil/`
-- `target/icml2026/airfrans/`
-- `target/icml2026/drivaerml/`
-
-It is fine if LR, scheduler, WD, or point-budget differ by dataset.
-It is not fine if the abstract only works because every dataset needs a different core idea.
-
-Because AirfRANS surface test is already over the line and Tandem is healthy, the next wave should be:
-
-- **DrivAerML-weighted**
-- **cross-dataset by default**
-- **test-aware when reporting**
+A shared recipe whose core changes work across TandemFoil, AirfRANS, and DrivAerML.
+DrivAerML is the main gap. All new work is DrivAerML-weighted and cross-dataset.
 
 ## Mandatory Config Rules
 
-- `--no-use-ema` is mandatory everywhere
-- `--epochs 999` is mandatory because the default epoch count is too small
-- inherit `SENPAI_TIMEOUT_MINUTES=360` from the pod env unless there is a clearly justified shorter run
-- inherit `SENPAI_MAX_EPOCHS=999` from the pod env unless there is a clearly justified override
-- for DrivAerML keep:
-  - `--batch-size 1`
-  - `--drivaerml-train-surface-points 50000`
-  - `--drivaerml-eval-surface-points 50000`
-  - `--max-train-batches 394`
-  - `--max-eval-batches 200`
-- when reporting benchmark-facing results, always keep the reported **test** metric beside its target or reference
+- `--no-use-ema` mandatory everywhere (robin #2899 tests a fix)
+- `--epochs 999` mandatory
+- DrivAerML: `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
+- Lion for TandemFoil; AdamW for AirfRANS/DrivAerML
 
 ## Default Assignment Pattern
 
-When a student is free, default to a **single hypothesis family across all three datasets** in one PR.
+Cross-dataset by default: 1 TF + 1 AF + 2-4 DrivAerML + nearby variants per student.
 
-Use the student's 8 GPUs roughly like this:
+## ACTIVE EXPERIMENTS — 79 WIP PRs
 
-- `1` TandemFoil run
-- `1` AirfRANS run
-- `2-4` DrivAerML runs
-- remaining GPUs for the most decision-critical nearby variants
+### Theme 1: AirfRANS Recipe Transfer to DrivAerML (HIGHEST PRIORITY)
 
-The resulting PR should let the same student answer:
+| Student | PR | Experiment |
+|---|---|---|
+| brook | #2878 | gc=1.0+WD=1e-2 (flagship compound) |
+| bulma | #2879 | T_max=10+gc=1.0 |
+| canute | #2880 | Full recipe: lr=7e-4+gc=1.0+WD=1e-2 |
+| chopper | #2882 | T_max=15+gc=1.0+WD=1e-2 |
+| einar | #2883 | gc=1.0+T_max=20+WD=1e-2 |
+| yuji | #2908 | Compound gc=1.0+WD=1e-2+T_max=15 |
 
-- did this transfer broadly?
-- did it help AirfRANS and TandemFoil but fail on DrivAerML?
-- is it too dataset-specific to support the abstract story?
+### Theme 2: DrivAerML LR+gc Exploration
 
-Single-dataset PRs are still acceptable only for:
+| Student | PR | Experiment |
+|---|---|---|
+| faye | #2885 | lr=7e-4+gc=1.0 |
+| franky | #2886 | lr=4e-4+gc=1.0 |
+| gohan | #2887 | gc=1.0+T_max=10 LR scan |
+| gojo | #2888 | gc=0.5+T_max=10 |
+| casca | #2881 | gc=1.5/gc=2.0 |
+| wolfwood | #2907 | lr=8e-4+gc=1.0 |
+| jin | #2893 | lr=1e-3+gc=1.0 |
 
-- AirfRANS benchmark cleanup or best-checkpoint / test cleanup
-- a clearly justified DrivAerML rescue lane
-- minimal Tandem anchor locking
+### Theme 3: DrivAerML Architecture
 
-## Keep And Prioritize
+| Student | PR | Experiment |
+|---|---|---|
+| griffith | #2889 | 3L/512d+gc=1.0 |
+| guts | #2890 | 4L/768d ultra-wide |
+| himmel | #2891 | 5L/512d deeper |
+| jet | #2892 | 3L/768d shallow+wide |
 
-### 1. Cross-dataset transfer evidence
+### Theme 4: Scheduler Innovations (CODE CHANGES)
 
-These are the clearest matches to the abstract story and should stay live:
+| Student | PR | Experiment |
+|---|---|---|
+| megumi | #2894 | Linear warmup+cosine |
+| mugen | #2895 | CosineAnnealingWarmRestarts T_mult |
+| vash | #2905 | OneCycleLR |
 
-- `#2834` askeladd — no-Lookahead ablation
-- `#2825` levi — 3L architecture transfer
+### Theme 5: Optimizer + Training Recipe Innovations (CODE CHANGES)
 
-New PRs should look more like these.
+| Student | PR | Experiment |
+|---|---|---|
+| nobara | #2897 | LLRD (layer-wise LR decay) |
+| robin | #2899 | Corrected EMA with warmup |
+| usopp | #2904 | Momentum-SAM |
+| sukuna | #2903 | SWA at cosine troughs |
+| spike | #2901 | Huber/log-cosh loss |
+| stark | #2902 | Gradient accumulation |
 
-### 2. DrivAerML rescue lanes
+### Theme 6: Throughput + Seeds + Surface-Only
 
-These are the highest-value single-benchmark lanes because DrivAerML is now the main gap:
+| Student | PR | Experiment |
+|---|---|---|
+| piccolo | #2898 | torch.compile throughput |
+| sanji | #2900 | surface-only DrivAerML |
+| vegeta | #2906 | 360min multi-seed replication |
+| nami | #2896 | Lion higher LR on DrivAerML |
 
-- `#2873` chrome — LR headroom above `5e-4`
-- `#2868` norman — `2L/512d` and `3L/512d`
-- `#2867` historia — `3L/256d` and `3L/384d`
-- `#2855` eren — seed replication
-- `#2853` zenitsu — `T_max` neighborhood
-- `#2851` shinobu — WD ablation
-- `#2849` rei — conservative LR neighborhood
-- `#2814` taki — mild regularization (`WD=1e-3 + gc=0.5`) if still behaving sanely
+### Continuing from Previous Wave (~20 students)
 
-### 3. Minimal Tandem anchor lanes
+| Student | PR | Dataset | Focus |
+|---|---|---|---|
+| chrome | #2873 | DrivAerML | LR headroom 4.5-6e-4 |
+| zoro | #2870 | DrivAerML | Lower LR 2-3e-4 |
+| shinji | #2869 | DrivAerML | gc=0.5/0.7+T_max=25/30 |
+| norman | #2868 | DrivAerML | 2L/512d+3L/512d |
+| historia | #2867 | DrivAerML | 3L/256d+3L/384d |
+| kaneda | #2858 | DrivAerML | gc=0.7/0.8/0.9 |
+| shouko | #2857 | DrivAerML | MLP ratio 2/3/6 |
+| eren | #2855 | DrivAerML | Seed replication |
+| zenitsu | #2853 | DrivAerML | T_max=20/25/35 |
+| shinobu | #2851 | DrivAerML | WD ablation |
+| ymir | #2847 | DrivAerML | Lion 5e-5/1e-4/2e-4 |
+| rei | #2849 | DrivAerML | Conservative LR |
+| taki | #2814 | DrivAerML | Mild regularization |
+| kakashi | #2823 | AirfRANS | T_max=10 (0.001095 pending rebase) |
+| inosuke | #2874 | AirfRANS | 2L+T_max=10 compound |
+| askeladd | #2834 | Cross | No-Lookahead ablation |
+| levi | #2825 | Cross | 3L architecture transfer |
+| Various | #2835-2876 | TandemFoil | LR/depth/gc fine-tuning |
 
-Keep only a small Tandem lane alive:
+## Research Insights from Literature
 
-- `#2864` senku — 2-layer depth frontier
-- `#2840` alphonse — `lr=1e-4` multi-seed replication
-- `#2837` fern — `3L/256d` width check
-- `#2842` tanjiro — compound lane only if it is already near a useful readout
+1. **Corrected EMA** (robin #2899): no-EMA was a bug fix, not a design choice. timm-style warmup fixes it.
+2. **SWA** (sukuna #2903): weight averaging at cosine troughs → flatter minima.
+3. **MSAM** (usopp #2904): flat-minima bias without SAM's 2x cost.
+4. **LLRD** (nobara #2897): 1-3% improvement in <10 epoch regime.
+5. **AB-UPT** achieves 3.71% via geometry-separated encoding — next escalation if recipe transfer fails.
+6. **Transolver-3** (arxiv 2602.04940): amortized mesh subset training for throughput.
 
-### 4. Minimal AirfRANS lane
+## Human Guidance
 
-AirfRANS should now be narrow:
+Issue #2545: Focus on DrivAerML and cross-dataset evidence. No new directives.
 
-- `#2823` kakashi — preserve / rebase / merge the current best validation anchor
-- `#2801` edward — only if it yields a broadly useful transferable lesson rather than another benchmark-specific trick
+## Next Priorities
 
-## Retask Or De-Emphasize
-
-These open lanes are **not** central to the new plan and should be retasked if they are not already very close to a useful answer:
-
-- `#2820` haku — AirfRANS local stability line
-- `#2786` thorfinn — AirfRANS `T_max=7`
-- `#2770` hinata — AirfRANS `WD=5e-3`
-- `#2801` edward — de-emphasize unless it is near review and clearly transferable
-- `#2842` tanjiro — de-emphasize if it is turning into another Tandem-only local sweep
-- `#2857` shouko — DrivAer MLP-ratio lane is lower value than LR / depth / seeds / scheduler
-
-Do **not** recreate the following families by default:
-
-- broad AirfRANS WD / LR / MLP-ratio neighborhoods around already-strong lines
-- broad Tandem LR / WD / `T_max` neighborhood mapping
-- DrivAerML Lion sweeps
-- DrivAerML clipping-heavy compounds that repeat already weak signals
-
-## Queue Notes
-
-- 29 PRs owned by retired students were closed during this refocus; if old notes mention them, they are no longer active
-- do not assign work to retired students
-- if many newly relaunched students are idle, assign cross-dataset matrices first, not more one-benchmark local sweeps
-
-## Immediate Priorities
-
-1. Keep DrivAerML as the main destination for fresh capacity
-2. Prefer cross-dataset PRs over single-benchmark PRs whenever possible
-3. Preserve the minimal AirfRANS and Tandem anchors without letting them dominate the queue
-4. Report test metrics beside SOTA targets / references when summarizing progress
-
-## Most Recent Human Guidance
-
-The current human direction is:
-
-- close stale dead-student PRs
-- focus the next wave on DrivAerML and cross-dataset evidence
-- keep pushing toward an ICML abstract story based on a shared recipe, not three disconnected wins
+1. Review PRs as results come in (~30-360 min)
+2. **brook #2878** (gc+WD transfer) = THE paper question
+3. **bulma #2879** (T_max=10+gc) = second priority
+4. Merge kakashi #2823 once rebased
+5. If recipe transfer fails → escalate to geometry-separated encoding (AB-UPT approach)
