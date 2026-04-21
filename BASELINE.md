@@ -190,11 +190,21 @@
 ## DrivAerML
 
 - **Primary metric:** `val_primary/surface_rel_l2_pct` (lower is better)
-- **Current best:** 12.70% (val) / 13.54% (test)
-- **Best PR:** #2593 (shinji — Fourier+4L/256d+no-EMA+T_max=30, 45 epochs, AdamW lr=5e-4)
-- **CRITICAL:** Must pass `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200` to avoid OOM and `--model-heads 4` for 256d model
-- **External target:** <3.71% (AB-UPT, ~500 epochs) — **3.4x gap remaining**
-- **Key insight:** Architecture depth is the critical lever. 4L/256d still converging at 45-epoch cap (SENPAI_MAX_EPOCHS). 5L/256d is WORSE (13.62%) — optimization instability beyond 4 layers. 3L/256d worse than 3L/192d. T_max=30 confirmed optimal.
+- **Current best:** 11.97% (val) / 13.03% (test)
+- **Best PR:** #2645 (taki — Fourier+4L/256d+no-EMA+T_max=30, 34 epochs, AdamW lr=5e-4, **600 batches/epoch**)
+- **CRITICAL:** Must pass `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 600 --max-eval-batches 200` to avoid OOM and `--model-heads 4` for 256d model
+- **External target:** <3.71% (AB-UPT, ~500 epochs) — **3.2x gap remaining**
+- **Key insight:** More data per epoch is the critical lever. 600 batches/epoch (vs 394) gives 53% more car configs per epoch, improving from 12.70% to 11.97% despite fewer total epochs (34 vs 45). 4L/256d architecture. 5L/256d is WORSE (13.62%) — optimization instability beyond 4 layers. T_max=30 confirmed optimal.
+
+### 2026-04-21 — PR #2645: DrivAerML: 4L/256d+T_max=30 — 600 batches/epoch — NEW BEST
+
+- **val_primary/surface_rel_l2_pct:** 11.97% (-5.7% vs 12.70%)
+- **test_primary/surface_rel_l2_pct:** 13.03% (-3.8% vs 13.54%)
+- **W&B run:** dar47nwl (34 epochs, hit 30-min timeout — still converging)
+- **val/loss:** 0.0334
+- **Epochs:** 34 (timeout, not epoch cap — model still trending downward)
+- **Key insight:** 600 batches/epoch (vs 394) sees 53% more car configurations per epoch. Fewer total epochs (34 vs 45) but per-epoch improvement compensates. Still converging at cutoff — longer training or even more batches could push further.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset drivaerml --optimizer adamw --lr 5e-4 --cosine_t_max 30 --no-use-ema --enable-fourier --model-layers 4 --model-hidden-dim 256 --model-heads 4 --epochs 999 --batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 600 --max-eval-batches 200`
 
 ### 2026-04-21 — PR #2593: DrivAerML: 4L/256d+T_max=30 replication — NEW BEST
 
