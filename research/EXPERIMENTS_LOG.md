@@ -1,5 +1,39 @@
 # SENPAI Research Results
 
+## 2026-04-21 ~15:45 — Round 37 (continued): TandemFoil BREAKTHROUGH + Massive Review Wave
+
+### PR #2810 (gilbert): TandemFoil lr=1.25e-4 + gc=1.0 — MERGED, NEW BEST
+
+| Metric | This Run | Previous Baseline | Delta |
+|---|---|---|---|
+| val_primary/surface_pressure_mae | **30.10** (ep157) | 44.72 | **-32.7%** |
+| W&B run | v6amjkh7 | — | — |
+| Config | Lion lr=1.25e-4, gc=1.0, WD=1e-2, T_max=10, 3L/192d | Lion lr=1.5e-4, gc=1.0, T_max=10, 3L/192d | — |
+
+**Key findings:**
+- LR descent from 1.5e-4 to 1.25e-4 gave another 32.7% improvement
+- Model still improving at ep157 when timeout hit
+- gc=1.0 essential for TandemFoil stability
+- Monotonic LR: 3e-4 to 2e-4 to 1.5e-4 to 1.25e-4 ALL improved
+
+### Batch review: 22 PRs closed, 2 sent back, 1 merged
+
+**TandemFoil** (4 closed): #2821 sasuke 30.11, #2753 alphonse 31.82, #2777 mikasa 31.98, #2796 gen 33.59
+
+**AirfRANS** (11 closed, 1 sent back): #2817 shoya 0.002780, #2812 violet 0.003421, #2809 tetsuo 0.003067, #2808 nezuko 0.003392, #2800 kohaku 0.001810, #2768 emma 0.003039, #2763 mitsuha 0.002085, #2818 roy 0.002086, #2816 armin 0.002851, #2833 winry 0.002482, #2819 tanjiro 0.004467. Sent back: #2820 haku 0.001761.
+
+**DrivAerML** (8 closed, 1 sent back): #2822 ymir 6.005%, #2815 rei 6.782%, #2806 shinobu 15.352%, #2805 zenitsu 13.055%, #2804 eren 10.333%, #2803 shouko 11.878%, #2798 kaneda 4.9623%, #2794 fern 5.331%. Sent back: #2814 taki 4.7915%.
+
+### New assignments: 24 PRs created
+
+**TandemFoil** (#2835-#2844): gilbert gc=0.5 compound, sasuke lr=1e-4, fern 3L/256d width, mikasa lr=7.5e-5, gen T_max=20, alphonse lr=1e-4 seeds, violet WD ablation, tanjiro 3L/256d+lr=1e-4+gc=0.5, tetsuo gc=0.5+T_max=5, mitsuha gc=0.5 seed replication.
+
+**AirfRANS** (#2845-#2856): shoya WD=0, nezuko seed replication, kohaku gc=0.5+WD sweep, emma higher LR, roy T_max=3, armin aggressive LR+gc, winry MLP ratio.
+
+**DrivAerML** (#2847-#2858): ymir Lion optimizer, rei conservative LR, shinobu WD ablation, zenitsu T_max sweep, eren seed replication, shouko MLP ratio, kaneda tight gc.
+
+---
+
 ## 2026-04-21 ~12:00 — Round 37: AirfRANS 3L/256d BREAKTHROUGH — val=0.001479 (46.6% vs baseline)
 
 ### PR #2771 (itachi): AirfRANS 3L/256d golden config — width vs depth ablation — PENDING MERGE (rebase in progress)
