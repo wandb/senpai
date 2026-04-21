@@ -3,9 +3,18 @@
 ## TandemFoilSet
 
 - **Primary metric:** `val_primary/surface_pressure_mae` (= `val_eq4/surface_pressure_mae`)
-- **Current best:** 45.07 (val) at epoch 107
-- **Best PR:** #2610 (tetsuo — T_max=10, 3L/192d, Fourier + physics + no-EMA, slices=64, Lion **lr=2e-4**, 119 epochs, 180-min)
-- **Key insight:** LOWER LR (2e-4 vs 3e-4) + MORE EPOCHS is the dominant lever. 3L/192d at lr=2e-4 (119ep) beats 5L/256d at lr=3e-4 (67ep). The lr=2e-4 produces more stable optimization with T_max=10 rapid cycling. Still improving at epoch 119 — more training and combining with 5L/256d architecture should push further. Next: lr=2e-4 at 5L/256d, lr=1.5e-4 sweep.
+- **Current best:** 44.72 (val) at epoch 89
+- **Best PR:** #2724 (gilbert — T_max=10, 3L/192d, Fourier + physics + no-EMA, slices=64, Lion **lr=1.5e-4**, 115 epochs, 180-min)
+- **Key insight:** LOWER LR continues to win. lr=1.5e-4 at 3L/192d (44.72 at ep89) beats lr=2e-4 (45.07 at ep107). Lower LR provides more stable Lion optimization. Trough envelope still descending at ep115 — more training could push further. 5L/256d tried at lr=2e-4 but underperformed (50.64).
+
+### 2026-04-21 — PR #2724: TandemFoil: lr=1.5e-4 — NEW BEST
+
+- **val_primary/surface_pressure_mae:** 44.72 (-0.78% vs 45.07) at epoch 89
+- **W&B run:** g82605dq (115 epochs, 180-min budget, still improving at cutoff)
+- **Epochs:** 115 (~1.57 min/epoch at 3L/192d)
+- **Per-split val at best (ep89):** geom_camber_cruise=29.65, geom_camber_rc=53.96, re_rand=41.10, single_in_dist=54.18
+- **Key insight:** Lower LR (1.5e-4) continues the downward trend from lr=3e-4→2e-4. Trough envelope 3 phases: rapid descent (ep1-30), oscillating descent (ep30-90), near-convergence (ep90-115). Best at ep89 (not final) — slight overfit after. Occasional spikes to 80-90 at cosine peaks suggest gc could help.
+- **Reproduce:** `cd target/icml2026 && SENPAI_TIMEOUT_MINUTES=180 SENPAI_MAX_EPOCHS=9999 python train.py --dataset tandemfoil --optimizer lion --lr 1.5e-4 --cosine-t-max 10 --no-use-ema --model-slices 64 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999`
 
 ### 2026-04-21 — PR #2610: TandemFoil: lr=2e-4 + T_max=10 — NEW BEST
 
