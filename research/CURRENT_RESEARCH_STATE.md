@@ -1,8 +1,8 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-21 22:00 (DrivAerML Refocus — Wave 2, EMA BREAKTHROUGH)
+- **Date:** 2026-04-21 22:45 (Wave 3 — Bold New Directions)
 - **Branch:** radford
-- **Fleet status:** 50 live students, ALL ASSIGNED (0 idle)
+- **Fleet status:** 59 live students, ALL ASSIGNED (0 idle)
 - **Current relaunch budget:** inherit pod env defaults
   - `SENPAI_TIMEOUT_MINUTES=360`
   - `SENPAI_MAX_EPOCHS=999`
@@ -69,16 +69,32 @@ comparability, include both:
 - `target/icml2026/tandemfoil/`
 - `target/icml2026/tandemfoil_paper/`
 
-## ACTIVE EXPERIMENTS — 50 WIP PRs
+## ACTIVE EXPERIMENTS — 59 WIP PRs
 
-### Theme 0: EMA Refinement (NEW HIGHEST PRIORITY — push new TF/AF bests)
+### Theme 7: Bold New Directions (Wave 3, 2026-04-21 22:45)
+
+9 new hypothesis families testing genuinely new mechanisms — loss reformulation, architecture innovations, optimization paradigm shifts, and physics-informed features.
+
+| Student | PR | Experiment | Risk |
+|---|---|---|---|
+| frieren | #2928 | **Relative L2 Training Loss** — align DM training loss with eval metric | LOW |
+| nezuko | #2929 | **SwiGLU FFN Replacement** — gated linear units for all Transolver blocks | LOW |
+| violet | #2930 | **Stochastic Depth (DropPath)** — layer-level regularization 0.1/0.2 | LOW |
+| gilbert | #2931 | **Prodigy Optimizer** — parameter-free LR adaptation | LOW-MED |
+| kohaku | #2932 | **Global Context Token** — break slice-local attention bottleneck | MEDIUM |
+| emma | #2933 | **Surface Normals + Curvature** — differential geometry input features | MEDIUM |
+| chihiro | #2934 | **Conservation Auxiliary Loss** — div(u)=0 physics regularization | MED-HIGH |
+| shoya | #2935 | **MoE FFN Layers** — sparse expert routing for physics-regime specialization | MED-HIGH |
+| mitsuha | #2936 | **SDF Wall-Distance Feature** — signed distance field geometry embedding | MEDIUM |
+
+### Theme 0: EMA Refinement
 
 | Student | PR | Experiment |
 |---|---|---|
 | robin | #2924 | TF lr=1e-4+EMA, TF gc=0.5+EMA, AF T_max=10+EMA, AF seed=43 |
 | zenitsu | #2925 | DrivAerML EMA+gc=1.0, EMA+gc+WD, EMA decay=0.9999, pure gc control |
 
-### Theme 1: AirfRANS Recipe Transfer to DrivAerML (HIGHEST PRIORITY)
+### Theme 1: AirfRANS Recipe Transfer to DrivAerML
 
 | Student | PR | Experiment |
 |---|---|---|
@@ -145,21 +161,21 @@ comparability, include both:
 | rei | #2913 | surface-points=75k resolution scaling |
 | levi | #2915 | no-Fourier ablation (faster epochs) |
 
-### Continuing from Previous Wave (~20 students)
+### Continuing from Previous Wave
 
 | Student | PR | Dataset | Focus |
 |---|---|---|---|
-| zoro | #2870 | DrivAerML | Lower LR 2-3e-4 |
-| shinji | #2869 | DrivAerML | gc=0.5/0.7+T_max=25/30 |
 | norman | #2868 | DrivAerML | 2L/512d+3L/512d |
 | historia | #2867 | DrivAerML | 3L/256d+3L/384d |
-| kaneda | #2858 | DrivAerML | gc=0.7/0.8/0.9 |
 | kakashi | #2823 | AirfRANS | gc=1.0+T_max=10 stabilization |
-| inosuke | #2874 | AirfRANS | 2L+T_max=10 compound |
 | thorfinn | #2786 | AirfRANS | gc=1.0+T_max=7 extended |
 | taki | #2814 | DrivAerML | Mild regularization |
 | tanjiro | #2842 | TandemFoil | 3L/192d+lr=1e-4+gc=0.5 (sent back) |
-| Various | #2835-2876 | TandemFoil | LR/depth/gc fine-tuning |
+| alphonse | #2840 | TandemFoil | lr=1e-4+gc=1.0 multi-seed |
+| fern | #2837 | TandemFoil | 3L/256d at lr=1.25e-4 |
+| senku | #2864 | TandemFoil | 2L/192d+2L/256d depth reduction |
+| haku | #2820 | AirfRANS | gc=0.5+lr=5e-4 extended |
+| hinata | #2770 | AirfRANS | 4L/256d WD=5e-3 |
 
 ## Research Insights
 
@@ -168,18 +184,28 @@ comparability, include both:
 3. **Width scaling ceiling at 512d for DM:** 640d is unstable. guts #2890 (768d) and himmel #2891 (5L/512d) will clarify the boundary.
 4. **AB-UPT** achieves 3.71% via geometry-separated encoding — escalation if EMA+recipe fails.
 
+## Current Research Themes and Priorities
+
+### Priority 1: DrivAerML Gap Closure (4.619% → 3.71%)
+- **Loss alignment** (frieren #2928): Most direct fix — training on relative L2 directly matches the evaluation metric
+- **Architectural upgrades** (nezuko #2929 SwiGLU, kohaku #2932 global context): Address known Transolver limitations
+- **Regularization** (violet #2930 DropPath): New orthogonal regularization dimension
+- **Physics-informed features** (emma #2933 curvature, mitsuha #2936 SDF): Give model explicit geometric knowledge it currently must learn implicitly
+
+### Priority 2: Cross-Benchmark Recipe Validation
+- Wave 3 experiments test across all 4 benchmarks by default
+- TandemFoil Paper benchmark provides calibration against published numbers
+- Ideas that help DM but hurt TF/AF are dataset hacks; we want shared wins
+
+### Priority 3: Optimization Paradigm Shift
+- Prodigy (gilbert #2931): If the LR search is truly exhausted, adaptive optimizers may find new trajectories
+- MoE (shoya #2935): Sparse expert specialization is fundamentally different from dense FFN
+- Conservation loss (chihiro #2934): Physics constraints as regularization
+
 ## Next Priorities
 
-1. EMA refinement (robin #2924) — can we push below TF 26 and AF 0.0007?
-2. DrivAerML EMA+gc test (zenitsu #2925) — the key 3-of-3 question
-3. Review brook #2878 (gc+WD) when ready — flagship recipe transfer result
-4. Watch bulma #2879, canute #2880, chopper #2882 — T_max cycle results
-5. If DM recipe transfer fails universally → escalate to geometry-separated encoding
-
-## Potential Next Directions
-
-- **TF+AF: EMA + lower LR** (robin #2924 covers this)
-- **DM: EMA+gc+WD compound** (zenitsu #2925 covers this)
-- **Test set evaluation from EMA best checkpoint** — ensure paper metrics reflect EMA model
-- **EMA with arch variants** — does EMA help on 5L/512d or 3L/768d DM configs?
-- **Residual prediction on DrivAerML** — works for TF (--residual-prediction), untested on DM
+1. Watch Wave 3 results (frieren #2928 rel-L2 is the highest-priority result)
+2. Review any WIP PRs that become ready
+3. If DM recipe transfer (Theme 1) fails universally → escalate to geometry-separated encoding
+4. If Wave 3 bold ideas show promise → double down with follow-up assignments
+5. Check for human team messages on GitHub issues
