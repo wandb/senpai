@@ -1,5 +1,46 @@
 # SENPAI Research Results
 
+## 2026-04-21 — Round 32: TandemFoil lr=1.5e-4 New Best (44.72), pressure-weight sweep expanding
+
+### PR #2724 (gilbert): TandemFoil lr=1.5e-4 — MERGED ✓ NEW BEST (44.72)
+
+| Metric | This Run | Previous Baseline |
+|---|---|---|
+| val_primary/surface_pressure_mae | **44.72** (ep89) | 45.07 (ep107) |
+| W&B | g82605dq | ixs1rqgk |
+| Epochs | 115 | 119 |
+
+- LR trend continues: 3e-4(52.81)→2e-4(45.07)→**1.5e-4(44.72)**
+- Trough envelope still descending at ep115 — more training could push further
+- Occasional spikes to 80-90 at cosine peaks suggest gc could help
+
+### PR #2780 (chihiro): AirfRANS 4L/320d+golden config — CLOSED ✗ (DIVERGED)
+
+| Metric | This Run | Baseline |
+|---|---|---|
+| val_primary/surface_mse | 0.0720 (ep15) | 0.007264 |
+| Grad norm | 12→2965 | stable |
+
+- lr=7e-4 is at/near stability boundary for 4L/256d; 4L/320d (+56% params) pushes past it
+- Root cause: golden config lr=7e-4 + T_max=5 leaves no low-LR recovery window for wider model
+
+### PR #2723 (violet): TandemFoil 5L/256d+lr=2e-4 (180-min rerun) — CLOSED ✗
+
+| Metric | This Run | Baseline |
+|---|---|---|
+| val_primary/surface_pressure_mae | 50.64 (ep58) | 44.72 |
+| Epochs | 65 | 115 |
+
+- 5L/256d is too deep for TandemFoil — 3L/192d has better capacity-efficiency tradeoff
+- lr=2e-4 at 5L/256d improved over lr=3e-4 (50.64 vs 52.81) but can't match 3L/192d
+
+### Round 32 Assignments
+| Student | Experiment | Dataset |
+|---|---|---|
+| gilbert | lr=1.25e-4+gc=1.0 (continue LR sweep) | TandemFoil |
+| chihiro | pressure-weight=10x at 3L/192d (weight sweep) | AirfRANS |
+| violet | pressure-weight=50x at 3L/192d (weight sweep upper bound) | AirfRANS |
+
 ## 2026-04-21 — Round 31: Shoya Extended Run Beating Baseline (0.00652 at 164ep, still running)
 
 ### PR #2725 (tetsuo): TandemFoil 5L/256d+lr=2e-4+T_max=20 — CLOSED ✗
