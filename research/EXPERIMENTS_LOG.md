@@ -1,5 +1,35 @@
 # SENPAI Research Results
 
+## 2026-04-21 — Round 21: TWO MAJOR BREAKTHROUGHS
+
+### PR #2737: AirfRANS grad-clip=1.5 (haku) — MERGED ✓ NEW BEST (0.00935!)
+
+- val_primary/surface_mse: **0.00935** (-26.4% vs 0.01271!)
+- W&B: 7bdiqnmi (40 epochs, 30-min, best at epoch 40)
+- PARADIGM SHIFT: clip=1.5 > clip=1.0 > clip=0.5. Moderate clipping outperforms tight clipping. The optimal allows enough gradient magnitude for learning while preventing catastrophic spikes.
+- Gap to external: **~2.2x** (was ~3x). Massive single-experiment improvement.
+
+### PR #2648: DrivAerML 4L/320d (zoro) — MERGED ✓ NEW BEST (5.027%)
+
+- val_primary/surface_rel_l2_pct: **5.027%** (-12.3% vs 5.73%) at epoch 257
+- test: 6.244%. W&B: qx7z7if3 (257 epochs, 180-min, still improving)
+- THROUGHPUT vs WIDTH: 4L/320d runs 257ep in 180min (~0.7 min/ep) vs 4L/384d's 151ep (~1.2 min/ep). The smaller model sees 70% more training in the same wall-clock. At fixed budget, more training at moderate width beats fewer steps at maximum width.
+- Gap to external: **1.35x** (was 1.55x).
+
+### PR #2596: DrivAerML 4L/256d+T_max=50 (zoro) — CLOSED ✗
+
+- 5.127% doesn't beat new 5.027% baseline.
+
+### PRs #2733 (norman), #2730 (edward): DrivAerML 180-min — SENT BACK
+
+- Both hit SENPAI_MAX_EPOCHS=50 cap. Need SENPAI_MAX_EPOCHS=9999.
+
+### Round 21 Assignments
+
+| Student | PR | Experiment |
+|---|---|---|
+| haku | #2743 | AirfRANS gc=1.5+T_max=5+WD=1e-2 triple compound |
+
 ## 2026-04-21 — Round 20: T_max=5 Breakthrough + TandemFoil Epoch Starvation
 
 ### PR #2732: AirfRANS T_max=5+grad-clip=1.0 (kohaku) — MERGED ✓ NEW BEST (0.01271)
