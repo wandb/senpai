@@ -1,5 +1,59 @@
 # SENPAI Research Results
 
+## 2026-04-21 — Round 16: Two Winners + Grad-Clip Breakthrough
+
+### PR #2595: TandemFoil 5L/256d deep model — MERGED ✓ NEW BEST (52.81)
+
+- sasuke/tandem-5L256d-tmax10
+- val_primary/surface_pressure_mae: **52.81** (-30.1% vs 75.59 baseline)
+- test_primary/surface_pressure_mae: 55.25 (-23.4%)
+- Per-split test: single_in_dist=61.80, geom_camber_rc=60.20, geom_camber_cruise=48.99, re_rand=50.00
+- W&B: l5kggnbg (67 epochs, 180-min budget, still improving)
+- Commentary: DEPTH SCALING works for TandemFoil too! 5L/256d vs 3L/192d = 30% improvement. All splits improved uniformly (cruise -30.8%, re_rand -27.9%). High oscillation (52-85) from T_max=10 but consistent downward envelope. Train loss 0.115 still decreasing. Mirrors DrivAerML width-scaling discovery.
+
+### PR #2680: AirfRANS lr=7e-4+grad-clip=1.0 — MERGED ✓ NEW BEST (0.01419)
+
+- haku/airfrans-lr7e4-gradclip
+- val_primary/surface_mse: **0.01419** (-7.3% vs 0.0153)
+- full_val/surface_mse_p: 0.0564, full_val/volume_mse: 0.0723 (-45.7%)
+- test_primary/surface_mse: 0.01513
+- W&B: 48ldl625 (41 epochs, 30-min, still improving)
+- CRITICAL: 91-98% of batches clipped at norm=1.0. Spike reduction 40-45% (peaks 0.23-0.27 → 0.15-0.17). Epoch 40 trough 2.2x deeper than unclipped. Volume MSE improvement (45.7%) even larger than surface.
+- Commentary: GRAD-CLIP REOPENS HIGH LR. Severe gradient instability at lr=7e-4 was destroying basins at cosine peaks. Clipping preserves deep trough discoveries. Gap to external: 3.3x (was 3.6x).
+
+### PR #2679: AirfRANS T_max=8 (kaneda) — CLOSED ✗
+
+- val_primary/surface_mse: 0.025 (64% worse than 0.0153 baseline). T_max=8 is a dead end.
+
+### PR #2678: AirfRANS lr=7e-4+WD=1e-2 (fern) — CLOSED ✗
+
+- val_primary/surface_mse: 0.02716 (91% worse than 0.01419 baseline). WD without grad-clip is insufficient.
+
+### PR #2676: DrivAerML 600b+gradclip 4L/256d (shoya) — CLOSED ✗
+
+- 12.82%, obsolete 4L/256d experiment.
+
+### PR #2682: DrivAerML T_max=50 (rei) — SENT BACK
+
+- 12.96% at 45 epochs (30-min budget). Cannot compare to 5.73% at 144 epochs (180-min). Sent back for longer training.
+
+### Round 16 Assignments
+
+| Student | PR | Experiment |
+|---|---|---|
+| shouko | #2700 | DrivAerML 4L/384d+seed=789 |
+| mitsuha | #2701 | DrivAerML 4L/384d+600b+T_max=50 |
+| luffy | #2702 | DrivAerML 4L/384d+warmup=3 |
+| nami | #2703 | AirfRANS pressure-upweighted loss (20x) |
+| asuka | #2704 | AirfRANS asinh-pressure at winning config |
+| zoro | #2705 | DrivAerML 4L/384d+lr=4e-4 |
+| sasuke | #2706 | TandemFoil 5L/256d+T_max=20 |
+| haku | #2707 | AirfRANS lr=7e-4+grad-clip=0.5 |
+| kaneda | #2708 | AirfRANS lr=3e-4+grad-clip=1.0+seed=789 |
+| fern | #2709 | AirfRANS lr=7e-4+grad-clip=1.0+WD=1e-2 |
+
+15 obsolete stale WIP PRs closed (3L/192d TandemFoil, no-grad-clip AirfRANS, 4L/256d DrivAerML). 12 students freed for reassignment.
+
 ## 2026-04-21 — PR #2655: AirfRANS: lr=3e-4 multi-seed — MERGED ✓ NEW BEST
 
 - gilbert/airfrans-lr3e4-multiseed
