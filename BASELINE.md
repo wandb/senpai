@@ -3,9 +3,17 @@
 ## TandemFoilSet
 
 - **Primary metric:** `val_primary/surface_pressure_mae` (= `val_eq4/surface_pressure_mae`)
-- **Current best:** 52.81 (val) / 55.25 (test)
-- **Best PR:** #2595 (sasuke — T_max=10, 5L/256d/4H, Fourier + physics + no-EMA, slices=64, Lion lr=3e-4, 67 epochs, 180-min)
-- **Key insight:** DEPTH SCALING is the dominant lever for TandemFoil. 5L/256d achieves 52.81 vs 3L/192d's 75.59 — a 30% relative improvement. 67 epochs in 180-min budget (still improving at cutoff). All splits improved uniformly. Next: T_max tuning at 5L/256d, 6L with grad-clip, longer training.
+- **Current best:** 45.07 (val) at epoch 107
+- **Best PR:** #2610 (tetsuo — T_max=10, 3L/192d, Fourier + physics + no-EMA, slices=64, Lion **lr=2e-4**, 119 epochs, 180-min)
+- **Key insight:** LOWER LR (2e-4 vs 3e-4) + MORE EPOCHS is the dominant lever. 3L/192d at lr=2e-4 (119ep) beats 5L/256d at lr=3e-4 (67ep). The lr=2e-4 produces more stable optimization with T_max=10 rapid cycling. Still improving at epoch 119 — more training and combining with 5L/256d architecture should push further. Next: lr=2e-4 at 5L/256d, lr=1.5e-4 sweep.
+
+### 2026-04-21 — PR #2610: TandemFoil: lr=2e-4 + T_max=10 — NEW BEST
+
+- **val_primary/surface_pressure_mae:** 45.07 (-14.7% vs 52.81)
+- **W&B run:** ixs1rqgk (119 epochs, 180-min budget, still improving!)
+- **Epochs:** 119 (180-min timeout, ~1.5 min/epoch at 3L/192d)
+- **Key insight:** lr=2e-4 at default 3L/192d beats lr=3e-4 at 5L/256d (45.07 vs 52.81). Lower LR + ultra-rapid cosine cycling (T_max=10) produces more stable optimization. Consistent downward envelope over 119 epochs with no sign of convergence. Oscillation amplitude ~10-20 points (vs 20-30 at lr=3e-4). T_max=10+lr=2e-4 also beats T_max=30+lr=2e-4 (49.99 at 79ep).
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 2e-4 --cosine-t-max 10 --no-use-ema --model-slices 64 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999`
 
 ### 2026-04-21 — PR #2595: TandemFoil: 5L/256d deep model — NEW BEST
 
