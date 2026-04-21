@@ -1,5 +1,34 @@
 # SENPAI Research Results
 
+## 2026-04-21 — Round 20: T_max=5 Breakthrough + TandemFoil Epoch Starvation
+
+### PR #2732: AirfRANS T_max=5+grad-clip=1.0 (kohaku) — MERGED ✓ NEW BEST (0.01271)
+
+- val_primary/surface_mse: **0.01271** (-3.9% vs 0.01323) at epoch 40
+- W&B: uh7fchiy (41 epochs, 30-min). Best at epoch 40 (cosine trough), ep41 rebounds to 0.043.
+- T_max=5 produces 8 full cosine cycles in 41 epochs (vs 4 for T_max=10). More frequent phase transitions = deeper basins.
+- NOTE: Used default WD=1e-4, NOT golden WD=1e-2. T_max=5+WD=1e-2 compound is HIGHEST PRIORITY.
+- Gap to external: **~3x** (was 3.1x).
+
+### PR #2726 (taki): AirfRANS multi-seed at old config — SENT BACK
+
+- Best seed: 0.01292 (seed=103). Doesn't beat new 0.01271 baseline. Sent back with updated golden config.
+
+### PR #2727 (shoya): AirfRANS 4L/256d+grad-clip — SENT BACK
+
+- 0.03693, 2.9x worse. Grad norms rising (10→29). Sent back with golden config + 180-min.
+
+### PRs #2723, #2722, #2724: TandemFoil lr=2e-4 variants — ALL SENT BACK (epoch starvation)
+
+- violet #2723: 5L/256d+lr=2e-4 — only 7 epochs (4.3 min/ep). Sent back for 180-min.
+- tanjiro #2722: lr=2e-4+T_max=20 — only 8 epochs (3.75 min/ep). Sent back for 180-min.
+- gilbert #2724: lr=1.5e-4 — only 7 epochs. Sent back for 180-min.
+- **CRITICAL BUG**: TandemFoil experiments defaulting to 30-min budget. Must set SENPAI_TIMEOUT_MINUTES=180.
+
+### PR #2689 (emma): AirfRANS lr=3e-4 seeds — CLOSED ✗
+
+- Pre-grad-clip experiment. Obsolete.
+
 ## 2026-04-21 — Round 19: AirfRANS Golden Config (grad-clip+WD)
 
 ### PR #2709: AirfRANS lr=7e-4+grad-clip=1.0+WD=1e-2 — MERGED ✓ NEW BEST (0.01323)
