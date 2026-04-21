@@ -8,16 +8,16 @@
 | Dataset | Metric | Value | PR | Key Mechanism |
 |---|---|---|---|---|
 | TandemFoil | val_primary/surface_pressure_mae | **30.10** | #2810 (3L/192d, Lion lr=1.25e-4, gc=1.0, T_max=10) | LR DESCENT |
-| AirfRANS | val_primary/surface_mse | **0.001095 PENDING** | #2823 (3L/256d, gc=1.0, T_max=10, lr=7e-4) | T_max=10! |
-| AirfRANS (merged) | val_primary/surface_mse | **0.001479** | #2771 (3L/256d, gc=1.0, WD=1e-2, T_max=5) | 3L/WIDTH |
+| AirfRANS | val_primary/surface_mse | **0.001236** | #2828 MERGED (2L/256d, gc=1.0, T_max=5, lr=7e-4) | 2L DEPTH! |
+| AirfRANS PENDING | val_primary/surface_mse | **0.001095** | #2823 (3L/256d, gc=1.0, T_max=10) awaiting rebase | T_max=10 |
 | DrivAerML | val_primary/surface_rel_l2_pct | **4.619%** | #2691 (4L/512d/8H, T_max=30, lr=5e-4) | WIDTH SCALES |
 
 ## EXTERNAL TARGETS
 
 | Dataset | External Best | Our Best | Gap |
 |---|---|---|---|
+| AirfRANS | 0.0043 | **0.001236 (merged)** | **CRUSHED by 71.3%** |
 | AirfRANS | 0.0043 | **0.001095 (pending)** | **CRUSHED by 74.5%** |
-| AirfRANS | 0.0043 | **0.001479 (merged)** | **CRUSHED by 65.6%** |
 | DrivAerML | <3.71% | 4.619% | **1.24x** |
 
 ## KEY INSIGHTS (updated Round 37 wave 2)
