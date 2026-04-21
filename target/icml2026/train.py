@@ -106,6 +106,7 @@ class TrainConfig:
     surface_anchor_points: int = 8_000
     volume_anchor_points: int = 8_000
     save_checkpoint: bool = False
+    grad_clip: float = 0.0
 
 
 @dataclass
@@ -1033,6 +1034,7 @@ def train_one_epoch(
     *,
     amp_mode: str = "none",
     max_batches: int = 0,
+    grad_clip: float = 0.0,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1076,6 +1078,16 @@ def train_one_epoch(
                     )
                     loss, _ = loss_grouped(batch, outputs, transform)
         loss.backward()
+        if grad_clip > 0:
+            params = list(model.parameters())
+            if anp_head is not None:
+                params += list(anp_head.parameters())
+            grad_norm = torch.nn.utils.clip_grad_norm_(params, grad_clip).item()
+            if "grad_norm" not in running:
+                running["grad_norm"] = 0.0
+                running["grad_norm_count"] = 0.0
+            running["grad_norm"] += grad_norm
+            running["grad_norm_count"] += 1.0
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
@@ -1086,6 +1098,9 @@ def train_one_epoch(
         running["loss"] += float(loss.detach().cpu().item())
         steps += 1
     running["loss"] /= max(steps, 1)
+    if "grad_norm" in running and running["grad_norm_count"] > 0:
+        running["grad_norm"] /= running["grad_norm_count"]
+        del running["grad_norm_count"]
     running["train_steps"] = float(steps)
     if scheduler is not None:
         running["lr"] = float(optimizer.param_groups[0]["lr"])
@@ -1256,6 +1271,7 @@ def main() -> None:
             model_name=config.model,
             amp_mode=config.amp_mode,
             max_batches=config.max_train_batches,
+            grad_clip=config.grad_clip,
         )
 
         if ema is not None:
