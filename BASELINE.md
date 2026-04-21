@@ -105,9 +105,17 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.00935 (val) at epoch 40
-- **Best PR:** #2737 (haku — Fourier+3L/192d + no-EMA + T_max=10, 40 epochs, AdamW **lr=7e-4**, **grad-clip=1.5**)
-- **Key insight:** GRAD-CLIP=1.5 > 1.0 > 0.5. Moderate clipping (1.5) prevents catastrophic spikes while allowing enough gradient magnitude for effective learning. 26.4% improvement over clip=1.0 baseline. The optimal clip threshold is NOT the tightest — it's a balance between stability and expressivity. External target: 0.0043 — **~2.2x gap remaining** (was 3x).
+- **Current best:** 0.007264 (val) at epoch 40
+- **Best PR:** #2727 (shoya — **4L/256d** + Fourier + no-EMA + T_max=5 + WD=1e-2 + gc=1.0, AdamW lr=7e-4, 50 epochs, hit epoch cap at 61 min of 180-min budget)
+- **Key insight:** ARCHITECTURE SCALING + GOLDEN CONFIG (WD=1e-2 + T_max=5) is the enabler. 4L/256d beats 3L/192d by 22.3% when properly regularized. Grad norms stabilized (18.7→7.1 over training) instead of diverging. Model hit SENPAI_MAX_EPOCHS=50 cap at only 61 min — trough envelope still descending, more training should improve further. Uses gc=1.0, NOT gc=1.5 — compounding gc=1.5 with this architecture is the highest priority. External target: 0.0043 — **~1.7x gap remaining** (was 2.2x).
+
+### 2026-04-21 — PR #2727: AirfRANS: 4L/256d + WD=1e-2 + T_max=5 + gc=1.0 — NEW BEST
+
+- **val_primary/surface_mse:** 0.007264 (-22.3% vs 0.00935)
+- **W&B run:** ruurxdqs (50 epochs, best at epoch 40, hit SENPAI_MAX_EPOCHS=50 cap at 61 min)
+- **Epochs:** 50 (epoch cap, NOT time cap — only used 61 of 180 min)
+- **Key insight:** 4L/256d architecture + WD=1e-2 + T_max=5 stabilizes grad norms (peaked at 18.7, decreased to 7.1). Architecture scaling IS viable on AirfRANS with proper regularization. Still uses gc=1.0 — gc=1.5 hasn't been tried with this architecture yet. Trough envelope still descending at cutoff. CRITICAL: need SENPAI_MAX_EPOCHS=9999 for future runs.
+- **Reproduce:** `cd target/icml2026 && SENPAI_MAX_EPOCHS=9999 python train.py --dataset airfrans --airfrans_task full --optimizer adamw --lr 7e-4 --cosine-t-max 5 --grad-clip 1.0 --weight-decay 1e-2 --no-use-ema --enable-fourier --model-layers 4 --model-hidden-dim 256 --model-heads 4 --epochs 999`
 
 ### 2026-04-21 — PR #2737: AirfRANS: lr=7e-4+grad-clip=1.5 — NEW BEST
 
