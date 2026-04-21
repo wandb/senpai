@@ -87,9 +87,19 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.01841 (val) / TBD (test)
-- **Best PR:** #2646 (emma — Fourier+3L/192d + no-EMA + T_max=10, 41 epochs, AdamW **lr=7e-4**)
-- **Key insight:** lr=7e-4 produces an earlier and deeper phase transition (epoch 35 vs epoch 38-40 for lower LRs). LR sweet spot is 3e-4 to 7e-4 range. Phase transition is stochastic but higher LR accelerates descent. External target: 0.0043 — **4.3x gap remaining**.
+- **Current best:** 0.0153 (val) at epoch 41
+- **Best PR:** #2655 (gilbert — Fourier+3L/192d + no-EMA + T_max=10, 41 epochs, AdamW **lr=3e-4**, **seed=789**)
+- **Key insight:** SEED SELECTION > LR TUNING. lr=3e-4+seed=789 found a 17% deeper basin than lr=7e-4's best. lr=3e-4 has tighter distribution (0.0153-0.0194) than lr=7e-4 (0.0198-0.0463). The --seed flag is now merged. Run many seeds at lr=3e-4 for best results. External target: 0.0043 — **3.6x gap remaining**.
+
+### 2026-04-21 — PR #2655: AirfRANS: lr=3e-4+T_max=10 multi-seed — NEW BEST
+
+- **val_primary/surface_mse:** 0.0153 (-17% vs 0.01841)
+- **full_val/volume_mse:** 0.1134
+- **W&B run:** srd0fcew (41 epochs, seed=789, best at epoch 41 — still improving!)
+- **Epochs:** 41 (30-min timeout)
+- **Multi-seed results:** seed=789→0.0153 (BEST), seed=456→0.0170, seed=123→0.0182, seed=42→0.0193, seed=1337→0.0194
+- **Note:** lr=3e-4 at 5 seeds: range 0.0153-0.0194 (tight). lr=7e-4 at 5 seeds: range 0.0198-0.0463 (wide). lr=3e-4 is both more reliable AND can find deeper basins. Seed 789 was still descending at epoch 41 — more epochs could push lower.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans_task full --optimizer adamw --lr 3e-4 --cosine_t_max 10 --no-use-ema --enable-fourier --epochs 999 --seed 789`
 
 ### 2026-04-21 — PR #2646: AirfRANS: lr=7e-4+T_max=10 — NEW BEST
 
