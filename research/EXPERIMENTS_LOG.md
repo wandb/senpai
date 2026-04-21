@@ -1,5 +1,28 @@
 # SENPAI Research Results
 
+## 2026-04-21 21:30 — Wave 2 Review Round 6: 640d unstable, AirfRANS near-beat
+
+### PR Closed
+
+| PR | Student | Dataset | Best Val | Baseline | Reason |
+|---|---|---|---|---|---|
+| #2917 | chrome | DrivAerML (primary) | 6.52% (ep125) | 4.619% | 4L/640d unstable: all 3 DM runs crashed (ep90-153). 512d→640d crosses stability boundary at lr=5e-4+gc=1.0. |
+
+**AirfRANS side result:** Run 4 (AF golden at seed=45) hit 0.001193 at ep237 — 3.5% below baseline 0.001236. But oscillating badly in late epochs (0.004-0.009). Not merged — fragile seed result, still running.
+
+**Key insights:**
+- **640d is unstable** at lr=5e-4+gc=1.0 on DrivAerML — WD=1e-2 delays crash by ~57 epochs but can't prevent it
+- **Width scaling above 512d needs lower LR or tighter gc** to stay stable
+- AirfRANS golden config seed variance reaches 0.001193 — near-beat but not robust
+
+### New Assignment
+
+| PR | Student | Focus | Key Config |
+|---|---|---|---|
+| #2923 | chrome | DrivAerML compile + gc=1.0 | torch.compile + gc=1.0 (throughput + stability), with and without WD |
+
+---
+
 ## 2026-04-21 20:30 — Wave 2 Review Round 5: compound crash, moderate WD next
 
 ### PR Closed
