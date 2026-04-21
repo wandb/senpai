@@ -121,11 +121,21 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.001479 (val) at epoch 202
-- **Best PR:** #2771 (itachi — **3L/256d**/4H + gc=1.0 + Fourier + no-EMA + T_max=5 + WD=1e-2, AdamW lr=7e-4, **282 epochs, 180-min budget, SENPAI_MAX_EPOCHS=9999**)
-- **Key insight:** WIDTH > DEPTH for AirfRANS. 3L/256d beats 4L/256d by 46.6% with a single change: removing one layer. The 3L architecture reduces over-transformation of local pressure features. Same T_max=5 divergence pattern but at ep202 (slightly earlier). **Beats external target 0.0043 by 65.6%.** Next: compound 3L/256d + gc=0.5, width frontier at 3L (320d, 384d, 512d), 2L depth frontier.
+- **Current best:** 0.001236 (val) at epoch 349
+- **Best PR:** #2828 (inosuke — **2L/256d**/4H + gc=1.0 + Fourier + no-EMA + T_max=5 + WD=1e-2, AdamW lr=7e-4, 388 epochs, 180-min budget, SENPAI_MAX_EPOCHS=9999)
+- **Key insight:** DEPTH REDUCTION CONTINUES. 2L/256d beats 3L/256d by 16.4% (0.001236 vs 0.001479). 4L→3L was 46.6%, 3L→2L is 16.4% — diminishing but real. Width 256d is the sweet spot at every depth level (2L/384d diverged, 2L/512d never converged). gc=1.0 still optimal. **Beats external target 0.0043 by 71.3%.** PENDING: T_max=10 at 2L/256d (itachi #2872) may push further given kakashi's T_max=10 breakthrough at 3L.
 
-### 2026-04-21 — PR #2771: AirfRANS: 3L/256d golden config — width vs depth ablation — NEW BEST
+### 2026-04-21 — PR #2828: AirfRANS: 2L/256d depth frontier — NEW BEST
+
+- **val_primary/surface_mse:** 0.001236 (-16.4% vs 0.001479) at epoch 349
+- **2L/256d gc=0.5:** 0.001405 (-5.1% vs 0.001479) at epoch 366 (also beats baseline)
+- **2L/384d:** DIVERGED (NaN from ep134 — width catastrophic at 2L)
+- **2L/512d:** Never converged (0.049 at ep19, then degraded monotonically)
+- **W&B run:** libpwryz (2L/256d gc=1.0, 388 epochs); w38iz72q (2L/256d gc=0.5, 386 epochs)
+- **Key insight:** Depth reduction 3L→2L gives 16.4% improvement. 256d is the critical width constraint at 2L — going wider diverges. gc=1.0 outperforms gc=0.5 at 2L (fewer gradient accumulation points means tighter clip is unnecessary). Both runs were still improving at timeout (best at ep349/366 out of 388/386). T_max=10 compound is the immediate next step.
+- **Reproduce:** `cd target/icml2026 && CUDA_VISIBLE_DEVICES=0 SENPAI_MAX_EPOCHS=9999 SENPAI_TIMEOUT_MINUTES=180 python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 7e-4 --cosine-t-max 5 --grad-clip 1.0 --weight-decay 1e-2 --no-use-ema --enable-fourier --model-layers 2 --model-hidden-dim 256 --model-heads 4 --epochs 999`
+
+### 2026-04-21 — PR #2771: AirfRANS: 3L/256d golden config — width vs depth ablation — PREVIOUS BEST
 
 - **val_primary/surface_mse:** 0.001479 (-46.6% vs 0.00277) at epoch 202
 - **Terminal val (ep282):** 0.006535 (model regressed after ep202 divergence)
