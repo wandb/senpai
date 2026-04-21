@@ -3,9 +3,29 @@
 ## TandemFoilSet
 
 - **Primary metric:** `val_primary/surface_pressure_mae` (= `val_eq4/surface_pressure_mae`)
-- **Current best:** 82.65 (val) / 80.63 (test)
-- **Best PR:** #2473 (edward — Fourier + core physics + no-EMA, slices=64, T_max=30, Lion lr=3e-4, 14 epochs)
-- **Key insight:** Fourier + physics is synergistic at slices=64 — gets 14 epochs AND better per-epoch quality. Still improving at cutoff. Single-best-config improvement: -28.1% vs 114.92.
+- **Current best:** 78.81 (val) / 75.13 (test)
+- **Best PR:** #2495 (nezuko — T_max=30 long run, Fourier + physics + no-EMA, slices=64, Lion lr=3e-4, 14 epochs, 180-min budget)
+- **Key insight:** Fourier + physics is synergistic at slices=64. T_max=30 rapid cycling (25 restarts/epoch) continues to win. Scheduler steps per-batch — T_max in gradient steps, not epochs. T_max=1000 hypothesis falsified (gave ~10 cycles, not 1). Still improving at cutoff.
+
+### 2026-04-21 — PR #2495: TandemFoil: T_max=30 long run (180-min budget) — NEW BEST
+
+- **val_primary/surface_pressure_mae:** 78.81 (-4.6% vs 82.65)
+- **test_primary/surface_pressure_mae:** 75.13 (-6.8% vs 80.63)
+- **Per-split val MAE:** single_in_dist=97.78, geom_camber_rc=79.50, geom_camber_cruise=65.56, re_rand=72.41
+- **Note:** T_max=1000 run (mjihidho) was worse at val=87.80 — falsified slow cosine hypothesis. Scheduler is per-batch; T_max=1000 at 750 steps/epoch gives ~10 cycles not 1. T_max=30 rapid cycling (25 restarts/epoch) continues to win. 14 epochs (180-min budget), still improving at cutoff.
+- **W&B run:** 8k0blg8s (winner, T_max=30); mjihidho (T_max=1000 — worse, val=87.80)
+- **Epochs:** 14 (180-min budget)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 3e-4 --cosine_t_max 30 --no-use-ema --model_slices 64 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999`
+
+### 2026-04-21 — PR #2494: TandemFoil: T_max=300 long training — SECONDARY WIN
+
+- **val_primary/surface_pressure_mae:** 80.50 (-2.6% vs old baseline 82.65)
+- **test_primary/surface_pressure_mae:** 77.82 (-3.5% vs 80.63)
+- **Per-split val MAE:** single_in_dist=91.68, geom_camber_rc=90.20, geom_camber_cruise=62.36, re_rand=77.78
+- **Note:** T_max=300 creates ~2.5 cycles/epoch oscillation. LR trough epoch progression: 154→97→86→80.50. Still improving at cutoff. Merged as secondary winner over old 82.65 baseline.
+- **W&B run:** 4ie6hkop
+- **Epochs:** 14
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 3e-4 --cosine_t_max 300 --no-use-ema --model_slices 64 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999`
 
 ### 2026-04-20 23:15 — PR #2473: TandemFoil: golden + Fourier + physics + no-EMA — NEW BEST
 
@@ -58,9 +78,17 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.2357 (val) / 0.2002 (test)
-- **Best PR:** #2482 (emma — 3L/192d + no-EMA + no-Fourier + T_max=50, 24 epochs, AdamW lr=5e-4)
-- **Key insight:** T_max=50 > T_max=150 at longer training (24 epochs). No-Fourier 3L/192d with T_max=50 beats Fourier+4L/256d with T_max=150 at 8 epochs. More cosine restarts within budget. Fourier+physics does NOT transfer to AirfRANS (asinh normalization space issue — physical-space is worse). Critical: epochs=2 is the default — must pass `--epochs 999`.
+- **Current best:** 0.2015 (val) / 0.1890 (test)
+- **Best PR:** #2538 (kohaku — Fourier+4L/256d + no-EMA + T_max=50, 14 epochs, AdamW lr=5e-4)
+- **Key insight:** Compound architecture+schedule confirmed — Fourier+4L/256d (PR #2478) and T_max=50 (PR #2482) gains are super-additive when combined. Pressure dominates composite MSE (~99.9%); Ux/Uy/nut are near-noise. Still converging at epoch 14 — further improvement expected with longer budget.
+
+### 2026-04-21 — PR #2538: AirfRANS: Fourier+4L/256d+T_max=50 (compound) — NEW BEST
+
+- **val_primary/surface_mse:** 0.2015 (-14.5% vs 0.2357)
+- **test_primary/surface_mse:** 0.1890 (-5.6% vs 0.2002)
+- **W&B run:** ty0cmdfz (winner, T_max=50, 14 epochs); 85pabaza (T_max=30, val=0.2195 — also beats baseline but dominated)
+- **Epochs:** 14 (still converging at cutoff — downward envelope clear across cosine cycles)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans_task full --optimizer adamw --lr 5e-4 --cosine_t_max 50 --no-use-ema --enable-fourier --model-layers 4 --model-hidden-dim 256 --model-heads 4 --epochs 999`
 
 ### 2026-04-21 01:00 — PR #2482: AirfRANS: no-EMA + T_max=50 + lr=5e-4 (24 epochs) — NEW BEST
 
@@ -122,10 +150,19 @@
 ## DrivAerML
 
 - **Primary metric:** `val_primary/surface_rel_l2_pct` (lower is better)
-- **Current best:** 51.35% (val) / 52.06% (test)
-- **Best PR:** #2475 (chihiro — Fourier + no-EMA, T_max=30, 2 epochs)
+- **Current best:** 33.65% (val) / 34.00% (test)
+- **Best PR:** #2543 (violet — Fourier + no-EMA + T_max=30, 6 epochs, 3L/192d, AdamW lr=5e-4)
+- **CRITICAL:** Must pass `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200` to avoid OOM and runaway batch counts
 - **External target:** <3.71% (AB-UPT, ~500 epochs)
-- **Key insight:** Fourier features deliver 9.8% relative improvement on DrivAerML. T_max=30 > T_max=150 with Fourier. With Fourier, lr=5e-4 outperforms lr=8e-4 (51.35% vs 54.33%).
+- **Key insight:** Training time is the dominant variable — the 2-epoch baseline was compute-limited. 6 epochs yields 33.65%, still converging. Fourier+no-EMA+T_max=30 is robust. luffy WIP run showing 28.80% at epoch 11 — further gains confirmed. 9x gap to external target remaining.
+
+### 2026-04-21 — PR #2543: DrivAerML: Fourier+no-EMA+T_max=30 long training replication — NEW BEST
+
+- **val_primary/surface_rel_l2_pct:** 33.65% (-34.5% relative vs 51.35%)
+- **test_primary/surface_rel_l2_pct:** 34.00%
+- **W&B run:** xm765o85 (6 epochs, 3L/192d, still converging at cutoff)
+- **Epochs:** 6 (~5 min/epoch; full 180-min run likely to push well below 30%)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset drivaerml --optimizer adamw --lr 5e-4 --cosine_t_max 30 --no-use-ema --enable-fourier --epochs 999 --batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
 
 ### 2026-04-21 00:05 — PR #2475: DrivAerML: Fourier + no-EMA (T_max=30) — NEW BEST
 
