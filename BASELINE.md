@@ -114,11 +114,20 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.003904 (val) at epoch 201
-- **Best PR:** #2755 (shoya — **4L/256d** + Fourier + no-EMA + T_max=5 + WD=1e-2 + gc=1.0, AdamW lr=7e-4, **223 epochs, 180-min budget, SENPAI_MAX_EPOCHS=9999**)
-- **Key insight:** EXTENDED TRAINING IS THE DOMINANT LEVER. Same golden config as PR #2727 but with SENPAI_MAX_EPOCHS=9999 unlocks 223 epochs (vs 50). Progressive descent: 0.237→0.081→0.023→0.00965→0.00620→0.00468→0.003904. **Beats external target 0.0043 by 9.2%.** Catastrophic divergence at ep208 — checkpoint-at-best essential. Two independent paths to sub-0.0043: (1) extended training here, (2) pressure-weight 20x (PR #2703, 0.00435 at 3L/192d). Combining both is the next mega-experiment.
+- **Current best:** 0.00277 (val) at epoch 150
+- **Best PR:** #2774 (roy — **4L/256d** + gc=**0.5** + Fourier + no-EMA + T_max=5 + WD=1e-2, AdamW lr=7e-4, **221 epochs, 180-min budget, SENPAI_MAX_EPOCHS=9999**)
+- **Key insight:** gc=0.5 reliably finds deeper basins than gc=1.0. Multiple sub-0.004 troughs: e77=0.00356, e183=0.00322, e204=0.00308, e150=0.00277 (best). Same T_max=5 divergence at ep205 (vs ep208 at gc=1.0). **Beats external target 0.0043 by 35.6%.** Next: gc=0.5 + T_max=10 to prevent divergence.
 
-### 2026-04-21 — PR #2755: AirfRANS: 4L/256d extended run (180-min, SENPAI_MAX_EPOCHS=9999) — NEW BEST
+### 2026-04-21 — PR #2774: AirfRANS: 4L/256d + gc=0.5 extended — NEW BEST
+
+- **val_primary/surface_mse:** 0.00277 (-28.9% vs 0.003904) at epoch 150
+- **Surface MSE breakdown (ep150):** Ux=3.50e-05, Uy=5.64e-06, nut=3.33e-06, p=0.01105
+- **full_val/volume_mse:** 0.01018
+- **W&B run:** 0pt769m4 (221 epochs, 180-min timeout, best at ep150, diverged ep205)
+- **Key insight:** gc=0.5 allows sharper optimization steps, finding 28.9% deeper basins than gc=1.0. Pressure channel (0.01105) still dominant error, same T_max=5 divergence pattern. Test metric invalid (diverged model). gc=0.5 now the default for AirfRANS experiments. Follow-up: gc=0.5 + T_max=10.
+- **Reproduce:** `cd target/icml2026 && CUDA_VISIBLE_DEVICES=0 SENPAI_MAX_EPOCHS=9999 SENPAI_TIMEOUT_MINUTES=180 python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 7e-4 --cosine-t-max 5 --grad-clip 0.5 --weight-decay 1e-2 --no-use-ema --enable-fourier --model-layers 4 --model-hidden-dim 256 --model-heads 4 --epochs 999`
+
+### 2026-04-21 — PR #2755: AirfRANS: 4L/256d extended run (180-min, SENPAI_MAX_EPOCHS=9999) — PREVIOUS BEST
 
 - **val_primary/surface_mse:** 0.003904 (-46.2% vs 0.007264) at epoch 201
 - **Surface MSE breakdown (ep201):** Ux=4.97e-05, Uy=1.09e-05, nut=1.05e-05, p=0.01555
