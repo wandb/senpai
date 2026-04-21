@@ -1,5 +1,44 @@
 # SENPAI Research Results
 
+## 2026-04-21 — PR #2617: AirfRANS: T_max=10 replication — MERGED ✓ NEW BEST
+
+- kohaku/airfrans-tmax10-replica
+- Hypothesis: Confirm phase transition is reproducible across runs.
+
+| Config | val_primary/surface_mse | Epochs | W&B |
+|---|---|---|---|
+| **T_max=10 (replica)** | **0.0207** | 41 | z7t3ibwi |
+| Original (PR #2556) | 0.0248 | 41 | 7qre8z5x |
+
+Commentary: Phase transition confirmed reproducible but STOCHASTIC. Different depths each run: 0.0248 (first), 0.0207 (replication), 0.0395 (emma extended run — bad run). The transition reliably occurs at epoch 40, but the basin depth varies. This stochasticity means running multiple seeds should help. New AirfRANS baseline: 0.0207. Gap to external: 4.8x.
+
+## 2026-04-21 — PR #2604: TandemFoil: T_max=10 long run (3rd attempt) — CLOSED ✗
+
+- frieren/tandem-tmax10-longrun-v2
+- Result: 91.13 (ep 7), only 8 epochs due to cold-start filesystem I/O (first 5 epochs at 5.4 min/ep vs 2.2 min/ep warm). Third consecutive failure from same infrastructure issue. CLOSED — reassigned to slices=32 approach.
+
+## 2026-04-21 — PRs #2608, #2606, #2609 — DrivAerML T_max/LR sweep — CLOSED ✗
+
+- T_max=15 (taki): 13.65% — worse than 12.70%
+- lr=3e-4 (tanjiro): 13.50% — worse than 12.70%
+- lr=1e-3 (rei): 12.91% — doesn't beat 12.70%
+- Dead ends confirmed: T_max=10<T_max=15<T_max=30=BEST>T_max=50. lr=3e-4<lr=5e-4=BEST>lr=1e-3 (marginal). W&B: crn4k87h, wo8d2l1g, p3lnxcqw.
+
+## 2026-04-21 — PR #2583: TandemFoil: lr=1e-3 — CLOSED ✗
+
+- kaneda/tandem-tmax10-lr1e3
+- Result: lr=1e-3 diverged at epoch 9 (val→377). Fallback lr=5e-4: 97.69 (7 ep). lr=3e-4 confirmed optimal for Lion+T_max=10. W&B: chutrgmm, hcx7882f. DEAD END.
+
+## 2026-04-21 — PR #2618: AirfRANS extended run — CLOSED ✗
+
+- emma/airfrans-tmax10-extended
+- Result: 0.0395 (worse than 0.0207). Same epoch count as baseline (41) due to same timeout. Phase transition is stochastic — this run got a shallow transition. DEAD END.
+
+## 2026-04-21 — PR #2520: DrivAerML T_max=150 (old arch) — CLOSED ✗
+
+- zoro/drivaerml-fourier-tmax150-longrun
+- 3L/192d config (pre-4L/256d), 18.49% at 32 epochs. Superseded by 12.70% baseline. DEAD END.
+
 ## 2026-04-21 — PR #2593: DrivAerML: 4L/256d+T_max=30 replication — MERGED ✓ NEW BEST
 
 - shinji/drivaerml-4L256d-tmax30-replica
