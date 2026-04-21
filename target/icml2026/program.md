@@ -21,6 +21,10 @@ The goal is to compare a clean shared training stack across the three datasets,
 with reference comparisons against a vanilla grouped-domain Transolver and an
 AB-UPT-style anchor model where appropriate.
 
+The ideal paper story is not three unrelated benchmark-specific wins. It is a
+shared recipe whose core ideas transfer across TandemFoilSet, AirfRANS, and
+DrivAerML, even if the best final hyperparameters differ somewhat by dataset.
+
 For TandemFoilSet specifically, this target should become the reproduction and
 extension path for the merged noam lineage through `#2379`, while AirfRANS and
 DrivAerML remain on the simpler shared path unless their own parity work is
@@ -69,6 +73,9 @@ Alignment policy:
   per-case or global over the split
 - keep hyperparameter-tuning metrics on validation splits, but reserve
   literature-facing comparison numbers for the matching test split
+- when model selection is done on validation, paper-facing test numbers should
+  be evaluated from the best validation checkpoint rather than the terminal
+  training state whenever possible
 - document any remaining irreducible discrepancy, such as the packaged
   DrivAerML case set being smaller than the nominal public split in AB-UPT
 - pin TandemFoilSet parity work to concrete source refs rather than a floating

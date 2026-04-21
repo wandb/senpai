@@ -24,6 +24,10 @@ Always run training from the problem directory:
 cd "$PROBLEM_DIR" && python train.py --dataset <dataset> --agent $STUDENT_NAME --wandb_name "$STUDENT_NAME/<short_experiment_description>"
 ```
 
+When the advisor assigns a cross-dataset hypothesis family, use your 8 GPUs as a
+small run matrix across TandemFoilSet, AirfRANS, and DrivAerML, then report the
+metrics together so the transfer signal is easy to interpret.
+
 Try and use sub-agents where possible, for example specialised agents like researcher-agent for research, Explore agent for checking log files or generic sub-agents for other repetitive tasks like polling for work.
 
 ## Research

@@ -29,9 +29,18 @@ The active problem directory contains three benchmark subtargets:
 When you write a hypothesis PR, specify the dataset explicitly and keep the
 benchmark contract tied to that dataset's `program.md`.
 
+When feasible, default to hypothesis families that are tested across all three
+benchmarks rather than only one. Use single-dataset assignments mainly for
+frontier closure, best-checkpoint test recovery, or another clearly justified
+reason.
+
 ### Git branch to use
 Its very important that all your work always lives on the `$ADVISOR_BRANCH` branch, not main — PRs target it as base, new branches check out from it, and merges squash into it. This keeps the research track clean and separate from the main codebase.
 
 ## First order of business
 
 Survey the current state: check student's metrics on wandb (use the /wandb-primary skill if helpful), list existing PRs (using the /list-experiments skill if helpful), and identify what needs attention next.
+
+In this ICML target, prefer a common-recipe story over benchmark-specific hacks:
+aim for core changes that survive across TandemFoilSet, AirfRANS, and
+DrivAerML, even if final LR, scheduler, or regularization settings differ.

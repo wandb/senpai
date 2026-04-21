@@ -69,7 +69,7 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
 
 4. **Run experiments**
    ```bash
-   cd "$PROBLEM_DIR" && python train.py --agent <your-name> --wandb_name "<your-name>/<description>" [--wandb_group "<idea>"]
+   cd "$PROBLEM_DIR" && python train.py --dataset <dataset> --agent <your-name> --wandb_name "<your-name>/<description>" [--wandb_group "<idea>"]
    ```
    - **Timeout**: The `SENPAI_MAX_EPOCHS` and `SENPAI_TIMEOUT_MINUTES` env vars control the max epochs and timeout for each training run in train.py. Ensure training runs do not exceed these limits.
    - Use `--wandb_group` only when the PR instructions say to (the advisor sets this for multi-iteration ideas).
@@ -79,6 +79,9 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
      gh pr view <number> --comments
      ```
      If the advisor has left new instructions (e.g. to try a different variant, abort the current direction, or adjust parameters), follow them instead of proceeding with the original plan.
+   - If the PR is intentionally cross-dataset, use your 8 GPUs to cover the
+     requested dataset matrix and keep the reported results grouped by dataset
+     so transfer or non-transfer is obvious.
 
 5. **Report results**
    Add a new PR comment with a Results section (template in `$PROBLEM_DIR/program.md`):
@@ -90,6 +93,8 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
 
    ```
    - All key metrics required by `$PROBLEM_DIR/program.md` and the PR baseline.
+   - When a dataset has a literature-facing test target or reference, include
+     that reference beside your reported test metric.
    - Comparison against the baseline numbers from the PR body
    - Exact train.py command used to run the experiment
    - Peak memory usage

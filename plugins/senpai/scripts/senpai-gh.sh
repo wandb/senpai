@@ -130,9 +130,9 @@ print(max(ts) if ts else '')
 # Queries
 # ---------------------------------------------------------------------------
 
-# GitHub CLI defaults list commands to 30 items, which silently truncates
-# advisor state once a branch gets busy. Use an explicit high limit everywhere
-# we enumerate PRs/issues so idle/review triage reflects the full queue.
+# GitHub CLI list commands default to 30 items, which silently truncates busy
+# research branches. Use an explicit high cap so advisor triage sees the full
+# queue when dozens of PRs are in flight.
 GH_LIST_LIMIT="${GH_LIST_LIMIT:-999}"
 
 # List human-created GitHub Issues addressed to a role (+ team issues).

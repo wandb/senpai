@@ -109,6 +109,13 @@ swap_gh_pr_label <pr#> "status:review" "status:wip"
 3. **Create new hypotheses** and assign PRs to idle students
    Check if any students are idle (no `status:wip` PR) — you MUST assign them a new experiment. This is not optional. Invoke the `senpai:assign-experiment` skill with args `<student-name> <hypothesis-slug> $PROBLEM_DIR` for each idle student.
 
+   In multi-benchmark targets like `target/icml2026`, the default unit of work
+   should be a hypothesis family that is tested across all relevant datasets,
+   not a one-off single-benchmark tweak. Use the student's 8 GPUs to cover a
+   small matrix across datasets and nearby variants unless a single-dataset
+   frontier closure or best-checkpoint recovery run is clearly the highest-value
+   use of that slot.
+
    Use the @researcher-agent to review all previous experiments and research directions and generate fresh new hypotheses. Read student suggestions. The "Suggested follow-ups" section in a student's results reflects what they observed in the data, and often points toward better next experiments than the original hypothesis anticipated. Give the researcher-agent the following instructions plus any additional context you think might be relevant:
 
    <researcher-agent-instructions>
@@ -180,6 +187,10 @@ Also use `--wandb_group` in instructions when a hypothesis is likely to need mul
 ### Experiment Results
 
 The experiment results will be added by the student in a new PR comment. Ensure you check the PR's comments for these results and any other feedback or questions from the student.
+
+For paper-facing benchmark comparisons, insist on the matching test metric and,
+when possible, test evaluated from the best validation checkpoint rather than
+the terminal epoch.
 
 ## Plateau Protocol
 
