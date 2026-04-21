@@ -25,11 +25,15 @@ from core.contracts import (
 from core.features import augment_case_sample, stable_hash32
 from drivaerml.data import prepare_drivaerml
 from tandemfoil.data import prepare_multi
+from tandemfoil_paper.data import prepare_multi as paper_prepare_multi
+from tandemfoil_paper.data import split_paper_experiment4
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_TANDEM_MANIFEST = ROOT_DIR / "tandemfoil/data/split_manifest_tandemfoilset_v2.json"
 DEFAULT_TANDEM_STATS = ROOT_DIR / "tandemfoil/data/split_stats.json"
+DEFAULT_TANDEM_PAPER_MANIFEST = ROOT_DIR / "tandemfoil_paper/data/split_manifest_tandemfoil_paper_experiment4.json"
+DEFAULT_TANDEM_PAPER_STATS = ROOT_DIR / "tandemfoil_paper/data/split_stats_tandemfoil_paper_experiment4.json"
 DEFAULT_AIRFRANS_MANIFEST = ROOT_DIR / "airfrans/data/split_manifest_airfrans.json"
 DEFAULT_DRIVAERML_MANIFEST = ROOT_DIR / "drivaerml/data/split_manifest_drivaerml.json"
 RUNTIME_CACHE_CASES = 16
@@ -95,6 +99,62 @@ class TandemFoilCaseDataset(Dataset):
             metadata={"base_idx": base_idx},
         )
         return sample
+
+
+class PaperTandemFoilCaseDataset(Dataset):
+    def __init__(
+        self,
+        split_indices: list[int],
+        pickle_files: list[str],
+        *,
+        root_candidates: list[str] | None = None,
+        debug: bool = False,
+        task_name: str,
+        enable_fourier: bool = False,
+        enable_wake_deficit: bool = False,
+        enable_wake_angle: bool = False,
+    ):
+        task_spec = split_paper_experiment4.TASK_SPECS[task_name]
+        candidates = list(root_candidates or split_paper_experiment4.DEFAULT_ROOT_CANDIDATES)
+        self.pickle_paths = split_paper_experiment4._resolve_task_pickle_paths(task_spec, candidates)
+        cache_size = -1 if debug else RUNTIME_CACHE_CASES
+        self.base = paper_prepare_multi.MultiFieldDataset(self.pickle_paths, cache_size=cache_size)
+        self.indices = list(split_indices)
+        self.task_name = task_name
+        self.augment = dict(
+            enable_fourier=enable_fourier,
+            enable_cp_panel=False,
+            enable_wake_deficit=enable_wake_deficit,
+            enable_wake_angle=enable_wake_angle,
+        )
+        expected_files = [path.name for path in self.pickle_paths]
+        if list(pickle_files) != expected_files:
+            raise ValueError(
+                f"Manifest pickle files for {task_name} do not match resolved files: "
+                f"{pickle_files} vs {expected_files}"
+            )
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int) -> CaseSample:
+        base_idx = self.indices[idx]
+        x, y, is_surface = self.base[base_idx]
+        surface_x = x[is_surface]
+        volume_x = x[~is_surface]
+        surface_y = y[is_surface]
+        volume_y = y[~is_surface]
+        sample = CaseSample(
+            case_id=f"{self.task_name}_{base_idx}",
+            dataset_name="tandemfoilset_paper",
+            space_dim=2,
+            surface_x=surface_x,
+            surface_y=surface_y,
+            volume_x=volume_x,
+            volume_y=volume_y,
+            metadata={"base_idx": base_idx, "task": self.task_name},
+        )
+        return augment_case_sample(sample, **self.augment)
 
 
 class AirfRANSCaseDataset(Dataset):
@@ -566,6 +626,94 @@ def build_airfrans_bundle(
     )
 
 
+def build_tandem_paper_bundle(
+    *,
+    task: str,
+    manifest_path: str | Path = DEFAULT_TANDEM_PAPER_MANIFEST,
+    stats_path: str | Path = DEFAULT_TANDEM_PAPER_STATS,
+    debug: bool = False,
+    enable_fourier: bool = False,
+    enable_wake_deficit: bool = False,
+    enable_wake_angle: bool = False,
+) -> DatasetBundle:
+    manifest_path = Path(manifest_path)
+    stats_path = Path(stats_path)
+    if not manifest_path.exists() or not stats_path.exists():
+        split_paper_experiment4.materialize_default_artifacts(
+            manifest_path=manifest_path,
+            stats_path=stats_path,
+        )
+    manifest = _read_json(manifest_path)
+    task_manifest = manifest["tasks"].get(task)
+    if task_manifest is None:
+        available = ", ".join(sorted(manifest["tasks"]))
+        raise ValueError(f"Unknown tandemfoil paper task {task!r}; available tasks: {available}")
+    task_stats = _read_json(stats_path)["tasks"].get(task)
+    if task_stats is None:
+        raise ValueError(f"Missing stats for tandemfoil paper task {task!r}")
+
+    train_dataset = PaperTandemFoilCaseDataset(
+        list(task_manifest["splits"]["train"]),
+        task_manifest["pickle_files"],
+        root_candidates=manifest.get("data_root_candidates"),
+        debug=debug,
+        task_name=task,
+        enable_fourier=enable_fourier,
+        enable_wake_deficit=enable_wake_deficit,
+        enable_wake_angle=enable_wake_angle,
+    )
+    val_dataset = PaperTandemFoilCaseDataset(
+        list(task_manifest["splits"]["val"]),
+        task_manifest["pickle_files"],
+        root_candidates=manifest.get("data_root_candidates"),
+        debug=debug,
+        task_name=task,
+        enable_fourier=enable_fourier,
+        enable_wake_deficit=enable_wake_deficit,
+        enable_wake_angle=enable_wake_angle,
+    )
+    test_dataset = PaperTandemFoilCaseDataset(
+        list(task_manifest["splits"]["test"]),
+        task_manifest["pickle_files"],
+        root_candidates=manifest.get("data_root_candidates"),
+        debug=debug,
+        task_name=task,
+        enable_fourier=enable_fourier,
+        enable_wake_deficit=enable_wake_deficit,
+        enable_wake_angle=enable_wake_angle,
+    )
+    augmented_dim = (
+        paper_prepare_multi.X_DIM
+        + (16 if enable_fourier else 0)
+        + (2 if enable_wake_deficit else 0)
+        + (1 if enable_wake_angle else 0)
+    )
+    return DatasetBundle(
+        train_dataset=train_dataset,
+        val_datasets={"val": val_dataset},
+        test_datasets={"test": test_dataset},
+        spec=DatasetSpec(
+            name="tandemfoilset_paper",
+            space_dim=2,
+            surface_input_dim=augmented_dim,
+            surface_output_dim=3,
+            volume_input_dim=augmented_dim,
+            volume_output_dim=3,
+            pressure_output_index=2,
+            default_metric="field_mse",
+            notes=[
+                "Paper-faithful high-Re TandemFoilSet benchmark using Experiment 4 split semantics.",
+                "Primary comparison metric is normalized full-field MSE, matching the paper contract.",
+            ],
+        ),
+        target_stats=TargetTransformStats(
+            y_mean=torch.tensor(task_stats["y_mean"], dtype=torch.float32),
+            y_std=torch.tensor(task_stats["y_std"], dtype=torch.float32),
+        ),
+        sample_weights=torch.ones(len(train_dataset), dtype=torch.float32),
+    )
+
+
 def build_drivaerml_bundle(
     *,
     manifest_path: str | Path = DEFAULT_DRIVAERML_MANIFEST,
@@ -652,6 +800,9 @@ def build_dataset_bundle(
     debug: bool = False,
     tandem_manifest: str | Path = DEFAULT_TANDEM_MANIFEST,
     tandem_stats: str | Path = DEFAULT_TANDEM_STATS,
+    tandemfoil_paper_task: str = "cruise_random_uniform",
+    tandemfoil_paper_manifest: str | Path = DEFAULT_TANDEM_PAPER_MANIFEST,
+    tandemfoil_paper_stats: str | Path = DEFAULT_TANDEM_PAPER_STATS,
     airfrans_manifest: str | Path = DEFAULT_AIRFRANS_MANIFEST,
     airfrans_root: str | Path | None = None,
     airfrans_task: str = "full",
@@ -680,6 +831,16 @@ def build_dataset_bundle(
             enable_wake_deficit=enable_wake_deficit,
             enable_wake_angle=enable_wake_angle,
             enable_vortex_panel_velocity=enable_vortex_panel_velocity,
+        )
+    if dataset_name in {"tandemfoil_paper", "tandemfoilset_paper"}:
+        return build_tandem_paper_bundle(
+            task=tandemfoil_paper_task,
+            manifest_path=tandemfoil_paper_manifest,
+            stats_path=tandemfoil_paper_stats,
+            debug=debug,
+            enable_fourier=enable_fourier,
+            enable_wake_deficit=enable_wake_deficit,
+            enable_wake_angle=enable_wake_angle,
         )
     if dataset_name == "airfrans":
         return build_airfrans_bundle(
