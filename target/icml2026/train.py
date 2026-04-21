@@ -668,8 +668,8 @@ def loss_grouped_tandem(
             outputs["surface_preds"][mask],
             prepared.surface_target[mask],
             surf_xy_norm,
-            n_bins=16,
-            weight=0.1,
+            n_bins=64,
+            weight=0.01,
         )
         total = total + aux_loss
         metrics["coarse_aux_loss"] = float(aux_loss.detach().cpu().item())
