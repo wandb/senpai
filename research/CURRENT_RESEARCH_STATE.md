@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-21 (Round 12 complete)
+- **Date:** 2026-04-21 (Round 13 complete)
 - **Branch:** radford
 
 ## CURRENT BASELINES
@@ -58,28 +58,30 @@
 | AirfRANS 3L/256d+T_max=10 | 0.0357 — too slow for phase transition |
 | AirfRANS 4L/256d+T_max=10 | 0.0881 — too slow per epoch (25 epochs in 30 min) |
 | AirfRANS T_max=10 extended run | Same epoch count, stochastic — shallow transition |
+| AirfRANS lr=2e-4+T_max=10 | 0.0306 — too conservative, delayed/shallow transition |
+| DrivAerML lr=3e-4+10ep warmup | 51.15% at 2ep — warmup+low LR too slow for 30-min budget |
+| DrivAerML seed=1 | 43.93% — extreme seed sensitivity (default seed was lucky) |
+| TandemFoil SCA (surface cross-attention) | 107.62 — epoch overhead (14→8 ep) fatal; SRF head sufficient |
 
-## CRITICAL INSIGHTS (Round 12)
+## CRITICAL INSIGHTS (Round 13)
 
-1. **DrivAerML: More data per epoch is a critical lever**: 600 batches/epoch (vs 394) improved from 12.70% to 11.97%. Model sees 53% more car configs/epoch. Still converging at cutoff (34 ep). Next: test 800 and 1000 batches to find saturation point.
+1. **DrivAerML is extremely seed-sensitive**: seed=1 gave 43.93% vs default's 12.70% (3.5x worse). The optimization landscape is rugged and initialization-dependent. Gradient clipping and regularization may help smooth the landscape.
 
-2. **AirfRANS: Higher LR = earlier + deeper phase transition**: lr=7e-4 triggers transition at epoch 35 (vs epoch 38-40 for lr=3e-4/5e-4) and finds deeper basin (0.01841 vs 0.0197). LR sweet spot is 3e-4 to 7e-4. High volatility at cosine peaks but robust troughs.
+2. **AirfRANS LR landscape fully mapped**: lr=2e-4 (0.0306) < lr=3e-4 (0.0197) < lr=5e-4 (0.0207) < lr=7e-4 (0.01841, BEST). lr=7e-4 triggers earlier phase transition (epoch 35 vs 38-40). LR sweet spot is 3e-4 to 7e-4.
 
-3. **AirfRANS phase transition is STOCHASTIC**: Same config gives different depths. Running multiple seeds at lr=7e-4 is the highest-value strategy.
+3. **SCA is a dead end**: Surface cross-attention adds 75% overhead per forward pass (14→8 epochs). SRF head already provides sufficient surface refinement. LayerScale (init=1e-4) is the correct initialization for post-backbone modules.
 
-4. **TandemFoil cold-start problem persists**: WD=1e-2 converges faster at same epoch count (95.59 vs 103.87 at 7 ep) but can't get enough epochs for fair comparison. slices=32 workaround failed.
+4. **DrivAerML compound experiments with 600 batches are the top priority**: Many WIP experiments used old 394-batch config. Promising ones (warmup, eta_min) being sent back to compound with 600 batches.
 
-5. **DrivAerML compound experiments needed**: Many WIP experiments (eta_min, warmup, grad-clip, dropout) used old 394-batch config. Must be updated to compound with 600 batches.
+5. **TandemFoil cold-start remains unsolved**: WD=1e-2 is the most promising direction but can't get fair epoch count. Human-directed experiments (Kutta, MQA, HyperSRF) are the best remaining paths.
 
 ## ACTIVE EXPERIMENTS BY DATASET
 
 ### TandemFoil (Baseline: 75.59)
 | Student | PR | Experiment | Notes |
 |---|---|---|---|
-| violet | NEW | WD=1e-2 | Assigning |
-| haku | #2582 | WD sweep (awaiting response) | Cold-start blocks fair test |
+| violet | #2675 | WD=1e-2 | |
 | alphonse | #2569 | Hypernetwork SRF (human-directed) | |
-| kaneda | #2627 | SCA surface cross-attention (human-directed) | |
 | kaworu | #2629 | Kutta TE constraint (human-directed) | |
 | gen | #2623 | MQA audit (human-directed) | |
 | sasuke | #2595 | 5L/256d deep model | |
@@ -97,15 +99,17 @@
 ### AirfRANS (Baseline: 0.01841)
 | Student | PR | Experiment | Notes |
 |---|---|---|---|
-| emma | NEW | lr=6e-4+T_max=10 | Assigning |
-| kohaku | NEW | lr=7e-4 multi-seed (5 seeds) | Assigning |
-| edward | NEW | lr=8e-4+T_max=10 | Assigning |
+| emma | #2673 | lr=6e-4+T_max=10 | |
+| kohaku | #2671 | lr=7e-4 multi-seed (5 seeds) | HIGH PRIORITY |
+| edward | #2674 | lr=8e-4+T_max=10 | |
+| fern | NEW | lr=7e-4+WD=1e-2 | Assigning |
+| kaneda | NEW | lr=7e-4+T_max=8 | Assigning |
+| haku | NEW | lr=7e-4+grad-clip=1.0 | Assigning |
 | gilbert | #2655 | lr=3e-4 multi-seed | |
 | eren | #2649 | T_max=10 multi-seed | |
 | historia | #2668 | lr=3e-4+WD=1e-2 | |
-| fern | #2657 | lr=2e-4 | |
 | nezuko | #2658 | lr=1e-4 | |
-| senku | #2664 | 3L/256d+lr=3e-4 | Likely dead end (3L/256d confirmed slow) |
+| senku | #2664 | 3L/256d+lr=3e-4 | Likely dead end |
 | shinji | #2663 | lr=3e-4+dropout | |
 | thorfinn | #2666 | T_max=5 | |
 | hinata | #2637 | T_max=10+WD=1e-2 | |
@@ -117,9 +121,11 @@
 ### DrivAerML (Baseline: 11.97%)
 | Student | PR | Experiment | Notes |
 |---|---|---|---|
-| frieren | NEW | 800 batches/epoch | Assigning |
-| taki | NEW | 1000 batches/epoch | Assigning |
-| norman | NEW | 600 batches + WD=1e-2 | Assigning |
+| frieren | #2669 | 800 batches/epoch | |
+| taki | #2670 | 1000 batches/epoch | |
+| norman | #2672 | 600 batches + WD=1e-2 | |
+| shoya | NEW | 600 batches + grad-clip=1.0 | Assigning |
+| askeladd | NEW | 600 batches + dropout=0.05 | Assigning |
 | tanjiro | #2641 | Warmup (sent back for 600-batch compound) | |
 | rei | #2643 | eta_min=1e-5 (sent back for 600-batch compound) | |
 | zenitsu | #2640 | T_max=40 | OLD 394 batches |

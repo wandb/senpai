@@ -1,5 +1,34 @@
 # SENPAI Research Results
 
+## 2026-04-21 — PR #2662: DrivAerML lr=3e-4+10ep warmup — CLOSED ✗
+
+- shoya/drivaerml-4L256d-lr3e4-warmup
+- Result: 51.15% at 2 epochs. Only reached warmup phase (10-epoch warmup + lr=3e-4 way too slow for 30-min budget). W&B: n8mepvlq. DEAD END.
+
+## 2026-04-21 — PR #2661: DrivAerML multi-seed (seed=1) — CLOSED ✗
+
+- askeladd/drivaerml-4L256d-multiseed
+- Hypothesis: Test run-to-run variance with deterministic seeding.
+- Result: seed=1 → 43.93% (3.5x worse than baseline 12.70%). W&B: 27ac33zp, 46 epochs.
+- **KEY INSIGHT:** DrivAerML is extremely initialization-sensitive. The default random seed landed in a favorable basin. Multi-seed runs are high-value for DrivAerML too. DEAD END but important finding.
+
+## 2026-04-21 — PR #2657: AirfRANS lr=2e-4+T_max=10 — CLOSED ✗
+
+- fern/airfrans-lr2e4-tmax10
+- Result: val=0.0306 (epoch 31). Phase transition occurs but is delayed and shallower than lr=3e-4 (0.0197) and lr=7e-4 (0.01841). Post-transition stall at epoch 31. LR lower bound confirmed: lr=2e-4 too conservative. W&B: 6hl0j2kn. DEAD END.
+
+## 2026-04-21 — PR #2627: TandemFoil SCA surface cross-attention — CLOSED ✗
+
+- kaneda/tandem-surface-cross-attention (human-directed from issue #2545)
+- Two variants: zero-init (destabilized E6, best 122.73) and LayerScale init=1e-4 (stable, best 107.62). Neither beats 75.59. Fatal issue: SCA reduces epochs from 14→8 (75% overhead). SRF head already provides sufficient surface refinement.
+- **Finding:** LayerScale (init=1e-4) is the correct initialization for post-backbone attention modules (zero-init causes catastrophic symmetry breaking).
+- W&B: fo4hnahz (zero-init), vmlw179l (LayerScale). DEAD END.
+
+## 2026-04-21 — PR #2582: TandemFoil WD sweep — CLOSED ✗
+
+- haku/tandem-tmax10-wd-sweep
+- Final results: WD=1e-2=95.59 (7ep), WD=0=96.39 (7ep), WD=1e-4=103.87 (5ep). WD=1e-2 converges 8% faster than default. Can't fairly compare to 14-epoch baseline due to cold-start I/O. violet (#2675) testing WD=1e-2 independently. W&B: wbeh83ah, ssosuyjt, 8tx8zt2n. CLOSED — insufficient epochs for fair comparison.
+
 ## 2026-04-21 — PR #2646: AirfRANS: lr=7e-4+T_max=10 — MERGED ✓ NEW BEST
 
 - emma/airfrans-tmax10-lr7e4
