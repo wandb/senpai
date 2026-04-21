@@ -627,6 +627,40 @@ def _case_masked_rel_l2(pred: torch.Tensor, target: torch.Tensor, mask: torch.Te
     return float(rel.detach().cpu().item())
 
 
+def _accumulate_case_rel_l2_sums(
+    case_sums: dict[str, tuple[torch.Tensor, torch.Tensor]],
+    *,
+    case_ids: list[str],
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> None:
+    mask_float = mask.float()
+    error_sq_sum = ((pred - target).square().sum(dim=-1) * mask_float).sum(dim=1)
+    target_sq_sum = (target.square().sum(dim=-1) * mask_float).sum(dim=1)
+    valid_cases = mask.any(dim=1)
+    for case_idx, case_id in enumerate(case_ids):
+        if not bool(valid_cases[case_idx]):
+            continue
+        prev = case_sums.get(case_id)
+        if prev is None:
+            case_sums[case_id] = (error_sq_sum[case_idx], target_sq_sum[case_idx])
+        else:
+            case_sums[case_id] = (prev[0] + error_sq_sum[case_idx], prev[1] + target_sq_sum[case_idx])
+
+
+def _finalize_case_rel_l2(case_sums: dict[str, tuple[torch.Tensor, torch.Tensor]]) -> float | None:
+    if not case_sums:
+        return None
+    error_sq = torch.stack([value[0] for value in case_sums.values()])
+    target_sq = torch.stack([value[1] for value in case_sums.values()])
+    valid = target_sq > 0
+    if not bool(valid.any()):
+        return None
+    rel_l2 = torch.sqrt(error_sq[valid] / target_sq[valid].clamp(min=1e-12))
+    return float(rel_l2.mean().detach().cpu().item())
+
+
 def _named_channel_metrics(prefix: str, values: torch.Tensor, names: tuple[str, ...]) -> dict[str, float]:
     metrics: dict[str, float] = {}
     for idx, value in enumerate(values):
@@ -745,8 +779,8 @@ def evaluate_grouped(
     n_vol = torch.zeros(3, device=device)
     surf_channel_sum = None
     vol_channel_sum = None
-    drivaer_surface_case_sums: dict[str, list[float]] = {}
-    drivaer_volume_case_sums: dict[str, list[float]] = {}
+    drivaer_surface_case_sums: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    drivaer_volume_case_sums: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
     batches = loader if max_batches <= 0 else itertools.islice(loader, max_batches)
     for batch in batches:
@@ -829,31 +863,21 @@ def evaluate_grouped(
 
         if dataset_name == "drivaerml":
             if pred_surface is not None and batch.surface_y is not None:
-                for case_idx, case_id in enumerate(batch.case_ids):
-                    valid = batch.surface_mask[case_idx].bool()
-                    if not valid.any():
-                        continue
-                    pred_valid = pred_surface[case_idx][valid]
-                    target_valid = batch.surface_y[case_idx][valid]
-                    target_sq = float(target_valid.square().sum().detach().cpu().item())
-                    if target_sq <= 0.0:
-                        continue
-                    state = drivaer_surface_case_sums.setdefault(case_id, [0.0, 0.0])
-                    state[0] += float((pred_valid - target_valid).square().sum().detach().cpu().item())
-                    state[1] += target_sq
+                _accumulate_case_rel_l2_sums(
+                    drivaer_surface_case_sums,
+                    case_ids=batch.case_ids,
+                    pred=pred_surface,
+                    target=batch.surface_y,
+                    mask=batch.surface_mask,
+                )
             if pred_volume is not None and batch.volume_mask is not None and batch.volume_y is not None:
-                for case_idx, case_id in enumerate(batch.case_ids):
-                    valid = batch.volume_mask[case_idx].bool()
-                    if not valid.any():
-                        continue
-                    pred_valid = pred_volume[case_idx][valid]
-                    target_valid = batch.volume_y[case_idx][valid]
-                    target_sq = float(target_valid.square().sum().detach().cpu().item())
-                    if target_sq <= 0.0:
-                        continue
-                    state = drivaer_volume_case_sums.setdefault(case_id, [0.0, 0.0])
-                    state[0] += float((pred_valid - target_valid).square().sum().detach().cpu().item())
-                    state[1] += target_sq
+                _accumulate_case_rel_l2_sums(
+                    drivaer_volume_case_sums,
+                    case_ids=batch.case_ids,
+                    pred=pred_volume,
+                    target=batch.volume_y,
+                    mask=batch.volume_mask,
+                )
             continue
 
         if pred_surface is not None:
@@ -883,23 +907,13 @@ def evaluate_grouped(
             metrics.update(_named_channel_metrics("volume_mse", vol_channel_sum / count_volume, AIRFRANS_FIELD_NAMES))
         return metrics
     if dataset_name == "drivaerml":
-        surface_values = [
-            math.sqrt(error_sq / target_sq)
-            for error_sq, target_sq in drivaer_surface_case_sums.values()
-            if target_sq > 0.0
-        ]
-        surface_rel_l2 = sum(surface_values) / max(len(surface_values), 1)
+        surface_rel_l2 = _finalize_case_rel_l2(drivaer_surface_case_sums) or 0.0
         metrics = {
             "surface_rel_l2": surface_rel_l2,
             "surface_rel_l2_pct": surface_rel_l2 * 100.0,
         }
-        volume_values = [
-            math.sqrt(error_sq / target_sq)
-            for error_sq, target_sq in drivaer_volume_case_sums.values()
-            if target_sq > 0.0
-        ]
-        if volume_values:
-            volume_rel_l2 = sum(volume_values) / len(volume_values)
+        volume_rel_l2 = _finalize_case_rel_l2(drivaer_volume_case_sums)
+        if volume_rel_l2 is not None:
             metrics["volume_rel_l2"] = volume_rel_l2
             metrics["volume_rel_l2_pct"] = volume_rel_l2 * 100.0
         return metrics
