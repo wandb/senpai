@@ -87,9 +87,19 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.0197 (val) / TBD (test)
-- **Best PR:** #2614 (gilbert — Fourier+3L/192d + no-EMA + T_max=10, 41 epochs, AdamW **lr=3e-4**)
-- **Key insight:** lr=3e-4 (lower than baseline 5e-4) produces a deeper phase transition basin. Phase transition is stochastic but LR matters: lr=3e-4 found a deeper basin (0.0197 at epoch 38) than lr=5e-4 (0.0207/0.0248). External target: 0.0043 — **4.6x gap remaining**.
+- **Current best:** 0.01841 (val) / TBD (test)
+- **Best PR:** #2646 (emma — Fourier+3L/192d + no-EMA + T_max=10, 41 epochs, AdamW **lr=7e-4**)
+- **Key insight:** lr=7e-4 produces an earlier and deeper phase transition (epoch 35 vs epoch 38-40 for lower LRs). LR sweet spot is 3e-4 to 7e-4 range. Phase transition is stochastic but higher LR accelerates descent. External target: 0.0043 — **4.3x gap remaining**.
+
+### 2026-04-21 — PR #2646: AirfRANS: lr=7e-4+T_max=10 — NEW BEST
+
+- **val_primary/surface_mse:** 0.01841 (-6.5% vs 0.0197)
+- **full_val/surface_mse_p:** 0.0735
+- **full_val/volume_mse:** 0.1331
+- **W&B run:** 3pbxocca (41 epochs, best at epoch 35 — earlier phase transition)
+- **Epochs:** 41 (30-min timeout, phase transition at epoch 35)
+- **Note:** lr=7e-4 triggers the phase transition 3-5 epochs earlier than lr=3e-4. Volatile peak-to-trough swings at cosine LR peaks (epochs 26, 28, 38, 41 spike to ~0.23-0.27). Epoch 35 found a qualitatively different basin at 0.018 while surrounding troughs at epochs 30, 40 were only 0.031. Test metric (0.2323) evaluated at final epoch LR peak — misleading.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans_task full --optimizer adamw --lr 7e-4 --cosine_t_max 10 --no-use-ema --enable-fourier --epochs 999`
 
 ### 2026-04-21 — PR #2614: AirfRANS: lr=3e-4+T_max=10 — NEW BEST
 
