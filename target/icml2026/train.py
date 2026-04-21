@@ -106,6 +106,8 @@ class TrainConfig:
     surface_anchor_points: int = 8_000
     volume_anchor_points: int = 8_000
     save_checkpoint: bool = False
+    surface_cross_attn: bool = False
+    surface_cross_attn_heads: int = 4
 
 
 @dataclass
@@ -439,6 +441,8 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
             surface_refine_layers=config.surface_refine_layers,
             surface_pressure_prior_idx=prior_idx,
             volume_pressure_prior_idx=prior_idx,
+            surface_cross_attn=config.surface_cross_attn,
+            surface_cross_attn_heads=config.surface_cross_attn_heads,
             **transolver_kwargs,
         )
     if config.model == "reference_abupt":

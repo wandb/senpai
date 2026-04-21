@@ -10,6 +10,35 @@ import torch.nn as nn
 from .transolver_reference import ReferenceTransolver
 
 
+class SurfaceCrossAttention(nn.Module):
+    """Global all-to-all attention over surface nodes only."""
+
+    def __init__(self, embed_dim: int, num_heads: int = 4, layerscale_init: float = 1e-4):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim=embed_dim, num_heads=num_heads, batch_first=True,
+        )
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.GELU(),
+            nn.Linear(embed_dim * 2, embed_dim),
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.gamma_attn = nn.Parameter(torch.full((embed_dim,), layerscale_init))
+        self.gamma_ffn = nn.Parameter(torch.full((embed_dim,), layerscale_init))
+
+    def forward(
+        self, h_surf: torch.Tensor, key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        h_attn, _ = self.attn(
+            h_surf, h_surf, h_surf, key_padding_mask=key_padding_mask,
+        )
+        h_surf = self.norm1(h_surf + self.gamma_attn * h_attn)
+        h_surf = self.norm2(h_surf + self.gamma_ffn * self.ffn(h_surf))
+        return h_surf
+
+
 class ZeroInitSurfaceRefinementHead(nn.Module):
     def __init__(
         self,
@@ -134,6 +163,8 @@ class SenpaiTransolver(ReferenceTransolver):
         surface_refine_layers: int = 2,
         surface_pressure_prior_idx: int | None = None,
         volume_pressure_prior_idx: int | None = None,
+        surface_cross_attn: bool = False,
+        surface_cross_attn_heads: int = 4,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -149,6 +180,11 @@ class SenpaiTransolver(ReferenceTransolver):
                 num_hidden_layers=surface_refine_layers,
             )
             if self.surface_refine
+            else None
+        )
+        self.sca = (
+            SurfaceCrossAttention(self.n_hidden, num_heads=surface_cross_attn_heads)
+            if surface_cross_attn
             else None
         )
 
@@ -189,6 +225,9 @@ class SenpaiTransolver(ReferenceTransolver):
             surface_x,
             self.surface_pressure_prior_idx,
         )
+        if self.sca is not None and outputs["surface_hidden"] is not None:
+            padding_mask = ~surface_mask  # True = ignore padded positions
+            outputs["surface_hidden"] = self.sca(outputs["surface_hidden"], key_padding_mask=padding_mask)
         if self.surface_head is not None and surface_preds is not None:
             surface_preds = surface_preds + self.surface_head(outputs["surface_hidden"], surface_preds)
             surface_preds = surface_preds * surface_mask.unsqueeze(-1)
