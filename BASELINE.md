@@ -87,9 +87,16 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.0696 (val) / 0.0877 (test)
-- **Best PR:** #2540 (emma — Fourier+3L/192d + no-EMA + T_max=50, 23 epochs, AdamW lr=5e-4)
-- **Key insight:** PHASE TRANSITION at epoch 23. Cosine LR near T_max=50 trough (very low LR) causes the model to settle into a sharp minimum — val jumps from ~0.19-0.21 plateau to 0.0696 in a single epoch. The 3L/192d model trains faster (23 ep in 30 min vs 14 ep for 4L/256d), reaching the transition first. lr=8e-4 also showed partial transition (0.1048) but was unstable. Pressure MSE_p dropped 70.5% (0.9427→0.2779). External target: 0.0043.
+- **Current best:** 0.0248 (val) / TBD (test)
+- **Best PR:** #2556 (emma — Fourier+3L/192d + no-EMA + T_max=10, 41 epochs, AdamW lr=5e-4)
+- **Key insight:** Phase transition mechanism confirmed repeatable. T_max=10 with more frequent cosine troughs (every ~10 steps) produces deeper phase transitions at epoch 40. val dropped from ~0.04 plateau to 0.0248 in a single epoch at the T_max trough. External target: 0.0043 — **5.8x gap remaining**.
+
+### 2026-04-21 — PR #2556: AirfRANS: Fourier+3L/192d+T_max=10 — NEW BEST (deeper phase transition)
+
+- **val_primary/surface_mse:** 0.0248 (-64.3% vs 0.0696)
+- **W&B run:** 7qre8z5x (41 epochs, best at epoch 40 — cosine trough)
+- **Epochs:** 41 (T_max=10, best at epoch 40 where cosine LR hits trough)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans_task full --optimizer adamw --lr 5e-4 --cosine_t_max 10 --no-use-ema --enable-fourier --epochs 999`
 
 ### 2026-04-21 — PR #2540: AirfRANS: Fourier+3L/192d+T_max=50 — NEW BEST (phase transition breakthrough)
 
