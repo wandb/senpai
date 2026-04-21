@@ -1,5 +1,42 @@
 # SENPAI Research Results
 
+## 2026-04-21 — Round 23: gc=1.0 Cleanup + gc=1.5 Expansion
+
+### PR #2742 (emma): AirfRANS gc=1.0+T_max=5+WD=1e-2 multi-seed — CLOSED ✗
+
+- Best seed (101): val_primary/surface_mse = 0.010020 vs 0.00935 baseline
+- W&B: hgs11esu. gc=1.0 superseded by gc=1.5 breakthrough.
+- NOTE: T_max=5 > T_max=10 confirmed (0.010020 vs 0.013270 across seeds at gc=1.0).
+
+### PR #2741 (kohaku): AirfRANS gc=1.0+T_max=5+WD=1e-2 — CLOSED ✗
+
+- val_primary/surface_mse = 0.014756. W&B: i2b7rd02. gc=1.0 dead end.
+
+### PR #2740 (kaneda): AirfRANS gc=1.0+T_max=10+WD=1e-2 multi-seed — CLOSED ✗
+
+- Best seed (102): val_primary/surface_mse = 0.013270. W&B: vg5is75a. gc=1.0 dead end.
+
+### PR #2738 (askeladd): DrivAerML 4L/384d+lr=2e-4 — SENT BACK
+
+- 12.800% at 50 epochs — hit SENPAI_MAX_EPOCHS cap. Sent back with SENPAI_MAX_EPOCHS=9999.
+
+### PR #2726 (taki): AirfRANS T_max=5 seeds at gc=1.0 — CLOSED ✗
+
+- Best: 0.010020 (seed 101). W&B: 8lgx68h9. Duplicate of emma's result. gc=1.0 dead end.
+
+### Round 23 Assignments
+
+| Student | PR | Experiment |
+|---|---|---|
+| kohaku | TBD | AirfRANS gc=1.5+T_max=5 (no WD) — isolate T_max effect |
+| emma | TBD | AirfRANS gc=1.5 multi-seed (100-104) — variance characterization |
+| taki | TBD | DrivAerML 4L/320d+gc=1.5 — transfer breakthrough |
+| kaneda | TBD | AirfRANS gc=1.5+lr=1e-3 — push LR higher with better clip |
+
+### Human Issue #2545 Update
+
+Responded to human researcher (morganmcg1) with comprehensive progress update. Key: AirfRANS -86.6%, DrivAerML -85.1%, TandemFoil -40.4% since issue filed.
+
 ## 2026-04-21 — Round 22: Clearing Stale PRs
 
 ### PR #2739: AirfRANS gc=1.0+WD=5e-3 (fern) — CLOSED ✗
