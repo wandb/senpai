@@ -3,9 +3,18 @@
 ## TandemFoilSet
 
 - **Primary metric:** `val_primary/surface_pressure_mae` (= `val_eq4/surface_pressure_mae`)
-- **Current best:** 78.81 (val) / 75.13 (test)
-- **Best PR:** #2495 (nezuko — T_max=30 long run, Fourier + physics + no-EMA, slices=64, Lion lr=3e-4, 14 epochs, 180-min budget)
-- **Key insight:** Fourier + physics is synergistic at slices=64. T_max=30 rapid cycling (25 restarts/epoch) continues to win. Scheduler steps per-batch — T_max in gradient steps, not epochs. T_max=1000 hypothesis falsified (gave ~10 cycles, not 1). Still improving at cutoff.
+- **Current best:** 75.59 (val) / 72.12 (test)
+- **Best PR:** #2490 (frieren — T_max=10, Fourier + physics + no-EMA, slices=64, Lion lr=3e-4, 14 epochs)
+- **Key insight:** T_max=10 creates ~75 cosine cycles per epoch (750 steps/epoch). Extremely rapid LR averaging produces the best minima. T_max=10 > T_max=20 > T_max=15 > T_max=30. Still improving at epoch 14 — longer training should push below 70.
+
+### 2026-04-21 — PR #2490: TandemFoil: Fourier+physics T_max=10 — NEW BEST
+
+- **val_primary/surface_pressure_mae:** 75.59 (-4.1% vs 78.81)
+- **test_primary/surface_pressure_mae:** 72.12 (-4.0% vs 75.13)
+- **Per-split test MAE:** single_in_dist=72.33, geom_camber_rc=76.01, geom_camber_cruise=70.80, re_rand=69.34
+- **W&B run:** 77yoba65 (winner, T_max=10); aiols138 (T_max=15: 80.23); yt60qcd1 (T_max=20: 77.00)
+- **Epochs:** 14 (30-min timeout, still improving)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 3e-4 --cosine_t_max 10 --no-use-ema --model_slices 64 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999`
 
 ### 2026-04-21 — PR #2495: TandemFoil: T_max=30 long run (180-min budget) — NEW BEST
 
@@ -78,9 +87,17 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.2015 (val) / 0.1890 (test)
-- **Best PR:** #2538 (kohaku — Fourier+4L/256d + no-EMA + T_max=50, 14 epochs, AdamW lr=5e-4)
-- **Key insight:** Compound architecture+schedule confirmed — Fourier+4L/256d (PR #2478) and T_max=50 (PR #2482) gains are super-additive when combined. Pressure dominates composite MSE (~99.9%); Ux/Uy/nut are near-noise. Still converging at epoch 14 — further improvement expected with longer budget.
+- **Current best:** 0.0696 (val) / 0.0877 (test)
+- **Best PR:** #2540 (emma — Fourier+3L/192d + no-EMA + T_max=50, 23 epochs, AdamW lr=5e-4)
+- **Key insight:** PHASE TRANSITION at epoch 23. Cosine LR near T_max=50 trough (very low LR) causes the model to settle into a sharp minimum — val jumps from ~0.19-0.21 plateau to 0.0696 in a single epoch. The 3L/192d model trains faster (23 ep in 30 min vs 14 ep for 4L/256d), reaching the transition first. lr=8e-4 also showed partial transition (0.1048) but was unstable. Pressure MSE_p dropped 70.5% (0.9427→0.2779). External target: 0.0043.
+
+### 2026-04-21 — PR #2540: AirfRANS: Fourier+3L/192d+T_max=50 — NEW BEST (phase transition breakthrough)
+
+- **val_primary/surface_mse:** 0.0696 (-65.4% vs 0.2015)
+- **test_primary/surface_mse:** 0.0877 (-53.6% vs 0.1890)
+- **W&B run:** ijwvfcms (winner, lr=5e-4, 23 epochs); km5xxa3n (lr=8e-4, best 0.1048 at epoch 21, unstable)
+- **Epochs:** 23 (30-min timeout — model at epoch 22 was 0.19, then phase-transitioned to 0.0696 at epoch 23)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans_task full --optimizer adamw --lr 5e-4 --cosine_t_max 50 --no-use-ema --enable-fourier --epochs 999`
 
 ### 2026-04-21 — PR #2538: AirfRANS: Fourier+4L/256d+T_max=50 (compound) — NEW BEST
 
