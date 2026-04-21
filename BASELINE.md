@@ -105,9 +105,17 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.01271 (val) at epoch 40
-- **Best PR:** #2732 (kohaku — Fourier+3L/192d + no-EMA + **T_max=5**, 41 epochs, AdamW **lr=7e-4**, **grad-clip=1.0**, WD=1e-4 default)
-- **Key insight:** T_max=5 produces 8 full cosine cycles in 41 epochs (vs 4 for T_max=10), enabling more frequent phase transitions and deeper basin exploration. Best at epoch 40 (cosine trough) — ep41 rebounds to 0.04259 (cosine peak). WD=1e-4 (not golden 1e-2) — improvement holds even without full WD. Golden config now: lr=7e-4 + grad-clip=1.0 + WD=1e-2 + T_max=5. External target: 0.0043 — **~3x gap remaining**.
+- **Current best:** 0.00935 (val) at epoch 40
+- **Best PR:** #2737 (haku — Fourier+3L/192d + no-EMA + T_max=10, 40 epochs, AdamW **lr=7e-4**, **grad-clip=1.5**)
+- **Key insight:** GRAD-CLIP=1.5 > 1.0 > 0.5. Moderate clipping (1.5) prevents catastrophic spikes while allowing enough gradient magnitude for effective learning. 26.4% improvement over clip=1.0 baseline. The optimal clip threshold is NOT the tightest — it's a balance between stability and expressivity. External target: 0.0043 — **~2.2x gap remaining** (was 3x).
+
+### 2026-04-21 — PR #2737: AirfRANS: lr=7e-4+grad-clip=1.5 — NEW BEST
+
+- **val_primary/surface_mse:** 0.00935 (-26.4% vs 0.01271)
+- **W&B run:** 7bdiqnmi (40 epochs, best at epoch 40 — still improving!)
+- **Epochs:** 40 (30-min timeout)
+- **Key insight:** grad-clip=1.5 at T_max=10 finds a dramatically deeper basin than clip=1.0. The clip sweep now shows: 0.5 (failed, +1.9%), 1.0 (0.01419), 1.5 (**0.00935**), 2.0 (pending). Moderate clipping outperforms tight clipping. Next: combine clip=1.5 with T_max=5 and WD=1e-2.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans_task full --optimizer adamw --lr 7e-4 --cosine-t-max 10 --grad-clip 1.5 --no-use-ema --enable-fourier --epochs 999`
 
 ### 2026-04-21 — PR #2732: AirfRANS: T_max=5+lr=7e-4+grad-clip=1.0 — NEW BEST
 
