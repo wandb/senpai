@@ -1,5 +1,56 @@
 # SENPAI Research Results
 
+## 2026-04-21 — Round 17: lr=2e-4 Breakthrough + Massive Cleanup
+
+### PR #2610: TandemFoil lr=2e-4+T_max=10 — MERGED ✓ NEW BEST (45.07)
+
+- tetsuo/tandem-tmax10-lr2e4
+- val_primary/surface_pressure_mae: **45.07** (-14.7% vs 52.81 baseline) at epoch 107/119
+- W&B: ixs1rqgk (119 epochs, 180-min budget, still improving)
+- CRITICAL: lr=2e-4 at DEFAULT 3L/192d beats lr=3e-4 at 5L/256d (45.07 vs 52.81). Lower LR + more epochs is the dominant lever. 119 epochs vs 67 epochs, oscillation ~10-20 points (vs 20-30 at lr=3e-4). T_max=10+lr=2e-4 also beats T_max=30+lr=2e-4 (49.99).
+- **PARADIGM SHIFT**: LR tuning > architecture scaling for TandemFoil. The combination of lr=2e-4 + 5L/256d is now the highest-priority experiment.
+
+### 8 PRs CLOSED (dead ends / budget mismatch)
+
+**AirfRANS (no grad-clip, all dominated by 0.01419 baseline):**
+- #2698 (tanjiro): lr=5e-4 multi-seed → best 0.01667 (17.5% worse). Seeds 100-104.
+- #2695 (violet): lr=4e-4 multi-seed → best 0.01703 (20% worse). Seeds 100-104.
+- #2683 (gilbert): lr=3e-4 multi-seed → best 0.01530 (7.8% worse). Wide variance (0.015-0.035).
+- **CONCLUSION**: LR sweep without grad-clip is exhausted. All future AirfRANS MUST use grad-clip.
+
+**DrivAerML (30-min budget vs 180-min baseline — uninterpretable):**
+- #2693 (edward): lr=3e-4 → 12.15% at 45ep (30-min)
+- #2692 (taki): 800b → 10.49% at 28ep (30-min)
+- #2690 (shoya): dropout=0.05 → 12.64% at 46ep (30-min)
+- #2685 (norman): eta_min=1e-5 → 11.42% at 45ep (30-min)
+- #2681 (shinji): 600b → 11.54% at 35ep (30-min)
+- **CRITICAL BUG**: All ran default 30-min, not 180-min baseline budget. Future DrivAerML MUST set SENPAI_TIMEOUT_MINUTES=180.
+
+### 10 Additional Stale PRs CLOSED
+
+**AirfRANS (no grad-clip):** #2658 (nezuko lr=1e-4), #2666+#2613 (thorfinn T_max=5), #2664+#2615 (senku 3L/256d+lr=1e-3), #2686 (kohaku seeds), #2668 (historia WD)
+**TandemFoil (old config):** #2665 (tetsuo dropout), #2667+#2616 (naruto gradclip+slices)
+
+### Round 17 Assignments (15 students)
+
+| Student | PR | Experiment | Dataset |
+|---|---|---|---|
+| tanjiro | ASSIGNING | lr=2e-4+T_max=20 | TandemFoil |
+| violet | ASSIGNING | lr=2e-4+5L/256d (HIGHEST PRIORITY) | TandemFoil |
+| gilbert | ASSIGNING | lr=1.5e-4 (bracket LR) | TandemFoil |
+| tetsuo | ASSIGNING | lr=2e-4+5L/256d+T_max=20 | TandemFoil |
+| naruto | ASSIGNING | lr=2e-4+grad-clip=1.0 | TandemFoil |
+| historia | ASSIGNING | lr=2e-4+T_max=5 | TandemFoil |
+| senku | ASSIGNING | lr=2e-4+WD=1e-2 | TandemFoil |
+| taki | ASSIGNING | lr=7e-4+gc=1.0 multi-seed | AirfRANS |
+| shoya | ASSIGNING | 4L/256d+gc=1.0 | AirfRANS |
+| kohaku | ASSIGNING | lr=7e-4+gc=1.0+T_max=5 | AirfRANS |
+| thorfinn | ASSIGNING | lr=7e-4+gc=1.0 seeds 200-204 | AirfRANS |
+| edward | ASSIGNING | 4L/384d+lr=3e-4 (180-min!) | DrivAerML |
+| norman | ASSIGNING | 4L/384d+600b (180-min!) | DrivAerML |
+| shinji | ASSIGNING | 4L/384d+600b+gc=1.0 (180-min!) | DrivAerML |
+| nezuko | ASSIGNING | 4L/384d+800b (180-min!) | DrivAerML |
+
 ## 2026-04-21 — Round 16: Two Winners + Grad-Clip Breakthrough
 
 ### PR #2595: TandemFoil 5L/256d deep model — MERGED ✓ NEW BEST (52.81)
