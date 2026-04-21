@@ -1,18 +1,38 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-21 22:45 (Wave 3 — Bold New Directions)
+- **Date:** 2026-04-21 23:50 (Wave 3 — Bold New Directions, Cross-Dataset Focus Directive)
 - **Branch:** radford
 - **Fleet status:** 59 live students, ALL ASSIGNED (0 idle)
 - **Current relaunch budget:** inherit pod env defaults
   - `SENPAI_TIMEOUT_MINUTES=360`
   - `SENPAI_MAX_EPOCHS=999`
 
+## CORE RESEARCH DIRECTIVE (Human Team Instruction — 2026-04-21)
+
+**CROSS-DATASET GENERALIZATION IS THE PRIMARY CONSTRAINT ON ALL NEW EXPERIMENTS.**
+
+The human research team has explicitly directed: every new hypothesis must be
+tested across all relevant datasets in a single PR. Dataset-specific tricks that
+do not transfer are not useful. The paper story requires a shared recipe.
+
+All four benchmarks are now active and required:
+
+1. **TandemFoil** — `val_primary/surface_pressure_mae` / `test_primary/surface_pressure_mae`
+2. **TandemFoil Paper** — `val_primary/field_mse` / `test_primary/field_mse` ← NEW 4th dataset (human directive 2026-04-21)
+3. **AirfRANS** — `val_primary/surface_mse` / `test_primary/surface_mse`
+4. **DrivAerML** — `val_primary/surface_rel_l2_pct` / `test_primary/surface_rel_l2_pct`
+
+**Assignment rule (effective immediately):**
+- New hyperparameter or architecture hypotheses MUST be tested on ALL four datasets in one PR.
+- Single-dataset assignments are only acceptable for dataset-specific ablations (e.g. DrivAerML batch size), TandemFoil Paper baseline runs, or targeted best-checkpoint recovery.
+- When in doubt: assign cross-dataset. An idea that only helps one dataset is a dataset hack.
+
 ## Paper-Facing Snapshot
 
 | Dataset | Paper-facing metric | Current best | Target / reference | Status |
 |---|---|---|---|---|
 | TandemFoil | `test_primary/surface_pressure_mae` | **33.88** (#2810) | no external scalar | needs test from new EMA best |
-| TandemFoil Paper | `test_primary/field_mse` | not run yet on `radford` | `0.10 / 0.18 / 0.36 / 0.13 / 0.14 / 0.21` by task | new calibration lane |
+| TandemFoil Paper | `test_primary/field_mse` | **not run yet on radford** | `0.10 / 0.18 / 0.36 / 0.13 / 0.14 / 0.21` by task | NEW — baseline run needed |
 | AirfRANS | `test_primary/surface_mse` | **0.003** (#2824) | `0.0043` | **BEATEN** — val now 0.000727 |
 | DrivAerML | `test_primary/surface_rel_l2_pct` | **6.24%** (#2691) | `3.71%` | **MAIN GAP — 1.68x** |
 
@@ -21,25 +41,27 @@
 | Dataset | Metric | Current anchor |
 |---|---|---|
 | TandemFoil | `val_primary/surface_pressure_mae` | **26.134** (#2899 MERGED — EMA decay=0.999) |
+| TandemFoil Paper | `val_primary/field_mse` | **not established** — baseline run needed urgently |
 | AirfRANS | `val_primary/surface_mse` | **0.000727** (#2899 MERGED — EMA decay=0.999, ep206) |
 | DrivAerML | `val_primary/surface_rel_l2_pct` | **4.619%** (#2691) |
 
 ## Main Scientific Goal
 
-A shared recipe whose core changes work across:
+A shared recipe whose core changes work across all four benchmarks:
 
 - the main TandemFoil parity target
-- the new TandemFoil paper-calibration target
+- the new TandemFoil paper-calibration target (Experiment 4, Table 6)
 - AirfRANS
 - DrivAerML
 
 DrivAerML is still the main gap. Corrected EMA warmup is now the shared recipe
-for TF+AF, and the paper-calibration Tandem benchmark exists to tell us whether
-Tandem-side gains are only helping the parity contract or also the literature-facing one.
+for TF+AF. TandemFoil Paper is a NEW required benchmark added by the human team
+— paper-faithful high-Re TandemFoilSet using normalized full-field MSE, 6 tasks.
+No baseline has been run yet on radford for this dataset.
 
 ## Mandatory Config Rules (UPDATED after EMA merge)
 
-- **TF + AF:** Use `--ema-decay 0.999` (NO --no-use-ema). decay=0.999 > 0.9999 on both.
+- **TF + AF + TF_paper:** Use `--ema-decay 0.999` (NO --no-use-ema). decay=0.999 > 0.9999 on both.
 - **DrivAerML:** Still `--no-use-ema` (EMA alone hurt DM; zenitsu #2925 tests EMA+gc compound)
 - `--epochs 999` mandatory
 - DrivAerML: `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
@@ -61,11 +83,18 @@ Tandem-side gains are only helping the parity contract or also the literature-fa
 
 ## Default Assignment Pattern
 
-Cross-dataset: TF+AF use EMA decay=0.999, DM still uses --no-use-ema.
+Cross-dataset is now the DEFAULT. Every new hypothesis should cover:
+- `target/icml2026/tandemfoil/`
+- `target/icml2026/tandemfoil_paper/`
+- `target/icml2026/airfrans/`
+- `target/icml2026/drivaerml/`
+
+Unless there is a strong reason to restrict to a single dataset (ablation,
+baseline run, known dataset-specific mechanism), all assignments are
+multi-dataset. This is the human team's explicit directive.
 
 When a hypothesis is relevant to TandemFoil generalization or paper
-comparability, include both:
-
+comparability, always include:
 - `target/icml2026/tandemfoil/`
 - `target/icml2026/tandemfoil_paper/`
 
@@ -183,29 +212,42 @@ comparability, include both:
 2. **DrivAerML is fragile to compounds:** gc+WD+cosine crashes (6/8 #2908), 640d crashes (#2917), T_max=5 crashes (#2911). Only gentle perturbations survive at 4L/512d.
 3. **Width scaling ceiling at 512d for DM:** 640d is unstable. guts #2890 (768d) and himmel #2891 (5L/512d) will clarify the boundary.
 4. **AB-UPT** achieves 3.71% via geometry-separated encoding — escalation if EMA+recipe fails.
+5. **TandemFoil Paper baseline urgently needed:** This dataset has never been run on radford. We need a val anchor before we can evaluate any experiment improvements against the paper's Table 6 numbers.
 
 ## Current Research Themes and Priorities
 
-### Priority 1: DrivAerML Gap Closure (4.619% → 3.71%)
+### Priority 0: Cross-Dataset Generalization (Human Team Directive — NON-NEGOTIABLE)
+- **Every new experiment must test across all 4 datasets.** Ideas that help only one dataset are not acceptable for the shared paper recipe.
+- **TandemFoil Paper is now a required 4th benchmark.** All future assignments must include it.
+- **Measurement gate:** An experiment is a win only if it does not cause regression on any of the 4 datasets (or shows a cross-dataset improvement).
+
+### Priority 1: TandemFoil Paper Baseline
+- **No val anchor exists yet for TF Paper.** First student to become idle should run the best current config (EMA decay=0.999, 3L/192d or 4L/512d, Lion lr=1.25e-4 for TF) on tandemfoil_paper to establish a baseline.
+- Paper targets (Table 6 MGN + PRE-RES-FREE+RES-COMB): 0.10/0.18/0.36/0.13/0.14/0.21 per task.
+- Metric: normalized full-field MSE (`val_primary/field_mse`).
+
+### Priority 2: DrivAerML Gap Closure (4.619% → 3.71%)
 - **Loss alignment** (frieren #2928): Most direct fix — training on relative L2 directly matches the evaluation metric
 - **Architectural upgrades** (nezuko #2929 SwiGLU, kohaku #2932 global context): Address known Transolver limitations
 - **Regularization** (violet #2930 DropPath): New orthogonal regularization dimension
 - **Physics-informed features** (emma #2933 curvature, mitsuha #2936 SDF): Give model explicit geometric knowledge it currently must learn implicitly
 
-### Priority 2: Cross-Benchmark Recipe Validation
-- Wave 3 experiments test across all 4 benchmarks by default
+### Priority 3: Cross-Benchmark Recipe Validation
+- Wave 3 experiments should test across all 4 benchmarks by default
 - TandemFoil Paper benchmark provides calibration against published numbers
-- Ideas that help DM but hurt TF/AF are dataset hacks; we want shared wins
+- Ideas that help DM but hurt TF/AF are dataset hacks; we want shared wins across all 4
 
-### Priority 3: Optimization Paradigm Shift
+### Priority 4: Optimization Paradigm Shift
 - Prodigy (gilbert #2931): If the LR search is truly exhausted, adaptive optimizers may find new trajectories
 - MoE (shoya #2935): Sparse expert specialization is fundamentally different from dense FFN
 - Conservation loss (chihiro #2934): Physics constraints as regularization
 
 ## Next Priorities
 
-1. Watch Wave 3 results (frieren #2928 rel-L2 is the highest-priority result)
-2. Review any WIP PRs that become ready
-3. If DM recipe transfer (Theme 1) fails universally → escalate to geometry-separated encoding
-4. If Wave 3 bold ideas show promise → double down with follow-up assignments
-5. Check for human team messages on GitHub issues
+1. **TandemFoil Paper baseline run** — assign first available idle student
+2. Watch Wave 3 results (frieren #2928 rel-L2 is the highest-priority result)
+3. Review any WIP PRs that become ready
+4. All new assignments: 4-dataset coverage mandatory per human team directive
+5. If DM recipe transfer (Theme 1) fails universally → escalate to geometry-separated encoding
+6. If Wave 3 bold ideas show promise → double down with follow-up assignments across all 4 datasets
+7. Check for human team messages on GitHub issues (priority — check very frequently)
