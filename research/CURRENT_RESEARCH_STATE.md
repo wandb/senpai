@@ -2,6 +2,10 @@
 
 - **Date:** 2026-04-21 (Round 37, post-review wave #2)
 - **Branch:** radford
+- **Current relaunch budget:** inherit the pod env defaults
+  - `SENPAI_TIMEOUT_MINUTES=360`
+  - `SENPAI_MAX_EPOCHS=999`
+  - any older `180` minute mentions below are historical and obsolete
 
 ## CURRENT BASELINES
 
@@ -38,8 +42,8 @@
 
 - `--no-use-ema` -- EMA bug, mandatory everywhere
 - `--epochs 999` -- Default is 2, must override
-- `SENPAI_MAX_EPOCHS=9999` -- Default cap of 50 kills long runs
-- `SENPAI_TIMEOUT_MINUTES=180` -- Default 30-min insufficient
+- `SENPAI_MAX_EPOCHS=999` -- current relaunch cap from the pod env; do not hardcode higher values by default
+- `SENPAI_TIMEOUT_MINUTES=360` -- current relaunch timeout from the pod env; do not hardcode `180`
 - Lion for TandemFoil; AdamW for AirfRANS/DrivAerML (AdamW vs Lion test in progress on TandemFoil)
 - DrivAerML: `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
 
