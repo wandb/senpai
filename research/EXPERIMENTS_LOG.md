@@ -1,5 +1,31 @@
 # SENPAI Research Results
 
+## 2026-04-21 — Round 18: 4L/512d Sent Back + Grad-Clip Sweep Data
+
+### PR #2691: DrivAerML 4L/512d (frieren) — SENT BACK (epoch cap bug)
+
+- 12.54% at 45 epochs (31 min). Student used `--epochs 50` instead of `--epochs 999`. Loss still steeply descending (63% → 12.5%). UNINTERPRETABLE — needs full 180-min budget. Sent back with corrected command.
+
+### PR #2707: AirfRANS grad-clip=0.5 (haku) — CLOSED ✗
+
+- 0.01446 (+1.9% worse than 0.01419 baseline). Tighter clip counterproductive: 98.6-100% batches clipped (vs 91-98% at clip=1.0). Val-test gap doubles. Hypothesis cleanly falsified — optimal clip is ≥1.0, not <1.0.
+
+### PR #2623: TandemFoil MQA audit (gen, human-directed) — SENT BACK
+
+- MQA: 45.95 at epoch 99 (120ep). Doesn't beat 45.07 baseline. BUT MQA halves val-test gap (4.96 vs 9.12) and beats non-MQA control by 2.1%. Genuine regularization benefit. Sent back to rerun with winning lr=2e-4 config.
+
+### PR #2696: DrivAerML 4L/384d seed sweep (askeladd) — CLOSED (valuable data)
+
+- 5 seeds at 30-min: 13.90-14.70% (std=0.33%). Can't compare to 5.73% baseline (180-min).
+- KEY INSIGHT: 4L/384d has remarkably LOW seed sensitivity (0.33% std vs 30pp+ at 4L/256d). No lucky seeds needed — one run is representative.
+
+### Round 18 Assignments
+
+| Student | PR | Experiment |
+|---|---|---|
+| haku | #2737 | AirfRANS lr=7e-4+grad-clip=1.5 (fill sweep gap) |
+| askeladd | #2738 | DrivAerML 4L/384d+lr=2e-4 (transfer TandemFoil finding, 180-min) |
+
 ## 2026-04-21 — Round 17: lr=2e-4 Breakthrough + Massive Cleanup
 
 ### PR #2610: TandemFoil lr=2e-4+T_max=10 — MERGED ✓ NEW BEST (45.07)
