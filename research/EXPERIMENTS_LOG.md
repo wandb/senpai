@@ -1,5 +1,57 @@
 # SENPAI Research Results
 
+## 2026-04-21 — Round 35: AirfRANS BEATS EXTERNAL TARGET — Extended Training Breakthrough (0.003904!)
+
+### PR #2755 (shoya): AirfRANS 4L/256d extended run (SENPAI_MAX_EPOCHS=9999, 180-min) — MERGED ✓ NEW BEST
+
+| Metric | This Run | Previous Baseline | External Target |
+|---|---|---|---|
+| val_primary/surface_mse | **0.003904** (ep201) | 0.007264 (ep40) | 0.0043 |
+| Delta vs baseline | **-46.2%** | — | **-9.2% (BEATEN!)** |
+| Surface Ux | 4.97e-05 | — | — |
+| Surface Uy | 1.09e-05 | — | — |
+| Surface p | 0.01555 | — | — |
+| full_val/volume_mse | 0.03198 | — | — |
+| W&B | stxm16tv | ruurxdqs | — |
+| Epochs | 223 (diverged ep208) | 50 (epoch-capped) | — |
+
+**Key findings:**
+- **Same code as baseline (#2727)** — the ONLY change is `SENPAI_MAX_EPOCHS=9999` unlocking 4.5x more training
+- Progressive descent through clear phases: 0.237(ep4)→0.081(ep17)→0.023(ep29)→0.00965(ep43)→0.00620(ep76)→0.00468(ep158)→**0.003904(ep201)**
+- Consistent sub-0.007264 from epoch 76 onward
+- Catastrophic divergence at ep208 (grad norms→∞, surface_mse→0.628) — T_max=5 aggressive cycling eventually triggers irreversible instability
+- **Test metrics invalid** — final evaluation was on diverged model; checkpoint-at-best is critical
+- CONFIRMED: golden config at 4L/256d was severely epoch-starved. This was a hidden capacity bug, not an architectural ceiling.
+
+**Two independent paths to sub-0.0043 now confirmed:**
+1. Extended training at 4L/256d golden config (this PR, 0.003904 at ep201)
+2. Pressure-weight 20x at 3L/192d (nami #2703, 0.00435 at ep117, pending merge/rebase)
+
+**Follow-up assignments:** armin #2816 (5L/256d+gc=0.5 stability), shoya #2817 (4L/256d+T_max=10 prevent divergence)
+
+### PR #2799 (armin): AirfRANS 5L/256d+golden config — CLOSED ✗ (doesn't beat new baseline)
+
+| Metric | This Run | New Baseline |
+|---|---|---|
+| val_primary/surface_mse | 0.005206 (ep56) | 0.003904 |
+| Delta vs new baseline | -33.3% worse | — |
+| W&B | zc6sryys | stxm16tv |
+| Epochs completed | 83 (diverged ep72) | 223 |
+
+**Key findings:**
+- 5L/256d achieves 0.005206 at ep56 — faster convergence speed than 4L (needed ep201) but diverges earlier (ep72 vs ep208)
+- Divergence pattern: grad norms 284→641→1433→3313. gc=1.0 insufficient for 5L gradient dynamics
+- Depth scaling is non-diminishing: 3L→4L=+22.3%, 4L→5L=+28.3% vs old baseline
+- Follow-up: armin #2816 (5L+gc=0.5) to stabilize for extended training
+
+### Round 35 Assignments
+| Student | PR | Experiment | Dataset |
+|---|---|---|---|
+| armin | #2816 | 5L/256d + gc=0.5 extended (stabilize fast convergence) | AirfRANS |
+| shoya | #2817 | 4L/256d + T_max=10 extended (prevent ep208 divergence) | AirfRANS |
+
+---
+
 ## 2026-04-21 — Round 32: TandemFoil lr=1.5e-4 New Best (44.72), pressure-weight sweep expanding
 
 ### PR #2724 (gilbert): TandemFoil lr=1.5e-4 — MERGED ✓ NEW BEST (44.72)

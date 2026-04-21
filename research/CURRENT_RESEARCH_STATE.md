@@ -1,130 +1,148 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-21 (Round 30 complete)
+- **Date:** 2026-04-21 (Round 35 complete)
 - **Branch:** radford
 
-## ⚠ PRESSURE-WEIGHT BREAKTHROUGH — PENDING MERGE
+## ⚡ EXTERNAL TARGET BEATEN — AirfRANS 0.003904 < 0.0043
 
-**PR #2703 (nami):** Pressure-weighted loss (20x) achieved **val_primary/surface_mse = 0.00435** at 3L/192d — **40% better than baseline, MATCHES external target 0.0043.** PR reopened, needs rebase before merge. Two students (edward, haku) assigned to independently implement and test at 4L/256d.
+**PR #2755 (shoya):** 4L/256d golden config with `SENPAI_MAX_EPOCHS=9999` + 180-min budget achieved **val_primary/surface_mse = 0.003904** at epoch 201 — **46.2% better than previous baseline, 9.2% better than external target 0.0043**. Same code as #2727, just more training. MERGED and on radford.
+
+Key insight: The golden config was severely epoch-starved at SENPAI_MAX_EPOCHS=50 (only used 61 of 180 min). With 9999 epochs, the model runs 223 epochs and descends through 6 distinct phases. **Extended training is the dominant lever.**
 
 ## CURRENT BASELINES
 
 | Dataset | Metric | Value | PR | Key Mechanism |
 |---|---|---|---|---|
-| TandemFoil | val_primary/surface_pressure_mae | **45.07** | #2610 (T_max=10, 3L/192d, Lion **lr=2e-4**, 119 ep) | **LOWER LR + MORE EPOCHS** |
-| AirfRANS | val_primary/surface_mse | **0.007264** | #2727 (**4L/256d** + T_max=5 + WD=1e-2 + gc=1.0, 50 ep, epoch-capped) | **ARCH SCALING + GOLDEN CONFIG** |
-| AirfRANS (unmerged) | val_primary/surface_mse | **0.00435** | #2703 (3L/192d, lr=3e-4, T_max=10, **pressure-weight=20**) | **LOSS REWEIGHTING** |
-| DrivAerML | val_primary/surface_rel_l2_pct | **4.619%** | #2691 (4L/**512d**/8H+T_max=30, 267 ep, 180-min) | **WIDTH SCALES AT 180-MIN** |
+| TandemFoil | val_primary/surface_pressure_mae | **44.72** | #2724 (gilbert — T_max=10, 3L/192d, Lion lr=1.5e-4, 115 ep) | **LOWER LR** |
+| AirfRANS | val_primary/surface_mse | **0.003904** | #2755 (shoya — 4L/256d golden config, 223 ep, 180-min) | **EXTENDED TRAINING** |
+| DrivAerML | val_primary/surface_rel_l2_pct | **4.619%** | #2691 (frieren — 4L/512d/8H+T_max=30, 267 ep, 180-min) | **WIDTH SCALES** |
 
 ## EXTERNAL TARGETS
 
-| Dataset | External Best | Our Best (merged) | Our Best (unmerged) | Gap |
-|---|---|---|---|---|
-| AirfRANS | 0.0043 | 0.007264 | **0.00435** | **≈1.0x (MATCHED!)** |
-| DrivAerML | <3.71% | 4.619% | — | **1.24x** |
+| Dataset | External Best | Our Best | Gap |
+|---|---|---|---|
+| AirfRANS | 0.0043 | **0.003904** | **BEATEN by 9.2%** |
+| DrivAerML | <3.71% | 4.619% | **1.24x** |
 
-## CRITICAL INSIGHTS (Rounds 17-30)
+## CRITICAL INSIGHTS (Rounds 17-35)
 
-1. **🔥 PRESSURE-WEIGHTED LOSS = BIGGEST SINGLE IMPROVEMENT** (Round 30): 20x upweighting of pressure channel MSE achieves 0.00435 at 3L/192d — 40% better than 4L/256d golden config baseline. Fixes fundamental gradient misallocation: pressure dominates composite MSE but gets equal gradient share. Phase transition delayed (ep117 vs ep23) but converges much deeper. EVERY future AirfRANS experiment should use `--pressure-loss-weight 20`.
+1. **🔥 EXTENDED TRAINING = BIGGEST AIRFRANS LEVER** (Round 35): Removing SENPAI_MAX_EPOCHS=50 cap at 4L/256d golden config achieves 0.003904 in 223 epochs (180-min). Progressive descent through 6 phases. Catastrophic divergence at ep208 — checkpoint-at-best essential. T_max=5 aggressive cycling eventually triggers gradient explosions.
 
-2. **4L/256d + GOLDEN CONFIG = BREAKTHROUGH** (Round 24): 4L/256d achieves 0.007264 vs 0.00935 at 3L/192d (-22.3%). Grad norms stabilize (18.7→7.1). Hit epoch cap at 61 min — trough still descending.
+2. **TWO INDEPENDENT PATHS TO SUB-0.0043**: (1) Extended training at 4L/256d golden config (0.003904, merged), (2) Pressure-weight 20x at 3L/192d (0.00435, PR #2703 pending rebase). Combining both is the obvious mega-experiment once pressure-weight code lands on radford.
 
-3. **gc=1.5 DEAD AT 4L/256d** (Rounds 27-29): 5 independent confirmations. Deeper architectures amplify gradients making gc=1.5 harmful.
+3. **5L DEPTH SCALING: FAST BUT FRAGILE** (Round 35): armin's 5L/256d achieved 0.005206 at ep56 (28.3% better than OLD baseline), but diverged at ep72. Faster convergence per epoch than 4L, but unstable. gc=0.5 assigned to stabilize.
 
-4. **WIDTH SCALES ON DrivAerML** (Round 28): 4L/512d (4.619%) beats 4L/320d (5.027%). Capacity wins over throughput at 180-min uncapped.
+4. **PRESSURE-WEIGHTED LOSS = GRADIENT MISALLOCATION FIX** (Round 30): 20x upweighting of pressure channel MSE achieves 0.00435 at 3L/192d. PR #2703 (nami) still needs rebase before merge.
 
-5. **WD=1e-2 DOES NOT TRANSFER TO DrivAerML** (Round 29): Catastrophic divergence. DrivAerML needs milder regularization.
+5. **4L/256d + GOLDEN CONFIG** (Round 24): Architecture + WD=1e-2 + T_max=5 stabilizes training. Grad norms 18.7→7.1. Was epoch-capped at 50 (now fixed with SENPAI_MAX_EPOCHS=9999).
 
-5. **T_max=3 TOO SHORT FOR 4L/256d** (Round 29): 0.011601 vs 0.007264 baseline. T_max hierarchy: T_max=5 ≈ baseline > T_max=3 (1.6x worse).
+6. **gc=1.5 DEAD AT 4L/256d** (Rounds 27-29): 5 independent confirmations. Deeper architectures amplify gradients.
 
-6. **LOWER LR + MORE EPOCHS** (Round 17): TandemFoil lr=2e-4 at 3L/192d (45.07, 119ep) beats lr=3e-4 at 5L/256d (52.81, 67ep).
+7. **WIDTH SCALES ON DrivAerML** (Round 28): 4L/512d (4.619%) beats 4L/320d (5.027%). Capacity wins at 180-min.
 
-7. **WD + GRAD-CLIP COMPOUNDS on AirfRANS** (Round 19): WD=1e-2 alone fails but with gc=1.0 achieves breakthroughs. Clipping prevents gradient explosions so WD provides clean regularization.
+8. **WD=1e-2 CATASTROPHIC ON DrivAerML** (Round 29): Confirmed. Grad norms 231x normal.
 
-8. **30-MIN TIMEOUT KILLS 4L/256d AirfRANS**: Model gets 36-37 epochs vs baseline's 50 (61 min). ALL 4L/256d AirfRANS experiments MUST use SENPAI_TIMEOUT_MINUTES≥60.
+9. **T_max=3 TOO SHORT FOR 4L/256d** (Round 29): 0.011601 vs 0.007264 baseline.
 
-## MANDATORY CONFIG FLAGS
+10. **LOWER LR + MORE EPOCHS** (Round 17): TandemFoil lr=2e-4 → 1.5e-4 → trend continues downward.
+
+## MANDATORY CONFIG FLAGS (ALL EXPERIMENTS)
 
 - `--no-use-ema` — EMA bug, mandatory everywhere
 - `--epochs 999` — Default is 2, must override
-- `SENPAI_MAX_EPOCHS=9999` — Default cap of 50 kills long runs
+- `SENPAI_MAX_EPOCHS=9999` — Default cap of 50 kills long runs (**CRITICAL — caused epoch starvation**)
 - `SENPAI_TIMEOUT_MINUTES=180` — Default 30-min insufficient for DrivAerML and 4L+ models
 - Lion optimizer for TandemFoil; AdamW for AirfRANS/DrivAerML
 
 ## ACTIVE EXPERIMENTS BY DATASET
 
-### AirfRANS (Baseline: 0.007264, 4L/256d+gc=1.0+WD=1e-2+T_max=5)
+### AirfRANS (Baseline: 0.003904, 4L/256d golden config, 223 epochs)
 | Student | PR | Experiment | Priority |
 |---|---|---|---|
-| armin | NEW | 5L/256d+golden config | HIGH — depth scaling |
-| kohaku | NEW | 4L/256d+lr=5e-4+golden | HIGH — LR sweep |
-| emma | #2768 | 4L/256d+lr=5e-4 (sent back for timeout) | HIGH |
-| haku | #2791 | gc=1.5+no WD+T_max=10 (cleanest gc=1.5 test) | MEDIUM |
-| hinata | #2770 | WD=5e-3 | MEDIUM |
-| roy | #2774 | gc=0.5 | MEDIUM |
-| chihiro | #2780 | 4L/320d+golden | MEDIUM |
-| itachi | #2771 | 3L/256d (width vs depth) | MEDIUM |
-| nezuko | #2778 | WD=0 ablation | MEDIUM |
-| shinji | #2763 | T_max=10 (gc=1.0) | LOW |
-| winry | #2765 | gc=2.0 | LOW |
-| giyu | #2764 | lr=1e-3 | LOW |
-| edward | #2762 | gc=1.5+T_max=10 | LOW (gc=1.5 dead) |
-| norman | #2784 | gc=1.5+WD=5e-3 | LOW (gc=1.5 dead) |
-| taki | #2785 | gc=1.5+no WD | LOW (gc=1.5 dead) |
-| shouko | #2786 | T_max=7 | LOW |
+| edward | #2801 | 20x pressure-weight at 4L/256d + golden + SENPAI_MAX_EPOCHS=9999 | **CRITICAL** — mega-experiment |
+| haku | #2802 | 20x pressure-weight at 4L/256d + lr=3e-4 + SENPAI_MAX_EPOCHS=9999 | **CRITICAL** — mega-experiment |
+| armin | #2816 | 5L/256d + gc=0.5 extended (stabilize fast convergence) | HIGH |
+| shoya | #2817 | 4L/256d + T_max=10 extended (prevent ep208 divergence) | HIGH |
+| chihiro | #2811 | pressure-weight 10x at 3L/192d | HIGH |
+| tetsuo | #2809 | pressure-weight 30x at 3L/192d | HIGH |
+| violet | #2812 | pressure-weight 50x at 3L/192d | HIGH |
+| nezuko | #2808 | 4L/256d baseline replication seed=789 | MEDIUM |
+| luffy | #2807 | 4L/256d lr=3e-4 + T_max=10 (isolate nami hyperparams) | MEDIUM |
+| kohaku | #2800 | 4L/256d lr=5e-4 golden | MEDIUM |
+| nami | #2703 | pressure-weight 20x at 3L/192d (NEEDS REBASE) | HIGH |
+| nami | #2758 | 5L/256d golden | MEDIUM |
+| thorfinn | #2786 | T_max=7 at 4L/256d | LOW |
+| winry | #2778 | WD=0 ablation at 4L/256d | LOW |
+| roy | #2774 | gc=0.5 at 4L/256d | LOW (now covered by armin's extended run) |
+| itachi | #2771 | 3L/256d golden (width vs depth) | LOW |
+| hinata | #2770 | WD=5e-3 at 4L/256d | LOW |
+| emma | #2768 | 4L/256d lr=5e-4 | LOW |
+| giyu | #2765 | gc=2.0 at 4L/256d | LOW |
+| inosuke | #2764 | lr=1e-3 at 4L/256d | LOW |
+| mitsuha | #2763 | T_max=10 at 4L/256d | LOW (now covered by shoya's extended run) |
+| asuka | #2760 | 4L/384d golden | LOW |
 
-### TandemFoil (Baseline: 45.07, 3L/192d+lr=2e-4+T_max=10)
+### TandemFoil (Baseline: 44.72, 3L/192d+lr=1.5e-4+T_max=10)
 | Student | PR | Experiment | Priority |
 |---|---|---|---|
-| kakashi | #2775 | 5L/256d+lr=2e-4 | HIGH — compound breakthrough |
-| sasuke | #2772 | 4L/256d+lr=2e-4 | HIGH — arch transfer |
-| gen | #2796 | 4L/256d transfer | HIGH |
-| historia | #2792 | lr=1.5e-4 | HIGH — LR sweep |
-| mikasa | #2777 | WD=1e-2+gc=1.0 transfer | HIGH |
-| sakura | #2773 | T_max=5 | MEDIUM |
-| senku | #2788 | WD+gc at lr=2e-4 | MEDIUM |
-| violet | #2789 | 3L/256d wider | MEDIUM |
+| gilbert | #2810 | lr=1.25e-4 + gc=1.0 | HIGH — LR trend continues |
+| sakura | #2813 | lr=1e-4 at 3L/192d | HIGH — push LR lower |
+| kakashi | #2775 | 5L/256d+lr=2e-4 | MEDIUM |
+| gen | #2796 | 4L/256d architecture transfer | MEDIUM |
+| historia | #2792 | lr=1.5e-4 (sent back) | MEDIUM |
+| shinji | #2789 | 3L/256d wider | LOW |
+| norman | #2788 | WD+gc at lr=2e-4 | LOW |
+| kaworu | #2754 | golden config (WD+T_max=5) at lr=2e-4 | LOW |
+| alphonse | #2753 | gc=1.5 at lr=2e-4 | LOW |
+| senku | #2731 | WD=1e-2+lr=2e-4 | LOW |
+| naruto | #2728 | gc=1.0+lr=2e-4 | LOW |
+| tanjiro | #2722 | lr=2e-4+T_max=20 | LOW |
+| mikasa | #2777 | WD+gc golden config transfer | LOW |
+| sasuke | #2772 | 4L/256d+lr=2e-4 | LOW |
 
 ### DrivAerML (Baseline: 4.619%, 4L/512d/8H+T_max=30)
 | Student | PR | Experiment | Priority |
 |---|---|---|---|
-| shouko | NEW | 5L/512d depth scaling | HIGH |
-| eren | NEW | 4L/512d+T_max=10 | HIGH |
-| zenitsu | NEW | 4L/640d push width | HIGH |
-| shinobu | NEW | 4L/512d+lr=7e-4 | HIGH |
+| zenitsu | #2805 | 4L/640d push width | HIGH |
+| shouko | #2803 | 5L/512d depth scaling | HIGH |
+| shinobu | #2806 | 4L/512d+lr=7e-4 | HIGH |
+| eren | #2804 | 4L/512d+T_max=10 | HIGH |
+| rei | #2815 | 4L/512d+T_max=50 | HIGH |
 | ray | #2797 | 4L/512d+lr=3e-4 | HIGH |
 | kaneda | #2798 | 4L/512d+gc=0.5 | HIGH |
 | frieren | #2793 | 4L/512d+gc=1.5 | HIGH |
-| fern | #2794 | 4L/512d+WD=1e-2 | MEDIUM (WD may diverge) |
-| rei | #2795 | 4L/512d+T_max=20 | HIGH |
-| levi | #2779 | 4L/320d+lr=3e-4 | LOW (superseded arch) |
+| taki | #2814 | 4L/512d+WD=1e-3+gc=0.5 (mild regularization) | MEDIUM |
+| fern | #2794 | 4L/512d+WD=1e-2 (likely diverge) | LOW |
+| levi | #2779 | 4L/320d+lr=3e-4 | LOW (superseded by 4L/512d) |
 | chrome | #2781 | 4L/320d+T_max=10 | LOW |
 | zoro | #2782 | 4L/320d+gc=1.5 | LOW |
 | askeladd | #2787 | 4L/320d+lr=7e-4 | LOW |
+| ymir | #2756 | 4L/320d+T_max=20 | LOW |
+
+## CRITICAL PENDING ACTIONS
+
+1. **Merge nami #2703** (pressure-weight 20x, 0.00435) — BLOCKED on rebase. Once merged, all AirfRANS experiments should add `--pressure-loss-weight 20`.
+2. **Watch edward #2801 + haku #2802** — mega-experiments combining pressure-weight + 4L/256d extended training. Expected to push well below 0.003.
+3. **Watch armin #2816 + shoya #2817** — stability fixes for extended training. Could unlock even deeper convergence.
+4. **DrivAerML 1.24x gap** — aggressive 4L/512d sweep in progress. Width (#2805) and depth (#2803) scaling are the priority.
 
 ## Next Priority Directions
 
-### AirfRANS — PRESSURE-WEIGHT IS THE DOMINANT LEVER
-1. **🔥 Merge PR #2703 (nami pressure-weight)** — BLOCKED on rebase. Once merged, ALL AirfRANS experiments should use `--pressure-loss-weight 20`.
-2. **Pressure-weight at 4L/256d** (edward + haku) — combining the biggest single improvement (pressure-weight) with the best architecture (4L/256d+golden). Expected to push well below 0.0043.
-3. **Pressure-weight sweep** — after merging: test 10x, 15x, 30x, 50x at 4L/256d
-4. **lr=3e-4 + T_max=10 at golden config** (luffy) — test nami's hyperparams without pressure-weight to isolate effects
-5. **Seed=789 + golden config replication** (nezuko) — extended baseline with proper timeout/epoch settings
-6. **Shoya #2755 extended run** — still the most critical pending result for non-pressure-weight baseline
-7. After pressure-weight merge: pressure-weight + 5L/256d, pressure-weight + 4L/320d
+### AirfRANS — PUSH BELOW 0.003
+1. **Wait for edward #2801 + haku #2802** — pressure-weight + 4L/256d extended = biggest expected compound improvement
+2. **Pressure-weight sweep results** (chihiro 10x, tetsuo 30x, violet 50x) — find optimal weight
+3. **Stability fixes** (armin 5L+gc=0.5, shoya 4L+T_max=10) — prevent divergence in extended training
+4. **After nami rebase**: pressure-weight at 5L/256d + pressure-weight at 4L/320d
+5. **After stability resolved**: 6L/256d depth scaling
 
-### DrivAerML (1.24x from external — aggressive 4L/512d sweep)
-1. **Width scaling** (zenitsu: 4L/640d) — push the width frontier
-2. **Depth scaling** (shouko: 5L/512d) — depth + width compound
-3. **LR sweep** (ray: lr=3e-4, shinobu: lr=7e-4) — bracket optimal LR
-4. **T_max sweep** (eren: T_max=10, rei: T_max=20) — faster cycling
-5. **Regularization** (kaneda: gc=0.5, frieren: gc=1.5) — gc-only is safer than WD
-6. After results: consider pressure-weight transfer to DrivAerML
-7. Watch fern #2794 (WD=1e-2) — likely to diverge
+### DrivAerML — CLOSE THE 1.24x GAP
+1. **Width frontier** (zenitsu 4L/640d) — push width
+2. **Depth + width** (shouko 5L/512d) — compound scaling
+3. **LR bracket** (ray lr=3e-4, shinobu lr=7e-4) — find optimal LR
+4. **T_max sweep** (eren T_max=10, rei T_max=50) — find stable schedule
+5. **After AirfRANS pressure-weight lands**: test pressure-weight concept on DrivAerML
 
-### TandemFoil (Focus on sustained improvement)
-1. **5L/256d+lr=2e-4** (kakashi #2775) — compound of depth+LR breakthroughs
-2. **4L/256d+lr=2e-4** (sasuke #2772, gen #2796) — architecture transfer
-3. **lr=1.5e-4** (historia #2792) — push LR even lower
-4. **Golden config transfer** (mikasa #2777, senku #2788) — WD+gc from AirfRANS
-5. After AirfRANS pressure-weight merge: test pressure-weighting concept on TandemFoil
+### TandemFoil — CONTINUE LR DESCENT
+1. **lr=1.25e-4** (gilbert #2810) — LR trend shows monotonic improvement as LR decreases
+2. **lr=1e-4** (sakura #2813) — push even lower
+3. **After AirfRANS pressure-weight validated**: test pressure-weighting concept on TandemFoil
