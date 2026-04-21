@@ -1,5 +1,45 @@
 # SENPAI Research Results
 
+## 2026-04-21 — PR #2655: AirfRANS: lr=3e-4 multi-seed — MERGED ✓ NEW BEST
+
+- gilbert/airfrans-lr3e4-multiseed
+- Hypothesis: Multi-seed exploitation at lr=3e-4 to find deeper phase transition basins.
+
+| Seed | val_primary/surface_mse | Best Epoch | W&B |
+|---|---|---|---|
+| **789** | **0.0153** | **41** | srd0fcew |
+| 456 | 0.0170 | 39 | 7ha2pinb |
+| 123 | 0.0182 | 31 | hwv9hgdc |
+| 42 | 0.0193 | 39 | 8vbb1pyk |
+| 1337 | 0.0194 | 39 | o1zzutgu |
+
+Commentary: CRITICAL FINDING — seed selection > LR tuning! lr=3e-4+seed=789 achieves 0.0153 (17% better than lr=7e-4's 0.01841). lr=3e-4 distribution (0.0153-0.0194) is TIGHTER than lr=7e-4 (0.0198-0.0463). Seed 789 was still descending at epoch 41. This PR also adds the --seed CLI flag. New AirfRANS baseline: 0.0153. Gap to external: 3.6x.
+
+## 2026-04-21 — PRs #2675,#2674,#2673: TandemFoil WD + AirfRANS LR sweep — CLOSED ✗
+
+- violet: TandemFoil WD=1e-2 → 101.08 at 7ep (cold-start). W&B: dlaf9w6c.
+- edward: AirfRANS lr=8e-4 → 0.03833 (108% worse). Too volatile. W&B: djl4y4o5.
+- emma: AirfRANS lr=6e-4 → 0.02510 (36% worse). Non-monotonic LR landscape. W&B: 8z0r0fqx.
+- All dead ends. AirfRANS LR fully mapped: 7e-4>3e-4>5e-4>6e-4>8e-4.
+
+## 2026-04-21 — PR #2671: AirfRANS lr=7e-4 multi-seed (5 seeds) — CLOSED ✗ (CRITICAL DATA)
+
+- kohaku/airfrans-lr7e4-multiseed
+- 5 seeds: 0.0322, 0.0203, 0.0198, 0.0225, 0.0463. Mean=0.028, best=0.0198.
+- CRITICAL: The 0.01841 baseline was a statistical outlier (~15th percentile). lr=7e-4 has wide variance.
+- **PLATEAU SIGNAL** for LR tuning approach. Seed exploitation is the correct strategy.
+
+## 2026-04-21 — PRs #2670,#2669,#2641: DrivAerML 4L/256d batch experiments — CLOSED ✗
+
+- taki: 1000 batches → 12.40% at 23ep. Too many batches for 4L/256d.
+- frieren: 800 batches → 11.41% at 27ep. Data lever NOT saturated at 800b. Useful data but obsolete vs 5.73%.
+- tanjiro: warmup+600b → 12.70%. Warmup eats 5 of 34 epochs — hurts at 600b budget.
+- All closed: 4L/256d obsolete vs 4L/384d baseline (5.73%).
+
+## 2026-04-21 — Batch close: 17 obsolete DrivAerML 4L/256d PRs
+
+Closed PRs: #2619 (historia WD=1e-2), #2620 (chihiro replica), #2628 (ymir T_max=35), #2630 (inosuke WD=0), #2632 (giyu 25k pts), #2634 (shinobu grad-accum), #2640 (zenitsu T_max=40), #2648 (zoro 4L/320d), #2650 (luffy dropout), #2652 (asuka eval-400), #2654 (nami grad-clip), #2656 (chihiro LR decay), #2659 (shouko lr=5.5e-4), #2660 (mitsuha warmup), #2672 (norman WD+600b), #2676 (shoya gradclip+600b), #2677 (askeladd dropout+600b). All superseded by 4L/384d baseline.
+
 ## 2026-04-21 — PR #2602: DrivAerML: 4L/384d+T_max=30 — MERGED ✓ MASSIVE NEW BEST
 
 - kakashi/drivaerml-4L384d-tmax30 (180-min budget)

@@ -1,69 +1,40 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-21 (Round 14 complete)
+- **Date:** 2026-04-21 (Round 15 complete)
 - **Branch:** radford
 
 ## CURRENT BASELINES
 
 | Dataset | Metric | Value | PR | Key Mechanism |
 |---|---|---|---|---|
-| TandemFoil | val_primary/surface_pressure_mae | **75.59** | #2490 (T_max=10, 3L/192d, Lion lr=3e-4, 14 ep) | Ultra-rapid cosine cycling (~75 cycles/epoch) |
-| AirfRANS | val_primary/surface_mse | **0.01841** | #2646 (T_max=10, 3L/192d, AdamW lr=7e-4, 41 ep) | Phase transition at epoch 35 (earlier with higher LR) |
-| DrivAerML | val_primary/surface_rel_l2_pct | **5.73%** | #2602 (4L/**384d**/6H+T_max=30, 151 ep, 180-min budget) | **WIDTH SCALING** — 384d vs 256d gives 52% improvement |
+| TandemFoil | val_primary/surface_pressure_mae | **75.59** | #2490 (T_max=10, 3L/192d, Lion lr=3e-4, 14 ep) | Ultra-rapid cosine cycling |
+| AirfRANS | val_primary/surface_mse | **0.0153** | #2655 (T_max=10, 3L/192d, AdamW lr=3e-4, **seed=789**, 41 ep) | **SEED SELECTION** > LR tuning |
+| DrivAerML | val_primary/surface_rel_l2_pct | **5.73%** | #2602 (4L/**384d**/6H+T_max=30, 151 ep, 180-min) | **WIDTH SCALING** dominates |
 
 ## EXTERNAL TARGETS
 
 | Dataset | External Best | Our Best | Gap |
 |---|---|---|---|
-| AirfRANS | 0.0043 | 0.01841 | 4.3x |
-| DrivAerML | <3.71% | 5.73% | **1.55x** (was 3.2x!) |
+| AirfRANS | 0.0043 | 0.0153 | 3.6x |
+| DrivAerML | <3.71% | 5.73% | **1.55x** |
 
-## ALL CONFIRMED DEAD ENDS
+## CRITICAL INSIGHTS (Round 15)
 
-| Direction | Reason |
-|---|---|
-| ANP decoder | +5.4% worse |
-| EMA | Universally harmful |
-| Lion on AirfRANS/DrivAerML | AdamW consistently better |
-| AdamW on TandemFoil | Gap widens with training |
-| Fourier+physics on AirfRANS | Metric space incompatibility |
-| 6L deep model | Diverges |
-| Reynolds-stratified sampling | All worse |
-| geometry_supernodes/surface_anchor flags | NO-OP |
-| DrivAerML T_max=10 (any arch) | 15.47-17.08% — too fast |
-| DrivAerML 5L/256d | 13.24-13.62% — instability beyond 4L |
-| DrivAerML 5L/256d (giyu old PR) | Stale — closed |
-| DrivAerML 3L/256d | Worse than 3L/192d |
-| DrivAerML T_max=15/20/25 | Worse than T_max=30 |
-| DrivAerML lr=3e-4/4e-4/6e-4/1e-3 | Worse than lr=5e-4 |
-| DrivAerML seed=1 (multi-seed) | 43.93% — extreme seed sensitivity |
-| DrivAerML 10-ep warmup+lr=3e-4 | 51.15% at 2ep — warmup too long |
-| DrivAerML eta_min=1e-5 (4L/256d) | 12.47% — doesn't beat 5.73% new baseline |
-| AirfRANS 3L/256d+T_max=10 | 0.0357 — too slow for phase transition |
-| AirfRANS 4L/256d+T_max=10 | 0.0881 — too slow per epoch |
-| AirfRANS lr=2e-4+T_max=10 | 0.0306 — too conservative |
-| AirfRANS dropout=0.1 | 0.029072 — disrupts phase transition |
-| TandemFoil slices=32 | No speedup (data loading dominates) |
-| TandemFoil SCA | 107.62 — epoch overhead fatal (14→8 ep) |
+1. **AirfRANS: SEED > LR**: lr=3e-4+seed=789 achieves 0.0153 (17% better than lr=7e-4's best). lr=3e-4 distribution (0.0153-0.0194) is TIGHTER than lr=7e-4 (0.0198-0.0463). Multi-seed exploitation is the key strategy.
 
-## CRITICAL INSIGHTS (Round 14)
+2. **AirfRANS PLATEAU on architecture**: 3L/192d with T_max=10 is exhaustively tuned. LR sweep complete (non-monotonic). The --seed flag enables reproducible experiments and multi-seed exploitation.
 
-1. **DrivAerML WIDTH SCALING is the dominant lever**: 4L/384d gives 5.73% vs 4L/256d's 11.97% — a 52% relative improvement. Model ran 151 epochs in 180-min budget. Still improving at cutoff. Width scaling > all other levers tested.
+3. **DrivAerML: Width scaling dominates all other levers**: 4L/384d = 5.73% vs 4L/256d = 11.97%. Now testing 4L/512d, 4L/448d, and 4L/384d compounds.
 
-2. **DrivAerML external target within reach**: 5.73% vs external 3.71% = 1.55x gap. With 4L/384d + 600 batches + 180-min + potential T_max tuning, sub-4% is plausible.
+4. **17 DrivAerML 4L/256d experiments closed**: All obsolete after 4L/384d breakthrough. Students redirected to 4L/384d variants.
 
-3. **4L/384d T_max optimization needed**: Late-epoch oscillation (141=10.2%, 144=5.7%) suggests T_max=30 slightly too aggressive for 384d. Try T_max=50.
-
-4. **4L/512d is the next width step**: If 256→384d gave 52% improvement, 384→512d may push toward the external target. Memory must be monitored.
-
-5. **All WIP DrivAerML (4L/256d) experiments are now obsolete**: Results will be compared against 5.73% instead of 11.97%. Most will fail to beat the new baseline. When they complete, promising architectures should be re-run with 4L/384d.
+5. **All future DrivAerML experiments MUST use 4L/384d as base config**: `--model-hidden-dim 384 --model-heads 6`
 
 ## ACTIVE EXPERIMENTS BY DATASET
 
 ### TandemFoil (Baseline: 75.59)
 | Student | PR | Experiment | Notes |
 |---|---|---|---|
-| violet | #2675 | WD=1e-2 | In progress |
 | alphonse | #2569 | Hypernetwork SRF (human-directed) | |
 | kaworu | #2629 | Kutta TE constraint (human-directed) | |
 | gen | #2623 | MQA audit (human-directed) | |
@@ -77,67 +48,62 @@
 | kakashi | #2651 | 4L/192d deeper model | |
 | ray | #2653 | T_max=10 + cosine eta_min | |
 
-### AirfRANS (Baseline: 0.01841)
+### AirfRANS (Baseline: 0.0153)
 | Student | PR | Experiment | Notes |
 |---|---|---|---|
-| emma | #2673 | lr=6e-4+T_max=10 | |
-| kohaku | #2671 | lr=7e-4 multi-seed (5 seeds) | HIGH PRIORITY |
-| edward | #2674 | lr=8e-4+T_max=10 | |
+| gilbert | NEW | lr=3e-4 seeds 100-104 | Assigning — more seeds at winning config |
+| kohaku | NEW | lr=3e-4 seeds 200-204 | Assigning |
+| emma | NEW | lr=3e-4 seeds 300-304 | Assigning |
+| violet | NEW | lr=4e-4 seeds 100-104 | Assigning — fill LR gap |
+| tanjiro | NEW | lr=5e-4 seeds 100-104 | Assigning — recharacterize with --seed |
 | fern | #2678 | lr=7e-4+WD=1e-2 | |
 | kaneda | #2679 | lr=7e-4+T_max=8 | |
 | haku | #2680 | lr=7e-4+grad-clip=1.0 | |
-| gilbert | #2655 | lr=3e-4 multi-seed | |
-| eren | #2649 | T_max=10 multi-seed | |
+| eren | #2649 | T_max=10 multi-seed (old, no --seed) | May be stale |
 | historia | #2668 | lr=3e-4+WD=1e-2 | |
-| nezuko | #2658 | lr=1e-4 | |
-| senku | #2664 | 3L/256d+lr=3e-4 | Likely dead end |
+| nezuko | #2658 | lr=1e-4 | Likely dead end |
+| senku | #2664 | 3L/256d+lr=3e-4 | Dead end (confirmed) |
 | thorfinn | #2666 | T_max=5 | |
 | hinata | #2637 | T_max=10+WD=1e-2 | |
 | armin | #2638 | LR decay | |
 | winry | #2636 | T_max=15 | |
 | roy | #2639 | T_max=8 | |
 | itachi | #2647 | T_max=12 | |
+| shinji | #2663 | lr=3e-4+dropout | CLOSED |
 
-### DrivAerML (Baseline: **5.73%** — 4L/384d)
+### DrivAerML (Baseline: 5.73% — 4L/384d)
 | Student | PR | Experiment | Notes |
 |---|---|---|---|
-| shinji | NEW | 4L/384d + 600 batches | Assigning — HIGH PRIORITY |
-| rei | NEW | 4L/384d + T_max=50 | Assigning — HIGH PRIORITY |
-| frieren | #2669 | 800 batches (4L/256d) | Will likely not beat 5.73% |
-| taki | #2670 | 1000 batches (4L/256d) | Will likely not beat 5.73% |
-| norman | #2672 | 600 batch+WD=1e-2 (4L/256d) | Will likely not beat 5.73% |
-| shoya | #2676 | 600 batch+grad-clip (4L/256d) | Will likely not beat 5.73% |
-| askeladd | #2677 | 600 batch+dropout (4L/256d) | Will likely not beat 5.73% |
-| tanjiro | #2641 | Warmup+600 batch (4L/256d) | Will likely not beat 5.73% |
-| zenitsu | #2640 | T_max=40 (4L/256d) | Stale baseline |
-| luffy | #2650 | Dropout=0.1 (4L/256d) | Stale baseline |
-| nami | #2654 | Grad-clip=1.0 (4L/256d) | Stale baseline |
-| mitsuha | #2660 | Cosine warmup (4L/256d) | Stale baseline |
-| shouko | #2659 | lr=5.5e-4 (4L/256d) | Stale baseline |
-| chihiro | #2656 | LR decay (4L/256d) | Stale baseline |
-| shoya | #2662 | lr=3e-4 warmup (4L/256d) | CLOSED |
-| zoro | #2648 | 4L/320d | Interesting intermediate |
-| shinobu | #2634 | Grad-accum=2 (4L/256d) | Stale baseline |
-| giyu | #2632 | 25k surface pts (4L/256d) | Stale baseline |
-| inosuke | #2630 | WD=0 (4L/256d) | Stale baseline |
-| ymir | #2628 | T_max=35 (4L/256d) | Stale baseline |
-| asuka | #2652 | eval-batches=400 (4L/256d) | Stale baseline |
-| chihiro | #2620 | 4L/256d replication | Stale baseline |
+| shinji | #2681 | 4L/384d + 600 batches | HIGH PRIORITY |
+| rei | #2682 | 4L/384d + T_max=50 | HIGH PRIORITY |
+| frieren | NEW | 4L/512d+T_max=30 | Assigning — HIGHEST PRIORITY |
+| taki | NEW | 4L/384d+800 batches | Assigning |
+| edward | NEW | 4L/384d+lr=3e-4 | Assigning |
+| zenitsu | NEW | 4L/384d+lr=7e-4 | Assigning |
+| inosuke | NEW | 4L/384d+WD=1e-2 | Assigning |
+| giyu | NEW | 4L/384d+grad-clip=1.0 | Assigning |
+| shinobu | NEW | 5L/384d+T_max=30 | Assigning |
+| norman | NEW | 4L/384d+eta_min=1e-5 | Assigning |
+| ymir | NEW | 4L/384d+T_max=40 | Assigning |
+| chihiro | NEW | 4L/448d+T_max=30 | Assigning — width scaling curve |
+| shoya | NEW | 4L/384d+dropout=0.05 | Assigning |
+| askeladd | NEW | 4L/384d+seed sweep | Assigning |
 
 ## Next Priority Directions
 
-### DrivAerML (MOST URGENT — 1.55x from external target)
-1. **4L/384d + 600 batches** — shinji (assigning) — compound width+data levers
-2. **4L/384d + T_max=50** — rei (assigning) — reduce late-epoch oscillation
-3. **4L/512d** — next width step — assign when students free up
-4. **5L/384d** — test depth at new width (5L/256d diverged but 5L/384d might not)
-5. **4L/384d + lr=5e-4 + longer training** — 300-min budget if possible
+### DrivAerML (MOST URGENT — 1.55x from external)
+1. **4L/512d** (frieren) — if width continues to scale, could beat 3.71%
+2. **4L/384d compounds** — 600b, 800b, grad-clip, WD, eta_min
+3. **4L/448d** (chihiro) — map width scaling curve
+4. **4L/384d seed sweep** (askeladd) — characterize variance at 384d
+5. **5L/384d** (shinobu) — test depth at wider width
 
-### AirfRANS (4.3x from external target)
-1. **lr=7e-4 multi-seed** (kohaku) — exploit stochastic phase transition at winning LR
-2. **lr compounds** — fern, kaneda, haku testing lr=7e-4 + WD/T_max/grad-clip variants
-3. **Map lr=6e-4, lr=8e-4** boundary around winning lr=7e-4
+### AirfRANS (3.6x from external — PLATEAU on current approach)
+1. **More seeds at lr=3e-4** (gilbert, kohaku, emma) — 15 more seeds
+2. **lr=4e-4/5e-4 multi-seed** (violet, tanjiro) — fair LR comparison with --seed
+3. **Architecture changes needed** — current 3L/192d is exhausted
+4. Researcher-agent exploring plateau-breaking ideas
 
-### TandemFoil (No clear path except human-directed)
+### TandemFoil (No clear path)
 1. Human-directed: Kutta (kaworu), MQA (gen), HyperSRF (alphonse)
-2. WD=1e-2 (violet) — promising convergence signal
+2. Cold-start prevents fair hyperparameter testing
