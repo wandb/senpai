@@ -107,6 +107,7 @@ class TrainConfig:
     volume_anchor_points: int = 8_000
     save_checkpoint: bool = False
     multi_query: bool = False
+    kv_heads: int = 0
 
 
 @dataclass
@@ -417,6 +418,7 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
         "mlp_ratio": config.model_mlp_ratio,
         "slice_num": config.model_slices,
         "multi_query": config.multi_query,
+        "kv_heads": config.kv_heads,
     }
     if config.model == "reference_transolver":
         return ReferenceTransolver(
