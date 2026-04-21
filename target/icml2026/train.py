@@ -597,6 +597,32 @@ def _named_channel_metrics(prefix: str, values: torch.Tensor, names: tuple[str, 
     return metrics
 
 
+def coarse_spatial_pool_loss(
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    xy: torch.Tensor,
+    n_bins: int = 16,
+    weight: float = 0.1,
+) -> torch.Tensor:
+    x_bin = (xy[:, 0].clamp(0.0, 1.0 - 1e-6) * n_bins).long()
+    y_bin = (xy[:, 1].clamp(0.0, 1.0 - 1e-6) * n_bins).long()
+    bin_idx = x_bin * n_bins + y_bin
+    num_bins = n_bins * n_bins
+    out_preds = torch.zeros(num_bins, preds.shape[-1], device=preds.device, dtype=preds.dtype)
+    out_targets = torch.zeros(num_bins, targets.shape[-1], device=targets.device, dtype=targets.dtype)
+    out_count = torch.zeros(num_bins, device=preds.device, dtype=preds.dtype)
+    out_preds.scatter_add_(0, bin_idx.unsqueeze(1).expand_as(preds), preds)
+    out_targets.scatter_add_(0, bin_idx.unsqueeze(1).expand_as(targets), targets)
+    out_count.scatter_add_(0, bin_idx, torch.ones(len(preds), device=preds.device, dtype=preds.dtype))
+    occupied = out_count > 0
+    if not occupied.any():
+        return preds.new_tensor(0.0)
+    count_safe = out_count[occupied].unsqueeze(1)
+    pool_preds = out_preds[occupied] / count_safe
+    pool_targets = out_targets[occupied] / count_safe
+    return weight * F.mse_loss(pool_preds, pool_targets)
+
+
 def loss_grouped(
     batch: GroupedBatch,
     outputs: dict[str, torch.Tensor | None],
@@ -632,6 +658,21 @@ def loss_grouped_tandem(
         vol_loss = F.mse_loss(outputs["volume_preds"][prepared.volume_mask], prepared.volume_target[prepared.volume_mask])
         total = total + vol_loss
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
+    if outputs["surface_preds"] is not None:
+        mask = prepared.surface_mask
+        surf_xy = prepared.surface_raw_xy[mask]
+        xy_min = surf_xy.min(dim=0).values
+        xy_max = surf_xy.max(dim=0).values
+        surf_xy_norm = (surf_xy - xy_min) / (xy_max - xy_min + 1e-8)
+        aux_loss = coarse_spatial_pool_loss(
+            outputs["surface_preds"][mask],
+            prepared.surface_target[mask],
+            surf_xy_norm,
+            n_bins=16,
+            weight=0.1,
+        )
+        total = total + aux_loss
+        metrics["coarse_aux_loss"] = float(aux_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
     return total, metrics
 
@@ -1019,7 +1060,10 @@ def train_one_epoch(
                     volume_mask=prepared.volume_mask,
                 )
                 outputs = maybe_apply_anp(outputs, prepared, anp_head)
-                loss, _ = loss_grouped_tandem(prepared, outputs)
+                loss, train_metrics = loss_grouped_tandem(prepared, outputs)
+                if "coarse_aux_loss" in train_metrics:
+                    running.setdefault("coarse_aux_loss", 0.0)
+                    running["coarse_aux_loss"] = running["coarse_aux_loss"] + train_metrics["coarse_aux_loss"]
             else:
                 outputs = model(
                     surface_x=batch.surface_x,
@@ -1039,6 +1083,8 @@ def train_one_epoch(
         running["loss"] += float(loss.detach().cpu().item())
         steps += 1
     running["loss"] /= max(steps, 1)
+    if "coarse_aux_loss" in running:
+        running["coarse_aux_loss"] /= max(steps, 1)
     running["train_steps"] = float(steps)
     if scheduler is not None:
         running["lr"] = float(optimizer.param_groups[0]["lr"])
