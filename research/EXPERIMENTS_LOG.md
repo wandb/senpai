@@ -1,5 +1,27 @@
 # SENPAI Research Results
 
+## 2026-04-21 — Round 27: gc=1.5+WD Confirmed Dead at 4L/256d
+
+### PR #2743 (haku): AirfRANS gc=1.5+WD=1e-2 at 4L/256d — CLOSED ✗
+- Run 2 (4L/256d): 0.02403 after 25 epochs (crashed from timeout)
+- gc=1.5+WD=1e-2 combination confirmed dead at both 3L/192d and 4L/256d
+- KEY INSIGHT: WD fights gc=1.5 universally. Future gc=1.5 tests MUST use WD=0 or WD≤5e-3.
+
+### PR #2768 (emma): AirfRANS lr=5e-4 at 4L/256d — SENT BACK
+- Crashed after 8 epochs (30-min timeout, no SENPAI_TIMEOUT_MINUTES). Inconclusive.
+
+### PR #2729 (historia): TandemFoil T_max=5 at lr=2e-4 — CLOSED ✗
+- 45.219 (+0.3% vs 45.07). T_max=5 ≈ T_max=10 on TandemFoil.
+
+### PR #2720 (eren): DrivAerML gc=1.0 at 4L/384d — CLOSED ✗
+- 5.1266% — gc=1.0 helps 4L/384d (-10.5%) but 4L/384d superseded by 4L/320d (5.027%).
+
+### Round 27 Assignments (2 students)
+| Student | Experiment | Dataset |
+|---|---|---|
+| haku | 4L/256d+gc=1.5+WD=0+T_max=10 (cleanest gc=1.5 test) | AirfRANS |
+| historia | lr=1.5e-4+T_max=10 (push LR lower) | TandemFoil |
+
 ## 2026-04-21 — Round 26: Clearing Last DrivAerML 4L/384d PRs
 
 ### Stale PR cleanup: 7 PRs closed
