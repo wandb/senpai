@@ -109,6 +109,7 @@ class TrainConfig:
     grad_clip: float = 0.0
     save_checkpoint: bool = False
     seed: int = 0
+    pressure_loss_weight: float = 1.0
 
 
 @dataclass
@@ -673,12 +674,21 @@ def loss_grouped(
     batch: GroupedBatch,
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
+    pressure_loss_weight: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.surface_x.device)
     metrics: dict[str, float] = {}
     if batch.surface_y is not None and outputs["surface_preds"] is not None:
         target = transform.apply(batch.surface_y)
-        surf_loss = F.mse_loss(outputs["surface_preds"][batch.surface_mask], target[batch.surface_mask])
+        preds_masked = outputs["surface_preds"][batch.surface_mask]
+        target_masked = target[batch.surface_mask]
+        if pressure_loss_weight != 1.0 and preds_masked.shape[-1] >= 3:
+            per_element_mse = (preds_masked - target_masked).pow(2)
+            weights = torch.ones(preds_masked.shape[-1], device=preds_masked.device)
+            weights[2] = pressure_loss_weight
+            surf_loss = (per_element_mse * weights).mean()
+        else:
+            surf_loss = F.mse_loss(preds_masked, target_masked)
         total = total + surf_loss
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
@@ -1051,6 +1061,7 @@ def train_one_epoch(
     amp_mode: str = "none",
     max_batches: int = 0,
     grad_clip: float = 0.0,
+    pressure_loss_weight: float = 1.0,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1092,7 +1103,7 @@ def train_one_epoch(
                         volume_x=batch.volume_x,
                         volume_mask=batch.volume_mask,
                     )
-                    loss, _ = loss_grouped(batch, outputs, transform)
+                    loss, _ = loss_grouped(batch, outputs, transform, pressure_loss_weight=pressure_loss_weight)
         loss.backward()
         all_params = list(model.parameters())
         if anp_head is not None:
@@ -1291,6 +1302,7 @@ def main() -> None:
             amp_mode=config.amp_mode,
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
+            pressure_loss_weight=config.pressure_loss_weight,
         )
 
         if ema is not None:
