@@ -87,9 +87,17 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.0207 (val) / TBD (test)
-- **Best PR:** #2617 (kohaku — Fourier+3L/192d + no-EMA + T_max=10, 41 epochs, AdamW lr=5e-4)
-- **Key insight:** Phase transition at T_max=10/epoch 40 is reproducible and improving across replications. The transition is stochastic — run-to-run variance exists (0.0207, 0.0248). External target: 0.0043 — **4.8x gap remaining**.
+- **Current best:** 0.0197 (val) / TBD (test)
+- **Best PR:** #2614 (gilbert — Fourier+3L/192d + no-EMA + T_max=10, 41 epochs, AdamW **lr=3e-4**)
+- **Key insight:** lr=3e-4 (lower than baseline 5e-4) produces a deeper phase transition basin. Phase transition is stochastic but LR matters: lr=3e-4 found a deeper basin (0.0197 at epoch 38) than lr=5e-4 (0.0207/0.0248). External target: 0.0043 — **4.6x gap remaining**.
+
+### 2026-04-21 — PR #2614: AirfRANS: lr=3e-4+T_max=10 — NEW BEST
+
+- **val_primary/surface_mse:** 0.0197 (-4.8% vs 0.0207)
+- **W&B run:** v5ka7832 (41 epochs, best at epoch 38 — cosine trough)
+- **Epochs:** 41 (phase transition at cosine trough near epoch 38-40)
+- **Note:** lr=3e-4 slower convergence BUT deeper final basin than lr=5e-4. The transition timing shifts slightly (epoch 38 vs 40).
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans_task full --optimizer adamw --lr 3e-4 --cosine_t_max 10 --no-use-ema --enable-fourier --epochs 999`
 
 ### 2026-04-21 — PR #2617: AirfRANS: T_max=10 replication — NEW BEST
 
