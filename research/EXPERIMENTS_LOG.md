@@ -1,5 +1,18 @@
 # SENPAI Research Results
 
+## 2026-04-21 — PR #2582: TandemFoil: T_max=10 weight decay sweep — REQUEST CHANGES
+
+- haku/tandem-tmax10-wd-sweep
+- Hypothesis: Weight decay interacts with Lion's sign-based updates. Default WD=1e-4 may be suboptimal.
+
+| Config | val_primary/surface_pressure_mae | Epochs | W&B |
+|---|---|---|---|
+| WD=1e-2 | 93.20 | 7 | wbeh83ah |
+| WD=0 | 96.39 | 7 | ssosuyjt |
+| WD=1e-4 (control) | 103.87 | 5 | 8tx8zt2n |
+
+Commentary: All runs ran only ~7 epochs in a 30-minute budget (vs 14 epochs needed for fair comparison to 75.59 baseline). WD=1e-2 has smoothest convergence and is still descending at cutoff. Interesting finding: Lion's implicit regularization may make small WD counterproductive (control WD=1e-4 is worst). Sent back for full 180-min run with WD=1e-2 only.
+
 ## 2026-04-21 — PR #2550: DrivAerML: Fourier+4L/256d+T_max=30 — MERGED ✓ NEW BEST
 
 - violet/drivaerml-fourier-4L256d-longrun
