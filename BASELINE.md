@@ -200,11 +200,19 @@
 ## DrivAerML
 
 - **Primary metric:** `val_primary/surface_rel_l2_pct` (lower is better)
-- **Current best:** 11.97% (val) / 13.03% (test)
-- **Best PR:** #2645 (taki — Fourier+4L/256d+no-EMA+T_max=30, 34 epochs, AdamW lr=5e-4, **600 batches/epoch**)
-- **CRITICAL:** Must pass `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 600 --max-eval-batches 200` to avoid OOM and `--model-heads 4` for 256d model
-- **External target:** <3.71% (AB-UPT, ~500 epochs) — **3.2x gap remaining**
-- **Key insight:** More data per epoch is the critical lever. 600 batches/epoch (vs 394) gives 53% more car configs per epoch, improving from 12.70% to 11.97% despite fewer total epochs (34 vs 45). 4L/256d architecture. 5L/256d is WORSE (13.62%) — optimization instability beyond 4 layers. T_max=30 confirmed optimal.
+- **Current best:** 5.73% (val) at epoch 144
+- **Best PR:** #2602 (kakashi — Fourier+**4L/384d**/6H+no-EMA+T_max=30, 151 epochs, AdamW lr=5e-4, 394 batches/epoch, **180-min budget**)
+- **CRITICAL:** Must pass `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200` and `--model-heads 6` for 384d model
+- **External target:** <3.71% (AB-UPT, ~500 epochs) — **1.55x gap remaining**
+- **Key insight:** WIDTH SCALING is the dominant lever. 4L/384d (vs 4L/256d) achieved 5.73% vs 11.97% — a 52% relative improvement. Model ran 151 epochs in 180 min (~1.2 min/epoch) and was still improving at cutoff. Next: compound 4L/384d with 600 batches, try 4L/512d, tune T_max for 384d (late oscillation suggests T_max=30 slightly aggressive).
+
+### 2026-04-21 — PR #2602: DrivAerML: 4L/384d+T_max=30 — wider architecture — NEW BEST
+
+- **val_primary/surface_rel_l2_pct:** 5.73% (-52.2% vs 11.97%) at epoch 144
+- **W&B run:** 7ogfs7ph (151 epochs, 180-min budget, still converging!)
+- **Epochs:** 151 (180-min timeout — ~1.2 min/epoch for 4L/384d)
+- **Key insight:** Width scaling is the dominant lever on DrivAerML. 384d vs 256d = 52% relative improvement. Model was still improving at epoch 151. Late-epoch oscillation (e.g., epoch 141=10.2%, 144=5.7%) suggests T_max=30 may be slightly aggressive for 384d.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset drivaerml --optimizer adamw --lr 5e-4 --cosine-t-max 30 --no-use-ema --enable-fourier --model-layers 4 --model-hidden-dim 384 --model-heads 6 --epochs 999 --batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
 
 ### 2026-04-21 — PR #2645: DrivAerML: 4L/256d+T_max=30 — 600 batches/epoch — NEW BEST
 
