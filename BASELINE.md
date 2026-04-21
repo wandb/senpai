@@ -3,9 +3,19 @@
 ## TandemFoilSet
 
 - **Primary metric:** `val_primary/surface_pressure_mae` (= `val_eq4/surface_pressure_mae`)
-- **Current best:** 75.59 (val) / 72.12 (test)
-- **Best PR:** #2490 (frieren — T_max=10, Fourier + physics + no-EMA, slices=64, Lion lr=3e-4, 14 epochs)
-- **Key insight:** T_max=10 creates ~75 cosine cycles per epoch (750 steps/epoch). Extremely rapid LR averaging produces the best minima. T_max=10 > T_max=20 > T_max=15 > T_max=30. Still improving at epoch 14 — longer training should push below 70.
+- **Current best:** 52.81 (val) / 55.25 (test)
+- **Best PR:** #2595 (sasuke — T_max=10, 5L/256d/4H, Fourier + physics + no-EMA, slices=64, Lion lr=3e-4, 67 epochs, 180-min)
+- **Key insight:** DEPTH SCALING is the dominant lever for TandemFoil. 5L/256d achieves 52.81 vs 3L/192d's 75.59 — a 30% relative improvement. 67 epochs in 180-min budget (still improving at cutoff). All splits improved uniformly. Next: T_max tuning at 5L/256d, 6L with grad-clip, longer training.
+
+### 2026-04-21 — PR #2595: TandemFoil: 5L/256d deep model — NEW BEST
+
+- **val_primary/surface_pressure_mae:** 52.81 (-30.1% vs 75.59)
+- **test_primary/surface_pressure_mae:** 55.25 (-23.4% vs 72.12)
+- **Per-split test MAE:** single_in_dist=61.80, geom_camber_rc=60.20, geom_camber_cruise=48.99, re_rand=50.00
+- **W&B run:** l5kggnbg (67 epochs, 180-min budget, still improving!)
+- **Epochs:** 67 (180-min timeout, ~2.7 min/epoch)
+- **Key insight:** 5L/256d depth+width scaling mirrors DrivAerML's width-scaling discovery. All splits improved uniformly (cruise -30.8%, re_rand -27.9%). High val oscillation (52-85 range) from T_max=10 but consistent downward envelope. Train loss (0.115) still decreasing at cutoff.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 3e-4 --cosine-t-max 10 --no-use-ema --model-slices 64 --model-layers 5 --model-hidden-dim 256 --model-heads 4 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999`
 
 ### 2026-04-21 — PR #2490: TandemFoil: Fourier+physics T_max=10 — NEW BEST
 
