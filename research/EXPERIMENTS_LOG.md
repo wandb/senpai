@@ -1,5 +1,29 @@
 # SENPAI Research Results
 
+## 2026-04-21 — Round 28: DrivAerML 4L/512d Breakthrough (4.619%)
+
+### PR #2691 (frieren): DrivAerML 4L/512d — MERGED ✓ NEW BEST (4.619%!)
+
+- val_primary/surface_rel_l2_pct: **4.619%** (-8.1% vs 5.027%) at epoch 256
+- W&B: k8qtsxxz (267 epochs, 180-min). Best at epoch 256, final 267 = 5.926% (overfit!)
+- PARADIGM SHIFT: WIDTH SCALES at 180-min budget. 4L/512d gets ~267 epochs (~0.67 min/ep) — comparable throughput to 4L/320d (257 ep) but more capacity. Extra capacity wins.
+- Gap to external: **1.24x** (was 1.35x).
+- CRITICAL: Must capture best checkpoint, not final. SENPAI_MAX_EPOCHS=9999.
+
+### PR #2766 (fern): AirfRANS gc=1.5 at 4L/256d (with WD) — CLOSED ✗
+- 0.014384, ~2x worse. gc=1.5+WD=1e-2 dead at 4L/256d too.
+
+### PR #2623 (gen): TandemFoil MQA audit — CLOSED ✗
+- MQA: 45.515, GQA: 46.099 — both worse than 45.07. Regularization benefit real but capacity penalty too high.
+
+### Round 28 Assignments (4 students)
+| Student | Experiment | Dataset |
+|---|---|---|
+| frieren | 4L/512d+gc=1.5 | DrivAerML |
+| fern | 4L/512d+WD=1e-2 | DrivAerML |
+| rei | 4L/512d+T_max=20 | DrivAerML |
+| gen | 4L/256d+lr=2e-4+gc+WD | TandemFoil |
+
 ## 2026-04-21 — Round 27: gc=1.5+WD Confirmed Dead at 4L/256d
 
 ### PR #2743 (haku): AirfRANS gc=1.5+WD=1e-2 at 4L/256d — CLOSED ✗

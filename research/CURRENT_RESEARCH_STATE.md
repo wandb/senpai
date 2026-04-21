@@ -9,14 +9,14 @@
 |---|---|---|---|---|
 | TandemFoil | val_primary/surface_pressure_mae | **45.07** | #2610 (T_max=10, 3L/192d, Lion **lr=2e-4**, 119 ep) | **LOWER LR + MORE EPOCHS** |
 | AirfRANS | val_primary/surface_mse | **0.007264** | #2727 (**4L/256d** + T_max=5 + WD=1e-2 + gc=1.0, 50 ep, epoch-capped) | **ARCH SCALING + GOLDEN CONFIG** |
-| DrivAerML | val_primary/surface_rel_l2_pct | **5.027%** | #2648 (4L/**320d**/5H+T_max=30, 257 ep, 180-min) | **THROUGHPUT > WIDTH** |
+| DrivAerML | val_primary/surface_rel_l2_pct | **4.619%** | #2691 (4L/**512d**/8H+T_max=30, 267 ep, 180-min) | **WIDTH SCALES AT 180-MIN** |
 
 ## EXTERNAL TARGETS
 
 | Dataset | External Best | Our Best | Gap |
 |---|---|---|---|
 | AirfRANS | 0.0043 | 0.007264 | **1.7x** |
-| DrivAerML | <3.71% | 5.027% | **1.35x** |
+| DrivAerML | <3.71% | 4.619% | **1.24x** |
 
 ## CRITICAL INSIGHTS (Rounds 17-24)
 
