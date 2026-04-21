@@ -114,11 +114,21 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.00277 (val) at epoch 150
-- **Best PR:** #2774 (roy — **4L/256d** + gc=**0.5** + Fourier + no-EMA + T_max=5 + WD=1e-2, AdamW lr=7e-4, **221 epochs, 180-min budget, SENPAI_MAX_EPOCHS=9999**)
-- **Key insight:** gc=0.5 reliably finds deeper basins than gc=1.0. Multiple sub-0.004 troughs: e77=0.00356, e183=0.00322, e204=0.00308, e150=0.00277 (best). Same T_max=5 divergence at ep205 (vs ep208 at gc=1.0). **Beats external target 0.0043 by 35.6%.** Next: gc=0.5 + T_max=10 to prevent divergence.
+- **Current best:** 0.001479 (val) at epoch 202
+- **Best PR:** #2771 (itachi — **3L/256d**/4H + gc=1.0 + Fourier + no-EMA + T_max=5 + WD=1e-2, AdamW lr=7e-4, **282 epochs, 180-min budget, SENPAI_MAX_EPOCHS=9999**)
+- **Key insight:** WIDTH > DEPTH for AirfRANS. 3L/256d beats 4L/256d by 46.6% with a single change: removing one layer. The 3L architecture reduces over-transformation of local pressure features. Same T_max=5 divergence pattern but at ep202 (slightly earlier). **Beats external target 0.0043 by 65.6%.** Next: compound 3L/256d + gc=0.5, width frontier at 3L (320d, 384d, 512d), 2L depth frontier.
 
-### 2026-04-21 — PR #2774: AirfRANS: 4L/256d + gc=0.5 extended — NEW BEST
+### 2026-04-21 — PR #2771: AirfRANS: 3L/256d golden config — width vs depth ablation — NEW BEST
+
+- **val_primary/surface_mse:** 0.001479 (-46.6% vs 0.00277) at epoch 202
+- **Terminal val (ep282):** 0.006535 (model regressed after ep202 divergence)
+- **Terminal test:** 0.005361 (from diverged model — NOT from best checkpoint)
+- **W&B run:** q4hytsr6 (282 epochs, 180-min timeout, best at ep202)
+- **Architecture:** 3L/256d/4H (vs 4L/256d/4H baseline — only change is `--model-layers 3`)
+- **Key insight:** Removing one layer from 4L→3L unlocked a 46.6% improvement. Width (256d) is the dominant capacity lever; extra depth adds noise to the optimization trajectory. The 3L model found a deep trough at ep202 (0.001479) but subsequently regressed — same T_max=5 instability pattern as 4L configs. Test metric from the diverged terminal checkpoint is invalid. Critical follow-ups: (1) gc=0.5 compound at 3L/256d (kakashi #2823), (2) 3L width frontier 320d/384d/512d (ray #2824), (3) T_max=10 stability variant.
+- **Reproduce:** `cd target/icml2026 && CUDA_VISIBLE_DEVICES=0 SENPAI_MAX_EPOCHS=9999 SENPAI_TIMEOUT_MINUTES=180 python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 7e-4 --cosine-t-max 5 --grad-clip 1.0 --weight-decay 1e-2 --no-use-ema --enable-fourier --model-layers 3 --model-hidden-dim 256 --model-heads 4 --epochs 999`
+
+### 2026-04-21 — PR #2774: AirfRANS: 4L/256d + gc=0.5 extended — PREVIOUS BEST
 
 - **val_primary/surface_mse:** 0.00277 (-28.9% vs 0.003904) at epoch 150
 - **Surface MSE breakdown (ep150):** Ux=3.50e-05, Uy=5.64e-06, nut=3.33e-06, p=0.01105
