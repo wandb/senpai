@@ -1,5 +1,74 @@
 # SENPAI Research Results
 
+## 2026-04-21 — PR #2646: AirfRANS: lr=7e-4+T_max=10 — MERGED ✓ NEW BEST
+
+- emma/airfrans-tmax10-lr7e4
+- Hypothesis: lr=7e-4 (between the successful 5e-4 and the unstable 1e-3) may find a deeper phase transition basin.
+
+| Config | val_primary/surface_mse | Epochs | Best Epoch | W&B |
+|---|---|---|---|---|
+| **lr=7e-4+T_max=10** | **0.01841** | 41 | 35 | 3pbxocca |
+| lr=3e-4+T_max=10 (prev best) | 0.0197 | 41 | 38 | v5ka7832 |
+| lr=5e-4+T_max=10 | 0.0207 | 41 | 40 | z7t3ibwi |
+
+Commentary: lr=7e-4 triggers the phase transition EARLIER (epoch 35 vs 38-40 for lower LRs) and finds a DEEPER basin (0.01841 vs 0.0197). High volatility at cosine LR peaks (epochs 26, 28, 38, 41 spike to ~0.23-0.27) but the trough at epoch 35 is robust. LR sweet spot for AirfRANS is now identified as 3e-4 to 7e-4 range. New baseline: 0.01841. Gap to external: 4.3x.
+
+## 2026-04-21 — PR #2645: DrivAerML: 4L/256d+T_max=30 — 600 batches/epoch — MERGED ✓ NEW BEST
+
+- taki/drivaerml-600batches
+- Hypothesis: Increasing train batches from 394 to 600 per epoch (53% more car configurations per epoch) should improve generalization.
+
+| Config | val_primary/surface_rel_l2_pct | test | Epochs | W&B |
+|---|---|---|---|---|
+| **600 batches/epoch** | **11.97%** | **13.03%** | 34 | dar47nwl |
+| 394 batches/epoch (prev best) | 12.70% | 13.54% | 45 | 3aaevlho |
+
+Commentary: KEY INSIGHT — more data per epoch is a critical lever. 600 batches sees 53% more car configs per epoch. Despite fewer total epochs (34 vs 45, hit 30-min timeout), per-epoch improvement compensates. Model still converging at cutoff — longer training or even more batches could push further. New DrivAerML baseline: 11.97%. Gap to external: 3.2x.
+
+## 2026-04-21 — PR #2641: DrivAerML: 4L/256d+T_max=30 — 5-epoch LR warmup — SEND BACK
+
+- tanjiro/drivaerml-4L256d-warmup
+- Hypothesis: Linear LR warmup (5 epochs) stabilizes early training.
+- Result: val=12.259% (beat old 12.70% baseline, but used old 394 batches). W&B: xf2hw10b, 45 epochs.
+- Sent back to compound warmup with new 600-batch baseline.
+
+## 2026-04-21 — PR #2643: DrivAerML: 4L/256d+T_max=30 — eta_min=1e-5 — SEND BACK
+
+- rei/drivaerml-4L256d-etamin
+- Result: val=12.38% (beat old 12.70%, but used old 394 batches). Sent back to compound with 600 batches.
+
+## 2026-04-21 — PR #2644: TandemFoil: T_max=10 + slices=32 — CLOSED ✗
+
+- frieren/tandem-tmax10-checkpoint-warmstart
+- Hypothesis: Reducing slices from 64 to 32 would speed up epochs enough to overcome cold-start.
+- Result: val=97.23 — dead end. No speedup from slices reduction (data loading dominates, not compute). DEAD END.
+
+## 2026-04-21 — PR #2642: AirfRANS: 3L/256d+T_max=10 — CLOSED ✗
+
+- kohaku/airfrans-3L256d-tmax10
+- Hypothesis: Width expansion (256d vs 192d) without depth overhead.
+- Result: val=0.0357 — dead end. Too slow per epoch to reach phase transition zone (~epoch 38-40). DEAD END.
+
+## 2026-04-21 — PR #2626: DrivAerML: 4L/256d+T_max=25 — CLOSED ✗
+
+- norman/drivaerml-4L256d-tmax25
+- Result: val≈13.1%. T_max landscape fully mapped: T_max=30 is the optimum. DEAD END.
+
+## 2026-04-21 — PRs #2625, #2624: DrivAerML LR fine-tuning — CLOSED ✗
+
+- violet: lr=6e-4 → 13.42%. shinji: lr=4e-4 → 13.28%. Best=12.81% (violet 2nd run). Neither beats 12.70%.
+- DrivAerML LR landscape fully mapped: lr=5e-4 optimal. DEAD END.
+
+## 2026-04-21 — PR #2612: AirfRANS: 4L/256d+T_max=10 — CLOSED ✗
+
+- edward/airfrans-4L256d-tmax10
+- Result: val=0.0881 (best at epoch 22, mid-phase-transition). Only 25 epochs in 30 min (too slow for AirfRANS phase transition). W&B: 77hjmn6u. DEAD END.
+
+## 2026-04-21 — PR #2521: DrivAerML: T_max=10 long run — CLOSED ✗
+
+- asuka/drivaerml-fourier-tmax10-longrun
+- Result: val=17.08% at 31 epochs (183 min). Confirms T_max=10 dead end on DrivAerML (2nd confirmation). W&B: x2m4rzm5. DEAD END.
+
 ## 2026-04-21 — PR #2614: AirfRANS: lr=3e-4+T_max=10 — MERGED ✓ NEW BEST
 
 - gilbert/airfrans-tmax10-lr3e4
