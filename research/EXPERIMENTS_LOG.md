@@ -1,5 +1,26 @@
 # SENPAI Research Results
 
+## 2026-04-21 20:10 — Wave 2 Review Round 4: MSAM dead end, gradient noise next
+
+### PR Closed
+
+| PR | Student | Dataset | Best Val | Baseline | Reason |
+|---|---|---|---|---|---|
+| #2904 | usopp | Cross (DM/AF/TF) | DM=29.84%, AF=0.0256, TF=110.25 | DM=4.619%, AF=0.001236, TF=30.10 | MSAM catastrophically worse everywhere (3.7-22.7x). Core premise false: actual cost was 2x compute (same as SAM). Lion momentum direction is anti-adversarial on TF. |
+
+**Key insights:**
+- MSAM is definitively dead for this codebase — do not retry
+- Lion optimizer's momentum buffer does NOT align with loss ascent direction (negative msam_loss_increase on TF)
+- The `_forward_and_loss()` code refactor was clean; could cherry-pick if needed
+
+### New Assignment
+
+| PR | Student | Focus | Key Config |
+|---|---|---|---|
+| #2920 | usopp | Gradient noise injection (code change) | Neelakantan 2015: eta=0.01/0.001/0.1, gamma=0.55, zero extra cost |
+
+---
+
 ## 2026-04-21 19:30 — Wave 2 Review Round 3: 1 PR closed, 1 new assignment
 
 ### PR Closed
