@@ -1,5 +1,39 @@
 # SENPAI Research Results
 
+## 2026-04-21 22:00 — BREAKTHROUGH: Corrected EMA warmup MERGED — TF -13.2%, AF -41.2%
+
+### PR #2899 (robin): Corrected EMA Warmup — MERGED, DUAL NEW BEST
+
+| Metric | EMA decay=0.999 | EMA decay=0.9999 | Previous Baseline | Delta (best) |
+|---|---|---|---|---|
+| TF val_primary/surface_pressure_mae | **26.134** (ep123) | 26.903 (ep113) | 30.10 | **-13.2%** |
+| AF val_primary/surface_mse | **0.000727** (ep206) | 0.001123 (ep275) | 0.001236 | **-41.2%** |
+| DM val_primary/surface_rel_l2_pct | 9.749% (ep60, diverged) | — | 4.619% | +111% (WORSE) |
+| W&B runs | nrn0q3ct (TF), i1sevgt2 (AF) | 3xi6cgx1 (TF), bz00wego (AF) | — | — |
+
+**Implementation:** EMAWithWarmup replaces bugged EMA. Formula: `actual_decay = min(target_decay, (1+step)/(10+step))`. Handles _orig_mod prefix (compile compat), store/copy_to/restore for val swap. Clean code.
+
+**Paper story implications:**
+- Corrected EMA is a SHARED RECIPE change — one code change benefits 2 of 3 datasets simultaneously
+- The new TF anchor is 26.134; the new AF anchor is 0.000727 (83.1% below external target 0.0043)
+- DrivAerML still needs --no-use-ema or EMA+gc compound testing (zenitsu #2925)
+
+### Other Reviews This Round
+
+| PR | Student | Action | Key Finding |
+|---|---|---|---|
+| #2911 | zenitsu | CLOSED | T_max=5 fatal for DM 4L/512d — all 3 runs crashed |
+| #2842 | tanjiro | SENT BACK | TF 30.23 at 3L/256d (near-miss). Try 3L/192d+lr=1e-4+gc=0.5 |
+
+### New Assignments
+
+| PR | Student | Focus |
+|---|---|---|
+| #2924 | robin | TF lr=1e-4+EMA, TF gc=0.5+EMA, AF T_max=10+EMA, AF seed=43 reproduce |
+| #2925 | zenitsu | DrivAerML EMA+gc=1.0, EMA+gc+WD, EMA decay=0.9999, control pure gc |
+
+---
+
 ## 2026-04-21 21:30 — Wave 2 Review Round 6: 640d unstable, AirfRANS near-beat
 
 ### PR Closed

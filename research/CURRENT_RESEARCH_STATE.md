@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-21 21:30 (DrivAerML Refocus — Wave 2, All Students Assigned)
+- **Date:** 2026-04-21 22:00 (DrivAerML Refocus — Wave 2, EMA BREAKTHROUGH)
 - **Branch:** radford
 - **Fleet status:** 50 live students, ALL ASSIGNED (0 idle)
 - **Current relaunch budget:** inherit pod env defaults
@@ -11,26 +11,27 @@
 
 | Dataset | Paper-facing metric | Current best | Target / reference | Status |
 |---|---|---|---|---|
-| TandemFoil | `test_primary/surface_pressure_mae` | **33.88** (#2810) | no single packaged external scalar | strong, no longer bottleneck |
-| AirfRANS | `test_primary/surface_mse` | **0.003** (#2824) | `0.0043` | **BEATEN** |
+| TandemFoil | `test_primary/surface_pressure_mae` | **33.88** (#2810) | no external scalar | needs test from new EMA best |
+| AirfRANS | `test_primary/surface_mse` | **0.003** (#2824) | `0.0043` | **BEATEN** — val now 0.000727 |
 | DrivAerML | `test_primary/surface_rel_l2_pct` | **6.24%** (#2691) | `3.71%` | **MAIN GAP — 1.68x** |
 
 ## Steering Anchors (validation, for experiment decisions)
 
 | Dataset | Metric | Current anchor |
 |---|---|---|
-| TandemFoil | `val_primary/surface_pressure_mae` | **30.10** (#2810) |
-| AirfRANS | `val_primary/surface_mse` | **0.001236** merged (#2828), **0.001095** pending (#2823 — unstable) |
+| TandemFoil | `val_primary/surface_pressure_mae` | **26.134** (#2899 MERGED — EMA decay=0.999) |
+| AirfRANS | `val_primary/surface_mse` | **0.000727** (#2899 MERGED — EMA decay=0.999, ep206) |
 | DrivAerML | `val_primary/surface_rel_l2_pct` | **4.619%** (#2691) |
 
 ## Main Scientific Goal
 
 A shared recipe whose core changes work across TandemFoil, AirfRANS, and DrivAerML.
-DrivAerML is the main gap. All new work is DrivAerML-weighted and cross-dataset.
+DrivAerML is the main gap. Corrected EMA warmup is now the shared recipe for TF+AF.
 
-## Mandatory Config Rules
+## Mandatory Config Rules (UPDATED after EMA merge)
 
-- `--no-use-ema` mandatory everywhere (robin #2899 tests a fix)
+- **TF + AF:** Use `--ema-decay 0.999` (NO --no-use-ema). decay=0.999 > 0.9999 on both.
+- **DrivAerML:** Still `--no-use-ema` (EMA alone hurt DM; zenitsu #2925 tests EMA+gc compound)
 - `--epochs 999` mandatory
 - DrivAerML: `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
 - Lion for TandemFoil; AdamW for AirfRANS/DrivAerML
@@ -39,34 +40,41 @@ DrivAerML is the main gap. All new work is DrivAerML-weighted and cross-dataset.
 
 - **No-Lookahead** (#2834): fatal across all datasets — diverges AF/DM, TF regresses
 - **3L/192d on TF or DM** (#2825): too shallow at current scale
-- **Pressure-weighted loss at wrong architecture** (#2801): pressure weighting hurts if applied at non-golden depth
+- **Pressure-weighted loss at wrong architecture** (#2801): pressure weighting hurts at non-golden depth
 - **LR above 5e-4 on DrivAerML** (#2873): 6e-4/5.5e-4/4.5e-4 all worse, LR optimum firmly at 5e-4
-- **surface_only_drivaerml is already default** (#2900): don't re-test; use --no-surface-only-drivaerml to test volume inclusion
-- **lr=8e-4 + Lion on DrivAerML** (#2907): confounded by wrong optimizer/architecture. Lion competitive at 3L but untested at 4L/512d (nami #2896 testing)
-- **lr=9e-4 is above DrivAerML ceiling** (#2907): both runs diverged catastrophically
-- **Momentum-SAM (MSAM)** (#2904): 3.7-22.7x worse everywhere. Cost is 2x (not ~0%), Lion momentum anti-adversarial on TF
-- **gc=1.0+WD=1e-2+cosine compound** (#2908): 6/8 runs crashed. gc=1.0 permits spikes at cosine LR peaks that cascade with WD
-- **4L/640d at lr=5e-4+gc=1.0** (#2917): all 3 DM runs crashed (ep90-153). Width above 512d needs lower LR or tighter gc
+- **surface_only_drivaerml is already default** (#2900): use --no-surface-only-drivaerml to test volume
+- **lr=9e-4 is above DrivAerML ceiling** (#2907): diverged catastrophically
+- **Momentum-SAM (MSAM)** (#2904): 3.7-22.7x worse everywhere; cost is actually 2x
+- **gc=1.0+WD=1e-2+cosine compound on DM** (#2908): 6/8 runs crashed
+- **4L/640d at lr=5e-4+gc=1.0** (#2917): all 3 DM runs crashed (ep90-153)
+- **T_max=5 on DrivAerML** (#2911): all 3 runs diverged — too rapid for 4L/512d scale
+- **EMA alone on DrivAerML** (#2899): 9.749% (worse than 4.619% baseline) — EMA+gc compound now being tested
 
 ## Default Assignment Pattern
 
-Cross-dataset by default: 1 TF + 1 AF + 2-4 DrivAerML + nearby variants per student.
+Cross-dataset: TF+AF use EMA decay=0.999, DM still uses --no-use-ema.
 
 ## ACTIVE EXPERIMENTS — 50 WIP PRs
+
+### Theme 0: EMA Refinement (NEW HIGHEST PRIORITY — push new TF/AF bests)
+
+| Student | PR | Experiment |
+|---|---|---|
+| robin | #2924 | TF lr=1e-4+EMA, TF gc=0.5+EMA, AF T_max=10+EMA, AF seed=43 |
+| zenitsu | #2925 | DrivAerML EMA+gc=1.0, EMA+gc+WD, EMA decay=0.9999, pure gc control |
 
 ### Theme 1: AirfRANS Recipe Transfer to DrivAerML (HIGHEST PRIORITY)
 
 | Student | PR | Experiment |
 |---|---|---|
-| brook | #2878 | gc=1.0+WD=1e-2 (flagship compound) |
+| brook | #2878 | gc=1.0+WD=1e-2 (flagship compound, no EMA) |
 | bulma | #2879 | T_max=10+gc=1.0 |
 | canute | #2880 | Full recipe: lr=7e-4+gc=1.0+WD=1e-2 |
 | chopper | #2882 | T_max=15+gc=1.0+WD=1e-2 |
 | einar | #2883 | gc=1.0+T_max=20+WD=1e-2 |
 | yuji | #2922 | WD=5e-3+gc=1.0 moderate, pure gc ablation, WD alone |
-| zenitsu | #2911 | T_max=5+gc=1.0+WD=1e-2 (AirfRANS golden scheduler) |
-| edward | #2916 | lr=6e-4+gc=1.0+WD=1e-2+T_max=10 (intermediate LR) |
-| wolfwood | #2919 | T_max=40/50+gc=1.0+WD=1e-2 (longer cosine cycling) |
+| edward | #2916 | lr=6e-4+gc=1.0+WD=1e-2+T_max=10 |
+| wolfwood | #2919 | T_max=40/50+gc=1.0+WD=1e-2 (longer cycling) |
 
 ### Theme 2: DrivAerML LR+gc Exploration
 
@@ -77,7 +85,6 @@ Cross-dataset by default: 1 TF + 1 AF + 2-4 DrivAerML + nearby variants per stud
 | gohan | #2887 | gc=1.0+T_max=10 LR scan |
 | gojo | #2888 | gc=0.5+T_max=10 |
 | casca | #2881 | gc=1.5/gc=2.0 |
-| wolfwood | #2907 | lr=8e-4+gc=1.0 |
 | jin | #2893 | lr=1e-3+gc=1.0 |
 | shinobu | #2912 | WD=3e-2/5e-2+gc=1.0 (heavy regularization) |
 | sanji | #2918 | gc=0.5+WD=1e-2 (softer clip + regularization compound) |
@@ -92,7 +99,7 @@ Cross-dataset by default: 1 TF + 1 AF + 2-4 DrivAerML + nearby variants per stud
 | jet | #2892 | 3L/768d shallow+wide |
 | shouko | #2909 | heads=16/4 ablation + gc=1.0 |
 | askeladd | #2914 | MLP ratio=6/2 + gc=1.0+WD=1e-2 |
-| chrome | #2923 | torch.compile + gc=1.0 (throughput + stability compound) |
+| chrome | #2923 | torch.compile + gc=1.0 (throughput + stability) |
 
 ### Theme 4: Scheduler Innovations (CODE CHANGES)
 
@@ -102,12 +109,11 @@ Cross-dataset by default: 1 TF + 1 AF + 2-4 DrivAerML + nearby variants per stud
 | mugen | #2895 | CosineAnnealingWarmRestarts T_mult |
 | vash | #2905 | OneCycleLR |
 
-### Theme 5: Optimizer + Training Recipe Innovations (CODE CHANGES)
+### Theme 5: Training Innovations (CODE CHANGES)
 
 | Student | PR | Experiment |
 |---|---|---|
 | nobara | #2897 | LLRD (layer-wise LR decay) |
-| robin | #2899 | Corrected EMA with warmup |
 | usopp | #2920 | Gradient noise injection (Neelakantan 2015) |
 | sukuna | #2903 | SWA at cosine troughs |
 | spike | #2901 | Huber/log-cosh loss |
@@ -117,8 +123,7 @@ Cross-dataset by default: 1 TF + 1 AF + 2-4 DrivAerML + nearby variants per stud
 
 | Student | PR | Experiment |
 |---|---|---|
-| piccolo | #2898 | torch.compile throughput |
-| sanji | #2900 | surface-only DrivAerML |
+| piccolo | #2898 | torch.compile throughput (baseline) |
 | vegeta | #2906 | 360min multi-seed replication |
 | nami | #2896 | Lion higher LR on DrivAerML |
 | eren | #2910 | max-train-batches=788 (2x data/epoch) |
@@ -129,45 +134,37 @@ Cross-dataset by default: 1 TF + 1 AF + 2-4 DrivAerML + nearby variants per stud
 
 | Student | PR | Dataset | Focus |
 |---|---|---|---|
-| chrome | #2873 | DrivAerML | LR headroom 4.5-6e-4 |
 | zoro | #2870 | DrivAerML | Lower LR 2-3e-4 |
 | shinji | #2869 | DrivAerML | gc=0.5/0.7+T_max=25/30 |
 | norman | #2868 | DrivAerML | 2L/512d+3L/512d |
 | historia | #2867 | DrivAerML | 3L/256d+3L/384d |
 | kaneda | #2858 | DrivAerML | gc=0.7/0.8/0.9 |
-| kakashi | #2823 | AirfRANS | gc=1.0+T_max=10 stabilization (lr=5e-4 + reproduce) |
+| kakashi | #2823 | AirfRANS | gc=1.0+T_max=10 stabilization |
 | inosuke | #2874 | AirfRANS | 2L+T_max=10 compound |
-| thorfinn | #2786 | AirfRANS | gc=1.0+T_max=7 extended budget |
+| thorfinn | #2786 | AirfRANS | gc=1.0+T_max=7 extended |
 | taki | #2814 | DrivAerML | Mild regularization |
+| tanjiro | #2842 | TandemFoil | 3L/192d+lr=1e-4+gc=0.5 (sent back) |
 | Various | #2835-2876 | TandemFoil | LR/depth/gc fine-tuning |
 
-## Research Insights from Literature
+## Research Insights
 
-1. **Corrected EMA** (robin #2899): no-EMA was a bug fix, not a design choice. timm-style warmup fixes it.
-2. **SWA** (sukuna #2903): weight averaging at cosine troughs → flatter minima.
-3. **MSAM** (usopp #2904): flat-minima bias without SAM's 2x cost.
-4. **LLRD** (nobara #2897): 1-3% improvement in <10 epoch regime.
-5. **AB-UPT** achieves 3.71% via geometry-separated encoding — next escalation if recipe transfer fails.
-6. **Transolver-3** (arxiv 2602.04940): amortized mesh subset training for throughput.
-7. **Lookahead is load-bearing**: removing it causes catastrophic divergence on AF/DM (confirmed #2834).
-
-## Human Guidance
-
-Issue #2545: Focus on DrivAerML and cross-dataset evidence. No new directives.
+1. **Corrected EMA (MERGED #2899):** timm-style warmup `min(decay, (1+step)/(10+step))` gives -13.2% TF and -41.2% AF. **This is the shared recipe change.** decay=0.999 > 0.9999 on both datasets.
+2. **DrivAerML is fragile to compounds:** gc+WD+cosine crashes (6/8 #2908), 640d crashes (#2917), T_max=5 crashes (#2911). Only gentle perturbations survive at 4L/512d.
+3. **Width scaling ceiling at 512d for DM:** 640d is unstable. guts #2890 (768d) and himmel #2891 (5L/512d) will clarify the boundary.
+4. **AB-UPT** achieves 3.71% via geometry-separated encoding — escalation if EMA+recipe fails.
 
 ## Next Priorities
 
-1. Review PRs as results come in (~30-360 min)
-2. **brook #2878** (gc+WD transfer) = THE paper question — first to report
-3. **bulma #2879** (T_max=10+gc) = second priority
-4. **kakashi #2823** (AirfRANS 0.001095 reproducibility) = AirfRANS question
-5. Watch for code-change PRs (robin #2899, megumi #2894, sukuna #2903, usopp #2904) — these need careful review
-6. If recipe transfer fails → escalate to geometry-separated encoding (AB-UPT approach)
+1. EMA refinement (robin #2924) — can we push below TF 26 and AF 0.0007?
+2. DrivAerML EMA+gc test (zenitsu #2925) — the key 3-of-3 question
+3. Review brook #2878 (gc+WD) when ready — flagship recipe transfer result
+4. Watch bulma #2879, canute #2880, chopper #2882 — T_max cycle results
+5. If DM recipe transfer fails universally → escalate to geometry-separated encoding
 
-## Potential Next Research Directions
+## Potential Next Directions
 
-- **Residual prediction on DrivAerML**: works for TandemFoil (--residual-prediction), untested on DM
-- **Geometry-separated encoding**: AB-UPT approach — encode surface geometry separately from flow fields
-- **Mesh decimation / adaptive sampling**: sample more points near high-curvature regions
-- **Ensemble of 4L/512d seeds**: if variance is ±0.2% and we ensemble 3 seeds, could get deterministic improvement
-- **Amortized subset training** (Transolver-3): alternate between subsets of the mesh per step
+- **TF+AF: EMA + lower LR** (robin #2924 covers this)
+- **DM: EMA+gc+WD compound** (zenitsu #2925 covers this)
+- **Test set evaluation from EMA best checkpoint** — ensure paper metrics reflect EMA model
+- **EMA with arch variants** — does EMA help on 5L/512d or 3L/768d DM configs?
+- **Residual prediction on DrivAerML** — works for TF (--residual-prediction), untested on DM
