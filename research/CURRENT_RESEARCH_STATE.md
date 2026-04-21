@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-21 (Round 8 complete)
+- **Date:** 2026-04-21 (Round 9 complete)
 - **Branch:** radford
 
 ## CURRENT BASELINES
@@ -9,14 +9,14 @@
 |---|---|---|---|---|
 | TandemFoil | val_primary/surface_pressure_mae | **75.59** | #2490 (T_max=10, 3L/192d, Lion lr=3e-4, 14 ep) | Ultra-rapid cosine cycling (75 cycles/epoch) |
 | AirfRANS | val_primary/surface_mse | **0.0248** | #2556 (T_max=10, 3L/192d, AdamW lr=5e-4, 41 ep) | Phase transition at cosine LR trough (epoch 40) |
-| DrivAerML | val_primary/surface_rel_l2_pct | **12.96%** | #2550 (4L/256d+T_max=30, AdamW lr=5e-4, 43 ep) | Architecture depth + long training |
+| DrivAerML | val_primary/surface_rel_l2_pct | **12.70%** | #2593 (4L/256d+T_max=30, AdamW lr=5e-4, 45 ep) | Architecture depth + model hit epoch cap (still converging!) |
 
 ## EXTERNAL TARGETS
 
 | Dataset | External Best | Our Best | Gap |
 |---|---|---|---|
 | AirfRANS | 0.0043 | 0.0248 | 5.8x |
-| DrivAerML | <3.71% | 12.96% | 3.5x |
+| DrivAerML | <3.71% | 12.70% | 3.4x |
 
 ## ALL CONFIRMED DEAD ENDS
 
@@ -43,91 +43,101 @@
 | Timeout override (240 min) | Violates constraint |
 | 4L/256d on TandemFoil | TOO SLOW (7-9 epochs vs 14 needed) |
 | 3L/256d on DrivAerML | WORSE than 3L/192d (width without depth) |
-| DrivAerML T_max=10 (3L/192d) | 15.47% (too fast for 3L) |
+| DrivAerML T_max=10 (3L/192d) | 15.47% (too fast) |
 | Cp panel on AirfRANS | Wrong physics regime (inviscid for viscous) |
 | Wake deficit features | Redundant with TE coord frame |
+| DrivAerML 5L/256d | 13.62% — optimization instability beyond 4 layers |
+| DrivAerML T_max=10+lr=3e-4 compound | 14.90% — TandemFoil hyperparams don't transfer |
+
+## CRITICAL INSIGHT (Round 9)
+
+**DrivAerML 4L/256d hits SENPAI_MAX_EPOCHS=50 cap, not timeout.** At ~4 min/epoch, 45 epochs = ~180 min = full time budget. Model was still converging at epoch 45. This means:
+1. The epoch cap and time budget are roughly aligned for DrivAerML 4L/256d at 50k surface points
+2. Reducing surface points to 25k (2x faster) could give 90+ epochs in same budget
+3. T_max, LR, and WD tuning can potentially push below 12%
 
 ## ACTIVE EXPERIMENTS BY DATASET
 
 ### TandemFoil (Baseline: 75.59)
 | Student | PR | Experiment | Notes |
 |---|---|---|---|
-| fern | #2546 | Coarse aux loss v3 (lighter weight) | Sent back — v2 reached 75.80 (0.21 away!) |
-| frieren | #2604 | T_max=10 long run retry | Ensure 14+ epochs |
-| haku | #2582 | Weight decay sweep (WD=1e-2 full run) | Sent back — WD=1e-2 best at 7ep |
-| askeladd | #2555 | T_max=5 ultra-short cycles | |
+| fern | #2546 | Coarse aux loss v3 | Sent back — v2 reached 75.80 (0.21 away!) |
+| haku | #2582 | Weight decay=1e-2 full run | Sent back |
+| alphonse | #2569 | Hypernetwork SRF (human-directed) | |
+| frieren | #2604 | T_max=10 long run retry | |
+| kaneda | NEW | Surface cross-attention (SCA, human) | Assigning |
+| kaworu | NEW | Kutta TE constraint (human) | Assigning |
+| mikasa | NEW | T_max=3 ultra-short | Assigning |
+| levi | NEW | T_max=10 + LR warmup | Assigning |
+| chrome | NEW | T_max=10 + input noise augmentation | Assigning |
+| askeladd | #2621 | T_max=10 + lr=5e-4 (higher LR) | |
+| tetsuo | #2610 | T_max=10 + lr=2e-4 (lower LR) | |
+| kaneda | #2583 | T_max=10 + lr=1e-3 (highest LR) | Wait, kaneda now on SCA |
 | nezuko | #2611 | T_max=7 interpolation | |
-| tetsuo | #2610 | lr=2e-4 (lower LR) | |
-| kaneda | #2583 | lr=1e-3 (higher LR) | |
-| sakura | #2597 | Gradient accumulation (effective batch) | |
+| sakura | #2597 | Gradient accumulation | |
 | naruto | #2616 | slices=48 (faster epochs) | |
 | sasuke | #2595 | 5L/256d deep model | |
-| nezuko | #2564 | Fourier-only (no physics) ablation | |
-| alphonse | #2569 | Hypernetwork SRF (historical port) | |
-| naruto | #2559 | Surface cross-attention (historical port) | |
-| thorfinn | #2560 | MQA audit (historical port) | |
-| historia | #2562 | Hard Kutta TE constraint (historical port) | |
+| gen | #2623 | MQA audit (human-directed) | |
 
 ### AirfRANS (Baseline: 0.0248)
 | Student | PR | Experiment | Notes |
 |---|---|---|---|
-| kohaku | #2617 | T_max=10 exact replication | Confirm reproducibility |
+| kohaku | #2617 | T_max=10 replication | |
 | edward | #2612 | 4L/256d + T_max=10 | Architecture + phase transition |
-| gilbert | #2614 | lr=3e-4 + T_max=10 | Lower LR phase transition |
-| senku | #2615 | lr=1e-3 + T_max=10 | Higher LR phase transition |
-| thorfinn | #2613 | T_max=5 ultra-short | Even faster transitions? |
-| hinata | #2567 | T_max sweep (25, 30, 40) | |
-| mikasa | #2578 | T_max=100 longer cycle | |
-| armin | #2580 | lr=2e-4 + T_max=50 | |
-| roy | #2568 | lr=3e-4 + T_max=50 | |
-| winry | #2571 | lr=1e-4 ultra-low | |
-| levi | #2585 | 5L/256d + T_max=50 | |
+| gilbert | #2614 | lr=3e-4 + T_max=10 | |
+| senku | #2615 | lr=1e-3 + T_max=10 | |
+| thorfinn | #2613 | T_max=5 | |
+| hinata | NEW | T_max=10 + WD=1e-2 | Assigning |
+| roy | NEW | T_max=8 interpolation | Assigning |
+| winry | NEW | T_max=15 | Assigning |
+| armin | NEW | T_max=10 + phase transition monitoring | Assigning |
+| hinata | #2567 | T_max sweep (25, 30, 40) | Wait, now on WD test |
+| mikasa | #2578 | T_max=100 | |
+| levi | #2585 | 5L/256d + T_max=50 | Wait, levi now on TandemFoil warmup |
 | eren | #2601 | 4L/256d + T_max=50 | |
 | itachi | #2598 | T_max=10 replication | |
-| kaworu | #2587 | OOD tasks with phase-transition config | |
+| kaworu | #2587 | OOD tasks | Wait, kaworu now on Kutta |
+| emma | #2618 | T_max=10 extended | |
 
-### DrivAerML (Baseline: 12.96%)
+### DrivAerML (Baseline: 12.70%)
 | Student | PR | Experiment | Notes |
 |---|---|---|---|
-| tanjiro | #2606 | 4L/256d + lr=3e-4 (lower LR) | |
-| nami | #2599 | 4L/256d + lr=3e-4 | |
-| asuka | #2600 | 4L/256d + lr=8e-4 (higher LR) | |
-| rei | #2609 | 4L/256d + lr=1e-3 (highest LR) | |
-| mitsuha | #2607 | 4L/256d + T_max=20 | |
-| taki | #2608 | 4L/256d + T_max=15 | |
-| zoro | #2596 | 4L/256d + T_max=50 | |
-| luffy | #2594 | 4L/256d + T_max=10 | |
-| shinji | #2593 | 4L/256d + T_max=30 replication | |
-| norman | #2603 | 4L/256d + T_max=10 + lr=3e-4 | |
-| shoya | #2605 | 5L/256d + T_max=30 | |
-| violet | #2592 | 5L/256d + T_max=30 (Fourier variant) | |
-| giyu | #2586 | 5L/256d + T_max=30 capacity | |
-| kakashi | #2602 | 4L/384d extra-wide | |
+| shinji | NEW | 4L/256d+T_max=30+lr=4e-4 | Assigning |
+| violet | NEW | 4L/256d+T_max=30+lr=6e-4 | Assigning |
+| norman | NEW | 4L/256d+T_max=25 | Assigning |
+| ymir | NEW | 4L/256d+T_max=35 | Assigning |
+| inosuke | NEW | 4L/256d+T_max=30+WD=0 | Assigning |
+| giyu | NEW | 4L/256d+T_max=30+25k surface points | Assigning |
+| shinobu | NEW | 4L/256d+T_max=30+grad-accum=2 | Assigning |
+| zenitsu | NEW | 4L/256d+T_max=40 | Assigning |
+| tanjiro | #2606 | 4L/256d+T_max=30+lr=3e-4 | |
+| nami | #2599 | 4L/256d+T_max=30+lr=3e-4 | (duplicate of tanjiro?) |
+| asuka | #2600 | 4L/256d+T_max=30+lr=8e-4 | |
+| rei | #2609 | 4L/256d+T_max=30+lr=1e-3 | |
+| mitsuha | #2607 | 4L/256d+T_max=20 | |
+| taki | #2608 | 4L/256d+T_max=15 | |
+| zoro | #2596 | 4L/256d+T_max=50 | |
+| luffy | #2594 | 4L/256d+T_max=10 | |
+| kakashi | #2602 | 4L/384d+T_max=30 | |
 | ray | #2591 | Weight decay sweep | |
-| zenitsu | #2581 | lr=1e-3 higher LR | |
-| chrome | #2589 | lr=3e-4 LR sweep | |
-| shinobu | #2588 | T_max=5 ultra-short | |
-| inosuke | #2584 | T_max=50 phase transition test | |
-| ymir | #2579 | T_max=10 long run | |
-| gen | #2590 | 3L/256d width expansion | Known dead end? |
-| taki | #2566 | 100k surface points | |
-| shoya | #2554 | 3L/192d T_max=30 long run | |
-| chihiro | #2537 | T_max=50 long run | |
+| historia | #2619 | Weight decay=1e-2 | |
+| chihiro | #2620 | 4L/256d+T_max=30 replication | |
+| shoya | #2605 | 5L/256d+T_max=30 | Likely dead end (5L confirmed worse) |
+| shouko | #2622 | 100k surface points | |
+| giyu | #2586 | 5L/256d+T_max=30 | Likely dead end |
+| violet (old) | #2592 | 5L/256d — CLOSED | |
 
 ## Research Themes
 
-1. **TandemFoil T_max=10 refinement**: Core config is locked (T_max=10, Lion lr=3e-4, 3L/192d, 14 ep). Exploring: weight decay (WD=1e-2 promising), even shorter cycles (T_max=5, 7), LR sweep (1e-4 to 1e-3), slices=48 for more epochs, gradient accumulation, coarse aux loss (near miss at 75.80). Historical mechanisms from human guidance: SCA, MQA, Kutta constraint, HyperSRF.
+1. **DrivAerML 4L/256d fine-tuning**: Anchor at 12.70% with T_max=30+lr=5e-4. Full parameter sweep underway: LR (3e-4, 4e-4, 6e-4, 8e-4, 1e-3), T_max (15, 20, 25, 30, 35, 40, 50), WD (0, 1e-2), surface points (25k, 50k, 100k), grad-accum, 4L/384d width. Goal: break 10%.
 
-2. **AirfRANS phase transition exploitation**: Phase transition at cosine LR trough is the critical mechanism (0.19→0.0696→0.0248). T_max=10 produced deeper transition than T_max=50. Now testing: replication (kohaku, itachi), LR sweep around transition (gilbert lr=3e-4, senku lr=1e-3), 4L/256d + T_max=10 (edward), even shorter T_max=5 (thorfinn), broader T_max sweep (hinata).
+2. **AirfRANS phase transition exploitation**: Phase transition at T_max=10/epoch 40 is the key mechanism (0.0248). Now testing: T_max sweep (5, 8, 10, 15, 25, 30), LR sweep (3e-4, 1e-3), 4L/256d+T_max=10, WD=1e-2. Gap to external target: 5.8x.
 
-3. **DrivAerML architecture optimization**: 4L/256d+T_max=30 at 12.96% is the anchor. Major parallel exploration: LR sweep (3e-4, 8e-4, 1e-3), T_max fine-tuning (15, 20, 50), 5L/256d depth test, 4L/384d width test, weight decay sweep, replication. Phase transition test with T_max=50.
-
-4. **Cross-dataset insights**: Ultra-short T_max works for both TandemFoil (T_max=10) and AirfRANS (T_max=10 phase transition). DrivAerML optimal at T_max=30 — may benefit from slightly shorter (T_max=15-20 being tested).
+3. **TandemFoil T_max=10 + historical mechanisms**: Core config locked (T_max=10, Lion lr=3e-4). Human-directed: SCA (kaneda), Kutta (kaworu), HyperSRF (alphonse), MQA (gen), aux loss (fern). Hyperparameter: WD=1e-2 (haku), T_max=3 (mikasa), LR sweep (askeladd, tetsuo, kaneda was kaneda), LR warmup (levi), noise aug (chrome), slices=48 (naruto), T_max=7 (nezuko).
 
 ## Next Priority Directions
 
-1. **Fern's aux loss** is 0.21 from TandemFoil baseline — lightest-weight variant could break through
-2. **AirfRANS 4L/256d + T_max=10** (edward #2612) combines architecture scaling with phase transition — high-impact test
-3. **DrivAerML 5L depth test** (shoya, violet, giyu) — if 4L beats 3L by 61%, does 5L continue?
-4. **LR optimization around DrivAerML winner** — 5e-4 may not be optimal at 43 epochs
-5. **Historical mechanisms** (SCA, MQA, Kutta, HyperSRF) — completely orthogonal to current approach
+1. **DrivAerML below 12%**: 45-epoch model still converging — 25k pts (2x epochs) is the key test
+2. **AirfRANS 4L/256d + T_max=10** (edward): Combining architecture + phase transition mechanism
+3. **Fern's aux loss v3**: 0.21 from TandemFoil baseline — lightest-weight path to improvement
+4. **Human mechanisms**: SCA + Kutta now reassigned (kaneda/kaworu)

@@ -1,5 +1,29 @@
 # SENPAI Research Results
 
+## 2026-04-21 — PR #2593: DrivAerML: 4L/256d+T_max=30 replication — MERGED ✓ NEW BEST
+
+- shinji/drivaerml-4L256d-tmax30-replica
+- Hypothesis: Confirm 12.96% result is robust and not an artifact.
+
+| Config | val_primary/surface_rel_l2_pct | test | Epochs | W&B |
+|---|---|---|---|---|
+| **4L/256d + T_max=30 (replica)** | **12.70%** | **13.54%** | 45 | 3aaevlho |
+| Original baseline (PR #2550) | 12.96% | 14.41% | 43 | 8s5i8y06 |
+
+Commentary: Replication succeeded and BEAT the original by 0.26pp. Key finding: model hit SENPAI_MAX_EPOCHS=50 cap (NOT the timeout) at epoch 45 — still converging! More training headroom confirmed. New DrivAerML baseline: 12.70%.
+
+## 2026-04-21 — PR #2592: DrivAerML: 5L/256d+T_max=30 — CLOSED ✗
+
+- violet/drivaerml-5L256d-tmax30
+- Hypothesis: If 4L beats 3L dramatically, does 5L continue the trend?
+- Result: val=13.62% (WORSE than 12.70%). 5L causes optimization instability (epoch 38: 21.05% — wild swings). 4L is the sweet spot for 256d width on DrivAerML. W&B: fhp6qzfc. DEAD END.
+
+## 2026-04-21 — PR #2603: DrivAerML: 4L/256d+T_max=10+lr=3e-4 — CLOSED ✗
+
+- norman/drivaerml-4L256d-tmax10-lr3e4
+- Hypothesis: Compound T_max=10 + lr=3e-4 on 4L architecture.
+- Result: val=14.90% (WORSE). T_max=10 too fast for DrivAerML (high variance). lr=3e-4 too slow. TandemFoil hyperparams don't transfer. W&B: l2kaq446. DEAD END.
+
 ## 2026-04-21 — PR #2582: TandemFoil: T_max=10 weight decay sweep — REQUEST CHANGES
 
 - haku/tandem-tmax10-wd-sweep
