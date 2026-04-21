@@ -1,5 +1,30 @@
 # SENPAI Research Results
 
+## 2026-04-21 — Round 22: Clearing Stale PRs
+
+### PR #2739: AirfRANS gc=1.0+WD=5e-3 (fern) — CLOSED ✗
+
+- val_primary/surface_mse: 0.01926 — 2.1x worse than 0.00935 baseline
+- W&B run completed, gc=1.0 experiments superseded by gc=1.5 breakthrough
+- Half-strength WD (5e-3 vs 1e-2) also underperformed
+- CONCLUSION: gc=1.0 variants are dead ends after gc=1.5 breakthrough. All future AirfRANS must use gc=1.5.
+
+### PR #2723 (violet): TandemFoil 5L/256d+lr=2e-4 — SENT BACK (again)
+
+- Student didn't rerun with SENPAI_TIMEOUT_MINUTES=180. Asked about lr ambiguity (PR body said lr=2e-4, experiment instructions had lr=3e-4 typo).
+- Sent back with exact bash command and SENPAI_TIMEOUT_MINUTES=180, lr=2e-4 confirmed.
+
+### PR #2724 (gilbert): TandemFoil lr=1.5e-4 — SENT BACK (again)
+
+- Student didn't rerun with SENPAI_TIMEOUT_MINUTES=180.
+- Sent back with exact bash command and SENPAI_TIMEOUT_MINUTES=180.
+
+### Round 22 Assignments
+
+| Student | PR | Experiment |
+|---|---|---|
+| fern | TBD | AirfRANS gc=1.5+WD=1e-2+T_max=10 |
+
 ## 2026-04-21 — Round 21: TWO MAJOR BREAKTHROUGHS
 
 ### PR #2737: AirfRANS grad-clip=1.5 (haku) — MERGED ✓ NEW BEST (0.00935!)
