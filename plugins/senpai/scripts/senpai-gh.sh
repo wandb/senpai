@@ -130,6 +130,11 @@ print(max(ts) if ts else '')
 # Queries
 # ---------------------------------------------------------------------------
 
+# GitHub CLI defaults list commands to 30 items, which silently truncates
+# advisor state once a branch gets busy. Use an explicit high limit everywhere
+# we enumerate PRs/issues so idle/review triage reflects the full queue.
+GH_LIST_LIMIT="${GH_LIST_LIMIT:-999}"
+
 # List human-created GitHub Issues addressed to a role (+ team issues).
 # Returns a JSON array, deduplicated by issue number.
 # Optional second arg: ISO timestamp — only return issues updated after it.
@@ -139,8 +144,10 @@ check_gh_issues() {
     local role="$1" since="${2:-}"
     local role_issues team_issues
     role_issues=$(gh_retry gh issue list --label "human" --label "$role" --state open \
+        --limit "$GH_LIST_LIMIT" \
         --json number,title,updatedAt,comments)
     team_issues=$(gh_retry gh issue list --label "human" --label "team" --state open \
+        --limit "$GH_LIST_LIMIT" \
         --json number,title,updatedAt,comments)
     printf '[%s,%s]' "$role_issues" "$team_issues" | python3 -c "
 import json, sys
@@ -165,6 +172,7 @@ list_ready_for_review_prs() {
     local branch="$1" since="${2:-}"
     local prs
     prs=$(gh_retry gh pr list --label "$branch" --label "status:review" \
+        --limit "$GH_LIST_LIMIT" \
         --json number,title,headRefName,labels,updatedAt)
     if [ -z "$since" ]; then
         printf '%s' "$prs"
@@ -183,6 +191,7 @@ print(json.dumps([p for p in prs if p.get('updatedAt', '') > sys.argv[1]]))
 list_all_prs() {
     local branch="$1"
     gh_retry gh pr list --label "$branch" \
+        --limit "$GH_LIST_LIMIT" \
         --json number,title,state,labels,headRefName,updatedAt,isDraft
 }
 
@@ -192,6 +201,7 @@ list_all_prs() {
 student_poll_for_work() {
     local name="$1"
     gh_retry gh pr list --label "student:${name}" --label "status:wip" \
+        --limit "$GH_LIST_LIMIT" \
         --json number,title,headRefName,updatedAt,body
 }
 
@@ -203,6 +213,7 @@ list_idle_students() {
     local students_csv="$1" branch="$2"
     local all_prs
     all_prs=$(gh_retry gh pr list --label "$branch" --label "status:wip" \
+        --limit "$GH_LIST_LIMIT" \
         --json labels)
     printf '%s' "$all_prs" | python3 -c "
 import json, sys
