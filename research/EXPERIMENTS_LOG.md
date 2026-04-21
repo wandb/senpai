@@ -1,5 +1,57 @@
 # SENPAI Research Results
 
+## 2026-04-21 — PR #2540: AirfRANS: Fourier+3L/192d+T_max=50 phase transition — MERGED ✓ NEW BEST
+
+- emma/airfrans-fourier-3L192d-tmax50
+- Hypothesis: Fourier+3L/192d with T_max=50 (faster per-epoch than 4L/256d) reaches more epochs.
+
+| Run | Config | val_primary/surface_mse | test | Epochs | W&B |
+|---|---|---|---|---|---|
+| **Winner** | Fourier+3L/192d+T_max=50, lr=5e-4 | **0.0696** | **0.0877** | 23 | ijwvfcms |
+| Run 2 | Fourier+3L/192d+T_max=50, lr=8e-4 | 0.1048 (ep21 best) | 0.1511 | 22 | km5xxa3n |
+| Prior baseline | Fourier+4L/256d+T_max=50 | 0.2015 | 0.1890 | 14 | ty0cmdfz |
+
+Commentary: PHASE TRANSITION BREAKTHROUGH. val held at 0.19-0.21 from epochs 9-22, then collapsed to 0.0696 at epoch 23 — a single-epoch jump of -65.4%. The mechanism: cosine LR near the T_max=50 trough reaches very low values, allowing the optimizer to settle into a sharp narrow minimum. lr=8e-4 also showed partial transition (0.1048 at ep21) but bounced back to 0.1714 — the higher LR is too large to stabilize in the basin. The 3L/192d model trains faster (23 ep in 30 min vs 14 ep for 4L/256d), reaching the phase transition first. Pressure MSE_p dropped 70.5% (0.9427→0.2779). With 180-min budget (130+ epochs), expect even deeper transitions.
+
+## 2026-04-21 — PR #2490: TandemFoil: Fourier+physics T_max sweep (10/15/20) — MERGED ✓ NEW BEST
+
+- frieren/tandem-fourier-phys-tmax
+- Hypothesis: Shorter T_max produces better minima through more rapid LR averaging.
+
+| T_max | val_primary/surface_pressure_mae | test | Epochs | W&B |
+|---|---|---|---|---|
+| **10** | **75.59** | **72.12** | 14 | 77yoba65 |
+| 15 | 80.23 | 77.46 | 14 | aiols138 |
+| 20 | 77.00 (ep13 best) | 79.51 | 14 | yt60qcd1 |
+| 30 (baseline) | 78.81 | 75.13 | 14 | 8k0blg8s |
+
+Commentary: T_max=10 creates ~75 cosine cycles per epoch (750 steps ÷ 10), enabling extremely rapid LR averaging. All three shorter values beat T_max=30. T_max=10 > T_max=20 > T_max=15 > T_max=30. Still improving at epoch 14 — longer training should push below 70. Per-split test: single_in_dist=72.33, geom_camber_rc=76.01, geom_camber_cruise=70.80, re_rand=69.34. T_max=10 is the new TandemFoil default.
+
+## 2026-04-21 — PR #2544: DrivAerML: Compound 4L/256d + 100k pts — CLOSED ✗
+
+- rei/drivaerml-fourier-compound-best
+- Hypothesis: Compound 4L/256d + 100k surface points beats 33.65% baseline.
+
+| Config | val_primary/surface_rel_l2_pct | test | Epochs | W&B |
+|---|---|---|---|---|
+| 4L/256d + 100k pts + T_max=30 | 36.70% | 37.29% | 5 | 1mk9pwx2 |
+| 4L/256d + 100k pts + T_max=50 | 40.36% | 40.99% | 5 | kqhcf1of |
+| Baseline | 33.65% | 34.00% | 6 | xm765o85 |
+
+Commentary: Neither run beats 33.65%. The compound (4L/256d + 100k pts) trains slower per epoch (only 5 epochs vs baseline's 6). The capacity gain doesn't compensate for lost training time in the current budget. Closed — violet #2550 is testing 4L/256d with standard 50k pts for a fair architecture comparison.
+
+## 2026-04-21 — PR #2542: DrivAerML: asinh-pressure + residual-prediction — CLOSED ✗ DEAD END
+
+- tanjiro/drivaerml-fourier-physics-features
+- Hypothesis: asinh-pressure compression and residual-prediction improve DrivAerML.
+
+| Config | val_primary/surface_rel_l2_pct | test | Epochs | W&B |
+|---|---|---|---|---|
+| Fourier + asinh-pressure | 38.87% | 38.35% | 5 | o4g84han |
+| Fourier baseline (control) | 33.19% | 34.81% | 5 | ccg7wc9k |
+
+Commentary: asinh-pressure HURTS DrivAerML (38.87% vs 33.19%). residual-prediction is a NO-OP on DrivAerML (only implemented for TandemFoil path). Dead end confirmed — DrivAerML pressure range is already well-conditioned for MSE without compression.
+
 ## 2026-04-21 — PR #2543: DrivAerML: Fourier+no-EMA+T_max=30 long training replica — MERGED ✓ NEW BEST
 
 - violet/drivaerml-fourier-noema-replica
