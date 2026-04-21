@@ -108,6 +108,7 @@ class TrainConfig:
     volume_anchor_points: int = 8_000
     save_checkpoint: bool = False
     seed: int = 0
+    grad_clip: float = 0.0
 
 
 @dataclass
@@ -1035,6 +1036,7 @@ def train_one_epoch(
     *,
     amp_mode: str = "none",
     max_batches: int = 0,
+    grad_clip: float = 0.0,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1078,6 +1080,11 @@ def train_one_epoch(
                     )
                     loss, _ = loss_grouped(batch, outputs, transform)
         loss.backward()
+        if grad_clip > 0:
+            all_params = list(model.parameters())
+            if anp_head is not None:
+                all_params.extend(anp_head.parameters())
+            torch.nn.utils.clip_grad_norm_(all_params, grad_clip)
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
@@ -1263,6 +1270,7 @@ def main() -> None:
             model_name=config.model,
             amp_mode=config.amp_mode,
             max_batches=config.max_train_batches,
+            grad_clip=config.grad_clip,
         )
 
         if ema is not None:
