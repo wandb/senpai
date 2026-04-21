@@ -173,7 +173,7 @@ if __name__ == "__main__":
 |---|---|---|
 | `Codex-sonnet-4-6` | 30 | Default — good balance of speed and cost |
 | `Codex-haiku-4-5` | 50 | Use for cheap, high-volume sub-calls |
-| `Codex-opus-4-6` | 5 | Heavy model; use only for root-level synthesis |
+| `Codex-opus-4-7` | 5 | Heavy model; use only for root-level synthesis |
 
 Use a **second semaphore** for downstream rate-limited APIs (e.g. W&B, GitHub):
 
