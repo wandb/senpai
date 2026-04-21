@@ -1,5 +1,28 @@
 # SENPAI Research Results
 
+## 2026-04-21 19:00 — Wave 2 Review Round 2: 2 more PRs closed, 2 new assignments
+
+### PRs Closed
+
+| PR | Student | Dataset | Best Val | Baseline | Reason |
+|---|---|---|---|---|---|
+| #2900 | sanji | DrivAerML | 11.065% (ep49) | 4.619% | Surface-only flag was already default (hypothesis untested). GA hurt due to T_max not scaled. 6 concurrent runs on 1 node = 45x slowdown. Student's follow-up insights were good. |
+| #2873 | chrome | DrivAerML | 5.240% (ep229) | 4.619% | LR headroom above 5e-4 definitively falsified: 6e-4=5.24%, 5.5e-4=5.39%, 4.5e-4=DIVERGED. LR optimum firmly at 5e-4 with gc=1.0 |
+
+**Key insights:**
+- DrivAerML LR is locked at 5e-4 — any deviation (even ±10%) degrades results
+- surface_only_drivaerml=True is already the default — future tests of volume inclusion need explicit `--no-surface-only-drivaerml`
+- GA requires T_max scaling (T_max/GA_factor) to equalize cosine cycles
+
+### New Assignments
+
+| PR | Student | Focus | Key Config |
+|---|---|---|---|
+| #2917 | chrome | DrivAerML 4L/640d mid-width | 640d/10 heads + gc=1.0 (between 512d and 768d) |
+| #2918 | sanji | DrivAerML gc=0.5 + WD=1e-2 | Softer clip from AirfRANS 4L recipe + regularization |
+
+---
+
 ## 2026-04-21 18:00 — Wave 2 Review Round: 5 PRs disposed, 8 new assignments
 
 ### PRs Closed (Dead Ends)
