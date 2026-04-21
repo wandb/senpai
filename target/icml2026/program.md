@@ -10,20 +10,28 @@ Autonomous research target for the ICML 2026 AI for Science workshop sprint.
 
 ## Problem
 
-This target packages the experiments for the ICML paper around three CFD surrogate
+This target packages the experiments for the ICML paper around four CFD surrogate
 benchmarks under one harness-compatible problem directory:
 
 - `tandemfoil/` — TandemFoilSet, the load-bearing benchmark and current strongest evidence
+- `tandemfoil_paper/` — paper-faithful high-Re TandemFoilSet calibration tasks
 - `airfrans/` — AirfRANS, the 2D transfer benchmark
 - `drivaerml/` — DrivAerML, the 3D surface-first transfer benchmark
 
-The goal is to compare a clean shared training stack across the three datasets,
+The goal is to compare a clean shared training stack across the four benchmark
+views,
 with reference comparisons against a vanilla grouped-domain Transolver and an
 AB-UPT-style anchor model where appropriate.
 
-The ideal paper story is not three unrelated benchmark-specific wins. It is a
-shared recipe whose core ideas transfer across TandemFoilSet, AirfRANS, and
-DrivAerML, even if the best final hyperparameters differ somewhat by dataset.
+The ideal paper story is not four unrelated benchmark-specific wins. It is a
+shared recipe whose core ideas transfer across:
+
+- the main `tandemfoil/` parity benchmark
+- the paper-faithful `tandemfoil_paper/` calibration benchmark
+- `airfrans/`
+- `drivaerml/`
+
+Hyperparameters may differ somewhat by dataset, but the core recipe should not.
 
 For TandemFoilSet specifically, this target should become the reproduction and
 extension path for the merged noam lineage through `#2379`, while AirfRANS and
@@ -34,7 +42,8 @@ explicitly requested.
 
 - `train.py` — shared ICML sprint trainer and model selector. **Primary editable entrypoint.**
 - `core/` — shared dataset contract, features, optimizers, and model definitions.
-- `tandemfoil/` — TandemFoilSet-specific data pipeline and benchmark docs.
+- `tandemfoil/` — TandemFoilSet-specific parity target and benchmark docs.
+- `tandemfoil_paper/` — paper-faithful TandemFoilSet high-Re benchmark docs.
 - `airfrans/` — AirfRANS-specific data pipeline and benchmark docs.
 - `drivaerml/` — DrivAerML-specific data pipeline and benchmark docs.
 - `data/` — shared split helpers and smoke tests for the multi-dataset target.
@@ -49,6 +58,11 @@ most decision-relevant metric for the selected benchmark:
   - `legacy_noam/*` for the denormalized historical `p_*` contract
   - `icml2026_v2/*` for the packaged `kagent` split contract
   - pressure and surface fidelity remain the decision-driving quantities
+- `tandemfoil_paper`
+  - prioritize normalized full-field MSE on the paper-faithful Experiment 4
+    tasks
+  - use this benchmark to decide whether our shared stack is actually
+    competitive against the published TandemFoilSet paper numbers
 - `airfrans`
   - prioritize surface and volume error on the official task split
   - compare against literature-reported Transolver and newer baselines
@@ -100,6 +114,8 @@ Primary harness metric aliases:
 
 - `tandemfoil`: `val_primary/surface_pressure_mae` and
   `test_primary/surface_pressure_mae`
+- `tandemfoil_paper`: `val_primary/field_mse` and
+  `test_primary/field_mse`
 - `airfrans`: `val_primary/surface_mse` and `test_primary/surface_mse`
 - `drivaerml`: `val_primary/surface_rel_l2_pct` and
   `test_primary/surface_rel_l2_pct`
@@ -109,6 +125,7 @@ Primary harness metric aliases:
 Read the dataset-specific subprogram before making dataset-specific claims:
 
 - `tandemfoil/program.md`
+- `tandemfoil_paper/program.md`
 - `airfrans/program.md`
 - `drivaerml/program.md`
 

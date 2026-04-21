@@ -15,6 +15,12 @@ recipe whose core changes more or less work across:
 It is fine if some hyperparameters differ by dataset. It is not fine if the
 story only works because every dataset needs a completely different core idea.
 
+For TandemFoilSet, remember there are now two useful views of the problem:
+
+- `target/icml2026/tandemfoil/` for the main parity / ICML sprint contract
+- `target/icml2026/tandemfoil_paper/` for a paper-faithful Experiment 4
+  high-Re MSE comparison
+
 ## Benchmark-facing priorities
 
 - `tandemfoil`
@@ -23,6 +29,15 @@ story only works because every dataset needs a completely different core idea.
   - current sprint anchor at time of writing (`2026-04-21`):
     - `val_primary/surface_pressure_mae = 44.72`
     - reported test from that lane: `50.77`
+- `tandemfoil_paper`
+  - paper-facing metric: `test_primary/field_mse`
+  - published paper reference numbers from Experiment 4 / Table 6:
+    - `cruise_random_uniform = 0.10`
+    - `cruise_random_aoa_extrap = 0.18`
+    - `cruise_random_re_extrap = 0.36`
+    - `cruise_random_stagger_extrap = 0.13`
+    - `cruise_random_gap_extrap = 0.14`
+    - `racecar_uniform = 0.21`
 - `airfrans`
   - paper-facing metric: `test_primary/surface_mse`
   - external targets:
@@ -50,15 +65,19 @@ Always keep the target or reference beside the reported test metric.
 ## Assignment guidance
 
 When a large fleet is available, default to assigning a hypothesis family across
-all three datasets to the same student.
+the relevant datasets to the same student.
 
 - A student has `8` GPUs.
 - Use those GPUs as a matrix across datasets and nearby variants.
 - A good default is:
-  - at least one run per dataset
+  - at least one run on `airfrans`
+  - at least one run on `drivaerml`
+  - at least one run on either `tandemfoil` or `tandemfoil_paper`
+  - include both Tandem variants when the question is about Tandem comparability
+    or transfer
   - remaining GPUs used for the most decision-critical nearby variants
-- The resulting PR should report metrics across all three datasets so the same
-  student can judge whether the idea transferred or was too dataset-specific.
+- The resulting PR should report metrics across the assigned benchmarks so the
+  same student can judge whether the idea transferred or was too dataset-specific.
 
 Single-dataset assignments are still appropriate for:
 
