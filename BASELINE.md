@@ -97,9 +97,21 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.0153 (val) at epoch 41
-- **Best PR:** #2655 (gilbert — Fourier+3L/192d + no-EMA + T_max=10, 41 epochs, AdamW **lr=3e-4**, **seed=789**)
-- **Key insight:** SEED SELECTION > LR TUNING. lr=3e-4+seed=789 found a 17% deeper basin than lr=7e-4's best. lr=3e-4 has tighter distribution (0.0153-0.0194) than lr=7e-4 (0.0198-0.0463). The --seed flag is now merged. Run many seeds at lr=3e-4 for best results. External target: 0.0043 — **3.6x gap remaining**.
+- **Current best:** 0.01419 (val) at epoch 41
+- **Best PR:** #2680 (haku — Fourier+3L/192d + no-EMA + T_max=10, 41 epochs, AdamW **lr=7e-4**, **grad-clip=1.0**)
+- **Key insight:** GRAD-CLIP REOPENS HIGH LR. lr=7e-4+grad-clip=1.0 achieves 0.01419 — 7.3% better than lr=3e-4+seed=789's 0.0153. 91-98% of batches being clipped reveals severe gradient instability. Clipping preserves deep basins at cosine troughs by reducing spike magnitude 40-45%. External target: 0.0043 — **3.3x gap remaining**.
+
+### 2026-04-21 — PR #2680: AirfRANS: lr=7e-4+grad-clip=1.0 — NEW BEST
+
+- **val_primary/surface_mse:** 0.01419 (-7.3% vs 0.0153)
+- **full_val/surface_mse_p:** 0.0564 (-23.3% vs 0.0735)
+- **full_val/volume_mse:** 0.0723 (-45.7% vs 0.1134)
+- **test_primary/surface_mse:** 0.01513
+- **W&B run:** 48ldl625 (41 epochs, best at epoch 41 — still improving!)
+- **Epochs:** 41 (30-min timeout)
+- **Grad-clip stats:** 327-353 of 360 batches clipped per epoch (91-98%). Mean grad norm ~10-22. Spike reduction: baseline peaks 0.23-0.27 → clipped peaks 0.15-0.17 (40-45% lower).
+- **Key insight:** Grad-clip=1.0 at lr=7e-4 reduces destructive spikes at cosine LR peaks while preserving the deep basin exploration. Epoch 40 trough depth: 0.01419 (clipped) vs 0.031 (baseline) — 2.2x deeper. Volume MSE improvement (45.7%) even larger than surface.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans_task full --optimizer adamw --lr 7e-4 --cosine_t_max 10 --grad-clip 1.0 --no-use-ema --enable-fourier --epochs 999`
 
 ### 2026-04-21 — PR #2655: AirfRANS: lr=3e-4+T_max=10 multi-seed — NEW BEST
 
