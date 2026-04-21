@@ -1,5 +1,48 @@
 # SENPAI Research Results
 
+## 2026-04-21 — Round 30: PRESSURE-WEIGHT BREAKTHROUGH (0.00435!)
+
+### CRITICAL DISCOVERY: PR #2703 (nami) — Pressure-weighted loss 20x at 3L/192d
+
+- **val_primary/surface_mse: 0.00435** at epoch 241 — **40% better than baseline (0.007264)**
+- **MATCHES EXTERNAL TARGET (0.0043)** — first time we've closed the gap
+- W&B run: toeli7xw (242 epochs, 3L/192d, lr=3e-4, T_max=10)
+- Config: `--pressure-loss-weight 20.0 --lr 3e-4 --cosine-t-max 10 --seed 789`
+- Architecture: 3L/192d (NOT 4L/256d — even more headroom expected at larger arch)
+- PR was prematurely closed as "superseded by 4L/256d" — REOPENED and sent back for rebase
+
+**Why this works:** Pressure channel dominates composite surface_mse but gets equal gradient weight. 20x upweighting fixes gradient misallocation, allowing the model to prioritize the physically-critical channel. Phase transition still occurs but later (epoch ~117 vs ~23-41) and converges much deeper.
+
+**Per-channel breakdown at best epoch:**
+| Channel | surface_mse |
+|---|---|
+| Ux | 1.54e-05 |
+| Uy | 2.67e-06 |
+| **p** | **0.01736** |
+| nut | 2.48e-06 |
+
+**KEY INSIGHT:** This is the single most impactful hyperparameter/loss change found in the entire research programme. Every future AirfRANS experiment should use `--pressure-loss-weight 20`.
+
+### Dead-end closures (8 PRs)
+- DrivAerML WD=1e-2 at 4L/320d: #2752 (shouko), #2761 (shinobu), #2783 (eren) — WD catastrophically diverges
+- DrivAerML 4L/256d: #2759 (zenitsu) — two generations behind
+- AirfRANS gc=1.5 at 4L/256d: #2762 (luffy), #2784 (nezuko), #2785 (edward), #2791 (haku) — 5+ confirmations of failure
+
+### PR #2790 (ray): DrivAerML gc=1.0+WD=1e-2 at 4L/320d — CLOSED ✗
+- Reviewed in round 29 (see below). 14.40% vs 4.619% baseline. Catastrophic divergence.
+
+### Round 30 Assignments (8 students)
+| Student | Experiment | Dataset | Priority |
+|---|---|---|---|
+| edward | pressure-weight=20 + 4L/256d + golden config | AirfRANS | **HIGHEST** |
+| haku | pressure-weight=20 + 4L/256d + lr=3e-4 | AirfRANS | **HIGHEST** |
+| shouko | 5L/512d depth scaling | DrivAerML | HIGH |
+| eren | 4L/512d + T_max=10 | DrivAerML | HIGH |
+| zenitsu | 4L/640d push width | DrivAerML | HIGH |
+| shinobu | 4L/512d + lr=7e-4 | DrivAerML | HIGH |
+| luffy | 4L/256d + lr=3e-4 + T_max=10 + golden (no pressure) | AirfRANS | HIGH |
+| nezuko | 4L/256d + seed=789 + golden (baseline replication) | AirfRANS | HIGH |
+
 ## 2026-04-21 — Round 29: gc=1.5 Dead at 4L/256d, WD=1e-2 Catastrophic on DrivAerML
 
 ### PR #2790 (ray): DrivAerML gc=1.0+WD=1e-2 at 4L/320d — CLOSED ✗ (CATASTROPHIC DIVERGENCE)
