@@ -1,5 +1,36 @@
 # SENPAI Research Results
 
+## 2026-04-21 — Round 25: gc=1.5 at 3L/192d Cannot Match 4L/256d
+
+### PR #2750 (emma): AirfRANS gc=1.5 multi-seed (5 seeds) — CLOSED ✗
+- Best seed (103): 0.007972 (+9.7% vs 0.007264 baseline). Mean across seeds: 0.01065.
+- Confirms gc=1.5 is robustly better than gc=1.0 at 3L/192d, but 4L/256d+gc=1.0 beats all gc=1.5 seeds.
+
+### PR #2748 (kohaku): AirfRANS gc=1.5+T_max=5 — CLOSED ✗
+- 0.009778 (+34.7%). T_max=5 too volatile with gc=1.5.
+
+### PR #2747 (kaneda): AirfRANS gc=1.5+lr=1e-3 — CLOSED ✗
+- 0.008582 (+18.2%). lr=1e-3 stable with gc=1.5 — no divergence. Worth testing at 4L/256d.
+
+### PR #2744 (fern): AirfRANS gc=1.5+WD=1e-2 — CLOSED ✗
+- 0.020327 (+180%). Catastrophic — WD fights gc=1.5's gradient headroom.
+
+### PR #2722 (tanjiro): TandemFoil lr=2e-4+T_max=20 — SENT BACK
+- 54.36 at 50 epochs (hit SENPAI_MAX_EPOCHS cap). Sent back with SENPAI_MAX_EPOCHS=9999.
+
+### KEY INSIGHT: gc=1.5 at 3L/192d CANNOT match 4L/256d+gc=1.0
+All gc=1.5 experiments at 3L/192d failed to beat 0.007264. Architecture scaling is the dominant lever. gc=1.5 needs to be tested AT the 4L/256d architecture.
+
+### Stale PR cleanup: 13 more PRs closed
+- AirfRANS gc=1.0/0.3: #2715,#2716,#2717,#2719
+- TandemFoil lr=3e-4: #2706,#2710,#2711,#2712,#2713,#2714
+- DrivAerML stale: #2688,#2718,#2705
+
+### Round 25 Assignments (17 students)
+AirfRANS 4L/256d: fern (gc=1.5+T_max=5), kohaku (gc=1.5+T_max=10), emma (lr=5e-4), kaneda (T_max=3), hinata (WD=5e-3), itachi (3L/256d), roy (gc=0.5), armin (lr=1e-3+gc=1.5), winry (no WD), chihiro (4L/320d)
+TandemFoil: sasuke (4L/256d), sakura (T_max=5), kakashi (5L/256d), mikasa (WD+gc)
+DrivAerML: levi (lr=3e-4), chrome (T_max=10), zoro (gc=1.5)
+
 ## 2026-04-21 — Round 24: 4L/256d ARCHITECTURE BREAKTHROUGH
 
 ### PR #2727 (shoya): AirfRANS 4L/256d+gc=1.0+WD=1e-2+T_max=5 — MERGED ✓ NEW BEST (0.007264!)
