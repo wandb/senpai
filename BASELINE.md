@@ -114,11 +114,21 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.007264 (val) at epoch 40
-- **Best PR:** #2727 (shoya — **4L/256d** + Fourier + no-EMA + T_max=5 + WD=1e-2 + gc=1.0, AdamW lr=7e-4, 50 epochs, hit epoch cap at 61 min of 180-min budget)
-- **Key insight:** ARCHITECTURE SCALING + GOLDEN CONFIG (WD=1e-2 + T_max=5) is the enabler. 4L/256d beats 3L/192d by 22.3% when properly regularized. Grad norms stabilized (18.7→7.1 over training) instead of diverging. Model hit SENPAI_MAX_EPOCHS=50 cap at only 61 min — trough envelope still descending, more training should improve further. Uses gc=1.0, NOT gc=1.5 — compounding gc=1.5 with this architecture is the highest priority. External target: 0.0043 — **~1.7x gap remaining** (was 2.2x).
+- **Current best:** 0.003904 (val) at epoch 201
+- **Best PR:** #2755 (shoya — **4L/256d** + Fourier + no-EMA + T_max=5 + WD=1e-2 + gc=1.0, AdamW lr=7e-4, **223 epochs, 180-min budget, SENPAI_MAX_EPOCHS=9999**)
+- **Key insight:** EXTENDED TRAINING IS THE DOMINANT LEVER. Same golden config as PR #2727 but with SENPAI_MAX_EPOCHS=9999 unlocks 223 epochs (vs 50). Progressive descent: 0.237→0.081→0.023→0.00965→0.00620→0.00468→0.003904. **Beats external target 0.0043 by 9.2%.** Catastrophic divergence at ep208 — checkpoint-at-best essential. Two independent paths to sub-0.0043: (1) extended training here, (2) pressure-weight 20x (PR #2703, 0.00435 at 3L/192d). Combining both is the next mega-experiment.
 
-### 2026-04-21 — PR #2727: AirfRANS: 4L/256d + WD=1e-2 + T_max=5 + gc=1.0 — NEW BEST
+### 2026-04-21 — PR #2755: AirfRANS: 4L/256d extended run (180-min, SENPAI_MAX_EPOCHS=9999) — NEW BEST
+
+- **val_primary/surface_mse:** 0.003904 (-46.2% vs 0.007264) at epoch 201
+- **Surface MSE breakdown (ep201):** Ux=4.97e-05, Uy=1.09e-05, nut=1.05e-05, p=0.01555
+- **full_val/volume_mse:** 0.03198
+- **W&B run:** stxm16tv (223 epochs, 180-min timeout, best at ep201)
+- **Epochs:** 223 (180-min timeout, ~0.81 min/epoch at 4L/256d)
+- **Key insight:** Removing the 50-epoch cap (SENPAI_MAX_EPOCHS=9999) unlocks 4.5x more training. Progressive descent through clear phases: 0.237 (ep4) → 0.081 (ep17) → 0.023 (ep29) → 0.00965 (ep43) → 0.00620 (ep76) → 0.00468 (ep158) → 0.003904 (ep201). Deep basins are stochastic — sub-0.005 readings appeared sporadically at ep195, 199, 201. Catastrophic divergence at ep208 (gradient norms → infinity) — T_max=5 cosine cycling eventually triggers irreversible instability. **CHECKPOINT AT BEST EPOCH IS ESSENTIAL.** Test metrics unreliable (final model diverged). Beats external target 0.0043 without pressure weighting — combining with `--pressure-loss-weight 20` is the obvious next step.
+- **Reproduce:** `cd target/icml2026 && CUDA_VISIBLE_DEVICES=0 SENPAI_MAX_EPOCHS=9999 SENPAI_TIMEOUT_MINUTES=180 python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 7e-4 --cosine-t-max 5 --grad-clip 1.0 --weight-decay 1e-2 --no-use-ema --enable-fourier --model-layers 4 --model-hidden-dim 256 --model-heads 4 --epochs 999`
+
+### 2026-04-21 — PR #2727: AirfRANS: 4L/256d + WD=1e-2 + T_max=5 + gc=1.0 — PREVIOUS BEST
 
 - **val_primary/surface_mse:** 0.007264 (-22.3% vs 0.00935)
 - **W&B run:** ruurxdqs (50 epochs, best at epoch 40, hit SENPAI_MAX_EPOCHS=50 cap at 61 min)
