@@ -106,6 +106,9 @@ class TrainConfig:
     surface_anchor_points: int = 8_000
     volume_anchor_points: int = 8_000
     save_checkpoint: bool = False
+    kutta_loss_weight: float = 0.0
+    kutta_hard_constraint: bool = False
+    kutta_region_k: int = 8
 
 
 @dataclass
@@ -127,6 +130,8 @@ class TandemPreparedBatch:
     is_tandem: torch.Tensor
     fore_surface_mask: torch.Tensor
     aft_surface_mask: torch.Tensor
+    fore_te_region_idx: torch.Tensor | None
+    aft_te_region_idx: torch.Tensor | None
 
 
 class TargetTransform:
@@ -311,6 +316,26 @@ class TandemTargetTransform:
         fore_surface_mask = batch.surface_mask & (surface_saf_norm <= 0.005)
         aft_surface_mask = batch.surface_mask & (surface_saf_norm > 0.005) & is_tandem[:, None]
 
+        fore_te_region_idx = None
+        aft_te_region_idx = None
+        K = self.config.kutta_region_k
+        if self.config.kutta_hard_constraint or self.config.kutta_loss_weight > 0:
+            B = surface_raw_xy.shape[0]
+            inf = 1e6
+            fore_x = surface_raw_xy[..., 0] * fore_surface_mask.float() - inf * (~fore_surface_mask).float()
+            fore_te_node = fore_x.argmax(dim=1)
+            fore_te_xy = surface_raw_xy[torch.arange(B, device=surface_raw_xy.device), fore_te_node]
+            dist_fore = ((surface_raw_xy - fore_te_xy[:, None, :]) ** 2).sum(-1)
+            dist_fore[~batch.surface_mask] = inf
+            fore_te_region_idx = dist_fore.topk(K, dim=1, largest=False).indices
+
+            aft_x = surface_raw_xy[..., 0] * aft_surface_mask.float() - inf * (~aft_surface_mask).float()
+            aft_te_node = aft_x.argmax(dim=1)
+            aft_te_xy = surface_raw_xy[torch.arange(B, device=surface_raw_xy.device), aft_te_node]
+            dist_aft = ((surface_raw_xy - aft_te_xy[:, None, :]) ** 2).sum(-1)
+            dist_aft[~batch.surface_mask] = inf
+            aft_te_region_idx = dist_aft.topk(K, dim=1, largest=False).indices
+
         return TandemPreparedBatch(
             surface_x=surface_x * batch.surface_mask.unsqueeze(-1),
             volume_x=None if volume_x is None else volume_x * volume_mask.unsqueeze(-1),
@@ -329,6 +354,8 @@ class TandemTargetTransform:
             is_tandem=is_tandem,
             fore_surface_mask=fore_surface_mask,
             aft_surface_mask=aft_surface_mask,
+            fore_te_region_idx=fore_te_region_idx,
+            aft_te_region_idx=aft_te_region_idx,
         )
 
     def invert_predictions(
@@ -653,15 +680,71 @@ def loss_grouped(
     return total, metrics
 
 
+def _apply_kutta_constraint(
+    surface_preds: torch.Tensor,
+    prepared: TandemPreparedBatch,
+    config: TrainConfig,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    metrics: dict[str, float] = {}
+    kutta_loss = torch.tensor(0.0, device=surface_preds.device, dtype=surface_preds.dtype)
+    if prepared.fore_te_region_idx is None:
+        return surface_preds, kutta_loss, metrics
+
+    B, N, C = surface_preds.shape
+    K = config.kutta_region_k
+    p_idx = 2
+
+    p_channel = surface_preds[..., p_idx]  # [B, N]
+    fore_idx = prepared.fore_te_region_idx  # [B, K]
+    fore_p = p_channel.gather(1, fore_idx)  # [B, K]
+
+    if config.kutta_loss_weight > 0:
+        kutta_fore = (fore_p.max(dim=1).values - fore_p.min(dim=1).values) ** 2
+        kutta_loss = kutta_loss + kutta_fore.mean()
+
+    if config.kutta_hard_constraint:
+        fore_p_mean = fore_p.mean(dim=1, keepdim=True).expand(-1, K)
+        p_channel = p_channel.scatter(1, fore_idx, fore_p_mean.to(p_channel.dtype))
+
+    if prepared.aft_te_region_idx is not None:
+        aft_idx = prepared.aft_te_region_idx
+        aft_p = p_channel.gather(1, aft_idx)
+        is_tandem_mask = prepared.is_tandem.float()
+
+        if config.kutta_loss_weight > 0:
+            kutta_aft = (aft_p.max(dim=1).values - aft_p.min(dim=1).values) ** 2
+            kutta_loss = kutta_loss + (kutta_aft * is_tandem_mask).mean()
+
+        if config.kutta_hard_constraint:
+            aft_p_mean = aft_p.mean(dim=1, keepdim=True).expand(-1, K)
+            aft_projected = aft_p_mean * is_tandem_mask[:, None] + aft_p * (1 - is_tandem_mask[:, None])
+            p_channel = p_channel.scatter(1, aft_idx, aft_projected.to(p_channel.dtype))
+
+    if config.kutta_hard_constraint:
+        channels = list(surface_preds.unbind(dim=-1))
+        channels[p_idx] = p_channel
+        surface_preds = torch.stack(channels, dim=-1)
+
+    metrics["kutta_loss"] = float(kutta_loss.detach().cpu().item())
+    return surface_preds, kutta_loss, metrics
+
+
 def loss_grouped_tandem(
     prepared: TandemPreparedBatch,
     outputs: dict[str, torch.Tensor | None],
+    config: TrainConfig | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=prepared.surface_x.device)
     metrics: dict[str, float] = {}
     if outputs["surface_preds"] is not None:
-        surf_loss = F.mse_loss(outputs["surface_preds"][prepared.surface_mask], prepared.surface_target[prepared.surface_mask])
+        preds = outputs["surface_preds"]
+        if config is not None and (config.kutta_hard_constraint or config.kutta_loss_weight > 0):
+            preds, kutta_loss_tensor, kutta_metrics = _apply_kutta_constraint(preds, prepared, config)
+            metrics.update(kutta_metrics)
+        surf_loss = F.mse_loss(preds[prepared.surface_mask], prepared.surface_target[prepared.surface_mask])
         total = total + surf_loss
+        if config is not None and config.kutta_loss_weight > 0:
+            total = total + config.kutta_loss_weight * kutta_loss_tensor
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if prepared.volume_target is not None and outputs["volume_preds"] is not None and prepared.volume_mask is not None:
         vol_loss = F.mse_loss(outputs["volume_preds"][prepared.volume_mask], prepared.volume_target[prepared.volume_mask])
@@ -1033,6 +1116,7 @@ def train_one_epoch(
     *,
     amp_mode: str = "none",
     max_batches: int = 0,
+    config: TrainConfig | None = None,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1065,7 +1149,10 @@ def train_one_epoch(
                         volume_mask=prepared.volume_mask,
                     )
                     outputs = maybe_apply_anp(outputs, prepared, anp_head)
-                    loss, _ = loss_grouped_tandem(prepared, outputs)
+                    loss, batch_metrics = loss_grouped_tandem(prepared, outputs, config=config)
+                    if "kutta_loss" in batch_metrics:
+                        running.setdefault("kutta_loss", 0.0)
+                        running["kutta_loss"] += batch_metrics["kutta_loss"]
             else:
                 with autocast_context(device, amp_mode):
                     outputs = model(
@@ -1086,6 +1173,8 @@ def train_one_epoch(
         running["loss"] += float(loss.detach().cpu().item())
         steps += 1
     running["loss"] /= max(steps, 1)
+    if "kutta_loss" in running:
+        running["kutta_loss"] /= max(steps, 1)
     running["train_steps"] = float(steps)
     if scheduler is not None:
         running["lr"] = float(optimizer.param_groups[0]["lr"])
@@ -1256,6 +1345,7 @@ def main() -> None:
             model_name=config.model,
             amp_mode=config.amp_mode,
             max_batches=config.max_train_batches,
+            config=config,
         )
 
         if ema is not None:
