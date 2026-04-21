@@ -74,7 +74,7 @@ class TrainConfig:
     persistent_workers: bool = True
     prefetch_factor: int = 4
     amp_mode: str = "bf16"
-    compile_model: bool = False
+    compile_model: bool = True
     debug: bool = False
     max_train_batches: int = 0
     max_eval_batches: int = 0
