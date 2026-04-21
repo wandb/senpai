@@ -105,9 +105,21 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.01419 (val) at epoch 41
-- **Best PR:** #2680 (haku — Fourier+3L/192d + no-EMA + T_max=10, 41 epochs, AdamW **lr=7e-4**, **grad-clip=1.0**)
-- **Key insight:** GRAD-CLIP REOPENS HIGH LR. lr=7e-4+grad-clip=1.0 achieves 0.01419 — 7.3% better than lr=3e-4+seed=789's 0.0153. 91-98% of batches being clipped reveals severe gradient instability. Clipping preserves deep basins at cosine troughs by reducing spike magnitude 40-45%. External target: 0.0043 — **3.3x gap remaining**.
+- **Current best:** 0.01323 (val) / 0.01478 (test) at epoch 41
+- **Best PR:** #2709 (fern — Fourier+3L/192d + no-EMA + T_max=10, 41 epochs, AdamW **lr=7e-4**, **grad-clip=1.0**, **WD=1e-2**)
+- **Key insight:** GRAD-CLIP + WEIGHT DECAY compounds. WD=1e-2 without grad-clip failed (0.027) but WITH grad-clip achieves 0.01323 — 6.8% better than grad-clip alone. Clipping prevents gradient explosions so WD can contribute positive regularization. Best at final epoch (still improving!). External target: 0.0043 — **3.1x gap remaining**.
+
+### 2026-04-21 — PR #2709: AirfRANS: lr=7e-4+grad-clip=1.0+WD=1e-2 — NEW BEST
+
+- **val_primary/surface_mse:** 0.01323 (-6.8% vs 0.01419)
+- **full_val/surface_mse_p:** 0.0528
+- **full_val/volume_mse:** 0.0804
+- **test_primary/surface_mse:** 0.01478 (-2.3% vs 0.01513)
+- **W&B run:** 7vic8kxn (41 epochs, best at epoch 41 — STILL IMPROVING!)
+- **Epochs:** 41 (30-min timeout)
+- **Phase transition:** epoch 14 (0.1239 → 0.0548), then smooth descent to 0.01323. 7 consecutive new-best epochs early (6-12) from WD regularization during plateau phase. Best at final epoch — longer training should push deeper.
+- **Key insight:** WD=1e-2 without grad-clip failed at 0.027 because gradient explosions at cosine peaks destroyed the regularization benefit. With grad-clip preventing spikes, WD provides clean regularization. The combo is strictly better than either alone.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans_task full --optimizer adamw --lr 7e-4 --cosine_t_max 10 --grad-clip 1.0 --weight-decay 1e-2 --no-use-ema --enable-fourier --epochs 999`
 
 ### 2026-04-21 — PR #2680: AirfRANS: lr=7e-4+grad-clip=1.0 — NEW BEST
 
