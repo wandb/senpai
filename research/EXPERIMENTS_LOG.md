@@ -1,5 +1,24 @@
 # SENPAI Research Results
 
+## 2026-04-21 — Round 26: Clearing Last DrivAerML 4L/384d PRs
+
+### Stale PR cleanup: 7 PRs closed
+- DrivAerML 4L/384d: #2735 (nezuko), #2730 (edward), #2738 (askeladd), #2733 (norman), #2736 (shinji), #2721 (ray)
+- AirfRANS gc=1.0 3L/192d: #2734 (thorfinn)
+
+### Round 26 Assignments (8 students)
+
+| Student | Experiment | Dataset |
+|---|---|---|
+| eren | 4L/320d+gc=1.5+WD=1e-2+T_max=20 compound | DrivAerML |
+| nezuko | 4L/256d+gc=1.5+WD=5e-3 (lighter WD) | AirfRANS |
+| edward | 4L/256d+gc=1.5+WD=0 (no WD) | AirfRANS |
+| thorfinn | 4L/256d+T_max=7 (intermediate cycles) | AirfRANS |
+| askeladd | 4L/320d+lr=7e-4 (higher LR) | DrivAerML |
+| norman | lr=2e-4+gc=1.0+WD=1e-2 | TandemFoil |
+| shinji | 3L/256d+lr=2e-4 (width-only scaling) | TandemFoil |
+| ray | 4L/320d+gc=1.0+WD=1e-2 (golden compound) | DrivAerML |
+
 ## 2026-04-21 — Round 25: gc=1.5 at 3L/192d Cannot Match 4L/256d
 
 ### PR #2750 (emma): AirfRANS gc=1.5 multi-seed (5 seeds) — CLOSED ✗
