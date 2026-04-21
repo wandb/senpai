@@ -1,5 +1,22 @@
 # SENPAI Research Results
 
+## 2026-04-21 — Round 19: AirfRANS Golden Config (grad-clip+WD)
+
+### PR #2709: AirfRANS lr=7e-4+grad-clip=1.0+WD=1e-2 — MERGED ✓ NEW BEST (0.01323)
+
+- fern/airfrans-lr7e4-gradclip-wd1e2
+- val_primary/surface_mse: **0.01323** (-6.8% vs 0.01419 baseline)
+- test_primary/surface_mse: 0.01478 (-2.3%)
+- W&B: 7vic8kxn (41 epochs, best at FINAL epoch — still improving!)
+- Phase transition at epoch 14, then smooth descent. 7 consecutive new-best epochs (6-12) from WD regularization.
+- GOLDEN CONFIG: lr=7e-4 + T_max=10 + grad-clip=1.0 + WD=1e-2 + Fourier + no-EMA.
+- Gap to external: **3.1x** (was 3.3x).
+
+### PR #2708: AirfRANS lr=3e-4+grad-clip+seed=789 (kaneda) — CLOSED ✗
+
+- 0.01706 (+20% worse). lr=7e-4 is essential for surface accuracy. lr=3e-4+grad-clip doesn't compete.
+- Insight: lr=3e-4 gives better volume_mse (0.093 vs 0.080) but worse surface_mse. Surface is the primary metric.
+
 ## 2026-04-21 — Round 18: 4L/512d Sent Back + Grad-Clip Sweep Data
 
 ### PR #2691: DrivAerML 4L/512d (frieren) — SENT BACK (epoch cap bug)
