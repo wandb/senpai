@@ -276,11 +276,19 @@
 ## DrivAerML
 
 - **Primary metric:** `val_primary/surface_rel_l2_pct` (lower is better)
-- **Current best:** 5.027% (val) / 6.244% (test) at epoch 257
-- **Best PR:** #2648 (zoro — Fourier+**4L/320d**/5H+no-EMA+T_max=30, 257 epochs, AdamW lr=5e-4, 394 batches/epoch, **180-min budget**)
+- **Current best:** 4.619% (val) at epoch 256
+- **Best PR:** #2691 (frieren — **4L/512d**/8H + Fourier + no-EMA + T_max=30, 267 epochs, AdamW lr=5e-4, **180-min budget**)
 - **CRITICAL:** Must pass `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
-- **External target:** <3.71% (AB-UPT, ~500 epochs) — **1.35x gap remaining** (was 1.55x)
-- **Key insight:** THROUGHPUT vs WIDTH tradeoff. 4L/320d runs 257 epochs in 180 min (~0.7 min/ep) vs 4L/384d's 151 epochs (~1.2 min/ep). The smaller model sees 70% more training steps at the same wall-clock budget. At fixed wall-clock, more training at moderate width beats fewer steps at maximum width. Still improving at epoch 257 — more headroom. Next: explore 4L/352d (intermediate), longer training at 320d, combine with grad-clip.
+- **External target:** <3.71% (AB-UPT, ~500 epochs) — **1.24x gap remaining** (was 1.35x)
+- **Key insight:** WIDTH SCALES at 180-min budget. 4L/512d gets 267 epochs (~0.67 min/ep) vs 4L/320d's 257 epochs (~0.7 min/ep) — comparable throughput but more capacity. Extra capacity pays off when given enough training time. Best checkpoint at epoch 256 (critical — final epoch 267 overfit at 5.926%). SENPAI_MAX_EPOCHS=9999 required. Next: gc=1.5 at 4L/512d, 5L/512d, compound with WD.
+
+### 2026-04-21 — PR #2691: DrivAerML: 4L/512d width scaling (180-min) — NEW BEST
+
+- **val_primary/surface_rel_l2_pct:** 4.619% (-8.1% vs 5.027%) at epoch 256
+- **W&B run:** k8qtsxxz (267 epochs, 180-min budget)
+- **Epochs:** 267 (~0.67 min/epoch for 4L/512d); best at epoch 256 (5.926% final at 267 = overfitting)
+- **Key insight:** 4L/512d gets comparable epoch count to 4L/320d but with higher model capacity. Width scaling IS beneficial at this budget when epoch limit is removed. Gap to external: 1.24x (was 1.35x).
+- **Reproduce:** `cd target/icml2026 && SENPAI_MAX_EPOCHS=9999 python train.py --dataset drivaerml --optimizer adamw --lr 5e-4 --cosine-t-max 30 --no-use-ema --enable-fourier --model-layers 4 --model-hidden-dim 512 --model-heads 8 --epochs 999 --batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
 
 ### 2026-04-21 — PR #2648: DrivAerML: 4L/320d+T_max=30 — throughput vs width — NEW BEST
 
