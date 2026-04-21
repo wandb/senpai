@@ -98,6 +98,8 @@ class TrainConfig:
     residual_prediction: bool = False
     re_stratified_sampling: bool = False
     cosine_t_max: int = 150
+    coarse_aux_bins: int = 64
+    coarse_aux_weight: float = 0.01
     geometry_points: int = 25_000
     geometry_supernodes: int = 4_096
     surface_anchor_points: int = 8_000
@@ -647,6 +649,8 @@ def loss_grouped(
 def loss_grouped_tandem(
     prepared: TandemPreparedBatch,
     outputs: dict[str, torch.Tensor | None],
+    coarse_aux_bins: int = 64,
+    coarse_aux_weight: float = 0.01,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=prepared.surface_x.device)
     metrics: dict[str, float] = {}
@@ -668,8 +672,8 @@ def loss_grouped_tandem(
             outputs["surface_preds"][mask],
             prepared.surface_target[mask],
             surf_xy_norm,
-            n_bins=64,
-            weight=0.01,
+            n_bins=coarse_aux_bins,
+            weight=coarse_aux_weight,
         )
         total = total + aux_loss
         metrics["coarse_aux_loss"] = float(aux_loss.detach().cpu().item())
@@ -1030,6 +1034,8 @@ def train_one_epoch(
     model_name: str,
     *,
     max_batches: int = 0,
+    coarse_aux_bins: int = 64,
+    coarse_aux_weight: float = 0.01,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1060,7 +1066,7 @@ def train_one_epoch(
                     volume_mask=prepared.volume_mask,
                 )
                 outputs = maybe_apply_anp(outputs, prepared, anp_head)
-                loss, train_metrics = loss_grouped_tandem(prepared, outputs)
+                loss, train_metrics = loss_grouped_tandem(prepared, outputs, coarse_aux_bins=coarse_aux_bins, coarse_aux_weight=coarse_aux_weight)
                 if "coarse_aux_loss" in train_metrics:
                     running.setdefault("coarse_aux_loss", 0.0)
                     running["coarse_aux_loss"] = running["coarse_aux_loss"] + train_metrics["coarse_aux_loss"]
@@ -1252,6 +1258,8 @@ def main() -> None:
             device=device,
             model_name=config.model,
             max_batches=config.max_train_batches,
+            coarse_aux_bins=config.coarse_aux_bins,
+            coarse_aux_weight=config.coarse_aux_weight,
         )
 
         if ema is not None:
