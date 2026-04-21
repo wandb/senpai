@@ -1,5 +1,25 @@
 # SENPAI Research Results
 
+## 2026-04-21 — PR #2602: DrivAerML: 4L/384d+T_max=30 — MERGED ✓ MASSIVE NEW BEST
+
+- kakashi/drivaerml-4L384d-tmax30 (180-min budget)
+- Hypothesis: Wider model (384d vs 256d) with proportional heads (6H vs 4H) should scale capacity for 3D automotive CFD.
+
+| Config | val_primary/surface_rel_l2_pct | Epochs | W&B |
+|---|---|---|---|
+| **4L/384d+T_max=30** | **5.73%** | 151 | 7ogfs7ph |
+| 4L/256d+600b (prev best) | 11.97% | 34 | dar47nwl |
+
+Commentary: BREAKTHROUGH — 52% relative improvement. Width scaling (256→384d) is the dominant lever. 151 epochs in 180-min budget (~1.2 min/epoch), still improving at cutoff. Late oscillation suggests T_max=30 slightly aggressive for 384d. External target (3.71%) now 1.55x away. New baseline: 5.73%.
+
+## 2026-04-21 — PR #2663: AirfRANS dropout=0.1 — CLOSED ✗
+
+- shinji/airfrans-lr3e4-dropout. val=0.029072 (58% worse than 0.01841). Dropout disrupts phase transition. W&B: qo0ytm1i. DEAD END.
+
+## 2026-04-21 — PR #2643: DrivAerML eta_min=1e-5+600batches — CLOSED ✗
+
+- rei/drivaerml-4L256d-etamin. val=12.47% — doesn't beat new 5.73% baseline. Architecture change is more important than LR tuning on 4L/256d.
+
 ## 2026-04-21 — PR #2662: DrivAerML lr=3e-4+10ep warmup — CLOSED ✗
 
 - shoya/drivaerml-4L256d-lr3e4-warmup
