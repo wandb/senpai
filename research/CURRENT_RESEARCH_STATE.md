@@ -12,6 +12,7 @@
 | Dataset | Paper-facing metric | Current best | Target / reference | Status |
 |---|---|---|---|---|
 | TandemFoil | `test_primary/surface_pressure_mae` | **33.88** (#2810) | no external scalar | needs test from new EMA best |
+| TandemFoil Paper | `test_primary/field_mse` | not run yet on `radford` | `0.10 / 0.18 / 0.36 / 0.13 / 0.14 / 0.21` by task | new calibration lane |
 | AirfRANS | `test_primary/surface_mse` | **0.003** (#2824) | `0.0043` | **BEATEN** — val now 0.000727 |
 | DrivAerML | `test_primary/surface_rel_l2_pct` | **6.24%** (#2691) | `3.71%` | **MAIN GAP — 1.68x** |
 
@@ -25,8 +26,16 @@
 
 ## Main Scientific Goal
 
-A shared recipe whose core changes work across TandemFoil, AirfRANS, and DrivAerML.
-DrivAerML is the main gap. Corrected EMA warmup is now the shared recipe for TF+AF.
+A shared recipe whose core changes work across:
+
+- the main TandemFoil parity target
+- the new TandemFoil paper-calibration target
+- AirfRANS
+- DrivAerML
+
+DrivAerML is still the main gap. Corrected EMA warmup is now the shared recipe
+for TF+AF, and the paper-calibration Tandem benchmark exists to tell us whether
+Tandem-side gains are only helping the parity contract or also the literature-facing one.
 
 ## Mandatory Config Rules (UPDATED after EMA merge)
 
@@ -53,6 +62,12 @@ DrivAerML is the main gap. Corrected EMA warmup is now the shared recipe for TF+
 ## Default Assignment Pattern
 
 Cross-dataset: TF+AF use EMA decay=0.999, DM still uses --no-use-ema.
+
+When a hypothesis is relevant to TandemFoil generalization or paper
+comparability, include both:
+
+- `target/icml2026/tandemfoil/`
+- `target/icml2026/tandemfoil_paper/`
 
 ## ACTIVE EXPERIMENTS — 50 WIP PRs
 

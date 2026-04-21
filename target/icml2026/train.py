@@ -93,6 +93,7 @@ LEGACY_VAL_ALIAS = {
     "val_ood_re": "p_re",
 }
 AIRFRANS_FIELD_NAMES = ("Ux", "Uy", "p", "nut")
+TANDEM_FIELD_NAMES = ("Ux", "Uy", "p")
 
 
 @dataclass
@@ -134,6 +135,9 @@ class TrainConfig:
     airfrans_task: str = "full"
     tandem_manifest: str = ""
     tandem_stats: str = ""
+    tandemfoil_paper_task: str = "cruise_random_uniform"
+    tandemfoil_paper_manifest: str = ""
+    tandemfoil_paper_stats: str = ""
     enable_fourier: bool = False
     enable_te_coord_frame: bool = False
     enable_cp_panel: bool = False
@@ -430,6 +434,7 @@ def build_bundle(config: TrainConfig) -> DatasetBundle:
     bundle_kwargs = {
         "dataset_name": config.dataset,
         "debug": config.debug,
+        "tandemfoil_paper_task": config.tandemfoil_paper_task,
         "airfrans_task": config.airfrans_task,
         "drivaerml_surface_only": config.surface_only_drivaerml,
         "drivaerml_train_surface_points": config.drivaerml_train_surface_points,
@@ -447,6 +452,10 @@ def build_bundle(config: TrainConfig) -> DatasetBundle:
         bundle_kwargs["tandem_manifest"] = config.tandem_manifest
     if config.tandem_stats:
         bundle_kwargs["tandem_stats"] = config.tandem_stats
+    if config.tandemfoil_paper_manifest:
+        bundle_kwargs["tandemfoil_paper_manifest"] = config.tandemfoil_paper_manifest
+    if config.tandemfoil_paper_stats:
+        bundle_kwargs["tandemfoil_paper_stats"] = config.tandemfoil_paper_stats
     return build_dataset_bundle(**bundle_kwargs)
 
 
@@ -831,6 +840,10 @@ def evaluate_grouped(
     n_vol = torch.zeros(3, device=device)
     surf_channel_sum = None
     vol_channel_sum = None
+    paper_surface_sq_sum = None
+    paper_volume_sq_sum = None
+    paper_surface_nodes = 0
+    paper_volume_nodes = 0
     drivaer_surface_case_sums: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     drivaer_volume_case_sums: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
@@ -906,6 +919,25 @@ def evaluate_grouped(
                         vol_channel_sum += channel_mean.to(device)
             continue
 
+        if dataset_name == "tandemfoilset_paper":
+            if batch.surface_y is not None and outputs["surface_preds"] is not None:
+                target = transform.apply(batch.surface_y)
+                case_values = (outputs["surface_preds"] - target).square()
+                valid = batch.surface_mask.unsqueeze(-1)
+                if paper_surface_sq_sum is None:
+                    paper_surface_sq_sum = torch.zeros(case_values.shape[-1], device=device)
+                paper_surface_sq_sum += (case_values * valid).sum(dim=(0, 1)).to(device)
+                paper_surface_nodes += int(batch.surface_mask.sum().detach().cpu().item())
+            if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
+                target = transform.apply(batch.volume_y)
+                case_values = (outputs["volume_preds"] - target).square()
+                valid = batch.volume_mask.unsqueeze(-1)
+                if paper_volume_sq_sum is None:
+                    paper_volume_sq_sum = torch.zeros(case_values.shape[-1], device=device)
+                paper_volume_sq_sum += (case_values * valid).sum(dim=(0, 1)).to(device)
+                paper_volume_nodes += int(batch.volume_mask.sum().detach().cpu().item())
+            continue
+
         pred_surface = None
         pred_volume = None
         if batch.surface_y is not None and outputs["surface_preds"] is not None:
@@ -969,6 +1001,25 @@ def evaluate_grouped(
             metrics["volume_rel_l2"] = volume_rel_l2
             metrics["volume_rel_l2_pct"] = volume_rel_l2 * 100.0
         return metrics
+    if dataset_name == "tandemfoilset_paper":
+        metrics: dict[str, float] = {}
+        total_sq_sum = 0.0
+        total_nodes = 0
+        if paper_surface_sq_sum is not None and paper_surface_nodes > 0:
+            surface_channel = paper_surface_sq_sum / paper_surface_nodes
+            metrics["surface_mse"] = float(surface_channel.mean().detach().cpu().item())
+            metrics.update(_named_channel_metrics("surface_mse", surface_channel, TANDEM_FIELD_NAMES))
+            total_sq_sum += float(paper_surface_sq_sum.sum().detach().cpu().item())
+            total_nodes += paper_surface_nodes
+        if paper_volume_sq_sum is not None and paper_volume_nodes > 0:
+            volume_channel = paper_volume_sq_sum / paper_volume_nodes
+            metrics["volume_mse"] = float(volume_channel.mean().detach().cpu().item())
+            metrics.update(_named_channel_metrics("volume_mse", volume_channel, TANDEM_FIELD_NAMES))
+            total_sq_sum += float(paper_volume_sq_sum.sum().detach().cpu().item())
+            total_nodes += paper_volume_nodes
+        if total_nodes > 0:
+            metrics["field_mse"] = total_sq_sum / (total_nodes * len(TANDEM_FIELD_NAMES))
+        return metrics
     metrics = {
         "surface_mae": total_surface / max(count_surface, 1),
         "volume_mae": total_volume / max(count_volume, 1),
@@ -1006,6 +1057,10 @@ def evaluate_abupt(
     count_volume = 0
     surf_channel_sum = None
     vol_channel_sum = None
+    paper_surface_sq_sum = None
+    paper_volume_sq_sum = None
+    paper_surface_nodes = 0
+    paper_volume_nodes = 0
     batches = loader if max_batches <= 0 else itertools.islice(loader, max_batches)
     for batch in batches:
         batch = batch.to(device)
@@ -1036,6 +1091,21 @@ def evaluate_abupt(
                 if vol_channel_sum is None:
                     vol_channel_sum = torch.zeros(channel_mean.shape[0], device=device)
                 vol_channel_sum += channel_mean.to(device)
+            continue
+
+        if dataset_name == "tandemfoilset_paper":
+            if batch.surface_anchor_target is not None and outputs["surface_preds"] is not None:
+                target = transform.apply(batch.surface_anchor_target)
+                if paper_surface_sq_sum is None:
+                    paper_surface_sq_sum = torch.zeros(target.shape[-1], device=device)
+                paper_surface_sq_sum += (outputs["surface_preds"] - target).square().sum(dim=(0, 1)).to(device)
+                paper_surface_nodes += batch.surface_anchor_target.shape[0] * batch.surface_anchor_target.shape[1]
+            if batch.volume_anchor_target is not None and outputs["volume_preds"] is not None:
+                target = transform.apply(batch.volume_anchor_target)
+                if paper_volume_sq_sum is None:
+                    paper_volume_sq_sum = torch.zeros(target.shape[-1], device=device)
+                paper_volume_sq_sum += (outputs["volume_preds"] - target).square().sum(dim=(0, 1)).to(device)
+                paper_volume_nodes += batch.volume_anchor_target.shape[0] * batch.volume_anchor_target.shape[1]
             continue
 
         if batch.surface_anchor_target is not None and outputs["surface_preds"] is not None:
@@ -1084,6 +1154,25 @@ def evaluate_abupt(
             volume_rel_l2 = total_volume / count_volume
             metrics["volume_rel_l2"] = volume_rel_l2
             metrics["volume_rel_l2_pct"] = volume_rel_l2 * 100.0
+        return metrics
+    if dataset_name == "tandemfoilset_paper":
+        metrics: dict[str, float] = {}
+        total_sq_sum = 0.0
+        total_nodes = 0
+        if paper_surface_sq_sum is not None and paper_surface_nodes > 0:
+            surface_channel = paper_surface_sq_sum / paper_surface_nodes
+            metrics["surface_mse"] = float(surface_channel.mean().detach().cpu().item())
+            metrics.update(_named_channel_metrics("surface_mse", surface_channel, TANDEM_FIELD_NAMES))
+            total_sq_sum += float(paper_surface_sq_sum.sum().detach().cpu().item())
+            total_nodes += paper_surface_nodes
+        if paper_volume_sq_sum is not None and paper_volume_nodes > 0:
+            volume_channel = paper_volume_sq_sum / paper_volume_nodes
+            metrics["volume_mse"] = float(volume_channel.mean().detach().cpu().item())
+            metrics.update(_named_channel_metrics("volume_mse", volume_channel, TANDEM_FIELD_NAMES))
+            total_sq_sum += float(paper_volume_sq_sum.sum().detach().cpu().item())
+            total_nodes += paper_volume_nodes
+        if total_nodes > 0:
+            metrics["field_mse"] = total_sq_sum / (total_nodes * len(TANDEM_FIELD_NAMES))
         return metrics
     return {"surface_mae": total_surface / max(count_surface, 1), "volume_mae": total_volume / max(count_volume, 1)}
 
