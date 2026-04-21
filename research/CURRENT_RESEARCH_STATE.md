@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-21 20:10 (DrivAerML Refocus — Wave 2, All Students Assigned)
+- **Date:** 2026-04-21 20:30 (DrivAerML Refocus — Wave 2, All Students Assigned)
 - **Branch:** radford
 - **Fleet status:** 50 live students, ALL ASSIGNED (0 idle)
 - **Current relaunch budget:** inherit pod env defaults
@@ -45,6 +45,7 @@ DrivAerML is the main gap. All new work is DrivAerML-weighted and cross-dataset.
 - **lr=8e-4 + Lion on DrivAerML** (#2907): confounded by wrong optimizer/architecture. Lion competitive at 3L but untested at 4L/512d (nami #2896 testing)
 - **lr=9e-4 is above DrivAerML ceiling** (#2907): both runs diverged catastrophically
 - **Momentum-SAM (MSAM)** (#2904): 3.7-22.7x worse everywhere. Cost is 2x (not ~0%), Lion momentum anti-adversarial on TF
+- **gc=1.0+WD=1e-2+cosine compound** (#2908): 6/8 runs crashed. gc=1.0 permits spikes at cosine LR peaks that cascade with WD
 
 ## Default Assignment Pattern
 
@@ -61,7 +62,7 @@ Cross-dataset by default: 1 TF + 1 AF + 2-4 DrivAerML + nearby variants per stud
 | canute | #2880 | Full recipe: lr=7e-4+gc=1.0+WD=1e-2 |
 | chopper | #2882 | T_max=15+gc=1.0+WD=1e-2 |
 | einar | #2883 | gc=1.0+T_max=20+WD=1e-2 |
-| yuji | #2908 | Compound gc=1.0+WD=1e-2+T_max=15 |
+| yuji | #2922 | WD=5e-3+gc=1.0 moderate, pure gc ablation, WD alone |
 | zenitsu | #2911 | T_max=5+gc=1.0+WD=1e-2 (AirfRANS golden scheduler) |
 | edward | #2916 | lr=6e-4+gc=1.0+WD=1e-2+T_max=10 (intermediate LR) |
 | wolfwood | #2919 | T_max=40/50+gc=1.0+WD=1e-2 (longer cosine cycling) |

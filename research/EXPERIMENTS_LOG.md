@@ -1,5 +1,27 @@
 # SENPAI Research Results
 
+## 2026-04-21 20:30 — Wave 2 Review Round 5: compound crash, moderate WD next
+
+### PR Closed
+
+| PR | Student | Dataset | Best Val | Baseline | Reason |
+|---|---|---|---|---|---|
+| #2908 | yuji | Cross (DM/AF/TF) | DM=6.19%, AF=0.001421, TF=36.33 | DM=4.619%, AF=0.001236, TF=30.10 | gc=1.0+WD=1e-2+cosine compound crashes: 6/8 runs exploded via gradient cascades at cosine LR peaks. Compound components interact destructively. |
+
+**Key insights:**
+- gc=1.0+WD=1e-2+aggressive cosine is UNSTABLE on DrivAerML — LR peaks cause gradient explosions
+- AF T_max=10 got 0.001421 before crashing — tantalizingly close to 0.001236 baseline
+- DM T_max=15 survived longest (6.19% at ep206) but still 34% worse and regressing
+- WD=1e-2 from AirfRANS may be too aggressive for DM's larger 4L/512d model
+
+### New Assignment
+
+| PR | Student | Focus | Key Config |
+|---|---|---|---|
+| #2922 | yuji | DrivAerML moderate WD + pure gc ablation | WD=5e-3+gc=1.0, WD=5e-3 alone, gc=1.0 alone, all at T_max=30 |
+
+---
+
 ## 2026-04-21 20:10 — Wave 2 Review Round 4: MSAM dead end, gradient noise next
 
 ### PR Closed
