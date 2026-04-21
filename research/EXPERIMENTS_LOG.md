@@ -1,5 +1,64 @@
 # SENPAI Research Results
 
+## 2026-04-21 — Round 29: gc=1.5 Dead at 4L/256d, WD=1e-2 Catastrophic on DrivAerML
+
+### PR #2790 (ray): DrivAerML gc=1.0+WD=1e-2 at 4L/320d — CLOSED ✗ (CATASTROPHIC DIVERGENCE)
+
+| Metric | This Run | Baseline |
+|---|---|---|
+| val_primary/surface_rel_l2_pct | 14.40% (best ep38) | 4.619% |
+| Status | Diverged at ep44 | Stable 267ep |
+| W&B | a1o9vikk | k8qtsxxz |
+
+- **Catastrophic divergence timeline:** Best 14.40% at ep38 → grad norm explosion at ep44 (8.4→16.3→231.7) → fully diverged by ep54
+- **Root cause:** WD=1e-2 is 100x default for DrivAerML. Combined with gc=1.0, the cosine restart high-LR phases trigger catastrophic gradient cascades. DrivAerML's 3D surface geometry creates sharper loss landscapes than AirfRANS's 2D.
+- **KEY INSIGHT:** WD=1e-2 does NOT transfer from AirfRANS to DrivAerML. DrivAerML needs much milder regularization (WD≤1e-3 or gc-only).
+
+### PR #2776 (armin): AirfRANS lr=1e-3+gc=1.5 at 4L/256d — CLOSED ✗ (DIVERGED)
+
+| Metric | This Run | Baseline |
+|---|---|---|
+| val_primary/surface_mse | 0.111 | 0.007264 |
+| Status | Diverged | Stable |
+
+- lr=1e-3 + gc=1.5 at 4L/256d = catastrophic. 15x worse than baseline.
+- Confirms gc=1.5 is universally dead at 4L/256d — even at higher LR.
+
+### PR #2769 (kaneda): AirfRANS T_max=3 at 4L/256d — CLOSED ✗
+
+| Metric | This Run | Baseline |
+|---|---|---|
+| val_primary/surface_mse | 0.011601 | 0.007264 |
+| Status | 1.6x worse | — |
+
+- T_max=3 too aggressive — cosine cycles too short for 4L/256d to converge within each cycle.
+- T_max hierarchy at 4L/256d: T_max=5 ≈ baseline > T_max=3 (1.6x worse)
+
+### PR #2767 (kohaku): AirfRANS gc=1.5+T_max=10 at 4L/256d — CLOSED ✗
+
+| Metric | This Run | Baseline |
+|---|---|---|
+| val_primary/surface_mse | 0.024106 | 0.007264 |
+| Status | 3.3x worse | — |
+
+- gc=1.5 without WD still fails at 4L/256d. 5th independent confirmation of gc=1.5 death.
+- gc=1.5 is ONLY viable at 3L/192d (where it was the breakthrough). Deeper architectures amplify gradients.
+
+### PR #2757 (rei): AirfRANS multi-seed at 4L/256d — CLOSED ✗ (CONFOUNDED)
+
+- All 5 seeds ran only 36-37 epochs (30-min timeout vs baseline's 50 epochs at 61 min)
+- Missing SENPAI_TIMEOUT_MINUTES=180 — results are NOT comparable
+- Best seed: 0.0093 (still worse than 0.007264 at 50ep)
+- LESSON: ALL future 4L/256d experiments MUST include SENPAI_TIMEOUT_MINUTES≥60
+
+### Round 29 Assignments (4 students)
+| Student | Experiment | Dataset |
+|---|---|---|
+| ray | 4L/512d+lr=3e-4 | DrivAerML |
+| kaneda | 4L/512d+gc=0.5 | DrivAerML |
+| armin | 5L/256d+golden config | AirfRANS |
+| kohaku | 4L/256d+lr=5e-4+golden | AirfRANS |
+
 ## 2026-04-21 — Round 28: DrivAerML 4L/512d Breakthrough (4.619%)
 
 ### PR #2691 (frieren): DrivAerML 4L/512d — MERGED ✓ NEW BEST (4.619%!)

@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-21 (Round 24 complete)
+- **Date:** 2026-04-21 (Round 29 complete)
 - **Branch:** radford
 
 ## CURRENT BASELINES
@@ -18,116 +18,100 @@
 | AirfRANS | 0.0043 | 0.007264 | **1.7x** |
 | DrivAerML | <3.71% | 4.619% | **1.24x** |
 
-## CRITICAL INSIGHTS (Rounds 17-24)
+## CRITICAL INSIGHTS (Rounds 17-29)
 
-1. **4L/256d + GOLDEN CONFIG = BREAKTHROUGH** (Round 24): Architecture scaling IS viable on AirfRANS with WD=1e-2+T_max=5. 4L/256d achieves 0.007264 vs 0.00935 at 3L/192d (-22.3%). Grad norms stabilize instead of diverging. Hit epoch cap at 61 min — trough still descending. Uses gc=1.0, NOT gc=1.5 — compounding is highest priority.
+1. **4L/256d + GOLDEN CONFIG = BREAKTHROUGH** (Round 24): 4L/256d achieves 0.007264 vs 0.00935 at 3L/192d (-22.3%). Grad norms stabilize (18.7→7.1). Hit epoch cap at 61 min — trough still descending.
 
-1b. **GRAD-CLIP=1.5 IS OPTIMAL AT 3L/192d** (Round 21): gc=1.5 > gc=1.0 > gc=0.5 at 3L/192d. But gc=1.5+T_max=5+WD triple compound FAILED (0.013262). gc=1.5 needs testing at 4L/256d where WD+T_max=5 already stabilizes training.
+2. **gc=1.5 DEAD AT 4L/256d** (Rounds 27-29): 5 independent confirmations. gc=1.5 fails with WD, without WD, at different T_max, at different LR. Deeper architectures amplify gradients making gc=1.5 harmful. gc=1.5 ONLY works at 3L/192d.
 
-2. **THROUGHPUT > WIDTH** (Round 21): DrivAerML 4L/320d (5.027%, 257ep) beats 4L/384d (5.73%, 151ep). In fixed wall-clock, more training at moderate width outperforms fewer steps at maximum width.
+3. **WIDTH SCALES ON DrivAerML** (Round 28): 4L/512d (4.619%, 267ep) beats 4L/320d (5.027%, 257ep). At 180-min with no epoch cap, capacity wins over throughput. Old "throughput > width" insight was wrong for uncapped training.
 
-3. **LOWER LR + MORE EPOCHS** (Round 17): TandemFoil lr=2e-4 at 3L/192d (45.07, 119ep) beats lr=3e-4 at 5L/256d (52.81, 67ep). LR was the bottleneck, not architecture.
+4. **WD=1e-2 DOES NOT TRANSFER TO DrivAerML** (Round 29): Catastrophic divergence at 4L/320d (14.40%, grad norms 231x). DrivAerML's 3D geometry needs much milder regularization (WD≤1e-3 or gc-only).
 
-4. **T_max=5 SHORTER CYCLES** (Round 20): More frequent cosine restarts help AirfRANS. T_max=5 (0.01271) beats T_max=10 (0.01323) at gc=1.0. Now testing at gc=1.5.
+5. **T_max=3 TOO SHORT FOR 4L/256d** (Round 29): 0.011601 vs 0.007264 baseline. T_max hierarchy: T_max=5 ≈ baseline > T_max=3 (1.6x worse).
 
-5. **WD + GRAD-CLIP COMPOUNDS** (Round 19): WD=1e-2 alone fails but with grad-clip achieves 0.01323 (PR #2709). Clipping prevents gradient explosions so WD provides clean regularization.
+6. **LOWER LR + MORE EPOCHS** (Round 17): TandemFoil lr=2e-4 at 3L/192d (45.07, 119ep) beats lr=3e-4 at 5L/256d (52.81, 67ep).
 
-6. **PHASE TRANSITION**: AirfRANS exhibits stochastic single-epoch loss collapse. High seed variance makes multi-seed characterization essential.
+7. **WD + GRAD-CLIP COMPOUNDS on AirfRANS** (Round 19): WD=1e-2 alone fails but with gc=1.0 achieves breakthroughs. Clipping prevents gradient explosions so WD provides clean regularization.
+
+8. **30-MIN TIMEOUT KILLS 4L/256d AirfRANS**: Model gets 36-37 epochs vs baseline's 50 (61 min). ALL 4L/256d AirfRANS experiments MUST use SENPAI_TIMEOUT_MINUTES≥60.
 
 ## MANDATORY CONFIG FLAGS
 
 - `--no-use-ema` — EMA bug, mandatory everywhere
 - `--epochs 999` — Default is 2, must override
-- `SENPAI_MAX_EPOCHS=9999` — Default cap of 50 kills DrivAerML runs
-- `SENPAI_TIMEOUT_MINUTES=180` — Default 30-min insufficient for DrivAerML and deep TandemFoil models
+- `SENPAI_MAX_EPOCHS=9999` — Default cap of 50 kills long runs
+- `SENPAI_TIMEOUT_MINUTES=180` — Default 30-min insufficient for DrivAerML and 4L+ models
 - Lion optimizer for TandemFoil; AdamW for AirfRANS/DrivAerML
 
 ## ACTIVE EXPERIMENTS BY DATASET
 
-### TandemFoil (Baseline: 45.07, lr=2e-4)
-| Student | PR | Experiment | Status |
+### AirfRANS (Baseline: 0.007264, 4L/256d+gc=1.0+WD=1e-2+T_max=5)
+| Student | PR | Experiment | Priority |
 |---|---|---|---|
-| violet | #2723 | 5L/256d+lr=2e-4 | Sent back 2x for 180-min |
-| gilbert | #2724 | lr=1.5e-4 | Sent back 2x for 180-min |
-| tetsuo | #2725 | lr=2e-4+5L/256d+T_max=20 | WIP |
-| tanjiro | #2722 | lr=2e-4+T_max=20 | WIP |
-| historia | #2729 | lr=2e-4+T_max=5 | WIP |
-| naruto | #2728 | lr=2e-4+grad-clip=1.0 | WIP |
-| senku | #2731 | lr=2e-4+WD=1e-2 | WIP |
-| alphonse | #2569 | Hypernetwork SRF (human-directed) | WIP (stale) |
-| kaworu | #2629 | Kutta TE constraint (human-directed) | WIP (stale) |
-| gen | #2623 | MQA audit — sent back for lr=2e-4 test | WIP |
-| sasuke | #2706 | 5L/256d+T_max=20 (at lr=3e-4) | WIP |
-| sakura | #2710 | 5L/256d+T_max=30 (at lr=3e-4) | WIP |
-| kakashi | #2711 | 6L/256d+grad-clip (at lr=3e-4) | WIP |
-| mikasa | #2712 | 5L/384d (at lr=3e-4) | WIP |
-| levi | #2713 | 5L/256d+WD=1e-2 (at lr=3e-4) | WIP |
-| chrome | #2714 | 5L/256d+grad-clip (at lr=3e-4) | WIP |
+| armin | NEW | 5L/256d+golden config | HIGH — depth scaling |
+| kohaku | NEW | 4L/256d+lr=5e-4+golden | HIGH — LR sweep |
+| emma | #2768 | 4L/256d+lr=5e-4 (sent back for timeout) | HIGH |
+| haku | #2791 | gc=1.5+no WD+T_max=10 (cleanest gc=1.5 test) | MEDIUM |
+| hinata | #2770 | WD=5e-3 | MEDIUM |
+| roy | #2774 | gc=0.5 | MEDIUM |
+| chihiro | #2780 | 4L/320d+golden | MEDIUM |
+| itachi | #2771 | 3L/256d (width vs depth) | MEDIUM |
+| nezuko | #2778 | WD=0 ablation | MEDIUM |
+| shinji | #2763 | T_max=10 (gc=1.0) | LOW |
+| winry | #2765 | gc=2.0 | LOW |
+| giyu | #2764 | lr=1e-3 | LOW |
+| edward | #2762 | gc=1.5+T_max=10 | LOW (gc=1.5 dead) |
+| norman | #2784 | gc=1.5+WD=5e-3 | LOW (gc=1.5 dead) |
+| taki | #2785 | gc=1.5+no WD | LOW (gc=1.5 dead) |
+| shouko | #2786 | T_max=7 | LOW |
 
-### AirfRANS (Baseline: 0.00935, gc=1.5)
-| Student | PR | Experiment | Status |
+### TandemFoil (Baseline: 45.07, 3L/192d+lr=2e-4+T_max=10)
+| Student | PR | Experiment | Priority |
 |---|---|---|---|
-| haku | #2743 | gc=1.5+T_max=5+WD=1e-2 triple compound | WIP — HIGHEST PRIORITY |
-| fern | #2744 | gc=1.5+WD=1e-2+T_max=10 | WIP |
-| kohaku | TBD | gc=1.5+T_max=5 (no WD) — isolate effect | Assigning |
-| emma | TBD | gc=1.5 multi-seed (100-104) | Assigning |
-| kaneda | TBD | gc=1.5+lr=1e-3 — push LR higher | Assigning |
-| hinata | #2715 | lr=1e-3+gc=1.0 | WIP (gc=1.0, may close) |
-| itachi | #2716 | gc=1.0+seed=789 | WIP (gc=1.0, may close) |
-| roy | #2717 | gc=0.3 | WIP (gc=0.3, may close) |
-| winry | #2718 | gc=2.0 | WIP |
-| armin | #2719 | lr=5e-4+gc=1.0 | WIP (gc=1.0, may close) |
-| thorfinn | #2734 | gc=1.0 seeds 200-204 | WIP (gc=1.0, may close) |
-| shoya | #2727 | 4L/256d+gc=1.0 | WIP |
-| nami | #2703 | Pressure-weighted loss (20x) | WIP (stale) |
-| asuka | #2704 | asinh-pressure | WIP (stale) |
+| kakashi | #2775 | 5L/256d+lr=2e-4 | HIGH — compound breakthrough |
+| sasuke | #2772 | 4L/256d+lr=2e-4 | HIGH — arch transfer |
+| gen | #2796 | 4L/256d transfer | HIGH |
+| historia | #2792 | lr=1.5e-4 | HIGH — LR sweep |
+| mikasa | #2777 | WD=1e-2+gc=1.0 transfer | HIGH |
+| sakura | #2773 | T_max=5 | MEDIUM |
+| senku | #2788 | WD+gc at lr=2e-4 | MEDIUM |
+| violet | #2789 | 3L/256d wider | MEDIUM |
 
-### DrivAerML (Baseline: 5.027% — 4L/320d, 180-min)
-| Student | PR | Experiment | Status |
+### DrivAerML (Baseline: 4.619%, 4L/512d/8H+T_max=30)
+| Student | PR | Experiment | Priority |
 |---|---|---|---|
-| taki | TBD | 4L/320d+gc=1.5 — transfer breakthrough | Assigning |
-| frieren | #2691 | 4L/512d — rerunning with 180-min | WIP (active) |
-| askeladd | #2738 | 4L/384d+lr=2e-4 — sent back for epoch cap | WIP |
-| norman | #2733 | 4L/384d+600b — sent back for epoch cap | WIP |
-| edward | #2730 | 4L/384d+lr=3e-4 — sent back for epoch cap | WIP |
-| shinji | #2736 | 4L/384d+600b+gc | WIP |
-| nezuko | #2735 | 4L/384d+800b | WIP |
-| chihiro | #2688 | 4L/448d | WIP (stale) |
-| eren | #2720 | 4L/384d+gc=1.0 | WIP |
-| ray | #2721 | 4L/384d+T_max=20 | WIP |
-| rei | #2682 | 4L/384d+T_max=50 — sent back for 180-min | WIP |
-| shouko | #2700 | 4L/384d+seed=789 | WIP (stale) |
-| mitsuha | #2701 | 4L/384d+600b+T_max=50 | WIP (stale) |
-| luffy | #2702 | 4L/384d+warmup=3 | WIP (stale) |
-| zoro | #2705 | 4L/384d+lr=4e-4 | WIP |
-| zenitsu | #2694 | 4L/384d+lr=7e-4 | WIP (stale) |
-| ymir | #2687 | 4L/384d+T_max=40 | WIP (stale) |
-| shinobu | #2684 | 5L/384d | WIP (stale) |
-| giyu | #2699 | 4L/384d+gc=1.0 | WIP (stale) |
-| inosuke | #2697 | 4L/384d+WD=1e-2 | WIP (stale) |
+| ray | NEW | 4L/512d+lr=3e-4 | HIGH — LR sweep |
+| kaneda | NEW | 4L/512d+gc=0.5 | HIGH — regularization |
+| frieren | #2793 | 4L/512d+gc=1.5 | HIGH |
+| fern | #2794 | 4L/512d+WD=1e-2 | HIGH (but WD may diverge!) |
+| rei | #2795 | 4L/512d+T_max=20 | HIGH |
+| levi | #2779 | 4L/320d+lr=3e-4 | LOW (superseded arch) |
+| chrome | #2781 | 4L/320d+T_max=10 | LOW (superseded arch) |
+| zoro | #2782 | 4L/320d+gc=1.5 | LOW (superseded arch) |
+| eren | #2783 | 4L/320d+WD+T_max=20 | LOW (superseded, WD will diverge) |
+| askeladd | #2787 | 4L/320d+lr=7e-4 | LOW (superseded arch) |
 
 ## Next Priority Directions
 
-### AirfRANS (HIGHEST PRIORITY — gc=1.5 momentum, 2.2x from external)
-1. **gc=1.5 compound sweep**: T_max=5 (haku+kohaku), WD=1e-2 (haku+fern), lr=1e-3 (kaneda)
-2. **Multi-seed at gc=1.5** (emma) — characterize variance at winning config
-3. **gc=1.5 + architecture scaling** — 4L/256d with gc=1.5 (after current sweep)
-4. **gc=2.0** (winry) — if gc=1.5 > gc=1.0, is gc=2.0 even better?
-5. If compound works → gc=1.5+T_max=5+WD+4L/256d mega-compound
+### AirfRANS (HIGHEST PRIORITY — 1.7x from external)
+1. **Shoya #2755 full 180-min rerun** — most critical pending experiment. Current baseline hit epoch cap at 50 epochs. Full budget could push well below 0.005.
+2. **Depth scaling** (armin: 5L/256d) — 3L→4L gave 22.3%, can 4L→5L give another step?
+3. **LR sweep at golden config** (kohaku: lr=5e-4, emma: lr=5e-4) — lower LR was TandemFoil breakthrough
+4. **Width scaling** (chihiro: 4L/320d) — more capacity at golden config
+5. **WD ablation** (hinata: 5e-3, nezuko: WD=0) — is WD=1e-2 optimal or can it be tuned?
+6. If gc=1.5 is truly dead at 4L/256d, try gc=0.7 or gc=0.8 — intermediate values
 
-### TandemFoil (Waiting for 180-min reruns)
-1. **lr=2e-4 + 5L/256d** (violet) — compound of two biggest breakthroughs
-2. **T_max sweep at lr=2e-4** (tanjiro=20, historia=5)
-3. **Transfer gc=1.5** (naruto has gc=1.0, should test gc=1.5 next)
-4. **Even lower LR** (gilbert=1.5e-4) — bracket optimal
-5. **MQA at lr=2e-4** (gen) — regularization benefit confirmed
+### DrivAerML (1.24x from external — 4L/512d focus)
+1. **LR sweep** (ray: lr=3e-4) — lower LR at wider model
+2. **gc-only regularization** (kaneda: gc=0.5) — WD=1e-2 catastrophically diverges, gc alone is safer
+3. **gc=1.5 transfer** (frieren: #2793) — worked at 3L/192d AirfRANS, might work here
+4. **T_max tuning** (rei: T_max=20) — baseline uses T_max=30, faster cycling might help
+5. Watch fern #2794 (WD=1e-2) — likely to diverge based on ray's result
+6. After initial 4L/512d sweep: try 5L/512d or 4L/640d for even more capacity
 
-### DrivAerML (1.35x from external — throughput-focused)
-1. **gc=1.5 at 4L/320d** (taki) — HIGHEST PRIORITY transfer
-2. **4L/512d rerun** (frieren) — will throughput penalty kill the wider model?
-3. **4L/320d variants** — need more experiments at winning width
-4. Many 4L/384d experiments still running — may provide comparison data
-5. Consider 4L/256d (even more throughput) if 320d+gc=1.5 doesn't beat baseline
-
-### Stale PR Cleanup Needed
-~12 DrivAerML PRs at 4L/384d with 0 comments may be stuck. Many AirfRANS PRs at gc=1.0 are dead ends. Will close/redirect as results come in.
+### TandemFoil (No external target, focus on sustained improvement)
+1. **5L/256d+lr=2e-4** (kakashi #2775) — compound of depth+LR breakthroughs
+2. **4L/256d+lr=2e-4** (sasuke #2772, gen #2796) — architecture transfer
+3. **lr=1.5e-4** (historia #2792) — push LR even lower
+4. **Golden config transfer** (mikasa #2777, senku #2788) — WD+gc from AirfRANS
