@@ -107,6 +107,7 @@ class TrainConfig:
     surface_anchor_points: int = 8_000
     volume_anchor_points: int = 8_000
     grad_clip: float = 0.0
+    grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -1051,15 +1052,18 @@ def train_one_epoch(
     amp_mode: str = "none",
     max_batches: int = 0,
     grad_clip: float = 0.0,
+    grad_accum_steps: int = 1,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
         anp_head.train()
     running = {"loss": 0.0}
-    steps = 0
+    micro_steps = 0
+    optimizer_steps = 0
+    accum = max(1, grad_accum_steps)
     batches = loader if max_batches <= 0 else itertools.islice(loader, max_batches)
+    optimizer.zero_grad(set_to_none=True)
     for batch in batches:
-        optimizer.zero_grad(set_to_none=True)
         if model_name == "reference_abupt":
             batch = batch.to(device)
             with autocast_context(device, amp_mode):
@@ -1093,29 +1097,50 @@ def train_one_epoch(
                         volume_mask=batch.volume_mask,
                     )
                     loss, _ = loss_grouped(batch, outputs, transform)
-        loss.backward()
+        scaled_loss = loss / accum
+        scaled_loss.backward()
+        running["loss"] += float(loss.detach().cpu().item())
+        micro_steps += 1
+        if micro_steps % accum == 0:
+            all_params = list(model.parameters())
+            if anp_head is not None:
+                all_params += list(anp_head.parameters())
+            grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=grad_clip if grad_clip > 0 else float("inf"))
+            running.setdefault("grad_norm_mean", 0.0)
+            running["grad_norm_mean"] += float(grad_norm)
+            if grad_clip > 0 and float(grad_norm) > grad_clip:
+                running.setdefault("grad_clip_events", 0.0)
+                running["grad_clip_events"] += 1.0
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+            if ema is not None:
+                ema.update(model)
+            if anp_head is not None and anp_ema is not None:
+                anp_ema.update(anp_head)
+            optimizer_steps += 1
+            optimizer.zero_grad(set_to_none=True)
+    if micro_steps % accum != 0:
         all_params = list(model.parameters())
         if anp_head is not None:
             all_params += list(anp_head.parameters())
         grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=grad_clip if grad_clip > 0 else float("inf"))
         running.setdefault("grad_norm_mean", 0.0)
         running["grad_norm_mean"] += float(grad_norm)
-        if grad_clip > 0 and float(grad_norm) > grad_clip:
-            running.setdefault("grad_clip_events", 0.0)
-            running["grad_clip_events"] += 1.0
         optimizer.step()
+        optimizer_steps += 1
         if scheduler is not None:
             scheduler.step()
         if ema is not None:
             ema.update(model)
         if anp_head is not None and anp_ema is not None:
             anp_ema.update(anp_head)
-        running["loss"] += float(loss.detach().cpu().item())
-        steps += 1
-    running["loss"] /= max(steps, 1)
+        optimizer.zero_grad(set_to_none=True)
+    running["loss"] /= max(micro_steps, 1)
     if "grad_norm_mean" in running:
-        running["grad_norm_mean"] /= max(steps, 1)
-    running["train_steps"] = float(steps)
+        running["grad_norm_mean"] /= max(optimizer_steps, 1)
+    running["train_steps"] = float(micro_steps)
+    running["optimizer_steps"] = float(optimizer_steps)
     if scheduler is not None:
         running["lr"] = float(optimizer.param_groups[0]["lr"])
     return running
@@ -1291,6 +1316,7 @@ def main() -> None:
             amp_mode=config.amp_mode,
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
+            grad_accum_steps=config.grad_accum_steps,
         )
 
         if ema is not None:
