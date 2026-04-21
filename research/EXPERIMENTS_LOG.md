@@ -1,5 +1,70 @@
 # SENPAI Research Results
 
+## 2026-04-21 — PR #2543: DrivAerML: Fourier+no-EMA+T_max=30 long training replica — MERGED ✓ NEW BEST
+
+- violet/drivaerml-fourier-noema-replica
+- Hypothesis: The 2-epoch baseline (51.35%) was compute-limited; longer training with the same config should substantially improve results.
+
+| Run | Config | val_primary/surface_rel_l2_pct | test | Epochs | W&B |
+|---|---|---|---|---|---|
+| **Winner** | Fourier+3L/192d+T_max=30+no-EMA | **33.65%** | **34.00%** | 6 | xm765o85 |
+| Prior baseline | Fourier+3L/192d+T_max=30+no-EMA | 51.35% | 52.06% | 2 | 5ncrjm32 |
+
+Commentary: -34.5% relative improvement. Epoch 2 (51.98%) replicates the original baseline closely, confirming reproducibility. Monotonic convergence, no instability. Run cut short at 6 epochs (~36 min); still strongly descending at cutoff. LR at epoch 6 was 4.77e-5 (cosine trough) — restart would accelerate further. Critical insight: training time is the dominant variable for DrivAerML. A full 180-min run likely pushes below 30%. Also: luffy WIP run shows 28.80% at epoch 11.
+
+## 2026-04-21 — PR #2538: AirfRANS: Fourier+4L/256d+T_max=50 (compound) — MERGED ✓ NEW BEST
+
+- kohaku/airfrans-fourier-4L256d-tmax50
+- Hypothesis: Compound architecture (4L/256d from #2478) + schedule (T_max=50 from #2482) gains are super-additive.
+
+| Run | Config | val_primary/surface_mse | test | Epochs | W&B |
+|---|---|---|---|---|---|
+| **Winner** | Fourier+4L/256d+T_max=50+no-EMA | **0.2015** | **0.1890** | 14 | ty0cmdfz |
+| Also beats baseline | Fourier+4L/256d+T_max=30+no-EMA | 0.2195 | 0.1889 | 14 | 85pabaza |
+| Prior baseline | no-Fourier+3L/192d+T_max=50 | 0.2357 | 0.2002 | 24 | xmrkwt1y |
+
+Commentary: -14.5% relative improvement. Compound hypothesis confirmed: Fourier+4L/256d (0.2387) + T_max=50 (0.2357) → compound (0.2015), gains are super-additive. Pressure MSE dominates (~99.9% of composite). Still converging at epoch 14 — envelope of cycle minima still descending. T_max=30 creates excessive oscillation (spikes to 0.52 at epoch 3), T_max=50 is better matched to this architecture.
+
+## 2026-04-21 — PR #2536: TandemFoil: Fourier+physics+T_max=60/90/120 sweep — REQUEST CHANGES
+
+- kaneda/tandem-fourier-physics-tmax60-sweep
+- Hypothesis: T_max should scale with epoch count for long training runs.
+
+| Config | val_primary/surface_pressure_mae | test | Epochs | W&B |
+|---|---|---|---|---|
+| T_max=120 | 78.95 | 75.61 | 13 | mqtawnqo |
+| T_max=90 | 89.65 | 96.65 | 12 | d0z3jqk7 |
+| T_max=60 | 90.26 | 92.28 | 13 | h8l5wru4 |
+| Baseline | 78.81 | 75.13 | 14 | 8k0blg8s |
+
+Commentary: T_max=120 misses baseline by 0.14 points (78.95 vs 78.81). T_max=60/90 are significantly worse — high-LR restart peaks dominate their trajectories. T_max=120 is still improving at epoch 13 (monotonically converging). Scheduler steps per-batch, not per-epoch — "epoch-scaling T_max" framing is not quite right. Sent back for T_max=120 extended run + T_max=80 comparison.
+
+## 2026-04-21 — PR #2539: AirfRANS: Fourier+4L/256d+T_max=25/15 — REQUEST CHANGES
+
+- gilbert/airfrans-fourier-4L256d-tmax25
+- Hypothesis: Shorter cosine cycles (T_max=25/15) improve convergence for Fourier+4L/256d.
+
+| Config | val_primary/surface_mse | test | Epochs | W&B |
+|---|---|---|---|---|
+| T_max=25 | **0.2044** | 0.1798 | 14 | lb20qwze |
+| T_max=15 | 0.2198 | 0.2146 | 14 | 917gyt1m |
+| Baseline | 0.2015 | 0.1890 | 14 | ty0cmdfz |
+
+Commentary: T_max=25 reaches 0.2044 — near miss, 1.4% above 0.2015 baseline. T_max=15 too aggressive (24 cosine cycles/epoch, epoch-end always at LR peak). T_max=25 still converging (epoch 12 spike 0.4634 → epoch 13 new best 0.2044). Test generalization excellent (0.1798 < val). Sent back for T_max=25 full 180-min run.
+
+## 2026-04-21 — PR #2534: TandemFoil: Fourier+physics+4L/256d capacity — REQUEST CHANGES
+
+- edward/tandem-fourier-physics-4L256d-180min
+- Hypothesis: 4L/256d capacity with 180-min budget can beat 78.81 (prior 2-epoch test was starved).
+
+| Config | val_primary/surface_pressure_mae | test | Epochs | W&B |
+|---|---|---|---|---|
+| 4L/256d lr=3e-4 | 95.57 | 102.09 | 9 | edfu20wd |
+| 4L/256d lr=2e-4 | 96.99 | 96.37 | 9 | fzx3yf7j |
+| Baseline | 78.81 | 75.13 | 14 | 8k0blg8s |
+
+Commentary: Neither run beats baseline (95.57 vs 78.81). But run got only 9 epochs instead of expected 40+ — the 180-min budget was not honored, again running ~30 min only. Trajectory still steeply descending at epoch 9 (95.57). lr=2e-4 more stable test generalization. Sent back with instruction to investigate timeout issue + switch to T_max=50.
+
 ## 2026-04-21 01:00 — PR #2482: AirfRANS: T_max=50 + lr=5e-4 + no-EMA (24 epochs) — MERGED ✓ NEW BEST
 
 - emma/airfrans-noema-lr-tmax-variants
