@@ -1,5 +1,38 @@
 # SENPAI Research Results
 
+## 2026-04-21 — PR #2549: TandemFoil: wake deficit features — CLOSED ✗
+
+- haku/tandem-wake-deficit
+- Hypothesis: Gap-normalized displacement from forefoil TE captures wake interaction effects.
+- Result: val=81.63 (best ep11), baseline=75.59. +8% worse. W&B: t0kg2ymx. TE coord frame already captures this signal; wake deficit adds noise. DEAD END.
+
+## 2026-04-21 — PR #2548: AirfRANS: Cp panel physics feature — CLOSED ✗
+
+- norman/airfrans-cp-panel
+- Hypothesis: Thin-airfoil Cp panel feature transfers from TandemFoil to AirfRANS.
+- Result: val=0.2395 (best ep21), baseline=0.0696. +3.4x worse. W&B: jbz675q4. Inviscid theory wrong physics for viscous AirfRANS regime. DEAD END.
+
+## 2026-04-21 — PR #2546: TandemFoil: coarse spatial-pooling aux loss — REQUEST CHANGES
+
+- fern/tandem-coarse-aux-loss
+- Hypothesis: 16x16 grid spatial-pooling auxiliary loss provides low-frequency supervision.
+- Result: val=79.15 (best ep13), baseline=75.59. +4.7% worse but closest miss. W&B: 7fasc0um. Sent back with instructions to try 64x64 grid, lower weight (0.01), and update to T_max=10.
+
+## 2026-04-21 — PR #2539: AirfRANS: Fourier+4L/256d+T_max=25/15 (round 2) — CLOSED ✗
+
+- gilbert/airfrans-fourier-4L256d-tmax25
+- No new results submitted after send-back. Original T_max=25 val=0.2044 — now 3x above 0.0696 baseline (phase transition superseded this approach). CLOSED — outdated architecture.
+
+## 2026-04-21 — PR #2536: TandemFoil: T_max=120/80 extended (round 2) — CLOSED ✗
+
+- kaneda/tandem-fourier-physics-tmax60-sweep
+- Round 2 results: T_max=120 regressed to 82.64 (from 78.95 in round 1). T_max=80: 88.90. W&B: x87qzcl3, dw5egv2w. Large T_max values leave LR near peak throughout training. DEAD END — T_max should be ≤ steps per epoch, not multiples of it.
+
+## 2026-04-21 — Bulk closure: 15 stale WIP PRs (#2504-2518)
+
+Closed 15 PRs from round 1-2 whose baselines shifted dramatically (TandemFoil 82.65→75.59, AirfRANS 0.2357→0.0696, DrivAerML 51.35%→33.65%). Students reassigned to current-generation experiments.
+- sasuke #2504, sakura #2505, eren #2506, mikasa #2508, armin #2509, levi #2510, ymir #2507, zenitsu #2511, inosuke #2512, giyu #2513, shinobu #2514, chrome #2515, gen #2516, ray #2518, kaworu #2517
+
 ## 2026-04-21 — PR #2540: AirfRANS: Fourier+3L/192d+T_max=50 phase transition — MERGED ✓ NEW BEST
 
 - emma/airfrans-fourier-3L192d-tmax50
