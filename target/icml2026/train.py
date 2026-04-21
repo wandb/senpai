@@ -9,11 +9,13 @@ import itertools
 import json
 import math
 import os
+import random
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import wandb
@@ -106,6 +108,7 @@ class TrainConfig:
     surface_anchor_points: int = 8_000
     volume_anchor_points: int = 8_000
     save_checkpoint: bool = False
+    seed: int = 42
 
 
 @dataclass
@@ -1154,6 +1157,10 @@ def compute_tandem_phys_stats(
 
 def main() -> None:
     config = parse_args()
+    random.seed(config.seed)
+    np.random.seed(config.seed)
+    torch.manual_seed(config.seed)
+    torch.cuda.manual_seed_all(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     max_epochs_env = os.getenv("SENPAI_MAX_EPOCHS")
     timeout_env = os.getenv("SENPAI_TIMEOUT_MINUTES")
