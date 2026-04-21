@@ -268,11 +268,20 @@
 ## DrivAerML
 
 - **Primary metric:** `val_primary/surface_rel_l2_pct` (lower is better)
-- **Current best:** 5.73% (val) at epoch 144
-- **Best PR:** #2602 (kakashi — Fourier+**4L/384d**/6H+no-EMA+T_max=30, 151 epochs, AdamW lr=5e-4, 394 batches/epoch, **180-min budget**)
-- **CRITICAL:** Must pass `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200` and `--model-heads 6` for 384d model
-- **External target:** <3.71% (AB-UPT, ~500 epochs) — **1.55x gap remaining**
-- **Key insight:** WIDTH SCALING is the dominant lever. 4L/384d (vs 4L/256d) achieved 5.73% vs 11.97% — a 52% relative improvement. Model ran 151 epochs in 180 min (~1.2 min/epoch) and was still improving at cutoff. Next: compound 4L/384d with 600 batches, try 4L/512d, tune T_max for 384d (late oscillation suggests T_max=30 slightly aggressive).
+- **Current best:** 5.027% (val) / 6.244% (test) at epoch 257
+- **Best PR:** #2648 (zoro — Fourier+**4L/320d**/5H+no-EMA+T_max=30, 257 epochs, AdamW lr=5e-4, 394 batches/epoch, **180-min budget**)
+- **CRITICAL:** Must pass `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
+- **External target:** <3.71% (AB-UPT, ~500 epochs) — **1.35x gap remaining** (was 1.55x)
+- **Key insight:** THROUGHPUT vs WIDTH tradeoff. 4L/320d runs 257 epochs in 180 min (~0.7 min/ep) vs 4L/384d's 151 epochs (~1.2 min/ep). The smaller model sees 70% more training steps at the same wall-clock budget. At fixed wall-clock, more training at moderate width beats fewer steps at maximum width. Still improving at epoch 257 — more headroom. Next: explore 4L/352d (intermediate), longer training at 320d, combine with grad-clip.
+
+### 2026-04-21 — PR #2648: DrivAerML: 4L/320d+T_max=30 — throughput vs width — NEW BEST
+
+- **val_primary/surface_rel_l2_pct:** 5.027% (-12.3% vs 5.73%) at epoch 257
+- **test_primary/surface_rel_l2_pct:** 6.244%
+- **W&B run:** qx7z7if3 (257 epochs, 180-min budget, still improving!)
+- **Epochs:** 257 (180-min timeout — ~0.7 min/epoch for 4L/320d)
+- **Key insight:** 4L/320d uses 5 heads (320/5=64 per head, same dim-per-head). Runs 70% more epochs than 4L/384d in the same wall-clock time. The throughput advantage outweighs the capacity disadvantage. Best at final epoch — no sign of convergence. Gap to external: 1.35x.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset drivaerml --optimizer adamw --lr 5e-4 --cosine-t-max 30 --no-use-ema --enable-fourier --model-layers 4 --model-hidden-dim 320 --model-heads 5 --epochs 999 --batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
 
 ### 2026-04-21 — PR #2602: DrivAerML: 4L/384d+T_max=30 — wider architecture — NEW BEST
 
