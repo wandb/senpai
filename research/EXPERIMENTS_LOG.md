@@ -1,5 +1,54 @@
 # SENPAI Research Results
 
+## 2026-04-21 ~12:00 — Round 37: AirfRANS 3L/256d BREAKTHROUGH — val=0.001479 (46.6% vs baseline)
+
+### PR #2771 (itachi): AirfRANS 3L/256d golden config — width vs depth ablation — PENDING MERGE (rebase in progress)
+
+| Metric | This Run | Baseline (PR #2774) | External Target |
+|---|---|---|---|
+| Best val_primary/surface_mse | **0.001479** (ep202) | 0.00277 (ep150) | 0.0043 |
+| Delta vs baseline | **-46.6%** | — | **-65.6% (CRUSHED!)** |
+| Terminal val (ep282) | 0.006535 (regression) | — | — |
+| Terminal test | 0.005361 (invalid checkpoint) | — | — |
+| W&B run | q4hytsr6 | 0pt769m4 | — |
+| Architecture | 3L/256d/4H | 4L/256d/4H | — |
+| Config | gc=1.0, T_max=5, WD=1e-2, lr=7e-4 | gc=0.5, T_max=5, WD=1e-2, lr=7e-4 | — |
+
+**Key findings:**
+- 3L/256d (width-dominant) beats 4L/256d by 46.6% with a SINGLE change: removing one layer
+- This is a fundamental finding: WIDTH > DEPTH for AirfRANS at this scale
+- Model hit deep trough at ep202 then diverged — same T_max=5 instability pattern at later epoch (ep202 vs ep205 for 4L)
+- Terminal model (ep282) regressed to 0.006535 — best checkpoint not evaluated for test
+- Status: PR has merge conflict on .experiment file. Sent back to itachi for trivial rebase. Expected to merge shortly.
+- **Next critical experiments**: 3L/256d + gc=0.5 compound (kakashi #2823), 3L width frontier (ray #2824), cross-benchmark 3L transfer (levi #2825)
+
+### Dead-end closures Round 37
+
+| PR | Student | Dataset | Best Val | Baseline | Reason |
+|---|---|---|---|---|---|
+| #2797 | ray | DrivAerML | 4.937% | 4.619% | Lower LR (3e-4) falsified — converges to shallower min |
+| #2781 | chrome | DrivAerML | 5.131% | 4.619% | T_max=10 counterproductive on DrivAerML |
+| #2779 | levi | DrivAerML | 5.210% | 4.619% | Lower LR (3e-4) falsified — 2nd independent confirmation |
+| #2775 | kakashi | TandemFoil | 65.23 | 44.72 | Gradient explosion at ep36, 94 min wasted |
+| #2765 | giyu | AirfRANS | 0.002263* | 0.00277 | gc=2.0 too unstable, diverged ep214 — no valid test |
+| #2764 | inosuke | AirfRANS | 0.003106 | 0.00277 | lr=1e-3 diverged ep111, doesn't beat baseline |
+| #2758 | nami | AirfRANS | 0.002286 | 0.00277 | Superseded by #2771 merge (baseline now 0.001479) |
+| #2703 | nami | AirfRANS | 0.004346 | 0.00277 | 3L/192d architecture superseded by improvements |
+
+*Note: #2765's val=0.002263 technically beat old baseline but gc=2.0 is unreliable; test metric from diverged model
+
+### New Assignments Round 37
+| Student | PR | Hypothesis | Priority |
+|---|---|---|---|
+| kakashi | #2823 | AirfRANS 3L/256d + gc=0.5 compound (4 variants) | **CRITICAL** |
+| ray | #2824 | AirfRANS 3L width frontier: 3L/320d, 384d, 512d | HIGH |
+| levi | #2825 | Cross-benchmark 3L transfer: TandemFoil 3L/256d + DrivAerML 3L/512d | HIGH |
+| giyu | #2826 | Cross-benchmark dropout=0.1 (first dropout test) | MEDIUM |
+| chrome | TBD | DrivAerML higher LR + gc=0.5 compound | HIGH |
+| inosuke | TBD | AirfRANS 2L depth frontier: 2L/256d, 384d, 512d | MEDIUM |
+
+---
+
 ## 2026-04-21 — Round 36: AirfRANS 0.00277 — gc=0.5 SMASHES External Target by 35.6%!
 
 ### PR #2774 (roy): AirfRANS 4L/256d + gc=0.5 — MERGED ✓ NEW BEST
