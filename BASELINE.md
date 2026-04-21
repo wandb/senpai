@@ -167,11 +167,19 @@
 ## DrivAerML
 
 - **Primary metric:** `val_primary/surface_rel_l2_pct` (lower is better)
-- **Current best:** 33.65% (val) / 34.00% (test)
-- **Best PR:** #2543 (violet — Fourier + no-EMA + T_max=30, 6 epochs, 3L/192d, AdamW lr=5e-4)
-- **CRITICAL:** Must pass `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200` to avoid OOM and runaway batch counts
-- **External target:** <3.71% (AB-UPT, ~500 epochs)
-- **Key insight:** Training time is the dominant variable — the 2-epoch baseline was compute-limited. 6 epochs yields 33.65%, still converging. Fourier+no-EMA+T_max=30 is robust. luffy WIP run showing 28.80% at epoch 11 — further gains confirmed. 9x gap to external target remaining.
+- **Current best:** 12.96% (val) / 14.41% (test)
+- **Best PR:** #2550 (violet — Fourier+4L/256d+no-EMA+T_max=30, 43 epochs, AdamW lr=5e-4)
+- **CRITICAL:** Must pass `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200` to avoid OOM and `--model-heads 4` for 256d model
+- **External target:** <3.71% (AB-UPT, ~500 epochs) — **3.5x gap remaining**
+- **Key insight:** Architecture depth is the critical lever. 4L/256d at 43 epochs yields 12.96% — still converging at cutoff. 3L/256d (36.14%) was WORSE than 3L/192d (33.65%), proving width alone doesn't help. T_max=30 slightly better than T_max=50 (12.96% vs 13.04%).
+
+### 2026-04-21 — PR #2550: DrivAerML: Fourier+4L/256d+T_max=30 — NEW BEST
+
+- **val_primary/surface_rel_l2_pct:** 12.96% (-61.5% relative vs 33.65%)
+- **test_primary/surface_rel_l2_pct:** 14.41%
+- **W&B run:** 8s5i8y06 (winner, T_max=30, 43 epochs); qf8vxows (T_max=50: 13.04%)
+- **Epochs:** 43 (still converging — LR=0.000083 at best epoch, not at trough)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset drivaerml --optimizer adamw --lr 5e-4 --cosine_t_max 30 --no-use-ema --enable-fourier --model-layers 4 --model-hidden-dim 256 --model-heads 4 --epochs 999 --batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
 
 ### 2026-04-21 — PR #2543: DrivAerML: Fourier+no-EMA+T_max=30 long training replication — NEW BEST
 
