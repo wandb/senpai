@@ -150,11 +150,19 @@
 ## DrivAerML
 
 - **Primary metric:** `val_primary/surface_rel_l2_pct` (lower is better)
-- **Current best:** 51.35% (val) / 52.06% (test)
-- **Best PR:** #2475 (chihiro — Fourier + no-EMA, T_max=30, 2 epochs)
+- **Current best:** 33.65% (val) / 34.00% (test)
+- **Best PR:** #2543 (violet — Fourier + no-EMA + T_max=30, 6 epochs, 3L/192d, AdamW lr=5e-4)
 - **CRITICAL:** Must pass `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200` to avoid OOM and runaway batch counts
 - **External target:** <3.71% (AB-UPT, ~500 epochs)
-- **Key insight:** Fourier features deliver 9.8% relative improvement on DrivAerML. T_max=30 > T_max=150 with Fourier. With Fourier, lr=5e-4 outperforms lr=8e-4 (51.35% vs 54.33%).
+- **Key insight:** Training time is the dominant variable — the 2-epoch baseline was compute-limited. 6 epochs yields 33.65%, still converging. Fourier+no-EMA+T_max=30 is robust. luffy WIP run showing 28.80% at epoch 11 — further gains confirmed. 9x gap to external target remaining.
+
+### 2026-04-21 — PR #2543: DrivAerML: Fourier+no-EMA+T_max=30 long training replication — NEW BEST
+
+- **val_primary/surface_rel_l2_pct:** 33.65% (-34.5% relative vs 51.35%)
+- **test_primary/surface_rel_l2_pct:** 34.00%
+- **W&B run:** xm765o85 (6 epochs, 3L/192d, still converging at cutoff)
+- **Epochs:** 6 (~5 min/epoch; full 180-min run likely to push well below 30%)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset drivaerml --optimizer adamw --lr 5e-4 --cosine_t_max 30 --no-use-ema --enable-fourier --epochs 999 --batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
 
 ### 2026-04-21 00:05 — PR #2475: DrivAerML: Fourier + no-EMA (T_max=30) — NEW BEST
 
