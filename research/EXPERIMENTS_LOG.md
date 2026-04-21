@@ -1,5 +1,43 @@
 # SENPAI Research Results
 
+## 2026-04-21 — Round 24: 4L/256d ARCHITECTURE BREAKTHROUGH
+
+### PR #2727 (shoya): AirfRANS 4L/256d+gc=1.0+WD=1e-2+T_max=5 — MERGED ✓ NEW BEST (0.007264!)
+
+- val_primary/surface_mse: **0.007264** (-22.3% vs 0.00935!) at epoch 40
+- W&B: ruurxdqs (50 epochs, hit SENPAI_MAX_EPOCHS=50 cap at 61 min of 180-min budget)
+- PARADIGM SHIFT: Architecture scaling IS viable on AirfRANS with WD=1e-2+T_max=5. Grad norms stabilized (18.7→7.1). Trough still descending at cutoff.
+- Uses gc=1.0, NOT gc=1.5. Compounding gc=1.5 with this arch is highest priority.
+- Gap to external: **1.7x** (was 2.2x).
+
+### PR #2743 (haku): AirfRANS gc=1.5+T_max=5+WD triple compound — SENT BACK
+
+- 0.013262 — T_max=5+gc=1.5 too volatile. Sent back for gc=1.5 at 4L/256d.
+
+### Stale PR cleanup: 13 PRs closed
+
+DrivAerML 4L/384d: #2700,#2702,#2687,#2694,#2697,#2699,#2684,#2682,#2701
+AirfRANS old: #2704,#2703. Human-directed stale: #2569,#2629.
+
+### Round 24 Assignments (14 students)
+
+| Student | Experiment | Dataset |
+|---|---|---|
+| shoya | 4L/256d full 180-min (epoch cap removed) | AirfRANS |
+| nami | 5L/256d+golden | AirfRANS |
+| asuka | 4L/384d+golden | AirfRANS |
+| luffy | 4L/256d+gc=1.5+T_max=10 | AirfRANS |
+| mitsuha | 4L/256d+T_max=10 | AirfRANS |
+| inosuke | 4L/256d+lr=1e-3 | AirfRANS |
+| giyu | 4L/256d+gc=2.0 | AirfRANS |
+| rei | 4L/256d multi-seed | AirfRANS |
+| shouko | 4L/320d+WD=1e-2 | DrivAerML |
+| ymir | 4L/320d+T_max=20 | DrivAerML |
+| zenitsu | 4L/256d throughput | DrivAerML |
+| shinobu | 4L/320d+gc=1.5+WD | DrivAerML |
+| alphonse | lr=2e-4+gc=1.5 | TandemFoil |
+| kaworu | lr=2e-4+WD+T_max=5 | TandemFoil |
+
 ## 2026-04-21 — Round 23: gc=1.0 Cleanup + gc=1.5 Expansion
 
 ### PR #2742 (emma): AirfRANS gc=1.0+T_max=5+WD=1e-2 multi-seed — CLOSED ✗

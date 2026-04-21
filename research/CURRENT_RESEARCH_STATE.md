@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-21 (Round 23 complete)
+- **Date:** 2026-04-21 (Round 24 complete)
 - **Branch:** radford
 
 ## CURRENT BASELINES
@@ -8,19 +8,21 @@
 | Dataset | Metric | Value | PR | Key Mechanism |
 |---|---|---|---|---|
 | TandemFoil | val_primary/surface_pressure_mae | **45.07** | #2610 (T_max=10, 3L/192d, Lion **lr=2e-4**, 119 ep) | **LOWER LR + MORE EPOCHS** |
-| AirfRANS | val_primary/surface_mse | **0.00935** | #2737 (T_max=10, AdamW lr=7e-4, **grad-clip=1.5**, 40 ep) | **MODERATE GRAD-CLIP** |
+| AirfRANS | val_primary/surface_mse | **0.007264** | #2727 (**4L/256d** + T_max=5 + WD=1e-2 + gc=1.0, 50 ep, epoch-capped) | **ARCH SCALING + GOLDEN CONFIG** |
 | DrivAerML | val_primary/surface_rel_l2_pct | **5.027%** | #2648 (4L/**320d**/5H+T_max=30, 257 ep, 180-min) | **THROUGHPUT > WIDTH** |
 
 ## EXTERNAL TARGETS
 
 | Dataset | External Best | Our Best | Gap |
 |---|---|---|---|
-| AirfRANS | 0.0043 | 0.00935 | **2.2x** |
+| AirfRANS | 0.0043 | 0.007264 | **1.7x** |
 | DrivAerML | <3.71% | 5.027% | **1.35x** |
 
-## CRITICAL INSIGHTS (Rounds 17-23)
+## CRITICAL INSIGHTS (Rounds 17-24)
 
-1. **GRAD-CLIP=1.5 IS OPTIMAL** (Round 21): Moderate clipping beats tight (1.0) and very tight (0.5). AirfRANS went 0.01271→0.00935 (-26.4%). The clip threshold balances stability with expressivity. All gc=1.0 experiments are now dead ends.
+1. **4L/256d + GOLDEN CONFIG = BREAKTHROUGH** (Round 24): Architecture scaling IS viable on AirfRANS with WD=1e-2+T_max=5. 4L/256d achieves 0.007264 vs 0.00935 at 3L/192d (-22.3%). Grad norms stabilize instead of diverging. Hit epoch cap at 61 min — trough still descending. Uses gc=1.0, NOT gc=1.5 — compounding is highest priority.
+
+1b. **GRAD-CLIP=1.5 IS OPTIMAL AT 3L/192d** (Round 21): gc=1.5 > gc=1.0 > gc=0.5 at 3L/192d. But gc=1.5+T_max=5+WD triple compound FAILED (0.013262). gc=1.5 needs testing at 4L/256d where WD+T_max=5 already stabilizes training.
 
 2. **THROUGHPUT > WIDTH** (Round 21): DrivAerML 4L/320d (5.027%, 257ep) beats 4L/384d (5.73%, 151ep). In fixed wall-clock, more training at moderate width outperforms fewer steps at maximum width.
 
