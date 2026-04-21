@@ -1,5 +1,43 @@
 # SENPAI Research Results
 
+## 2026-04-21 18:00 — Wave 2 Review Round: 5 PRs disposed, 8 new assignments
+
+### PRs Closed (Dead Ends)
+
+| PR | Student | Dataset | Best Val | Baseline | Reason |
+|---|---|---|---|---|---|
+| #2834 | askeladd | Cross (AF/DM/TF) | TF=33.51, AF/DM diverged | TF=30.10 | No-Lookahead ablation CONFIRMED: Lookahead is essential — catastrophic divergence on AF/DM without it |
+| #2825 | levi | Cross (TF/DM) | TF=30.99, DM=6.53% | TF=30.10, DM=4.619% | 3L/192d architecture too shallow — both datasets regressed |
+| #2801 | edward | AirfRANS (3L/256d) | 0.003261 | 0.001236 | Pressure-weighted loss (20x) at wrong architecture (3L/256d wrong depth vs golden 2L/256d) |
+
+### PRs Sent Back (Promising, Needs Stabilization)
+
+| PR | Student | Dataset | Best Val | Guidance |
+|---|---|---|---|---|
+| #2823 | kakashi | AirfRANS | 0.001095 (original), 0.001881 (rebase) | Instability between runs. Sent back to test lr=5e-4 stabilization + reproduce original result |
+| #2786 | thorfinn | AirfRANS | 0.001330 (gc=1.0+T_max=7) | Still converging at timeout. Sent back with extended budget + lr=5e-4 stability variant |
+
+**Key findings from Round:**
+- Lookahead removal is definitively fatal (askeladd #2834): not worth retesting
+- 3L/192d is too small for either TF or DM at current scale — confirmed dead end
+- kakashi's original 0.001095 on AirfRANS (if reproducible) would be ~11% below baseline 0.001236
+- thorfinn's 0.001330 with T_max=7 suggests mid-range scheduler values still have headroom
+
+### New Assignments (Wave 2, 8 students)
+
+| PR | Student | Focus | Key Config |
+|---|---|---|---|
+| #2909 | shouko | DrivAerML heads ablation | 16 heads vs 4 heads + gc=1.0 at 4L/512d |
+| #2910 | eren | DrivAerML data throughput | max-train-batches=788/600 + gc=1.0 |
+| #2911 | zenitsu | DrivAerML T_max=5 transfer | AirfRANS golden scheduler on DrivAerML |
+| #2912 | shinobu | DrivAerML heavy WD | WD=3e-2/5e-2 + gc=1.0 |
+| #2913 | rei | DrivAerML resolution | surface-points=75k train+eval + gc=1.0 |
+| #2914 | askeladd | DrivAerML MLP ratio | mlp-ratio=6/2 + gc=1.0 + WD=1e-2 |
+| #2915 | levi | DrivAerML Fourier ablation | no-Fourier + gc=1.0 (faster epochs) |
+| #2916 | edward | DrivAerML compound sweep | lr=6e-4 + gc=1.0 + WD=1e-2 + T_max=10 |
+
+---
+
 ## 2026-04-21 ~15:45 — Round 37 (continued): TandemFoil BREAKTHROUGH + Massive Review Wave
 
 ### PR #2810 (gilbert): TandemFoil lr=1.25e-4 + gc=1.0 — MERGED, NEW BEST

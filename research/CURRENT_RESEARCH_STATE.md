@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-21 17:30 (DrivAerML Refocus Relaunch — Wave 2)
+- **Date:** 2026-04-21 18:15 (DrivAerML Refocus Relaunch — Wave 2, All Students Assigned)
 - **Branch:** radford
 - **Fleet status:** 50 live students, ALL ASSIGNED (0 idle)
 - **Current relaunch budget:** inherit pod env defaults
@@ -20,7 +20,7 @@
 | Dataset | Metric | Current anchor |
 |---|---|---|
 | TandemFoil | `val_primary/surface_pressure_mae` | **30.10** (#2810) |
-| AirfRANS | `val_primary/surface_mse` | **0.001236** merged (#2828), **0.001095** pending (#2823) |
+| AirfRANS | `val_primary/surface_mse` | **0.001236** merged (#2828), **0.001095** pending (#2823 — unstable) |
 | DrivAerML | `val_primary/surface_rel_l2_pct` | **4.619%** (#2691) |
 
 ## Main Scientific Goal
@@ -35,11 +35,17 @@ DrivAerML is the main gap. All new work is DrivAerML-weighted and cross-dataset.
 - DrivAerML: `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
 - Lion for TandemFoil; AdamW for AirfRANS/DrivAerML
 
+## Negative Results (Do Not Repeat)
+
+- **No-Lookahead** (#2834): fatal across all datasets — diverges AF/DM, TF regresses
+- **3L/192d on TF or DM** (#2825): too shallow at current scale
+- **Pressure-weighted loss at wrong architecture** (#2801): pressure weighting hurts if applied at non-golden depth
+
 ## Default Assignment Pattern
 
 Cross-dataset by default: 1 TF + 1 AF + 2-4 DrivAerML + nearby variants per student.
 
-## ACTIVE EXPERIMENTS — 79 WIP PRs
+## ACTIVE EXPERIMENTS — 50 WIP PRs
 
 ### Theme 1: AirfRANS Recipe Transfer to DrivAerML (HIGHEST PRIORITY)
 
@@ -51,6 +57,8 @@ Cross-dataset by default: 1 TF + 1 AF + 2-4 DrivAerML + nearby variants per stud
 | chopper | #2882 | T_max=15+gc=1.0+WD=1e-2 |
 | einar | #2883 | gc=1.0+T_max=20+WD=1e-2 |
 | yuji | #2908 | Compound gc=1.0+WD=1e-2+T_max=15 |
+| zenitsu | #2911 | T_max=5+gc=1.0+WD=1e-2 (AirfRANS golden scheduler) |
+| edward | #2916 | lr=6e-4+gc=1.0+WD=1e-2+T_max=10 (intermediate LR) |
 
 ### Theme 2: DrivAerML LR+gc Exploration
 
@@ -63,6 +71,7 @@ Cross-dataset by default: 1 TF + 1 AF + 2-4 DrivAerML + nearby variants per stud
 | casca | #2881 | gc=1.5/gc=2.0 |
 | wolfwood | #2907 | lr=8e-4+gc=1.0 |
 | jin | #2893 | lr=1e-3+gc=1.0 |
+| shinobu | #2912 | WD=3e-2/5e-2+gc=1.0 (heavy regularization) |
 
 ### Theme 3: DrivAerML Architecture
 
@@ -72,6 +81,8 @@ Cross-dataset by default: 1 TF + 1 AF + 2-4 DrivAerML + nearby variants per stud
 | guts | #2890 | 4L/768d ultra-wide |
 | himmel | #2891 | 5L/512d deeper |
 | jet | #2892 | 3L/768d shallow+wide |
+| shouko | #2909 | heads=16/4 ablation + gc=1.0 |
+| askeladd | #2914 | MLP ratio=6/2 + gc=1.0+WD=1e-2 |
 
 ### Theme 4: Scheduler Innovations (CODE CHANGES)
 
@@ -92,7 +103,7 @@ Cross-dataset by default: 1 TF + 1 AF + 2-4 DrivAerML + nearby variants per stud
 | spike | #2901 | Huber/log-cosh loss |
 | stark | #2902 | Gradient accumulation |
 
-### Theme 6: Throughput + Seeds + Surface-Only
+### Theme 6: Throughput + Seeds + Ablations
 
 | Student | PR | Experiment |
 |---|---|---|
@@ -100,6 +111,9 @@ Cross-dataset by default: 1 TF + 1 AF + 2-4 DrivAerML + nearby variants per stud
 | sanji | #2900 | surface-only DrivAerML |
 | vegeta | #2906 | 360min multi-seed replication |
 | nami | #2896 | Lion higher LR on DrivAerML |
+| eren | #2910 | max-train-batches=788 (2x data/epoch) |
+| rei | #2913 | surface-points=75k resolution scaling |
+| levi | #2915 | no-Fourier ablation (faster epochs) |
 
 ### Continuing from Previous Wave (~20 students)
 
@@ -111,17 +125,10 @@ Cross-dataset by default: 1 TF + 1 AF + 2-4 DrivAerML + nearby variants per stud
 | norman | #2868 | DrivAerML | 2L/512d+3L/512d |
 | historia | #2867 | DrivAerML | 3L/256d+3L/384d |
 | kaneda | #2858 | DrivAerML | gc=0.7/0.8/0.9 |
-| shouko | #2857 | DrivAerML | MLP ratio 2/3/6 |
-| eren | #2855 | DrivAerML | Seed replication |
-| zenitsu | #2853 | DrivAerML | T_max=20/25/35 |
-| shinobu | #2851 | DrivAerML | WD ablation |
-| ymir | #2847 | DrivAerML | Lion 5e-5/1e-4/2e-4 |
-| rei | #2849 | DrivAerML | Conservative LR |
-| taki | #2814 | DrivAerML | Mild regularization |
-| kakashi | #2823 | AirfRANS | T_max=10 (0.001095 pending rebase) |
+| kakashi | #2823 | AirfRANS | gc=1.0+T_max=10 stabilization (lr=5e-4 + reproduce) |
 | inosuke | #2874 | AirfRANS | 2L+T_max=10 compound |
-| askeladd | #2834 | Cross | No-Lookahead ablation |
-| levi | #2825 | Cross | 3L architecture transfer |
+| thorfinn | #2786 | AirfRANS | gc=1.0+T_max=7 extended budget |
+| taki | #2814 | DrivAerML | Mild regularization |
 | Various | #2835-2876 | TandemFoil | LR/depth/gc fine-tuning |
 
 ## Research Insights from Literature
@@ -132,6 +139,7 @@ Cross-dataset by default: 1 TF + 1 AF + 2-4 DrivAerML + nearby variants per stud
 4. **LLRD** (nobara #2897): 1-3% improvement in <10 epoch regime.
 5. **AB-UPT** achieves 3.71% via geometry-separated encoding — next escalation if recipe transfer fails.
 6. **Transolver-3** (arxiv 2602.04940): amortized mesh subset training for throughput.
+7. **Lookahead is load-bearing**: removing it causes catastrophic divergence on AF/DM (confirmed #2834).
 
 ## Human Guidance
 
@@ -140,7 +148,16 @@ Issue #2545: Focus on DrivAerML and cross-dataset evidence. No new directives.
 ## Next Priorities
 
 1. Review PRs as results come in (~30-360 min)
-2. **brook #2878** (gc+WD transfer) = THE paper question
+2. **brook #2878** (gc+WD transfer) = THE paper question — first to report
 3. **bulma #2879** (T_max=10+gc) = second priority
-4. Merge kakashi #2823 once rebased
-5. If recipe transfer fails → escalate to geometry-separated encoding (AB-UPT approach)
+4. **kakashi #2823** (AirfRANS 0.001095 reproducibility) = AirfRANS question
+5. Watch for code-change PRs (robin #2899, megumi #2894, sukuna #2903, usopp #2904) — these need careful review
+6. If recipe transfer fails → escalate to geometry-separated encoding (AB-UPT approach)
+
+## Potential Next Research Directions
+
+- **Residual prediction on DrivAerML**: works for TandemFoil (--residual-prediction), untested on DM
+- **Geometry-separated encoding**: AB-UPT approach — encode surface geometry separately from flow fields
+- **Mesh decimation / adaptive sampling**: sample more points near high-curvature regions
+- **Ensemble of 4L/512d seeds**: if variance is ±0.2% and we ensemble 3 seeds, could get deterministic improvement
+- **Amortized subset training** (Transolver-3): alternate between subsets of the mesh per step
