@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-21 20:30 (DrivAerML Refocus — Wave 2, All Students Assigned)
+- **Date:** 2026-04-21 21:30 (DrivAerML Refocus — Wave 2, All Students Assigned)
 - **Branch:** radford
 - **Fleet status:** 50 live students, ALL ASSIGNED (0 idle)
 - **Current relaunch budget:** inherit pod env defaults
@@ -46,6 +46,7 @@ DrivAerML is the main gap. All new work is DrivAerML-weighted and cross-dataset.
 - **lr=9e-4 is above DrivAerML ceiling** (#2907): both runs diverged catastrophically
 - **Momentum-SAM (MSAM)** (#2904): 3.7-22.7x worse everywhere. Cost is 2x (not ~0%), Lion momentum anti-adversarial on TF
 - **gc=1.0+WD=1e-2+cosine compound** (#2908): 6/8 runs crashed. gc=1.0 permits spikes at cosine LR peaks that cascade with WD
+- **4L/640d at lr=5e-4+gc=1.0** (#2917): all 3 DM runs crashed (ep90-153). Width above 512d needs lower LR or tighter gc
 
 ## Default Assignment Pattern
 
@@ -91,7 +92,7 @@ Cross-dataset by default: 1 TF + 1 AF + 2-4 DrivAerML + nearby variants per stud
 | jet | #2892 | 3L/768d shallow+wide |
 | shouko | #2909 | heads=16/4 ablation + gc=1.0 |
 | askeladd | #2914 | MLP ratio=6/2 + gc=1.0+WD=1e-2 |
-| chrome | #2917 | 4L/640d mid-width + gc=1.0 (between 512d and 768d) |
+| chrome | #2923 | torch.compile + gc=1.0 (throughput + stability compound) |
 
 ### Theme 4: Scheduler Innovations (CODE CHANGES)
 
