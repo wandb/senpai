@@ -109,6 +109,8 @@ class TrainConfig:
     grad_clip: float = 0.0
     save_checkpoint: bool = False
     seed: int = 0
+    use_msam: bool = False
+    msam_rho: float = 0.02
 
 
 @dataclass
@@ -1036,6 +1038,65 @@ def evaluate_abupt(
     return {"surface_mae": total_surface / max(count_surface, 1), "volume_mae": total_volume / max(count_volume, 1)}
 
 
+def _forward_and_loss(model, model_name, batch, transform, anp_head, device, amp_mode):
+    if model_name == "reference_abupt":
+        with autocast_context(device, amp_mode):
+            outputs = model(
+                geometry_position=batch.geometry_position,
+                geometry_supernode_idx=batch.geometry_supernode_idx,
+                geometry_batch_idx=batch.geometry_batch_idx,
+                surface_anchor_position=batch.surface_anchor_position,
+                volume_anchor_position=batch.volume_anchor_position,
+            )
+            loss, _ = loss_abupt(batch, outputs, transform)
+    elif isinstance(transform, TandemTargetTransform):
+        prepared = transform.prepare_batch(batch)
+        with autocast_context(device, amp_mode):
+            outputs = model(
+                surface_x=prepared.surface_x,
+                surface_mask=prepared.surface_mask,
+                volume_x=prepared.volume_x,
+                volume_mask=prepared.volume_mask,
+            )
+            outputs = maybe_apply_anp(outputs, prepared, anp_head)
+            loss, _ = loss_grouped_tandem(prepared, outputs)
+    else:
+        with autocast_context(device, amp_mode):
+            outputs = model(
+                surface_x=batch.surface_x,
+                surface_mask=batch.surface_mask,
+                volume_x=batch.volume_x,
+                volume_mask=batch.volume_mask,
+            )
+            loss, _ = loss_grouped(batch, outputs, transform)
+    return loss
+
+
+def _msam_perturb(base_optimizer, rho):
+    deltas = {}
+    with torch.no_grad():
+        for group in base_optimizer.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = base_optimizer.state[p]
+                if "exp_avg" not in state:
+                    continue
+                momentum = state["exp_avg"]
+                norm = momentum.norm()
+                if norm > 0:
+                    delta = rho * momentum / norm
+                    deltas[p] = delta
+                    p.data.add_(delta)
+    return deltas
+
+
+def _msam_unperturb(deltas):
+    with torch.no_grad():
+        for p, delta in deltas.items():
+            p.data.sub_(delta)
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     anp_head: ANPSurfaceDecoder | None,
@@ -1051,6 +1112,8 @@ def train_one_epoch(
     amp_mode: str = "none",
     max_batches: int = 0,
     grad_clip: float = 0.0,
+    use_msam: bool = False,
+    msam_rho: float = 0.02,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1058,42 +1121,26 @@ def train_one_epoch(
     running = {"loss": 0.0}
     steps = 0
     batches = loader if max_batches <= 0 else itertools.islice(loader, max_batches)
+
+    base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
+
     for batch in batches:
         optimizer.zero_grad(set_to_none=True)
-        if model_name == "reference_abupt":
-            batch = batch.to(device)
-            with autocast_context(device, amp_mode):
-                outputs = model(
-                    geometry_position=batch.geometry_position,
-                    geometry_supernode_idx=batch.geometry_supernode_idx,
-                    geometry_batch_idx=batch.geometry_batch_idx,
-                    surface_anchor_position=batch.surface_anchor_position,
-                    volume_anchor_position=batch.volume_anchor_position,
-                )
-                loss, _ = loss_abupt(batch, outputs, transform)
-        else:
-            batch = batch.to(device)
-            if isinstance(transform, TandemTargetTransform):
-                prepared = transform.prepare_batch(batch)
-                with autocast_context(device, amp_mode):
-                    outputs = model(
-                        surface_x=prepared.surface_x,
-                        surface_mask=prepared.surface_mask,
-                        volume_x=prepared.volume_x,
-                        volume_mask=prepared.volume_mask,
-                    )
-                    outputs = maybe_apply_anp(outputs, prepared, anp_head)
-                    loss, _ = loss_grouped_tandem(prepared, outputs)
-            else:
-                with autocast_context(device, amp_mode):
-                    outputs = model(
-                        surface_x=batch.surface_x,
-                        surface_mask=batch.surface_mask,
-                        volume_x=batch.volume_x,
-                        volume_mask=batch.volume_mask,
-                    )
-                    loss, _ = loss_grouped(batch, outputs, transform)
+        batch = batch.to(device)
+        loss = _forward_and_loss(model, model_name, batch, transform, anp_head, device, amp_mode)
         loss.backward()
+        original_loss = float(loss.detach().cpu().item())
+
+        if use_msam:
+            deltas = _msam_perturb(base_optimizer, msam_rho)
+            if deltas:
+                optimizer.zero_grad(set_to_none=True)
+                loss_perturbed = _forward_and_loss(model, model_name, batch, transform, anp_head, device, amp_mode)
+                loss_perturbed.backward()
+                _msam_unperturb(deltas)
+                running.setdefault("msam_loss_increase", 0.0)
+                running["msam_loss_increase"] += float(loss_perturbed.detach().cpu().item()) - original_loss
+
         all_params = list(model.parameters())
         if anp_head is not None:
             all_params += list(anp_head.parameters())
@@ -1110,11 +1157,13 @@ def train_one_epoch(
             ema.update(model)
         if anp_head is not None and anp_ema is not None:
             anp_ema.update(anp_head)
-        running["loss"] += float(loss.detach().cpu().item())
+        running["loss"] += original_loss
         steps += 1
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    if "msam_loss_increase" in running:
+        running["msam_loss_increase"] /= max(steps, 1)
     running["train_steps"] = float(steps)
     if scheduler is not None:
         running["lr"] = float(optimizer.param_groups[0]["lr"])
@@ -1291,6 +1340,8 @@ def main() -> None:
             amp_mode=config.amp_mode,
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
+            use_msam=config.use_msam,
+            msam_rho=config.msam_rho,
         )
 
         if ema is not None:
