@@ -1,5 +1,30 @@
 # SENPAI Research Results
 
+## 2026-04-21 — Round 31: Shoya Extended Run Beating Baseline (0.00652 at 164ep, still running)
+
+### PR #2725 (tetsuo): TandemFoil 5L/256d+lr=2e-4+T_max=20 — CLOSED ✗
+
+| Metric | This Run | Baseline |
+|---|---|---|
+| val_primary/surface_pressure_mae | 56.37 (ep55) | 45.07 (ep107) |
+| Epochs | 65 (180-min timeout) | 119 |
+| W&B | 3c162k1j | ixs1rqgk |
+
+- 5L/256d at ~2.5 min/ep → only 65 epochs (vs baseline's 119 at 3L/192d)
+- T_max=20 oscillation amplitude ~14 points — too aggressive for TandemFoil
+- Kakashi #2775 already testing 5L/256d with correct T_max=10
+- **KEY: TandemFoil larger architectures are epoch-starved at 180-min**
+
+### W&B Live Check: shoya #2755 AirfRANS extended run
+- **RUNNING at 133 min, 164 epochs, primary = 0.00652** — ALREADY beats baseline (0.007264)!
+- Confirms golden config was severely epoch-starved at 50-epoch cap
+- ~47 min remaining, still descending
+
+### Round 31 Assignment
+| Student | Experiment | Dataset |
+|---|---|---|
+| tetsuo | pressure-weight=30x at 3L/192d (weight sweep) | AirfRANS |
+
 ## 2026-04-21 — Round 30: PRESSURE-WEIGHT BREAKTHROUGH (0.00435!)
 
 ### CRITICAL DISCOVERY: PR #2703 (nami) — Pressure-weighted loss 20x at 3L/192d
