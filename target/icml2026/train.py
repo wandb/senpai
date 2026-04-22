@@ -148,6 +148,7 @@ class TrainConfig:
     enable_vortex_panel_velocity: bool = False
     vortex_panel_scale: float = 0.1
     vortex_panel_n: int = 64
+    enable_wall_distance: bool = False
     enable_pressure_prior_addition: bool = False
     surface_refine: bool = True
     surface_refine_hidden: int = 128
@@ -226,6 +227,66 @@ class TargetTransform:
         if self.asinh_pressure and self.pressure_index is not None:
             out[..., self.pressure_index] = torch.sinh(out[..., self.pressure_index]) / max(self.asinh_scale, 1e-6)
         return out
+
+
+@torch.no_grad()
+def _compute_wall_distance_cases(
+    coords: torch.Tensor,
+    surface_coords: torch.Tensor,
+    mask: torch.Tensor,
+    surface_mask: torch.Tensor,
+    chunk_size: int = 4096,
+) -> torch.Tensor:
+    """Compute log-normalized wall distance per case in a batch.
+
+    Args:
+        coords: [B, N, D] coordinates of all query points
+        surface_coords: [B, M, D] coordinates of surface (wall) points
+        mask: [B, N] valid-point mask for query points
+        surface_mask: [B, M] valid-point mask for surface points
+        chunk_size: chunk size for cdist to avoid OOM
+
+    Returns:
+        [B, N, 1] log-normalized wall distance feature
+    """
+    B, N, D = coords.shape
+    result = coords.new_zeros(B, N, 1)
+    for b in range(B):
+        valid_surf = surface_coords[b][surface_mask[b].bool()]
+        if valid_surf.shape[0] == 0:
+            continue
+        dists = []
+        for i in range(0, N, chunk_size):
+            chunk = coords[b, i : i + chunk_size]
+            d = torch.cdist(chunk.unsqueeze(0).float(), valid_surf.unsqueeze(0).float())[0]
+            dists.append(d.min(dim=-1).values)
+        wd = torch.cat(dists, dim=0)
+        valid_wd = wd[mask[b].bool()]
+        mean_dist = valid_wd.mean().clamp(min=1e-8) if valid_wd.numel() > 0 else wd.new_tensor(1.0)
+        result[b, :, 0] = torch.log1p(wd / mean_dist)
+    return result
+
+
+def augment_batch_wall_distance(batch: "GroupedBatch") -> "GroupedBatch":
+    """Append wall-distance feature to surface_x (and volume_x if present).
+
+    Surface points are on the wall so their wall distance is 0.
+    Volume points get actual distance to nearest surface point.
+    """
+    space_dim = batch.space_dim
+    surf_coords = batch.surface_x[..., :space_dim]
+
+    surf_wd = batch.surface_x.new_zeros(*batch.surface_x.shape[:-1], 1)
+    batch.surface_x = torch.cat([batch.surface_x, surf_wd], dim=-1)
+
+    if batch.volume_x is not None and batch.volume_mask is not None:
+        vol_coords = batch.volume_x[..., :space_dim]
+        vol_wd = _compute_wall_distance_cases(
+            vol_coords, surf_coords, batch.volume_mask, batch.surface_mask,
+        )
+        batch.volume_x = torch.cat([batch.volume_x, vol_wd.to(batch.volume_x.dtype)], dim=-1)
+
+    return batch
 
 
 class TandemTargetTransform:
@@ -323,6 +384,11 @@ class TandemTargetTransform:
                 include_angle=self.config.enable_wake_angle,
             )
             x = torch.cat([x, wake_feats], dim=-1)
+        if self.config.enable_wall_distance:
+            wall_dist = _compute_wall_distance_cases(
+                raw_xy, raw_xy, full_mask, full_is_surface.bool(),
+            )
+            x = torch.cat([x, wall_dist.to(x.dtype)], dim=-1)
         if self.config.enable_fourier:
             x = append_batched_fourier_features(x)
 
@@ -829,6 +895,7 @@ def evaluate_grouped(
     *,
     amp_mode: str = "none",
     max_batches: int = 0,
+    enable_wall_distance: bool = False,
 ) -> dict[str, float]:
     model.eval()
     if anp_head is not None:
@@ -893,6 +960,8 @@ def evaluate_grouped(
                 count_volume += 1
             continue
 
+        if enable_wall_distance:
+            augment_batch_wall_distance(batch)
         with autocast_context(device, amp_mode):
             outputs = model(
                 surface_x=batch.surface_x,
@@ -1200,6 +1269,7 @@ def train_one_epoch(
     max_batches: int = 0,
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
+    enable_wall_distance: bool = False,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1248,6 +1318,8 @@ def train_one_epoch(
                         outputs = maybe_apply_anp(outputs, prepared, anp_head)
                         loss, _ = loss_grouped_tandem(prepared, outputs)
                 else:
+                    if enable_wall_distance:
+                        augment_batch_wall_distance(batch)
                     with autocast_context(device, amp_mode):
                         outputs = model(
                             surface_x=batch.surface_x,
@@ -1385,6 +1457,7 @@ def evaluate_phase_metrics(
                 device,
                 amp_mode=config.amp_mode,
                 max_batches=config.max_eval_batches,
+                enable_wall_distance=config.enable_wall_distance,
             )
         metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
         if phase == "val" and split_name in LEGACY_VAL_ALIAS and "mae_surf_p" in split_metrics:
@@ -1481,6 +1554,10 @@ def main() -> None:
         _ds.TandemFoilCaseDataset.__init__ = _patched_init
 
     bundle = build_bundle(config)
+    if config.enable_wall_distance:
+        bundle.spec.surface_input_dim += 1
+        if bundle.spec.volume_input_dim > 0:
+            bundle.spec.volume_input_dim += 1
     resolved_num_workers = resolve_num_workers(config, bundle.spec.name)
     if bundle.spec.name == "tandemfoilset":
         phys_stats = compute_tandem_phys_stats(
@@ -1568,6 +1645,7 @@ def main() -> None:
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
+            enable_wall_distance=config.enable_wall_distance,
         )
 
         if ema is not None:
