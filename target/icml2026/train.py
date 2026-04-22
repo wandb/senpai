@@ -228,6 +228,19 @@ class TargetTransform:
         return out
 
 
+def comparison_metric_tensors(
+    preds: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    train_transform: TargetTransform,
+    metric_transform: TargetTransform | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if metric_transform is None:
+        return preds, train_transform.apply(target)
+    pred_raw = train_transform.invert(preds)
+    return metric_transform.apply(pred_raw), metric_transform.apply(target)
+
+
 class TandemTargetTransform:
     def __init__(
         self,
@@ -825,6 +838,7 @@ def evaluate_grouped(
     anp_head: ANPSurfaceDecoder | None,
     loader: DataLoader,
     transform: TargetTransform | TandemTargetTransform,
+    metric_transform: TargetTransform | None,
     device: torch.device,
     *,
     amp_mode: str = "none",
@@ -902,9 +916,16 @@ def evaluate_grouped(
             )
         outputs = float_outputs(outputs)
         if dataset_name == "airfrans":
+            if not isinstance(transform, TargetTransform):
+                raise TypeError("AirfRANS evaluation requires TargetTransform")
             if batch.surface_y is not None and outputs["surface_preds"] is not None:
-                target = transform.apply(batch.surface_y)
-                case_values = (outputs["surface_preds"] - target).square()
+                surface_pred, surface_target = comparison_metric_tensors(
+                    outputs["surface_preds"],
+                    batch.surface_y,
+                    train_transform=transform,
+                    metric_transform=metric_transform,
+                )
+                case_values = (surface_pred - surface_target).square()
                 for case_idx in range(case_values.shape[0]):
                     channel_mean = _case_masked_channel_means(case_values[case_idx], batch.surface_mask[case_idx])
                     if channel_mean is not None:
@@ -914,8 +935,13 @@ def evaluate_grouped(
                             surf_channel_sum = torch.zeros(channel_mean.shape[0], device=device)
                         surf_channel_sum += channel_mean.to(device)
             if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
-                target = transform.apply(batch.volume_y)
-                case_values = (outputs["volume_preds"] - target).square()
+                volume_pred, volume_target = comparison_metric_tensors(
+                    outputs["volume_preds"],
+                    batch.volume_y,
+                    train_transform=transform,
+                    metric_transform=metric_transform,
+                )
+                case_values = (volume_pred - volume_target).square()
                 for case_idx in range(case_values.shape[0]):
                     channel_mean = _case_masked_channel_means(case_values[case_idx], batch.volume_mask[case_idx])
                     if channel_mean is not None:
@@ -927,17 +953,29 @@ def evaluate_grouped(
             continue
 
         if dataset_name == "tandemfoilset_paper":
+            if not isinstance(transform, TargetTransform):
+                raise TypeError("TandemFoil paper evaluation requires TargetTransform")
             if batch.surface_y is not None and outputs["surface_preds"] is not None:
-                target = transform.apply(batch.surface_y)
-                case_values = (outputs["surface_preds"] - target).square()
+                surface_pred, surface_target = comparison_metric_tensors(
+                    outputs["surface_preds"],
+                    batch.surface_y,
+                    train_transform=transform,
+                    metric_transform=metric_transform,
+                )
+                case_values = (surface_pred - surface_target).square()
                 valid = batch.surface_mask.unsqueeze(-1)
                 if paper_surface_sq_sum is None:
                     paper_surface_sq_sum = torch.zeros(case_values.shape[-1], device=device)
                 paper_surface_sq_sum += (case_values * valid).sum(dim=(0, 1)).to(device)
                 paper_surface_nodes += int(batch.surface_mask.sum().detach().cpu().item())
             if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
-                target = transform.apply(batch.volume_y)
-                case_values = (outputs["volume_preds"] - target).square()
+                volume_pred, volume_target = comparison_metric_tensors(
+                    outputs["volume_preds"],
+                    batch.volume_y,
+                    train_transform=transform,
+                    metric_transform=metric_transform,
+                )
+                case_values = (volume_pred - volume_target).square()
                 valid = batch.volume_mask.unsqueeze(-1)
                 if paper_volume_sq_sum is None:
                     paper_volume_sq_sum = torch.zeros(case_values.shape[-1], device=device)
@@ -1051,6 +1089,7 @@ def evaluate_abupt(
     model: torch.nn.Module,
     loader: DataLoader,
     transform: TargetTransform,
+    metric_transform: TargetTransform | None,
     device: torch.device,
     *,
     amp_mode: str = "none",
@@ -1083,16 +1122,26 @@ def evaluate_abupt(
         outputs = float_outputs(outputs)
         if dataset_name == "airfrans":
             if batch.surface_anchor_target is not None and outputs["surface_preds"] is not None:
-                target = transform.apply(batch.surface_anchor_target)
-                channel_mean = (outputs["surface_preds"] - target).square().mean(dim=(0, 1))
+                surface_pred, surface_target = comparison_metric_tensors(
+                    outputs["surface_preds"],
+                    batch.surface_anchor_target,
+                    train_transform=transform,
+                    metric_transform=metric_transform,
+                )
+                channel_mean = (surface_pred - surface_target).square().mean(dim=(0, 1))
                 total_surface += float(channel_mean.mean().detach().cpu().item())
                 count_surface += 1
                 if surf_channel_sum is None:
                     surf_channel_sum = torch.zeros(channel_mean.shape[0], device=device)
                 surf_channel_sum += channel_mean.to(device)
             if batch.volume_anchor_target is not None and outputs["volume_preds"] is not None:
-                target = transform.apply(batch.volume_anchor_target)
-                channel_mean = (outputs["volume_preds"] - target).square().mean(dim=(0, 1))
+                volume_pred, volume_target = comparison_metric_tensors(
+                    outputs["volume_preds"],
+                    batch.volume_anchor_target,
+                    train_transform=transform,
+                    metric_transform=metric_transform,
+                )
+                channel_mean = (volume_pred - volume_target).square().mean(dim=(0, 1))
                 total_volume += float(channel_mean.mean().detach().cpu().item())
                 count_volume += 1
                 if vol_channel_sum is None:
@@ -1102,16 +1151,26 @@ def evaluate_abupt(
 
         if dataset_name == "tandemfoilset_paper":
             if batch.surface_anchor_target is not None and outputs["surface_preds"] is not None:
-                target = transform.apply(batch.surface_anchor_target)
+                surface_pred, surface_target = comparison_metric_tensors(
+                    outputs["surface_preds"],
+                    batch.surface_anchor_target,
+                    train_transform=transform,
+                    metric_transform=metric_transform,
+                )
                 if paper_surface_sq_sum is None:
-                    paper_surface_sq_sum = torch.zeros(target.shape[-1], device=device)
-                paper_surface_sq_sum += (outputs["surface_preds"] - target).square().sum(dim=(0, 1)).to(device)
+                    paper_surface_sq_sum = torch.zeros(surface_target.shape[-1], device=device)
+                paper_surface_sq_sum += (surface_pred - surface_target).square().sum(dim=(0, 1)).to(device)
                 paper_surface_nodes += batch.surface_anchor_target.shape[0] * batch.surface_anchor_target.shape[1]
             if batch.volume_anchor_target is not None and outputs["volume_preds"] is not None:
-                target = transform.apply(batch.volume_anchor_target)
+                volume_pred, volume_target = comparison_metric_tensors(
+                    outputs["volume_preds"],
+                    batch.volume_anchor_target,
+                    train_transform=transform,
+                    metric_transform=metric_transform,
+                )
                 if paper_volume_sq_sum is None:
-                    paper_volume_sq_sum = torch.zeros(target.shape[-1], device=device)
-                paper_volume_sq_sum += (outputs["volume_preds"] - target).square().sum(dim=(0, 1)).to(device)
+                    paper_volume_sq_sum = torch.zeros(volume_target.shape[-1], device=device)
+                paper_volume_sq_sum += (volume_pred - volume_target).square().sum(dim=(0, 1)).to(device)
                 paper_volume_nodes += batch.volume_anchor_target.shape[0] * batch.volume_anchor_target.shape[1]
             continue
 
@@ -1362,6 +1421,7 @@ def evaluate_phase_metrics(
     anp_head: ANPSurfaceDecoder | None,
     loaders: dict[str, DataLoader],
     transform: TargetTransform | TandemTargetTransform,
+    metric_transform: TargetTransform | None,
     device: torch.device,
     phase: str,
 ) -> dict[str, float]:
@@ -1372,6 +1432,7 @@ def evaluate_phase_metrics(
                 forward_model,
                 loader,
                 transform,
+                metric_transform,
                 device,
                 amp_mode=config.amp_mode,
                 max_batches=config.max_eval_batches,
@@ -1382,6 +1443,7 @@ def evaluate_phase_metrics(
                 anp_head,
                 loader,
                 transform,
+                metric_transform,
                 device,
                 amp_mode=config.amp_mode,
                 max_batches=config.max_eval_batches,
@@ -1496,6 +1558,7 @@ def main() -> None:
             phys_stats=phys_stats,
             config=config,
         )
+        metric_transform = None
     else:
         transform = TargetTransform(
             pressure_index=bundle.spec.pressure_output_index,
@@ -1504,6 +1567,17 @@ def main() -> None:
             asinh_pressure=config.asinh_pressure,
             asinh_scale=config.asinh_scale,
         )
+        metric_transform = None
+        if bundle.spec.name in {"airfrans", "tandemfoilset_paper"}:
+            # Keep literature-facing metrics in the dataset's raw z-score space
+            # even when training applies an auxiliary target transform.
+            metric_transform = TargetTransform(
+                pressure_index=bundle.spec.pressure_output_index,
+                stats_mean=bundle.target_stats.y_mean,
+                stats_std=bundle.target_stats.y_std,
+                asinh_pressure=False,
+                asinh_scale=config.asinh_scale,
+            )
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
@@ -1584,6 +1658,7 @@ def main() -> None:
             anp_head=anp_head,
             loaders=val_loaders,
             transform=transform,
+            metric_transform=metric_transform,
             device=device,
             phase="val",
         )
@@ -1643,6 +1718,7 @@ def main() -> None:
             anp_head=anp_head,
             loaders=test_loaders,
             transform=transform,
+            metric_transform=metric_transform,
             device=device,
             phase="test",
         )
@@ -1668,6 +1744,7 @@ def main() -> None:
                 anp_head=anp_head,
                 loaders=test_loaders,
                 transform=transform,
+                metric_transform=metric_transform,
                 device=device,
                 phase="test",
             )

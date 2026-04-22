@@ -40,6 +40,8 @@ It is not fine if every benchmark needs a different core idea.
   - this is the ICML sprint parity target, not the original paper contract
 - `tandemfoil_paper`
   - paper-facing metric: `test_primary/field_mse`
+  - this is normalized full-field MSE over `[Ux, Uy, p]`, not a surface-only metric
+  - `surface_mse` / `volume_mse` are diagnostics only
   - published Experiment 4 references:
     - `cruise_random_uniform = 0.10`
     - `cruise_random_aoa_extrap = 0.18`

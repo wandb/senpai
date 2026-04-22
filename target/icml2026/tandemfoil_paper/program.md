@@ -66,8 +66,20 @@ IDs cannot be recovered from the PDF alone.
 
 ## Metrics
 
-The paper reports **normalized full-field MSE** after z-score normalization with
-training-set statistics.
+The paper’s main benchmark tables report **MSE test losses** on the full flow
+field, not a surface-only metric.
+
+Why we interpret it this way:
+
+- Experiment 4 says “Table 6 shows that the `MSE` test losses are higher...”
+- the training appendix says the model predicts three fields:
+  `[Ux, Uy, p]`
+- the appendix later introduces **boundary MSE** separately for the three-airfoil
+  extension, which implies the main-text tables are the overall full-field
+  metric unless boundary restriction is stated explicitly
+
+The paper also says a “standard z-score style normalisation” is used with the
+training-set mean and standard deviation.
 
 This subtarget therefore uses:
 
@@ -81,6 +93,14 @@ This subtarget therefore uses:
   - normalized-space MSE on non-surface nodes only
 
 Lower is better.
+
+Important repo contract:
+
+- `field_mse` is the only paper-facing comparison scalar
+- `surface_mse` and `volume_mse` are auxiliary diagnostics
+- if training enables an extra target transform such as `--asinh-pressure`, the
+  evaluator must still decode predictions back to raw target space and then
+  recompute `field_mse` in the paper’s plain train-stat z-score space
 
 Primary harness aliases:
 
@@ -117,4 +137,3 @@ stack is competitive on the paper-style TandemFoil evaluation.
   stack as `tandemfoil/`, but **not** the noam-style pressure-denorm contract.
 - It is a benchmark-calibration target, not a replacement for the main
   `tandemfoil/` ICML sprint target.
-
