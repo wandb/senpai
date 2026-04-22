@@ -122,6 +122,37 @@ class ANPSurfaceDecoder(nn.Module):
         return correction
 
 
+class GlobalContextBlock(nn.Module):
+    """BERT [CLS]-style global context token that aggregates global flow field
+    information via cross-attention and broadcasts it back to all nodes."""
+
+    def __init__(self, dim: int, num_heads: int = 8):
+        super().__init__()
+        self.global_token = nn.Parameter(torch.zeros(1, 1, dim))
+        nn.init.trunc_normal_(self.global_token, std=0.02)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            batch_first=True,
+            dropout=0.0,
+        )
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.shape[0]
+        g = self.global_token.expand(B, -1, -1)
+        g_updated, _ = self.cross_attn(
+            query=self.norm1(g),
+            key=self.norm2(x),
+            value=x,
+        )
+        g = g + g_updated
+        global_bias = self.proj(g)
+        return x + global_bias
+
+
 class SenpaiTransolver(ReferenceTransolver):
     """Grouped-domain Transolver plus the retained Senpai refinement mechanisms."""
 
@@ -134,6 +165,8 @@ class SenpaiTransolver(ReferenceTransolver):
         surface_refine_layers: int = 2,
         surface_pressure_prior_idx: int | None = None,
         volume_pressure_prior_idx: int | None = None,
+        global_context_token: bool = False,
+        global_context_token_interval: int = 2,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -151,6 +184,19 @@ class SenpaiTransolver(ReferenceTransolver):
             if self.surface_refine
             else None
         )
+        self.use_global_context = global_context_token
+        if global_context_token:
+            n_blocks = len(self.backbone.blocks)
+            n_heads = self.n_hidden // 64 if self.n_hidden >= 64 else 1
+            # Place one GlobalContextBlock after every K transformer blocks
+            self.global_ctx_interval = global_context_token_interval
+            n_ctx_blocks = (n_blocks + global_context_token_interval - 1) // global_context_token_interval
+            self.global_ctx_blocks = nn.ModuleList(
+                [GlobalContextBlock(dim=self.n_hidden, num_heads=n_heads) for _ in range(n_ctx_blocks)]
+            )
+        else:
+            self.global_ctx_interval = global_context_token_interval
+            self.global_ctx_blocks = nn.ModuleList()
 
     def _apply_pressure_prior_addition(
         self,
@@ -170,6 +216,24 @@ class SenpaiTransolver(ReferenceTransolver):
         preds[..., self.pressure_output_index] = preds[..., self.pressure_output_index] + x[..., prior_idx]
         return preds
 
+    def _forward_backbone_with_global_ctx(
+        self,
+        hidden: torch.Tensor,
+        attn_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run backbone blocks, injecting GlobalContextBlock after every K blocks."""
+        ctx_idx = 0
+        for block_idx, block in enumerate(self.backbone.blocks):
+            hidden = block(hidden, attn_mask=attn_mask)
+            # Apply global context after every K-th block (1-indexed)
+            if (block_idx + 1) % self.global_ctx_interval == 0 and ctx_idx < len(self.global_ctx_blocks):
+                hidden = self.global_ctx_blocks[ctx_idx](hidden)
+                ctx_idx += 1
+        # Apply any remaining global context blocks after the final backbone block
+        if ctx_idx < len(self.global_ctx_blocks):
+            hidden = self.global_ctx_blocks[ctx_idx](hidden)
+        return hidden
+
     def forward(
         self,
         *,
@@ -178,12 +242,47 @@ class SenpaiTransolver(ReferenceTransolver):
         volume_x: torch.Tensor | None = None,
         volume_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | None]:
-        outputs = super().forward(
-            surface_x=surface_x,
-            surface_mask=surface_mask,
-            volume_x=volume_x,
-            volume_mask=volume_mask,
-        )
+        if not self.use_global_context:
+            outputs = super().forward(
+                surface_x=surface_x,
+                surface_mask=surface_mask,
+                volume_x=volume_x,
+                volume_mask=volume_mask,
+            )
+        else:
+            # Replicate ReferenceTransolver.forward with global context injection
+            surface_hidden = self._group_hidden(surface_x, self.project_surface_features, self.surface_bias)
+            hidden_parts = [surface_hidden]
+            mask_parts = [surface_mask]
+            volume_hidden = None
+            if volume_x is not None and volume_mask is not None and self.volume_output_dim > 0:
+                volume_hidden = self._group_hidden(volume_x, self.project_volume_features, self.volume_bias)
+                hidden_parts.append(volume_hidden)
+                mask_parts.append(volume_mask)
+            hidden = torch.cat(hidden_parts, dim=1) + self.placeholder
+            attn_mask = torch.cat(mask_parts, dim=1)
+            hidden = self._forward_backbone_with_global_ctx(hidden, attn_mask)
+            raw_output = self.out(self.norm(hidden))
+
+            surface_tokens = surface_x.shape[1]
+            surface_preds = raw_output[:, :surface_tokens, : self.surface_output_dim]
+            volume_preds = None
+            if self.volume_output_dim > 0 and volume_x is not None:
+                volume_tokens = volume_x.shape[1]
+                start = self.surface_output_dim
+                volume_preds = raw_output[:, surface_tokens : surface_tokens + volume_tokens, start : start + self.volume_output_dim]
+
+            surface_preds = surface_preds * surface_mask.unsqueeze(-1)
+            if volume_preds is not None and volume_mask is not None:
+                volume_preds = volume_preds * volume_mask.unsqueeze(-1)
+
+            outputs = {
+                "surface_hidden": hidden[:, :surface_tokens],
+                "surface_preds": surface_preds,
+                "volume_hidden": None if volume_hidden is None else hidden[:, surface_tokens:],
+                "volume_preds": volume_preds,
+            }
+
         surface_preds = self._apply_pressure_prior_addition(
             outputs["surface_preds"],
             surface_x,

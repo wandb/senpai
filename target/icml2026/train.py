@@ -166,6 +166,7 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    global_context_token: bool = False
 
 
 @dataclass
@@ -504,6 +505,7 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
             surface_refine_layers=config.surface_refine_layers,
             surface_pressure_prior_idx=prior_idx,
             volume_pressure_prior_idx=prior_idx,
+            global_context_token=config.global_context_token,
             **transolver_kwargs,
         )
     if config.model == "reference_abupt":
