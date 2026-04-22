@@ -31,6 +31,7 @@ from core.features import (
     compute_wake_deficit_features,
 )
 from core.optim import Lion, Lookahead
+from torch.optim.swa_utils import AveragedModel, update_bn
 
 
 class EMAWithWarmup:
@@ -166,6 +167,8 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    use_swa: bool = False
+    swa_start_epoch: int = 50
 
 
 @dataclass
@@ -1426,6 +1429,9 @@ def main() -> None:
 
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
+
+    swa_model = AveragedModel(model) if config.use_swa else None
+    swa_n_averaged = 0
     history: list[dict[str, float]] = []
 
     run = None
@@ -1464,18 +1470,28 @@ def main() -> None:
             grad_accum_steps=config.grad_accum_steps,
         )
 
-        if ema is not None:
-            ema.store(model)
-            ema.copy_to(model)
-        if anp_head is not None and anp_ema is not None:
-            anp_ema.store(anp_head)
-            anp_ema.copy_to(anp_head)
+        if swa_model is not None and epoch >= config.swa_start_epoch:
+            swa_model.update_parameters(model)
+            swa_n_averaged += 1
+
+        swa_active = swa_model is not None and swa_n_averaged > 0
+        if swa_active:
+            update_bn(train_loader, swa_model, device=device)
+            eval_model = swa_model
+        else:
+            if ema is not None:
+                ema.store(model)
+                ema.copy_to(model)
+            if anp_head is not None and anp_ema is not None:
+                anp_ema.store(anp_head)
+                anp_ema.copy_to(anp_head)
+            eval_model = forward_model
 
         eval_metrics: dict[str, float] = {}
         for split_name, loader in val_loaders.items():
             if config.model == "reference_abupt":
                 split_metrics = evaluate_abupt(
-                    forward_model,
+                    eval_model,
                     loader,
                     transform,
                     device,
@@ -1484,7 +1500,7 @@ def main() -> None:
                 )
             else:
                 split_metrics = evaluate_grouped(
-                    forward_model,
+                    eval_model,
                     anp_head,
                     loader,
                     transform,
@@ -1507,11 +1523,14 @@ def main() -> None:
             if len(eq4_values) == 4:
                 eval_metrics["val_eq4/surface_pressure_mae"] = sum(eq4_values) / 4.0
         eval_metrics = add_primary_metric_aliases(bundle, eval_metrics, phase="val")
+        if swa_active:
+            eval_metrics["swa/n_averaged"] = float(swa_n_averaged)
 
-        if ema is not None:
-            ema.restore(model)
-        if anp_head is not None and anp_ema is not None:
-            anp_ema.restore(anp_head)
+        if not swa_active:
+            if ema is not None:
+                ema.restore(model)
+            if anp_head is not None and anp_ema is not None:
+                anp_ema.restore(anp_head)
 
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
         history.append(epoch_metrics)
@@ -1521,18 +1540,24 @@ def main() -> None:
         print(json.dumps(epoch_metrics, sort_keys=True), flush=True)
 
     final_test_metrics: dict[str, float] = {}
+    swa_active = swa_model is not None and swa_n_averaged > 0
     if test_loaders:
-        if ema is not None:
-            ema.store(model)
-            ema.copy_to(model)
-        if anp_head is not None and anp_ema is not None:
-            anp_ema.store(anp_head)
-            anp_ema.copy_to(anp_head)
+        if swa_active:
+            update_bn(train_loader, swa_model, device=device)
+            test_eval_model = swa_model
+        else:
+            if ema is not None:
+                ema.store(model)
+                ema.copy_to(model)
+            if anp_head is not None and anp_ema is not None:
+                anp_ema.store(anp_head)
+                anp_ema.copy_to(anp_head)
+            test_eval_model = forward_model
 
         for split_name, loader in test_loaders.items():
             if config.model == "reference_abupt":
                 split_metrics = evaluate_abupt(
-                    forward_model,
+                    test_eval_model,
                     loader,
                     transform,
                     device,
@@ -1541,7 +1566,7 @@ def main() -> None:
                 )
             else:
                 split_metrics = evaluate_grouped(
-                    forward_model,
+                    test_eval_model,
                     anp_head,
                     loader,
                     transform,
@@ -1561,11 +1586,14 @@ def main() -> None:
             if len(eq4_values) == 4:
                 final_test_metrics["test_eq4/surface_pressure_mae"] = sum(eq4_values) / 4.0
         final_test_metrics = add_primary_metric_aliases(bundle, final_test_metrics, phase="test")
+        if swa_active:
+            final_test_metrics["swa/n_averaged"] = float(swa_n_averaged)
 
-        if ema is not None:
-            ema.restore(model)
-        if anp_head is not None and anp_ema is not None:
-            anp_ema.restore(anp_head)
+        if not swa_active:
+            if ema is not None:
+                ema.restore(model)
+            if anp_head is not None and anp_ema is not None:
+                anp_ema.restore(anp_head)
         if run is not None:
             wandb.log(final_test_metrics, step=int(history[-1]["epoch"]) if history else 0)
             run.summary.update(final_test_metrics)
