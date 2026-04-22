@@ -31,6 +31,8 @@ For TandemFoilSet, remember there are now two useful views of the problem:
     - reported test from that lane: `50.77`
 - `tandemfoil_paper`
   - paper-facing metric: `test_primary/field_mse`
+  - this is normalized full-field MSE, not a surface-only metric
+  - `surface_mse` / `volume_mse` are diagnostics, not the comparison scalar
   - published paper reference numbers from Experiment 4 / Table 6:
     - `cruise_random_uniform = 0.10`
     - `cruise_random_aoa_extrap = 0.18`

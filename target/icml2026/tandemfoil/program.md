@@ -85,6 +85,10 @@ Use the following metric definitions exactly:
 
 Lower is better. For the paper sprint, the decision-driving quantity is **surface pressure MAE on the explicit validation tracks**, with the equal-weight 4-way average used as the benchmark summary.
 
+Do not compare `tandemfoil/` `surface_pressure_mae` directly against the
+original TandemFoilSet paper’s Table 6 `MSE` values. That apples-to-apples
+literature-facing contract lives under `tandemfoil_paper/`.
+
 For held-out reporting after model selection, the trainer also computes the
 analogous `test_eq4/surface_pressure_mae` summary when the four matching test
 tracks are available in the split manifest.

@@ -31,6 +31,23 @@ class _IdentityPaperModel(torch.nn.Module):
         }
 
 
+class _FixedPaperModel(torch.nn.Module):
+    def __init__(self, *, surface_preds: torch.Tensor, volume_preds: torch.Tensor | None):
+        super().__init__()
+        self._surface_preds = surface_preds
+        self._volume_preds = volume_preds
+
+    def eval(self):
+        return self
+
+    def forward(self, *, surface_x, surface_mask, volume_x, volume_mask):
+        del surface_x, surface_mask, volume_x, volume_mask
+        return {
+            "surface_preds": self._surface_preds,
+            "volume_preds": self._volume_preds,
+        }
+
+
 def test_uniform_split_uses_80_10_10_counts():
     splits = split_uniform_indices(900, seed=42)
     assert len(splits["train"]) == 720
@@ -73,6 +90,60 @@ def test_paper_eval_reports_normalized_field_mse():
         None,
         [batch],
         TargetTransform(pressure_index=2, stats_mean=torch.zeros(3), stats_std=torch.ones(3)),
+        None,
+        torch.device("cpu"),
+    )
+
+    surface_sq = 3.0
+    volume_sq = 2.0
+    expected_surface = surface_sq / (2 * 3)
+    expected_volume = volume_sq / (1 * 3)
+    expected_field = (surface_sq + volume_sq) / (3 * 3)
+
+    assert math.isclose(metrics["surface_mse"], expected_surface, rel_tol=1e-6, abs_tol=1e-6)
+    assert math.isclose(metrics["volume_mse"], expected_volume, rel_tol=1e-6, abs_tol=1e-6)
+    assert math.isclose(metrics["field_mse"], expected_field, rel_tol=1e-6, abs_tol=1e-6)
+
+
+def test_paper_eval_uses_raw_zscore_metric_even_with_asinh_training_transform():
+    raw_surface_target = torch.tensor([[[1.0, 2.0, 3.0], [1.0, 1.0, 1.0]]], dtype=torch.float32)
+    raw_volume_target = torch.tensor([[[2.0, 2.0, 2.0]]], dtype=torch.float32)
+    raw_surface_pred = torch.tensor([[[2.0, 2.0, 3.0], [0.0, 1.0, 2.0]]], dtype=torch.float32)
+    raw_volume_pred = torch.tensor([[[3.0, 1.0, 2.0]]], dtype=torch.float32)
+    train_transform = TargetTransform(
+        pressure_index=2,
+        stats_mean=torch.zeros(3),
+        stats_std=torch.ones(3),
+        asinh_pressure=True,
+        asinh_scale=0.75,
+    )
+    metric_transform = TargetTransform(
+        pressure_index=2,
+        stats_mean=torch.zeros(3),
+        stats_std=torch.ones(3),
+        asinh_pressure=False,
+    )
+    batch = GroupedBatch(
+        case_ids=["paper-case"],
+        dataset_name="tandemfoilset_paper",
+        space_dim=2,
+        surface_x=torch.zeros(1, 2, 4, dtype=torch.float32),
+        surface_y=raw_surface_target,
+        surface_mask=torch.ones(1, 2, dtype=torch.bool),
+        volume_x=torch.zeros(1, 1, 4, dtype=torch.float32),
+        volume_y=raw_volume_target,
+        volume_mask=torch.ones(1, 1, dtype=torch.bool),
+        metadata=[],
+    )
+    metrics = evaluate_grouped(
+        _FixedPaperModel(
+            surface_preds=train_transform.apply(raw_surface_pred),
+            volume_preds=train_transform.apply(raw_volume_pred),
+        ),
+        None,
+        [batch],
+        train_transform,
+        metric_transform,
         torch.device("cpu"),
     )
 

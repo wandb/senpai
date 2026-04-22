@@ -36,6 +36,22 @@ DEFAULT_TANDEM_PAPER_MANIFEST = ROOT_DIR / "tandemfoil_paper/data/split_manifest
 DEFAULT_TANDEM_PAPER_STATS = ROOT_DIR / "tandemfoil_paper/data/split_stats_tandemfoil_paper_experiment4.json"
 DEFAULT_AIRFRANS_MANIFEST = ROOT_DIR / "airfrans/data/split_manifest_airfrans.json"
 DEFAULT_DRIVAERML_MANIFEST = ROOT_DIR / "drivaerml/data/split_manifest_drivaerml.json"
+EXPECTED_DRIVAERML_SURFACE_SPLIT_COUNTS = {"train": 400, "val": 34, "test": 50}
+EXPECTED_DRIVAERML_EXCLUDED_CASE_COUNT = 0
+REQUIRED_DRIVAERML_CASE_IDS = frozenset(
+    {
+        "run_44",
+        "run_133",
+        "run_158",
+        "run_184",
+        "run_203",
+        "run_226",
+        "run_249",
+        "run_310",
+        "run_416",
+        "run_484",
+    }
+)
 RUNTIME_CACHE_CASES = 16
 
 
@@ -60,6 +76,59 @@ def _stats_from_json(stats_path: str | Path) -> TargetTransformStats:
         y_mean=torch.tensor(raw["y_mean"], dtype=torch.float32),
         y_std=torch.tensor(raw["y_std"], dtype=torch.float32),
     )
+
+
+def _validate_drivaerml_manifest(manifest: dict, manifest_path: str | Path) -> None:
+    surface_splits = manifest.get("surface_splits")
+    if not isinstance(surface_splits, dict):
+        raise ValueError(f"DrivAerML manifest {manifest_path} is missing surface_splits")
+
+    missing_splits = sorted(set(EXPECTED_DRIVAERML_SURFACE_SPLIT_COUNTS) - set(surface_splits))
+    if missing_splits:
+        raise ValueError(f"DrivAerML manifest {manifest_path} is missing surface splits: {missing_splits}")
+
+    actual_counts = {
+        split: len(surface_splits[split])
+        for split in EXPECTED_DRIVAERML_SURFACE_SPLIT_COUNTS
+    }
+    if actual_counts != EXPECTED_DRIVAERML_SURFACE_SPLIT_COUNTS:
+        raise ValueError(
+            "DrivAerML manifest does not match the repaired public benchmark split: "
+            f"{actual_counts} vs {EXPECTED_DRIVAERML_SURFACE_SPLIT_COUNTS} ({manifest_path})"
+        )
+
+    split_sets = {
+        split: set(surface_splits[split])
+        for split in EXPECTED_DRIVAERML_SURFACE_SPLIT_COUNTS
+    }
+    surface_case_ids = set().union(*split_sets.values())
+    if len(surface_case_ids) != sum(actual_counts.values()):
+        raise ValueError(f"DrivAerML manifest {manifest_path} has overlapping surface splits")
+
+    excluded_case_count = int(
+        manifest.get("excluded_case_count", len(manifest.get("excluded_case_ids", [])))
+    )
+    if excluded_case_count != EXPECTED_DRIVAERML_EXCLUDED_CASE_COUNT:
+        raise ValueError(
+            "DrivAerML manifest still excludes repaired public cases: "
+            f"{excluded_case_count} excluded in {manifest_path}"
+        )
+
+    missing_required = sorted(REQUIRED_DRIVAERML_CASE_IDS - surface_case_ids)
+    if missing_required:
+        raise ValueError(
+            f"DrivAerML manifest {manifest_path} is missing restored public cases: {missing_required}"
+        )
+
+    volume_splits = manifest.get("volume_splits", {})
+    if isinstance(volume_splits, dict):
+        for split_name, case_ids in volume_splits.items():
+            extra_case_ids = sorted(set(case_ids) - split_sets.get(split_name, set()))
+            if extra_case_ids:
+                raise ValueError(
+                    "DrivAerML volume split must stay aligned with the same surface split: "
+                    f"{split_name} has extras {extra_case_ids} in {manifest_path}"
+                )
 
 
 class TandemFoilCaseDataset(Dataset):
@@ -726,6 +795,7 @@ def build_drivaerml_bundle(
     eval_volume_points: int = 0,
 ) -> DatasetBundle:
     manifest = _read_json(manifest_path)
+    _validate_drivaerml_manifest(manifest, manifest_path)
     train_sampling_mode = "train_random" if train_surface_points > 0 or train_volume_points > 0 else "full"
     eval_sampling_mode = "eval_chunk" if eval_surface_points > 0 or eval_volume_points > 0 else "full"
     train_dataset = DrivAerMLCaseDataset(
@@ -782,7 +852,7 @@ def build_drivaerml_bundle(
             pressure_output_index=0,
             default_metric="surface_rel_l2_pct",
             notes=[
-                "DrivAerML defaults to the packaged public surface split for the paper sprint.",
+                "DrivAerML defaults to the repaired public 400/34/50 surface split for the paper sprint.",
                 "Surface-first mode is the default; the volume subset stays optional.",
                 "Paper-facing evaluation follows AB-UPT's average per-case relative-L2 contract on unnormalized targets.",
                 "When DrivAerML train point limits are set, each epoch repeats a case ceil(N / points_per_view) times.",
