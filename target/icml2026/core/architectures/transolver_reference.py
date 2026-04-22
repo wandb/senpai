@@ -99,6 +99,7 @@ class TransolverAttention(nn.Module):
         self.in_project_x = LinearProjection(hidden_dim, hidden_dim)
         self.in_project_fx = LinearProjection(hidden_dim, hidden_dim)
         self.in_project_slice = LinearProjection(self.dim_head, num_slices)
+        self.log_attn_temperature = nn.Parameter(torch.zeros(num_heads))
         self.qkv = LinearProjection(self.dim_head, self.dim_head * 3, bias=False)
         self.proj = LinearProjection(hidden_dim, hidden_dim)
         self.proj_dropout = nn.Dropout(dropout)
@@ -120,6 +121,8 @@ class TransolverAttention(nn.Module):
         slice_tokens, slice_weights = self.create_slices(x, attn_mask=attn_mask)
         qkv = self.qkv(slice_tokens)
         q, k, v = qkv.chunk(3, dim=-1)
+        temp_scale = torch.exp(-self.log_attn_temperature.clamp(-2.0, 2.0)).view(1, self.num_heads, 1, 1)
+        q = q * temp_scale
         out_slice = F.scaled_dot_product_attention(
             q,
             k,

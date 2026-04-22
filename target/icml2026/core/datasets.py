@@ -140,6 +140,7 @@ class PaperTandemFoilCaseDataset(Dataset):
     def __getitem__(self, idx: int) -> CaseSample:
         base_idx = self.indices[idx]
         x, y, is_surface = self.base[base_idx]
+        y = torch.where(torch.isfinite(y), y, torch.zeros_like(y))
         surface_x = x[is_surface]
         volume_x = x[~is_surface]
         surface_y = y[is_surface]

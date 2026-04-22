@@ -165,6 +165,7 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
+    attn_temp_reg: float = 0.0
     seed: int = 0
 
 
@@ -1194,6 +1195,7 @@ def train_one_epoch(
     max_batches: int = 0,
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
+    attn_temp_reg: float = 0.0,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1251,6 +1253,13 @@ def train_one_epoch(
                         )
                         loss, _ = loss_grouped(batch, outputs, transform)
 
+            if attn_temp_reg > 0:
+                temp_reg = sum(
+                    m.log_attn_temperature.pow(2).mean()
+                    for m in model.modules()
+                    if hasattr(m, "log_attn_temperature")
+                )
+                loss = loss + attn_temp_reg * temp_reg
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
             micro_count += 1
@@ -1462,6 +1471,7 @@ def main() -> None:
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
+            attn_temp_reg=config.attn_temp_reg,
         )
 
         if ema is not None:
@@ -1513,7 +1523,20 @@ def main() -> None:
         if anp_head is not None and anp_ema is not None:
             anp_ema.restore(anp_head)
 
-        epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
+        temp_metrics: dict[str, float] = {}
+        all_temps = []
+        for name, mod in model.named_modules():
+            if hasattr(mod, "log_attn_temperature"):
+                temps = torch.exp(mod.log_attn_temperature).detach().cpu()
+                for i, t in enumerate(temps):
+                    all_temps.append(float(t))
+                    temp_metrics[f"attn_temp/{name}_h{i}"] = float(t)
+        if all_temps:
+            temp_metrics["attn_temp/mean"] = sum(all_temps) / len(all_temps)
+            temp_metrics["attn_temp/min"] = min(all_temps)
+            temp_metrics["attn_temp/max"] = max(all_temps)
+
+        epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics, **temp_metrics}
         history.append(epoch_metrics)
         if run is not None:
             wandb.log(epoch_metrics, step=epoch)
