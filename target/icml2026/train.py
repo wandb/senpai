@@ -165,6 +165,8 @@ class TrainConfig:
     grad_clip: float = 0.0
     save_checkpoint: bool = False
     seed: int = 0
+    loss_type: str = "mse"
+    huber_delta: float = 1.0
 
 
 @dataclass
@@ -730,21 +732,33 @@ def _named_channel_metrics(prefix: str, values: torch.Tensor, names: tuple[str, 
     return metrics
 
 
+def _compute_loss(pred: torch.Tensor, target: torch.Tensor, loss_type: str = "mse", huber_delta: float = 1.0) -> torch.Tensor:
+    if loss_type == "huber":
+        return F.huber_loss(pred, target, delta=huber_delta)
+    if loss_type == "log_cosh":
+        diff = pred - target
+        abs_diff = diff.abs()
+        return torch.mean(abs_diff + F.softplus(-2.0 * abs_diff) - math.log(2.0))
+    return F.mse_loss(pred, target)
+
+
 def loss_grouped(
     batch: GroupedBatch,
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
+    loss_type: str = "mse",
+    huber_delta: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.surface_x.device)
     metrics: dict[str, float] = {}
     if batch.surface_y is not None and outputs["surface_preds"] is not None:
         target = transform.apply(batch.surface_y)
-        surf_loss = F.mse_loss(outputs["surface_preds"][batch.surface_mask], target[batch.surface_mask])
+        surf_loss = _compute_loss(outputs["surface_preds"][batch.surface_mask], target[batch.surface_mask], loss_type, huber_delta)
         total = total + surf_loss
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
         target = transform.apply(batch.volume_y)
-        vol_loss = F.mse_loss(outputs["volume_preds"][batch.volume_mask], target[batch.volume_mask])
+        vol_loss = _compute_loss(outputs["volume_preds"][batch.volume_mask], target[batch.volume_mask], loss_type, huber_delta)
         total = total + vol_loss
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
@@ -754,15 +768,17 @@ def loss_grouped(
 def loss_grouped_tandem(
     prepared: TandemPreparedBatch,
     outputs: dict[str, torch.Tensor | None],
+    loss_type: str = "mse",
+    huber_delta: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=prepared.surface_x.device)
     metrics: dict[str, float] = {}
     if outputs["surface_preds"] is not None:
-        surf_loss = F.mse_loss(outputs["surface_preds"][prepared.surface_mask], prepared.surface_target[prepared.surface_mask])
+        surf_loss = _compute_loss(outputs["surface_preds"][prepared.surface_mask], prepared.surface_target[prepared.surface_mask], loss_type, huber_delta)
         total = total + surf_loss
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if prepared.volume_target is not None and outputs["volume_preds"] is not None and prepared.volume_mask is not None:
-        vol_loss = F.mse_loss(outputs["volume_preds"][prepared.volume_mask], prepared.volume_target[prepared.volume_mask])
+        vol_loss = _compute_loss(outputs["volume_preds"][prepared.volume_mask], prepared.volume_target[prepared.volume_mask], loss_type, huber_delta)
         total = total + vol_loss
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
@@ -773,17 +789,19 @@ def loss_abupt(
     batch: ABUPTBatch,
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
+    loss_type: str = "mse",
+    huber_delta: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.geometry_position.device)
     metrics: dict[str, float] = {}
     if batch.surface_anchor_target is not None and outputs["surface_preds"] is not None:
         surf_target = transform.apply(batch.surface_anchor_target)
-        surf_loss = F.mse_loss(outputs["surface_preds"], surf_target)
+        surf_loss = _compute_loss(outputs["surface_preds"], surf_target, loss_type, huber_delta)
         total = total + surf_loss
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if batch.volume_anchor_target is not None and outputs["volume_preds"] is not None:
         vol_target = transform.apply(batch.volume_anchor_target)
-        vol_loss = F.mse_loss(outputs["volume_preds"], vol_target)
+        vol_loss = _compute_loss(outputs["volume_preds"], vol_target, loss_type, huber_delta)
         total = total + vol_loss
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
@@ -1192,6 +1210,8 @@ def train_one_epoch(
     amp_mode: str = "none",
     max_batches: int = 0,
     grad_clip: float = 0.0,
+    loss_type: str = "mse",
+    huber_delta: float = 1.0,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1211,7 +1231,7 @@ def train_one_epoch(
                     surface_anchor_position=batch.surface_anchor_position,
                     volume_anchor_position=batch.volume_anchor_position,
                 )
-                loss, _ = loss_abupt(batch, outputs, transform)
+                loss, _ = loss_abupt(batch, outputs, transform, loss_type, huber_delta)
         else:
             batch = batch.to(device)
             if isinstance(transform, TandemTargetTransform):
@@ -1224,7 +1244,7 @@ def train_one_epoch(
                         volume_mask=prepared.volume_mask,
                     )
                     outputs = maybe_apply_anp(outputs, prepared, anp_head)
-                    loss, _ = loss_grouped_tandem(prepared, outputs)
+                    loss, _ = loss_grouped_tandem(prepared, outputs, loss_type, huber_delta)
             else:
                 with autocast_context(device, amp_mode):
                     outputs = model(
@@ -1233,7 +1253,7 @@ def train_one_epoch(
                         volume_x=batch.volume_x,
                         volume_mask=batch.volume_mask,
                     )
-                    loss, _ = loss_grouped(batch, outputs, transform)
+                    loss, _ = loss_grouped(batch, outputs, transform, loss_type, huber_delta)
         loss.backward()
         all_params = list(model.parameters())
         if anp_head is not None:
@@ -1433,6 +1453,8 @@ def main() -> None:
             amp_mode=config.amp_mode,
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
+            loss_type=config.loss_type,
+            huber_delta=config.huber_delta,
         )
 
         if ema is not None:
