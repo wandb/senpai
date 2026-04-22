@@ -1,5 +1,21 @@
 # SENPAI Research Results
 
+## 2026-04-23 02:05 — PR #3073: DrivAerML EMA=0.999 + gc=0.5 compound (faye) — CLOSED
+
+- **Branch:** faye/dm-ema-999-gc05-compound
+- **Hypothesis:** EMA + gc synergy — gc prevents gradient spikes while EMA smooths checkpoint sequence
+- **Results:**
+
+| Metric | Value | vs Baseline |
+|---|---|---|
+| Best val surface_rel_l2_pct | 9.953% ep113 | +149% worse |
+| Run state | Crashed ep191 | — |
+| Baseline | 3.997% ep467 | — |
+
+- **W&B run:** x3wvqyqa
+- **Analysis:** gc=0.5 insufficient — gradient spikes of 293 (ep64) and 153 (ep118) broke through clip threshold. Terminal divergence at ep136 with grad_norm=Infinity. EMA now tested in 3 configs on DM: alone=9.749%, +gc=9.953%, +gc+WD=crash. All dramatically worse than no-EMA champion. EMA is definitively contraindicated for DrivAerML.
+- **Decision:** CLOSED — 149% above baseline, crashed
+
 ## 2026-04-23 01:50 — PR #3094: TFP 4L/192d depth at champion config (robin) — CLOSED
 
 - **Branch:** robin/tfp-4l-192d-depth
