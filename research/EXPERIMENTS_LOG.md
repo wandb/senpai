@@ -2903,3 +2903,59 @@ TF Round 1 (3L/256d): val=27.53 (W&B: 7q5o98le) — worse than baseline.
 
 **Status:** CLOSED — all results superseded by subsequent PRs.
 
+## 2026-04-22 18:30 — PR #3030: Relative L2 training loss to align DrivAerML objective with eval metric
+- violet/wave4-relative-l2-loss
+- **Hypothesis:** Replace absolute MSE training loss with relative L2 (normalized by target magnitude) to align DrivAerML's training objective with its evaluation metric (surface_rel_l2_pct). Also test a mixed variant (0.5 rel_l2 + 0.5 MSE). Cross-dataset: DM + TF.
+
+| Run | Loss | Dataset | Best Val Metric | Best Epoch | W&B Run ID | Status |
+|-----|------|---------|----------------|------------|------------|--------|
+| DM-rel_l2 | rel_l2 | DrivAerML | 75.328% surface_rel_l2_pct | ep2 | t76rb6wd | DEAD END |
+| DM-mixed | mixed | DrivAerML | 75.341% surface_rel_l2_pct | ep488 | fa0q7xwf | DEAD END |
+| TF-rel_l2 | rel_l2 | TandemFoil | 22.151 surface_pressure_mae | ep249 | 7pe7v990 | BEATS BASELINE (diverges ep280) |
+| TF-mixed | mixed | TandemFoil | 22.412 surface_pressure_mae | ep306 | 5q3gor8f | BEATS BASELINE (stable) |
+
+Baselines: DM 3.997% | TF 22.537
+
+**Results Commentary:**
+- **DrivAerML: Catastrophic failure.** Both rel_l2 (75.3%) and mixed (75.3%) are ~19x worse than 3.997% baseline. Per-point relative normalization amplifies noise on near-zero pressure targets, destroying gradient signal. Converged to ~75% at ep2 and never improved.
+- **TandemFoil: Two wins.** TF-rel_l2 achieved 22.151 (best TF result from any loss variant) but diverged catastrophically after ep280. TF-mixed achieved 22.412 with full stability through 321 epochs. Both beat 22.537 baseline.
+- Student's diagnosis: near-zero DM surface pressure targets make per-point normalization numerically unstable. Correct and well-reasoned.
+
+**Conclusions:**
+- Relative L2 loss is fundamentally incompatible with DrivAerML's near-zero pressure targets — **blacklisted for DM**
+- On TandemFoil, rel_l2 loss aligns better with surface_pressure_mae evaluation and yields small improvements, but instability is a concern
+- Mixed loss (0.5/0.5 MSE+rel_l2) provides the stability benefit of MSE with partial rel_l2 alignment
+- Potential future direction: per-sample (not per-point) normalization might avoid the near-zero target issue on DM
+
+**Status:** CLOSED — DM failure is decisive; TF finding logged for potential revisiting.
+
+## 2026-04-22 18:30 — PR #3027: DrivAerML surface-points sampling sweep: 16k/32k/64k vs 50k baseline
+- mugen/drivaerml-surface-points-sweep
+- **Hypothesis:** Varying the number of surface mesh points sampled per training step (16k/32k/64k vs 50k baseline) affects DrivAerML accuracy. Lower surface-point budget may act as regularizer. Cross-dataset: DM + AF.
+
+| Run | Surface Pts | Dataset | Best Val Metric | Best Epoch | W&B Run ID | Status |
+|-----|-------------|---------|----------------|------------|------------|--------|
+| dm-32k | 32k | DrivAerML | 7.463% surface_rel_l2_pct | ep227 | zyga67vh | WORSE |
+| dm-64k | 64k | DrivAerML | 8.810% surface_rel_l2_pct | ep121 | k7y6d4ls | WORSE (diverged terminal) |
+| dm-50k-ref | 50k | DrivAerML | 12.772% surface_rel_l2_pct | ep52 | f1wgyavj | WORSE (under-trained) |
+| dm-16k | 16k | DrivAerML | 14.334% surface_rel_l2_pct | ep100 | mm1kiuf1 | WORSE |
+| af-coverage | N/A | AirfRANS | 0.006790 surface_mse | ep134 | h2ui8m9m | WORSE |
+
+Baselines: DM 3.997% | AF 0.000482
+
+**Results Commentary:**
+- No run beat baseline. Best (32k) at 7.463% is 87% worse than 3.997%. The 50k reference itself reached only 12.772% (vs baseline's 3.997% at ep467), confirming severe under-training.
+- **Key confounds:** (1) No best-checkpoint saving (PR #3029 not merged into branch), (2) Only 263-291 epochs vs baseline's 467, (3) Terminal values degraded by cosine restart oscillations.
+- **Interesting signal:** 32k (7.463%) < 50k (12.772%) < 16k (14.334%) at best-checkpoint, suggesting a regularization sweet spot around 32k. But this ranking is unreliable given the confounds.
+- 64k diverged to NaN at terminal epochs despite best of 8.810% at ep121.
+- TandemFoil runs OOM'd — 4L/512d/8H champion config too large for TF multi-split eval on single H100.
+
+**Conclusions:**
+- Surface-point count reduction (32k) MAY act as useful regularization, but signal is unreliable without clean reproduction at 467+ epochs with checkpoint saving
+- 16k is too aggressive (information loss outweighs regularization benefit)
+- 64k is unstable with cosine restarts (NaN divergence)
+- 4L/512d/8H model is incompatible with TandemFoil multi-split eval (OOM at 97.9GB)
+- Re-test with PR #3029 (best-checkpoint saving) when it lands
+
+**Status:** CLOSED — results too far from baseline and confounded by experimental setup.
+

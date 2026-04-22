@@ -1,14 +1,29 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-22 (benchmark-contract refresh applied; use this top section plus live GitHub state for prioritization, not older wave counts below)
+- **Date:** 2026-04-22 18:45 (advisor cycle — reviewed 2 PRs, closed 2, assigned 2 new)
 - **Branch:** radford
-- **Fleet status:** GitHub currently shows **69 open PRs**, with **15 open PRs** in the newest `#3021-#3042` family.
+- **Idle students:** NONE — all students now assigned
+- **PRs ready for review:** 0
+- **PRs in WIP:** 59 (57 prior + #3058 mugen + #3059 violet)
+- **Fleet status:** 59 open WIP PRs
   - **merged:** `#3025` (TFP Lion champion transfer), `#3036` (AdaFactor cross-dataset)
-  - **closed negative / no longer active:** `#3021`, `#3023`, `#3026`, `#3042`
-  - **critical open PRs:** `#3029` (best-checkpoint save/eval), `#3027` (DrivAerML surface-points), `#3028` (AdamW beta sweep), `#3030` (relative-L2 objective), `#3031-#3035`, `#3038-#3041`
+  - **closed negative / no longer active:** `#3021`, `#3023`, `#3026`, `#3027`, `#3030`, `#3042`
+    - `#3030` (violet rel_l2 loss): DM catastrophic failure; TF 22.151 positive finding logged but not merged due to instability + complexity
+    - `#3027` (mugen surface-points sweep): Results too far from baseline, confounded by no-checkpoint-saving and under-training
+  - **NEW this cycle:** `#3058` (mugen — coord noise σ=0.001/0.005 cross-dataset), `#3059` (violet — 2-layer MLP output head cross-dataset)
+  - **critical open PRs:** `#3029` (best-checkpoint save/eval — HIGH PRIORITY), `#3028` (AdamW β sweep), `#3031-#3035`, `#3038-#3041`, `#3043-#3059`
 - **Current relaunch budget:** inherit pod env defaults
   - `SENPAI_TIMEOUT_MINUTES=360`
   - `SENPAI_MAX_EPOCHS=999`
+
+## Latest Research Directives (human team — #3020, 2026-04-21, still active)
+
+1. **DrivAerML closure is top priority** — 3.997% vs 3.71% external target (1.08x gap)
+2. **Best-checkpoint test eval MANDATORY** for paper-facing runs (megumi #3029 critical)
+3. **DM sampling signal:** 32k surface points may outperform 50k (logged from #3027, needs clean reproduction when #3029 lands)
+4. **Cross-dataset by default** — simple hypotheses cover DM+AF+TF+TFP in one PR
+5. **Tandem debug discipline:** smoke → short debug → long run
+6. **No truncated eval on benchmark-facing runs**
 
 ## CORE RESEARCH DIRECTIVE (Human Team Instruction — 2026-04-21)
 
