@@ -3,11 +3,19 @@
 ## TandemFoilSet
 
 - **Primary metric:** `val_primary/surface_pressure_mae` (= `val_eq4/surface_pressure_mae`)
-- **Current best:** 26.06 (val) at epoch 300
-- **Best PR:** #2887 (gohan — lr=1e-4 no-EMA LR scan, 3L/192d, Lion lr=1e-4, gc=1.0, WD=1e-2, T_max=10)
-- **Note:** This beats 26.134 (#2899 with EMA) using no-EMA + lower LR. The EMA recipe (#2899) is still the recommended shared recipe — the 26.06 result is a marginal improvement from longer training at lower LR.
+- **Current best:** 22.537 (val) at epoch 336
+- **Best PR:** #2924 (robin — gc=0.5 EMA refinement, Lion lr=1.25e-4, T_max=10, gc=0.5, WD=1e-2, EMA decay=0.999, 3L/192d)
+- **Note:** gc=0.5 (softer clip vs standard gc=1.0) enables stable EMA training across 336+ epochs where gc=1.0 diverged after ep167. Model still descending at ep336 — result is an underestimate of the ceiling.
 
-### 2026-04-22 — PR #2887: TandemFoil: lr=1e-4 gc=1.0 LR scan — NEW BEST
+### 2026-04-22 — PR #2924: TandemFoil: EMA refinement gc=0.5 — NEW BEST (CURRENT)
+
+- **val_primary/surface_pressure_mae:** 22.537 (-13.8% vs 26.06) at epoch 336
+- **W&B run:** 0lv7fnun (robin/ema-refine-tf-gc05)
+- **Config:** Lion lr=1.25e-4, T_max=10, gc=0.5, WD=1e-2, EMA decay=0.999, 3L/192d, Fourier+physics, 360-min budget
+- **Key insight:** gc=0.5 enables stable EMA training across 336+ epochs; gc=1.0 diverged after ep167 (Run 1). Model still descending at ep336 — result is an underestimate of the ceiling. AirfRANS Run 3 (0.000659) was superseded by stark #2951 T_max=50 result (0.000482).
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 1.25e-4 --cosine-t-max 10 --grad-clip 0.5 --weight-decay 1e-2 --model-slices 64 --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999 --ema-decay 0.999`
+
+### 2026-04-22 — PR #2887: TandemFoil: lr=1e-4 gc=1.0 LR scan — PREVIOUS BEST
 
 - **val_primary/surface_pressure_mae:** 26.06 (-0.3% vs 26.134) at epoch 300
 - **W&B run:** pbq4kgdk
