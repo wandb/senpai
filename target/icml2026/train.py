@@ -160,6 +160,7 @@ class TrainConfig:
     residual_prediction: bool = False
     re_stratified_sampling: bool = False
     cosine_t_max: int = 150
+    warmup_epochs: int = 0
     geometry_points: int = 25_000
     geometry_supernodes: int = 4_096
     surface_anchor_points: int = 8_000
@@ -1625,7 +1626,18 @@ def main() -> None:
     scheduler = None
     if config.cosine_t_max > 0:
         base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
+        if config.warmup_epochs > 0:
+            steps_per_epoch = config.max_train_batches if config.max_train_batches > 0 else len(train_loader)
+            warmup_steps = config.warmup_epochs * steps_per_epoch
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                base_optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps,
+            )
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                base_optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_steps],
+            )
+        else:
+            scheduler = cosine_scheduler
 
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
@@ -1707,7 +1719,9 @@ def main() -> None:
         if anp_head is not None and anp_ema is not None:
             anp_ema.restore(anp_head)
 
-        epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
+        _lr_optim = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
+        current_lr = _lr_optim.param_groups[0]["lr"]
+        epoch_metrics = {"epoch": float(epoch), "lr": current_lr, **train_metrics, **eval_metrics}
         history.append(epoch_metrics)
         if run is not None:
             wandb.log(epoch_metrics, step=epoch)
