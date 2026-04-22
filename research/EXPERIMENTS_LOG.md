@@ -1,5 +1,31 @@
 # SENPAI Research Results
 
+## 2026-04-22 — PR #3052: TFP data pipeline bug fixes (guts) — MERGED
+
+- **Branch:** guts/tfp-bugfixes
+- **Changes:** Three bug fixes unblocking tandemfoil_paper training:
+  1. `split_paper_experiment4.py`: `torch.where(mask, yd, zeros)` replaces `yd * mask` — fixes IEEE 754 `nan * 0 = nan` in stats computation
+  2. `train.py`: inf-clamping after TargetTransform.apply() — prevents NaN loss from float16 overflow in cruise_random pickles
+  3. Minor: removed redundant counter, `.item()` fix for scalar comparison
+- **Result: MERGED** — clean bug fix, no experiment metrics, unblocks all TFP experiments including #2948
+
+## 2026-04-22 — PR #3026: AirfRANS LR fine-tune sweep above champion (usopp) — CLOSED
+
+- **Branch:** usopp/airfrans-lr-fine-tune-sweep
+- **Hypothesis:** LR above champion (6e-4) improves AF convergence.
+
+| LR | Best val surface_mse | vs Baseline | W&B |
+|----|---------------------|-------------|-----|
+| 7e-4 | 0.000716 | +48.6% worse | tjgi3g9l |
+| 8e-4 | 0.000707 | +46.6% worse | 1xeqvfj6 |
+| 9e-4 | 0.000608 | +26.2% worse | 1uu7mns9 |
+
+**Result: CLOSED — LR optimum at 6e-4 confirmed. All higher LRs worse.**
+
+Student noted T_max=50 creates 7.2 full cosine cycles per epoch (per-batch scheduling), causing massive early oscillation. However, the champion already uses this exact scheduler at lr=6e-4 and it produces 0.000482 — the rapid cycling is beneficial at the right LR. LR tuning for AF is now closed.
+
+**usopp reassigned to #3054: Width scaling at per-dataset champion configs (TF/AF/TFP/DM).**
+
 ## 2026-04-22 — PR #2990: Head-dim scaling cross-dataset (gojo) — CLOSED
 
 - **Branch:** gojo/attention-head-width-scaling-cross-dataset
