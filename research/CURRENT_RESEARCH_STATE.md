@@ -85,7 +85,7 @@ No baseline has been run yet on radford for this dataset.
 
 **Required trainer change:** After each validation epoch, if `val_primary_metric < best_val_so_far`, save `checkpoint_best.pt`. At the end of training, load and evaluate from `checkpoint_best.pt` (not the final epoch).
 
-**Priority:** HIGH — assign a student to add this as a code change with a cross-dataset validation run.
+**Priority:** HIGH — **ASSIGNED to megumi, PR #3029** (`megumi/best-checkpoint-save-cross-dataset`). Wave 14.
 
 ## Negative Results (Do Not Repeat)
 
@@ -191,7 +191,7 @@ Thirteen new cross-dataset hypotheses spanning optimizer hyperparameters, archit
 | senku | #3006 | **2L/192d + gc=0.3 + EMA cross-dataset** — softer clip variant; explore gc=0.3 which may be less restrictive than gc=0.5 for 2L | Architecture |
 | shouko | #3007 | **4L/512d + T_max=10 cross-dataset** — shorter cosine for DrivAerML-compatible schedule; test at 4L where gc stability is known | Architecture |
 | stark | #3008 | **AirfRANS depth sweep + T_max transfer** — AF-specific depth/T_max sensitivity; also tests cross-dataset transfer of AirfRANS tuning | Optimization |
-| megumi | #3009 | **Lion lr sweep cross-dataset** — systematic Lion LR search: find optimal lr for TF+AirfRANS+TFP+DM | Optimization |
+| ~~megumi~~ | ~~#3009~~ | ~~**Lion lr sweep cross-dataset** — systematic Lion LR search: find optimal lr for TF+AirfRANS+TFP+DM~~ **CLOSED — confirmed dead end; catastrophic AF/DM instability at all LRs (1e-4, 1.25e-4, 1.5e-4, 2e-4)** | ~~Optimization~~ |
 | piccolo | #3010 | **DrivAerML grad-clip sweep + gc transfer** — gc sensitivity sweep on DM; test which gc generalises cross-dataset | Optimization |
 | sukuna | #3011 | **Weight decay sweep cross-dataset** — wd=5e-3 vs wd=2e-2; explore WD sensitivity (DM WD=0 constraint still applies) | Regularization |
 | usopp | #3012 | **AdamW lr ablation** — systematic AdamW LR on TF + standard cross-dataset coverage | Optimization |
@@ -486,7 +486,7 @@ Their old PRs remain in-flight but are now listed under their new assignments in
 
 ## Next Priorities
 
-1. ~~**URGENT: Best-checkpoint saving code change**~~ — **IN PROGRESS (#2974 mugen Wave 4).** The T_mult experiment (#2895) proved TF=25.459 and AF=0.000371 exist in the landscape. mugen implementing `checkpoint_best.pt` saving. **Wave 5 launched: #2980-#2984 (PCGrad/AttnTemp/ZScore/RoPE/LLRD) — all true cross-dataset.**
+1. ~~**URGENT: Best-checkpoint saving code change**~~ — **ASSIGNED to megumi PR #3029 (Wave 14).** The T_mult experiment (#2895) proved TF=25.459 and AF=0.000371 exist in the landscape. megumi implementing `checkpoint_best.pt` saving cross-dataset.
 2. **Monitor Wave 12** (einar #3021 LayerScale, wolfwood #3022 attn dropout, emma #3023 SDF wall-distance, shoya #3024 LLRD) — four new cross-dataset hypotheses targeting residual scaling, attention regularization, physics features, and LR scheduling.
 3. **Monitor Wave 11** (griffith #3016 sigma-Reparam, casca #3017 GeGLU) — two new cross-dataset hypotheses, directly motivated by Wave 9/10 closure analysis.
 3. **Monitor Wave 10** (#3001–#3013, 13 PRs) — broad coverage sweep: slice temp, Fourier bands, channel dropout, long cosine, 2L+EMA variants, 4L+T_max=10, AF depth, Lion/AdamW lr sweeps, WD sweep, DM gc sweep, Fourier ablation. All cross-dataset.
