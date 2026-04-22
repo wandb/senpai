@@ -393,6 +393,7 @@
 - **CRITICAL:** Must pass `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
 - **External target:** <3.71% (AB-UPT, ~500 epochs) — **1.08x gap remaining** (was 1.24x)
 - **Key insight:** Longer training on the golden 4L/512d config (SENPAI_MAX_EPOCHS=9999 with 360-min budget) finds a deeper basin at epoch 467 vs 256. torch.compile gives no throughput benefit on DrivAerML and the compile run diverged to NaN at ep454 without --grad-clip — future compile experiments MUST include --grad-clip 1.0. SENPAI_MAX_EPOCHS=9999 required.
+- **gc=2.0 finding (PR #2886):** gc=2.0+lr=4e-4+WD=1e-2 = **4.346%** (W&B: ginhxdco) — new 4L/512d gc ablation best. Does NOT beat current 3.997% baseline (achieved with different architecture/config) but represents the best gc sweep result on the golden 4L/512d foundation. gc=2.0 > gc=1.0 > gc=5.0 for DrivAerML.
 
 ### 2026-04-22 — PR #2898: DrivAerML: torch.compile throughput (no-compile wins) — NEW BEST
 
