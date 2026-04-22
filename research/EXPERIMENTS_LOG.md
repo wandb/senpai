@@ -1,5 +1,21 @@
 # SENPAI Research Results
 
+## 2026-04-23 02:35 — PR #3086: DrivAerML SGDR T_mult=2 (megumi) — CLOSED
+
+- **Branch:** megumi/dm-cosine-restart-tmult2
+- **Hypothesis:** SGDR with exponentially growing cosine periods (30→60→120→240) progressively lengthens low-LR phases for deeper convergence
+- **Results:**
+
+| Run | Config | W&B ID | Best val surface_rel_l2_pct | Fate |
+|---|---|---|---|---|
+| No gc | T_mult=2 | 3pl2a2q8 | 7.022% ep77 | Crashed |
+| gc=1.0 | T_mult=2 | 2n6tt16b | 7.697% ep77 | Crashed |
+| gc=0.5 | T_mult=2 | i05go4xl | 11.952% ep54 | Crashed |
+| Baseline | T_max=30 fixed | bht6h42t | 3.997% ep467 | — |
+
+- **Analysis:** Structural incompatibility. Model converges through cycles 1-3 (T=30/60/120) reaching ~7% by ep77, but the 240-step 4th cycle sustains lr=5e-4 for 2x longer than any previous cycle — fatal on DM. Grad-clipping delayed divergence but couldn't prevent it. Key insight: DM is stable below ~120 contiguous high-LR steps, which is why fixed T_max=30 works.
+- **Decision:** CLOSED — 75-200% above baseline, all crashed
+
 ## 2026-04-23 02:20 — PR #3120: DrivAerML RAdam optimizer (senku) — CLOSED
 
 - **Branch:** senku/dm-radam-optimizer
