@@ -3,11 +3,18 @@
 ## TandemFoilSet
 
 - **Primary metric:** `val_primary/surface_pressure_mae` (= `val_eq4/surface_pressure_mae`)
-- **Current best:** 26.134 (val) at epoch 123
-- **Best PR:** #2899 (robin — corrected EMA warmup decay=0.999 at 3L/192d, Fourier + physics, Lion lr=1.25e-4, gc=1.0, WD=1e-2, T_max=10)
-- **Key insight:** CORRECTED EMA BREAKS THROUGH. timm-style EMA warmup (min(decay, (1+step)/(10+step))) gives 13.2% improvement over no-EMA (26.134 vs 30.10). The old EMA was bugged (corrupted by early random weights) — the fix restores EMA's regularization benefit. With proper warmup, decay=0.999 > decay=0.9999 > no-EMA. The shared recipe now includes --ema-decay 0.999 (without --no-use-ema) for TandemFoil and AirfRANS.
+- **Current best:** 26.06 (val) at epoch 300
+- **Best PR:** #2887 (gohan — lr=1e-4 no-EMA LR scan, 3L/192d, Lion lr=1e-4, gc=1.0, WD=1e-2, T_max=10)
+- **Note:** This beats 26.134 (#2899 with EMA) using no-EMA + lower LR. The EMA recipe (#2899) is still the recommended shared recipe — the 26.06 result is a marginal improvement from longer training at lower LR.
 
-### 2026-04-21 — PR #2899: TandemFoil: Corrected EMA warmup (decay=0.999) — NEW BEST
+### 2026-04-22 — PR #2887: TandemFoil: lr=1e-4 gc=1.0 LR scan — NEW BEST
+
+- **val_primary/surface_pressure_mae:** 26.06 (-0.3% vs 26.134) at epoch 300
+- **W&B run:** pbq4kgdk
+- **Config:** Lion lr=1e-4, T_max=10, gc=1.0, WD=1e-2, 3L/192d, Fourier+physics, no-EMA
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 1e-4 --cosine-t-max 10 --grad-clip 1.0 --weight-decay 1e-2 --no-use-ema --model-slices 64 --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999`
+
+### 2026-04-21 — PR #2899: TandemFoil: Corrected EMA warmup (decay=0.999) — PREVIOUS BEST
 
 - **val_primary/surface_pressure_mae:** 26.134 (-13.2% vs 30.10) at epoch 123
 - **decay=0.9999:** 26.903 at epoch 113 (also beats baseline — 10.6% improvement)
@@ -130,11 +137,18 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.000727 (val) at epoch 206
-- **Best PR:** #2899 (robin — corrected EMA decay=0.999, 2L/256d + gc=1.0 + Fourier + T_max=5 + WD=1e-2, AdamW lr=7e-4)
-- **Key insight:** CORRECTED EMA SHATTERS THE BASELINE. EMAWithWarmup at decay=0.999 gives 0.000727 — a 41.2% improvement over 0.001236. The timm-style warmup prevents EMA from being dominated by random early weights. **Beats external target 0.0043 by 83.1%.** Both EMA decay values beat old baseline (0.9999 → 0.001123, 8.7% improvement; 0.999 → 0.000727, 41.2%). The EMA model is evaluated by swapping weights at validation time. Best checkpoint at ep206, late-training oscillation from T_max=5.
+- **Current best:** 0.000699 (val) at epoch 653
+- **Best PR:** #2887 (gohan — AirfRANS lr=6e-4 gc=1.0 T_max=10, 2L/256d, no-EMA)
+- **Key insight:** Slightly lower LR (6e-4 vs 7e-4) with longer training (653 epochs) at T_max=10 pushes below EMA baseline. **Beats external target 0.0043 by 83.7%.** Note: this uses no-EMA while the previous best (#2899) used EMA. Next step is applying EMA to lr=6e-4 T_max=10.
 
-### 2026-04-21 — PR #2899: AirfRANS: Corrected EMA warmup (decay=0.999) — NEW BEST
+### 2026-04-22 — PR #2887: AirfRANS: lr=6e-4 gc=1.0 T_max=10 LR scan — NEW BEST
+
+- **val_primary/surface_mse:** 0.000699 (-3.6% vs 0.000727) at epoch 653
+- **W&B run:** 7m6c1ydk
+- **Config:** 2L/256d, AdamW lr=6e-4, T_max=10, gc=1.0, WD=1e-2, no-EMA, Fourier
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 6e-4 --cosine-t-max 10 --grad-clip 1.0 --weight-decay 1e-2 --no-use-ema --enable-fourier --model-layers 2 --model-hidden-dim 256 --model-heads 4 --epochs 999`
+
+### 2026-04-21 — PR #2899: AirfRANS: Corrected EMA warmup (decay=0.999) — PREVIOUS BEST
 
 - **val_primary/surface_mse:** 0.000727 (-41.2% vs 0.001236) at epoch 206 (W&B run i1sevgt2)
 - **decay=0.9999:** 0.001123 (-8.7% vs 0.001236) at epoch 275 (W&B run bz00wego — also beats baseline)
