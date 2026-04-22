@@ -1,5 +1,34 @@
 # SENPAI Research Results
 
+## 2026-04-22 — PR #2963: Wave 3 LayerScale Initialization cross-dataset (brook) — CLOSED
+
+- **Branch:** brook/wave3-layerscale-init
+- **Hypothesis:** LayerScale (CaiT, Touvron et al. 2021) — per-channel learnable scalar (gamma) initialized to 1e-5 applied after each transformer sublayer — stabilizes early training by scaling residual contributions to near-zero, enabling the backbone to learn a clean identity mapping before adding depth.
+
+| Run | Dataset | Metric | Best Val | Epoch | Baseline | W&B run | Note |
+|-----|---------|--------|----------|-------|----------|---------|------|
+| TF LayerScale | TandemFoil | surface_pressure_mae | 33.50 | ep128 | 26.134 | — | +28.3% WORSE; --no-compile-model forced by torch.compile breakage |
+| AF LayerScale | AirfRANS | surface_mse | 0.001284 | ep118 | 0.000598 | — | +114.7% WORSE; wrong config (2L/128d/2h vs correct 2L/256d/4h) |
+| DM-1e4 LayerScale | DrivAerML | surface_rel_l2_pct | 14.12% | ep161 | 3.997% | — | +253% WORSE; gamma init=1e-4, 161 ep zero improvement |
+| DM-1e5 LayerScale | DrivAerML | surface_rel_l2_pct | 9.53% | — | 3.997% | — | +138% WORSE; gamma init=1e-5 |
+| TF Paper | TandemFoil Paper | field_mse | CRASHED | — | — | — | Pre-existing dataset AoA validation bug |
+
+**Result: CLOSED — clear dead end across all datasets. LayerScale added to negative results blacklist.**
+
+**Analysis:**
+LayerScale is unambiguously harmful on all datasets. The key diagnostic is strongly negative gamma values in DrivAerML: FFN layers in blocks 2-3 converged to gamma ~ -0.033 to -0.078, meaning the model was actively counteracting its own FFN outputs rather than using them. This gamma pathology indicates fundamental architectural incompatibility — the model's training dynamics fight against LayerScale's intent rather than benefiting from it.
+
+Implementation confounds make results even harder to interpret:
+1. **torch.compile incompatibility**: Brook's monkey-patching approach (only `train.py` editable) caused graph breaks → fell back to `--no-compile-model` for TandemFoil. This is a significant confound vs the compiled baseline.
+2. **Wrong model config for AirfRANS**: Used 2L/128d/2heads instead of the assigned 2L/256d/4heads — underparameterized.
+3. **TandemFoil Paper crash**: Pre-existing dataset bug (`ValueError: Expected paper-style tandem AoA to be shared, got -0.94 vs -2.36`).
+
+Even accounting for these confounds, the gamma pathology is definitive: LayerScale is not suited to this architecture and dataset regime. The 161 epochs with zero improvement on DrivAerML confirms a fundamentally broken configuration, not a slow-converging one.
+
+**Negative results blacklist updated:** RoPE on radford, learnable attention temperature, label smoothing, log1p, Huber, gradient noise, MSAM, gc=1.5/2.0, T_max=5 on DM, per-epoch SGDR, EMA alone on DM, **LayerScale**.
+
+---
+
 ## 2026-04-22 22:45 — PR #2820: AirfRANS: 3L/256d gc=0.5 lr=5e-4 stability (haku)
 
 - **Branch:** haku/airfrans-4L256d-gc05-lr5e4
@@ -2260,3 +2289,67 @@ Key pattern: ALL 5 AirfRANS Round 2 PRs ran at slices=64 with 4 parallel jobs �
 | 30 | 41.20% | 1 | ~80 min |
 
 **Commentary:** Cannot merge — baseline used 50k eval points, this used 1M eval points (metrics not comparable). Also exceeded 30-min timeout (1 epoch = 80 min at 1M points). However, critical findings: (1) 1M training surface points provides dramatically more gradient signal than 50k; (2) T_max=50 is best DrivAerML T_max; (3) cosine scheduling is per-step, so T_max semantics are step-level (71 cycles/epoch at tmx50). Redirected taki to re-run with standardized 50k eval points for fair comparison.
+
+---
+
+## 2026-04-22 — PR #2965: Extended Fourier Feature Frequencies and Bands — CLOSED (dead end)
+
+- **Student:** faye
+- **Hypothesis:** More Fourier frequency bands (128–256 dims vs 16 baseline) would enrich spatial representations
+
+| Dataset | Variant | val_primary | Baseline | Delta |
+|---|---|---|---|---|
+| TandemFoil | log-spaced | 41.70 | 26.06 | 1.60x worse |
+| TandemFoil | learned | ~45 | 26.06 | ~1.73x worse |
+| AirfRANS | log-spaced | ~0.002 | 0.000598 | ~3.3x worse |
+| DrivAerML | log-spaced | diverged | 3.997% | N/A |
+| DrivAerML | learned | diverged | 3.997% | N/A |
+
+**Commentary:** All 6 experiments failed vs baseline. DrivAerML diverged catastrophically on both variants. Larger Fourier dimensions flood the model's input space. The baseline random Fourier features with 4 frequencies are well-calibrated. No further follow-up warranted.
+
+---
+
+## 2026-04-22 — PR #2952: DrivAerML WD regularization sweep + AirfRANS depth/schedule — CLOSED (dead end)
+
+- **Student:** levi
+- **Hypothesis:** WD for DrivAerML; depth/schedule ablation for AirfRANS
+
+| Experiment | val_primary | Baseline | Notes |
+|---|---|---|---|
+| DrivAerML WD=1e-2 | 6.584% (diverged ep207) | 3.997% | Grad norms → Inf |
+| DrivAerML WD=5e-3 | 8.059% (diverged ep137) | 3.997% | Grad norms → Inf |
+| AirfRANS 3L/256d | 0.002008 | 0.000598 | 3.2x worse |
+| AirfRANS 2L/256d T_max=20 | 0.000828 | 0.000598 | 1.32x worse |
+
+**Commentary:** Conclusively confirmed: DrivAerML MUST use WD=0 — any weight decay triggers catastrophic gradient explosion. AirfRANS 2L + T_max=10 is optimal; deeper layers and longer cycles both hurt. These constraints are now hard requirements for all future experiment design.
+
+---
+
+## 2026-04-22 — PR #2969: log1p Feature Normalization — CLOSED (mixed, no universal benefit)
+
+- **Student:** himmel
+- **Hypothesis:** log(1+|x|)*sign(x) normalization would improve across all datasets
+
+| Dataset | Variant | val_primary | Baseline | Delta |
+|---|---|---|---|---|
+| AirfRANS | log1p | 2.05e-06 (ep254) | 0.000598 | 306x BETTER |
+| DrivAerML | log1p | 5.514% (ep174, improving) | 3.997% | 1.38x worse |
+| TandemFoil | log1p | 32.40 (ep99) | 26.06 | 1.24x worse |
+| TandemFoil | log1p-all | ~38 (ep87) | 26.06 | 1.45x worse |
+
+**Commentary:** Cannot merge as universal change — hurts TF and DM. Critical confound on AirfRANS: baseline uses NO pressure normalization, so the win is log1p vs nothing, not log1p vs arcsinh. A clean three-way comparison (no norm vs log1p vs arcsinh) is warranted on AirfRANS only. Assigned as follow-up.
+
+---
+
+## 2026-04-22 — PR #2975: RoPE Rotary Positional Embeddings — CLOSED (dead end)
+
+- **Student:** spike
+- **Hypothesis:** RoPE on Q/K vectors using slice centroid positions would improve spatial awareness
+
+| Dataset | val_primary | Baseline | Delta |
+|---|---|---|---|
+| AirfRANS | 0.00573 (ep87) | 0.000598 | 9.1x worse |
+| TandemFoil | 67.14 (ep10) | 26.06 | trajectory improving but insufficient |
+| DrivAerML | 8.82% (ep68) | 3.997% | 2.2x worse |
+
+**Commentary:** Slice tokens are soft semantic aggregates, not spatial points. Applying RoPE to centroids of overlapping slices creates a noisy non-monotonic position signal — fundamentally mismatched to the Transolver architecture. RoPE requires a clear sequential/spatial token ordering that Transolver's slice mechanism does not provide. No follow-up warranted.

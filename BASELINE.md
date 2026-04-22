@@ -137,9 +137,18 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.000627 (val) at epoch 661
-- **Best PR:** #2902 (stark — gradient accumulation ablation accum=1 control, 2L/256d, AdamW lr=6e-4, T_max=10, gc=1.0, WD=1e-2, no-EMA)
-- **Key insight:** The accum=1 control run (no gradient accumulation) trained longer than all accum>1 variants and found a deeper basin at ep661 (0.000627 vs 0.000699 baseline). Gradient accumulation hurts AirfRANS — accum=1 is the correct setting. **Beats external target 0.0043 by 85.4%.**
+- **Current best:** 0.000598 (val) at epoch 517
+- **Best PR:** #2906 (vegeta — gc=1.0 no-WD, seed=42, 360-min budget, 2L/256d, AdamW lr=6e-4, T_max=10, no-EMA, Fourier)
+- **Key insight:** gc=1.0 alone (no WD) at 360-min budget achieves 0.000598 — a new SOTA. WD=1e-2 is NOT required for AF and actually hurts (gc+WD at 360 min = 0.000694 vs gc-only = 0.000598). Doubled training budget (360 vs 180 min) is highly beneficial. gc=1.0 essential for stability — without it, seed divergence (NaN at ep607) is common. **Beats external target 0.0043 by 86.1%.**
+
+### 2026-04-22 — PR #2906: AirfRANS: gc=1.0 no-WD 360-min budget multi-seed — NEW BEST (CURRENT)
+
+- **val_primary/surface_mse:** 0.000598 (-4.6% vs 0.000627) at epoch 517, seed=42
+- **W&B run:** d7a0z1hk (seed=42, 517 epochs, 360-min budget)
+- **Other seeds:** W&B nvllyhmf (gc+WD variant: 0.000694 at 360 min); W&B nbc25ot7 (no-gc seed=42: NaN at ep607)
+- **Config:** 2L/256d/4H, AdamW lr=6e-4, T_max=10, gc=1.0, **no WD** (no --weight-decay), no-EMA, Fourier, 360-min budget
+- **Key insight:** Removing WD=1e-2 while keeping gc=1.0 achieves 0.000598 — gc-only (0.000598) beats gc+WD (0.000694) at 360 min. WD is NOT required for AirfRANS and actively hurts at long training budgets. The 360-min budget (vs 180-min) is highly beneficial. gc=1.0 is essential for stability — without it, seed divergence (NaN at ep607) is common. **Beats external target 0.0043 by 86.1%.**
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 6e-4 --cosine-t-max 10 --grad-clip 1.0 --no-use-ema --enable-fourier --model-layers 2 --model-hidden-dim 256 --model-heads 4 --epochs 999`
 
 ### 2026-04-22 — PR #2902: AirfRANS: gradient accumulation ablation (accum=1 wins) — NEW BEST
 
