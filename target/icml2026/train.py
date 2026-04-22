@@ -1300,6 +1300,11 @@ def write_run_summary(
     config: TrainConfig,
     bundle: DatasetBundle,
     history: list[dict[str, float]],
+    best_epoch: int | None = None,
+    best_val_primary_metric_name: str | None = None,
+    best_val_primary_metric: float | None = None,
+    best_val_metrics: dict[str, float] | None = None,
+    best_test_metrics: dict[str, float] | None = None,
     final_test_metrics: dict[str, float] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1317,9 +1322,98 @@ def write_run_summary(
             "notes": bundle.spec.notes,
         },
         "history": history,
+        "best_epoch": best_epoch,
+        "best_val_primary_metric_name": best_val_primary_metric_name,
+        "best_val_primary_metric": best_val_primary_metric,
+        "best_val_metrics": best_val_metrics or {},
+        "best_test_metrics": best_test_metrics or {},
         "final_test_metrics": final_test_metrics or {},
     }
     path.write_text(json.dumps(payload, indent=2))
+
+
+def primary_metric_key(bundle: DatasetBundle, *, phase: str) -> str:
+    if bundle.spec.name == "tandemfoilset":
+        return f"{phase}_primary/surface_pressure_mae"
+    return f"{phase}_primary/{bundle.spec.default_metric}"
+
+
+def snapshot_module_state(module: torch.nn.Module | None) -> dict[str, torch.Tensor] | None:
+    if module is None:
+        return None
+    return {key: value.detach().cpu().clone() for key, value in module.state_dict().items()}
+
+
+def restore_module_state(module: torch.nn.Module | None, state: dict[str, torch.Tensor] | None) -> None:
+    if module is None or state is None:
+        return
+    module.load_state_dict(state)
+
+
+def best_checkpoint_metric_aliases(metrics: dict[str, float]) -> dict[str, float]:
+    return {f"best_{key}": value for key, value in metrics.items()}
+
+
+def evaluate_phase_metrics(
+    *,
+    bundle: DatasetBundle,
+    config: TrainConfig,
+    forward_model: torch.nn.Module,
+    anp_head: ANPSurfaceDecoder | None,
+    loaders: dict[str, DataLoader],
+    transform: TargetTransform | TandemTargetTransform,
+    device: torch.device,
+    phase: str,
+) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    for split_name, loader in loaders.items():
+        if config.model == "reference_abupt":
+            split_metrics = evaluate_abupt(
+                forward_model,
+                loader,
+                transform,
+                device,
+                amp_mode=config.amp_mode,
+                max_batches=config.max_eval_batches,
+            )
+        else:
+            split_metrics = evaluate_grouped(
+                forward_model,
+                anp_head,
+                loader,
+                transform,
+                device,
+                amp_mode=config.amp_mode,
+                max_batches=config.max_eval_batches,
+            )
+        metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
+        if phase == "val" and split_name in LEGACY_VAL_ALIAS and "mae_surf_p" in split_metrics:
+            metrics[f"legacy_noam/{LEGACY_VAL_ALIAS[split_name]}"] = split_metrics["mae_surf_p"]
+
+    if bundle.spec.name == "tandemfoilset":
+        suffix = {
+            "val": "val_eq4/surface_pressure_mae",
+            "test": "test_eq4/surface_pressure_mae",
+        }[phase]
+        eq4_keys = {
+            "val": [
+                "val_single_in_dist/surface_pressure_mae",
+                "val_geom_camber_rc/surface_pressure_mae",
+                "val_geom_camber_cruise/surface_pressure_mae",
+                "val_re_rand/surface_pressure_mae",
+            ],
+            "test": [
+                "test_single_in_dist/surface_pressure_mae",
+                "test_geom_camber_rc/surface_pressure_mae",
+                "test_geom_camber_cruise/surface_pressure_mae",
+                "test_re_rand/surface_pressure_mae",
+            ],
+        }[phase]
+        eq4_values = [metrics[key] for key in eq4_keys if key in metrics]
+        if len(eq4_values) == 4:
+            metrics[suffix] = sum(eq4_values) / 4.0
+
+    return add_primary_metric_aliases(bundle, metrics, phase=phase)
 
 
 def compute_tandem_phys_stats(
@@ -1433,6 +1527,12 @@ def main() -> None:
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
     history: list[dict[str, float]] = []
+    best_epoch: int | None = None
+    best_val_primary_metric_name = primary_metric_key(bundle, phase="val")
+    best_val_primary_metric: float | None = None
+    best_val_metrics: dict[str, float] = {}
+    best_model_state: dict[str, torch.Tensor] | None = None
+    best_anp_state: dict[str, torch.Tensor] | None = None
 
     run = None
     if config.wandb_name:
@@ -1477,42 +1577,26 @@ def main() -> None:
             anp_ema.store(anp_head)
             anp_ema.copy_to(anp_head)
 
-        eval_metrics: dict[str, float] = {}
-        for split_name, loader in val_loaders.items():
-            if config.model == "reference_abupt":
-                split_metrics = evaluate_abupt(
-                    forward_model,
-                    loader,
-                    transform,
-                    device,
-                    amp_mode=config.amp_mode,
-                    max_batches=config.max_eval_batches,
-                )
-            else:
-                split_metrics = evaluate_grouped(
-                    forward_model,
-                    anp_head,
-                    loader,
-                    transform,
-                    device,
-                    amp_mode=config.amp_mode,
-                    max_batches=config.max_eval_batches,
-                )
-            eval_metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
-            if split_name in LEGACY_VAL_ALIAS and "mae_surf_p" in split_metrics:
-                eval_metrics[f"legacy_noam/{LEGACY_VAL_ALIAS[split_name]}"] = split_metrics["mae_surf_p"]
+        eval_metrics = evaluate_phase_metrics(
+            bundle=bundle,
+            config=config,
+            forward_model=forward_model,
+            anp_head=anp_head,
+            loaders=val_loaders,
+            transform=transform,
+            device=device,
+            phase="val",
+        )
 
-        if bundle.spec.name == "tandemfoilset":
-            eq4_keys = [
-                "val_single_in_dist/surface_pressure_mae",
-                "val_geom_camber_rc/surface_pressure_mae",
-                "val_geom_camber_cruise/surface_pressure_mae",
-                "val_re_rand/surface_pressure_mae",
-            ]
-            eq4_values = [eval_metrics[key] for key in eq4_keys if key in eval_metrics]
-            if len(eq4_values) == 4:
-                eval_metrics["val_eq4/surface_pressure_mae"] = sum(eq4_values) / 4.0
-        eval_metrics = add_primary_metric_aliases(bundle, eval_metrics, phase="val")
+        current_primary_metric = eval_metrics.get(best_val_primary_metric_name)
+        if current_primary_metric is not None and (
+            best_val_primary_metric is None or current_primary_metric < best_val_primary_metric
+        ):
+            best_epoch = epoch
+            best_val_primary_metric = current_primary_metric
+            best_val_metrics = dict(eval_metrics)
+            best_model_state = snapshot_module_state(model)
+            best_anp_state = snapshot_module_state(anp_head)
 
         if ema is not None:
             ema.restore(model)
@@ -1526,7 +1610,24 @@ def main() -> None:
             run.summary["epoch"] = epoch
         print(json.dumps(epoch_metrics, sort_keys=True), flush=True)
 
+    if best_epoch is not None:
+        print(
+            json.dumps(
+                {
+                    "best_checkpoint": {
+                        "epoch": float(best_epoch),
+                        "val_primary_metric_name": best_val_primary_metric_name,
+                        "val_primary_metric": best_val_primary_metric,
+                    }
+                },
+                sort_keys=True,
+            )
+        )
+
     final_test_metrics: dict[str, float] = {}
+    best_test_metrics: dict[str, float] = {}
+    terminal_model_state: dict[str, torch.Tensor] | None = None
+    terminal_anp_state: dict[str, torch.Tensor] | None = None
     if test_loaders:
         if ema is not None:
             ema.store(model)
@@ -1535,47 +1636,70 @@ def main() -> None:
             anp_ema.store(anp_head)
             anp_ema.copy_to(anp_head)
 
-        for split_name, loader in test_loaders.items():
-            if config.model == "reference_abupt":
-                split_metrics = evaluate_abupt(
-                    forward_model,
-                    loader,
-                    transform,
-                    device,
-                    amp_mode=config.amp_mode,
-                    max_batches=config.max_eval_batches,
-                )
-            else:
-                split_metrics = evaluate_grouped(
-                    forward_model,
-                    anp_head,
-                    loader,
-                    transform,
-                    device,
-                    amp_mode=config.amp_mode,
-                    max_batches=config.max_eval_batches,
-                )
-            final_test_metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
-        if bundle.spec.name == "tandemfoilset":
-            eq4_keys = [
-                "test_single_in_dist/surface_pressure_mae",
-                "test_geom_camber_rc/surface_pressure_mae",
-                "test_geom_camber_cruise/surface_pressure_mae",
-                "test_re_rand/surface_pressure_mae",
-            ]
-            eq4_values = [final_test_metrics[key] for key in eq4_keys if key in final_test_metrics]
-            if len(eq4_values) == 4:
-                final_test_metrics["test_eq4/surface_pressure_mae"] = sum(eq4_values) / 4.0
-        final_test_metrics = add_primary_metric_aliases(bundle, final_test_metrics, phase="test")
+        final_test_metrics = evaluate_phase_metrics(
+            bundle=bundle,
+            config=config,
+            forward_model=forward_model,
+            anp_head=anp_head,
+            loaders=test_loaders,
+            transform=transform,
+            device=device,
+            phase="test",
+        )
 
         if ema is not None:
             ema.restore(model)
         if anp_head is not None and anp_ema is not None:
             anp_ema.restore(anp_head)
+        terminal_model_state = snapshot_module_state(model)
+        terminal_anp_state = snapshot_module_state(anp_head)
         if run is not None:
             wandb.log(final_test_metrics, step=int(history[-1]["epoch"]) if history else 0)
             run.summary.update(final_test_metrics)
         print(json.dumps({"final_test_metrics": final_test_metrics}, sort_keys=True), flush=True)
+
+        if best_model_state is not None:
+            restore_module_state(model, best_model_state)
+            restore_module_state(anp_head, best_anp_state)
+            best_test_metrics = evaluate_phase_metrics(
+                bundle=bundle,
+                config=config,
+                forward_model=forward_model,
+                anp_head=anp_head,
+                loaders=test_loaders,
+                transform=transform,
+                device=device,
+                phase="test",
+            )
+            if run is not None:
+                best_checkpoint_metrics: dict[str, float | int | str] = {
+                    "best_epoch": int(best_epoch) if best_epoch is not None else -1,
+                    "best_val_primary_metric_name": best_val_primary_metric_name or "",
+                }
+                if best_val_primary_metric is not None:
+                    best_checkpoint_metrics["best_val_primary_metric"] = best_val_primary_metric
+                best_checkpoint_metrics.update({f"best_val/{key}": value for key, value in best_val_metrics.items()})
+                best_checkpoint_metrics.update({f"best_test/{key}": value for key, value in best_test_metrics.items()})
+                best_checkpoint_metrics.update(best_checkpoint_metric_aliases(best_val_metrics))
+                best_checkpoint_metrics.update(best_checkpoint_metric_aliases(best_test_metrics))
+                wandb.log(
+                    best_checkpoint_metrics,
+                    step=int(best_epoch) if best_epoch is not None else (int(history[-1]["epoch"]) if history else 0),
+                )
+                run.summary.update(best_checkpoint_metrics)
+            print(
+                json.dumps(
+                    {
+                        "best_test_metrics": {
+                            "epoch": float(best_epoch) if best_epoch is not None else None,
+                            **best_test_metrics,
+                        }
+                    },
+                    sort_keys=True,
+                )
+            )
+            restore_module_state(model, terminal_model_state)
+            restore_module_state(anp_head, terminal_anp_state)
 
     output_dir = Path(config.output_dir)
     write_run_summary(
@@ -1583,13 +1707,28 @@ def main() -> None:
         config,
         bundle,
         history,
+        best_epoch=best_epoch,
+        best_val_primary_metric_name=best_val_primary_metric_name,
+        best_val_primary_metric=best_val_primary_metric,
+        best_val_metrics=best_val_metrics,
+        best_test_metrics=best_test_metrics,
         final_test_metrics=final_test_metrics,
     )
     if config.save_checkpoint:
         output_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(model.state_dict(), output_dir / f"{config.dataset}_{config.model}.pt")
+        if terminal_model_state is not None:
+            torch.save(terminal_model_state, output_dir / f"{config.dataset}_{config.model}.pt")
+        else:
+            torch.save(model.state_dict(), output_dir / f"{config.dataset}_{config.model}.pt")
+        if best_model_state is not None:
+            torch.save(best_model_state, output_dir / f"{config.dataset}_{config.model}_best.pt")
         if anp_head is not None:
-            torch.save(anp_head.state_dict(), output_dir / f"{config.dataset}_{config.model}_anp.pt")
+            if terminal_anp_state is not None:
+                torch.save(terminal_anp_state, output_dir / f"{config.dataset}_{config.model}_anp.pt")
+            else:
+                torch.save(anp_head.state_dict(), output_dir / f"{config.dataset}_{config.model}_anp.pt")
+            if best_anp_state is not None:
+                torch.save(best_anp_state, output_dir / f"{config.dataset}_{config.model}_anp_best.pt")
     if run is not None:
         run.finish()
 
