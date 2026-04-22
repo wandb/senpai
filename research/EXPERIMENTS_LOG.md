@@ -1,5 +1,27 @@
 # SENPAI Research Results
 
+## 2026-04-22 23:30 — PR #2949: TFP depth/width sweep (vash) — SENT BACK
+
+- **Branch:** vash/tandemfoil-paper-depth-width-sweep
+- **Hypothesis:** Test 3L/4L/5L × 192d/256d/384d architectures at Lion lr=1e-4 on TFP.
+
+| Config | Val (best-ckpt) | Test (best-ckpt) | W&B | Notes |
+|--------|----------------|------------------|-----|-------|
+| D: 4L/192d | 0.002988 (ep376) | 0.002503 | rf6qyax6 | BEST RUN |
+| G: 5L/192d | 0.003047 | 0.002816 | 7p6pd3s3 | Degraded late |
+| H: 5L/256d | 0.003353 | 0.003549 | 99op3jzc | Degraded late |
+| E: 4L/256d | 0.003240 | 0.003953 | 3x2qs87j | Most stable terminal |
+| F: 4L/384d | 0.003778 | 0.003411 | 5l8kfcnx | — |
+| B: 3L/256d | diverged | diverged | kzo2rm82 | DIVERGED at ep~300 |
+| A: 3L/192d | 0.007082 | 0.007305 | 8ou4uk6x | Instability |
+| C: 3L/384d | 0.008798 | 0.008569 | 2xsnrhdr | Instability |
+
+**Result: SENT BACK — did not beat baseline (0.002383). Key findings:**
+- 4L is the optimal depth for TFP (3L unstable, 5L degrades late)
+- 4L/192d is best config, but still 25% above baseline
+- 4 data pipeline bug fixes included (AoA assertion, -inf clamping, NaN stats, IEEE-754)
+- Student advised to: try lr=5e-5 with 4L/192d, add early stopping, try EMA
+
 ## 2026-04-22 — PR #3025: TFP Lion+gc=0.5+EMA champion config (haku) — MERGED ✓ NEW BEST
 
 - **Branch:** haku/tfp-lion-champion-config
