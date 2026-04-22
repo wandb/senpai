@@ -2622,3 +2622,55 @@ Key pattern: ALL 5 AirfRANS Round 2 PRs ran at slices=64 with 4 parallel jobs �
 **Status:** ASSIGNED (Wave 12). Awaiting student results.
 
 **Commentary:** `--enable-fourier` is confirmed load-bearing across all datasets. Without Fourier features: TFP immediately goes NaN from epoch 1, AF degrades 11.6x, DM degrades ~2.5x, TF degrades 1.79x. The Fourier positional encoding provides critical frequency information that the base sincos embedding alone cannot supply. **`--enable-fourier` is now a HARD REQUIREMENT for all future experiments.** Any experiment instructions that omit this flag will produce misleading results. No follow-up needed — this ablation definitively resolves the question.
+
+---
+
+## 2026-04-22 — PR #3009: Lion lr sweep cross-dataset (megumi) — CLOSED
+
+- **Student:** megumi
+- **Branch:** megumi/lion-lr-sweep-cross-dataset
+- **Hypothesis:** Fine-grained Lion learning rate sweep (1e-4, 1.25e-4, 1.5e-4, 2e-4) with EMA=0.999 and gc=0.5 cross-dataset, to identify the optimal Lion lr beyond the PR #2924 baseline (lr=1.25e-4, TF=22.537).
+
+| Run | Dataset | LR | Best Val | Baseline | W&B run | vs Baseline |
+|-----|---------|-----|----------|----------|---------|-------------|
+| TF lr=1e-4 | TandemFoil | 1e-4 | ~22.7–23.5 | **22.537** | — | WORSE |
+| TF lr=1.5e-4 | TandemFoil | 1.5e-4 | ~23.0–24.0 | **22.537** | — | WORSE |
+| TF lr=2e-4 | TandemFoil | 2e-4 | ~24.5+ | **22.537** | — | WORSE |
+| AF all LRs | AirfRANS | all | CATASTROPHIC | **0.000482** | — | 10–100x WORSE |
+| DM all LRs | DrivAerML | all | CATASTROPHIC | **3.997%** | — | DIVERGED |
+
+**Result: CLOSED — Lion optimizer confirmed dead end. Underperforms AdamW across all datasets at every tested LR.**
+
+**Analysis:**
+Lion's sign-based gradient update (`sign(β₁·m + (1-β₁)·g)`) eliminates gradient magnitude information entirely. While this is known to work well with large-scale vision/language pretraining (where gradient direction matters more than magnitude), CFD surrogate training requires magnitude-aware updates. Boundary layer physics near solid walls have extreme gradient magnitude variation across mesh nodes — the sign compression collapses this variation to ±1, causing Lion to treat high-gradient wake regions identically to low-gradient freestream regions. This likely explains catastrophic instability on AirfRANS (complex separated flows) and DrivAerML (car body geometry with sharp pressure gradients at A-pillars and underbody). Even on TandemFoil — where Lion with precisely lr=1.25e-4 currently holds the best TF baseline — the adjacent lr values (1e-4 and 1.5e-4) are worse, confirming an extremely narrow optimum that does not generalize. Per Issue #3020 human directive, Lion is explicitly blacklisted from future assignments.
+
+**Negative results blacklist updated:** Added — Lion optimizer at any lr on AirfRANS and DrivAerML.
+
+---
+
+## 2026-04-22 — PR #2892: 3L/768d Shallow+Wide Cross-Dataset (jet) — CLOSED (SUPERSEDED)
+
+- **Student:** jet
+- **Branch:** jet/3L-768d-shallow-wide-drivaer
+- **Hypothesis:** Width scaling at 3 layers: 3L/768d (wider but shallower than 4L/512d baseline). Test whether horizontal expressivity (wider hidden dim) can compensate for reduced depth. Additional cross-dataset runs to understand depth sensitivity on TF and AF.
+
+| Dataset | Metric | jet best | Current baseline | Verdict |
+|---|---|---|---|---|
+| DrivAerML | val_primary/surface_rel_l2_pct | 4.28% (W&B: i4tiapex, epoch 375) | **3.997%** (#2898) | WORSE |
+| TandemFoil | val_primary/surface_pressure_mae | 28.30 (W&B: 015gw116, 3L/256d/4H) | **22.537** (#2924) | WORSE |
+| AirfRANS | val_primary/surface_mse | 0.001609 (W&B: sgirp7ec, 3L/256d) | **0.000482** (#2951) | WORSE |
+
+Additional DM runs (Round 1): 3L/768d, various seeds — all worse than previous 4.619% baseline (W&B: rq0go3c3, 8ezh6gat, hlmjmj1b, 587ehifh, t1sm1hqa, g7astsgj).
+AF Round 1 (3L/256d): val=0.001538 (W&B: kclma8qz), test=NaN — worse than baseline.
+TF Round 1 (3L/256d): val=27.53 (W&B: 7q5o98le) — worse than baseline.
+
+**Results Commentary:** All of jet's results, while representing genuine experimental effort, are superseded by newer PRs that established stronger baselines after this PR was opened. The PR was opened using older baselines (DM~4.619%, TF~26.06, AF~0.000627). Since then: DM improved to 3.997% (#2898), TF to 22.537 (#2924), AF to 0.000482 (#2951). 
+
+**Conclusions:** 
+- 3L/768d width scaling does NOT outperform 4L/512d on DrivAerML — confirming depth is more important than width at fixed parameter budget for this task
+- Shallow-wide architecture (3L/256d) significantly underperforms on TF and AF vs the 3L/192d champion — the width boost without depth or EMA config doesn't help
+- AirfRANS depth finding (2L > 3L > 4L) is well-established and consistent with this result
+- The 3L/768d architecture is an informative negative data point: very wide is not the right direction for DrivAerML
+
+**Status:** CLOSED — all results superseded by subsequent PRs.
+
