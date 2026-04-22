@@ -11,6 +11,7 @@ import math
 import os
 import random
 import time
+import types
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -166,6 +167,7 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    topk_attention: int = 0
 
 
 @dataclass
@@ -472,6 +474,37 @@ def cp_panel_prior_index(config: TrainConfig, bundle: DatasetBundle) -> int | No
     return None
 
 
+def _apply_topk_attention(model: torch.nn.Module, topk: int) -> None:
+    from core.architectures.transolver_reference import TransolverAttention
+
+    def _make_forward(k: int):
+        def _forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+            slice_tokens, slice_weights = self.create_slices(x, attn_mask=attn_mask)
+            qkv = self.qkv(slice_tokens)
+            q, key, v = qkv.chunk(3, dim=-1)
+            scale = q.shape[-1] ** -0.5
+            scores = torch.matmul(q, key.transpose(-2, -1)) * scale
+            if k < scores.shape[-1]:
+                topk_vals, topk_idx = torch.topk(scores, k=k, dim=-1)
+                sparse_mask = torch.full_like(scores, float("-inf"))
+                sparse_mask.scatter_(-1, topk_idx, topk_vals)
+                scores = sparse_mask
+            attn = torch.softmax(scores, dim=-1)
+            drop_p = self.dropout if self.training else 0.0
+            if drop_p > 0:
+                attn = F.dropout(attn, p=drop_p)
+            out_slice = torch.matmul(attn, v)
+            out_x = torch.einsum("bhsc,bhns->bhnc", out_slice, slice_weights)
+            out_x = out_x.permute(0, 2, 1, 3).contiguous().view(x.shape[0], x.shape[1], self.hidden_dim)
+            return self.proj_dropout(self.proj(out_x))
+
+        return _forward
+
+    for module in model.modules():
+        if isinstance(module, TransolverAttention):
+            module.forward = types.MethodType(_make_forward(topk), module)
+
+
 def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
     transolver_kwargs = {
         "n_layers": config.model_layers,
@@ -482,7 +515,7 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
         "slice_num": config.model_slices,
     }
     if config.model == "reference_transolver":
-        return ReferenceTransolver(
+        model = ReferenceTransolver(
             space_dim=bundle.spec.space_dim,
             surface_input_dim=bundle.spec.surface_input_dim,
             surface_output_dim=bundle.spec.surface_output_dim,
@@ -490,9 +523,9 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
             volume_output_dim=bundle.spec.volume_output_dim,
             **transolver_kwargs,
         )
-    if config.model == "senpai_transolver":
+    elif config.model == "senpai_transolver":
         prior_idx = cp_panel_prior_index(config, bundle)
-        return SenpaiTransolver(
+        model = SenpaiTransolver(
             space_dim=bundle.spec.space_dim,
             surface_input_dim=bundle.spec.surface_input_dim,
             surface_output_dim=bundle.spec.surface_output_dim,
@@ -506,13 +539,17 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
             volume_pressure_prior_idx=prior_idx,
             **transolver_kwargs,
         )
-    if config.model == "reference_abupt":
-        return ABUPTReference(
+    elif config.model == "reference_abupt":
+        model = ABUPTReference(
             space_dim=bundle.spec.space_dim,
             surface_output_dim=bundle.spec.surface_output_dim,
             volume_output_dim=bundle.spec.volume_output_dim,
         )
-    raise ValueError(f"Unknown model: {config.model}")
+    else:
+        raise ValueError(f"Unknown model: {config.model}")
+    if config.topk_attention > 0:
+        _apply_topk_attention(model, config.topk_attention)
+    return model
 
 
 def build_optimizer(params, config: TrainConfig):
