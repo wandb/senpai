@@ -164,6 +164,8 @@ class TrainConfig:
     volume_anchor_points: int = 8_000
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
+    spectral_norm_attn: bool = False
+    spectral_norm_ffn: bool = False
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -470,6 +472,18 @@ def cp_panel_prior_index(config: TrainConfig, bundle: DatasetBundle) -> int | No
         base_dim -= 1
         return base_dim
     return None
+
+
+def apply_spectral_norm(model: torch.nn.Module, attn: bool = True, ffn: bool = False) -> torch.nn.Module:
+    from torch.nn.utils import spectral_norm
+    for block in model.backbone.blocks:
+        if attn:
+            spectral_norm(block.attention.qkv.project)
+            spectral_norm(block.attention.proj.project)
+        if ffn:
+            spectral_norm(block.mlp.fc1)
+            spectral_norm(block.mlp.fc2)
+    return model
 
 
 def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
@@ -1407,6 +1421,8 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
+    if config.spectral_norm_attn or config.spectral_norm_ffn:
+        apply_spectral_norm(model, attn=config.spectral_norm_attn, ffn=config.spectral_norm_ffn)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
