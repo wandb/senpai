@@ -166,6 +166,7 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    surface_normals_curvature: bool = False
 
 
 @dataclass
@@ -418,6 +419,126 @@ class TandemTargetTransform:
         return self._split_full(pred_orig, surface_preds.shape[1], volume_tokens)
 
 
+NC_K = 10
+NC_EXACT_THRESHOLD = 10000
+NC_RANDOM_CANDIDATES = 1000
+
+
+@torch.no_grad()
+def _compute_nc_features(
+    pos: torch.Tensor,
+    mask: torch.Tensor,
+    precomputed_normals: torch.Tensor | None,
+    space_dim: int,
+) -> torch.Tensor:
+    """Compute surface normals and curvature features.
+
+    Returns [B, N, 5]: (nx, ny, nz, arcsinh_scaled_mean_curvature, 0).
+    For 2D datasets nz=0; for datasets with pre-computed normals those are
+    reused and only curvature is estimated from normal variation over k-NN.
+    """
+    B, N = mask.shape
+    out = pos.new_zeros(B, N, 5)
+    k = NC_K
+    ek = k + 1
+
+    for b in range(B):
+        valid = mask[b].nonzero(as_tuple=True)[0]
+        M = valid.shape[0]
+        if M < 4:
+            continue
+        pts = pos[b, valid].float()
+        actual_ek = min(ek, M)
+
+        if M <= NC_EXACT_THRESHOLD:
+            dists = torch.cdist(pts, pts)
+            _, knn = dists.topk(actual_ek, dim=1, largest=False)
+        else:
+            nc = min(NC_RANDOM_CANDIDATES, M - 1)
+            self_col = torch.arange(M, device=pts.device).unsqueeze(1)
+            rand_cols = torch.randint(M, (M, nc), device=pts.device)
+            cand_idx = torch.cat([self_col, rand_cols], dim=1)
+            dsq = (pts[cand_idx] - pts.unsqueeze(1)).square().sum(dim=2)
+            _, topk_local = dsq.topk(actual_ek, dim=1, largest=False)
+            knn = cand_idx.gather(1, topk_local)
+
+        if precomputed_normals is not None:
+            pre = precomputed_normals[b, valid].float()
+            if pre.shape[1] < 3:
+                normals = torch.cat([pre, pre.new_zeros(M, 3 - pre.shape[1])], dim=1)
+            else:
+                normals = pre[:, :3]
+            nlen = normals.norm(dim=1, keepdim=True).clamp(min=1e-8)
+            normals = normals / nlen
+        else:
+            nb = pts[knn[:, :actual_ek]]
+            centered = nb - nb.mean(dim=1, keepdim=True)
+            cov = torch.bmm(centered.transpose(1, 2), centered)
+            cov = cov + 1e-6 * torch.eye(space_dim, device=pts.device).unsqueeze(0)
+            _, ev = torch.linalg.eigh(cov)
+            local_n = ev[:, :, 0]
+            centroid = pts.mean(dim=0)
+            flip = ((pts - centroid) * local_n).sum(dim=1) < 0
+            local_n[flip] *= -1
+            if space_dim == 2:
+                normals = torch.cat([local_n, local_n.new_zeros(M, 1)], dim=1)
+            else:
+                normals = local_n
+
+        nb_idx = knn[:, 1:actual_ek]
+        if nb_idx.shape[1] == 0:
+            out[b, valid, :3] = normals
+            continue
+        dp = pts[nb_idx] - pts.unsqueeze(1)
+        dn = normals.unsqueeze(1) - normals[nb_idx]
+        dp_sq = dp.square().sum(dim=2).clamp(min=1e-10)
+        dn_dp = (dn[..., :space_dim] * dp).sum(dim=2)
+        mean_curv = (dn_dp / dp_sq).mean(dim=1)
+        k1 = torch.asinh(mean_curv / 0.01)
+
+        out[b, valid, :3] = normals
+        out[b, valid, 3] = k1
+
+    return out
+
+
+def _augment_batch_nc(batch: GroupedBatch) -> None:
+    """Augment a non-tandem GroupedBatch in-place with normals+curvature."""
+    precomputed: torch.Tensor | None = None
+    if batch.dataset_name == "drivaerml":
+        precomputed = batch.surface_x[..., 3:6]
+    elif batch.dataset_name == "airfrans":
+        precomputed = batch.surface_x[..., 5:7]
+    nc = _compute_nc_features(
+        batch.surface_x[..., : batch.space_dim],
+        batch.surface_mask,
+        precomputed,
+        batch.space_dim,
+    )
+    batch.surface_x = torch.cat([batch.surface_x, nc], dim=-1)
+    if batch.volume_x is not None:
+        batch.volume_x = torch.cat(
+            [batch.volume_x, batch.volume_x.new_zeros(*batch.volume_x.shape[:2], 5)],
+            dim=-1,
+        )
+
+
+def _augment_tandem_nc(batch: GroupedBatch, prepared: TandemPreparedBatch) -> None:
+    """Augment TandemPreparedBatch in-place with normals+curvature."""
+    nc = _compute_nc_features(
+        batch.surface_x[..., :2],
+        batch.surface_mask,
+        None,
+        2,
+    )
+    prepared.surface_x = torch.cat([prepared.surface_x, nc], dim=-1)
+    if prepared.volume_x is not None:
+        prepared.volume_x = torch.cat(
+            [prepared.volume_x, prepared.volume_x.new_zeros(*prepared.volume_x.shape[:2], 5)],
+            dim=-1,
+        )
+
+
 def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser(description="Unified ICML 2026 CFD trainer")
     for field_name, field_value in TrainConfig().__dict__.items():
@@ -464,6 +585,8 @@ def cp_panel_prior_index(config: TrainConfig, bundle: DatasetBundle) -> int | No
     if not config.enable_cp_panel or not config.enable_pressure_prior_addition:
         return None
     base_dim = bundle.spec.surface_input_dim
+    if config.surface_normals_curvature:
+        base_dim -= 5
     if config.enable_vortex_panel_velocity:
         base_dim -= 4
     if config.enable_cp_panel:
@@ -823,6 +946,7 @@ def evaluate_grouped(
     *,
     amp_mode: str = "none",
     max_batches: int = 0,
+    surface_normals_curvature: bool = False,
 ) -> dict[str, float]:
     model.eval()
     if anp_head is not None:
@@ -855,6 +979,8 @@ def evaluate_grouped(
 
         if isinstance(transform, TandemTargetTransform):
             prepared = transform.prepare_batch(batch)
+            if surface_normals_curvature:
+                _augment_tandem_nc(batch, prepared)
             with autocast_context(device, amp_mode):
                 outputs = model(
                     surface_x=prepared.surface_x,
@@ -887,6 +1013,8 @@ def evaluate_grouped(
                 count_volume += 1
             continue
 
+        if surface_normals_curvature:
+            _augment_batch_nc(batch)
         with autocast_context(device, amp_mode):
             outputs = model(
                 surface_x=batch.surface_x,
@@ -1194,6 +1322,7 @@ def train_one_epoch(
     max_batches: int = 0,
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
+    surface_normals_curvature: bool = False,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1232,6 +1361,8 @@ def train_one_epoch(
                 batch = batch.to(device)
                 if isinstance(transform, TandemTargetTransform):
                     prepared = transform.prepare_batch(batch)
+                    if surface_normals_curvature:
+                        _augment_tandem_nc(batch, prepared)
                     with autocast_context(device, amp_mode):
                         outputs = model(
                             surface_x=prepared.surface_x,
@@ -1242,6 +1373,8 @@ def train_one_epoch(
                         outputs = maybe_apply_anp(outputs, prepared, anp_head)
                         loss, _ = loss_grouped_tandem(prepared, outputs)
                 else:
+                    if surface_normals_curvature:
+                        _augment_batch_nc(batch)
                     with autocast_context(device, amp_mode):
                         outputs = model(
                             surface_x=batch.surface_x,
@@ -1381,6 +1514,10 @@ def main() -> None:
         _ds.TandemFoilCaseDataset.__init__ = _patched_init
 
     bundle = build_bundle(config)
+    if config.surface_normals_curvature:
+        bundle.spec.surface_input_dim += 5
+        if bundle.spec.volume_input_dim > 0:
+            bundle.spec.volume_input_dim += 5
     resolved_num_workers = resolve_num_workers(config, bundle.spec.name)
     if bundle.spec.name == "tandemfoilset":
         phys_stats = compute_tandem_phys_stats(
@@ -1462,6 +1599,7 @@ def main() -> None:
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
+            surface_normals_curvature=config.surface_normals_curvature,
         )
 
         if ema is not None:
@@ -1491,6 +1629,7 @@ def main() -> None:
                     device,
                     amp_mode=config.amp_mode,
                     max_batches=config.max_eval_batches,
+                    surface_normals_curvature=config.surface_normals_curvature,
                 )
             eval_metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
             if split_name in LEGACY_VAL_ALIAS and "mae_surf_p" in split_metrics:
@@ -1548,6 +1687,7 @@ def main() -> None:
                     device,
                     amp_mode=config.amp_mode,
                     max_batches=config.max_eval_batches,
+                    surface_normals_curvature=config.surface_normals_curvature,
                 )
             final_test_metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
         if bundle.spec.name == "tandemfoilset":
