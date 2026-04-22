@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-22 00:15 (Wave 3 Reassigned + casca AGC)
+- **Date:** 2026-04-22 02:00 (Wave 3 + tandemfoil_paper baseline wave + DrivAerML Lion + AirfRANS LR sweep)
 - **Branch:** radford
 - **Fleet status:** 60 live students, ALL ASSIGNED (0 idle)
 - **Current relaunch budget:** inherit pod env defaults
@@ -118,6 +118,31 @@ comparability, always include:
 | mitsuha | #2945 | **SDF Wall-Distance Feature** — signed distance field geometry embedding | MEDIUM |
 | casca | #2946 | **Adaptive Gradient Clipping (AGC)** — NFNet-style unit-invariant clipping | LOW-MED |
 
+### Theme 8: TandemFoil Paper Baseline Wave (NEW — 2026-04-22)
+
+First experiments ever run on `tandemfoil_paper` on the radford programme. Racing to establish the val anchor for `val_primary/field_mse`.
+
+| Student | PR | Experiment | Risk |
+|---|---|---|---|
+| jin | #2947 | **TF Paper LR Sweep** — Lion lr=1e-4/1.25e-4/1.5e-4/2e-4 at 3L/192d+3L/256d; AdamW refs | LOW |
+| guts | #2948 | **TF Paper Physics-Flag Ablation** — 8 runs removing flags one-by-one from full golden config | LOW |
+| vash | #2949 | **TF Paper Depth/Width Arch Sweep** — 3L/4L/5L × 192d/256d/384d at Lion lr=1e-4 | LOW |
+
+Paper targets (Experiment 4, Table 6 — MGN best / paper best per task):
+- cruise_random_uniform: 1.79 / **0.10**
+- cruise_random_aoa_extrap: 2.03 / **0.18**
+- cruise_random_re_extrap: 4.85 / **0.36**
+- cruise_random_stagger_extrap: 1.74 / **0.13**
+- cruise_random_gap_extrap: 1.95 / **0.14**
+- racecar_uniform: 0.61 / **0.21**
+
+### Theme 9: DrivAerML + AirfRANS Optimizer Sweeps (NEW — 2026-04-22)
+
+| Student | PR | Experiment | Risk |
+|---|---|---|---|
+| piccolo | #2950 | **DrivAerML Lion Optimizer** — Lion lr=1e-4/2e-4/3e-4/5e-4 × T_max=30/50 + AdamW refs at 4L/512d | LOW-MED |
+| stark | #2951 | **AirfRANS LR+Cosine Sweep** — AdamW lr=7e-4/8e-4/9e-4/1e-3 × T_max=10/20/50 at 2L/256d/4H | LOW |
+
 ### Theme 0: EMA Refinement
 
 | Student | PR | Experiment |
@@ -147,7 +172,7 @@ comparability, always include:
 | gohan | #2887 | gc=1.0+T_max=10 LR scan |
 | gojo | #2888 | gc=0.5+T_max=10 |
 | ~~casca~~ | ~~#2881~~ | ~~gc=1.5/gc=2.0~~ CLOSED — dead end. Reassigned to #2946 AGC |
-| jin | #2893 | lr=1e-3+gc=1.0 |
+| jin | #2947 | TandemFoil Paper first baseline — Lion lr sweep 1e-4/1.25e-4/1.5e-4/2e-4 × 3L/192d+3L/256d + AdamW refs |
 | shinobu | #2912 | WD=3e-2/5e-2+gc=1.0 (heavy regularization) |
 | sanji | #2918 | gc=0.5+WD=1e-2 (softer clip + regularization compound) |
 
@@ -156,7 +181,7 @@ comparability, always include:
 | Student | PR | Experiment |
 |---|---|---|
 | griffith | #2889 | 3L/512d+gc=1.0 |
-| guts | #2890 | 4L/768d ultra-wide |
+| guts | #2948 | TandemFoil Paper physics-flag ablation — 8 runs removing flags from golden config |
 | himmel | #2891 | 5L/512d deeper |
 | jet | #2892 | 3L/768d shallow+wide |
 | shouko | #2909 | heads=16/4 ablation + gc=1.0 |
@@ -169,7 +194,7 @@ comparability, always include:
 |---|---|---|
 | megumi | #2894 | Linear warmup+cosine |
 | mugen | #2895 | CosineAnnealingWarmRestarts T_mult |
-| vash | #2905 | OneCycleLR |
+| vash | #2949 | TandemFoil Paper depth/width arch sweep — 3L/4L/5L × 192d/256d/384d |
 
 ### Theme 5: Training Innovations (CODE CHANGES)
 
@@ -179,13 +204,13 @@ comparability, always include:
 | usopp | #2920 | Gradient noise injection (Neelakantan 2015) |
 | sukuna | #2903 | SWA at cosine troughs |
 | spike | #2901 | Huber/log-cosh loss |
-| stark | #2902 | Gradient accumulation |
+| stark | #2951 | AirfRANS LR+cosine sweep — lr=7e-4/8e-4/9e-4/1e-3 × T_max=10/20/50 |
 
 ### Theme 6: Throughput + Seeds + Ablations
 
 | Student | PR | Experiment |
 |---|---|---|
-| piccolo | #2898 | torch.compile throughput (baseline) |
+| piccolo | #2950 | DrivAerML Lion optimizer sweep — lr=1e-4/2e-4/3e-4/5e-4 × T_max=30/50 + AdamW refs |
 | vegeta | #2906 | 360min multi-seed replication |
 | nami | #2896 | Lion higher LR on DrivAerML |
 | eren | #2910 | max-train-batches=788 (2x data/epoch) |
@@ -208,6 +233,9 @@ comparability, always include:
 | haku | #2820 | AirfRANS | gc=0.5+lr=5e-4 extended |
 | hinata | #2770 | AirfRANS | 4L/256d WD=5e-3 |
 
+Note: jin (#2893), guts (#2890), vash (#2905), piccolo (#2898), stark (#2902) were reassigned to new experiments on 2026-04-22.
+Their old PRs remain in-flight but are now listed under their new assignments in Themes 8 and 9 above.
+
 ## Research Insights
 
 1. **Corrected EMA (MERGED #2899):** timm-style warmup `min(decay, (1+step)/(10+step))` gives -13.2% TF and -41.2% AF. **This is the shared recipe change.** decay=0.999 > 0.9999 on both datasets.
@@ -223,9 +251,11 @@ comparability, always include:
 - **TandemFoil Paper is now a required 4th benchmark.** All future assignments must include it.
 - **Measurement gate:** An experiment is a win only if it does not cause regression on any of the 4 datasets (or shows a cross-dataset improvement).
 
-### Priority 1: TandemFoil Paper Baseline
-- **No val anchor exists yet for TF Paper.** First student to become idle should run the best current config (EMA decay=0.999, 3L/192d or 4L/512d, Lion lr=1.25e-4 for TF) on tandemfoil_paper to establish a baseline.
+### Priority 1: TandemFoil Paper Baseline (IN PROGRESS)
+- **THREE simultaneous baseline runs launched (#2947 jin, #2948 guts, #2949 vash).** Racing to establish a val anchor on `val_primary/field_mse`.
+- jin (#2947) sweeps Lion LR; guts (#2948) ablates physics flags; vash (#2949) sweeps architecture depth/width.
 - Paper targets (Table 6 MGN + PRE-RES-FREE+RES-COMB): 0.10/0.18/0.36/0.13/0.14/0.21 per task.
+- Once the first result arrives, update BASELINE.md with the new `tandemfoil_paper` section.
 - Metric: normalized full-field MSE (`val_primary/field_mse`).
 
 ### Priority 2: DrivAerML Gap Closure (4.619% → 3.71%)
@@ -246,10 +276,12 @@ comparability, always include:
 
 ## Next Priorities
 
-1. **TandemFoil Paper baseline run** — assign first available idle student
-2. Watch Wave 3 results (frieren #2928 rel-L2 is the highest-priority result)
-3. Review any WIP PRs that become ready
-4. All new assignments: 4-dataset coverage mandatory per human team directive
-5. If DM recipe transfer (Theme 1) fails universally → escalate to geometry-separated encoding
-6. If Wave 3 bold ideas show promise → double down with follow-up assignments across all 4 datasets
-7. Check for human team messages on GitHub issues (priority — check very frequently)
+1. **Monitor TF Paper baseline wave** (#2947 jin, #2948 guts, #2949 vash) — update BASELINE.md with new section once first results arrive
+2. **Monitor DrivAerML Lion** (#2950 piccolo) — first Lion run on DrivAerML; could be significant
+3. **Monitor AirfRANS LR ceiling** (#2951 stark) — tests whether lr>6e-4 helps AF
+4. Watch Wave 3 results (frieren #2937 rel-L2, kohaku #2941 global context, casca #2946 AGC are highest priority)
+5. Review any WIP PRs that become ready
+6. All new assignments: 4-dataset coverage mandatory per human team directive
+7. If DM recipe transfer (Theme 1) fails universally → escalate to geometry-separated encoding
+8. If Wave 3 bold ideas show promise → double down with follow-up assignments across all 4 datasets
+9. Check for human team messages on GitHub issues (priority — check very frequently)
