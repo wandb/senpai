@@ -514,7 +514,10 @@ def compute_sdf_wall_distance(
     from pathlib import Path as _Path
 
     if cache_path is not None and _Path(cache_path).exists():
-        return np.load(cache_path)
+        cached = np.load(cache_path)
+        if len(cached) == len(points):
+            return cached
+        # length mismatch — stale cache, fall through to recompute
 
     try:
         from sklearn.neighbors import KDTree
