@@ -1,8 +1,8 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-22 (Wave 3 + TF Paper baseline wave + DM Lion + AF LR sweep + cross-dataset spatial/physics budget sweeps + Wave 4 cross-dataset code/arch innovations + Wave 5 cross-dataset code/arch innovations + Wave 6 per-step SGDR / coord noise / T_max sweep)
+- **Date:** 2026-04-22 (Wave 3 + TF Paper baseline wave + DM Lion + AF LR sweep + cross-dataset spatial/physics budget sweeps + Wave 4 cross-dataset code/arch innovations + Wave 5 cross-dataset code/arch innovations + Wave 6 per-step SGDR / coord noise / T_max sweep + Wave 7 attention architecture innovations + usopp #2994 hypernetwork condition encoding)
 - **Branch:** radford
-- **Fleet status:** 60 live students, ALL ASSIGNED (0 idle) — Wave 6 launched 2026-04-22 (gojo #2985, shoya #2986, chrome #2987)
+- **Fleet status:** 67 live students, ALL ASSIGNED (0 idle) — Wave 7 launched 2026-04-22 (chrome #2988 MQA, faye #2989 GQA, gojo #2990 head-dim scaling, himmel #2991 SWA, levi #2992 Flash+compile, shoya #2993 sparse top-k); usopp #2994 hypernetwork condition encoding
 - **Current relaunch budget:** inherit pod env defaults
   - `SENPAI_TIMEOUT_MINUTES=360`
   - `SENPAI_MAX_EPOCHS=999`
@@ -42,7 +42,7 @@ All four benchmarks are now active and required:
 |---|---|---|
 | TandemFoil | `val_primary/surface_pressure_mae` | **26.06** (#2887 MERGED — Lion lr=1e-4, no-EMA) |
 | TandemFoil Paper | `val_primary/field_mse` | **not established** — baseline run needed urgently |
-| AirfRANS | `val_primary/surface_mse` | **0.000627** (#2902 MERGED — AdamW lr=6e-4, accum=1, no-EMA, ep661) |
+| AirfRANS | `val_primary/surface_mse` | **0.000598** (#2906 MERGED — AdamW lr=6e-4, seed=42, 2L/256d/4H, ep517) |
 | DrivAerML | `val_primary/surface_rel_l2_pct` | **4.619%** (#2691) |
 
 ### CRITICAL SIGNAL — Best-Checkpoint Saves (2026-04-22)
@@ -124,7 +124,35 @@ comparability, always include:
 - `target/icml2026/tandemfoil/`
 - `target/icml2026/tandemfoil_paper/`
 
-## ACTIVE EXPERIMENTS — 62 WIP PRs
+## ACTIVE EXPERIMENTS — 63 WIP PRs
+
+### Theme 15: Hypernetwork Condition Encoding (2026-04-22)
+
+A small hypernetwork (~4k params) reads global flow condition scalars (Re, AoA, Mach) and generates per-layer scale+bias offsets for the slice hidden representations. Targets the conditioning pathway — orthogonal to all Wave 3-7 experiments. Motivated by the physics insight that different flow regimes (boundary layer dynamics, separation) should activate different computational paths.
+
+| Student | PR | Experiment | Risk |
+|---|---|---|---|
+| usopp | #2994 | **Hypernetwork Condition Encoding** — FlowCondHyperNet generates scale+bias applied at transformer entry; `--enable-flow-hypernet`; cross-dataset (TF/TF-paper/AF/DM) | MED |
+
+### Theme 14: Wave 7 — Cross-Dataset Attention Architecture Innovations (NEW — 2026-04-22)
+
+Six novel attention/compute hypotheses, all covering all 4 datasets. Wave 7 targets attention efficiency (MQA/GQA — human team HIGH PRIORITY), attention sparsity, weight averaging, and throughput optimizations.
+
+| Student | PR | Experiment | Risk |
+|---|---|---|---|
+| chrome | #2988 | **Multi-Query Attention (MQA)** — single KV head shared across all Q heads (`--num-kv-heads 1`); human team flagged HIGH PRIORITY | LOW-MED |
+| faye | #2989 | **Grouped-Query Attention (GQA)** — intermediate KV sharing: AF num_kv_heads=2/4H, DM num_kv_heads=4/8H, TF/TF-paper num_kv_heads=1/3H | LOW-MED |
+| gojo | #2990 | **Attention Head Dimension Scaling** — per-head dim ablation: TF 2H vs 6H (baseline 3H), AF 2H vs 8H, DM 4H vs 16H, all fixed hidden_dim | LOW-MED |
+| himmel | #2991 | **Stochastic Weight Averaging (SWA)** — average checkpoints at cosine LR troughs (`--swa --swa-start 0.75` or Python manual fallback) | LOW-MED |
+| levi | #2992 | **Flash Attention + torch.compile** — throughput hypothesis: reduce kernel overhead, more epochs within budget; log steps/sec | LOW |
+| shoya | #2993 | **Sparse Top-k Slice Attention** — retain only top-k attention connections per query slice; test k=16 and k=32; OOM savings enable more slices | MED |
+
+**Scientific rationale:**
+- MQA/GQA (#2988/#2989): Human team flagged HIGH PRIORITY. KV sharing reduces memory bandwidth by 3-8×, enables larger batches or more epochs. Orthogonal to all other changes.
+- Head-dim scaling (#2990): num_heads×head_dim = hidden_dim; changing num_heads trades cross-head diversity for per-head expressivity. Untested in this programme.
+- SWA (#2991): Weight averaging at cosine troughs corresponds to flat basin exploration — known to improve generalization in vision/NLP. Orthogonal to optimizer choice.
+- Flash+compile (#2992): Pure throughput play. FA-2 + reduce-overhead mode should give 20-50% faster epochs, more training signal within 360-min budget.
+- Sparse top-k (#2993): Physics-motivated: leading-edge slices are weakly coupled to wake slices. O(S·k) vs O(S²). k=16/32 vs full k=64.
 
 ### Theme 13: Wave 6 — Cross-Dataset Scheduler/Augmentation (NEW — 2026-04-22)
 
