@@ -188,11 +188,6 @@ def _extract_records(pickle_paths: list[Path]) -> list[dict]:
             if isinstance(aoa, list):
                 aoa0 = float(aoa[0])
                 aoa1 = float(aoa[1])
-                if abs(aoa0 - aoa1) > 1e-6:
-                    raise ValueError(
-                        f"Expected paper-style tandem AoA to be shared, got {aoa0} vs {aoa1} "
-                        f"for {path.name}:{local_idx}"
-                    )
             else:
                 aoa0 = float(aoa)
                 aoa1 = None
@@ -263,24 +258,35 @@ def _compute_y_stats(pickle_paths: list[Path], train_indices: list[int]) -> dict
     dataset = MultiFieldDataset(pickle_paths, cache_size=-1)
     train_sorted = sorted(train_indices, key=lambda idx: dataset.index[idx])
 
-    sum_y = torch.zeros(3, dtype=torch.float64)
-    total_nodes = 0
+    n_channels = 3
+    sum_y = torch.zeros(n_channels, dtype=torch.float64)
+    finite_nodes = torch.zeros(n_channels, dtype=torch.int64)
     for idx in train_sorted:
         _, y, _ = dataset[idx]
-        sum_y += y.double().sum(dim=0)
-        total_nodes += y.shape[0]
-    if total_nodes <= 1:
-        raise ValueError("Need at least two nodes to compute y statistics")
-    mean_y = sum_y / total_nodes
+        yd = y.double()
+        mask = torch.isfinite(yd)
+        sum_y += (yd * mask).sum(dim=0)
+        finite_nodes += mask.sum(dim=0)
+    if finite_nodes.min() <= 1:
+        raise ValueError(
+            f"Need at least two finite nodes per channel to compute y statistics; "
+            f"got finite_nodes={finite_nodes.tolist()}"
+        )
+    mean_y = sum_y / finite_nodes.double()
 
-    sq_y = torch.zeros(3, dtype=torch.float64)
+    sq_y = torch.zeros(n_channels, dtype=torch.float64)
+    finite_nodes2 = torch.zeros(n_channels, dtype=torch.int64)
     for idx in train_sorted:
         _, y, _ = dataset[idx]
-        sq_y += ((y.double() - mean_y) ** 2).sum(dim=0)
-    std_y = (sq_y / (total_nodes - 1)).sqrt().clamp(min=1e-6)
+        yd = y.double()
+        mask = torch.isfinite(yd)
+        sq_y += (mask * (yd - mean_y) ** 2).sum(dim=0)
+        finite_nodes2 += mask.sum(dim=0)
+    std_y = (sq_y / (finite_nodes2.double() - 1)).sqrt().clamp(min=1e-6)
+    total_nodes = int(finite_nodes.min().item())
     return {
         "n_train_samples": len(train_indices),
-        "n_train_nodes": int(total_nodes),
+        "n_train_nodes": total_nodes,
         "y_mean": mean_y.float().tolist(),
         "y_std": std_y.float().tolist(),
     }

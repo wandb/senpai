@@ -155,6 +155,7 @@ class TrainConfig:
     anp_srf: bool = False
     asinh_pressure: bool = False
     asinh_scale: float = 0.75
+    zscore_pressure: bool = False
     residual_prediction: bool = False
     re_stratified_sampling: bool = False
     cosine_t_max: int = 150
@@ -189,6 +190,13 @@ class TandemPreparedBatch:
     aft_surface_mask: torch.Tensor
 
 
+def _sanitize_nan_stats(t: torch.Tensor, fill: float) -> torch.Tensor:
+    if t.isnan().any():
+        t = t.clone()
+        t[t.isnan()] = fill
+    return t
+
+
 class TargetTransform:
     def __init__(
         self,
@@ -200,13 +208,16 @@ class TargetTransform:
         asinh_scale: float = 1.0,
     ):
         self.pressure_index = pressure_index
-        self.stats_mean = stats_mean
-        self.stats_std = stats_std
+        self.stats_mean = _sanitize_nan_stats(stats_mean, fill=0.0) if stats_mean is not None else None
+        self.stats_std = _sanitize_nan_stats(stats_std, fill=1.0) if stats_std is not None else None
         self.asinh_pressure = asinh_pressure
         self.asinh_scale = asinh_scale
 
     def apply(self, y: torch.Tensor) -> torch.Tensor:
         out = y.clone()
+        if not out.is_floating_point():
+            out = out.float()
+        out = torch.where(torch.isfinite(out), out, torch.zeros_like(out))
         if self.asinh_pressure and self.pressure_index is not None:
             out[..., self.pressure_index] = torch.asinh(out[..., self.pressure_index] * self.asinh_scale)
         if self.stats_mean is not None and self.stats_std is not None and self.stats_mean.numel() == out.shape[-1]:
@@ -1351,6 +1362,8 @@ def compute_tandem_phys_stats(
 
 def main() -> None:
     config = parse_args()
+    if config.zscore_pressure and config.asinh_pressure:
+        raise ValueError("--zscore-pressure and --asinh-pressure are mutually exclusive")
     if config.seed != 0:
         random.seed(config.seed)
         torch.manual_seed(config.seed)
@@ -1440,6 +1453,17 @@ def main() -> None:
             config=run_config,
             tags=[config.dataset, config.model],
         )
+        if bundle.spec.name == "tandemfoilset":
+            field_names = TANDEM_FIELD_NAMES
+            norm_mean, norm_std = phys_stats.y_mean, phys_stats.y_std
+        else:
+            field_names = AIRFRANS_FIELD_NAMES if "airfrans" in config.dataset else ("p",)
+            norm_mean = bundle.target_stats.y_mean
+            norm_std = bundle.target_stats.y_std
+        if norm_mean is not None and norm_std is not None:
+            for i, name in enumerate(field_names):
+                if i < norm_mean.numel():
+                    wandb.config.update({f"norm_mean/{name}": norm_mean[i].item(), f"norm_std/{name}": norm_std[i].item()}, allow_val_change=True)
 
     start_time = time.monotonic()
     timeout_seconds = None if not timeout_env else float(timeout_env) * 60.0
