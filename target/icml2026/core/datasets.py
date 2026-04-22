@@ -485,6 +485,8 @@ def build_tandem_bundle(
     enable_wake_deficit: bool = False,
     enable_wake_angle: bool = False,
     enable_vortex_panel_velocity: bool = False,
+    sdf_wall_distance: bool = False,
+    sdf_cache_dir: str = ".sdf_cache",
 ) -> DatasetBundle:
     manifest = _read_json(manifest_path)
     train_indices = list(manifest["splits"]["train"])
@@ -528,6 +530,7 @@ def build_tandem_bundle(
         + (16 if enable_fourier else 0)
         + (1 if enable_cp_panel else 0)
         + (4 if enable_vortex_panel_velocity else 0)
+        + (1 if sdf_wall_distance else 0)
     )
     return DatasetBundle(
         train_dataset=train_dataset,
@@ -560,6 +563,8 @@ def build_airfrans_bundle(
     debug: bool = False,
     enable_fourier: bool = False,
     enable_cp_panel: bool = False,
+    sdf_wall_distance: bool = False,
+    sdf_cache_dir: str = ".sdf_cache",
 ) -> DatasetBundle:
     manifest = _read_json(manifest_path)
     train_name = f"{task}_train"
@@ -601,7 +606,7 @@ def build_airfrans_bundle(
         cache_size=-1 if debug else RUNTIME_CACHE_CASES,
     )
     base_dim = prepare_airfrans.X_DIM
-    augmented_dim = base_dim + (16 if enable_fourier else 0) + (1 if enable_cp_panel else 0)
+    augmented_dim = base_dim + (16 if enable_fourier else 0) + (1 if enable_cp_panel else 0) + (1 if sdf_wall_distance else 0)
     return DatasetBundle(
         train_dataset=train_dataset,
         val_datasets={val_name: val_dataset},
@@ -635,6 +640,8 @@ def build_tandem_paper_bundle(
     enable_fourier: bool = False,
     enable_wake_deficit: bool = False,
     enable_wake_angle: bool = False,
+    sdf_wall_distance: bool = False,
+    sdf_cache_dir: str = ".sdf_cache",
 ) -> DatasetBundle:
     manifest_path = Path(manifest_path)
     stats_path = Path(stats_path)
@@ -687,6 +694,7 @@ def build_tandem_paper_bundle(
         + (16 if enable_fourier else 0)
         + (2 if enable_wake_deficit else 0)
         + (1 if enable_wake_angle else 0)
+        + (1 if sdf_wall_distance else 0)
     )
     return DatasetBundle(
         train_dataset=train_dataset,
@@ -724,6 +732,8 @@ def build_drivaerml_bundle(
     eval_surface_points: int = 0,
     train_volume_points: int = 0,
     eval_volume_points: int = 0,
+    sdf_wall_distance: bool = False,
+    sdf_cache_dir: str = ".sdf_cache",
 ) -> DatasetBundle:
     manifest = _read_json(manifest_path)
     train_sampling_mode = "train_random" if train_surface_points > 0 or train_volume_points > 0 else "full"
@@ -768,6 +778,7 @@ def build_drivaerml_bundle(
     base_surface_dim = prepare_drivaerml.SURFACE_X_DIM
     base_volume_dim = 0 if surface_only else prepare_drivaerml.VOLUME_X_DIM
     fourier_extra = 24 if enable_fourier else 0
+    sdf_extra = 1 if sdf_wall_distance else 0
     return DatasetBundle(
         train_dataset=train_dataset,
         val_datasets={"val_surface": val_dataset},
@@ -775,9 +786,9 @@ def build_drivaerml_bundle(
         spec=DatasetSpec(
             name="drivaerml",
             space_dim=3,
-            surface_input_dim=base_surface_dim + fourier_extra,
+            surface_input_dim=base_surface_dim + fourier_extra + sdf_extra,
             surface_output_dim=prepare_drivaerml.SURFACE_Y_DIM,
-            volume_input_dim=base_volume_dim + fourier_extra if base_volume_dim else 0,
+            volume_input_dim=(base_volume_dim + fourier_extra + sdf_extra) if base_volume_dim else 0,
             volume_output_dim=0 if surface_only else prepare_drivaerml.VOLUME_Y_DIM,
             pressure_output_index=0,
             default_metric="surface_rel_l2_pct",
@@ -819,6 +830,8 @@ def build_dataset_bundle(
     enable_wake_deficit: bool = False,
     enable_wake_angle: bool = False,
     enable_vortex_panel_velocity: bool = False,
+    sdf_wall_distance: bool = False,
+    sdf_cache_dir: str = ".sdf_cache",
 ) -> DatasetBundle:
     if dataset_name in {"tandemfoil", "tandemfoilset"}:
         return build_tandem_bundle(
@@ -831,6 +844,8 @@ def build_dataset_bundle(
             enable_wake_deficit=enable_wake_deficit,
             enable_wake_angle=enable_wake_angle,
             enable_vortex_panel_velocity=enable_vortex_panel_velocity,
+            sdf_wall_distance=sdf_wall_distance,
+            sdf_cache_dir=sdf_cache_dir,
         )
     if dataset_name in {"tandemfoil_paper", "tandemfoilset_paper"}:
         return build_tandem_paper_bundle(
@@ -841,6 +856,8 @@ def build_dataset_bundle(
             enable_fourier=enable_fourier,
             enable_wake_deficit=enable_wake_deficit,
             enable_wake_angle=enable_wake_angle,
+            sdf_wall_distance=sdf_wall_distance,
+            sdf_cache_dir=sdf_cache_dir,
         )
     if dataset_name == "airfrans":
         return build_airfrans_bundle(
@@ -850,6 +867,8 @@ def build_dataset_bundle(
             debug=debug,
             enable_fourier=enable_fourier,
             enable_cp_panel=enable_cp_panel,
+            sdf_wall_distance=sdf_wall_distance,
+            sdf_cache_dir=sdf_cache_dir,
         )
     if dataset_name == "drivaerml":
         return build_drivaerml_bundle(
@@ -861,5 +880,7 @@ def build_dataset_bundle(
             eval_surface_points=drivaerml_eval_surface_points,
             train_volume_points=drivaerml_train_volume_points,
             eval_volume_points=drivaerml_eval_volume_points,
+            sdf_wall_distance=sdf_wall_distance,
+            sdf_cache_dir=sdf_cache_dir,
         )
     raise ValueError(f"Unknown dataset: {dataset_name}")

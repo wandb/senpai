@@ -166,6 +166,8 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    sdf_wall_distance: bool = False
+    sdf_cache_dir: str = ".sdf_cache"
 
 
 @dataclass
@@ -341,6 +343,18 @@ class TandemTargetTransform:
                 vortex = vortex * self.config.vortex_panel_scale
             x = torch.cat([x, vortex], dim=-1)
 
+        if self.config.sdf_wall_distance:
+            import numpy as np
+            sdf_feats = []
+            for b in range(raw_xy.shape[0]):
+                pts = raw_xy[b].detach().cpu().numpy()
+                surf_mask_b = full_is_surface[b].detach().cpu().numpy().astype(bool)
+                surf_pts = pts[surf_mask_b]
+                wall_dist = compute_sdf_wall_distance(pts, surf_pts)
+                sdf_feats.append(torch.from_numpy(wall_dist))
+            sdf_tensor = torch.stack(sdf_feats, dim=0).unsqueeze(-1).to(x.device, dtype=x.dtype)
+            x = torch.cat([x, sdf_tensor], dim=-1)
+
         umag, q = self._umag_q(full_y_raw, full_mask)
         y_phys = self._phys_norm(full_y_raw, umag, q)
         if self.config.asinh_pressure:
@@ -448,6 +462,8 @@ def build_bundle(config: TrainConfig) -> DatasetBundle:
         "enable_wake_deficit": config.enable_wake_deficit,
         "enable_wake_angle": config.enable_wake_angle,
         "enable_vortex_panel_velocity": config.enable_vortex_panel_velocity,
+        "sdf_wall_distance": config.sdf_wall_distance,
+        "sdf_cache_dir": config.sdf_cache_dir,
     }
     if config.tandem_manifest:
         bundle_kwargs["tandem_manifest"] = config.tandem_manifest
@@ -470,6 +486,138 @@ def cp_panel_prior_index(config: TrainConfig, bundle: DatasetBundle) -> int | No
         base_dim -= 1
         return base_dim
     return None
+
+
+def compute_sdf_wall_distance(
+    points: "np.ndarray",
+    surface_points: "np.ndarray",
+    cache_path=None,
+) -> "np.ndarray":
+    """Compute wall distance (SDF) for each point to the nearest surface point.
+
+    Distances are normalized via arcsinh(d / 0.01) matching the pressure
+    normalization convention used elsewhere in this stack. Results are cached
+    to disk as .npy files to avoid repeated KDTree queries across epochs.
+    """
+    import numpy as np
+    from pathlib import Path as _Path
+
+    if cache_path is not None and _Path(cache_path).exists():
+        return np.load(cache_path)
+
+    try:
+        from sklearn.neighbors import KDTree
+
+        tree = KDTree(surface_points)
+        dist, _ = tree.query(points, k=1)
+        wall_dist = dist.squeeze(-1).astype(np.float32)
+    except ImportError:
+        chunks = []
+        for i in range(0, len(points), 1000):
+            chunk = points[i : i + 1000]
+            d = np.linalg.norm(chunk[:, None] - surface_points[None], axis=-1)
+            chunks.append(d.min(axis=1))
+        wall_dist = np.concatenate(chunks).astype(np.float32)
+
+    wall_dist_normalized = np.arcsinh(wall_dist / 0.01).astype(np.float32)
+
+    if cache_path is not None:
+        _Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+        np.save(cache_path, wall_dist_normalized)
+
+    return wall_dist_normalized
+
+
+def _augment_batch_with_sdf(
+    batch,
+    *,
+    sdf_cache_dir: str = ".sdf_cache",
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Return (augmented_surface_x, augmented_volume_x) with wall-distance appended.
+
+    Works for 2-D (space_dim=2) and 3-D (space_dim=3) batches.  The surface
+    positions are the first ``space_dim`` columns of ``batch.surface_x``.
+    Each point's distance to the nearest surface point is arcsinh-normalised
+    and appended as a single channel.
+
+    Caching is per-(dataset, case-id) so the KDTree is only built once.
+
+    NOTE: SDF values are computed and cached for the **valid (unmasked) points
+    only** — independent of the per-batch padding length.  They are then placed
+    into a zero-padded buffer of the current batch's padded size so that
+    ``torch.stack`` always produces tensors of identical shape regardless of
+    which cases are co-batched.
+    """
+    import numpy as np
+    from pathlib import Path as _Path
+
+    space_dim = batch.space_dim
+    device = batch.surface_x.device
+    dtype = batch.surface_x.dtype
+    B = batch.surface_x.shape[0]
+    S_padded = batch.surface_x.shape[1]
+
+    sdf_surf_list = []
+    sdf_vol_list = []
+
+    has_volume = batch.volume_x is not None and batch.volume_mask is not None
+    V_padded = batch.volume_x.shape[1] if has_volume else 0
+
+    for b in range(B):
+        # --- surface positions --------------------------------------------------
+        s_mask_np = batch.surface_mask[b].bool().cpu().numpy()
+        surf_pos_full = batch.surface_x[b, :, :space_dim].detach().cpu().numpy()
+        surf_pts = surf_pos_full[s_mask_np]            # valid (unpadded) surface pts
+        valid_surf_pos = surf_pos_full[s_mask_np]      # same: points for which we compute SDF
+
+        # determine a stable cache key — independent of padding
+        case_id = batch.case_ids[b] if hasattr(batch, "case_ids") and batch.case_ids else str(b)
+        ds_name = getattr(batch, "dataset_name", "unknown")
+
+        # cache stores only the unpadded valid-point values
+        surf_cache = (
+            _Path(sdf_cache_dir) / ds_name / f"{case_id}_surface.npy"
+            if sdf_cache_dir
+            else None
+        )
+        # compute SDF for the valid surface points only (wall dist to nearest surf pt)
+        sdf_valid_surf = compute_sdf_wall_distance(valid_surf_pos, surf_pts, cache_path=surf_cache)
+
+        # scatter into a padded buffer matching the current batch's S_padded
+        sdf_surf_padded = np.zeros(S_padded, dtype=np.float32)
+        sdf_surf_padded[s_mask_np] = sdf_valid_surf
+        sdf_surf_list.append(torch.from_numpy(sdf_surf_padded))
+
+        # volume points SDF (optional)
+        if has_volume:
+            v_mask_np = batch.volume_mask[b].bool().cpu().numpy()
+            vol_pos_full = batch.volume_x[b, :, :space_dim].detach().cpu().numpy()
+            valid_vol_pos = vol_pos_full[v_mask_np]
+
+            vol_cache = (
+                _Path(sdf_cache_dir) / ds_name / f"{case_id}_volume.npy"
+                if sdf_cache_dir
+                else None
+            )
+            sdf_valid_vol = compute_sdf_wall_distance(valid_vol_pos, surf_pts, cache_path=vol_cache)
+
+            sdf_vol_padded = np.zeros(V_padded, dtype=np.float32)
+            sdf_vol_padded[v_mask_np] = sdf_valid_vol
+            sdf_vol_list.append(torch.from_numpy(sdf_vol_padded))
+
+    sdf_surf_tensor = (
+        torch.stack(sdf_surf_list, dim=0).unsqueeze(-1).to(device=device, dtype=dtype)
+    )
+    aug_surface_x = torch.cat([batch.surface_x, sdf_surf_tensor], dim=-1)
+
+    aug_volume_x = batch.volume_x
+    if sdf_vol_list:
+        sdf_vol_tensor = (
+            torch.stack(sdf_vol_list, dim=0).unsqueeze(-1).to(device=device, dtype=dtype)
+        )
+        aug_volume_x = torch.cat([batch.volume_x, sdf_vol_tensor], dim=-1)
+
+    return aug_surface_x, aug_volume_x
 
 
 def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
@@ -823,6 +971,8 @@ def evaluate_grouped(
     *,
     amp_mode: str = "none",
     max_batches: int = 0,
+    sdf_wall_distance: bool = False,
+    sdf_cache_dir: str = ".sdf_cache",
 ) -> dict[str, float]:
     model.eval()
     if anp_head is not None:
@@ -887,11 +1037,17 @@ def evaluate_grouped(
                 count_volume += 1
             continue
 
+        eval_surface_x = batch.surface_x
+        eval_volume_x = batch.volume_x
+        if sdf_wall_distance:
+            eval_surface_x, eval_volume_x = _augment_batch_with_sdf(
+                batch, sdf_cache_dir=sdf_cache_dir
+            )
         with autocast_context(device, amp_mode):
             outputs = model(
-                surface_x=batch.surface_x,
+                surface_x=eval_surface_x,
                 surface_mask=batch.surface_mask,
-                volume_x=batch.volume_x,
+                volume_x=eval_volume_x,
                 volume_mask=batch.volume_mask,
             )
         outputs = float_outputs(outputs)
@@ -1194,6 +1350,8 @@ def train_one_epoch(
     max_batches: int = 0,
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
+    sdf_wall_distance: bool = False,
+    sdf_cache_dir: str = ".sdf_cache",
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1242,11 +1400,17 @@ def train_one_epoch(
                         outputs = maybe_apply_anp(outputs, prepared, anp_head)
                         loss, _ = loss_grouped_tandem(prepared, outputs)
                 else:
+                    train_surface_x = batch.surface_x
+                    train_volume_x = batch.volume_x
+                    if sdf_wall_distance:
+                        train_surface_x, train_volume_x = _augment_batch_with_sdf(
+                            batch, sdf_cache_dir=sdf_cache_dir
+                        )
                     with autocast_context(device, amp_mode):
                         outputs = model(
-                            surface_x=batch.surface_x,
+                            surface_x=train_surface_x,
                             surface_mask=batch.surface_mask,
-                            volume_x=batch.volume_x,
+                            volume_x=train_volume_x,
                             volume_mask=batch.volume_mask,
                         )
                         loss, _ = loss_grouped(batch, outputs, transform)
@@ -1462,6 +1626,8 @@ def main() -> None:
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
+            sdf_wall_distance=config.sdf_wall_distance,
+            sdf_cache_dir=config.sdf_cache_dir,
         )
 
         if ema is not None:
@@ -1491,6 +1657,8 @@ def main() -> None:
                     device,
                     amp_mode=config.amp_mode,
                     max_batches=config.max_eval_batches,
+                    sdf_wall_distance=config.sdf_wall_distance,
+                    sdf_cache_dir=config.sdf_cache_dir,
                 )
             eval_metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
             if split_name in LEGACY_VAL_ALIAS and "mae_surf_p" in split_metrics:
@@ -1548,6 +1716,8 @@ def main() -> None:
                     device,
                     amp_mode=config.amp_mode,
                     max_batches=config.max_eval_batches,
+                    sdf_wall_distance=config.sdf_wall_distance,
+                    sdf_cache_dir=config.sdf_cache_dir,
                 )
             final_test_metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
         if bundle.spec.name == "tandemfoilset":
