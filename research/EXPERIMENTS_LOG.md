@@ -1,5 +1,23 @@
 # SENPAI Research Results
 
+## 2026-04-22 — PR #3016: sigma-Reparam attention projections — cross-dataset (griffith) — CLOSED
+
+- **Branch:** griffith/wave11-sigma-reparam
+- **Hypothesis:** sigma-Reparam (Zhai et al. ICML 2023) replaces W with g * V / ||V||_σ in attention Q/K/V/O projections. Cleaner alternative to spectral norm that avoids torch.compile incompatibility.
+
+| Dataset | Optimizer | Best Val | Baseline | vs Baseline | W&B run |
+|---------|-----------|----------|----------|-------------|---------|
+| TandemFoil | Lion (correct) | 24.452 (ep147) | 22.537 | +8.5% worse | sl9flfmc |
+| TandemFoil Paper | Lion | 0.02906 (ep318) | 0.00434 | +570% worse | ldea14ng |
+| AirfRANS | Lion | 0.000659 (ep98, diverged ep215) | 0.000482 | +37% worse | sy2v5bne |
+| DrivAerML | Lion | 5.763% (ep116) | 3.997% | +44% worse | wq44ydl2 |
+
+**Result: CLOSED after 3 review rounds — no positive signal, persistent execution issues.**
+
+Analysis: sigma-Reparam over-constrains learned representations in the presence of Fourier features and physics priors. TF (cleanest comparison, correct Lion config, 147 epochs) was 8.5% worse. AF diverged at ep215 regardless of optimizer. The student was sent back twice for using wrong optimizer (Lion instead of AdamW) on AF/DM/TFP, and the corrected AdamW runs showed even worse results (AF 0.004147 at ep89, DM 18.10% at ep33). TFP AdamW run had NaN stats bug (val=25808).
+
+**griffith reassigned to #3045: DrivAerML T_max cosine period sweep at champion config.**
+
 ## 2026-04-22 — PR #3042: SAM Optimizer (Sharpness-Aware Minimization) — cross-dataset (emma) — CLOSED
 
 - **Branch:** emma/sam-optimizer-cross-dataset
