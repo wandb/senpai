@@ -33,6 +33,27 @@ from core.features import (
 from core.optim import Lion, Lookahead
 
 
+class RMSNorm(torch.nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.g = torch.nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        norm = torch.norm(x, dim=-1, keepdim=True) * (x.shape[-1] ** -0.5)
+        return x / norm.clamp(min=self.eps) * self.g
+
+
+def _replace_layernorm_in_transformer_blocks(model: torch.nn.Module) -> None:
+    for module in model.modules():
+        for attr_name in ("norm1", "norm2"):
+            sub = getattr(module, attr_name, None)
+            if isinstance(sub, torch.nn.LayerNorm):
+                dim = sub.normalized_shape[0]
+                new_norm = RMSNorm(dim).to(device=sub.weight.device, dtype=sub.weight.dtype)
+                setattr(module, attr_name, new_norm)
+
+
 class EMAWithWarmup:
     """EMA with timm-style adaptive decay warmup: min(target, (1+step)/(10+step))."""
 
@@ -166,6 +187,7 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    rmsnorm: bool = False
 
 
 @dataclass
@@ -1507,6 +1529,8 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
+    if config.rmsnorm:
+        _replace_layernorm_in_transformer_blocks(model)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
