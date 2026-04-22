@@ -1,8 +1,8 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-22 (last polled — Wave 3 + TF Paper baseline wave + DM Lion + AF LR sweep + cross-dataset spatial/physics budget sweeps + Wave 4 cross-dataset code/arch innovations + Wave 5 cross-dataset code/arch innovations + Wave 6 per-step SGDR / coord noise / T_max sweep + Wave 7 attention architecture innovations + usopp #2994 hypernetwork + Wave 8 spike #2995 attention dropout. brook #2996 MQA reassignment also WIP.)
+- **Date:** 2026-04-22 (last polled — Wave 3 + TF Paper baseline wave + DM Lion + AF LR sweep + cross-dataset spatial/physics budget sweeps + Wave 4 cross-dataset code/arch innovations + Wave 5 cross-dataset code/arch innovations + Wave 6 per-step SGDR / coord noise / T_max sweep + Wave 7 attention architecture innovations + usopp #2994 hypernetwork + Wave 8 spike #2995 attention dropout + Wave 9 brook #2999 LayerScale + zenitsu #3000 Spectral Norm attn.)
 - **Branch:** radford
-- **Fleet status:** 57 WIP PRs, ALL ASSIGNED (0 idle) — Wave 7: chrome #2988 MQA, faye #2989 GQA, gojo #2990 head-dim scaling, himmel #2991 SWA, levi #2992 Flash+compile, shoya #2993 sparse top-k; usopp #2994 hypernetwork; Wave 8: spike #2995 attention dropout; zenitsu #2983 RoPE; brook #2996 MQA (reassignment from #2878). PRs CLOSED: #2981 (spike, QK attention temp), #2977 (zenitsu, learnable per-head attn temperature — 1.4x–3.0x worse on all datasets, dead end).
+- **Fleet status:** 59 WIP PRs, ALL ASSIGNED (0 idle) — Wave 7: chrome #2988 MQA, faye #2989 GQA, gojo #2990 head-dim scaling, himmel #2991 SWA, levi #2992 Flash+compile, shoya #2993 sparse top-k; usopp #2994 hypernetwork; Wave 8: spike #2995 attention dropout; Wave 9: brook #2999 LayerScale cross-dataset, zenitsu #3000 Spectral Norm attn cross-dataset. PRs CLOSED: #2981 (spike, QK attention temp), #2977 (zenitsu, learnable per-head attn temperature — 1.4x–3.0x worse on all datasets, dead end). NOTE: brook #2996 MQA (old draft) and zenitsu #2983 RoPE (old draft) were superseded by Wave 9 assignments.
 - **Current relaunch budget:** inherit pod env defaults
   - `SENPAI_TIMEOUT_MINUTES=360`
   - `SENPAI_MAX_EPOCHS=999`
@@ -125,7 +125,20 @@ comparability, always include:
 - `target/icml2026/tandemfoil/`
 - `target/icml2026/tandemfoil_paper/`
 
-## ACTIVE EXPERIMENTS — 57 WIP PRs (updated 2026-04-22 after PR #2981 closed, #2995 assigned)
+## ACTIVE EXPERIMENTS — 59 WIP PRs (updated 2026-04-22 after Wave 9 assigned: brook #2999 LayerScale, zenitsu #3000 Spectral Norm)
+
+### Theme 17: Wave 9 — Cross-Dataset Residual Stability Innovations (NEW — 2026-04-22)
+
+Two novel residual/regularization hypotheses targeting transformer stability and attention Lipschitz constraint. Both cover all 4 datasets.
+
+| Student | PR | Experiment | Risk |
+|---|---|---|---|
+| brook | #2999 | **LayerScale on Transolver residuals** — per-layer learnable diagonal scale `ls1/ls2 = nn.Parameter(ones * 1e-6)` on attention+FFN residuals; `--layer-scale`; cross-dataset (TF/TF-paper/AF/DM) | LOW |
+| zenitsu | #3000 | **Spectral Norm on attention Q/K/V/O projections** — `torch.nn.utils.spectral_norm` wraps linear projections to bound Lipschitz constant; `--spectral-norm-attn`; cross-dataset (TF/TF-paper/AF/DM) | LOW |
+
+**Scientific rationale:**
+- brook #2999 (LayerScale): Touvron et al. 2021 (CaiT/DeiT-III) showed that initialising residual scale at 1e-6 stabilises deep ViT training by preventing gradient explosion in early epochs. Applied to Transolver blocks: `x = x + ls1 * attn(norm1(x))` and `x = x + ls2 * ffn(norm2(x))`. Zero overhead at inference — ls values become near-1.0 after convergence in stable runs. Orthogonal to all Wave 3-8 experiments.
+- zenitsu #3000 (Spectral Norm): Miyato et al. 2018 (SNGAN) / Brock et al. 2018 (BigGAN) showed spectral normalisation stabilises GAN training by bounding the largest singular value of each weight matrix to ≤1. For attention projections, this constrains how sensitive the attention map is to small changes in input features — directly relevant to CFD meshes where nearby points are strongly correlated. Should combine with existing recipe (EMA + Lion/AdamW) without conflict.
 
 ### Theme 16: Wave 8 — Cross-Dataset Regularization Innovations (NEW — 2026-04-22)
 
@@ -402,12 +415,14 @@ Their old PRs remain in-flight but are now listed under their new assignments in
 ## Next Priorities
 
 1. ~~**URGENT: Best-checkpoint saving code change**~~ — **IN PROGRESS (#2974 mugen Wave 4).** The T_mult experiment (#2895) proved TF=25.459 and AF=0.000371 exist in the landscape. mugen implementing `checkpoint_best.pt` saving. **Wave 5 launched: #2980-#2984 (PCGrad/AttnTemp/ZScore/RoPE/LLRD) — all true cross-dataset.**
-2. **Monitor TF Paper baseline wave** (#2947 jin, #2948 guts, #2949 vash) — update BASELINE.md with new section once first results arrive
-3. **Monitor DrivAerML Lion** (#2950 piccolo) — first Lion run on DrivAerML; could be significant
-4. **Monitor AirfRANS LR ceiling** (#2951 stark) — tests whether lr>6e-4 helps AF
-5. **Monitor spatial/physics budget sweeps** (#2972 bulma model_slices, #2973 wolfwood supernode/anchor) — first systematic spatial resolution sweep in cross-dataset format
-6. Watch Wave 3 v3 results (#2953-2962: Relative L2, SwiGLU, DropPath, Prodigy, Global Context, Curvature, Conservation Loss, MoE, SDF, AGC)
-7. Watch new Wave 3+ hypotheses (#2963-2971: LayerScale, Multi-Scale Attention, Extended Fourier, Huber, SGDR, SpectralNorm, log1p, PointDropout, LabelSmoothing)
-8. All new assignments: 4-dataset coverage mandatory per human team directive
-9. If DM recipe transfer (Theme 1) fails universally → escalate to geometry-separated encoding
-10. Check for human team messages on GitHub issues (priority — check very frequently)
+2. **Monitor Wave 9** (#2999 brook LayerScale, #3000 zenitsu Spectral Norm) — lowest-risk stability hypotheses, both fully cross-dataset.
+3. **Close old draft PRs** — brook #2996 (MQA draft, never ran) and zenitsu #2983 (RoPE draft, never ran) should be closed or explicitly queued. Their Wave 9 replacements are now active.
+4. **Monitor TF Paper baseline wave** (#2947 jin, #2948 guts, #2949 vash) — update BASELINE.md with new section once first results arrive
+5. **Monitor DrivAerML Lion** (#2950 piccolo) — first Lion run on DrivAerML; could be significant
+6. **Monitor AirfRANS LR ceiling** (#2951 stark) — tests whether lr>6e-4 helps AF
+7. **Monitor spatial/physics budget sweeps** (#2972 bulma model_slices, #2973 wolfwood supernode/anchor) — first systematic spatial resolution sweep in cross-dataset format
+8. Watch Wave 3 v3 results (#2953-2962: Relative L2, SwiGLU, DropPath, Prodigy, Global Context, Curvature, Conservation Loss, MoE, SDF, AGC)
+9. Watch Wave 6–8 hypotheses (#2985-#2995: per-step SGDR, coord noise, T_max sweep, MQA/GQA/head-dim/SWA/Flash+compile/sparse top-k, hypernetwork, attn dropout)
+10. All new assignments: 4-dataset coverage mandatory per human team directive
+11. If DM recipe transfer (Theme 1) fails universally → escalate to geometry-separated encoding
+12. Check for human team messages on GitHub issues (priority — check very frequently)
