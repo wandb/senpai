@@ -166,6 +166,8 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    enable_flow_hypernet: bool = False
+    flow_hypernet_hidden: int = 64
 
 
 @dataclass
@@ -472,6 +474,73 @@ def cp_panel_prior_index(config: TrainConfig, bundle: DatasetBundle) -> int | No
     return None
 
 
+class FlowCondHyperNet(torch.nn.Module):
+    def __init__(self, cond_dim: int, target_dim: int, hidden: int = 64):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(cond_dim, hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden, hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden, target_dim * 2),
+        )
+        torch.nn.init.zeros_(self.net[-1].weight)
+        torch.nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, cond: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        out = self.net(cond)
+        scale, bias = out.chunk(2, dim=-1)
+        return 1.0 + scale, bias
+
+
+class FiLMTransformerBackbone(torch.nn.Module):
+    def __init__(self, backbone: torch.nn.Module, hypernet: FlowCondHyperNet):
+        super().__init__()
+        self.inner = backbone
+        self.hypernet = hypernet
+        self._cond: torch.Tensor | None = None
+
+    @property
+    def blocks(self):
+        return self.inner.blocks
+
+    def set_cond(self, cond: torch.Tensor | None) -> None:
+        self._cond = cond
+
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+        if self._cond is not None:
+            scale, bias = self.hypernet(self._cond)
+            x = x * scale.unsqueeze(1) + bias.unsqueeze(1)
+            self._cond = None
+        return self.inner(x, attn_mask=attn_mask)
+
+
+def _flow_cond_dim(config_dataset: str) -> int:
+    if config_dataset in ("tandemfoil", "tandemfoil_paper"):
+        return 2
+    if config_dataset == "airfrans":
+        return 2
+    return 0
+
+
+def extract_flow_cond(batch: GroupedBatch) -> torch.Tensor | None:
+    name = batch.dataset_name
+    if name in ("tandemfoilset", "tandemfoilset_paper"):
+        return torch.cat([
+            batch.surface_x[:, 0, 13:14],
+            batch.surface_x[:, 0, 14:15],
+        ], dim=-1)
+    if name == "airfrans":
+        return batch.surface_x[:, 0, 2:4]
+    return None
+
+
+def _set_backbone_cond(model: torch.nn.Module, cond: torch.Tensor | None) -> None:
+    backbone = getattr(model, "backbone", None)
+    if backbone is not None and isinstance(backbone, FiLMTransformerBackbone):
+        backbone.set_cond(cond)
+
+
 def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
     transolver_kwargs = {
         "n_layers": config.model_layers,
@@ -513,6 +582,20 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
             volume_output_dim=bundle.spec.volume_output_dim,
         )
     raise ValueError(f"Unknown model: {config.model}")
+
+
+def _maybe_wrap_flow_hypernet(model: torch.nn.Module, config: TrainConfig) -> torch.nn.Module:
+    if not config.enable_flow_hypernet:
+        return model
+    cond_dim = _flow_cond_dim(config.dataset)
+    if cond_dim == 0:
+        return model
+    backbone = getattr(model, "backbone", None)
+    if backbone is None:
+        return model
+    hypernet = FlowCondHyperNet(cond_dim, model.n_hidden, config.flow_hypernet_hidden)
+    model.backbone = FiLMTransformerBackbone(backbone, hypernet)
+    return model
 
 
 def build_optimizer(params, config: TrainConfig):
@@ -853,6 +936,7 @@ def evaluate_grouped(
         batch = batch.to(device)
         dataset_name = batch.dataset_name
 
+        _set_backbone_cond(model, extract_flow_cond(batch))
         if isinstance(transform, TandemTargetTransform):
             prepared = transform.prepare_batch(batch)
             with autocast_context(device, amp_mode):
@@ -1230,6 +1314,7 @@ def train_one_epoch(
                     loss, _ = loss_abupt(batch, outputs, transform)
             else:
                 batch = batch.to(device)
+                _set_backbone_cond(model, extract_flow_cond(batch))
                 if isinstance(transform, TandemTargetTransform):
                     prepared = transform.prepare_batch(batch)
                     with autocast_context(device, amp_mode):
@@ -1406,8 +1491,14 @@ def main() -> None:
         )
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
-    model = build_model(config, bundle).to(device)
-    forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
+    model = _maybe_wrap_flow_hypernet(build_model(config, bundle), config).to(device)
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameters: {total_params:,}", flush=True)
+    if config.enable_flow_hypernet:
+        cond_dim = _flow_cond_dim(config.dataset)
+        print(f"Flow hypernet: cond_dim={cond_dim}, hidden={config.flow_hypernet_hidden}, active={cond_dim > 0}", flush=True)
+    use_compile = config.compile_model and device.type == "cuda" and not config.enable_flow_hypernet
+    forward_model = torch.compile(model) if use_compile else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
         anp_head = ANPSurfaceDecoder(
@@ -1432,6 +1523,8 @@ def main() -> None:
     if config.wandb_name:
         run_config = asdict(config)
         run_config["effective_batch_size"] = config.batch_size * config.grad_accum_steps
+        run_config["flow_hypernet_cond_dim"] = _flow_cond_dim(config.dataset) if config.enable_flow_hypernet else 0
+        run_config["flow_hypernet_active"] = config.enable_flow_hypernet and _flow_cond_dim(config.dataset) > 0
         run = wandb.init(
             project=os.getenv("WANDB_PROJECT", "senpai-v1"),
             entity=os.getenv("WANDB_ENTITY"),
