@@ -41,7 +41,7 @@ All four benchmarks are now active and required:
 | Dataset | Metric | Current anchor |
 |---|---|---|
 | TandemFoil | `val_primary/surface_pressure_mae` | **22.537** (#2924 MERGED — Lion lr=1e-4, gc=0.5, EMA=0.999, 3L/192d/3H) |
-| TandemFoil Paper | `val_primary/field_mse` | **not established** — baseline run needed urgently |
+| TandemFoil Paper | `val_primary/field_mse` | **0.002383** (#3025 MERGED — Lion lr=1.25e-4, T_max=10, gc=0.5, EMA=0.999, 3L/192d) |
 | AirfRANS | `val_primary/surface_mse` | **0.000482** (#2951 MERGED — AdamW lr=6e-4, T_max=50, no-EMA, 2L/256d/4H) |
 | DrivAerML | `val_primary/surface_rel_l2_pct` | **3.997%** (#2898 MERGED — AdamW lr=5e-4, T_max=30, no-EMA, 4L/512d/8H) |
 

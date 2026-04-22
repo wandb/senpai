@@ -1,5 +1,23 @@
 # SENPAI Research Results
 
+## 2026-04-22 — PR #3025: TFP Lion+gc=0.5+EMA champion config (haku) — MERGED ✓ NEW BEST
+
+- **Branch:** haku/tfp-lion-champion-config
+- **Hypothesis:** TF champion config (Lion lr=1.25e-4, T_max=10, gc=0.5, EMA=0.999) transfers to TFP.
+
+| Metric | Best Val | Baseline | vs Baseline | W&B |
+|--------|----------|----------|-------------|-----|
+| TFP field_mse | **0.002383** (ep443) | 0.00434 | **-45.1%** | d1xh0o1p |
+| surface_mse | 0.001517 | — | — | — |
+| surface_mse_p | 4.81e-05 | — | — | — |
+| volume_mse | 0.002397 | — | — | — |
+
+**Result: MERGED — 45.1% improvement. New TFP baseline: 0.002383.**
+
+Analysis: The TF champion config (Lion+EMA+gc=0.5) transfers directly to TFP with a decisive margin. Both TF and TFP share tandemfoil geometry — Lion optimizer + EMA is the winning combination for this geometry class. Training diverged at ep462 (known T_max=10 cycling instability) but EMA preserved ep443 best. 
+
+**haku reassigned to #3056: TFP Lion refinement — T_max/gc/LR sweep to push below 0.002383.**
+
 ## 2026-04-22 — PR #3017: GeGLU FFN activation cross-dataset (casca) — CLOSED
 
 - **Branch:** casca/wave11-geglu
