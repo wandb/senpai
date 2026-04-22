@@ -1,5 +1,28 @@
 # SENPAI Research Results
 
+## 2026-04-23 00:30 — PR #3097: TFP lr=1.5e-4 (shouko) — CLOSED
+
+- **Branch:** shouko/tfp-lr-15e5
+- **Hypothesis:** Higher LR (1.5e-4 vs 1.25e-4 champion) helps TFP converge faster.
+- **Result:** val_primary/field_mse = **Infinity** for all 89 epochs. Pressure channel never finite. 100% grad clip rate.
+- **W&B:** tzwac8i0
+- **Conclusion:** lr=1.5e-4 is above Lion+gc=0.5 stability ceiling for TFP pressure. lr=1.25e-4 confirmed near the stability boundary. LR above champion is dead.
+- **shouko reassigned to #3113: DM attention dropout=0.05**
+
+## 2026-04-23 00:30 — PR #3071: DrivAerML EMA=0.999 (edward) — CLOSED
+
+- **Branch:** edward/dm-ema-999-champion
+- **Hypothesis:** EMA stabilizes 4L/512d champion at current config.
+
+| Run | Config | Best Val % | Epoch | W&B |
+|-----|--------|-----------|-------|-----|
+| 1 | EMA=0.999, no gc | 21.797 | ep21 | fyzaouhr |
+| 2 | EMA=0.999, gc=0.5 | 10.936 | ep56 | wqihmy4x |
+
+- **Result:** Both diverged catastrophically. EMA is structurally incompatible with DM batch_size=1 gradient variance.
+- **Conclusion:** EMA is dead for DrivAerML at any decay/gc combination. Positive feedback loop: single explosive update contaminates EMA, which degrades subsequent optimization. Confirms #2899 (9.749%).
+- **edward reassigned to #3112: DM gradient centralization**
+
 ## 2026-04-23 00:10 — PR #3080: DrivAerML T_max=50 cosine schedule (himmel) — CLOSED
 
 - **Branch:** himmel/dm-tmax-50
