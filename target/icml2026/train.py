@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from torch.utils.data import DataLoader, WeightedRandomSampler
@@ -86,6 +87,47 @@ class EMAWithWarmup:
         self.backup = None
 
 
+def _normalize_coords_01(x: torch.Tensor) -> torch.Tensor:
+    """Per-sample min-max normalization to [0,1], matching append_batched_fourier_features."""
+    x_min = x.amin(dim=-2, keepdim=True)
+    x_max = x.amax(dim=-2, keepdim=True)
+    return (x - x_min) / (x_max - x_min + 1e-8)
+
+
+class LearnedFourierFeatures(nn.Module):
+    """Learned Fourier feature mapping. Frequencies are trained via backprop."""
+
+    def __init__(self, input_dim: int = 3, num_bands: int = 64, init_scale: float = 10.0):
+        super().__init__()
+        B_init = torch.randn(input_dim, num_bands) * init_scale
+        self.B = nn.Parameter(B_init)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = _normalize_coords_01(x)
+        proj = x @ self.B
+        return torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)
+
+
+class LogSpacedFourierFeatures(nn.Module):
+    """Deterministic log-spaced Fourier features. Better spectral coverage than random."""
+
+    def __init__(self, input_dim: int = 3, num_bands: int = 64, min_freq: float = 0.5, max_freq: float = 32.0):
+        super().__init__()
+        freqs = torch.logspace(
+            start=torch.log10(torch.tensor(min_freq)),
+            end=torch.log10(torch.tensor(max_freq)),
+            steps=num_bands,
+        )
+        directions = F.normalize(torch.randn(input_dim, num_bands), dim=0)
+        B = directions * freqs.unsqueeze(0)
+        self.register_buffer("B", B)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = _normalize_coords_01(x)
+        proj = x @ self.B
+        return torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)
+
+
 LEGACY_VAL_ALIAS = {
     "val_in_dist": "p_in",
     "val_ood_cond": "p_oodc",
@@ -139,6 +181,9 @@ class TrainConfig:
     tandemfoil_paper_manifest: str = ""
     tandemfoil_paper_stats: str = ""
     enable_fourier: bool = False
+    fourier_mode: str = "random"
+    fourier_num_bands: int = 64
+    fourier_max_freq: float = 32.0
     enable_te_coord_frame: bool = False
     enable_cp_panel: bool = False
     enable_cp_panel_tandem_only: bool = False
@@ -275,6 +320,13 @@ class TandemTargetTransform:
         volume = full_tensor[:, surface_tokens : surface_tokens + volume_tokens] if volume_tokens > 0 else None
         return surface, volume
 
+    def _apply_fourier_module(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the learned or log-spaced Fourier module on spatial coords, concatenating output."""
+        # Use only the first 2 spatial coordinates (x, y), matching append_batched_fourier_features
+        coords = x[..., :2]
+        feats = self.fourier_module(coords)
+        return torch.cat([x, feats], dim=-1)
+
     def prepare_batch(self, batch: GroupedBatch) -> TandemPreparedBatch:
         surface_tokens = batch.surface_x.shape[1]
         volume_tokens = 0 if batch.volume_x is None else batch.volume_x.shape[1]
@@ -318,7 +370,10 @@ class TandemTargetTransform:
             )
             x = torch.cat([x, wake_feats], dim=-1)
         if self.config.enable_fourier:
-            x = append_batched_fourier_features(x)
+            if self.config.fourier_mode == "random":
+                x = append_batched_fourier_features(x)
+            else:
+                x = self._apply_fourier_module(x)
 
         cp_panel_unscaled = None
         if self.config.enable_cp_panel:
@@ -442,7 +497,7 @@ def build_bundle(config: TrainConfig) -> DatasetBundle:
         "drivaerml_eval_surface_points": config.drivaerml_eval_surface_points,
         "drivaerml_train_volume_points": config.drivaerml_train_volume_points,
         "drivaerml_eval_volume_points": config.drivaerml_eval_volume_points,
-        "enable_fourier": config.enable_fourier,
+        "enable_fourier": config.enable_fourier and config.fourier_mode == "random",
         "enable_te_coord_frame": config.enable_te_coord_frame,
         "enable_cp_panel": config.enable_cp_panel,
         "enable_wake_deficit": config.enable_wake_deficit,
@@ -823,10 +878,13 @@ def evaluate_grouped(
     *,
     amp_mode: str = "none",
     max_batches: int = 0,
+    extra_fourier_module: nn.Module | None = None,
 ) -> dict[str, float]:
     model.eval()
     if anp_head is not None:
         anp_head.eval()
+    if extra_fourier_module is not None:
+        extra_fourier_module.eval()
 
     dataset_name: str | None = None
     total_surface = 0.0
@@ -887,11 +945,20 @@ def evaluate_grouped(
                 count_volume += 1
             continue
 
+        eval_surface_x = batch.surface_x
+        eval_volume_x = batch.volume_x
+        if extra_fourier_module is not None:
+            space_dim = batch.space_dim
+            surf_feats = extra_fourier_module(eval_surface_x[..., :space_dim])
+            eval_surface_x = torch.cat([eval_surface_x, surf_feats], dim=-1)
+            if eval_volume_x is not None:
+                vol_feats = extra_fourier_module(eval_volume_x[..., :space_dim])
+                eval_volume_x = torch.cat([eval_volume_x, vol_feats], dim=-1)
         with autocast_context(device, amp_mode):
             outputs = model(
-                surface_x=batch.surface_x,
+                surface_x=eval_surface_x,
                 surface_mask=batch.surface_mask,
-                volume_x=batch.volume_x,
+                volume_x=eval_volume_x,
                 volume_mask=batch.volume_mask,
             )
         outputs = float_outputs(outputs)
@@ -1194,6 +1261,7 @@ def train_one_epoch(
     max_batches: int = 0,
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
+    extra_fourier_module: nn.Module | None = None,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1242,11 +1310,20 @@ def train_one_epoch(
                         outputs = maybe_apply_anp(outputs, prepared, anp_head)
                         loss, _ = loss_grouped_tandem(prepared, outputs)
                 else:
+                    train_surface_x = batch.surface_x
+                    train_volume_x = batch.volume_x
+                    if extra_fourier_module is not None:
+                        space_dim = batch.space_dim
+                        surf_feats = extra_fourier_module(train_surface_x[..., :space_dim])
+                        train_surface_x = torch.cat([train_surface_x, surf_feats], dim=-1)
+                        if train_volume_x is not None:
+                            vol_feats = extra_fourier_module(train_volume_x[..., :space_dim])
+                            train_volume_x = torch.cat([train_volume_x, vol_feats], dim=-1)
                     with autocast_context(device, amp_mode):
                         outputs = model(
-                            surface_x=batch.surface_x,
+                            surface_x=train_surface_x,
                             surface_mask=batch.surface_mask,
-                            volume_x=batch.volume_x,
+                            volume_x=train_volume_x,
                             volume_mask=batch.volume_mask,
                         )
                         loss, _ = loss_grouped(batch, outputs, transform)
@@ -1405,6 +1482,32 @@ def main() -> None:
             asinh_scale=config.asinh_scale,
         )
 
+    # Build optional learned/log-spaced Fourier module (non-random modes)
+    extra_fourier_module: nn.Module | None = None
+    if config.enable_fourier and config.fourier_mode != "random":
+        space_dim = bundle.spec.space_dim
+        if config.fourier_mode == "learned":
+            extra_fourier_module = LearnedFourierFeatures(
+                input_dim=space_dim,
+                num_bands=config.fourier_num_bands,
+            ).to(device)
+        elif config.fourier_mode == "log-spaced":
+            extra_fourier_module = LogSpacedFourierFeatures(
+                input_dim=space_dim,
+                num_bands=config.fourier_num_bands,
+                max_freq=config.fourier_max_freq,
+            ).to(device)
+        else:
+            raise ValueError(f"Unknown fourier_mode: {config.fourier_mode!r}")
+        # Adjust input dim for extra Fourier features (2 * num_bands for sin+cos)
+        fourier_extra_dims = 2 * config.fourier_num_bands
+        bundle.spec.surface_input_dim += fourier_extra_dims
+        if bundle.spec.volume_input_dim > 0:
+            bundle.spec.volume_input_dim += fourier_extra_dims
+        # Attach module to the transform so prepare_batch can use it (tandem path)
+        if isinstance(transform, TandemTargetTransform):
+            transform.fourier_module = extra_fourier_module
+
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
@@ -1418,6 +1521,8 @@ def main() -> None:
     params = list(model.parameters())
     if anp_head is not None:
         params.extend(list(anp_head.parameters()))
+    if extra_fourier_module is not None:
+        params.extend(list(extra_fourier_module.parameters()))
     optimizer = build_optimizer(params, config)
     scheduler = None
     if config.cosine_t_max > 0:
@@ -1462,6 +1567,7 @@ def main() -> None:
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
+            extra_fourier_module=extra_fourier_module,
         )
 
         if ema is not None:
@@ -1491,6 +1597,7 @@ def main() -> None:
                     device,
                     amp_mode=config.amp_mode,
                     max_batches=config.max_eval_batches,
+                    extra_fourier_module=extra_fourier_module,
                 )
             eval_metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
             if split_name in LEGACY_VAL_ALIAS and "mae_surf_p" in split_metrics:
@@ -1548,6 +1655,7 @@ def main() -> None:
                     device,
                     amp_mode=config.amp_mode,
                     max_batches=config.max_eval_batches,
+                    extra_fourier_module=extra_fourier_module,
                 )
             final_test_metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
         if bundle.spec.name == "tandemfoilset":
