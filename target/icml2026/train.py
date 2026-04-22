@@ -86,6 +86,27 @@ class EMAWithWarmup:
         self.backup = None
 
 
+class PointDropout(torch.nn.Module):
+    """Spatial point-level dropout: randomly zero node features during training."""
+
+    def __init__(self, p: float = 0.1, mode: str = "feature"):
+        super().__init__()
+        self.p = p
+        self.mode = mode
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.p == 0:
+            return x
+        B, N, D = x.shape
+        if self.mode == "feature":
+            mask = torch.bernoulli(torch.ones(B, N, D, device=x.device) * (1 - self.p))
+            return x * mask / (1 - self.p)
+        elif self.mode == "point":
+            mask = torch.bernoulli(torch.ones(B, N, 1, device=x.device) * (1 - self.p))
+            return x * mask
+        return x
+
+
 LEGACY_VAL_ALIAS = {
     "val_in_dist": "p_in",
     "val_ood_cond": "p_oodc",
@@ -166,6 +187,8 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    point_dropout: float = 0.0
+    point_dropout_mode: str = "feature"
 
 
 @dataclass
@@ -1194,6 +1217,7 @@ def train_one_epoch(
     max_batches: int = 0,
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
+    point_dropout: PointDropout | None = None,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1232,6 +1256,10 @@ def train_one_epoch(
                 batch = batch.to(device)
                 if isinstance(transform, TandemTargetTransform):
                     prepared = transform.prepare_batch(batch)
+                    if point_dropout is not None:
+                        prepared.surface_x = point_dropout(prepared.surface_x)
+                        if prepared.volume_x is not None:
+                            prepared.volume_x = point_dropout(prepared.volume_x)
                     with autocast_context(device, amp_mode):
                         outputs = model(
                             surface_x=prepared.surface_x,
@@ -1242,6 +1270,10 @@ def train_one_epoch(
                         outputs = maybe_apply_anp(outputs, prepared, anp_head)
                         loss, _ = loss_grouped_tandem(prepared, outputs)
                 else:
+                    if point_dropout is not None:
+                        batch.surface_x = point_dropout(batch.surface_x)
+                        if batch.volume_x is not None:
+                            batch.volume_x = point_dropout(batch.volume_x)
                     with autocast_context(device, amp_mode):
                         outputs = model(
                             surface_x=batch.surface_x,
@@ -1426,6 +1458,11 @@ def main() -> None:
 
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
+    point_dropout_module = (
+        PointDropout(p=config.point_dropout, mode=config.point_dropout_mode)
+        if config.point_dropout > 0.0
+        else None
+    )
     history: list[dict[str, float]] = []
 
     run = None
@@ -1462,6 +1499,7 @@ def main() -> None:
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
+            point_dropout=point_dropout_module,
         )
 
         if ema is not None:
