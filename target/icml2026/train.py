@@ -33,6 +33,34 @@ from core.features import (
 from core.optim import Lion, Lookahead
 
 
+class GeGLUFFN(torch.nn.Module):
+    """GeGLU feed-forward: FFN(x) = (xW_up) * GELU(xW_gate) @ W_down (Shazeer 2020)."""
+
+    def __init__(self, hidden_dim: int, ffn_dim: int):
+        super().__init__()
+        self.W_gate = torch.nn.Linear(hidden_dim, ffn_dim, bias=False)
+        self.W_up = torch.nn.Linear(hidden_dim, ffn_dim, bias=False)
+        self.W_down = torch.nn.Linear(ffn_dim, hidden_dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.W_down(F.gelu(self.W_gate(x)) * self.W_up(x))
+
+
+def _replace_ffn_with_geglu(model: torch.nn.Module) -> int:
+    """Walk model tree and replace all UpActDownMlp instances with GeGLUFFN."""
+    from core.architectures.transolver_reference import UpActDownMlp
+
+    count = 0
+    for name, module in model.named_modules():
+        for child_name, child in module.named_children():
+            if isinstance(child, UpActDownMlp):
+                hidden_dim = child.fc1.in_features
+                ffn_dim = child.fc1.out_features
+                setattr(module, child_name, GeGLUFFN(hidden_dim, ffn_dim))
+                count += 1
+    return count
+
+
 class EMAWithWarmup:
     """EMA with timm-style adaptive decay warmup: min(target, (1+step)/(10+step))."""
 
@@ -165,6 +193,7 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
+    geglu: bool = False
     seed: int = 0
 
 
@@ -1506,7 +1535,11 @@ def main() -> None:
         )
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
-    model = build_model(config, bundle).to(device)
+    model = build_model(config, bundle)
+    if config.geglu:
+        n_replaced = _replace_ffn_with_geglu(model)
+        print(f"[GeGLU] Replaced {n_replaced} FFN blocks with GeGLU")
+    model = model.to(device)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
@@ -1538,6 +1571,7 @@ def main() -> None:
     if config.wandb_name:
         run_config = asdict(config)
         run_config["effective_batch_size"] = config.batch_size * config.grad_accum_steps
+        run_config["model_params"] = sum(p.numel() for p in model.parameters())
         run = wandb.init(
             project=os.getenv("WANDB_PROJECT", "senpai-v1"),
             entity=os.getenv("WANDB_ENTITY"),
