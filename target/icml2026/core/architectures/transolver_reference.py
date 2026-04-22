@@ -72,6 +72,18 @@ class MLP(nn.Module):
         return self.net(x)
 
 
+class DropPath(nn.Module):
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.drop_prob == 0.0:
+            return x
+        keep = (torch.rand(x.shape[0], *([1] * (x.ndim - 1)), device=x.device) >= self.drop_prob).to(x.dtype)
+        return x * keep / (1.0 - self.drop_prob)
+
+
 class UpActDownMlp(nn.Module):
     def __init__(self, hidden_dim: int, mlp_hidden_dim: int):
         super().__init__()
@@ -139,6 +151,7 @@ class TransformerBlock(nn.Module):
         mlp_expansion_factor: int | float,
         num_slices: int,
         dropout: float = 0.0,
+        drop_path_rate: float = 0.0,
     ):
         super().__init__()
         mlp_hidden_dim = int(math.ceil(hidden_dim * mlp_expansion_factor))
@@ -151,10 +164,11 @@ class TransformerBlock(nn.Module):
         )
         self.norm2 = nn.LayerNorm(hidden_dim, eps=1e-6)
         self.mlp = UpActDownMlp(hidden_dim=hidden_dim, mlp_hidden_dim=mlp_hidden_dim)
+        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
-        x = x + self.attention(self.norm1(x), attn_mask=attn_mask)
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.drop_path(self.attention(self.norm1(x), attn_mask=attn_mask))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
 
@@ -167,8 +181,10 @@ class Transformer(nn.Module):
         mlp_expansion_factor: int | float,
         num_slices: int,
         dropout: float = 0.0,
+        drop_path_rate: float = 0.0,
     ):
         super().__init__()
+        dpr = [drop_path_rate * i / max(depth - 1, 1) for i in range(depth)]
         self.blocks = nn.ModuleList(
             [
                 TransformerBlock(
@@ -177,8 +193,9 @@ class Transformer(nn.Module):
                     mlp_expansion_factor=mlp_expansion_factor,
                     num_slices=num_slices,
                     dropout=dropout,
+                    drop_path_rate=dpr[i],
                 )
-                for _ in range(depth)
+                for i in range(depth)
             ]
         )
 
@@ -205,6 +222,7 @@ class ReferenceTransolver(nn.Module):
         n_head: int = 3,
         mlp_ratio: int = 4,
         slice_num: int = 96,
+        drop_path_rate: float = 0.0,
     ):
         super().__init__()
         self.space_dim = space_dim
@@ -233,6 +251,7 @@ class ReferenceTransolver(nn.Module):
             mlp_expansion_factor=mlp_ratio,
             num_slices=slice_num,
             dropout=dropout,
+            drop_path_rate=drop_path_rate,
         )
         self.norm = nn.LayerNorm(n_hidden, eps=1e-6)
         self.out = LinearProjection(n_hidden, surface_output_dim + volume_output_dim)
