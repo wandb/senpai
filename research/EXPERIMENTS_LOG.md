@@ -1,5 +1,27 @@
 # SENPAI Research Results
 
+## 2026-04-22 — PR #3043: DrivAerML gradient accumulation ablation + full eval baseline (einar) — SENT BACK
+
+- **Branch:** einar/dm-grad-accum-ablation
+- **Hypothesis:** Gradient accumulation (accum=2, accum=4) reduces gradient noise in DrivAerML's batch_size=1 regime. Step-matching (doubling `--max-train-batches`) isolates the smoothing effect from optimizer step reduction. Secondary goal: establish a full-eval paper-facing baseline without `--max-eval-batches`.
+- **Baseline:** val=3.997% (PR #2898, W&B bht6h42t, 4L/512d, AdamW lr=5e-4, T_max=30)
+
+| Run | Description | W&B ID | Best Val % | Best Ep | Best Test % | Notes |
+|-----|-------------|--------|-----------|---------|------------|-------|
+| 1 | DM control, full eval | 9kn1satv | 14.098 | ep40 | 13.644 | Hit epoch budget at ep42; severely undertrained |
+| 2 | DM accum=2, fewer steps | dguhbgax | 11.390 | ep365 | 11.933 | Late divergence (val→67% by final ep444) |
+| 3 | DM accum=2, step-matched | wpbqofwh | **4.860** | ep153 | **6.091** | Post-peak decay; best run in ablation |
+| 4 | DM accum=4 | hngfgj6i | 9.391 | ep124 | 9.702 | Never converged to competitive range |
+| 5 | AF accum=2, T_max=50 | 1nc85857 | 0.000534 MSE | ep466 | 0.000712 MSE | Late divergence ep723; confirms accum hurts AF |
+
+**Result: SENT BACK (request changes)**
+- No run beat baseline. Best: Run 3 at 4.860% (21.6% above 3.997%)
+- Run 3 (accum=2, step-matched) is directionally promising — closest any non-baseline DM run has come
+- Post-ep153 instability in Run 3 suggests T_max is mismatched to the effective doubled batch size
+- Full-eval control (Run 1) hit epoch budget at ep42 — not a valid paper number
+- accum=2 hurts AF (confirmed); no further AF accum experiments warranted
+- **Next iteration:** accum=2 step-matched + T_max=60 (2x baseline T_max=30) + cosine-eta-min=1e-6; wandb-group dm_grad_accum_v3
+
 ## 2026-04-22 23:35 — PR #2948: TFP physics-flag ablation (guts) — CLOSED
 
 - **Branch:** guts-tfp-physics-v2 / tandemfoil_paper_physics_ablation_v5
