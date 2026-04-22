@@ -107,6 +107,7 @@ class TrainConfig:
     surface_anchor_points: int = 8_000
     volume_anchor_points: int = 8_000
     grad_clip: float = 0.0
+    grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -1051,49 +1052,71 @@ def train_one_epoch(
     amp_mode: str = "none",
     max_batches: int = 0,
     grad_clip: float = 0.0,
+    grad_accum_steps: int = 1,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
         anp_head.train()
     running = {"loss": 0.0}
     steps = 0
+    micro_batches_total = 0
     batches = loader if max_batches <= 0 else itertools.islice(loader, max_batches)
-    for batch in batches:
+    batch_iter = iter(batches)
+    exhausted = False
+
+    while not exhausted:
         optimizer.zero_grad(set_to_none=True)
-        if model_name == "reference_abupt":
-            batch = batch.to(device)
-            with autocast_context(device, amp_mode):
-                outputs = model(
-                    geometry_position=batch.geometry_position,
-                    geometry_supernode_idx=batch.geometry_supernode_idx,
-                    geometry_batch_idx=batch.geometry_batch_idx,
-                    surface_anchor_position=batch.surface_anchor_position,
-                    volume_anchor_position=batch.volume_anchor_position,
-                )
-                loss, _ = loss_abupt(batch, outputs, transform)
-        else:
-            batch = batch.to(device)
-            if isinstance(transform, TandemTargetTransform):
-                prepared = transform.prepare_batch(batch)
+        accum_loss = 0.0
+        micro_count = 0
+
+        for _ in range(grad_accum_steps):
+            try:
+                batch = next(batch_iter)
+            except StopIteration:
+                exhausted = True
+                break
+
+            if model_name == "reference_abupt":
+                batch = batch.to(device)
                 with autocast_context(device, amp_mode):
                     outputs = model(
-                        surface_x=prepared.surface_x,
-                        surface_mask=prepared.surface_mask,
-                        volume_x=prepared.volume_x,
-                        volume_mask=prepared.volume_mask,
+                        geometry_position=batch.geometry_position,
+                        geometry_supernode_idx=batch.geometry_supernode_idx,
+                        geometry_batch_idx=batch.geometry_batch_idx,
+                        surface_anchor_position=batch.surface_anchor_position,
+                        volume_anchor_position=batch.volume_anchor_position,
                     )
-                    outputs = maybe_apply_anp(outputs, prepared, anp_head)
-                    loss, _ = loss_grouped_tandem(prepared, outputs)
+                    loss, _ = loss_abupt(batch, outputs, transform)
             else:
-                with autocast_context(device, amp_mode):
-                    outputs = model(
-                        surface_x=batch.surface_x,
-                        surface_mask=batch.surface_mask,
-                        volume_x=batch.volume_x,
-                        volume_mask=batch.volume_mask,
-                    )
-                    loss, _ = loss_grouped(batch, outputs, transform)
-        loss.backward()
+                batch = batch.to(device)
+                if isinstance(transform, TandemTargetTransform):
+                    prepared = transform.prepare_batch(batch)
+                    with autocast_context(device, amp_mode):
+                        outputs = model(
+                            surface_x=prepared.surface_x,
+                            surface_mask=prepared.surface_mask,
+                            volume_x=prepared.volume_x,
+                            volume_mask=prepared.volume_mask,
+                        )
+                        outputs = maybe_apply_anp(outputs, prepared, anp_head)
+                        loss, _ = loss_grouped_tandem(prepared, outputs)
+                else:
+                    with autocast_context(device, amp_mode):
+                        outputs = model(
+                            surface_x=batch.surface_x,
+                            surface_mask=batch.surface_mask,
+                            volume_x=batch.volume_x,
+                            volume_mask=batch.volume_mask,
+                        )
+                        loss, _ = loss_grouped(batch, outputs, transform)
+
+            accum_loss += float(loss.detach().cpu().item())
+            (loss / grad_accum_steps).backward()
+            micro_count += 1
+
+        if micro_count == 0:
+            break
+
         all_params = list(model.parameters())
         if anp_head is not None:
             all_params += list(anp_head.parameters())
@@ -1110,12 +1133,15 @@ def train_one_epoch(
             ema.update(model)
         if anp_head is not None and anp_ema is not None:
             anp_ema.update(anp_head)
-        running["loss"] += float(loss.detach().cpu().item())
+        running["loss"] += accum_loss / micro_count
+        micro_batches_total += micro_count
         steps += 1
+
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
     running["train_steps"] = float(steps)
+    running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
         running["lr"] = float(optimizer.param_groups[0]["lr"])
     return running
@@ -1262,12 +1288,14 @@ def main() -> None:
 
     run = None
     if config.wandb_name:
+        run_config = asdict(config)
+        run_config["effective_batch_size"] = config.batch_size * config.grad_accum_steps
         run = wandb.init(
             project=os.getenv("WANDB_PROJECT", "senpai-v1"),
             entity=os.getenv("WANDB_ENTITY"),
             name=config.wandb_name,
             group=config.wandb_group or None,
-            config=asdict(config),
+            config=run_config,
             tags=[config.dataset, config.model],
         )
 
@@ -1291,6 +1319,7 @@ def main() -> None:
             amp_mode=config.amp_mode,
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
+            grad_accum_steps=config.grad_accum_steps,
         )
 
         if ema is not None:
