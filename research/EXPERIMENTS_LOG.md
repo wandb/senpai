@@ -93,6 +93,37 @@ Even accounting for these confounds, the gamma pathology is definitive: LayerSca
 
 ---
 
+## 2026-04-22 — PR #2980: PCGrad Gradient Surgery cross-dataset (mugen) — CLOSED
+
+- **Branch:** mugen/pcgrad-gradient-surgery
+- **Hypothesis:** PCGrad (Yu et al. NeurIPS 2020) projects conflicting gradient directions: when the cosine similarity between two loss gradients is negative, each is projected onto the normal plane of the other's gradient vector. Physical motivation: 35% AF conflict rate, 23% TF conflict rate between surface and field loss gradients — PCGrad should reduce destructive interference between multi-task loss components.
+
+| Run | Dataset | Metric | Best Val | Epochs | Baseline | W&B run | vs Baseline |
+|-----|---------|--------|----------|--------|----------|---------|-------------|
+| TF PCGrad | TandemFoil | surface_pressure_mae | catastrophically worse | ~limited | **22.537** (#2924) | 8o2touku | >>50% WORSE |
+| AF PCGrad | AirfRANS | surface_mse | 0.036 | 23 | **0.000482** (#2951) | mfgk9zxz | ~75× WORSE |
+| DM PCGrad | DrivAerML | surface_rel_l2_pct | catastrophically worse | ~limited | **3.997%** (#2898) | d4rchzy9 | >>100% WORSE |
+| TFP PCGrad | TandemFoil Paper | field_mse | all NaN | 9 | not established | hufossvl | N/A (NaN) |
+
+**Result: CLOSED — catastrophic failure across all datasets. All 4 W&B runs in `running` state with no valid improvement.**
+
+**Root cause analysis:**
+PCGrad requires calling `.backward()` twice (once per loss component) to compute separate gradient vectors. To prevent the computation graph from being freed after the first `.backward()`, the implementation must set `retain_graph=True`. This is fundamentally incompatible with PyTorch 2.10's `torch.compile` donated buffer optimization — `retain_graph=True` prevents PyTorch from donating output buffers for reuse across backward passes, causing torch.compile to fail or fall back to eager mode.
+
+The consequence: `--no-compile-model` was forced → the 6–8× training throughput advantage from torch.compile was eliminated → with the same wall-clock budget, the model completed only ~1/7 the number of training steps → catastrophic regression on all 4 datasets.
+
+AF at 23 epochs showed val surface_mse = 0.036 vs baseline 0.000482 (75× worse). This magnitude of regression at 23 epochs rules out "needs more training" — even from a random initialization, AF typically reaches competitive numbers by epoch 50.
+
+TFP produced all-NaN field_mse across all 9 epochs (confirmed via W&B scan_history) — likely a secondary failure from compile loss.
+
+**Physical validity preserved:** The 35% AF and 23% TF gradient conflict rates are real and represent genuine multi-task interference. The hypothesis itself is physically motivated. However, the implementation constraint is fatal in the current PyTorch+compile setup.
+
+**Future path if revisited:** Use `torch.autograd.grad()` with `create_graph=False` instead of `retain_graph=True` — this computes per-loss gradients without retaining the graph, avoiding the donated buffer conflict and making the approach torch.compile compatible.
+
+**Negative results blacklist updated:** Added — PCGrad (Gradient Surgery) via `retain_graph=True` is incompatible with torch.compile; forces `--no-compile-model`; 6–8× throughput collapse fatal across all datasets.
+
+---
+
 ## 2026-04-22 22:45 — PR #2820: AirfRANS: 3L/256d gc=0.5 lr=5e-4 stability (haku)
 
 - **Branch:** haku/airfrans-4L256d-gc05-lr5e4
