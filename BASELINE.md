@@ -3,11 +3,19 @@
 ## TandemFoilSet
 
 - **Primary metric:** `val_primary/surface_pressure_mae` (= `val_eq4/surface_pressure_mae`)
-- **Current best:** 26.06 (val) at epoch 300
-- **Best PR:** #2887 (gohan — lr=1e-4 no-EMA LR scan, 3L/192d, Lion lr=1e-4, gc=1.0, WD=1e-2, T_max=10)
-- **Note:** This beats 26.134 (#2899 with EMA) using no-EMA + lower LR. The EMA recipe (#2899) is still the recommended shared recipe — the 26.06 result is a marginal improvement from longer training at lower LR.
+- **Current best:** 22.537 (val) at epoch 336
+- **Best PR:** #2924 (robin — gc=0.5 EMA refinement, Lion lr=1.25e-4, T_max=10, gc=0.5, WD=1e-2, EMA decay=0.999, 3L/192d)
+- **Note:** gc=0.5 (softer clip vs standard gc=1.0) enables stable EMA training across 336+ epochs where gc=1.0 diverged after ep167. Model still descending at ep336 — result is an underestimate of the ceiling.
 
-### 2026-04-22 — PR #2887: TandemFoil: lr=1e-4 gc=1.0 LR scan — NEW BEST
+### 2026-04-22 — PR #2924: TandemFoil: EMA refinement gc=0.5 — NEW BEST (CURRENT)
+
+- **val_primary/surface_pressure_mae:** 22.537 (-13.8% vs 26.06) at epoch 336
+- **W&B run:** 0lv7fnun (robin/ema-refine-tf-gc05)
+- **Config:** Lion lr=1.25e-4, T_max=10, gc=0.5, WD=1e-2, EMA decay=0.999, 3L/192d, Fourier+physics, 360-min budget
+- **Key insight:** gc=0.5 enables stable EMA training across 336+ epochs; gc=1.0 diverged after ep167 (Run 1). Model still descending at ep336 — result is an underestimate of the ceiling. AirfRANS Run 3 (0.000659) was superseded by stark #2951 T_max=50 result (0.000482).
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 1.25e-4 --cosine-t-max 10 --grad-clip 0.5 --weight-decay 1e-2 --model-slices 64 --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999 --ema-decay 0.999`
+
+### 2026-04-22 — PR #2887: TandemFoil: lr=1e-4 gc=1.0 LR scan — PREVIOUS BEST
 
 - **val_primary/surface_pressure_mae:** 26.06 (-0.3% vs 26.134) at epoch 300
 - **W&B run:** pbq4kgdk
@@ -137,9 +145,26 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.000627 (val) at epoch 661
-- **Best PR:** #2902 (stark — gradient accumulation ablation accum=1 control, 2L/256d, AdamW lr=6e-4, T_max=10, gc=1.0, WD=1e-2, no-EMA)
-- **Key insight:** The accum=1 control run (no gradient accumulation) trained longer than all accum>1 variants and found a deeper basin at ep661 (0.000627 vs 0.000699 baseline). Gradient accumulation hurts AirfRANS — accum=1 is the correct setting. **Beats external target 0.0043 by 85.4%.**
+- **Current best:** 0.000482 (val) at epoch 576
+- **Best PR:** #2951 (stark — lr=6e-4, T_max=50, 2L/256d, AdamW, gc=1.0, wd=1e-2, no-EMA, Fourier)
+- **Key insight:** T_max=50 cosine schedule is the critical breakthrough — longer cosine periods allow the model to fully descend into loss basins before being kicked back up. lr=6e-4 + T_max=50 achieves 0.000482, a -19.4% improvement over the previous best (0.000598 at T_max=10). The run was still at ep576 within the 360-min budget. **Beats external target 0.0043 by 88.8%.**
+
+### 2026-04-22 — PR #2951: AirfRANS: LR + T_max sweep — NEW BEST (CURRENT)
+
+- **val_primary/surface_mse:** 0.000482 (-19.4% vs 0.000598) at epoch 576
+- **W&B run:** pr4wsbfm (Run G: lr=6e-4, T_max=50, ~760 epochs trained)
+- **Config:** 2L/256d/4H, AdamW lr=6e-4, T_max=50, gc=1.0, WD=1e-2, no-EMA, Fourier, 360-min budget
+- **Key insight:** T_max=50 is the decisive variable. T_max=10 configs all underperformed; T_max=20 was intermediate. lr=1e-3 diverged. lr=6e-4 + T_max=50 is the new reference config. Best checkpoint at ep576 (not final). Note: WD=1e-2 was re-added vs #2906 no-WD — this combination still wins because T_max=50 is the dominant effect.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 6e-4 --cosine-t-max 50 --grad-clip 1.0 --weight-decay 1e-2 --no-use-ema --enable-fourier --model-layers 2 --model-hidden-dim 256 --model-heads 4 --epochs 999`
+
+### 2026-04-22 — PR #2906: AirfRANS: gc=1.0 no-WD 360-min budget multi-seed — PREVIOUS BEST
+
+- **val_primary/surface_mse:** 0.000598 (-4.6% vs 0.000627) at epoch 517, seed=42
+- **W&B run:** d7a0z1hk (seed=42, 517 epochs, 360-min budget)
+- **Other seeds:** W&B nvllyhmf (gc+WD variant: 0.000694 at 360 min); W&B nbc25ot7 (no-gc seed=42: NaN at ep607)
+- **Config:** 2L/256d/4H, AdamW lr=6e-4, T_max=10, gc=1.0, **no WD** (no --weight-decay), no-EMA, Fourier, 360-min budget
+- **Key insight:** Removing WD=1e-2 while keeping gc=1.0 achieves 0.000598 — gc-only (0.000598) beats gc+WD (0.000694) at 360 min. WD is NOT required for AirfRANS and actively hurts at long training budgets. The 360-min budget (vs 180-min) is highly beneficial. gc=1.0 is essential for stability — without it, seed divergence (NaN at ep607) is common. **Beats external target 0.0043 by 86.1%.**
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 6e-4 --cosine-t-max 10 --grad-clip 1.0 --no-use-ema --enable-fourier --model-layers 2 --model-hidden-dim 256 --model-heads 4 --epochs 999`
 
 ### 2026-04-22 — PR #2902: AirfRANS: gradient accumulation ablation (accum=1 wins) — NEW BEST
 
@@ -384,6 +409,7 @@
 - **CRITICAL:** Must pass `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
 - **External target:** <3.71% (AB-UPT, ~500 epochs) — **1.08x gap remaining** (was 1.24x)
 - **Key insight:** Longer training on the golden 4L/512d config (SENPAI_MAX_EPOCHS=9999 with 360-min budget) finds a deeper basin at epoch 467 vs 256. torch.compile gives no throughput benefit on DrivAerML and the compile run diverged to NaN at ep454 without --grad-clip — future compile experiments MUST include --grad-clip 1.0. SENPAI_MAX_EPOCHS=9999 required.
+- **gc=2.0 finding (PR #2886):** gc=2.0+lr=4e-4+WD=1e-2 = **4.346%** (W&B: ginhxdco) — new 4L/512d gc ablation best. Does NOT beat current 3.997% baseline (achieved with different architecture/config) but represents the best gc sweep result on the golden 4L/512d foundation. gc=2.0 > gc=1.0 > gc=5.0 for DrivAerML.
 
 ### 2026-04-22 — PR #2898: DrivAerML: torch.compile throughput (no-compile wins) — NEW BEST
 
