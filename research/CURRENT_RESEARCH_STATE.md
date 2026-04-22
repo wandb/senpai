@@ -31,10 +31,10 @@ All four benchmarks are now active and required:
 
 | Dataset | Paper-facing metric | Current best | Target / reference | Status |
 |---|---|---|---|---|
-| TandemFoil | `test_primary/surface_pressure_mae` | **33.88** (#2810) | no external scalar | needs test from new EMA best |
-| TandemFoil Paper | `test_primary/field_mse` | **not run yet on radford** | `0.10 / 0.18 / 0.36 / 0.13 / 0.14 / 0.21` by task | NEW — baseline run needed |
-| AirfRANS | `test_primary/surface_mse` | **0.003** (#2824) | `0.0043` | **BEATEN** — val now 0.000727 |
-| DrivAerML | `test_primary/surface_rel_l2_pct` | **6.24%** (#2691) | `3.71%` | **MAIN GAP — 1.68x** |
+| TandemFoil | `test_primary/surface_pressure_mae` | **33.88** (#2810) | no external scalar | STALE — val now 22.537; test from #2924 needed |
+| TandemFoil Paper | `test_primary/field_mse` | **baseline established** (#2979 haku — 0.00434 val) | `0.10 / 0.18 / 0.36 / 0.13 / 0.14 / 0.21` by task | IN PROGRESS — multiple runs underway |
+| AirfRANS | `test_primary/surface_mse` | **0.003** (#2824) | `0.0043` | **BEATEN** — val now 0.000482; test from #2951 needed |
+| DrivAerML | `test_primary/surface_rel_l2_pct` | **6.24%** (#2691) | `3.71%` | **CLOSING GAP** — val now 3.997% (1.08x) |
 
 ## Steering Anchors (validation, for experiment decisions)
 
@@ -47,13 +47,12 @@ All four benchmarks are now active and required:
 
 ### CRITICAL SIGNAL — Best-Checkpoint Saves (2026-04-22)
 
-PR #2895 (mugen, T_mult cosine restarts) found **transient** bests:
-- TF: **25.459** @ ep109 (vs 26.06 current) — 2.3% improvement visible in val curve!
-- AF: **0.000371** @ ep221 (vs 0.000627 current) — **40.8%** improvement!
+PR #2895 (mugen, T_mult cosine restarts) found transient bests that were erased by post-restart regression:
+- TF: 25.459 @ ep109 — now SUPERSEDED (current TF anchor 22.537 is better)
+- AF: **0.000371** @ ep221 (vs 0.000482 current) — **23% improvement** — **still beats current anchor!**
 
-Both were erased by post-restart regression. The final checkpoint is worse than baseline.
-**The loss landscape has much deeper minima than our current results suggest.**
-**Best-checkpoint saving (save whenever val improves) is now a CRITICAL CODE CHANGE.**
+The AF transient min (0.000371) represents a genuinely deeper basin that we haven't captured yet.
+**Best-checkpoint saving (save whenever val improves) is a CRITICAL CODE CHANGE — ASSIGNED to megumi PR #3029.**
 
 ## Main Scientific Goal
 
@@ -64,10 +63,7 @@ A shared recipe whose core changes work across all four benchmarks:
 - AirfRANS
 - DrivAerML
 
-DrivAerML is still the main gap. Corrected EMA warmup is now the shared recipe
-for TF+AF. TandemFoil Paper is a NEW required benchmark added by the human team
-— paper-faithful high-Re TandemFoilSet using normalized full-field MSE, 6 tasks.
-No baseline has been run yet on radford for this dataset.
+DrivAerML gap is closing (3.997% val, 1.08x from 3.71% target). EMA+gc=0.5 is now the shared TF recipe. TFP baseline established at 0.00434 val (haku #2979). AF anchor 0.000482 from T_max=50 extended training. Best-checkpoint saving (megumi #3029) is the critical pending code change that may unlock transient AF=0.000371.
 
 ## Mandatory Config Rules (UPDATED after EMA merge)
 
