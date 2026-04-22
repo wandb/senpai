@@ -1,8 +1,8 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-22 (Wave 3 + TF Paper baseline wave + DM Lion + AF LR sweep + cross-dataset spatial/physics budget sweeps + Wave 4 cross-dataset code/arch innovations + Wave 5 cross-dataset code/arch innovations + Wave 6 per-step SGDR / coord noise / T_max sweep + Wave 7 attention architecture innovations + usopp #2994 hypernetwork + Wave 8 spike #2995 attention dropout)
+- **Date:** 2026-04-22 (last polled — Wave 3 + TF Paper baseline wave + DM Lion + AF LR sweep + cross-dataset spatial/physics budget sweeps + Wave 4 cross-dataset code/arch innovations + Wave 5 cross-dataset code/arch innovations + Wave 6 per-step SGDR / coord noise / T_max sweep + Wave 7 attention architecture innovations + usopp #2994 hypernetwork + Wave 8 spike #2995 attention dropout. brook #2996 MQA reassignment also WIP.)
 - **Branch:** radford
-- **Fleet status:** 57 WIP PRs, ALL ASSIGNED (0 idle) — Wave 7: chrome #2988 MQA, faye #2989 GQA, gojo #2990 head-dim scaling, himmel #2991 SWA, levi #2992 Flash+compile, shoya #2993 sparse top-k; usopp #2994 hypernetwork; Wave 8: spike #2995 attention dropout. PR #2981 (spike, attention temp) CLOSED.
+- **Fleet status:** 57 WIP PRs, ALL ASSIGNED (0 idle) — Wave 7: chrome #2988 MQA, faye #2989 GQA, gojo #2990 head-dim scaling, himmel #2991 SWA, levi #2992 Flash+compile, shoya #2993 sparse top-k; usopp #2994 hypernetwork; Wave 8: spike #2995 attention dropout; zenitsu #2983 RoPE; brook #2996 MQA (reassignment from #2878). PRs CLOSED: #2981 (spike, QK attention temp), #2977 (zenitsu, learnable per-head attn temperature — 1.4x–3.0x worse on all datasets, dead end).
 - **Current relaunch budget:** inherit pod env defaults
   - `SENPAI_TIMEOUT_MINUTES=360`
   - `SENPAI_MAX_EPOCHS=999`
