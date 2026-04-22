@@ -107,6 +107,8 @@ class TrainConfig:
     surface_anchor_points: int = 8_000
     volume_anchor_points: int = 8_000
     grad_clip: float = 0.0
+    grad_noise_eta: float = 0.0
+    grad_noise_gamma: float = 0.55
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -1051,6 +1053,9 @@ def train_one_epoch(
     amp_mode: str = "none",
     max_batches: int = 0,
     grad_clip: float = 0.0,
+    grad_noise_eta: float = 0.0,
+    grad_noise_gamma: float = 0.55,
+    epoch: int = 1,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1058,7 +1063,8 @@ def train_one_epoch(
     running = {"loss": 0.0}
     steps = 0
     batches = loader if max_batches <= 0 else itertools.islice(loader, max_batches)
-    for batch in batches:
+    steps_per_epoch = max_batches if max_batches > 0 else len(loader)
+    for batch_idx, batch in enumerate(batches):
         optimizer.zero_grad(set_to_none=True)
         if model_name == "reference_abupt":
             batch = batch.to(device)
@@ -1103,6 +1109,14 @@ def train_one_epoch(
         if grad_clip > 0 and float(grad_norm) > grad_clip:
             running.setdefault("grad_clip_events", 0.0)
             running["grad_clip_events"] += 1.0
+        if grad_noise_eta > 0:
+            step_count = (epoch - 1) * steps_per_epoch + batch_idx
+            sigma = grad_noise_eta / (1 + step_count) ** grad_noise_gamma
+            for param in all_params:
+                if param.grad is not None:
+                    param.grad.add_(torch.randn_like(param.grad) * sigma)
+            running.setdefault("grad_noise_sigma", 0.0)
+            running["grad_noise_sigma"] += sigma
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
@@ -1115,6 +1129,8 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    if "grad_noise_sigma" in running:
+        running["grad_noise_sigma"] /= max(steps, 1)
     running["train_steps"] = float(steps)
     if scheduler is not None:
         running["lr"] = float(optimizer.param_groups[0]["lr"])
@@ -1291,6 +1307,9 @@ def main() -> None:
             amp_mode=config.amp_mode,
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
+            grad_noise_eta=config.grad_noise_eta,
+            grad_noise_gamma=config.grad_noise_gamma,
+            epoch=epoch,
         )
 
         if ema is not None:
