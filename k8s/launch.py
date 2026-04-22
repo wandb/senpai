@@ -6,6 +6,7 @@
 
 """Launch senpai advisor and student agents as K8s resources."""
 
+import json
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -53,6 +54,7 @@ class Args:
     extra_instructions: str = ""  # extra prompt text for the advisor: a .md file path or a literal string
     timeout_minutes: float = 30.0  # training run wall-clock limit (SENPAI_TIMEOUT_MINUTES)
     max_epochs: int = 50  # maximum training epochs (SENPAI_MAX_EPOCHS)
+    namespace: str = "default"  # Kubernetes namespace for senpai resources
     dry_run: bool = False  # print manifests without applying
 
 
@@ -150,6 +152,45 @@ def kubectl_apply(manifest: str, name: str):
         print(f"  {result.stdout.strip()}")
 
 
+def get_existing_student_names(tag: str, namespace: str) -> list[str]:
+    """Return currently deployed senpai student names for the given research tag."""
+    result = subprocess.run(
+        [
+            "kubectl",
+            "get",
+            "deployments",
+            "-n",
+            namespace,
+            "-l",
+            f"app=senpai,role=student,research-tag={tag}",
+            "-o",
+            "json",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(result.stdout)
+    names: list[str] = []
+    for item in payload.get("items", []):
+        deployment_name = item["metadata"]["name"]
+        if deployment_name.startswith("senpai-"):
+            names.append(deployment_name.removeprefix("senpai-"))
+    return names
+
+
+def ordered_unique(values: list[str]) -> list[str]:
+    """Deduplicate a list while preserving first occurrence order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
 def main():
     args = sp.parse(Args, config_path=str(SENPAI_CONFIG))
 
@@ -175,9 +216,14 @@ def main():
         else:
             kubectl_apply(manifest, f"student {name}")
 
+    advisor_student_list = student_list
+    if args.advisor and not args.dry_run:
+        existing_students = get_existing_student_names(args.tag, args.namespace)
+        advisor_student_list = ordered_unique(existing_students + student_list)
+
     # --- Deploy advisor ---
     if args.advisor:
-        manifest = render_advisor(advisor_template, args.tag, student_list, args)
+        manifest = render_advisor(advisor_template, args.tag, advisor_student_list, args)
         if args.dry_run:
             print("--- Advisor ---")
             print(manifest)
@@ -188,14 +234,14 @@ def main():
     if not args.dry_run:
         print(f"\nLaunched {len(student_list)} students: {', '.join(student_list)}")
         if args.advisor:
-            print("Launched advisor pod")
+            print(f"Launched advisor pod with {len(advisor_student_list)} students in scope")
         print(f"\nMonitor:")
-        print(f"  kubectl get deployments -l research-tag={args.tag}")
-        print(f"  kubectl get deployment senpai-advisor")
+        print(f"  kubectl get deployments -n {args.namespace} -l research-tag={args.tag}")
+        print(f"  kubectl get deployment -n {args.namespace} senpai-advisor")
         if student_list:
-            print(f"  kubectl logs -f deployment/senpai-{student_list[0]}")
+            print(f"  kubectl logs -n {args.namespace} -f deployment/senpai-{student_list[0]}")
         print(f"\nStop:")
-        print(f"  kubectl delete deployments,configmaps -l research-tag={args.tag}")
+        print(f"  kubectl delete -n {args.namespace} deployments,configmaps -l research-tag={args.tag}")
 
 
 if __name__ == "__main__":
