@@ -546,6 +546,8 @@ def build_optimizer(params, config: TrainConfig):
         optimizer = Lion(params, lr=config.lr, weight_decay=config.weight_decay)
     elif config.optimizer == "adamw":
         optimizer = torch.optim.AdamW(params, lr=config.lr, weight_decay=config.weight_decay)
+    elif config.optimizer == "radam":
+        optimizer = torch.optim.RAdam(params, lr=config.lr, weight_decay=config.weight_decay)
     else:
         raise ValueError(f"Unknown optimizer: {config.optimizer}")
     if config.use_lookahead:
