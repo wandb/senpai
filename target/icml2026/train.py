@@ -21,6 +21,7 @@ import wandb
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from core.architectures import ABUPTReference, ANPSurfaceDecoder, ReferenceTransolver, SenpaiTransolver
+from core.architectures.transolver_reference import TransolverAttention
 from core.contracts import ABUPTBatch, DatasetBundle, GroupedBatch, TargetTransformStats
 from core.datasets import ABUPTCollate, build_dataset_bundle, collate_grouped
 from core.features import (
@@ -166,6 +167,8 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    learnable_attn_temperature: bool = False
+    attn_temperature_scale: float = 1.0
 
 
 @dataclass
@@ -470,6 +473,53 @@ def cp_panel_prior_index(config: TrainConfig, bundle: DatasetBundle) -> int | No
         base_dim -= 1
         return base_dim
     return None
+
+
+def _attn_forward_with_temperature(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+    """TransolverAttention.forward with per-head temperature scaling on QKV attention."""
+    slice_tokens, slice_weights = self.create_slices(x, attn_mask=attn_mask)
+    qkv = self.qkv(slice_tokens)
+    q, k, v = qkv.chunk(3, dim=-1)
+    if hasattr(self, "log_attn_temperature"):
+        q = q * torch.exp(-self.log_attn_temperature).view(1, -1, 1, 1)
+    elif hasattr(self, "fixed_attn_temp_scale"):
+        q = q / self.fixed_attn_temp_scale
+    out_slice = F.scaled_dot_product_attention(
+        q, k, v, dropout_p=self.dropout if self.training else 0.0,
+    )
+    out_x = torch.einsum("bhsc,bhns->bhnc", out_slice, slice_weights)
+    out_x = out_x.permute(0, 2, 1, 3).contiguous().view(x.shape[0], x.shape[1], self.hidden_dim)
+    return self.proj_dropout(self.proj(out_x))
+
+
+def apply_attn_temperature(model: torch.nn.Module, config: TrainConfig) -> None:
+    """Add learnable or fixed temperature scaling to all TransolverAttention modules."""
+    TransolverAttention.forward = _attn_forward_with_temperature
+    for module in model.modules():
+        if isinstance(module, TransolverAttention):
+            device = next(module.parameters()).device
+            if config.learnable_attn_temperature:
+                module.log_attn_temperature = torch.nn.Parameter(
+                    torch.zeros(module.num_heads, device=device)
+                )
+            elif config.attn_temperature_scale != 1.0:
+                module.register_buffer(
+                    "fixed_attn_temp_scale",
+                    torch.tensor(config.attn_temperature_scale, device=device),
+                )
+
+
+def get_attn_temperature_stats(model: torch.nn.Module) -> dict[str, float]:
+    """Extract learned temperature statistics for W&B logging."""
+    stats: dict[str, float] = {}
+    for i, module in enumerate(m for m in model.modules() if isinstance(m, TransolverAttention)):
+        if hasattr(module, "log_attn_temperature"):
+            temps = torch.exp(module.log_attn_temperature).detach().cpu()
+            stats[f"attn_temp/layer{i}_mean"] = temps.mean().item()
+            stats[f"attn_temp/layer{i}_std"] = temps.std().item()
+            for h in range(temps.numel()):
+                stats[f"attn_temp/layer{i}_head{h}"] = temps[h].item()
+    return stats
 
 
 def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
@@ -1407,6 +1457,8 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
+    if config.learnable_attn_temperature or config.attn_temperature_scale != 1.0:
+        apply_attn_temperature(model, config)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
@@ -1514,6 +1566,8 @@ def main() -> None:
             anp_ema.restore(anp_head)
 
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
+        if config.learnable_attn_temperature:
+            epoch_metrics.update(get_attn_temperature_stats(model))
         history.append(epoch_metrics)
         if run is not None:
             wandb.log(epoch_metrics, step=epoch)
