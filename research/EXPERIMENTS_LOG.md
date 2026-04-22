@@ -1,5 +1,21 @@
 # SENPAI Research Results
 
+## 2026-04-23 03:15 — PR #3105: AirfRANS EMA=0.999 for volume (violet) — CLOSED
+
+- **Branch:** violet/af-ema-volume
+- **Hypothesis:** EMA=0.999 stabilizes noisy volume predictions on AirfRANS
+- **Results:**
+
+| Metric | EMA=0.999 | Baseline | Delta |
+|---|---|---|---|
+| val_primary/surface_mse | 0.000583 ep417 | 0.000482 | +21% WORSE |
+| full_val/volume_mse | **0.004400** ep443 | 0.00764 | **-42.4% BETTER** |
+
+- **W&B run:** vlq1dzfz
+- **Analysis:** EMA creates a clear trade-off: volume improves dramatically (-42.4%) but surface regresses (+21%). Mechanistically sound — volume fields are spatially smoother and benefit from parameter averaging; surface boundary nodes require sharp prediction where EMA's lag hurts. Even regressed surface (0.000583) still beats SpiderSolver (0.0043) by 7.4x. Best volume result in the project — critical finding for the AF volume gap.
+- **Follow-up:** Test EMA=0.995 and EMA=0.99 to find sweet spot minimizing surface regression while preserving volume improvement.
+- **Decision:** CLOSED — primary metric (surface_mse) did not beat baseline
+
 ## 2026-04-23 02:50 — PR #3070: DrivAerML 10-epoch linear warmup (chrome) — CLOSED
 
 - **Branch:** chrome/dm-linear-warmup-10ep
