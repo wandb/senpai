@@ -166,6 +166,7 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    div_loss_weight: float = 0.0
 
 
 @dataclass
@@ -1194,6 +1195,8 @@ def train_one_epoch(
     max_batches: int = 0,
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
+    div_loss_weight: float = 0.0,
+    velocity_channels: int = 0,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1251,6 +1254,22 @@ def train_one_epoch(
                         )
                         loss, _ = loss_grouped(batch, outputs, transform)
 
+            if div_loss_weight > 0.0 and velocity_channels > 0:
+                div_reg = torch.tensor(0.0, device=loss.device)
+                n_terms = 0
+                sp = outputs.get("surface_preds")
+                if sp is not None and sp.shape[-1] >= velocity_channels:
+                    div_reg = div_reg + sp[..., :velocity_channels].var(dim=-2).mean()
+                    n_terms += 1
+                vp = outputs.get("volume_preds")
+                if vp is not None and vp.shape[-1] >= velocity_channels:
+                    div_reg = div_reg + vp[..., :velocity_channels].var(dim=-2).mean()
+                    n_terms += 1
+                if n_terms > 0:
+                    loss = loss + div_loss_weight * div_reg
+                    running.setdefault("div_reg", 0.0)
+                    running["div_reg"] += float(div_reg.detach())
+
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
             micro_count += 1
@@ -1282,6 +1301,8 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    if "div_reg" in running:
+        running["div_reg"] /= max(steps, 1)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1462,6 +1483,8 @@ def main() -> None:
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
+            div_loss_weight=config.div_loss_weight,
+            velocity_channels=bundle.spec.pressure_output_index or 0,
         )
 
         if ema is not None:
