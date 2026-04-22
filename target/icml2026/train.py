@@ -33,6 +33,25 @@ from core.features import (
 from core.optim import Lion, Lookahead
 
 
+class SwiGLUFFN(torch.nn.Module):
+    def __init__(self, dim: int, hidden_dim: int | None = None):
+        super().__init__()
+        hidden_dim = hidden_dim or int(dim * 4 * 2 / 3)
+        hidden_dim = ((hidden_dim + 63) // 64) * 64
+        self.w1 = torch.nn.Linear(dim, hidden_dim, bias=False)
+        self.w2 = torch.nn.Linear(hidden_dim, dim, bias=False)
+        self.w3 = torch.nn.Linear(dim, hidden_dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+def _replace_ffn_with_swiglu(model: torch.nn.Module) -> None:
+    for block in model.backbone.blocks:
+        dim = block.mlp.fc1.in_features
+        block.mlp = SwiGLUFFN(dim)
+
+
 class EMAWithWarmup:
     """EMA with timm-style adaptive decay warmup: min(target, (1+step)/(10+step))."""
 
@@ -166,6 +185,7 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    ffn_type: str = "gelu"
 
 
 @dataclass
@@ -481,8 +501,9 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
         "mlp_ratio": config.model_mlp_ratio,
         "slice_num": config.model_slices,
     }
+    model: torch.nn.Module
     if config.model == "reference_transolver":
-        return ReferenceTransolver(
+        model = ReferenceTransolver(
             space_dim=bundle.spec.space_dim,
             surface_input_dim=bundle.spec.surface_input_dim,
             surface_output_dim=bundle.spec.surface_output_dim,
@@ -490,9 +511,9 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
             volume_output_dim=bundle.spec.volume_output_dim,
             **transolver_kwargs,
         )
-    if config.model == "senpai_transolver":
+    elif config.model == "senpai_transolver":
         prior_idx = cp_panel_prior_index(config, bundle)
-        return SenpaiTransolver(
+        model = SenpaiTransolver(
             space_dim=bundle.spec.space_dim,
             surface_input_dim=bundle.spec.surface_input_dim,
             surface_output_dim=bundle.spec.surface_output_dim,
@@ -506,13 +527,19 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
             volume_pressure_prior_idx=prior_idx,
             **transolver_kwargs,
         )
-    if config.model == "reference_abupt":
-        return ABUPTReference(
+    elif config.model == "reference_abupt":
+        model = ABUPTReference(
             space_dim=bundle.spec.space_dim,
             surface_output_dim=bundle.spec.surface_output_dim,
             volume_output_dim=bundle.spec.volume_output_dim,
         )
-    raise ValueError(f"Unknown model: {config.model}")
+    else:
+        raise ValueError(f"Unknown model: {config.model}")
+
+    if config.ffn_type == "swiglu" and hasattr(model, "backbone"):
+        _replace_ffn_with_swiglu(model)
+
+    return model
 
 
 def build_optimizer(params, config: TrainConfig):
@@ -1407,6 +1434,9 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model params: {total_params:,} total, {trainable_params:,} trainable (ffn_type={config.ffn_type})")
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
@@ -1432,6 +1462,8 @@ def main() -> None:
     if config.wandb_name:
         run_config = asdict(config)
         run_config["effective_batch_size"] = config.batch_size * config.grad_accum_steps
+        run_config["total_params"] = total_params
+        run_config["trainable_params"] = trainable_params
         run = wandb.init(
             project=os.getenv("WANDB_PROJECT", "senpai-v1"),
             entity=os.getenv("WANDB_ENTITY"),
