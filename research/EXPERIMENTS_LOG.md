@@ -1,5 +1,68 @@
 # SENPAI Research Results
 
+## 2026-04-23 01:50 — PR #3094: TFP 4L/192d depth at champion config (robin) — CLOSED
+
+- **Branch:** robin/tfp-4l-192d-depth
+- **Hypothesis:** 4L/192d (deeper than 3L champion) at full champion optimizer config might improve TFP
+- **Results:**
+
+| Metric | 4L/192d | 3L/192d Baseline |
+|---|---|---|
+| val_primary/field_mse | **Infinity** (all 140 eps) | 0.002383 ep443 |
+| Divergence onset | ep116 | ep462 |
+| val/surface_mse_Ux | 0.001558 ep114 | — |
+
+- **W&B run:** x982sfdv
+- **Analysis:** Pressure channel overflows via asinh transform — velocity channels converge normally (Ux=0.00156 competitive). T_max=10 cycling too aggressive for 4L. Diverged 3.7x earlier than 3L champion. 4L needs separate LR/T_max tuning.
+- **Decision:** CLOSED — val_primary/field_mse never finite
+
+## 2026-04-23 01:50 — PR #3091: TFP gc=0.7 at champion config (nobara) — CLOSED
+
+- **Branch:** nobara/tfp-gc-07
+- **Hypothesis:** Higher gc (0.7 vs champion 0.5) provides tighter gradient control
+- **Results:**
+
+| Metric | gc=0.7 | gc=0.5 Baseline |
+|---|---|---|
+| val_primary/field_mse | **Infinity** (all 177 eps) | 0.002383 ep443 |
+| Divergence onset | ep142 | ep462 |
+| Terminal grad norm | 1,326 | — |
+
+- **W&B run:** e0am2f3z
+- **Analysis:** gc=0.7 is strictly worse. Diverged 3x earlier (ep142 vs ep462). Relaxing gc beyond 0.5 destabilizes Lion+T_max=10 on TFP. gc=0.5 is the stability boundary — tighter (gc=0.3) is the promising direction.
+- **Decision:** CLOSED — val_primary/field_mse never finite
+
+## 2026-04-23 01:50 — PR #3087: TFP T_max=15 at champion config (mitsuha) — CLOSED
+
+- **Branch:** mitsuha/tfp-tmax-15
+- **Hypothesis:** Longer cosine period (T_max=15 vs champion 10) delays late-training divergence
+- **Results:**
+
+| Metric | T_max=15 | T_max=10 Baseline |
+|---|---|---|
+| val_primary/field_mse | **Infinity** (all 176 eps) | 0.002383 ep443 |
+| Divergence onset | ep124 | ep462 |
+
+- **W&B run:** tqirkf0l
+- **Analysis:** Falsified in opposite direction. T_max=15 diverged 3.5x earlier. Longer cosine extends LR peak phase, compounding pressure channel instability via asinh overflow. T_max=10 confirmed as sharp optimum for TFP.
+- **Decision:** CLOSED — val_primary/field_mse never finite
+
+## 2026-04-23 01:50 — PR #3060: DrivAerML bilateral symmetry augmentation (levi) — CLOSED
+
+- **Branch:** levi/dm-bilateral-symmetry-augmentation
+- **Hypothesis:** Reflecting car geometries left-right doubles effective training data (400→800 cases)
+- **Results:**
+
+| Run | Best val surface_rel_l2_pct | vs Baseline |
+|---|---|---|
+| Aug ON | 14.01% ep50 | +250% worse |
+| Control | 8.34% ep75 | +109% worse (undertrained) |
+| Baseline | 3.997% ep467 | — |
+
+- **W&B runs:** d76aehil (aug), e9sf9fwv (control)
+- **Analysis:** Stochastic per-batch flipping creates distributional variance that compounds gradient instability at T_max=30 LR peaks — 31 spike epochs vs 4 in control. Symmetry axis is valid (y-center within ±0.001) but implementation needs stabilization. Pre-generated mirrored copies as permanent dataset entries would be a better approach.
+- **Decision:** CLOSED — augmentation harmful due to gradient instability
+
 ## 2026-04-23 01:20 — PR #3082: DrivAerML T_max=40 cosine schedule (historia) — CLOSED
 
 - **Branch:** historia/dm-tmax-40
