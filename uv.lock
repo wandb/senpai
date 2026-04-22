@@ -8,10 +8,6 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 
-[options]
-exclude-newer = "2026-04-13T13:27:18.562569Z"
-exclude-newer-span = "P7D"
-
 [[package]]
 name = "abnf"
 version = "2.2.0"

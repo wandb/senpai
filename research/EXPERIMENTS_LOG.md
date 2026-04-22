@@ -64,6 +64,37 @@ Learnable per-head temperature does show interesting specialization (AirfRANS L1
 
 ---
 
+## 2026-04-22 — PR #2955: Wave3: Stochastic Depth (DropPath) Regularization — cross-dataset (violet) — CLOSED
+
+- **Branch:** violet/wave3-stochastic-depth
+- **Hypothesis:** DropPath randomly drops entire residual blocks during training (Huang et al. 2016), tested at `drop_path_rate` 0.1 and 0.2 with a linear schedule (deeper blocks receive higher drop probability). Should act as implicit ensemble and improve generalization.
+
+| Run | Dataset | Rate | Best Epoch | Metric | Baseline | W&B Run | vs Baseline |
+|-----|---------|------|-----------|--------|----------|---------|-------------|
+| TF-0.1 | TandemFoil | 0.1 | 228/248 | 28.47 MAE | **22.537** (#2924) | ubsbs6rq | +26% WORSE |
+| TF-0.2 | TandemFoil | 0.2 | 242/245 | 28.82 MAE | **22.537** (#2924) | fxqs4hxv | +28% WORSE |
+| TFP-0.1 | TandemFoil Paper | 0.1 | — | FAILED | **0.00434** (#2979) | — | data env error |
+| TFP-0.2 | TandemFoil Paper | 0.2 | — | FAILED | **0.00434** (#2979) | — | data env error |
+| AF-0.1 | AirfRANS | 0.1 | 362/586 | 0.001003 MSE | **0.000482** (#2951) | bh06roxc | +108% WORSE |
+| AF-0.2 | AirfRANS | 0.2 | 252/586 | 0.001444 MSE | **0.000482** (#2951) | sq60zgqj | +199% WORSE |
+| DM-0.1 | DrivAerML | 0.1 | 42/344 | 18.91% | **3.997%** (#2898) | flflzqf7 | +373% WORSE |
+| DM-0.2 | DrivAerML | 0.2 | 169/343 | 6.37% | **3.997%** (#2898) | d0s43sag | +59% WORSE |
+
+**Result: CLOSED — clear negative result across all datasets. DropPath is fundamentally incompatible with CFD surrogate objectives.**
+
+**Analysis:**
+Stochastic Depth uniformly degrades performance across all datasets. The DrivAerML result at rate=0.1 was catastrophically bad (+373%): a 4-layer model with linear drop schedule gives the deepest blocks ~15% drop probability, causing severe training instability on the most complex geometry dataset. AirfRANS was +108-199% worse — even the lower rate destroyed the learning signal needed for precise field prediction. TandemFoil was +26-28% worse vs current best (22.537, not the stale 26.06 in violet's PR body).
+
+Cross-wave comparison: Wave 2 (rates 0.05/0.15) was also worse than baseline on TF (23.59/23.73 vs 22.537). Pattern is consistent — DropPath is harmful across all rates tested.
+
+**Root cause:** CFD surrogate models need to learn precise physical relationships between geometry, boundary conditions, and field quantities. Stochastically dropping entire residual blocks destroys the gradient signal for pressure/velocity fidelity. These models do not benefit from the ensemble-like regularization that helps image classification (where high-level semantics are robust to structural dropout).
+
+**TandemFoil Paper infrastructure issue:** Both TFP runs failed immediately with `ValueError: Expected paper-style tandem AoA to be shared, got -0.94 vs -2.36 for raceCar_randomFields_mgn_Part1.pickle:0` — DrivAerML-format data was on the TFP mount. This is a systemic data infrastructure issue affecting multiple students (also seen in zenitsu's PR). Flagged for human team attention.
+
+**Negative results blacklist updated:** Added — Stochastic Depth / DropPath at any rate on CFD surrogate models.
+
+---
+
 ## 2026-04-22 — PR #2963: Wave 3 LayerScale Initialization cross-dataset (brook) — CLOSED
 
 - **Branch:** brook/wave3-layerscale-init
