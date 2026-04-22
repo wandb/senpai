@@ -1,5 +1,23 @@
 # SENPAI Research Results
 
+## 2026-04-22 23:35 — PR #2948: TFP physics-flag ablation (guts) — CLOSED
+
+- **Branch:** guts-tfp-physics-v2 / tandemfoil_paper_physics_ablation_v5
+- **Hypothesis:** Which physics-encoding flags contribute to `val_primary/field_mse` on TFP?
+
+| Run | Config | State | Best val field_mse | W&B |
+|-----|--------|-------|--------------------|-----|
+| zoq2wf1p | AdamW lr=5e-4, T_max=150, full physics | RUNNING | 0.003564 (ep443) | zoq2wf1p |
+| 5 ablation runs | Various flag removals | ALL CRASHED | N/A | — |
+
+**Result: CLOSED**
+- Convergence run val=0.003564 is 49% worse than current baseline 0.002383
+- Config (AdamW lr=5e-4, T_max=150) is inferior to Lion champion
+- All 5 ablation runs crashed — no valid ablation conclusions possible
+- Bug fixes already merged separately in #3052
+
+**guts reassigned to #3109: DrivAerML lr=4e-4 full-eval paper-facing baseline**
+
 ## 2026-04-22 23:30 — PR #2949: TFP depth/width sweep (vash) — SENT BACK
 
 - **Branch:** vash/tandemfoil-paper-depth-width-sweep
