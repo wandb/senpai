@@ -1,5 +1,32 @@
 # SENPAI Research Results
 
+## 2026-04-22 — Wave 10-12 Review: 6 closures, 2 send-backs, 0 merges
+
+### Closed (6 dead ends)
+
+| PR | Student | Hypothesis | Best DM | Best AF | Best TF | Conclusion |
+|----|---------|-----------|---------|---------|---------|------------|
+| #3011 | sukuna | WD sweep (5e-3/2e-2) | NaN ep178 (wd=5e-3) | 0.000666 (wd=2e-2) | 22.661 (wd=5e-3) | wd=1e-2 confirmed optimal; deviations catastrophic |
+| #3010 | piccolo | gc sweep DM | 4.541% (gc=0.5), NaN (gc=2.0) | 0.000598 (replicate) | 22.754 | Natural grad norms ~0.14 — gc adds unnecessary damping |
+| #3008 | stark | AF depth + T_max transfer | 4.219% (near-miss) | 0.000960 (1L) | 23.464 (T_max=50) | 1L below AF floor; T_max=50 doesn't transfer to TF |
+| #3006 | senku | 2L/192d + gc=0.3 + EMA | 5.582% (diverged) | 0.000618 | 23.061 | 2L capacity bottleneck dominates all datasets |
+| #2992 | levi | Flash+compile cross-dataset | 8.465% (diverged) | 0.002291 | OOM | CUDA graphs incompatible with variable mesh; Flash no benefit at 64 tokens |
+| #2972 | bulma | model_slices 48/64/96/128 | 7.93% (slice=48) | 0.000557 (slice=96) | 24.14 (slice=96) | Flat response; slices not a productive lever |
+
+**Key insights from this batch:**
+1. **DM NaN cliff at ~ep178** reproducible across wd=5e-3 (#3011) and gc=2.0 (#3010) — specific instability in loss landscape
+2. **wd=1e-2 is tightly optimal** — 5e-3 and 2e-2 both degrade significantly
+3. **AF depth floor confirmed at 2L** — 1L is 2x worse
+4. **T_max transfer is dataset-specific** — T_max=50 helps AF but hurts TF
+5. **torch.compile(reduce-overhead) is fundamentally incompatible** with variable-size meshes
+
+### Sent Back (2 promising)
+
+| PR | Student | Key Signal | Follow-up |
+|----|---------|-----------|-----------|
+| #3007 | shouko | TF 22.567 at ep326 with 4L/512d (tied with 3L/192d baseline, still descending!) | Retry TF-only with T_max=30, gc=0.5+EMA |
+| #2982 | taki | TFP 0.00573 — first successful TFP training via learned norm | Fix AF eval space, use T_max=300 to avoid restart divergence |
+
 ## 2026-04-22 — PR #3016: sigma-Reparam attention projections — cross-dataset (griffith) — CLOSED
 
 - **Branch:** griffith/wave11-sigma-reparam
