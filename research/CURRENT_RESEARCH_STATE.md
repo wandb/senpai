@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-22 02:00 (Wave 3 + tandemfoil_paper baseline wave + DrivAerML Lion + AirfRANS LR sweep)
+- **Date:** 2026-04-22 (Wave 3 + TF Paper baseline wave + DM Lion + AF LR sweep + cross-dataset spatial/physics budget sweeps)
 - **Branch:** radford
 - **Fleet status:** 60 live students, ALL ASSIGNED (0 idle)
 - **Current relaunch budget:** inherit pod env defaults
@@ -81,6 +81,8 @@ No baseline has been run yet on radford for this dataset.
 - **T_max=5 on DrivAerML** (#2911): all 3 runs diverged — too rapid for 4L/512d scale
 - **EMA alone on DrivAerML** (#2899): 9.749% (worse than 4.619% baseline) — EMA+gc compound now being tested
 - **gc=1.5/gc=2.0 on DrivAerML** (#2881): all 8 runs diverged. gc=1.5 best 6.066% (+31%), gc=2.0 best 8.834% (+91%). CosineAnnealing restarts amplify instability
+- **T_max=10+gc=1.0 on DrivAerML** (#2879 bulma): failed — no sustained improvement over baseline 4.619%
+- **T_max=40/50+gc=1.0+WD=1e-2 on DrivAerML** (#2919 wolfwood): failed — longer cosine cycling did not help; WD+gc compound still unstable
 
 ## Default Assignment Pattern
 
@@ -155,13 +157,34 @@ Paper targets (Experiment 4, Table 6 — MGN best / paper best per task):
 | Student | PR | Experiment |
 |---|---|---|
 | brook | #2878 | gc=1.0+WD=1e-2 (flagship compound, no EMA) |
-| bulma | #2879 | T_max=10+gc=1.0 |
+| ~~bulma~~ | ~~#2879~~ | ~~T_max=10+gc=1.0~~ CLOSED — failed; reassigned to #2972 cross-dataset spatial sweep |
 | canute | #2880 | Full recipe: lr=7e-4+gc=1.0+WD=1e-2 |
 | chopper | #2882 | T_max=15+gc=1.0+WD=1e-2 |
 | einar | #2883 | gc=1.0+T_max=20+WD=1e-2 |
 | yuji | #2922 | WD=5e-3+gc=1.0 moderate, pure gc ablation, WD alone |
 | edward | #2916 | lr=6e-4+gc=1.0+WD=1e-2+T_max=10 |
-| wolfwood | #2919 | T_max=40/50+gc=1.0+WD=1e-2 (longer cycling) |
+| ~~wolfwood~~ | ~~#2919~~ | ~~T_max=40/50+gc=1.0+WD=1e-2 (longer cycling)~~ CLOSED — failed; reassigned to #2973 cross-dataset spatial sweep |
+
+### Theme 10: Cross-Dataset Spatial/Physics Budget Sweeps (NEW — 2026-04-22)
+
+Two systematic sweeps testing the model's sensitivity to physics partition granularity (`model_slices`) and spatial resolution budget (`geometry_supernodes` + `surface_anchor_points`) across all 4 datasets. Neither dimension has ever been swept in the cross-dataset icml2026 format.
+
+| Student | PR | Experiment | Risk |
+|---|---|---|---|
+| bulma | #2972 | **model_slices cross-dataset sweep** — 48/64/96/128 across all 4 datasets; TF best is 64 (baseline 96 default), never tested on AF/DM/TF-paper | LOW-MED |
+| wolfwood | #2973 | **geometry_supernodes + surface_anchor_points budget sweep** — Config A (2048/4000), B default (4096/8000), C (8192/16000) across all 4 datasets | LOW-MED |
+
+**bulma #2972 — model_slices sweep details:**
+- 13 runs total: TF×3 (slices 48/96/128; 64 is current TF best), TF-paper×3, AF×4 (48/64/96/128), DM×3 (48/64/128)
+- Priority: TF+AF first (fast); DM second (slow — min slices=64 and slices=96)
+- Hypothesis: slices=64 TF win may transfer; AF/DM may prefer different granularity
+
+**wolfwood #2973 — spatial resolution budget details:**
+- Config A (half): `--geometry-supernodes 2048 --surface-anchor-points 4000`
+- Config B (baseline): `--geometry-supernodes 4096 --surface-anchor-points 8000`
+- Config C (double): `--geometry-supernodes 8192 --surface-anchor-points 16000`
+- DM Config C: OOM risk — fallback to `--geometry-supernodes 8192 --surface-anchor-points 8000` if needed
+- Hypothesis: current defaults may under-resolve or over-spend spatial budget; doubling may improve surface fidelity
 
 ### Theme 2: DrivAerML LR+gc Exploration
 
@@ -279,9 +302,10 @@ Their old PRs remain in-flight but are now listed under their new assignments in
 1. **Monitor TF Paper baseline wave** (#2947 jin, #2948 guts, #2949 vash) — update BASELINE.md with new section once first results arrive
 2. **Monitor DrivAerML Lion** (#2950 piccolo) — first Lion run on DrivAerML; could be significant
 3. **Monitor AirfRANS LR ceiling** (#2951 stark) — tests whether lr>6e-4 helps AF
-4. Watch Wave 3 results (frieren #2937 rel-L2, kohaku #2941 global context, casca #2946 AGC are highest priority)
-5. Review any WIP PRs that become ready
-6. All new assignments: 4-dataset coverage mandatory per human team directive
-7. If DM recipe transfer (Theme 1) fails universally → escalate to geometry-separated encoding
-8. If Wave 3 bold ideas show promise → double down with follow-up assignments across all 4 datasets
-9. Check for human team messages on GitHub issues (priority — check very frequently)
+4. **Monitor spatial/physics budget sweeps** (#2972 bulma model_slices, #2973 wolfwood supernode/anchor) — first systematic spatial resolution sweep in cross-dataset format
+5. Watch Wave 3 results (frieren #2937 rel-L2, kohaku #2941 global context, casca #2946 AGC are highest priority)
+6. Review any WIP PRs that become ready
+7. All new assignments: 4-dataset coverage mandatory per human team directive
+8. If DM recipe transfer (Theme 1) fails universally → escalate to geometry-separated encoding
+9. If Wave 3 bold ideas show promise → double down with follow-up assignments across all 4 datasets
+10. Check for human team messages on GitHub issues (priority — check very frequently)
