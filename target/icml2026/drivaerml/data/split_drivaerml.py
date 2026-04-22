@@ -40,10 +40,14 @@ def build_manifest(
     volume_manifest_path: str,
     case_root: str,
     case_root_candidates: list[str],
+    *,
+    surface_manifest_read_path: str | None = None,
+    surface_full_manifest_read_path: str | None = None,
+    volume_manifest_read_path: str | None = None,
 ) -> dict:
-    surface_rows = _read_csv_rows(surface_manifest_path)
-    surface_full_rows = _read_csv_rows(surface_full_manifest_path)
-    volume_rows = _read_csv_rows(volume_manifest_path)
+    surface_rows = _read_csv_rows(surface_manifest_read_path or surface_manifest_path)
+    surface_full_rows = _read_csv_rows(surface_full_manifest_read_path or surface_full_manifest_path)
+    volume_rows = _read_csv_rows(volume_manifest_read_path or volume_manifest_path)
 
     surface_splits = {
         split: [row["case_id"] for row in surface_rows if row["split"] == split]
@@ -57,6 +61,19 @@ def build_manifest(
     current_ids = {row["case_id"] for row in surface_rows}
     full_ids = {row["case_id"] for row in surface_full_rows}
     excluded_case_ids = sorted(full_ids - current_ids)
+
+    notes = [
+        "Surface splits come directly from the current preprocessed manifest.csv on the PVC.",
+        "Volume splits come from volume_manifest.csv and are a strict subset of the surface cases.",
+    ]
+    if excluded_case_ids:
+        notes.append(
+            "manifest_full_failed10_included.csv is used to identify cases excluded from the current processed manifest."
+        )
+    else:
+        notes.append(
+            "manifest.csv and manifest_full_failed10_included.csv currently agree on all packaged processed surface cases."
+        )
 
     return {
         "dataset": "DrivAerML",
@@ -72,17 +89,13 @@ def build_manifest(
         "volume_split_counts": {k: len(v) for k, v in volume_splits.items()},
         "excluded_case_ids": excluded_case_ids,
         "excluded_case_count": len(excluded_case_ids),
-        "notes": [
-            "Surface splits come directly from the current preprocessed manifest.csv on the PVC.",
-            "Volume splits come from volume_manifest.csv and are a strict subset of the surface cases.",
-            "manifest_full_failed10_included.csv is used to identify cases excluded from the current processed manifest.",
-        ],
+        "notes": notes,
     }
 
 
 def verify_manifest(manifest: dict) -> None:
     surface_counts = manifest["surface_split_counts"]
-    if surface_counts != {"train": 394, "val": 34, "test": 46}:
+    if surface_counts != {"train": 400, "val": 34, "test": 50}:
         raise ValueError(f"Unexpected DrivAerML surface split counts: {surface_counts}")
 
     ensure_disjoint(manifest["surface_splits"])
@@ -105,8 +118,8 @@ def verify_manifest(manifest: dict) -> None:
                     f"Volume case {case_id} split {split} mismatches surface split {surface_by_case.get(case_id)}"
                 )
 
-    if manifest["excluded_case_count"] != 10:
-        raise ValueError(f"Expected 10 excluded DrivAerML cases, got {manifest['excluded_case_count']}")
+    if manifest["excluded_case_count"] != 0:
+        raise ValueError(f"Expected 0 excluded DrivAerML cases, got {manifest['excluded_case_count']}")
 
 
 def main() -> None:
@@ -125,12 +138,19 @@ def main() -> None:
     args = parser.parse_args()
 
     case_root_candidates = args.case_root_candidate or DEFAULT_CASE_ROOT_CANDIDATES
+    surface_manifest_path = str(args.surface_manifest)
+    surface_full_manifest_path = str(args.surface_manifest_full)
+    volume_manifest_path = str(args.volume_manifest)
+    case_root = str(args.case_root)
     manifest = build_manifest(
-        surface_manifest_path=str(rewrite_under_pvc_mount(args.surface_manifest)),
-        surface_full_manifest_path=str(rewrite_under_pvc_mount(args.surface_manifest_full)),
-        volume_manifest_path=str(rewrite_under_pvc_mount(args.volume_manifest)),
-        case_root=str(rewrite_under_pvc_mount(args.case_root)),
+        surface_manifest_path=surface_manifest_path,
+        surface_full_manifest_path=surface_full_manifest_path,
+        volume_manifest_path=volume_manifest_path,
+        case_root=case_root,
         case_root_candidates=expand_pvc_candidates(case_root_candidates),
+        surface_manifest_read_path=str(rewrite_under_pvc_mount(surface_manifest_path)),
+        surface_full_manifest_read_path=str(rewrite_under_pvc_mount(surface_full_manifest_path)),
+        volume_manifest_read_path=str(rewrite_under_pvc_mount(volume_manifest_path)),
     )
     verify_manifest(manifest)
     write_json(args.out, manifest)
