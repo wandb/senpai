@@ -1,5 +1,21 @@
 # SENPAI Research Results
 
+## 2026-04-22 — PR #3017: GeGLU FFN activation cross-dataset (casca) — CLOSED
+
+- **Branch:** casca/wave11-geglu
+- **Hypothesis:** GeGLU gated activation (xW₁ ⊙ GELU(xV))W₂ improves FFN representational capacity.
+
+| Dataset | Best Val | Baseline | vs Baseline | W&B | Notes |
+|---------|----------|----------|-------------|-----|-------|
+| TandemFoil | 23.265 (ep290) | 22.537 | +3.2% worse | 7u3lumdq | Nearest miss |
+| TandemFoil Paper | NaN | 0.00434 | failed | e7fm7vp7 | Lion+GeGLU NaN from ep1 |
+| AirfRANS | 0.000800 (ep301) | 0.000482 | +66% worse | c04kt42i | Diverged post-peak |
+| DrivAerML | 10.302% (ep49) | 3.997% | +158% worse | b5bfvzy6 | Grad norms 0.7→273+ |
+
+**Result: CLOSED — gated FFN destabilizes training on 3D CFD. Waiting for SwiGLU (#2954) to decide if GLU family is fully closed.**
+
+**casca reassigned to #3055: Lower LR + longer T_max co-sweep (TF/AF/TFP).**
+
 ## 2026-04-22 — PR #3052: TFP data pipeline bug fixes (guts) — MERGED
 
 - **Branch:** guts/tfp-bugfixes

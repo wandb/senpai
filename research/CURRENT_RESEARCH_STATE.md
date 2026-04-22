@@ -123,6 +123,7 @@ DrivAerML gap is closing (3.997% val, 1.08x from 3.71% target). EMA+gc=0.5 is no
 - **DM NaN cliff at ~ep178** (reproducible across #3011 wd=5e-3 and #3010 gc=2.0): specific instability in loss landscape. The champion config (no gc, no WD) stays clear of this cliff.
 - **Head-dimension scaling** (#2990 gojo, CLOSED): 2H/128d (wider) and 8H/32d (narrower) both worse. AF 2H/128d=0.000573 (19% worse vs real anchor 0.000482 — student used stale baseline). DM crashed at both configs. TF 18% worse. Head count 4H is already optimal; head-dim is not a productive lever.
 - **AirfRANS LR above champion** (#3026 usopp, CLOSED): lr=7e-4 (+48.6%), 8e-4 (+46.6%), 9e-4 (+26.2%) all worse than baseline 0.000482. LR optimum at 6e-4 confirmed — do not test higher LRs on AF.
+- **GeGLU FFN activation** (#3017 casca, CLOSED): TF +3.2% (nearest miss), AF +66%, DM +158%, TFP NaN. Gated FFN destabilizes 3D CFD training. Lion+GeGLU incompatibility causes TFP NaN from ep1. DM grad norms escalated 0.7→273+. SwiGLU (#2954) pending — may close entire GLU family.
 
 ## Default Assignment Pattern
 
