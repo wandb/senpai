@@ -1,8 +1,11 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-22 (last polled — Wave 3 + TF Paper baseline wave + DM Lion + AF LR sweep + cross-dataset spatial/physics budget sweeps + Wave 4 cross-dataset code/arch innovations + Wave 5 cross-dataset code/arch innovations + Wave 6 per-step SGDR / coord noise / T_max sweep + Wave 7 attention architecture innovations + usopp #2994 hypernetwork + Wave 8 spike #2995 attention dropout + Wave 9 brook #2999 LayerScale + zenitsu #3000 Spectral Norm + Wave 10 #3001–#3013 (13 new PRs) + Wave 11: griffith sigma-Reparam + casca GeGLU — CLOSED: griffith #2968 Spectral Norm attn, casca #2962 AGC, usopp #3012 AdamW lr ablation (cross-dataset, all worse), mugen #2980 PCGrad Gradient Surgery (torch.compile incompatible) — Wave 12: einar #3021 LayerScale residuals + wolfwood #3022 attn dropout + emma #3023 SDF wall-distance + shoya #3024 LLRD + haku #3025 TFP Lion champion config + usopp #3026 AirfRANS lr fine-tune sweep — Wave 13: mugen #3027 DrivAerML surface-points sweep + jet #3028 AdamW β1/β2 sweep — Wave 14: megumi #3029 best-checkpoint saving cross-dataset — Wave 15: violet #3030 Relative L2 training loss (TF+DM, two variants) — Wave 16: alphonse #3031 Pre-LN + fern #3032 RMSNorm + hinata #3033 linear warmup + kakashi #3034 gradient centralization + tanjiro #3035 SGDR T_mult=2 (thorfinn #3036 AdaFactor never launched — re-assigned as Wave 17 #3041) — Wave 17: faye #3038 surface-normals-curvature + kohaku #3039 mass-conservation-aux-loss + chihiro #3040 moe-ffn-layers + thorfinn #3041 adafactor-optimizer — Wave 18: emma #3042 SAM-optimizer-cross-dataset — CLOSED: megumi #3009 Lion lr sweep cross-dataset, confirmed Lion dead end across all datasets/LRs; violet #2955 Stochastic Depth/DropPath all datasets negative — confirmed dead end)
+- **Date:** 2026-04-22 (benchmark-contract refresh applied; use this top section plus live GitHub state for prioritization, not older wave counts below)
 - **Branch:** radford
-- **Fleet status:** 72 WIP PRs — Wave 18 NEW: emma #3042 SAM-optimizer-cross-dataset — Wave 17 NEW: faye #3038 surface-normals-curvature, kohaku #3039 mass-conservation-aux-loss, chihiro #3040 moe-ffn-layers, thorfinn #3041 adafactor-optimizer (re-assignment of stale Wave 16 #3036) — Wave 16: alphonse #3031 Pre-LN normalization, fern #3032 RMSNorm, hinata #3033 linear warmup, kakashi #3034 gradient centralization, tanjiro #3035 SGDR T_mult=2 — violet #3030 Relative L2 training loss TF+DM (Wave 15) — megumi #3029 best-checkpoint-save cross-dataset (Wave 14) — mugen #3027 DrivAerML surface-points sweep (Wave 13) + jet #3028 AdamW β1/β2 sweep (Wave 13) — Wave 12 NEW: haku #3025 TFP Lion+gc=0.5+EMA champion config, usopp #3026 AirfRANS lr sweep (7e-4/8e-4/9e-4) — Wave 12: einar #3021 LayerScale residuals cross-dataset, wolfwood #3022 attn dropout cross-dataset, emma #3023 SDF wall-distance feature cross-dataset, shoya #3024 LLRD cross-dataset — Wave 11: griffith #3016 sigma-Reparam, casca #3017 GeGLU — Wave 7: chrome #2988 MQA, faye #2989 GQA, gojo #2990 head-dim scaling, himmel #2991 SWA, levi #2992 Flash+compile, shoya #2993 sparse top-k; usopp #2994 hypernetwork; Wave 8: spike #2995 attention dropout; Wave 9: brook #2999 LayerScale on Transolver residuals (cross-dataset TF/TFP/AF/DM); Wave 10: canute #3001 slice temp sweep, franky #3002 Fourier freq bands, norman #3003 channel dropout, sanji #3004 long cosine, robin #3005 2L+EMA+gc=0.5, senku #3006 2L+EMA+gc=0.3, shouko #3007 4L+T_max=10, stark #3008 AF depth+T_max, piccolo #3010 DM gc sweep, sukuna #3011 WD sweep, shoya #3013 Fourier ablation. MERGED: zenitsu #2997 Kutta TE v2 (cross-dataset), brook #2998 AF normalization 3-way, haku #2979 TFP first baseline (0.00434). PRs CLOSED: #2968 (griffith, Spectral Norm attn), #2962 (casca, AGC), #2981 (spike, QK attention temp), #2977 (zenitsu, learnable per-head attn temperature), #2996 (brook, MQA draft — superseded), #3012 (usopp, AdamW lr ablation — all worse than baselines), #2980 (mugen, PCGrad — torch.compile incompatible → 75× worse on AF), #3009 (megumi, Lion lr sweep — CONFIRMED DEAD END, catastrophic AF/DM instability at all LRs). NOTE: zenitsu #2983 RoPE dead end was closed. griffith #2889 (3L/512d+gc=1.0 DM) STILL IN FLIGHT.
+- **Fleet status:** GitHub currently shows **69 open PRs**, with **15 open PRs** in the newest `#3021-#3042` family.
+  - **merged:** `#3025` (TFP Lion champion transfer), `#3036` (AdaFactor cross-dataset)
+  - **closed negative / no longer active:** `#3021`, `#3023`, `#3026`, `#3042`
+  - **critical open PRs:** `#3029` (best-checkpoint save/eval), `#3027` (DrivAerML surface-points), `#3028` (AdamW beta sweep), `#3030` (relative-L2 objective), `#3031-#3035`, `#3038-#3041`
 - **Current relaunch budget:** inherit pod env defaults
   - `SENPAI_TIMEOUT_MINUTES=360`
   - `SENPAI_MAX_EPOCHS=999`
@@ -27,14 +30,36 @@ All four benchmarks are now active and required:
 - Single-dataset assignments are only acceptable for dataset-specific ablations (e.g. DrivAerML batch size), TandemFoil Paper baseline runs, or targeted best-checkpoint recovery.
 - When in doubt: assign cross-dataset. An idea that only helps one dataset is a dataset hack.
 
+## BENCHMARK REPORTING RULES (MANDATORY)
+
+- **TandemFoil parity target**
+  - Report `surface_pressure_mae` on the public `kagent` v2 split family.
+  - Do **not** compare this metric directly against the original TandemFoilSet paper Table 6 `field_mse`.
+
+- **TandemFoil Paper**
+  - For literature-facing claims, report `field_mse` only.
+  - `surface_mse` and `volume_mse` are diagnostics, not the paper comparison scalar.
+
+- **AirfRANS**
+  - Paper-facing claims must report the official full-task pair:
+    - `Surf MSE`
+    - `Vol MSE`
+  - A surface-only number is an auxiliary headline, not a full benchmark win.
+  - If training uses any extra target transform, paper-facing evaluation must decode back to raw target space and then rescore with the official AirfRANS normalization only.
+
+- **DrivAerML**
+  - Paper-facing claims must report `surface_rel_l2_pct` on the repaired public `400 / 34 / 50` split.
+  - Treat this as a **surface-pressure comparison only**; do not claim a full multi-field benchmark win yet.
+  - Full evaluation is mandatory for paper-facing runs; do not cite truncated `--max-eval-batches` results as benchmark numbers.
+
 ## Paper-Facing Snapshot
 
 | Dataset | Paper-facing metric | Current best | Target / reference | Status |
 |---|---|---|---|---|
-| TandemFoil | `test_primary/surface_pressure_mae` | **33.88** (#2810) | no external scalar | STALE — val now 22.537; test from #2924 needed |
-| TandemFoil Paper | `test_primary/field_mse` | **baseline established** (#2979 haku — 0.00434 val) | `0.10 / 0.18 / 0.36 / 0.13 / 0.14 / 0.21` by task | IN PROGRESS — multiple runs underway |
-| AirfRANS | `test_primary/surface_mse` | **0.003** (#2824) | `0.0043` | **BEATEN** — val now 0.000482; test from #2951 needed |
-| DrivAerML | `test_primary/surface_rel_l2_pct` | **6.24%** (#2691) | `3.71%` | **CLOSING GAP** — val now 3.997% (1.08x) |
+| TandemFoil | `test_primary/surface_pressure_mae` | **24.581** (run `nrn0q3ct`, latest finished EMA lane) | no external scalar on this contract | strong internal anchor; no longer the blocker |
+| TandemFoil Paper | `test_primary/field_mse` | **no clean paper-facing test row yet** | `0.10 / 0.18 / 0.36 / 0.13 / 0.14 / 0.21` by task | strong internal val, but paper-facing test/provenance still need cleanup |
+| AirfRANS | official full-task `Surf MSE / Vol MSE` pair | **`0.003 / 0.00764`** (#2824 best lane) | **`0.0043 / 0.0017`** (SpiderSolver) | surface beats target; full benchmark pair still not closed |
+| DrivAerML | `test_primary/surface_rel_l2_pct` | **6.244%** (`qx7z7if3`) | `3.71%`–`3.82%` | main paper-facing gap remains |
 
 ## Steering Anchors (validation, for experiment decisions)
 
@@ -56,25 +81,37 @@ The AF transient min (0.000371) represents a genuinely deeper basin that we have
 
 ## Main Scientific Goal
 
-A shared recipe whose core changes work across all four benchmarks:
+A shared recipe whose core changes work across all four benchmarks, but with the
+remaining closure work prioritized correctly:
 
-- the main TandemFoil parity target
-- the new TandemFoil paper-calibration target (Experiment 4, Table 6)
-- AirfRANS
-- DrivAerML
+- **TandemFoil parity**
+  - treat as the strong internal anchor
+  - avoid broad new Tandem-only exploration unless it directly supports cross-dataset transfer
+- **TandemFoil Paper**
+  - prioritize a clean `test_primary/field_mse` story and per-task provenance
+  - do not confuse strong validation with a paper-ready benchmark result
+- **AirfRANS**
+  - prioritize best-checkpoint evaluation and `Vol MSE` closure
+  - stop treating surface-only progress as sufficient for benchmark closure
+- **DrivAerML**
+  - this remains the main empirical gap
+  - prioritize objective/sampling/stability work that has a plausible chance to improve **test**, not just validation
+- **Queue hygiene**
+  - close stale novelty breadth when it does not directly support one of the three unresolved items above
 
-DrivAerML gap is closing (3.997% val, 1.08x from 3.71% target). EMA+gc=0.5 is now the shared TF recipe. TFP baseline established at 0.00434 val (haku #2979). AF anchor 0.000482 from T_max=50 extended training. Best-checkpoint saving (megumi #3029) is the critical pending code change that may unlock transient AF=0.000371.
+In short:
+the advisor should now optimize for **benchmark-faithful closure**, not just more frontier breadth.
 
 ## Mandatory Config Rules (UPDATED per issue #3020 + EMA merge)
 
 - **TF:** Lion lr=1.25e-4, T_max=10, gc=0.5, WD=1e-2, `--ema-decay 0.999`, 3L/192d
-- **TFP:** AdamW lr=5e-4, T_max=150, gc=1.0, WD=1e-2, no-EMA, 3L/192d (per #2979 baseline)
-- **AF:** AdamW lr=6e-4, T_max=50, gc=1.0, WD=1e-2, no-EMA, 2L/256d (per #2951 baseline)
+- **TFP:** Lion lr=1.25e-4, T_max=10, gc=0.5, WD=1e-2, `--ema-decay 0.999`, 3L/192d (current steering champion from `#3025`)
+- **AF:** AdamW lr=6e-4, T_max=50, gc=1.0, WD=1e-2, no-EMA, 2L/256d (per `#2951` steering anchor)
 - **DM:** AdamW lr=5e-4, T_max=30, **NO gc, NO WD**, no-EMA, 4L/512d (per #2898 baseline — champion reproduce command has NO --grad-clip, NO --weight-decay)
 - `--epochs 999` mandatory
 - DrivAerML: `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394`
 - **Paper-facing DM runs: DO NOT use --max-eval-batches** (human directive #3020). Truncated eval is only acceptable for fast iteration, NOT for benchmark submissions.
-- **Best-checkpoint test eval is mandatory** for paper-facing runs (report: best val epoch, final test, best-ckpt test, truncated vs full eval)
+- **Best-checkpoint test eval is mandatory** for paper-facing AF / DM / TFP runs (report: best val epoch, final test, best-ckpt test, truncated vs full eval)
 - **DM val/test gap WARNING:** val=3.997% but test≈5.93% — checkpoint selection and full eval are the bottleneck
 
 ## Critical Code Change Needed: Best-Checkpoint Saving
@@ -142,29 +179,11 @@ comparability, always include:
 - `target/icml2026/tandemfoil/`
 - `target/icml2026/tandemfoil_paper/`
 
-## ACTIVE EXPERIMENTS — 72 WIP PRs (updated 2026-04-22 after Wave 18: emma #3042 SAM optimizer cross-dataset)
+## ACTIVE EXPERIMENTS — 69 open PRs on GitHub (benchmark-contract refresh applied 2026-04-22 17:45 IST)
 
-### Theme 25: Wave 18 — Sharpness-Aware Minimization (SAM) Optimizer Cross-Dataset (NEW — 2026-04-22)
+### Theme 25: CLOSED — SAM optimizer cross-dataset
 
-**Scientific rationale:** SAM (Foret et al. ICLR 2021) finds flat minima in the loss landscape by performing a two-step update: first perturb weights to the local worst-case direction (ε = rho * g / ||g||), then compute gradients at the perturbed point and take the actual update step, restoring original weights. Flat minima correlate strongly with better generalization — particularly OOD generalization. CFD surrogates have large distribution shifts between in-distribution (Re, AoA) and OOD splits. SAM costs ~2× compute per step (two forward+backward passes), but on 96 GB VRAM GPUs with our small batch sizes the wall-clock overhead is acceptable. Prior negative result #2904 (MSAM / Momentum-SAM) does NOT apply here — MSAM had catastrophic 3.7–22.7× regressions, but MSAM is a different variant that reuses gradients across steps (cheaper but fundamentally different). This PR tests the original SAM formulation with a bespoke wrapper class and tests two perturbation radii (rho=0.05 / rho=0.1) to find the optimal regularization strength.
-
-**Note on MSAM vs SAM:** MSAM (#2904) failure was due to stale gradient approximation, not SAM itself. Classic SAM with proper two-step (fresh gradients at perturbed point) has not been tested.
-
-| Student | Branch | PR | Hypothesis | Runs |
-|---|---|---|---|---|
-| emma | `emma/sam-optimizer-cross-dataset` | #3042 | **SAM optimizer** — SAM(Lion) for TF (rho=0.05/0.1), SAM(AdamW) for AF/DM/TFP (rho=0.05/0.1); training loop: clip→first_step→second forward+backward→clip→second_step | 7 runs: TF×2 + AF×2 + DM×2 + TFP×1 (optional) |
-
-**Baselines to beat (all 4 datasets):**
-- TF: `val_primary/surface_pressure_mae` = **22.537** (#2924)
-- TFP: `val_primary/field_mse` = **0.00434** (#2979/haku baseline)
-- AF: `val_primary/surface_mse` = **0.000482** (#2951)
-- DM: `val_primary/surface_rel_l2_pct` = **3.997%** (#2898)
-
-**CLI flags needed:** `--optimizer sam_lion`/`--optimizer sam_adamw`, `--sam-rho 0.05` (or 0.1)
-
-**W&B group:** `sam_cross_dataset`
-
-**Key risk:** 2× compute budget means fewer epochs in same wall-clock time. Monitor early epoch counts vs baseline to ensure convergence is not cut short by timeout.
+`#3042` is already closed negative and should be treated as a do-not-repeat result, not an active lane.
 
 ### Theme 24: Wave 17 — Geometry Features, Physics Constraints, Architecture Capacity, Optimizer Alternatives (NEW — 2026-04-22)
 
@@ -175,12 +194,12 @@ comparability, always include:
 | faye | `faye/surface-normals-curvature` | #3038 | **Surface normals + principal curvature** — PCA-based normal estimation (k=16 NN) + trimesh discrete principal curvatures (arcsinh-scaled); zero-init extra weight columns in first linear; GPU split: DM=4, TF=2, TFP=1, AF=1 | `--surface-normals --surface-curvature` |
 | kohaku | `kohaku/mass-conservation-aux-loss` | #3039 | **Mass conservation auxiliary loss** — divergence via KNN k=8 Green-Gauss FD; `div_loss = (div_per_point^2).mean()`; applied only to velocity outputs; `total_loss = data_loss + 0.01 * div_loss`; GPU split: DM=4, TFP=2, AF=2 | `--div-loss-weight 0.01` |
 | chihiro | `chihiro/moe-ffn-layers` | #3040 | **Sparse MoE FFN in last Transolver blocks** — 8 experts, top-2 routing, load-balance loss; apply to last 1 block only; GPU split: DM=4, TF=2, TFP=1, AF=1 | `--moe-layers 1 --moe-n-experts 8 --moe-load-balance-weight 0.01` |
-| thorfinn | `thorfinn/adafactor-optimizer` | #3041 | **AdaFactor optimizer** — factored second-moment (Shazeer & Stern 2018); fixed-LR mode (`scale_parameter=False`, `relative_step=False`); re-assignment of Wave 16 PR #3036 which never launched; GPU split: DM=4, TF=2, TFP=1, AF=1 | `--optimizer adafactor` |
+| thorfinn | `thorfinn/adafactor-optimizer` | #3041 | **AdaFactor optimizer follow-up** — additional AdaFactor coverage after the earlier cross-dataset AdaFactor PR `#3036` already merged; GPU split: DM=4, TF=2, TFP=1, AF=1 | `--optimizer adafactor` |
 
 **Baselines to beat (all 4 datasets):**
 - TF: `val_primary/surface_pressure_mae` = **22.537** (#2924)
-- TFP: `val_primary/field_mse` = **0.00434** (#2979/haku baseline)
-- AF: `val_primary/surface_mse` = **0.000340** (#2898)
+- TFP: `val_primary/field_mse` = **0.002383** (#3025)
+- AF: `val_primary/surface_mse` = **0.000482** (#2951)
 - DM: `val_primary/surface_rel_l2_pct` = **3.997%** (#2898)
 
 **Per-dataset mandatory config (students must follow exactly):**
@@ -189,7 +208,7 @@ comparability, always include:
 - AF: AdamW, `--no-use-ema`, `--cosine-t-max 50`, `--grad-clip 1.0`, `--weight-decay 1e-2`
 - DM: AdamW, `--no-use-ema`, `--cosine-t-max 30`, `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`; requires `SENPAI_MAX_EPOCHS=9999`
 
-**Note on Wave 16 thorfinn #3036:** This PR was originally assigned in Wave 16 but never launched (no commits, no pod activity). The hypothesis has been re-assigned to thorfinn as Wave 17 PR #3041 with the same AdaFactor hypothesis. #3036 can be considered superseded/stale.
+**Note on AdaFactor:** `#3036` already merged on `2026-04-22`. `#3041` should therefore be treated as a follow-up / extension lane, not as the first launch of the hypothesis.
 
 ### Theme 23: Wave 16 — Normalization, Warmup, and Optimizer Foundations (NEW — 2026-04-22)
 
@@ -202,12 +221,12 @@ comparability, always include:
 | hinata | `hinata/linear-warmup-scheduler` | #3033 | **Linear warmup + cosine** — 10-epoch linear ramp to peak LR, then CosineAnnealing; prevents cold-start instability in first epochs | `--warmup-epochs 10` |
 | kakashi | `kakashi/gradient-centralization` | #3034 | **Gradient centralization** — subtract per-tensor gradient mean before optimizer step; smooths loss landscape, acts as implicit weight regularizer | `--grad-centralization` |
 | tanjiro | `tanjiro/sgdr-tmult-best-checkpoint` | #3035 | **SGDR T_mult=2** — CosineAnnealingWarmRestarts with doubling restart intervals; uses best-checkpoint saving (megumi #3029) to capture transient minima at each restart | `--cosine-t-mult 2` |
-| ~~thorfinn~~ | ~~`thorfinn/adafactor-optimizer`~~ | ~~#3036~~ | ~~**AdaFactor optimizer** — factored second-moment estimation (Shazeer & Stern 2018); memory-efficient alternative to AdamW; run with fixed LR mode~~ (**NEVER LAUNCHED — superseded by Wave 17 PR #3041**) | ~~`--optimizer adafactor`~~ |
+| ~~thorfinn~~ | ~~`thorfinn/adafactor-optimizer`~~ | ~~#3036~~ | ~~**AdaFactor optimizer** — factored second-moment estimation (Shazeer & Stern 2018); memory-efficient alternative to AdamW; run with fixed LR mode~~ (**MERGED on 2026-04-22; now superseded only as an older AdaFactor lane, not as a never-launched one**) | ~~`--optimizer adafactor`~~ |
 
 **Baselines to beat (all 4 datasets):**
 - TF: `val_primary/surface_pressure_mae` = **22.537** (#2924)
-- TFP: `val_primary/field_mse` = **0.00434** (#2979/haku baseline)
-- AF: `val_primary/surface_mse` = **0.000340** (#2898)
+- TFP: `val_primary/field_mse` = **0.002383** (#3025)
+- AF: `val_primary/surface_mse` = **0.000482** (#2951)
 - DM: `val_primary/surface_rel_l2_pct` = **3.997%** (#2898)
 
 **Per-dataset mandatory config (students must follow exactly):**
@@ -558,7 +577,7 @@ Their old PRs remain in-flight but are now listed under their new assignments in
 2. **DrivAerML is fragile to compounds:** gc+WD+cosine crashes (6/8 #2908), 640d crashes (#2917), T_max=5 crashes (#2911). Only gentle perturbations survive at 4L/512d.
 3. **Width scaling ceiling at 512d for DM:** 640d is unstable. guts #2890 (768d) and himmel #2891 (5L/512d) will clarify the boundary.
 4. **AB-UPT** achieves 3.71% via geometry-separated encoding — escalation if EMA+recipe fails.
-5. **TandemFoil Paper baseline urgently needed:** This dataset has never been run on radford. We need a val anchor before we can evaluate any experiment improvements against the paper's Table 6 numbers.
+5. **TandemFoil Paper has a strong steering anchor now, but still needs a clean test/provenance story:** `#3025` established `val_primary/field_mse = 0.002383`, yet the literature-facing task still requires a trustworthy `test_primary/field_mse` row and per-task Table 6 comparison.
 
 ## Current Research Themes and Priorities
 
@@ -567,40 +586,46 @@ Their old PRs remain in-flight but are now listed under their new assignments in
 - **TandemFoil Paper is now a required 4th benchmark.** All future assignments must include it.
 - **Measurement gate:** An experiment is a win only if it does not cause regression on any of the 4 datasets (or shows a cross-dataset improvement).
 
-### Priority 1: TandemFoil Paper Baseline (IN PROGRESS)
-- **THREE simultaneous baseline runs launched (#2947 jin, #2948 guts, #2949 vash).** Racing to establish a val anchor on `val_primary/field_mse`.
-- jin (#2947) sweeps Lion LR; guts (#2948) ablates physics flags; vash (#2949) sweeps architecture depth/width.
-- Paper targets (Table 6 MGN + PRE-RES-FREE+RES-COMB): 0.10/0.18/0.36/0.13/0.14/0.21 per task.
-- Once the first result arrives, update BASELINE.md with the new `tandemfoil_paper` section.
-- Metric: normalized full-field MSE (`val_primary/field_mse`).
+### Priority 1: Best-Checkpoint Closure And Benchmark-Faithful Evaluation
+- **Land `#3029`** and make best-checkpoint test evaluation mandatory for AirfRANS, DrivAerML, and TandemFoil Paper paper-facing runs.
+- AirfRANS still has a real uncaptured transient minimum (`0.000371` val) that may matter once best-checkpoint evaluation is in place.
+- Benchmark-facing reports must use the corrected contracts from the top of this file, not the older surface-only shorthand.
 
-### Priority 2: DrivAerML Gap Closure (4.619% → 3.71%)
-- **Loss alignment** (frieren #2928): Most direct fix — training on relative L2 directly matches the evaluation metric
-- **Architectural upgrades** (nezuko #2929 SwiGLU, kohaku #2932 global context): Address known Transolver limitations
-- **Regularization** (violet #2930 DropPath): New orthogonal regularization dimension
-- **Physics-informed features** (emma #2933 curvature, mitsuha #2936 SDF): Give model explicit geometric knowledge it currently must learn implicitly
+### Priority 2: DrivAerML Test Closure
+- The main empirical gap is still DrivAerML test: `6.244%` vs the published `3.71%`–`3.82%` band.
+- Highest-EV open lanes are:
+  - `#3027` surface-points sweep
+  - `#3028` AdamW beta sweep
+  - `#3030` relative-L2 objective
+- New DrivAerML work should be favored only when it has a plausible path to improving **test**, not just validation.
 
-### Priority 3: Cross-Benchmark Recipe Validation
-- Wave 3 experiments should test across all 4 benchmarks by default
-- TandemFoil Paper benchmark provides calibration against published numbers
-- Ideas that help DM but hurt TF/AF are dataset hacks; we want shared wins across all 4
+### Priority 3: AirfRANS Full-Benchmark Closure
+- AirfRANS is not "done" just because surface is strong.
+- The key remaining work is:
+  - best-checkpoint evaluation
+  - `Vol MSE` closure
+  - provenance cleanup for the final paper table
+- Deprioritize new AirfRANS surface-only breadth unless it directly addresses one of those items.
 
-### Priority 4: Optimization Paradigm Shift
-- Prodigy (gilbert #2931): If the LR search is truly exhausted, adaptive optimizers may find new trajectories
-- MoE (shoya #2935): Sparse expert specialization is fundamentally different from dense FFN
-- Conservation loss (chihiro #2934): Physics constraints as regularization
+### Priority 4: TandemFoil Paper Provenance And Test Story
+- `#3025` established a strong steering anchor at `val_primary/field_mse = 0.002383`.
+- The remaining job is a clean literature-facing `test_primary/field_mse` row and a per-task comparison table against Experiment 4 / Table 6.
+- Do not overclaim on the basis of validation alone.
+
+### Priority 5: Queue Hygiene
+- Close stale novelty lanes when they do not clearly support:
+  - DrivAerML test closure
+  - AirfRANS full-pair closure
+  - TandemFoil Paper benchmark provenance
+- The project now needs sharper concentration, not more breadth for its own sake.
 
 ## Next Priorities
 
-1. **Monitor Wave 16** (alphonse #3031 Pre-LN, fern #3032 RMSNorm, hinata #3033 linear warmup, kakashi #3034 gradient centralization, tanjiro #3035 SGDR T_mult=2, thorfinn #3036 AdaFactor) — six new cross-dataset hypotheses targeting normalization placement, normalization variant, warmup, gradient processing, restart schedule shape, and memory-efficient optimization. All 4 benchmarks mandatory per PR.
-2. **Monitor Wave 15** (violet #3030 Relative L2 loss — TF+DM) — if rel_l2 or mixed loss beats DM baseline (3.997%), this is a signal to try relative loss formulations on AF and TFP as well.
-3. **Monitor Wave 14** (megumi #3029 best-checkpoint saving) — critical enabler for tanjiro #3035 SGDR T_mult=2; once merged, tanjiro can properly exploit restart transient minima.
-4. **Monitor Wave 12** (einar #3021 LayerScale, wolfwood #3022 attn dropout, emma #3023 SDF wall-distance, shoya #3024 LLRD) — four new cross-dataset hypotheses targeting residual scaling, attention regularization, physics features, and LR scheduling.
-5. **Monitor Wave 11** (griffith #3016 sigma-Reparam, casca #3017 GeGLU) — two new cross-dataset hypotheses, directly motivated by Wave 9/10 closure analysis.
-6. **Monitor Wave 10** (#3001–#3013, 13 PRs) — broad coverage sweep: slice temp, Fourier bands, channel dropout, long cosine, 2L+EMA variants, 4L+T_max=10, AF depth, Lion/AdamW lr sweeps, WD sweep, DM gc sweep, Fourier ablation. All cross-dataset.
-7. **Monitor Wave 9** (#2999 brook LayerScale) — lowest-risk stability hypothesis, fully cross-dataset.
-8. Watch Wave 3 v3 results (#2953-2962: Relative L2, SwiGLU, DropPath, Prodigy, Global Context, Curvature, Conservation Loss, MoE, SDF, AGC)
-9. Watch Wave 6–8 hypotheses (#2985-#2995: per-step SGDR, coord noise, T_max sweep, MQA/GQA/head-dim/SWA/Flash+compile/sparse top-k, hypernetwork, attn dropout)
-10. All new assignments: 4-dataset coverage mandatory per human team directive
-11. If DM recipe transfer (Theme 1) fails universally → escalate to geometry-separated encoding
-12. Check for human team messages on GitHub issues (priority — check very frequently)
+1. **Land `#3029`** and switch all paper-facing AF / DM / TFP reporting to best-checkpoint test evaluation.
+2. **Prioritize DrivAerML test-improving lanes**: `#3027`, `#3028`, `#3030`.
+3. **Prioritize AirfRANS full-benchmark closure**, not more surface-only wins: best-checkpoint evaluation plus `Vol MSE`.
+4. **Convert TFP from strong validation to a clean test/provenance story** using the `field_mse` contract only.
+5. **Review open breadth-heavy novelty PRs** (`#3031-#3035`, `#3038-#3041`, plus older open waves) against the three closure goals above and close the ones that are not clearly helping.
+6. **Treat closed lanes as closed**: do not keep monitoring `#3021`, `#3023`, `#3026`, `#3042`, or already-merged `#3036` as if they were still active.
+7. **All new assignments**: 4-dataset coverage remains mandatory unless the run is explicitly a benchmark-specific recovery lane.
+8. **Check for human team messages on GitHub issues very frequently.**
