@@ -102,6 +102,7 @@ class TrainConfig:
     residual_prediction: bool = False
     re_stratified_sampling: bool = False
     cosine_t_max: int = 150
+    use_one_cycle: bool = False
     geometry_points: int = 25_000
     geometry_supernodes: int = 4_096
     surface_anchor_points: int = 8_000
@@ -1252,8 +1253,15 @@ def main() -> None:
         params.extend(list(anp_head.parameters()))
     optimizer = build_optimizer(params, config)
     scheduler = None
-    if config.cosine_t_max > 0:
-        base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
+    base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
+    if config.use_one_cycle:
+        batches_per_epoch = len(train_loader) if config.max_train_batches <= 0 else min(len(train_loader), config.max_train_batches)
+        total_steps = config.epochs * batches_per_epoch
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            base_optimizer, max_lr=config.lr, total_steps=total_steps,
+            pct_start=0.1, anneal_strategy='cos',
+        )
+    elif config.cosine_t_max > 0:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
 
     ema = EMA(model, decay=config.ema_decay, start_step=config.ema_start_step) if config.use_ema else None
