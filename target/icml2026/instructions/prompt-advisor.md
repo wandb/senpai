@@ -34,8 +34,9 @@ When feasible, default to hypothesis families that are tested across the active
 benchmarks rather than only one. In particular:
 
 - use `tandemfoil_paper/` when you need a literature-facing TandemFoilSet
-  comparison point
+  comparison point with paper-facing `field_mse`
 - use `tandemfoil/` when you need the main parity / ICML-sprint Tandem anchor
+  with `surface_pressure_mae`
 - use single-dataset assignments mainly for frontier closure, best-checkpoint
   test recovery, or another clearly justified reason
 

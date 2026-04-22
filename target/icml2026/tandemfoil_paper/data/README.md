@@ -60,3 +60,25 @@ dual-foil preprocessing as `tandemfoil/`. The difference is the split contract
 and the metric contract: this benchmark evaluates normalized full-field MSE,
 matching the paper’s Experiment 4 reporting style.
 
+## Metric Contract
+
+Paper-facing comparison metric:
+
+- `field_mse`
+  - full-field MSE over all valid nodes and all three output channels
+    `[Ux, Uy, p]`
+  - computed in the paper’s raw train-stat z-score space
+
+Auxiliary diagnostics:
+
+- `surface_mse`
+- `volume_mse`
+
+These diagnostics are useful for mechanism analysis, but they are **not** the
+Table 6 comparison scalar.
+
+Repo evaluation rule:
+
+- if training uses an optional target transform such as `--asinh-pressure`, the
+  evaluator still decodes predictions back to raw target space before
+  recomputing `field_mse` with the task-local training-set mean/std
