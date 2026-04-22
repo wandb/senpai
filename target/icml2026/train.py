@@ -155,6 +155,7 @@ class TrainConfig:
     anp_srf: bool = False
     asinh_pressure: bool = False
     asinh_scale: float = 0.75
+    feature_norm: str = "none"
     residual_prediction: bool = False
     re_stratified_sampling: bool = False
     cosine_t_max: int = 150
@@ -189,6 +190,14 @@ class TandemPreparedBatch:
     aft_surface_mask: torch.Tensor
 
 
+def log1p_signed(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    return torch.log1p(torch.abs(x) + eps) * torch.sign(x)
+
+
+def log1p_signed_inverse(y: torch.Tensor) -> torch.Tensor:
+    return torch.expm1(torch.abs(y)) * torch.sign(y)
+
+
 class TargetTransform:
     def __init__(
         self,
@@ -198,16 +207,22 @@ class TargetTransform:
         stats_std: torch.Tensor | None,
         asinh_pressure: bool = False,
         asinh_scale: float = 1.0,
+        feature_norm: str = "none",
     ):
         self.pressure_index = pressure_index
         self.stats_mean = stats_mean
         self.stats_std = stats_std
         self.asinh_pressure = asinh_pressure
         self.asinh_scale = asinh_scale
+        self.feature_norm = feature_norm
 
     def apply(self, y: torch.Tensor) -> torch.Tensor:
         out = y.clone()
-        if self.asinh_pressure and self.pressure_index is not None:
+        if self.feature_norm == "log1p" and self.pressure_index is not None:
+            out[..., self.pressure_index] = log1p_signed(out[..., self.pressure_index])
+        elif self.feature_norm == "log1p-all":
+            out = log1p_signed(out)
+        elif self.asinh_pressure and self.pressure_index is not None:
             out[..., self.pressure_index] = torch.asinh(out[..., self.pressure_index] * self.asinh_scale)
         if self.stats_mean is not None and self.stats_std is not None and self.stats_mean.numel() == out.shape[-1]:
             out = (out - self.stats_mean.to(out.device)) / self.stats_std.to(out.device).clamp(min=1e-6)
@@ -217,7 +232,11 @@ class TargetTransform:
         out = y.clone()
         if self.stats_mean is not None and self.stats_std is not None and self.stats_mean.numel() == out.shape[-1]:
             out = out * self.stats_std.to(out.device) + self.stats_mean.to(out.device)
-        if self.asinh_pressure and self.pressure_index is not None:
+        if self.feature_norm == "log1p" and self.pressure_index is not None:
+            out[..., self.pressure_index] = log1p_signed_inverse(out[..., self.pressure_index])
+        elif self.feature_norm == "log1p-all":
+            out = log1p_signed_inverse(out)
+        elif self.asinh_pressure and self.pressure_index is not None:
             out[..., self.pressure_index] = torch.sinh(out[..., self.pressure_index]) / max(self.asinh_scale, 1e-6)
         return out
 
@@ -294,7 +313,10 @@ class TandemTargetTransform:
         raw_gap = full_x_raw[:, :, 22].mean(dim=1)
         is_tandem = full_x_raw[:, 0, 22].abs() > 0.01
 
-        x = (full_x_raw - self.x_mean.to(full_x_raw.device)) / self.x_std.to(full_x_raw.device).clamp(min=1e-6)
+        x_for_norm = full_x_raw
+        if self.config.feature_norm == "log1p-all":
+            x_for_norm = log1p_signed(full_x_raw)
+        x = (x_for_norm - self.x_mean.to(full_x_raw.device)) / self.x_std.to(full_x_raw.device).clamp(min=1e-6)
         raw_dsdf = full_x_raw[..., 2:10]
         dist_feat = torch.log1p(raw_dsdf.abs().min(dim=-1, keepdim=True).values * 10.0)
         curv = x[..., 2:6].norm(dim=-1, keepdim=True) * full_is_surface.float().unsqueeze(-1)
@@ -343,7 +365,13 @@ class TandemTargetTransform:
 
         umag, q = self._umag_q(full_y_raw, full_mask)
         y_phys = self._phys_norm(full_y_raw, umag, q)
-        if self.config.asinh_pressure:
+        if self.config.feature_norm in ("log1p", "log1p-all"):
+            y_phys = y_phys.clone()
+            if self.config.feature_norm == "log1p":
+                y_phys[..., 2:3] = log1p_signed(y_phys[..., 2:3])
+            else:
+                y_phys = log1p_signed(y_phys)
+        elif self.config.asinh_pressure:
             y_phys = y_phys.clone()
             y_phys[..., 2:3] = torch.asinh(y_phys[..., 2:3] * self.config.asinh_scale)
         y_norm = (y_phys - self.phys_mean.to(full_y_raw.device)) / self.phys_std.to(full_y_raw.device).clamp(min=1e-6)
@@ -411,7 +439,13 @@ class TandemTargetTransform:
         if self.config.residual_prediction and prepared.freestream is not None:
             full_pred = full_pred + prepared.freestream
         pred_phys = full_pred * self.phys_std.to(full_pred.device) + self.phys_mean.to(full_pred.device)
-        if self.config.asinh_pressure:
+        if self.config.feature_norm in ("log1p", "log1p-all"):
+            pred_phys = pred_phys.clone()
+            if self.config.feature_norm == "log1p":
+                pred_phys[..., 2:3] = log1p_signed_inverse(pred_phys[..., 2:3])
+            else:
+                pred_phys = log1p_signed_inverse(pred_phys)
+        elif self.config.asinh_pressure:
             pred_phys = pred_phys.clone()
             pred_phys[..., 2:3] = torch.sinh(pred_phys[..., 2:3]) / max(self.config.asinh_scale, 1e-6)
         pred_orig = self._phys_denorm(pred_phys, prepared.umag, prepared.q)
@@ -1324,6 +1358,7 @@ def compute_tandem_phys_stats(
     device: torch.device,
     asinh_pressure: bool,
     asinh_scale: float,
+    feature_norm: str = "none",
 ) -> TargetTransformStats:
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_grouped)
     phys_sum = torch.zeros(3, device=device)
@@ -1337,7 +1372,13 @@ def compute_tandem_phys_stats(
         full_mask = torch.cat([batch.surface_mask, volume_mask], dim=1)
         umag, q = TandemTargetTransform._umag_q(full_y, full_mask)
         y_phys = TandemTargetTransform._phys_norm(full_y, umag, q)
-        if asinh_pressure:
+        if feature_norm in ("log1p", "log1p-all"):
+            y_phys = y_phys.clone()
+            if feature_norm == "log1p":
+                y_phys[..., 2:3] = log1p_signed(y_phys[..., 2:3])
+            else:
+                y_phys = log1p_signed(y_phys)
+        elif asinh_pressure:
             y_phys = y_phys.clone()
             y_phys[..., 2:3] = torch.asinh(y_phys[..., 2:3] * asinh_scale)
         mask = full_mask.float().unsqueeze(-1)
@@ -1390,6 +1431,7 @@ def main() -> None:
             device=device,
             asinh_pressure=config.asinh_pressure,
             asinh_scale=config.asinh_scale,
+            feature_norm=config.feature_norm,
         )
         transform: TargetTransform | TandemTargetTransform = TandemTargetTransform(
             stats=bundle.target_stats,
@@ -1403,6 +1445,7 @@ def main() -> None:
             stats_std=bundle.target_stats.y_std,
             asinh_pressure=config.asinh_pressure,
             asinh_scale=config.asinh_scale,
+            feature_norm=config.feature_norm,
         )
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
