@@ -166,6 +166,7 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    sigma_reparam: bool = False
 
 
 @dataclass
@@ -200,6 +201,20 @@ class TargetTransform:
         asinh_scale: float = 1.0,
     ):
         self.pressure_index = pressure_index
+        # FIX (Bug 4): sanitize stats tensors — if the stats JSON was computed on
+        # data whose pressure channel is entirely NaN (e.g. tandemfoilset_paper
+        # cruise tasks), y_mean/y_std contain NaN for that channel.  Replace NaN/inf
+        # in the mean with 0 (identity shift) and in the std with 1 (identity scale)
+        # so those channels pass through unnormalised rather than propagating NaN
+        # into every training loss value.
+        if stats_mean is not None:
+            safe_mean = stats_mean.clone().float()
+            safe_mean[~torch.isfinite(safe_mean)] = 0.0
+            stats_mean = safe_mean
+        if stats_std is not None:
+            safe_std = stats_std.clone().float()
+            safe_std[~torch.isfinite(safe_std)] = 1.0
+            stats_std = safe_std
         self.stats_mean = stats_mean
         self.stats_std = stats_std
         self.asinh_pressure = asinh_pressure
@@ -486,6 +501,7 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
         "n_head": config.model_heads,
         "mlp_ratio": config.model_mlp_ratio,
         "slice_num": config.model_slices,
+        "sigma_reparam": config.sigma_reparam,
     }
     if config.model == "reference_transolver":
         return ReferenceTransolver(

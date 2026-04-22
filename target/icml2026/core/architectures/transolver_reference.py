@@ -18,6 +18,29 @@ def _init_linear(module: nn.Module, std: float = 0.02) -> None:
             nn.init.zeros_(module.bias)
 
 
+class SigmaReparam(nn.Module):
+    """
+    Reparameterize a linear layer as W = g * (V / ||V||_sigma).
+
+    Zhai et al., ICML 2023 (https://arxiv.org/abs/2301.09578).
+    Spectral norm of the effective weight is bounded to |g| throughout training.
+    No hooks, no auxiliary state — compatible with torch.compile and any optimizer.
+    """
+
+    def __init__(self, linear: nn.Linear):
+        super().__init__()
+        self.V = nn.Parameter(linear.weight.data.clone())
+        with torch.no_grad():
+            sigma_init = torch.linalg.matrix_norm(self.V, ord=2)
+        self.g = nn.Parameter(sigma_init.reshape(1))
+        self.bias = linear.bias  # shared reference (may be None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        sigma = torch.linalg.matrix_norm(self.V, ord=2)
+        W = self.g * self.V / sigma
+        return F.linear(x, W, self.bias)
+
+
 class LinearProjection(nn.Module):
     def __init__(self, input_dim: int, output_dim: int, bias: bool = True):
         super().__init__()
@@ -85,7 +108,7 @@ class UpActDownMlp(nn.Module):
 
 
 class TransolverAttention(nn.Module):
-    def __init__(self, hidden_dim: int, num_heads: int, num_slices: int, dropout: float = 0.0):
+    def __init__(self, hidden_dim: int, num_heads: int, num_slices: int, dropout: float = 0.0, sigma_reparam: bool = False):
         super().__init__()
         if hidden_dim % num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads")
@@ -102,6 +125,9 @@ class TransolverAttention(nn.Module):
         self.qkv = LinearProjection(self.dim_head, self.dim_head * 3, bias=False)
         self.proj = LinearProjection(hidden_dim, hidden_dim)
         self.proj_dropout = nn.Dropout(dropout)
+        if sigma_reparam:
+            self.qkv.project = SigmaReparam(self.qkv.project)
+            self.proj.project = SigmaReparam(self.proj.project)
 
     def create_slices(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, num_tokens, _ = x.shape
@@ -139,6 +165,7 @@ class TransformerBlock(nn.Module):
         mlp_expansion_factor: int | float,
         num_slices: int,
         dropout: float = 0.0,
+        sigma_reparam: bool = False,
     ):
         super().__init__()
         mlp_hidden_dim = int(math.ceil(hidden_dim * mlp_expansion_factor))
@@ -148,6 +175,7 @@ class TransformerBlock(nn.Module):
             num_heads=num_heads,
             num_slices=num_slices,
             dropout=dropout,
+            sigma_reparam=sigma_reparam,
         )
         self.norm2 = nn.LayerNorm(hidden_dim, eps=1e-6)
         self.mlp = UpActDownMlp(hidden_dim=hidden_dim, mlp_hidden_dim=mlp_hidden_dim)
@@ -167,6 +195,7 @@ class Transformer(nn.Module):
         mlp_expansion_factor: int | float,
         num_slices: int,
         dropout: float = 0.0,
+        sigma_reparam: bool = False,
     ):
         super().__init__()
         self.blocks = nn.ModuleList(
@@ -177,6 +206,7 @@ class Transformer(nn.Module):
                     mlp_expansion_factor=mlp_expansion_factor,
                     num_slices=num_slices,
                     dropout=dropout,
+                    sigma_reparam=sigma_reparam,
                 )
                 for _ in range(depth)
             ]
@@ -205,6 +235,7 @@ class ReferenceTransolver(nn.Module):
         n_head: int = 3,
         mlp_ratio: int = 4,
         slice_num: int = 96,
+        sigma_reparam: bool = False,
     ):
         super().__init__()
         self.space_dim = space_dim
@@ -233,6 +264,7 @@ class ReferenceTransolver(nn.Module):
             mlp_expansion_factor=mlp_ratio,
             num_slices=slice_num,
             dropout=dropout,
+            sigma_reparam=sigma_reparam,
         )
         self.norm = nn.LayerNorm(n_hidden, eps=1e-6)
         self.out = LinearProjection(n_hidden, surface_output_dim + volume_output_dim)
