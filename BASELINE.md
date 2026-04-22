@@ -3,11 +3,35 @@
 ## TandemFoilSet
 
 - **Primary metric:** `val_primary/surface_pressure_mae` (= `val_eq4/surface_pressure_mae`)
-- **Current best:** 30.10 (val) at epoch 157
-- **Best PR:** #2810 (gilbert — T_max=10, 3L/192d, Fourier + physics + no-EMA, slices=64, Lion **lr=1.25e-4**, gc=1.0, WD=1e-2, 180-min)
-- **Key insight:** Lower LR KEEPS WINNING. lr=1.25e-4 at 3L/192d (30.10 at ep157) beats lr=1.5e-4 (44.72). **32.8% improvement in one step!** gc=1.0 provides critical stability — gradient clipping is now confirmed essential for TandemFoil. Also: gc=0.5 at lr=1.5e-4 (sasuke, 30.11) nearly identical to gc=1.0 at lr=1.25e-4. gc and LR interact — both paths reach ~30.1. Still descending at ep161 timeout. Next: lr=1e-4 + gc, 3L/256d width scaling at lr=1.25e-4.
+- **Current best:** 22.537 (val) at epoch 336
+- **Best PR:** #2924 (robin — gc=0.5 EMA refinement, Lion lr=1.25e-4, T_max=10, gc=0.5, WD=1e-2, EMA decay=0.999, 3L/192d)
+- **Note:** gc=0.5 (softer clip vs standard gc=1.0) enables stable EMA training across 336+ epochs where gc=1.0 diverged after ep167. Model still descending at ep336 — result is an underestimate of the ceiling.
 
-### 2026-04-21 — PR #2810: TandemFoil: lr=1.25e-4 + gc=1.0 — NEW BEST
+### 2026-04-22 — PR #2924: TandemFoil: EMA refinement gc=0.5 — NEW BEST (CURRENT)
+
+- **val_primary/surface_pressure_mae:** 22.537 (-13.8% vs 26.06) at epoch 336
+- **W&B run:** 0lv7fnun (robin/ema-refine-tf-gc05)
+- **Config:** Lion lr=1.25e-4, T_max=10, gc=0.5, WD=1e-2, EMA decay=0.999, 3L/192d, Fourier+physics, 360-min budget
+- **Key insight:** gc=0.5 enables stable EMA training across 336+ epochs; gc=1.0 diverged after ep167 (Run 1). Model still descending at ep336 — result is an underestimate of the ceiling. AirfRANS Run 3 (0.000659) was superseded by stark #2951 T_max=50 result (0.000482).
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 1.25e-4 --cosine-t-max 10 --grad-clip 0.5 --weight-decay 1e-2 --model-slices 64 --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999 --ema-decay 0.999`
+
+### 2026-04-22 — PR #2887: TandemFoil: lr=1e-4 gc=1.0 LR scan — PREVIOUS BEST
+
+- **val_primary/surface_pressure_mae:** 26.06 (-0.3% vs 26.134) at epoch 300
+- **W&B run:** pbq4kgdk
+- **Config:** Lion lr=1e-4, T_max=10, gc=1.0, WD=1e-2, 3L/192d, Fourier+physics, no-EMA
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 1e-4 --cosine-t-max 10 --grad-clip 1.0 --weight-decay 1e-2 --no-use-ema --model-slices 64 --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999`
+
+### 2026-04-21 — PR #2899: TandemFoil: Corrected EMA warmup (decay=0.999) — PREVIOUS BEST
+
+- **val_primary/surface_pressure_mae:** 26.134 (-13.2% vs 30.10) at epoch 123
+- **decay=0.9999:** 26.903 at epoch 113 (also beats baseline — 10.6% improvement)
+- **W&B run:** nrn0q3ct (decay=0.999, still running at ep125, still improving)
+- **Key insight:** EMAWithWarmup replaces bugged EMA. Timm formula `min(target_decay, (1+step)/(10+step))` ramps decay from 0 to target, preventing random-init dominance of EMA weights. Both decay values beat baseline significantly. decay=0.999 is the winner. DrivAerML did NOT benefit (9.749% at 60 eps).
+- **Config:** Lion lr=1.25e-4, T_max=10, gc=1.0, WD=1e-2, 3L/192d, Fourier+physics, EMA decay=0.999 (WITHOUT --no-use-ema)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 1.25e-4 --cosine-t-max 10 --grad-clip 1.0 --weight-decay 1e-2 --model-slices 64 --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999 --ema-decay 0.999`
+
+### 2026-04-21 — PR #2810: TandemFoil: lr=1.25e-4 + gc=1.0 — PREVIOUS BEST
 
 - **val_primary/surface_pressure_mae:** 30.10 (-32.8% vs 44.72) at epoch 157
 - **W&B run:** v6amjkh7 (157+ epochs, 180-min budget, still descending at cutoff)
@@ -121,11 +145,51 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.001236 (val) at epoch 349
-- **Best PR:** #2828 (inosuke — **2L/256d**/4H + gc=1.0 + Fourier + no-EMA + T_max=5 + WD=1e-2, AdamW lr=7e-4, 388 epochs, 180-min budget, SENPAI_MAX_EPOCHS=9999)
-- **Key insight:** DEPTH REDUCTION CONTINUES. 2L/256d beats 3L/256d by 16.4% (0.001236 vs 0.001479). 4L→3L was 46.6%, 3L→2L is 16.4% — diminishing but real. Width 256d is the sweet spot at every depth level (2L/384d diverged, 2L/512d never converged). gc=1.0 still optimal. **Beats external target 0.0043 by 71.3%.** PENDING: T_max=10 at 2L/256d (itachi #2872) may push further given kakashi's T_max=10 breakthrough at 3L.
+- **Current best:** 0.000482 (val) at epoch 576
+- **Best PR:** #2951 (stark — lr=6e-4, T_max=50, 2L/256d, AdamW, gc=1.0, wd=1e-2, no-EMA, Fourier)
+- **Key insight:** T_max=50 cosine schedule is the critical breakthrough — longer cosine periods allow the model to fully descend into loss basins before being kicked back up. lr=6e-4 + T_max=50 achieves 0.000482, a -19.4% improvement over the previous best (0.000598 at T_max=10). The run was still at ep576 within the 360-min budget. **Beats external target 0.0043 by 88.8%.**
 
-### 2026-04-21 — PR #2828: AirfRANS: 2L/256d depth frontier — NEW BEST
+### 2026-04-22 — PR #2951: AirfRANS: LR + T_max sweep — NEW BEST (CURRENT)
+
+- **val_primary/surface_mse:** 0.000482 (-19.4% vs 0.000598) at epoch 576
+- **W&B run:** pr4wsbfm (Run G: lr=6e-4, T_max=50, ~760 epochs trained)
+- **Config:** 2L/256d/4H, AdamW lr=6e-4, T_max=50, gc=1.0, WD=1e-2, no-EMA, Fourier, 360-min budget
+- **Key insight:** T_max=50 is the decisive variable. T_max=10 configs all underperformed; T_max=20 was intermediate. lr=1e-3 diverged. lr=6e-4 + T_max=50 is the new reference config. Best checkpoint at ep576 (not final). Note: WD=1e-2 was re-added vs #2906 no-WD — this combination still wins because T_max=50 is the dominant effect.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 6e-4 --cosine-t-max 50 --grad-clip 1.0 --weight-decay 1e-2 --no-use-ema --enable-fourier --model-layers 2 --model-hidden-dim 256 --model-heads 4 --epochs 999`
+
+### 2026-04-22 — PR #2906: AirfRANS: gc=1.0 no-WD 360-min budget multi-seed — PREVIOUS BEST
+
+- **val_primary/surface_mse:** 0.000598 (-4.6% vs 0.000627) at epoch 517, seed=42
+- **W&B run:** d7a0z1hk (seed=42, 517 epochs, 360-min budget)
+- **Other seeds:** W&B nvllyhmf (gc+WD variant: 0.000694 at 360 min); W&B nbc25ot7 (no-gc seed=42: NaN at ep607)
+- **Config:** 2L/256d/4H, AdamW lr=6e-4, T_max=10, gc=1.0, **no WD** (no --weight-decay), no-EMA, Fourier, 360-min budget
+- **Key insight:** Removing WD=1e-2 while keeping gc=1.0 achieves 0.000598 — gc-only (0.000598) beats gc+WD (0.000694) at 360 min. WD is NOT required for AirfRANS and actively hurts at long training budgets. The 360-min budget (vs 180-min) is highly beneficial. gc=1.0 is essential for stability — without it, seed divergence (NaN at ep607) is common. **Beats external target 0.0043 by 86.1%.**
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 6e-4 --cosine-t-max 10 --grad-clip 1.0 --no-use-ema --enable-fourier --model-layers 2 --model-hidden-dim 256 --model-heads 4 --epochs 999`
+
+### 2026-04-22 — PR #2902: AirfRANS: gradient accumulation ablation (accum=1 wins) — NEW BEST
+
+- **val_primary/surface_mse:** 0.000627 (-10.3% vs 0.000699) at epoch 661
+- **W&B run:** ww9w4x4u (accum=1 control run, 661 epochs)
+- **Config:** 2L/256d, AdamW lr=6e-4, T_max=10, gc=1.0, WD=1e-2, no-EMA, Fourier
+- **Key insight:** accum=1 (no accumulation) trained longest and found the deepest basin. accum=2 and accum=4 were strictly worse — gradient accumulation is detrimental for AirfRANS. The control run essentially extended training beyond the previous 653-epoch run.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 6e-4 --cosine-t-max 10 --grad-clip 1.0 --weight-decay 1e-2 --no-use-ema --enable-fourier --model-layers 2 --model-hidden-dim 256 --model-heads 4 --epochs 999`
+
+### 2026-04-22 — PR #2887: AirfRANS: lr=6e-4 gc=1.0 T_max=10 LR scan — NEW BEST
+
+- **val_primary/surface_mse:** 0.000699 (-3.6% vs 0.000727) at epoch 653
+- **W&B run:** 7m6c1ydk
+- **Config:** 2L/256d, AdamW lr=6e-4, T_max=10, gc=1.0, WD=1e-2, no-EMA, Fourier
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 6e-4 --cosine-t-max 10 --grad-clip 1.0 --weight-decay 1e-2 --no-use-ema --enable-fourier --model-layers 2 --model-hidden-dim 256 --model-heads 4 --epochs 999`
+
+### 2026-04-21 — PR #2899: AirfRANS: Corrected EMA warmup (decay=0.999) — PREVIOUS BEST
+
+- **val_primary/surface_mse:** 0.000727 (-41.2% vs 0.001236) at epoch 206 (W&B run i1sevgt2)
+- **decay=0.9999:** 0.001123 (-8.7% vs 0.001236) at epoch 275 (W&B run bz00wego — also beats baseline)
+- **Key insight:** EMA with timm warmup recovers the regularization benefit that was broken by the bugged EMA. Best checkpoint at ep206; late epochs oscillate due to T_max=5 cycling. decay=0.999 massively outperforms decay=0.9999 on AirfRANS.
+- **Config:** 2L/256d, AdamW lr=7e-4, T_max=5, gc=1.0, WD=1e-2, Fourier, EMA decay=0.999 (WITHOUT --no-use-ema)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 7e-4 --cosine-t-max 5 --grad-clip 1.0 --weight-decay 1e-2 --enable-fourier --model-layers 2 --model-hidden-dim 256 --model-heads 4 --epochs 999 --ema-decay 0.999`
+
+### 2026-04-21 — PR #2828: AirfRANS: 2L/256d depth frontier — PREVIOUS BEST
 
 - **val_primary/surface_mse:** 0.001236 (-16.4% vs 0.001479) at epoch 349
 - **2L/256d gc=0.5:** 0.001405 (-5.1% vs 0.001479) at epoch 366 (also beats baseline)
@@ -144,6 +208,15 @@
 - **Architecture:** 3L/256d/4H (vs 4L/256d/4H baseline — only change is `--model-layers 3`)
 - **Key insight:** Removing one layer from 4L→3L unlocked a 46.6% improvement. Width (256d) is the dominant capacity lever; extra depth adds noise to the optimization trajectory. The 3L model found a deep trough at ep202 (0.001479) but subsequently regressed — same T_max=5 instability pattern as 4L configs. Test metric from the diverged terminal checkpoint is invalid. Critical follow-ups: (1) gc=0.5 compound at 3L/256d (kakashi #2823), (2) 3L width frontier 320d/384d/512d (ray #2824), (3) T_max=10 stability variant.
 - **Reproduce:** `cd target/icml2026 && CUDA_VISIBLE_DEVICES=0 SENPAI_MAX_EPOCHS=9999 SENPAI_TIMEOUT_MINUTES=180 python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 7e-4 --cosine-t-max 5 --grad-clip 1.0 --weight-decay 1e-2 --no-use-ema --enable-fourier --model-layers 3 --model-hidden-dim 256 --model-heads 4 --epochs 999`
+
+### 2026-04-22 — PR #2820: AirfRANS: 3L/256d gc=0.5 lr=5e-4 — 3L LINEAGE BEST
+
+- **val_primary/surface_mse:** 0.001241 (-16.1% vs 0.001479) at epoch 232
+- **test_primary/surface_mse:** 0.003734 (from best-checkpoint run)
+- **W&B run:** rvwmsfth (284 epochs, best at ep232; model regressed after ep232)
+- **Config:** 3L/256d, AdamW lr=5e-4, T_max=5, gc=0.5, WD=1e-2, no-EMA, Fourier
+- **Key insight:** gc=0.5 + lr=5e-4 is stable through ep284 — no divergence vs. ep205 divergence at lr=7e-4. Hypothesis confirmed: lower LR prevents the catastrophic gradient spikes at cosine T_max=5 peaks. Best 3L/256d result to date. Does not beat the overall AirfRANS best (2L/256d at 0.000627). First-phase 4L/256d run (W&B: 21u2f2n3) yielded 0.00176 at ep160.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 5e-4 --cosine-t-max 5 --grad-clip 0.5 --weight-decay 1e-2 --no-use-ema --enable-fourier --model-layers 3 --model-hidden-dim 256 --model-heads 4 --epochs 999`
 
 ### 2026-04-21 — PR #2774: AirfRANS: 4L/256d + gc=0.5 extended — PREVIOUS BEST
 
@@ -331,11 +404,20 @@
 ## DrivAerML
 
 - **Primary metric:** `val_primary/surface_rel_l2_pct` (lower is better)
-- **Current best:** 4.619% (val) at epoch 256
-- **Best PR:** #2691 (frieren — **4L/512d**/8H + Fourier + no-EMA + T_max=30, 267 epochs, AdamW lr=5e-4, **180-min budget**)
+- **Current best:** 3.997% (val) at epoch 467
+- **Best PR:** #2898 (piccolo — **4L/512d**/8H + Fourier + no-EMA + T_max=30, 467 epochs, AdamW lr=5e-4, **SENPAI_MAX_EPOCHS=9999**, no-compile)
 - **CRITICAL:** Must pass `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
-- **External target:** <3.71% (AB-UPT, ~500 epochs) — **1.24x gap remaining** (was 1.35x)
-- **Key insight:** WIDTH SCALES at 180-min budget. 4L/512d gets 267 epochs (~0.67 min/ep) vs 4L/320d's 257 epochs (~0.7 min/ep) — comparable throughput but more capacity. Extra capacity pays off when given enough training time. Best checkpoint at epoch 256 (critical — final epoch 267 overfit at 5.926%). SENPAI_MAX_EPOCHS=9999 required. Next: gc=1.5 at 4L/512d, 5L/512d, compound with WD.
+- **External target:** <3.71% (AB-UPT, ~500 epochs) — **1.08x gap remaining** (was 1.24x)
+- **Key insight:** Longer training on the golden 4L/512d config (SENPAI_MAX_EPOCHS=9999 with 360-min budget) finds a deeper basin at epoch 467 vs 256. torch.compile gives no throughput benefit on DrivAerML and the compile run diverged to NaN at ep454 without --grad-clip — future compile experiments MUST include --grad-clip 1.0. SENPAI_MAX_EPOCHS=9999 required.
+- **gc=2.0 finding (PR #2886):** gc=2.0+lr=4e-4+WD=1e-2 = **4.346%** (W&B: ginhxdco) — new 4L/512d gc ablation best. Does NOT beat current 3.997% baseline (achieved with different architecture/config) but represents the best gc sweep result on the golden 4L/512d foundation. gc=2.0 > gc=1.0 > gc=5.0 for DrivAerML.
+
+### 2026-04-22 — PR #2898: DrivAerML: torch.compile throughput (no-compile wins) — NEW BEST
+
+- **val_primary/surface_rel_l2_pct:** 3.997% (-13.5% vs 4.619%) at epoch 467
+- **W&B run:** bht6h42t (no-compile baseline run, 467 epochs, SENPAI_MAX_EPOCHS=9999)
+- **Config:** 4L/512d/8H, AdamW lr=5e-4, T_max=30, no-EMA, Fourier, 360-min budget
+- **Key insight:** torch.compile gives 0% throughput benefit on DrivAerML but the no-compile run trained longer (467 vs 256 epochs) and found a deeper basin. The compile run diverged to NaN at ep454 due to operator fusion without --grad-clip — future DrivAerML compile experiments MUST include --grad-clip 1.0. Gap to external: 1.08x (was 1.24x).
+- **Reproduce:** `cd target/icml2026 && SENPAI_MAX_EPOCHS=9999 python train.py --dataset drivaerml --optimizer adamw --lr 5e-4 --cosine-t-max 30 --no-use-ema --enable-fourier --model-layers 4 --model-hidden-dim 512 --model-heads 8 --epochs 999 --batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
 
 ### 2026-04-21 — PR #2691: DrivAerML: 4L/512d width scaling (180-min) — NEW BEST
 
@@ -420,3 +502,23 @@
 - **W&B run:** kulxytfg
 - **Epochs:** 2 (30-min timeout)
 - **Reproduce:** `cd target/icml2026 && python train.py --dataset drivaerml --optimizer adamw --lr 5e-4 --cosine_t_max 150`
+
+## TandemFoil Paper
+
+- **Primary metric:** `val_primary/field_mse` (lower is better)
+- **Current best:** 0.00434 (val) at epoch 199 — **first SENPAI result, crushes paper MGN baseline (~1.79) by >99%**
+- **Best PR:** #2979 (haku — 3L/192d, AdamW lr=5e-4, T_max=150, no-EMA, Fourier)
+- **External target:** Paper MGN ~1.79 (already crushed — internal frontier is now the only meaningful target)
+- **Key insight:** 3L significantly outperforms 2L (0.00434 vs 0.00534). Data pipeline had 3 critical bugs fixed in PR #2979: (1) AoA validation too strict in split_paper_experiment4.py:191, (2) non-finite pressure values in core/datasets.py:142 clamped via torch.where, (3) stats computation masked non-finite values in split_paper_experiment4.py:262.
+- **Critical flags:** Must use `--tandemfoil-paper` dataset key (see train.py for exact flag)
+- **Reproduce (3L champion):** `cd target/icml2026 && python train.py --dataset tandemfoil_paper --optimizer adamw --lr 5e-4 --cosine-t-max 150 --no-use-ema --enable-fourier --model-layers 3 --model-hidden-dim 192 --model-heads 3 --epochs 999`
+
+### 2026-04-22 — PR #2979: TandemFoil Paper: Cross-dataset 2L depth reduction — FIRST BASELINES
+
+- **val_primary/field_mse (3L/192d):** 0.00434 at epoch 199 ← **NEW DATASET CHAMPION**
+- **val_primary/field_mse (2L/192d):** 0.00534 at epoch 184
+- **W&B run (3L):** (haku/2l-depth-cross-dataset group, tandemfoil_paper 3L run)
+- **W&B run (2L):** (haku/2l-depth-cross-dataset group, tandemfoil_paper 2L run)
+- **Note:** These are the FIRST SENPAI runs on the TandemFoil Paper dataset. Paper MGN baseline ~1.79 crushed by >99%. 3L outperforms 2L — depth matters for this complex geometry. Three data pipeline bugs fixed as part of this PR.
+- **Depth hypothesis verdict:** FALSIFIED for TandemFoil Paper (3L > 2L), consistent with DrivAerML finding (3D/complex geometry prefers deeper models).
+- **Reproduce (3L):** `cd target/icml2026 && python train.py --dataset tandemfoil_paper --optimizer adamw --lr 5e-4 --cosine-t-max 150 --no-use-ema --enable-fourier --model-layers 3 --model-hidden-dim 192 --model-heads 3 --epochs 999`

@@ -30,7 +30,60 @@ from core.features import (
     compute_vortex_panel_velocity,
     compute_wake_deficit_features,
 )
-from core.optim import EMA, Lion, Lookahead
+from core.optim import Lion, Lookahead
+
+
+class EMAWithWarmup:
+    """EMA with timm-style adaptive decay warmup: min(target, (1+step)/(10+step))."""
+
+    def __init__(self, model: torch.nn.Module, decay: float = 0.9999):
+        self.decay = decay
+        self.step_counter = 0
+        self.shadow = {
+            self._clean(name): param.detach().clone()
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        }
+        self.backup: dict[str, torch.Tensor] | None = None
+
+    @staticmethod
+    def _clean(name: str) -> str:
+        return name.replace("_orig_mod.", "")
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        self.step_counter += 1
+        actual_decay = min(self.decay, (1 + self.step_counter) / (10 + self.step_counter))
+        for name, param in model.named_parameters():
+            key = self._clean(name)
+            if not param.requires_grad or key not in self.shadow:
+                continue
+            self.shadow[key].mul_(actual_decay).add_(param.detach(), alpha=1 - actual_decay)
+
+    @torch.no_grad()
+    def store(self, model: torch.nn.Module) -> None:
+        self.backup = {
+            self._clean(name): param.detach().clone()
+            for name, param in model.named_parameters()
+            if param.requires_grad and self._clean(name) in self.shadow
+        }
+
+    @torch.no_grad()
+    def copy_to(self, model: torch.nn.Module) -> None:
+        for name, param in model.named_parameters():
+            key = self._clean(name)
+            if param.requires_grad and key in self.shadow:
+                param.data.copy_(self.shadow[key])
+
+    @torch.no_grad()
+    def restore(self, model: torch.nn.Module) -> None:
+        if self.backup is None:
+            return
+        for name, param in model.named_parameters():
+            key = self._clean(name)
+            if param.requires_grad and key in self.backup:
+                param.data.copy_(self.backup[key])
+        self.backup = None
 
 
 LEGACY_VAL_ALIAS = {
@@ -40,6 +93,7 @@ LEGACY_VAL_ALIAS = {
     "val_ood_re": "p_re",
 }
 AIRFRANS_FIELD_NAMES = ("Ux", "Uy", "p", "nut")
+TANDEM_FIELD_NAMES = ("Ux", "Uy", "p")
 
 
 @dataclass
@@ -69,8 +123,7 @@ class TrainConfig:
     optimizer: str = "lion"
     use_lookahead: bool = True
     use_ema: bool = True
-    ema_decay: float = 0.999
-    ema_start_step: int = 50
+    ema_decay: float = 0.9999
     num_workers: int = -1
     pin_memory: bool = True
     persistent_workers: bool = True
@@ -84,6 +137,9 @@ class TrainConfig:
     airfrans_task: str = "full"
     tandem_manifest: str = ""
     tandem_stats: str = ""
+    tandemfoil_paper_task: str = "cruise_random_uniform"
+    tandemfoil_paper_manifest: str = ""
+    tandemfoil_paper_stats: str = ""
     enable_fourier: bool = False
     enable_te_coord_frame: bool = False
     enable_cp_panel: bool = False
@@ -109,6 +165,7 @@ class TrainConfig:
     surface_anchor_points: int = 8_000
     volume_anchor_points: int = 8_000
     grad_clip: float = 0.0
+    grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -152,6 +209,12 @@ class TargetTransform:
 
     def apply(self, y: torch.Tensor) -> torch.Tensor:
         out = y.clone()
+        # FIX (Bug 3): clamp non-finite input values before normalization so that
+        # ±inf from float16 overflow in raw TandemFoil Paper pickles do not
+        # propagate as NaN through the normalization arithmetic.
+        if not out.is_floating_point():
+            out = out.float()
+        out = torch.where(torch.isfinite(out), out, torch.zeros_like(out))
         if self.asinh_pressure and self.pressure_index is not None:
             out[..., self.pressure_index] = torch.asinh(out[..., self.pressure_index] * self.asinh_scale)
         if self.stats_mean is not None and self.stats_std is not None and self.stats_mean.numel() == out.shape[-1]:
@@ -165,6 +228,19 @@ class TargetTransform:
         if self.asinh_pressure and self.pressure_index is not None:
             out[..., self.pressure_index] = torch.sinh(out[..., self.pressure_index]) / max(self.asinh_scale, 1e-6)
         return out
+
+
+def comparison_metric_tensors(
+    preds: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    train_transform: TargetTransform,
+    metric_transform: TargetTransform | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if metric_transform is None:
+        return preds, train_transform.apply(target)
+    pred_raw = train_transform.invert(preds)
+    return metric_transform.apply(pred_raw), metric_transform.apply(target)
 
 
 class TandemTargetTransform:
@@ -380,6 +456,7 @@ def build_bundle(config: TrainConfig) -> DatasetBundle:
     bundle_kwargs = {
         "dataset_name": config.dataset,
         "debug": config.debug,
+        "tandemfoil_paper_task": config.tandemfoil_paper_task,
         "airfrans_task": config.airfrans_task,
         "drivaerml_surface_only": config.surface_only_drivaerml,
         "drivaerml_train_surface_points": config.drivaerml_train_surface_points,
@@ -401,6 +478,10 @@ def build_bundle(config: TrainConfig) -> DatasetBundle:
         bundle_kwargs["drivaerml_manifest"] = config.drivaerml_manifest
     if config.drivaerml_root:
         bundle_kwargs["drivaerml_root"] = config.drivaerml_root
+    if config.tandemfoil_paper_manifest:
+        bundle_kwargs["tandemfoil_paper_manifest"] = config.tandemfoil_paper_manifest
+    if config.tandemfoil_paper_stats:
+        bundle_kwargs["tandemfoil_paper_stats"] = config.tandemfoil_paper_stats
     return build_dataset_bundle(**bundle_kwargs)
 
 
@@ -763,6 +844,7 @@ def evaluate_grouped(
     anp_head: ANPSurfaceDecoder | None,
     loader: DataLoader,
     transform: TargetTransform | TandemTargetTransform,
+    metric_transform: TargetTransform | None,
     device: torch.device,
     *,
     amp_mode: str = "none",
@@ -785,6 +867,10 @@ def evaluate_grouped(
     n_vol = torch.zeros(3, device=device)
     surf_channel_sum = None
     vol_channel_sum = None
+    paper_surface_sq_sum = None
+    paper_volume_sq_sum = None
+    paper_surface_nodes = 0
+    paper_volume_nodes = 0
     drivaer_surface_case_sums: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     drivaer_volume_case_sums: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
@@ -836,9 +922,16 @@ def evaluate_grouped(
             )
         outputs = float_outputs(outputs)
         if dataset_name == "airfrans":
+            if not isinstance(transform, TargetTransform):
+                raise TypeError("AirfRANS evaluation requires TargetTransform")
             if batch.surface_y is not None and outputs["surface_preds"] is not None:
-                target = transform.apply(batch.surface_y)
-                case_values = (outputs["surface_preds"] - target).square()
+                surface_pred, surface_target = comparison_metric_tensors(
+                    outputs["surface_preds"],
+                    batch.surface_y,
+                    train_transform=transform,
+                    metric_transform=metric_transform,
+                )
+                case_values = (surface_pred - surface_target).square()
                 for case_idx in range(case_values.shape[0]):
                     channel_mean = _case_masked_channel_means(case_values[case_idx], batch.surface_mask[case_idx])
                     if channel_mean is not None:
@@ -848,8 +941,13 @@ def evaluate_grouped(
                             surf_channel_sum = torch.zeros(channel_mean.shape[0], device=device)
                         surf_channel_sum += channel_mean.to(device)
             if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
-                target = transform.apply(batch.volume_y)
-                case_values = (outputs["volume_preds"] - target).square()
+                volume_pred, volume_target = comparison_metric_tensors(
+                    outputs["volume_preds"],
+                    batch.volume_y,
+                    train_transform=transform,
+                    metric_transform=metric_transform,
+                )
+                case_values = (volume_pred - volume_target).square()
                 for case_idx in range(case_values.shape[0]):
                     channel_mean = _case_masked_channel_means(case_values[case_idx], batch.volume_mask[case_idx])
                     if channel_mean is not None:
@@ -858,6 +956,37 @@ def evaluate_grouped(
                         if vol_channel_sum is None:
                             vol_channel_sum = torch.zeros(channel_mean.shape[0], device=device)
                         vol_channel_sum += channel_mean.to(device)
+            continue
+
+        if dataset_name == "tandemfoilset_paper":
+            if not isinstance(transform, TargetTransform):
+                raise TypeError("TandemFoil paper evaluation requires TargetTransform")
+            if batch.surface_y is not None and outputs["surface_preds"] is not None:
+                surface_pred, surface_target = comparison_metric_tensors(
+                    outputs["surface_preds"],
+                    batch.surface_y,
+                    train_transform=transform,
+                    metric_transform=metric_transform,
+                )
+                case_values = (surface_pred - surface_target).square()
+                valid = batch.surface_mask.unsqueeze(-1)
+                if paper_surface_sq_sum is None:
+                    paper_surface_sq_sum = torch.zeros(case_values.shape[-1], device=device)
+                paper_surface_sq_sum += (case_values * valid).sum(dim=(0, 1)).to(device)
+                paper_surface_nodes += int(batch.surface_mask.sum().detach().cpu().item())
+            if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
+                volume_pred, volume_target = comparison_metric_tensors(
+                    outputs["volume_preds"],
+                    batch.volume_y,
+                    train_transform=transform,
+                    metric_transform=metric_transform,
+                )
+                case_values = (volume_pred - volume_target).square()
+                valid = batch.volume_mask.unsqueeze(-1)
+                if paper_volume_sq_sum is None:
+                    paper_volume_sq_sum = torch.zeros(case_values.shape[-1], device=device)
+                paper_volume_sq_sum += (case_values * valid).sum(dim=(0, 1)).to(device)
+                paper_volume_nodes += int(batch.volume_mask.sum().detach().cpu().item())
             continue
 
         pred_surface = None
@@ -923,6 +1052,25 @@ def evaluate_grouped(
             metrics["volume_rel_l2"] = volume_rel_l2
             metrics["volume_rel_l2_pct"] = volume_rel_l2 * 100.0
         return metrics
+    if dataset_name == "tandemfoilset_paper":
+        metrics: dict[str, float] = {}
+        total_sq_sum = 0.0
+        total_nodes = 0
+        if paper_surface_sq_sum is not None and paper_surface_nodes > 0:
+            surface_channel = paper_surface_sq_sum / paper_surface_nodes
+            metrics["surface_mse"] = float(surface_channel.mean().detach().cpu().item())
+            metrics.update(_named_channel_metrics("surface_mse", surface_channel, TANDEM_FIELD_NAMES))
+            total_sq_sum += float(paper_surface_sq_sum.sum().detach().cpu().item())
+            total_nodes += paper_surface_nodes
+        if paper_volume_sq_sum is not None and paper_volume_nodes > 0:
+            volume_channel = paper_volume_sq_sum / paper_volume_nodes
+            metrics["volume_mse"] = float(volume_channel.mean().detach().cpu().item())
+            metrics.update(_named_channel_metrics("volume_mse", volume_channel, TANDEM_FIELD_NAMES))
+            total_sq_sum += float(paper_volume_sq_sum.sum().detach().cpu().item())
+            total_nodes += paper_volume_nodes
+        if total_nodes > 0:
+            metrics["field_mse"] = total_sq_sum / (total_nodes * len(TANDEM_FIELD_NAMES))
+        return metrics
     metrics = {
         "surface_mae": total_surface / max(count_surface, 1),
         "volume_mae": total_volume / max(count_volume, 1),
@@ -947,6 +1095,7 @@ def evaluate_abupt(
     model: torch.nn.Module,
     loader: DataLoader,
     transform: TargetTransform,
+    metric_transform: TargetTransform | None,
     device: torch.device,
     *,
     amp_mode: str = "none",
@@ -960,6 +1109,10 @@ def evaluate_abupt(
     count_volume = 0
     surf_channel_sum = None
     vol_channel_sum = None
+    paper_surface_sq_sum = None
+    paper_volume_sq_sum = None
+    paper_surface_nodes = 0
+    paper_volume_nodes = 0
     batches = loader if max_batches <= 0 else itertools.islice(loader, max_batches)
     for batch in batches:
         batch = batch.to(device)
@@ -975,21 +1128,56 @@ def evaluate_abupt(
         outputs = float_outputs(outputs)
         if dataset_name == "airfrans":
             if batch.surface_anchor_target is not None and outputs["surface_preds"] is not None:
-                target = transform.apply(batch.surface_anchor_target)
-                channel_mean = (outputs["surface_preds"] - target).square().mean(dim=(0, 1))
+                surface_pred, surface_target = comparison_metric_tensors(
+                    outputs["surface_preds"],
+                    batch.surface_anchor_target,
+                    train_transform=transform,
+                    metric_transform=metric_transform,
+                )
+                channel_mean = (surface_pred - surface_target).square().mean(dim=(0, 1))
                 total_surface += float(channel_mean.mean().detach().cpu().item())
                 count_surface += 1
                 if surf_channel_sum is None:
                     surf_channel_sum = torch.zeros(channel_mean.shape[0], device=device)
                 surf_channel_sum += channel_mean.to(device)
             if batch.volume_anchor_target is not None and outputs["volume_preds"] is not None:
-                target = transform.apply(batch.volume_anchor_target)
-                channel_mean = (outputs["volume_preds"] - target).square().mean(dim=(0, 1))
+                volume_pred, volume_target = comparison_metric_tensors(
+                    outputs["volume_preds"],
+                    batch.volume_anchor_target,
+                    train_transform=transform,
+                    metric_transform=metric_transform,
+                )
+                channel_mean = (volume_pred - volume_target).square().mean(dim=(0, 1))
                 total_volume += float(channel_mean.mean().detach().cpu().item())
                 count_volume += 1
                 if vol_channel_sum is None:
                     vol_channel_sum = torch.zeros(channel_mean.shape[0], device=device)
                 vol_channel_sum += channel_mean.to(device)
+            continue
+
+        if dataset_name == "tandemfoilset_paper":
+            if batch.surface_anchor_target is not None and outputs["surface_preds"] is not None:
+                surface_pred, surface_target = comparison_metric_tensors(
+                    outputs["surface_preds"],
+                    batch.surface_anchor_target,
+                    train_transform=transform,
+                    metric_transform=metric_transform,
+                )
+                if paper_surface_sq_sum is None:
+                    paper_surface_sq_sum = torch.zeros(surface_target.shape[-1], device=device)
+                paper_surface_sq_sum += (surface_pred - surface_target).square().sum(dim=(0, 1)).to(device)
+                paper_surface_nodes += batch.surface_anchor_target.shape[0] * batch.surface_anchor_target.shape[1]
+            if batch.volume_anchor_target is not None and outputs["volume_preds"] is not None:
+                volume_pred, volume_target = comparison_metric_tensors(
+                    outputs["volume_preds"],
+                    batch.volume_anchor_target,
+                    train_transform=transform,
+                    metric_transform=metric_transform,
+                )
+                if paper_volume_sq_sum is None:
+                    paper_volume_sq_sum = torch.zeros(volume_target.shape[-1], device=device)
+                paper_volume_sq_sum += (volume_pred - volume_target).square().sum(dim=(0, 1)).to(device)
+                paper_volume_nodes += batch.volume_anchor_target.shape[0] * batch.volume_anchor_target.shape[1]
             continue
 
         if batch.surface_anchor_target is not None and outputs["surface_preds"] is not None:
@@ -1039,6 +1227,25 @@ def evaluate_abupt(
             metrics["volume_rel_l2"] = volume_rel_l2
             metrics["volume_rel_l2_pct"] = volume_rel_l2 * 100.0
         return metrics
+    if dataset_name == "tandemfoilset_paper":
+        metrics: dict[str, float] = {}
+        total_sq_sum = 0.0
+        total_nodes = 0
+        if paper_surface_sq_sum is not None and paper_surface_nodes > 0:
+            surface_channel = paper_surface_sq_sum / paper_surface_nodes
+            metrics["surface_mse"] = float(surface_channel.mean().detach().cpu().item())
+            metrics.update(_named_channel_metrics("surface_mse", surface_channel, TANDEM_FIELD_NAMES))
+            total_sq_sum += float(paper_surface_sq_sum.sum().detach().cpu().item())
+            total_nodes += paper_surface_nodes
+        if paper_volume_sq_sum is not None and paper_volume_nodes > 0:
+            volume_channel = paper_volume_sq_sum / paper_volume_nodes
+            metrics["volume_mse"] = float(volume_channel.mean().detach().cpu().item())
+            metrics.update(_named_channel_metrics("volume_mse", volume_channel, TANDEM_FIELD_NAMES))
+            total_sq_sum += float(paper_volume_sq_sum.sum().detach().cpu().item())
+            total_nodes += paper_volume_nodes
+        if total_nodes > 0:
+            metrics["field_mse"] = total_sq_sum / (total_nodes * len(TANDEM_FIELD_NAMES))
+        return metrics
     return {"surface_mae": total_surface / max(count_surface, 1), "volume_mae": total_volume / max(count_volume, 1)}
 
 
@@ -1048,8 +1255,8 @@ def train_one_epoch(
     loader: DataLoader,
     optimizer,
     scheduler,
-    ema: EMA | None,
-    anp_ema: EMA | None,
+    ema: EMAWithWarmup | None,
+    anp_ema: EMAWithWarmup | None,
     transform: TargetTransform | TandemTargetTransform,
     device: torch.device,
     model_name: str,
@@ -1057,49 +1264,71 @@ def train_one_epoch(
     amp_mode: str = "none",
     max_batches: int = 0,
     grad_clip: float = 0.0,
+    grad_accum_steps: int = 1,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
         anp_head.train()
     running = {"loss": 0.0}
     steps = 0
+    micro_batches_total = 0
     batches = loader if max_batches <= 0 else itertools.islice(loader, max_batches)
-    for batch in batches:
+    batch_iter = iter(batches)
+    exhausted = False
+
+    while not exhausted:
         optimizer.zero_grad(set_to_none=True)
-        if model_name == "reference_abupt":
-            batch = batch.to(device)
-            with autocast_context(device, amp_mode):
-                outputs = model(
-                    geometry_position=batch.geometry_position,
-                    geometry_supernode_idx=batch.geometry_supernode_idx,
-                    geometry_batch_idx=batch.geometry_batch_idx,
-                    surface_anchor_position=batch.surface_anchor_position,
-                    volume_anchor_position=batch.volume_anchor_position,
-                )
-                loss, _ = loss_abupt(batch, outputs, transform)
-        else:
-            batch = batch.to(device)
-            if isinstance(transform, TandemTargetTransform):
-                prepared = transform.prepare_batch(batch)
+        accum_loss = 0.0
+        micro_count = 0
+
+        for _ in range(grad_accum_steps):
+            try:
+                batch = next(batch_iter)
+            except StopIteration:
+                exhausted = True
+                break
+
+            if model_name == "reference_abupt":
+                batch = batch.to(device)
                 with autocast_context(device, amp_mode):
                     outputs = model(
-                        surface_x=prepared.surface_x,
-                        surface_mask=prepared.surface_mask,
-                        volume_x=prepared.volume_x,
-                        volume_mask=prepared.volume_mask,
+                        geometry_position=batch.geometry_position,
+                        geometry_supernode_idx=batch.geometry_supernode_idx,
+                        geometry_batch_idx=batch.geometry_batch_idx,
+                        surface_anchor_position=batch.surface_anchor_position,
+                        volume_anchor_position=batch.volume_anchor_position,
                     )
-                    outputs = maybe_apply_anp(outputs, prepared, anp_head)
-                    loss, _ = loss_grouped_tandem(prepared, outputs)
+                    loss, _ = loss_abupt(batch, outputs, transform)
             else:
-                with autocast_context(device, amp_mode):
-                    outputs = model(
-                        surface_x=batch.surface_x,
-                        surface_mask=batch.surface_mask,
-                        volume_x=batch.volume_x,
-                        volume_mask=batch.volume_mask,
-                    )
-                    loss, _ = loss_grouped(batch, outputs, transform)
-        loss.backward()
+                batch = batch.to(device)
+                if isinstance(transform, TandemTargetTransform):
+                    prepared = transform.prepare_batch(batch)
+                    with autocast_context(device, amp_mode):
+                        outputs = model(
+                            surface_x=prepared.surface_x,
+                            surface_mask=prepared.surface_mask,
+                            volume_x=prepared.volume_x,
+                            volume_mask=prepared.volume_mask,
+                        )
+                        outputs = maybe_apply_anp(outputs, prepared, anp_head)
+                        loss, _ = loss_grouped_tandem(prepared, outputs)
+                else:
+                    with autocast_context(device, amp_mode):
+                        outputs = model(
+                            surface_x=batch.surface_x,
+                            surface_mask=batch.surface_mask,
+                            volume_x=batch.volume_x,
+                            volume_mask=batch.volume_mask,
+                        )
+                        loss, _ = loss_grouped(batch, outputs, transform)
+
+            accum_loss += float(loss.detach().cpu().item())
+            (loss / grad_accum_steps).backward()
+            micro_count += 1
+
+        if micro_count == 0:
+            break
+
         all_params = list(model.parameters())
         if anp_head is not None:
             all_params += list(anp_head.parameters())
@@ -1114,14 +1343,18 @@ def train_one_epoch(
             scheduler.step()
         if ema is not None:
             ema.update(model)
+            running["ema_decay_actual"] = min(ema.decay, (1 + ema.step_counter) / (10 + ema.step_counter))
         if anp_head is not None and anp_ema is not None:
             anp_ema.update(anp_head)
-        running["loss"] += float(loss.detach().cpu().item())
+        running["loss"] += accum_loss / micro_count
+        micro_batches_total += micro_count
         steps += 1
+
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
     running["train_steps"] = float(steps)
+    running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
         running["lr"] = float(optimizer.param_groups[0]["lr"])
     return running
@@ -1132,6 +1365,11 @@ def write_run_summary(
     config: TrainConfig,
     bundle: DatasetBundle,
     history: list[dict[str, float]],
+    best_epoch: int | None = None,
+    best_val_primary_metric_name: str | None = None,
+    best_val_primary_metric: float | None = None,
+    best_val_metrics: dict[str, float] | None = None,
+    best_test_metrics: dict[str, float] | None = None,
     final_test_metrics: dict[str, float] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1149,6 +1387,11 @@ def write_run_summary(
             "notes": bundle.spec.notes,
         },
         "history": history,
+        "best_epoch": best_epoch,
+        "best_val_primary_metric_name": best_val_primary_metric_name,
+        "best_val_primary_metric": best_val_primary_metric,
+        "best_val_metrics": best_val_metrics or {},
+        "best_test_metrics": best_test_metrics or {},
         "final_test_metrics": final_test_metrics or {},
     }
     drivaerml_split = drivaerml_split_summary(bundle)
@@ -1174,6 +1417,93 @@ def drivaerml_split_summary(bundle: DatasetBundle) -> dict[str, object] | None:
         "excluded_case_count": manifest.get("excluded_case_count"),
         "excluded_case_ids": manifest.get("excluded_case_ids", []),
     }
+
+
+def primary_metric_key(bundle: DatasetBundle, *, phase: str) -> str:
+    if bundle.spec.name == "tandemfoilset":
+        return f"{phase}_primary/surface_pressure_mae"
+    return f"{phase}_primary/{bundle.spec.default_metric}"
+
+
+def snapshot_module_state(module: torch.nn.Module | None) -> dict[str, torch.Tensor] | None:
+    if module is None:
+        return None
+    return {key: value.detach().cpu().clone() for key, value in module.state_dict().items()}
+
+
+def restore_module_state(module: torch.nn.Module | None, state: dict[str, torch.Tensor] | None) -> None:
+    if module is None or state is None:
+        return
+    module.load_state_dict(state)
+
+
+def best_checkpoint_metric_aliases(metrics: dict[str, float]) -> dict[str, float]:
+    return {f"best_{key}": value for key, value in metrics.items()}
+
+
+def evaluate_phase_metrics(
+    *,
+    bundle: DatasetBundle,
+    config: TrainConfig,
+    forward_model: torch.nn.Module,
+    anp_head: ANPSurfaceDecoder | None,
+    loaders: dict[str, DataLoader],
+    transform: TargetTransform | TandemTargetTransform,
+    metric_transform: TargetTransform | None,
+    device: torch.device,
+    phase: str,
+) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    for split_name, loader in loaders.items():
+        if config.model == "reference_abupt":
+            split_metrics = evaluate_abupt(
+                forward_model,
+                loader,
+                transform,
+                metric_transform,
+                device,
+                amp_mode=config.amp_mode,
+                max_batches=config.max_eval_batches,
+            )
+        else:
+            split_metrics = evaluate_grouped(
+                forward_model,
+                anp_head,
+                loader,
+                transform,
+                metric_transform,
+                device,
+                amp_mode=config.amp_mode,
+                max_batches=config.max_eval_batches,
+            )
+        metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
+        if phase == "val" and split_name in LEGACY_VAL_ALIAS and "mae_surf_p" in split_metrics:
+            metrics[f"legacy_noam/{LEGACY_VAL_ALIAS[split_name]}"] = split_metrics["mae_surf_p"]
+
+    if bundle.spec.name == "tandemfoilset":
+        suffix = {
+            "val": "val_eq4/surface_pressure_mae",
+            "test": "test_eq4/surface_pressure_mae",
+        }[phase]
+        eq4_keys = {
+            "val": [
+                "val_single_in_dist/surface_pressure_mae",
+                "val_geom_camber_rc/surface_pressure_mae",
+                "val_geom_camber_cruise/surface_pressure_mae",
+                "val_re_rand/surface_pressure_mae",
+            ],
+            "test": [
+                "test_single_in_dist/surface_pressure_mae",
+                "test_geom_camber_rc/surface_pressure_mae",
+                "test_geom_camber_cruise/surface_pressure_mae",
+                "test_re_rand/surface_pressure_mae",
+            ],
+        }[phase]
+        eq4_values = [metrics[key] for key in eq4_keys if key in metrics]
+        if len(eq4_values) == 4:
+            metrics[suffix] = sum(eq4_values) / 4.0
+
+    return add_primary_metric_aliases(bundle, metrics, phase=phase)
 
 
 def compute_tandem_phys_stats(
@@ -1256,6 +1586,7 @@ def main() -> None:
             phys_stats=phys_stats,
             config=config,
         )
+        metric_transform = None
     else:
         transform = TargetTransform(
             pressure_index=bundle.spec.pressure_output_index,
@@ -1264,6 +1595,17 @@ def main() -> None:
             asinh_pressure=config.asinh_pressure,
             asinh_scale=config.asinh_scale,
         )
+        metric_transform = None
+        if bundle.spec.name in {"airfrans", "tandemfoilset_paper"}:
+            # Keep literature-facing metrics in the dataset's raw z-score space
+            # even when training applies an auxiliary target transform.
+            metric_transform = TargetTransform(
+                pressure_index=bundle.spec.pressure_output_index,
+                stats_mean=bundle.target_stats.y_mean,
+                stats_std=bundle.target_stats.y_std,
+                asinh_pressure=False,
+                asinh_scale=config.asinh_scale,
+            )
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
@@ -1284,18 +1626,26 @@ def main() -> None:
         base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
 
-    ema = EMA(model, decay=config.ema_decay, start_step=config.ema_start_step) if config.use_ema else None
-    anp_ema = EMA(anp_head, decay=config.ema_decay, start_step=config.ema_start_step) if config.use_ema and anp_head is not None else None
+    ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
+    anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
     history: list[dict[str, float]] = []
+    best_epoch: int | None = None
+    best_val_primary_metric_name = primary_metric_key(bundle, phase="val")
+    best_val_primary_metric: float | None = None
+    best_val_metrics: dict[str, float] = {}
+    best_model_state: dict[str, torch.Tensor] | None = None
+    best_anp_state: dict[str, torch.Tensor] | None = None
 
     run = None
     if config.wandb_name:
+        run_config = asdict(config)
+        run_config["effective_batch_size"] = config.batch_size * config.grad_accum_steps
         run = wandb.init(
             project=os.getenv("WANDB_PROJECT", "senpai-v1"),
             entity=os.getenv("WANDB_ENTITY"),
             name=config.wandb_name,
             group=config.wandb_group or None,
-            config=asdict(config),
+            config=run_config,
             tags=[config.dataset, config.model],
         )
 
@@ -1319,6 +1669,7 @@ def main() -> None:
             amp_mode=config.amp_mode,
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
+            grad_accum_steps=config.grad_accum_steps,
         )
 
         if ema is not None:
@@ -1328,42 +1679,27 @@ def main() -> None:
             anp_ema.store(anp_head)
             anp_ema.copy_to(anp_head)
 
-        eval_metrics: dict[str, float] = {}
-        for split_name, loader in val_loaders.items():
-            if config.model == "reference_abupt":
-                split_metrics = evaluate_abupt(
-                    forward_model,
-                    loader,
-                    transform,
-                    device,
-                    amp_mode=config.amp_mode,
-                    max_batches=config.max_eval_batches,
-                )
-            else:
-                split_metrics = evaluate_grouped(
-                    forward_model,
-                    anp_head,
-                    loader,
-                    transform,
-                    device,
-                    amp_mode=config.amp_mode,
-                    max_batches=config.max_eval_batches,
-                )
-            eval_metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
-            if split_name in LEGACY_VAL_ALIAS and "mae_surf_p" in split_metrics:
-                eval_metrics[f"legacy_noam/{LEGACY_VAL_ALIAS[split_name]}"] = split_metrics["mae_surf_p"]
+        eval_metrics = evaluate_phase_metrics(
+            bundle=bundle,
+            config=config,
+            forward_model=forward_model,
+            anp_head=anp_head,
+            loaders=val_loaders,
+            transform=transform,
+            metric_transform=metric_transform,
+            device=device,
+            phase="val",
+        )
 
-        if bundle.spec.name == "tandemfoilset":
-            eq4_keys = [
-                "val_single_in_dist/surface_pressure_mae",
-                "val_geom_camber_rc/surface_pressure_mae",
-                "val_geom_camber_cruise/surface_pressure_mae",
-                "val_re_rand/surface_pressure_mae",
-            ]
-            eq4_values = [eval_metrics[key] for key in eq4_keys if key in eval_metrics]
-            if len(eq4_values) == 4:
-                eval_metrics["val_eq4/surface_pressure_mae"] = sum(eq4_values) / 4.0
-        eval_metrics = add_primary_metric_aliases(bundle, eval_metrics, phase="val")
+        current_primary_metric = eval_metrics.get(best_val_primary_metric_name)
+        if current_primary_metric is not None and (
+            best_val_primary_metric is None or current_primary_metric < best_val_primary_metric
+        ):
+            best_epoch = epoch
+            best_val_primary_metric = current_primary_metric
+            best_val_metrics = dict(eval_metrics)
+            best_model_state = snapshot_module_state(model)
+            best_anp_state = snapshot_module_state(anp_head)
 
         if ema is not None:
             ema.restore(model)
@@ -1377,7 +1713,24 @@ def main() -> None:
             run.summary["epoch"] = epoch
         print(json.dumps(epoch_metrics, sort_keys=True), flush=True)
 
+    if best_epoch is not None:
+        print(
+            json.dumps(
+                {
+                    "best_checkpoint": {
+                        "epoch": float(best_epoch),
+                        "val_primary_metric_name": best_val_primary_metric_name,
+                        "val_primary_metric": best_val_primary_metric,
+                    }
+                },
+                sort_keys=True,
+            )
+        )
+
     final_test_metrics: dict[str, float] = {}
+    best_test_metrics: dict[str, float] = {}
+    terminal_model_state: dict[str, torch.Tensor] | None = None
+    terminal_anp_state: dict[str, torch.Tensor] | None = None
     if test_loaders:
         if ema is not None:
             ema.store(model)
@@ -1386,47 +1739,72 @@ def main() -> None:
             anp_ema.store(anp_head)
             anp_ema.copy_to(anp_head)
 
-        for split_name, loader in test_loaders.items():
-            if config.model == "reference_abupt":
-                split_metrics = evaluate_abupt(
-                    forward_model,
-                    loader,
-                    transform,
-                    device,
-                    amp_mode=config.amp_mode,
-                    max_batches=config.max_eval_batches,
-                )
-            else:
-                split_metrics = evaluate_grouped(
-                    forward_model,
-                    anp_head,
-                    loader,
-                    transform,
-                    device,
-                    amp_mode=config.amp_mode,
-                    max_batches=config.max_eval_batches,
-                )
-            final_test_metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
-        if bundle.spec.name == "tandemfoilset":
-            eq4_keys = [
-                "test_single_in_dist/surface_pressure_mae",
-                "test_geom_camber_rc/surface_pressure_mae",
-                "test_geom_camber_cruise/surface_pressure_mae",
-                "test_re_rand/surface_pressure_mae",
-            ]
-            eq4_values = [final_test_metrics[key] for key in eq4_keys if key in final_test_metrics]
-            if len(eq4_values) == 4:
-                final_test_metrics["test_eq4/surface_pressure_mae"] = sum(eq4_values) / 4.0
-        final_test_metrics = add_primary_metric_aliases(bundle, final_test_metrics, phase="test")
+        final_test_metrics = evaluate_phase_metrics(
+            bundle=bundle,
+            config=config,
+            forward_model=forward_model,
+            anp_head=anp_head,
+            loaders=test_loaders,
+            transform=transform,
+            metric_transform=metric_transform,
+            device=device,
+            phase="test",
+        )
 
         if ema is not None:
             ema.restore(model)
         if anp_head is not None and anp_ema is not None:
             anp_ema.restore(anp_head)
+        terminal_model_state = snapshot_module_state(model)
+        terminal_anp_state = snapshot_module_state(anp_head)
         if run is not None:
             wandb.log(final_test_metrics, step=int(history[-1]["epoch"]) if history else 0)
             run.summary.update(final_test_metrics)
         print(json.dumps({"final_test_metrics": final_test_metrics}, sort_keys=True), flush=True)
+
+        if best_model_state is not None:
+            restore_module_state(model, best_model_state)
+            restore_module_state(anp_head, best_anp_state)
+            best_test_metrics = evaluate_phase_metrics(
+                bundle=bundle,
+                config=config,
+                forward_model=forward_model,
+                anp_head=anp_head,
+                loaders=test_loaders,
+                transform=transform,
+                metric_transform=metric_transform,
+                device=device,
+                phase="test",
+            )
+            if run is not None:
+                best_checkpoint_metrics: dict[str, float | int | str] = {
+                    "best_epoch": int(best_epoch) if best_epoch is not None else -1,
+                    "best_val_primary_metric_name": best_val_primary_metric_name or "",
+                }
+                if best_val_primary_metric is not None:
+                    best_checkpoint_metrics["best_val_primary_metric"] = best_val_primary_metric
+                best_checkpoint_metrics.update({f"best_val/{key}": value for key, value in best_val_metrics.items()})
+                best_checkpoint_metrics.update({f"best_test/{key}": value for key, value in best_test_metrics.items()})
+                best_checkpoint_metrics.update(best_checkpoint_metric_aliases(best_val_metrics))
+                best_checkpoint_metrics.update(best_checkpoint_metric_aliases(best_test_metrics))
+                wandb.log(
+                    best_checkpoint_metrics,
+                    step=int(best_epoch) if best_epoch is not None else (int(history[-1]["epoch"]) if history else 0),
+                )
+                run.summary.update(best_checkpoint_metrics)
+            print(
+                json.dumps(
+                    {
+                        "best_test_metrics": {
+                            "epoch": float(best_epoch) if best_epoch is not None else None,
+                            **best_test_metrics,
+                        }
+                    },
+                    sort_keys=True,
+                )
+            )
+            restore_module_state(model, terminal_model_state)
+            restore_module_state(anp_head, terminal_anp_state)
 
     output_dir = Path(config.output_dir)
     write_run_summary(
@@ -1434,13 +1812,28 @@ def main() -> None:
         config,
         bundle,
         history,
+        best_epoch=best_epoch,
+        best_val_primary_metric_name=best_val_primary_metric_name,
+        best_val_primary_metric=best_val_primary_metric,
+        best_val_metrics=best_val_metrics,
+        best_test_metrics=best_test_metrics,
         final_test_metrics=final_test_metrics,
     )
     if config.save_checkpoint:
         output_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(model.state_dict(), output_dir / f"{config.dataset}_{config.model}.pt")
+        if terminal_model_state is not None:
+            torch.save(terminal_model_state, output_dir / f"{config.dataset}_{config.model}.pt")
+        else:
+            torch.save(model.state_dict(), output_dir / f"{config.dataset}_{config.model}.pt")
+        if best_model_state is not None:
+            torch.save(best_model_state, output_dir / f"{config.dataset}_{config.model}_best.pt")
         if anp_head is not None:
-            torch.save(anp_head.state_dict(), output_dir / f"{config.dataset}_{config.model}_anp.pt")
+            if terminal_anp_state is not None:
+                torch.save(terminal_anp_state, output_dir / f"{config.dataset}_{config.model}_anp.pt")
+            else:
+                torch.save(anp_head.state_dict(), output_dir / f"{config.dataset}_{config.model}_anp.pt")
+            if best_anp_state is not None:
+                torch.save(best_anp_state, output_dir / f"{config.dataset}_{config.model}_anp_best.pt")
     if run is not None:
         run.finish()
 

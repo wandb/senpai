@@ -1,77 +1,126 @@
 # data
 
-Data preparation, benchmark splits, and normalization stats for the TandemFoilSet
-subtarget inside `target/icml2026`.
+Data preparation, benchmark splits, and normalization stats for the packaged
+TandemFoilSet parity target inside `target/icml2026`.
 
 The shared trainer lives at `../../train.py`.
 
+This README documents the **active `tandemfoil/` contract**:
+
+- split manifest: `split_manifest_tandemfoilset_v2.json`
+- metrics: denormalized surface-pressure MAE on the balanced `kagent` split
+  family
+
+It is intentionally **not** the original TandemFoilSet paper’s Experiment 4 MSE
+contract. For that literature-facing benchmark, see `../../tandemfoil_paper/`.
+
 ---
 
-## Why a structured benchmark?
+## Why this split design?
 
-A naive random 90/10 split mostly tests **interpolation**: the model sees the same
-airfoil families, nearby (Re, α, gap, stagger) values, and often the same front/rear
-shapes in both train and test. That hides the paper's central question — whether
-single-airfoil pretraining actually helps on unseen tandem configurations.
+The active `tandemfoil/` target uses the public `kagent` TandemFoilSet split
+design (v2), which was built to answer four concrete questions with balanced
+validation and test tracks.
 
-The structured split instead tests four orthogonal failure modes:
+All val/test tracks are balanced:
 
-| Track | What it tests | Why it matters |
-|-------|--------------|----------------|
-| `val_in_dist` | Interpolation on seen shapes and conditions | Sanity check; should be easy |
-| `val_tandem_transfer` | Tandem pair with a front foil (NACA6416) absent from tandem training | Core claim: does single-foil data transfer to unseen tandem front shapes? |
-| `val_ood_cond` | Cruise cases in the frontier 20% of the joint (AoA, gap, stagger) space | Condition extrapolation — far from the training distribution centroid |
-| `val_ood_re` | All cruise Part2 cases (Re=4.445M, entirely outside training Re range) | Reynolds-number extrapolation — a clean OOD physics shift |
+- `100` validation cases per track
+- `200` test cases per track
+- paper-facing summary = equal-weight average surface-pressure MAE across the four tracks
 
-These four tracks map directly onto the paper's evaluation axes: **composition**,
-**transfer**, **condition OOD**, and **physics OOD**. Reporting each separately
-prevents a single global MSE from masking failures on harder sub-tasks (e.g. near-wall
-regions, wake prediction on novel pairs).
+### Validation / test tracks
 
-### Split assignment rules
+| Split | Source | Selection | What it tests |
+|-------|--------|-----------|---------------|
+| `val_single_in_dist` / `test_single_in_dist` | file `0` | random holdout | Sanity check on single-foil interpolation |
+| `val_geom_camber_rc` / `test_geom_camber_rc` | file `2` | full file holdout | Race-car tandem geometry generalization to unseen front-foil camber `M=6-8` |
+| `val_geom_camber_cruise` / `test_geom_camber_cruise` | file `5` | full file holdout | Cruise tandem geometry generalization to unseen front-foil camber `M=2-4` |
+| `val_re_rand` / `test_re_rand` | files `1, 3, 4, 6` | every 4th sample after sorting by `Re` | Cross-regime Reynolds-number generalization across the tandem training domains |
 
-The seven pickle files are divided as follows:
+### File allocation
 
-| File | Samples | Assignment |
-|------|---------|------------|
-| `raceCar_single` (file 0) | 899 | 70% subsample → 90% train, 10% `val_in_dist` |
-| `raceCar_tandem Part1` (file 1, front=NACA2412) | 300 | 70% subsample → train |
-| `raceCar_tandem Part2` (file 2, front=NACA6416) | 300 | 70% subsample → `val_tandem_transfer` |
-| `raceCar_tandem Part3` (file 3, front=NACA9412) | 300 | 70% subsample → train |
-| `cruise Part1` (file 4, Re=1.475M) | 300 | 70% subsample → interior 80% train, frontier 20% `val_ood_cond` |
-| `cruise Part2` (file 5, Re=4.445M) | 300 | 70% subsample → `val_ood_re` |
-| `cruise Part3` (file 6, Re=802K) | 300 | 70% subsample → interior 80% train, frontier 20% `val_ood_cond` |
+| File | Name | Train | Val | Test | Rationale |
+|------|------|------:|----:|-----:|-----------|
+| `0` | raceCar single | `599` | `100` | `200` | random in-distribution sanity check |
+| `1` | raceCar tandem P1 | `~225` | `~25` | `~50` | contributes to stratified `Re` holdout |
+| `2` | raceCar tandem P2 | `0` | `100` | `200` | full geometry holdout: unseen front-foil camber `M=6-8` |
+| `3` | raceCar tandem P3 | `~225` | `~25` | `~50` | contributes to stratified `Re` holdout |
+| `4` | cruise tandem P1 | `~225` | `~25` | `~50` | contributes to stratified `Re` holdout |
+| `5` | cruise tandem P2 | `0` | `100` | `200` | full geometry holdout: unseen front-foil camber `M=2-4` |
+| `6` | cruise tandem P3 | `~225` | `~25` | `~50` | contributes to stratified `Re` holdout |
 
-**Key design choices:**
+Split totals:
 
-- **Part2 files go entirely to val.** raceCar tandem Part2 uses NACA6416 as the front
-  foil, which does not appear as a tandem front foil in any training file. This makes
-  `val_tandem_transfer` a true held-out shape test rather than a re-split of seen pairs.
-  Similarly, cruise Part2's Re=4.445M is above the training ceiling (~1.5M), giving a
-  clean physics-OOD track.
+- train: `1499`
+- validation: `400`
+- test: `800`
 
-- **Frontier detection for `val_ood_cond`.** Cruise Parts 1+3 are split by distance from
-  the centroid in normalized (AoA, gap, stagger) space. The outermost 20% of cases —
-  those with the most extreme combined conditions — are held out. This is better than
-  holding out tails of a single variable, which would leave near-duplicates in train.
+### Why these holdouts?
 
-- **30% subsampling** (SAMPLE_FRACTION=0.70) is applied proportionally to every source
-  before splitting, so no domain is disproportionately thinned.
-
-**1,889 samples** retained (70% of 2,699, balanced across sources): **1,322 train** + 567 val (63 + 210 + 84 + 210).
+- Full-file geometry holdouts give the cleanest separation for camber
+  generalization because the held-out front-foil families do not appear in
+  training at all.
+- Stratified Reynolds-number holdout tests whether one model works across the
+  full `Re` range instead of only at one corner of the distribution.
+- The random single-foil holdout acts as a sanity check so the harder tandem
+  tracks are interpreted against an easier baseline.
 
 ### Training sampler
 
-Even after structured splitting, raw sample counts are unbalanced (raceCar single has
-~4× more training samples than cruise). A `WeightedRandomSampler` gives each of the
-three domain groups — `racecar_single`, `racecar_tandem`, `cruise` — equal expected
-weight per minibatch, preventing the largest domain from dominating the loss and
-obscuring transfer performance on the smaller tandem/cruise groups.
+The active manifest also keeps balanced domain sampling via three train-domain
+groups:
 
-Features:
-- 24-dim input features (adds foil-2 NACA/AoA, gap, stagger)
-- `SURFACE_IDS` includes boundary ID 7 (foil-2 surface nodes)
-- Balanced domain sampler (racecar_single / racecar_tandem / cruise equally weighted)
+- `racecar_single`
+- `racecar_tandem`
+- `cruise`
+
+A `WeightedRandomSampler` gives those groups equal expected minibatch weight so
+the largest domain does not dominate the loss.
+
+---
+
+## Metric contract
+
+Primary harness metric:
+
+- `val_primary/surface_pressure_mae`
+- `test_primary/surface_pressure_mae`
+
+Definition:
+
+- per split, compute
+  `surface_pressure_mae = mean |p_hat - p_true|`
+- use the pressure / `C_p` channel only
+- evaluate **after full denormalization back to the original target space**
+- aggregate globally over all valid surface nodes in the split, not per case
+
+Summary metric:
+
+- `val_eq4/surface_pressure_mae`
+- `test_eq4/surface_pressure_mae`
+
+This is the equal-weight mean of the four active split-specific surface-pressure
+MAEs:
+
+- `single_in_dist`
+- `geom_camber_rc`
+- `geom_camber_cruise`
+- `re_rand`
+
+Secondary diagnostics:
+
+- `mae_surf_Ux`, `mae_surf_Uy`, `mae_surf_p`
+- `mae_vol_Ux`, `mae_vol_Uy`, `mae_vol_p`
+- per-split validation loss
+
+Historical note:
+
+- the old `split_manifest.json` and legacy names `p_in`, `p_oodc`, `p_tan`,
+  `p_re` are still useful for historical lineage
+- the active `tandemfoil/` target does **not** rank runs on that legacy split
+  family anymore
+- do not compare `surface_pressure_mae` on the v2 manifest directly against the
+  paper’s Table 6 `field_mse` numbers
 
 ---
 
@@ -79,22 +128,20 @@ Features:
 
 | File | Purpose |
 |------|---------|
-| `split.py` | One-time script to regenerate the manifest and stats |
-| `prepare_multi.py` | Extended preprocessing: 24-dim x, foil-2 features, boundary ID 7 |
-| `split_manifest.json` | Committed train/val indices (run `split.py` to regenerate) |
-| `split_stats.json` | Committed normalization stats over training set |
+| `split_tandemfoilset_v2.py` | normalize the public `kagent` competition manifest into this repo’s schema |
+| `split_manifest_tandemfoilset_v2.json` | committed active train/val/test manifest |
+| `split_stats.json` | committed normalization stats over the active training split |
+| `prepare_multi.py` | extended preprocessing: 24-dim `x`, foil-2 features, boundary ID `7` |
+| `split.py` | older legacy split generator kept for historical reference |
+| `split_manifest.json` | older legacy structured manifest kept for historical reference |
 
 ---
 
 ## Running
 
 ```bash
-# Standard run (manifest and stats default to the committed files)
+# Standard run (manifest and stats default to the committed active files)
 cd target/icml2026 && python train.py --dataset tandemfoil --agent <your-name> --wandb_name "<your-name>/<description>"
-
-# Debug run (6 train samples, 2 per val split, 3 epochs)
-cd target/icml2026 && python tandemfoil/data/split.py --quick
-cd target/icml2026 && python train.py --dataset tandemfoil --debug
 ```
 
 **W&B project:** `wandb-applied-ai-team / senpai-v1`
@@ -103,15 +150,15 @@ cd target/icml2026 && python train.py --dataset tandemfoil --debug
 
 ## Regenerating the manifest
 
-Only needed if you change `SAMPLE_FRACTION`, the file list, or the split logic:
+Only needed if the public competition split is updated or the active TandemFoil
+parity contract changes:
 
 ```bash
-# Full run (~30-60 min — loads all 7 pickle files twice for two-pass stats)
-python data/split.py
-
-# Quick debug manifest (instant — no data loading, identity normalization)
-python data/split.py --quick
+cd target/icml2026
+python tandemfoil/data/split_tandemfoilset_v2.py
 ```
+
+The legacy `split.py` flow is retained only for historical experiments.
 
 ---
 
@@ -124,8 +171,8 @@ python k8s/launch.py \
   [--n_students 4]
 ```
 
-`launch.py` defaults to `--repo_branch main`. Once this branch is merged to main,
-student pods will clone main and get `train.py`, the committed manifest,
+`launch.py` defaults to `--repo_branch main`. Once this branch is merged to
+main, student pods will clone main and get `train.py`, the committed manifest,
 and the stats file automatically.
 
 ---
