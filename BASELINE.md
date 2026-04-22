@@ -137,9 +137,17 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.000699 (val) at epoch 653
-- **Best PR:** #2887 (gohan — AirfRANS lr=6e-4 gc=1.0 T_max=10, 2L/256d, no-EMA)
-- **Key insight:** Slightly lower LR (6e-4 vs 7e-4) with longer training (653 epochs) at T_max=10 pushes below EMA baseline. **Beats external target 0.0043 by 83.7%.** Note: this uses no-EMA while the previous best (#2899) used EMA. Next step is applying EMA to lr=6e-4 T_max=10.
+- **Current best:** 0.000627 (val) at epoch 661
+- **Best PR:** #2902 (stark — gradient accumulation ablation accum=1 control, 2L/256d, AdamW lr=6e-4, T_max=10, gc=1.0, WD=1e-2, no-EMA)
+- **Key insight:** The accum=1 control run (no gradient accumulation) trained longer than all accum>1 variants and found a deeper basin at ep661 (0.000627 vs 0.000699 baseline). Gradient accumulation hurts AirfRANS — accum=1 is the correct setting. **Beats external target 0.0043 by 85.4%.**
+
+### 2026-04-22 — PR #2902: AirfRANS: gradient accumulation ablation (accum=1 wins) — NEW BEST
+
+- **val_primary/surface_mse:** 0.000627 (-10.3% vs 0.000699) at epoch 661
+- **W&B run:** ww9w4x4u (accum=1 control run, 661 epochs)
+- **Config:** 2L/256d, AdamW lr=6e-4, T_max=10, gc=1.0, WD=1e-2, no-EMA, Fourier
+- **Key insight:** accum=1 (no accumulation) trained longest and found the deepest basin. accum=2 and accum=4 were strictly worse — gradient accumulation is detrimental for AirfRANS. The control run essentially extended training beyond the previous 653-epoch run.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 6e-4 --cosine-t-max 10 --grad-clip 1.0 --weight-decay 1e-2 --no-use-ema --enable-fourier --model-layers 2 --model-hidden-dim 256 --model-heads 4 --epochs 999`
 
 ### 2026-04-22 — PR #2887: AirfRANS: lr=6e-4 gc=1.0 T_max=10 LR scan — NEW BEST
 
@@ -362,11 +370,19 @@
 ## DrivAerML
 
 - **Primary metric:** `val_primary/surface_rel_l2_pct` (lower is better)
-- **Current best:** 4.619% (val) at epoch 256
-- **Best PR:** #2691 (frieren — **4L/512d**/8H + Fourier + no-EMA + T_max=30, 267 epochs, AdamW lr=5e-4, **180-min budget**)
+- **Current best:** 3.997% (val) at epoch 467
+- **Best PR:** #2898 (piccolo — **4L/512d**/8H + Fourier + no-EMA + T_max=30, 467 epochs, AdamW lr=5e-4, **SENPAI_MAX_EPOCHS=9999**, no-compile)
 - **CRITICAL:** Must pass `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
-- **External target:** <3.71% (AB-UPT, ~500 epochs) — **1.24x gap remaining** (was 1.35x)
-- **Key insight:** WIDTH SCALES at 180-min budget. 4L/512d gets 267 epochs (~0.67 min/ep) vs 4L/320d's 257 epochs (~0.7 min/ep) — comparable throughput but more capacity. Extra capacity pays off when given enough training time. Best checkpoint at epoch 256 (critical — final epoch 267 overfit at 5.926%). SENPAI_MAX_EPOCHS=9999 required. Next: gc=1.5 at 4L/512d, 5L/512d, compound with WD.
+- **External target:** <3.71% (AB-UPT, ~500 epochs) — **1.08x gap remaining** (was 1.24x)
+- **Key insight:** Longer training on the golden 4L/512d config (SENPAI_MAX_EPOCHS=9999 with 360-min budget) finds a deeper basin at epoch 467 vs 256. torch.compile gives no throughput benefit on DrivAerML and the compile run diverged to NaN at ep454 without --grad-clip — future compile experiments MUST include --grad-clip 1.0. SENPAI_MAX_EPOCHS=9999 required.
+
+### 2026-04-22 — PR #2898: DrivAerML: torch.compile throughput (no-compile wins) — NEW BEST
+
+- **val_primary/surface_rel_l2_pct:** 3.997% (-13.5% vs 4.619%) at epoch 467
+- **W&B run:** bht6h42t (no-compile baseline run, 467 epochs, SENPAI_MAX_EPOCHS=9999)
+- **Config:** 4L/512d/8H, AdamW lr=5e-4, T_max=30, no-EMA, Fourier, 360-min budget
+- **Key insight:** torch.compile gives 0% throughput benefit on DrivAerML but the no-compile run trained longer (467 vs 256 epochs) and found a deeper basin. The compile run diverged to NaN at ep454 due to operator fusion without --grad-clip — future DrivAerML compile experiments MUST include --grad-clip 1.0. Gap to external: 1.08x (was 1.24x).
+- **Reproduce:** `cd target/icml2026 && SENPAI_MAX_EPOCHS=9999 python train.py --dataset drivaerml --optimizer adamw --lr 5e-4 --cosine-t-max 30 --no-use-ema --enable-fourier --model-layers 4 --model-hidden-dim 512 --model-heads 8 --epochs 999 --batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
 
 ### 2026-04-21 — PR #2691: DrivAerML: 4L/512d width scaling (180-min) — NEW BEST
 
