@@ -165,6 +165,7 @@ class TrainConfig:
     grad_clip: float = 0.0
     save_checkpoint: bool = False
     seed: int = 0
+    global_context_token: bool = False
 
 
 @dataclass
@@ -469,6 +470,70 @@ def cp_panel_prior_index(config: TrainConfig, bundle: DatasetBundle) -> int | No
         base_dim -= 1
         return base_dim
     return None
+
+
+class GlobalContextToken(torch.nn.Module):
+    """Learnable global summary token updated via cross-attention to slice embeddings."""
+
+    def __init__(self, hidden_dim: int, num_heads: int):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.initial_token = torch.nn.Parameter(torch.empty(1, 1, hidden_dim))
+        torch.nn.init.trunc_normal_(self.initial_token, std=0.02)
+        self.q_proj = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.k_proj = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.v_proj = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.out_proj = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)
+        torch.nn.init.zeros_(self.out_proj.weight)
+        self.norm = torch.nn.LayerNorm(hidden_dim)
+
+    def update(self, current_token: torch.Tensor, slice_embeddings: torch.Tensor) -> torch.Tensor:
+        B, S, _ = slice_embeddings.shape
+        H, Dh = self.num_heads, self.head_dim
+        q = self.q_proj(current_token).view(B, 1, H, Dh).transpose(1, 2)
+        k = self.k_proj(slice_embeddings).view(B, S, H, Dh).transpose(1, 2)
+        v = self.v_proj(slice_embeddings).view(B, S, H, Dh).transpose(1, 2)
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, 1, self.hidden_dim)
+        return self.norm(current_token + self.out_proj(attn_out))
+
+
+class GlobalContextBackbone(torch.nn.Module):
+    """Wraps a Transformer backbone to inject a global context token into slice attention."""
+
+    def __init__(self, backbone: torch.nn.Module, hidden_dim: int, num_heads: int):
+        super().__init__()
+        self.inner = backbone
+        self.gct = GlobalContextToken(hidden_dim, num_heads)
+
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+        B = x.shape[0]
+        current_token = self.gct.initial_token.expand(B, -1, -1)
+        for block in self.inner.blocks:
+            normed_x = block.norm1(x)
+            slice_tokens, slice_weights = block.attention.create_slices(normed_x, attn_mask=attn_mask)
+            _, H, S, Dh = slice_tokens.shape
+            D = H * Dh
+            slice_flat = slice_tokens.permute(0, 2, 1, 3).contiguous().view(B, S, D)
+            current_token = self.gct.update(current_token, slice_flat)
+            global_per_head = current_token.view(B, 1, H, Dh).permute(0, 2, 1, 3)
+            qkv = block.attention.qkv(slice_tokens)
+            q, k, v = qkv.chunk(3, dim=-1)
+            global_qkv = block.attention.qkv(global_per_head)
+            _, gk, gv = global_qkv.chunk(3, dim=-1)
+            k = torch.cat([gk, k], dim=2)
+            v = torch.cat([gv, v], dim=2)
+            out_slice = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=block.attention.dropout if block.attention.training else 0.0
+            )
+            out_x = torch.einsum("bhsc,bhns->bhnc", out_slice, slice_weights)
+            out_x = out_x.permute(0, 2, 1, 3).contiguous().view(B, x.shape[1], block.attention.hidden_dim)
+            attn_out = block.attention.proj_dropout(block.attention.proj(out_x))
+            x = x + attn_out
+            x = x + block.mlp(block.norm2(x))
+        return x
 
 
 def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
@@ -1380,7 +1445,10 @@ def main() -> None:
         )
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
-    model = build_model(config, bundle).to(device)
+    model = build_model(config, bundle)
+    if config.global_context_token and hasattr(model, "backbone"):
+        model.backbone = GlobalContextBackbone(model.backbone, config.model_hidden_dim, config.model_heads)
+    model = model.to(device)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
