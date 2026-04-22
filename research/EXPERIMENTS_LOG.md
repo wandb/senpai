@@ -1,5 +1,25 @@
 # SENPAI Research Results
 
+## 2026-04-23 00:10 — PR #3080: DrivAerML T_max=50 cosine schedule (himmel) — CLOSED
+
+- **Branch:** himmel/dm-tmax-50
+- **Hypothesis:** T_max=50 (longer cosine cycles) helps DrivAerML like it helped AirfRANS.
+
+| Epoch | val_primary/surface_rel_l2_pct | W&B |
+|-------|-------------------------------|-----|
+| 28 | 17.48% (cycle 1 trough) | oilrfmix |
+| 54 | **12.76%** (pre-divergence best) | — |
+| 61 | 46.26% (gradient explosion) | — |
+| 70 | 23.34% (recovering) | — |
+
+**Result: CLOSED — T_max=50 falsified for DrivAerML**
+- Best val 12.76% at ep54, 3.19x worse than baseline 3.997%
+- Gradient explosion at ep61; run still recovering at ep71
+- AirfRANS→DrivAerML T_max transfer is falsified: 4L/512d needs shorter cycles (T_max=30)
+- historia #3082 testing T_max=40 will complete the picture
+
+**himmel reassigned to #3111: DrivAerML cosine eta_min=1e-6/1e-5 (LR floor)**
+
 ## 2026-04-22 23:50 — PR #3043: DrivAerML gradient accumulation ablation (einar) — CLOSED
 
 - **Branch:** einar/dm-grad-accum-ablation
