@@ -1,8 +1,8 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-22 (Wave 3 + TF Paper baseline wave + DM Lion + AF LR sweep + cross-dataset spatial/physics budget sweeps + Wave 4 cross-dataset code/arch innovations + Wave 5 cross-dataset code/arch innovations)
+- **Date:** 2026-04-22 (Wave 3 + TF Paper baseline wave + DM Lion + AF LR sweep + cross-dataset spatial/physics budget sweeps + Wave 4 cross-dataset code/arch innovations + Wave 5 cross-dataset code/arch innovations + Wave 6 per-step SGDR / coord noise / T_max sweep)
 - **Branch:** radford
-- **Fleet status:** 60 live students, ALL ASSIGNED (0 idle) — Wave 5 launched 2026-04-22
+- **Fleet status:** 60 live students, ALL ASSIGNED (0 idle) — Wave 6 launched 2026-04-22 (gojo #2985, shoya #2986, chrome #2987)
 - **Current relaunch budget:** inherit pod env defaults
   - `SENPAI_TIMEOUT_MINUTES=360`
   - `SENPAI_MAX_EPOCHS=999`
@@ -124,7 +124,22 @@ comparability, always include:
 - `target/icml2026/tandemfoil/`
 - `target/icml2026/tandemfoil_paper/`
 
-## ACTIVE EXPERIMENTS — 59 WIP PRs
+## ACTIVE EXPERIMENTS — 62 WIP PRs
+
+### Theme 13: Wave 6 — Cross-Dataset Scheduler/Augmentation (NEW — 2026-04-22)
+
+Three new cross-dataset hypotheses targeting scheduler correctness, geometric augmentation, and T_max sensitivity. All cover all 4 datasets.
+
+| Student | PR | Experiment | Risk |
+|---|---|---|---|
+| gojo | #2985 | **Per-Step SGDR** — `CosineAnnealingWarmRestarts` with step-level T_0=1000, T_mult=2; preserves rapid oscillation regularizer that per-epoch SGDR (#2967) destroyed | LOW-MED |
+| shoya | #2986 | **Coordinate Noise Augmentation** — Gaussian noise σ=0.01 on node 3D positions during training only; forces physics-invariant representations (different from point dropout #2970) | LOW |
+| chrome | #2987 | **Cosine T_max Cross-Dataset Sweep** — T_max=5 (primary) and T_max=20 across all 4 datasets; first unified T_max comparison vs per-dataset baselines (TF=10, DM=30) | LOW |
+
+**Scientific rationale:**
+- gojo #2985: Per-epoch SGDR (#2967) failed because ~750 steps/epoch → LR monotonically decreasing for full epoch → sharp basin → divergence. Per-step T_0=1000 restores the per-step oscillation cycle.
+- shoya #2986: Entirely untested in this pipeline. Standard in 3D point cloud literature (PointNet/DGCNN). σ=0.01 is a gentle perturbation that should regularize without distorting physics.
+- chrome #2987: TF baseline T_max=10, DM baseline T_max=30 set independently. Cross-dataset optimum has never been measured. Note: T_max=5 previously diverged DM (#2911) — a key data point for comparison.
 
 ### Theme 7: Bold New Directions (Wave 3 — recreated after accidental merge of #2928-2936)
 
