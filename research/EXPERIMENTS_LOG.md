@@ -1,5 +1,21 @@
 # SENPAI Research Results
 
+## 2026-04-23 03:35 — PR #3116: DrivAerML SGDR T_0=15 T_mult=2 (sanji) — CLOSED
+
+- **Branch:** sanji/dm-sgdr-t0-15-tmult2
+- **Hypothesis:** SGDR with shorter initial cycles (T_0=15 vs megumi's T_0=30) for rapid early exploration then progressive settling
+- **Results:**
+
+| Metric | Value | vs Baseline |
+|---|---|---|
+| Best val surface_rel_l2_pct | 12.846% ep38 | +221% worse |
+| Terminal val (crashed) | 64.96% ep199 | — |
+| Baseline | 3.997% ep467 | — |
+
+- **W&B run:** gm1o0yvp (crashed, grad_norm=3.98e10)
+- **Analysis:** Same failure mode as megumi's SGDR (#3086): healthy first 3 cycles (ep0-38), then LR restart from ~0 → 5e-4 destabilizes at ep~39. Val spiked 12.8%→72% and never recovered. SGDR is structurally incompatible with DM's no-gc regime — any LR restart from near-zero to peak causes catastrophic instability.
+- **Decision:** CLOSED — 3.2x worse than baseline, crashed
+
 ## 2026-04-23 03:15 — PR #3105: AirfRANS EMA=0.999 for volume (violet) — CLOSED
 
 - **Branch:** violet/af-ema-volume
