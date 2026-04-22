@@ -1,5 +1,35 @@
 # SENPAI Research Results
 
+## 2026-04-23 02:20 — PR #3120: DrivAerML RAdam optimizer (senku) — CLOSED
+
+- **Branch:** senku/dm-radam-optimizer
+- **Hypothesis:** RAdam's variance rectification provides built-in warmup for stable early-epoch dynamics
+- **Results:**
+
+| Run | LR | W&B ID | Best val surface_rel_l2_pct | Fate |
+|---|---|---|---|---|
+| RAdam lr=5e-4 | 5e-4 | hh0vm4a2 | 19.95% ep40 | Diverged ep41-43 |
+| RAdam lr=7e-4 | 7e-4 | tkx91w4v | 20.79% ep38 | NaN ep39 |
+| Baseline | 5e-4 | bht6h42t | 3.997% ep467 | — |
+
+- **Analysis:** RAdam's rectification only provides early-epoch warmup; it offers no protection at recurring cosine LR peaks where DM divergence happens. Both runs survived cycle 1 but diverged in cycle 2 at LR peak. Confirms DM instability is LR-peak driven, not warmup-driven. AdamW's implicit regularization via decoupled weight decay may be the key.
+- **Decision:** CLOSED — both runs ~5x worse than baseline
+
+## 2026-04-23 02:20 — PR #3078: DrivAerML 6L/512d depth scaling (gohan) — CLOSED
+
+- **Branch:** gohan/dm-6l-512d-deeper
+- **Hypothesis:** Monotonic depth trend (2L<3L<4L) continues to 6L for even better results
+- **Results:**
+
+| Run | Config | W&B ID | Best val surface_rel_l2_pct | Fate |
+|---|---|---|---|---|
+| Run 1 | 6L no gc | ca8rh3q8 | 14.680% ep33 | Catastrophic divergence ep37 |
+| Run 2 | 6L gc=0.5 | 9cccs3ze | 6.372% ep155 | Slow divergence ep161 |
+| Baseline | 4L no gc | bht6h42t | 3.997% ep467 | — |
+
+- **Analysis:** Depth trend does NOT continue beyond 4L. 6L amplifies gradient explosions at LR peaks. Even gc=0.5 couldn't stabilize for the 400+ epochs needed (6.372% best at ep155 vs 3.997% at ep467 for 4L). 4L confirmed as DM depth sweet spot. The 6L model converges faster early but hits a stability ceiling.
+- **Decision:** CLOSED — 59% worse than baseline at best (gc run), catastrophic without gc
+
 ## 2026-04-23 02:05 — PR #3073: DrivAerML EMA=0.999 + gc=0.5 compound (faye) — CLOSED
 
 - **Branch:** faye/dm-ema-999-gc05-compound
