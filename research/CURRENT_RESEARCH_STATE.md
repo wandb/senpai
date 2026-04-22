@@ -1,8 +1,8 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-22 (Wave 3 + TF Paper baseline wave + DM Lion + AF LR sweep + cross-dataset spatial/physics budget sweeps + Wave 4 cross-dataset code/arch innovations)
+- **Date:** 2026-04-22 (Wave 3 + TF Paper baseline wave + DM Lion + AF LR sweep + cross-dataset spatial/physics budget sweeps + Wave 4 cross-dataset code/arch innovations + Wave 5 cross-dataset code/arch innovations)
 - **Branch:** radford
-- **Fleet status:** 60 live students, ALL ASSIGNED (0 idle) — Wave 4 launched 2026-04-22
+- **Fleet status:** 60 live students, ALL ASSIGNED (0 idle) — Wave 5 launched 2026-04-22
 - **Current relaunch budget:** inherit pod env defaults
   - `SENPAI_TIMEOUT_MINUTES=360`
   - `SENPAI_MAX_EPOCHS=999`
@@ -188,9 +188,21 @@ Paper targets (Experiment 4, Table 6 — MGN best / paper best per task):
 | edward | #2916 | lr=6e-4+gc=1.0+WD=1e-2+T_max=10 |
 | ~~wolfwood~~ | ~~#2919~~ | ~~T_max=40/50+gc=1.0+WD=1e-2 (longer cycling)~~ CLOSED — failed; reassigned to #2973 cross-dataset spatial sweep |
 
-### Theme 11: Wave 4 — Cross-Dataset Code/Architecture Innovations (NEW — 2026-04-22)
+### Theme 12: Wave 5 — Cross-Dataset Code/Architecture Innovations (NEW — 2026-04-22)
 
-Five novel hypotheses, all covering all 4 datasets. None overlap Wave 3.
+Five novel hypotheses, all covering all 4 datasets. Wave 5 re-runs Wave 4 ideas as TRUE cross-dataset PRs (the Wave 4 assignments #2974-#2978 were single-dataset; Wave 5 is the corrected multi-dataset version).
+
+| Student | PR | Experiment | Risk |
+|---|---|---|---|
+| mugen | #2980 | **PCGrad Gradient Surgery** — project conflicting surface/volume gradients using PCGrad (Yu et al. 2020); `pcgrad_backward()` helper; all 4 datasets | MED |
+| spike | #2981 | **Learnable Attention Temperature** — per-head log-space temperature scalar `self.log_temperature = nn.Parameter(torch.zeros(n_heads))`; scale=`exp(-log_temp)/sqrt(d_k)`; all 4 datasets | LOW-MED |
+| taki | #2982 | **Z-Score Pressure Normalization** — replace `--asinh-pressure` with `LearnedPressureNorm` using running_mean/running_var buffers (momentum=0.01); all 4 datasets | LOW |
+| zenitsu | #2983 | **RoPE Positional Embeddings** — rotary positional encoding on QK using 3D node coordinates; alongside `--enable-fourier`; all 4 datasets | LOW-MED |
+| frieren | #2984 | **LLRD (Layer-wise Learning Rate Decay)** — `get_llrd_param_groups(model, base_lr, decay=0.8)`, test decay=0.8 and 0.9 on TF first; all 4 datasets | LOW |
+
+### Theme 11: Wave 4 — Cross-Dataset Code/Architecture Innovations (2026-04-22, SUPERSEDED by Wave 5)
+
+NOTE: These PRs (#2974-#2978) were originally framed as cross-dataset but were single-dataset implementations. Wave 5 (#2980-#2984) is the corrected multi-dataset version. These PRs may still complete and should be reviewed individually.
 
 | Student | PR | Experiment | Risk |
 |---|---|---|---|
@@ -334,7 +346,7 @@ Their old PRs remain in-flight but are now listed under their new assignments in
 
 ## Next Priorities
 
-1. ~~**URGENT: Best-checkpoint saving code change**~~ — **IN PROGRESS (#2974 mugen).** The T_mult experiment (#2895) proved TF=25.459 and AF=0.000371 exist in the landscape. mugen is implementing `checkpoint_best.pt` saving across all 4 datasets.
+1. ~~**URGENT: Best-checkpoint saving code change**~~ — **IN PROGRESS (#2974 mugen Wave 4).** The T_mult experiment (#2895) proved TF=25.459 and AF=0.000371 exist in the landscape. mugen implementing `checkpoint_best.pt` saving. **Wave 5 launched: #2980-#2984 (PCGrad/AttnTemp/ZScore/RoPE/LLRD) — all true cross-dataset.**
 2. **Monitor TF Paper baseline wave** (#2947 jin, #2948 guts, #2949 vash) — update BASELINE.md with new section once first results arrive
 3. **Monitor DrivAerML Lion** (#2950 piccolo) — first Lion run on DrivAerML; could be significant
 4. **Monitor AirfRANS LR ceiling** (#2951 stark) — tests whether lr>6e-4 helps AF
