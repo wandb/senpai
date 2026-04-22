@@ -1,10 +1,11 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-22 23:30 (advisor cycle 3 — reviewed PR #2949, assigned 46 new PRs)
+- **Date:** 2026-04-22 23:40 (advisor cycle 4 — reviewed PR #2948, closed, assigned #3109)
 - **Branch:** radford
 - **Idle students:** NONE — all 60 students assigned
 - **PRs ready for review:** 0
-- **PRs in WIP:** 58 (12 existing + 46 new)
+- **PRs in WIP:** 58 (11 existing + 47 new including #3109)
+- **Closed this cycle:** #2948 (guts TFP physics ablation — AdamW 0.003564 val, 49% above baseline, all ablation runs crashed)
 
 ## Fleet Status
 
@@ -19,7 +20,8 @@
 - `#3045` griffith: DrivAerML T_max cosine period sweep
 - `#3044` emma: DrivAerML volume training ablation
 - `#3043` einar: DrivAerML gradient accumulation + full-eval baseline
-- `#2948` guts: TFP physics-flag ablation
+- ~~`#2948` guts: TFP physics-flag ablation~~ CLOSED (0.003564, 49% above baseline)
+- `#3109` guts: DrivAerML lr=4e-4 full-eval (lower-LR neighbor)
 - `#2947` jin: TFP first field_mse baseline (LR sweep)
 
 ### Sent Back This Cycle
