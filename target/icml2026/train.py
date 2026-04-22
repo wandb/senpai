@@ -166,6 +166,7 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    rope_dim: int = 0
 
 
 @dataclass
@@ -480,6 +481,7 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
         "n_head": config.model_heads,
         "mlp_ratio": config.model_mlp_ratio,
         "slice_num": config.model_slices,
+        "rope_dim": config.rope_dim,
     }
     if config.model == "reference_transolver":
         return ReferenceTransolver(

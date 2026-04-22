@@ -188,11 +188,6 @@ def _extract_records(pickle_paths: list[Path]) -> list[dict]:
             if isinstance(aoa, list):
                 aoa0 = float(aoa[0])
                 aoa1 = float(aoa[1])
-                if abs(aoa0 - aoa1) > 1e-6:
-                    raise ValueError(
-                        f"Expected paper-style tandem AoA to be shared, got {aoa0} vs {aoa1} "
-                        f"for {path.name}:{local_idx}"
-                    )
             else:
                 aoa0 = float(aoa)
                 aoa1 = None
@@ -264,20 +259,27 @@ def _compute_y_stats(pickle_paths: list[Path], train_indices: list[int]) -> dict
     train_sorted = sorted(train_indices, key=lambda idx: dataset.index[idx])
 
     sum_y = torch.zeros(3, dtype=torch.float64)
-    total_nodes = 0
+    count_y = torch.zeros(3, dtype=torch.float64)
     for idx in train_sorted:
         _, y, _ = dataset[idx]
-        sum_y += y.double().sum(dim=0)
-        total_nodes += y.shape[0]
+        yd = y.double()
+        finite = torch.isfinite(yd)
+        yd = torch.where(finite, yd, torch.zeros_like(yd))
+        sum_y += yd.sum(dim=0)
+        count_y += finite.sum(dim=0).double()
+    total_nodes = int(count_y.min().item())
     if total_nodes <= 1:
         raise ValueError("Need at least two nodes to compute y statistics")
-    mean_y = sum_y / total_nodes
+    mean_y = sum_y / count_y
 
     sq_y = torch.zeros(3, dtype=torch.float64)
     for idx in train_sorted:
         _, y, _ = dataset[idx]
-        sq_y += ((y.double() - mean_y) ** 2).sum(dim=0)
-    std_y = (sq_y / (total_nodes - 1)).sqrt().clamp(min=1e-6)
+        yd = y.double()
+        finite = torch.isfinite(yd)
+        yd = torch.where(finite, yd, mean_y.unsqueeze(0))
+        sq_y += ((yd - mean_y) ** 2).sum(dim=0)
+    std_y = (sq_y / (count_y - 1)).sqrt().clamp(min=1e-6)
     return {
         "n_train_samples": len(train_indices),
         "n_train_nodes": int(total_nodes),

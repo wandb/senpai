@@ -18,6 +18,38 @@ def _init_linear(module: nn.Module, std: float = 0.02) -> None:
             nn.init.zeros_(module.bias)
 
 
+def apply_rope_nd(x: torch.Tensor, positions: torch.Tensor, rope_dim: int) -> torch.Tensor:
+    """Apply N-dimensional Rotary Position Embeddings using continuous spatial coordinates.
+
+    x: [..., D] tensor (query or key)
+    positions: [..., space_dim] continuous coordinates
+    rope_dim: number of head dimensions to rotate (rest pass through unchanged)
+    """
+    D = x.shape[-1]
+    space_dim = positions.shape[-1]
+    dims_per_axis = (rope_dim // space_dim) & ~1
+    if dims_per_axis < 2:
+        return x
+    total_rope = dims_per_axis * space_dim
+    half = dims_per_axis // 2
+    freq_seq = torch.arange(half, device=x.device, dtype=torch.float32) / half
+    freqs = 1.0 / (10000.0 ** freq_seq)
+    angles = positions.unsqueeze(-1) * freqs
+    angles = angles.flatten(-2)
+    cos_a = angles.cos().to(x.dtype)
+    sin_a = angles.sin().to(x.dtype)
+    x_rope = x[..., :total_rope]
+    x_rest = x[..., total_rope:]
+    x1 = x_rope[..., 0::2]
+    x2 = x_rope[..., 1::2]
+    y1 = cos_a * x1 - sin_a * x2
+    y2 = sin_a * x1 + cos_a * x2
+    x_rotated = torch.stack([y1, y2], dim=-1).flatten(-2)
+    if x_rest.shape[-1] > 0:
+        return torch.cat([x_rotated, x_rest], dim=-1)
+    return x_rotated
+
+
 class LinearProjection(nn.Module):
     def __init__(self, input_dim: int, output_dim: int, bias: bool = True):
         super().__init__()
@@ -85,7 +117,7 @@ class UpActDownMlp(nn.Module):
 
 
 class TransolverAttention(nn.Module):
-    def __init__(self, hidden_dim: int, num_heads: int, num_slices: int, dropout: float = 0.0):
+    def __init__(self, hidden_dim: int, num_heads: int, num_slices: int, dropout: float = 0.0, rope_dim: int = 0):
         super().__init__()
         if hidden_dim % num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads")
@@ -94,6 +126,7 @@ class TransolverAttention(nn.Module):
         self.dim_head = hidden_dim // num_heads
         self.num_slices = num_slices
         self.dropout = dropout
+        self.rope_dim = rope_dim
 
         self.temperature = nn.Parameter(torch.full((1, num_heads, 1, 1), 0.5))
         self.in_project_x = LinearProjection(hidden_dim, hidden_dim)
@@ -116,10 +149,16 @@ class TransolverAttention(nn.Module):
         slice_tokens = torch.einsum("bhnc,bhns->bhsc", fx_mid, slice_weights) / (slice_norm + 1e-5)
         return slice_tokens, slice_weights
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None, coords: torch.Tensor | None = None) -> torch.Tensor:
         slice_tokens, slice_weights = self.create_slices(x, attn_mask=attn_mask)
         qkv = self.qkv(slice_tokens)
         q, k, v = qkv.chunk(3, dim=-1)
+        if self.rope_dim > 0 and coords is not None:
+            slice_mass = slice_weights.sum(dim=2)
+            centroids = torch.einsum("bhns,bnp->bhsp", slice_weights, coords)
+            centroids = centroids / (slice_mass.unsqueeze(-1) + 1e-8)
+            q = apply_rope_nd(q, centroids, self.rope_dim)
+            k = apply_rope_nd(k, centroids, self.rope_dim)
         out_slice = F.scaled_dot_product_attention(
             q,
             k,
@@ -139,6 +178,7 @@ class TransformerBlock(nn.Module):
         mlp_expansion_factor: int | float,
         num_slices: int,
         dropout: float = 0.0,
+        rope_dim: int = 0,
     ):
         super().__init__()
         mlp_hidden_dim = int(math.ceil(hidden_dim * mlp_expansion_factor))
@@ -148,12 +188,13 @@ class TransformerBlock(nn.Module):
             num_heads=num_heads,
             num_slices=num_slices,
             dropout=dropout,
+            rope_dim=rope_dim,
         )
         self.norm2 = nn.LayerNorm(hidden_dim, eps=1e-6)
         self.mlp = UpActDownMlp(hidden_dim=hidden_dim, mlp_hidden_dim=mlp_hidden_dim)
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
-        x = x + self.attention(self.norm1(x), attn_mask=attn_mask)
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None, coords: torch.Tensor | None = None) -> torch.Tensor:
+        x = x + self.attention(self.norm1(x), attn_mask=attn_mask, coords=coords)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -167,6 +208,7 @@ class Transformer(nn.Module):
         mlp_expansion_factor: int | float,
         num_slices: int,
         dropout: float = 0.0,
+        rope_dim: int = 0,
     ):
         super().__init__()
         self.blocks = nn.ModuleList(
@@ -177,14 +219,15 @@ class Transformer(nn.Module):
                     mlp_expansion_factor=mlp_expansion_factor,
                     num_slices=num_slices,
                     dropout=dropout,
+                    rope_dim=rope_dim,
                 )
                 for _ in range(depth)
             ]
         )
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None, coords: torch.Tensor | None = None) -> torch.Tensor:
         for block in self.blocks:
-            x = block(x, attn_mask=attn_mask)
+            x = block(x, attn_mask=attn_mask, coords=coords)
         return x
 
 
@@ -205,6 +248,7 @@ class ReferenceTransolver(nn.Module):
         n_head: int = 3,
         mlp_ratio: int = 4,
         slice_num: int = 96,
+        rope_dim: int = 0,
     ):
         super().__init__()
         self.space_dim = space_dim
@@ -233,6 +277,7 @@ class ReferenceTransolver(nn.Module):
             mlp_expansion_factor=mlp_ratio,
             num_slices=slice_num,
             dropout=dropout,
+            rope_dim=rope_dim,
         )
         self.norm = nn.LayerNorm(n_hidden, eps=1e-6)
         self.out = LinearProjection(n_hidden, surface_output_dim + volume_output_dim)
@@ -256,14 +301,17 @@ class ReferenceTransolver(nn.Module):
         surface_hidden = self._group_hidden(surface_x, self.project_surface_features, self.surface_bias)
         hidden_parts = [surface_hidden]
         mask_parts = [surface_mask]
+        coord_parts = [surface_x[:, :, : self.space_dim]]
         volume_hidden = None
         if volume_x is not None and volume_mask is not None and self.volume_output_dim > 0:
             volume_hidden = self._group_hidden(volume_x, self.project_volume_features, self.volume_bias)
             hidden_parts.append(volume_hidden)
             mask_parts.append(volume_mask)
+            coord_parts.append(volume_x[:, :, : self.space_dim])
         hidden = torch.cat(hidden_parts, dim=1) + self.placeholder
         attn_mask = torch.cat(mask_parts, dim=1)
-        hidden = self.backbone(hidden, attn_mask=attn_mask)
+        coords = torch.cat(coord_parts, dim=1)
+        hidden = self.backbone(hidden, attn_mask=attn_mask, coords=coords)
         raw_output = self.out(self.norm(hidden))
 
         surface_tokens = surface_x.shape[1]
