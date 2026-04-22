@@ -169,6 +169,7 @@ class TrainConfig:
     seed: int = 0
     use_swa: bool = False
     swa_start_epoch: int = 50
+    swa_trough_only: bool = False
 
 
 @dataclass
@@ -1471,8 +1472,12 @@ def main() -> None:
         )
 
         if swa_model is not None and epoch >= config.swa_start_epoch:
-            swa_model.update_parameters(model)
-            swa_n_averaged += 1
+            do_swa_update = True
+            if config.swa_trough_only and config.cosine_t_max > 0:
+                do_swa_update = epoch % config.cosine_t_max == 0
+            if do_swa_update:
+                swa_model.update_parameters(model)
+                swa_n_averaged += 1
 
         swa_active = swa_model is not None and swa_n_averaged > 0
         if swa_active:
@@ -1525,6 +1530,7 @@ def main() -> None:
         eval_metrics = add_primary_metric_aliases(bundle, eval_metrics, phase="val")
         if swa_active:
             eval_metrics["swa/n_averaged"] = float(swa_n_averaged)
+            eval_metrics["swa/trough_only"] = float(config.swa_trough_only)
 
         if not swa_active:
             if ema is not None:
