@@ -157,6 +157,8 @@ class TrainConfig:
     anp_srf: bool = False
     asinh_pressure: bool = False
     asinh_scale: float = 0.75
+    learned_pressure_norm: bool = False
+    learned_pressure_norm_momentum: float = 0.01
     residual_prediction: bool = False
     re_stratified_sampling: bool = False
     cosine_t_max: int = 150
@@ -191,6 +193,37 @@ class TandemPreparedBatch:
     aft_surface_mask: torch.Tensor
 
 
+class LearnedPressureNorm(torch.nn.Module):
+    """Running z-score normalization for pressure targets (BatchNorm-style stats)."""
+
+    def __init__(self, momentum: float = 0.01):
+        super().__init__()
+        self.register_buffer("running_mean", torch.zeros(1))
+        self.register_buffer("running_var", torch.ones(1))
+        self.momentum = momentum
+        self.eps = 1e-5
+
+    def forward(self, x: torch.Tensor, update_stats: bool = True) -> torch.Tensor:
+        if self.training and update_stats:
+            batch_mean = x.mean()
+            batch_var = x.var()
+            self.running_mean.lerp_(batch_mean.detach(), self.momentum)
+            self.running_var.lerp_(batch_var.detach(), self.momentum)
+        mean = self.running_mean
+        std = (self.running_var + self.eps).sqrt()
+        return (x - mean) / std
+
+    def denorm(self, x_norm: torch.Tensor) -> torch.Tensor:
+        std = (self.running_var + self.eps).sqrt()
+        return x_norm * std + self.running_mean
+
+    def stats_dict(self) -> dict[str, float]:
+        return {
+            "learned_pressure_norm/running_mean": float(self.running_mean.item()),
+            "learned_pressure_norm/running_std": float((self.running_var + self.eps).sqrt().item()),
+        }
+
+
 class TargetTransform:
     def __init__(
         self,
@@ -200,12 +233,14 @@ class TargetTransform:
         stats_std: torch.Tensor | None,
         asinh_pressure: bool = False,
         asinh_scale: float = 1.0,
+        learned_norm: LearnedPressureNorm | None = None,
     ):
         self.pressure_index = pressure_index
         self.stats_mean = stats_mean
         self.stats_std = stats_std
         self.asinh_pressure = asinh_pressure
         self.asinh_scale = asinh_scale
+        self.learned_norm = learned_norm
 
     def apply(self, y: torch.Tensor) -> torch.Tensor:
         out = y.clone()
@@ -215,7 +250,9 @@ class TargetTransform:
         if not out.is_floating_point():
             out = out.float()
         out = torch.where(torch.isfinite(out), out, torch.zeros_like(out))
-        if self.asinh_pressure and self.pressure_index is not None:
+        if self.learned_norm is not None and self.pressure_index is not None:
+            out[..., self.pressure_index] = self.learned_norm(out[..., self.pressure_index])
+        elif self.asinh_pressure and self.pressure_index is not None:
             out[..., self.pressure_index] = torch.asinh(out[..., self.pressure_index] * self.asinh_scale)
         if self.stats_mean is not None and self.stats_std is not None and self.stats_mean.numel() == out.shape[-1]:
             out = (out - self.stats_mean.to(out.device)) / self.stats_std.to(out.device).clamp(min=1e-6)
@@ -226,7 +263,9 @@ class TargetTransform:
         out = y.clone()
         if self.stats_mean is not None and self.stats_std is not None and self.stats_mean.numel() == out.shape[-1]:
             out = out * self.stats_std.to(out.device) + self.stats_mean.to(out.device)
-        if self.asinh_pressure and self.pressure_index is not None:
+        if self.learned_norm is not None and self.pressure_index is not None:
+            out[..., self.pressure_index] = self.learned_norm.denorm(out[..., self.pressure_index])
+        elif self.asinh_pressure and self.pressure_index is not None:
             out[..., self.pressure_index] = torch.sinh(out[..., self.pressure_index]) / max(self.asinh_scale, 1e-6)
         return out
 
@@ -251,6 +290,7 @@ class TandemTargetTransform:
         stats: TargetTransformStats,
         phys_stats: TargetTransformStats,
         config: TrainConfig,
+        learned_norm: LearnedPressureNorm | None = None,
     ):
         if stats.x_mean is None or stats.x_std is None:
             raise ValueError("Tandem parity path requires x_mean/x_std in split stats")
@@ -261,6 +301,7 @@ class TandemTargetTransform:
         self.phys_mean = phys_stats.y_mean
         self.phys_std = phys_stats.y_std
         self.config = config
+        self.learned_norm = learned_norm
 
     @staticmethod
     def _umag_q(y: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -365,7 +406,10 @@ class TandemTargetTransform:
 
         umag, q = self._umag_q(full_y_raw, full_mask)
         y_phys = self._phys_norm(full_y_raw, umag, q)
-        if self.config.asinh_pressure:
+        if self.learned_norm is not None:
+            y_phys = y_phys.clone()
+            y_phys[..., 2:3] = self.learned_norm(y_phys[..., 2:3])
+        elif self.config.asinh_pressure:
             y_phys = y_phys.clone()
             y_phys[..., 2:3] = torch.asinh(y_phys[..., 2:3] * self.config.asinh_scale)
         y_norm = (y_phys - self.phys_mean.to(full_y_raw.device)) / self.phys_std.to(full_y_raw.device).clamp(min=1e-6)
@@ -433,7 +477,10 @@ class TandemTargetTransform:
         if self.config.residual_prediction and prepared.freestream is not None:
             full_pred = full_pred + prepared.freestream
         pred_phys = full_pred * self.phys_std.to(full_pred.device) + self.phys_mean.to(full_pred.device)
-        if self.config.asinh_pressure:
+        if self.learned_norm is not None:
+            pred_phys = pred_phys.clone()
+            pred_phys[..., 2:3] = self.learned_norm.denorm(pred_phys[..., 2:3])
+        elif self.config.asinh_pressure:
             pred_phys = pred_phys.clone()
             pred_phys[..., 2:3] = torch.sinh(pred_phys[..., 2:3]) / max(self.config.asinh_scale, 1e-6)
         pred_orig = self._phys_denorm(pred_phys, prepared.umag, prepared.q)
@@ -1542,6 +1589,8 @@ def compute_tandem_phys_stats(
 
 def main() -> None:
     config = parse_args()
+    if config.learned_pressure_norm and config.asinh_pressure:
+        raise ValueError("--learned-pressure-norm and --asinh-pressure are mutually exclusive")
     if config.seed != 0:
         random.seed(config.seed)
         torch.manual_seed(config.seed)
@@ -1573,19 +1622,25 @@ def main() -> None:
 
     bundle = build_bundle(config)
     resolved_num_workers = resolve_num_workers(config, bundle.spec.name)
+
+    learned_norm: LearnedPressureNorm | None = None
+    if config.learned_pressure_norm:
+        learned_norm = LearnedPressureNorm(momentum=config.learned_pressure_norm_momentum).to(device)
+
     if bundle.spec.name == "tandemfoilset":
         phys_stats = compute_tandem_phys_stats(
             bundle.train_dataset,
             batch_size=config.batch_size,
             num_workers=resolved_num_workers,
             device=device,
-            asinh_pressure=config.asinh_pressure,
+            asinh_pressure=config.asinh_pressure if not config.learned_pressure_norm else False,
             asinh_scale=config.asinh_scale,
         )
         transform: TargetTransform | TandemTargetTransform = TandemTargetTransform(
             stats=bundle.target_stats,
             phys_stats=phys_stats,
             config=config,
+            learned_norm=learned_norm,
         )
         metric_transform = None
     else:
@@ -1595,11 +1650,10 @@ def main() -> None:
             stats_std=bundle.target_stats.y_std,
             asinh_pressure=config.asinh_pressure,
             asinh_scale=config.asinh_scale,
+            learned_norm=learned_norm,
         )
         metric_transform = None
         if bundle.spec.name in {"airfrans", "tandemfoilset_paper"}:
-            # Keep literature-facing metrics in the dataset's raw z-score space
-            # even when training applies an auxiliary target transform.
             metric_transform = TargetTransform(
                 pressure_index=bundle.spec.pressure_output_index,
                 stats_mean=bundle.target_stats.y_mean,
@@ -1656,6 +1710,8 @@ def main() -> None:
     for epoch in range(1, config.epochs + 1):
         if timeout_seconds is not None and epoch > 1 and (time.monotonic() - start_time) >= timeout_seconds:
             break
+        if learned_norm is not None:
+            learned_norm.train()
         train_metrics = train_one_epoch(
             model=forward_model,
             anp_head=anp_head,
@@ -1672,6 +1728,9 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
         )
+        if learned_norm is not None:
+            train_metrics.update(learned_norm.stats_dict())
+            learned_norm.eval()
 
         if ema is not None:
             ema.store(model)
