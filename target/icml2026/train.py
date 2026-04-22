@@ -167,6 +167,7 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
+    deep_output_head: bool = False
     seed: int = 0
 
 
@@ -539,6 +540,23 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
             volume_output_dim=bundle.spec.volume_output_dim,
         )
     raise ValueError(f"Unknown model: {config.model}")
+
+
+def _maybe_apply_deep_output_head(model: torch.nn.Module, config: TrainConfig) -> None:
+    if not config.deep_output_head:
+        return
+    if not hasattr(model, "out"):
+        return
+    n_hidden = config.model_hidden_dim
+    out_dim = model.out.project.out_features
+    deep_head = torch.nn.Sequential(
+        torch.nn.Linear(n_hidden, n_hidden),
+        torch.nn.GELU(),
+        torch.nn.Linear(n_hidden, out_dim),
+    )
+    torch.nn.init.normal_(deep_head[2].weight, std=0.02)
+    torch.nn.init.zeros_(deep_head[2].bias)
+    model.out = deep_head
 
 
 def build_optimizer(params, config: TrainConfig):
@@ -1609,7 +1627,9 @@ def main() -> None:
             )
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
-    model = build_model(config, bundle).to(device)
+    model = build_model(config, bundle)
+    _maybe_apply_deep_output_head(model, config)
+    model = model.to(device)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
