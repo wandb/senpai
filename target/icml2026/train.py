@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from torch.utils.data import DataLoader, WeightedRandomSampler
@@ -105,6 +106,7 @@ class TrainConfig:
     model_heads: int = 3
     model_mlp_ratio: int = 4
     model_slices: int = 96
+    num_kv_heads: int = 0
     model_dropout: float = 0.0
     drivaerml_train_surface_points: int = 0
     drivaerml_eval_surface_points: int = 0
@@ -470,6 +472,78 @@ def cp_panel_prior_index(config: TrainConfig, bundle: DatasetBundle) -> int | No
         base_dim -= 1
         return base_dim
     return None
+
+
+class GQATransolverAttention(nn.Module):
+    def __init__(self, hidden_dim: int, num_heads: int, num_kv_heads: int, num_slices: int, dropout: float = 0.0):
+        super().__init__()
+        if hidden_dim % num_heads != 0:
+            raise ValueError("hidden_dim must be divisible by num_heads")
+        if num_heads % num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads")
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.dim_head = hidden_dim // num_heads
+        self.num_slices = num_slices
+        self.dropout = dropout
+        self.heads_per_group = num_heads // num_kv_heads
+
+        self.temperature = nn.Parameter(torch.full((1, num_heads, 1, 1), 0.5))
+        self.in_project_x = nn.Linear(hidden_dim, hidden_dim)
+        self.in_project_fx = nn.Linear(hidden_dim, hidden_dim)
+        self.in_project_slice = nn.Linear(self.dim_head, num_slices)
+        self.q_proj = nn.Linear(self.dim_head, self.dim_head, bias=False)
+        self.kv_proj = nn.Linear(self.dim_head, self.dim_head * 2, bias=False)
+        self.proj = nn.Linear(hidden_dim, hidden_dim)
+        self.proj_dropout = nn.Dropout(dropout)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+        B, N, _ = x.shape
+        H, KV_H, G = self.num_heads, self.num_kv_heads, self.heads_per_group
+        S, D = self.num_slices, self.dim_head
+
+        fx_mid = self.in_project_fx(x).view(B, N, H, D).permute(0, 2, 1, 3)
+        x_mid = self.in_project_x(x).view(B, N, H, D).permute(0, 2, 1, 3)
+        slice_logits = self.in_project_slice(x_mid) / self.temperature
+        slice_weights = F.softmax(slice_logits, dim=-1)
+        if attn_mask is not None:
+            mask = attn_mask[:, None, :, None].float()
+            slice_weights = slice_weights * mask
+        slice_norm = slice_weights.sum(dim=2, keepdim=False).unsqueeze(-1)
+        slice_tokens = torch.einsum("bhnc,bhns->bhsc", fx_mid, slice_weights) / (slice_norm + 1e-5)
+
+        q = self.q_proj(slice_tokens)
+        kv_tokens = slice_tokens.view(B, KV_H, G, S, D).mean(dim=2)
+        kv = self.kv_proj(kv_tokens)
+        k, v = kv.chunk(2, dim=-1)
+        k = k.unsqueeze(2).expand(B, KV_H, G, S, D).reshape(B, H, S, D)
+        v = v.unsqueeze(2).expand(B, KV_H, G, S, D).reshape(B, H, S, D)
+
+        out_slice = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout if self.training else 0.0)
+        out_x = torch.einsum("bhsc,bhns->bhnc", out_slice, slice_weights)
+        out_x = out_x.permute(0, 2, 1, 3).contiguous().view(B, N, self.hidden_dim)
+        return self.proj_dropout(self.proj(out_x))
+
+
+def apply_gqa_to_model(model: nn.Module, num_kv_heads: int) -> None:
+    for block in model.backbone.blocks:
+        old = block.attention
+        block.attention = GQATransolverAttention(
+            hidden_dim=old.hidden_dim,
+            num_heads=old.num_heads,
+            num_kv_heads=num_kv_heads,
+            num_slices=old.num_slices,
+            dropout=old.dropout,
+        )
 
 
 def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
@@ -1406,7 +1480,12 @@ def main() -> None:
         )
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
-    model = build_model(config, bundle).to(device)
+    model = build_model(config, bundle)
+    if config.num_kv_heads > 0 and config.num_kv_heads < config.model_heads:
+        apply_gqa_to_model(model, config.num_kv_heads)
+    model = model.to(device)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {total_params:,} (num_kv_heads={config.num_kv_heads or config.model_heads})", flush=True)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
@@ -1432,6 +1511,7 @@ def main() -> None:
     if config.wandb_name:
         run_config = asdict(config)
         run_config["effective_batch_size"] = config.batch_size * config.grad_accum_steps
+        run_config["total_params"] = total_params
         run = wandb.init(
             project=os.getenv("WANDB_PROJECT", "senpai-v1"),
             entity=os.getenv("WANDB_ENTITY"),
