@@ -168,6 +168,7 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    spectral_norm_attn: bool = False
 
 
 @dataclass
@@ -496,6 +497,18 @@ def cp_panel_prior_index(config: TrainConfig, bundle: DatasetBundle) -> int | No
         base_dim -= 1
         return base_dim
     return None
+
+
+def apply_spectral_norm_attn(model: torch.nn.Module) -> None:
+    from torch.nn.utils import spectral_norm
+    from core.architectures.transolver_reference import TransolverAttention
+    count = 0
+    for module in model.modules():
+        if isinstance(module, TransolverAttention):
+            spectral_norm(module.qkv.project)
+            spectral_norm(module.proj.project)
+            count += 1
+    print(f"[spectral-norm-attn] Applied to {count} TransolverAttention layers (qkv + proj)")
 
 
 def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
@@ -1610,6 +1623,8 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
+    if config.spectral_norm_attn:
+        apply_spectral_norm_attn(model)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
