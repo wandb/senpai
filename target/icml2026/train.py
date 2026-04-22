@@ -166,6 +166,7 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    slice_temperature: float = 0.5
 
 
 @dataclass
@@ -1407,6 +1408,10 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
+    if config.slice_temperature != 0.5:
+        for module in model.modules():
+            if hasattr(module, "temperature") and isinstance(module.temperature, torch.nn.Parameter):
+                module.temperature.data.fill_(config.slice_temperature)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
