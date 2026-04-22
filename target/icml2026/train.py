@@ -219,6 +219,7 @@ class TargetTransform:
             out[..., self.pressure_index] = torch.asinh(out[..., self.pressure_index] * self.asinh_scale)
         if self.stats_mean is not None and self.stats_std is not None and self.stats_mean.numel() == out.shape[-1]:
             out = (out - self.stats_mean.to(out.device)) / self.stats_std.to(out.device).clamp(min=1e-6)
+        out = torch.where(out.isfinite(), out, torch.zeros_like(out))
         return out
 
     def invert(self, y: torch.Tensor) -> torch.Tensor:
