@@ -184,6 +184,15 @@
 - **Key insight:** Removing one layer from 4L→3L unlocked a 46.6% improvement. Width (256d) is the dominant capacity lever; extra depth adds noise to the optimization trajectory. The 3L model found a deep trough at ep202 (0.001479) but subsequently regressed — same T_max=5 instability pattern as 4L configs. Test metric from the diverged terminal checkpoint is invalid. Critical follow-ups: (1) gc=0.5 compound at 3L/256d (kakashi #2823), (2) 3L width frontier 320d/384d/512d (ray #2824), (3) T_max=10 stability variant.
 - **Reproduce:** `cd target/icml2026 && CUDA_VISIBLE_DEVICES=0 SENPAI_MAX_EPOCHS=9999 SENPAI_TIMEOUT_MINUTES=180 python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 7e-4 --cosine-t-max 5 --grad-clip 1.0 --weight-decay 1e-2 --no-use-ema --enable-fourier --model-layers 3 --model-hidden-dim 256 --model-heads 4 --epochs 999`
 
+### 2026-04-22 — PR #2820: AirfRANS: 3L/256d gc=0.5 lr=5e-4 — 3L LINEAGE BEST
+
+- **val_primary/surface_mse:** 0.001241 (-16.1% vs 0.001479) at epoch 232
+- **test_primary/surface_mse:** 0.003734 (from best-checkpoint run)
+- **W&B run:** rvwmsfth (284 epochs, best at ep232; model regressed after ep232)
+- **Config:** 3L/256d, AdamW lr=5e-4, T_max=5, gc=0.5, WD=1e-2, no-EMA, Fourier
+- **Key insight:** gc=0.5 + lr=5e-4 is stable through ep284 — no divergence vs. ep205 divergence at lr=7e-4. Hypothesis confirmed: lower LR prevents the catastrophic gradient spikes at cosine T_max=5 peaks. Best 3L/256d result to date. Does not beat the overall AirfRANS best (2L/256d at 0.000627). First-phase 4L/256d run (W&B: 21u2f2n3) yielded 0.00176 at ep160.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 5e-4 --cosine-t-max 5 --grad-clip 0.5 --weight-decay 1e-2 --no-use-ema --enable-fourier --model-layers 3 --model-hidden-dim 256 --model-heads 4 --epochs 999`
+
 ### 2026-04-21 — PR #2774: AirfRANS: 4L/256d + gc=0.5 extended — PREVIOUS BEST
 
 - **val_primary/surface_mse:** 0.00277 (-28.9% vs 0.003904) at epoch 150
