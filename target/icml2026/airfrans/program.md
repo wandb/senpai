@@ -34,6 +34,7 @@ Use the **official AirfRANS benchmark metric family**. For literature comparison
     - `loss_vol = loss_vol_var.mean()`
   - Finally average those case-level scalars over the evaluation split.
   - In the original AirfRANS training / scoring code, these MSEs are computed on the **normalized target tensors** produced by the official `Dataset(...)` loader using the training-set normalization coefficients, not on denormalized physical-unit fields.
+  - If training uses any extra target transform beyond that official z-score normalization, the paper-facing scorer must first map predictions back to raw target space and then recompute metrics with the official AirfRANS normalization only.
   - In the shared trainer, validation metrics are logged on `*_val` splits for model selection, while paper-facing comparison numbers come from the matching `*_test` split. The harness aliases these as `val_primary/surface_mse` and `test_primary/surface_mse`.
 
 - **Official target-field contract**
@@ -56,6 +57,7 @@ Use the **official AirfRANS benchmark metric family**. For literature comparison
     - the task name: `full`, `scarce`, `reynolds`, or `aoa`
     - `Surf MSE`
     - `Vol MSE`
+  - Always report both `Surf MSE` and `Vol MSE` together for paper-facing AirfRANS claims.
   - Do not relabel these as MAE or relative L2.
   - If a run is selected on validation, the final paper number must still be recomputed on the official task test split before citing it.
 

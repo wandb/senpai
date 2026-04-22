@@ -79,14 +79,14 @@ Use the **DrivAerML relative-L2 contract** used by AB-UPT and continued in later
     `surface_cp` sprint target and shared-trainer implementation used in this repo.
   - The closest published surface-pressure references use the same nominal
     public DrivAerML train/val/test counts:
-    - `Transolver-3` (Table 4, `400 train / 34 effective val / 50 test`):
-      - `p_s = 3.71`
     - `AB-UPT` (same table):
       - `p_s = 3.82`
-    - `Transolver++` (same table):
-      - `p_s = 4.12`
-    - `Transolver` (same table):
+    - `Transolver` baseline reported by `AB-UPT` on the same DrivAerML contract:
       - `p_s = 4.81`
+    - `Transolver-3` (Table 4, same public split family):
+      - `p_s = 3.71`
+    - `Transolver++` (later baseline row inside `Transolver-3` Table 4):
+      - `p_s = 4.12`
   - A separate `NeuralCFD` benchmark table reports `Transolver` at raw
     `L2 = 0.0388` on its own random `80/10/10` DrivAerML split with 40k sampled
     surface points. Interpreted on the percent scale used by
@@ -105,9 +105,10 @@ Use the **DrivAerML relative-L2 contract** used by AB-UPT and continued in later
 ## Sources
 
 - AB-UPT paper: <https://openreview.net/pdf?id=nwQ8nitlTZ>
+- AB-UPT arXiv mirror: <https://arxiv.org/abs/2502.09692>
 - `milieu_cfd` common evaluator: `scripts/eval_drivaerml.py` and `nn_cfd/noether/callbacks.py`
 - Transolver-3 paper: <https://arxiv.org/abs/2602.04940>
-- NeuralCFD paper: <https://arxiv.org/abs/2502.09692>
+- DrivAerML dataset paper: <https://arxiv.org/abs/2408.11969>
 
 ## Training schedules in related work
 
