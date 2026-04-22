@@ -270,7 +270,7 @@ def _compute_y_stats(pickle_paths: list[Path], train_indices: list[int]) -> dict
         _, y, _ = dataset[idx]
         yd = y.double()
         mask = torch.isfinite(yd)  # (N, C)
-        sum_y += (yd * mask).sum(dim=0)
+        sum_y += torch.where(mask, yd, torch.zeros_like(yd)).sum(dim=0)
         finite_nodes += mask.sum(dim=0)
     if finite_nodes.min() <= 1:
         raise ValueError(
@@ -285,7 +285,8 @@ def _compute_y_stats(pickle_paths: list[Path], train_indices: list[int]) -> dict
         _, y, _ = dataset[idx]
         yd = y.double()
         mask = torch.isfinite(yd)
-        sq_y += (mask * (yd - mean_y) ** 2).sum(dim=0)
+        diff = torch.where(mask, yd - mean_y, torch.zeros_like(yd))
+        sq_y += (diff ** 2).sum(dim=0)
         finite_nodes2 += mask.sum(dim=0)
     std_y = (sq_y / (finite_nodes2.double() - 1)).sqrt().clamp(min=1e-6)
     total_nodes = int(finite_nodes.min().item())  # report minimum across channels
