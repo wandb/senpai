@@ -1,5 +1,21 @@
 # SENPAI Research Results
 
+## 2026-04-23 02:50 — PR #3070: DrivAerML 10-epoch linear warmup (chrome) — CLOSED
+
+- **Branch:** chrome/dm-linear-warmup-10ep
+- **Hypothesis:** 10-epoch linear warmup (LR 5e-5→5e-4) before cosine T_max=30 provides stable gradient directions before full LR
+- **Results:**
+
+| Metric | Value | vs Baseline |
+|---|---|---|
+| Best val surface_rel_l2_pct | 6.225% ep105 | +56% worse |
+| Divergence onset | ep114 (81.9% spike) | — |
+| Baseline | 3.997% ep467 | — |
+
+- **W&B run:** w1c7l3jo
+- **Analysis:** Warmup itself worked correctly (63%→24% in epochs 1-10). But catastrophic divergence at ep114 at a cosine LR peak — same failure mode as all non-gc DM experiments. Warmup without gc is insufficient. The real test is warmup+gc combined.
+- **Decision:** CLOSED — 56% above baseline, diverged ep114
+
 ## 2026-04-23 02:35 — PR #3086: DrivAerML SGDR T_mult=2 (megumi) — CLOSED
 
 - **Branch:** megumi/dm-cosine-restart-tmult2
