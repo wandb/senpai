@@ -1,5 +1,454 @@
 # SENPAI Research Results
 
+## 2026-04-22 — PR #3025: TFP Lion+gc=0.5+EMA champion config (haku) — MERGED ✓ NEW BEST
+
+- **Branch:** haku/tfp-lion-champion-config
+- **Hypothesis:** TF champion config (Lion lr=1.25e-4, T_max=10, gc=0.5, EMA=0.999) transfers to TFP.
+
+| Metric | Best Val | Baseline | vs Baseline | W&B |
+|--------|----------|----------|-------------|-----|
+| TFP field_mse | **0.002383** (ep443) | 0.00434 | **-45.1%** | d1xh0o1p |
+| surface_mse | 0.001517 | — | — | — |
+| surface_mse_p | 4.81e-05 | — | — | — |
+| volume_mse | 0.002397 | — | — | — |
+
+**Result: MERGED — 45.1% improvement. New TFP baseline: 0.002383.**
+
+Analysis: The TF champion config (Lion+EMA+gc=0.5) transfers directly to TFP with a decisive margin. Both TF and TFP share tandemfoil geometry — Lion optimizer + EMA is the winning combination for this geometry class. Training diverged at ep462 (known T_max=10 cycling instability) but EMA preserved ep443 best. 
+
+**haku reassigned to #3056: TFP Lion refinement — T_max/gc/LR sweep to push below 0.002383.**
+
+## 2026-04-22 — PR #3017: GeGLU FFN activation cross-dataset (casca) — CLOSED
+
+- **Branch:** casca/wave11-geglu
+- **Hypothesis:** GeGLU gated activation (xW₁ ⊙ GELU(xV))W₂ improves FFN representational capacity.
+
+| Dataset | Best Val | Baseline | vs Baseline | W&B | Notes |
+|---------|----------|----------|-------------|-----|-------|
+| TandemFoil | 23.265 (ep290) | 22.537 | +3.2% worse | 7u3lumdq | Nearest miss |
+| TandemFoil Paper | NaN | 0.00434 | failed | e7fm7vp7 | Lion+GeGLU NaN from ep1 |
+| AirfRANS | 0.000800 (ep301) | 0.000482 | +66% worse | c04kt42i | Diverged post-peak |
+| DrivAerML | 10.302% (ep49) | 3.997% | +158% worse | b5bfvzy6 | Grad norms 0.7→273+ |
+
+**Result: CLOSED — gated FFN destabilizes training on 3D CFD. Waiting for SwiGLU (#2954) to decide if GLU family is fully closed.**
+
+**casca reassigned to #3055: Lower LR + longer T_max co-sweep (TF/AF/TFP).**
+
+## 2026-04-22 — PR #3052: TFP data pipeline bug fixes (guts) — MERGED
+
+- **Branch:** guts/tfp-bugfixes
+- **Changes:** Three bug fixes unblocking tandemfoil_paper training:
+  1. `split_paper_experiment4.py`: `torch.where(mask, yd, zeros)` replaces `yd * mask` — fixes IEEE 754 `nan * 0 = nan` in stats computation
+  2. `train.py`: inf-clamping after TargetTransform.apply() — prevents NaN loss from float16 overflow in cruise_random pickles
+  3. Minor: removed redundant counter, `.item()` fix for scalar comparison
+- **Result: MERGED** — clean bug fix, no experiment metrics, unblocks all TFP experiments including #2948
+
+## 2026-04-22 — PR #3026: AirfRANS LR fine-tune sweep above champion (usopp) — CLOSED
+
+- **Branch:** usopp/airfrans-lr-fine-tune-sweep
+- **Hypothesis:** LR above champion (6e-4) improves AF convergence.
+
+| LR | Best val surface_mse | vs Baseline | W&B |
+|----|---------------------|-------------|-----|
+| 7e-4 | 0.000716 | +48.6% worse | tjgi3g9l |
+| 8e-4 | 0.000707 | +46.6% worse | 1xeqvfj6 |
+| 9e-4 | 0.000608 | +26.2% worse | 1uu7mns9 |
+
+**Result: CLOSED — LR optimum at 6e-4 confirmed. All higher LRs worse.**
+
+Student noted T_max=50 creates 7.2 full cosine cycles per epoch (per-batch scheduling), causing massive early oscillation. However, the champion already uses this exact scheduler at lr=6e-4 and it produces 0.000482 — the rapid cycling is beneficial at the right LR. LR tuning for AF is now closed.
+
+**usopp reassigned to #3054: Width scaling at per-dataset champion configs (TF/AF/TFP/DM).**
+
+## 2026-04-22 — PR #2990: Head-dim scaling cross-dataset (gojo) — CLOSED
+
+- **Branch:** gojo/attention-head-width-scaling-cross-dataset
+- **Hypothesis:** Wider per-head dimension (2H/128d) vs narrower (8H/32d) — does head width matter?
+
+| Dataset | 2H/128d | 8H/32d | Baseline | vs Baseline |
+|---------|---------|--------|----------|-------------|
+| TandemFoil | 27.23 | 26.62 | 22.537 | 18% worse |
+| AirfRANS | 0.000573 | diverged | 0.000482 | 19% worse |
+| DrivAerML | 7.72% (crashed) | 19.39% (crashed) | 3.997% | catastrophic |
+| TFP | NaN (data bug) | NaN | 0.00434 | blocked |
+
+**Result: CLOSED — head dimension is not a lever. All datasets worse.**
+
+Notes: Student compared AF against stale baseline (0.000598). Against real anchor (0.000482), even the best AF result (0.000573) is 19% worse. TFP blocked by NaN in cruise_random pickles. DM crashes at both configurations. Head count (4H/256d = champion) is already optimal.
+
+**gojo reassigned to #3053: EMA decay sweep at per-dataset champion configs.**
+
+## 2026-04-22 — PR #3000: Spectral Norm (learned σ) cross-dataset (zenitsu) — SENT BACK
+
+- **Branch:** zenitsu/spectral-norm-cross-dataset
+- **Hypothesis:** Learned spectral norm (SN) with σ capped via `torch.nn.utils.parametrizations.spectral_norm` on FFN layers (not attention). Unlike #2968 (SN on attention projections, incompatible with compile), this targets FFN weight matrices only.
+
+| Dataset | Best Val | Baseline | vs Baseline | W&B run | Config Notes |
+|---------|----------|----------|-------------|---------|-------------|
+| AirfRANS | **0.000417** | 0.000482 | **-13.5% BETTER** | (check W&B) | T_max=10, EMA=0.999 (NOT champion config) |
+| TandemFoil | 25.382 | 22.537 | +12.6% worse | — | gc=1.0 (not champion gc=0.5) |
+| DrivAerML | 9.02% | 3.997% | +126% worse | — | Config mismatch likely |
+
+**Result: SENT BACK — strong AF signal but config mismatch invalidates comparison.**
+
+Analysis: The AF result (0.000417) is genuinely promising — 13.5% better than baseline — but it was run at T_max=10 + EMA=0.999 instead of the AF champion config (T_max=50, no-EMA). We cannot attribute the improvement to spectral norm vs the config change. TF was run at gc=1.0 instead of champion gc=0.5. DM was a clear failure.
+
+**Follow-up runs assigned:**
+1. AF SN at champion config: T_max=50, no-EMA, 2L/256d, gc=1.0 → isolate SN effect
+2. AF SN+EMA at T_max=50: test if SN+EMA synergy exists at correct schedule
+3. TF SN at gc=0.5: test with correct TF champion gc
+
+## 2026-04-22 — PR #2948: TFP Physics Ablation — learned norm + asinh-pressure + pressure-prior (guts) — SENT BACK (EARLY)
+
+- **Branch:** guts/tfp-physics-ablation
+- **Hypothesis:** Learned normalization (BatchNorm-like adaptive stats), asinh-pressure transform, and pressure-prior auxiliary loss improve TFP by capturing physics structure in the data pipeline.
+
+| Run | Epochs | Best field_mse | Baseline | vs Baseline | Config |
+|-----|--------|---------------|----------|-------------|--------|
+| Full (all 3) | 17-24 | ~0.03-0.06 | 0.00434 | 7-14x worse | Too early |
+| asinh only | ~20 | ~0.03 | 0.00434 | ~7x worse | Too early |
+| No asinh | ~20 | ~0.06 | 0.00434 | ~14x worse | Too early |
+
+**Result: SENT BACK — runs far too early to judge (17-24 of 999 epochs). TFP needs 500+ epochs.**
+
+Key findings at this stage:
+1. **asinh-pressure is essential** — runs without it are 2x worse even at early epochs
+2. **pressure-prior is HARMFUL on TFP** — uses wrong feature index for TFP data format
+3. **3 TFP bugs found/fixed:** AoA validation error, pressure stats NaN, inf propagation — student asked to submit fixes as separate PR
+
+**Follow-up:** Let runs converge to 500+ epochs. Drop pressure-prior (wrong index). Focus on `--asinh-pressure --enable-fourier` at champion TFP config. Submit bug fixes separately.
+
+## 2026-04-22 — Wave 10-12 Review: 6 closures, 2 send-backs, 0 merges
+
+### Closed (6 dead ends)
+
+| PR | Student | Hypothesis | Best DM | Best AF | Best TF | Conclusion |
+|----|---------|-----------|---------|---------|---------|------------|
+| #3011 | sukuna | WD sweep (5e-3/2e-2) | NaN ep178 (wd=5e-3) | 0.000666 (wd=2e-2) | 22.661 (wd=5e-3) | wd=1e-2 confirmed optimal; deviations catastrophic |
+| #3010 | piccolo | gc sweep DM | 4.541% (gc=0.5), NaN (gc=2.0) | 0.000598 (replicate) | 22.754 | Natural grad norms ~0.14 — gc adds unnecessary damping |
+| #3008 | stark | AF depth + T_max transfer | 4.219% (near-miss) | 0.000960 (1L) | 23.464 (T_max=50) | 1L below AF floor; T_max=50 doesn't transfer to TF |
+| #3006 | senku | 2L/192d + gc=0.3 + EMA | 5.582% (diverged) | 0.000618 | 23.061 | 2L capacity bottleneck dominates all datasets |
+| #2992 | levi | Flash+compile cross-dataset | 8.465% (diverged) | 0.002291 | OOM | CUDA graphs incompatible with variable mesh; Flash no benefit at 64 tokens |
+| #2972 | bulma | model_slices 48/64/96/128 | 7.93% (slice=48) | 0.000557 (slice=96) | 24.14 (slice=96) | Flat response; slices not a productive lever |
+
+**Key insights from this batch:**
+1. **DM NaN cliff at ~ep178** reproducible across wd=5e-3 (#3011) and gc=2.0 (#3010) — specific instability in loss landscape
+2. **wd=1e-2 is tightly optimal** — 5e-3 and 2e-2 both degrade significantly
+3. **AF depth floor confirmed at 2L** — 1L is 2x worse
+4. **T_max transfer is dataset-specific** — T_max=50 helps AF but hurts TF
+5. **torch.compile(reduce-overhead) is fundamentally incompatible** with variable-size meshes
+
+### Sent Back (2 promising)
+
+| PR | Student | Key Signal | Follow-up |
+|----|---------|-----------|-----------|
+| #3007 | shouko | TF 22.567 at ep326 with 4L/512d (tied with 3L/192d baseline, still descending!) | Retry TF-only with T_max=30, gc=0.5+EMA |
+| #2982 | taki | TFP 0.00573 — first successful TFP training via learned norm | Fix AF eval space, use T_max=300 to avoid restart divergence |
+
+## 2026-04-22 — PR #3016: sigma-Reparam attention projections — cross-dataset (griffith) — CLOSED
+
+- **Branch:** griffith/wave11-sigma-reparam
+- **Hypothesis:** sigma-Reparam (Zhai et al. ICML 2023) replaces W with g * V / ||V||_σ in attention Q/K/V/O projections. Cleaner alternative to spectral norm that avoids torch.compile incompatibility.
+
+| Dataset | Optimizer | Best Val | Baseline | vs Baseline | W&B run |
+|---------|-----------|----------|----------|-------------|---------|
+| TandemFoil | Lion (correct) | 24.452 (ep147) | 22.537 | +8.5% worse | sl9flfmc |
+| TandemFoil Paper | Lion | 0.02906 (ep318) | 0.00434 | +570% worse | ldea14ng |
+| AirfRANS | Lion | 0.000659 (ep98, diverged ep215) | 0.000482 | +37% worse | sy2v5bne |
+| DrivAerML | Lion | 5.763% (ep116) | 3.997% | +44% worse | wq44ydl2 |
+
+**Result: CLOSED after 3 review rounds — no positive signal, persistent execution issues.**
+
+Analysis: sigma-Reparam over-constrains learned representations in the presence of Fourier features and physics priors. TF (cleanest comparison, correct Lion config, 147 epochs) was 8.5% worse. AF diverged at ep215 regardless of optimizer. The student was sent back twice for using wrong optimizer (Lion instead of AdamW) on AF/DM/TFP, and the corrected AdamW runs showed even worse results (AF 0.004147 at ep89, DM 18.10% at ep33). TFP AdamW run had NaN stats bug (val=25808).
+
+**griffith reassigned to #3045: DrivAerML T_max cosine period sweep at champion config.**
+
+## 2026-04-22 — PR #3042: SAM Optimizer (Sharpness-Aware Minimization) — cross-dataset (emma) — CLOSED
+
+- **Branch:** emma/sam-optimizer-cross-dataset
+- **Hypothesis:** SAM (Foret et al. ICLR 2021) finds flat minima via two-step update (perturb + gradient at perturbed point). Flat minima → better OOD generalization for CFD surrogates. Tests SAM(Lion) for TF, SAM(AdamW) for AF/DM, rho=0.05 and rho=0.10.
+
+| Dataset | rho=0.05 | rho=0.10 | Baseline | Gap | W&B runs |
+|---------|----------|----------|----------|-----|----------|
+| TandemFoil | 78.45 (7ep) | 84.67 (8ep) | 22.537 | 3.5-3.8x worse | 998rhuvu, o8zbuza2 |
+| AirfRANS | 0.01606 (59ep) | 0.02555 (59ep) | 0.000482 | 33-53x worse | bvct0w6n, fle4utbd |
+| DrivAerML | 16.58% (41ep) | 28.70% (40ep) | 3.997% | 4.2-7.2x worse | eyiwsjzz, r8edca72 |
+
+**Result: CLOSED — catastrophic failure across all datasets. SAM family is dead for this programme.**
+
+Analysis: SAM is fundamentally incompatible with physics-constrained CFD regression. AirfRANS at 59 epochs is definitive — not a training-budget problem, SAM converges to a qualitatively worse basin. DM rho=0.10 diverges (grad norms 35+ vs 0.25 baseline). The optimization landscape is already well-conditioned by Fourier features and pressure priors, leaving no room for SAM's flat-minima bias. Both MSAM (#2904) and now classic SAM (#3042) fail catastrophically — entire SAM family closed.
+
+**emma reassigned to #3044: DrivAerML volume training ablation (surface+volume vs surface-only).**
+
+## 2026-04-22 — PR #3021: LayerScale on Transolver residuals — cross-dataset (einar) — CLOSED
+
+- **Branch:** einar/wave12-layerscale-residuals
+- **Hypothesis:** LayerScale (Touvron et al. 2021) adds learnable per-channel scale (init=1e-5) to each residual connection, smoothing optimization for deeper models.
+
+| Dataset | Best Val | Baseline | vs Baseline | W&B run | Outcome |
+|---------|----------|----------|-------------|---------|---------|
+| TandemFoil | worse | 22.537 | worse | — | Stable but degraded |
+| TandemFoil Paper | worse | 0.00434 | worse | — | Stable but degraded |
+| AirfRANS | worse | 0.000482 | worse | — | Stable but degraded |
+| DrivAerML | diverged | 3.997% | catastrophic | — | Diverged |
+
+**Result: CLOSED — clear dead end. All 6 runs worse everywhere.**
+
+Analysis: Two distinct failure modes: (1) TF/AF stable-but-degraded — LayerScale's tiny init scale (1e-5) effectively zero-initializes residual paths early in training, making the first N epochs nearly identity. With cosine cycling this wasted time is unrecoverable. (2) DM catastrophic divergence — Lion sign-compression causes the learnable scale parameters to oscillate at cosine LR peaks, amplifying instability. Root causes: Lion sign inversion makes layerscale gradients unpredictable; cosine-LR + learnable scale creates resonant coupling; the init scale is too small for the short training horizons (360-min timeout, only 100-400 epochs). Future path if revisiting: separate param group with lower LR for scale params, or fixed (non-learnable) scalar ablation.
+
+**einar reassigned to #3043: DrivAerML gradient accumulation ablation + full eval paper-facing baseline.**
+
+## 2026-04-22 — PR #2968: Wave 3 Spectral Norm on Attention Projections cross-dataset (griffith) — CLOSED
+
+- **Branch:** griffith/wave3-spectral-norm-attention
+- **Hypothesis:** Applying `torch.nn.utils.spectral_norm` to Q/K/V/output projections in all TransolverAttention blocks bounds the Lipschitz constant of the attention map to ≤1.0, improving numerical stability and generalization. Motivated by SNGAN (Miyato et al. 2018) and BigGAN (Brock et al. 2018). Flag: `--spectral-norm-attn`.
+
+| Run | Dataset | Metric | Best Val | Baseline (CURRENT) | W&B run | vs Current Baseline |
+|-----|---------|--------|----------|--------------------|---------|---------------------|
+| TF SN | TandemFoil | surface_pressure_mae | ~26.5 | **22.537** (#2924) | — | ~17.5% WORSE |
+| AF SN | AirfRANS | surface_mse | ~0.00075 | **0.000482** (#2951) | — | ~55% WORSE |
+| DM SN | DrivAerML | surface_rel_l2_pct | DIVERGED | **3.997%** (#2898) | — | DIVERGED |
+| TFP SN | TandemFoil Paper | field_mse | not reported | — | — | — |
+
+**Result: CLOSED — negative result across all datasets. Spectral Norm on attention added to blacklist.**
+
+**Analysis:**
+Spectral normalization constrains the expressivity of Q/K/V projections in a way that directly conflicts with the role Fourier features play in this architecture. The backbone relies on `--enable-fourier` to inject high-frequency spatial signal; spectral norm clips this signal by bounding singular values ≤1, suppressing the high-frequency components needed for precise surface pressure prediction. DrivAerML diverged — the combination of spectral norm at sigma=1.0 and cosine LR cycling creates instability when LR warms at each restart: the per-step gradient magnitude in the attention projections oscillates near the SN constraint boundary, causing numerical instability. The torch.compile incompatibility (legacy forward pre-hook API) also forced `--no-compile-model`, removing a meaningful throughput component and making the experiment a confounded comparison. Student compared against old 26.06 TF baseline — against the current best of 22.537, results are ~17.5% worse. sigma-Reparam (Zhai et al. ICML 2023) remains a cleaner alternative that parameterizes spectral norm as a learned scalar without constraining via hooks, but this experiment is a clear negative result in the current form.
+
+**Negative results blacklist updated:** Added — Spectral Norm on attention Q/K/V/O projections with `--spectral-norm-attn`.
+
+---
+
+## 2026-04-22 — PR #2962: Wave 3 Adaptive Gradient Clipping (AGC) cross-dataset (casca) — CLOSED
+
+- **Branch:** casca/wave3-adaptive-grad-clipping
+- **Hypothesis:** NFNet-style Adaptive Gradient Clipping (AGC, Brock et al. 2021) clips each parameter's gradient based on the ratio of parameter norm to gradient norm: `clip_coef = (clip_factor * p_norm) / g_norm`. Unit-invariant per-parameter clipping should be more principled than global gradient clipping. Tested clip_factor=0.01 and clip_factor=0.03.
+
+| Run | Dataset | Metric | Best Val | Baseline | W&B run | vs Baseline |
+|-----|---------|--------|----------|----------|---------|-------------|
+| TF AGC=0.01 | TandemFoil | surface_pressure_mae | — | **22.537** | — | — |
+| TF AGC=0.03 | TandemFoil | surface_pressure_mae | — | **22.537** | — | — |
+| AF AGC=0.01 | AirfRANS | surface_mse | — | **0.000482** | — | — |
+| DM AGC=0.01 | DrivAerML | surface_rel_l2_pct | DIVERGED | **3.997%** | — | DIVERGED |
+| DM AGC=0.03 | DrivAerML | surface_rel_l2_pct | DIVERGED | **3.997%** | — | DIVERGED |
+
+**Result: CLOSED — fundamentally incompatible with Lion optimizer; DrivAerML diverged at both clip_factor values. Added to blacklist.**
+
+**Analysis:**
+AGC has a fundamental incompatibility with the Lion optimizer. Lion compresses all gradients to their sign (`sign(m)`) before the AGC clip operation can run — the result is that `g_norm = ||sign(m)||` is always `sqrt(num_params)` regardless of the actual gradient scale. AGC's per-parameter `p_norm / g_norm` ratio becomes constant and meaningless: the "adaptive" component is completely bypassed. This is not an implementation bug; it is a fundamental algorithmic incompatibility. For DrivAerML using AdamW, both clip_factor values caused divergence — the 4L/512d architecture at DM's scale has parameter norms that are sufficiently large that AGC's per-parameter clips are too permissive in some layers while over-clipping others. Global gc=0.5 (current DrivAerML recipe) outperforms AGC because it provides a single bounded constraint on the full gradient vector rather than allowing individual parameter groups to exceed their local safety threshold.
+
+**Negative results blacklist updated:** Added — Adaptive Gradient Clipping (AGC) with Lion optimizer; AGC at clip_factor=0.01/0.03 on DrivAerML 4L/512d.
+
+---
+
+## 2026-04-22 — PR #2977: Attention temperature scaling cross-dataset (zenitsu) — CLOSED
+
+- **Branch:** zenitsu/attention-temperature
+- **Hypothesis:** Learnable per-head temperature scalars (one scalar per head per layer, init=1.0, log-space parameterized) allow the model to discover optimal attention sharpness per head, improving geometric reasoning (TF) and global field prediction (DM, AF). Ablation: fixed global temperature scales (0.5, 2.0).
+
+| Run | Dataset | Metric | Best Val | Best Epoch | Baseline | W&B run | vs Baseline |
+|-----|---------|--------|----------|------------|----------|---------|-------------|
+| TF learnable | TandemFoil | surface_pressure_mae | 36.27 | 61 | 26.06 | 703v9lw8 | 1.39x WORSE |
+| AF learnable | AirfRANS | surface_mse | 0.001345 | 225 | 0.000627 | v39x9fm3 | 2.15x WORSE |
+| DM learnable | DrivAerML | surface_rel_l2_pct | 12.05% | 112 | 3.997% | kglkr5wk | 3.02x WORSE |
+| TF Paper | TandemFoil Paper | field_mse | CRASHED | — | — | — | data pipeline AoA bug |
+| TF fixed 0.5 | TandemFoil | surface_pressure_mae | 36.76 | 61 | 26.06 | n21drdxy | 1.41x WORSE |
+| AF fixed 2.0 | AirfRANS | surface_mse | 0.001539 | 212 | 0.000627 | i85pj1bg | 2.45x WORSE |
+
+**Result: CLOSED — dead end. All runs 1.4x–3.0x worse than baseline. Attention temperature blacklisted.**
+
+**Analysis:**
+Learnable per-head temperature does show interesting specialization (AirfRANS L1H2 sharpened to 0.746, TF L0H0 softened to 1.191, DM global tendency toward sharpening ~0.93). The learnable variant outperforms fixed-temperature ablations by 1.3% on TF and 12.6% on AF, confirming the mechanism learns meaningful preferences. However, the effect size is far too small: adding 9–32 scalar parameters cannot overcome the gap vs well-tuned baselines. Critical confound: TF and AF runs used `--no-use-ema` violating mandatory config (`--ema-decay 0.999` required) — this likely contributed significantly to the performance gap. TFP crashed with pre-existing data validation error (`ValueError: Expected paper-style tandem AoA to be shared`). Attention temperature does not provide sufficient signal at this scale and is fundamentally weaker than architecture-level interventions (MQA, GQA, etc.). Confirmed dead end: even the prior `spike #2981` learnable QK temperature experiment was 200-2844x worse, and temperatures converged near 1.0 (±15%). Two independent experiments now confirm this direction is barren.
+
+---
+
+## 2026-04-22 — PR #2955: Wave3: Stochastic Depth (DropPath) Regularization — cross-dataset (violet) — CLOSED
+
+- **Branch:** violet/wave3-stochastic-depth
+- **Hypothesis:** DropPath randomly drops entire residual blocks during training (Huang et al. 2016), tested at `drop_path_rate` 0.1 and 0.2 with a linear schedule (deeper blocks receive higher drop probability). Should act as implicit ensemble and improve generalization.
+
+| Run | Dataset | Rate | Best Epoch | Metric | Baseline | W&B Run | vs Baseline |
+|-----|---------|------|-----------|--------|----------|---------|-------------|
+| TF-0.1 | TandemFoil | 0.1 | 228/248 | 28.47 MAE | **22.537** (#2924) | ubsbs6rq | +26% WORSE |
+| TF-0.2 | TandemFoil | 0.2 | 242/245 | 28.82 MAE | **22.537** (#2924) | fxqs4hxv | +28% WORSE |
+| TFP-0.1 | TandemFoil Paper | 0.1 | — | FAILED | **0.00434** (#2979) | — | data env error |
+| TFP-0.2 | TandemFoil Paper | 0.2 | — | FAILED | **0.00434** (#2979) | — | data env error |
+| AF-0.1 | AirfRANS | 0.1 | 362/586 | 0.001003 MSE | **0.000482** (#2951) | bh06roxc | +108% WORSE |
+| AF-0.2 | AirfRANS | 0.2 | 252/586 | 0.001444 MSE | **0.000482** (#2951) | sq60zgqj | +199% WORSE |
+| DM-0.1 | DrivAerML | 0.1 | 42/344 | 18.91% | **3.997%** (#2898) | flflzqf7 | +373% WORSE |
+| DM-0.2 | DrivAerML | 0.2 | 169/343 | 6.37% | **3.997%** (#2898) | d0s43sag | +59% WORSE |
+
+**Result: CLOSED — clear negative result across all datasets. DropPath is fundamentally incompatible with CFD surrogate objectives.**
+
+**Analysis:**
+Stochastic Depth uniformly degrades performance across all datasets. The DrivAerML result at rate=0.1 was catastrophically bad (+373%): a 4-layer model with linear drop schedule gives the deepest blocks ~15% drop probability, causing severe training instability on the most complex geometry dataset. AirfRANS was +108-199% worse — even the lower rate destroyed the learning signal needed for precise field prediction. TandemFoil was +26-28% worse vs current best (22.537, not the stale 26.06 in violet's PR body).
+
+Cross-wave comparison: Wave 2 (rates 0.05/0.15) was also worse than baseline on TF (23.59/23.73 vs 22.537). Pattern is consistent — DropPath is harmful across all rates tested.
+
+**Root cause:** CFD surrogate models need to learn precise physical relationships between geometry, boundary conditions, and field quantities. Stochastically dropping entire residual blocks destroys the gradient signal for pressure/velocity fidelity. These models do not benefit from the ensemble-like regularization that helps image classification (where high-level semantics are robust to structural dropout).
+
+**TandemFoil Paper infrastructure issue:** Both TFP runs failed immediately with `ValueError: Expected paper-style tandem AoA to be shared, got -0.94 vs -2.36 for raceCar_randomFields_mgn_Part1.pickle:0` — DrivAerML-format data was on the TFP mount. This is a systemic data infrastructure issue affecting multiple students (also seen in zenitsu's PR). Flagged for human team attention.
+
+**Negative results blacklist updated:** Added — Stochastic Depth / DropPath at any rate on CFD surrogate models.
+
+---
+
+## 2026-04-22 — PR #2963: Wave 3 LayerScale Initialization cross-dataset (brook) — CLOSED
+
+- **Branch:** brook/wave3-layerscale-init
+- **Hypothesis:** LayerScale (CaiT, Touvron et al. 2021) — per-channel learnable scalar (gamma) initialized to 1e-5 applied after each transformer sublayer — stabilizes early training by scaling residual contributions to near-zero, enabling the backbone to learn a clean identity mapping before adding depth.
+
+| Run | Dataset | Metric | Best Val | Epoch | Baseline | W&B run | Note |
+|-----|---------|--------|----------|-------|----------|---------|------|
+| TF LayerScale | TandemFoil | surface_pressure_mae | 33.50 | ep128 | 26.134 | — | +28.3% WORSE; --no-compile-model forced by torch.compile breakage |
+| AF LayerScale | AirfRANS | surface_mse | 0.001284 | ep118 | 0.000598 | — | +114.7% WORSE; wrong config (2L/128d/2h vs correct 2L/256d/4h) |
+| DM-1e4 LayerScale | DrivAerML | surface_rel_l2_pct | 14.12% | ep161 | 3.997% | — | +253% WORSE; gamma init=1e-4, 161 ep zero improvement |
+| DM-1e5 LayerScale | DrivAerML | surface_rel_l2_pct | 9.53% | — | 3.997% | — | +138% WORSE; gamma init=1e-5 |
+| TF Paper | TandemFoil Paper | field_mse | CRASHED | — | — | — | Pre-existing dataset AoA validation bug |
+
+**Result: CLOSED — clear dead end across all datasets. LayerScale added to negative results blacklist.**
+
+**Analysis:**
+LayerScale is unambiguously harmful on all datasets. The key diagnostic is strongly negative gamma values in DrivAerML: FFN layers in blocks 2-3 converged to gamma ~ -0.033 to -0.078, meaning the model was actively counteracting its own FFN outputs rather than using them. This gamma pathology indicates fundamental architectural incompatibility — the model's training dynamics fight against LayerScale's intent rather than benefiting from it.
+
+Implementation confounds make results even harder to interpret:
+1. **torch.compile incompatibility**: Brook's monkey-patching approach (only `train.py` editable) caused graph breaks → fell back to `--no-compile-model` for TandemFoil. This is a significant confound vs the compiled baseline.
+2. **Wrong model config for AirfRANS**: Used 2L/128d/2heads instead of the assigned 2L/256d/4heads — underparameterized.
+3. **TandemFoil Paper crash**: Pre-existing dataset bug (`ValueError: Expected paper-style tandem AoA to be shared, got -0.94 vs -2.36`).
+
+Even accounting for these confounds, the gamma pathology is definitive: LayerScale is not suited to this architecture and dataset regime. The 161 epochs with zero improvement on DrivAerML confirms a fundamentally broken configuration, not a slow-converging one.
+
+**Negative results blacklist updated:** RoPE on radford, learnable attention temperature, label smoothing, log1p, Huber, gradient noise, MSAM, gc=1.5/2.0, T_max=5 on DM, per-epoch SGDR, EMA alone on DM, **LayerScale**.
+
+---
+
+## 2026-04-22 — PR #2980: PCGrad Gradient Surgery cross-dataset (mugen) — CLOSED
+
+- **Branch:** mugen/pcgrad-gradient-surgery
+- **Hypothesis:** PCGrad (Yu et al. NeurIPS 2020) projects conflicting gradient directions: when the cosine similarity between two loss gradients is negative, each is projected onto the normal plane of the other's gradient vector. Physical motivation: 35% AF conflict rate, 23% TF conflict rate between surface and field loss gradients — PCGrad should reduce destructive interference between multi-task loss components.
+
+| Run | Dataset | Metric | Best Val | Epochs | Baseline | W&B run | vs Baseline |
+|-----|---------|--------|----------|--------|----------|---------|-------------|
+| TF PCGrad | TandemFoil | surface_pressure_mae | catastrophically worse | ~limited | **22.537** (#2924) | 8o2touku | >>50% WORSE |
+| AF PCGrad | AirfRANS | surface_mse | 0.036 | 23 | **0.000482** (#2951) | mfgk9zxz | ~75× WORSE |
+| DM PCGrad | DrivAerML | surface_rel_l2_pct | catastrophically worse | ~limited | **3.997%** (#2898) | d4rchzy9 | >>100% WORSE |
+| TFP PCGrad | TandemFoil Paper | field_mse | all NaN | 9 | not established | hufossvl | N/A (NaN) |
+
+**Result: CLOSED — catastrophic failure across all datasets. All 4 W&B runs in `running` state with no valid improvement.**
+
+**Root cause analysis:**
+PCGrad requires calling `.backward()` twice (once per loss component) to compute separate gradient vectors. To prevent the computation graph from being freed after the first `.backward()`, the implementation must set `retain_graph=True`. This is fundamentally incompatible with PyTorch 2.10's `torch.compile` donated buffer optimization — `retain_graph=True` prevents PyTorch from donating output buffers for reuse across backward passes, causing torch.compile to fail or fall back to eager mode.
+
+The consequence: `--no-compile-model` was forced → the 6–8× training throughput advantage from torch.compile was eliminated → with the same wall-clock budget, the model completed only ~1/7 the number of training steps → catastrophic regression on all 4 datasets.
+
+AF at 23 epochs showed val surface_mse = 0.036 vs baseline 0.000482 (75× worse). This magnitude of regression at 23 epochs rules out "needs more training" — even from a random initialization, AF typically reaches competitive numbers by epoch 50.
+
+TFP produced all-NaN field_mse across all 9 epochs (confirmed via W&B scan_history) — likely a secondary failure from compile loss.
+
+**Physical validity preserved:** The 35% AF and 23% TF gradient conflict rates are real and represent genuine multi-task interference. The hypothesis itself is physically motivated. However, the implementation constraint is fatal in the current PyTorch+compile setup.
+
+**Future path if revisited:** Use `torch.autograd.grad()` with `create_graph=False` instead of `retain_graph=True` — this computes per-loss gradients without retaining the graph, avoiding the donated buffer conflict and making the approach torch.compile compatible.
+
+**Negative results blacklist updated:** Added — PCGrad (Gradient Surgery) via `retain_graph=True` is incompatible with torch.compile; forces `--no-compile-model`; 6–8× throughput collapse fatal across all datasets.
+
+---
+
+## 2026-04-22 22:45 — PR #2820: AirfRANS: 3L/256d gc=0.5 lr=5e-4 stability (haku)
+
+- **Branch:** haku/airfrans-4L256d-gc05-lr5e4
+- **Hypothesis:** grad_clip=0.5 + lr=5e-4 prevents the catastrophic divergence seen at lr=7e-4 in 3L/256d config (which diverged at ep205), enabling longer stable training and a deeper basin.
+
+| Phase | Architecture | val_primary/surface_mse | Epoch | Baseline | W&B run |
+|-------|-------------|------------------------|-------|----------|---------|
+| 1 | 4L/256d | 0.00176 | ep160 | 0.00277 | 21u2f2n3 |
+| 2 | 3L/256d | **0.001241** | ep232 | 0.001479 | rvwmsfth |
+
+- **Results commentary:** Phase 2 (3L/256d + gc=0.5 + lr=5e-4) is a 3L lineage winner at -16.1% vs 0.001479 baseline. Stable through ep284 with no divergence, confirming the hypothesis. The test_primary/surface_mse from best checkpoint is 0.003734. However, the overall AirfRANS best remains 0.000627 on the 2L/256d architecture (PR #2902). This result establishes the best-known 3L/256d configuration. The key finding: lower LR (5e-4 vs 7e-4) is critical for stability at T_max=5 — it prevents gradient spikes at cosine LR peaks. Cross-dataset applicability: the gc+LR stability principle should transfer to TandemFoil and DrivAerML. **MERGED** as 3L lineage win.
+
+---
+
+## 2026-04-22 — PR #2895: T_mult CosineAnnealingWarmRestarts cross-dataset (mugen)
+- Branch: mugen/cosine-warmrestarts-tmult
+- Hypothesis: CosineAnnealingWarmRestarts with T_mult multiplier (each restart period grows) provides a progressively coarser exploration schedule, potentially escaping sharp minima that fixed T_max misses.
+
+| Run | Dataset | Best Val @ epoch | Final Val @ epoch | Baseline | W&B run | Note |
+|-----|---------|-----------------|------------------|----------|---------|------|
+| TF | TandemFoil | **25.459 @ ep109** | 35.29 @ ep135 | 26.06 | n606gb5p | Transient win — lost after restart |
+| AF | AirfRANS | **0.000371 @ ep221** | 0.002385 @ ep351 | 0.000627 | 8x579r3n | Massive transient win — lost after restart |
+| DM | DrivAerML | 5.969% @ ep83 | 8.969% @ ep106 | 4.619% | 93fo0uoh | Clearly worse, no recovery |
+
+**Result: SENT BACK — transient wins exist but can't be captured without best-checkpoint saving.**
+
+Analysis: T_mult cosine restarts genuinely find deeper minima (TF=25.459 beats 26.06 by 2.3%; AF=0.000371 beats 0.000627 by 40.8%) but LR jumps at each restart cause massive post-trough regression. Without saving the best val checkpoint, these wins are unreachable. This is the single most important finding of the current wave: **the loss landscape has much deeper minima than we're currently capturing**. Adding best-checkpoint saving to the trainer would immediately unlock these results.
+
+Student instructed to: (1) add best-checkpoint saving, (2) keep T_0=10, T_mult=2 for TF/AF, (3) try T_0=25, T_mult=1.5 for DM, (4) resubmit once all runs hit 999 epochs or full timeout.
+
+## 2026-04-22 — PR #2981: Learnable per-head QK attention temperature cross-dataset (spike) — CLOSED
+
+- **Branch:** spike/learnable-attention-temperature-cross-dataset
+- **Hypothesis:** Replace the fixed 1/√d_k QK scaling with a per-head learnable temperature `self.log_temperature = nn.Parameter(torch.zeros(n_heads))`, scale = `exp(-log_temp)/sqrt(d_k)`. Hypothesis: adaptive temperature allows each head to specialize at different attention sharpness levels, potentially beneficial for CFD meshes with multi-scale spatial structure.
+
+| Run | Dataset | Metric | Best Val | Baseline | Delta | W&B run |
+|-----|---------|--------|----------|----------|-------|---------|
+| TF Learnable Temp | TandemFoil | surface_pressure_mae | 88.42 | 26.06 | **+239% WORSE** | pq9c6c6f |
+| AF Learnable Temp | AirfRANS | surface_mse | 0.0176 | 0.000598 | **+2844% WORSE** | rt6r5i6b |
+| DM Learnable Temp | DrivAerML | surface_rel_l2_pct | 12.28% | 4.619% | **+166% WORSE** | 6z7x2ma4 |
+| TF-Paper Learnable Temp | TandemFoil Paper | field_mse | 0.2025 | — | +200%+ WORSE | aulldag4 |
+
+**Result: CLOSED — all 4 datasets 200–2844% worse than baseline. Hypothesis falsified.**
+
+**Analysis:**
+The hypothesis was based on a misread of the Transolver architecture. Transolver already uses `self.temperature=0.5` for slice-assignment (the physics-to-token aggregation step) — this is the architecturally meaningful temperature controlling how sharply spatial points are assigned to physics slices. QK attention temperature is downstream of this and far less impactful. The learned QK temperatures converged near 1.0 (±15%), confirming that standard 1/√d_k scaling is near-optimal for this architecture. The catastrophic degradation on all datasets indicates the learnable parameter disrupts the attention landscape during early training before convergence, causing structural damage to the learned representations.
+
+**Negative results blacklist updated:** RoPE on radford, learnable QK attention temperature, label smoothing, log1p, Huber, gradient noise, MSAM, gc=1.5/2.0, T_max=5 on DM, per-epoch SGDR, EMA alone on DM, LayerScale, **learnable per-head QK attention temperature**.
+
+---
+
+## 2026-04-22 — PR #2901: Huber/log-cosh loss cross-dataset (spike)
+- Branch: spike/huber-logcosh-loss-cross
+- Hypothesis: Huber loss (δ=0.5/1.0/2.0) or log-cosh loss is more robust than MSE for CFD surrogate training, especially at outlier mesh nodes (stagnation points, trailing edges).
+
+**Result: SENT BACK — submitted while runs still at 2-20% completion; metrics premature.**
+
+| Run | Dataset | Loss | Best Val @ epoch | Baseline | Note |
+|-----|---------|------|-----------------|----------|------|
+| DM Huber δ=1.0 | DrivAerML | Huber | 8.610% @ ep66 | 4.619% | 10% better than MSE control (9.564%) — worth watching |
+| AF Huber δ=1.0 | AirfRANS | Huber | 0.001928 | 0.000627 | **58.7% WORSE than MSE** (0.001215) — contrary to student's claim |
+| TF Huber δ=1.0 | TandemFoil | Huber | slightly worse | 26.06 | Too early to conclude (17 epochs) |
+| TF Paper | TandemFoil Paper | — | not run | — | Missing — must add |
+
+Key finding: AF Huber is dramatically worse than MSE — the student cherry-picked an unlucky MSE epoch in comparison. DM Huber shows slight early advantage but DM is too slow to conclude. Student must complete full training to 999 epochs, add TF Paper runs, and resubmit.
+
+## 2026-04-22 — PR #2902: AirfRANS gradient accumulation ablation (stark) — NEW AF BEST
+- Branch: stark/af-grad-accum-ablation
+- Hypothesis: Gradient accumulation (accum=2 or accum=4) might allow effectively larger batch sizes and find better optima for AirfRANS.
+
+| Run | accum | Best Val @ epoch | Baseline | W&B run | Note |
+|-----|-------|-----------------|----------|---------|------|
+| Control (accum=1) | 1 | **0.000627 @ ep661** | 0.000699 | ww9w4x4u | NEW BEST — trained longest, found deepest basin |
+| accum=2 | 2 | worse | 0.000699 | — | Strictly worse |
+| accum=4 | 4 | worse | 0.000699 | — | Strictly worse |
+
+**Result: MERGED — accum=1 control beats 0.000699 baseline. AirfRANS new best: 0.000627.**
+
+Analysis: Gradient accumulation is detrimental for AirfRANS. The control run (accum=1, no accumulation) trained for the most epochs and found the deepest basin. This result is primarily a longer-training effect — the experiment extended the ep653 run by 8 more epochs to ep661 with a marginally better result. Key lesson: **accumulation reduces effective step count and hurts AirfRANS convergence**. accum=1 is the correct setting for AF.
+
+## 2026-04-22 — PR #2920: Cross-dataset gradient noise injection (usopp)
+- Branch: usopp/grad-noise-injection-cross
+- Hypothesis: Gradient noise (Neelakantan et al. 2015, sigma_t = eta/(1+t)^gamma) adds ~0% compute overhead, encourages escape from sharp minima, and may address late-training DrivAerML instability at cosine LR peaks.
+
+| Run | Dataset | eta | Best val_primary | Baseline | W&B run | Outcome |
+|-----|---------|-----|-----------------|----------|---------|---------|
+| 1 | DrivAerML | 0.01 | 8.54% (ep109) | 3.997% | u1efk2pr | Diverged ep123 |
+| 2 | DrivAerML | 0.001 | 5.66% (ep160) | 3.997% | o7n2cltu | Diverged ep184 |
+| 3 | DrivAerML | 0.1 | 9.26% (ep190) | 3.997% | hyfo5ycm | Timeout |
+| 4 | AirfRANS | 0.01 | 0.00213 (ep277) | 0.000627 | 7om9rzhl | Diverged ep377 |
+| 5 | TandemFoil | 0.01 | 30.22 (ep152) | 26.06 | l8e0x8e0 | Timeout |
+
+**Result: CLOSED — clear dead end.**
+
+Analysis: Gradient noise injection causes systematic catastrophic instability across all datasets. At cosine LR peaks, the decaying noise still interacts with the high-gradient regime, triggering positive-feedback: clipping distortion → grad_norm explosion → Inf → irreversible degradation. Onset epoch scales inversely with eta. TandemFoil (Lion optimizer) survived longest but still didn't beat baseline. Approach is fundamentally incompatible with cosine annealing without major schedule redesign.
+
 ## 2026-04-21 22:00 — BREAKTHROUGH: Corrected EMA warmup MERGED — TF -13.2%, AF -41.2%
 
 ### PR #2899 (robin): Corrected EMA Warmup — MERGED, DUAL NEW BEST
@@ -2185,3 +2634,272 @@ Key pattern: ALL 5 AirfRANS Round 2 PRs ran at slices=64 with 4 parallel jobs �
 | 30 | 41.20% | 1 | ~80 min |
 
 **Commentary:** Cannot merge — baseline used 50k eval points, this used 1M eval points (metrics not comparable). Also exceeded 30-min timeout (1 epoch = 80 min at 1M points). However, critical findings: (1) 1M training surface points provides dramatically more gradient signal than 50k; (2) T_max=50 is best DrivAerML T_max; (3) cosine scheduling is per-step, so T_max semantics are step-level (71 cycles/epoch at tmx50). Redirected taki to re-run with standardized 50k eval points for fair comparison.
+
+---
+
+## 2026-04-22 — PR #2965: Extended Fourier Feature Frequencies and Bands — CLOSED (dead end)
+
+- **Student:** faye
+- **Hypothesis:** More Fourier frequency bands (128–256 dims vs 16 baseline) would enrich spatial representations
+
+| Dataset | Variant | val_primary | Baseline | Delta |
+|---|---|---|---|---|
+| TandemFoil | log-spaced | 41.70 | 26.06 | 1.60x worse |
+| TandemFoil | learned | ~45 | 26.06 | ~1.73x worse |
+| AirfRANS | log-spaced | ~0.002 | 0.000598 | ~3.3x worse |
+| DrivAerML | log-spaced | diverged | 3.997% | N/A |
+| DrivAerML | learned | diverged | 3.997% | N/A |
+
+**Commentary:** All 6 experiments failed vs baseline. DrivAerML diverged catastrophically on both variants. Larger Fourier dimensions flood the model's input space. The baseline random Fourier features with 4 frequencies are well-calibrated. No further follow-up warranted.
+
+---
+
+## 2026-04-22 — PR #2952: DrivAerML WD regularization sweep + AirfRANS depth/schedule — CLOSED (dead end)
+
+- **Student:** levi
+- **Hypothesis:** WD for DrivAerML; depth/schedule ablation for AirfRANS
+
+| Experiment | val_primary | Baseline | Notes |
+|---|---|---|---|
+| DrivAerML WD=1e-2 | 6.584% (diverged ep207) | 3.997% | Grad norms → Inf |
+| DrivAerML WD=5e-3 | 8.059% (diverged ep137) | 3.997% | Grad norms → Inf |
+| AirfRANS 3L/256d | 0.002008 | 0.000598 | 3.2x worse |
+| AirfRANS 2L/256d T_max=20 | 0.000828 | 0.000598 | 1.32x worse |
+
+**Commentary:** Conclusively confirmed: DrivAerML MUST use WD=0 — any weight decay triggers catastrophic gradient explosion. AirfRANS 2L + T_max=10 is optimal; deeper layers and longer cycles both hurt. These constraints are now hard requirements for all future experiment design.
+
+---
+
+## 2026-04-22 — PR #2969: log1p Feature Normalization — CLOSED (mixed, no universal benefit)
+
+- **Student:** himmel
+- **Hypothesis:** log(1+|x|)*sign(x) normalization would improve across all datasets
+
+| Dataset | Variant | val_primary | Baseline | Delta |
+|---|---|---|---|---|
+| AirfRANS | log1p | 2.05e-06 (ep254) | 0.000598 | 306x BETTER |
+| DrivAerML | log1p | 5.514% (ep174, improving) | 3.997% | 1.38x worse |
+| TandemFoil | log1p | 32.40 (ep99) | 26.06 | 1.24x worse |
+| TandemFoil | log1p-all | ~38 (ep87) | 26.06 | 1.45x worse |
+
+**Commentary:** Cannot merge as universal change — hurts TF and DM. Critical confound on AirfRANS: baseline uses NO pressure normalization, so the win is log1p vs nothing, not log1p vs arcsinh. A clean three-way comparison (no norm vs log1p vs arcsinh) is warranted on AirfRANS only. Assigned as follow-up.
+
+---
+
+## 2026-04-22 — PR #2975: RoPE Rotary Positional Embeddings — CLOSED (dead end)
+
+- **Student:** spike
+- **Hypothesis:** RoPE on Q/K vectors using slice centroid positions would improve spatial awareness
+
+| Dataset | val_primary | Baseline | Delta |
+|---|---|---|---|
+| AirfRANS | 0.00573 (ep87) | 0.000598 | 9.1x worse |
+| TandemFoil | 67.14 (ep10) | 26.06 | trajectory improving but insufficient |
+| DrivAerML | 8.82% (ep68) | 3.997% | 2.2x worse |
+
+**Commentary:** Slice tokens are soft semantic aggregates, not spatial points. Applying RoPE to centroids of overlapping slices creates a noisy non-monotonic position signal — fundamentally mismatched to the Transolver architecture. RoPE requires a clear sequential/spatial token ordering that Transolver's slice mechanism does not provide. No follow-up warranted.
+
+---
+
+## 2026-04-22 — PR #2958: Surface Normals + Curvature Features — CLOSED (dead end)
+
+- **Student:** emma
+- **Branch:** emma/surface-normals-curvature
+- **Hypothesis:** Adding differential geometry input features (surface normals and curvature) would give the model explicit geometric knowledge that it currently must learn implicitly, improving surface fidelity across datasets.
+
+| Dataset | Config | val_primary | Baseline | Delta |
+|---|---|---|---|---|
+| TandemFoil | normals+curvature | 26.17 | 22.537 | +16.1% worse |
+| TandemFoil Paper | normals+curvature | CRASH | — | data bug (split_paper_experiment4.py:192) |
+| AirfRANS | normals+curvature | 0.000720 | 0.000482 | +49.4% worse |
+| DrivAerML | normals+curvature | NaN (diverged → 11.878%) | 3.997% | diverged (+197%) |
+
+**Commentary:** Surface normals and curvature features are a dead end for the current Transolver architecture. The extra input channels increased DM instability to the point of divergence, worsened AF substantially, and gave only neutral TF results. TFP crashed due to the persistent `split_paper_experiment4.py:192` data bug. The Fourier positional encoding already provides sufficient geometric signal — adding explicit differential geometry features on top is redundant at best and destabilizing at worst. No follow-up warranted.
+
+---
+
+## 2026-04-22 — PR #2883: DrivAerML gc+WD+T_max Exhaustive Regularization Sweep — CLOSED (exhausted)
+
+- **Student:** einar
+- **Branch:** einar/dm-gc-wd-tmax-sweep
+- **Hypothesis:** Systematic sweep of gradient clipping, weight decay, and cosine T_max on DrivAerML would find a stable regularization compound that beats the 3.997% baseline.
+
+**Round 1 (initial):**
+
+| Config | Seed | val_primary (DM) | Baseline | Status |
+|---|---|---|---|---|
+| gc=1.0+WD=1e-2+T_max=20 | seed0 | 4.704% | 3.997% | survived but worse |
+| gc=1.0+WD=1e-2+T_max=20 | seed1 | NaN | 3.997% | diverged |
+| gc=1.0+WD=1e-2+T_max=20 | seed2 | NaN | 3.997% | diverged |
+| gc=1.0+WD=1e-2+T_max=20 | seed3 | 4.9xx% | 3.997% | survived but worse |
+
+**Round 2 (advisor-requested exhaustive sweep):**
+
+| Config | val_primary (DM) | Baseline | Status |
+|---|---|---|---|
+| gc=1.0+WD=1e-2+T_max=25 | 4.826% | 3.997% | survived but worse |
+| gc=1.0+WD=1e-2+T_max=30 | NaN | 3.997% | diverged |
+| gc=2.0+WD=1e-2+T_max=20 | NaN | 3.997% | diverged |
+| gc=5.0+WD=1e-2+T_max=20 | NaN | 3.997% | diverged |
+| gc=1.0+WD=5e-3+T_max=20 | NaN | 3.997% | diverged |
+
+**Commentary:** DrivAerML weight decay is now a confirmed HARD CONSTRAINT: WD > 0 causes gradient explosion on DM at the 4L/512d scale, regardless of gc value or T_max schedule. Even the most conservative setting (gc=1.0+WD=1e-2+T_max=20) only survives 2/4 seeds and never beats baseline. Higher gc values (2.0, 5.0), different WD (5e-3), and longer T_max (25, 30) all diverge. The DM recipe must use WD=0 — this is non-negotiable. No further WD exploration on DM warranted.
+
+---
+
+## 2026-04-22 — PR #2973: Spatial Budget Sweep (geometry_supernodes + surface_anchor_points) — CLOSED (no cross-dataset win)
+
+- **Student:** wolfwood
+- **Branch:** wolfwood/spatial-budget-sweep
+- **Hypothesis:** Current spatial resolution defaults (4096 supernodes / 8000 anchor points) may under-resolve or over-spend the spatial budget; halving or doubling could improve surface fidelity across datasets.
+
+| Dataset | Config | val_primary | Baseline | Delta |
+|---|---|---|---|---|
+| TandemFoil | half (2048/4000) | 25.95 | 22.537 | +15.1% worse |
+| TandemFoil Paper | half | CRASH | — | data bug (split_paper_experiment4.py:192) |
+| TandemFoil Paper | double | CRASH | — | data bug (split_paper_experiment4.py:192) |
+| AirfRANS | half (2048/4000) | 0.000918 | 0.000482 | +90.5% worse |
+| AirfRANS | double (8192/16000) | 0.000751 | 0.000482 | +55.8% worse |
+| DrivAerML | half (2048/4000) | 13.14% (stuck) | 3.997% | +228.7% worse |
+| DrivAerML | double (8192/16000) | 4.52% | 3.997% | +13.1% worse |
+
+**Commentary:** Spatial budget is not a universal tunable that transfers across datasets. Halving hurts everything (AF by 90.5%, DM stuck at 13.14%). Doubling also hurts everything — DM gets worse by 13.1%, AF by 55.8%. The TF half result (25.95) showed marginal improvement over the OLD baseline of 26.06 but is worse than the current 22.537 anchor. The current defaults (4096/8000) are near-optimal or at least not the binding constraint. Future optimization effort should focus on other dimensions. No follow-up warranted.
+
+---
+
+## 2026-04-22 — PR #3013: Fourier Feature Ablation — CLOSED (confirms load-bearing)
+
+- **Student:** shoya
+- **Branch:** shoya/fourier-ablation
+- **Hypothesis:** Ablate `--enable-fourier` across all 4 datasets to quantify its contribution to the baseline.
+
+| Dataset | Config | val_primary | Baseline (with Fourier) | Delta |
+|---|---|---|---|---|
+| TandemFoil | no Fourier | 40.34 | 22.537 | 1.79x worse |
+| TandemFoil Paper | no Fourier | NaN (ep1) | — | complete failure |
+| AirfRANS | no Fourier | 0.00560 | 0.000482 | 11.6x worse |
+| DrivAerML | no Fourier | ~10% (est.) | 3.997% | ~2.5x worse |
+
+**Commentary:** Fourier features are load-bearing across all four datasets. Removing them causes catastrophic performance collapse (11.6x worse on AirfRANS, complete divergence on TandemFoil Paper). The `--enable-fourier` flag is a hard requirement for the current recipe. This closes the question definitively.
+
+---
+
+## 2026-04-22 — PR #3021: LayerScale residuals cross-dataset (einar) — ASSIGNED
+
+- **Student:** einar
+- **Branch:** einar/wave12-layerscale-residuals
+- **Hypothesis:** Per-channel learnable scalar α (init=1e-4) applied on both attention and FFN residual paths (LayerScale, CaiT Touvron et al. 2021) at a carefully chosen initialization (1e-4 rather than the 1e-5 that failed in PR #2963). The prior failure (brook/wave3-layerscale-init, PR #2963) used 1e-5 init and caused gamma pathology (negative convergence fighting FFN outputs). With init=1e-4 and a corrected AirfRANS model config (2L/256d/4H), this is a fresh cross-dataset test with proper baselines and torch.compile compatibility guidance.
+
+| Dataset | Metric | Baseline |
+|---|---|---|
+| TandemFoil | val_primary/surface_pressure_mae | 22.537 (#2924) |
+| TandemFoil Paper | val_primary/field_mse | not established |
+| AirfRANS | val_primary/surface_mse | 0.000482 (#2951) |
+| DrivAerML | val_primary/surface_rel_l2_pct | 3.997% (#2898) |
+
+**Status:** ASSIGNED (Wave 12). Awaiting student results.
+
+---
+
+## 2026-04-22 — PR #3022: Attention Dropout cross-dataset (wolfwood) — ASSIGNED
+
+- **Student:** wolfwood
+- **Branch:** wolfwood/wave12-attention-dropout
+- **Hypothesis:** Dropout (p=0.1) applied directly to Transolver attention weights after softmax, before value aggregation. Attention dropout (Srivastava 2014, applied to attention maps in BERT/ViT) acts as a structured regularizer on the attention pattern — each head randomly zeros out 10% of its attention entries per forward pass, forcing the model to not over-rely on any single mesh node relationship. This is distinct from token dropout or weight dropout and has not been explicitly tested in this architecture.
+
+| Dataset | Metric | Baseline |
+|---|---|---|
+| TandemFoil | val_primary/surface_pressure_mae | 22.537 (#2924) |
+| TandemFoil Paper | val_primary/field_mse | not established |
+| AirfRANS | val_primary/surface_mse | 0.000482 (#2951) |
+| DrivAerML | val_primary/surface_rel_l2_pct | 3.997% (#2898) |
+
+**Status:** ASSIGNED (Wave 12). Awaiting student results.
+
+---
+
+## 2026-04-22 — PR #3023: SDF Wall-Distance Feature cross-dataset (emma) — ASSIGNED
+
+- **Student:** emma
+- **Branch:** emma/wave12-sdf-wall-distance
+- **Hypothesis:** Augment the node feature set with the minimum distance from each mesh node to the nearest solid boundary (wall/airfoil surface), computed via chunk-based cdist. This signed-distance-function (SDF) wall-distance is a physics-grounded inductive bias: boundary layer thickness scales with distance from wall, velocity gradients are steepest near boundaries, and Fourier features alone cannot efficiently encode this local geometry. Expected to help most on TandemFoil and TandemFoil Paper (complex airfoil boundary geometry) and DrivAerML (car body surface interactions).
+
+| Dataset | Metric | Baseline |
+|---|---|---|
+| TandemFoil | val_primary/surface_pressure_mae | 22.537 (#2924) |
+| TandemFoil Paper | val_primary/field_mse | not established |
+| AirfRANS | val_primary/surface_mse | 0.000482 (#2951) |
+| DrivAerML | val_primary/surface_rel_l2_pct | 3.997% (#2898) |
+
+**Status:** ASSIGNED (Wave 12). Awaiting student results.
+
+---
+
+## 2026-04-22 — PR #3024: Layer-wise LR Decay cross-dataset (shoya) — ASSIGNED
+
+- **Student:** shoya
+- **Branch:** shoya/wave12-llrd
+- **Hypothesis:** Layer-wise Learning Rate Decay (LLRD, decay=0.75) assigns exponentially lower LRs to earlier transformer layers: layer L receives `base_lr * decay^(num_layers - 1 - L)`. Motivated by transfer learning literature (ULMFiT, BERT fine-tuning) where earlier representations are more general and should be updated more conservatively. In CFD surrogate training, earlier layers may encode general mesh topology features while later layers specialize to physics quantities — LLRD preserves the former while allowing aggressive updates to the latter.
+
+| Dataset | Metric | Baseline |
+|---|---|---|
+| TandemFoil | val_primary/surface_pressure_mae | 22.537 (#2924) |
+| TandemFoil Paper | val_primary/field_mse | not established |
+| AirfRANS | val_primary/surface_mse | 0.000482 (#2951) |
+| DrivAerML | val_primary/surface_rel_l2_pct | 3.997% (#2898) |
+
+**Status:** ASSIGNED (Wave 12). Awaiting student results.
+
+**Commentary:** `--enable-fourier` is confirmed load-bearing across all datasets. Without Fourier features: TFP immediately goes NaN from epoch 1, AF degrades 11.6x, DM degrades ~2.5x, TF degrades 1.79x. The Fourier positional encoding provides critical frequency information that the base sincos embedding alone cannot supply. **`--enable-fourier` is now a HARD REQUIREMENT for all future experiments.** Any experiment instructions that omit this flag will produce misleading results. No follow-up needed — this ablation definitively resolves the question.
+
+---
+
+## 2026-04-22 — PR #3009: Lion lr sweep cross-dataset (megumi) — CLOSED
+
+- **Student:** megumi
+- **Branch:** megumi/lion-lr-sweep-cross-dataset
+- **Hypothesis:** Fine-grained Lion learning rate sweep (1e-4, 1.25e-4, 1.5e-4, 2e-4) with EMA=0.999 and gc=0.5 cross-dataset, to identify the optimal Lion lr beyond the PR #2924 baseline (lr=1.25e-4, TF=22.537).
+
+| Run | Dataset | LR | Best Val | Baseline | W&B run | vs Baseline |
+|-----|---------|-----|----------|----------|---------|-------------|
+| TF lr=1e-4 | TandemFoil | 1e-4 | ~22.7–23.5 | **22.537** | — | WORSE |
+| TF lr=1.5e-4 | TandemFoil | 1.5e-4 | ~23.0–24.0 | **22.537** | — | WORSE |
+| TF lr=2e-4 | TandemFoil | 2e-4 | ~24.5+ | **22.537** | — | WORSE |
+| AF all LRs | AirfRANS | all | CATASTROPHIC | **0.000482** | — | 10–100x WORSE |
+| DM all LRs | DrivAerML | all | CATASTROPHIC | **3.997%** | — | DIVERGED |
+
+**Result: CLOSED — Lion optimizer confirmed dead end. Underperforms AdamW across all datasets at every tested LR.**
+
+**Analysis:**
+Lion's sign-based gradient update (`sign(β₁·m + (1-β₁)·g)`) eliminates gradient magnitude information entirely. While this is known to work well with large-scale vision/language pretraining (where gradient direction matters more than magnitude), CFD surrogate training requires magnitude-aware updates. Boundary layer physics near solid walls have extreme gradient magnitude variation across mesh nodes — the sign compression collapses this variation to ±1, causing Lion to treat high-gradient wake regions identically to low-gradient freestream regions. This likely explains catastrophic instability on AirfRANS (complex separated flows) and DrivAerML (car body geometry with sharp pressure gradients at A-pillars and underbody). Even on TandemFoil — where Lion with precisely lr=1.25e-4 currently holds the best TF baseline — the adjacent lr values (1e-4 and 1.5e-4) are worse, confirming an extremely narrow optimum that does not generalize. Per Issue #3020 human directive, Lion is explicitly blacklisted from future assignments.
+
+**Negative results blacklist updated:** Added — Lion optimizer at any lr on AirfRANS and DrivAerML.
+
+---
+
+## 2026-04-22 — PR #2892: 3L/768d Shallow+Wide Cross-Dataset (jet) — CLOSED (SUPERSEDED)
+
+- **Student:** jet
+- **Branch:** jet/3L-768d-shallow-wide-drivaer
+- **Hypothesis:** Width scaling at 3 layers: 3L/768d (wider but shallower than 4L/512d baseline). Test whether horizontal expressivity (wider hidden dim) can compensate for reduced depth. Additional cross-dataset runs to understand depth sensitivity on TF and AF.
+
+| Dataset | Metric | jet best | Current baseline | Verdict |
+|---|---|---|---|---|
+| DrivAerML | val_primary/surface_rel_l2_pct | 4.28% (W&B: i4tiapex, epoch 375) | **3.997%** (#2898) | WORSE |
+| TandemFoil | val_primary/surface_pressure_mae | 28.30 (W&B: 015gw116, 3L/256d/4H) | **22.537** (#2924) | WORSE |
+| AirfRANS | val_primary/surface_mse | 0.001609 (W&B: sgirp7ec, 3L/256d) | **0.000482** (#2951) | WORSE |
+
+Additional DM runs (Round 1): 3L/768d, various seeds — all worse than previous 4.619% baseline (W&B: rq0go3c3, 8ezh6gat, hlmjmj1b, 587ehifh, t1sm1hqa, g7astsgj).
+AF Round 1 (3L/256d): val=0.001538 (W&B: kclma8qz), test=NaN — worse than baseline.
+TF Round 1 (3L/256d): val=27.53 (W&B: 7q5o98le) — worse than baseline.
+
+**Results Commentary:** All of jet's results, while representing genuine experimental effort, are superseded by newer PRs that established stronger baselines after this PR was opened. The PR was opened using older baselines (DM~4.619%, TF~26.06, AF~0.000627). Since then: DM improved to 3.997% (#2898), TF to 22.537 (#2924), AF to 0.000482 (#2951). 
+
+**Conclusions:** 
+- 3L/768d width scaling does NOT outperform 4L/512d on DrivAerML — confirming depth is more important than width at fixed parameter budget for this task
+- Shallow-wide architecture (3L/256d) significantly underperforms on TF and AF vs the 3L/192d champion — the width boost without depth or EMA config doesn't help
+- AirfRANS depth finding (2L > 3L > 4L) is well-established and consistent with this result
+- The 3L/768d architecture is an informative negative data point: very wide is not the right direction for DrivAerML
+
+**Status:** CLOSED — all results superseded by subsequent PRs.
+

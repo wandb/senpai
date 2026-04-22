@@ -58,9 +58,13 @@ most decision-relevant metric for the selected benchmark:
   - `legacy_noam/*` for the denormalized historical `p_*` contract
   - `icml2026_v2/*` for the packaged `kagent` split contract
   - pressure and surface fidelity remain the decision-driving quantities
+  - this is intentionally **not** the original TandemFoilSet paper’s Table 6
+    MSE contract
 - `tandemfoil_paper`
   - prioritize normalized full-field MSE on the paper-faithful Experiment 4
     tasks
+  - the paper-facing scalar is `field_mse`; `surface_mse` / `volume_mse` are
+    diagnostics only
   - use this benchmark to decide whether our shared stack is actually
     competitive against the published TandemFoilSet paper numbers
 - `airfrans`
@@ -85,13 +89,17 @@ Alignment policy:
 - use the benchmark metric calculation exactly, including whether evaluation is
   done on normalized or unnormalized targets and whether aggregation is
   per-case or global over the split
+- when training uses an auxiliary target transform but the benchmark contract
+  does not, decode predictions back to raw target space and recompute the
+  paper-facing metric in the official metric space
 - keep hyperparameter-tuning metrics on validation splits, but reserve
   literature-facing comparison numbers for the matching test split
 - when model selection is done on validation, paper-facing test numbers should
   be evaluated from the best validation checkpoint rather than the terminal
   training state whenever possible
-- document any remaining irreducible discrepancy, such as the packaged
-  DrivAerML case set being smaller than the nominal public split in AB-UPT
+- document any remaining irreducible discrepancy, such as unavailable
+  hidden-validation cases or differences between packaged sprint targets and
+  published full-task targets
 - pin TandemFoilSet parity work to concrete source refs rather than a floating
   branch head:
   - transform, metric, residual, and merged feature-stack contract:
@@ -103,6 +111,11 @@ Alignment policy:
   - historical best merged single-seed anchor in the report: `#2319`
   - merged parity lineage this target should reproduce and extend:
     `#2319 -> #2350 -> #2357 -> #2379`
+- keep the two TandemFoil benchmark contracts distinct:
+  - `tandemfoil/` = packaged parity target on the `kagent` split family with
+    denormalized surface-pressure MAE
+  - `tandemfoil_paper/` = paper-faithful Experiment 4 tasks with normalized
+    full-field `field_mse`
 - emit both TandemFoil metric regimes explicitly instead of silently mixing
   them:
   - `legacy_noam/p_in`, `legacy_noam/p_oodc`, `legacy_noam/p_tan`,

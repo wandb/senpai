@@ -5,6 +5,10 @@
   "source_surface_manifest_full": "/mnt/pvc/Processed/drivaerml_processed/manifest_full_failed10_included.csv",
   "source_volume_manifest": "/mnt/pvc/Processed/drivaerml_processed/volume_manifest.csv",
   "case_root": "/mnt/pvc/Processed/drivaerml_processed",
+  "case_root_candidates": [
+    "/mnt/pvc/Processed/drivaerml_processed",
+    "/mnt/new-pvc/Processed/drivaerml_processed"
+  ],
   "surface_splits": {
     "train": [
       "run_1",
@@ -40,6 +44,7 @@
       "run_40",
       "run_42",
       "run_43",
+      "run_44",
       "run_45",
       "run_46",
       "run_47",
@@ -163,6 +168,7 @@
       "run_181",
       "run_182",
       "run_183",
+      "run_184",
       "run_185",
       "run_186",
       "run_189",
@@ -206,6 +212,7 @@
       "run_244",
       "run_245",
       "run_246",
+      "run_249",
       "run_250",
       "run_251",
       "run_254",
@@ -251,6 +258,7 @@
       "run_307",
       "run_308",
       "run_309",
+      "run_310",
       "run_312",
       "run_313",
       "run_314",
@@ -329,6 +337,7 @@
       "run_413",
       "run_414",
       "run_415",
+      "run_416",
       "run_417",
       "run_418",
       "run_419",
@@ -386,6 +395,7 @@
       "run_481",
       "run_482",
       "run_483",
+      "run_484",
       "run_485",
       "run_486",
       "run_488",
@@ -452,19 +462,23 @@
       "run_108",
       "run_124",
       "run_127",
+      "run_133",
       "run_142",
+      "run_158",
       "run_173",
       "run_180",
       "run_187",
       "run_188",
       "run_197",
       "run_199",
+      "run_203",
       "run_205",
       "run_207",
       "run_208",
       "run_210",
       "run_215",
       "run_222",
+      "run_226",
       "run_258",
       "run_263",
       "run_280",
@@ -488,9 +502,9 @@
     ]
   },
   "surface_split_counts": {
-    "train": 394,
+    "train": 400,
     "val": 34,
-    "test": 46
+    "test": 50
   },
   "volume_splits": {
     "train": [
@@ -518,22 +532,11 @@
     "train": 15,
     "val": 1
   },
-  "excluded_case_ids": [
-    "run_133",
-    "run_158",
-    "run_184",
-    "run_203",
-    "run_226",
-    "run_249",
-    "run_310",
-    "run_416",
-    "run_44",
-    "run_484"
-  ],
-  "excluded_case_count": 10,
+  "excluded_case_ids": [],
+  "excluded_case_count": 0,
   "notes": [
     "Surface splits come directly from the current preprocessed manifest.csv on the PVC.",
     "Volume splits come from volume_manifest.csv and are a strict subset of the surface cases.",
-    "manifest_full_failed10_included.csv is used to identify cases excluded from the current processed manifest."
+    "manifest.csv and manifest_full_failed10_included.csv currently agree on all packaged processed surface cases."
   ]
 }

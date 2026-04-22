@@ -28,7 +28,8 @@ When the advisor assigns a cross-dataset hypothesis family, use your 8 GPUs as a
 small run matrix across the relevant benchmarks, then report the metrics
 together so the transfer signal is easy to interpret. If the hypothesis is
 about TandemFoil generalization or paper comparability, include both
-`tandemfoil/` and `tandemfoil_paper/`.
+`tandemfoil/` and `tandemfoil_paper/`, and keep their metrics distinct:
+`surface_pressure_mae` for `tandemfoil/`, `field_mse` for `tandemfoil_paper/`.
 
 Try and use sub-agents where possible, for example specialised agents like researcher-agent for research, Explore agent for checking log files or generic sub-agents for other repetitive tasks like polling for work.
 
