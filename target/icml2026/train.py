@@ -164,6 +164,8 @@ class TrainConfig:
     volume_anchor_points: int = 8_000
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
+    agc: bool = False
+    agc_clip_factor: float = 0.01
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -1178,6 +1180,25 @@ def evaluate_abupt(
     return {"surface_mae": total_surface / max(count_surface, 1), "volume_mae": total_volume / max(count_volume, 1)}
 
 
+def adaptive_gradient_clip(parameters, clip_factor: float = 0.01, eps: float = 1e-3) -> tuple[int, float]:
+    clipped = 0
+    total_grad_norm_sq = 0.0
+    for p in parameters:
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        total_grad_norm_sq += g.norm(2).item() ** 2
+        if p.ndim < 2:
+            continue
+        p_norm = p.detach().norm(2).clamp_(min=eps)
+        g_norm = g.norm(2)
+        max_norm = clip_factor * p_norm
+        if g_norm > max_norm:
+            g.mul_(max_norm / g_norm.clamp(min=1e-8))
+            clipped += 1
+    return clipped, total_grad_norm_sq ** 0.5
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     anp_head: ANPSurfaceDecoder | None,
@@ -1194,6 +1215,8 @@ def train_one_epoch(
     max_batches: int = 0,
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
+    agc: bool = False,
+    agc_clip_factor: float = 0.01,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1261,12 +1284,18 @@ def train_one_epoch(
         all_params = list(model.parameters())
         if anp_head is not None:
             all_params += list(anp_head.parameters())
-        grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=grad_clip if grad_clip > 0 else float("inf"))
+        if agc:
+            agc_clipped, grad_norm_val = adaptive_gradient_clip(all_params, clip_factor=agc_clip_factor)
+            grad_norm = torch.tensor(grad_norm_val)
+            running.setdefault("agc_clip_events", 0.0)
+            running["agc_clip_events"] += float(agc_clipped)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=grad_clip if grad_clip > 0 else float("inf"))
+            if grad_clip > 0 and float(grad_norm) > grad_clip:
+                running.setdefault("grad_clip_events", 0.0)
+                running["grad_clip_events"] += 1.0
         running.setdefault("grad_norm_mean", 0.0)
         running["grad_norm_mean"] += float(grad_norm)
-        if grad_clip > 0 and float(grad_norm) > grad_clip:
-            running.setdefault("grad_clip_events", 0.0)
-            running["grad_clip_events"] += 1.0
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
@@ -1462,6 +1491,8 @@ def main() -> None:
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
+            agc=config.agc,
+            agc_clip_factor=config.agc_clip_factor,
         )
 
         if ema is not None:
