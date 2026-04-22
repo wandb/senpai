@@ -1,8 +1,8 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-21 23:50 (Wave 3 — Bold New Directions, Cross-Dataset Focus Directive)
+- **Date:** 2026-04-22 00:15 (Wave 3 Reassigned + casca AGC)
 - **Branch:** radford
-- **Fleet status:** 59 live students, ALL ASSIGNED (0 idle)
+- **Fleet status:** 60 live students, ALL ASSIGNED (0 idle)
 - **Current relaunch budget:** inherit pod env defaults
   - `SENPAI_TIMEOUT_MINUTES=360`
   - `SENPAI_MAX_EPOCHS=999`
@@ -80,6 +80,7 @@ No baseline has been run yet on radford for this dataset.
 - **4L/640d at lr=5e-4+gc=1.0** (#2917): all 3 DM runs crashed (ep90-153)
 - **T_max=5 on DrivAerML** (#2911): all 3 runs diverged — too rapid for 4L/512d scale
 - **EMA alone on DrivAerML** (#2899): 9.749% (worse than 4.619% baseline) — EMA+gc compound now being tested
+- **gc=1.5/gc=2.0 on DrivAerML** (#2881): all 8 runs diverged. gc=1.5 best 6.066% (+31%), gc=2.0 best 8.834% (+91%). CosineAnnealing restarts amplify instability
 
 ## Default Assignment Pattern
 
@@ -100,21 +101,22 @@ comparability, always include:
 
 ## ACTIVE EXPERIMENTS — 59 WIP PRs
 
-### Theme 7: Bold New Directions (Wave 3, 2026-04-21 22:45)
+### Theme 7: Bold New Directions (Wave 3 — recreated after accidental merge of #2928-2936)
 
-9 new hypothesis families testing genuinely new mechanisms — loss reformulation, architecture innovations, optimization paradigm shifts, and physics-informed features.
+10 hypothesis families: loss reformulation, architecture innovations, optimization shifts, physics-informed features, unit-invariant clipping.
 
 | Student | PR | Experiment | Risk |
 |---|---|---|---|
-| frieren | #2928 | **Relative L2 Training Loss** — align DM training loss with eval metric | LOW |
-| nezuko | #2929 | **SwiGLU FFN Replacement** — gated linear units for all Transolver blocks | LOW |
-| violet | #2930 | **Stochastic Depth (DropPath)** — layer-level regularization 0.1/0.2 | LOW |
-| gilbert | #2931 | **Prodigy Optimizer** — parameter-free LR adaptation | LOW-MED |
-| kohaku | #2932 | **Global Context Token** — break slice-local attention bottleneck | MEDIUM |
-| emma | #2933 | **Surface Normals + Curvature** — differential geometry input features | MEDIUM |
-| chihiro | #2934 | **Conservation Auxiliary Loss** — div(u)=0 physics regularization | MED-HIGH |
-| shoya | #2935 | **MoE FFN Layers** — sparse expert routing for physics-regime specialization | MED-HIGH |
-| mitsuha | #2936 | **SDF Wall-Distance Feature** — signed distance field geometry embedding | MEDIUM |
+| frieren | #2937 | **Relative L2 Training Loss** — align DM training loss with eval metric | LOW |
+| nezuko | #2938 | **SwiGLU FFN Replacement** — gated linear units for all Transolver blocks | LOW |
+| violet | #2939 | **Stochastic Depth (DropPath)** — layer-level regularization 0.1/0.2 | LOW |
+| gilbert | #2940 | **Prodigy Optimizer** — parameter-free LR adaptation | LOW-MED |
+| kohaku | #2941 | **Global Context Token** — break slice-local attention bottleneck | MEDIUM |
+| emma | #2942 | **Surface Normals + Curvature** — differential geometry input features | MEDIUM |
+| chihiro | #2943 | **Conservation Auxiliary Loss** — div(u)=0 physics regularization | MED-HIGH |
+| shoya | #2944 | **MoE FFN Layers** — sparse expert routing for physics-regime specialization | MED-HIGH |
+| mitsuha | #2945 | **SDF Wall-Distance Feature** — signed distance field geometry embedding | MEDIUM |
+| casca | #2946 | **Adaptive Gradient Clipping (AGC)** — NFNet-style unit-invariant clipping | LOW-MED |
 
 ### Theme 0: EMA Refinement
 
@@ -144,7 +146,7 @@ comparability, always include:
 | franky | #2886 | lr=4e-4+gc=1.0 |
 | gohan | #2887 | gc=1.0+T_max=10 LR scan |
 | gojo | #2888 | gc=0.5+T_max=10 |
-| casca | #2881 | gc=1.5/gc=2.0 |
+| ~~casca~~ | ~~#2881~~ | ~~gc=1.5/gc=2.0~~ CLOSED — dead end. Reassigned to #2946 AGC |
 | jin | #2893 | lr=1e-3+gc=1.0 |
 | shinobu | #2912 | WD=3e-2/5e-2+gc=1.0 (heavy regularization) |
 | sanji | #2918 | gc=0.5+WD=1e-2 (softer clip + regularization compound) |
