@@ -1,8 +1,8 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-22 (last polled — Wave 3 + TF Paper baseline wave + DM Lion + AF LR sweep + cross-dataset spatial/physics budget sweeps + Wave 4 cross-dataset code/arch innovations + Wave 5 cross-dataset code/arch innovations + Wave 6 per-step SGDR / coord noise / T_max sweep + Wave 7 attention architecture innovations + usopp #2994 hypernetwork + Wave 8 spike #2995 attention dropout + Wave 9 brook #2999 LayerScale + zenitsu #3000 Spectral Norm attn. — latest poll confirms 53 WIP, 0 idle, 0 review-ready)
+- **Date:** 2026-04-22 (last polled — Wave 3 + TF Paper baseline wave + DM Lion + AF LR sweep + cross-dataset spatial/physics budget sweeps + Wave 4 cross-dataset code/arch innovations + Wave 5 cross-dataset code/arch innovations + Wave 6 per-step SGDR / coord noise / T_max sweep + Wave 7 attention architecture innovations + usopp #2994 hypernetwork + Wave 8 spike #2995 attention dropout + Wave 9 brook #2999 LayerScale + zenitsu #3000 Spectral Norm + Wave 10 #3001–#3013 (13 new PRs) + Wave 11: griffith sigma-Reparam + casca GeGLU — CLOSED: griffith #2968 Spectral Norm attn, casca #2962 AGC — 2 students newly idle, assigning Wave 11)
 - **Branch:** radford
-- **Fleet status:** 53 WIP PRs, ALL ASSIGNED (0 idle) — Wave 7: chrome #2988 MQA, faye #2989 GQA, gojo #2990 head-dim scaling, himmel #2991 SWA, levi #2992 Flash+compile, shoya #2993 sparse top-k; usopp #2994 hypernetwork; Wave 8: spike #2995 attention dropout; Wave 9: brook #2999 LayerScale cross-dataset, zenitsu #3000 Spectral Norm attn cross-dataset. PRs CLOSED: #2981 (spike, QK attention temp), #2977 (zenitsu, learnable per-head attn temperature — 1.4x–3.0x worse on all datasets, dead end). NOTE: brook #2996 MQA (old draft) and zenitsu #2983 RoPE (old draft) were superseded by Wave 9 assignments.
+- **Fleet status:** 60 WIP PRs, 0 IDLE — Wave 11: griffith #3016 sigma-Reparam, casca #3017 GeGLU — Wave 7: chrome #2988 MQA, faye #2989 GQA, gojo #2990 head-dim scaling, himmel #2991 SWA, levi #2992 Flash+compile, shoya #2993 sparse top-k; usopp #2994 hypernetwork; Wave 8: spike #2995 attention dropout; Wave 9: brook #2999 LayerScale on Transolver residuals (cross-dataset TF/TFP/AF/DM); Wave 10: canute #3001 slice temp sweep, franky #3002 Fourier freq bands, norman #3003 channel dropout, sanji #3004 long cosine, robin #3005 2L+EMA+gc=0.5, senku #3006 2L+EMA+gc=0.3, shouko #3007 4L+T_max=10, stark #3008 AF depth+T_max, megumi #3009 Lion lr sweep, piccolo #3010 DM gc sweep, sukuna #3011 WD sweep, usopp #3012 AdamW lr ablation, shoya #3013 Fourier ablation. MERGED: zenitsu #2997 Kutta TE v2 (cross-dataset), brook #2998 AF normalization 3-way. PRs CLOSED: #2968 (griffith, Spectral Norm attn — 17.5-55% worse, DM diverged), #2962 (casca, AGC — incompatible with Lion; DM diverged), #2981 (spike, QK attention temp), #2977 (zenitsu, learnable per-head attn temperature), #2996 (brook, MQA draft — superseded). NOTE: zenitsu #2983 RoPE dead end was closed. griffith #2889 (3L/512d+gc=1.0 DM) STILL IN FLIGHT.
 - **Current relaunch budget:** inherit pod env defaults
   - `SENPAI_TIMEOUT_MINUTES=360`
   - `SENPAI_MAX_EPOCHS=999`
@@ -107,6 +107,8 @@ No baseline has been run yet on radford for this dataset.
 - **AirfRANS gradient accumulation** (#2902 stark accum>1): strictly detrimental — accum=1 (control) trained longest (661 ep) and found best basin; accumulation hurts AF
 - **Huber loss on AirfRANS** (#2901 spike, early read): 58.7% WORSE than MSE at same epoch — Huber δ=1.0 is NOT beneficial for AF; final verdict pending completion
 - **Learnable per-head QK attention temperature** (#2981 spike, CLOSED): all 4 datasets 200-2844% worse than baseline. Hypothesis falsified — Transolver already has `self.temperature=0.5` for slice assignment (more important than QK scaling); learned QK temperatures converged near 1.0 (±15%), confirming standard 1/√d_k scaling is near-optimal. Mechanism analysis: QK temperature is downstream of the architecturally meaningful slice-assignment temperature.
+- **Spectral Norm on attention Q/K/V/O projections** (#2968 griffith, CLOSED): `torch.nn.utils.spectral_norm` on all 4 attention projections — 17.5% worse on TF, 55% worse on AF, DM diverged. SN constrains expressivity, conflicts with Fourier features, incompatible with torch.compile (legacy forward pre-hook API), and DM divergence from SN + cosine cycling instability (sigma collapse/oscillation during LR warm phases). sigma-Reparam (Zhai et al. ICML 2023) is the clean alternative (`W = g * V / ||V||_σ`).
+- **Adaptive Gradient Clipping / AGC** (#2962 casca, CLOSED): NFNet-style AGC at clip_factor=0.01 and 0.03 — fundamentally incompatible with Lion optimizer (Lion sign-compression makes g_norm = ||sign(m)|| = sqrt(num_params) constant, bypassing the adaptive component entirely); DrivAerML diverged at both clip_factor values. Global gc=0.5 outperforms AGC everywhere tested.
 
 ## Default Assignment Pattern
 
@@ -125,7 +127,42 @@ comparability, always include:
 - `target/icml2026/tandemfoil/`
 - `target/icml2026/tandemfoil_paper/`
 
-## ACTIVE EXPERIMENTS — 59 WIP PRs (updated 2026-04-22 after Wave 9 assigned: brook #2999 LayerScale, zenitsu #3000 Spectral Norm)
+## ACTIVE EXPERIMENTS — 60 WIP PRs (updated 2026-04-22 after Wave 10 assigned: canute #3001 – shoya #3013)
+
+### Theme 19: Wave 11 — sigma-Reparam + GeGLU (NEW — 2026-04-22, post-Wave 9/10 closures)
+
+Two new cross-dataset hypotheses assigned after closing griffith #2968 (Spectral Norm) and casca #2962 (AGC). Both cover all 4 datasets.
+
+| Student | PR | Experiment | Risk |
+|---|---|---|---|
+| griffith | #3016 | **sigma-Reparam on attention projections** — `W = g * (V / ||V||_σ)` per Zhai et al. ICML 2023; learned scalar g controls spectral norm without hooks; torch.compile compatible; `--sigma-reparam` flag; cross-dataset TF/TFP/AF/DM | LOW |
+| casca | #3017 | **GeGLU FFN activation** — `FFN(x) = (xW_1) * GELU(xW_3) * W_2`; distinct from SwiGLU (nezuko #2938 uses SiLU gate); GELU gate has different gradient properties; `--geglu` flag; cross-dataset TF/TFP/AF/DM | LOW |
+
+**Scientific rationale:**
+- griffith sigma-Reparam: Directly motivated by griffith's own spectral norm review (he cited Zhai et al. as "a cleaner future alternative"). sigma-Reparam parameterizes W as `g * (V/||V||_σ)` where g is a learned scalar and V an unconstrained matrix — achieves spectral norm control natively in the forward pass, no hook API, no torch.compile issues, and g can be regularized independently. Hypothesis: spectral bound helps attention expressivity when implemented cleanly rather than via SN hooks.
+- casca GeGLU: Complementary to SwiGLU (nezuko #2938). The key difference: GELU gate is smoother than SiLU/Swish near zero, with heavier tails. For CFD meshes where many nodes have near-zero physical quantities (pressure, velocity in quiescent regions), GELU gating may provide better sparsity. Dauphin et al. GLU (2017) + Noam Shazeer (2020) GeGLU/SwiGLU survey: both consistently outperform vanilla ReLU FFN.
+
+### Theme 18: Wave 10 — Cross-Dataset Optimization/Architecture/Augmentation Sweep (NEW — 2026-04-22)
+
+Thirteen new cross-dataset hypotheses spanning optimizer hyperparameters, architecture depth/width, regularization, and feature engineering. Wave 10 is a broad sweep to cover underexplored corners of the search space while Wave 9 stability runs are in flight.
+
+| Student | PR | Experiment | Hypothesis |
+|---|---|---|---|
+| canute | #3001 | **Slice temperature sweep** — Transolver's `self.temperature` is the most architecturally important temperature parameter (slice assignment); systematic sweep to find optimal value | Architecture |
+| franky | #3002 | **Extended Fourier frequency bands** — increase Fourier band cutoffs beyond defaults; richer frequency decomposition for complex flow structures | Features |
+| norman | #3003 | **Input channel dropout regularization** — randomly zero entire input channels during training; prevents overfit to any single physics feature | Regularization |
+| sanji | #3004 | **Long cosine schedule with linear warmup** — extended T_max with slow warmup; test if longer cosine reduces terminal LR overshoot | Optimization |
+| robin | #3005 | **2L/192d + gc=0.5 + EMA cross-dataset** — depth meets EMA breakthrough; shallower architecture with gradient clipping and EMA | Architecture |
+| senku | #3006 | **2L/192d + gc=0.3 + EMA cross-dataset** — softer clip variant; explore gc=0.3 which may be less restrictive than gc=0.5 for 2L | Architecture |
+| shouko | #3007 | **4L/512d + T_max=10 cross-dataset** — shorter cosine for DrivAerML-compatible schedule; test at 4L where gc stability is known | Architecture |
+| stark | #3008 | **AirfRANS depth sweep + T_max transfer** — AF-specific depth/T_max sensitivity; also tests cross-dataset transfer of AirfRANS tuning | Optimization |
+| megumi | #3009 | **Lion lr sweep cross-dataset** — systematic Lion LR search: find optimal lr for TF+AirfRANS+TFP+DM | Optimization |
+| piccolo | #3010 | **DrivAerML grad-clip sweep + gc transfer** — gc sensitivity sweep on DM; test which gc generalises cross-dataset | Optimization |
+| sukuna | #3011 | **Weight decay sweep cross-dataset** — wd=5e-3 vs wd=2e-2; explore WD sensitivity (DM WD=0 constraint still applies) | Regularization |
+| usopp | #3012 | **AdamW lr ablation** — systematic AdamW LR on TF + standard cross-dataset coverage | Optimization |
+| shoya | #3013 | **Fourier feature ablation cross-dataset** — ablate `--enable-fourier` across all datasets to quantify its contribution to baseline | Features |
+
+**Scientific rationale:** Wave 10 is a systematic coverage sweep. After 9 waves of targeted innovations, several hyperparameter axes remain only coarsely explored: slice temperature (most important Transolver parameter per #2981 analysis), Fourier band width, optimizer LR across all datasets simultaneously, and depth variants with EMA. This wave aims to either establish tighter optima or rule out further gains in these directions.
 
 ### Theme 17: Wave 9 — Cross-Dataset Residual Stability Innovations (NEW — 2026-04-22)
 
@@ -209,7 +246,7 @@ Three new cross-dataset hypotheses targeting scheduler correctness, geometric au
 | chihiro | #2943 | **Conservation Auxiliary Loss** — div(u)=0 physics regularization | MED-HIGH |
 | shoya | #2944 | **MoE FFN Layers** — sparse expert routing for physics-regime specialization | MED-HIGH |
 | mitsuha | #2945 | **SDF Wall-Distance Feature** — signed distance field geometry embedding | MEDIUM |
-| casca | #2946 | **Adaptive Gradient Clipping (AGC)** — NFNet-style unit-invariant clipping | LOW-MED |
+| ~~casca~~ | ~~#2946~~ | ~~**Adaptive Gradient Clipping (AGC)**~~ CLOSED — incompatible with Lion; DM diverged; reassigned to Wave 11 GeGLU | ~~LOW-MED~~ |
 
 ### Theme 8: TandemFoil Paper Baseline Wave (NEW — 2026-04-22)
 
@@ -415,8 +452,9 @@ Their old PRs remain in-flight but are now listed under their new assignments in
 ## Next Priorities
 
 1. ~~**URGENT: Best-checkpoint saving code change**~~ — **IN PROGRESS (#2974 mugen Wave 4).** The T_mult experiment (#2895) proved TF=25.459 and AF=0.000371 exist in the landscape. mugen implementing `checkpoint_best.pt` saving. **Wave 5 launched: #2980-#2984 (PCGrad/AttnTemp/ZScore/RoPE/LLRD) — all true cross-dataset.**
-2. **Monitor Wave 9** (#2999 brook LayerScale, #3000 zenitsu Spectral Norm) — lowest-risk stability hypotheses, both fully cross-dataset.
-3. **Close old draft PRs** — brook #2996 (MQA draft, never ran) and zenitsu #2983 (RoPE draft, never ran) should be closed or explicitly queued. Their Wave 9 replacements are now active.
+2. **Monitor Wave 11** (griffith #3016 sigma-Reparam, casca #3017 GeGLU) — two new cross-dataset hypotheses, directly motivated by Wave 9/10 closure analysis.
+3. **Monitor Wave 10** (#3001–#3013, 13 PRs) — broad coverage sweep: slice temp, Fourier bands, channel dropout, long cosine, 2L+EMA variants, 4L+T_max=10, AF depth, Lion/AdamW lr sweeps, WD sweep, DM gc sweep, Fourier ablation. All cross-dataset.
+4. **Monitor Wave 9** (#2999 brook LayerScale) — lowest-risk stability hypothesis, fully cross-dataset. NOTE: zenitsu #3000 Spectral Norm was the Wave 9 spectral norm experiment — superseded by griffith #2968 (already closed); brook #2999 LayerScale is still in flight.
 4. **Monitor TF Paper baseline wave** (#2947 jin, #2948 guts, #2949 vash) — update BASELINE.md with new section once first results arrive
 5. **Monitor DrivAerML Lion** (#2950 piccolo) — first Lion run on DrivAerML; could be significant
 6. **Monitor AirfRANS LR ceiling** (#2951 stark) — tests whether lr>6e-4 helps AF
