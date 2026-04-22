@@ -160,6 +160,7 @@ class TrainConfig:
     residual_prediction: bool = False
     re_stratified_sampling: bool = False
     cosine_t_max: int = 150
+    cosine_t_mult: int = 1
     geometry_points: int = 25_000
     geometry_supernodes: int = 4_096
     surface_anchor_points: int = 8_000
@@ -1625,7 +1626,12 @@ def main() -> None:
     scheduler = None
     if config.cosine_t_max > 0:
         base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
+        if config.cosine_t_mult > 1:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                base_optimizer, T_0=config.cosine_t_max, T_mult=config.cosine_t_mult
+            )
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
 
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
