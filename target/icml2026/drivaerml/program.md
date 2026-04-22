@@ -50,16 +50,15 @@ Use the **DrivAerML relative-L2 contract** used by AB-UPT and continued in later
 
 - **Split contract**
   - Default split for this repo target:
-    - `394 train / 34 val / 46 test`
+    - `400 train / 34 val / 50 test`
   - This is the packaged public processed split present on the PVC.
-  - It is slightly smaller than the nominal public split discussed in AB-UPT because `10` processed public cases are absent from the packaged PVC.
+  - The packaged surface manifests now match the public AB-UPT train/val/test case counts on the processed PVC.
 
 - **Important comparison note**
-  - The packaged PVC split is not identical to the nominal AB-UPT public split because `10` processed public cases are missing.
-  - That split discrepancy must be disclosed whenever we compare against AB-UPT, PhysicsNeMo, or Transolver-3 tables.
+  - The packaged public processed split now aligns with the public AB-UPT `400 / 34 / 50` train/val/test partition.
+  - AB-UPT also tracks a separate `16`-case hidden validation bucket that is not part of the public processed PVC contract used here.
   - The local `reference_abupt` model path should be treated as an **AB-UPT-style reference architecture**, not a byte-for-byte reproduction of the published AB-UPT DrivAerML setup.
   - The main remaining differences are:
-    - **split**: this target uses the packaged processed split `394 / 34 / 46`, whereas AB-UPT reports the nominal public split `400 / 34 effective val / 50 test`
     - **targets**: the packaged sprint path is surface-first and predicts packaged `surface_cp`, whereas AB-UPT predicts 4 surface variables and 7 volume variables on the full task
     - **token counts**: the AB-UPT paper uses `16384` geometry supernodes, `16384` surface anchors, and `16384` volume anchors for DrivAerML; the local sprint defaults are smaller and configurable for practicality
     - **architecture depth / recipe**: the paper uses the full published AB-UPT block schedule and training recipe (`500` epochs, `bs=1`, Lion with warmup+cosine, mixed precision). The local sprint trainer exposes a shared training loop and does not yet hard-pin every AB-UPT hyperparameter to those paper values
@@ -68,7 +67,7 @@ Use the **DrivAerML relative-L2 contract** used by AB-UPT and continued in later
 ## Published reference targets
 
 - **Exact local contract used by this target**
-  - packaged processed split: `394 train / 34 val / 46 test`
+  - packaged processed split: `400 train / 34 val / 50 test`
   - packaged target: `surface_cp`
   - paper-facing metric:
     - `test_primary/surface_rel_l2_pct`
@@ -77,10 +76,10 @@ Use the **DrivAerML relative-L2 contract** used by AB-UPT and continued in later
 
 - **What we found in the literature**
   - We did **not** find a published paper that reports the exact packaged
-    `394 / 34 / 46` `surface_cp` contract used in this repo.
-  - The closest published surface-pressure references use the nominal public
-    DrivAerML benchmark rather than the packaged PVC subset:
-    - `Transolver-3` (Table 4, random `400 train / 34 effective val / 50 test`):
+    `surface_cp` sprint target and shared-trainer implementation used in this repo.
+  - The closest published surface-pressure references use the same nominal
+    public DrivAerML train/val/test counts:
+    - `Transolver-3` (Table 4, `400 train / 34 effective val / 50 test`):
       - `p_s = 3.71`
     - `AB-UPT` (same table):
       - `p_s = 3.82`
@@ -94,8 +93,11 @@ Use the **DrivAerML relative-L2 contract** used by AB-UPT and continued in later
     `surface_rel_l2_pct`, that is approximately `3.88`.
 
 - **Implication for this repo**
-  - There is no exact published apples-to-apples number for our packaged split,
-    so the paper should disclose that clearly.
+  - The split counts now align with the public AB-UPT benchmark, so split-size
+    disclosure is no longer the main caveat.
+  - There is still no exact published apples-to-apples number for our packaged
+    `surface_cp` sprint target and trainer path, so the paper should disclose
+    that clearly.
   - The right external target band for `surface_rel_l2_pct` is nevertheless
     low-single-digit surface-pressure error, with `3.71` from `Transolver-3`
     as the strongest nominal DrivAerML reference we found.

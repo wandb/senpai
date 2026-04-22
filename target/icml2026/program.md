@@ -97,8 +97,9 @@ Alignment policy:
 - when model selection is done on validation, paper-facing test numbers should
   be evaluated from the best validation checkpoint rather than the terminal
   training state whenever possible
-- document any remaining irreducible discrepancy, such as the packaged
-  DrivAerML case set being smaller than the nominal public split in AB-UPT
+- document any remaining irreducible discrepancy, such as unavailable
+  hidden-validation cases or differences between packaged sprint targets and
+  published full-task targets
 - pin TandemFoilSet parity work to concrete source refs rather than a floating
   branch head:
   - transform, metric, residual, and merged feature-stack contract:

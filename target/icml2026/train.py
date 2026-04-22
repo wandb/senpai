@@ -110,6 +110,8 @@ class TrainConfig:
     drivaerml_eval_surface_points: int = 0
     drivaerml_train_volume_points: int = 0
     drivaerml_eval_volume_points: int = 0
+    drivaerml_manifest: str = ""
+    drivaerml_root: str = ""
     agent: str = ""
     wandb_name: str = ""
     wandb_group: str = ""
@@ -472,6 +474,10 @@ def build_bundle(config: TrainConfig) -> DatasetBundle:
         bundle_kwargs["tandem_manifest"] = config.tandem_manifest
     if config.tandem_stats:
         bundle_kwargs["tandem_stats"] = config.tandem_stats
+    if config.drivaerml_manifest:
+        bundle_kwargs["drivaerml_manifest"] = config.drivaerml_manifest
+    if config.drivaerml_root:
+        bundle_kwargs["drivaerml_root"] = config.drivaerml_root
     if config.tandemfoil_paper_manifest:
         bundle_kwargs["tandemfoil_paper_manifest"] = config.tandemfoil_paper_manifest
     if config.tandemfoil_paper_stats:
@@ -1388,7 +1394,29 @@ def write_run_summary(
         "best_test_metrics": best_test_metrics or {},
         "final_test_metrics": final_test_metrics or {},
     }
+    drivaerml_split = drivaerml_split_summary(bundle)
+    if drivaerml_split is not None:
+        payload["drivaerml_split"] = drivaerml_split
     path.write_text(json.dumps(payload, indent=2))
+
+
+def drivaerml_split_summary(bundle: DatasetBundle) -> dict[str, object] | None:
+    if bundle.spec.name != "drivaerml":
+        return None
+    store = getattr(bundle.train_dataset, "store", None)
+    manifest = getattr(store, "manifest", None)
+    if not isinstance(manifest, dict):
+        return None
+    return {
+        "manifest_path": str(store.manifest_path),
+        "case_root": str(store.root),
+        "surface_split_counts": manifest.get("surface_split_counts", {}),
+        "surface_splits": manifest.get("surface_splits", {}),
+        "volume_split_counts": manifest.get("volume_split_counts", {}),
+        "volume_splits": manifest.get("volume_splits", {}),
+        "excluded_case_count": manifest.get("excluded_case_count"),
+        "excluded_case_ids": manifest.get("excluded_case_ids", []),
+    }
 
 
 def primary_metric_key(bundle: DatasetBundle, *, phase: str) -> str:
