@@ -33,6 +33,15 @@ from core.features import (
 from core.optim import Lion, Lookahead
 
 
+def _make_fourier_freqs(n_features: int) -> tuple[float, ...]:
+    n_values = max(1, n_features // 4)
+    if n_values == 1:
+        return (4.0,)
+    return tuple(
+        0.5 * (64.0 ** (i / (n_values - 1))) for i in range(n_values)
+    )
+
+
 class EMAWithWarmup:
     """EMA with timm-style adaptive decay warmup: min(target, (1+step)/(10+step))."""
 
@@ -139,6 +148,7 @@ class TrainConfig:
     tandemfoil_paper_manifest: str = ""
     tandemfoil_paper_stats: str = ""
     enable_fourier: bool = False
+    fourier_freqs: int = 16
     enable_te_coord_frame: bool = False
     enable_cp_panel: bool = False
     enable_cp_panel_tandem_only: bool = False
@@ -318,7 +328,9 @@ class TandemTargetTransform:
             )
             x = torch.cat([x, wake_feats], dim=-1)
         if self.config.enable_fourier:
-            x = append_batched_fourier_features(x)
+            x = append_batched_fourier_features(
+                x, freqs=_make_fourier_freqs(self.config.fourier_freqs)
+            )
 
         cp_panel_unscaled = None
         if self.config.enable_cp_panel:
@@ -1381,6 +1393,21 @@ def main() -> None:
         _ds.TandemFoilCaseDataset.__init__ = _patched_init
 
     bundle = build_bundle(config)
+
+    if config.enable_fourier and config.fourier_freqs != 16:
+        _custom_freqs = _make_fourier_freqs(config.fourier_freqs)
+        _n_vals = len(_custom_freqs)
+        _sd = bundle.spec.space_dim
+        _delta = (_n_vals - 4) * _sd * 2
+        bundle.spec.surface_input_dim += _delta
+        if bundle.spec.volume_input_dim > 0:
+            bundle.spec.volume_input_dim += _delta
+        _orig_augment = _ds.augment_case_sample
+        def _patched_augment(sample, _freqs=_custom_freqs, _orig=_orig_augment, **kwargs):
+            kwargs["fourier_freqs"] = _freqs
+            return _orig(sample, **kwargs)
+        _ds.augment_case_sample = _patched_augment
+
     resolved_num_workers = resolve_num_workers(config, bundle.spec.name)
     if bundle.spec.name == "tandemfoilset":
         phys_stats = compute_tandem_phys_stats(
@@ -1432,6 +1459,8 @@ def main() -> None:
     if config.wandb_name:
         run_config = asdict(config)
         run_config["effective_batch_size"] = config.batch_size * config.grad_accum_steps
+        if config.enable_fourier:
+            run_config["fourier_freq_values"] = list(_make_fourier_freqs(config.fourier_freqs))
         run = wandb.init(
             project=os.getenv("WANDB_PROJECT", "senpai-v1"),
             entity=os.getenv("WANDB_ENTITY"),
