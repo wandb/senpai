@@ -207,6 +207,12 @@ class TargetTransform:
 
     def apply(self, y: torch.Tensor) -> torch.Tensor:
         out = y.clone()
+        # FIX (Bug 3): clamp non-finite input values before normalization so that
+        # ±inf from float16 overflow in raw TandemFoil Paper pickles do not
+        # propagate as NaN through the normalization arithmetic.
+        if not out.is_floating_point():
+            out = out.float()
+        out = torch.where(torch.isfinite(out), out, torch.zeros_like(out))
         if self.asinh_pressure and self.pressure_index is not None:
             out[..., self.pressure_index] = torch.asinh(out[..., self.pressure_index] * self.asinh_scale)
         if self.stats_mean is not None and self.stats_std is not None and self.stats_mean.numel() == out.shape[-1]:
