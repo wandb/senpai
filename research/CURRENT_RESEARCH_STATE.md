@@ -65,13 +65,17 @@ A shared recipe whose core changes work across all four benchmarks:
 
 DrivAerML gap is closing (3.997% val, 1.08x from 3.71% target). EMA+gc=0.5 is now the shared TF recipe. TFP baseline established at 0.00434 val (haku #2979). AF anchor 0.000482 from T_max=50 extended training. Best-checkpoint saving (megumi #3029) is the critical pending code change that may unlock transient AF=0.000371.
 
-## Mandatory Config Rules (UPDATED after EMA merge)
+## Mandatory Config Rules (UPDATED per issue #3020 + EMA merge)
 
-- **TF + AF + TF_paper:** Use `--ema-decay 0.999` (NO --no-use-ema). decay=0.999 > 0.9999 on both.
-- **DrivAerML:** Still `--no-use-ema` (EMA alone hurt DM; zenitsu #2925 tests EMA+gc compound)
+- **TF:** Lion lr=1.25e-4, T_max=10, gc=0.5, WD=1e-2, `--ema-decay 0.999`, 3L/192d
+- **TFP:** AdamW lr=5e-4, T_max=150, gc=1.0, WD=1e-2, no-EMA, 3L/192d (per #2979 baseline)
+- **AF:** AdamW lr=6e-4, T_max=50, gc=1.0, WD=1e-2, no-EMA, 2L/256d (per #2951 baseline)
+- **DM:** AdamW lr=5e-4, T_max=30, gc=1.0, WD=1e-2, no-EMA, 4L/512d (per #2898 baseline)
 - `--epochs 999` mandatory
-- DrivAerML: `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
-- Lion for TandemFoil; AdamW for AirfRANS/DrivAerML
+- DrivAerML: `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394`
+- **Paper-facing DM runs: DO NOT use --max-eval-batches** (human directive #3020). Truncated eval is only acceptable for fast iteration, NOT for benchmark submissions.
+- **Best-checkpoint test eval is mandatory** for paper-facing runs (report: best val epoch, final test, best-ckpt test, truncated vs full eval)
+- **DM val/test gap WARNING:** val=3.997% but test≈5.93% — checkpoint selection and full eval are the bottleneck
 
 ## Critical Code Change Needed: Best-Checkpoint Saving
 
