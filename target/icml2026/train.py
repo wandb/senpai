@@ -128,6 +128,8 @@ class TrainConfig:
     prefetch_factor: int = 4
     amp_mode: str = "bf16"
     compile_model: bool = True
+    flash_attention: bool = False
+    torch_compile: bool = False
     debug: bool = False
     max_train_batches: int = 0
     max_eval_batches: int = 0
@@ -1407,7 +1409,16 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
-    forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
+    if config.flash_attention and device.type == "cuda":
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_math_sdp(False)
+    if config.torch_compile and device.type == "cuda":
+        forward_model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
+    elif config.compile_model and device.type == "cuda":
+        forward_model = torch.compile(model)
+    else:
+        forward_model = model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
         anp_head = ANPSurfaceDecoder(
@@ -1447,6 +1458,8 @@ def main() -> None:
     for epoch in range(1, config.epochs + 1):
         if timeout_seconds is not None and epoch > 1 and (time.monotonic() - start_time) >= timeout_seconds:
             break
+        epoch_t0 = time.monotonic()
+        train_t0 = time.monotonic()
         train_metrics = train_one_epoch(
             model=forward_model,
             anp_head=anp_head,
@@ -1463,6 +1476,7 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
         )
+        train_elapsed = time.monotonic() - train_t0
 
         if ema is not None:
             ema.store(model)
@@ -1513,7 +1527,13 @@ def main() -> None:
         if anp_head is not None and anp_ema is not None:
             anp_ema.restore(anp_head)
 
-        epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
+        epoch_elapsed = time.monotonic() - epoch_t0
+        train_steps = train_metrics.get("train_steps", 0)
+        throughput = {"epoch_seconds": epoch_elapsed, "train_seconds": train_elapsed}
+        if train_steps > 0 and train_elapsed > 0:
+            throughput["train_steps_per_sec"] = train_steps / train_elapsed
+
+        epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics, **throughput}
         history.append(epoch_metrics)
         if run is not None:
             wandb.log(epoch_metrics, step=epoch)
