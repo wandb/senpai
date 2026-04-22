@@ -60,6 +60,7 @@ class TaskSpec:
     paper_table6_best: float
     paper_table6_best_std: float
     notes: tuple[str, ...]
+    require_shared_aoa: bool = True
 
 
 TASK_SPECS: dict[str, TaskSpec] = {
@@ -163,7 +164,9 @@ TASK_SPECS: dict[str, TaskSpec] = {
         notes=(
             "Experiment 4 Race Car uniform split.",
             "Paper uses uniform sampling on Race Car rather than an extrapolation split.",
+            "Race Car geometry has two distinct AoA values (multi-surface); shared-AoA check disabled.",
         ),
+        require_shared_aoa=False,
     ),
 }
 
@@ -178,7 +181,7 @@ def _resolve_task_pickle_paths(task: TaskSpec, root_candidates: list[str]) -> li
     return [root / name for name in task.pickle_files]
 
 
-def _extract_records(pickle_paths: list[Path]) -> list[dict]:
+def _extract_records(pickle_paths: list[Path], *, require_shared_aoa: bool = True) -> list[dict]:
     records: list[dict] = []
     task_local_idx = 0
     for file_idx, path in enumerate(pickle_paths):
@@ -188,7 +191,7 @@ def _extract_records(pickle_paths: list[Path]) -> list[dict]:
             if isinstance(aoa, list):
                 aoa0 = float(aoa[0])
                 aoa1 = float(aoa[1])
-                if abs(aoa0 - aoa1) > 1e-6:
+                if require_shared_aoa and abs(aoa0 - aoa1) > 1e-6:
                     raise ValueError(
                         f"Expected paper-style tandem AoA to be shared, got {aoa0} vs {aoa1} "
                         f"for {path.name}:{local_idx}"
@@ -267,8 +270,12 @@ def _compute_y_stats(pickle_paths: list[Path], train_indices: list[int]) -> dict
     total_nodes = 0
     for idx in train_sorted:
         _, y, _ = dataset[idx]
-        sum_y += y.double().sum(dim=0)
-        total_nodes += y.shape[0]
+        # Filter out any non-finite rows (e.g. ghost/boundary nodes with -inf pressure)
+        # so that corrupted CFD nodes don't poison the running statistics.
+        finite_mask = torch.isfinite(y).all(dim=1)
+        y_finite = y[finite_mask].double()
+        sum_y += y_finite.sum(dim=0)
+        total_nodes += y_finite.shape[0]
     if total_nodes <= 1:
         raise ValueError("Need at least two nodes to compute y statistics")
     mean_y = sum_y / total_nodes
@@ -276,7 +283,9 @@ def _compute_y_stats(pickle_paths: list[Path], train_indices: list[int]) -> dict
     sq_y = torch.zeros(3, dtype=torch.float64)
     for idx in train_sorted:
         _, y, _ = dataset[idx]
-        sq_y += ((y.double() - mean_y) ** 2).sum(dim=0)
+        finite_mask = torch.isfinite(y).all(dim=1)
+        y_finite = y[finite_mask].double()
+        sq_y += ((y_finite - mean_y) ** 2).sum(dim=0)
     std_y = (sq_y / (total_nodes - 1)).sqrt().clamp(min=1e-6)
     return {
         "n_train_samples": len(train_indices),
@@ -307,7 +316,7 @@ def build_artifacts(root_candidates: list[str]) -> tuple[dict, dict]:
 
     for task_name, task in TASK_SPECS.items():
         pickle_paths = _resolve_task_pickle_paths(task, root_candidates)
-        records = _extract_records(pickle_paths)
+        records = _extract_records(pickle_paths, require_shared_aoa=task.require_shared_aoa)
         if task.split_style == "uniform":
             splits = split_uniform_indices(len(records), seed=SEED)
         elif task.split_style == "tail_extrapolation":

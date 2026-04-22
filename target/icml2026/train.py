@@ -158,6 +158,7 @@ class TrainConfig:
     residual_prediction: bool = False
     re_stratified_sampling: bool = False
     cosine_t_max: int = 150
+    warmup_frac: float = 0.0
     geometry_points: int = 25_000
     geometry_supernodes: int = 4_096
     surface_anchor_points: int = 8_000
@@ -242,9 +243,14 @@ class TandemTargetTransform:
 
     @staticmethod
     def _umag_q(y: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        n_nodes = mask.float().sum(dim=1, keepdim=True).clamp(min=1.0)
-        ux_mean = (y[..., 0] * mask.float()).sum(dim=1, keepdim=True) / n_nodes
-        uy_mean = (y[..., 1] * mask.float()).sum(dim=1, keepdim=True) / n_nodes
+        # Use only finite, valid nodes to avoid -inf * 0.0 = NaN (IEEE 754).
+        # Ghost/boundary CFD nodes can carry -inf pressure values; multiplying
+        # them by the boolean mask (cast to 0.0) produces NaN, which then
+        # contaminates the entire batch.
+        finite_and_valid = mask & torch.isfinite(y).all(dim=-1)
+        n_nodes = finite_and_valid.float().sum(dim=1, keepdim=True).clamp(min=1.0)
+        ux_mean = (y[..., 0] * finite_and_valid.float()).sum(dim=1, keepdim=True) / n_nodes
+        uy_mean = (y[..., 1] * finite_and_valid.float()).sum(dim=1, keepdim=True) / n_nodes
         umag = (ux_mean.square() + uy_mean.square()).sqrt().clamp(min=1.0).unsqueeze(-1)
         q = 0.5 * umag.square()
         return umag, q
@@ -357,6 +363,10 @@ class TandemTargetTransform:
             y_norm = y_norm - freestream
 
         x = x * full_mask.unsqueeze(-1)
+        # Clamp any residual NaN/Inf in node features (e.g. from ghost nodes
+        # that survived the mask with non-finite coords) to zero so the model
+        # never receives NaN inputs.
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
         surface_x, volume_x = self._split_full(x, surface_tokens, volume_tokens)
         surface_target, volume_target = self._split_full(y_norm, surface_tokens, volume_tokens)
         surface_raw_y, volume_raw_y = self._split_full(full_y_raw, surface_tokens, volume_tokens)
@@ -759,13 +769,21 @@ def loss_grouped_tandem(
     total = torch.tensor(0.0, device=prepared.surface_x.device)
     metrics: dict[str, float] = {}
     if outputs["surface_preds"] is not None:
-        surf_loss = F.mse_loss(outputs["surface_preds"][prepared.surface_mask], prepared.surface_target[prepared.surface_mask])
-        total = total + surf_loss
-        metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
+        surf_target = prepared.surface_target[prepared.surface_mask]
+        surf_pred = outputs["surface_preds"][prepared.surface_mask]
+        finite_mask = torch.isfinite(surf_target).all(dim=-1)
+        if finite_mask.any():
+            surf_loss = F.mse_loss(surf_pred[finite_mask], surf_target[finite_mask])
+            total = total + surf_loss
+            metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if prepared.volume_target is not None and outputs["volume_preds"] is not None and prepared.volume_mask is not None:
-        vol_loss = F.mse_loss(outputs["volume_preds"][prepared.volume_mask], prepared.volume_target[prepared.volume_mask])
-        total = total + vol_loss
-        metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
+        vol_target = prepared.volume_target[prepared.volume_mask]
+        vol_pred = outputs["volume_preds"][prepared.volume_mask]
+        finite_mask = torch.isfinite(vol_target).all(dim=-1)
+        if finite_mask.any():
+            vol_loss = F.mse_loss(vol_pred[finite_mask], vol_target[finite_mask])
+            total = total + vol_loss
+            metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
     return total, metrics
 
@@ -1422,7 +1440,29 @@ def main() -> None:
     scheduler = None
     if config.cosine_t_max > 0:
         base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
+        if config.warmup_frac > 0.0:
+            # Scheduler steps per-batch; convert epoch-based warmup to batch steps.
+            steps_per_epoch = len(train_loader)
+            warmup_epochs = max(1, int(config.warmup_frac * config.epochs))
+            warmup_steps = warmup_epochs * steps_per_epoch
+            cosine_steps = config.cosine_t_max * steps_per_epoch
+            warmup_sched = torch.optim.lr_scheduler.LinearLR(
+                base_optimizer,
+                start_factor=0.01,
+                end_factor=1.0,
+                total_iters=warmup_steps,
+            )
+            cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                base_optimizer,
+                T_max=cosine_steps,
+            )
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                base_optimizer,
+                schedulers=[warmup_sched, cosine_sched],
+                milestones=[warmup_steps],
+            )
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
 
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
