@@ -2959,3 +2959,79 @@ Baselines: DM 3.997% | AF 0.000482
 
 **Status:** CLOSED — results too far from baseline and confounded by experimental setup.
 
+## 2026-04-22 19:00 — PR #3049: DrivAerML: torch.compile(mode='default')
+- levi/dm-compile-default-mode
+- **Hypothesis:** torch.compile with mode='default' (JIT fusion only, no CUDA graphs) provides 10-30% throughput improvement on DrivAerML, yielding more epochs within wall-clock budget and deeper convergence.
+
+| Run | Config | Best val surface_rel_l2_pct | Epoch rate | W&B ID | Status |
+|-----|--------|---------------------------|------------|--------|--------|
+| DM compile | compile_model=True | 14.19% (ep40) | 1.29 ep/min | xayn77u6 | runs still early |
+| DM no-compile | compile_model=False | 12.47% (ep45) | 1.35 ep/min | adujnx1r | runs still early |
+| AF compile | compile_model=True | 0.006048 (ep58) | — | p6bgp7ne | runs still early |
+
+Baseline: DM 3.997% (ep467)
+
+**Results Commentary:**
+- **0% throughput benefit.** Epoch rates identical (1.29 vs 1.35 ep/min). Data loading (50k surface points/batch) is the bottleneck, not compute — JIT fusion has nothing to optimize.
+- Compile uses ~17% less GPU memory (5,985 vs 7,241 MiB) but doesn't translate to speed.
+- grad-clip=1.0 prevents NaN divergence (confirmed through ep44+).
+- Student suggests flipping compile_model default to False — 0% benefit + NaN risk without gc.
+
+**Conclusions:**
+- torch.compile(mode='default') is a dead end for DrivAerML throughput
+- DrivAerML bottleneck is data loading, not model compute
+- mode='reduce-overhead' (CUDA graphs) incompatible with variable-length inputs (#2992)
+- Compile is NOT a viable path to more epochs in the DM time budget
+
+**Status:** CLOSED — hypothesis cleanly falsified with proper control run.
+
+## 2026-04-22 19:00 — PR #2961: SDF Wall Distance Feature as Input (cross-dataset)
+- mitsuha/wave3-sdf-wall-distance
+- **Hypothesis:** Adding signed-distance-function wall distance as an extra input channel gives the model explicit geometric context about proximity to walls/surfaces, expected 2-5% improvement on AF/DM.
+
+| Dataset | Metric | Baseline | Best SDF | Best Epoch | W&B ID | Status |
+|---------|--------|----------|----------|------------|--------|--------|
+| TandemFoil | surface_pressure_mae | 22.537 | 28.41 | ep182 | huw0kq75 | 26% WORSE |
+| AirfRANS | surface_mse | 0.000482 | 0.000994 | ep368 | srnmxdf3 | 2.1x WORSE (diverged NaN) |
+| DrivAerML | surface_rel_l2_pct | 3.997% | 7.68% | ep114 | v2vmz9vw | 1.9x WORSE (grad explosion) |
+| TFP | field_mse | 0.002383 | NOT LAUNCHED | — | — | N/A |
+
+**Results Commentary:**
+- All datasets significantly worse. AF diverged to NaN at ep400 (post cosine restart). DM grad norms exploded past ep162.
+- Root causes identified by student: (1) arcsinh(d/0.01) scale mismatch with normalized features, (2) redundancy with existing Fourier + TE frame + Cp priors, (3) on surface-only datasets (DM), SDF degenerates to local mesh density artifact.
+
+**Conclusions:**
+- SDF wall distance as raw input does not work — model already has sufficient geometric context from Fourier + physics features
+- Scale mismatch and optimization instability would require significant engineering for marginal expected upside
+- **SDF input is a confirmed dead end — do not repeat**
+
+**Status:** CLOSED — clear negative on all datasets.
+
+## 2026-04-22 19:00 — PR #2954: SwiGLU FFN Replacement (cross-dataset)
+- nezuko/wave3-swiglu-ffn
+- **Hypothesis:** Replace GeLU FFN with SwiGLU gated FFN (silu(W1*x) * W3*x) with 2/3 hidden dim to maintain param count. Expected 1-3% improvement from gating mechanism.
+
+| Dataset | Metric | Baseline | Best SwiGLU | Config | W&B ID | Status |
+|---------|--------|----------|------------|--------|--------|--------|
+| AirfRANS | surface_mse | 0.000482 | **0.000461** | SwiGLU+EMA, lr=7e-4, T=5 | 8y1tvnps | **BEATS BASELINE by 4.4%** |
+| AirfRANS | surface_mse | 0.000482 | 0.000793 | SwiGLU, lr=6e-4, T=10 | 3ehn0xgo | worse |
+| TandemFoil | surface_pressure_mae | 22.537 | 23.296 | SwiGLU+EMA | 08k0pfct | 3.4% worse |
+| DrivAerML | surface_rel_l2_pct | 3.997% | 4.693% | SwiGLU 3L/384d | wp1mlhj9 | 17% worse (diverged terminal) |
+| DrivAerML | surface_rel_l2_pct | 3.997% | 4.94% | SwiGLU 4L/512d | japcezir | worse (diverged) |
+| TFP | field_mse | 0.002383 | Infinity | SwiGLU+EMA+Lion | 1pckp9dn | CRASHED from ep1 |
+
+**Results Commentary:**
+- **AirfRANS: genuine beat!** SwiGLU+EMA achieves 0.000461 — 4.4% below baseline. W&B confirmed. But used non-standard config (lr=7e-4, T_max=5 vs champion lr=6e-4, T_max=50).
+- **TFP: numerical blow-up.** SwiGLU's multiplicative gating overflows on pressure dynamic range. Infinity from step 1.
+- **DM: catastrophic divergence.** All 5 DM runs show post-peak collapse. Best 4.693% at ep312 → 15.5% terminal. gc+WD variants diverged to NaN.
+- **TF:** SwiGLU+EMA 23.296 — 3.4% worse than baseline.
+
+**Conclusions:**
+- SwiGLU is dataset-specific (AF only) and harmful on 3/4 benchmarks
+- Contradicts shared recipe directive — closed per human team's "dataset-specific tricks that do not transfer are not useful"
+- AF already 88.8% better than external target — further AF-only optimization is low priority
+- AF finding logged for potential revisiting if recipe changes
+- **GeGLU (#3017) + SwiGLU (#2954) = entire GLU FFN family is dead for CFD surrogates** (except AF-specific SwiGLU+EMA)
+
+**Status:** CLOSED — AF beat logged but doesn't transfer, contradicts shared recipe directive.
+

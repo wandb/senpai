@@ -1,20 +1,38 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-22 18:45 (advisor cycle — reviewed 2 PRs, closed 2, assigned 2 new)
+- **Date:** 2026-04-22 19:10 (advisor cycle 2 — reviewed 4 PRs, closed 3, sent back 1, assigned 3 new)
 - **Branch:** radford
-- **Idle students:** NONE — all students now assigned
+- **Idle students:** NONE — all students assigned
 - **PRs ready for review:** 0
-- **PRs in WIP:** 59 (57 prior + #3058 mugen + #3059 violet)
-- **Fleet status:** 59 open WIP PRs
+- **PRs in WIP:** 59
+- **Fleet status:**
   - **merged:** `#3025` (TFP Lion champion transfer), `#3036` (AdaFactor cross-dataset)
-  - **closed negative / no longer active:** `#3021`, `#3023`, `#3026`, `#3027`, `#3030`, `#3042`
-    - `#3030` (violet rel_l2 loss): DM catastrophic failure; TF 22.151 positive finding logged but not merged due to instability + complexity
-    - `#3027` (mugen surface-points sweep): Results too far from baseline, confounded by no-checkpoint-saving and under-training
-  - **NEW this cycle:** `#3058` (mugen — coord noise σ=0.001/0.005 cross-dataset), `#3059` (violet — 2-layer MLP output head cross-dataset)
-  - **critical open PRs:** `#3029` (best-checkpoint save/eval — HIGH PRIORITY), `#3028` (AdamW β sweep), `#3031-#3035`, `#3038-#3041`, `#3043-#3059`
+  - **closed negative this cycle:** `#3049` (levi torch.compile — 0% throughput), `#2961` (mitsuha SDF — all worse), `#2954` (nezuko SwiGLU — AF beat but crashes TFP/DM, doesn't transfer)
+  - **closed earlier:** `#3021`, `#3023`, `#3026`, `#3027`, `#3030`, `#3042`
+  - **sent back:** `#3002` (franky Fourier bands — runs still early, need convergence)
+  - **NEW this cycle:** `#3060` (levi DM bilateral symmetry aug), `#3061` (mitsuha aux flow-condition head), `#3062` (nezuko per-case z-score normalization)
+  - **critical open PRs:** `#3029` (best-checkpoint save/eval — HIGH PRIORITY), `#3028`, `#3031-#3035`, `#3038-#3041`, `#3043-#3062`
 - **Current relaunch budget:** inherit pod env defaults
   - `SENPAI_TIMEOUT_MINUTES=360`
   - `SENPAI_MAX_EPOCHS=999`
+
+## Key Findings This Cycle (2026-04-22 19:10)
+
+1. **SwiGLU AF beat (0.000461 vs 0.000482):** Real but dataset-specific. Closed per shared recipe directive. Logged for potential revisiting.
+2. **torch.compile dead end:** DrivAerML bottleneck is data loading, not compute. JIT fusion gives 0% speedup.
+3. **SDF input dead end:** Redundant with Fourier + physics features already in model.
+4. **GLU FFN family fully closed:** GeGLU (#3017) + SwiGLU (#2954) both fail on CFD surrogates (except AF-specific SwiGLU+EMA).
+5. **Fourier bands signal:** AF may benefit from freqs=32 (more bands). Needs convergence to confirm.
+
+## Researcher Agent Top Ideas (2026-04-22 18:30) — Priority Queue
+
+| Rank | Idea | Assigned? | Expected Impact |
+|------|------|-----------|-----------------|
+| 1 | **DM bilateral symmetry augmentation** (free 2x data) | **YES → levi #3060** | HIGH |
+| 2 | **Per-case z-score normalization** (case-level output norm) | **YES → nezuko #3062** | MEDIUM-HIGH |
+| 3 | **Auxiliary flow-condition prediction head** (Re prediction) | **YES → mitsuha #3061** | MEDIUM |
+| 4 | Progressive surface-point curriculum (start 20k → 50k) | not yet | MEDIUM |
+| 5 | Freestream Cp normalization check (raw P vs Cp?) | not yet — investigate first | POTENTIALLY HIGH |
 
 ## Latest Research Directives (human team — #3020, 2026-04-21, still active)
 
