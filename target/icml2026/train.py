@@ -241,6 +241,16 @@ def comparison_metric_tensors(
     if metric_transform is None:
         return preds, train_transform.apply(target)
     pred_raw = train_transform.invert(preds)
+    # Clamp raw predictions: sinh inversion with large pressure std (~462)
+    # produces extreme-but-finite values (e.g. 3.4e9) from small z-score
+    # deviations that would otherwise dominate the MSE.
+    if train_transform.stats_mean is not None and train_transform.stats_std is not None:
+        lo = train_transform.stats_mean - 10 * train_transform.stats_std
+        hi = train_transform.stats_mean + 10 * train_transform.stats_std
+        pred_raw = pred_raw.clamp(
+            min=lo.to(pred_raw.device),
+            max=hi.to(pred_raw.device),
+        )
     return metric_transform.apply(pred_raw), metric_transform.apply(target)
 
 

@@ -209,6 +209,7 @@ class PaperTandemFoilCaseDataset(Dataset):
     def __getitem__(self, idx: int) -> CaseSample:
         base_idx = self.indices[idx]
         x, y, is_surface = self.base[base_idx]
+        y = y.where(y.isfinite(), y.new_zeros(()))
         surface_x = x[is_surface]
         volume_x = x[~is_surface]
         surface_y = y[is_surface]
