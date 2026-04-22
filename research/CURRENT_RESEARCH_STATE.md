@@ -40,10 +40,20 @@ All four benchmarks are now active and required:
 
 | Dataset | Metric | Current anchor |
 |---|---|---|
-| TandemFoil | `val_primary/surface_pressure_mae` | **26.134** (#2899 MERGED — EMA decay=0.999) |
+| TandemFoil | `val_primary/surface_pressure_mae` | **26.06** (#2887 MERGED — Lion lr=1e-4, no-EMA) |
 | TandemFoil Paper | `val_primary/field_mse` | **not established** — baseline run needed urgently |
-| AirfRANS | `val_primary/surface_mse` | **0.000727** (#2899 MERGED — EMA decay=0.999, ep206) |
+| AirfRANS | `val_primary/surface_mse` | **0.000627** (#2902 MERGED — AdamW lr=6e-4, accum=1, no-EMA, ep661) |
 | DrivAerML | `val_primary/surface_rel_l2_pct` | **4.619%** (#2691) |
+
+### CRITICAL SIGNAL — Best-Checkpoint Saves (2026-04-22)
+
+PR #2895 (mugen, T_mult cosine restarts) found **transient** bests:
+- TF: **25.459** @ ep109 (vs 26.06 current) — 2.3% improvement visible in val curve!
+- AF: **0.000371** @ ep221 (vs 0.000627 current) — **40.8%** improvement!
+
+Both were erased by post-restart regression. The final checkpoint is worse than baseline.
+**The loss landscape has much deeper minima than our current results suggest.**
+**Best-checkpoint saving (save whenever val improves) is now a CRITICAL CODE CHANGE.**
 
 ## Main Scientific Goal
 
@@ -67,6 +77,16 @@ No baseline has been run yet on radford for this dataset.
 - DrivAerML: `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
 - Lion for TandemFoil; AdamW for AirfRANS/DrivAerML
 
+## Critical Code Change Needed: Best-Checkpoint Saving
+
+**Evidence:** #2895 (mugen T_mult) saw TF=25.459 and AF=0.000371 as transient minima, both clearly beating current baselines, but post-restart LR jumps erased both. The trainer currently saves the **final** checkpoint, not the **best val** checkpoint.
+
+**Impact:** Every experiment with cosine warm restarts (T_mult, SGDR, multi-cycle) is leaving improvement on the table. The minima exist — we just don't capture them.
+
+**Required trainer change:** After each validation epoch, if `val_primary_metric < best_val_so_far`, save `checkpoint_best.pt`. At the end of training, load and evaluate from `checkpoint_best.pt` (not the final epoch).
+
+**Priority:** HIGH — assign a student to add this as a code change with a cross-dataset validation run.
+
 ## Negative Results (Do Not Repeat)
 
 - **No-Lookahead** (#2834): fatal across all datasets — diverges AF/DM, TF regresses
@@ -83,6 +103,9 @@ No baseline has been run yet on radford for this dataset.
 - **gc=1.5/gc=2.0 on DrivAerML** (#2881): all 8 runs diverged. gc=1.5 best 6.066% (+31%), gc=2.0 best 8.834% (+91%). CosineAnnealing restarts amplify instability
 - **T_max=10+gc=1.0 on DrivAerML** (#2879 bulma): failed — no sustained improvement over baseline 4.619%
 - **T_max=40/50+gc=1.0+WD=1e-2 on DrivAerML** (#2919 wolfwood): failed — longer cosine cycling did not help; WD+gc compound still unstable
+- **Gradient noise injection cross-dataset** (#2920 usopp): fatal — systematic catastrophic instability on all datasets; incompatible with cosine annealing
+- **AirfRANS gradient accumulation** (#2902 stark accum>1): strictly detrimental — accum=1 (control) trained longest (661 ep) and found best basin; accumulation hurts AF
+- **Huber loss on AirfRANS** (#2901 spike, early read): 58.7% WORSE than MSE at same epoch — Huber δ=1.0 is NOT beneficial for AF; final verdict pending completion
 
 ## Default Assignment Pattern
 
@@ -216,7 +239,7 @@ Two systematic sweeps testing the model's sensitivity to physics partition granu
 | Student | PR | Experiment |
 |---|---|---|
 | megumi | #2894 | Linear warmup+cosine |
-| mugen | #2895 | CosineAnnealingWarmRestarts T_mult |
+| mugen | #2895 | CosineAnnealingWarmRestarts T_mult (SENT BACK — found TF=25.459/AF=0.000371 transient but lost due to no best-ckpt save; must add checkpoint saving + retry) |
 | vash | #2949 | TandemFoil Paper depth/width arch sweep — 3L/4L/5L × 192d/256d/384d |
 
 ### Theme 5: Training Innovations (CODE CHANGES)
@@ -224,9 +247,9 @@ Two systematic sweeps testing the model's sensitivity to physics partition granu
 | Student | PR | Experiment |
 |---|---|---|
 | nobara | #2897 | LLRD (layer-wise LR decay) |
-| usopp | #2920 | Gradient noise injection (Neelakantan 2015) |
+| ~~usopp~~ | ~~#2920~~ | ~~Gradient noise injection~~ CLOSED — fatal instability all datasets; reassigned to #2970 Point Dropout |
 | sukuna | #2903 | SWA at cosine troughs |
-| spike | #2901 | Huber/log-cosh loss |
+| spike | #2901 | Huber/log-cosh loss (SENT BACK — submitted while still running; AF Huber is 58.7% worse than MSE) |
 | stark | #2951 | AirfRANS LR+cosine sweep — lr=7e-4/8e-4/9e-4/1e-3 × T_max=10/20/50 |
 
 ### Theme 6: Throughput + Seeds + Ablations
@@ -299,13 +322,13 @@ Their old PRs remain in-flight but are now listed under their new assignments in
 
 ## Next Priorities
 
-1. **Monitor TF Paper baseline wave** (#2947 jin, #2948 guts, #2949 vash) — update BASELINE.md with new section once first results arrive
-2. **Monitor DrivAerML Lion** (#2950 piccolo) — first Lion run on DrivAerML; could be significant
-3. **Monitor AirfRANS LR ceiling** (#2951 stark) — tests whether lr>6e-4 helps AF
-4. **Monitor spatial/physics budget sweeps** (#2972 bulma model_slices, #2973 wolfwood supernode/anchor) — first systematic spatial resolution sweep in cross-dataset format
-5. Watch Wave 3 results (frieren #2937 rel-L2, kohaku #2941 global context, casca #2946 AGC are highest priority)
-6. Review any WIP PRs that become ready
-7. All new assignments: 4-dataset coverage mandatory per human team directive
-8. If DM recipe transfer (Theme 1) fails universally → escalate to geometry-separated encoding
-9. If Wave 3 bold ideas show promise → double down with follow-up assignments across all 4 datasets
+1. **URGENT: Best-checkpoint saving code change** — The T_mult experiment (#2895) proved TF=25.459 and AF=0.000371 exist in the landscape but are unreachable without saving the best val checkpoint. This is the single highest-leverage code change available. Assign to an idle/completing student immediately.
+2. **Monitor TF Paper baseline wave** (#2947 jin, #2948 guts, #2949 vash) — update BASELINE.md with new section once first results arrive
+3. **Monitor DrivAerML Lion** (#2950 piccolo) — first Lion run on DrivAerML; could be significant
+4. **Monitor AirfRANS LR ceiling** (#2951 stark) — tests whether lr>6e-4 helps AF
+5. **Monitor spatial/physics budget sweeps** (#2972 bulma model_slices, #2973 wolfwood supernode/anchor) — first systematic spatial resolution sweep in cross-dataset format
+6. Watch Wave 3 v3 results (#2953-2962: Relative L2, SwiGLU, DropPath, Prodigy, Global Context, Curvature, Conservation Loss, MoE, SDF, AGC)
+7. Watch new Wave 3+ hypotheses (#2963-2971: LayerScale, Multi-Scale Attention, Extended Fourier, Huber, SGDR, SpectralNorm, log1p, PointDropout, LabelSmoothing)
+8. All new assignments: 4-dataset coverage mandatory per human team directive
+9. If DM recipe transfer (Theme 1) fails universally → escalate to geometry-separated encoding
 10. Check for human team messages on GitHub issues (priority — check very frequently)

@@ -1,5 +1,66 @@
 # SENPAI Research Results
 
+## 2026-04-22 — PR #2895: T_mult CosineAnnealingWarmRestarts cross-dataset (mugen)
+- Branch: mugen/cosine-warmrestarts-tmult
+- Hypothesis: CosineAnnealingWarmRestarts with T_mult multiplier (each restart period grows) provides a progressively coarser exploration schedule, potentially escaping sharp minima that fixed T_max misses.
+
+| Run | Dataset | Best Val @ epoch | Final Val @ epoch | Baseline | W&B run | Note |
+|-----|---------|-----------------|------------------|----------|---------|------|
+| TF | TandemFoil | **25.459 @ ep109** | 35.29 @ ep135 | 26.06 | n606gb5p | Transient win — lost after restart |
+| AF | AirfRANS | **0.000371 @ ep221** | 0.002385 @ ep351 | 0.000627 | 8x579r3n | Massive transient win — lost after restart |
+| DM | DrivAerML | 5.969% @ ep83 | 8.969% @ ep106 | 4.619% | 93fo0uoh | Clearly worse, no recovery |
+
+**Result: SENT BACK — transient wins exist but can't be captured without best-checkpoint saving.**
+
+Analysis: T_mult cosine restarts genuinely find deeper minima (TF=25.459 beats 26.06 by 2.3%; AF=0.000371 beats 0.000627 by 40.8%) but LR jumps at each restart cause massive post-trough regression. Without saving the best val checkpoint, these wins are unreachable. This is the single most important finding of the current wave: **the loss landscape has much deeper minima than we're currently capturing**. Adding best-checkpoint saving to the trainer would immediately unlock these results.
+
+Student instructed to: (1) add best-checkpoint saving, (2) keep T_0=10, T_mult=2 for TF/AF, (3) try T_0=25, T_mult=1.5 for DM, (4) resubmit once all runs hit 999 epochs or full timeout.
+
+## 2026-04-22 — PR #2901: Huber/log-cosh loss cross-dataset (spike)
+- Branch: spike/huber-logcosh-loss-cross
+- Hypothesis: Huber loss (δ=0.5/1.0/2.0) or log-cosh loss is more robust than MSE for CFD surrogate training, especially at outlier mesh nodes (stagnation points, trailing edges).
+
+**Result: SENT BACK — submitted while runs still at 2-20% completion; metrics premature.**
+
+| Run | Dataset | Loss | Best Val @ epoch | Baseline | Note |
+|-----|---------|------|-----------------|----------|------|
+| DM Huber δ=1.0 | DrivAerML | Huber | 8.610% @ ep66 | 4.619% | 10% better than MSE control (9.564%) — worth watching |
+| AF Huber δ=1.0 | AirfRANS | Huber | 0.001928 | 0.000627 | **58.7% WORSE than MSE** (0.001215) — contrary to student's claim |
+| TF Huber δ=1.0 | TandemFoil | Huber | slightly worse | 26.06 | Too early to conclude (17 epochs) |
+| TF Paper | TandemFoil Paper | — | not run | — | Missing — must add |
+
+Key finding: AF Huber is dramatically worse than MSE — the student cherry-picked an unlucky MSE epoch in comparison. DM Huber shows slight early advantage but DM is too slow to conclude. Student must complete full training to 999 epochs, add TF Paper runs, and resubmit.
+
+## 2026-04-22 — PR #2902: AirfRANS gradient accumulation ablation (stark) — NEW AF BEST
+- Branch: stark/af-grad-accum-ablation
+- Hypothesis: Gradient accumulation (accum=2 or accum=4) might allow effectively larger batch sizes and find better optima for AirfRANS.
+
+| Run | accum | Best Val @ epoch | Baseline | W&B run | Note |
+|-----|-------|-----------------|----------|---------|------|
+| Control (accum=1) | 1 | **0.000627 @ ep661** | 0.000699 | ww9w4x4u | NEW BEST — trained longest, found deepest basin |
+| accum=2 | 2 | worse | 0.000699 | — | Strictly worse |
+| accum=4 | 4 | worse | 0.000699 | — | Strictly worse |
+
+**Result: MERGED — accum=1 control beats 0.000699 baseline. AirfRANS new best: 0.000627.**
+
+Analysis: Gradient accumulation is detrimental for AirfRANS. The control run (accum=1, no accumulation) trained for the most epochs and found the deepest basin. This result is primarily a longer-training effect — the experiment extended the ep653 run by 8 more epochs to ep661 with a marginally better result. Key lesson: **accumulation reduces effective step count and hurts AirfRANS convergence**. accum=1 is the correct setting for AF.
+
+## 2026-04-22 — PR #2920: Cross-dataset gradient noise injection (usopp)
+- Branch: usopp/grad-noise-injection-cross
+- Hypothesis: Gradient noise (Neelakantan et al. 2015, sigma_t = eta/(1+t)^gamma) adds ~0% compute overhead, encourages escape from sharp minima, and may address late-training DrivAerML instability at cosine LR peaks.
+
+| Run | Dataset | eta | Best val_primary | Baseline | W&B run | Outcome |
+|-----|---------|-----|-----------------|----------|---------|---------|
+| 1 | DrivAerML | 0.01 | 8.54% (ep109) | 3.997% | u1efk2pr | Diverged ep123 |
+| 2 | DrivAerML | 0.001 | 5.66% (ep160) | 3.997% | o7n2cltu | Diverged ep184 |
+| 3 | DrivAerML | 0.1 | 9.26% (ep190) | 3.997% | hyfo5ycm | Timeout |
+| 4 | AirfRANS | 0.01 | 0.00213 (ep277) | 0.000627 | 7om9rzhl | Diverged ep377 |
+| 5 | TandemFoil | 0.01 | 30.22 (ep152) | 26.06 | l8e0x8e0 | Timeout |
+
+**Result: CLOSED — clear dead end.**
+
+Analysis: Gradient noise injection causes systematic catastrophic instability across all datasets. At cosine LR peaks, the decaying noise still interacts with the high-gradient regime, triggering positive-feedback: clipping distortion → grad_norm explosion → Inf → irreversible degradation. Onset epoch scales inversely with eta. TandemFoil (Lion optimizer) survived longest but still didn't beat baseline. Approach is fundamentally incompatible with cosine annealing without major schedule redesign.
+
 ## 2026-04-21 22:00 — BREAKTHROUGH: Corrected EMA warmup MERGED — TF -13.2%, AF -41.2%
 
 ### PR #2899 (robin): Corrected EMA Warmup — MERGED, DUAL NEW BEST
