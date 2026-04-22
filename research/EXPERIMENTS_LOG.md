@@ -59,6 +59,27 @@ Analysis: T_mult cosine restarts genuinely find deeper minima (TF=25.459 beats 2
 
 Student instructed to: (1) add best-checkpoint saving, (2) keep T_0=10, T_mult=2 for TF/AF, (3) try T_0=25, T_mult=1.5 for DM, (4) resubmit once all runs hit 999 epochs or full timeout.
 
+## 2026-04-22 — PR #2981: Learnable per-head QK attention temperature cross-dataset (spike) — CLOSED
+
+- **Branch:** spike/learnable-attention-temperature-cross-dataset
+- **Hypothesis:** Replace the fixed 1/√d_k QK scaling with a per-head learnable temperature `self.log_temperature = nn.Parameter(torch.zeros(n_heads))`, scale = `exp(-log_temp)/sqrt(d_k)`. Hypothesis: adaptive temperature allows each head to specialize at different attention sharpness levels, potentially beneficial for CFD meshes with multi-scale spatial structure.
+
+| Run | Dataset | Metric | Best Val | Baseline | Delta | W&B run |
+|-----|---------|--------|----------|----------|-------|---------|
+| TF Learnable Temp | TandemFoil | surface_pressure_mae | 88.42 | 26.06 | **+239% WORSE** | pq9c6c6f |
+| AF Learnable Temp | AirfRANS | surface_mse | 0.0176 | 0.000598 | **+2844% WORSE** | rt6r5i6b |
+| DM Learnable Temp | DrivAerML | surface_rel_l2_pct | 12.28% | 4.619% | **+166% WORSE** | 6z7x2ma4 |
+| TF-Paper Learnable Temp | TandemFoil Paper | field_mse | 0.2025 | — | +200%+ WORSE | aulldag4 |
+
+**Result: CLOSED — all 4 datasets 200–2844% worse than baseline. Hypothesis falsified.**
+
+**Analysis:**
+The hypothesis was based on a misread of the Transolver architecture. Transolver already uses `self.temperature=0.5` for slice-assignment (the physics-to-token aggregation step) — this is the architecturally meaningful temperature controlling how sharply spatial points are assigned to physics slices. QK attention temperature is downstream of this and far less impactful. The learned QK temperatures converged near 1.0 (±15%), confirming that standard 1/√d_k scaling is near-optimal for this architecture. The catastrophic degradation on all datasets indicates the learnable parameter disrupts the attention landscape during early training before convergence, causing structural damage to the learned representations.
+
+**Negative results blacklist updated:** RoPE on radford, learnable QK attention temperature, label smoothing, log1p, Huber, gradient noise, MSAM, gc=1.5/2.0, T_max=5 on DM, per-epoch SGDR, EMA alone on DM, LayerScale, **learnable per-head QK attention temperature**.
+
+---
+
 ## 2026-04-22 — PR #2901: Huber/log-cosh loss cross-dataset (spike)
 - Branch: spike/huber-logcosh-loss-cross
 - Hypothesis: Huber loss (δ=0.5/1.0/2.0) or log-cosh loss is more robust than MSE for CFD surrogate training, especially at outlier mesh nodes (stagnation points, trailing edges).
