@@ -166,6 +166,37 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    layer_scale_init: float = 0.0
+
+
+class LayerScale(torch.nn.Module):
+    def __init__(self, dim: int, init_value: float = 1e-4):
+        super().__init__()
+        self.gamma = torch.nn.Parameter(init_value * torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.gamma
+
+
+def apply_layer_scale(model: torch.nn.Module, init_value: float) -> None:
+    from core.architectures.transolver_reference import TransformerBlock
+
+    for block in model.modules():
+        if not isinstance(block, TransformerBlock):
+            continue
+        dim = block.norm1.normalized_shape[0]
+        block.layer_scale_1 = LayerScale(dim, init_value)
+        block.layer_scale_2 = LayerScale(dim, init_value)
+        _orig_forward = block.forward.__func__ if hasattr(block.forward, '__func__') else None
+
+        def _make_forward(blk):
+            def forward(self, x, attn_mask=None):
+                x = x + self.layer_scale_1(self.attention(self.norm1(x), attn_mask=attn_mask))
+                x = x + self.layer_scale_2(self.mlp(self.norm2(x)))
+                return x
+            return forward.__get__(blk, type(blk))
+
+        block.forward = _make_forward(block)
 
 
 @dataclass
@@ -1406,7 +1437,10 @@ def main() -> None:
         )
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
-    model = build_model(config, bundle).to(device)
+    model = build_model(config, bundle)
+    if config.layer_scale_init > 0:
+        apply_layer_scale(model, config.layer_scale_init)
+    model = model.to(device)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
@@ -1514,6 +1548,10 @@ def main() -> None:
             anp_ema.restore(anp_head)
 
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
+        if config.layer_scale_init > 0:
+            for i, block in enumerate(m for m in model.modules() if hasattr(m, 'layer_scale_1')):
+                epoch_metrics[f"layer_scale/block{i}_attn_mean"] = block.layer_scale_1.gamma.data.mean().item()
+                epoch_metrics[f"layer_scale/block{i}_ffn_mean"] = block.layer_scale_2.gamma.data.mean().item()
         history.append(epoch_metrics)
         if run is not None:
             wandb.log(epoch_metrics, step=epoch)
