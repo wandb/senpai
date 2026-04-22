@@ -121,6 +121,7 @@ DrivAerML gap is closing (3.997% val, 1.08x from 3.71% target). EMA+gc=0.5 is no
 - **torch.compile(reduce-overhead) incompatible** (#2992 levi): CUDA graphs require fixed tensor shapes — variable CFD meshes crash. FlashAttn no benefit at 64-token slices.
 - **model_slices is not a productive lever** (#2972 bulma): flat response on TF, non-monotonic on AF (96 best but still 15% worse), DM degrades badly at all non-default values.
 - **DM NaN cliff at ~ep178** (reproducible across #3011 wd=5e-3 and #3010 gc=2.0): specific instability in loss landscape. The champion config (no gc, no WD) stays clear of this cliff.
+- **Head-dimension scaling** (#2990 gojo, CLOSED): 2H/128d (wider) and 8H/32d (narrower) both worse. AF 2H/128d=0.000573 (19% worse vs real anchor 0.000482 — student used stale baseline). DM crashed at both configs. TF 18% worse. Head count 4H is already optimal; head-dim is not a productive lever.
 
 ## Default Assignment Pattern
 

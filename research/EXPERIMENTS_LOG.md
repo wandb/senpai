@@ -1,5 +1,23 @@
 # SENPAI Research Results
 
+## 2026-04-22 — PR #2990: Head-dim scaling cross-dataset (gojo) — CLOSED
+
+- **Branch:** gojo/attention-head-width-scaling-cross-dataset
+- **Hypothesis:** Wider per-head dimension (2H/128d) vs narrower (8H/32d) — does head width matter?
+
+| Dataset | 2H/128d | 8H/32d | Baseline | vs Baseline |
+|---------|---------|--------|----------|-------------|
+| TandemFoil | 27.23 | 26.62 | 22.537 | 18% worse |
+| AirfRANS | 0.000573 | diverged | 0.000482 | 19% worse |
+| DrivAerML | 7.72% (crashed) | 19.39% (crashed) | 3.997% | catastrophic |
+| TFP | NaN (data bug) | NaN | 0.00434 | blocked |
+
+**Result: CLOSED — head dimension is not a lever. All datasets worse.**
+
+Notes: Student compared AF against stale baseline (0.000598). Against real anchor (0.000482), even the best AF result (0.000573) is 19% worse. TFP blocked by NaN in cruise_random pickles. DM crashes at both configurations. Head count (4H/256d = champion) is already optimal.
+
+**gojo reassigned to #3053: EMA decay sweep at per-dataset champion configs.**
+
 ## 2026-04-22 — PR #3000: Spectral Norm (learned σ) cross-dataset (zenitsu) — SENT BACK
 
 - **Branch:** zenitsu/spectral-norm-cross-dataset
