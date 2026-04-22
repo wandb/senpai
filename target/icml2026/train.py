@@ -166,6 +166,7 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    coord_noise_sigma: float = 0.0
 
 
 @dataclass
@@ -1194,6 +1195,7 @@ def train_one_epoch(
     max_batches: int = 0,
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
+    coord_noise_sigma: float = 0.0,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1230,6 +1232,13 @@ def train_one_epoch(
                     loss, _ = loss_abupt(batch, outputs, transform)
             else:
                 batch = batch.to(device)
+                if coord_noise_sigma > 0:
+                    sd = batch.space_dim
+                    batch.surface_x = batch.surface_x.clone()
+                    batch.surface_x[:, :, :sd] += torch.randn_like(batch.surface_x[:, :, :sd]) * coord_noise_sigma
+                    if batch.volume_x is not None:
+                        batch.volume_x = batch.volume_x.clone()
+                        batch.volume_x[:, :, :sd] += torch.randn_like(batch.volume_x[:, :, :sd]) * coord_noise_sigma
                 if isinstance(transform, TandemTargetTransform):
                     prepared = transform.prepare_batch(batch)
                     with autocast_context(device, amp_mode):
@@ -1462,6 +1471,7 @@ def main() -> None:
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
+            coord_noise_sigma=config.coord_noise_sigma,
         )
 
         if ema is not None:
