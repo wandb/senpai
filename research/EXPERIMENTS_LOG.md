@@ -1,5 +1,23 @@
 # SENPAI Research Results
 
+## 2026-04-22 — PR #3021: LayerScale on Transolver residuals — cross-dataset (einar) — CLOSED
+
+- **Branch:** einar/wave12-layerscale-residuals
+- **Hypothesis:** LayerScale (Touvron et al. 2021) adds learnable per-channel scale (init=1e-5) to each residual connection, smoothing optimization for deeper models.
+
+| Dataset | Best Val | Baseline | vs Baseline | W&B run | Outcome |
+|---------|----------|----------|-------------|---------|---------|
+| TandemFoil | worse | 22.537 | worse | — | Stable but degraded |
+| TandemFoil Paper | worse | 0.00434 | worse | — | Stable but degraded |
+| AirfRANS | worse | 0.000482 | worse | — | Stable but degraded |
+| DrivAerML | diverged | 3.997% | catastrophic | — | Diverged |
+
+**Result: CLOSED — clear dead end. All 6 runs worse everywhere.**
+
+Analysis: Two distinct failure modes: (1) TF/AF stable-but-degraded — LayerScale's tiny init scale (1e-5) effectively zero-initializes residual paths early in training, making the first N epochs nearly identity. With cosine cycling this wasted time is unrecoverable. (2) DM catastrophic divergence — Lion sign-compression causes the learnable scale parameters to oscillate at cosine LR peaks, amplifying instability. Root causes: Lion sign inversion makes layerscale gradients unpredictable; cosine-LR + learnable scale creates resonant coupling; the init scale is too small for the short training horizons (360-min timeout, only 100-400 epochs). Future path if revisiting: separate param group with lower LR for scale params, or fixed (non-learnable) scalar ablation.
+
+**einar reassigned to #3043: DrivAerML gradient accumulation ablation + full eval paper-facing baseline.**
+
 ## 2026-04-22 — PR #2968: Wave 3 Spectral Norm on Attention Projections cross-dataset (griffith) — CLOSED
 
 - **Branch:** griffith/wave3-spectral-norm-attention
