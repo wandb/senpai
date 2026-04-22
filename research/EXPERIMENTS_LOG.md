@@ -1,5 +1,22 @@
 # SENPAI Research Results
 
+## 2026-04-22 — PR #3042: SAM Optimizer (Sharpness-Aware Minimization) — cross-dataset (emma) — CLOSED
+
+- **Branch:** emma/sam-optimizer-cross-dataset
+- **Hypothesis:** SAM (Foret et al. ICLR 2021) finds flat minima via two-step update (perturb + gradient at perturbed point). Flat minima → better OOD generalization for CFD surrogates. Tests SAM(Lion) for TF, SAM(AdamW) for AF/DM, rho=0.05 and rho=0.10.
+
+| Dataset | rho=0.05 | rho=0.10 | Baseline | Gap | W&B runs |
+|---------|----------|----------|----------|-----|----------|
+| TandemFoil | 78.45 (7ep) | 84.67 (8ep) | 22.537 | 3.5-3.8x worse | 998rhuvu, o8zbuza2 |
+| AirfRANS | 0.01606 (59ep) | 0.02555 (59ep) | 0.000482 | 33-53x worse | bvct0w6n, fle4utbd |
+| DrivAerML | 16.58% (41ep) | 28.70% (40ep) | 3.997% | 4.2-7.2x worse | eyiwsjzz, r8edca72 |
+
+**Result: CLOSED — catastrophic failure across all datasets. SAM family is dead for this programme.**
+
+Analysis: SAM is fundamentally incompatible with physics-constrained CFD regression. AirfRANS at 59 epochs is definitive — not a training-budget problem, SAM converges to a qualitatively worse basin. DM rho=0.10 diverges (grad norms 35+ vs 0.25 baseline). The optimization landscape is already well-conditioned by Fourier features and pressure priors, leaving no room for SAM's flat-minima bias. Both MSAM (#2904) and now classic SAM (#3042) fail catastrophically — entire SAM family closed.
+
+**emma reassigned to #3044: DrivAerML volume training ablation (surface+volume vs surface-only).**
+
 ## 2026-04-22 — PR #3021: LayerScale on Transolver residuals — cross-dataset (einar) — CLOSED
 
 - **Branch:** einar/wave12-layerscale-residuals
