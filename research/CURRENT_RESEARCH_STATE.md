@@ -113,6 +113,14 @@ DrivAerML gap is closing (3.997% val, 1.08x from 3.71% target). EMA+gc=0.5 is no
 - **LayerScale on Transolver residuals** (#3021 einar, CLOSED): init=1e-5 learnable per-channel scale — TF/AF stable-but-degraded, DM catastrophic divergence. Lion sign-compression + cosine LR creates resonant coupling with learnable scale params. 1e-5 init wastes early epochs (identity path). Not viable without separate param group + lower LR for scales.
 - **SAM optimizer (Sharpness-Aware Minimization)** (#3042 emma, CLOSED): catastrophic 3.5-53x worse everywhere. AirfRANS definitive at 59ep (33x worse — not a budget issue). DM rho=0.10 diverges (grad norms 35+). SAM family (MSAM #2904 + classic SAM #3042) is completely dead for CFD surrogates — loss landscape already well-conditioned by physics features.
 - **sigma-Reparam attention projections** (#3016 griffith, CLOSED after 3 rounds): TF 8.5% worse (147ep, cleanest comparison), AF diverged ep215, DM 44% worse, TFP 570% worse. Over-constrains learned representations with Fourier features. AdamW corrected runs even worse (AF 8.6x, DM 4.5x at early epochs).
+- **WD sweep cross-dataset** (#3011 sukuna): wd=5e-3 NaN on DM at ep178, wd=2e-2 degrades AF 38%. **wd=1e-2 is tightly optimal** — do not deviate.
+- **DM gc sweep** (#3010 piccolo): gc=0.5 adds damping (4.54%), gc=2.0 NaN at ep178. Natural grad norms ~0.14 — DM champion needs NO explicit gc.
+- **AF depth 1L** (#3008 stark): 1L/256d is 2x worse on AF (0.000960 vs 0.000482). **2L is the minimum viable depth for AF.**
+- **T_max=50 does NOT transfer from AF to TF** (#3008 stark): TF 23.464 vs 22.537 (+4.1%). Each dataset needs its own tuned schedule.
+- **2L/192d is capacity-limited** (#3006 senku): gc=0.3 cannot compensate for insufficient depth. All datasets worse.
+- **torch.compile(reduce-overhead) incompatible** (#2992 levi): CUDA graphs require fixed tensor shapes — variable CFD meshes crash. FlashAttn no benefit at 64-token slices.
+- **model_slices is not a productive lever** (#2972 bulma): flat response on TF, non-monotonic on AF (96 best but still 15% worse), DM degrades badly at all non-default values.
+- **DM NaN cliff at ~ep178** (reproducible across #3011 wd=5e-3 and #3010 gc=2.0): specific instability in loss landscape. The champion config (no gc, no WD) stays clear of this cliff.
 
 ## Default Assignment Pattern
 
