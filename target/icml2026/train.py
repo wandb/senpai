@@ -168,6 +168,7 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    drivaerml_symmetry_aug: bool = False
 
 
 @dataclass
@@ -570,6 +571,32 @@ def autocast_context(device: torch.device, amp_mode: str):
     if not supports_bf16():
         return nullcontext()
     return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+
+def apply_drivaerml_symmetry_flip(batch: GroupedBatch, *, space_dim: int = 3) -> GroupedBatch:
+    surface_x = batch.surface_x.clone()
+    surface_x[:, :, 1] = -surface_x[:, :, 1]
+    surface_x[:, :, space_dim + 1] = -surface_x[:, :, space_dim + 1]
+    base_dim = 2 * space_dim + 1
+    feat_dim = surface_x.shape[-1]
+    if feat_dim > base_dim:
+        cols_per_freq = 2 * space_dim
+        n_freqs = (feat_dim - base_dim) // cols_per_freq
+        for i in range(n_freqs):
+            y_sin_col = base_dim + i * cols_per_freq + 1
+            surface_x[:, :, y_sin_col] = -surface_x[:, :, y_sin_col]
+    return GroupedBatch(
+        case_ids=batch.case_ids,
+        dataset_name=batch.dataset_name,
+        space_dim=batch.space_dim,
+        surface_x=surface_x,
+        surface_y=batch.surface_y,
+        surface_mask=batch.surface_mask,
+        volume_x=batch.volume_x,
+        volume_y=batch.volume_y,
+        volume_mask=batch.volume_mask,
+        metadata=batch.metadata,
+    )
 
 
 def float_outputs(outputs: dict[str, torch.Tensor | None]) -> dict[str, torch.Tensor | None]:
@@ -1266,11 +1293,13 @@ def train_one_epoch(
     max_batches: int = 0,
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
+    drivaerml_symmetry_aug: bool = False,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
         anp_head.train()
     running = {"loss": 0.0}
+    sym_aug_count = 0
     steps = 0
     micro_batches_total = 0
     batches = loader if max_batches <= 0 else itertools.islice(loader, max_batches)
@@ -1302,6 +1331,9 @@ def train_one_epoch(
                     loss, _ = loss_abupt(batch, outputs, transform)
             else:
                 batch = batch.to(device)
+                if drivaerml_symmetry_aug and batch.dataset_name == "drivaerml" and torch.rand(1).item() < 0.5:
+                    batch = apply_drivaerml_symmetry_flip(batch, space_dim=batch.space_dim)
+                    sym_aug_count += 1
                 if isinstance(transform, TandemTargetTransform):
                     prepared = transform.prepare_batch(batch)
                     with autocast_context(device, amp_mode):
@@ -1356,6 +1388,8 @@ def train_one_epoch(
         running["grad_norm_mean"] /= max(steps, 1)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
+    if sym_aug_count > 0:
+        running["symmetry_aug_flips"] = float(sym_aug_count)
     if scheduler is not None:
         running["lr"] = float(optimizer.param_groups[0]["lr"])
     return running
@@ -1671,6 +1705,7 @@ def main() -> None:
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
+            drivaerml_symmetry_aug=config.drivaerml_symmetry_aug,
         )
 
         if ema is not None:
