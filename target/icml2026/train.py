@@ -166,6 +166,7 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    relative_l2_loss: str = ""
 
 
 @dataclass
@@ -731,21 +732,44 @@ def _named_channel_metrics(prefix: str, values: torch.Tensor, names: tuple[str, 
     return metrics
 
 
+def _relative_l2(pred: torch.Tensor, target: torch.Tensor, mode: str) -> torch.Tensor:
+    eps = 1e-8
+    diff = pred - target
+    if mode == "global":
+        return (diff.pow(2).sum() / (target.pow(2).sum() + eps)).sqrt()
+    if mode == "per-point":
+        return (diff.pow(2).sum(-1) / (target.pow(2).sum(-1) + eps)).sqrt().mean()
+    global_loss = (diff.pow(2).sum() / (target.pow(2).sum() + eps)).sqrt()
+    per_pt_loss = (diff.pow(2).sum(-1) / (target.pow(2).sum(-1) + eps)).sqrt().mean()
+    return 0.5 * global_loss + 0.5 * per_pt_loss
+
+
 def loss_grouped(
     batch: GroupedBatch,
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
+    relative_l2_loss: str = "",
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.surface_x.device)
     metrics: dict[str, float] = {}
     if batch.surface_y is not None and outputs["surface_preds"] is not None:
         target = transform.apply(batch.surface_y)
-        surf_loss = F.mse_loss(outputs["surface_preds"][batch.surface_mask], target[batch.surface_mask])
+        pred_masked = outputs["surface_preds"][batch.surface_mask]
+        tgt_masked = target[batch.surface_mask]
+        if relative_l2_loss:
+            surf_loss = _relative_l2(pred_masked, tgt_masked, relative_l2_loss)
+        else:
+            surf_loss = F.mse_loss(pred_masked, tgt_masked)
         total = total + surf_loss
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
         target = transform.apply(batch.volume_y)
-        vol_loss = F.mse_loss(outputs["volume_preds"][batch.volume_mask], target[batch.volume_mask])
+        pred_masked = outputs["volume_preds"][batch.volume_mask]
+        tgt_masked = target[batch.volume_mask]
+        if relative_l2_loss:
+            vol_loss = _relative_l2(pred_masked, tgt_masked, relative_l2_loss)
+        else:
+            vol_loss = F.mse_loss(pred_masked, tgt_masked)
         total = total + vol_loss
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
@@ -755,15 +779,26 @@ def loss_grouped(
 def loss_grouped_tandem(
     prepared: TandemPreparedBatch,
     outputs: dict[str, torch.Tensor | None],
+    relative_l2_loss: str = "",
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=prepared.surface_x.device)
     metrics: dict[str, float] = {}
     if outputs["surface_preds"] is not None:
-        surf_loss = F.mse_loss(outputs["surface_preds"][prepared.surface_mask], prepared.surface_target[prepared.surface_mask])
+        pred_masked = outputs["surface_preds"][prepared.surface_mask]
+        tgt_masked = prepared.surface_target[prepared.surface_mask]
+        if relative_l2_loss:
+            surf_loss = _relative_l2(pred_masked, tgt_masked, relative_l2_loss)
+        else:
+            surf_loss = F.mse_loss(pred_masked, tgt_masked)
         total = total + surf_loss
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if prepared.volume_target is not None and outputs["volume_preds"] is not None and prepared.volume_mask is not None:
-        vol_loss = F.mse_loss(outputs["volume_preds"][prepared.volume_mask], prepared.volume_target[prepared.volume_mask])
+        pred_masked = outputs["volume_preds"][prepared.volume_mask]
+        tgt_masked = prepared.volume_target[prepared.volume_mask]
+        if relative_l2_loss:
+            vol_loss = _relative_l2(pred_masked, tgt_masked, relative_l2_loss)
+        else:
+            vol_loss = F.mse_loss(pred_masked, tgt_masked)
         total = total + vol_loss
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
@@ -774,17 +809,24 @@ def loss_abupt(
     batch: ABUPTBatch,
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
+    relative_l2_loss: str = "",
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.geometry_position.device)
     metrics: dict[str, float] = {}
     if batch.surface_anchor_target is not None and outputs["surface_preds"] is not None:
         surf_target = transform.apply(batch.surface_anchor_target)
-        surf_loss = F.mse_loss(outputs["surface_preds"], surf_target)
+        if relative_l2_loss:
+            surf_loss = _relative_l2(outputs["surface_preds"], surf_target, relative_l2_loss)
+        else:
+            surf_loss = F.mse_loss(outputs["surface_preds"], surf_target)
         total = total + surf_loss
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if batch.volume_anchor_target is not None and outputs["volume_preds"] is not None:
         vol_target = transform.apply(batch.volume_anchor_target)
-        vol_loss = F.mse_loss(outputs["volume_preds"], vol_target)
+        if relative_l2_loss:
+            vol_loss = _relative_l2(outputs["volume_preds"], vol_target, relative_l2_loss)
+        else:
+            vol_loss = F.mse_loss(outputs["volume_preds"], vol_target)
         total = total + vol_loss
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
@@ -1194,6 +1236,7 @@ def train_one_epoch(
     max_batches: int = 0,
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
+    relative_l2_loss: str = "",
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1227,7 +1270,7 @@ def train_one_epoch(
                         surface_anchor_position=batch.surface_anchor_position,
                         volume_anchor_position=batch.volume_anchor_position,
                     )
-                    loss, _ = loss_abupt(batch, outputs, transform)
+                    loss, _ = loss_abupt(batch, outputs, transform, relative_l2_loss)
             else:
                 batch = batch.to(device)
                 if isinstance(transform, TandemTargetTransform):
@@ -1240,7 +1283,7 @@ def train_one_epoch(
                             volume_mask=prepared.volume_mask,
                         )
                         outputs = maybe_apply_anp(outputs, prepared, anp_head)
-                        loss, _ = loss_grouped_tandem(prepared, outputs)
+                        loss, _ = loss_grouped_tandem(prepared, outputs, relative_l2_loss)
                 else:
                     with autocast_context(device, amp_mode):
                         outputs = model(
@@ -1249,7 +1292,7 @@ def train_one_epoch(
                             volume_x=batch.volume_x,
                             volume_mask=batch.volume_mask,
                         )
-                        loss, _ = loss_grouped(batch, outputs, transform)
+                        loss, _ = loss_grouped(batch, outputs, transform, relative_l2_loss)
 
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
@@ -1462,6 +1505,7 @@ def main() -> None:
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
+            relative_l2_loss=config.relative_l2_loss,
         )
 
         if ema is not None:
