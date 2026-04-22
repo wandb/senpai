@@ -70,7 +70,7 @@ DrivAerML gap is closing (3.997% val, 1.08x from 3.71% target). EMA+gc=0.5 is no
 - **TF:** Lion lr=1.25e-4, T_max=10, gc=0.5, WD=1e-2, `--ema-decay 0.999`, 3L/192d
 - **TFP:** AdamW lr=5e-4, T_max=150, gc=1.0, WD=1e-2, no-EMA, 3L/192d (per #2979 baseline)
 - **AF:** AdamW lr=6e-4, T_max=50, gc=1.0, WD=1e-2, no-EMA, 2L/256d (per #2951 baseline)
-- **DM:** AdamW lr=5e-4, T_max=30, gc=1.0, WD=1e-2, no-EMA, 4L/512d (per #2898 baseline)
+- **DM:** AdamW lr=5e-4, T_max=30, **NO gc, NO WD**, no-EMA, 4L/512d (per #2898 baseline — champion reproduce command has NO --grad-clip, NO --weight-decay)
 - `--epochs 999` mandatory
 - DrivAerML: `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394`
 - **Paper-facing DM runs: DO NOT use --max-eval-batches** (human directive #3020). Truncated eval is only acceptable for fast iteration, NOT for benchmark submissions.

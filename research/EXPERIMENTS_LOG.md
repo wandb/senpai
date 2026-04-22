@@ -1,5 +1,45 @@
 # SENPAI Research Results
 
+## 2026-04-22 — PR #3000: Spectral Norm (learned σ) cross-dataset (zenitsu) — SENT BACK
+
+- **Branch:** zenitsu/spectral-norm-cross-dataset
+- **Hypothesis:** Learned spectral norm (SN) with σ capped via `torch.nn.utils.parametrizations.spectral_norm` on FFN layers (not attention). Unlike #2968 (SN on attention projections, incompatible with compile), this targets FFN weight matrices only.
+
+| Dataset | Best Val | Baseline | vs Baseline | W&B run | Config Notes |
+|---------|----------|----------|-------------|---------|-------------|
+| AirfRANS | **0.000417** | 0.000482 | **-13.5% BETTER** | (check W&B) | T_max=10, EMA=0.999 (NOT champion config) |
+| TandemFoil | 25.382 | 22.537 | +12.6% worse | — | gc=1.0 (not champion gc=0.5) |
+| DrivAerML | 9.02% | 3.997% | +126% worse | — | Config mismatch likely |
+
+**Result: SENT BACK — strong AF signal but config mismatch invalidates comparison.**
+
+Analysis: The AF result (0.000417) is genuinely promising — 13.5% better than baseline — but it was run at T_max=10 + EMA=0.999 instead of the AF champion config (T_max=50, no-EMA). We cannot attribute the improvement to spectral norm vs the config change. TF was run at gc=1.0 instead of champion gc=0.5. DM was a clear failure.
+
+**Follow-up runs assigned:**
+1. AF SN at champion config: T_max=50, no-EMA, 2L/256d, gc=1.0 → isolate SN effect
+2. AF SN+EMA at T_max=50: test if SN+EMA synergy exists at correct schedule
+3. TF SN at gc=0.5: test with correct TF champion gc
+
+## 2026-04-22 — PR #2948: TFP Physics Ablation — learned norm + asinh-pressure + pressure-prior (guts) — SENT BACK (EARLY)
+
+- **Branch:** guts/tfp-physics-ablation
+- **Hypothesis:** Learned normalization (BatchNorm-like adaptive stats), asinh-pressure transform, and pressure-prior auxiliary loss improve TFP by capturing physics structure in the data pipeline.
+
+| Run | Epochs | Best field_mse | Baseline | vs Baseline | Config |
+|-----|--------|---------------|----------|-------------|--------|
+| Full (all 3) | 17-24 | ~0.03-0.06 | 0.00434 | 7-14x worse | Too early |
+| asinh only | ~20 | ~0.03 | 0.00434 | ~7x worse | Too early |
+| No asinh | ~20 | ~0.06 | 0.00434 | ~14x worse | Too early |
+
+**Result: SENT BACK — runs far too early to judge (17-24 of 999 epochs). TFP needs 500+ epochs.**
+
+Key findings at this stage:
+1. **asinh-pressure is essential** — runs without it are 2x worse even at early epochs
+2. **pressure-prior is HARMFUL on TFP** — uses wrong feature index for TFP data format
+3. **3 TFP bugs found/fixed:** AoA validation error, pressure stats NaN, inf propagation — student asked to submit fixes as separate PR
+
+**Follow-up:** Let runs converge to 500+ epochs. Drop pressure-prior (wrong index). Focus on `--asinh-pressure --enable-fourier` at champion TFP config. Submit bug fixes separately.
+
 ## 2026-04-22 — Wave 10-12 Review: 6 closures, 2 send-backs, 0 merges
 
 ### Closed (6 dead ends)
