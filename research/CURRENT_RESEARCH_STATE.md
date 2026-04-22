@@ -1,8 +1,8 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-22 (Wave 3 + TF Paper baseline wave + DM Lion + AF LR sweep + cross-dataset spatial/physics budget sweeps)
+- **Date:** 2026-04-22 (Wave 3 + TF Paper baseline wave + DM Lion + AF LR sweep + cross-dataset spatial/physics budget sweeps + Wave 4 cross-dataset code/arch innovations)
 - **Branch:** radford
-- **Fleet status:** 60 live students, ALL ASSIGNED (0 idle)
+- **Fleet status:** 60 live students, ALL ASSIGNED (0 idle) — Wave 4 launched 2026-04-22
 - **Current relaunch budget:** inherit pod env defaults
   - `SENPAI_TIMEOUT_MINUTES=360`
   - `SENPAI_MAX_EPOCHS=999`
@@ -188,6 +188,18 @@ Paper targets (Experiment 4, Table 6 — MGN best / paper best per task):
 | edward | #2916 | lr=6e-4+gc=1.0+WD=1e-2+T_max=10 |
 | ~~wolfwood~~ | ~~#2919~~ | ~~T_max=40/50+gc=1.0+WD=1e-2 (longer cycling)~~ CLOSED — failed; reassigned to #2973 cross-dataset spatial sweep |
 
+### Theme 11: Wave 4 — Cross-Dataset Code/Architecture Innovations (NEW — 2026-04-22)
+
+Five novel hypotheses, all covering all 4 datasets. None overlap Wave 3.
+
+| Student | PR | Experiment | Risk |
+|---|---|---|---|
+| mugen | #2974 | **Best-Checkpoint Saving** — save `checkpoint_best.pt` whenever val improves; load best at end; all 4 datasets | LOW |
+| spike | #2975 | **RoPE Positional Embeddings** — rotary positional encoding on QK using 3D node (x,y,z) coordinates; `--rope-dim 32`; all 4 datasets | LOW-MED |
+| taki | #2976 | **Z-Score Pressure Normalization** — replace `--asinh-pressure` with per-dataset mean/std `--zscore-pressure`; all 4 datasets | LOW |
+| zenitsu | #2977 | **Learnable Attention Temperature** — per-head log-space temperature scalar `nn.Parameter`; `--learnable-attn-temperature`; all 4 datasets | LOW-MED |
+| frieren | #2978 | **PCGrad Gradient Surgery** — project conflicting surface/volume gradients; `--pcgrad`; logs `gradient_conflict_rate`; all 4 datasets | MED |
+
 ### Theme 10: Cross-Dataset Spatial/Physics Budget Sweeps (NEW — 2026-04-22)
 
 Two systematic sweeps testing the model's sensitivity to physics partition granularity (`model_slices`) and spatial resolution budget (`geometry_supernodes` + `surface_anchor_points`) across all 4 datasets. Neither dimension has ever been swept in the cross-dataset icml2026 format.
@@ -322,7 +334,7 @@ Their old PRs remain in-flight but are now listed under their new assignments in
 
 ## Next Priorities
 
-1. **URGENT: Best-checkpoint saving code change** — The T_mult experiment (#2895) proved TF=25.459 and AF=0.000371 exist in the landscape but are unreachable without saving the best val checkpoint. This is the single highest-leverage code change available. Assign to an idle/completing student immediately.
+1. ~~**URGENT: Best-checkpoint saving code change**~~ — **IN PROGRESS (#2974 mugen).** The T_mult experiment (#2895) proved TF=25.459 and AF=0.000371 exist in the landscape. mugen is implementing `checkpoint_best.pt` saving across all 4 datasets.
 2. **Monitor TF Paper baseline wave** (#2947 jin, #2948 guts, #2949 vash) — update BASELINE.md with new section once first results arrive
 3. **Monitor DrivAerML Lion** (#2950 piccolo) — first Lion run on DrivAerML; could be significant
 4. **Monitor AirfRANS LR ceiling** (#2951 stark) — tests whether lr>6e-4 helps AF
