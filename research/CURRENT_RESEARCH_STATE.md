@@ -1,8 +1,8 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-22 (last polled — Wave 3 + TF Paper baseline wave + DM Lion + AF LR sweep + cross-dataset spatial/physics budget sweeps + Wave 4 cross-dataset code/arch innovations + Wave 5 cross-dataset code/arch innovations + Wave 6 per-step SGDR / coord noise / T_max sweep + Wave 7 attention architecture innovations + usopp #2994 hypernetwork + Wave 8 spike #2995 attention dropout + Wave 9 brook #2999 LayerScale + zenitsu #3000 Spectral Norm + Wave 10 #3001–#3013 (13 new PRs) + Wave 11: griffith sigma-Reparam + casca GeGLU — CLOSED: griffith #2968 Spectral Norm attn, casca #2962 AGC — 2 students newly idle, assigning Wave 11)
+- **Date:** 2026-04-22 (last polled — Wave 3 + TF Paper baseline wave + DM Lion + AF LR sweep + cross-dataset spatial/physics budget sweeps + Wave 4 cross-dataset code/arch innovations + Wave 5 cross-dataset code/arch innovations + Wave 6 per-step SGDR / coord noise / T_max sweep + Wave 7 attention architecture innovations + usopp #2994 hypernetwork + Wave 8 spike #2995 attention dropout + Wave 9 brook #2999 LayerScale + zenitsu #3000 Spectral Norm + Wave 10 #3001–#3013 (13 new PRs) + Wave 11: griffith sigma-Reparam + casca GeGLU — CLOSED: griffith #2968 Spectral Norm attn, casca #2962 AGC — Wave 12: einar #3021 LayerScale residuals + wolfwood #3022 attn dropout + emma #3023 SDF wall-distance + shoya #3024 LLRD)
 - **Branch:** radford
-- **Fleet status:** 60 WIP PRs, 0 IDLE — Wave 11: griffith #3016 sigma-Reparam, casca #3017 GeGLU — Wave 7: chrome #2988 MQA, faye #2989 GQA, gojo #2990 head-dim scaling, himmel #2991 SWA, levi #2992 Flash+compile, shoya #2993 sparse top-k; usopp #2994 hypernetwork; Wave 8: spike #2995 attention dropout; Wave 9: brook #2999 LayerScale on Transolver residuals (cross-dataset TF/TFP/AF/DM); Wave 10: canute #3001 slice temp sweep, franky #3002 Fourier freq bands, norman #3003 channel dropout, sanji #3004 long cosine, robin #3005 2L+EMA+gc=0.5, senku #3006 2L+EMA+gc=0.3, shouko #3007 4L+T_max=10, stark #3008 AF depth+T_max, megumi #3009 Lion lr sweep, piccolo #3010 DM gc sweep, sukuna #3011 WD sweep, usopp #3012 AdamW lr ablation, shoya #3013 Fourier ablation. MERGED: zenitsu #2997 Kutta TE v2 (cross-dataset), brook #2998 AF normalization 3-way. PRs CLOSED: #2968 (griffith, Spectral Norm attn — 17.5-55% worse, DM diverged), #2962 (casca, AGC — incompatible with Lion; DM diverged), #2981 (spike, QK attention temp), #2977 (zenitsu, learnable per-head attn temperature), #2996 (brook, MQA draft — superseded). NOTE: zenitsu #2983 RoPE dead end was closed. griffith #2889 (3L/512d+gc=1.0 DM) STILL IN FLIGHT.
+- **Fleet status:** 64 WIP PRs, 0 IDLE — Wave 12: einar #3021 LayerScale residuals cross-dataset, wolfwood #3022 attn dropout cross-dataset, emma #3023 SDF wall-distance feature cross-dataset, shoya #3024 LLRD cross-dataset — Wave 11: griffith #3016 sigma-Reparam, casca #3017 GeGLU — Wave 7: chrome #2988 MQA, faye #2989 GQA, gojo #2990 head-dim scaling, himmel #2991 SWA, levi #2992 Flash+compile, shoya #2993 sparse top-k; usopp #2994 hypernetwork; Wave 8: spike #2995 attention dropout; Wave 9: brook #2999 LayerScale on Transolver residuals (cross-dataset TF/TFP/AF/DM); Wave 10: canute #3001 slice temp sweep, franky #3002 Fourier freq bands, norman #3003 channel dropout, sanji #3004 long cosine, robin #3005 2L+EMA+gc=0.5, senku #3006 2L+EMA+gc=0.3, shouko #3007 4L+T_max=10, stark #3008 AF depth+T_max, megumi #3009 Lion lr sweep, piccolo #3010 DM gc sweep, sukuna #3011 WD sweep, usopp #3012 AdamW lr ablation, shoya #3013 Fourier ablation. MERGED: zenitsu #2997 Kutta TE v2 (cross-dataset), brook #2998 AF normalization 3-way. PRs CLOSED: #2968 (griffith, Spectral Norm attn — 17.5-55% worse, DM diverged), #2962 (casca, AGC — incompatible with Lion; DM diverged), #2981 (spike, QK attention temp), #2977 (zenitsu, learnable per-head attn temperature), #2996 (brook, MQA draft — superseded). NOTE: zenitsu #2983 RoPE dead end was closed. griffith #2889 (3L/512d+gc=1.0 DM) STILL IN FLIGHT.
 - **Current relaunch budget:** inherit pod env defaults
   - `SENPAI_TIMEOUT_MINUTES=360`
   - `SENPAI_MAX_EPOCHS=999`
@@ -40,10 +40,10 @@ All four benchmarks are now active and required:
 
 | Dataset | Metric | Current anchor |
 |---|---|---|
-| TandemFoil | `val_primary/surface_pressure_mae` | **26.06** (#2887 MERGED — Lion lr=1e-4, no-EMA) |
+| TandemFoil | `val_primary/surface_pressure_mae` | **22.537** (#2924 MERGED — Lion lr=1e-4, gc=0.5, EMA=0.999, 3L/192d/3H) |
 | TandemFoil Paper | `val_primary/field_mse` | **not established** — baseline run needed urgently |
-| AirfRANS | `val_primary/surface_mse` | **0.000598** (#2906 MERGED — AdamW lr=6e-4, seed=42, 2L/256d/4H, ep517) |
-| DrivAerML | `val_primary/surface_rel_l2_pct` | **4.619%** (#2691) |
+| AirfRANS | `val_primary/surface_mse` | **0.000482** (#2951 MERGED — AdamW lr=6e-4, T_max=50, no-EMA, 2L/256d/4H) |
+| DrivAerML | `val_primary/surface_rel_l2_pct` | **3.997%** (#2898 MERGED — AdamW lr=5e-4, T_max=30, no-EMA, 4L/512d/8H) |
 
 ### CRITICAL SIGNAL — Best-Checkpoint Saves (2026-04-22)
 
@@ -127,7 +127,30 @@ comparability, always include:
 - `target/icml2026/tandemfoil/`
 - `target/icml2026/tandemfoil_paper/`
 
-## ACTIVE EXPERIMENTS — 60 WIP PRs (updated 2026-04-22 after Wave 10 assigned: canute #3001 – shoya #3013)
+## ACTIVE EXPERIMENTS — 64 WIP PRs (updated 2026-04-22 after Wave 12 assigned: einar #3021 – shoya #3024)
+
+### Theme 20: Wave 12 — Residual Scaling / Regularization / Features / Optimization (NEW — 2026-04-22)
+
+Four new cross-dataset hypotheses targeting underexplored levers: residual initialization, attention regularization, physics-informed geometry features, and layer-wise LR scheduling. All cover all 4 datasets (TF/TFP/AF/DM).
+
+| Student | PR | Experiment | Risk |
+|---|---|---|---|
+| einar | #3021 | **LayerScale residuals (cross-dataset)** — per-channel learnable scalar α (init=1e-4) on attention+FFN residuals; `--layer-scale`; cross-dataset TF/TFP/AF/DM | LOW |
+| wolfwood | #3022 | **Attention Dropout (p=0.1)** — dropout on Transolver attention weights after softmax; `--attn-dropout 0.1`; cross-dataset TF/TFP/AF/DM | LOW |
+| emma | #3023 | **SDF Wall-Distance Feature** — min distance from each mesh node to solid boundary surface as physics input feature; cross-dataset TF/TFP/AF/DM | MEDIUM |
+| shoya | #3024 | **Layer-wise LR Decay (LLRD, decay=0.75)** — deeper layers receive lower LR (`base_lr * 0.75^(L-i-1)`); cross-dataset TF/TFP/AF/DM | LOW |
+
+**Scientific rationale:**
+- einar #3021 (LayerScale): Touvron et al. 2021 CaiT paper showed per-channel α init at 1e-4 stabilises deep transformer training. Distinct from brook #2999 (which used scalar per-layer, not per-channel). Per-channel gives finer-grained control.
+- wolfwood #3022 (Attention Dropout): Current spike #2995 tests standard attn dropout (p=0.1) but may still be in flight. wolfwood tests the same mechanism but cross-dataset via all 4 benchmarks simultaneously, ensuring no dataset-specific regression.
+- emma #3023 (SDF Wall-Distance): Wall distance is a classical CFD feature (used in k-ω SST turbulence models). Provides the model with explicit geometric information about proximity to solid boundaries — directly relevant to boundary layer physics. Tested at mesh-node level via chunk-based cdist.
+- shoya #3024 (LLRD, decay=0.75): More aggressive than frieren's #2984 (decay=0.8). Earlier layers see LR reduced by 0.75^(L-1) relative to head. Physics intuition: later layers learn task-specific representations (should adapt faster) while earlier layers learn geometry/features (should be more stable).
+
+**Baselines for Wave 12 PRs:**
+- TF: val=22.537 (#2924) / test=N/A
+- TFP: val=not established
+- AF: val=0.000482 (#2951) / test=0.003 (#2824)
+- DM: val=3.997% (#2898) / test=6.24% (#2691)
 
 ### Theme 19: Wave 11 — sigma-Reparam + GeGLU (NEW — 2026-04-22, post-Wave 9/10 closures)
 
@@ -452,7 +475,8 @@ Their old PRs remain in-flight but are now listed under their new assignments in
 ## Next Priorities
 
 1. ~~**URGENT: Best-checkpoint saving code change**~~ — **IN PROGRESS (#2974 mugen Wave 4).** The T_mult experiment (#2895) proved TF=25.459 and AF=0.000371 exist in the landscape. mugen implementing `checkpoint_best.pt` saving. **Wave 5 launched: #2980-#2984 (PCGrad/AttnTemp/ZScore/RoPE/LLRD) — all true cross-dataset.**
-2. **Monitor Wave 11** (griffith #3016 sigma-Reparam, casca #3017 GeGLU) — two new cross-dataset hypotheses, directly motivated by Wave 9/10 closure analysis.
+2. **Monitor Wave 12** (einar #3021 LayerScale, wolfwood #3022 attn dropout, emma #3023 SDF wall-distance, shoya #3024 LLRD) — four new cross-dataset hypotheses targeting residual scaling, attention regularization, physics features, and LR scheduling.
+3. **Monitor Wave 11** (griffith #3016 sigma-Reparam, casca #3017 GeGLU) — two new cross-dataset hypotheses, directly motivated by Wave 9/10 closure analysis.
 3. **Monitor Wave 10** (#3001–#3013, 13 PRs) — broad coverage sweep: slice temp, Fourier bands, channel dropout, long cosine, 2L+EMA variants, 4L+T_max=10, AF depth, Lion/AdamW lr sweeps, WD sweep, DM gc sweep, Fourier ablation. All cross-dataset.
 4. **Monitor Wave 9** (#2999 brook LayerScale) — lowest-risk stability hypothesis, fully cross-dataset. NOTE: zenitsu #3000 Spectral Norm was the Wave 9 spectral norm experiment — superseded by griffith #2968 (already closed); brook #2999 LayerScale is still in flight.
 4. **Monitor TF Paper baseline wave** (#2947 jin, #2948 guts, #2949 vash) — update BASELINE.md with new section once first results arrive
