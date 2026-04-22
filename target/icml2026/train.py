@@ -164,6 +164,7 @@ class TrainConfig:
     volume_anchor_points: int = 8_000
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
+    enable_pcgrad: bool = False
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -741,60 +742,69 @@ def loss_grouped(
     batch: GroupedBatch,
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
-) -> tuple[torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, dict[str, float], list[torch.Tensor]]:
     total = torch.tensor(0.0, device=batch.surface_x.device)
     metrics: dict[str, float] = {}
+    individual: list[torch.Tensor] = []
     if batch.surface_y is not None and outputs["surface_preds"] is not None:
         target = transform.apply(batch.surface_y)
         surf_loss = F.mse_loss(outputs["surface_preds"][batch.surface_mask], target[batch.surface_mask])
         total = total + surf_loss
+        individual.append(surf_loss)
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
         target = transform.apply(batch.volume_y)
         vol_loss = F.mse_loss(outputs["volume_preds"][batch.volume_mask], target[batch.volume_mask])
         total = total + vol_loss
+        individual.append(vol_loss)
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
-    return total, metrics
+    return total, metrics, individual
 
 
 def loss_grouped_tandem(
     prepared: TandemPreparedBatch,
     outputs: dict[str, torch.Tensor | None],
-) -> tuple[torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, dict[str, float], list[torch.Tensor]]:
     total = torch.tensor(0.0, device=prepared.surface_x.device)
     metrics: dict[str, float] = {}
+    individual: list[torch.Tensor] = []
     if outputs["surface_preds"] is not None:
         surf_loss = F.mse_loss(outputs["surface_preds"][prepared.surface_mask], prepared.surface_target[prepared.surface_mask])
         total = total + surf_loss
+        individual.append(surf_loss)
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if prepared.volume_target is not None and outputs["volume_preds"] is not None and prepared.volume_mask is not None:
         vol_loss = F.mse_loss(outputs["volume_preds"][prepared.volume_mask], prepared.volume_target[prepared.volume_mask])
         total = total + vol_loss
+        individual.append(vol_loss)
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
-    return total, metrics
+    return total, metrics, individual
 
 
 def loss_abupt(
     batch: ABUPTBatch,
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
-) -> tuple[torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, dict[str, float], list[torch.Tensor]]:
     total = torch.tensor(0.0, device=batch.geometry_position.device)
     metrics: dict[str, float] = {}
+    individual: list[torch.Tensor] = []
     if batch.surface_anchor_target is not None and outputs["surface_preds"] is not None:
         surf_target = transform.apply(batch.surface_anchor_target)
         surf_loss = F.mse_loss(outputs["surface_preds"], surf_target)
         total = total + surf_loss
+        individual.append(surf_loss)
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if batch.volume_anchor_target is not None and outputs["volume_preds"] is not None:
         vol_target = transform.apply(batch.volume_anchor_target)
         vol_loss = F.mse_loss(outputs["volume_preds"], vol_target)
         total = total + vol_loss
+        individual.append(vol_loss)
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
-    return total, metrics
+    return total, metrics, individual
 
 
 def maybe_apply_anp(
@@ -1184,6 +1194,54 @@ def evaluate_abupt(
     return {"surface_mae": total_surface / max(count_surface, 1), "volume_mae": total_volume / max(count_volume, 1)}
 
 
+def pcgrad_backward(
+    individual_losses: list[torch.Tensor],
+    all_params: list[torch.nn.Parameter],
+    grad_accum_steps: int,
+) -> float:
+    n = len(individual_losses)
+    if n <= 1:
+        (individual_losses[0] / grad_accum_steps).backward()
+        return 0.0
+
+    saved_grads = [p.grad.clone() if p.grad is not None else None for p in all_params]
+
+    loss_grads: list[list[torch.Tensor]] = []
+    for i, loss in enumerate(individual_losses):
+        for p in all_params:
+            p.grad = None
+        retain = i < n - 1
+        (loss / grad_accum_steps).backward(retain_graph=retain)
+        loss_grads.append([p.grad.clone() if p.grad is not None else torch.zeros_like(p) for p in all_params])
+
+    conflict_count = 0
+    total_pairs = 0
+    projected = [[g.clone() for g in grads] for grads in loss_grads]
+
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            total_pairs += 1
+            dot_ij = sum(
+                (gi * gj).sum() for gi, gj in zip(loss_grads[i], loss_grads[j])
+            )
+            if dot_ij < 0:
+                conflict_count += 1
+                norm_sq_j = sum((gj * gj).sum() for gj in loss_grads[j])
+                coeff = dot_ij / (norm_sq_j + 1e-8)
+                for k in range(len(all_params)):
+                    projected[i][k] = projected[i][k] - coeff * loss_grads[j][k]
+
+    for k, p in enumerate(all_params):
+        combined = projected[0][k]
+        for i in range(1, n):
+            combined = combined + projected[i][k]
+        p.grad = (saved_grads[k] + combined) if saved_grads[k] is not None else combined
+
+    return conflict_count / max(total_pairs, 1)
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     anp_head: ANPSurfaceDecoder | None,
@@ -1200,6 +1258,7 @@ def train_one_epoch(
     max_batches: int = 0,
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
+    enable_pcgrad: bool = False,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1210,11 +1269,16 @@ def train_one_epoch(
     batches = loader if max_batches <= 0 else itertools.islice(loader, max_batches)
     batch_iter = iter(batches)
     exhausted = False
+    all_params = list(model.parameters())
+    if anp_head is not None:
+        all_params += list(anp_head.parameters())
 
     while not exhausted:
         optimizer.zero_grad(set_to_none=True)
         accum_loss = 0.0
         micro_count = 0
+        step_conflicts = 0.0
+        step_conflict_samples = 0
 
         for _ in range(grad_accum_steps):
             try:
@@ -1233,7 +1297,7 @@ def train_one_epoch(
                         surface_anchor_position=batch.surface_anchor_position,
                         volume_anchor_position=batch.volume_anchor_position,
                     )
-                    loss, _ = loss_abupt(batch, outputs, transform)
+                    loss, _, individual = loss_abupt(batch, outputs, transform)
             else:
                 batch = batch.to(device)
                 if isinstance(transform, TandemTargetTransform):
@@ -1246,7 +1310,7 @@ def train_one_epoch(
                             volume_mask=prepared.volume_mask,
                         )
                         outputs = maybe_apply_anp(outputs, prepared, anp_head)
-                        loss, _ = loss_grouped_tandem(prepared, outputs)
+                        loss, _, individual = loss_grouped_tandem(prepared, outputs)
                 else:
                     with autocast_context(device, amp_mode):
                         outputs = model(
@@ -1255,18 +1319,19 @@ def train_one_epoch(
                             volume_x=batch.volume_x,
                             volume_mask=batch.volume_mask,
                         )
-                        loss, _ = loss_grouped(batch, outputs, transform)
+                        loss, _, individual = loss_grouped(batch, outputs, transform)
 
             accum_loss += float(loss.detach().cpu().item())
-            (loss / grad_accum_steps).backward()
+            if enable_pcgrad and len(individual) > 1:
+                conflict_frac = pcgrad_backward(individual, all_params, grad_accum_steps)
+                step_conflicts += conflict_frac
+                step_conflict_samples += 1
+            else:
+                (loss / grad_accum_steps).backward()
             micro_count += 1
 
         if micro_count == 0:
             break
-
-        all_params = list(model.parameters())
-        if anp_head is not None:
-            all_params += list(anp_head.parameters())
         grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=grad_clip if grad_clip > 0 else float("inf"))
         running.setdefault("grad_norm_mean", 0.0)
         running["grad_norm_mean"] += float(grad_norm)
@@ -1282,12 +1347,17 @@ def train_one_epoch(
         if anp_head is not None and anp_ema is not None:
             anp_ema.update(anp_head)
         running["loss"] += accum_loss / micro_count
+        if step_conflict_samples > 0:
+            running.setdefault("pcgrad_conflict_frac", 0.0)
+            running["pcgrad_conflict_frac"] += step_conflicts / step_conflict_samples
         micro_batches_total += micro_count
         steps += 1
 
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    if "pcgrad_conflict_frac" in running:
+        running["pcgrad_conflict_frac"] /= max(steps, 1)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1451,6 +1521,9 @@ def compute_tandem_phys_stats(
 
 def main() -> None:
     config = parse_args()
+    if config.enable_pcgrad and config.compile_model:
+        print("PCGrad requires retain_graph=True; disabling torch.compile", flush=True)
+        config.compile_model = False
     if config.seed != 0:
         random.seed(config.seed)
         torch.manual_seed(config.seed)
@@ -1568,6 +1641,7 @@ def main() -> None:
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
+            enable_pcgrad=config.enable_pcgrad,
         )
 
         if ema is not None:
