@@ -1,8 +1,8 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-22 (Wave 3 + TF Paper baseline wave + DM Lion + AF LR sweep + cross-dataset spatial/physics budget sweeps + Wave 4 cross-dataset code/arch innovations + Wave 5 cross-dataset code/arch innovations + Wave 6 per-step SGDR / coord noise / T_max sweep + Wave 7 attention architecture innovations + usopp #2994 hypernetwork condition encoding)
+- **Date:** 2026-04-22 (Wave 3 + TF Paper baseline wave + DM Lion + AF LR sweep + cross-dataset spatial/physics budget sweeps + Wave 4 cross-dataset code/arch innovations + Wave 5 cross-dataset code/arch innovations + Wave 6 per-step SGDR / coord noise / T_max sweep + Wave 7 attention architecture innovations + usopp #2994 hypernetwork + Wave 8 spike #2995 attention dropout)
 - **Branch:** radford
-- **Fleet status:** 67 live students, ALL ASSIGNED (0 idle) — Wave 7 launched 2026-04-22 (chrome #2988 MQA, faye #2989 GQA, gojo #2990 head-dim scaling, himmel #2991 SWA, levi #2992 Flash+compile, shoya #2993 sparse top-k); usopp #2994 hypernetwork condition encoding
+- **Fleet status:** 57 WIP PRs, ALL ASSIGNED (0 idle) — Wave 7: chrome #2988 MQA, faye #2989 GQA, gojo #2990 head-dim scaling, himmel #2991 SWA, levi #2992 Flash+compile, shoya #2993 sparse top-k; usopp #2994 hypernetwork; Wave 8: spike #2995 attention dropout. PR #2981 (spike, attention temp) CLOSED.
 - **Current relaunch budget:** inherit pod env defaults
   - `SENPAI_TIMEOUT_MINUTES=360`
   - `SENPAI_MAX_EPOCHS=999`
@@ -106,6 +106,7 @@ No baseline has been run yet on radford for this dataset.
 - **Gradient noise injection cross-dataset** (#2920 usopp): fatal — systematic catastrophic instability on all datasets; incompatible with cosine annealing
 - **AirfRANS gradient accumulation** (#2902 stark accum>1): strictly detrimental — accum=1 (control) trained longest (661 ep) and found best basin; accumulation hurts AF
 - **Huber loss on AirfRANS** (#2901 spike, early read): 58.7% WORSE than MSE at same epoch — Huber δ=1.0 is NOT beneficial for AF; final verdict pending completion
+- **Learnable per-head QK attention temperature** (#2981 spike, CLOSED): all 4 datasets 200-2844% worse than baseline. Hypothesis falsified — Transolver already has `self.temperature=0.5` for slice assignment (more important than QK scaling); learned QK temperatures converged near 1.0 (±15%), confirming standard 1/√d_k scaling is near-optimal. Mechanism analysis: QK temperature is downstream of the architecturally meaningful slice-assignment temperature.
 
 ## Default Assignment Pattern
 
@@ -124,7 +125,18 @@ comparability, always include:
 - `target/icml2026/tandemfoil/`
 - `target/icml2026/tandemfoil_paper/`
 
-## ACTIVE EXPERIMENTS — 63 WIP PRs
+## ACTIVE EXPERIMENTS — 57 WIP PRs (updated 2026-04-22 after PR #2981 closed, #2995 assigned)
+
+### Theme 16: Wave 8 — Cross-Dataset Regularization Innovations (NEW — 2026-04-22)
+
+New regularization hypotheses targeting attention and architecture. All cover all 4 datasets.
+
+| Student | PR | Experiment | Risk |
+|---|---|---|---|
+| spike | #2995 | **Attention Dropout (0.1)** — add `dropout=0.1` to all `nn.MultiheadAttention` calls; forces distributed attention representations; prevents overfitting to dominant local mesh patterns; cross-dataset (TF/TF-paper/AF/DM) | LOW |
+
+**Scientific rationale:**
+- spike #2995: Current model uses `dropout=0.0` everywhere. Attention dropout is a well-established regularizer — forces heads to learn redundant, distributed representations. CFD meshes are highly structured (nearby points strongly correlated); dropout may prevent overfitting to local mesh topology. Negligible compute overhead.
 
 ### Theme 15: Hypernetwork Condition Encoding (2026-04-22)
 
@@ -238,7 +250,7 @@ Five novel hypotheses, all covering all 4 datasets. Wave 5 re-runs Wave 4 ideas 
 | Student | PR | Experiment | Risk |
 |---|---|---|---|
 | mugen | #2980 | **PCGrad Gradient Surgery** — project conflicting surface/volume gradients using PCGrad (Yu et al. 2020); `pcgrad_backward()` helper; all 4 datasets | MED |
-| spike | #2981 | **Learnable Attention Temperature** — per-head log-space temperature scalar `self.log_temperature = nn.Parameter(torch.zeros(n_heads))`; scale=`exp(-log_temp)/sqrt(d_k)`; all 4 datasets | LOW-MED |
+| ~~spike~~ | ~~#2981~~ | ~~**Learnable Attention Temperature**~~ CLOSED — all 4 datasets 200-2844% worse; QK temp learning is downstream of the slice-assignment temperature; learned values ≈1.0 confirms standard 1/√d_k near-optimal | ~~LOW-MED~~ |
 | taki | #2982 | **Z-Score Pressure Normalization** — replace `--asinh-pressure` with `LearnedPressureNorm` using running_mean/running_var buffers (momentum=0.01); all 4 datasets | LOW |
 | zenitsu | #2983 | **RoPE Positional Embeddings** — rotary positional encoding on QK using 3D node coordinates; alongside `--enable-fourier`; all 4 datasets | LOW-MED |
 | frieren | #2984 | **LLRD (Layer-wise Learning Rate Decay)** — `get_llrd_param_groups(model, base_lr, decay=0.8)`, test decay=0.8 and 0.9 on TF first; all 4 datasets | LOW |
