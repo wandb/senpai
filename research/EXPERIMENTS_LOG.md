@@ -1,5 +1,43 @@
 # SENPAI Research Results
 
+## 2026-04-23 00:50 — PR #3095: TFP 4L/256d deeper+wider (sanji) — CLOSED
+
+- **Branch:** sanji/tfp-4l-256d-depth-width
+- **Hypothesis:** 4L/256d (2.7x more params) improves TFP field_mse.
+- **Result:** val_primary/field_mse = **Infinity** all 70 epochs. Pressure overflow in asinh inversion at larger arch.
+- **W&B:** sfbvlaof
+- **sanji reassigned to #3116: DM SGDR T_0=15, T_mult=2**
+
+## 2026-04-23 00:50 — PR #3047: DM LR fine-tuning (piccolo) — CLOSED
+
+- **Branch:** piccolo/dm-lr-fine-tune
+- **Hypothesis:** Fine-tune LR ±10-20% around champion lr=5e-4.
+
+| LR | Best val% | W&B |
+|----|----------|-----|
+| 3e-4 | 5.745% (+44%) | 73iaz6a5 |
+| 4e-4 | 13.851% (+247%) | vvo4tj1t |
+| 4.5e-4 | 15.278% (+282%) | 3m5bs4do |
+| 5.5e-4 | 12.706% (+218%) | qvrsywc4 |
+
+- **Result:** lr=5e-4 is at a sharp optimum. Even ±10% destroys stability. LR axis exhausted for DM 4L/512d.
+- **piccolo reassigned to #3115: DM batch_size=2 with 25k points**
+
+## 2026-04-23 00:50 — PR #3045: DM T_max cosine sweep (griffith) — CLOSED
+
+- **Branch:** griffith/dm-tmax-sweep-champion-config
+- **Hypothesis:** T_max != 30 may be better for DM at champion config.
+
+| T_max | Best val% | Max grad norm | Diverged? | W&B |
+|-------|----------|---------------|-----------|-----|
+| 15 | 14.17% | 1.5e8 | Yes | zcl6gppr |
+| 30 (ctrl) | 19.32% (33ep only) | 5.9 | No | wtvv25ul |
+| 50 | 10.41% | 4.5e8 | Yes | 1lnn5f76 |
+| 100 | 11.48% | 5.1e10 | Yes | t6n3na4h |
+
+- **Result:** T_max=30 is the only stable setting without gc. Longer periods cause gradient explosions.
+- **griffith reassigned to #3114: DM T_max=50 + gc=1.0 compound**
+
 ## 2026-04-23 00:30 — PR #3097: TFP lr=1.5e-4 (shouko) — CLOSED
 
 - **Branch:** shouko/tfp-lr-15e5
