@@ -1,5 +1,19 @@
 # SENPAI Research Results
 
+## 2026-04-22 22:45 — PR #2820: AirfRANS: 3L/256d gc=0.5 lr=5e-4 stability (haku)
+
+- **Branch:** haku/airfrans-4L256d-gc05-lr5e4
+- **Hypothesis:** grad_clip=0.5 + lr=5e-4 prevents the catastrophic divergence seen at lr=7e-4 in 3L/256d config (which diverged at ep205), enabling longer stable training and a deeper basin.
+
+| Phase | Architecture | val_primary/surface_mse | Epoch | Baseline | W&B run |
+|-------|-------------|------------------------|-------|----------|---------|
+| 1 | 4L/256d | 0.00176 | ep160 | 0.00277 | 21u2f2n3 |
+| 2 | 3L/256d | **0.001241** | ep232 | 0.001479 | rvwmsfth |
+
+- **Results commentary:** Phase 2 (3L/256d + gc=0.5 + lr=5e-4) is a 3L lineage winner at -16.1% vs 0.001479 baseline. Stable through ep284 with no divergence, confirming the hypothesis. The test_primary/surface_mse from best checkpoint is 0.003734. However, the overall AirfRANS best remains 0.000627 on the 2L/256d architecture (PR #2902). This result establishes the best-known 3L/256d configuration. The key finding: lower LR (5e-4 vs 7e-4) is critical for stability at T_max=5 — it prevents gradient spikes at cosine LR peaks. Cross-dataset applicability: the gc+LR stability principle should transfer to TandemFoil and DrivAerML. **MERGED** as 3L lineage win.
+
+---
+
 ## 2026-04-22 — PR #2895: T_mult CosineAnnealingWarmRestarts cross-dataset (mugen)
 - Branch: mugen/cosine-warmrestarts-tmult
 - Hypothesis: CosineAnnealingWarmRestarts with T_mult multiplier (each restart period grows) provides a progressively coarser exploration schedule, potentially escaping sharp minima that fixed T_max misses.
