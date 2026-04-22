@@ -506,14 +506,25 @@
 ## TandemFoil Paper
 
 - **Primary metric:** `val_primary/field_mse` (lower is better)
-- **Current best:** 0.00434 (val) at epoch 199 — **first SENPAI result, crushes paper MGN baseline (~1.79) by >99%**
-- **Best PR:** #2979 (haku — 3L/192d, AdamW lr=5e-4, T_max=150, no-EMA, Fourier)
-- **External target:** Paper MGN ~1.79 (already crushed — internal frontier is now the only meaningful target)
-- **Key insight:** 3L significantly outperforms 2L (0.00434 vs 0.00534). Data pipeline had 3 critical bugs fixed in PR #2979: (1) AoA validation too strict in split_paper_experiment4.py:191, (2) non-finite pressure values in core/datasets.py:142 clamped via torch.where, (3) stats computation masked non-finite values in split_paper_experiment4.py:262.
+- **Current best:** 0.002383 (val) at epoch 443 — **45.1% improvement over previous best**
+- **Best PR:** #3025 (haku — Lion lr=1.25e-4, T_max=10, gc=0.5, EMA=0.999, 3L/192d, Fourier+physics)
+- **External target:** Paper MGN ~1.79 (crushed by >99% — internal frontier is the only meaningful target)
+- **Key insight:** The TF champion recipe (Lion+gc=0.5+EMA) transfers strongly to TFP. Lion+EMA at T_max=10 is the decisive combination — both the optimizer and the weight averaging contribute. Divergence at ep462 (known T_max=10 instability) but EMA preserves the best checkpoint.
 - **Critical flags:** Must use `--tandemfoil-paper` dataset key (see train.py for exact flag)
-- **Reproduce (3L champion):** `cd target/icml2026 && python train.py --dataset tandemfoil_paper --optimizer adamw --lr 5e-4 --cosine-t-max 150 --no-use-ema --enable-fourier --model-layers 3 --model-hidden-dim 192 --model-heads 3 --epochs 999`
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil_paper --optimizer lion --lr 1.25e-4 --cosine-t-max 10 --grad-clip 0.5 --weight-decay 1e-2 --enable-fourier --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999 --ema-decay 0.999`
 
-### 2026-04-22 — PR #2979: TandemFoil Paper: Cross-dataset 2L depth reduction — FIRST BASELINES
+### 2026-04-22 — PR #3025: TandemFoil Paper: Lion+gc=0.5+EMA champion config — NEW BEST (CURRENT)
+
+- **val_primary/field_mse:** 0.002383 (-45.1% vs 0.00434) at epoch 443
+- **val/surface_mse:** 0.001517
+- **val/surface_mse_p:** 4.81e-05
+- **val/volume_mse:** 0.002397
+- **W&B run:** d1xh0o1p (haku/tfp-lion-champion-config)
+- **Config:** Lion lr=1.25e-4, T_max=10, gc=0.5, WD=1e-2, EMA=0.999, 3L/192d, Fourier+physics, 360-min budget
+- **Key insight:** TF champion config transfers directly to TFP with a 45.1% improvement. Lion optimizer + EMA is the winning combination for tandemfoil geometry (both TF and TFP). Divergence at ep462 from T_max=10 cycling instability, but EMA correctly preserved the ep443 best. Follow-ups: gc=0.3, LR sweep, T_max=20/30 for stability.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil_paper --optimizer lion --lr 1.25e-4 --cosine-t-max 10 --grad-clip 0.5 --weight-decay 1e-2 --enable-fourier --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999 --ema-decay 0.999`
+
+### 2026-04-22 — PR #2979: TandemFoil Paper: Cross-dataset 2L depth reduction — PREVIOUS BEST
 
 - **val_primary/field_mse (3L/192d):** 0.00434 at epoch 199 ← **NEW DATASET CHAMPION**
 - **val_primary/field_mse (2L/192d):** 0.00534 at epoch 184
