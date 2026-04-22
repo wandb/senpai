@@ -502,3 +502,23 @@
 - **W&B run:** kulxytfg
 - **Epochs:** 2 (30-min timeout)
 - **Reproduce:** `cd target/icml2026 && python train.py --dataset drivaerml --optimizer adamw --lr 5e-4 --cosine_t_max 150`
+
+## TandemFoil Paper
+
+- **Primary metric:** `val_primary/field_mse` (lower is better)
+- **Current best:** 0.00434 (val) at epoch 199 — **first SENPAI result, crushes paper MGN baseline (~1.79) by >99%**
+- **Best PR:** #2979 (haku — 3L/192d, AdamW lr=5e-4, T_max=150, no-EMA, Fourier)
+- **External target:** Paper MGN ~1.79 (already crushed — internal frontier is now the only meaningful target)
+- **Key insight:** 3L significantly outperforms 2L (0.00434 vs 0.00534). Data pipeline had 3 critical bugs fixed in PR #2979: (1) AoA validation too strict in split_paper_experiment4.py:191, (2) non-finite pressure values in core/datasets.py:142 clamped via torch.where, (3) stats computation masked non-finite values in split_paper_experiment4.py:262.
+- **Critical flags:** Must use `--tandemfoil-paper` dataset key (see train.py for exact flag)
+- **Reproduce (3L champion):** `cd target/icml2026 && python train.py --dataset tandemfoil_paper --optimizer adamw --lr 5e-4 --cosine-t-max 150 --no-use-ema --enable-fourier --model-layers 3 --model-hidden-dim 192 --model-heads 3 --epochs 999`
+
+### 2026-04-22 — PR #2979: TandemFoil Paper: Cross-dataset 2L depth reduction — FIRST BASELINES
+
+- **val_primary/field_mse (3L/192d):** 0.00434 at epoch 199 ← **NEW DATASET CHAMPION**
+- **val_primary/field_mse (2L/192d):** 0.00534 at epoch 184
+- **W&B run (3L):** (haku/2l-depth-cross-dataset group, tandemfoil_paper 3L run)
+- **W&B run (2L):** (haku/2l-depth-cross-dataset group, tandemfoil_paper 2L run)
+- **Note:** These are the FIRST SENPAI runs on the TandemFoil Paper dataset. Paper MGN baseline ~1.79 crushed by >99%. 3L outperforms 2L — depth matters for this complex geometry. Three data pipeline bugs fixed as part of this PR.
+- **Depth hypothesis verdict:** FALSIFIED for TandemFoil Paper (3L > 2L), consistent with DrivAerML finding (3D/complex geometry prefers deeper models).
+- **Reproduce (3L):** `cd target/icml2026 && python train.py --dataset tandemfoil_paper --optimizer adamw --lr 5e-4 --cosine-t-max 150 --no-use-ema --enable-fourier --model-layers 3 --model-hidden-dim 192 --model-heads 3 --epochs 999`
