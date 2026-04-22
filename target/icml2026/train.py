@@ -345,13 +345,24 @@ class TandemTargetTransform:
 
         if self.config.sdf_wall_distance:
             import numpy as np
+            from pathlib import Path as _Path
             sdf_feats = []
             for b in range(raw_xy.shape[0]):
-                pts = raw_xy[b].detach().cpu().numpy()
-                surf_mask_b = full_is_surface[b].detach().cpu().numpy().astype(bool)
-                surf_pts = pts[surf_mask_b]
-                wall_dist = compute_sdf_wall_distance(pts, surf_pts)
-                sdf_feats.append(torch.from_numpy(wall_dist))
+                pts_full = raw_xy[b].detach().cpu().numpy()
+                valid_mask_b = full_mask[b].detach().cpu().numpy().astype(bool)
+                surf_is_valid_b = full_is_surface[b].detach().cpu().numpy().astype(bool)
+                surf_pts = pts_full[surf_is_valid_b]       # valid surface (wall) points only
+                valid_pts = pts_full[valid_mask_b]         # all valid (non-padded) points
+                case_id = batch.case_ids[b] if hasattr(batch, "case_ids") and batch.case_ids else str(b)
+                cache_path = (
+                    _Path(self.config.sdf_cache_dir) / "tandemfoilset" / f"{case_id}.npy"
+                    if self.config.sdf_cache_dir
+                    else None
+                )
+                sdf_valid = compute_sdf_wall_distance(valid_pts, surf_pts, cache_path=cache_path)
+                sdf_full = np.zeros(pts_full.shape[0], dtype=np.float32)
+                sdf_full[valid_mask_b] = sdf_valid
+                sdf_feats.append(torch.from_numpy(sdf_full))
             sdf_tensor = torch.stack(sdf_feats, dim=0).unsqueeze(-1).to(x.device, dtype=x.dtype)
             x = torch.cat([x, sdf_tensor], dim=-1)
 
