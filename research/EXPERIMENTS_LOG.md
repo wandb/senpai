@@ -1,5 +1,67 @@
 # SENPAI Research Results
 
+## 2026-04-23 01:20 — PR #3082: DrivAerML T_max=40 cosine schedule (historia) — CLOSED
+
+- **Branch:** historia/dm-tmax-40
+- **Hypothesis:** T_max=40 as a finer sweep point between champion T_max=30 and previously-crashed T_max=50
+- **Results:**
+
+| Metric | Value | Epoch | vs Baseline |
+|---|---|---|---|
+| Best val surface_rel_l2_pct | 12.840% | ep87 | +221% worse |
+| Final val (diverged) | 18.552% | ep160 | — |
+| Baseline (T_max=30) | 3.997% | ep467 | — |
+
+- **W&B run:** mzwuykvf
+- **Analysis:** Three-phase training: healthy convergence to ep47, first gradient explosion at ep48, partial recovery reaching 12.84% at ep87, terminal divergence from ep94 with grad norms up to 2222. Confirms T_max=30 is uniquely stable without gc on DrivAerML. T_max=40 joins T_max=15/20/50/100 as dead ends.
+- **Decision:** CLOSED — 221% above baseline, catastrophic divergence
+
+## 2026-04-23 01:20 — PR #3081: DrivAerML T_max=20 cosine schedule (hinata) — CLOSED
+
+- **Branch:** hinata/dm-tmax-20
+- **Hypothesis:** Shorter cosine cycles (T_max=20) for more frequent basin-hopping
+- **Results:**
+
+| Metric | Value | Epoch | vs Baseline |
+|---|---|---|---|
+| Best val surface_rel_l2_pct | 11.055% | ep76 | +177% worse |
+| Final val (degraded) | 27.158% | ep162 | — |
+| Baseline (T_max=30) | 3.997% | ep467 | — |
+
+- **W&B run:** t50xj6j8
+- **Analysis:** 13 spike events, grad norms up to 193.6. Chronically unstable — 42/162 checkpoints had grad_norm > 10. Best was still 2.77x worse than baseline. Confirms shorter T_max is catastrophically unstable without gc.
+- **Decision:** CLOSED — 177% above baseline, chronic instability
+
+## 2026-04-23 01:20 — PR #3051: DrivAerML 4x case revisits (bulma) — CLOSED
+
+- **Branch:** bulma/dm-multi-revisit-epoch
+- **Hypothesis:** More training batches per epoch (4x/8x revisits with different random 50k-point subsamples) acts as data augmentation
+- **Results:**
+
+| Run | W&B ID | Best val | Best test | vs Baseline |
+|---|---|---|---|---|
+| 4x (1576 batches) | a5oa7wpt | 9.382% ep36 | 10.226% | +135% worse |
+| 8x (3152 batches) | xsmxmlg7 | 15.211% ep10 | 15.905% | +281% worse |
+| 1x control (full eval) | itlteubz | 13.950% ep43 | 13.519% | +249% worse |
+
+- **Analysis:** 4x and 8x diverged because more gradient steps per cosine cycle compounds instability without gc. 4x early trajectory was promising (9.38% at ep36 vs ~12-13% for champion at same point) but couldn't survive long enough. 1x control only reached 46 epochs (vs 467 baseline) — confirms --max-eval-batches 200 is essential for throughput.
+- **Decision:** CLOSED — all runs 135-281% above baseline
+
+## 2026-04-23 01:20 — PR #3048: DrivAerML depth reduction 2L/3L vs 4L/512d (senku) — CLOSED
+
+- **Branch:** senku/dm-2l-3l-depth-at-champion
+- **Hypothesis:** Shallower architectures (2L/3L at 512d) might match or beat 4L by training faster, mirroring AirfRANS depth preference
+- **Results:**
+
+| Run | W&B ID | Best val | Best test | vs Baseline |
+|---|---|---|---|---|
+| 2L/512d | r0zsdxe8 | 11.259% | 11.705% | 2.82x worse |
+| 3L/512d | eagewa9c | 9.992% | 10.470% | 2.50x worse |
+| 4L/512d full-eval | fhe0j04g | 14.999% | 14.514% | 3.75x worse (epoch-starved) |
+
+- **Analysis:** Clean negative result — DrivAerML has OPPOSITE depth preference from AirfRANS. Monotonic: 2L < 3L < 4L. Both shallow models also diverged to NaN, indicating lack of depth makes optimization fragile at this scale. Full-eval control only 36 epochs — confirms full-eval-every-epoch impractical. Key finding: 4L is NOT over-parameterized on DrivAerML.
+- **Decision:** CLOSED — 2.5-2.8x worse than baseline
+
 ## 2026-04-23 00:50 — PR #3095: TFP 4L/256d deeper+wider (sanji) — CLOSED
 
 - **Branch:** sanji/tfp-4l-256d-depth-width
