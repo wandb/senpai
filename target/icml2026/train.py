@@ -15,13 +15,14 @@ from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import wandb
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from core.architectures import ABUPTReference, ANPSurfaceDecoder, ReferenceTransolver, SenpaiTransolver
-from core.contracts import ABUPTBatch, DatasetBundle, GroupedBatch, TargetTransformStats
+from core.contracts import ABUPTBatch, CaseSample, DatasetBundle, GroupedBatch, TargetTransformStats
 from core.datasets import ABUPTCollate, build_dataset_bundle, collate_grouped
 from core.features import (
     append_batched_fourier_features,
@@ -165,6 +166,9 @@ class TrainConfig:
     grad_clip: float = 0.0
     save_checkpoint: bool = False
     seed: int = 0
+    sdf_feature: bool = False
+    edge_distance_feature: bool = False
+    sdf_scale: float = 0.01
 
 
 @dataclass
@@ -219,6 +223,102 @@ class TargetTransform:
         if self.asinh_pressure and self.pressure_index is not None:
             out[..., self.pressure_index] = torch.sinh(out[..., self.pressure_index]) / max(self.asinh_scale, 1e-6)
         return out
+
+
+def _compute_wall_distance(surface_pos: np.ndarray, query_pos: np.ndarray, scale: float) -> np.ndarray:
+    from scipy.spatial import cKDTree
+    tree = cKDTree(surface_pos)
+    dists, _ = tree.query(query_pos)
+    return np.arcsinh(dists / scale).astype(np.float32)
+
+
+def _compute_edge_distance(
+    surface_pos: np.ndarray,
+    surface_normals: np.ndarray,
+    scale: float,
+    k: int = 20,
+    dihedral_deg: float = 60.0,
+) -> np.ndarray:
+    from scipy.spatial import cKDTree
+    n = len(surface_pos)
+    if n < 2:
+        return np.zeros(n, dtype=np.float32)
+    norms = np.linalg.norm(surface_normals, axis=1, keepdims=True)
+    normals = surface_normals / np.clip(norms, 1e-8, None)
+    tree = cKDTree(surface_pos)
+    k_actual = min(k + 1, n)
+    _, indices = tree.query(surface_pos, k=k_actual)
+    neighbor_normals = normals[indices[:, 1:]]
+    cos_angles = (normals[:, None, :] * neighbor_normals).sum(axis=2)
+    threshold_cos = np.cos(np.radians(dihedral_deg))
+    edge_mask = np.any(cos_angles < threshold_cos, axis=1)
+    if not edge_mask.any():
+        return np.zeros(n, dtype=np.float32)
+    edge_tree = cKDTree(surface_pos[edge_mask])
+    edge_dists, _ = edge_tree.query(surface_pos)
+    return np.arcsinh(edge_dists / scale).astype(np.float32)
+
+
+def augment_batch_sdf(batch: GroupedBatch, scale: float) -> GroupedBatch:
+    B, N_s, _ = batch.surface_x.shape
+    space_dim = batch.space_dim
+    surf_sdf = torch.zeros(B, N_s, 1, dtype=batch.surface_x.dtype)
+    vol_sdf = None
+    if batch.volume_x is not None:
+        vol_sdf = torch.zeros(B, batch.volume_x.shape[1], 1, dtype=batch.volume_x.dtype)
+    for b in range(B):
+        s_mask = batch.surface_mask[b].numpy().astype(bool)
+        if not s_mask.any():
+            continue
+        surf_pts = batch.surface_x[b, s_mask, :space_dim].numpy()
+        dists = _compute_wall_distance(surf_pts, surf_pts, scale)
+        surf_sdf[b, s_mask, 0] = torch.from_numpy(dists)
+        if batch.volume_x is not None and batch.volume_mask is not None and vol_sdf is not None:
+            v_mask = batch.volume_mask[b].numpy().astype(bool)
+            if v_mask.any():
+                vol_pts = batch.volume_x[b, v_mask, :space_dim].numpy()
+                vol_dists = _compute_wall_distance(surf_pts, vol_pts, scale)
+                vol_sdf[b, v_mask, 0] = torch.from_numpy(vol_dists)
+    new_surface_x = torch.cat([batch.surface_x, surf_sdf], dim=-1)
+    new_volume_x = torch.cat([batch.volume_x, vol_sdf], dim=-1) if batch.volume_x is not None and vol_sdf is not None else batch.volume_x
+    return GroupedBatch(
+        case_ids=batch.case_ids,
+        dataset_name=batch.dataset_name,
+        space_dim=batch.space_dim,
+        surface_x=new_surface_x,
+        surface_y=batch.surface_y,
+        surface_mask=batch.surface_mask,
+        volume_x=new_volume_x,
+        volume_y=batch.volume_y,
+        volume_mask=batch.volume_mask,
+        metadata=batch.metadata,
+    )
+
+
+def augment_batch_edge_distance(batch: GroupedBatch, scale: float) -> GroupedBatch:
+    B, N_s, _ = batch.surface_x.shape
+    edge_feat = torch.zeros(B, N_s, 1, dtype=batch.surface_x.dtype)
+    for b in range(B):
+        s_mask = batch.surface_mask[b].numpy().astype(bool)
+        if not s_mask.any():
+            continue
+        surf_pts = batch.surface_x[b, s_mask, :3].numpy()
+        surf_normals = batch.surface_x[b, s_mask, 3:6].numpy()
+        dists = _compute_edge_distance(surf_pts, surf_normals, scale)
+        edge_feat[b, s_mask, 0] = torch.from_numpy(dists)
+    new_surface_x = torch.cat([batch.surface_x, edge_feat], dim=-1)
+    return GroupedBatch(
+        case_ids=batch.case_ids,
+        dataset_name=batch.dataset_name,
+        space_dim=batch.space_dim,
+        surface_x=new_surface_x,
+        surface_y=batch.surface_y,
+        surface_mask=batch.surface_mask,
+        volume_x=batch.volume_x,
+        volume_y=batch.volume_y,
+        volume_mask=batch.volume_mask,
+        metadata=batch.metadata,
+    )
 
 
 class TandemTargetTransform:
@@ -298,6 +398,21 @@ class TandemTargetTransform:
         dist_feat = torch.log1p(raw_dsdf.abs().min(dim=-1, keepdim=True).values * 10.0)
         curv = x[..., 2:6].norm(dim=-1, keepdim=True) * full_is_surface.float().unsqueeze(-1)
         x = torch.cat([x, curv, dist_feat], dim=-1)
+
+        if self.config.sdf_feature:
+            B = raw_xy.shape[0]
+            wall_dist = torch.zeros(B, raw_xy.shape[1], 1, device=x.device, dtype=x.dtype)
+            xy_cpu = raw_xy.detach().cpu().numpy()
+            is_surf_cpu = full_is_surface.detach().cpu().bool().numpy()
+            mask_cpu = full_mask.detach().cpu().bool().numpy()
+            for b in range(B):
+                s_mask = is_surf_cpu[b] & mask_cpu[b]
+                q_mask = mask_cpu[b]
+                if not s_mask.any() or not q_mask.any():
+                    continue
+                dists = _compute_wall_distance(xy_cpu[b, s_mask], xy_cpu[b, q_mask], self.config.sdf_scale)
+                wall_dist[b, q_mask, 0] = torch.from_numpy(dists).to(x.device)
+            x = torch.cat([x, wall_dist], dim=-1)
 
         fore_te_x = None
         fore_te_y = None
@@ -822,6 +937,9 @@ def evaluate_grouped(
     *,
     amp_mode: str = "none",
     max_batches: int = 0,
+    sdf_feature: bool = False,
+    edge_distance_feature: bool = False,
+    sdf_scale: float = 0.01,
 ) -> dict[str, float]:
     model.eval()
     if anp_head is not None:
@@ -849,6 +967,11 @@ def evaluate_grouped(
 
     batches = loader if max_batches <= 0 else itertools.islice(loader, max_batches)
     for batch in batches:
+        if not isinstance(transform, TandemTargetTransform):
+            if sdf_feature:
+                batch = augment_batch_sdf(batch, sdf_scale)
+            if edge_distance_feature:
+                batch = augment_batch_edge_distance(batch, sdf_scale)
         batch = batch.to(device)
         dataset_name = batch.dataset_name
 
@@ -1192,6 +1315,9 @@ def train_one_epoch(
     amp_mode: str = "none",
     max_batches: int = 0,
     grad_clip: float = 0.0,
+    sdf_feature: bool = False,
+    edge_distance_feature: bool = False,
+    sdf_scale: float = 0.01,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1213,6 +1339,11 @@ def train_one_epoch(
                 )
                 loss, _ = loss_abupt(batch, outputs, transform)
         else:
+            if not isinstance(transform, TandemTargetTransform):
+                if sdf_feature:
+                    batch = augment_batch_sdf(batch, sdf_scale)
+                if edge_distance_feature:
+                    batch = augment_batch_edge_distance(batch, sdf_scale)
             batch = batch.to(device)
             if isinstance(transform, TandemTargetTransform):
                 prepared = transform.prepare_batch(batch)
@@ -1354,7 +1485,41 @@ def main() -> None:
 
         _ds.TandemFoilCaseDataset.__init__ = _patched_init
 
+    if config.dataset == "drivaerml" and not config.surface_only_drivaerml:
+        import core.features as _feat
+        _orig_augment = _feat.augment_case_sample
+
+        def _patched_augment(sample, **kwargs):
+            if sample.volume_x is not None and sample.surface_x.shape[1] != sample.volume_x.shape[1]:
+                pad = sample.surface_x.shape[1] - sample.volume_x.shape[1]
+                if pad > 0:
+                    sample = CaseSample(
+                        case_id=sample.case_id,
+                        dataset_name=sample.dataset_name,
+                        space_dim=sample.space_dim,
+                        surface_x=sample.surface_x,
+                        surface_y=sample.surface_y,
+                        volume_x=torch.cat([sample.volume_x, torch.zeros(sample.volume_x.shape[0], pad, dtype=sample.volume_x.dtype)], dim=1),
+                        volume_y=sample.volume_y,
+                        metadata=dict(sample.metadata),
+                    )
+            return _orig_augment(sample, **kwargs)
+
+        _feat.augment_case_sample = _patched_augment
+        _ds.augment_case_sample = _patched_augment
+
     bundle = build_bundle(config)
+    if config.dataset == "drivaerml" and not config.surface_only_drivaerml:
+        from drivaerml.data.prepare_drivaerml import SURFACE_X_DIM, VOLUME_X_DIM
+        pad_dim = SURFACE_X_DIM - VOLUME_X_DIM
+        if pad_dim > 0 and bundle.spec.volume_input_dim > 0:
+            bundle.spec.volume_input_dim += pad_dim
+    if config.sdf_feature:
+        bundle.spec.surface_input_dim += 1
+        if bundle.spec.volume_input_dim > 0:
+            bundle.spec.volume_input_dim += 1
+    if config.edge_distance_feature:
+        bundle.spec.surface_input_dim += 1
     resolved_num_workers = resolve_num_workers(config, bundle.spec.name)
     if bundle.spec.name == "tandemfoilset":
         phys_stats = compute_tandem_phys_stats(
@@ -1433,6 +1598,9 @@ def main() -> None:
             amp_mode=config.amp_mode,
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
+            sdf_feature=config.sdf_feature,
+            edge_distance_feature=config.edge_distance_feature,
+            sdf_scale=config.sdf_scale,
         )
 
         if ema is not None:
@@ -1462,6 +1630,9 @@ def main() -> None:
                     device,
                     amp_mode=config.amp_mode,
                     max_batches=config.max_eval_batches,
+                    sdf_feature=config.sdf_feature,
+                    edge_distance_feature=config.edge_distance_feature,
+                    sdf_scale=config.sdf_scale,
                 )
             eval_metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
             if split_name in LEGACY_VAL_ALIAS and "mae_surf_p" in split_metrics:
@@ -1519,6 +1690,9 @@ def main() -> None:
                     device,
                     amp_mode=config.amp_mode,
                     max_batches=config.max_eval_batches,
+                    sdf_feature=config.sdf_feature,
+                    edge_distance_feature=config.edge_distance_feature,
+                    sdf_scale=config.sdf_scale,
                 )
             final_test_metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
         if bundle.spec.name == "tandemfoilset":
