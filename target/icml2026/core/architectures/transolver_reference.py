@@ -139,6 +139,7 @@ class TransformerBlock(nn.Module):
         mlp_expansion_factor: int | float,
         num_slices: int,
         dropout: float = 0.0,
+        layer_scale_init: float = 0.0,
     ):
         super().__init__()
         mlp_hidden_dim = int(math.ceil(hidden_dim * mlp_expansion_factor))
@@ -151,10 +152,18 @@ class TransformerBlock(nn.Module):
         )
         self.norm2 = nn.LayerNorm(hidden_dim, eps=1e-6)
         self.mlp = UpActDownMlp(hidden_dim=hidden_dim, mlp_hidden_dim=mlp_hidden_dim)
+        self.use_layer_scale = layer_scale_init > 0.0
+        if self.use_layer_scale:
+            self.layer_scale_1 = nn.Parameter(layer_scale_init * torch.ones(hidden_dim))
+            self.layer_scale_2 = nn.Parameter(layer_scale_init * torch.ones(hidden_dim))
 
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
-        x = x + self.attention(self.norm1(x), attn_mask=attn_mask)
-        x = x + self.mlp(self.norm2(x))
+        if self.use_layer_scale:
+            x = x + self.layer_scale_1 * self.attention(self.norm1(x), attn_mask=attn_mask)
+            x = x + self.layer_scale_2 * self.mlp(self.norm2(x))
+        else:
+            x = x + self.attention(self.norm1(x), attn_mask=attn_mask)
+            x = x + self.mlp(self.norm2(x))
         return x
 
 
@@ -167,6 +176,7 @@ class Transformer(nn.Module):
         mlp_expansion_factor: int | float,
         num_slices: int,
         dropout: float = 0.0,
+        layer_scale_init: float = 0.0,
     ):
         super().__init__()
         self.blocks = nn.ModuleList(
@@ -177,6 +187,7 @@ class Transformer(nn.Module):
                     mlp_expansion_factor=mlp_expansion_factor,
                     num_slices=num_slices,
                     dropout=dropout,
+                    layer_scale_init=layer_scale_init,
                 )
                 for _ in range(depth)
             ]
@@ -205,6 +216,7 @@ class ReferenceTransolver(nn.Module):
         n_head: int = 3,
         mlp_ratio: int = 4,
         slice_num: int = 96,
+        layer_scale_init: float = 0.0,
     ):
         super().__init__()
         self.space_dim = space_dim
@@ -233,6 +245,7 @@ class ReferenceTransolver(nn.Module):
             mlp_expansion_factor=mlp_ratio,
             num_slices=slice_num,
             dropout=dropout,
+            layer_scale_init=layer_scale_init,
         )
         self.norm = nn.LayerNorm(n_hidden, eps=1e-6)
         self.out = LinearProjection(n_hidden, surface_output_dim + volume_output_dim)

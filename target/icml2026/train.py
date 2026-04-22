@@ -164,6 +164,7 @@ class TrainConfig:
     volume_anchor_points: int = 8_000
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
+    layer_scale_init: float = 0.0
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -486,6 +487,7 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
         "n_head": config.model_heads,
         "mlp_ratio": config.model_mlp_ratio,
         "slice_num": config.model_slices,
+        "layer_scale_init": config.layer_scale_init,
     }
     if config.model == "reference_transolver":
         return ReferenceTransolver(
@@ -1604,6 +1606,11 @@ def main() -> None:
             anp_ema.restore(anp_head)
 
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
+        if config.layer_scale_init > 0.0:
+            for block_idx, block in enumerate(model.backbone.blocks):
+                if hasattr(block, "layer_scale_1"):
+                    epoch_metrics[f"layer_scale/block{block_idx}_attn_mean"] = float(block.layer_scale_1.data.mean().item())
+                    epoch_metrics[f"layer_scale/block{block_idx}_ffn_mean"] = float(block.layer_scale_2.data.mean().item())
         history.append(epoch_metrics)
         if run is not None:
             wandb.log(epoch_metrics, step=epoch)
