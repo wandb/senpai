@@ -1609,7 +1609,7 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
-    forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
+    forward_model = torch.compile(model, mode="default") if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
         anp_head = ANPSurfaceDecoder(
