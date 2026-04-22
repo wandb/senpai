@@ -272,21 +272,33 @@ def augment_case_sample(
 
     surface_x = sample.surface_x
     volume_x = sample.volume_x
-    full_x = torch.cat([surface_x, volume_x], dim=0) if volume_x is not None else surface_x
 
-    appended_full: list[torch.Tensor] = []
-    if enable_fourier:
-        full_x = append_fourier_features(full_x, sample.space_dim, fourier_freqs)
-    if enable_cp_panel and sample.dataset_name == "airfrans":
-        appended_full.append(_compute_airfrans_cp_panel(full_x))
-    if enable_wake_deficit and sample.dataset_name.startswith("tandemfoilset"):
-        appended_full.append(_compute_tandem_wake_deficit(full_x, include_angle=enable_wake_angle))
-    if appended_full:
-        full_x = torch.cat([full_x, *appended_full], dim=1)
-
-    num_surface = sample.surface_x.shape[0]
-    surface_x = full_x[:num_surface]
-    volume_x = full_x[num_surface:] if sample.volume_x is not None else None
+    can_cat = volume_x is None or surface_x.shape[1] == volume_x.shape[1]
+    if can_cat:
+        full_x = torch.cat([surface_x, volume_x], dim=0) if volume_x is not None else surface_x
+        if enable_fourier:
+            full_x = append_fourier_features(full_x, sample.space_dim, fourier_freqs)
+        appended_full: list[torch.Tensor] = []
+        if enable_cp_panel and sample.dataset_name == "airfrans":
+            appended_full.append(_compute_airfrans_cp_panel(full_x))
+        if enable_wake_deficit and sample.dataset_name.startswith("tandemfoilset"):
+            appended_full.append(_compute_tandem_wake_deficit(full_x, include_angle=enable_wake_angle))
+        if appended_full:
+            full_x = torch.cat([full_x, *appended_full], dim=1)
+        num_surface = sample.surface_x.shape[0]
+        surface_x = full_x[:num_surface]
+        volume_x = full_x[num_surface:] if sample.volume_x is not None else None
+    else:
+        if enable_fourier:
+            surface_x = append_fourier_features(surface_x, sample.space_dim, fourier_freqs)
+            volume_x = append_fourier_features(volume_x, sample.space_dim, fourier_freqs)
+        appended_srf: list[torch.Tensor] = []
+        if enable_cp_panel and sample.dataset_name == "airfrans":
+            appended_srf.append(_compute_airfrans_cp_panel(surface_x))
+        if enable_wake_deficit and sample.dataset_name.startswith("tandemfoilset"):
+            appended_srf.append(_compute_tandem_wake_deficit(surface_x, include_angle=enable_wake_angle))
+        if appended_srf:
+            surface_x = torch.cat([surface_x, *appended_srf], dim=1)
     return CaseSample(
         case_id=sample.case_id,
         dataset_name=sample.dataset_name,
