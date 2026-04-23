@@ -1636,7 +1636,6 @@ def main() -> None:
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
     history: list[dict[str, float]] = []
     best_epoch: int | None = None
-    best_val_primary_metric_name = primary_metric_key(bundle, phase="val")
     best_val_primary_metric: float | None = None
     best_val_metrics: dict[str, float] = {}
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1646,6 +1645,7 @@ def main() -> None:
         primary_metric_key = "val_primary/surface_pressure_mae"
     else:
         primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
+    best_val_primary_metric_name = primary_metric_key
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
