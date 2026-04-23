@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 05:30 (advisor cycle 64)
+- **Date:** 2026-04-24 06:00 (advisor cycle 66)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -33,7 +33,7 @@
 - `#3209` sanji: TFP cp_panel bug fix + multi-seed retest — STABILIZATION PRIORITY
 - `#3244` faye: DM Track 1 paper-facing full eval (champion config, NO --max-eval-batches) — PAPER-FACING Track 1
 - `#3160` griffith: 16H heads
-- `#3237` nobara: snapshot ensemble at cosine troughs (test-time averaging) — INNOVATION
+- `#3248` nobara: decaying peak LR at cosine restarts (SGDR eta_mult) — INNOVATION
 - `#3152` eren: EMA decay sweep (0.999 vs 0.9995)
 - `#3146` taki: top-5 checkpoint averaging
 - `#3143` thorfinn: Lookahead(AdamW)
@@ -189,6 +189,7 @@
 - Auxiliary gradient prediction (∂p/∂x,y,z): kNN targets too noisy — aux_weight=0.1 diverges ep22, aux_weight=0.01 best 5.485% (+43%). Noise dominates once primary loss flattens
 - Mixup regularization (buffer-based latent): 85-109% worse, crashed ~ep235. Buffer staleness + non-smooth geometry-specific latent space fundamentally incompatible with bs=1
 - Fourier-encoded surface normals: 4.374%/4.454% (4 bands/2 bands). Normals are unit vectors in [-1,1] — don't benefit from Fourier lifting like unbounded coords. More bands = earlier divergence
+- Snapshot ensemble (cosine trough checkpoints): test=6.044% single best, WORSE with more snapshots (K=3→6.24%, K=5→6.98%, K=6→7.81%). Quality gradient dominates diversity. EMA already provides implicit smoothing.
 - Attention temperature annealing: 4.024% (+5% vs 3.833%). External annealed τ compounds with existing learnable per-head τ. noam result doesn't transfer
 - SAM optimizer (rho=0.05/0.02): 5.36%/9.08%. SAM perturbation + cosine restart = double shock → catastrophic divergence. 2x compute penalty also prohibitive
 - True monotonic cosine (T_max=393606, no restarts): 4.086% (+0.253pp). Confirms T_max=30 rapid restarts are core mechanism, not noise. Monotonic decay can't compete

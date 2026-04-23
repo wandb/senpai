@@ -1,5 +1,15 @@
 # SENPAI Research Results
 
+## 2026-04-24 06:00 — PR #3237: DM snapshot ensemble at cosine troughs (nobara) — CLOSED (dead end)
+
+- nobara/dm-snapshot-ensemble, W&B group: dm-snapshot-ensemble, runs: cwg22dhi (single best), lcil8t4n (K=3), c8bn99m6 (K=5), lp19d8uo (K=6), c31seso3 (training)
+- Hypothesis: save EMA checkpoints at cosine LR troughs, average predictions at test time for variance reduction
+- Training run: val=4.807% ep193, then crashed ep214 (grad explosion: 0.19→0.50→3.25→100.4→6459 in 15 epochs). Never reached baseline quality.
+- Single best checkpoint (ep180): test=6.044% (+29% vs 4.685% baseline)
+- **Ensembling makes it WORSE monotonically:** K=3→6.238%, K=5→6.980%, K=6→7.810%. Quality gradient dominates — early checkpoints (ep30=17.3%) dilute later ones (ep180=5.0%)
+- **Root cause: EMA=0.9995 already provides implicit smoothing over ~2000 steps. Snapshot averaging on top of EMA adds noise, not signal.** Also, available snapshots were from a run that crashed before reaching baseline quality.
+- **Conclusion: snapshot ensemble dead for DM.** Requires similarly-capable checkpoints with diverse predictions — but single-run cosine trough checkpoints have dominant quality gradient.
+
 ## 2026-04-24 05:30 — PR #3217: DM Fourier-encoded surface normals (brook) — CLOSED (dead end)
 
 - brook/dm-fourier-normals, W&B group: dm-fourier-normals
