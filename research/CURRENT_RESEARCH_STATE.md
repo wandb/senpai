@@ -2,7 +2,7 @@
 
 - **Date:** 2026-04-23 23:15 (advisor cycle 49)
 - **Branch:** radford
-- **Idle students:** 0 (brook being reassigned)
+- **Idle students:** 0
 - **PRs ready for review:** 0
 - **CRITICAL:** TFP champion config is BROKEN — code regression since #3025, seed=0 no longer reproduces (#3205). Waiting for sanji #3209 cp_panel bug fix.
 
@@ -12,7 +12,7 @@
 **Innovation track (new physics-aware/ML ideas per directive):**
 - `#3216` canute: attention distance bias (ALiBi-inspired spatial prior) — INNOVATION
 - `#3214` kakashi: auxiliary gradient prediction (∂p/∂x,y,z) — INNOVATION
-- `#3213` brook: Fourier encoding of surface normals — INNOVATION (reassigned)
+- `#3217` brook: Fourier encoding of surface normals — INNOVATION
 - `#3203` vegeta: attention temperature annealing — INNOVATION
 - `#3202` senku: GLU preprocess MLP — INNOVATION
 - `#3201` jet: DomainLayerNorm — INNOVATION
@@ -151,7 +151,7 @@
 - DomainLayerNorm — jet #3201 (merged; awaiting results)
 
 **New physics-aware/ML ideas (cycle 48):**
-- Fourier encoding of surface normals (angular frequency features) — brook #3213 (reassigned)
+- Fourier encoding of surface normals (angular frequency features) — brook #3217
 - Auxiliary gradient prediction (∂p/∂x,y,z as regularization) — kakashi #3214
 - Attention distance bias (ALiBi-inspired spatial prior) — canute #3216
 
