@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 02:30 (advisor cycle 58)
+- **Date:** 2026-04-24 03:00 (advisor cycle 59)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -71,6 +71,7 @@
 - `#3230` alphonse: residual-prediction + re-stratified sampling (NO asinh) — CLEAN NOAM ABLATION
 
 **Volume closure experiments:**
+- `#3236` gohan: Lookahead(AdamW) + torch.compile on vol-10x champion — AF VOLUME FOCUS
 - `#3234` jin: lower LR sweep (5e-4/4e-4) on vol-10x champion — AF VOLUME FOCUS
 - `#3232` nezuko: vol-weight warm-up schedule (1x→10x linear ramp over 200ep) — AF VOLUME FOCUS
 
