@@ -1,5 +1,23 @@
 # SENPAI Research Results
 
+## 2026-04-24 07:30 — PR #3225: DM self-distillation via EMA teacher (canute) — CLOSED (dead end)
+
+- canute/dm-self-distillation, W&B runs: 1df67nu8 (α=0.3), r8c2ztmm (α=0.1), group: dm-self-distillation
+- Hypothesis: EMA model as soft-target teacher for online model, loss = (1-α)*MSE(pred,target) + α*MSE(pred,ema_pred)
+- Trial A (α=0.3): val=6.446% ep159, diverged ~ep170. +68% vs baseline
+- Trial B (α=0.1): val=4.323% ep335, diverged ~ep400. +12.8% vs baseline
+- **Structural flaw: EMA=0.9995 creates ~2000-step teacher lag → destabilizing feedback loop in late training.** Higher α → earlier divergence (clean monotonic relationship). The distillation term overcomes gc=0.5 and sends grad norms to infinity.
+- **Conclusion: self-distillation dead for DM.** Same EMA for checkpoint tracking and distillation is fundamentally incompatible. Would need separate lower-decay EMA teacher + alpha decay schedule — a substantially different approach.
+
+## 2026-04-24 07:30 — PR #3223: AF volume smoothness regularization (norman) — CLOSED (dead end)
+
+- norman/af-volume-smooth-regularization, W&B runs: 6oo3dn4f, q2zyfwfg, 6dqv5rod, wr3xsn6u
+- Hypothesis: KNN-based spatial smoothness penalty on volume predictions encourages physically smooth fields
+- 4 trials (2 formulations × 2 lambda/k settings): ALL regressed BOTH metrics. Surface 44-94% worse, volume 60-97% worse
+- Best trial (Form A, λ=0.01, k=4): surface=0.000426 (+44%), vol=0.004791 (+88%)
+- **Root cause: KNN Euclidean smoothness is physically misaligned.** BL, wakes, shear layers have legitimate sharp gradients. Penalty suppresses real physics. Gradient interference from shared backbone also corrupts surface gradients.
+- **Conclusion: volume smoothness reg dead for AF.** Even λ=1e-4 harmful. Mesh-topology-aware or residual-gradient approaches would be fundamentally different.
+
 ## 2026-04-24 07:00 — PR #3224: DM spectral normalization on attention (fern) — CLOSED (dead end)
 
 - fern/dm-spectral-norm, W&B run: 4ylvrt7k, group: dm-spectral-norm
