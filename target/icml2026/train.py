@@ -86,6 +86,64 @@ class EMAWithWarmup:
         self.backup = None
 
 
+class ManualSWA:
+    """Manual SWA: collect and average model weights at specific epochs (Izmailov et al. 2018)."""
+
+    def __init__(self, model: torch.nn.Module):
+        self.n_collected = 0
+        self.swa_params: dict[str, torch.Tensor] | None = None
+        self.backup: dict[str, torch.Tensor] | None = None
+
+    @staticmethod
+    def _clean(name: str) -> str:
+        return name.replace("_orig_mod.", "")
+
+    @torch.no_grad()
+    def collect(self, model: torch.nn.Module) -> None:
+        self.n_collected += 1
+        n = self.n_collected
+        if self.swa_params is None:
+            self.swa_params = {
+                self._clean(name): param.detach().clone()
+                for name, param in model.named_parameters()
+                if param.requires_grad
+            }
+        else:
+            for name, param in model.named_parameters():
+                key = self._clean(name)
+                if param.requires_grad and key in self.swa_params:
+                    self.swa_params[key].mul_((n - 1) / n).add_(param.detach(), alpha=1.0 / n)
+
+    @torch.no_grad()
+    def store(self, model: torch.nn.Module) -> None:
+        if self.swa_params is None:
+            return
+        self.backup = {
+            self._clean(name): param.detach().clone()
+            for name, param in model.named_parameters()
+            if param.requires_grad and self._clean(name) in self.swa_params
+        }
+
+    @torch.no_grad()
+    def copy_to(self, model: torch.nn.Module) -> None:
+        if self.swa_params is None:
+            return
+        for name, param in model.named_parameters():
+            key = self._clean(name)
+            if param.requires_grad and key in self.swa_params:
+                param.data.copy_(self.swa_params[key])
+
+    @torch.no_grad()
+    def restore(self, model: torch.nn.Module) -> None:
+        if self.backup is None:
+            return
+        for name, param in model.named_parameters():
+            key = self._clean(name)
+            if param.requires_grad and key in self.backup:
+                param.data.copy_(self.backup[key])
+        self.backup = None
+
+
 LEGACY_VAL_ALIAS = {
     "val_in_dist": "p_in",
     "val_ood_cond": "p_oodc",
@@ -124,6 +182,8 @@ class TrainConfig:
     use_lookahead: bool = True
     use_ema: bool = True
     ema_decay: float = 0.9999
+    swa_start_epoch: int = 0
+    swa_collect_interval: int = 0
     num_workers: int = -1
     pin_memory: bool = True
     persistent_workers: bool = True
@@ -1540,6 +1600,52 @@ def compute_tandem_phys_stats(
     return TargetTransformStats(y_mean=mean, y_std=std)
 
 
+@torch.no_grad()
+def _update_swa_bn(
+    model: torch.nn.Module,
+    train_loader: DataLoader,
+    transform: "TargetTransform | TandemTargetTransform",
+    device: torch.device,
+    config: TrainConfig,
+) -> None:
+    """Update BatchNorm running stats for SWA model. No-op if no BN layers."""
+    has_bn = any(
+        isinstance(m, torch.nn.modules.batchnorm._BatchNorm)
+        for m in model.modules()
+    )
+    if not has_bn:
+        return
+    for module in model.modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            module.running_mean.zero_()
+            module.running_var.fill_(1)
+            module.num_batches_tracked.zero_()
+    was_training = model.training
+    model.train()
+    batches = train_loader if config.max_train_batches <= 0 else itertools.islice(train_loader, config.max_train_batches)
+    for batch in batches:
+        batch = batch.to(device)
+        if isinstance(transform, TandemTargetTransform):
+            prepared = transform.prepare_batch(batch)
+            with autocast_context(device, config.amp_mode):
+                model(
+                    surface_x=prepared.surface_x,
+                    surface_mask=prepared.surface_mask,
+                    volume_x=prepared.volume_x,
+                    volume_mask=prepared.volume_mask,
+                )
+        else:
+            with autocast_context(device, config.amp_mode):
+                model(
+                    surface_x=batch.surface_x,
+                    surface_mask=batch.surface_mask,
+                    volume_x=batch.volume_x,
+                    volume_mask=batch.volume_mask,
+                )
+    if not was_training:
+        model.eval()
+
+
 def main() -> None:
     config = parse_args()
     if config.seed != 0:
@@ -1637,6 +1743,11 @@ def main() -> None:
     best_model_state: dict[str, torch.Tensor] | None = None
     best_anp_state: dict[str, torch.Tensor] | None = None
 
+    swa = ManualSWA(model) if config.swa_start_epoch > 0 and config.swa_collect_interval > 0 else None
+    swa_best_epoch: int | None = None
+    swa_best_val_primary_metric: float | None = None
+    swa_best_val_metrics: dict[str, float] = {}
+
     run = None
     if config.wandb_name:
         run_config = asdict(config)
@@ -1673,6 +1784,15 @@ def main() -> None:
             grad_accum_steps=config.grad_accum_steps,
         )
 
+        swa_collected_this_epoch = False
+        if (
+            swa is not None
+            and epoch >= config.swa_start_epoch
+            and (epoch - config.swa_start_epoch) % config.swa_collect_interval == 0
+        ):
+            swa.collect(model)
+            swa_collected_this_epoch = True
+
         if ema is not None:
             ema.store(model)
             ema.copy_to(model)
@@ -1707,7 +1827,35 @@ def main() -> None:
         if anp_head is not None and anp_ema is not None:
             anp_ema.restore(anp_head)
 
-        epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
+        swa_eval_metrics: dict[str, float] = {}
+        if swa is not None and swa.n_collected > 0 and swa_collected_this_epoch:
+            swa.store(model)
+            swa.copy_to(model)
+            _update_swa_bn(model, train_loader, transform, device, config)
+            swa_raw = evaluate_phase_metrics(
+                bundle=bundle,
+                config=config,
+                forward_model=forward_model,
+                anp_head=anp_head,
+                loaders=val_loaders,
+                transform=transform,
+                metric_transform=metric_transform,
+                device=device,
+                phase="val",
+            )
+            swa_eval_metrics = {f"swa_{key}": value for key, value in swa_raw.items()}
+            swa_primary = swa_raw.get(best_val_primary_metric_name)
+            if swa_primary is not None and (
+                swa_best_val_primary_metric is None or swa_primary < swa_best_val_primary_metric
+            ):
+                swa_best_epoch = epoch
+                swa_best_val_primary_metric = swa_primary
+                swa_best_val_metrics = dict(swa_raw)
+            swa.restore(model)
+
+        epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics, **swa_eval_metrics}
+        if swa is not None and swa.n_collected > 0:
+            epoch_metrics["swa/n_collected"] = float(swa.n_collected)
         history.append(epoch_metrics)
         if run is not None:
             wandb.log(epoch_metrics, step=epoch)
@@ -1806,6 +1954,33 @@ def main() -> None:
             )
             restore_module_state(model, terminal_model_state)
             restore_module_state(anp_head, terminal_anp_state)
+
+        if swa is not None and swa.n_collected > 0:
+            swa.store(model)
+            swa.copy_to(model)
+            _update_swa_bn(model, train_loader, transform, device, config)
+            swa_final_test = evaluate_phase_metrics(
+                bundle=bundle,
+                config=config,
+                forward_model=forward_model,
+                anp_head=anp_head,
+                loaders=test_loaders,
+                transform=transform,
+                metric_transform=metric_transform,
+                device=device,
+                phase="test",
+            )
+            swa_test_log = {f"swa_{key}": value for key, value in swa_final_test.items()}
+            if run is not None:
+                swa_summary: dict[str, float | int | None] = dict(swa_test_log)
+                swa_summary["swa_best_epoch"] = swa_best_epoch
+                swa_summary["swa_best_val_primary_metric"] = swa_best_val_primary_metric
+                swa_summary["swa_n_collected"] = swa.n_collected
+                swa_summary.update({f"swa_best_val/{key}": value for key, value in swa_best_val_metrics.items()})
+                wandb.log(swa_test_log, step=int(history[-1]["epoch"]) if history else 0)
+                run.summary.update(swa_summary)
+            print(json.dumps({"swa_final_test_metrics": swa_final_test}, sort_keys=True), flush=True)
+            swa.restore(model)
 
     output_dir = Path(config.output_dir)
     write_run_summary(
