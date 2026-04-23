@@ -1,5 +1,20 @@
 # SENPAI Research Results
 
+## 2026-04-24 08:30 — PR #3231: DM pressure gradient smoothness reg (emma) — CLOSED (dead end)
+
+- emma/dm-pressure-gradient-reg, W&B runs: lqgwricr (λ=0.01), e2rko1vh (λ=0.1), xcynbcli (λ=1.0), group: dm-pressure-grad-reg
+- Hypothesis: KNN-based smoothness penalty on surface pressure predictions encourages physically smooth predictions
+- λ=0.01: val=4.481% (+17%). λ=0.1: 4.876% (+27%). λ=1.0: 12.521% (+227%). All worse
+- **Two failures:** (1) KNN on 50k pts imposes ~30% throughput overhead, cutting epochs from 511 to ~355. At λ=0.01, degradation is mostly throughput-induced. (2) Car surfaces have legitimately sharp features that smoothness penalties destroy.
+- **Key insight from student:** remaining DM error is systematic bias, not high-freq noise. Smoothness priors are the wrong tool.
+
+## 2026-04-24 08:30 — PR #3196: TF EMA decay sweep 0.9999/0.99995 (zenitsu) — CLOSED (dead end)
+
+- zenitsu/tf-ema-decay-sweep, W&B runs: 8zpc9p92 (0.9999), ipgmi52n (0.99995), group: tf-ema-decay
+- EMA=0.9999: val=21.807 (+2.3% vs 21.319 baseline). EMA=0.99995: val=22.153 (+3.9%)
+- **Monotonic ordering confirmed: 0.999 > 0.9999 > 0.99995 for TF.** Matches AF finding — higher decay consistently harmful across both benchmarks.
+- TF is guardrail-only, no further EMA sweeps warranted.
+
 ## 2026-04-24 08:00 — PR #3236: AF Lookahead+compile ablation (gohan) — CLOSED (important finding)
 
 - gohan/af-lookahead-compile, W&B runs: dm5ykwmx (no features), bl5kty7w (Lookahead only), ejjf27ob (compile only)
