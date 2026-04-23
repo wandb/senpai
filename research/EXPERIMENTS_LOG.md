@@ -1,5 +1,9 @@
 # SENPAI Research Results
 
+## 2026-04-23 11:00 — PR #3127: DM attention heads 4H/16H (senku) — CLOSED
+
+- 4H: 11.02% ep54 (W&B: `v51k5hkn`). 16H: 13.83% ep77 (W&B: `yxldhqli`). Both with recurring gradient instability (no gc/EMA). 8H uniquely stable at 512d under old regime. 4H+EMA+gc assigned as #3165; 16H+EMA+gc in-flight as griffith #3160.
+
 ## 2026-04-23 10:30 — PR #3125: DM SWA at cosine troughs (faye) — CLOSED
 
 - Raw model best 14.30% ep89, SWA average degraded to 88.98% over 16 collections (W&B: `hgnyelv3`). Without gc/EMA, gradient explosions scatter weights across incompatible basins; SWA equal-weight averaging then poisons the average. EMA champion (#3072) subsumes SWA benefit via continuous averaging.
