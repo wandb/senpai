@@ -1,5 +1,9 @@
 # SENPAI Research Results
 
+## 2026-04-23 22:00 — PR #3171: DM LR warmup + EMA+gc (sanji) — CLOSED
+
+- 5-ep warmup: 11.325% ep31 then collapsed to 66.8% (W&B: `ulog3zq2`). 10-ep warmup: 3.918% ep496, plateaued (W&B: `5ltdja3j`) — 0.085pp worse than 3.833% baseline, no further descent trend (last 50 epochs mean 4.02%). Warmup is neutral-to-harmful when EMA+gc=0.5 already provides stability. Adding to dead ends.
+
 ## 2026-04-23 21:30 — PR #3168: TFP multi-seed variance (jin) — CLOSED — CRITICAL FINDING
 
 - Seed 42: field_mse=4.28e+26 (velocity OK, pressure diverged). Seed 123: Infinity from ep70. Seed 456: Infinity from ep200. Baseline (seed=0): 0.002383. **0/3 seeds reproduce the champion**. The TFP baseline is a SINGLE LUCKY SEED (seed=0/default), not a robust result. This redefines TFP as a stabilization problem — the pressure representation (asinh/sinh transforms) is extremely initialization-sensitive. Bug fix: primary_metric_key shadowing.
