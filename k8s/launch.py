@@ -6,8 +6,12 @@
 
 """Launch senpai advisor and student agents as K8s resources."""
 
+import base64
+import json
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -146,6 +150,64 @@ def render_advisor(template: str, tag: str, student_list: list[str], args: Args)
     return configmap + "\n---\n" + deployment
 
 
+def preflight_check_target_repo_access(target_repo_url: str) -> None:
+    """Verify senpai-secrets/github-token has push access to target_repo_url.
+
+    Catches the 403-on-push scenario before pods spin up: reads the token
+    from the current kubectl context and checks /repos/:slug permissions.push.
+    """
+    slug = target_repo_slug(target_repo_url)
+    context = subprocess.run(
+        ["kubectl", "config", "current-context"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    print(f"Preflight: checking senpai-secrets/github-token against {slug} on {context}")
+
+    res = subprocess.run(
+        ["kubectl", "get", "secret", "senpai-secrets",
+         "-o", "jsonpath={.data.github-token}"],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0 or not res.stdout.strip():
+        sys.exit(f"ERROR: senpai-secrets/github-token not found on context {context}: {res.stderr.strip()}")
+    token = base64.b64decode(res.stdout.strip()).decode().strip()
+
+    def gh_api(path: str) -> dict:
+        req = urllib.request.Request(
+            f"https://api.github.com{path}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "senpai-launch-preflight",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+
+    try:
+        repo = gh_api(f"/repos/{slug}")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        sys.exit(f"ERROR: GitHub API {e.code} for /repos/{slug}: {body}\n"
+                 f"  → senpai-secrets/github-token can't see {slug}. "
+                 f"Rotate the token or grant its user access to the repo.")
+
+    try:
+        user = gh_api("/user").get("login", "<unknown>")
+    except urllib.error.HTTPError:
+        user = "<unknown>"
+
+    perms = repo.get("permissions", {})
+    if not perms.get("push", False):
+        sys.exit(f"ERROR: senpai-secrets/github-token (authenticated as '{user}') cannot push to {slug}\n"
+                 f"  permissions: {perms}\n"
+                 f"  → advisor `git push` and student PRs will 403.\n"
+                 f"  Fix: rotate senpai-secrets/github-token to a PAT with write on {slug}, "
+                 f"or grant '{user}' collaborator write on {slug}.")
+
+    print(f"  OK — token (user '{user}') has push access to {slug}")
+
+
 def kubectl_apply(manifest: str, name: str):
     """Apply a manifest via kubectl."""
     print(f"Launching: {name}")
@@ -163,6 +225,9 @@ def kubectl_apply(manifest: str, name: str):
 
 def main():
     args = sp.parse(Args, config_path=str(SENPAI_CONFIG))
+
+    if not args.dry_run:
+        preflight_check_target_repo_access(args.target_repo_url)
 
     # Resolve student list
     if args.names:
