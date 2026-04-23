@@ -1,5 +1,17 @@
 # SENPAI Research Results
 
+## 2026-04-23 19:30 — PR #3142: TF gc=0.3 longer budget 480-min (zenitsu) — CLOSED
+
+- Best val=22.016 ep460 (W&B: `w0wlkumg`). Doesn't beat 21.350 baseline (#3140). Extra 120min budget provides no benefit — cosine T_max=10 cycling means more epochs are independent LR-cycle draws, not monotone descent. Three gc=0.3 runs span 0.7 MAE variance (21.909, 21.350, 22.016). gc=0.3 clips rarely (44 events/467 epochs, grad_norm_mean=0.1884) — functionally equivalent to gc=0.2. geom_camber_rc ~30.9 MAE remains persistent architectural bottleneck.
+
+## 2026-04-23 19:30 — PR #3115: DM bs=2 + 50k pts + EMA+gc (piccolo) — CLOSED
+
+- Phase 1 (bs=2/25k/fp16): val=4.323% (W&B: `l7np1pv0`), confounded by 13 gradient spikes from fp16 fallback. Phase 2 (bs=2/50k/fp32/EMA+gc): val=4.373% ep368 (W&B: `oohxhf86`). Both worse than 3.833% baseline. Blackwell bf16+bs>1 CUBLAS bug forces fp32, which only gets 37% of baseline optimizer steps within 6h timeout. The gradient-variance hypothesis cannot be fairly tested on this platform. Per-step efficiency signal weakly interesting (4.37% at 37% steps) but not actionable.
+
+## 2026-04-23 19:30 — PR #3079: DM 4L/640d (gojo) — CLOSED
+
+- Run 1: val=4.516% ep359 (W&B: `7uuhe2qr`), diverged ep360+. Run 2: 6.457% ep137 (W&B: `ho8eosr3`), crashed ep152. Run 3: 5.724% ep169 (W&B: `txttvm2n`), diverged ep244+. All 3 runs used lr=5e-4/T_max=30/no-EMA — student never applied instructed config (lr=3e-4/T_max=60/EMA) despite 2 send-backs. Combined with franky #3159 (640d+EMA → 8.636%), 640d is dead at any tested config. Width amplifies gradient magnitudes beyond gc=0.5 containment.
+
 ## 2026-04-23 18:30 — PR #3159: DM 4L/640d wider on EMA+gc champion (franky) — CLOSED
 
 - 640d: best val=8.636% ep81 (W&B: `yccjqzbi`), catastrophic divergence ep82 → 86% terminal. gc=0.5 clipped every batch but couldn't contain gradient explosion. grad_norm_mean=Infinity confirmed. EMA+gc delayed divergence vs prior 640d attempt (gojo #3079, ep28) but didn't prevent it. 640d at lr=5e-4 is fundamentally incompatible. Bug fix: primary_metric_key shadowing.
