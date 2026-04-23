@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-23 21:30 (advisor cycle 45 — closed #3168/#3154/#3083, assigning jin/brook/historia/jet)
+- **Date:** 2026-04-23 12:30 (advisor cycle 46 — updated per human directive #3174)
 - **Branch:** radford
 - **Idle students:** 0 (4 being assigned)
 - **PRs ready for review:** 0
@@ -111,27 +111,50 @@
 
 ## Current Research Focus
 
-### LATEST HUMAN DIRECTIVE — Issue #3174 Update (2026-04-23 11:08)
+### LATEST HUMAN DIRECTIVES — Issue #3174 (2026-04-23 11:08–11:48)
 
-1. **AirfRANS → "Finish the job"**: Surface is strong. ALL new AF work must focus on **volume error reduction only** (vol_mse < 0.0017), without regressing surface.
-2. **DrivAerML → Two-track strategy**:
-   - **Track 1:** Stable full-eval champion track (best-checkpoint test eval) — faye #3164
-   - **Track 2:** Innovation track for genuinely new physics-aware and ML ideas — NOT more Radford/Noam recipe tuning. Code ports from noam: attn temp annealing (vegeta #3203), GLU preprocess (senku #3202), DomainLayerNorm (jet #3201)
-3. **TandemFoil Paper → Stabilization-first**: Failure mode is NaN/inf, not underperformance. Short, cheap diagnostic experiments to find one finite reproducible recipe. brook #3200 mapping stability.
-4. **TandemFoil → Guardrail only**: Parity is healthy. Minimal compute sink.
+> "We are no longer in a broad discovery phase, and we should stop acting like every benchmark wants the same recipe."
+> — morganmcg1, 2026-04-23
 
-### Noam Feature Activation (still highest priority)
-- `--anp-srf` — ANP cross-attention decoder (-58.9% TF!) — TF/TFP only
-- `--asinh-pressure --asinh-scale 0.75` — asinh pressure norm — ALL datasets
-- `--residual-prediction` — learned correction to freestream — ALL datasets
-- Physics features: TF only (TFP pipeline bug: cp_panel/TE/vortex silently ignored)
-- `--re-stratified-sampling` — OOD Re robustness — TF/TFP/AF
+**Strategic posture by benchmark (BINDING):**
+
+#### AirfRANS — "Finish the Job" (Volume Closure Mode)
+- Surface is already strong. **ALL new AF experiments must target vol_mse < 0.0017 specifically.**
+- Surface error is a hard constraint: NO regressions accepted, even for large volume gains.
+- No more broad novelty sweeps. This lane is in finish-the-job mode.
+
+#### DrivAerML — Two-Track Approach
+- **Track 1 (Stable Champion):** Keep current best config alive with full best-checkpoint test eval. No shortcuts. No `--max-eval-batches` on paper-facing runs.
+- **Track 2 (Innovation):** Genuinely new physics-aware and ML ideas — NOT Radford/Noam recipe retuning. Search for benchmark-specific improvements. Code ports from noam: attn temp annealing (#3203), GLU preprocess (#3202), DomainLayerNorm (#3201). Look beyond: mesh-based operators, physics-informed losses, geometry encoders, domain-specific normalizations.
+- Bold ideas permitted and encouraged here. Local neighborhood exhausted.
+
+#### TandemFoil Paper — Stabilization First (CRISIS MODE)
+- **The failure mode is NaN/inf, not underperformance.** Optimize for finding ONE finite reproducible recipe, not performance.
+- Protocol: smoke test (1-3 epochs) → short debug (10-20 epochs) → long run ONLY after both are clean.
+- NaN/inf failures get closed immediately, no extensions.
+- brook #3200 reveals: base config (no physics) stable at 0.047; `cp_panel_prior_index()` is broken for TFP dataset — **champion may be unreproducible** with current code.
+- Next step: fix `cp_panel_prior_index()` bug, then re-run stable configs.
+
+#### TandemFoil — Guardrail Only
+- Parity is healthy. Minimal compute sink. Keep as sanity anchor, not a major compute investment.
+- No ambitious per-run experiments here.
+
+### Noam Feature Activation (context-dependent per benchmark)
+- `--anp-srf` — ANP cross-attention decoder (-58.9% TF!) — TF only (TFP stability-first)
+- `--asinh-pressure --asinh-scale 0.75` — asinh pressure norm — DM, AF (not TFP until stable)
+- `--residual-prediction` — learned correction to freestream — DM, AF
+- Physics features: TF only (TFP pipeline bug: cp_panel/TE/vortex corrupted)
+- `--re-stratified-sampling` — OOD Re robustness — TF/AF
 
 ### DM Innovation Track (code ports from noam)
 - Attention temperature annealing (-11% on noam) — vegeta #3203
 - GLU preprocess MLP — senku #3202
-- DomainLayerNorm — jet #3201
+- DomainLayerNorm — jet #3201 (merged; awaiting results)
 - Still needed: vol_loss_scale, PCGrad (for AF multi-objective)
+
+### Critical Known Bug
+- **`cp_panel_prior_index()` broken for tandemfoil_paper** (PR #3200): When `--enable-cp-panel` + `--enable-pressure-prior-addition` are both set, the function returns the wrong index (last Fourier feature, not cp_panel), corrupting all pressure predictions. Fix required before running any long TFP experiments with these flags.
+- **TFP champion (#3025, 0.002383) may be unreproducible** with current codebase — this is a CRITICAL issue to resolve.
 
 ## Key Dead Ends (Do Not Repeat)
 
