@@ -10,9 +10,9 @@ problem: target/
 repo_url: https://github.com/wandb/senpai.git
 repo_branch: main
 
-# problem-package repo (agent commits/PRs land here, not in senpai)
-# The entrypoint clones this into $PROBLEM_DIR and checks out advisor_branch.
-target_repo_url: https://github.com/morganmcg1/tandemfoil2.git
+# problem-package repo is REQUIRED and must be passed on the CLI
+#   python k8s/launch.py --tag <tag> --target_repo_url https://github.com/<org>/<repo>.git
+# The entrypoint clones it into $PROBLEM_DIR and checks out advisor_branch.
 
 # docker image
 image: ghcr.io/wandb/senpai:latest
