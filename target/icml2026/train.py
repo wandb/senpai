@@ -167,8 +167,21 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
+    gradnorm_alpha: float = 0.0
+    gradnorm_lr: float = 0.025
     save_checkpoint: bool = False
     seed: int = 0
+
+
+class GradNormState:
+    def __init__(self, w_surface_init: float, w_volume_init: float, alpha: float, lr: float, device: torch.device):
+        self.w_surface = torch.nn.Parameter(torch.tensor(w_surface_init, device=device))
+        self.w_volume = torch.nn.Parameter(torch.tensor(w_volume_init, device=device))
+        self.optimizer = torch.optim.Adam([self.w_surface, self.w_volume], lr=lr)
+        self.alpha = alpha
+        self.initial_weight_sum = w_surface_init + w_volume_init
+        self.L0_surface: float | None = None
+        self.L0_volume: float | None = None
 
 
 @dataclass
@@ -763,9 +776,12 @@ def loss_grouped(
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
     volume_loss_weight: float = 1.0,
-) -> tuple[torch.Tensor, dict[str, float]]:
+    return_separate: bool = False,
+) -> tuple[torch.Tensor, dict[str, float]] | tuple[torch.Tensor, dict[str, float], torch.Tensor | None, torch.Tensor | None]:
     total = torch.tensor(0.0, device=batch.surface_x.device)
     metrics: dict[str, float] = {}
+    surf_loss = None
+    vol_loss = None
     if batch.surface_y is not None and outputs["surface_preds"] is not None:
         target = transform.apply(batch.surface_y)
         surf_loss = F.mse_loss(outputs["surface_preds"][batch.surface_mask], target[batch.surface_mask])
@@ -777,6 +793,8 @@ def loss_grouped(
         total = total + vol_loss * volume_loss_weight
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
+    if return_separate:
+        return total, metrics, surf_loss, vol_loss
     return total, metrics
 
 
@@ -1254,6 +1272,59 @@ def evaluate_abupt(
     return {"surface_mae": total_surface / max(count_surface, 1), "volume_mae": total_volume / max(count_volume, 1)}
 
 
+def _gradnorm_step(
+    gn: GradNormState,
+    surf_loss: torch.Tensor,
+    vol_loss: torch.Tensor,
+    shared_params: list[torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Compute GradNorm weight update and return the weighted loss for the main backward."""
+    if gn.L0_surface is None:
+        gn.L0_surface = surf_loss.detach().item()
+        gn.L0_volume = vol_loss.detach().item()
+
+    w_surf_val = gn.w_surface.detach().clone()
+    w_vol_val = gn.w_volume.detach().clone()
+
+    g_surf = torch.autograd.grad(surf_loss, shared_params, retain_graph=True, allow_unused=True)
+    G_surf_raw = torch.norm(torch.cat([g.contiguous().flatten() for g in g_surf if g is not None]).float()).detach()
+
+    g_vol = torch.autograd.grad(vol_loss, shared_params, retain_graph=True, allow_unused=True)
+    G_vol_raw = torch.norm(torch.cat([g.contiguous().flatten() for g in g_vol if g is not None]).float()).detach()
+
+    G_surf = gn.w_surface * G_surf_raw
+    G_vol = gn.w_volume * G_vol_raw
+    G_avg = (G_surf + G_vol).detach() / 2.0
+
+    r_surf = surf_loss.detach().item() / max(gn.L0_surface, 1e-12)
+    r_vol = vol_loss.detach().item() / max(gn.L0_volume, 1e-12)
+    r_avg = (r_surf + r_vol) / 2.0
+
+    G_target_surf = (G_avg * (r_surf / max(r_avg, 1e-12)) ** gn.alpha).detach()
+    G_target_vol = (G_avg * (r_vol / max(r_avg, 1e-12)) ** gn.alpha).detach()
+
+    gradnorm_loss = torch.abs(G_surf - G_target_surf) + torch.abs(G_vol - G_target_vol)
+    gn.optimizer.zero_grad()
+    gradnorm_loss.backward()
+    gn.optimizer.step()
+
+    with torch.no_grad():
+        w_sum = gn.w_surface.data + gn.w_volume.data
+        gn.w_surface.data *= gn.initial_weight_sum / w_sum
+        gn.w_volume.data *= gn.initial_weight_sum / w_sum
+
+    loss = w_surf_val * surf_loss + w_vol_val * vol_loss
+
+    gn_metrics = {
+        "gradnorm/w_surface": gn.w_surface.item(),
+        "gradnorm/w_volume": gn.w_volume.item(),
+        "gradnorm/G_surface": G_surf.detach().item(),
+        "gradnorm/G_volume": G_vol.detach().item(),
+        "gradnorm/loss": gradnorm_loss.detach().item(),
+    }
+    return loss, gn_metrics
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     anp_head: ANPSurfaceDecoder | None,
@@ -1271,16 +1342,23 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    gradnorm_state: GradNormState | None = None,
+    raw_model: torch.nn.Module | None = None,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
         anp_head.train()
     running = {"loss": 0.0}
+    gn_running: dict[str, float] = {}
     steps = 0
     micro_batches_total = 0
     batches = loader if max_batches <= 0 else itertools.islice(loader, max_batches)
     batch_iter = iter(batches)
     exhausted = False
+
+    shared_params: list[torch.Tensor] | None = None
+    if gradnorm_state is not None and raw_model is not None:
+        shared_params = list(raw_model.backbone.blocks[-1].parameters())
 
     while not exhausted:
         optimizer.zero_grad(set_to_none=True)
@@ -1326,7 +1404,22 @@ def train_one_epoch(
                             volume_x=batch.volume_x,
                             volume_mask=batch.volume_mask,
                         )
-                        loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                        if gradnorm_state is not None and shared_params is not None:
+                            _, metrics, surf_loss, vol_loss = loss_grouped(
+                                batch, outputs, transform, volume_loss_weight=1.0, return_separate=True,
+                            )
+                        else:
+                            loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+
+                    if gradnorm_state is not None and shared_params is not None:
+                        if surf_loss is not None and vol_loss is not None:
+                            loss, gn_step_metrics = _gradnorm_step(
+                                gradnorm_state, surf_loss.float(), vol_loss.float(), shared_params,
+                            )
+                            for k, v in gn_step_metrics.items():
+                                gn_running[k] = gn_running.get(k, 0.0) + v
+                        else:
+                            loss = (surf_loss if surf_loss is not None else vol_loss) or torch.tensor(0.0, device=device)
 
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
@@ -1363,6 +1456,9 @@ def train_one_epoch(
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
         running["lr"] = float(optimizer.param_groups[0]["lr"])
+    if gn_running:
+        for k, v in gn_running.items():
+            running[k] = v / max(steps, 1)
     return running
 
 
@@ -1615,7 +1711,8 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
-    forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
+    use_compile = config.compile_model and device.type == "cuda" and config.gradnorm_alpha <= 0
+    forward_model = torch.compile(model) if use_compile else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
         anp_head = ANPSurfaceDecoder(
@@ -1632,6 +1729,16 @@ def main() -> None:
         base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
 
+    gradnorm_state: GradNormState | None = None
+    if config.gradnorm_alpha > 0:
+        gradnorm_state = GradNormState(
+            w_surface_init=1.0,
+            w_volume_init=config.volume_loss_weight if config.volume_loss_weight > 1.0 else 10.0,
+            alpha=config.gradnorm_alpha,
+            lr=config.gradnorm_lr,
+            device=device,
+        )
+
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
     history: list[dict[str, float]] = []
@@ -1643,9 +1750,9 @@ def main() -> None:
     best_anp_state: dict[str, torch.Tensor] | None = None
 
     if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
+        best_metric_key = "val_primary/surface_pressure_mae"
     else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
+        best_metric_key = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1688,6 +1795,8 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            gradnorm_state=gradnorm_state,
+            raw_model=model if gradnorm_state is not None else None,
         )
 
         if ema is not None:
@@ -1719,7 +1828,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(best_metric_key)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
@@ -1746,6 +1855,10 @@ def main() -> None:
             run.summary["best_epoch"] = best_epoch
             run.summary["best_val_metric"] = best_val_metric
         print(json.dumps(epoch_metrics, sort_keys=True), flush=True)
+
+    if gradnorm_state is not None and run is not None:
+        run.summary["final_w_surface"] = gradnorm_state.w_surface.item()
+        run.summary["final_w_volume"] = gradnorm_state.w_volume.item()
 
     if best_epoch is not None:
         print(
