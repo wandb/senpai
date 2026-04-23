@@ -167,6 +167,8 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
+    resume_checkpoint: str = ""
+    eval_only: bool = False
     seed: int = 0
 
 
@@ -1610,6 +1612,10 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
+    if config.resume_checkpoint:
+        state_dict = torch.load(config.resume_checkpoint, map_location=device, weights_only=True)
+        model.load_state_dict(state_dict)
+        print(json.dumps({"resumed_checkpoint": config.resume_checkpoint}), flush=True)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
@@ -1618,17 +1624,22 @@ def main() -> None:
             output_dim=bundle.spec.surface_output_dim,
         ).to(device)
 
-    params = list(model.parameters())
-    if anp_head is not None:
-        params.extend(list(anp_head.parameters()))
-    optimizer = build_optimizer(params, config)
-    scheduler = None
-    if config.cosine_t_max > 0:
-        base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
-
-    ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
-    anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
+    if config.eval_only:
+        ema = None
+        anp_ema = None
+        optimizer = None
+        scheduler = None
+    else:
+        params = list(model.parameters())
+        if anp_head is not None:
+            params.extend(list(anp_head.parameters()))
+        optimizer = build_optimizer(params, config)
+        scheduler = None
+        if config.cosine_t_max > 0:
+            base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
+        ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
+        anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
     history: list[dict[str, float]] = []
     best_epoch: int | None = None
     best_val_primary_metric_name = primary_metric_key(bundle, phase="val")
@@ -1637,10 +1648,6 @@ def main() -> None:
     best_model_state: dict[str, torch.Tensor] | None = None
     best_anp_state: dict[str, torch.Tensor] | None = None
 
-    if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
-    else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1664,7 +1671,13 @@ def main() -> None:
     start_time = time.monotonic()
     timeout_seconds = None if not timeout_env else float(timeout_env) * 60.0
 
-    for epoch in range(1, config.epochs + 1):
+    if config.eval_only:
+        best_model_state = snapshot_module_state(model)
+        best_anp_state = snapshot_module_state(anp_head)
+        best_epoch = 0
+        print(json.dumps({"eval_only": True, "checkpoint": config.resume_checkpoint}), flush=True)
+
+    for epoch in range(1, 0 if config.eval_only else config.epochs + 1):
         if timeout_seconds is not None and epoch > 1 and (time.monotonic() - start_time) >= timeout_seconds:
             break
         train_metrics = train_one_epoch(
@@ -1713,7 +1726,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(best_val_primary_metric_name)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
