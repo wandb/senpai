@@ -7,50 +7,51 @@
 
 ## Fleet Status (57 active PRs)
 
-### DrivAerML WIP (30 PRs)
-**Noam-pivot experiments (highest priority):**
-- `#3192` casca: asinh-pressure alone (scale=0.75/0.5 sweep) — NOAM ABLATION
-- `#3188` chihiro: 2H/16H heads sweep on champion — NOAM ABLATION
-- `#3181` himmel: asinh+residual on champion — NOAM ABLATION
-- `#3175` hinata: full noam stack on champion — NOAM ABLATION
+### DrivAerML WIP (27 PRs)
+**Innovation track (code ports — new directive):**
+- `#3203` vegeta: attention temperature annealing — INNOVATION
+- `#3202` senku: GLU preprocess MLP — INNOVATION
+- `#3201` jet: DomainLayerNorm — INNOVATION
 
-**Pre-pivot champion tuning:**
+**Noam-pivot experiments:**
+- `#3199` megumi: EMA=0.9999/0.99995 (noam optimal decay) — NOAM ABLATION
+- `#3192` casca: asinh-pressure alone (scale=0.75/0.5) — NOAM ABLATION
+- `#3193` franky: residual-prediction alone — NOAM ABLATION
+- `#3194` bulma: higher LR sweep (5.5e-4/6e-4)
+- `#3188` chihiro: 2H/16H heads sweep — NOAM ABLATION
+- `#3181` himmel: asinh+residual on champion — NOAM ABLATION
+- `#3175` hinata: full noam stack — NOAM ABLATION
+
+**Champion tuning / paper-facing:**
 - `#3173` kakashi: shorter cosine T_max=15/20
-- `#3171` sanji: LR warmup (5-ep/10-ep) on champion
-- `#3165` senku: 4H heads (128d/head)
-- `#3164` faye: paper-facing full eval (two-phase) — PAPER-FACING
+- `#3171` sanji: LR warmup (5-ep/10-ep)
+- `#3164` faye: paper-facing full eval (two-phase) — PAPER-FACING Track 1
 - `#3163` shouko: attn dropout=0.05
 - `#3161` spike: eta_min=1e-5 (cosine floor)
 - `#3160` griffith: 16H heads
-- `#3193` franky: DM residual-prediction alone — NOAM ABLATION
-- `#3194` bulma: DM higher LR sweep (5.5e-4/6e-4)
 - `#3155` nobara: longer T_max (45/60)
 - `#3154` historia: monotonic cosine (no restarts)
 - `#3152` eren: EMA decay sweep (0.999 vs 0.9995)
 - `#3146` taki: top-5 checkpoint averaging
 - `#3143` thorfinn: Lookahead(AdamW)
-- `#3198` gohan: TFP asinh-pressure isolation (scale=0.75/0.5) — NOAM ABLATION
 - `#3121` levi: dropout regularization sweep
-- `#3195` piccolo: AF re-stratified sampling alone — NOAM ABLATION
 - `#3110` einar: beta2=0.99/0.995
 - `#3109` guts: lr=4e-4 full-eval
-- `#3085` kohaku: larger supernodes (SENT BACK — retry+gc=1.0)
-- `#3197` gojo: TF residual-prediction alone — NOAM ABLATION
-- `#3076` frieren: log-cosh loss (SENT BACK — retry+gc=1.0)
-- `#3067` askeladd: 32k surface points (SENT BACK — add max-eval-batches 200)
-- `#3063` canute: paper-facing full-eval (SENT BACK — two-phase)
-- `#3046` sukuna: WD+gc compound (SENT BACK — WD=5e-4/1e-4+gc=1.0)
+- `#3085` kohaku: larger supernodes (SENT BACK)
+- `#3076` frieren: log-cosh loss (SENT BACK)
+- `#3067` askeladd: 32k surface points (SENT BACK)
+- `#3063` canute: paper-facing full-eval (SENT BACK)
+- `#3046` sukuna: WD+gc compound (SENT BACK)
 
-### TandemFoil WIP (6 PRs)
-**Noam-pivot experiments (highest priority):**
-- `#3189` emma: asinh+physics features (no ANP, no T_max) — NOAM ABLATION
-- `#3186` norman: T_max=150 alone (gc=0.3/0.5) — NOAM ABLATION
-- `#3185` fern: full noam stack (ANP+physics+T_max=150) — NOAM ABLATION
+### TandemFoil WIP (7 PRs) — GUARDRAIL ONLY per directive
+**Noam-pivot experiments:**
+- `#3197` gojo: residual-prediction alone — NOAM ABLATION
+- `#3196` zenitsu: EMA decay sweep (0.9999/0.99995) — NOAM ABLATION
+- `#3189` emma: asinh+physics features — NOAM ABLATION
+- `#3186` norman: T_max=150 alone — NOAM ABLATION
+- `#3185` fern: full noam stack — NOAM ABLATION
 - `#3180` chopper: ANP decoder alone — NOAM ABLATION
-
-**Other:**
-- `#3196` zenitsu: TF EMA decay sweep (0.9999/0.99995) — NOAM ABLATION
-- `#3150` yuji: clean test row gc=0.3 champion — PAPER-FACING
+- `#3150` yuji: clean test row — PAPER-FACING
 
 ### TandemFoil Paper WIP (10 PRs)
 **Noam-pivot experiments (highest priority):**
@@ -106,46 +107,27 @@
 
 ## Current Research Focus
 
-### STRATEGIC PIVOT — "Think Bigger" (Human directive, issue #3174)
+### LATEST HUMAN DIRECTIVE — Issue #3174 Update (2026-04-23 11:08)
 
-**Key finding:** The noam branch has ~100 merged PRs with winning techniques. Many are ALREADY PORTED to radford's train.py but UNUSED. We've been doing incremental HP sweeps when major architectural features were available all along.
+1. **AirfRANS → "Finish the job"**: Surface is strong. ALL new AF work must focus on **volume error reduction only** (vol_mse < 0.0017), without regressing surface.
+2. **DrivAerML → Two-track strategy**:
+   - **Track 1:** Stable full-eval champion track (best-checkpoint test eval) — faye #3164
+   - **Track 2:** Innovation track for genuinely new physics-aware and ML ideas — NOT more Radford/Noam recipe tuning. Code ports from noam: attn temp annealing (vegeta #3203), GLU preprocess (senku #3202), DomainLayerNorm (jet #3201)
+3. **TandemFoil Paper → Stabilization-first**: Failure mode is NaN/inf, not underperformance. Short, cheap diagnostic experiments to find one finite reproducible recipe. brook #3200 mapping stability.
+4. **TandemFoil → Guardrail only**: Parity is healthy. Minimal compute sink.
 
-**New priority:** Every new assignment should test noam-ported features or bold new approaches. No more incremental tweaks.
-
-### Available features NOT USED (ready in train.py)
+### Noam Feature Activation (still highest priority)
 - `--anp-srf` — ANP cross-attention decoder (-58.9% TF!) — TF/TFP only
-- `--asinh-pressure --asinh-scale 0.75` — asinh pressure norm (-8% ood) — ALL datasets
+- `--asinh-pressure --asinh-scale 0.75` — asinh pressure norm — ALL datasets
 - `--residual-prediction` — learned correction to freestream — ALL datasets
-- `--enable-cp-panel`, `--enable-te-coord-frame`, `--enable-wake-deficit`, `--enable-wake-angle`, `--enable-vortex-panel-velocity` — physics features — TF/TFP
+- Physics features: TF only (TFP pipeline bug: cp_panel/TE/vortex silently ignored)
 - `--re-stratified-sampling` — OOD Re robustness — TF/TFP/AF
-- `--compile-model` — throughput gain (more epochs in time budget) — ALL
-- 96 slices, 3 heads (at 192d), Lookahead — all defaults we haven't tested
 
-### Key config mismatches
-- TF/TFP T_max=10 vs noam optimal T_max=150 (15x longer!)
-- Radford 8 heads vs noam 3 heads (at 192d)
-- Missing: vol_loss_scale, PCGrad, temperature annealing, DomainLayerNorm (need code ports)
-
-### Benchmark Sprint Priorities (revised)
-
-1. **TandemFoil** — HIGHEST PRIORITY for noam feature activation
-   - ANP decoder alone was -58.9% on noam. With full stack: potentially 9-12 range vs our 21.909
-   - **Next assignments:** full noam stack, ANP alone, T_max=150 alone
-   - Paper-facing: yuji #3150 clean test
-
-2. **TandemFoil Paper** — Same noam features apply
-   - T_max=150 could break the "fully locked" constraint — it was locked at the WRONG config
-   - ANP + physics features could transform results
-   - **Next assignments:** full noam stack, ANP + T_max=150
-
-3. **DrivAerML** — val=3.833%, gap to AB-UPT only 0.013 pp
-   - **Applicable noam features:** asinh-pressure, residual-prediction, compile-model, 96 slices
-   - **Bold changes:** Lion optimizer (noam's final choice), higher EMA decay (0.9999)
-   - Existing champion platform still valid as base
-
-4. **AirfRANS volume** — 1.63x gap to target
-   - **Applicable noam features:** asinh-pressure, residual-prediction, re-stratified-sampling
-   - **Bold changes:** 96 slices, compile for throughput, vol_loss_scale (needs code port)
+### DM Innovation Track (code ports from noam)
+- Attention temperature annealing (-11% on noam) — vegeta #3203
+- GLU preprocess MLP — senku #3202
+- DomainLayerNorm — jet #3201
+- Still needed: vol_loss_scale, PCGrad (for AF multi-objective)
 
 ## Key Dead Ends (Do Not Repeat)
 
@@ -173,6 +155,7 @@
 - 4L/640d: dead at ALL tested configs — lr=5e-4+EMA+gc: 8.636% diverge ep82 (#3159); lr=5e-4 no-EMA: 4.516%/6.457%/5.724% all diverge (#3079). Width amplifies gradients beyond gc containment.
 - lr<5e-4 under EMA: steep monotonic cliff (4.5e-4=4.134%, 4e-4=5.924%)
 - bs=2: Blackwell bf16+bs>1 CUBLAS bug forces fp32, gets only 37% of optimizer steps. 4.373% at bs=2/fp32 vs 3.833% bs=1/bf16. Platform-blocked.
+- 4H heads with EMA+gc: 6.650% ep123, diverged ep133. DM heads: 8H optimal, 4H/16H both worse
 
 **TandemFoil Paper:**
 - T_max≠10 (all directions diverge)
@@ -188,8 +171,9 @@
 - 2L/384d and 3L/384d: catastrophic divergence
 - EMA<0.999 (0.99, 0.995 both worse)
 - T_max≠50 (30 and 100 both worse)
-- Vol-weight=10x: worse on both metrics
+- Vol-weight<10x (2x/5x/7x): all worse on both metrics. 10x+EMA=0.999 is AF sweet spot
 - Vol-weight=30x: catastrophic — surface 4.3x worse, vol 3.1x worse
+- LR>6e-4: 8e-4 +110% surface, 1e-3 catastrophic divergence
 
 **TandemFoil:**
 - gc≥0.5: monotonically worse than gc=0.3

@@ -1,5 +1,21 @@
 # SENPAI Research Results
 
+## 2026-04-23 21:00 — PR #3190: TFP physics features isolation (brook) — CLOSED
+
+- Trial 1 (all physics): val=Infinity — cp_panel_prior_index() wrong index for tandemfoil_paper (W&B: `0eq5jqij`). Trial 2 (wake only): val=0.7396, diverged (W&B: `kqknlctz`). CRITICAL: TFP pipeline only supports enable_fourier/wake_deficit/wake_angle — other physics flags silently ignored.
+
+## 2026-04-23 21:00 — PR #3167: AF higher LR 8e-4/1e-3 (gilbert) — CLOSED
+
+- lr=8e-4: surface +110%, vol +89% vs baseline (W&B: `dfed8vam`). lr=1e-3: catastrophic divergence (W&B: `tb2h5odt`). LR=6e-4 confirmed AF sweet spot.
+
+## 2026-04-23 21:00 — PR #3166: AF vol-weight=5x/7x (vegeta) — CLOSED
+
+- 5x: surface +46%, vol +52% (W&B: `dxna9k23`). 7x: surface +48%, vol +154%, diverged (W&B: `20nl7euu`). 10x+EMA=0.999 confirmed AF sweet spot.
+
+## 2026-04-23 21:00 — PR #3165: DM 4H heads EMA+gc (senku) — CLOSED
+
+- Best val=6.650% ep123, diverged ep133 (W&B: `o5mcbmp9`). 4H unstable at 4L/512d. DM heads: 8H champion > 4H > 16H.
+
 ## 2026-04-23 20:30 — PR #3134: AF vol-weight=30x (megumi) — CLOSED
 
 - Surface=0.001264 (4.3x worse than 0.000296 baseline), vol=0.006235 (3.1x worse than 0.002039 baseline) (W&B: `wupz6iuj`). 30x volume weighting massively overshoots — optimizer saturates on volume gradients and both metrics collapse. Model diverged post-ep400, terminal surface=0.621 vol=1.533. No Pareto improvement at any epoch. Sweet spot confirmed at 10x (#3135). Adding to dead ends: vol-weight≥30x catastrophic.
