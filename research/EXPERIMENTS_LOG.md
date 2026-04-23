@@ -1,5 +1,43 @@
 # SENPAI Research Results
 
+## 2026-04-23 05:30 — PR #3108: TandemFoil gc=0.3+EMA=0.999 (zenitsu) — MERGED ✓
+
+- **Branch:** zenitsu/tf-gc03-ema999
+- **Hypothesis:** Softer gc (0.3 vs 0.5) under EMA stability finds a deeper basin
+- **Results:**
+
+| Metric | gc=0.3 | gc=0.5 Baseline | Delta |
+|---|---|---|---|
+| val_primary/surface_pressure_mae | **21.909** ep334 | 22.537 ep336 | **-2.8% NEW BEST** |
+| test_primary/surface_pressure_mae | **23.419** | 24.581 | **-4.7%** |
+
+- **W&B run:** kzg626hf
+- **Decision:** MERGED — new TF champion (gc=0.3 continues the trend: 1.0→0.5→0.3 all improve)
+
+## 2026-04-23 05:30 — PR #3104: AF T_max=100 (vegeta) — CLOSED
+
+- surface_mse=0.000709 (+47% vs baseline). T_max sweep closed: T_max=50 is optimal on AF.
+
+## 2026-04-23 05:30 — PR #3103: AF T_max=30 (usopp) — CLOSED
+
+- surface_mse=0.000829 (+72% vs old baseline). Vol=0.004210 (-45% vs old, but +74% vs new post-#3050 baseline 0.002777).
+
+## 2026-04-23 05:30 — PR #3099: AF 3L/256d (spike) — CLOSED
+
+- surface=0.000663 (+38% vs old, +44% vs new). Vol=0.004851 (-36% old but +74% vs new 0.002777). Superseded by 2L+EMA (#3050) on both metrics.
+
+## 2026-04-23 05:30 — PR #3084: DM max-train-batches=788 (kakashi) — CLOSED
+
+- Best val 11.565% ep42 (+190%). Diverged catastrophically ep45 — T_max=30 halves effective cosine cycle with 2x batches, more frequent LR peak shocks without gc.
+
+## 2026-04-23 05:30 — PR #3079: DM 4L/640d+gc=0.5 (gojo) — SENT BACK
+
+- Best val 4.516% ep359, diverged ep436. Promising direction — WD+gc compound was the real crash culprit. Sent back with T_max=60 + lr=3e-4 instructions.
+
+## 2026-04-23 05:30 — PR #3069: DM 5-epoch warmup (chopper) — CLOSED
+
+- Best val 5.823% ep163 (+46%). Diverged ep523. Warmup doesn't prevent LR-peak divergence without gc.
+
 ## 2026-04-23 05:00 — PR #3050: AirfRANS EMA=0.999 at T_max=50 champion (stark) — MERGED ✓
 
 - **Branch:** stark/af-ema-champion
