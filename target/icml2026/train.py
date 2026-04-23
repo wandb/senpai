@@ -162,6 +162,8 @@ class TrainConfig:
     geometry_supernodes: int = 4_096
     surface_anchor_points: int = 8_000
     volume_anchor_points: int = 8_000
+    adamw_beta1: float = 0.9
+    adamw_beta2: float = 0.999
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
@@ -525,7 +527,7 @@ def build_optimizer(params, config: TrainConfig):
     if config.optimizer == "lion":
         optimizer = Lion(params, lr=config.lr, weight_decay=config.weight_decay)
     elif config.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(params, lr=config.lr, weight_decay=config.weight_decay)
+        optimizer = torch.optim.AdamW(params, lr=config.lr, weight_decay=config.weight_decay, betas=(config.adamw_beta1, config.adamw_beta2))
     else:
         raise ValueError(f"Unknown optimizer: {config.optimizer}")
     if config.use_lookahead:
