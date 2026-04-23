@@ -1,5 +1,21 @@
 # SENPAI Research Results
 
+## 2026-04-23 08:30 — PR #3148: DM 10-ep warmup + gc=1.0 (franky) — CLOSED
+
+- val=11.196% ep80, diverged ep87 (W&B: `rp02hbxl`). gc=1.0 insufficient to prevent cascade divergence with T_max=30 restarts. Grad norms→41.5M. 7.4pp worse than 3.833% baseline.
+
+## 2026-04-23 08:30 — PR #3117: DM Lion optimizer sweep (bulma) — CLOSED
+
+- lr=5e-5: 5.92% ep119 then diverged (W&B: `rxelzn84`). lr=1e-4: 6.36% then diverged (W&B: `a8mbflb1`). lr=5e-5+gc=0.5: 6.95% then diverged (W&B: `qmd1mp43`). All 54%+ worse. Lion's sign-based updates amplify DM gradient instabilities. Lion dead for DM.
+
+## 2026-04-23 08:30 — PR #3112: DM gradient centralization (edward) — CLOSED
+
+- val=5.492% ep181, diverged ep200 at cosine restart (grad norms 0.21→351,932). (W&B: `yblf2j7a`). GC removes gradient DC component making model fragile at LR restart boundaries. 43% worse pre-divergence. Explicit gradient modifications hurt DM.
+
+## 2026-04-23 08:30 — PR #3089: TFP T_max=30 (nami) — CLOSED
+
+- field_mse ~4.36e+23 all 536 epochs (W&B: `rfr8qkrc`). Pressure never converged even with sinh clamp fix. Confirms T_max>10 dead for TFP: T_max=15 diverged ep124, T_max=30 pressure never finite. Student found sinh clamp bug fix — noted but doesn't save T_max>10. T_max=10 confirmed sharp optimum.
+
 ## 2026-04-23 08:00 — PR #3122: DM polynomial LR decay (nobara) — CLOSED
 
 - Linear (power=1.0): 17.88% ep64, diverged ep69 (W&B: `i1qbv9t4`). Quadratic (power=2.0): 12.20% ep75, diverged ep91 (W&B: `kkuery47`). Both 3-4x worse. Key insight: cosine's periodic low-LR troughs are load-bearing for stability — polynomial keeps LR high without recovery windows. Polynomial LR dead for DM.
