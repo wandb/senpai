@@ -159,6 +159,7 @@ class TrainConfig:
     asinh_scale: float = 0.75
     residual_prediction: bool = False
     re_stratified_sampling: bool = False
+    warmup_epochs: int = 0
     cosine_t_max: int = 150
     geometry_points: int = 25_000
     geometry_supernodes: int = 4_096
@@ -1628,24 +1629,33 @@ def main() -> None:
         params.extend(list(anp_head.parameters()))
     optimizer = build_optimizer(params, config)
     scheduler = None
+    base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
     if config.cosine_t_max > 0:
-        base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
+        if config.warmup_epochs > 0:
+            steps_per_epoch = max(1, len(train_loader) // config.grad_accum_steps)
+            warmup_steps = config.warmup_epochs * steps_per_epoch
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(base_optimizer, start_factor=1e-6, total_iters=warmup_steps)
+            scheduler = torch.optim.lr_scheduler.SequentialLR(base_optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
+        else:
+            scheduler = cosine_scheduler
+    elif config.warmup_epochs > 0:
+        steps_per_epoch = max(1, len(train_loader) // config.grad_accum_steps)
+        warmup_steps = config.warmup_epochs * steps_per_epoch
+        scheduler = torch.optim.lr_scheduler.LinearLR(base_optimizer, start_factor=1e-6, total_iters=warmup_steps)
 
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
     history: list[dict[str, float]] = []
-    best_epoch: int | None = None
+
+    if bundle.spec.name == "tandemfoilset":
+        primary_metric_key_str = "val_primary/surface_pressure_mae"
+    else:
+        primary_metric_key_str = f"val_primary/{bundle.spec.default_metric}"
+
     best_val_primary_metric_name = primary_metric_key(bundle, phase="val")
     best_val_primary_metric: float | None = None
     best_val_metrics: dict[str, float] = {}
-    best_model_state: dict[str, torch.Tensor] | None = None
-    best_anp_state: dict[str, torch.Tensor] | None = None
-
-    if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
-    else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1719,7 +1729,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(primary_metric_key_str)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
