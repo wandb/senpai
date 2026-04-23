@@ -1,5 +1,21 @@
 # SENPAI Research Results
 
+## 2026-04-23 04:50 — PR #3090: TFP gc=0.3 at champion config (nezuko) — CLOSED
+
+- **Branch:** nezuko/tfp-gc-03
+- **Hypothesis:** Tighter gc (0.3 vs champion 0.5) delays divergence, allowing more productive training
+- **Results:**
+
+| Metric | gc=0.3 | gc=0.5 Baseline |
+|---|---|---|
+| val_primary/field_mse | **Infinity** (all 496 eps) | 0.002383 ep443 |
+| Divergence onset | ~ep155 | ep462 |
+| val/surface_mse_Ux | 0.329 (partial) | converged |
+
+- **W&B run:** 230pms51
+- **Analysis:** gc=0.3 clips too aggressively — prevents the large corrective updates the pressure head needs via sinh-domain inversion. Velocity channels show partial convergence, confirming failure is pressure-specific. gc=0.5 confirmed as SHARP OPTIMUM for TFP: gc=0.3 starves pressure learning, gc=0.7 (#3091) destabilizes. gc sweep FULLY CLOSED.
+- **Decision:** CLOSED — Infinity all epochs, pressure never finite
+
 ## 2026-04-23 04:20 — PR #3128: DrivAerML AdamW beta2 sweep (megumi) — CLOSED
 
 - **Branch:** megumi/dm-adamw-beta2-sweep
