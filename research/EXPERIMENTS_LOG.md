@@ -1,5 +1,17 @@
 # SENPAI Research Results
 
+## 2026-04-23 12:00 — PR #3151: DM EMA=0.9995 + gc sweep (gilbert) — CLOSED
+
+- gc=0.25: 13.1% — gradient starvation, underfitting (W&B: check PR comments). gc=1.0: 6.21% — insufficient dampening, partial divergence. gc=0.5 remains the sharp optimum for DM EMA regime. Combined with #3072 (gc=0.5=3.833%) and #3114 (T_max=50+gc variants both diverge), the gc=0.5 sweet spot is now triple-confirmed. No further gc sweeps warranted.
+
+## 2026-04-23 12:00 — PR #3141: DM 5L/512d + gc=1.0 (vegeta) — CLOSED
+
+- val=5.515% at best (W&B: check PR comments). 44% worse than 4L baseline (3.833%). Consistent with prior 5L result (#3104: 4.172% without EMA). 5L adds optimization surface complexity that destabilizes training even with gc. 4L confirmed as optimal depth for DM — both 5L and 6L dead.
+
+## 2026-04-23 12:00 — PR #2947: TFP LR sweep (jin) — CLOSED
+
+- Original LR sweep from early TFP exploration. Results superseded by champion config (Lion lr=1.25e-4, gc=0.5, EMA=0.999, T_max=10) which emerged from later experiments. LR=1.5e-4 was +34% worse. Closing as historical — student reassigned to paper-facing multi-seed variance check.
+
 ## 2026-04-23 11:00 — PR #3127: DM attention heads 4H/16H (senku) — CLOSED
 
 - 4H: 11.02% ep54 (W&B: `v51k5hkn`). 16H: 13.83% ep77 (W&B: `yxldhqli`). Both with recurring gradient instability (no gc/EMA). 8H uniquely stable at 512d under old regime. 4H+EMA+gc assigned as #3165; 16H+EMA+gc in-flight as griffith #3160.
