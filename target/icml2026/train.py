@@ -165,6 +165,7 @@ class TrainConfig:
     surface_anchor_points: int = 8_000
     volume_anchor_points: int = 8_000
     grad_clip: float = 0.0
+    warmup_epochs: int = 0
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
@@ -1625,7 +1626,16 @@ def main() -> None:
     scheduler = None
     if config.cosine_t_max > 0:
         base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
+        if config.warmup_epochs > 0:
+            batches_per_epoch = min(len(train_loader), config.max_train_batches) if config.max_train_batches > 0 else len(train_loader)
+            steps_per_epoch = max(batches_per_epoch // config.grad_accum_steps, 1)
+            warmup_steps = config.warmup_epochs * steps_per_epoch
+            warmup = torch.optim.lr_scheduler.LinearLR(base_optimizer, start_factor=1e-7, end_factor=1.0, total_iters=warmup_steps)
+            scheduler = torch.optim.lr_scheduler.SequentialLR(base_optimizer, [warmup, cosine], milestones=[warmup_steps])
+            print(f"[warmup] {config.warmup_epochs} epochs = {warmup_steps} steps linear warmup, then cosine T_max={config.cosine_t_max}")
+        else:
+            scheduler = cosine
 
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
