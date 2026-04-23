@@ -165,6 +165,7 @@ class TrainConfig:
     surface_anchor_points: int = 8_000
     volume_anchor_points: int = 8_000
     grad_clip: float = 0.0
+    agc_clip: float = 0.0
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
@@ -1250,6 +1251,20 @@ def evaluate_abupt(
     return {"surface_mae": total_surface / max(count_surface, 1), "volume_mae": total_volume / max(count_volume, 1)}
 
 
+def agc_clip_grads(params, clip_factor: float, eps: float = 1e-3) -> float:
+    total_norm_sq = 0.0
+    for p in params:
+        if p.grad is None:
+            continue
+        g_norm = p.grad.data.norm(2)
+        total_norm_sq += float(g_norm) ** 2
+        p_norm = p.data.norm(2).clamp(min=eps)
+        max_norm = p_norm * clip_factor
+        if g_norm > max_norm:
+            p.grad.data.mul_(max_norm / g_norm)
+    return total_norm_sq ** 0.5
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     anp_head: ANPSurfaceDecoder | None,
@@ -1265,6 +1280,7 @@ def train_one_epoch(
     amp_mode: str = "none",
     max_batches: int = 0,
     grad_clip: float = 0.0,
+    agc_clip: float = 0.0,
     grad_accum_steps: int = 1,
 ) -> dict[str, float]:
     model.train()
@@ -1333,12 +1349,18 @@ def train_one_epoch(
         all_params = list(model.parameters())
         if anp_head is not None:
             all_params += list(anp_head.parameters())
-        grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=grad_clip if grad_clip > 0 else float("inf"))
+        if agc_clip > 0:
+            grad_norm = agc_clip_grads(all_params, clip_factor=agc_clip)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=grad_clip if grad_clip > 0 else float("inf"))
         running.setdefault("grad_norm_mean", 0.0)
         running["grad_norm_mean"] += float(grad_norm)
         if grad_clip > 0 and float(grad_norm) > grad_clip:
             running.setdefault("grad_clip_events", 0.0)
             running["grad_clip_events"] += 1.0
+        if agc_clip > 0:
+            running.setdefault("agc_clip_events", 0.0)
+            running["agc_clip_events"] += 1.0
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
@@ -1637,10 +1659,6 @@ def main() -> None:
     best_model_state: dict[str, torch.Tensor] | None = None
     best_anp_state: dict[str, torch.Tensor] | None = None
 
-    if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
-    else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1681,6 +1699,7 @@ def main() -> None:
             amp_mode=config.amp_mode,
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
+            agc_clip=config.agc_clip,
             grad_accum_steps=config.grad_accum_steps,
         )
 
@@ -1713,7 +1732,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(best_val_primary_metric_name)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
