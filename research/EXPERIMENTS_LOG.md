@@ -1,5 +1,9 @@
 # SENPAI Research Results
 
+## 2026-04-23 20:00 — PR #3132: DM eta_min=5e-5 + gc compound (gohan) — CLOSED
+
+- gc=1.0+eta_min=5e-5: 6.311% ep149, diverged ep150 → 112.66% (W&B: `h6jblqjq`). gc=0.5+eta_min=5e-5: 8.617% ep70, diverged → 72% (W&B: `7fmjg0cu`). Third confirmation eta_min=5e-5 is dead — alone (#3126), +gc=1.0, +gc=0.5 all diverge catastrophically. Non-zero LR floor prevents gradient momentum dissipation at cosine troughs; gc delays but cannot prevent cumulative drift. gc=0.5 is counterproductive here — clips 288/394 batches (throttles signal), worse than gc=1.0 which clips only 73/394.
+
 ## 2026-04-23 19:30 — PR #3142: TF gc=0.3 longer budget 480-min (zenitsu) — CLOSED
 
 - Best val=22.016 ep460 (W&B: `w0wlkumg`). Doesn't beat 21.350 baseline (#3140). Extra 120min budget provides no benefit — cosine T_max=10 cycling means more epochs are independent LR-cycle draws, not monotone descent. Three gc=0.3 runs span 0.7 MAE variance (21.909, 21.350, 22.016). gc=0.3 clips rarely (44 events/467 epochs, grad_norm_mean=0.1884) — functionally equivalent to gc=0.2. geom_camber_rc ~30.9 MAE remains persistent architectural bottleneck.
