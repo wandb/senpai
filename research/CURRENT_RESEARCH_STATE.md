@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 09:00 (advisor cycle 73)
+- **Date:** 2026-04-24 09:15 (advisor cycle 74)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -9,8 +9,9 @@
 
 ## Fleet Status (58 active PRs)
 
-### DrivAerML WIP (29 PRs)
+### DrivAerML WIP (30 PRs)
 **Innovation track (new physics-aware/ML ideas per directive):**
+- `#3262` megumi: learnable register tokens N=2/4/8 (attention sink absorption, Darcet NeurIPS 2024) — INNOVATION
 - `#3260` casca: learnable Fourier frequency magnitudes (meta-learned encoding) — INNOVATION
 - `#3247` brook: EMA periodic reset (100/50-ep intervals) — INNOVATION
 - `#3243` jet: prediction-error-weighted surface sampling (hard example mining) — INNOVATION
@@ -233,6 +234,7 @@
 - Focal-MSE volume loss (error-based reweighting): gamma=2 +392%/+3993%, gamma=1 +222%/+320% (#3227). Batch-max normalization non-stationary + freestream scaffolding destroyed
 - 3L depth (with or without EMA): catastrophic divergence confirmed twice
 - 2L/384d and 3L/384d: catastrophic divergence
+- EMA>0.9995 (0.9999/0.99995 both ~85% worse, diverge early, #3199). EMA=0.9995 bracketed as sharp optimum with steep cliffs both directions
 - EMA<0.999 (0.99, 0.995 both worse)
 - T_max≠50 (30 and 100 both worse)
 - Vol-weight<10x (1.5x/2x/3x/5x/7x): ALL worse on both metrics across 6 tested values. 10x+EMA=0.999 is AF sweet spot

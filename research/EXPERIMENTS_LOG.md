@@ -1,5 +1,19 @@
 # SENPAI Research Results
 
+## 2026-04-24 09:15 — PR #3199: DM EMA=0.9999/0.99995 upward sweep (megumi) — CLOSED (dead end)
+
+- megumi/dm-ema-0.9999, W&B runs: c168t4dq (EMA=0.9999), 26n0lcmg (EMA=0.99995)
+- Hypothesis: higher EMA decay (slower shadow update) might find a deeper basin by reducing noise in the EMA weights
+
+| Trial | EMA | best val_pct | vs baseline | Diverged |
+|-------|-----|-------------|-------------|---------|
+| T1 | 0.9999 | 7.106% | +85% | NaN ep~171 |
+| T2 | 0.99995 | 7.095% | +85% | Collapse ep~120, plateau 83.56% |
+
+- **Mechanism:** Both values cause EMA shadow weights to lag too far behind the online model. Cosine LR peaks (T_max=30) produce gradient spikes that gc=0.5 can't contain when the gap between online and shadow is too large. Both floor at ~7.1% then diverge.
+- **Combined with #3152 (eren, EMA=0.999 sweep downward):** EMA=0.9995 is now bracketed as a sharp optimum — steep cliff in both directions. Not a broad plateau.
+- **Conclusion: EMA=0.9995 is the definitive DM optimum.** Dead end.
+
 ## 2026-04-24 09:00 — PR #3232: AF vol-weight warm-up schedule (nezuko) — CLOSED (dead end)
 
 - nezuko/af-vol-warmup, W&B runs: 9tc2udwf (200ep ramp), gp149j2g (100ep ramp), o8ifqyac (50ep ramp), group: af-vol-warmup
