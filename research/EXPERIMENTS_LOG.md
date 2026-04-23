@@ -1,5 +1,9 @@
 # SENPAI Research Results
 
+## 2026-04-23 13:30 — PR #3068: DM 64k surface points (brook) — SENT BACK
+
+- Original run (no fix): 12.10% ep55, timeout (W&B: `ekrddnwe`). Retry no-gc: 16.91% ep30, diverged (W&B: `7gg7iqw8`). Retry gc=1.0: **5.26% ep236**, terminal diverge ep277 (W&B: `7uvkow6r`). All runs WITHOUT EMA — unfair comparison to 3.833% champion. gc=1.0 insufficient (diverged); need gc=0.5+EMA=0.9995. Sent back for re-run on champion platform. 64k direction not dead — 28% more surface coverage per sample may still improve quality.
+
 ## 2026-04-23 13:00 — PR #3131: DM OneCycleLR schedule (sanji) — CLOSED
 
 - max_lr=5e-4: 8.040% ep~190 then diverged to 51.4% (W&B: `ed60ojeo`). max_lr=1e-3: 8.041% ep~125 then diverged to 65.5%/NaN (W&B: `24r056y4`). Both WITHOUT EMA+gc (old regime). OneCycleLR's sustained high-LR warmup more damaging than cosine peaks — no periodic recovery troughs. 2x worse than old 3.997% baseline. Confirms cosine troughs are load-bearing for DM stability.
