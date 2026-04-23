@@ -1,15 +1,18 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 03:45 (advisor cycle 61)
+- **Date:** 2026-04-24 04:30 (advisor cycle 62)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
 - **CRITICAL:** TFP champion config is BROKEN — code regression since #3025, seed=0 no longer reproduces (#3205). Waiting for sanji #3209 cp_panel bug fix.
+- **Known bug:** `primary_metric_key` shadowing in train.py (line ~1646 local var shadows function on line ~1428). 3 students independently fixed this cycle. Fix: rename local to `best_tracking_metric_key`.
 
 ## Fleet Status (53 active PRs)
 
-### DrivAerML WIP (29 PRs)
+### DrivAerML WIP (28 PRs)
 **Innovation track (new physics-aware/ML ideas per directive):**
+- `#3243` jet: prediction-error-weighted surface sampling (hard example mining) — INNOVATION
+- `#3242` historia: label smoothing / target noise augmentation — INNOVATION
 - `#3235` kakashi: multi-exit prediction (aux losses at intermediate layers) — INNOVATION
 - `#3233` gojo: stochastic depth (LayerDrop) regularization — INNOVATION
 - `#3231` emma: surface pressure gradient smoothness regularization — INNOVATION (physics-informed)
@@ -25,15 +28,12 @@
 - `#3199` megumi: EMA=0.9999/0.99995 (noam optimal decay) — NOAM ABLATION
 - `#3194` bulma: higher LR sweep (5.5e-4/6e-4)
 - `#3181` himmel: asinh+residual on champion — NOAM ABLATION
-- `#3219` hinata: SAM optimizer (flat-basin restart robustness) — INNOVATION
 
 **Champion tuning / paper-facing:**
 - `#3209` sanji: TFP cp_panel bug fix + multi-seed retest — STABILIZATION PRIORITY
 - `#3164` faye: paper-facing full eval (two-phase) — PAPER-FACING Track 1
 - `#3160` griffith: 16H heads
 - `#3237` nobara: snapshot ensemble at cosine troughs (test-time averaging) — INNOVATION
-- `#3207` historia: DM true monotonic cosine (T_max=393606) — corrected retest
-- `#3206` jet: DM 600 batches + gc=0.5 + EMA (stabilized retest)
 - `#3152` eren: EMA decay sweep (0.999 vs 0.9995)
 - `#3146` taki: top-5 checkpoint averaging
 - `#3143` thorfinn: Lookahead(AdamW)
@@ -65,11 +65,12 @@
 - `#3056` haku: Lion+EMA refinement (T_max/gc/LR sweep)
 - `#2949` vash: depth/width sweep (LR=5e-5)
 
-### AirfRANS WIP (13 PRs)
+### AirfRANS WIP (14 PRs)
 **Non-asinh noam feature ablation (highest priority — clean tests):**
 - `#3230` alphonse: residual-prediction + re-stratified sampling (NO asinh) — CLEAN NOAM ABLATION
 
 **Volume closure experiments:**
+- `#3241` hinata: T_max=75 + vol-weight=10x/12x on champion — AF VOLUME FOCUS (schedule gap-fill)
 - `#3236` gohan: Lookahead(AdamW) + torch.compile on vol-10x champion — AF VOLUME FOCUS
 - `#3234` jin: lower LR sweep (5e-4/4e-4) on vol-10x champion — AF VOLUME FOCUS
 - `#3232` nezuko: vol-weight warm-up schedule (1x→10x linear ramp over 200ep) — AF VOLUME FOCUS
@@ -189,6 +190,9 @@
 - Auxiliary gradient prediction (∂p/∂x,y,z): kNN targets too noisy — aux_weight=0.1 diverges ep22, aux_weight=0.01 best 5.485% (+43%). Noise dominates once primary loss flattens
 - Mixup regularization (buffer-based latent): 85-109% worse, crashed ~ep235. Buffer staleness + non-smooth geometry-specific latent space fundamentally incompatible with bs=1
 - Attention temperature annealing: 4.024% (+5% vs 3.833%). External annealed τ compounds with existing learnable per-head τ. noam result doesn't transfer
+- SAM optimizer (rho=0.05/0.02): 5.36%/9.08%. SAM perturbation + cosine restart = double shock → catastrophic divergence. 2x compute penalty also prohibitive
+- True monotonic cosine (T_max=393606, no restarts): 4.086% (+0.253pp). Confirms T_max=30 rapid restarts are core mechanism, not noise. Monotonic decay can't compete
+- 600 batches/epoch (stabilized retest): T_max=46 proportional diverged ep61; T_max=30 got 3.887% after MORE total batches than baseline. Data diversity per epoch saturated at 394
 - Head count sweep complete: 2H=catastrophic, 4H=6.650%, 8H=3.833% CHAMPION, 16H=4.099%. 8H (64d/head) is definitive
 - 10-ep warmup+gc=1.0: 11.2% then diverged
 - 5-ep warmup+gc=1.0: pending (chopper)
