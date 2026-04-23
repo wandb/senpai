@@ -110,17 +110,27 @@ n_students: 4
 
 `launch.py` reads this via `simple_parsing` — every field can be overridden on the CLI.
 
-> **Target-repo permissions.** The `GITHUB_TOKEN` injected into the pods (from the `senpai-secrets` k8s secret) must be able to **clone** `target_repo_url` and **push branches + open/merge PRs** against it. If the token's user isn't an owner of `target_repo_url`, give that user write access on the target repo — otherwise the entrypoint's clone, the student's `git push`, and `gh pr create` will all fail. Same applies to the `CLAUDE_CODE_OAUTH_TOKEN` user if you rely on `gh auth status` inside the pod.
+### GitHub token (per-launch)
 
-### API Key
+`launch.py` resolves your GitHub token at launch time and materialises it as an ephemeral, per-tag k8s Secret (`senpai-github-token-<tag>`) that the pods reference for `GITHUB_TOKEN`. Resolution order:
 
-Due to the high cost of running CC with ANTHROPIC_API_KEY, instead use CLAUDE_CODE_OAUTH_TOKEN. Create this token as follows:
+1. `$GITHUB_TOKEN` in your shell env (shell or [`direnv`](https://direnv.net/) wins).
+2. `.env` at the senpai repo root (`GITHUB_TOKEN=ghp_...`). Not committed; don't paste into a shared file.
+3. `gh auth token` — works out-of-the-box if you're already logged into the `gh` CLI.
+
+If none resolves, `launch.py` exits with instructions. The launch-scoped Secret is labelled with your research tag and is cleaned up by `kubectl delete deployments,configmaps,secrets -l research-tag=<tag>` (see [Running](#running)).
+
+> **Target-repo permissions.** The token you supply must be able to **clone** `target_repo_url` and **push branches + open/merge PRs** against it. `launch.py` preflights this against the GitHub API before spinning up pods and fails loudly if `permissions.push` is false. Same applies to the `CLAUDE_CODE_OAUTH_TOKEN` user (still in `senpai-secrets`) if you rely on `gh auth status` inside the pod.
+
+### Claude Code OAuth token
+
+Due to the high cost of running CC with `ANTHROPIC_API_KEY`, use `CLAUDE_CODE_OAUTH_TOKEN` instead. Create it with:
 
 ```
 claude setup-token
 ```
 
-and push the key to the k8s secrets.
+and push the key into the shared `senpai-secrets` k8s Secret. Unlike the GitHub token, this one is cluster-wide and not per-launch.
 
 ## Running
 
@@ -142,6 +152,9 @@ python k8s/launch.py --tag <research-tag> --n_students 7 --dry_run
 
 # Pass extra instructions to the advisor
 python k8s/launch.py --tag <research-tag> --advisor --extra_instructions "Only consider optimizer changes."
+
+# Stop a launch (tears down deployments, configmaps, and the per-tag token Secret)
+kubectl delete deployments,configmaps,secrets -l research-tag=<research-tag>
 ```
 
 ## Adding a new problem

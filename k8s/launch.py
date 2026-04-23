@@ -8,6 +8,7 @@
 
 import base64
 import json
+import os
 import subprocess
 import sys
 import urllib.error
@@ -86,7 +87,7 @@ def target_repo_slug(url: str) -> str:
     return slug
 
 
-def render_student(template: str, student_name: str, tag: str, args: Args) -> str:
+def render_student(template: str, student_name: str, tag: str, secret_name: str, args: Args) -> str:
     configmap = render_configmap(
         name=f"senpai-config-student-{student_name}",
         labels={"app": "senpai", "role": "student", "research-tag": tag},
@@ -114,12 +115,12 @@ def render_student(template: str, student_name: str, tag: str, args: Args) -> st
         "ADVISOR_BRANCH": args.advisor_branch,
         "PVC_CLAIM_NAME": args.pvc_claim_name,
         "PVC_MOUNT_PATH": args.pvc_mount_path,
+        "GITHUB_TOKEN_SECRET_NAME": secret_name,
     })
     return configmap + "\n---\n" + deployment
 
 
-def render_advisor(template: str, tag: str, student_list: list[str], args: Args) -> str:
-    import base64
+def render_advisor(template: str, tag: str, student_list: list[str], secret_name: str, args: Args) -> str:
     data = {
         "REPO_URL": args.repo_url,
         "REPO_BRANCH": args.repo_branch,
@@ -146,31 +147,67 @@ def render_advisor(template: str, tag: str, student_list: list[str], args: Args)
         "RESEARCH_TAG": tag,
         "PVC_CLAIM_NAME": args.pvc_claim_name,
         "PVC_MOUNT_PATH": args.pvc_mount_path,
+        "GITHUB_TOKEN_SECRET_NAME": secret_name,
     })
     return configmap + "\n---\n" + deployment
 
 
-def preflight_check_target_repo_access(target_repo_url: str) -> None:
-    """Verify senpai-secrets/github-token has push access to target_repo_url.
+def _load_dotenv(path: Path) -> None:
+    """Read KEY=VAL lines from path into os.environ (doesn't override existing)."""
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        v = v.strip().strip('"').strip("'")
+        os.environ.setdefault(k.strip(), v)
 
-    Catches the 403-on-push scenario before pods spin up: reads the token
-    from the current kubectl context and checks /repos/:slug permissions.push.
+
+def resolve_github_token() -> str:
+    """Resolve the GitHub token: $GITHUB_TOKEN → .env → `gh auth token` → hard error."""
+    # Treat empty $GITHUB_TOKEN as unset so .env fallback still kicks in.
+    if not os.environ.get("GITHUB_TOKEN", "").strip():
+        os.environ.pop("GITHUB_TOKEN", None)
+    _load_dotenv(Path(__file__).parent.parent / ".env")
+    tok = os.environ.get("GITHUB_TOKEN", "").strip()
+    if tok:
+        return tok
+    try:
+        res = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True)
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    except FileNotFoundError:
+        pass
+    sys.exit("ERROR: no github token. Set $GITHUB_TOKEN in your shell, add it to .env "
+             "at the senpai repo root, or run `gh auth login`.")
+
+
+def render_token_secret(tag: str, token: str) -> str:
+    """Per-launch k8s Secret holding only the github-token key."""
+    enc = base64.b64encode(token.encode()).decode()
+    return (
+        "apiVersion: v1\n"
+        "kind: Secret\n"
+        "metadata:\n"
+        f"  name: senpai-github-token-{tag}\n"
+        "  labels:\n"
+        "    app: senpai\n"
+        f"    research-tag: {tag}\n"
+        "type: Opaque\n"
+        "data:\n"
+        f"  github-token: {enc}\n"
+    )
+
+
+def preflight_check_target_repo_access(target_repo_url: str, token: str) -> None:
+    """Verify the supplied github token has push access to target_repo_url.
+
+    Catches the 403-on-push scenario before pods spin up.
     """
     slug = target_repo_slug(target_repo_url)
-    context = subprocess.run(
-        ["kubectl", "config", "current-context"],
-        capture_output=True, text=True, check=True,
-    ).stdout.strip()
-    print(f"Preflight: checking senpai-secrets/github-token against {slug} on {context}")
-
-    res = subprocess.run(
-        ["kubectl", "get", "secret", "senpai-secrets",
-         "-o", "jsonpath={.data.github-token}"],
-        capture_output=True, text=True,
-    )
-    if res.returncode != 0 or not res.stdout.strip():
-        sys.exit(f"ERROR: senpai-secrets/github-token not found on context {context}: {res.stderr.strip()}")
-    token = base64.b64decode(res.stdout.strip()).decode().strip()
+    print(f"Preflight: checking github token against {slug}")
 
     def gh_api(path: str) -> dict:
         req = urllib.request.Request(
@@ -189,9 +226,9 @@ def preflight_check_target_repo_access(target_repo_url: str) -> None:
         return
 
     user = gh_api("/user").get("login", "<unknown>")
-    sys.exit(f"ERROR: senpai-secrets/github-token (user '{user}') cannot push to {slug}\n"
+    sys.exit(f"ERROR: github token (user '{user}') cannot push to {slug}\n"
              f"  permissions: {perms}\n"
-             f"  Fix: rotate senpai-secrets/github-token to a PAT with write on {slug}, "
+             f"  Fix: supply a token with write on {slug} via $GITHUB_TOKEN / .env / gh auth, "
              f"or grant '{user}' collaborator write on {slug}.")
 
 
@@ -212,9 +249,10 @@ def kubectl_apply(manifest: str, name: str):
 
 def main():
     args = sp.parse(Args, config_path=str(SENPAI_CONFIG))
+    token = resolve_github_token()
 
     if not args.dry_run:
-        preflight_check_target_repo_access(args.target_repo_url)
+        preflight_check_target_repo_access(args.target_repo_url, token)
 
     # Resolve student list
     if args.names:
@@ -227,10 +265,19 @@ def main():
 
     student_template = STUDENT_TEMPLATE.read_text()
     advisor_template = ADVISOR_TEMPLATE.read_text()
+    secret_name = f"senpai-github-token-{args.tag}"
+
+    # --- Apply per-launch token secret first (pods reference it on startup) ---
+    if args.dry_run:
+        print(f"--- Secret: {secret_name} ---")
+        print(render_token_secret(args.tag, "<REDACTED>"))
+        print()
+    else:
+        kubectl_apply(render_token_secret(args.tag, token), f"secret {secret_name}")
 
     # --- Deploy students ---
     for name in student_list:
-        manifest = render_student(student_template, name, args.tag, args)
+        manifest = render_student(student_template, name, args.tag, secret_name, args)
         if args.dry_run:
             print(f"--- Student: {name} ---")
             print(manifest)
@@ -240,7 +287,7 @@ def main():
 
     # --- Deploy advisor ---
     if args.advisor:
-        manifest = render_advisor(advisor_template, args.tag, student_list, args)
+        manifest = render_advisor(advisor_template, args.tag, student_list, secret_name, args)
         if args.dry_run:
             print("--- Advisor ---")
             print(manifest)
@@ -258,7 +305,7 @@ def main():
         if student_list:
             print(f"  kubectl logs -f deployment/senpai-{student_list[0]}")
         print(f"\nStop:")
-        print(f"  kubectl delete deployments,configmaps -l research-tag={args.tag}")
+        print(f"  kubectl delete deployments,configmaps,secrets -l research-tag={args.tag}")
 
 
 if __name__ == "__main__":
