@@ -1,5 +1,21 @@
 # SENPAI Research Results
 
+## 2026-04-23 21:00 — PR #3190: TFP physics features isolation (brook) — CLOSED
+
+- Trial 1 (all physics): val=Infinity — cp_panel_prior_index() returns wrong index for tandemfoil_paper, applies sinh(Fourier_value) → overflow. Ux/Uy learn normally but pressure permanently broken (W&B: `0eq5jqij`). Trial 2 (wake only): val=0.7396 ep98, diverged via unbounded dx_norm/dy_norm (W&B: `kqknlctz`). CRITICAL FINDING: build_tandemfoil_paper_bundle only supports enable_fourier/wake_deficit/wake_angle — TE coord, cp_panel, vortex flags silently ignored. primary_metric_key bug fix noted.
+
+## 2026-04-23 21:00 — PR #3167: AF higher LR 8e-4/1e-3 (gilbert) — CLOSED
+
+- lr=8e-4: surface=0.000623 (+110%), vol=0.003850 (+89%) vs baseline (W&B: `dfed8vam`). lr=1e-3: catastrophic divergence, surface=0.000979 best → 0.621 terminal (W&B: `tb2h5odt`). 8H vs champion's 4H confound noted. LR=6e-4 confirmed AF sweet spot — boundary between stable/unstable is 6e-4 to 8e-4.
+
+## 2026-04-23 21:00 — PR #3166: AF vol-weight=5x/7x (vegeta) — CLOSED
+
+- 5x: surface=0.000432 (+46%), vol=0.003094 (+52%) (W&B: `dxna9k23`). 7x: surface=0.000438 (+48%), vol=0.005187 (+154%), diverged ep322 (W&B: `20nl7euu`). Both used 8H (wrong, champion is 4H). vol-weight sweep complete: 2x/5x/7x all worse, 10x+EMA=0.999 champion, 30x catastrophic.
+
+## 2026-04-23 21:00 — PR #3165: DM 4H heads EMA+gc (senku) — CLOSED
+
+- Best val=6.650% ep123, then diverged ep133 via gradient explosion (grad_norm→22.73) despite gc=0.5 (W&B: `o5mcbmp9`). EMA+gc delayed divergence (ep123 vs ep28 for gojo #3079) but 4H fundamentally unstable at 4L/512d. DM heads sweep complete: 8H champion > 4H (crashed) > 16H.
+
 ## 2026-04-23 20:30 — PR #3134: AF vol-weight=30x (megumi) — CLOSED
 
 - Surface=0.001264 (4.3x worse than 0.000296 baseline), vol=0.006235 (3.1x worse than 0.002039 baseline) (W&B: `wupz6iuj`). 30x volume weighting massively overshoots — optimizer saturates on volume gradients and both metrics collapse. Model diverged post-ep400, terminal surface=0.621 vol=1.533. No Pareto improvement at any epoch. Sweet spot confirmed at 10x (#3135). Adding to dead ends: vol-weight≥30x catastrophic.
