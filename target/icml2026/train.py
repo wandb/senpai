@@ -160,6 +160,8 @@ class TrainConfig:
     residual_prediction: bool = False
     re_stratified_sampling: bool = False
     cosine_t_max: int = 150
+    lr_schedule: str = "cosine"
+    lr_poly_power: float = 1.0
     geometry_points: int = 25_000
     geometry_supernodes: int = 4_096
     surface_anchor_points: int = 8_000
@@ -1623,8 +1625,10 @@ def main() -> None:
         params.extend(list(anp_head.parameters()))
     optimizer = build_optimizer(params, config)
     scheduler = None
-    if config.cosine_t_max > 0:
-        base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
+    base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
+    if config.lr_schedule == "polynomial":
+        scheduler = torch.optim.lr_scheduler.PolynomialLR(base_optimizer, total_iters=config.epochs, power=config.lr_poly_power)
+    elif config.cosine_t_max > 0:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
 
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
@@ -1656,12 +1660,13 @@ def main() -> None:
     for epoch in range(1, config.epochs + 1):
         if timeout_seconds is not None and epoch > 1 and (time.monotonic() - start_time) >= timeout_seconds:
             break
+        batch_scheduler = scheduler if config.lr_schedule != "polynomial" else None
         train_metrics = train_one_epoch(
             model=forward_model,
             anp_head=anp_head,
             loader=train_loader,
             optimizer=optimizer,
-            scheduler=scheduler,
+            scheduler=batch_scheduler,
             ema=ema,
             anp_ema=anp_ema,
             transform=transform,
@@ -1672,6 +1677,11 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
         )
+
+        if config.lr_schedule == "polynomial" and scheduler is not None:
+            scheduler.step()
+            base_opt = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
+            train_metrics["lr"] = float(base_opt.param_groups[0]["lr"])
 
         if ema is not None:
             ema.store(model)
