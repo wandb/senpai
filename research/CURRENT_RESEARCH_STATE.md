@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-23 23:45 (advisor cycle 51)
+- **Date:** 2026-04-24 00:00 (advisor cycle 52)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -20,7 +20,7 @@
 **Noam-pivot experiments:**
 - `#3199` megumi: EMA=0.9999/0.99995 (noam optimal decay) — NOAM ABLATION
 - `#3192` casca: asinh-pressure alone (scale=0.75/0.5) — NOAM ABLATION
-- `#3193` franky: residual-prediction alone — NOAM ABLATION
+- franky: gradient noise injection — INNOVATION (PR pending)
 - `#3194` bulma: higher LR sweep (5.5e-4/6e-4)
 - `#3188` chihiro: 2H/16H heads sweep — NOAM ABLATION
 - `#3181` himmel: asinh+residual on champion — NOAM ABLATION
@@ -58,7 +58,6 @@
 **Stabilization status: CODE REGRESSION CONFIRMED — seed=0 broken, waiting for sanji #3209 bug fix**
 
 **Noam-pivot experiments:**
-- `#3183` rei: ANP+T_max=150 — NOAM ABLATION
 - `#3179` usopp: T_max=150+wake+96sl+Lookahead — NOAM ABLATION
 - `#3176` mitsuha: full noam stack — NOAM ABLATION
 
@@ -79,6 +78,7 @@
 **Other:**
 - `#3172` robin: LR warmup (5-ep/10-ep)
 - `#3169` nami: heads sweep 4H/16H
+- rei: proximity-weighted volume loss — AF VOLUME FOCUS (PR pending)
 - `#3218` shouko: GradNorm adaptive multi-task loss balancing — AF VOLUME FOCUS
 - `#3215` tanjiro: Huber loss on volume channel (robust to outliers) — AF VOLUME FOCUS
 - `#3212` jin: PCGrad multi-objective gradient surgery — AF VOLUME FOCUS
@@ -178,7 +178,7 @@
 - OneCycleLR (no troughs): 8.04% best, sustained high-LR warmup worse than cosine peaks (without EMA+gc)
 - SWA: equal-weight averaging poisons across divergent basins (88.98%)
 - T_max≠30: ALL tested — 15→4.406%, 20→4.943%, 30→3.833% CHAMPION, 45→4.638%, 50→diverge, 60→4.409%. T_max=30 is definitive sweet spot
-- Noam feature stack on DM: full stack→4.447%, asinh-only→4.421%, residual-only→4.651%. All diverge. Features tuned for T_max=150/3H/no-gc regime don't transfer to T_max=30/8H/gc=0.5
+- Noam feature stack on DM: full stack→4.447%, asinh-only→4.421%, residual-only→4.651%/15.0%(crashed). All diverge. Features tuned for T_max=150/3H/no-gc regime. Residual-pred requires asinh as hard prerequisite; even combined→3.999% (doesn't beat 3.833%)
 - 10-ep warmup+gc=1.0: 11.2% then diverged
 - 5-ep warmup+gc=1.0: pending (chopper)
 - LR warmup + EMA+gc=0.5: 5-ep=11.325% diverged, 10-ep=3.918% plateaued (didn't beat 3.833%)
