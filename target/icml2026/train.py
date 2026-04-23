@@ -167,6 +167,7 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
+    mixup_alpha: float = 0.0
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -1254,6 +1255,39 @@ def evaluate_abupt(
     return {"surface_mae": total_surface / max(count_surface, 1), "volume_mae": total_volume / max(count_volume, 1)}
 
 
+def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model._orig_mod if hasattr(model, "_orig_mod") else model
+
+
+def decode_from_hidden(
+    model: torch.nn.Module,
+    hidden: torch.Tensor,
+    surface_tokens: int,
+    surface_x: torch.Tensor | None,
+    surface_mask: torch.Tensor,
+) -> dict[str, torch.Tensor | None]:
+    raw = _unwrap_model(model)
+    raw_output = raw.out(raw.norm(hidden))
+    surface_preds = raw_output[:, :surface_tokens, : raw.surface_output_dim]
+    volume_preds = None
+    if raw.volume_output_dim > 0 and hidden.shape[1] > surface_tokens:
+        vt = hidden.shape[1] - surface_tokens
+        s = raw.surface_output_dim
+        volume_preds = raw_output[:, surface_tokens : surface_tokens + vt, s : s + raw.volume_output_dim]
+    if hasattr(raw, "_apply_pressure_prior_addition"):
+        surface_preds = raw._apply_pressure_prior_addition(
+            surface_preds, surface_x, getattr(raw, "surface_pressure_prior_idx", None)
+        )
+    if getattr(raw, "surface_head", None) is not None and surface_preds is not None:
+        surface_preds = surface_preds + raw.surface_head(hidden[:, :surface_tokens], surface_preds)
+    if surface_preds is not None:
+        surface_preds = surface_preds * surface_mask.unsqueeze(-1)
+    if volume_preds is not None and surface_mask is not None:
+        vol_mask = torch.ones(volume_preds.shape[:2], dtype=torch.bool, device=volume_preds.device)
+        volume_preds = volume_preds * vol_mask.unsqueeze(-1)
+    return {"surface_preds": surface_preds, "volume_preds": volume_preds}
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     anp_head: ANPSurfaceDecoder | None,
@@ -1271,11 +1305,14 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    mixup_alpha: float = 0.0,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
         anp_head.train()
     running = {"loss": 0.0}
+    mixup_buffer: dict[str, torch.Tensor] | None = None
+    beta_dist = torch.distributions.Beta(mixup_alpha, mixup_alpha) if mixup_alpha > 0 else None
     steps = 0
     micro_batches_total = 0
     batches = loader if max_batches <= 0 else itertools.islice(loader, max_batches)
@@ -1326,7 +1363,35 @@ def train_one_epoch(
                             volume_x=batch.volume_x,
                             volume_mask=batch.volume_mask,
                         )
-                        loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                        if (
+                            beta_dist is not None
+                            and mixup_buffer is not None
+                            and outputs["surface_hidden"].shape == mixup_buffer["hidden"].shape
+                        ):
+                            lam = beta_dist.sample().to(device)
+                            cur_hidden = outputs["surface_hidden"]
+                            mixed_hidden = lam * cur_hidden + (1 - lam) * mixup_buffer["hidden"]
+                            mixed_out = decode_from_hidden(
+                                model, mixed_hidden, batch.surface_x.shape[1],
+                                batch.surface_x, batch.surface_mask,
+                            )
+                            cur_target = transform.apply(batch.surface_y)
+                            mixed_target = lam * cur_target + (1 - lam) * mixup_buffer["target"]
+                            mixed_mask = batch.surface_mask & mixup_buffer["mask"]
+                            loss = F.mse_loss(
+                                mixed_out["surface_preds"][mixed_mask],
+                                mixed_target[mixed_mask],
+                            )
+                            running.setdefault("mixup_lambda_mean", 0.0)
+                            running["mixup_lambda_mean"] += float(lam)
+                        else:
+                            loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                        if beta_dist is not None:
+                            mixup_buffer = {
+                                "hidden": outputs["surface_hidden"].detach().clone(),
+                                "target": transform.apply(batch.surface_y).detach().clone(),
+                                "mask": batch.surface_mask.detach().clone(),
+                            }
 
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
@@ -1359,6 +1424,8 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    if "mixup_lambda_mean" in running:
+        running["mixup_lambda_mean"] /= max(micro_batches_total - 1, 1)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1643,9 +1710,9 @@ def main() -> None:
     best_anp_state: dict[str, torch.Tensor] | None = None
 
     if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
+        primary_metric_str = "val_primary/surface_pressure_mae"
     else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
+        primary_metric_str = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1688,6 +1755,7 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            mixup_alpha=config.mixup_alpha,
         )
 
         if ema is not None:
@@ -1719,7 +1787,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(primary_metric_str)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
