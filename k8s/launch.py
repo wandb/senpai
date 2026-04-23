@@ -41,8 +41,10 @@ class Args:
     problem: str = "target/icml2026"  # active problem directory path (from senpai.yaml)
     names: str = ""  # comma-separated student names (e.g. "frieren,fern")
     n_students: int = 4  # number of students to launch (ignored if --names is provided)
-    repo_url: str = "https://github.com/wandb/senpai.git"  # git repo URL
-    repo_branch: str = "main"  # git branch to clone
+    repo_url: str = "https://github.com/wandb/senpai.git"  # git repo URL (senpai runner)
+    repo_branch: str = "main"  # git branch to clone (senpai runner)
+    target_repo_url: str = "https://github.com/morganmcg1/tandemfoil2.git"  # submodule repo agent commits/PRs go to
+    target_working_branch: str = "kagent_royal_rumble"  # integration branch inside the submodule repo
     image: str = "ghcr.io/wandb/senpai:latest"  # container image for students
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
     wandb_project: str = "senpai-v1"  # W&B project name
@@ -75,6 +77,12 @@ def render_configmap(name: str, labels: dict[str, str], data: dict[str, str]) ->
     return "\n".join(lines)
 
 
+def target_repo_slug(url: str) -> str:
+    """Extract owner/repo slug from a GitHub URL (for `gh --repo`)."""
+    slug = url.split("github.com", 1)[-1].lstrip(":/").removesuffix(".git")
+    return slug
+
+
 def render_student(template: str, student_name: str, tag: str, args: Args) -> str:
     configmap = render_configmap(
         name=f"senpai-config-student-{student_name}",
@@ -82,6 +90,9 @@ def render_student(template: str, student_name: str, tag: str, args: Args) -> st
         data={
             "REPO_URL": args.repo_url,
             "REPO_BRANCH": args.repo_branch,
+            "TARGET_REPO_URL": args.target_repo_url,
+            "TARGET_REPO": target_repo_slug(args.target_repo_url),
+            "TARGET_WORKING_BRANCH": args.target_working_branch,
             "STUDENT_NAME": student_name,
             "RESEARCH_TAG": tag,
             "WANDB_ENTITY": args.wandb_entity,
@@ -110,6 +121,9 @@ def render_advisor(template: str, tag: str, student_list: list[str], args: Args)
     data = {
         "REPO_URL": args.repo_url,
         "REPO_BRANCH": args.repo_branch,
+        "TARGET_REPO_URL": args.target_repo_url,
+        "TARGET_REPO": target_repo_slug(args.target_repo_url),
+        "TARGET_WORKING_BRANCH": args.target_working_branch,
         "RESEARCH_TAG": tag,
         "STUDENT_NAMES": ",".join(student_list),
         "WANDB_ENTITY": args.wandb_entity,

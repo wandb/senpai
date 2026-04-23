@@ -1,12 +1,16 @@
 # senpai project configuration
 # All fields can be overridden via CLI: python k8s/launch.py --tag <tag> [--field value]
 
-# active problem directory (repo-relative path)
-problem: target/icml2026
+# active problem directory (repo-relative path — points at a submodule under target/)
+problem: target/tandemfoil2
 
-# git
+# git (senpai itself)
 repo_url: https://github.com/wandb/senpai.git
-repo_branch: kaiming
+repo_branch: main
+
+# target submodule (agent commits/PRs land here, not in senpai)
+target_repo_url: https://github.com/morganmcg1/tandemfoil2.git
+target_working_branch: kagent_royal_rumble
 
 # docker image
 image: ghcr.io/wandb/senpai:latest
@@ -19,8 +23,8 @@ pvc_mount_path: /mnt/new-pvc
 wandb_entity: wandb-applied-ai-team
 wandb_project: senpai-v1
 
-# advisor
-advisor_branch: kaiming
+# advisor — the integration branch inside the target submodule that advisor PRs merge into
+advisor_branch: kagent_royal_rumble
 
 # training limits
 timeout_minutes: 30.0

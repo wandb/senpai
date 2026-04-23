@@ -1,0 +1,12 @@
+[submodule "target/tandemfoil2"]
+	path = target/tandemfoil2
+	url = https://github.com/morganmcg1/tandemfoil2.git
+	branch = kagent_royal_rumble
+[submodule "target/icml2026"]
+	path = target/icml2026
+	url = https://github.com/morganmcg1/icml2026.git
+	branch = main
+[submodule "target/cfd_tandemfoil"]
+	path = target/cfd_tandemfoil
+	url = https://github.com/morganmcg1/cfd_tandemfoil_v1.git
+	branch = main
