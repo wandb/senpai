@@ -159,6 +159,7 @@ class TrainConfig:
     asinh_scale: float = 0.75
     residual_prediction: bool = False
     re_stratified_sampling: bool = False
+    lr_schedule: str = "cosine"
     cosine_t_max: int = 150
     geometry_points: int = 25_000
     geometry_supernodes: int = 4_096
@@ -1623,8 +1624,24 @@ def main() -> None:
         params.extend(list(anp_head.parameters()))
     optimizer = build_optimizer(params, config)
     scheduler = None
-    if config.cosine_t_max > 0:
-        base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
+    base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
+    if config.lr_schedule == "onecycle":
+        if config.max_train_batches > 0:
+            micro_per_epoch = config.max_train_batches
+        else:
+            micro_per_epoch = len(train_loader)
+        steps_per_epoch = (micro_per_epoch + config.grad_accum_steps - 1) // config.grad_accum_steps
+        total_steps = config.epochs * steps_per_epoch
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            base_optimizer,
+            max_lr=config.lr,
+            total_steps=total_steps,
+            pct_start=0.3,
+            anneal_strategy='cos',
+            div_factor=25,
+            final_div_factor=1e4,
+        )
+    elif config.cosine_t_max > 0:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
 
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
@@ -1641,6 +1658,11 @@ def main() -> None:
     if config.wandb_name:
         run_config = asdict(config)
         run_config["effective_batch_size"] = config.batch_size * config.grad_accum_steps
+        if config.lr_schedule == "onecycle" and scheduler is not None:
+            run_config["onecycle_total_steps"] = scheduler.total_steps
+            run_config["onecycle_pct_start"] = 0.3
+            run_config["onecycle_div_factor"] = 25
+            run_config["onecycle_final_div_factor"] = 1e4
         run = wandb.init(
             project=os.getenv("WANDB_PROJECT", "senpai-v1"),
             entity=os.getenv("WANDB_ENTITY"),
