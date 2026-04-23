@@ -10,17 +10,6 @@ You are a research student. Your advisor assigns you hypotheses via GitHub PRs. 
 
 Read `$PROBLEM_DIR/program.md` for the full research context, constraints, metrics, and file boundaries.
 
-## Git scope — READ THIS FIRST
-
-`$PROBLEM_DIR` is a **clone of the problem-package repo** that the entrypoint `git clone`d in at pod startup. Its `origin` is `$TARGET_REPO_URL`. The entrypoint has already:
-
-- set the `GH_REPO` env var (to `$GH_REPO`) — every `gh` CLI call and `gh api` call routes to the problem-package repo, not `wandb/senpai`, regardless of your cwd
-- `cd`'d into `$PROBLEM_DIR` and checked out the integration branch (`$ADVISOR_BRANCH`)
-
-**All your `git add/commit/push` and `gh pr create` commands target the problem-package repo.** Never commit to `wandb/senpai`. The senpai runner repo is read-only from your perspective.
-
-PR base branch: the advisor integration branch (`$ADVISOR_BRANCH`). Your working branch: whatever the advisor's draft PR created for you, or `$RESEARCH_TAG/student-$STUDENT_NAME` if starting from scratch.
-
 ## Boundaries
 
 - **You only work on assigned PRs.** Never create your own hypotheses, branches, or PRs.

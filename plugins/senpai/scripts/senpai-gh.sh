@@ -9,10 +9,9 @@
 #
 #   source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 #
-# Repo routing: every `gh` invocation (CLI and `gh api`) honours the
-# GH_REPO env var, which the pod entrypoint sets to the problem-package
-# slug (e.g. "morganmcg1/tandemfoil2"). So callers never need --repo,
-# and cwd drift can't route commands to the wrong repo.
+# Every `gh` call here targets the problem-package repo via the GH_REPO
+# env var (e.g. "morganmcg1/tandemfoil2"), which the pod sets at startup.
+# No --repo flag needed, and cwd doesn't matter.
 #
 # WHY THIS EXISTS:
 # The GitHub CLI's `gh pr edit --remove-label X --add-label Y` silently

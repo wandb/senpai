@@ -54,7 +54,7 @@ GitHub's `gh pr edit --remove-label X --add-label Y` silently strips **all other
 
 ### Queries (both roles)
 
-All queries target `$GH_REPO` (owner/repo of the problem-package repo, set by the pod entrypoint) via gh's native repo env var. No `--repo` flag needed.
+The default repo for `gh` is set via the injected `GH_REPO` env var, so no `--repo` flag is needed.
 
 | Function | What it does |
 |---|---|
