@@ -78,18 +78,18 @@
 
 | Dataset | Metric | Current anchor |
 |---|---|---|
-| TandemFoil | `val_primary/surface_pressure_mae` | **21.909** (#3108 — gc=0.3+EMA=0.999) |
+| TandemFoil | `val_primary/surface_pressure_mae` | **21.350** (#3140 MERGED — gc=0.2+EMA=0.999) |
 | TandemFoil Paper | `val_primary/field_mse` | **0.002383** (#3025) |
-| AirfRANS | `val_primary/surface_mse` + `vol_mse` | **0.000459 / 0.002777** (#3050 — EMA+T_max=50) |
+| AirfRANS | `val_primary/surface_mse` + `vol_mse` | **0.000296 / 0.002039** (#3135 MERGED — EMA+vol-weight=10x) |
 | DrivAerML | `val_primary/surface_rel_l2_pct` | **3.833%** (#3072 MERGED — EMA=0.9995+gc=0.5) |
 
 ## Paper-Facing Snapshot
 
 | Dataset | Metric | Current best | External target | Status |
 |---|---|---|---|---|
-| TandemFoil | `test_primary/surface_pressure_mae` | **23.419** (PR #3108) | (internal) | Strong |
+| TandemFoil | `test_primary/surface_pressure_mae` | **23.195** (PR #3140) | (internal) | Improving |
 | TandemFoil Paper | `test_primary/field_mse` | **NO CLEAN ROW YET** | ~0.10-0.36/task | URGENT — #3098 in-progress |
-| AirfRANS | `Surf MSE / Vol MSE` | **0.000459 / 0.002777** | 0.0043 / 0.0017 | Surface 9.4x better, Volume 1.63x gap |
+| AirfRANS | `Surf MSE / Vol MSE` | **0.000296 / 0.002039** | 0.0043 / 0.0017 | Surface 14.5x better, Volume 1.20x gap |
 | DrivAerML | `test_primary/surface_rel_l2_pct` | **4.685%** (#3072, partial eval) | 3.71% | Gap closing — #3164 paper eval in-progress |
 
 ## Current Research Focus

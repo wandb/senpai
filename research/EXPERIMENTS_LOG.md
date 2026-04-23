@@ -1,5 +1,25 @@
 # SENPAI Research Results
 
+## 2026-04-23 16:00 — PR #3135: AF EMA=0.999 + vol-weight=10x (nezuko) — MERGED ★ NEW BEST
+
+- **surface_mse: 0.000296 (-35.5%)**, **vol_mse: 0.002039 (-26.6%)** vs baseline 0.000459/0.002777. W&B: `sh2zyfwr`. Model still improving at ep763 timeout. EMA stabilizes the upweighted volume gradient — without EMA, 10x is worse; with EMA it's dramatic. Vol gap: 1.20x (was 1.63x). New AF champion.
+
+## 2026-04-23 16:00 — PR #3140: TF gc=0.2 sweep (usopp) — MERGED ★ NEW BEST
+
+- **val=21.350 (-2.6%)**, test=23.195 (-1.0%) vs 21.909/23.419. gc=0.2: W&B `9g11l7tm`. gc=0.1: 22.141 (W&B `55xdv4fq`) — single_in_dist regression +12.4%, overshoot. gc monotonic floor at 0.2. New TF champion.
+
+## 2026-04-23 16:00 — PR #3176: TFP full noam stack (mitsuha) — SENT BACK
+
+- No runs executed. Student identified 3 blockers: wrong dataset name (`tandem_foil_set` → `tandemfoilset`), ANP silently disabled on `tandemfoil_paper`, physics features silently dropped on `tandemfoil_paper`. Sent back to run on `tandemfoilset` where all features work. Baseline updated to TF 21.350.
+
+## 2026-04-23 16:00 — PR #3137: DM 5-ep warmup + gc=1.0 (chopper) — CLOSED
+
+- warmup+gc=1.0: 9.505% ep48, diverged ep50 (W&B: `f4jfokoj`). gc=1.0 only: 9.064% ep89, diverged ep91 (W&B: `kkkmsuxc`). gc=1.0 clips 100% of batches — underfitting then explosion. 2.4x worse than baseline. gc=1.0 family without EMA conclusively dead.
+
+## 2026-04-23 16:00 — PR #3085: DM larger supernodes (kohaku) — SENT BACK
+
+- Run 1: 6.121% ep121, diverged (W&B: `e3nmais2`). Run 2: 8.847% ep70, diverged (W&B: `pf01oz4d`). Both WITHOUT EMA+gc — old regime, ceiling 3.997%. Sent back for champion platform re-run (gc=0.5+EMA=0.9995) with supernodes 8192 and 16000.
+
 ## 2026-04-23 15:00 — PR #3123: TFP shorter T_max (T_max=5/8) (mitsuha) — CLOSED
 
 - T_max=5 (W&B: `5kp3yu51`): diverged, field_mse never finite. T_max=8 (W&B: `rcysi68k`): diverged, field_mse never finite. Confirms T_max=10 is a stability resonance for current stripped-down TFP config. However, noam branch uses T_max=150 with ANP decoder + full feature stack — the stability constraint is architecture-dependent. Reassigned to TFP full noam stack (ANP + physics features + T_max=150).
