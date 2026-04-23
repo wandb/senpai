@@ -227,7 +227,7 @@ class TargetTransform:
         if self.stats_mean is not None and self.stats_std is not None and self.stats_mean.numel() == out.shape[-1]:
             out = out * self.stats_std.to(out.device) + self.stats_mean.to(out.device)
         if self.asinh_pressure and self.pressure_index is not None:
-            out[..., self.pressure_index] = torch.sinh(out[..., self.pressure_index]) / max(self.asinh_scale, 1e-6)
+            out[..., self.pressure_index] = torch.sinh(out[..., self.pressure_index].clamp(-40.0, 40.0)) / max(self.asinh_scale, 1e-6)
         return out
 
 
@@ -972,8 +972,8 @@ def evaluate_grouped(
                 case_values = (surface_pred - surface_target).square()
                 valid = batch.surface_mask.unsqueeze(-1)
                 if paper_surface_sq_sum is None:
-                    paper_surface_sq_sum = torch.zeros(case_values.shape[-1], device=device)
-                paper_surface_sq_sum += (case_values * valid).sum(dim=(0, 1)).to(device)
+                    paper_surface_sq_sum = torch.zeros(case_values.shape[-1], device=device, dtype=torch.float64)
+                paper_surface_sq_sum += (case_values * valid).sum(dim=(0, 1)).to(device=device, dtype=torch.float64)
                 paper_surface_nodes += int(batch.surface_mask.sum().detach().cpu().item())
             if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
                 volume_pred, volume_target = comparison_metric_tensors(
@@ -985,8 +985,8 @@ def evaluate_grouped(
                 case_values = (volume_pred - volume_target).square()
                 valid = batch.volume_mask.unsqueeze(-1)
                 if paper_volume_sq_sum is None:
-                    paper_volume_sq_sum = torch.zeros(case_values.shape[-1], device=device)
-                paper_volume_sq_sum += (case_values * valid).sum(dim=(0, 1)).to(device)
+                    paper_volume_sq_sum = torch.zeros(case_values.shape[-1], device=device, dtype=torch.float64)
+                paper_volume_sq_sum += (case_values * valid).sum(dim=(0, 1)).to(device=device, dtype=torch.float64)
                 paper_volume_nodes += int(batch.volume_mask.sum().detach().cpu().item())
             continue
 
