@@ -1,9 +1,10 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-23 (advisor cycle 44 — gilbert assigned af-vol-15x-clean #3204)
+- **Date:** 2026-04-23 21:30 (advisor cycle 45 — closed #3168/#3154/#3083, assigning jin/brook/historia/jet)
 - **Branch:** radford
-- **Idle students:** 0 (gilbert assigned: #3204 af-vol-15x-clean — vol-weight=15x/20x clean control)
+- **Idle students:** 0 (4 being assigned)
 - **PRs ready for review:** 0
+- **CRITICAL:** TFP champion (0.002383) is unreproducible — 0/3 seeds stay finite (#3168)
 
 ## Fleet Status (57 active PRs)
 
@@ -30,7 +31,8 @@
 - `#3161` spike: eta_min=1e-5 (cosine floor)
 - `#3160` griffith: 16H heads
 - `#3155` nobara: longer T_max (45/60)
-- `#3154` historia: monotonic cosine (no restarts)
+- `#NEW` historia: DM true monotonic cosine (T_max=393606) — corrected retest
+- `#NEW` jet: DM 600 batches + gc=0.5 + EMA (stabilized retest)
 - `#3152` eren: EMA decay sweep (0.999 vs 0.9995)
 - `#3146` taki: top-5 checkpoint averaging
 - `#3143` thorfinn: Lookahead(AdamW)
@@ -53,15 +55,17 @@
 - `#3180` chopper: ANP decoder alone — NOAM ABLATION
 - `#3150` yuji: clean test row — PAPER-FACING
 
-### TandemFoil Paper WIP (10 PRs)
-**Noam-pivot experiments (highest priority):**
-- `#3200` brook: TFP stabilization diagnostic (20-ep probes) — STABILIZATION
+### TandemFoil Paper WIP (11 PRs) — STABILIZATION CRISIS
+**Stabilization diagnostic (HIGHEST PRIORITY — baseline unreproducible):**
+- `#NEW` jin: TFP seed sensitivity (seed=0 verify, seed=42 + gc/warmup/asinh probes)
+- `#NEW` brook: TFP pressure stabilization (base config, lower LR, AdamW vs Lion)
+
+**Noam-pivot experiments:**
 - `#3183` rei: ANP+T_max=150 — NOAM ABLATION
 - `#3179` usopp: T_max=150+wake+96sl+Lookahead — NOAM ABLATION
 - `#3176` mitsuha: full noam stack — NOAM ABLATION
 
 **Other:**
-- `#3168` jin: multi-seed paper-facing (seeds 42/123/456)
 - `#3133` shinobu: WD sweep (5e-3/2e-2)
 - `#3098` shoya: clean test evaluation — URGENT PAPER-FACING
 - `#3088` mugen: T_max=20
