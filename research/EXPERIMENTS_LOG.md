@@ -1,5 +1,21 @@
 # SENPAI Research Results
 
+## 2026-04-24 00:30 — PR #3216: DM attention distance bias ALiBi-inspired (canute) — CLOSED (dead end)
+
+- Linear bias: 12.144% ep45, diverged ep90 (W&B: 306ayrb2). Log bias: 5.511% ep169, stable but still converging at timeout (W&B: pbnxsdha). Neither beats 3.833%. Alpha values barely moved from init — distance prior redundant with existing Transolver slice-based spatial grouping.
+
+## 2026-04-24 00:30 — PR #3192: DM asinh-pressure alone scale=0.75/0.5 (casca) — CLOSED (dead end — TRIPLE CONFIRMED)
+
+- scale=0.75: 4.072% (W&B: mh9wcdop), scale=0.5: 4.475% diverged ep310 (W&B: uzpui6j5). Neither beats 3.833%. Combined with hinata #3175 (asinh-only=4.421%) and franky #3193 (residual+asinh=3.999%), asinh is TRIPLE CONFIRMED harmful on DM. Signal compression hurts fine-grained surface learning. Added to dead ends.
+
+## 2026-04-24 00:30 — PR #3188: DM 2H/16H attention heads sweep (chihiro) — CLOSED (dead end)
+
+- 2H: 13.878% crashed ep40 (W&B: qcaxbz95). 16H: 4.099% diverged ep431 (W&B: 6n9i88a3). Neither beats 3.833%. ALL head counts now tested: 2H=catastrophic, 4H=6.650% diverge, 8H=3.833% champion, 16H=4.099% late-diverge. 8H (64d/head) is the definitive DM sweet spot.
+
+## 2026-04-24 00:30 — PR #3180: TF ANP decoder alone (chopper) — CLOSED (dead end)
+
+- ANP+T_max=10 gc=0.3: val=21.590 (W&B: eaat1lne). ANP+T_max=150 gc=0.3: val=22.057 (W&B: 4kwi4mv2). Neither beats old baseline (21.350) or new (#3185=21.319). ANP alone doesn't help TF — benefit requires full stack combination.
+
 ## 2026-04-24 00:15 — PR #3185: TF full noam stack (fern) — MERGED ✓ NEW TF CHAMPION
 
 - Trial 1 (full stack: ANP+physics+T_max=150+96sl+Lookahead+compile+re-strat): val=21.319 ep277, test=22.868 (W&B: v05jt92n). Beats baseline 21.350/23.195 on both metrics (-0.15% val, -1.41% test). Trial 2 (ANP+physics only, T_max=10): val=22.276 ep233 (W&B: anluw1ab), diverged ep289. Key insight: full-stack extras (Lookahead, compile, 96 slices, re-stratified) only compound in late training (after ep200). T2 led for first 180 epochs. T_max=150 essential for full benefit. New TF config: Lion lr=1.25e-4, T_max=150, gc=0.2, EMA=0.999, 96 slices, ANP+full physics+asinh-scale=0.75+residual+Lookahead+compile+re-strat.
