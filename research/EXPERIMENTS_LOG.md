@@ -1,5 +1,48 @@
 # SENPAI Research Results
 
+## 2026-04-24 01:15 — PR #3191: AF noam features (asinh+residual+re-strat) on base and vol-10x (alphonse) — CLOSED (dead end)
+
+- alphonse/af-noam-features, W&B group: af-noam-features-base
+- Hypothesis: noam features (asinh-pressure, residual-prediction, re-stratified-sampling) transfer to AirfRANS
+- Trial 1 (no vol-weight, W&B: wvdm76ep): surface_mse=0.646 (1408x worse than 0.000459), vol_mse=Inf — catastrophic
+- Trial 2 (vol-10x, W&B: rmg1uigw): surface_mse=0.611 (2063x worse than 0.000296), vol_mse=Inf — catastrophic
+- **Root cause: sinh() denormalization exponentially amplifies pressure errors on AF.** Non-pressure channels (Ux, Uy, nut) converge fine. Failure is entirely pressure-specific via asinh-pressure feature.
+- **Conclusion: asinh-pressure is DEFINITIVELY incompatible with AirfRANS.** Combined with nezuko #3177 (3 asinh trials → Inf) = 5 independent confirmations. Added to AF dead ends. Bug fix: primary_metric_key shadowing noted.
+- Student suggestion: test residual-prediction + re-stratified WITHOUT asinh — high value follow-up.
+
+## 2026-04-24 01:15 — PR #3189: TF asinh+physics features, no ANP, no T_max change (emma) — CLOSED (dead end)
+
+- emma/tf-asinh-residual-physics, W&B group: tf-noam-features-no-anp
+- Hypothesis: isolate contribution of physics features (wake-deficit, wake-angle, cp-panel, vortex-panel) + asinh normalization on TF without ANP
+- Trial 1 (full physics, W&B: 7kdfc3by): val=22.423 ep311, test=23.427 — +5.2% worse than 21.319 baseline
+- Trial 2 (norm only, W&B: qfycb0ww): val=22.911 ep324, test=24.365 — +7.5% worse
+- **Confound: both trials omitted --enable-pressure-prior-addition** which champion uses. Cannot attribute regression to physics features vs missing pressure prior.
+- Physics features do add modest benefit (+0.49 MAE improvement T1 vs T2).
+- **Conclusion: experiment confounded. TF needs pressure-prior-addition.** geom_camber_rc remains hardest split (val ~34-36 vs ~12 for cruise).
+
+## 2026-04-24 01:15 — PR #3177: AF vol-weight 15x/20x + asinh+residual compound push (nezuko) — CLOSED (dead end)
+
+- nezuko/af-vol-weight-compound-push, W&B group: af-vol-weight-compound
+- Hypothesis: compound higher vol-weight + asinh + residual to break vol_mse < 0.0017
+- 6 trials total (3 instructed + 3 fallback):
+  - Trials 1-3 (with asinh): ALL catastrophic — vol_mse_p → Inf (pressure volume explosion)
+  - Trial 4 (15x no-asinh, W&B: m2p9bi0f): crashed ep325, vol_mse=0.005437 best
+  - Trial 5 (20x no-asinh, W&B: vt5yzmm7): surface=0.000304 ep665, vol=0.002689 ep653 — still running ep699 but won't reach baseline
+  - Trial 6 (10x no-asinh, W&B: z1n4yt1k): crashed ep108
+- **Key finding: non-monotonic stability** — 10x crashed, 15x crashed at LR peak, 20x stable through ep700+. Heavier vol-weight paradoxically dampens pressure gradient oscillations at cosine peaks.
+- Best result: surface=0.000304 (+2.7%), vol=0.002689 (+31.9%) — neither beats baseline.
+- **Conclusion: asinh-pressure confirmed broken for AF volume fields (3 more confirmations = 5 total). 20x vol-weight is stable but slow to converge.**
+
+## 2026-04-24 01:15 — PR #3172: AF LR warmup 5ep/10ep + EMA (robin) — SENT BACK (confounded)
+
+- robin/af-warmup-ema
+- Hypothesis: linear LR warmup before cosine annealing improves AF training stability
+- Trial 1 (5ep warmup, W&B: p7xqdmxx): surface=0.000312, vol=0.004723, diverged ep586
+- Trial 2 (10ep warmup, W&B: gcc0sb6p): surface=0.000333, vol=0.003189, stable
+- Neither beats baseline (surface=0.000296, vol=0.002039).
+- **Confound: used 8H (not champion's 4H) and omitted vol-loss-weight=10x.** Experiment uninterpretable — warmup hypothesis untested, not disproven.
+- Sent back with corrected config: exact champion + --warmup-epochs 5 as only change.
+
 ## 2026-04-24 00:30 — PR #3216: DM attention distance bias ALiBi-inspired (canute) — CLOSED (dead end)
 
 - Linear bias: 12.144% ep45, diverged ep90 (W&B: 306ayrb2). Log bias: 5.511% ep169, stable but still converging at timeout (W&B: pbnxsdha). Neither beats 3.833%. Alpha values barely moved from init — distance prior redundant with existing Transolver slice-based spatial grouping.
