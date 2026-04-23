@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 08:30 (advisor cycle 71)
+- **Date:** 2026-04-24 09:00 (advisor cycle 73)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -9,14 +9,14 @@
 
 ## Fleet Status (58 active PRs)
 
-### DrivAerML WIP (28 PRs)
+### DrivAerML WIP (29 PRs)
 **Innovation track (new physics-aware/ML ideas per directive):**
+- `#3260` casca: learnable Fourier frequency magnitudes (meta-learned encoding) — INNOVATION
 - `#3247` brook: EMA periodic reset (100/50-ep intervals) — INNOVATION
 - `#3243` jet: prediction-error-weighted surface sampling (hard example mining) — INNOVATION
 - `#3242` historia: label smoothing / target noise augmentation — INNOVATION
 - `#3235` kakashi: multi-exit prediction (aux losses at intermediate layers) — INNOVATION
 - `#3233` gojo: stochastic depth (LayerDrop) regularization — INNOVATION
-- `#3231` emma: surface pressure gradient smoothness regularization — INNOVATION (physics-informed)
 - `#3251` fern: Pre-LayerNorm architecture ablation (+ RMSNorm variant) — INNOVATION
 - `#3259` zenitsu: curvature-weighted loss (per-point weighting by local curvature) — INNOVATION
 - `#3258` emma: auxiliary surface normal prediction (multi-task regularization) — INNOVATION
@@ -67,13 +67,13 @@
 - `#3056` haku: Lion+EMA refinement (T_max/gc/LR sweep)
 - `#2949` vash: depth/width sweep (LR=5e-5)
 
-### AirfRANS WIP (14 PRs)
+### AirfRANS WIP (13 PRs)
 **Volume closure experiments:**
+- `#3261` nezuko: 2L/320d wider model (width scaling for vol closure) — AF VOLUME FOCUS
 - `#3255` gohan: no-Lookahead/no-compile champion full budget — AF VOLUME FOCUS (critical ablation follow-up)
 - `#3257` chihiro: extended training via reduced eval frequency (every 3/5 epochs) — AF VOLUME FOCUS
 - `#3241` hinata: T_max=75 + vol-weight=10x/12x on champion — AF VOLUME FOCUS (schedule gap-fill)
 - `#3234` jin: lower LR sweep (5e-4/4e-4) on vol-10x champion — AF VOLUME FOCUS
-- `#3232` nezuko: vol-weight warm-up schedule (1x→10x linear ramp over 200ep) — AF VOLUME FOCUS
 
 **Noam-pivot experiments (asinh-dependent — likely to fail):**
 - `#3187` stark: asinh+residual on vol-10x champion — NOAM ABLATION (asinh confirmed dead for AF)
@@ -82,7 +82,6 @@
 **Other:**
 - `#3172` robin: LR warmup — SENT BACK (confounded config, re-running with correct champion config)
 - `#3169` nami: heads sweep 4H/16H
-- `#3227` casca: focal-MSE volume loss (upweight hard predictions) — AF VOLUME FOCUS
 - `#3254` norman: multi-seed champion run (seeds 42/123/789) — AF VOLUME FOCUS
 - `#3238` rei: WD=0 ablation on vol-10x+EMA champion — AF VOLUME FOCUS
 - `#3245` tanjiro: per-channel volume loss weighting (upweight nut×4, p×2) — AF VOLUME FOCUS
@@ -230,6 +229,8 @@
 - Lookahead hurts AF surface by 53% at equal epochs (#3236 ablation). Compile also hurts surface despite more epochs. Both are default-on in baseline — ambiguity on synergistic effect at long training
 - Proximity-weighted volume loss: 118-2516% worse (#3222). Extreme weight ratios starve far-field gradients while overdriving near-surface. Structural failure at scale=0.1/eps=0.01
 - Huber loss on volume channel: no improvement over MSE on either metric (#3215). AF volume residuals are well-behaved, not heavy-tailed — Huber δ threshold adds no benefit
+- Vol-weight warm-up (1x→10x ramp): 2/3 collapsed, best stable +28% surface/+69% vol (#3232). Cosine restarts inject LR peak when vol-weight ramps — destructive. Static 10x TRIPLE-CONFIRMED
+- Focal-MSE volume loss (error-based reweighting): gamma=2 +392%/+3993%, gamma=1 +222%/+320% (#3227). Batch-max normalization non-stationary + freestream scaffolding destroyed
 - 3L depth (with or without EMA): catastrophic divergence confirmed twice
 - 2L/384d and 3L/384d: catastrophic divergence
 - EMA<0.999 (0.99, 0.995 both worse)
