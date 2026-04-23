@@ -1,5 +1,33 @@
 # SENPAI Research Results
 
+## 2026-04-24 09:00 — PR #3232: AF vol-weight warm-up schedule (nezuko) — CLOSED (dead end)
+
+- nezuko/af-vol-warmup, W&B runs: 9tc2udwf (200ep ramp), gp149j2g (100ep ramp), o8ifqyac (50ep ramp), group: af-vol-warmup
+- Hypothesis: linear vol-weight warm-up from 1x→10x over N epochs lets model learn surface first, then shift to volume (physics-motivated: BL must resolve before volume)
+
+| Trial | Warmup | surface_mse | vs baseline | vol_mse | vs baseline | Status |
+|-------|--------|-------------|-------------|---------|-------------|--------|
+| T1 | 200 ep | 0.000421 | +42% | 0.003456 | +70% | COLLAPSED ep600 |
+| T2 | 100 ep | 0.000379 | +28% | 0.003443 | +69% | stable |
+| T3 | 50 ep | 0.001098 | +271% | 0.010298 | +405% | COLLAPSED ep200 |
+
+- **Collapse mechanism:** Cosine LR restarts (T_max=50) inject LR peak at the moment vol_weight reaches 10x → destructive gradient spikes. T1/T3 collapse into degenerate constant predictions (Ux=Uy=nut≈0, p≈2.48). T2 survives but +28% surface / +69% volume.
+- **Conclusion: vol-weight warm-up dead for AF. Static 10x from epoch 0 is now TRIPLE-CONFIRMED optimal** (this + curriculum #3226 + vol>10x #3204). The optimizer needs to adapt to full 10x from the start.
+
+## 2026-04-24 09:00 — PR #3227: Focal-MSE loss for AF volume (casca) — CLOSED (dead end)
+
+- casca/af-focal-volume-loss, W&B runs: 332df4z1 (gamma=2), kasxtssl (gamma=1), group: af-focal-volume-loss
+- Hypothesis: focal weighting `(error/error_max)^gamma * error^2` on volume loss upweights hard cells (near-wall/wake), redistributing gradient signal toward physically important regions
+
+| Trial | gamma | surface_mse | vs baseline | vol_mse | vs baseline | Best epoch |
+|-------|-------|-------------|-------------|---------|-------------|------------|
+| T1 | 2.0 | 0.001456 | +392% | 0.08343 | +3993% | 198 |
+| T2 | 1.0 | 0.000952 | +222% | 0.008557 | +320% | 585 |
+
+- **Root cause (dual failure):** (1) Batch-max normalization makes loss landscape non-stationary — denominator shifts each step as predictions improve. (2) Freestream cells downweighted by focal serve as essential scaffolding for optimization trajectory. Stronger gamma = more aggressive scaffolding removal = earlier collapse.
+- **Monotonic gamma-degradation:** gamma=2 peaked ep198 (catastrophic), gamma=1 peaked ep585 (bad). Confirms focal redistribution is fundamentally wrong direction.
+- **Conclusion: focal-MSE dead for AF volume.** Any error-based per-point reweighting faces the non-stationarity problem. Would need EMA-smoothed normalization for ground-up reformulation.
+
 ## 2026-04-24 08:30 — PR #3231: DM pressure gradient smoothness reg (emma) — CLOSED (dead end)
 
 - emma/dm-pressure-gradient-reg, W&B runs: lqgwricr (λ=0.01), e2rko1vh (λ=0.1), xcynbcli (λ=1.0), group: dm-pressure-grad-reg
