@@ -1,5 +1,25 @@
 # SENPAI Research Results
 
+## 2026-04-23 23:00 — PR #3208: TFP seed stability diagnostic — strip physics flags (brook) — CLOSED (diagnostic complete)
+
+- All 3 trials STABLE at seed=42 with no physics flags. Lion lr=1.25e-4: val=0.04931, test=0.04134 (W&B: confirmed). Lion lr=6.25e-5: val=0.04920, test=0.04302. AdamW lr=1e-4: val=0.08036, test=0.06962. Zero NaN/Inf at any point. **Definitive proof: physics transforms (asinh/sinh pressure) cause TFP instability, not seed sensitivity.** Stable floor ~0.047-0.049 across seeds and optimizers. Path forward: fix pressure transforms (sanji #3209), then reintroduce one at a time.
+
+## 2026-04-23 23:00 — PR #3205: TFP seed sensitivity — is seed=0 a lucky init? (jin) — CLOSED — CRITICAL: CODE REGRESSION
+
+- **Seed=0 no longer reproduces the champion.** All 4 trials produce Inf on pressure: T1 seed=0 control (W&B: 65q3qcbo), T2 seed=42 gc=0.3 (6hv5zqio), T3 seed=42 warmup=3 (g3hvoya7), T4 seed=42 asinh=0.5 (e2arojym). Velocity channels healthy (Ux~0.004, Uy~0.014) — pathology isolated to sinh inverse pressure transform at eval. This upgrades TFP crisis: it's not "one lucky seed" but a **code regression since PR #3025**. The champion config is BROKEN in the current codebase. No stabilization approach (gc/warmup/asinh-scale) helped. Waiting for sanji #3209 cp_panel bug fix.
+
+## 2026-04-23 23:00 — PR #3173: DM shorter cosine T_max=15/20 + EMA+gc (kakashi) — CLOSED (dead end)
+
+- T_max=15: best val=4.406% ep259, stable but plateaued (W&B: nufcf02f). T_max=20: best val=4.943% ep186, catastrophic divergence ep187 → 62.9% by ep259 (W&B: fqozs87o). Neither beats 3.833%. T_max=15 converges to higher plateau because shorter cycles reset LR before productive optimization completes. T_max=20 diverges at first restart. T_max=30 confirmed as DM sweet spot; T_max<30 added to dead ends.
+
+## 2026-04-23 23:00 — PR #3101: AF vol-weight=1.5x/3x (tanjiro) — CLOSED (dead end)
+
+- Vol-weight=3.0: surface=0.000381 (+29%), vol=0.003904 (+91%) vs champion (W&B: 2ebhl15x). Vol-weight=1.5: surface=0.000371 (+25%), vol=0.004224 (+107%) (W&B: ivwcw1xj, 5wv8vbas). Both diverged at cosine LR peaks. Completes vol-weight<10x dead end: 1.5x/2x/3x/5x/7x ALL confirmed worse. 10x+EMA=0.999 is the AF sweet spot.
+
+## 2026-04-23 23:00 — PR #3063: DM paper-facing full eval seed=42 (canute) — CLOSED (superseded)
+
+- Used outdated config (gc=1.0, no EMA) — champion has since evolved to gc=0.5+EMA=0.9995. Phase 1 diverged without gc, restarted with gc=1.0. Phase 2 full eval: val=5.25%, test=4.81% (W&B: typ76b0y). Not a valid paper-facing number due to config mismatch. Superseded by faye #3164 running proper champion config.
+
 ## 2026-04-23 22:30 — PR #3161: DM eta_min=1e-5 cosine floor + EMA+gc (spike) — CLOSED
 
 - Best val=4.202% ep297, then diverged ep312 → 16.3% (W&B run from student report). Trough-smoothing effect confirmed — eta_min prevents hard zeros at cosine troughs, giving EMA smoother targets. But 4.202% is 9.6% worse than 3.833% baseline. Root cause: gc=0.5 relies on zero-LR trough damping as a natural stability reset; eta_min=1e-5 removes that reset, allowing gradient accumulation through troughs → eventual divergence. Triple confirmation: eta_min+gc is incompatible at any gc value (gc=1.0→6.311%, gc=0.5→8.617% prior, now gc=0.5+EMA→4.202% diverge). Added to dead ends.
