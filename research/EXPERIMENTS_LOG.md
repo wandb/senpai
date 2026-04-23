@@ -1,5 +1,31 @@
 # SENPAI Research Results
 
+## 2026-04-24 08:00 — PR #3236: AF Lookahead+compile ablation (gohan) — CLOSED (important finding)
+
+- gohan/af-lookahead-compile, W&B runs: dm5ykwmx (no features), bl5kty7w (Lookahead only), ejjf27ob (compile only)
+- Hypothesis: test whether Lookahead+compile (discovered to be default-on) help AF
+- **CRITICAL FINDING: Both features are DEFAULT ON in baseline.** Gohan correctly reframed as ablation study.
+- Trial A (no features): surface=0.000538 ep422 (still running, GPU-shared). Trial B (Lookahead only): 0.000826 (+53% worse). Trial C (compile only): 0.001104 (worst despite 49% more epochs).
+- **Lookahead hurts AF surface by 53% at equal epochs.** Compile hurts surface quality despite throughput gains. "Double averaging" (EMA + Lookahead) is harmful for AF.
+- **Ambiguity: baseline with both features = 0.000296@ep704 (better than all ablations).** Could be synergy at long training or just single-GPU vs GPU-sharing budget difference.
+- Follow-up assigned: gohan #3255 no-Lookahead/no-compile full single-GPU budget to resolve ambiguity.
+
+## 2026-04-24 08:00 — PR #3230: AF residual-prediction + re-stratified sampling no-asinh (alphonse) — CLOSED (dead end)
+
+- alphonse/af-residual-restrat, W&B runs: qrws45k4 (both features), 9t9k4w26 (residual only)
+- Hypothesis: residual prediction + re-stratified sampling (without toxic asinh) help AF
+- Trial 1 (both): surface=0.000459 (+55%), vol=0.002652 (+30%). Trial 2 (residual only): surface=0.000509 (+72%), vol=0.003256 (+60%)
+- **Residual prediction harmful for AF:** flow has large separated regions where "correction from freestream" IS the entire signal. Re-stratified sampling is a no-op (AF returns uniform sample weights).
+- **Conclusion: residual-prediction added to AF dead-end list alongside asinh-pressure.**
+
+## 2026-04-24 08:00 — PR #3226: AF vol-weight curriculum 20x→10x (chihiro) — CLOSED (dead end)
+
+- chihiro/af-volume-weight-curriculum, W&B runs: 75lpm3lz (20x→10x), 72xdp0o9 (15x→10x)
+- Hypothesis: decaying vol-weight curriculum — front-load volume emphasis then relax to 10x
+- Trial 1 (20x→10x): surface=0.001295 (4.4x worse), vol=0.005167 (2.5x worse). Collapsed ep335 (grad norms 200-500x normal)
+- Trial 2 (15x→10x): surface=0.000408 (+38%), vol=0.003097 (+52%). Stable but both metrics worse
+- **Conclusion: vol-weight curriculum dead. Static 10x validated as optimal operating point.** Any deviation above 10x (even temporary) costs surface without vol benefit.
+
 ## 2026-04-24 07:30 — PR #3225: DM self-distillation via EMA teacher (canute) — CLOSED (dead end)
 
 - canute/dm-self-distillation, W&B runs: 1df67nu8 (α=0.3), r8c2ztmm (α=0.1), group: dm-self-distillation

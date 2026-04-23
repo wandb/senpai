@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 07:30 (advisor cycle 69)
+- **Date:** 2026-04-24 08:00 (advisor cycle 70)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -21,6 +21,7 @@
 - `#3252` mitsuha: progressive surface point training (resolution curriculum) — INNOVATION
 - `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
 - `#3228` chopper: stochastic weight perturbation at cosine troughs — INNOVATION
+- `#3256` alphonse: coordinate noise augmentation (σ=0.001/0.005 input perturbation) — INNOVATION
 - `#3253` canute: input feature dropout (Fourier channel dropout 10%/20%) — INNOVATION
 - `#3202` senku: GLU preprocess MLP — INNOVATION
 - `#3201` jet: DomainLayerNorm — INNOVATION
@@ -67,12 +68,10 @@
 - `#2949` vash: depth/width sweep (LR=5e-5)
 
 ### AirfRANS WIP (14 PRs)
-**Non-asinh noam feature ablation (highest priority — clean tests):**
-- `#3230` alphonse: residual-prediction + re-stratified sampling (NO asinh) — CLEAN NOAM ABLATION
-
 **Volume closure experiments:**
+- `#3255` gohan: no-Lookahead/no-compile champion full budget — AF VOLUME FOCUS (critical ablation follow-up)
+- `#3257` chihiro: extended training via reduced eval frequency (every 3/5 epochs) — AF VOLUME FOCUS
 - `#3241` hinata: T_max=75 + vol-weight=10x/12x on champion — AF VOLUME FOCUS (schedule gap-fill)
-- `#3236` gohan: Lookahead(AdamW) + torch.compile on vol-10x champion — AF VOLUME FOCUS
 - `#3234` jin: lower LR sweep (5e-4/4e-4) on vol-10x champion — AF VOLUME FOCUS
 - `#3232` nezuko: vol-weight warm-up schedule (1x→10x linear ramp over 200ep) — AF VOLUME FOCUS
 
@@ -84,7 +83,6 @@
 - `#3172` robin: LR warmup — SENT BACK (confounded config, re-running with correct champion config)
 - `#3169` nami: heads sweep 4H/16H
 - `#3227` casca: focal-MSE volume loss (upweight hard predictions) — AF VOLUME FOCUS
-- `#3226` chihiro: volume weight curriculum (20x→10x) — AF VOLUME FOCUS
 - `#3254` norman: multi-seed champion run (seeds 42/123/789) — AF VOLUME FOCUS
 - `#3238` rei: WD=0 ablation on vol-10x+EMA champion — AF VOLUME FOCUS
 - `#3245` tanjiro: per-channel volume loss weighting (upweight nut×4, p×2) — AF VOLUME FOCUS
@@ -226,6 +224,9 @@
 - PCGrad gradient surgery: 5-6x worse on both metrics (#3212). retain_graph=True disables torch.compile (40% throughput loss). Gradient conflict is NOT the bottleneck.
 - GradNorm adaptive loss balancing: surface 1.74x worse, vol 2.64x worse (#3218). retain_graph=True breaks compile (halves throughput). GradNorm converges to w_vol~8x, LOWER than hand-tuned 10x — fights intentional asymmetry
 - Volume smoothness regularization (KNN): ALL 4 trials regressed both metrics 44-97% (#3223). KNN Euclidean smoothness penalizes legitimate BL/wake/shear gradients. Even λ=1e-4 harmful
+- Residual prediction (no asinh): +55-72% surface worse (#3230). AF has large separated regions — "correction from freestream" IS the entire signal. Re-stratified sampling is no-op (uniform weights)
+- Vol-weight curriculum (20x→10x / 15x→10x): collapsed or 38-52% worse on both metrics (#3226). Static 10x validated as optimal — any deviation above hurts
+- Lookahead hurts AF surface by 53% at equal epochs (#3236 ablation). Compile also hurts surface despite more epochs. Both are default-on in baseline — ambiguity on synergistic effect at long training
 - Proximity-weighted volume loss: 118-2516% worse (#3222). Extreme weight ratios starve far-field gradients while overdriving near-surface. Structural failure at scale=0.1/eps=0.01
 - Huber loss on volume channel: no improvement over MSE on either metric (#3215). AF volume residuals are well-behaved, not heavy-tailed — Huber δ threshold adds no benefit
 - 3L depth (with or without EMA): catastrophic divergence confirmed twice
