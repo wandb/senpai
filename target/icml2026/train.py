@@ -227,7 +227,7 @@ class TargetTransform:
         if self.stats_mean is not None and self.stats_std is not None and self.stats_mean.numel() == out.shape[-1]:
             out = out * self.stats_std.to(out.device) + self.stats_mean.to(out.device)
         if self.asinh_pressure and self.pressure_index is not None:
-            out[..., self.pressure_index] = torch.sinh(out[..., self.pressure_index]) / max(self.asinh_scale, 1e-6)
+            out[..., self.pressure_index] = torch.sinh(out[..., self.pressure_index].clamp(-20.0, 20.0)) / max(self.asinh_scale, 1e-6)
         return out
 
 
@@ -1638,9 +1638,9 @@ def main() -> None:
     best_anp_state: dict[str, torch.Tensor] | None = None
 
     if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
+        primary_metric_str = "val_primary/surface_pressure_mae"
     else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
+        primary_metric_str = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1713,7 +1713,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(primary_metric_str)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
