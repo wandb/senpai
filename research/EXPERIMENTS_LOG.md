@@ -1,5 +1,13 @@
 # SENPAI Research Results
 
+## 2026-04-23 09:30 — PR #3139: AF 3L/256d + EMA=0.999 (spike) — CLOSED
+
+- surface=0.002863 (6.2x worse), vol=0.011626 (4.2x worse), diverged ep149 (W&B: `ooxb9roq`). Consistent with all prior 3L AF tests. 3L adds optimization noise that destabilizes trajectory. 2L confirmed optimal for AirfRANS.
+
+## 2026-04-23 09:30 — PR #3079: DM 4L/640d+gc=0.5 retry (gojo) — SENT BACK (again)
+
+- Retry2 used same config as retry1 (instructions not followed). Best 4.516% ep359 (W&B: `7uuhe2qr`), retry2 6.457% ep137 (W&B: `ho8eosr3`). Sent back again with firm instructions: lr=3e-4 + T_max=60 + EMA=0.9995 + gc=0.5.
+
 ## 2026-04-23 09:00 — PR #3138: DM 788 batches + T_max=60 (kakashi) — SENT BACK
 
 - val=6.620% ep66, diverged ep72 at second cosine cycle (W&B: `7sa8l03q`). Proportional T_max scaling confirmed (much better than #3084's 11.57%) but gc=1.0 insufficient. Sent back for gc=0.5 + EMA=0.9995.
