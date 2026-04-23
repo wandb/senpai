@@ -93,7 +93,7 @@ senpai/
 All project settings live in `senpai.yaml`:
 
 ```yaml
-problem: target/                          # active problem directory — entrypoint clones target_repo_url here
+problem_dir: target/                      # active problem directory — entrypoint clones target_repo_url here
 repo_url: https://github.com/wandb/senpai.git
 repo_branch: main
 target_repo_url: https://github.com/morganmcg1/tandemfoil2.git   # problem-package repo: agent commits/PRs target this

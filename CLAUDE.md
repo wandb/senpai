@@ -23,7 +23,7 @@ When asked for a large piece of work which seems vague or needs clarification, p
 
 ## Key docs
 
-- Here `<problem>` means the active problem package name under `target/`, selected by `senpai.yaml`'s `problem` path. With the default config, `<problem>` is `cfd_tandemfoil`.
+- Here `<problem>` means the active problem package name under `target/`, selected by `senpai.yaml`'s `problem_dir` path. With the default config, `<problem>` is `cfd_tandemfoil`.
 - The active problem package defines the current benchmark's dataset details, geometry assumptions, and exact metric names. Global system instructions should stay focused on CFD surrogate modelling rather than any one benchmark.
 - `target/<problem>/program.md` — active research context, goals, metrics, file constraints (default: `target/cfd_tandemfoil/program.md`)
 - `system_instructions/CLAUDE-ADVISOR.md` — advisor role workflow

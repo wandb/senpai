@@ -4,7 +4,7 @@
 # active problem directory
 # The entrypoint clones target_repo_url into this path at pod startup, so the
 # problem-package repo's root ends up at ./target/ in the pod workspace.
-problem: target/
+problem_dir: target/
 
 # git (senpai itself)
 repo_url: https://github.com/wandb/senpai.git

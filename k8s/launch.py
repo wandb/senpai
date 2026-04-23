@@ -43,7 +43,7 @@ class Args:
     """Launch senpai advisor and/or student agents on Kubernetes."""
     tag: str  # research tag (e.g. mar13)
     target_repo_url: str  # problem-package repo (entrypoint clones this into $PROBLEM_DIR; agent commits/PRs land here) — REQUIRED, no default
-    problem: str = "target/"  # active problem directory — entrypoint clones target_repo_url here (from senpai.yaml)
+    problem_dir: str = "target/"  # active problem directory — entrypoint clones target_repo_url here (from senpai.yaml)
     names: str = ""  # comma-separated student names (e.g. "frieren,fern")
     n_students: int = 4  # number of students to launch (ignored if --names is provided)
     repo_url: str = "https://github.com/wandb/senpai.git"  # git repo URL (senpai runner)
@@ -103,7 +103,7 @@ def render_student(template: str, student_name: str, tag: str, args: Args) -> st
             "WANDB_MODE": "online",
             "SENPAI_TIMEOUT_MINUTES": str(args.timeout_minutes),
             "SENPAI_MAX_EPOCHS": str(args.max_epochs),
-            "PROBLEM_DIR": args.problem,
+            "PROBLEM_DIR": args.problem_dir,
             "PVC_MOUNT_PATH": args.pvc_mount_path,
         },
     )
@@ -130,7 +130,7 @@ def render_advisor(template: str, tag: str, student_list: list[str], args: Args)
         "WANDB_ENTITY": args.wandb_entity,
         "WANDB_PROJECT": args.wandb_project,
         "ADVISOR_BRANCH": args.advisor_branch,
-        "PROBLEM_DIR": args.problem,
+        "PROBLEM_DIR": args.problem_dir,
         "PVC_MOUNT_PATH": args.pvc_mount_path,
     }
     if args.extra_instructions:
