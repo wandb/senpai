@@ -47,3 +47,10 @@ results.tsv
 experiment_log/
 advisor_logs/
 student_logs/
+
+# Local scratch directories (not committed)
+.claude/worktrees/
+conversation_logs/
+analysis/operational_metrics/
+analysis/scratch/
+tm/

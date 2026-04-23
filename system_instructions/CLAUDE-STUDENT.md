@@ -99,6 +99,7 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
    - Exact train.py command used to run the experiment
    - Peak memory usage
    - W&B run ID
+   - Metric curves analysis: Detailed description of the relevant metrics curves (e.g. loss, reward, etc.). The goal is to provide a concise and clear description of the trends observed - different phases, spikes, plateaus, slopes, etc, as well as any diganostics for those observations. Use the wandb skill to help you with this. This information will be very helpful for future researchers trying to understand the quality of the training run.
    - **What happened** — honest analysis: did it work? why or why not?
    - **Suggested follow-ups** — what would you try next based on what you learned?
 
