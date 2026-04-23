@@ -25,7 +25,7 @@
 
 **Champion tuning / paper-facing:**
 - `#3173` kakashi: shorter cosine T_max=15/20
-- `#NEW` sanji: TFP cp_panel bug fix + multi-seed retest — STABILIZATION PRIORITY
+- `#3209` sanji: TFP cp_panel bug fix + multi-seed retest — STABILIZATION PRIORITY
 - `#3164` faye: paper-facing full eval (two-phase) — PAPER-FACING Track 1
 - `#3163` shouko: attn dropout=0.05
 - `#3161` spike: eta_min=1e-5 (cosine floor)
