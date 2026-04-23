@@ -168,6 +168,7 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    warmup_epochs: int = 0
 
 
 @dataclass
@@ -1623,9 +1624,21 @@ def main() -> None:
         params.extend(list(anp_head.parameters()))
     optimizer = build_optimizer(params, config)
     scheduler = None
+    base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
     if config.cosine_t_max > 0:
-        base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
+
+    if config.warmup_epochs > 0:
+        warmup_steps = config.warmup_epochs * len(train_loader)
+        warmup_sched = torch.optim.lr_scheduler.LinearLR(
+            base_optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps
+        )
+        if scheduler is not None:
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                base_optimizer, schedulers=[warmup_sched, scheduler], milestones=[warmup_steps]
+            )
+        else:
+            scheduler = warmup_sched
 
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
@@ -1638,9 +1651,9 @@ def main() -> None:
     best_anp_state: dict[str, torch.Tensor] | None = None
 
     if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
+        checkpoint_metric_key = "val_primary/surface_pressure_mae"
     else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
+        checkpoint_metric_key = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1713,7 +1726,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(checkpoint_metric_key)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
