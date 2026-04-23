@@ -1,8 +1,8 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-23 12:30 (advisor cycle 31 — closed #3162/#3157, assigning himmel/nami)
+- **Date:** 2026-04-23 13:00 (advisor cycle 32 — closed #3131/#3124, assigning sanji/robin)
 - **Branch:** radford
-- **Idle students:** 0 (himmel/nami being assigned)
+- **Idle students:** 0 (sanji/robin being assigned)
 - **PRs ready for review:** 0
 
 ## Fleet Status
@@ -27,7 +27,7 @@
 - `#3138` kakashi: 788 batches+T_max=60 (SENT BACK — add gc=0.5+EMA)
 - `#3137` chopper: 5-ep warmup+gc=1.0
 - `#3132` gohan: eta_min=5e-5+gc=1.0
-- `#3131` sanji: OneCycleLR schedule
+- `#NEW` sanji: warmup (5-ep/10-ep) + EMA+gc champion — BEING ASSIGNED
 - `#3121` levi: dropout regularization sweep
 - `#3118` hinata: WD alone at champion config
 - `#3115` piccolo: bs2+25k pts (SENT BACK — 50k+gc=0.5+EMA)
@@ -49,7 +49,7 @@
 - `#NEW` nami: attention heads sweep (4H/16H) — BEING ASSIGNED (moved from TFP)
 - `#3145` rei: gc=0.4 boundary test
 - `#3133` shinobu: WD sweep (5e-3/2e-2)
-- `#3124` robin: 3L/256d wider model
+- `#NEW` robin: warmup (5-ep/10-ep) + EMA=0.999 — BEING ASSIGNED (moved from TFP)
 - `#3123` mitsuha: shorter T_max (5/8)
 - `#3098` shoya: clean test evaluation — URGENT PAPER-FACING
 - `#3088` mugen: T_max=20
@@ -139,6 +139,7 @@
 - Lion optimizer: all LR variants diverge (5e-5, 1e-4, 5e-5+gc)
 - Gradient centralization: fragile at LR restart boundaries (5.492% then diverge)
 - Polynomial LR (no cosine troughs): catastrophic — troughs are load-bearing stability features
+- OneCycleLR (no troughs): 8.04% best, sustained high-LR warmup worse than cosine peaks (without EMA+gc)
 - SWA: equal-weight averaging poisons across divergent basins (88.98%)
 - T_max=50+gc (both 0.5 and 1.0): diverge — T_max=30 only viable period
 - 10-ep warmup+gc=1.0: 11.2% then diverged
@@ -155,6 +156,7 @@
 - EMA≠0.999 (0.99 and 0.9995 both cause sinh overflow — very narrow window)
 - 4L depth (pressure overflow), LR=1.5e-4 (+34%)
 - 3L/224d width: catastrophic divergence (field_mse ~2.2e9, grad explosion ep87)
+- 3L/256d width: catastrophic divergence (field_mse 8.61e+24, 27 orders worse)
 - T_max=20/30: field_mse never reaches finite values
 
 **AirfRANS:**
