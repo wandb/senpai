@@ -1637,6 +1637,17 @@ def main() -> None:
     best_model_state: dict[str, torch.Tensor] | None = None
     best_anp_state: dict[str, torch.Tensor] | None = None
 
+    if bundle.spec.name == "tandemfoilset":
+        primary_metric_key = "val_primary/surface_pressure_mae"
+    else:
+        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
+    best_val_metric = float("inf")
+    best_epoch = 0
+    best_model_state: dict[str, torch.Tensor] | None = None
+    best_anp_state: dict[str, torch.Tensor] | None = None
+    best_ema_shadow: dict[str, torch.Tensor] | None = None
+    best_anp_ema_shadow: dict[str, torch.Tensor] | None = None
+
     run = None
     if config.wandb_name:
         run_config = asdict(config)
@@ -1702,16 +1713,32 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
+        current_val = eval_metrics.get(primary_metric_key)
+        if current_val is not None and current_val < best_val_metric:
+            best_val_metric = current_val
+            best_epoch = epoch
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            if anp_head is not None:
+                best_anp_state = {k: v.cpu().clone() for k, v in anp_head.state_dict().items()}
+            if ema is not None:
+                best_ema_shadow = {k: v.cpu().clone() for k, v in ema.shadow.items()}
+            if anp_ema is not None:
+                best_anp_ema_shadow = {k: v.cpu().clone() for k, v in anp_ema.shadow.items()}
+
         if ema is not None:
             ema.restore(model)
         if anp_head is not None and anp_ema is not None:
             anp_ema.restore(anp_head)
 
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
+        epoch_metrics["best_val_metric"] = best_val_metric
+        epoch_metrics["best_epoch"] = float(best_epoch)
         history.append(epoch_metrics)
         if run is not None:
             wandb.log(epoch_metrics, step=epoch)
             run.summary["epoch"] = epoch
+            run.summary["best_epoch"] = best_epoch
+            run.summary["best_val_metric"] = best_val_metric
         print(json.dumps(epoch_metrics, sort_keys=True), flush=True)
 
     if best_epoch is not None:
@@ -1761,7 +1788,9 @@ def main() -> None:
         if run is not None:
             wandb.log(final_test_metrics, step=int(history[-1]["epoch"]) if history else 0)
             run.summary.update(final_test_metrics)
-        print(json.dumps({"final_test_metrics": final_test_metrics}, sort_keys=True), flush=True)
+            run.summary["best_epoch"] = best_epoch
+            run.summary["best_val_metric"] = best_val_metric
+        print(json.dumps({"final_test_metrics": final_test_metrics, "best_epoch": best_epoch, "best_val_metric": best_val_metric}, sort_keys=True), flush=True)
 
         if best_model_state is not None:
             restore_module_state(model, best_model_state)
