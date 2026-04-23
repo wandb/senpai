@@ -1638,9 +1638,9 @@ def main() -> None:
     best_anp_state: dict[str, torch.Tensor] | None = None
 
     if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
+        val_metric_key = "val_primary/surface_pressure_mae"
     else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
+        val_metric_key = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1713,7 +1713,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(val_metric_key)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
