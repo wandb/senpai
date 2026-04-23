@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 07:00 (advisor cycle 68)
+- **Date:** 2026-04-24 07:30 (advisor cycle 69)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -21,7 +21,7 @@
 - `#3252` mitsuha: progressive surface point training (resolution curriculum) — INNOVATION
 - `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
 - `#3228` chopper: stochastic weight perturbation at cosine troughs — INNOVATION
-- `#3225` canute: self-distillation with EMA teacher — INNOVATION
+- `#3253` canute: input feature dropout (Fourier channel dropout 10%/20%) — INNOVATION
 - `#3202` senku: GLU preprocess MLP — INNOVATION
 - `#3201` jet: DomainLayerNorm — INNOVATION
 
@@ -85,7 +85,7 @@
 - `#3169` nami: heads sweep 4H/16H
 - `#3227` casca: focal-MSE volume loss (upweight hard predictions) — AF VOLUME FOCUS
 - `#3226` chihiro: volume weight curriculum (20x→10x) — AF VOLUME FOCUS
-- `#3223` norman: volume smoothness regularization — AF VOLUME FOCUS
+- `#3254` norman: multi-seed champion run (seeds 42/123/789) — AF VOLUME FOCUS
 - `#3238` rei: WD=0 ablation on vol-10x+EMA champion — AF VOLUME FOCUS
 - `#3245` tanjiro: per-channel volume loss weighting (upweight nut×4, p×2) — AF VOLUME FOCUS
 - `#3211` spike: AF vol_loss_scale learnable scalar (noam port) — AF VOLUME FOCUS
@@ -191,6 +191,7 @@
 - Fourier-encoded surface normals: 4.374%/4.454% (4 bands/2 bands). Normals are unit vectors in [-1,1] — don't benefit from Fourier lifting like unbounded coords. More bands = earlier divergence
 - Snapshot ensemble (cosine trough checkpoints): test=6.044% single best, WORSE with more snapshots (K=3→6.24%, K=5→6.98%, K=6→7.81%). Quality gradient dominates diversity. EMA already provides implicit smoothing.
 - Spectral norm on QKV: 4.035% (+5.3%). σ=1 cap over-restricts attention capacity. Late collapse ep502 from unconstrained FFN layers. gc=0.5 already solves restart stability.
+- Self-distillation via EMA teacher: α=0.3→6.446% diverge ep170, α=0.1→4.323% diverge ep400. EMA=0.9995 lag creates destabilizing feedback loop. Same EMA for ckpt+teacher incompatible.
 - Attention temperature annealing: 4.024% (+5% vs 3.833%). External annealed τ compounds with existing learnable per-head τ. noam result doesn't transfer
 - SAM optimizer (rho=0.05/0.02): 5.36%/9.08%. SAM perturbation + cosine restart = double shock → catastrophic divergence. 2x compute penalty also prohibitive
 - True monotonic cosine (T_max=393606, no restarts): 4.086% (+0.253pp). Confirms T_max=30 rapid restarts are core mechanism, not noise. Monotonic decay can't compete
@@ -224,6 +225,7 @@
 - asinh-pressure: DEFINITIVELY DEAD — 5 independent confirmations (#3191 T1/T2, #3177 T1/T2/T3). sinh() denormalization exponentially amplifies pressure errors. Non-pressure channels fine. Incompatible with AF pressure distribution.
 - PCGrad gradient surgery: 5-6x worse on both metrics (#3212). retain_graph=True disables torch.compile (40% throughput loss). Gradient conflict is NOT the bottleneck.
 - GradNorm adaptive loss balancing: surface 1.74x worse, vol 2.64x worse (#3218). retain_graph=True breaks compile (halves throughput). GradNorm converges to w_vol~8x, LOWER than hand-tuned 10x — fights intentional asymmetry
+- Volume smoothness regularization (KNN): ALL 4 trials regressed both metrics 44-97% (#3223). KNN Euclidean smoothness penalizes legitimate BL/wake/shear gradients. Even λ=1e-4 harmful
 - Proximity-weighted volume loss: 118-2516% worse (#3222). Extreme weight ratios starve far-field gradients while overdriving near-surface. Structural failure at scale=0.1/eps=0.01
 - Huber loss on volume channel: no improvement over MSE on either metric (#3215). AF volume residuals are well-behaved, not heavy-tailed — Huber δ threshold adds no benefit
 - 3L depth (with or without EMA): catastrophic divergence confirmed twice
