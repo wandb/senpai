@@ -168,6 +168,7 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    full_test_eval: bool = False
 
 
 @dataclass
@@ -1453,7 +1454,9 @@ def evaluate_phase_metrics(
     metric_transform: TargetTransform | None,
     device: torch.device,
     phase: str,
+    max_eval_batches_override: int | None = None,
 ) -> dict[str, float]:
+    max_batches = max_eval_batches_override if max_eval_batches_override is not None else config.max_eval_batches
     metrics: dict[str, float] = {}
     for split_name, loader in loaders.items():
         if config.model == "reference_abupt":
@@ -1464,7 +1467,7 @@ def evaluate_phase_metrics(
                 metric_transform,
                 device,
                 amp_mode=config.amp_mode,
-                max_batches=config.max_eval_batches,
+                max_batches=max_batches,
             )
         else:
             split_metrics = evaluate_grouped(
@@ -1475,7 +1478,7 @@ def evaluate_phase_metrics(
                 metric_transform,
                 device,
                 amp_mode=config.amp_mode,
-                max_batches=config.max_eval_batches,
+                max_batches=max_batches,
             )
         metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
         if phase == "val" and split_name in LEGACY_VAL_ALIAS and "mae_surf_p" in split_metrics:
@@ -1740,6 +1743,7 @@ def main() -> None:
             anp_ema.store(anp_head)
             anp_ema.copy_to(anp_head)
 
+        test_max_batches_override = 0 if config.full_test_eval else None
         final_test_metrics = evaluate_phase_metrics(
             bundle=bundle,
             config=config,
@@ -1750,6 +1754,7 @@ def main() -> None:
             metric_transform=metric_transform,
             device=device,
             phase="test",
+            max_eval_batches_override=test_max_batches_override,
         )
 
         if ema is not None:
@@ -1776,6 +1781,7 @@ def main() -> None:
                 metric_transform=metric_transform,
                 device=device,
                 phase="test",
+                max_eval_batches_override=test_max_batches_override,
             )
             if run is not None:
                 best_checkpoint_metrics: dict[str, float | int | str] = {
