@@ -1,5 +1,17 @@
 # SENPAI Research Results
 
+## 2026-04-23 18:00 — PR #3068: DM 64k surface points (brook) — CLOSED
+
+- 64k points + EMA=0.9995 + gc=0.5: surface_rel_l2=12.16% (W&B: `j2p2i1c0`). Prior 64k without EMA+gc: 8.18%. Adding EMA+gc on 64k made it WORSE — structural instability compounds. 50k remains the only viable surface point count for DM. Full surface point investigation complete: 16k=11.672%, 32k=7.558%, 64k=12.16%, all dead vs 50k=3.833% baseline.
+
+## 2026-04-23 18:00 — PR #3066: DM 16k surface points (alphonse) — CLOSED
+
+- 16k surface points: surface_rel_l2=11.672% (W&B: `q95gpjjq`). Student reported crash at epoch 213 on original attempt, then retried with fixed settings. Even with proper config, 3x worse than 50k baseline. Low point counts cause unstable gradient estimates on DrivAerML's complex surface geometry.
+
+## 2026-04-23 18:00 — PR #3064: DM multi-seed s123 two-phase (casca) — CLOSED
+
+- Phase 1 (capped): 6.284% ep175 (W&B: `3zhuvd2h`). Phase 2 (full): val=11.888% (W&B: `88ixfvzx`). Used old config without EMA+gc=0.5 — diverges catastrophically in uncapped phase. Not valid for paper-facing comparison. Multi-seed runs need to wait for post-noam-pivot best config.
+
 ## 2026-04-23 17:30 — PR #3153: DM EMA+gc+light WD (emma) — CLOSED
 
 - WD=1e-4: 14.76% ep35, diverged ep36 (W&B: `cbkbmr7n`). WD=5e-4: 4.920% ep247, diverged ep248 (W&B: `t1pqa5qd`). WD destabilizes EMA shadow model — no-WD confirmed for DM champion. Bug fix noted (primary_metric_key shadowing).
