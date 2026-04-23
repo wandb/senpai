@@ -25,7 +25,7 @@ wandb_entity: wandb-applied-ai-team
 wandb_project: senpai-v1
 
 # advisor — the integration branch inside the problem-package repo that advisor PRs merge into
-advisor_branch: kagent_royal_rumble
+advisor_branch: schmidhuber
 
 # training limits
 timeout_minutes: 30.0
