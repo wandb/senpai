@@ -3,11 +3,20 @@
 ## TandemFoilSet
 
 - **Primary metric:** `val_primary/surface_pressure_mae` (= `val_eq4/surface_pressure_mae`)
-- **Current best:** 21.350 (val) at epoch 331 — test 23.195
-- **Best PR:** #3140 (usopp — gc=0.2+EMA=0.999, Lion lr=1.25e-4, T_max=10, WD=1e-2, 3L/192d)
-- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 1.25e-4 --cosine-t-max 10 --grad-clip 0.2 --weight-decay 1e-2 --model-slices 64 --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999 --ema-decay 0.999`
+- **Current best:** 21.319 (val) at epoch 277 — test 22.868
+- **Best PR:** #3185 (fern — full noam stack: ANP+physics+T_max=150+Lookahead+compile+re-strat+96sl)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 1.25e-4 --cosine-t-max 150 --grad-clip 0.2 --weight-decay 1e-2 --model-slices 96 --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --enable-wake-deficit --enable-wake-angle --enable-vortex-panel-velocity --asinh-pressure --asinh-scale 0.75 --residual-prediction --enable-pressure-prior-addition --re-stratified-sampling --anp-srf --use-lookahead --compile-model --ema-decay 0.999 --epochs 999`
 
-### 2026-04-23 — PR #3140: TandemFoil: gc=0.2 + EMA=0.999 — NEW BEST (CURRENT)
+### 2026-04-24 — PR #3185: TandemFoil: full noam stack (ANP+physics+T_max=150+Lookahead+96sl) — NEW BEST (CURRENT)
+
+- **val_primary/surface_pressure_mae:** 21.319 (-0.15% vs 21.350) at epoch 277
+- **test_primary/surface_pressure_mae:** 22.868 (-1.41% vs 23.195)
+- **W&B run:** v05jt92n (fern/tf-full-noam-stack)
+- **Config:** Lion lr=1.25e-4, T_max=150, gc=0.2, WD=1e-2, EMA=0.999, 3L/192d, 96 slices, Lookahead(α=0.5,k=5), torch.compile, re-stratified sampling, ANP decoder, wake deficit + wake angle + vortex panel physics, asinh-scale=0.75
+- **Key insight:** Full noam feature stack outperforms the stripped champion. Extras (Lookahead, compile, 96 slices, re-stratified) only take effect after ep200 — T2 (ANP+physics only, T_max=10) led for first 180 epochs, then T1 pulled ahead. Late-training compounding effect. T_max=150 needed for full benefit; T_max=10 (T2) diverged at ep289.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 1.25e-4 --cosine-t-max 150 --grad-clip 0.2 --weight-decay 1e-2 --model-slices 96 --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --enable-wake-deficit --enable-wake-angle --enable-vortex-panel-velocity --asinh-pressure --asinh-scale 0.75 --residual-prediction --enable-pressure-prior-addition --re-stratified-sampling --anp-srf --use-lookahead --compile-model --ema-decay 0.999 --epochs 999`
+
+### 2026-04-23 — PR #3140: TandemFoil: gc=0.2 + EMA=0.999 — PREVIOUS BEST
 
 - **val_primary/surface_pressure_mae:** 21.350 (-2.6% vs 21.909) at epoch 331
 - **test_primary/surface_pressure_mae:** 23.195 (-1.0% vs 23.419)
