@@ -1630,12 +1630,6 @@ def main() -> None:
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
     history: list[dict[str, float]] = []
-    best_epoch: int | None = None
-    best_val_primary_metric_name = primary_metric_key(bundle, phase="val")
-    best_val_primary_metric: float | None = None
-    best_val_metrics: dict[str, float] = {}
-    best_model_state: dict[str, torch.Tensor] | None = None
-    best_anp_state: dict[str, torch.Tensor] | None = None
 
     if bundle.spec.name == "tandemfoilset":
         primary_metric_key = "val_primary/surface_pressure_mae"
@@ -1647,6 +1641,9 @@ def main() -> None:
     best_anp_state: dict[str, torch.Tensor] | None = None
     best_ema_shadow: dict[str, torch.Tensor] | None = None
     best_anp_ema_shadow: dict[str, torch.Tensor] | None = None
+    best_val_primary_metric_name = primary_metric_key
+    best_val_primary_metric: float | None = None
+    best_val_metrics: dict[str, float] = {}
 
     run = None
     if config.wandb_name:
