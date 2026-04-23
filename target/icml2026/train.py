@@ -167,6 +167,7 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
+    eval_checkpoint: str = ""
     seed: int = 0
 
 
@@ -1649,6 +1650,48 @@ def main() -> None:
             config=run_config,
             tags=[config.dataset, config.model],
         )
+
+    if config.eval_checkpoint:
+        ckpt_path = Path(config.eval_checkpoint)
+        ckpt_state = torch.load(ckpt_path, map_location=device, weights_only=True)
+        model.load_state_dict(ckpt_state)
+        print(f"Loaded checkpoint from {ckpt_path}", flush=True)
+
+        anp_ckpt_path = ckpt_path.with_name(ckpt_path.name.replace("_best.pt", "_anp_best.pt"))
+        if anp_head is not None and anp_ckpt_path.exists():
+            anp_head.load_state_dict(torch.load(anp_ckpt_path, map_location=device, weights_only=True))
+
+        val_metrics = evaluate_phase_metrics(
+            bundle=bundle, config=config, forward_model=forward_model, anp_head=anp_head,
+            loaders=val_loaders, transform=transform, metric_transform=metric_transform,
+            device=device, phase="val",
+        )
+        test_metrics = evaluate_phase_metrics(
+            bundle=bundle, config=config, forward_model=forward_model, anp_head=anp_head,
+            loaders=test_loaders, transform=transform, metric_transform=metric_transform,
+            device=device, phase="test",
+        ) if test_loaders else {}
+
+        all_metrics = {**val_metrics, **test_metrics}
+        if run is not None:
+            wandb.log(all_metrics, step=0)
+            run.summary.update(all_metrics)
+
+        print(json.dumps({"eval_checkpoint_val": val_metrics}, sort_keys=True), flush=True)
+        print(json.dumps({"eval_checkpoint_test": test_metrics}, sort_keys=True), flush=True)
+
+        output_dir = Path(config.output_dir)
+        write_run_summary(
+            output_dir / f"{config.dataset}_{config.model}_summary.json",
+            config, bundle, [], best_epoch=0,
+            best_val_primary_metric_name=best_val_primary_metric_name,
+            best_val_primary_metric=val_metrics.get(best_val_primary_metric_name),
+            best_val_metrics=val_metrics, best_test_metrics=test_metrics,
+            final_test_metrics=test_metrics,
+        )
+        if run is not None:
+            run.finish()
+        return
 
     start_time = time.monotonic()
     timeout_seconds = None if not timeout_env else float(timeout_env) * 60.0
