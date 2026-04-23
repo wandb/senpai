@@ -141,7 +141,13 @@ Every pod also reads three keys from the shared, cluster-wide `senpai-secrets` S
 | `claude-code-oauth-token` | `CLAUDE_CODE_OAUTH_TOKEN` — Claude Code auth. Prefer this over `ANTHROPIC_API_KEY` (much cheaper) |
 | `exa-api-key` | `EXA_API_KEY` — Exa web search used by the research agent |
 
-Create the secret once with:
+If you don't already have a Claude Code OAuth token, generate one interactively:
+
+```bash
+claude setup-token
+```
+
+Then create the secret (the `$(claude setup-token)` inline below works too if you'd rather skip the separate step):
 
 ```bash
 kubectl create secret generic senpai-secrets \
