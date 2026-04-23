@@ -1,5 +1,36 @@
 # SENPAI Research Results
 
+## 2026-04-23 03:55 — PR #3126: DrivAerML cosine eta_min sweep (gohan) — CLOSED
+
+- **Branch:** gohan/dm-cosine-eta-min
+- **Hypothesis:** Non-zero eta_min (1e-5, 5e-5) keeps optimizer active at cosine troughs
+- **Results:**
+
+| Run | eta_min | W&B ID | Best val surface_rel_l2_pct | Fate |
+|---|---|---|---|---|
+| Run 1 | 1e-5 | kg7eolnk | 7.584% ep112 | Diverged |
+| Run 2 | 5e-5 | 1n8peifp | 6.800% ep98 | Diverged |
+| Baseline | 0 | bht6h42t | 3.997% ep467 | — |
+
+- **Analysis:** Faster early convergence (confirming hypothesis direction) but both diverged — without eta_min=0's natural LR "rest" at troughs, gradient noise accumulates unchecked. ~40% of steps above 20% error. eta_min=5e-5 + gc=1.0 is the promising follow-up.
+- **Decision:** CLOSED — 70-90% above baseline, both diverged
+
+## 2026-04-23 03:55 — PR #3096: TFP lr=1e-4 at champion config (shinobu) — CLOSED
+
+- **Branch:** shinobu/tfp-lr-1e4
+- **Hypothesis:** Lower LR (1e-4 vs champion 1.25e-4) continues the TF improvement trend
+- **Results:**
+
+| Metric | lr=1e-4 | lr=1.25e-4 Baseline |
+|---|---|---|
+| val_primary/field_mse | **Infinity** (all 393 eps) | 0.002383 ep443 |
+| vol pressure finite epochs | 0/393 | — |
+| val/surface_mse_Ux | 0.00128 (healthy) | — |
+
+- **W&B run:** z63sarn6
+- **Analysis:** 20% lower LR causes pressure channel to never resolve within budget — asinh(sinh()) overflow persists all 393 epochs. Velocity channels converge normally, confirming this is a pressure convergence speed issue. LR=1.25e-4 is near the minimum viable LR for TFP with current architecture.
+- **Decision:** CLOSED — Infinity field_mse, pressure never finite
+
 ## 2026-04-23 03:35 — PR #3116: DrivAerML SGDR T_0=15 T_mult=2 (sanji) — CLOSED
 
 - **Branch:** sanji/dm-sgdr-t0-15-tmult2
