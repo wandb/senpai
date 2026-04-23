@@ -1635,18 +1635,13 @@ def main() -> None:
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
     history: list[dict[str, float]] = []
-    best_epoch: int | None = None
-    best_val_primary_metric_name = primary_metric_key(bundle, phase="val")
-    best_val_primary_metric: float | None = None
-    best_val_metrics: dict[str, float] = {}
-    best_model_state: dict[str, torch.Tensor] | None = None
-    best_anp_state: dict[str, torch.Tensor] | None = None
 
     if bundle.spec.name == "tandemfoilset":
         primary_metric_key = "val_primary/surface_pressure_mae"
     else:
         primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
+    best_val_metrics: dict[str, float] = {}
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
     best_anp_state: dict[str, torch.Tensor] | None = None
@@ -1709,19 +1704,10 @@ def main() -> None:
             phase="val",
         )
 
-        current_primary_metric = eval_metrics.get(best_val_primary_metric_name)
-        if current_primary_metric is not None and (
-            best_val_primary_metric is None or current_primary_metric < best_val_primary_metric
-        ):
-            best_epoch = epoch
-            best_val_primary_metric = current_primary_metric
-            best_val_metrics = dict(eval_metrics)
-            best_model_state = snapshot_module_state(model)
-            best_anp_state = snapshot_module_state(anp_head)
-
         current_val = eval_metrics.get(primary_metric_key)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
+            best_val_metrics = dict(eval_metrics)
             best_epoch = epoch
             best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             if anp_head is not None:
@@ -1753,8 +1739,8 @@ def main() -> None:
                 {
                     "best_checkpoint": {
                         "epoch": float(best_epoch),
-                        "val_primary_metric_name": best_val_primary_metric_name,
-                        "val_primary_metric": best_val_primary_metric,
+                        "val_primary_metric_name": primary_metric_key,
+                        "val_primary_metric": best_val_metric,
                     }
                 },
                 sort_keys=True,
@@ -1815,10 +1801,10 @@ def main() -> None:
             if run is not None:
                 best_checkpoint_metrics: dict[str, float | int | str] = {
                     "best_epoch": int(best_epoch) if best_epoch is not None else -1,
-                    "best_val_primary_metric_name": best_val_primary_metric_name or "",
+                    "best_val_primary_metric_name": primary_metric_key,
                 }
-                if best_val_primary_metric is not None:
-                    best_checkpoint_metrics["best_val_primary_metric"] = best_val_primary_metric
+                if best_val_metric < float("inf"):
+                    best_checkpoint_metrics["best_val_primary_metric"] = best_val_metric
                 best_checkpoint_metrics.update({f"best_val/{key}": value for key, value in best_val_metrics.items()})
                 best_checkpoint_metrics.update({f"best_test/{key}": value for key, value in best_test_metrics.items()})
                 best_checkpoint_metrics.update(best_checkpoint_metric_aliases(best_val_metrics))
@@ -1849,8 +1835,8 @@ def main() -> None:
         bundle,
         history,
         best_epoch=best_epoch,
-        best_val_primary_metric_name=best_val_primary_metric_name,
-        best_val_primary_metric=best_val_primary_metric,
+        best_val_primary_metric_name=primary_metric_key,
+        best_val_primary_metric=best_val_metric if best_val_metric < float("inf") else None,
         best_val_metrics=best_val_metrics,
         best_test_metrics=best_test_metrics,
         final_test_metrics=final_test_metrics,
