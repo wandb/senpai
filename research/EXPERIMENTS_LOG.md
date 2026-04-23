@@ -1,5 +1,71 @@
 # SENPAI Research Results
 
+## 2026-04-23 06:15 — PR #2974: Best-checkpoint saving infrastructure (mugen) — MERGED ✓
+
+- **Branch:** mugen/best-checkpoint-saving
+- **Purpose:** Infrastructure — save best val checkpoint and restore before test eval
+- **Results:**
+
+| Dataset | W&B Run | Best Val | Best Ep | Best-ckpt Test | Terminal Test | Value |
+|---|---|---|---|---|---|---|
+| TandemFoil | `d9pk596u` | 26.80 | 241 | 28.80 | 29.19 | +1.4% |
+| AirfRANS | `as2mn0nw` | 0.00107 | 422 | 0.00160 | **NaN** | NaN rescued |
+| DrivAerML | `aq9xd1vg` | 13.23% | 54 | 13.86% | 47.15% | **3.4x improvement** |
+
+- **Decision:** MERGED — essential infrastructure. AirfRANS NaN recovery demonstrates this is critical: without it, a 627-epoch run produces zero usable results. All future branches on radford benefit automatically.
+
+## 2026-04-23 06:15 — PR #3130: AF EMA decay sweep (0.995/0.99) (violet) — CLOSED
+
+- EMA=0.995: surface=0.000695, vol=0.007556 (W&B: `lecm4fhl`). EMA=0.99: surface=0.002217, vol=0.009048 (W&B: `b6inrppx`). Both monotonically worse than EMA=0.999 (0.000459/0.002777). EMA sweep fully closed for AirfRANS — 0.999 is the sweet spot.
+
+## 2026-04-23 06:15 — PR #3102: AF 10x volume loss weight (thorfinn) — CLOSED
+
+- surface=0.000481, vol=0.004144 (W&B: `aldagms8`). Both metrics worse than EMA champion (0.000459/0.002777) — student compared against stale pre-EMA baseline. Closing; follow up at 1.5x/2.0x is the right direction (see tanjiro send-back).
+
+## 2026-04-23 06:15 — PR #3101: AF 3x volume loss weight (tanjiro) — SENT BACK
+
+- surface=**0.000381** (-17% NEW BEST surface), vol=0.003904 (+41% vs champion 0.002777). (W&B: `2ebhl15x`). Surface improvement is real — late-stage divergence ep767 is a concern. Sent back for retry at vol-weight=1.5 + possible gc=0.5 tightening.
+
+## 2026-04-23 06:15 — PR #3100: AF 3L/384d architecture (taki) — CLOSED
+
+- Catastrophic divergence ep53 — surface=0.01947/vol=0.08889 (30-40x worse). (W&B: `kt3h6c9t`). Matches 2L/384d failure. 2L/256d is hard stability constraint for AF. Architecture dead end.
+
+## 2026-04-23 06:15 — PR #3107: TF clean test (old gc=0.5 config) (yuji) — CLOSED
+
+- val=22.454, test=23.578 (W&B: `eyj4ltf8`). Config was gc=0.5 (old champion) — current best is gc=0.3 (test=23.419, PR #3108). Closed and reassigning yuji to clean test row for gc=0.3 champion.
+
+## 2026-04-23 06:15 — PR #3093: TFP EMA=0.99 (rei) — CLOSED
+
+- val/field_mse=Infinity all 532 epochs (W&B: `9j29lyiw`). Faster EMA (~100-update window) allows early noisy pressure to survive sinh() inverse transform. EMA<0.999 dead for TFP — sinh amplification is fundamental.
+
+## 2026-04-23 06:15 — PR #3092: TFP EMA=0.9995 (norman) — CLOSED
+
+- field_mse ~1e+28 all 536 epochs (W&B: `xy01mjzl`). Slower EMA (~2000-update window) retains too much weight from early extreme pressure values. Mirror-image failure to EMA=0.99. EMA=0.999 confirmed as sharp optimum for TFP — both directions fail. TFP EMA sweep fully closed.
+
+## 2026-04-23 06:15 — PR #3085: DM larger supernodes 8192/16000 (kohaku) — SENT BACK
+
+- Best val 6.121% ep143, then catastrophic divergence ep144 (grad norms →158T). (W&B: `e3nmais2`). Missing --grad-clip — 2x larger graph amplifies gradient magnitudes. Sent back for retry with gc=1.0.
+
+## 2026-04-23 06:15 — PR #3076: DM log-cosh loss (frieren) — SENT BACK
+
+- Best val 6.344% ep126, diverged ep134 (grad norms →181B). (W&B: `z2k4uz99`). Fast early convergence is interesting. Sent back for retry with gc=1.0 to get a clean result.
+
+## 2026-04-23 06:15 — PR #3075: DM Huber loss delta=0.1 and 1.0 (franky) — CLOSED
+
+- delta=0.1: 6.681% ep185 then NaN (W&B: `hrcuze3j`). delta=1.0: 8.531% ep135 then NaN (W&B: `to5hq7f2`). Both 67%/113% worse than baseline. Consistent with AF Huber underperformance — MSE outlier gradients help learn hard CFD pressure cases. Huber direction dead across datasets.
+
+## 2026-04-23 06:15 — PR #3074: DM relative L2 training loss (fern) — CLOSED
+
+- Pure rel_l2: 75.27%, mixed 50/50: 75.30% — both degenerate to z-mean prediction immediately (W&B: `lago3za1`, `cxrfryjm`). Root cause: rel_l2 on z-normalized targets creates near-zero division instability. Dead end in current form. Fix (raw-space rel_l2) would be a distinct hypothesis.
+
+## 2026-04-23 06:15 — PR #3046: DM WD+gc compound (sukuna) — SENT BACK
+
+- WD=1e-3+gc=1.0: **4.44%** ep448 stable (W&B: `9hflnw2d`). WD=1e-3 alone: 22.07% then diverged. gc=1.0 alone: 5.20% then diverged. (W&B runs: `9hflnw2d`, `zromiqrc`, `imyzfshf`, `igbb8kb2`). Sent back for lighter WD=5e-4/1e-4 + gc=1.0.
+
+## 2026-04-23 06:15 — PR #3063: DM paper-facing full-eval seed=42 (canute) — SENT BACK
+
+- val=12.23% ep49, test=12.82% ep49. (W&B: `r4jrfhfu`). Run hit timeout at ep50 — full eval costs ~7 min/ep, only 50 of ~467 epochs completed. Sent back with two-phase approach: train with max-eval-batches, then single final full-eval pass from best checkpoint.
+
 ## 2026-04-23 05:30 — PR #3108: TandemFoil gc=0.3+EMA=0.999 (zenitsu) — MERGED ✓
 
 - **Branch:** zenitsu/tf-gc03-ema999
