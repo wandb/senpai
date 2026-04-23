@@ -47,14 +47,16 @@ source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
 SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
 source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
 
-# Gh helpers target the problem-package repo, not senpai. Pre-seed the slug cache.
-export _SENPAI_REPO="$TARGET_REPO"
+# $GH_REPO comes from the ConfigMap (set by launch.py = owner/repo of the
+# problem-package repo). The gh CLI honours it natively, so every `gh`
+# command and `gh api` call targets the problem-package repo, not senpai,
+# regardless of the agent's cwd.
 
 # --- Build prompts (CC auto-discovers CLAUDE.md for role instructions) ---
 TASK_INSTRUCTIONS="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-student.md" | sed '/^<!--$/,/^-->$/d')"
 PROMPT="${TASK_INSTRUCTIONS}"
 
-KEY_INFO=$'\n\nKey information:\n\nStudent: '"$STUDENT_NAME"' | Target repo: '"$TARGET_REPO"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
+KEY_INFO=$'\n\nKey information:\n\nStudent: '"$STUDENT_NAME"' | Target repo: '"$GH_REPO"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
 HEARTBEAT_PROMPT="Continue your student loop. Check for assigned PRs, check for GitHub issues, and resume any in-progress work."
@@ -78,8 +80,13 @@ while true; do
     git checkout "$ADVISOR_BRANCH" 2>/dev/null || true
     git pull origin "$ADVISOR_BRANCH" 2>/dev/null || true
 
-    # Overwrite CLAUDE.md with the student role instructions — git checkout/pull clobbers it with the developer copy
-    envsubst '$PROBLEM_DIR' < "$WORKDIR/system_instructions/CLAUDE-STUDENT.md" | sed '/^<!--$/,/^-->$/d' > "$WORKDIR/CLAUDE.md"
+    # Overwrite CLAUDE.md with the student role instructions — git checkout/pull clobbers it with the developer copy.
+    # Whitelist vars so envsubst substitutes pod env vars but leaves Claude Code runtime vars
+    # like ${CLAUDE_PLUGIN_ROOT} alone (those get expanded by the agent's shell at call time).
+    envsubst '$PROBLEM_DIR $TARGET_REPO_URL $GH_REPO $ADVISOR_BRANCH $RESEARCH_TAG $STUDENT_NAME $WANDB_ENTITY $WANDB_PROJECT' \
+        < "$WORKDIR/system_instructions/CLAUDE-STUDENT.md" \
+        | sed '/^<!--$/,/^-->$/d' \
+        > "$WORKDIR/CLAUDE.md"
 
     echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) in $PROBLEM_DIR ==="
     echo "=== GPU: $(nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null) ==="

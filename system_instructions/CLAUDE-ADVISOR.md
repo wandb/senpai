@@ -12,14 +12,14 @@ Read `$PROBLEM_DIR/program.md` for the full research context, constraints, metri
 
 ## Git scope — READ THIS FIRST
 
-`$PROBLEM_DIR` is a **clone of the problem-package repo** that the entrypoint `git clone`d in at pod startup. Its `origin` is `$TARGET_REPO_URL` (usually `https://github.com/<owner>/<problem>.git`). The entrypoint has already:
+`$PROBLEM_DIR` is a **clone of the problem-package repo** that the entrypoint `git clone`d in at pod startup. Its `origin` is `$TARGET_REPO_URL`. The entrypoint has already:
 
-- pre-seeded `_SENPAI_REPO` so the `senpai-gh` helpers and `gh` commands target the **problem-package repo**, not `wandb/senpai`
-- `cd`'d into `$PROBLEM_DIR` and created/checked out the advisor integration branch (`$ADVISOR_BRANCH`, default `kagent_royal_rumble`)
+- set the `GH_REPO` env var (to `$GH_REPO`) — every `gh` CLI call and `gh api` call routes to the problem-package repo, not `wandb/senpai`, regardless of your cwd
+- `cd`'d into `$PROBLEM_DIR` and created/checked out the advisor integration branch (`$ADVISOR_BRANCH`)
 
-**All your `git` operations, `gh pr create`, `gh pr comment`, label swaps, and merge actions run inside `$PROBLEM_DIR`, against its `origin`.** Never commit to `wandb/senpai`. The senpai runner repo is read-only from your perspective.
+**All your `git` operations, `gh pr create`, `gh pr comment`, label swaps, and merge actions target the problem-package repo.** Never commit to `wandb/senpai`. The senpai runner repo is read-only from your perspective.
 
-Your draft PRs for students: `gh pr create --base $ADVISOR_BRANCH` (implicitly in the problem-package repo, since `_SENPAI_REPO` is set).
+Your draft PRs for students: `gh pr create --base $ADVISOR_BRANCH` (no `--repo` needed — `$GH_REPO` routes it).
 
 ## Your Identity
 

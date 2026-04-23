@@ -9,8 +9,10 @@
 #
 #   source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 #
-# Functions auto-detect {owner}/{repo} from the git remote so callers
-# never need to hardcode it.
+# Repo routing: every `gh` invocation (CLI and `gh api`) honours the
+# GH_REPO env var, which the pod entrypoint sets to the problem-package
+# slug (e.g. "morganmcg1/tandemfoil2"). So callers never need --repo,
+# and cwd drift can't route commands to the wrong repo.
 #
 # WHY THIS EXISTS:
 # The GitHub CLI's `gh pr edit --remove-label X --add-label Y` silently
@@ -18,20 +20,6 @@
 # DELETE + POST calls are the only safe way to swap a single label.
 # This library wraps that pattern so nobody has to remember (or get
 # bitten by) the footgun.
-
-# ---------------------------------------------------------------------------
-# Internal: repo slug cache
-# ---------------------------------------------------------------------------
-_SENPAI_REPO=""
-
-# Print owner/repo (e.g. "wandb/senpai"), cached after first call.
-print_gh_repo() {
-    if [ -z "$_SENPAI_REPO" ]; then
-        _SENPAI_REPO=$(git remote get-url origin 2>/dev/null \
-            | sed -E 's|.*github\.com[:/]||; s|\.git$||')
-    fi
-    echo "$_SENPAI_REPO"
-}
 
 # ---------------------------------------------------------------------------
 # Retry helper: up to 6 attempts with 15s backoff, then fail loudly.
@@ -52,15 +40,14 @@ gh_retry() {
 
 # Atomically swap one label for another on a PR/issue.
 #   swap_gh_pr_label <number> <remove_label> <add_label>
+# Uses $GH_REPO for the repo slug (set by the pod entrypoint).
 swap_gh_pr_label() {
     local num="$1" remove="$2" add="$3"
-    local repo
-    repo=$(print_gh_repo)
 
     # DELETE the old label — retry transient failures, tolerate 404 (already gone).
     local attempt err
     for attempt in 1 2 3 4 5 6; do
-        err=$(gh api "repos/${repo}/issues/${num}/labels/${remove}" \
+        err=$(gh api "repos/${GH_REPO}/issues/${num}/labels/${remove}" \
             --method DELETE --silent 2>&1) && break
         echo "$err" | grep -q "404" && break
         echo "swap_gh_pr_label: DELETE attempt $attempt failed, retrying in 15s..." >&2
@@ -69,7 +56,7 @@ swap_gh_pr_label() {
     done
 
     # POST the new label (gh_retry gives 6 attempts on transient failure).
-    gh_retry gh api "repos/${repo}/issues/${num}/labels" \
+    gh_retry gh api "repos/${GH_REPO}/issues/${num}/labels" \
         -f "labels[]=${add}" --method POST --silent
 }
 
