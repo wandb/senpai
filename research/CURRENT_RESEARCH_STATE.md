@@ -1,11 +1,11 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-23 18:30 (advisor cycle 40 — closed #3159/#3158, assigning franky/bulma)
+- **Date:** 2026-04-23 19:30 (advisor cycle 41 — closed #3142/#3115/#3079, assigning zenitsu/gojo/piccolo)
 - **Branch:** radford
-- **Idle students:** 0
+- **Idle students:** 0 (zenitsu/gojo/piccolo being assigned)
 - **PRs ready for review:** 0
 
-## Fleet Status (59 active PRs)
+## Fleet Status (56 active PRs → 59 after assignments)
 
 ### DrivAerML WIP (30 PRs)
 **Noam-pivot experiments (highest priority):**
@@ -31,12 +31,12 @@
 - `#3143` thorfinn: Lookahead(AdamW)
 - `#3132` gohan: eta_min=5e-5+gc=1.0
 - `#3121` levi: dropout regularization sweep
-- `#3115` piccolo: bs2+25k pts (SENT BACK — 50k+gc=0.5+EMA)
+- `#NEW` piccolo: AF re-stratified sampling alone — BEING ASSIGNED
 - `#3110` einar: beta2=0.99/0.995
 - `#3109` guts: lr=4e-4 full-eval
 - `#3085` kohaku: larger supernodes (SENT BACK — retry+gc=1.0)
 - `#3083` jet: max-train-batches=600
-- `#3079` gojo: 4L/640d (SENT BACK — lr=3e-4+T_max=60+EMA)
+- `#NEW` gojo: TF residual-prediction alone — BEING ASSIGNED
 - `#3076` frieren: log-cosh loss (SENT BACK — retry+gc=1.0)
 - `#3067` askeladd: 32k surface points (SENT BACK — add max-eval-batches 200)
 - `#3063` canute: paper-facing full-eval (SENT BACK — two-phase)
@@ -50,8 +50,8 @@
 - `#3180` chopper: ANP decoder alone — NOAM ABLATION
 
 **Other:**
+- `#NEW` zenitsu: TF EMA decay sweep (0.9999/0.99995) — BEING ASSIGNED
 - `#3150` yuji: clean test row gc=0.3 champion — PAPER-FACING
-- `#3142` zenitsu: gc=0.3+longer budget (480-min)
 
 ### TandemFoil Paper WIP (10 PRs)
 **Noam-pivot experiments (highest priority):**
@@ -169,8 +169,9 @@
 - Attention dropout without EMA/gc: toxic combo with T_max=30
 - Cosine eta_min without EMA/gc: diverges (7.255-7.918%)
 - Surface points ≠50k: 16k=11.672%, 32k=7.558%, 64k=12.16% (even with EMA+gc) — 50k only viable count
-- 4L/640d at lr=5e-4: 8.636% then diverge ep82 even with EMA+gc (grad_norm=Infinity)
+- 4L/640d: dead at ALL tested configs — lr=5e-4+EMA+gc: 8.636% diverge ep82 (#3159); lr=5e-4 no-EMA: 4.516%/6.457%/5.724% all diverge (#3079). Width amplifies gradients beyond gc containment.
 - lr<5e-4 under EMA: steep monotonic cliff (4.5e-4=4.134%, 4e-4=5.924%)
+- bs=2: Blackwell bf16+bs>1 CUBLAS bug forces fp32, gets only 37% of optimizer steps. 4.373% at bs=2/fp32 vs 3.833% bs=1/bf16. Platform-blocked.
 
 **TandemFoil Paper:**
 - T_max≠10 (all directions diverge)
@@ -190,6 +191,7 @@
 
 **TandemFoil:**
 - gc≥0.5: monotonically worse than gc=0.3
+- Longer budget (480-min): no benefit with cosine T_max=10 cycling — more epochs = more independent draws, not monotone descent (22.016 at 480min vs 21.909 at 360min)
 
 ## Mandatory Config Rules
 
