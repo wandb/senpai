@@ -168,6 +168,7 @@ class TrainConfig:
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
+    input_feature_dropout: float = 0.0
 
 
 @dataclass
@@ -1266,6 +1267,7 @@ def train_one_epoch(
     max_batches: int = 0,
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
+    input_feature_dropout: float = 0.0,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1304,21 +1306,25 @@ def train_one_epoch(
                 batch = batch.to(device)
                 if isinstance(transform, TandemTargetTransform):
                     prepared = transform.prepare_batch(batch)
+                    srf_x = F.dropout(prepared.surface_x, p=input_feature_dropout, training=True) if input_feature_dropout > 0 else prepared.surface_x
+                    vol_x = F.dropout(prepared.volume_x, p=input_feature_dropout, training=True) if input_feature_dropout > 0 and prepared.volume_x is not None else prepared.volume_x
                     with autocast_context(device, amp_mode):
                         outputs = model(
-                            surface_x=prepared.surface_x,
+                            surface_x=srf_x,
                             surface_mask=prepared.surface_mask,
-                            volume_x=prepared.volume_x,
+                            volume_x=vol_x,
                             volume_mask=prepared.volume_mask,
                         )
                         outputs = maybe_apply_anp(outputs, prepared, anp_head)
                         loss, _ = loss_grouped_tandem(prepared, outputs)
                 else:
+                    srf_x = F.dropout(batch.surface_x, p=input_feature_dropout, training=True) if input_feature_dropout > 0 else batch.surface_x
+                    vol_x = F.dropout(batch.volume_x, p=input_feature_dropout, training=True) if input_feature_dropout > 0 and batch.volume_x is not None else batch.volume_x
                     with autocast_context(device, amp_mode):
                         outputs = model(
-                            surface_x=batch.surface_x,
+                            surface_x=srf_x,
                             surface_mask=batch.surface_mask,
-                            volume_x=batch.volume_x,
+                            volume_x=vol_x,
                             volume_mask=batch.volume_mask,
                         )
                         loss, _ = loss_grouped(batch, outputs, transform)
@@ -1637,10 +1643,6 @@ def main() -> None:
     best_model_state: dict[str, torch.Tensor] | None = None
     best_anp_state: dict[str, torch.Tensor] | None = None
 
-    if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
-    else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1682,6 +1684,7 @@ def main() -> None:
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
+            input_feature_dropout=config.input_feature_dropout,
         )
 
         if ema is not None:
@@ -1713,7 +1716,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(best_val_primary_metric_name)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
