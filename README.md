@@ -110,6 +110,8 @@ n_students: 4
 
 `launch.py` reads this via `simple_parsing` — every field can be overridden on the CLI.
 
+> **Target-repo permissions.** The `GITHUB_TOKEN` injected into the pods (from the `senpai-secrets` k8s secret) must be able to **clone** `target_repo_url` and **push branches + open/merge PRs** against it. If the token's user isn't an owner of `target_repo_url`, give that user write access on the target repo — otherwise the entrypoint's clone, the student's `git push`, and `gh pr create` will all fail. Same applies to the `CLAUDE_CODE_OAUTH_TOKEN` user if you rely on `gh auth status` inside the pod.
+
 ### API Key
 
 Due to the high cost of running CC with ANTHROPIC_API_KEY, instead use CLAUDE_CODE_OAUTH_TOKEN. Create this token as follows:
