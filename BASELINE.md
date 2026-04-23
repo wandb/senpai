@@ -145,9 +145,19 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.000482 (val) at epoch 576
-- **Best PR:** #2951 (stark — lr=6e-4, T_max=50, 2L/256d, AdamW, gc=1.0, wd=1e-2, no-EMA, Fourier)
-- **Key insight:** T_max=50 cosine schedule is the critical breakthrough — longer cosine periods allow the model to fully descend into loss basins before being kicked back up. lr=6e-4 + T_max=50 achieves 0.000482, a -19.4% improvement over the previous best (0.000598 at T_max=10). The run was still at ep576 within the 360-min budget. **Beats external target 0.0043 by 88.8%.**
+- **Current best:** 0.000459 (val) at epoch 771 — with Vol MSE 0.002777 (best in programme)
+- **Best PR:** #3050 (stark — EMA=0.999 + T_max=50, 2L/256d, AdamW lr=6e-4, gc=1.0, WD=1e-2)
+- **Key insight:** EMA=0.999 combined with T_max=50 improves BOTH primary metrics simultaneously: surface -4.8% (0.000459 vs 0.000482) AND volume -63.6% (0.002777 vs 0.00764). EMA is harmonious with T_max=50 — the longer cosine cycle lets EMA track effectively. Vol MSE 0.002777 closes gap to SpiderSolver from 4.5x to 1.63x.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 6e-4 --cosine-t-max 50 --grad-clip 1.0 --weight-decay 1e-2 --enable-fourier --model-layers 2 --model-hidden-dim 256 --model-heads 4 --epochs 999 --ema-decay 0.999`
+
+### 2026-04-23 — PR #3050: AirfRANS: EMA=0.999 at T_max=50 champion — NEW BEST (CURRENT)
+
+- **val_primary/surface_mse:** 0.000459 (-4.8% vs 0.000482) at epoch 771
+- **full_val/volume_mse:** 0.002777 (-63.6% vs 0.00764) — best volume result in programme
+- **W&B run:** z6pry4b9 (stark/af-ema-champion)
+- **Config:** 2L/256d/4H, AdamW lr=6e-4, T_max=50, gc=1.0, WD=1e-2, **EMA=0.999**, Fourier
+- **Key insight:** EMA + T_max=50 is synergistic — the longer cosine cycle (50 vs 10) allows EMA to track the optimization trajectory harmoniously, improving both surface sharpness and volume smoothing simultaneously. Vol MSE 0.002777 closes the SpiderSolver gap from 4.5x to 1.63x. Model still descending at ep771 — further training would push both metrics lower.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 6e-4 --cosine-t-max 50 --grad-clip 1.0 --weight-decay 1e-2 --enable-fourier --model-layers 2 --model-hidden-dim 256 --model-heads 4 --epochs 999 --ema-decay 0.999`
 
 ### 2026-04-22 — PR #2951: AirfRANS: LR + T_max sweep — NEW BEST (CURRENT)
 
