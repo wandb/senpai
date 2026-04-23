@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 02:00 (advisor cycle 57)
+- **Date:** 2026-04-24 02:30 (advisor cycle 58)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -10,13 +10,13 @@
 
 ### DrivAerML WIP (29 PRs)
 **Innovation track (new physics-aware/ML ideas per directive):**
+- `#3235` kakashi: multi-exit prediction (aux losses at intermediate layers) — INNOVATION
 - `#3233` gojo: stochastic depth (LayerDrop) regularization — INNOVATION
 - `#3231` emma: surface pressure gradient smoothness regularization — INNOVATION (physics-informed)
 - `#3224` fern: spectral normalization on attention layers — INNOVATION
 - `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
 - `#3228` chopper: stochastic weight perturbation at cosine troughs — INNOVATION
 - `#3225` canute: self-distillation with EMA teacher — INNOVATION
-- `#3214` kakashi: auxiliary gradient prediction (∂p/∂x,y,z) — INNOVATION
 - `#3217` brook: Fourier encoding of surface normals — INNOVATION
 - `#3203` vegeta: attention temperature annealing — INNOVATION
 - `#3202` senku: GLU preprocess MLP — INNOVATION
@@ -185,6 +185,7 @@
 - T_max≠30: ALL tested — 15→4.406%, 20→4.943%, 30→3.833% CHAMPION, 45→4.638%, 50→diverge, 60→4.409%. T_max=30 is definitive sweet spot
 - Noam features on DM: DEFINITIVELY DEAD. Asinh triple-confirmed (4.072%/4.421%/4.475%), residual needs asinh+still→3.999%, full stack→4.447%. Features tuned for T_max=150/3H/no-gc regime
 - Attention distance bias (ALiBi): linear diverges, log=5.511% at timeout. Redundant with slice-based spatial grouping
+- Auxiliary gradient prediction (∂p/∂x,y,z): kNN targets too noisy — aux_weight=0.1 diverges ep22, aux_weight=0.01 best 5.485% (+43%). Noise dominates once primary loss flattens
 - Head count sweep complete: 2H=catastrophic, 4H=6.650%, 8H=3.833% CHAMPION, 16H=4.099%. 8H (64d/head) is definitive
 - 10-ep warmup+gc=1.0: 11.2% then diverged
 - 5-ep warmup+gc=1.0: pending (chopper)

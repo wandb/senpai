@@ -1,5 +1,14 @@
 # SENPAI Research Results
 
+## 2026-04-24 02:30 — PR #3214: DM auxiliary surface gradient prediction (kakashi) — CLOSED (dead end)
+
+- kakashi/dm-auxiliary-gradient, W&B group: dm-auxiliary-gradient
+- Hypothesis: supervise spatial pressure gradients (∂p/∂x,y,z via kNN finite-differences) as auxiliary regularization loss
+- Trial 1 (aux_weight=0.1, W&B: h611t6dg): best val=23.5% ep20, diverged ep22 — gradient explosion (norm 2.25→15.3)
+- Trial 2 (aux_weight=0.01, W&B: exbz0pb4): best val=5.485% ep191 (+43% worse than 3.833%), instability event ep192, degraded to 7.38%
+- **Root cause: kNN gradient targets are inherently noisy.** Once primary loss flattens in late training, the noisy auxiliary signal dominates and injects harmful variance. Even pre-divergence convergence trajectory was decelerating — would need ~137 more epochs just to reach baseline, far exceeding realistic budget.
+- **Conclusion: supervised gradient prediction dead for DM.** The model already learns appropriate gradient structure from the dense primary pressure loss. kNN noise > benefit.
+
 ## 2026-04-24 02:00 — PR #3212: AF PCGrad gradient surgery (jin) — CLOSED (dead end)
 
 - jin/af-pcgrad, W&B group: af-pcgrad
