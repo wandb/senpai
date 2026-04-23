@@ -490,6 +490,12 @@ def build_bundle(config: TrainConfig) -> DatasetBundle:
 def cp_panel_prior_index(config: TrainConfig, bundle: DatasetBundle) -> int | None:
     if not config.enable_cp_panel or not config.enable_pressure_prior_addition:
         return None
+    # Only tandemfoilset and airfrans bundles actually include cp_panel features
+    # in their tensors.  Other datasets (tandemfoilset_paper, drivaerml) silently
+    # ignore the enable_cp_panel flag, so computing an index would point to a
+    # wrong column (e.g. a Fourier feature) and cause numeric overflow.
+    if bundle.spec.name not in {"tandemfoilset", "airfrans"}:
+        return None
     base_dim = bundle.spec.surface_input_dim
     if config.enable_vortex_panel_velocity:
         base_dim -= 4
