@@ -1,5 +1,13 @@
 # SENPAI Research Results
 
+## 2026-04-23 18:30 — PR #3159: DM 4L/640d wider on EMA+gc champion (franky) — CLOSED
+
+- 640d: best val=8.636% ep81 (W&B: `yccjqzbi`), catastrophic divergence ep82 → 86% terminal. gc=0.5 clipped every batch but couldn't contain gradient explosion. grad_norm_mean=Infinity confirmed. EMA+gc delayed divergence vs prior 640d attempt (gojo #3079, ep28) but didn't prevent it. 640d at lr=5e-4 is fundamentally incompatible. Bug fix: primary_metric_key shadowing.
+
+## 2026-04-23 18:30 — PR #3158: DM lr=4e-4/4.5e-4 under EMA+gc (bulma) — CLOSED
+
+- lr=4e-4: 5.924% ep175 (+54.5%, W&B: `zq5czggz`). lr=4.5e-4: 4.134% ep429 (+7.9%, W&B: `2ddsixfm`). Steep monotonic cliff below lr=5e-4 — EMA regime does NOT shift LR optimum downward. Lower LR converges too slowly and gets destroyed at cosine restart peaks. Gradient points upward: lr>5e-4 is the unexplored direction. Bug fix: primary_metric_key shadowing.
+
 ## 2026-04-23 18:00 — PR #3068: DM 64k surface points (brook) — CLOSED
 
 - 64k points + EMA=0.9995 + gc=0.5: surface_rel_l2=12.16% (W&B: `j2p2i1c0`). Prior 64k without EMA+gc: 8.18%. Adding EMA+gc on 64k made it WORSE — structural instability compounds. 50k remains the only viable surface point count for DM. Full surface point investigation complete: 16k=11.672%, 32k=7.558%, 64k=12.16%, all dead vs 50k=3.833% baseline.
