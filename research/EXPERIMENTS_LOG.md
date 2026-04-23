@@ -1,5 +1,13 @@
 # SENPAI Research Results
 
+## 2026-04-23 13:00 — PR #3131: DM OneCycleLR schedule (sanji) — CLOSED
+
+- max_lr=5e-4: 8.040% ep~190 then diverged to 51.4% (W&B: `ed60ojeo`). max_lr=1e-3: 8.041% ep~125 then diverged to 65.5%/NaN (W&B: `24r056y4`). Both WITHOUT EMA+gc (old regime). OneCycleLR's sustained high-LR warmup more damaging than cosine peaks — no periodic recovery troughs. 2x worse than old 3.997% baseline. Confirms cosine troughs are load-bearing for DM stability.
+
+## 2026-04-23 13:00 — PR #3124: TFP 3L/256d wider model (robin) — CLOSED
+
+- field_mse=8.61e+24 at ep177, catastrophic divergence ep229 (W&B: `3j33y6wi`). 27 orders of magnitude worse than baseline (0.002383). Combined with #3157 (3L/224d, field_mse ~2.2e9), width beyond 192d conclusively dead for TFP. 192d confirmed as the capacity ceiling — gradient instability scales with hidden dim in TFP's narrow stability window.
+
 ## 2026-04-23 12:30 — PR #3162: DM EMA=0.9995 + gc=0.3 (himmel) — CLOSED
 
 - Best val=8.816% at ep80, then catastrophic divergence ep81 (grad norm 17.8→430, killed ep90). W&B: `og8ny8s7`. gc=0.3 is 2.3x worse than baseline (3.833%). gc=0.5 now quad-confirmed as sharp optimum: 0.25=13.1% (starves), 0.3=8.816% (diverges), 0.5=3.833% (champion), 1.0=6.21% (insufficient). Student noted potential bug fix (primary_metric_key shadowing) and suggested AGC — assigning AGC as fresh experiment.
