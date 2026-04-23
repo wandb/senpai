@@ -1,5 +1,15 @@
 # SENPAI Research Results
 
+## 2026-04-24 03:00 — PR #3198: TFP asinh pressure scale ablation 0.75/0.5 (gohan) — CLOSED (dead end)
+
+- gohan/tfp-asinh-pressure
+- Hypothesis: asinh pressure normalization alone (without physics stack) can stabilize TFP pressure
+- Trial 1 (asinh-0.75, W&B: 08s8cxns): field_mse=0.775 apparent best ep324, but 60/554 steps Inf (chaotic transient). Terminal 9.05e+08. ~325x worse than 0.002383 baseline
+- Trial 2 (asinh-0.50, W&B: pqawyn4k): field_mse=34,047 ep501 — 14M x worse
+- **NOT caused by cp_panel code regression** — runs don't use physics stack. This is a clean result.
+- **Root cause: without residual prediction + pressure prior, sinh() denormalization exponentially amplifies pressure errors.** Velocity channels (Ux, Uy) healthy; failure entirely pressure-specific.
+- **Conclusion: asinh alone incompatible with TFP.** Requires full physics stack scaffolding to constrain pressure prediction.
+
 ## 2026-04-24 02:30 — PR #3214: DM auxiliary surface gradient prediction (kakashi) — CLOSED (dead end)
 
 - kakashi/dm-auxiliary-gradient, W&B group: dm-auxiliary-gradient
