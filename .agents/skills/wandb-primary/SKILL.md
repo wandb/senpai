@@ -22,11 +22,11 @@ Once you know the environment, **write your finding into this skill** by replaci
 
 <!-- AGENT: Replace the content between the ENVIRONMENT markers with the detected environment -->
 <!-- ENVIRONMENT_START -->
-**Detected Python environment:** _not yet detected_
+**Detected Python environment:** `uv` with a local `.venv`
 
 ```
-# Run command: <not yet detected>
-# Install command: <not yet detected>
+# Run command: uv run script.py
+# Install command: uv pip install <pkg>
 ```
 <!-- ENVIRONMENT_END -->
 
@@ -121,6 +121,27 @@ from curve_plots import (
 )
 ```
 
+### One-shot curve diagnostics CLI
+
+Use `scripts/curve_diagnostics_cli.py` when you want the default training-curve workflow without hand-writing a temporary script. It confirms the `step_key` (or refuses if ambiguous), prints helper-derived tables, and writes the standard PNGs.
+
+Run it with the command runner from the environment section above.
+
+```bash
+# Replace `python` with the runner from the environment section above if needed.
+python .agents/skills/wandb-primary/scripts/curve_diagnostics_cli.py \
+  --entity "$WANDB_ENTITY" \
+  --project "$WANDB_PROJECT" \
+  --run <run_id>
+
+python .agents/skills/wandb-primary/scripts/curve_diagnostics_cli.py \
+  --entity "$WANDB_ENTITY" \
+  --project "$WANDB_PROJECT" \
+  --run <run_id_a> \
+  --run <run_id_b> \
+  --metric <metric_key>
+```
+
 ### Reference docs
 
 Read these as needed — they contain full API surfaces and recipes:
@@ -183,17 +204,24 @@ This converts everything to plain Python dicts/lists that work with json, pandas
 
 ## Environment setup
 
-The sandbox has `wandb`, `weave`, `pandas`, and `numpy` pre-installed.
+The sandbox often has `wandb`, `weave`, `numpy`, and plotting/data packages available, but you should verify imports in the detected project environment before relying on them. In this repo's current `uv` environment, `pandas` was missing during audit-time verification even though the diagnostics helpers import it.
 
 ```python
 import os
+import importlib
+
 entity  = os.environ["WANDB_ENTITY"]
 project = os.environ["WANDB_PROJECT"]
+
+for module_name in ["wandb", "weave", "numpy", "matplotlib", "pandas"]:
+    importlib.import_module(module_name)
 ```
 
 ### Installing extra packages and running scripts
 
 Use whichever run/install commands you wrote in the **Python environment detection** section above. If you haven't detected the environment yet, go back and do that first.
+
+If one of the imports above fails, install the missing package before using `training_diagnostics`, `curve_plots`, or the CLI wrapper. The diagnostics stack imports `pandas` and `matplotlib` at module import time, so a missing dependency will fail fast.
 
 ---
 
@@ -339,6 +367,8 @@ Use `expr.Config("lr")`, `expr.Summary("loss")`, `expr.Tags().isin([...])` for r
 
 Use this when the user asks whether a run is healthy, why training diverged, whether a run overfit, or which run has the best training dynamics.
 
+This workflow is the default for curve-health questions. A raw W&B query plus hand-written curve narration is not enough unless the user explicitly asked for a quick scalar-only check.
+
 Keep the inline workflow short and load detail on demand:
 
 1. Confirm `step_key` before doing any curve work. Never assume `_step`.
@@ -347,6 +377,30 @@ Keep the inline workflow short and load detail on demand:
 4. Load `references/TRAINING_DIAGNOSTICS.md` while you interpret the results.
 5. End with a verdict, evidence tied to step ranges, and concrete next actions.
 
+### Stop signs
+
+If you catch yourself writing any of these phrases before running the helpers, stop and switch to the workflow or the CLI:
+
+- "trough envelope plateaued/regressed"
+- "gradient storm"
+- "restart disruption"
+- "spikes at cosine peaks"
+- "still descending at cutoff"
+- "best checkpoint not final"
+
+Those are exactly the cases the diagnostics helpers are meant to standardize.
+
+### Completion gate
+
+A curve-analysis answer is incomplete until it includes all of:
+
+1. The chosen `step_key` and why it was chosen.
+2. At least one helper-derived table (`curve_features`, `compare_runs_curves`, `lr_schedule_features`, or `grad_norm_features`).
+3. At least one rendered PNG (`plot_single_run_overview`, `plot_run_comparison`, `plot_grad_histogram_heatmap`, or `plot_grad_norm_by_layer`) unless the run truly lacks the required metrics.
+4. A verdict tied to specific steps, step ranges, or checkpoints.
+
+If you skip one of these, say why.
+
 ### Required sequence
 
 Use `list_candidate_step_keys()`, `guess_step_key_from_workspace()`, and `format_step_candidates()` to confirm the x-axis. If there is one obvious candidate and it matches the workspace guess, say which `step_key` you picked. Otherwise, ask the user to choose before plotting or comparing runs.
@@ -354,6 +408,20 @@ Use `list_candidate_step_keys()`, `guess_step_key_from_workspace()`, and `format
 For a single run, compute a compact feature table from the metrics that actually exist, then render `plot_single_run_overview(run, step_key=step_key)`. If gradient histograms or per-layer scalar norms are logged, add `plot_grad_histogram_heatmap()` or `plot_grad_norm_by_layer()`.
 
 For multi-run comparisons, use `compare_runs_curves()` for the ranking table and `plot_run_comparison()` for the overlay. Keep overlays to at most 6 runs; if there are more, rank first and then plot the shortlist.
+
+### Phrase-to-helper mapping
+
+| If you're about to say... | Compute / inspect first |
+|---|---|
+| "trough envelope plateaued/regressed" | `curve_features(...)[["final_10pct_mean", "final_10pct_std", "smoothness", "checkpoint_slopes"]]` |
+| "still descending at cutoff" | `curve_features` tail slope / final segment + `compare_runs_curves` ranking table |
+| "gradient storm" or "spikes at cosine peaks" | `grad_norm_features`, `lr_schedule_features`, and the LR + grad-norm panels in `plot_single_run_overview` |
+| "restart disruption" | `lr_schedule_features()["restart_steps"]` plus the comparison plot around the restart window |
+| "best checkpoint not final" or "late overfit" | `curve_features`, then the overfitting section of `references/TRAINING_DIAGNOSTICS.md` |
+
+### Fastest default path
+
+If the user wants the standard curve-analysis loop and you already know the run IDs, use the CLI above instead of building a throwaway script. It exists to lower the activation energy from "I know the heuristics" to "I actually ran the helpers".
 
 ### Output shape
 
