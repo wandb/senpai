@@ -10,6 +10,22 @@ Use this as reference material while interpreting training curves. It captures t
 
 Recommended order: confirm the real `step_key`, compute features with `training_diagnostics.py`, open the PNGs from `curve_plots.py`, then use the heuristics below to write a verdict with step-indexed evidence.
 
+Before you narrate the curve:
+
+- Do not trust epoch-based trough timing until you confirm the real `step_key`. Many schedulers step per batch rather than per epoch, so "the trough should happen every N epochs" can be nonsense if you guessed the x-axis.
+- If you are about to describe "trough envelope plateau," "gradient storm," "restart disruption," or "late overfit" from memory alone, stop and compute the helper outputs first.
+
+## 0. Manual Phrase -> Helper Check
+
+| If you're about to say... | Verify with... |
+|---|---|
+| "trough envelope plateaued/regressed" | `curve_features`: `checkpoint_slopes`, `final_10pct_mean`, `final_10pct_std`, `smoothness` |
+| "still descending at cutoff" | `curve_features` tail slope and the final checkpoint segments |
+| "gradient storm" | `grad_norm_features` + LR panel from `plot_single_run_overview` |
+| "restart disruption" | `lr_schedule_features()["restart_steps"]` plus post-restart recovery on the plot |
+| "best checkpoint not final" | Overfitting signatures below + compare best checkpoint vs final tail |
+| "single best epoch wins" | `compare_runs_curves` with final mean, smoothness, slope, and spike count |
+
 ---
 
 ## 1. What a healthy loss curve looks like
@@ -54,6 +70,7 @@ Look at `checkpoint_slopes`. If the last 3 segments all sit near zero and the va
 - **Linear decay**: straight line from peak to final. Verify `decay_shape == "linear"`.
 - **Flat tail** (LR pinned at a small value for the final segment): often good; lets the model settle.
 - **Restarts**: `restart_steps` non-empty means LR went back up after its global peak. Intentional (SGDR) or a bug — ask before assuming.
+- **Restart spike triage**: a brief eval-loss blip right after a restart can be normal if the run quickly recovers to a new best and grad norms stay contained. Repeated worse troughs, rising clip counts, or a sustained grad-norm surge after the restart is real instability.
 - **Mismatch with loss**: if loss starts diverging right at the LR peak step, the peak is too high. If loss flatlines as soon as LR enters the decay segment, decay may be too aggressive.
 
 ## 6. Grad-norm intuition
@@ -61,6 +78,7 @@ Look at `checkpoint_slopes`. If the last 3 segments all sit near zero and the va
 - Early grad-norm **high and dropping** is normal — the model is adjusting large weights.
 - Stable mid-run grad-norm is good.
 - **Late-training grad-norm spikes** indicate instability. A single spike that recovers is fine; repeated spikes in the last 30% → lower LR or clip more aggressively.
+- **Gradient storm** is the informal name for repeated late spikes that coincide with worse troughs, rising clipping, or disrupted forward progress. If you use that phrase, tie it back to `grad_norm_features`, spike timing, and the LR schedule.
 - **Sudden drop to ~zero** (`dead_flag` in `grad_norm_features`) often means a layer died (ReLU collapse) or the schedule drove LR to zero prematurely.
 - **Kurtosis** > ~3 indicates heavy-tailed update distribution — often a sign of rare catastrophic updates that gradient clipping would catch.
 
@@ -89,6 +107,7 @@ Rules of thumb when ranking:
 
 - Prefer **smoother + slightly higher final** over **noisier + slightly lower final** when the gap is within 2× the final-10%-std.
 - A run that is still descending at 100% is evidence to **train longer**, not evidence that the hyperparameters are bad.
+- Do not rank by a single best epoch alone. Single-epoch bests are easy to overstate when the curve is noisy or cyclic.
 - If two runs tie on final metric but one has 10× more spikes, the stable one is the better policy for future work.
 - A run with lower peak-grad-norm at the same final metric is generally more robust.
 
