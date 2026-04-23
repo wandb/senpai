@@ -1,5 +1,17 @@
 # SENPAI Research Results
 
+## 2026-04-23 21:30 — PR #3168: TFP multi-seed variance (jin) — CLOSED — CRITICAL FINDING
+
+- Seed 42: field_mse=4.28e+26 (velocity OK, pressure diverged). Seed 123: Infinity from ep70. Seed 456: Infinity from ep200. Baseline (seed=0): 0.002383. **0/3 seeds reproduce the champion**. The TFP baseline is a SINGLE LUCKY SEED (seed=0/default), not a robust result. This redefines TFP as a stabilization problem — the pressure representation (asinh/sinh transforms) is extremely initialization-sensitive. Bug fix: primary_metric_key shadowing.
+
+## 2026-04-23 21:30 — PR #3154: DM monotonic cosine + EMA (historia) — CLOSED (wrong parameter)
+
+- Best val=4.392% ep308 (W&B: `we38omf3`), 14.6% worse than 3.833%. HOWEVER: T_max=999 is in STEPS not epochs — actually tested rapid 5-epoch cycling, not monotonic decay. True monotonic needs T_max=393606. Diverged ep336 via EMA cascade (corrupted online → 14+ epochs to flush from EMA buffer). Rapid cycling confirmed worse. True monotonic hypothesis remains untested — reassigning.
+
+## 2026-04-23 21:30 — PR #3083: DM 600 batches no gc (jet) — CLOSED
+
+- Best val=9.537% ep48, diverged to NaN ep266 (W&B: `s4kvc8oz`). 2.5x worse than baseline. 600 batches at 4L/512d WITHOUT gradient clipping is fundamentally unstable. Student correctly diagnosed: gc=0.5+EMA mandatory, T_max needs scaling to ~46. Reassigning with proper stabilization config.
+
 ## 2026-04-23 21:00 — PR #3190: TFP physics features isolation (brook) — CLOSED
 
 - Trial 1 (all physics): val=Infinity — cp_panel_prior_index() wrong index for tandemfoil_paper (W&B: `0eq5jqij`). Trial 2 (wake only): val=0.7396, diverged (W&B: `kqknlctz`). CRITICAL: TFP pipeline only supports enable_fourier/wake_deficit/wake_angle — other physics flags silently ignored.
