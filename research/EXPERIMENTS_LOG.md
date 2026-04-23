@@ -1,5 +1,9 @@
 # SENPAI Research Results
 
+## 2026-04-23 23:30 — PR #3163: DM attn-dropout=0.05 + EMA+gc (shouko) — CLOSED (dead end)
+
+- Best val=10.118% ep73 (W&B: j0t5bn67), 2.64x worse than 3.833%. Catastrophic divergence ep74 — grad_norm→Infinity, gc=0.5 firing every step (394 clip events/epoch) but couldn't contain compounding dropout noise. Final val=75.33%. EMA preserved ep73 checkpoint. Confirms attn-dropout incompatible with DM at any stability level: without EMA/gc → 12.533% (#3113), with EMA/gc → 10.118% (19% better early but same ultimate fate). The multiplicative noise from dropout compounds faster than gc can clip as the loss landscape steepens at cosine restart boundaries. Added to dead ends.
+
 ## 2026-04-23 23:15 — PR #3213: DM surface normal input features (brook) — CLOSED (already implemented)
 
 - No trials ran. Brook discovered surface normals are ALREADY present in DrivAerML input tensor (columns 3-5 of SURFACE_X_DIM=7, loaded from surface_normals.npy in prepare_drivaerml.py). The champion already has full access to normals. Hypothesis moot. Pivot: Fourier encoding of normals (currently only xyz cols 0-2 get Fourier features, not normals) — reassigning brook to this follow-up.

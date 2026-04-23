@@ -1,8 +1,8 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-23 23:15 (advisor cycle 49)
+- **Date:** 2026-04-23 23:30 (advisor cycle 50)
 - **Branch:** radford
-- **Idle students:** 0
+- **Idle students:** 0 (shouko being assigned)
 - **PRs ready for review:** 0
 - **CRITICAL:** TFP champion config is BROKEN — code regression since #3025, seed=0 no longer reproduces (#3205). Waiting for sanji #3209 cp_panel bug fix.
 
@@ -29,7 +29,7 @@
 **Champion tuning / paper-facing:**
 - `#3209` sanji: TFP cp_panel bug fix + multi-seed retest — STABILIZATION PRIORITY
 - `#3164` faye: paper-facing full eval (two-phase) — PAPER-FACING Track 1
-- `#3163` shouko: attn dropout=0.05
+- `#3163` shouko: ~~attn dropout=0.05~~ → reassigning to AF GradNorm
 - `#3160` griffith: 16H heads
 - `#3155` nobara: longer T_max (45/60)
 - `#3207` historia: DM true monotonic cosine (T_max=393606) — corrected retest
@@ -184,7 +184,7 @@
 - Huber loss, relative L2 loss (degenerate), SGDR, RAdam
 - beta2≠0.999, LR≠5e-4 (without EMA), WD+gc heavy (WD=1e-3: 4.44%)
 - Bilateral symmetry aug, torch.compile, gradient accumulation
-- Attention dropout without EMA/gc: toxic combo with T_max=30
+- Attention dropout=0.05: incompatible at any stability level. Without EMA/gc→12.533%, with EMA+gc→10.118% (delayed divergence ep74 but same fate). Dropout noise compounds faster than gc clips.
 - Cosine eta_min without EMA/gc: diverges (7.255-7.918%)
 - eta_min+gc (any combination): gc=1.0→6.311%, gc=0.5→8.617%, gc=0.5+EMA→4.202% diverge ep312 — TRIPLE CONFIRMED. gc=0.5 relies on zero-LR trough damping; eta_min removes reset.
 - Surface points ≠50k: 16k=11.672%, 32k=7.558%, 64k=12.16% (even with EMA+gc) — 50k only viable count
