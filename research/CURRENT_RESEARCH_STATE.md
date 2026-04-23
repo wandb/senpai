@@ -1,15 +1,18 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-23 22:30 (advisor cycle 47)
+- **Date:** 2026-04-23 23:00 (advisor cycle 48)
 - **Branch:** radford
-- **Idle students:** 0
+- **Idle students:** 0 (5 being assigned)
 - **PRs ready for review:** 0
-- **CRITICAL:** TFP champion (0.002383) is unreproducible — 0/3 seeds stay finite (#3168)
+- **CRITICAL:** TFP champion config is BROKEN — code regression since #3025, seed=0 no longer reproduces (#3205). Waiting for sanji #3209 cp_panel bug fix.
 
-## Fleet Status (57 active PRs)
+## Fleet Status (53 active PRs)
 
 ### DrivAerML WIP (27 PRs)
-**Innovation track (code ports — new directive):**
+**Innovation track (new physics-aware/ML ideas per directive):**
+- `#3216` canute: attention distance bias (ALiBi-inspired spatial prior) — INNOVATION
+- `#3214` kakashi: auxiliary gradient prediction (∂p/∂x,y,z) — INNOVATION
+- `#3213` brook: surface normal input features — INNOVATION
 - `#3203` vegeta: attention temperature annealing — INNOVATION
 - `#3202` senku: GLU preprocess MLP — INNOVATION
 - `#3201` jet: DomainLayerNorm — INNOVATION
@@ -24,7 +27,6 @@
 - `#3175` hinata: full noam stack — NOAM ABLATION
 
 **Champion tuning / paper-facing:**
-- `#3173` kakashi: shorter cosine T_max=15/20
 - `#3209` sanji: TFP cp_panel bug fix + multi-seed retest — STABILIZATION PRIORITY
 - `#3164` faye: paper-facing full eval (two-phase) — PAPER-FACING Track 1
 - `#3163` shouko: attn dropout=0.05
@@ -41,7 +43,6 @@
 - `#3085` kohaku: larger supernodes (SENT BACK)
 - `#3076` frieren: log-cosh loss (SENT BACK)
 - `#3067` askeladd: 32k surface points (SENT BACK)
-- `#3063` canute: paper-facing full-eval (SENT BACK)
 - `#3046` sukuna: WD+gc compound (SENT BACK)
 
 ### TandemFoil WIP (7 PRs) — GUARDRAIL ONLY per directive
@@ -54,10 +55,8 @@
 - `#3180` chopper: ANP decoder alone — NOAM ABLATION
 - `#3150` yuji: clean test row — PAPER-FACING
 
-### TandemFoil Paper WIP (11 PRs) — STABILIZATION CRISIS
-**Stabilization diagnostic (HIGHEST PRIORITY — baseline unreproducible):**
-- `#3205` jin: TFP seed sensitivity (seed=0 verify, seed=42 + gc/warmup/asinh probes)
-- `#3208` brook: TFP pressure stabilization (base config, lower LR, AdamW vs Lion)
+### TandemFoil Paper WIP (9 PRs) — STABILIZATION CRISIS
+**Stabilization status: CODE REGRESSION CONFIRMED — seed=0 broken, waiting for sanji #3209 bug fix**
 
 **Noam-pivot experiments:**
 - `#3183` rei: ANP+T_max=150 — NOAM ABLATION
@@ -81,15 +80,14 @@
 **Other:**
 - `#3172` robin: LR warmup (5-ep/10-ep)
 - `#3169` nami: heads sweep 4H/16H
+- `#3215` tanjiro: Huber loss on volume channel (robust to outliers) — AF VOLUME FOCUS
+- `#3212` jin: PCGrad multi-objective gradient surgery — AF VOLUME FOCUS
 - `#3211` spike: AF vol_loss_scale learnable scalar (noam port) — AF VOLUME FOCUS
 - `#3204` gilbert: vol-weight=15x/20x clean control (no extra features) — AF VOLUME FOCUS
-- `#3167` gilbert: higher LR (8e-4/1e-3)
-- `#3166` vegeta: vol-weight=5.0/7.0+EMA=0.999
+- `#3195` piccolo: Re-stratified sampling
 - `#3156` edward: softer gc=0.5
 - `#3144` violet: vol-weight=2.0+EMA=0.999
-- `#3199` megumi: DM EMA=0.9999/0.99995 (noam optimal decay) — NOAM ABLATION
 - `#3129` chrome: 4L/256d deeper
-- `#3101` tanjiro: vol-loss-weight=1.5 (SENT BACK)
 
 ## Steering Anchors
 
@@ -128,12 +126,12 @@
 - **Track 2 (Innovation):** Genuinely new physics-aware and ML ideas — NOT Radford/Noam recipe retuning. Search for benchmark-specific improvements. Code ports from noam: attn temp annealing (#3203), GLU preprocess (#3202), DomainLayerNorm (#3201). Look beyond: mesh-based operators, physics-informed losses, geometry encoders, domain-specific normalizations.
 - Bold ideas permitted and encouraged here. Local neighborhood exhausted.
 
-#### TandemFoil Paper — Stabilization First (CRISIS MODE)
-- **The failure mode is NaN/inf, not underperformance.** Optimize for finding ONE finite reproducible recipe, not performance.
-- Protocol: smoke test (1-3 epochs) → short debug (10-20 epochs) → long run ONLY after both are clean.
+#### TandemFoil Paper — Stabilization First (CRISIS MODE — UPGRADED)
+- **CODE REGRESSION CONFIRMED (#3205):** seed=0 no longer reproduces champion. ALL seeds + ALL stabilization probes → Inf pressure. This is NOT seed sensitivity — it's a broken pressure transform path in current codebase.
+- **Base config (no physics) IS stable** across seeds (#3208): floor ~0.047-0.049. Velocity channels healthy. Pathology isolated to sinh inverse pressure transform.
+- **Root cause:** cp_panel_prior_index() bug (#3200) + possible eval-time sinh overflow. Sanji #3209 fixing the cp_panel bug — MUST land before any further TFP optimization.
+- Protocol: fix bug → verify seed=0 reproduces → then reintroduce pressure transforms one at a time.
 - NaN/inf failures get closed immediately, no extensions.
-- brook #3200 reveals: base config (no physics) stable at 0.047; `cp_panel_prior_index()` is broken for TFP dataset — **champion may be unreproducible** with current code.
-- Next step: fix `cp_panel_prior_index()` bug, then re-run stable configs.
 
 #### TandemFoil — Guardrail Only
 - Parity is healthy. Minimal compute sink. Keep as sanity anchor, not a major compute investment.
@@ -146,15 +144,25 @@
 - Physics features: TF only (TFP pipeline bug: cp_panel/TE/vortex corrupted)
 - `--re-stratified-sampling` — OOD Re robustness — TF/AF
 
-### DM Innovation Track (code ports from noam)
+### DM Innovation Track (expanded beyond recipe tuning)
+**Code ports from noam:**
 - Attention temperature annealing (-11% on noam) — vegeta #3203
 - GLU preprocess MLP — senku #3202
 - DomainLayerNorm — jet #3201 (merged; awaiting results)
-- Still needed: vol_loss_scale, PCGrad (for AF multi-objective)
+
+**New physics-aware/ML ideas (cycle 48):**
+- Surface normal input features (local geometry context) — brook #3213
+- Auxiliary gradient prediction (∂p/∂x,y,z as regularization) — kakashi #3214
+- Attention distance bias (ALiBi-inspired spatial prior) — canute #3216
+
+**AF volume closure:**
+- vol_loss_scale learnable scalar (noam port, -15.9%) — spike #3211
+- PCGrad gradient surgery (surface/volume conflict resolution) — jin #3212
+- Huber loss on volume channel (robust to outlier gradients) — tanjiro #3215
 
 ### Critical Known Bug
-- **`cp_panel_prior_index()` broken for tandemfoil_paper** (PR #3200): When `--enable-cp-panel` + `--enable-pressure-prior-addition` are both set, the function returns the wrong index (last Fourier feature, not cp_panel), corrupting all pressure predictions. Fix required before running any long TFP experiments with these flags.
-- **TFP champion (#3025, 0.002383) may be unreproducible** with current codebase — this is a CRITICAL issue to resolve.
+- **`cp_panel_prior_index()` broken for tandemfoil_paper** (PR #3200): Fix in progress (sanji #3209).
+- **TFP champion config BROKEN in current codebase** — code regression confirmed (#3205). Seed=0 no longer reproduces. Base config without physics is stable (#3208). Root cause: pressure transform path (sinh inverse).
 
 ## Key Dead Ends (Do Not Repeat)
 
@@ -169,7 +177,7 @@
 - Polynomial LR (no cosine troughs): catastrophic — troughs are load-bearing stability features
 - OneCycleLR (no troughs): 8.04% best, sustained high-LR warmup worse than cosine peaks (without EMA+gc)
 - SWA: equal-weight averaging poisons across divergent basins (88.98%)
-- T_max=50+gc (both 0.5 and 1.0): diverge — T_max=30 only viable period
+- T_max≠30: T_max=50+gc diverges; T_max=15→4.406% plateaued; T_max=20→4.943% diverged. T_max=30 ONLY viable period
 - 10-ep warmup+gc=1.0: 11.2% then diverged
 - 5-ep warmup+gc=1.0: pending (chopper)
 - LR warmup + EMA+gc=0.5: 5-ep=11.325% diverged, 10-ep=3.918% plateaued (didn't beat 3.833%)
@@ -199,7 +207,7 @@
 - 2L/384d and 3L/384d: catastrophic divergence
 - EMA<0.999 (0.99, 0.995 both worse)
 - T_max≠50 (30 and 100 both worse)
-- Vol-weight<10x (2x/5x/7x): all worse on both metrics. 10x+EMA=0.999 is AF sweet spot
+- Vol-weight<10x (1.5x/2x/3x/5x/7x): ALL worse on both metrics across 6 tested values. 10x+EMA=0.999 is AF sweet spot
 - Vol-weight=30x: catastrophic — surface 4.3x worse, vol 3.1x worse
 - LR>6e-4: 8e-4 +110% surface, 1e-3 catastrophic divergence
 
