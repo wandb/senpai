@@ -166,6 +166,7 @@ class TrainConfig:
     volume_anchor_points: int = 8_000
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
+    warmup_epochs: int = 0
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -1625,7 +1626,22 @@ def main() -> None:
     scheduler = None
     if config.cosine_t_max > 0:
         base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
+        if config.warmup_epochs > 0:
+            if config.max_train_batches > 0:
+                steps_per_epoch = max(1, config.max_train_batches // max(1, config.grad_accum_steps))
+            else:
+                steps_per_epoch = len(train_loader)
+            warmup_steps = config.warmup_epochs * steps_per_epoch
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                base_optimizer, start_factor=1e-6, end_factor=1.0, total_iters=warmup_steps,
+            )
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                base_optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_steps],
+            )
+            print(f"Warmup: {warmup_steps} steps ({config.warmup_epochs} epochs × {steps_per_epoch} steps/epoch)", flush=True)
+        else:
+            scheduler = cosine_scheduler
 
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
@@ -1637,10 +1653,6 @@ def main() -> None:
     best_model_state: dict[str, torch.Tensor] | None = None
     best_anp_state: dict[str, torch.Tensor] | None = None
 
-    if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
-    else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1652,6 +1664,8 @@ def main() -> None:
     if config.wandb_name:
         run_config = asdict(config)
         run_config["effective_batch_size"] = config.batch_size * config.grad_accum_steps
+        if config.warmup_epochs > 0 and config.max_train_batches > 0:
+            run_config["warmup_steps"] = config.warmup_epochs * max(1, config.max_train_batches // max(1, config.grad_accum_steps))
         run = wandb.init(
             project=os.getenv("WANDB_PROJECT", "senpai-v1"),
             entity=os.getenv("WANDB_ENTITY"),
@@ -1713,7 +1727,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(best_val_primary_metric_name)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
