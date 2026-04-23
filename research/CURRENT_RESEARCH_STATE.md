@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 06:30 (advisor cycle 67)
+- **Date:** 2026-04-24 07:00 (advisor cycle 68)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -17,7 +17,8 @@
 - `#3235` kakashi: multi-exit prediction (aux losses at intermediate layers) — INNOVATION
 - `#3233` gojo: stochastic depth (LayerDrop) regularization — INNOVATION
 - `#3231` emma: surface pressure gradient smoothness regularization — INNOVATION (physics-informed)
-- `#3224` fern: spectral normalization on attention layers — INNOVATION
+- `#3251` fern: Pre-LayerNorm architecture ablation (+ RMSNorm variant) — INNOVATION
+- `#3252` mitsuha: progressive surface point training (resolution curriculum) — INNOVATION
 - `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
 - `#3228` chopper: stochastic weight perturbation at cosine troughs — INNOVATION
 - `#3225` canute: self-distillation with EMA teacher — INNOVATION
@@ -57,7 +58,6 @@
 
 **Noam-pivot experiments:**
 - `#3179` usopp: T_max=150+wake+96sl+Lookahead — NOAM ABLATION
-- `#3176` mitsuha: full noam stack — NOAM ABLATION
 
 **Other:**
 - `#3133` shinobu: WD sweep (5e-3/2e-2)
@@ -190,6 +190,7 @@
 - Mixup regularization (buffer-based latent): 85-109% worse, crashed ~ep235. Buffer staleness + non-smooth geometry-specific latent space fundamentally incompatible with bs=1
 - Fourier-encoded surface normals: 4.374%/4.454% (4 bands/2 bands). Normals are unit vectors in [-1,1] — don't benefit from Fourier lifting like unbounded coords. More bands = earlier divergence
 - Snapshot ensemble (cosine trough checkpoints): test=6.044% single best, WORSE with more snapshots (K=3→6.24%, K=5→6.98%, K=6→7.81%). Quality gradient dominates diversity. EMA already provides implicit smoothing.
+- Spectral norm on QKV: 4.035% (+5.3%). σ=1 cap over-restricts attention capacity. Late collapse ep502 from unconstrained FFN layers. gc=0.5 already solves restart stability.
 - Attention temperature annealing: 4.024% (+5% vs 3.833%). External annealed τ compounds with existing learnable per-head τ. noam result doesn't transfer
 - SAM optimizer (rho=0.05/0.02): 5.36%/9.08%. SAM perturbation + cosine restart = double shock → catastrophic divergence. 2x compute penalty also prohibitive
 - True monotonic cosine (T_max=393606, no restarts): 4.086% (+0.253pp). Confirms T_max=30 rapid restarts are core mechanism, not noise. Monotonic decay can't compete
