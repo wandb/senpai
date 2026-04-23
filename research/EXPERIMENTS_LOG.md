@@ -1,5 +1,22 @@
 # SENPAI Research Results
 
+## 2026-04-24 02:00 — PR #3212: AF PCGrad gradient surgery (jin) — CLOSED (dead end)
+
+- jin/af-pcgrad, W&B group: af-pcgrad
+- Hypothesis: PCGrad (Yu et al., 2020) resolves surface/volume gradient conflicts to improve vol_mse
+- Trial 1 (PCGrad vol-10x, W&B: p89omv2u): surface=0.001926 (+550%), vol=0.011321 (+455%) — 5-6x worse on both metrics
+- Trial 2 (PCGrad vol-15x, W&B: 8cq4fd0i): surface=0.001510 (+410%), vol=0.011741 (+476%) — 5-6x worse on both metrics
+- **Root cause:** PCGrad requires retain_graph=True which disables torch.compile, causing ~40% throughput loss. Gradient conflict rate ~30-40% per step provides persistent magnitude reduction. The gradient conflict between surface and volume is NOT the bottleneck.
+- **Conclusion: PCGrad dead for AF.** Multi-backward-pass methods are fundamentally incompatible with the compile-dependent training pipeline. Added to AF dead ends.
+
+## 2026-04-24 02:00 — PR #3197: TF residual-prediction alone (gojo) — CLOSED (dead end)
+
+- gojo/tf-residual-prediction, W&B group: tf-residual-pred
+- Hypothesis: isolate contribution of --residual-prediction on TF without full noam stack
+- Trial 1 (residual alone, W&B: ja9b5iih): val=24.522 ep318 — +14.9% worse than 21.319
+- Trial 2 (residual+asinh, W&B: spykkoka): val=22.491 ep293 — +5.5% worse than 21.319
+- **Conclusion: residual-prediction is necessary but not sufficient for TF.** Adding asinh closes ~40% of the gap to champion but the full compound stack (ANP+physics+T_max=150+Lookahead+compile+96sl+re-strat) is required. Noam features don't decompose into independently useful TF components.
+
 ## 2026-04-24 01:15 — PR #3191: AF noam features (asinh+residual+re-strat) on base and vol-10x (alphonse) — CLOSED (dead end)
 
 - alphonse/af-noam-features, W&B group: af-noam-features-base
