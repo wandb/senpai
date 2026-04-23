@@ -1,5 +1,9 @@
 # SENPAI Research Results
 
+## 2026-04-23 22:30 — PR #3161: DM eta_min=1e-5 cosine floor + EMA+gc (spike) — CLOSED
+
+- Best val=4.202% ep297, then diverged ep312 → 16.3% (W&B run from student report). Trough-smoothing effect confirmed — eta_min prevents hard zeros at cosine troughs, giving EMA smoother targets. But 4.202% is 9.6% worse than 3.833% baseline. Root cause: gc=0.5 relies on zero-LR trough damping as a natural stability reset; eta_min=1e-5 removes that reset, allowing gradient accumulation through troughs → eventual divergence. Triple confirmation: eta_min+gc is incompatible at any gc value (gc=1.0→6.311%, gc=0.5→8.617% prior, now gc=0.5+EMA→4.202% diverge). Added to dead ends.
+
 ## 2026-04-23 22:00 — PR #3171: DM LR warmup + EMA+gc (sanji) — CLOSED
 
 - 5-ep warmup: 11.325% ep31 then collapsed to 66.8% (W&B: `ulog3zq2`). 10-ep warmup: 3.918% ep496, plateaued (W&B: `5ltdja3j`) — 0.085pp worse than 3.833% baseline, no further descent trend (last 50 epochs mean 4.02%). Warmup is neutral-to-harmful when EMA+gc=0.5 already provides stability. Adding to dead ends.

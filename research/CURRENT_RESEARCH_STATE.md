@@ -1,8 +1,8 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-23 12:30 (advisor cycle 46 — updated per human directive #3174)
+- **Date:** 2026-04-23 22:30 (advisor cycle 47)
 - **Branch:** radford
-- **Idle students:** 0 (4 being assigned)
+- **Idle students:** 0
 - **PRs ready for review:** 0
 - **CRITICAL:** TFP champion (0.002383) is unreproducible — 0/3 seeds stay finite (#3168)
 
@@ -28,7 +28,6 @@
 - `#3209` sanji: TFP cp_panel bug fix + multi-seed retest — STABILIZATION PRIORITY
 - `#3164` faye: paper-facing full eval (two-phase) — PAPER-FACING Track 1
 - `#3163` shouko: attn dropout=0.05
-- `#3161` spike: eta_min=1e-5 (cosine floor)
 - `#3160` griffith: 16H heads
 - `#3155` nobara: longer T_max (45/60)
 - `#3207` historia: DM true monotonic cosine (T_max=393606) — corrected retest
@@ -82,6 +81,7 @@
 **Other:**
 - `#3172` robin: LR warmup (5-ep/10-ep)
 - `#3169` nami: heads sweep 4H/16H
+- `#3211` spike: AF vol_loss_scale learnable scalar (noam port) — AF VOLUME FOCUS
 - `#3204` gilbert: vol-weight=15x/20x clean control (no extra features) — AF VOLUME FOCUS
 - `#3167` gilbert: higher LR (8e-4/1e-3)
 - `#3166` vegeta: vol-weight=5.0/7.0+EMA=0.999
@@ -178,7 +178,7 @@
 - Bilateral symmetry aug, torch.compile, gradient accumulation
 - Attention dropout without EMA/gc: toxic combo with T_max=30
 - Cosine eta_min without EMA/gc: diverges (7.255-7.918%)
-- eta_min=5e-5+gc (any value): gc=1.0→6.311%, gc=0.5→8.617%, both diverge — 3rd confirmation
+- eta_min+gc (any combination): gc=1.0→6.311%, gc=0.5→8.617%, gc=0.5+EMA→4.202% diverge ep312 — TRIPLE CONFIRMED. gc=0.5 relies on zero-LR trough damping; eta_min removes reset.
 - Surface points ≠50k: 16k=11.672%, 32k=7.558%, 64k=12.16% (even with EMA+gc) — 50k only viable count
 - 4L/640d: dead at ALL tested configs — lr=5e-4+EMA+gc: 8.636% diverge ep82 (#3159); lr=5e-4 no-EMA: 4.516%/6.457%/5.724% all diverge (#3079). Width amplifies gradients beyond gc containment.
 - lr<5e-4 under EMA: steep monotonic cliff (4.5e-4=4.134%, 4e-4=5.924%)
