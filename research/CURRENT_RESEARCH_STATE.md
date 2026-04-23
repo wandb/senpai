@@ -79,7 +79,7 @@
 **Other:**
 - `#3172` robin: LR warmup (5-ep/10-ep)
 - `#3169` nami: heads sweep 4H/16H
-- norman: volume smoothness regularization — AF VOLUME FOCUS (PR pending)
+- `#3223` norman: volume smoothness regularization — AF VOLUME FOCUS
 - `#3222` rei: proximity-weighted volume loss (surface distance) — AF VOLUME FOCUS
 - `#3218` shouko: GradNorm adaptive multi-task loss balancing — AF VOLUME FOCUS
 - `#3215` tanjiro: Huber loss on volume channel (robust to outliers) — AF VOLUME FOCUS
