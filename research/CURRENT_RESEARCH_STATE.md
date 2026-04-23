@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-23 18:00 (advisor cycle 39 — closed #3068/#3066/#3064, assigned brook/alphonse/casca)
+- **Date:** 2026-04-23 18:30 (advisor cycle 40 — closed #3159/#3158, assigning franky/bulma)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -22,8 +22,8 @@
 - `#3163` shouko: attn dropout=0.05
 - `#3161` spike: eta_min=1e-5 (cosine floor)
 - `#3160` griffith: 16H heads
-- `#3159` franky: 4L/640d wider
-- `#3158` bulma: lr=4e-4
+- `#NEW` franky: DM residual-prediction alone — BEING ASSIGNED
+- `#NEW` bulma: DM higher LR sweep (5.5e-4/6e-4) — BEING ASSIGNED
 - `#3155` nobara: longer T_max (45/60)
 - `#3154` historia: monotonic cosine (no restarts)
 - `#3152` eren: EMA decay sweep (0.999 vs 0.9995)
@@ -169,6 +169,8 @@
 - Attention dropout without EMA/gc: toxic combo with T_max=30
 - Cosine eta_min without EMA/gc: diverges (7.255-7.918%)
 - Surface points ≠50k: 16k=11.672%, 32k=7.558%, 64k=12.16% (even with EMA+gc) — 50k only viable count
+- 4L/640d at lr=5e-4: 8.636% then diverge ep82 even with EMA+gc (grad_norm=Infinity)
+- lr<5e-4 under EMA: steep monotonic cliff (4.5e-4=4.134%, 4e-4=5.924%)
 
 **TandemFoil Paper:**
 - T_max≠10 (all directions diverge)
