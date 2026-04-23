@@ -20,7 +20,7 @@
 **Noam-pivot experiments:**
 - `#3199` megumi: EMA=0.9999/0.99995 (noam optimal decay) — NOAM ABLATION
 - `#3192` casca: asinh-pressure alone (scale=0.75/0.5) — NOAM ABLATION
-- franky: gradient noise injection — INNOVATION (PR pending)
+- `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
 - `#3194` bulma: higher LR sweep (5.5e-4/6e-4)
 - `#3188` chihiro: 2H/16H heads sweep — NOAM ABLATION
 - `#3181` himmel: asinh+residual on champion — NOAM ABLATION
@@ -78,7 +78,7 @@
 **Other:**
 - `#3172` robin: LR warmup (5-ep/10-ep)
 - `#3169` nami: heads sweep 4H/16H
-- rei: proximity-weighted volume loss — AF VOLUME FOCUS (PR pending)
+- `#3222` rei: proximity-weighted volume loss (surface distance) — AF VOLUME FOCUS
 - `#3218` shouko: GradNorm adaptive multi-task loss balancing — AF VOLUME FOCUS
 - `#3215` tanjiro: Huber loss on volume channel (robust to outliers) — AF VOLUME FOCUS
 - `#3212` jin: PCGrad multi-objective gradient surgery — AF VOLUME FOCUS
