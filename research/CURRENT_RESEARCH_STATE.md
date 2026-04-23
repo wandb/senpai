@@ -25,7 +25,7 @@
 
 **Champion tuning / paper-facing:**
 - `#3173` kakashi: shorter cosine T_max=15/20
-- `#3171` sanji: LR warmup (5-ep/10-ep)
+- `#NEW` sanji: TFP cp_panel bug fix + multi-seed retest — STABILIZATION PRIORITY
 - `#3164` faye: paper-facing full eval (two-phase) — PAPER-FACING Track 1
 - `#3163` shouko: attn dropout=0.05
 - `#3161` spike: eta_min=1e-5 (cosine floor)
@@ -172,6 +172,7 @@
 - T_max=50+gc (both 0.5 and 1.0): diverge — T_max=30 only viable period
 - 10-ep warmup+gc=1.0: 11.2% then diverged
 - 5-ep warmup+gc=1.0: pending (chopper)
+- LR warmup + EMA+gc=0.5: 5-ep=11.325% diverged, 10-ep=3.918% plateaued (didn't beat 3.833%)
 - Huber loss, relative L2 loss (degenerate), SGDR, RAdam
 - beta2≠0.999, LR≠5e-4 (without EMA), WD+gc heavy (WD=1e-3: 4.44%)
 - Bilateral symmetry aug, torch.compile, gradient accumulation
