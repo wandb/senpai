@@ -1,5 +1,33 @@
 # SENPAI Research Results
 
+## 2026-04-24 04:30 — PR #3219: DM SAM optimizer (hinata) — CLOSED (dead end)
+
+- hinata/dm-sam-optimizer, W&B group: dm-sam-optimizer
+- Hypothesis: SAM (Sharpness-Aware Minimization) wrapping AdamW finds flat basins robust to cosine LR restarts
+- Trial 1 (rho=0.05, W&B: 7z3a4ous): val=5.359% ep273, then catastrophic divergence at ep278+ (grad_norm=3.18, 353 clips at ep288). +40% worse than 3.833%
+- Trial 2 (rho=0.02, W&B: dn33cgny): val=9.082% ep97, crashed ep103 (grad_norm → 38.5M). +137% worse. Negative sharpness (-0.000166) at ep130 = SAM lost regularization effect
+- **Root cause: SAM's perturbation step compounds destructively with cosine LR restarts.** Double shock (LR jump + SAM perturbation) at restart boundaries. Also 2x compute penalty — only reached ep276-289 vs ~500 baseline epochs.
+- **Conclusion: SAM dead for DM.** Flat-basin hypothesis not disproven, but SAM is incompatible with rapid cosine restarts. SWA (averaging checkpoints across cycles) would avoid both compute penalty and restart-shock.
+
+## 2026-04-24 04:30 — PR #3207: DM true monotonic cosine T_max=393606 (historia) — CLOSED (dead end)
+
+- historia/dm-true-monotonic-cosine, W&B run: 6yiwl01x, group: dm-monotonic-cosine
+- Hypothesis: single half-cosine decay from lr=5e-4 to 0 over full 999 epochs (no restarts) removes restart-induced gradient perturbation, allowing smoother EMA accumulation
+- Result: val=4.086% ep519, test=4.390%. +0.253pp / +6.6% worse than 3.833% baseline
+- Training dynamics: clean smooth convergence, grad norms dropped 9.4→0.08, no instability. LR decayed to 2.46e-4 at ep521 (52% through cycle). Val plateauing well above baseline.
+- **Compared to PR #3154 (T_max=999 steps, accidental rapid cycling): meaningful improvement 4.086% vs 4.39%, but still can't match baseline's rapid restarts.**
+- **Conclusion: monotonic cosine dead for DM.** Confirms T_max=30 rapid restarts are a core mechanism, not noise. Beneficial gradient perturbation from restarts is essential.
+
+## 2026-04-24 04:30 — PR #3206: DM 600 batches + gc=0.5 + EMA stabilized (jet) — CLOSED (dead end)
+
+- jet/dm-600-batches-stabilized, W&B group: dm-data-efficiency
+- Hypothesis: 600 batches/epoch (+52% data per epoch) with full stability stack (gc=0.5+EMA=0.9995) finds deeper basins through greater car diversity per epoch
+- Trial 1 (T_max=46 proportional, W&B: pv8nchbg): val=11.451% ep46, NaN divergence from ep61. Cosine restart at ep46 catastrophic despite gc=0.5. +199% worse
+- Trial 2 (T_max=30 baseline schedule, W&B: wr1x3ked): val=3.887% ep378, stable. +0.054pp vs 3.833%. Time-limited at 378 epochs but ran 226,800 total batches vs baseline's 201,334 at best epoch
+- **Key analysis: Trial 2 saw more total data than baseline yet couldn't match it.** Late trajectory (3.92-4.06% at ep375) shows no sign of descending toward new minimum. Data diversity per epoch is not the bottleneck.
+- **Conclusion: 600 batches/epoch dead for DM.** 394 batches/epoch already saturates data diversity. Proportional T_max scaling (T_max=46) confirmed unstable at higher batch counts.
+- **Bug fix noted:** jet fixed primary_metric_key shadowing bug (also fixed independently by hinata and historia in their PRs).
+
 ## 2026-04-24 03:45 — PR #3203: DM attention temperature annealing (vegeta) — CLOSED (dead end)
 
 - vegeta/dm-attn-temp-annealing, W&B run: ybh108ny
