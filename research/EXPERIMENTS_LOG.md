@@ -1,5 +1,13 @@
 # SENPAI Research Results
 
+## 2026-04-23 17:30 — PR #3153: DM EMA+gc+light WD (emma) — CLOSED
+
+- WD=1e-4: 14.76% ep35, diverged ep36 (W&B: `cbkbmr7n`). WD=5e-4: 4.920% ep247, diverged ep248 (W&B: `t1pqa5qd`). WD destabilizes EMA shadow model — no-WD confirmed for DM champion. Bug fix noted (primary_metric_key shadowing).
+
+## 2026-04-23 17:30 — PR #3065: DM multi-seed s456 two-phase (chihiro) — CLOSED
+
+- Phase 1 (capped): 5.709% ep130 (W&B: `6zuvrm3t`). Phase 2 (full): val=6.827%, test=6.456% (W&B: `tyn802bq`). Run used old config without EMA+gc=0.5 — not valid paper-facing data against 3.833% champion. Multi-seed runs should wait for post-noam-pivot best config.
+
 ## 2026-04-23 17:00 — PR #3182: DM compile + 96 slices (norman) — CLOSED (no-op)
 
 - Student correctly identified that model_slices=96 and compile_model=True are ALREADY defaults in train.py. The champion config already uses both. Experiment was vacuous as designed — no runs executed. Important correction to our noam analysis: these features were never "unused."
