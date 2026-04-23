@@ -21,6 +21,7 @@ import wandb
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from core.architectures import ABUPTReference, ANPSurfaceDecoder, ReferenceTransolver, SenpaiTransolver
+from core.architectures.transolver_reference import TransolverAttention
 from core.contracts import ABUPTBatch, DatasetBundle, GroupedBatch, TargetTransformStats
 from core.datasets import ABUPTCollate, build_dataset_bundle, collate_grouped
 from core.features import (
@@ -169,6 +170,9 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    attn_temp_annealing: bool = False
+    attn_temp_start: float = 2.0
+    attn_temp_end: float = 1.0
 
 
 @dataclass
@@ -452,6 +456,55 @@ def parse_args() -> TrainConfig:
             parser.add_argument(arg_name, type=type(field_value), default=field_value)
     namespace = parser.parse_args()
     return TrainConfig(**vars(namespace))
+
+
+def _patched_create_slices(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, num_tokens, _ = x.shape
+    fx_mid = self.in_project_fx(x).view(batch_size, num_tokens, self.num_heads, self.dim_head).permute(0, 2, 1, 3)
+    x_mid = self.in_project_x(x).view(batch_size, num_tokens, self.num_heads, self.dim_head).permute(0, 2, 1, 3)
+    slice_logits = self.in_project_slice(x_mid) / self.temperature
+    tau = getattr(self, "_attn_temp_tau", 1.0)
+    if tau != 1.0:
+        slice_logits = slice_logits / tau
+    slice_weights = F.softmax(slice_logits, dim=-1)
+    if attn_mask is not None:
+        mask = attn_mask[:, None, :, None].float()
+        slice_weights = slice_weights * mask
+    slice_norm = slice_weights.sum(dim=2, keepdim=False).unsqueeze(-1)
+    slice_tokens = torch.einsum("bhnc,bhns->bhsc", fx_mid, slice_weights) / (slice_norm + 1e-5)
+    return slice_tokens, slice_weights
+
+
+def _patched_attn_forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+    slice_tokens, slice_weights = self.create_slices(x, attn_mask=attn_mask)
+    qkv = self.qkv(slice_tokens)
+    q, k, v = qkv.chunk(3, dim=-1)
+    tau = getattr(self, "_attn_temp_tau", 1.0)
+    scale = None if tau == 1.0 else 1.0 / (self.dim_head ** 0.5 * tau)
+    out_slice = F.scaled_dot_product_attention(
+        q, k, v,
+        dropout_p=self.dropout if self.training else 0.0,
+        scale=scale,
+    )
+    out_x = torch.einsum("bhsc,bhns->bhnc", out_slice, slice_weights)
+    out_x = out_x.permute(0, 2, 1, 3).contiguous().view(x.shape[0], x.shape[1], self.hidden_dim)
+    return self.proj_dropout(self.proj(out_x))
+
+
+def enable_attn_temp_annealing(model: torch.nn.Module) -> None:
+    TransolverAttention.create_slices = _patched_create_slices
+    TransolverAttention.forward = _patched_attn_forward
+    for module in model.modules():
+        if isinstance(module, TransolverAttention):
+            module._attn_temp_tau = 1.0
+
+
+def update_attn_temp_tau(model: torch.nn.Module, epoch: int, total_epochs: int, start: float, end: float) -> float:
+    tau = start - (start - end) * ((epoch - 1) / max(total_epochs - 1, 1))
+    for module in model.modules():
+        if isinstance(module, TransolverAttention):
+            module._attn_temp_tau = tau
+    return tau
 
 
 def build_bundle(config: TrainConfig) -> DatasetBundle:
@@ -1615,6 +1668,8 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
+    if config.attn_temp_annealing:
+        enable_attn_temp_annealing(model)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
@@ -1642,10 +1697,7 @@ def main() -> None:
     best_model_state: dict[str, torch.Tensor] | None = None
     best_anp_state: dict[str, torch.Tensor] | None = None
 
-    if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
-    else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
+    _primary_metric_str = best_val_primary_metric_name
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1672,6 +1724,8 @@ def main() -> None:
     for epoch in range(1, config.epochs + 1):
         if timeout_seconds is not None and epoch > 1 and (time.monotonic() - start_time) >= timeout_seconds:
             break
+        if config.attn_temp_annealing:
+            tau = update_attn_temp_tau(model, epoch, config.epochs, config.attn_temp_start, config.attn_temp_end)
         train_metrics = train_one_epoch(
             model=forward_model,
             anp_head=anp_head,
@@ -1719,7 +1773,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(_primary_metric_str)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
@@ -1739,6 +1793,8 @@ def main() -> None:
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
         epoch_metrics["best_val_metric"] = best_val_metric
         epoch_metrics["best_epoch"] = float(best_epoch)
+        if config.attn_temp_annealing:
+            epoch_metrics["attn_temp_tau"] = tau
         history.append(epoch_metrics)
         if run is not None:
             wandb.log(epoch_metrics, step=epoch)
