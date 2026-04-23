@@ -1,5 +1,13 @@
 # SENPAI Research Results
 
+## 2026-04-23 15:00 — PR #3123: TFP shorter T_max (T_max=5/8) (mitsuha) — CLOSED
+
+- T_max=5 (W&B: `5kp3yu51`): diverged, field_mse never finite. T_max=8 (W&B: `rcysi68k`): diverged, field_mse never finite. Confirms T_max=10 is a stability resonance for current stripped-down TFP config. However, noam branch uses T_max=150 with ANP decoder + full feature stack — the stability constraint is architecture-dependent. Reassigned to TFP full noam stack (ANP + physics features + T_max=150).
+
+## 2026-04-23 15:00 — PR #3118: DM weight decay alone (hinata) — CLOSED
+
+- WD=1e-4: 13.45% ep53 (W&B: `zh2ofwsj`). WD=5e-4: 5.17% ep181 (W&B: `guy2f5cr`). WD=1e-3: 10.46% ep219 (W&B: `4e3y5q6g`). ALL runs without EMA/gc — wrong platform, dead regime. Best 5.17% is 35% worse than 3.833% baseline. Emma #3153 already covers WD+EMA+gc (correct follow-up). Reassigned to DM noam features (asinh-pressure + residual-prediction + compile + 96 slices).
+
 ## 2026-04-23 14:00 — PR #3138: DM 788 batches + T_max=60 (kakashi) — CLOSED
 
 - Run 1 (gc=1.0, no EMA): 6.620% ep66, diverged ep72 (W&B: `7sa8l03q`). Run 2 (gc=0.5+EMA=0.9995): 4.661% ep141, diverged ep143 (W&B: `jzg8os84`). Champion platform extended stability from ep72→ep143 and improved 6.62%→4.66%, but divergence is structural. 788 batches accumulate only 111k steps before dying vs baseline's 201k — throughput advantage completely erased by shorter training horizon. Three attempts (incl #3084) all diverge within 2 cosine cycles. Higher batch count per epoch dead for DM.
