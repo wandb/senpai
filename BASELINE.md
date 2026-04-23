@@ -3,11 +3,20 @@
 ## TandemFoilSet
 
 - **Primary metric:** `val_primary/surface_pressure_mae` (= `val_eq4/surface_pressure_mae`)
-- **Current best:** 21.909 (val) at epoch 334 — test 23.419
-- **Best PR:** #3108 (zenitsu — gc=0.3+EMA=0.999, Lion lr=1.25e-4, T_max=10, WD=1e-2, 3L/192d)
-- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 1.25e-4 --cosine-t-max 10 --grad-clip 0.3 --weight-decay 1e-2 --model-slices 64 --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999 --ema-decay 0.999`
+- **Current best:** 21.350 (val) at epoch 331 — test 23.195
+- **Best PR:** #3140 (usopp — gc=0.2+EMA=0.999, Lion lr=1.25e-4, T_max=10, WD=1e-2, 3L/192d)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 1.25e-4 --cosine-t-max 10 --grad-clip 0.2 --weight-decay 1e-2 --model-slices 64 --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999 --ema-decay 0.999`
 
-### 2026-04-23 — PR #3108: TandemFoil: gc=0.3 + EMA=0.999 — NEW BEST (CURRENT)
+### 2026-04-23 — PR #3140: TandemFoil: gc=0.2 + EMA=0.999 — NEW BEST (CURRENT)
+
+- **val_primary/surface_pressure_mae:** 21.350 (-2.6% vs 21.909) at epoch 331
+- **test_primary/surface_pressure_mae:** 23.195 (-1.0% vs 23.419)
+- **W&B run:** 9g11l7tm (usopp/tf-gc-02-sweep)
+- **Config:** Lion lr=1.25e-4, T_max=10, **gc=0.2**, WD=1e-2, **EMA=0.999**, 3L/192d, Fourier+physics
+- **Key insight:** gc monotonic trend continues: 1.0→0.5→0.3→0.2 all improve. gc=0.1 overshoots (22.141, single_in_dist +12.4%). gc=0.2 is the floor — bracketed. Model best at ep331, not terminal.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 1.25e-4 --cosine-t-max 10 --grad-clip 0.2 --weight-decay 1e-2 --model-slices 64 --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999 --ema-decay 0.999`
+
+### 2026-04-23 — PR #3108: TandemFoil: gc=0.3 + EMA=0.999 — PREVIOUS BEST
 
 - **val_primary/surface_pressure_mae:** 21.909 (-2.8% vs 22.537) at epoch 334
 - **test_primary/surface_pressure_mae:** 23.419 (-4.7% vs 24.581)
