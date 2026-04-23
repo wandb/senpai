@@ -165,6 +165,7 @@ class TrainConfig:
     surface_anchor_points: int = 8_000
     volume_anchor_points: int = 8_000
     grad_clip: float = 0.0
+    adam_beta2: float = 0.999
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
     seed: int = 0
@@ -545,7 +546,7 @@ def build_optimizer(params, config: TrainConfig):
     if config.optimizer == "lion":
         optimizer = Lion(params, lr=config.lr, weight_decay=config.weight_decay)
     elif config.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(params, lr=config.lr, weight_decay=config.weight_decay)
+        optimizer = torch.optim.AdamW(params, lr=config.lr, weight_decay=config.weight_decay, betas=(0.9, config.adam_beta2))
     else:
         raise ValueError(f"Unknown optimizer: {config.optimizer}")
     if config.use_lookahead:
