@@ -1,5 +1,20 @@
 # SENPAI Research Results
 
+## 2026-04-23 04:20 — PR #3128: DrivAerML AdamW beta2 sweep (megumi) — CLOSED
+
+- **Branch:** megumi/dm-adamw-beta2-sweep
+- **Hypothesis:** Lower beta2 (0.99, 0.95) makes optimizer more responsive to recent gradient variance across cosine LR transitions
+- **Results:**
+
+| Run | beta2 | W&B ID | Best val surface_rel_l2_pct | Fate |
+|---|---|---|---|---|
+| Run 1 | 0.99 | 95teq8ui | 7.113% ep140 | Progressive instability |
+| Run 2 | 0.95 | 4dladx7q | 13.332% ep40 | Diverged (grad_norm 1.26M) |
+| Baseline | 0.999 | bht6h42t | 3.997% ep467 | — |
+
+- **Analysis:** beta2=0.999's long memory is a STABILITY FEATURE, not a bug. Faster adaptation amplifies outlier batches into cascading gradient spikes at cosine LR peaks. Clear monotonic: 0.999 > 0.99 > 0.95. beta2=0.95 had mean grad_norm of 14,540 with max 1.26M. Leave beta2 at default.
+- **Decision:** CLOSED — 78-234% above baseline
+
 ## 2026-04-23 03:55 — PR #3126: DrivAerML cosine eta_min sweep (gohan) — CLOSED
 
 - **Branch:** gohan/dm-cosine-eta-min
