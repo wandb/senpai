@@ -1,5 +1,22 @@
 # SENPAI Research Results
 
+## 2026-04-24 03:45 — PR #3203: DM attention temperature annealing (vegeta) — CLOSED (dead end)
+
+- vegeta/dm-attn-temp-annealing, W&B run: ybh108ny
+- Hypothesis: linearly anneal attention temperature τ from 2.0→1.0 over training (soft→sharp attention)
+- Result: val=4.024% ep485 (+5.0% vs 3.833%), test=4.975% (+6.2% vs 4.685%)
+- **Root cause: external annealed τ compounded with Transolver's existing learnable per-head temperature parameter.** Double-τ created convoluted optimization, not intended soft→sharp progression.
+- **Conclusion: attn temp annealing dead for DM.** The -11% improvement on noam does not transfer — noam likely lacks the learnable τ or has different optimizer dynamics.
+
+## 2026-04-24 03:45 — PR #3204: AF vol-weight=15x/20x clean control (gilbert) — CLOSED (dead end)
+
+- gilbert/af-vol-15x-clean, W&B group: af-vol-15x-clean
+- Hypothesis: higher vol-weight (15x/20x) without extra features may improve vol_mse
+- Trial 1 (15x, W&B: o048z651): surface=0.000352 (+19%), vol=0.003402 (+67%), best vol=0.002378 at ep763 (still 16.6% above baseline but descending)
+- Trial 2 (20x, W&B: pne2413l): crashed ep381, NaN grad norms — beyond stability boundary
+- **Key finding: surface-anchored checkpoint selection HIDES vol improvements.** At ep763, vol_mse=0.002378 but surface_mse=0.000594. The best-checkpoint metric (surface_mse) doesn't capture the best volume state.
+- **Conclusion: vol-weight>10x worsens surface/volume Pareto from current operating point.** But joint checkpoint selection could unlock vol gains at moderate vol-weight (11x-13x). Added vol-15x/20x to AF dead ends.
+
 ## 2026-04-24 03:15 — PR #3220: DM Mixup regularization (nobara) — CLOSED (dead end)
 
 - nobara/dm-mixup, W&B group: dm-mixup
