@@ -11,49 +11,28 @@ WORKDIR="/workspace/senpai"
 
 echo "=== Senpai Advisor ==="
 echo "Runner repo:  $REPO_URL (branch: $REPO_BRANCH)"
-echo "Target repo:  $TARGET_REPO_URL (branch: $TARGET_WORKING_BRANCH)"
+echo "Target repo:  $TARGET_REPO_URL (branch: $ADVISOR_BRANCH)"
 echo "Problem dir:  $PROBLEM_DIR"
 echo "Tag:          $RESEARCH_TAG"
 echo "Students:     $STUDENT_NAMES"
 
-# Senpai runner repo already cloned by the deployment args block.
+# Senpai runner repo already cloned by the deployment args block
 cd "$WORKDIR"
 
-# Clone the problem-package repo into $PROBLEM_DIR (bring-your-own-repo model —
+# Clone the problem-package repo into $PROBLEM_DIR (bring-your-own-repo —
 # agent commits/PRs live in $TARGET_REPO_URL, not wandb/senpai).
 if [ ! -d "$PROBLEM_DIR/.git" ]; then
-    git clone --branch "$TARGET_WORKING_BRANCH" "$TARGET_REPO_URL" "$PROBLEM_DIR"
+    git clone "$TARGET_REPO_URL" "$PROBLEM_DIR"
 fi
 
 uv pip install --system -e .
 
-# --- Start Hivemind logging service ---
-mkdir -p ~/.claude/projects
-uvx --from wandb-hivemind hivemind run &
-echo "=== Hivemind started (PID=$!) ==="
-
-# --- Load CC run command helper function ---
-source "$WORKDIR/k8s/run-senpai-claude.sh"
-
-# --- Register Weave CC plugin (tools already baked into Docker image) ---
-export PATH="$HOME/.claude/bin:$PATH"
-source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
-
-# --- Register Senpai CC plugin ---
-SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
-source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
-
-# Gh helpers target the problem-package repo, not senpai. Pre-seed the slug cache.
-export _SENPAI_REPO="$TARGET_REPO"
-
-# From here on, all git/gh ops happen inside the problem-package working tree.
+# --- Git identity (inside the problem-package repo) ---
 cd "$WORKDIR/$PROBLEM_DIR"
-
 git config user.name "senpai-advisor"
 git config user.email "senpai-advisor@senpai"
-git remote set-url origin "$TARGET_REPO_URL"
 
-# --- Ensure the advisor integration branch exists in the problem-package repo ---
+# --- Create or checkout advisor branch ---
 git fetch origin
 if git rev-parse --verify "origin/$ADVISOR_BRANCH" >/dev/null 2>&1; then
     git checkout "$ADVISOR_BRANCH"
@@ -67,6 +46,25 @@ fi
 LOGDIR="$WORKDIR/advisor_logs"
 mkdir -p "$LOGDIR"
 
+# --- Start Hivemind logging service (streams CC session logs to hivemind.wandb.tools) ---
+mkdir -p ~/.claude/projects
+uvx --from wandb-hivemind hivemind run &
+echo "=== Hivemind started (PID=$!) ==="
+
+# --- Load CC run command helper function ---
+source "$WORKDIR/k8s/run-senpai-claude.sh"
+
+# --- Register Weave CC plugin (tools already baked into Docker image) ---
+export PATH="$HOME/.claude/bin:$PATH"
+source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
+
+# --- Register Senpai CC plugin (skills + tools for common git tasks; CC uses --plugin-dir SENPAI_PLUGIN for tools) ---
+SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
+source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
+
+# Gh helpers target the problem-package repo, not senpai. Pre-seed the slug cache.
+export _SENPAI_REPO="$TARGET_REPO"
+
 # --- Build prompts (CC auto-discovers CLAUDE.md for role instructions) ---
 TASK_INSTRUCTIONS="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-advisor.md" | sed '/^<!--$/,/^-->$/d')"
 PROMPT="${TASK_INSTRUCTIONS}"
@@ -76,9 +74,11 @@ if [ -n "${EXTRA_INSTRUCTIONS_B64:-}" ]; then
     PROMPT="${PROMPT}"$'\n\n# Finally, some additional instructions\n\n'"$(printf '%s' "$EXTRA_INSTRUCTIONS_B64" | base64 -d)"
 fi
 
-KEY_INFO=$'\n\n Key information:\n\n Students: '"$STUDENT_NAMES"' | Tag: '"$RESEARCH_TAG"' | Target repo: '"$TARGET_REPO"' | Advisor branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
+# Add "$KEY_INFO" (reminder of student names etc) to PROMPT
+KEY_INFO=$'\n\n Key information:\n\n Students: '"$STUDENT_NAMES"' | Tag: '"$RESEARCH_TAG"' | Target repo: '"$TARGET_REPO"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
+# Heartbeat prompt for polling
 HEARTBEAT_PROMPT="Continue your advisor loop. Attached is the current research state. Review any completed experiment PRs, assign work to all idle students, and check for human gh issues and comments."
 
 # --- Last-check timestamp state for filtering PRs and issues ---
@@ -92,18 +92,21 @@ MAX_TURNS=10000
 
 ITERATION=0
 while true; do
+    # Set log dir, print loop and git info
     ITERATION=$((ITERATION + 1))
     LOGFILE="$LOGDIR/iteration_${ITERATION}_$(date +%Y%m%d_%H%M%S).log"
     echo "=== Advisor Heartbeat iteration $ITERATION ($(date)) ==="
-
     cd "$WORKDIR/$PROBLEM_DIR"
-    echo "=== Problem-package HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) in $PROBLEM_DIR ==="
+    echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) in $PROBLEM_DIR ==="
 
+    # Overwrite CLAUDE.md with advisor-specific one — CC's git operations may clobber it with the developer copy
     envsubst '$PROBLEM_DIR' < "$WORKDIR/system_instructions/CLAUDE-ADVISOR.md" | sed '/^<!--$/,/^-->$/d' > "$WORKDIR/CLAUDE.md"
 
+    # --- Read last-check timestamp for filtering PRs and issues (empty on first run = no filtering) ---
     SINCE=""
     [ -f "$LAST_CHECK_FILE" ] && SINCE=$(cat "$LAST_CHECK_FILE")
 
+    # --- Check research state before invoking CC ---
     REVIEW_JSON=$(list_ready_for_review_prs "$ADVISOR_BRANCH" "$SINCE")
     REVIEW_COUNT=$(printf '%s' "$REVIEW_JSON" | json_len)
     ISSUE_JSON=$(check_gh_issues "$ADVISOR_BRANCH" "$SINCE")
@@ -111,14 +114,17 @@ while true; do
     IDLE_JSON=$(list_idle_students "$STUDENT_NAMES" "$ADVISOR_BRANCH")
     IDLE_COUNT=$(printf '%s' "$IDLE_JSON" | json_len)
 
+    # --- Derive watermark from the data we actually fetched (no gap, no overlap) ---
     WATERMARK=$(max_updated_at "$REVIEW_JSON" "$ISSUE_JSON")
 
+    # --- Build triage info (used in logs, CC prompt, and skip check) ---
     TRIAGE_INFO="## Research state (since ${SINCE:-boot})"
     [ "$REVIEW_COUNT" -gt 0 ] && TRIAGE_INFO+=$'\n'"- **GitHub PRs to review ($REVIEW_COUNT):** $(printf '%s' "$REVIEW_JSON" | json_numbers)"
     [ "$ISSUE_COUNT" -gt 0 ]  && TRIAGE_INFO+=$'\n'"- **GitHub issues ($ISSUE_COUNT):** $(printf '%s' "$ISSUE_JSON" | json_numbers)"
     [ "$IDLE_COUNT" -gt 0 ]   && TRIAGE_INFO+=$'\n'"- **Idle students ($IDLE_COUNT):** $(printf '%s' "$IDLE_JSON" | json_join)"
     echo "$TRIAGE_INFO"
 
+    # --- Log triage state and select prompt ---
     echo "=== Log: $LOGFILE ==="
     echo "$TRIAGE_INFO" > "$LOGFILE"
 
@@ -130,6 +136,7 @@ while true; do
         echo "$TRIAGE_INFO"
         run_senpai_claude $MAX_TURNS "${FULL_PROMPT}"$'\n\n'"${TRIAGE_INFO}" || EXIT_CODE=$?
     else
+        # --- Programmatic skip: skip rest of CC loop if nothing actionable ---
         if [ "$REVIEW_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ] && [ "$IDLE_COUNT" -eq 0 ]; then
             echo "=== Iteration $ITERATION: Nothing actionable, sleeping $SLEEP_TIME_S seconds ==="
             sleep "$SLEEP_TIME_S"
@@ -145,6 +152,7 @@ while true; do
     fi
     DURATION=$(( $(date +%s) - START_TS ))
 
+    # --- Advance watermark to max updatedAt of items we fetched (only on success so failed runs retry) ---
     if [ "$EXIT_CODE" -eq 0 ] && [ -n "$WATERMARK" ]; then
         echo "$WATERMARK" > "$LAST_CHECK_FILE"
     fi

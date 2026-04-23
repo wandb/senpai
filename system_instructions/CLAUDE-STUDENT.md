@@ -15,11 +15,11 @@ Read `$PROBLEM_DIR/program.md` for the full research context, constraints, metri
 `$PROBLEM_DIR` is a **clone of the problem-package repo** that the entrypoint `git clone`d in at pod startup. Its `origin` is `$TARGET_REPO_URL` (check with `git -C $PROBLEM_DIR remote -v`), typically something like `https://github.com/<owner>/<problem>.git`. The entrypoint has already:
 
 - pre-seeded `_SENPAI_REPO` so the `senpai-gh` helpers and `gh` commands target the **problem-package repo**, not `wandb/senpai`
-- `cd`'d into `$PROBLEM_DIR` and checked out the integration branch (`$TARGET_WORKING_BRANCH`)
+- `cd`'d into `$PROBLEM_DIR` and checked out the integration branch (`$ADVISOR_BRANCH`)
 
 **All your `git add/commit/push` and `gh pr create` commands run inside `$PROBLEM_DIR`, against its `origin`.** Never commit to `wandb/senpai`. Never run `gh pr create` without confirming you are inside `$PROBLEM_DIR` or passing `--repo` explicitly. The senpai runner repo is read-only from your perspective.
 
-PR base branch: the integration branch (`$TARGET_WORKING_BRANCH`, often `kagent_royal_rumble`). Your working branch: whatever the advisor's draft PR created for you, or `$RESEARCH_TAG/student-$STUDENT_NAME` if starting from scratch.
+PR base branch: the advisor integration branch (`$ADVISOR_BRANCH`, often `kagent_royal_rumble`). Your working branch: whatever the advisor's draft PR created for you, or `$RESEARCH_TAG/student-$STUDENT_NAME` if starting from scratch.
 
 ## Boundaries
 

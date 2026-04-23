@@ -11,20 +11,25 @@ WORKDIR="/workspace/senpai"
 
 echo "=== Senpai Student: $STUDENT_NAME ==="
 echo "Runner repo:  $REPO_URL (branch: $REPO_BRANCH)"
-echo "Target repo:  $TARGET_REPO_URL (branch: $TARGET_WORKING_BRANCH)"
+echo "Target repo:  $TARGET_REPO_URL (branch: $ADVISOR_BRANCH)"
 echo "Problem dir:  $PROBLEM_DIR"
 echo "GPUs:         $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l) x $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
 
-# Senpai runner repo already cloned by the deployment args block.
+# Senpai runner repo already cloned by the deployment args block
 cd "$WORKDIR"
 
-# Clone the problem-package repo into $PROBLEM_DIR (bring-your-own-repo model —
+# Clone the problem-package repo into $PROBLEM_DIR (bring-your-own-repo —
 # agent commits/PRs live in $TARGET_REPO_URL, not wandb/senpai).
 if [ ! -d "$PROBLEM_DIR/.git" ]; then
-    git clone --branch "$TARGET_WORKING_BRANCH" "$TARGET_REPO_URL" "$PROBLEM_DIR"
+    git clone "$TARGET_REPO_URL" "$PROBLEM_DIR"
 fi
 
 uv pip install --system -e .
+
+# --- Git identity for commits (inside the problem-package repo) ---
+cd "$WORKDIR/$PROBLEM_DIR"
+git config user.name "senpai-$STUDENT_NAME"
+git config user.email "senpai-$STUDENT_NAME@senpai"
 
 # --- Start Hivemind (streams CC session logs to hivemind.wandb.tools) ---
 mkdir -p ~/.claude/projects
@@ -45,18 +50,11 @@ source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
 # Gh helpers target the problem-package repo, not senpai. Pre-seed the slug cache.
 export _SENPAI_REPO="$TARGET_REPO"
 
-# From here on, all git/gh ops happen inside the problem-package working tree.
-cd "$WORKDIR/$PROBLEM_DIR"
-
-git config user.name "senpai-$STUDENT_NAME"
-git config user.email "senpai-$STUDENT_NAME@senpai"
-git remote set-url origin "$TARGET_REPO_URL"
-
 # --- Build prompts (CC auto-discovers CLAUDE.md for role instructions) ---
 TASK_INSTRUCTIONS="$(envsubst < "$WORKDIR/$PROBLEM_DIR/instructions/prompt-student.md" | sed '/^<!--$/,/^-->$/d')"
 PROMPT="${TASK_INSTRUCTIONS}"
 
-KEY_INFO=$'\n\nKey information:\n\nStudent: '"$STUDENT_NAME"' | Target repo: '"$TARGET_REPO"' | Target branch: '"$TARGET_WORKING_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
+KEY_INFO=$'\n\nKey information:\n\nStudent: '"$STUDENT_NAME"' | Target repo: '"$TARGET_REPO"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
 HEARTBEAT_PROMPT="Continue your student loop. Check for assigned PRs, check for GitHub issues, and resume any in-progress work."
@@ -75,17 +73,15 @@ while true; do
     LOGFILE="$LOGDIR/iteration_${ITERATION}_$(date +%Y%m%d_%H%M%S).log"
     echo "=== Student Heartbeat iteration $ITERATION ($(date)) ==="
 
-    # Refresh the problem-package working tree to the latest integration branch before each iteration.
+    # Return to latest advisor branch so student starts from the current baseline
     cd "$WORKDIR/$PROBLEM_DIR"
-    git fetch origin "$TARGET_WORKING_BRANCH" 2>/dev/null || true
-    git checkout "$TARGET_WORKING_BRANCH" 2>/dev/null || true
-    git pull origin "$TARGET_WORKING_BRANCH" 2>/dev/null || true
+    git checkout "$ADVISOR_BRANCH" 2>/dev/null || true
+    git pull origin "$ADVISOR_BRANCH" 2>/dev/null || true
 
-    # Overwrite CLAUDE.md in senpai root with the student role instructions —
-    # CC walks up from $PROBLEM_DIR and picks this up.
+    # Overwrite CLAUDE.md with the student role instructions — git checkout/pull clobbers it with the developer copy
     envsubst '$PROBLEM_DIR' < "$WORKDIR/system_instructions/CLAUDE-STUDENT.md" | sed '/^<!--$/,/^-->$/d' > "$WORKDIR/CLAUDE.md"
 
-    echo "=== Problem-package HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) in $PROBLEM_DIR ==="
+    echo "=== Git HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) in $PROBLEM_DIR ==="
     echo "=== GPU: $(nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null) ==="
 
     # --- Check for work before invoking CC ---

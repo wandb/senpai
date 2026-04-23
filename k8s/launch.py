@@ -44,7 +44,6 @@ class Args:
     repo_url: str = "https://github.com/wandb/senpai.git"  # git repo URL (senpai runner)
     repo_branch: str = "main"  # git branch to clone (senpai runner)
     target_repo_url: str = "https://github.com/morganmcg1/tandemfoil2.git"  # problem-package repo (entrypoint clones this into $PROBLEM_DIR; agent commits/PRs land here)
-    target_working_branch: str = "kagent_royal_rumble"  # integration branch inside the problem-package repo
     image: str = "ghcr.io/wandb/senpai:latest"  # container image for students
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
     wandb_project: str = "senpai-v1"  # W&B project name
@@ -92,7 +91,6 @@ def render_student(template: str, student_name: str, tag: str, args: Args) -> st
             "REPO_BRANCH": args.repo_branch,
             "TARGET_REPO_URL": args.target_repo_url,
             "TARGET_REPO": target_repo_slug(args.target_repo_url),
-            "TARGET_WORKING_BRANCH": args.target_working_branch,
             "STUDENT_NAME": student_name,
             "RESEARCH_TAG": tag,
             "WANDB_ENTITY": args.wandb_entity,
@@ -123,7 +121,6 @@ def render_advisor(template: str, tag: str, student_list: list[str], args: Args)
         "REPO_BRANCH": args.repo_branch,
         "TARGET_REPO_URL": args.target_repo_url,
         "TARGET_REPO": target_repo_slug(args.target_repo_url),
-        "TARGET_WORKING_BRANCH": args.target_working_branch,
         "RESEARCH_TAG": tag,
         "STUDENT_NAMES": ",".join(student_list),
         "WANDB_ENTITY": args.wandb_entity,

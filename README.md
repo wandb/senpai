@@ -98,13 +98,12 @@ problem: target/tandemfoil2               # active problem directory (entrypoint
 repo_url: https://github.com/wandb/senpai.git
 repo_branch: main
 target_repo_url: https://github.com/morganmcg1/tandemfoil2.git   # problem-package repo: agent commits/PRs target this
-target_working_branch: kagent_royal_rumble                       # integration branch inside the problem-package repo
+advisor_branch: kagent_royal_rumble                              # integration branch inside the problem-package repo (advisor PRs merge here; students branch off it)
 image: ghcr.io/wandb/senpai:latest
 pvc_claim_name: new-pvc
 pvc_mount_path: /mnt/new-pvc
 wandb_entity: wandb-applied-ai-team
 wandb_project: senpai-v1
-advisor_branch: kagent_royal_rumble
 timeout_minutes: 30.0
 max_epochs: 50
 n_students: 4
@@ -157,11 +156,10 @@ python k8s/launch.py --tag <research-tag> --advisor --extra_instructions "Only c
    # edit senpai.yaml:
    #   problem: target/my_problem
    #   target_repo_url: https://github.com/myorg/my_problem.git
-   #   target_working_branch: <branch>
    #   advisor_branch: <branch>
    git add senpai.yaml && git commit -m "Point senpai at my_problem"
    ```
-   Or pass on the CLI: `--problem target/my_problem --target_repo_url ... --target_working_branch ... --advisor_branch ...`.
+   Or pass on the CLI: `--problem target/my_problem --target_repo_url ... --advisor_branch ...`.
 3. Deploy as usual — `python k8s/launch.py --tag <tag> --advisor`. Agent commits/PRs will land in `myorg/my_problem`, not senpai.
 
 ## References

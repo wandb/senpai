@@ -10,8 +10,8 @@ repo_url: https://github.com/wandb/senpai.git
 repo_branch: main
 
 # problem-package repo (agent commits/PRs land here, not in senpai)
+# The entrypoint clones this into $PROBLEM_DIR and checks out advisor_branch.
 target_repo_url: https://github.com/morganmcg1/tandemfoil2.git
-target_working_branch: kagent_royal_rumble
 
 # docker image
 image: ghcr.io/wandb/senpai:latest

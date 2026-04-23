@@ -13,9 +13,9 @@ This directory is **empty by design**. senpai itself is problem-agnostic — all
 At pod launch, `k8s/entrypoint-{advisor,student}.sh` clones the problem-package repo into `target/<name>/` using two env vars wired up by `k8s/launch.py`:
 
 - `TARGET_REPO_URL` — the repo the agents commit to (defaults come from `senpai.yaml`, override with `--target_repo_url`)
-- `TARGET_WORKING_BRANCH` — integration branch inside that repo (`--target_working_branch`)
+- `ADVISOR_BRANCH` — integration branch inside that repo (advisor PRs merge here; students branch off it). Override with `--advisor_branch`.
 
-The active problem path is `senpai.yaml`'s `problem:` field (e.g. `target/tandemfoil2`) — the entrypoint clones `TARGET_REPO_URL` into that path.
+The active problem path is `senpai.yaml`'s `problem:` field (e.g. `target/tandemfoil2`) — the entrypoint clones `TARGET_REPO_URL` into that path and checks out `ADVISOR_BRANCH`.
 
 ## Local development
 
