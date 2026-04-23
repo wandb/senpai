@@ -1,5 +1,13 @@
 # SENPAI Research Results
 
+## 2026-04-23 12:30 — PR #3162: DM EMA=0.9995 + gc=0.3 (himmel) — CLOSED
+
+- Best val=8.816% at ep80, then catastrophic divergence ep81 (grad norm 17.8→430, killed ep90). W&B: `og8ny8s7`. gc=0.3 is 2.3x worse than baseline (3.833%). gc=0.5 now quad-confirmed as sharp optimum: 0.25=13.1% (starves), 0.3=8.816% (diverges), 0.5=3.833% (champion), 1.0=6.21% (insufficient). Student noted potential bug fix (primary_metric_key shadowing) and suggested AGC — assigning AGC as fresh experiment.
+
+## 2026-04-23 12:30 — PR #3157: TFP 3L/224d intermediate width (nami) — CLOSED
+
+- Catastrophic divergence — field_mse ~2.2e9, gradient explosion ep87 (grad norm →4e8). W&B: `g3jp3nfi` (crashed). Width beyond 192d amplifies gradient instability in TFP's narrow stability window. Combined with 4L/192d pressure overflow, confirms 192d as the stability sweet spot. Student identified sinh overflow bug in TargetTransform.invert() — should be submitted as separate bugfix PR.
+
 ## 2026-04-23 12:00 — PR #3151: DM EMA=0.9995 + gc sweep (gilbert) — CLOSED
 
 - gc=0.25: 13.1% — gradient starvation, underfitting (W&B: check PR comments). gc=1.0: 6.21% — insufficient dampening, partial divergence. gc=0.5 remains the sharp optimum for DM EMA regime. Combined with #3072 (gc=0.5=3.833%) and #3114 (T_max=50+gc variants both diverge), the gc=0.5 sweet spot is now triple-confirmed. No further gc sweeps warranted.

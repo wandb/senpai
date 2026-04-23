@@ -1,8 +1,8 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-23 12:00 (advisor cycle 30 — closed #3151/#3141/#2947, assigning gilbert/vegeta/jin)
+- **Date:** 2026-04-23 12:30 (advisor cycle 31 — closed #3162/#3157, assigning himmel/nami)
 - **Branch:** radford
-- **Idle students:** 0 (gilbert/vegeta/jin being assigned)
+- **Idle students:** 0 (himmel/nami being assigned)
 - **PRs ready for review:** 0
 
 ## Fleet Status
@@ -11,7 +11,7 @@
 - `#3165` senku: EMA+gc+4H heads (128d/head)
 - `#3164` faye: paper-facing full eval (two-phase) — PAPER-FACING
 - `#3163` shouko: EMA+gc+attn dropout=0.05
-- `#3162` himmel: EMA+gc=0.3 (softer gc test)
+- `#NEW` himmel: AGC (adaptive gradient clipping) on EMA champion — BEING ASSIGNED
 - `#3161` spike: EMA+gc+eta_min=1e-5 (cosine floor)
 - `#3160` griffith: EMA+gc+16H heads
 - `#3159` franky: EMA+gc+4L/640d (wider)
@@ -46,7 +46,7 @@
 - `#3046` sukuna: WD+gc compound (SENT BACK — WD=5e-4/1e-4+gc=1.0)
 
 ### TandemFoil Paper WIP (~10 students, ~17%)
-- `#3157` nami: 3L/224d intermediate width
+- `#NEW` nami: attention heads sweep (4H/16H) — BEING ASSIGNED (moved from TFP)
 - `#3145` rei: gc=0.4 boundary test
 - `#3133` shinobu: WD sweep (5e-3/2e-2)
 - `#3124` robin: 3L/256d wider model
@@ -131,7 +131,7 @@
 ## Key Dead Ends (Do Not Repeat)
 
 **DrivAerML:**
-- gc≠0.5 with EMA: 0.25 starves (13.1%), 1.0 insufficient (6.21%) — TRIPLE CONFIRMED
+- gc≠0.5 with EMA: 0.25 starves (13.1%), 0.3 diverges ep81 (8.816%), 1.0 insufficient (6.21%) — QUAD CONFIRMED
 - EMA without gc: diverges (confirmed #3072 Run 1, plus 3 prior attempts)
 - gc alone (any value, no EMA): best 4.346%, above baseline ceiling
 - Non-EMA regime ceiling: 3.997% (all diverge at cosine restart peaks)
@@ -154,6 +154,7 @@
 - gc≠0.5 (0.3=starvation, 0.7=destabilize; 0.4 being tested)
 - EMA≠0.999 (0.99 and 0.9995 both cause sinh overflow — very narrow window)
 - 4L depth (pressure overflow), LR=1.5e-4 (+34%)
+- 3L/224d width: catastrophic divergence (field_mse ~2.2e9, grad explosion ep87)
 - T_max=20/30: field_mse never reaches finite values
 
 **AirfRANS:**
