@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 08:00 (advisor cycle 70)
+- **Date:** 2026-04-24 08:30 (advisor cycle 71)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -18,6 +18,8 @@
 - `#3233` gojo: stochastic depth (LayerDrop) regularization — INNOVATION
 - `#3231` emma: surface pressure gradient smoothness regularization — INNOVATION (physics-informed)
 - `#3251` fern: Pre-LayerNorm architecture ablation (+ RMSNorm variant) — INNOVATION
+- `#3259` zenitsu: curvature-weighted loss (per-point weighting by local curvature) — INNOVATION
+- `#3258` emma: auxiliary surface normal prediction (multi-task regularization) — INNOVATION
 - `#3252` mitsuha: progressive surface point training (resolution curriculum) — INNOVATION
 - `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
 - `#3228` chopper: stochastic weight perturbation at cosine troughs — INNOVATION
@@ -48,10 +50,8 @@
 - `#3067` askeladd: 32k surface points (SENT BACK)
 - `#3046` sukuna: WD+gc compound (SENT BACK)
 
-### TandemFoil WIP (3 PRs) — GUARDRAIL ONLY per directive
+### TandemFoil WIP (2 PRs) — GUARDRAIL ONLY per directive
 **New champion config:** ANP+full physics+T_max=150+gc=0.2+EMA=0.999+96sl+Lookahead+compile+re-strat (#3185)
-**Noam-pivot experiments (still running):**
-- `#3196` zenitsu: EMA decay sweep (0.9999/0.99995) — NOAM ABLATION
 - `#3150` yuji: clean test row — PAPER-FACING
 
 ### TandemFoil Paper WIP (9 PRs) — STABILIZATION CRISIS
@@ -190,6 +190,7 @@
 - Snapshot ensemble (cosine trough checkpoints): test=6.044% single best, WORSE with more snapshots (K=3→6.24%, K=5→6.98%, K=6→7.81%). Quality gradient dominates diversity. EMA already provides implicit smoothing.
 - Spectral norm on QKV: 4.035% (+5.3%). σ=1 cap over-restricts attention capacity. Late collapse ep502 from unconstrained FFN layers. gc=0.5 already solves restart stability.
 - Self-distillation via EMA teacher: α=0.3→6.446% diverge ep170, α=0.1→4.323% diverge ep400. EMA=0.9995 lag creates destabilizing feedback loop. Same EMA for ckpt+teacher incompatible.
+- Pressure gradient smoothness reg (KNN): λ=0.01→4.481%, λ=0.1→4.876%, λ=1.0→12.52%. KNN 30% throughput overhead + sharp car features penalized. Remaining error is systematic bias, not noise.
 - Attention temperature annealing: 4.024% (+5% vs 3.833%). External annealed τ compounds with existing learnable per-head τ. noam result doesn't transfer
 - SAM optimizer (rho=0.05/0.02): 5.36%/9.08%. SAM perturbation + cosine restart = double shock → catastrophic divergence. 2x compute penalty also prohibitive
 - True monotonic cosine (T_max=393606, no restarts): 4.086% (+0.253pp). Confirms T_max=30 rapid restarts are core mechanism, not noise. Monotonic decay can't compete
