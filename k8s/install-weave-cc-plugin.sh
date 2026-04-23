@@ -13,5 +13,10 @@
 # WANDB_API_KEY is already in the pod env (from senpai-secrets) and is picked
 # up automatically by `--non-interactive`.
 
+# The installer invokes `git clone git@github.com:...` internally. Fresh pods
+# have no known_hosts entry for github.com, so rewrite SSH URLs to the
+# already-token-authenticated HTTPS form set up in the deployment entrypoint.
+git config --global url."https://${GITHUB_TOKEN}@github.com/".insteadOf "git@github.com:"
+
 WEAVE_PROJECT="${WANDB_ENTITY}/${WANDB_PROJECT}" \
     weave-claude-plugin install --non-interactive
