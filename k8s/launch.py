@@ -175,37 +175,24 @@ def preflight_check_target_repo_access(target_repo_url: str) -> None:
     def gh_api(path: str) -> dict:
         req = urllib.request.Request(
             f"https://api.github.com{path}",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "User-Agent": "senpai-launch-preflight",
-            },
+            headers={"Authorization": f"Bearer {token}", "User-Agent": "senpai-launch-preflight"},
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read())
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            sys.exit(f"ERROR: GitHub API {e.code} for {path}: {e.read().decode(errors='replace')}")
 
-    try:
-        repo = gh_api(f"/repos/{slug}")
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
-        sys.exit(f"ERROR: GitHub API {e.code} for /repos/{slug}: {body}\n"
-                 f"  → senpai-secrets/github-token can't see {slug}. "
-                 f"Rotate the token or grant its user access to the repo.")
+    perms = gh_api(f"/repos/{slug}").get("permissions", {})
+    if perms.get("push"):
+        print(f"  OK — token has push access to {slug}")
+        return
 
-    try:
-        user = gh_api("/user").get("login", "<unknown>")
-    except urllib.error.HTTPError:
-        user = "<unknown>"
-
-    perms = repo.get("permissions", {})
-    if not perms.get("push", False):
-        sys.exit(f"ERROR: senpai-secrets/github-token (authenticated as '{user}') cannot push to {slug}\n"
-                 f"  permissions: {perms}\n"
-                 f"  → advisor `git push` and student PRs will 403.\n"
-                 f"  Fix: rotate senpai-secrets/github-token to a PAT with write on {slug}, "
-                 f"or grant '{user}' collaborator write on {slug}.")
-
-    print(f"  OK — token (user '{user}') has push access to {slug}")
+    user = gh_api("/user").get("login", "<unknown>")
+    sys.exit(f"ERROR: senpai-secrets/github-token (user '{user}') cannot push to {slug}\n"
+             f"  permissions: {perms}\n"
+             f"  Fix: rotate senpai-secrets/github-token to a PAT with write on {slug}, "
+             f"or grant '{user}' collaborator write on {slug}.")
 
 
 def kubectl_apply(manifest: str, name: str):
