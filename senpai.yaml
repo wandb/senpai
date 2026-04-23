@@ -1,9 +1,10 @@
 # senpai project configuration
 # All fields can be overridden via CLI: python k8s/launch.py --tag <tag> [--field value]
 
-# active problem directory (repo-relative path under target/)
-# The entrypoint clones target_repo_url into this path at pod startup.
-problem: target/tandemfoil2
+# active problem directory
+# The entrypoint clones target_repo_url into this path at pod startup, so the
+# problem-package repo's root ends up at ./target/ in the pod workspace.
+problem: target/
 
 # git (senpai itself)
 repo_url: https://github.com/wandb/senpai.git

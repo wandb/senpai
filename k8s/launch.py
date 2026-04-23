@@ -38,7 +38,7 @@ STUDENT_NAMES = [
 class Args:
     """Launch senpai advisor and/or student agents on Kubernetes."""
     tag: str  # research tag (e.g. mar13)
-    problem: str = "target/icml2026"  # active problem directory path (from senpai.yaml)
+    problem: str = "target/"  # active problem directory — entrypoint clones target_repo_url here (from senpai.yaml)
     names: str = ""  # comma-separated student names (e.g. "frieren,fern")
     n_students: int = 4  # number of students to launch (ignored if --names is provided)
     repo_url: str = "https://github.com/wandb/senpai.git"  # git repo URL (senpai runner)

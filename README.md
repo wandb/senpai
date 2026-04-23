@@ -12,11 +12,11 @@ Autonomous ML research loop powered by Claude Code agents coordinated through Gi
 
 An **advisor** agent (no GPU) creates hypothesis PRs and assigns them to **student** agents (GPU nodes). Students implement the hypothesis, run experiments, and report results. The advisor reviews: merges winners, iterates on promising ideas, closes dead ends. All coordination happens through GitHub labels and PRs. W&B tracks metrics.
 
-The repo is **problem-agnostic** — `target/` is empty by default. You bring your own problem-package repo (model, training script, data pipeline, instructions) and the pod entrypoint clones it into `target/<name>/` at startup. `senpai.yaml` points `problem:` at that path and `target_repo_url:` at the repo to clone.
+The repo is **problem-agnostic** — `target/` is empty by default. You bring your own problem-package repo (model, training script, data pipeline, instructions) and the pod entrypoint clones it into `target/` at startup, so the problem-package's repo root lands at `./target/`. `senpai.yaml` sets `target_repo_url:` to the repo to clone.
 
-### Current problem: `target/tandemfoil2`
+### Current problem
 
-TandemFoilSet 3D velocity-field prediction, seeded from the [`tcapelle/kagent`](https://github.com/tcapelle/kagent/tree/main/tandemfoil-competition) competition as a clean Transolver-based implementation. Lives in [`morganmcg1/tandemfoil2`](https://github.com/morganmcg1/tandemfoil2) on branch `kagent_royal_rumble`. The entrypoint clones it into `target/tandemfoil2/` at pod startup.
+TandemFoilSet 3D velocity-field prediction, seeded from the [`tcapelle/kagent`](https://github.com/tcapelle/kagent/tree/main/tandemfoil-competition) competition as a clean Transolver-based implementation. Lives in [`morganmcg1/tandemfoil2`](https://github.com/morganmcg1/tandemfoil2) on branch `kagent_royal_rumble`. The entrypoint clones it into `target/` at pod startup.
 
 ### Reference problem packages
 
@@ -65,15 +65,14 @@ graph TD
 
 ```
 senpai/
-├── senpai.yaml                    # Project config: active problem + problem-package repo/branch + launch defaults
-├── target/                        # Empty by default. Entrypoint clones target_repo_url here at pod startup.
-│   └── <problem>/                 #   (populated at runtime — or cloned manually for local dev)
-│       ├── train.py               #     Training script + model (students modify this)
-│       ├── program.md             #     Research context, metrics, constraints
-│       ├── data.py / data/        #     Data pipeline
-│       └── instructions/          #     Task-specific Claude Code prompt templates
-│           ├── prompt-advisor.md
-│           └── prompt-student.md
+├── senpai.yaml                    # Project config: problem-package repo/branch + launch defaults
+├── target/                        # Empty by default. Entrypoint clones target_repo_url here at pod startup, so the problem-package repo's root lands at ./target/.
+│   ├── train.py                   #   Training script + model (students modify this)
+│   ├── program.md                 #   Research context, metrics, constraints
+│   ├── data.py / data/            #   Data pipeline
+│   └── instructions/              #   Task-specific Claude Code prompt templates
+│       ├── prompt-advisor.md
+│       └── prompt-student.md
 ├── system_instructions/           # System-level Claude Code instructions (run the role)
 │   ├── CLAUDE-ADVISOR.md
 │   └── CLAUDE-STUDENT.md
@@ -94,11 +93,11 @@ senpai/
 All project settings live in `senpai.yaml`:
 
 ```yaml
-problem: target/tandemfoil2               # active problem directory (entrypoint clones target_repo_url here)
+problem: target/                          # active problem directory — entrypoint clones target_repo_url here
 repo_url: https://github.com/wandb/senpai.git
 repo_branch: main
 target_repo_url: https://github.com/morganmcg1/tandemfoil2.git   # problem-package repo: agent commits/PRs target this
-advisor_branch: kagent_royal_rumble                              # integration branch inside the problem-package repo (advisor PRs merge here; students branch off it)
+advisor_branch: schmidhuber                                      # integration branch inside the problem-package repo (advisor PRs merge here; students branch off it)
 image: ghcr.io/wandb/senpai:latest
 pvc_claim_name: new-pvc
 pvc_mount_path: /mnt/new-pvc
@@ -125,10 +124,10 @@ and push the key to the k8s secrets.
 
 ```bash
 # Clone the active problem-package repo into target/ (one-time, for local dev)
-git clone -b kagent_royal_rumble https://github.com/morganmcg1/tandemfoil2.git target/tandemfoil2
+git clone -b kagent_royal_rumble https://github.com/morganmcg1/tandemfoil2.git target/
 
 # Train locally (inside the active problem package)
-cd target/tandemfoil2 && python train.py --wandb_name "<name>/<description>"
+cd target/ && python train.py --wandb_name "<name>/<description>"
 
 # Deploy to k8s (reads defaults from senpai.yaml, only --tag is required)
 python k8s/launch.py --tag <research-tag> --advisor
@@ -154,12 +153,11 @@ python k8s/launch.py --tag <research-tag> --advisor --extra_instructions "Only c
 2. Point senpai's config at it — the pod entrypoint will clone it for you:
    ```bash
    # edit senpai.yaml:
-   #   problem: target/my_problem
    #   target_repo_url: https://github.com/myorg/my_problem.git
    #   advisor_branch: <branch>
    git add senpai.yaml && git commit -m "Point senpai at my_problem"
    ```
-   Or pass on the CLI: `--problem target/my_problem --target_repo_url ... --advisor_branch ...`.
+   Or pass on the CLI: `--target_repo_url ... --advisor_branch ...`.
 3. Deploy as usual — `python k8s/launch.py --tag <tag> --advisor`. Agent commits/PRs will land in `myorg/my_problem`, not senpai.
 
 ## References
