@@ -87,7 +87,7 @@
 - `#3223` norman: volume smoothness regularization — AF VOLUME FOCUS
 - `#3238` rei: WD=0 ablation on vol-10x+EMA champion — AF VOLUME FOCUS
 - `#3218` shouko: GradNorm adaptive multi-task loss balancing — AF VOLUME FOCUS
-- `#3215` tanjiro: Huber loss on volume channel (robust to outliers) — AF VOLUME FOCUS
+- `#3245` tanjiro: per-channel volume loss weighting (upweight nut×4, p×2) — AF VOLUME FOCUS
 - `#3211` spike: AF vol_loss_scale learnable scalar (noam port) — AF VOLUME FOCUS
 - `#3240` gilbert: joint checkpoint selection + vol-weight 11x/12x/13x fine sweep — AF VOLUME FOCUS
 - `#3239` vegeta: additive boundary layer auxiliary volume loss — AF VOLUME FOCUS
@@ -164,8 +164,7 @@
 
 **AF volume closure:**
 - vol_loss_scale learnable scalar (noam port, -15.9%) — spike #3211
-- PCGrad gradient surgery (surface/volume conflict resolution) — jin #3212
-- Huber loss on volume channel (robust to outlier gradients) — tanjiro #3215
+- Per-channel volume loss weighting (upweight nut×4, p×2) — tanjiro #3245
 
 ### Critical Known Bug
 - **`cp_panel_prior_index()` broken for tandemfoil_paper** (PR #3200): Fix in progress (sanji #3209).
@@ -222,6 +221,7 @@
 - asinh-pressure: DEFINITIVELY DEAD — 5 independent confirmations (#3191 T1/T2, #3177 T1/T2/T3). sinh() denormalization exponentially amplifies pressure errors. Non-pressure channels fine. Incompatible with AF pressure distribution.
 - PCGrad gradient surgery: 5-6x worse on both metrics (#3212). retain_graph=True disables torch.compile (40% throughput loss). Gradient conflict is NOT the bottleneck.
 - Proximity-weighted volume loss: 118-2516% worse (#3222). Extreme weight ratios starve far-field gradients while overdriving near-surface. Structural failure at scale=0.1/eps=0.01
+- Huber loss on volume channel: no improvement over MSE on either metric (#3215). AF volume residuals are well-behaved, not heavy-tailed — Huber δ threshold adds no benefit
 - 3L depth (with or without EMA): catastrophic divergence confirmed twice
 - 2L/384d and 3L/384d: catastrophic divergence
 - EMA<0.999 (0.99, 0.995 both worse)
