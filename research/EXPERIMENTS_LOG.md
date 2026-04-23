@@ -1,5 +1,17 @@
 # SENPAI Research Results
 
+## 2026-04-23 07:30 — PR #3129: AF 4L/256d deeper architecture (chrome) — SENT BACK
+
+- surface=0.002412 (5.25x worse), vol=0.009138 (3.3x worse). Diverged ep171 at cosine restart (W&B: `9brflieq`). Trajectory was improving before divergence. Sent back to retry with lr=3e-4 + T_max=100.
+
+## 2026-04-23 07:30 — PR #3119: DM higher LR + warmup (historia) — CLOSED
+
+- lr=7e-4: 19.82% (W&B: `8swgnhho`). lr=1e-3: 17.75% then NaN (W&B: `87ecgqp8`). Both 5-6x worse. DM stability boundary confirmed at ~6e-4 regardless of warmup. LR direction fully exhausted: 4e-4/4.5e-4/5.5e-4/7e-4/1e-3 all dead. lr=5e-4 sharp optimum.
+
+## 2026-04-23 07:30 — PR #3044: DM volume training ablation (emma) — CLOSED
+
+- 50k surf+16k vol: 58.55% (W&B: `eurdv6ot`). 16k surf+16k vol: 64.86% (W&B: `pbsrazga`). 40,000x loss scale mismatch (volume MSE ~18,700 vs surface ~0.48) destroys surface learning. Grad norms 500x baseline. Dead end without explicit volume_loss_weight=0.0001.
+
 ## 2026-04-23 07:00 — PR #3072: DrivAerML EMA=0.9995+gc=0.5 (eren) — MERGED ✓
 
 - **Branch:** eren/dm-ema-9995-gc05
