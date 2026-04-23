@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 00:15 (advisor cycle 53)
+- **Date:** 2026-04-24 00:30 (advisor cycle 54)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -12,7 +12,7 @@
 **Innovation track (new physics-aware/ML ideas per directive):**
 - `#3224` fern: spectral normalization on attention layers — INNOVATION
 - `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
-- `#3216` canute: attention distance bias (ALiBi-inspired spatial prior) — INNOVATION
+- canute: self-distillation with EMA teacher — INNOVATION (PR pending)
 - `#3214` kakashi: auxiliary gradient prediction (∂p/∂x,y,z) — INNOVATION
 - `#3217` brook: Fourier encoding of surface normals — INNOVATION
 - `#3203` vegeta: attention temperature annealing — INNOVATION
@@ -21,10 +21,10 @@
 
 **Noam-pivot experiments:**
 - `#3199` megumi: EMA=0.9999/0.99995 (noam optimal decay) — NOAM ABLATION
-- `#3192` casca: asinh-pressure alone (scale=0.75/0.5) — NOAM ABLATION
+- casca: → AF focal-MSE volume loss (PR pending)
 - `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
 - `#3194` bulma: higher LR sweep (5.5e-4/6e-4)
-- `#3188` chihiro: 2H/16H heads sweep — NOAM ABLATION
+- chihiro: → AF vol-weight curriculum (PR pending)
 - `#3181` himmel: asinh+residual on champion — NOAM ABLATION
 - `#3219` hinata: SAM optimizer (flat-basin restart robustness) — INNOVATION
 
@@ -52,7 +52,7 @@
 - `#3197` gojo: residual-prediction alone — NOAM ABLATION
 - `#3196` zenitsu: EMA decay sweep (0.9999/0.99995) — NOAM ABLATION
 - `#3189` emma: asinh+physics features — NOAM ABLATION
-- `#3180` chopper: ANP decoder alone — NOAM ABLATION
+- chopper: → DM weight perturbation at troughs (PR pending)
 - `#3150` yuji: clean test row — PAPER-FACING
 
 ### TandemFoil Paper WIP (9 PRs) — STABILIZATION CRISIS
@@ -180,7 +180,9 @@
 - OneCycleLR (no troughs): 8.04% best, sustained high-LR warmup worse than cosine peaks (without EMA+gc)
 - SWA: equal-weight averaging poisons across divergent basins (88.98%)
 - T_max≠30: ALL tested — 15→4.406%, 20→4.943%, 30→3.833% CHAMPION, 45→4.638%, 50→diverge, 60→4.409%. T_max=30 is definitive sweet spot
-- Noam feature stack on DM: full stack→4.447%, asinh-only→4.421%, residual-only→4.651%/15.0%(crashed). All diverge. Features tuned for T_max=150/3H/no-gc regime. Residual-pred requires asinh as hard prerequisite; even combined→3.999% (doesn't beat 3.833%)
+- Noam features on DM: DEFINITIVELY DEAD. Asinh triple-confirmed (4.072%/4.421%/4.475%), residual needs asinh+still→3.999%, full stack→4.447%. Features tuned for T_max=150/3H/no-gc regime
+- Attention distance bias (ALiBi): linear diverges, log=5.511% at timeout. Redundant with slice-based spatial grouping
+- Head count sweep complete: 2H=catastrophic, 4H=6.650%, 8H=3.833% CHAMPION, 16H=4.099%. 8H (64d/head) is definitive
 - 10-ep warmup+gc=1.0: 11.2% then diverged
 - 5-ep warmup+gc=1.0: pending (chopper)
 - LR warmup + EMA+gc=0.5: 5-ep=11.325% diverged, 10-ep=3.918% plateaued (didn't beat 3.833%)
