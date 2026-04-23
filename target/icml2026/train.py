@@ -167,6 +167,8 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
+    resume_checkpoint: str = ""
+    eval_only: bool = False
     seed: int = 0
 
 
@@ -1610,6 +1612,10 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
+    if config.resume_checkpoint:
+        ckpt_state = torch.load(config.resume_checkpoint, map_location=device, weights_only=True)
+        model.load_state_dict(ckpt_state)
+        print(f"Loaded checkpoint from {config.resume_checkpoint}", flush=True)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
@@ -1653,33 +1659,7 @@ def main() -> None:
     start_time = time.monotonic()
     timeout_seconds = None if not timeout_env else float(timeout_env) * 60.0
 
-    for epoch in range(1, config.epochs + 1):
-        if timeout_seconds is not None and epoch > 1 and (time.monotonic() - start_time) >= timeout_seconds:
-            break
-        train_metrics = train_one_epoch(
-            model=forward_model,
-            anp_head=anp_head,
-            loader=train_loader,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            ema=ema,
-            anp_ema=anp_ema,
-            transform=transform,
-            device=device,
-            model_name=config.model,
-            amp_mode=config.amp_mode,
-            max_batches=config.max_train_batches,
-            grad_clip=config.grad_clip,
-            grad_accum_steps=config.grad_accum_steps,
-        )
-
-        if ema is not None:
-            ema.store(model)
-            ema.copy_to(model)
-        if anp_head is not None and anp_ema is not None:
-            anp_ema.store(anp_head)
-            anp_ema.copy_to(anp_head)
-
+    if config.eval_only:
         eval_metrics = evaluate_phase_metrics(
             bundle=bundle,
             config=config,
@@ -1691,28 +1671,76 @@ def main() -> None:
             device=device,
             phase="val",
         )
-
-        current_primary_metric = eval_metrics.get(best_val_primary_metric_name)
-        if current_primary_metric is not None and (
-            best_val_primary_metric is None or current_primary_metric < best_val_primary_metric
-        ):
-            best_epoch = epoch
-            best_val_primary_metric = current_primary_metric
-            best_val_metrics = dict(eval_metrics)
-            best_model_state = snapshot_module_state(model)
-            best_anp_state = snapshot_module_state(anp_head)
-
-        if ema is not None:
-            ema.restore(model)
-        if anp_head is not None and anp_ema is not None:
-            anp_ema.restore(anp_head)
-
-        epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
-        history.append(epoch_metrics)
+        best_val_primary_metric = eval_metrics.get(best_val_primary_metric_name)
+        best_val_metrics = dict(eval_metrics)
+        best_model_state = snapshot_module_state(model)
+        best_anp_state = snapshot_module_state(anp_head)
+        best_epoch = 0
+        history.append({"epoch": 0.0, **eval_metrics})
         if run is not None:
-            wandb.log(epoch_metrics, step=epoch)
-            run.summary["epoch"] = epoch
-        print(json.dumps(epoch_metrics, sort_keys=True), flush=True)
+            wandb.log({"epoch": 0.0, **eval_metrics}, step=0)
+        print(json.dumps({"eval_only": True, "epoch": 0.0, **eval_metrics}, sort_keys=True), flush=True)
+    else:
+        for epoch in range(1, config.epochs + 1):
+            if timeout_seconds is not None and epoch > 1 and (time.monotonic() - start_time) >= timeout_seconds:
+                break
+            train_metrics = train_one_epoch(
+                model=forward_model,
+                anp_head=anp_head,
+                loader=train_loader,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                ema=ema,
+                anp_ema=anp_ema,
+                transform=transform,
+                device=device,
+                model_name=config.model,
+                amp_mode=config.amp_mode,
+                max_batches=config.max_train_batches,
+                grad_clip=config.grad_clip,
+                grad_accum_steps=config.grad_accum_steps,
+            )
+
+            if ema is not None:
+                ema.store(model)
+                ema.copy_to(model)
+            if anp_head is not None and anp_ema is not None:
+                anp_ema.store(anp_head)
+                anp_ema.copy_to(anp_head)
+
+            eval_metrics = evaluate_phase_metrics(
+                bundle=bundle,
+                config=config,
+                forward_model=forward_model,
+                anp_head=anp_head,
+                loaders=val_loaders,
+                transform=transform,
+                metric_transform=metric_transform,
+                device=device,
+                phase="val",
+            )
+
+            current_primary_metric = eval_metrics.get(best_val_primary_metric_name)
+            if current_primary_metric is not None and (
+                best_val_primary_metric is None or current_primary_metric < best_val_primary_metric
+            ):
+                best_epoch = epoch
+                best_val_primary_metric = current_primary_metric
+                best_val_metrics = dict(eval_metrics)
+                best_model_state = snapshot_module_state(model)
+                best_anp_state = snapshot_module_state(anp_head)
+
+            if ema is not None:
+                ema.restore(model)
+            if anp_head is not None and anp_ema is not None:
+                anp_ema.restore(anp_head)
+
+            epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
+            history.append(epoch_metrics)
+            if run is not None:
+                wandb.log(epoch_metrics, step=epoch)
+                run.summary["epoch"] = epoch
+            print(json.dumps(epoch_metrics, sort_keys=True), flush=True)
 
     if best_epoch is not None:
         print(
