@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 00:30 (advisor cycle 54)
+- **Date:** 2026-04-24 01:45 (advisor cycle 56)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -8,8 +8,9 @@
 
 ## Fleet Status (53 active PRs)
 
-### DrivAerML WIP (27 PRs)
+### DrivAerML WIP (28 PRs)
 **Innovation track (new physics-aware/ML ideas per directive):**
+- `#3231` emma: surface pressure gradient smoothness regularization — INNOVATION (physics-informed)
 - `#3224` fern: spectral normalization on attention layers — INNOVATION
 - `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
 - `#3228` chopper: stochastic weight perturbation at cosine troughs — INNOVATION
@@ -44,12 +45,11 @@
 - `#3067` askeladd: 32k surface points (SENT BACK)
 - `#3046` sukuna: WD+gc compound (SENT BACK)
 
-### TandemFoil WIP (5 PRs) — GUARDRAIL ONLY per directive
+### TandemFoil WIP (4 PRs) — GUARDRAIL ONLY per directive
 **New champion config:** ANP+full physics+T_max=150+gc=0.2+EMA=0.999+96sl+Lookahead+compile+re-strat (#3185)
 **Noam-pivot experiments (still running):**
 - `#3197` gojo: residual-prediction alone — NOAM ABLATION
 - `#3196` zenitsu: EMA decay sweep (0.9999/0.99995) — NOAM ABLATION
-- `#3189` emma: asinh+physics features — NOAM ABLATION
 - `#3150` yuji: clean test row — PAPER-FACING
 
 ### TandemFoil Paper WIP (9 PRs) — STABILIZATION CRISIS
@@ -67,14 +67,16 @@
 - `#2949` vash: depth/width sweep (LR=5e-5)
 
 ### AirfRANS WIP (13 PRs)
-**Noam-pivot experiments (highest priority):**
-- `#3191` alphonse: noam features on base and vol-10x — NOAM ABLATION
-- `#3187` stark: asinh+residual on vol-10x champion — NOAM ABLATION
-- `#3184` wolfwood: full noam stack — NOAM ABLATION
-- `#3177` nezuko: vol-weight 15x/20x + asinh+residual — NOAM ABLATION
+**Non-asinh noam feature ablation (highest priority — clean tests):**
+- `#3230` alphonse: residual-prediction + re-stratified sampling (NO asinh) — CLEAN NOAM ABLATION
+- `#3232` nezuko: vol-weight warm-up schedule (1x→10x linear ramp over 200ep) — AF VOLUME FOCUS
+
+**Noam-pivot experiments (asinh-dependent — likely to fail):**
+- `#3187` stark: asinh+residual on vol-10x champion — NOAM ABLATION (asinh confirmed dead for AF)
+- `#3184` wolfwood: full noam stack — NOAM ABLATION (asinh confirmed dead for AF)
 
 **Other:**
-- `#3172` robin: LR warmup (5-ep/10-ep)
+- `#3172` robin: LR warmup — SENT BACK (confounded config, re-running with correct champion config)
 - `#3169` nami: heads sweep 4H/16H
 - `#3227` casca: focal-MSE volume loss (upweight hard predictions) — AF VOLUME FOCUS
 - `#3226` chihiro: volume weight curriculum (20x→10x) — AF VOLUME FOCUS
@@ -207,6 +209,7 @@
 - T_max=20/30: field_mse never reaches finite values
 
 **AirfRANS:**
+- asinh-pressure: DEFINITIVELY DEAD — 5 independent confirmations (#3191 T1/T2, #3177 T1/T2/T3). sinh() denormalization exponentially amplifies pressure errors. Non-pressure channels fine. Incompatible with AF pressure distribution.
 - 3L depth (with or without EMA): catastrophic divergence confirmed twice
 - 2L/384d and 3L/384d: catastrophic divergence
 - EMA<0.999 (0.99, 0.995 both worse)
