@@ -167,6 +167,9 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
+    vol_smooth_lambda: float = 0.0
+    vol_smooth_k: int = 4
+    vol_smooth_formulation: str = "A"
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -821,6 +824,62 @@ def loss_abupt(
     return total, metrics
 
 
+_MAX_SMOOTH_NODES = 4000
+
+
+def compute_vol_smooth_loss(
+    batch: GroupedBatch,
+    outputs: dict[str, torch.Tensor | None],
+    transform: TargetTransform,
+    k: int = 4,
+    formulation: str = "A",
+) -> torch.Tensor | None:
+    if batch.volume_x is None or batch.volume_y is None or batch.volume_mask is None:
+        return None
+    vol_preds = outputs.get("volume_preds")
+    if vol_preds is None:
+        return None
+
+    vol_target = transform.apply(batch.volume_y)
+    B = batch.volume_mask.shape[0]
+    smooth_total = torch.tensor(0.0, device=batch.volume_x.device)
+    count = 0
+
+    for i in range(B):
+        mask_i = batch.volume_mask[i]
+        valid_idx = mask_i.nonzero(as_tuple=True)[0]
+        n_valid = valid_idx.shape[0]
+        if n_valid <= k:
+            continue
+
+        if n_valid > _MAX_SMOOTH_NODES:
+            perm = torch.randperm(n_valid, device=valid_idx.device)[:_MAX_SMOOTH_NODES]
+            valid_idx = valid_idx[perm]
+            n_valid = _MAX_SMOOTH_NODES
+
+        pos_i = batch.volume_x[i, valid_idx, :batch.space_dim].float()
+        pred_i = vol_preds[i, valid_idx]
+        target_i = vol_target[i, valid_idx]
+
+        with torch.no_grad():
+            dist = torch.cdist(pos_i, pos_i)
+            dist.fill_diagonal_(float("inf"))
+            _, knn_idx = dist.topk(k, dim=1, largest=False)
+
+        src = torch.arange(n_valid, device=dist.device).unsqueeze(1).expand_as(knn_idx).reshape(-1)
+        dst = knn_idx.reshape(-1)
+
+        if formulation == "A":
+            smooth_total = smooth_total + ((pred_i[src] - pred_i[dst]) ** 2 - (target_i[src] - target_i[dst]) ** 2).pow(2).mean()
+        else:
+            smooth_total = smooth_total + ((pred_i[src] - pred_i[dst]) ** 2).mean()
+        count += 1
+
+    if count == 0:
+        return None
+    return smooth_total / count
+
+
 def maybe_apply_anp(
     outputs: dict[str, torch.Tensor | None],
     prepared: TandemPreparedBatch,
@@ -1271,6 +1330,9 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    vol_smooth_lambda: float = 0.0,
+    vol_smooth_k: int = 4,
+    vol_smooth_formulation: str = "A",
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1327,6 +1389,12 @@ def train_one_epoch(
                             volume_mask=batch.volume_mask,
                         )
                         loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                    if vol_smooth_lambda > 0:
+                        smooth = compute_vol_smooth_loss(batch, outputs, transform, k=vol_smooth_k, formulation=vol_smooth_formulation)
+                        if smooth is not None:
+                            loss = loss + vol_smooth_lambda * smooth
+                            running.setdefault("vol_smooth_loss", 0.0)
+                            running["vol_smooth_loss"] += float(smooth.detach().cpu().item())
 
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
@@ -1359,6 +1427,8 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    if "vol_smooth_loss" in running:
+        running["vol_smooth_loss"] /= max(steps, 1)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1688,6 +1758,9 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            vol_smooth_lambda=config.vol_smooth_lambda,
+            vol_smooth_k=config.vol_smooth_k,
+            vol_smooth_formulation=config.vol_smooth_formulation,
         )
 
         if ema is not None:
