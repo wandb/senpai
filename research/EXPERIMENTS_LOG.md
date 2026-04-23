@@ -1,5 +1,9 @@
 # SENPAI Research Results
 
+## 2026-04-23 10:30 — PR #3125: DM SWA at cosine troughs (faye) — CLOSED
+
+- Raw model best 14.30% ep89, SWA average degraded to 88.98% over 16 collections (W&B: `hgnyelv3`). Without gc/EMA, gradient explosions scatter weights across incompatible basins; SWA equal-weight averaging then poisons the average. EMA champion (#3072) subsumes SWA benefit via continuous averaging.
+
 ## 2026-04-23 10:00 — PR #3113: DM attention dropout=0.05 (shouko) — CLOSED
 
 - val=12.53% ep118, 7 divergence spikes over 206 epochs (W&B: `qjceei69`). Dropout+T_max=30+no-EMA toxic combo — LR peaks amplify dropout noise. Reassigned with EMA+gc stability platform (#3163).
