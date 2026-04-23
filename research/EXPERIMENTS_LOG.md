@@ -1,5 +1,14 @@
 # SENPAI Research Results
 
+## 2026-04-24 05:00 — PR #3164: DM paper-facing full eval two-phase (faye) — CLOSED (did not reproduce champion)
+
+- faye/dm-ema-paper-fulleval, W&B: qd7g8npf (Phase 1 training), 37gsknn6 (Phase 2 full eval)
+- Goal: get clean paper-facing full-eval test metric for DM champion config (no --max-eval-batches)
+- Phase 1 (training, no-compile): val=4.198% ep432, test=4.793% (truncated). Champion is 3.833% — 0.365pp gap. Model did NOT reproduce champion quality.
+- Phase 2 (full eval on Phase 1 best checkpoint): test=4.496% full eval (vs 4.793% truncated) — confirms truncated eval slightly overstates error (~0.3pp).
+- Two compiled runs diverged ep60-87 (grad_norm to 65k) — torch.compile + DrivAerML is a systematic regression, likely from EMAWithWarmup interaction.
+- **Conclusion: full eval test for true champion still unknown. faye's 4.496% is from a weaker model.** Reassigned faye to #3244 for a clean rerun.
+
 ## 2026-04-24 04:30 — PR #3219: DM SAM optimizer (hinata) — CLOSED (dead end)
 
 - hinata/dm-sam-optimizer, W&B group: dm-sam-optimizer
