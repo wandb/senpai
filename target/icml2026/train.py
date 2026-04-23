@@ -168,6 +168,9 @@ class TrainConfig:
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
+    save_trough_checkpoints: bool = False
+    snapshot_ensemble_k: int = 0
+    eval_only: bool = False
     seed: int = 0
 
 
@@ -1512,6 +1515,84 @@ def evaluate_phase_metrics(
     return add_primary_metric_aliases(bundle, metrics, phase=phase)
 
 
+@torch.no_grad()
+def evaluate_snapshot_ensemble(
+    *,
+    model: torch.nn.Module,
+    forward_model: torch.nn.Module,
+    trough_states: list[dict[str, torch.Tensor]],
+    loaders: dict[str, DataLoader],
+    transform: TargetTransform | TandemTargetTransform,
+    metric_transform: TargetTransform | None,
+    config: TrainConfig,
+    bundle: DatasetBundle,
+    device: torch.device,
+    phase: str,
+) -> dict[str, float]:
+    """Evaluate by averaging raw predictions from multiple trough checkpoints."""
+    model.eval()
+    metrics: dict[str, float] = {}
+    for split_name, loader in loaders.items():
+        drivaer_surface_case_sums: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        drivaer_volume_case_sums: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        batches = loader if config.max_eval_batches <= 0 else itertools.islice(loader, config.max_eval_batches)
+        for batch in batches:
+            batch = batch.to(device)
+            all_surface_preds = []
+            all_volume_preds = []
+            for state in trough_states:
+                model.load_state_dict(state, strict=False)
+                if config.compile_model and device.type == "cuda":
+                    forward_model = model
+                with autocast_context(device, config.amp_mode):
+                    outputs = forward_model(
+                        surface_x=batch.surface_x,
+                        surface_mask=batch.surface_mask,
+                        volume_x=batch.volume_x,
+                        volume_mask=batch.volume_mask,
+                    )
+                outputs = float_outputs(outputs)
+                pred_surface = transform.invert(outputs["surface_preds"]) if outputs["surface_preds"] is not None else None
+                pred_volume = None
+                if outputs["volume_preds"] is not None and batch.volume_mask is not None:
+                    pred_volume = transform.invert(outputs["volume_preds"])
+                all_surface_preds.append(pred_surface)
+                all_volume_preds.append(pred_volume)
+
+            avg_surface = torch.stack([p for p in all_surface_preds if p is not None]).mean(dim=0) if all_surface_preds[0] is not None else None
+            avg_volume = torch.stack([p for p in all_volume_preds if p is not None]).mean(dim=0) if all_volume_preds[0] is not None else None
+
+            if batch.dataset_name == "drivaerml":
+                if avg_surface is not None and batch.surface_y is not None:
+                    _accumulate_case_rel_l2_sums(
+                        drivaer_surface_case_sums,
+                        case_ids=batch.case_ids,
+                        pred=avg_surface,
+                        target=batch.surface_y,
+                        mask=batch.surface_mask,
+                    )
+                if avg_volume is not None and batch.volume_mask is not None and batch.volume_y is not None:
+                    _accumulate_case_rel_l2_sums(
+                        drivaer_volume_case_sums,
+                        case_ids=batch.case_ids,
+                        pred=avg_volume,
+                        target=batch.volume_y,
+                        mask=batch.volume_mask,
+                    )
+
+        surface_rel_l2 = _finalize_case_rel_l2(drivaer_surface_case_sums) or 0.0
+        split_metrics: dict[str, float] = {
+            "surface_rel_l2": surface_rel_l2,
+            "surface_rel_l2_pct": surface_rel_l2 * 100.0,
+        }
+        volume_rel_l2 = _finalize_case_rel_l2(drivaer_volume_case_sums)
+        if volume_rel_l2 is not None:
+            split_metrics["volume_rel_l2"] = volume_rel_l2
+            split_metrics["volume_rel_l2_pct"] = volume_rel_l2 * 100.0
+        metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
+    return add_primary_metric_aliases(bundle, metrics, phase=phase)
+
+
 def compute_tandem_phys_stats(
     dataset,
     *,
@@ -1623,6 +1704,72 @@ def main() -> None:
             output_dim=bundle.spec.surface_output_dim,
         ).to(device)
 
+    if config.eval_only:
+        run = None
+        if config.wandb_name:
+            run_config = asdict(config)
+            run = wandb.init(
+                project=os.getenv("WANDB_PROJECT", "senpai-v1"),
+                entity=os.getenv("WANDB_ENTITY"),
+                name=config.wandb_name,
+                group=config.wandb_group or None,
+                config=run_config,
+                tags=[config.dataset, config.model, "eval-only"],
+            )
+        output_dir = Path(config.output_dir)
+        eval_loaders = test_loaders if test_loaders else val_loaders
+        phase = "test" if test_loaders else "val"
+
+        if config.snapshot_ensemble_k > 0:
+            trough_files = sorted(output_dir.glob("checkpoint_trough_ep*.pt"), key=lambda p: int(p.stem.split("ep")[1]))
+            if not trough_files:
+                raise FileNotFoundError(f"No trough checkpoints found in {output_dir}")
+            selected = trough_files[-config.snapshot_ensemble_k:]
+            print(f"Snapshot ensemble: loading {len(selected)} trough checkpoints: {[p.name for p in selected]}", flush=True)
+            trough_states = [torch.load(p, map_location=device, weights_only=True) for p in selected]
+            ensemble_metrics = evaluate_snapshot_ensemble(
+                model=model,
+                forward_model=forward_model,
+                trough_states=trough_states,
+                loaders=eval_loaders,
+                transform=transform,
+                metric_transform=metric_transform,
+                config=config,
+                bundle=bundle,
+                device=device,
+                phase=phase,
+            )
+            ensemble_metrics["snapshot_ensemble_k"] = float(len(selected))
+            print(json.dumps({"ensemble_metrics": ensemble_metrics}, sort_keys=True), flush=True)
+            if run is not None:
+                run.summary.update(ensemble_metrics)
+                wandb.log(ensemble_metrics)
+        else:
+            best_path = output_dir / f"{config.dataset}_{config.model}_best.pt"
+            if best_path.exists():
+                state = torch.load(best_path, map_location=device, weights_only=True)
+                model.load_state_dict(state, strict=False)
+                print(f"Loaded best checkpoint from {best_path}", flush=True)
+            single_metrics = evaluate_phase_metrics(
+                bundle=bundle,
+                config=config,
+                forward_model=forward_model,
+                anp_head=anp_head,
+                loaders=eval_loaders,
+                transform=transform,
+                metric_transform=metric_transform,
+                device=device,
+                phase=phase,
+            )
+            print(json.dumps({"single_best_metrics": single_metrics}, sort_keys=True), flush=True)
+            if run is not None:
+                run.summary.update(single_metrics)
+                wandb.log(single_metrics)
+
+        if run is not None:
+            run.finish()
+        return
+
     params = list(model.parameters())
     if anp_head is not None:
         params.extend(list(anp_head.parameters()))
@@ -1730,6 +1877,13 @@ def main() -> None:
                 best_ema_shadow = {k: v.cpu().clone() for k, v in ema.shadow.items()}
             if anp_ema is not None:
                 best_anp_ema_shadow = {k: v.cpu().clone() for k, v in anp_ema.shadow.items()}
+
+        if config.save_trough_checkpoints and config.cosine_t_max > 0 and epoch % config.cosine_t_max == 0:
+            trough_dir = Path(config.output_dir)
+            trough_dir.mkdir(parents=True, exist_ok=True)
+            trough_path = trough_dir / f"checkpoint_trough_ep{epoch}.pt"
+            torch.save(model.state_dict(), trough_path)
+            print(json.dumps({"trough_checkpoint_saved": str(trough_path), "epoch": epoch}), flush=True)
 
         if ema is not None:
             ema.restore(model)
