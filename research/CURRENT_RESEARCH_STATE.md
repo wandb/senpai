@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-23 23:30 (advisor cycle 50)
+- **Date:** 2026-04-23 23:45 (advisor cycle 51)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -24,13 +24,13 @@
 - `#3194` bulma: higher LR sweep (5.5e-4/6e-4)
 - `#3188` chihiro: 2H/16H heads sweep — NOAM ABLATION
 - `#3181` himmel: asinh+residual on champion — NOAM ABLATION
-- `#3175` hinata: full noam stack — NOAM ABLATION
+- `#3219` hinata: SAM optimizer (flat-basin restart robustness) — INNOVATION
 
 **Champion tuning / paper-facing:**
 - `#3209` sanji: TFP cp_panel bug fix + multi-seed retest — STABILIZATION PRIORITY
 - `#3164` faye: paper-facing full eval (two-phase) — PAPER-FACING Track 1
 - `#3160` griffith: 16H heads
-- `#3155` nobara: longer T_max (45/60)
+- `#3220` nobara: Mixup regularization (feature interpolation) — INNOVATION
 - `#3207` historia: DM true monotonic cosine (T_max=393606) — corrected retest
 - `#3206` jet: DM 600 batches + gc=0.5 + EMA (stabilized retest)
 - `#3152` eren: EMA decay sweep (0.999 vs 0.9995)
@@ -177,7 +177,8 @@
 - Polynomial LR (no cosine troughs): catastrophic — troughs are load-bearing stability features
 - OneCycleLR (no troughs): 8.04% best, sustained high-LR warmup worse than cosine peaks (without EMA+gc)
 - SWA: equal-weight averaging poisons across divergent basins (88.98%)
-- T_max≠30: T_max=50+gc diverges; T_max=15→4.406% plateaued; T_max=20→4.943% diverged. T_max=30 ONLY viable period
+- T_max≠30: ALL tested — 15→4.406%, 20→4.943%, 30→3.833% CHAMPION, 45→4.638%, 50→diverge, 60→4.409%. T_max=30 is definitive sweet spot
+- Noam feature stack on DM: full stack→4.447%, asinh-only→4.421%, residual-only→4.651%. All diverge. Features tuned for T_max=150/3H/no-gc regime don't transfer to T_max=30/8H/gc=0.5
 - 10-ep warmup+gc=1.0: 11.2% then diverged
 - 5-ep warmup+gc=1.0: pending (chopper)
 - LR warmup + EMA+gc=0.5: 5-ep=11.325% diverged, 10-ep=3.918% plateaued (didn't beat 3.833%)

@@ -1,5 +1,13 @@
 # SENPAI Research Results
 
+## 2026-04-23 23:45 — PR #3175: DM full noam stack + individual ablations (hinata) — CLOSED (dead end)
+
+- Full stack (asinh+residual+compile+96sl+srf): best val=4.447% ep342 (W&B: vddf3qle), diverged → 64%. Asinh-only (scale=0.75): best val=4.421% ep303 (W&B: 0ks1aaz5), diverged → 61%. Residual-only: best val=4.651% ep242 (W&B: xmx6y3ws), diverged → NaN. All 0.6-0.8pp worse than 3.833%. Root cause: noam features were tuned for T_max=150/3H/no-gc regime — cosine T_max=30 restarts amplify gradient instability through these features despite gc=0.5. Asinh least harmful, residual most harmful. Individual ablations (casca #3192, franky #3193) may find narrower windows. Bug fix: primary_metric_key scoping.
+
+## 2026-04-23 23:45 — PR #3155: DM longer T_max=45/60 + EMA+gc (nobara) — CLOSED (dead end)
+
+- T_max=45: best val=4.638% ep240, diverged → 61.4% (W&B: tskmw04v). T_max=60: best val=4.409% ep331, diverged → 54.9% (W&B: fmxxu3ol). Both worse than 3.833%. Longer cycles keep model in high-LR territory too long, causing progressive destabilization. T_max=30 gives ~17 restart cycles in 500 epochs, which is the optimal frequency. Now ALL T_max values tested: 15 (4.406%), 20 (4.943%), 30 (3.833% champion), 45 (4.638%), 50 (diverge), 60 (4.409%). T_max=30 is definitive DM sweet spot.
+
 ## 2026-04-23 23:30 — PR #3163: DM attn-dropout=0.05 + EMA+gc (shouko) — CLOSED (dead end)
 
 - Best val=10.118% ep73 (W&B: j0t5bn67), 2.64x worse than 3.833%. Catastrophic divergence ep74 — grad_norm→Infinity, gc=0.5 firing every step (394 clip events/epoch) but couldn't contain compounding dropout noise. Final val=75.33%. EMA preserved ep73 checkpoint. Confirms attn-dropout incompatible with DM at any stability level: without EMA/gc → 12.533% (#3113), with EMA/gc → 10.118% (19% better early but same ultimate fate). The multiplicative noise from dropout compounds faster than gc can clip as the loss landscape steepens at cosine restart boundaries. Added to dead ends.
