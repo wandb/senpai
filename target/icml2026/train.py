@@ -167,6 +167,8 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
+    vol_weight_start: float = 0.0
+    vol_weight_end: float = 0.0
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -1669,9 +1671,24 @@ def main() -> None:
     start_time = time.monotonic()
     timeout_seconds = None if not timeout_env else float(timeout_env) * 60.0
 
+    use_vol_curriculum = (
+        config.vol_weight_start > 0.0
+        and config.vol_weight_end > 0.0
+        and config.vol_weight_start != config.vol_weight_end
+    )
+    vol_decay_epochs = int(0.5 * config.epochs) if use_vol_curriculum else 0
+
     for epoch in range(1, config.epochs + 1):
         if timeout_seconds is not None and epoch > 1 and (time.monotonic() - start_time) >= timeout_seconds:
             break
+
+        if use_vol_curriculum:
+            ep0 = epoch - 1
+            t = min(1.0, ep0 / vol_decay_epochs) if vol_decay_epochs > 0 else 1.0
+            current_vol_weight = config.vol_weight_start - (config.vol_weight_start - config.vol_weight_end) * t
+        else:
+            current_vol_weight = config.volume_loss_weight
+
         train_metrics = train_one_epoch(
             model=forward_model,
             anp_head=anp_head,
@@ -1687,7 +1704,7 @@ def main() -> None:
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
-            volume_loss_weight=config.volume_loss_weight,
+            volume_loss_weight=current_vol_weight,
         )
 
         if ema is not None:
@@ -1736,7 +1753,7 @@ def main() -> None:
         if anp_head is not None and anp_ema is not None:
             anp_ema.restore(anp_head)
 
-        epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
+        epoch_metrics = {"epoch": float(epoch), "vol_weight": current_vol_weight, **train_metrics, **eval_metrics}
         epoch_metrics["best_val_metric"] = best_val_metric
         epoch_metrics["best_epoch"] = float(best_epoch)
         history.append(epoch_metrics)
