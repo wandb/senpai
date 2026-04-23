@@ -106,6 +106,7 @@ class TrainConfig:
     model_mlp_ratio: int = 4
     model_slices: int = 96
     model_dropout: float = 0.0
+    attn_dropout: float = 0.0
     drivaerml_train_surface_points: int = 0
     drivaerml_eval_surface_points: int = 0
     drivaerml_train_volume_points: int = 0
@@ -502,7 +503,7 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
     transolver_kwargs = {
         "n_layers": config.model_layers,
         "n_hidden": config.model_hidden_dim,
-        "dropout": config.model_dropout,
+        "dropout": config.attn_dropout if config.attn_dropout > 0 else config.model_dropout,
         "n_head": config.model_heads,
         "mlp_ratio": config.model_mlp_ratio,
         "slice_num": config.model_slices,
