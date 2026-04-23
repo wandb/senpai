@@ -3,11 +3,21 @@
 ## TandemFoilSet
 
 - **Primary metric:** `val_primary/surface_pressure_mae` (= `val_eq4/surface_pressure_mae`)
-- **Current best:** 22.537 (val) at epoch 336
-- **Best PR:** #2924 (robin — gc=0.5 EMA refinement, Lion lr=1.25e-4, T_max=10, gc=0.5, WD=1e-2, EMA decay=0.999, 3L/192d)
-- **Note:** gc=0.5 (softer clip vs standard gc=1.0) enables stable EMA training across 336+ epochs where gc=1.0 diverged after ep167. Model still descending at ep336 — result is an underestimate of the ceiling.
+- **Current best:** 21.909 (val) at epoch 334 — test 23.419
+- **Best PR:** #3108 (zenitsu — gc=0.3+EMA=0.999, Lion lr=1.25e-4, T_max=10, WD=1e-2, 3L/192d)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 1.25e-4 --cosine-t-max 10 --grad-clip 0.3 --weight-decay 1e-2 --model-slices 64 --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999 --ema-decay 0.999`
 
-### 2026-04-22 — PR #2924: TandemFoil: EMA refinement gc=0.5 — NEW BEST (CURRENT)
+### 2026-04-23 — PR #3108: TandemFoil: gc=0.3 + EMA=0.999 — NEW BEST (CURRENT)
+
+- **val_primary/surface_pressure_mae:** 21.909 (-2.8% vs 22.537) at epoch 334
+- **test_primary/surface_pressure_mae:** 23.419 (-4.7% vs 24.581)
+- **Per-split test MAE:** geom_camber_cruise=27.436, geom_camber_rc=31.587, re_rand=17.119, single_in_dist=17.533
+- **W&B run:** kzg626hf (zenitsu/tf-gc03-ema999)
+- **Config:** Lion lr=1.25e-4, T_max=10, **gc=0.3**, WD=1e-2, **EMA=0.999**, 3L/192d, Fourier+physics
+- **Key insight:** Softer gc (0.3 vs 0.5) under EMA stability finds a deeper basin. gc=0.5 was already soft relative to standard gc=1.0 — gc=0.3 continues the trend. Model best at ep334 not terminal — still room to improve.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 1.25e-4 --cosine-t-max 10 --grad-clip 0.3 --weight-decay 1e-2 --model-slices 64 --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999 --ema-decay 0.999`
+
+### 2026-04-22 — PR #2924: TandemFoil: EMA refinement gc=0.5 — PREVIOUS BEST
 
 - **val_primary/surface_pressure_mae:** 22.537 (-13.8% vs 26.06) at epoch 336
 - **W&B run:** 0lv7fnun (robin/ema-refine-tf-gc05)
