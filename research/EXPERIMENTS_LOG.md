@@ -1,5 +1,24 @@
 # SENPAI Research Results
 
+## 2026-04-24 07:00 — PR #3224: DM spectral normalization on attention (fern) — CLOSED (dead end)
+
+- fern/dm-spectral-norm, W&B run: 4ylvrt7k, group: dm-spectral-norm
+- Hypothesis: spectral norm on QKV projections constrains Lipschitz constant, stabilizing cosine restart boundaries
+- Trial 1 (SN-QKV): val=4.035% ep479, test=5.113%. +0.202pp / +5.3% vs 3.833% baseline
+- Stability validated: zero grad spikes across 16 restart boundaries. Grad norm monotonically decreased 9.7→0.09.
+- **Late collapse at ep502:** grad_norm jumped 0.39→0.88→4.74→423 in 25 epochs. Collapse from UNCONSTRAINED FFN/embedding layers, not from SN-protected QKV (sigma stayed bounded at ~5.6).
+- **Root cause: σ=1 hard cap over-restricts attention representational capacity from epoch 1. The gradient spike problem it was designed to solve doesn't exist — gc=0.5 already handles restart stability in the baseline.**
+- **Conclusion: spectral norm dead for DM.** Partial Lipschitz bounds create asymmetric instability.
+
+## 2026-04-24 07:00 — PR #3176: TF full noam stack at T_max=150 (mitsuha) — CLOSED (dead end)
+
+- mitsuha/tfp-noam-stack (pivoted from TFP to TF due to dataset compatibility), W&B runs: i9wvy2bd/nx4gpbp4 (T1), wue7pa0i/4hxt7np6 (T2), 5kdoiqr0/kr931hp9 (T3)
+- Hypothesis: full noam stack (ANP+physics+T_max=150+Lookahead+compile+96sl+re-strat) transfers from TFP to TF
+- Best: Trial 1 (full stack) val=22.469 ep279, +5.2% vs 21.350 baseline. Re-run confirmed: 23.034
+- Trial 2 (ANP+T_max=150 only): 25.093. Trial 3 (arch+T_max=150 only): 25.621
+- **Key finding: T_max=150 is the decisive negative factor.** TF baseline uses T_max=10 (21.350). ANP contributes ~10% improvement WITHIN T_max=150 regime but can't overcome the schedule penalty.
+- **Conclusion: full noam stack dead for TF at T_max=150.** ANP at T_max=10 would be the valuable follow-up (untested).
+
 ## 2026-04-24 06:30 — PR #3218: AF GradNorm adaptive multi-task loss balancing (shouko) — CLOSED (dead end)
 
 - shouko/af-gradnorm, W&B runs: p5b6fgoa (α=1.5), 93rkwc57 (α=0.5)
