@@ -21,6 +21,7 @@ import wandb
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from core.architectures import ABUPTReference, ANPSurfaceDecoder, ReferenceTransolver, SenpaiTransolver
+from core.architectures.transolver_reference import TransolverAttention
 from core.contracts import ABUPTBatch, DatasetBundle, GroupedBatch, TargetTransformStats
 from core.datasets import ABUPTCollate, build_dataset_bundle, collate_grouped
 from core.features import (
@@ -169,6 +170,7 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    distance_bias: str = "none"
 
 
 @dataclass
@@ -499,6 +501,81 @@ def cp_panel_prior_index(config: TrainConfig, bundle: DatasetBundle) -> int | No
     return None
 
 
+class DistanceBiasTransolverAttention(TransolverAttention):
+    """TransolverAttention with ALiBi-style spatial distance bias on slice centroids."""
+
+    def __init__(self, hidden_dim: int, num_heads: int, num_slices: int, dropout: float = 0.0, *, use_log_distance: bool = False):
+        super().__init__(hidden_dim, num_heads, num_slices, dropout)
+        self.use_log_distance = use_log_distance
+        log_alpha_init = torch.zeros(num_heads)
+        for h in range(num_heads):
+            target = 2.0 ** (-8.0 * (h + 1) / num_heads)
+            log_alpha_init[h] = math.log(math.exp(target) - 1.0)
+        self.log_alpha = torch.nn.Parameter(log_alpha_init)
+        self._cached_pos: torch.Tensor | None = None
+
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+        slice_tokens, slice_weights = self.create_slices(x, attn_mask=attn_mask)
+        qkv = self.qkv(slice_tokens)
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        distance_bias = None
+        pos = self._cached_pos
+        if pos is not None:
+            slice_norm = slice_weights.sum(dim=2)
+            slice_pos = torch.einsum("bhns,bnd->bhsd", slice_weights, pos.float()) / (slice_norm.unsqueeze(-1) + 1e-5)
+            d = torch.cdist(slice_pos, slice_pos)
+            alpha = F.softplus(self.log_alpha)
+            if self.use_log_distance:
+                distance_bias = -alpha[None, :, None, None] * torch.log1p(d)
+            else:
+                distance_bias = -alpha[None, :, None, None] * d
+
+        out_slice = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=distance_bias,
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+        out_x = torch.einsum("bhsc,bhns->bhnc", out_slice, slice_weights)
+        out_x = out_x.permute(0, 2, 1, 3).contiguous().view(x.shape[0], x.shape[1], self.hidden_dim)
+        return self.proj_dropout(self.proj(out_x))
+
+
+class DistanceBiasSenpaiTransolver(SenpaiTransolver):
+    """SenpaiTransolver with distance-biased attention."""
+
+    def __init__(self, *, use_log_distance: bool = False, **kwargs):
+        super().__init__(**kwargs)
+        self._use_log_distance = use_log_distance
+        for block in self.backbone.blocks:
+            old = block.attention
+            new_attn = DistanceBiasTransolverAttention(
+                hidden_dim=old.hidden_dim,
+                num_heads=old.num_heads,
+                num_slices=old.num_slices,
+                dropout=old.dropout,
+                use_log_distance=use_log_distance,
+            )
+            new_attn.load_state_dict(old.state_dict(), strict=False)
+            block.attention = new_attn
+
+    def forward(self, *, surface_x: torch.Tensor, surface_mask: torch.Tensor, volume_x: torch.Tensor | None = None, volume_mask: torch.Tensor | None = None) -> dict[str, torch.Tensor | None]:
+        pos_parts = [surface_x[:, :, :self.space_dim]]
+        if volume_x is not None and volume_mask is not None and self.volume_output_dim > 0:
+            pos_parts.append(volume_x[:, :, :self.space_dim])
+        all_pos = torch.cat(pos_parts, dim=1)
+
+        for blk in self.backbone.blocks:
+            blk.attention._cached_pos = all_pos
+
+        result = super().forward(surface_x=surface_x, surface_mask=surface_mask, volume_x=volume_x, volume_mask=volume_mask)
+
+        for blk in self.backbone.blocks:
+            blk.attention._cached_pos = None
+
+        return result
+
+
 def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
     transolver_kwargs = {
         "n_layers": config.model_layers,
@@ -508,8 +585,9 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
         "mlp_ratio": config.model_mlp_ratio,
         "slice_num": config.model_slices,
     }
+    model: torch.nn.Module
     if config.model == "reference_transolver":
-        return ReferenceTransolver(
+        model = ReferenceTransolver(
             space_dim=bundle.spec.space_dim,
             surface_input_dim=bundle.spec.surface_input_dim,
             surface_output_dim=bundle.spec.surface_output_dim,
@@ -517,9 +595,9 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
             volume_output_dim=bundle.spec.volume_output_dim,
             **transolver_kwargs,
         )
-    if config.model == "senpai_transolver":
+    elif config.model == "senpai_transolver":
         prior_idx = cp_panel_prior_index(config, bundle)
-        return SenpaiTransolver(
+        senpai_kwargs = dict(
             space_dim=bundle.spec.space_dim,
             surface_input_dim=bundle.spec.surface_input_dim,
             surface_output_dim=bundle.spec.surface_output_dim,
@@ -533,13 +611,20 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
             volume_pressure_prior_idx=prior_idx,
             **transolver_kwargs,
         )
-    if config.model == "reference_abupt":
-        return ABUPTReference(
+        if config.distance_bias != "none":
+            model = DistanceBiasSenpaiTransolver(use_log_distance=config.distance_bias == "log", **senpai_kwargs)
+        else:
+            model = SenpaiTransolver(**senpai_kwargs)
+    elif config.model == "reference_abupt":
+        model = ABUPTReference(
             space_dim=bundle.spec.space_dim,
             surface_output_dim=bundle.spec.surface_output_dim,
             volume_output_dim=bundle.spec.volume_output_dim,
         )
-    raise ValueError(f"Unknown model: {config.model}")
+    else:
+        raise ValueError(f"Unknown model: {config.model}")
+
+    return model
 
 
 def build_optimizer(params, config: TrainConfig):
@@ -1635,17 +1720,8 @@ def main() -> None:
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
     history: list[dict[str, float]] = []
-    best_epoch: int | None = None
     best_val_primary_metric_name = primary_metric_key(bundle, phase="val")
     best_val_primary_metric: float | None = None
-    best_val_metrics: dict[str, float] = {}
-    best_model_state: dict[str, torch.Tensor] | None = None
-    best_anp_state: dict[str, torch.Tensor] | None = None
-
-    if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
-    else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1719,7 +1795,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(best_val_primary_metric_name)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
@@ -1739,6 +1815,12 @@ def main() -> None:
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
         epoch_metrics["best_val_metric"] = best_val_metric
         epoch_metrics["best_epoch"] = float(best_epoch)
+        for blk_idx, blk in enumerate(getattr(getattr(model, "backbone", None), "blocks", [])):
+            attn = blk.attention
+            if isinstance(attn, DistanceBiasTransolverAttention):
+                alphas = F.softplus(attn.log_alpha).detach().cpu()
+                for head_idx in range(alphas.shape[0]):
+                    epoch_metrics[f"distance_bias/layer{blk_idx}_head{head_idx}_alpha"] = float(alphas[head_idx])
         history.append(epoch_metrics)
         if run is not None:
             wandb.log(epoch_metrics, step=epoch)
