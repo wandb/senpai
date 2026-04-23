@@ -1,5 +1,21 @@
 # SENPAI Research Results
 
+## 2026-04-23 05:00 — PR #3050: AirfRANS EMA=0.999 at T_max=50 champion (stark) — MERGED ✓
+
+- **Branch:** stark/af-ema-champion
+- **Hypothesis:** EMA + T_max=50 (longer cosine) is synergistic — EMA can track the optimization trajectory harmoniously with longer cycles
+- **Results:**
+
+| Metric | EMA=0.999 | Previous Baseline | Delta |
+|---|---|---|---|
+| val_primary/surface_mse | **0.000459** ep771 | 0.000482 | **-4.8% NEW BEST** |
+| full_val/volume_mse | **0.002777** ep771 | 0.00764 | **-63.6% NEW BEST** |
+| SpiderSolver vol gap | — | 4.5x | **1.63x** (closed) |
+
+- **W&B run:** z6pry4b9
+- **Analysis:** EMA=0.999 with T_max=50 improves BOTH metrics simultaneously — the only intervention to do so. Key difference from PR #3105 (EMA=0.999 at T_max=10 which regressed surface): T_max=50 provides a longer stable optimization window for EMA to track. Model still descending at ep771. SpiderSolver volume gap now 1.63x (down from 4.5x).
+- **Decision:** MERGED — new AirfRANS champion
+
 ## 2026-04-23 04:50 — PR #3090: TFP gc=0.3 at champion config (nezuko) — CLOSED
 
 - **Branch:** nezuko/tfp-gc-03
