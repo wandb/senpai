@@ -155,12 +155,21 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.000459 (val) at epoch 771 — with Vol MSE 0.002777 (best in programme)
-- **Best PR:** #3050 (stark — EMA=0.999 + T_max=50, 2L/256d, AdamW lr=6e-4, gc=1.0, WD=1e-2)
-- **Key insight:** EMA=0.999 combined with T_max=50 improves BOTH primary metrics simultaneously: surface -4.8% (0.000459 vs 0.000482) AND volume -63.6% (0.002777 vs 0.00764). EMA is harmonious with T_max=50 — the longer cosine cycle lets EMA track effectively. Vol MSE 0.002777 closes gap to SpiderSolver from 4.5x to 1.63x.
-- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 6e-4 --cosine-t-max 50 --grad-clip 1.0 --weight-decay 1e-2 --enable-fourier --model-layers 2 --model-hidden-dim 256 --model-heads 4 --epochs 999 --ema-decay 0.999`
+- **Current best:** 0.000296 (val) at epoch 704 — with Vol MSE 0.002039 (best in programme)
+- **Best PR:** #3135 (nezuko — EMA=0.999 + vol-weight=10x, 2L/256d, AdamW lr=6e-4, gc=1.0, WD=1e-2)
+- **Key insight:** EMA=0.999 + vol-weight=10x compound dramatically improves both metrics simultaneously: surface -35.5% (0.000296 vs 0.000459) AND volume -26.6% (0.002039 vs 0.002777). Volume gap to SpiderSolver target closed from 1.63x to 1.20x. Model still improving at ep763 timeout.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 6e-4 --cosine-t-max 50 --grad-clip 1.0 --weight-decay 1e-2 --enable-fourier --model-layers 2 --model-hidden-dim 256 --model-heads 4 --epochs 999 --ema-decay 0.999 --vol-loss-weight 10.0`
 
-### 2026-04-23 — PR #3050: AirfRANS: EMA=0.999 at T_max=50 champion — NEW BEST (CURRENT)
+### 2026-04-23 — PR #3135: AirfRANS: EMA=0.999 + vol-weight=10x — NEW BEST (CURRENT)
+
+- **val_primary/surface_mse:** 0.000296 (-35.5% vs 0.000459) at epoch 704
+- **val_primary/vol_mse:** 0.002039 (-26.6% vs 0.002777) at epoch 743
+- **W&B run:** sh2zyfwr (nezuko/af-ema-vol-weight-10x)
+- **Config:** 2L/256d/4H, AdamW lr=6e-4, T_max=50, gc=1.0, WD=1e-2, **EMA=0.999**, vol-weight=10x, Fourier
+- **Key insight:** vol-weight=10x without EMA was confirmed worse. With EMA=0.999, the combination works dramatically better — EMA stabilizes the upweighted volume gradient. Surface -35.5% and volume -26.6% simultaneously. Vol gap to SpiderSolver: 1.20x (was 1.63x). Model at ep763 still converging.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 6e-4 --cosine-t-max 50 --grad-clip 1.0 --weight-decay 1e-2 --enable-fourier --model-layers 2 --model-hidden-dim 256 --model-heads 4 --epochs 999 --ema-decay 0.999 --vol-loss-weight 10.0`
+
+### 2026-04-23 — PR #3050: AirfRANS: EMA=0.999 at T_max=50 champion — PREVIOUS BEST
 
 - **val_primary/surface_mse:** 0.000459 (-4.8% vs 0.000482) at epoch 771
 - **full_val/volume_mse:** 0.002777 (-63.6% vs 0.00764) — best volume result in programme
