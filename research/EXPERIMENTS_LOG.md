@@ -1,5 +1,13 @@
 # SENPAI Research Results
 
+## 2026-04-23 10:00 — PR #3113: DM attention dropout=0.05 (shouko) — CLOSED
+
+- val=12.53% ep118, 7 divergence spikes over 206 epochs (W&B: `qjceei69`). Dropout+T_max=30+no-EMA toxic combo — LR peaks amplify dropout noise. Reassigned with EMA+gc stability platform (#3163).
+
+## 2026-04-23 10:00 — PR #3111: DM cosine eta_min (himmel) — CLOSED
+
+- eta_min=1e-6: 7.918% ep180 (W&B: `gu7hfzs1`). eta_min=1e-5: 7.255% ep109 (W&B: `q6zdf6xk`). Both diverged — tested without gc/EMA (wrong regime). spike #3161 carries hypothesis with EMA+gc.
+
 ## 2026-04-23 09:30 — PR #3139: AF 3L/256d + EMA=0.999 (spike) — CLOSED
 
 - surface=0.002863 (6.2x worse), vol=0.011626 (4.2x worse), diverged ep149 (W&B: `ooxb9roq`). Consistent with all prior 3L AF tests. 3L adds optimization noise that destabilizes trajectory. 2L confirmed optimal for AirfRANS.
