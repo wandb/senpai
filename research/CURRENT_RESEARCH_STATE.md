@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 03:15 (advisor cycle 60)
+- **Date:** 2026-04-24 03:45 (advisor cycle 61)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -18,7 +18,6 @@
 - `#3228` chopper: stochastic weight perturbation at cosine troughs — INNOVATION
 - `#3225` canute: self-distillation with EMA teacher — INNOVATION
 - `#3217` brook: Fourier encoding of surface normals — INNOVATION
-- `#3203` vegeta: attention temperature annealing — INNOVATION
 - `#3202` senku: GLU preprocess MLP — INNOVATION
 - `#3201` jet: DomainLayerNorm — INNOVATION
 
@@ -89,7 +88,8 @@
 - `#3218` shouko: GradNorm adaptive multi-task loss balancing — AF VOLUME FOCUS
 - `#3215` tanjiro: Huber loss on volume channel (robust to outliers) — AF VOLUME FOCUS
 - `#3211` spike: AF vol_loss_scale learnable scalar (noam port) — AF VOLUME FOCUS
-- `#3204` gilbert: vol-weight=15x/20x clean control (no extra features) — AF VOLUME FOCUS
+- `#3240` gilbert: joint checkpoint selection + vol-weight 11x/12x/13x fine sweep — AF VOLUME FOCUS
+- `#3239` vegeta: additive boundary layer auxiliary volume loss — AF VOLUME FOCUS
 - `#3195` piccolo: Re-stratified sampling
 - `#3156` edward: softer gc=0.5
 - `#3144` violet: vol-weight=2.0+EMA=0.999
@@ -188,6 +188,7 @@
 - Attention distance bias (ALiBi): linear diverges, log=5.511% at timeout. Redundant with slice-based spatial grouping
 - Auxiliary gradient prediction (∂p/∂x,y,z): kNN targets too noisy — aux_weight=0.1 diverges ep22, aux_weight=0.01 best 5.485% (+43%). Noise dominates once primary loss flattens
 - Mixup regularization (buffer-based latent): 85-109% worse, crashed ~ep235. Buffer staleness + non-smooth geometry-specific latent space fundamentally incompatible with bs=1
+- Attention temperature annealing: 4.024% (+5% vs 3.833%). External annealed τ compounds with existing learnable per-head τ. noam result doesn't transfer
 - Head count sweep complete: 2H=catastrophic, 4H=6.650%, 8H=3.833% CHAMPION, 16H=4.099%. 8H (64d/head) is definitive
 - 10-ep warmup+gc=1.0: 11.2% then diverged
 - 5-ep warmup+gc=1.0: pending (chopper)
@@ -223,6 +224,7 @@
 - T_max≠50 (30 and 100 both worse)
 - Vol-weight<10x (1.5x/2x/3x/5x/7x): ALL worse on both metrics across 6 tested values. 10x+EMA=0.999 is AF sweet spot
 - Vol-weight=30x: catastrophic — surface 4.3x worse, vol 3.1x worse
+- Vol-weight=15x: surface +19%, vol +67% (#3204). Vol-weight=20x: crashed ep381 (#3204). 10x is definitive AF operating point
 - LR>6e-4: 8e-4 +110% surface, 1e-3 catastrophic divergence
 
 **TandemFoil:**
