@@ -542,6 +542,35 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
     raise ValueError(f"Unknown model: {config.model}")
 
 
+def apply_spectral_norm(model: torch.nn.Module, mode: str = "qkv") -> int:
+    """Apply spectral norm to attention layers. Returns count of wrapped layers.
+
+    mode="qkv": only QKV projections (Trial 1)
+    mode="all": every nn.Linear in the model (Trial 2)
+    """
+    sn = torch.nn.utils.spectral_norm
+    count = 0
+    if mode == "all":
+        for module in model.modules():
+            if isinstance(module, torch.nn.Linear):
+                sn(module)
+                count += 1
+        return count
+    backbone = getattr(model, "backbone", None)
+    if backbone is None:
+        return 0
+    blocks = getattr(backbone, "blocks", [])
+    for block in blocks:
+        attn = getattr(block, "attention", None)
+        if attn is None:
+            continue
+        qkv = getattr(attn, "qkv", None)
+        if qkv is not None and hasattr(qkv, "project"):
+            sn(qkv.project)
+            count += 1
+    return count
+
+
 def build_optimizer(params, config: TrainConfig):
     if config.optimizer == "lion":
         optimizer = Lion(params, lr=config.lr, weight_decay=config.weight_decay)
@@ -1615,6 +1644,9 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
+    sn_count = apply_spectral_norm(model, mode="qkv")
+    if sn_count > 0:
+        print(f"[spectral_norm] Applied to {sn_count} QKV projection(s)", flush=True)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
@@ -1739,6 +1771,16 @@ def main() -> None:
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
         epoch_metrics["best_val_metric"] = best_val_metric
         epoch_metrics["best_epoch"] = float(best_epoch)
+        backbone = getattr(model, "backbone", None)
+        if backbone is not None:
+            for i, block in enumerate(getattr(backbone, "blocks", [])):
+                attn = getattr(block, "attention", None)
+                if attn is not None:
+                    qkv = getattr(attn, "qkv", None)
+                    if qkv is not None and hasattr(qkv.project, "weight_orig"):
+                        with torch.no_grad():
+                            sigma = torch.linalg.norm(qkv.project.weight_orig, ord=2).item()
+                        epoch_metrics[f"spectral_sigma/block_{i}_qkv"] = sigma
         history.append(epoch_metrics)
         if run is not None:
             wandb.log(epoch_metrics, step=epoch)
