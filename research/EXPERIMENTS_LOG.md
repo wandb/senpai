@@ -1,5 +1,13 @@
 # SENPAI Research Results
 
+## 2026-04-24 00:15 — PR #3185: TF full noam stack (fern) — MERGED ✓ NEW TF CHAMPION
+
+- Trial 1 (full stack: ANP+physics+T_max=150+96sl+Lookahead+compile+re-strat): val=21.319 ep277, test=22.868 (W&B: v05jt92n). Beats baseline 21.350/23.195 on both metrics (-0.15% val, -1.41% test). Trial 2 (ANP+physics only, T_max=10): val=22.276 ep233 (W&B: anluw1ab), diverged ep289. Key insight: full-stack extras (Lookahead, compile, 96 slices, re-stratified) only compound in late training (after ep200). T2 led for first 180 epochs. T_max=150 essential for full benefit. New TF config: Lion lr=1.25e-4, T_max=150, gc=0.2, EMA=0.999, 96 slices, ANP+full physics+asinh-scale=0.75+residual+Lookahead+compile+re-strat.
+
+## 2026-04-24 00:15 — PR #3186: TF T_max=150 alone (norman) — CLOSED (dead end)
+
+- gc=0.3+T_max=150: val=24.534 ep320 (+14.9% vs 21.350, W&B: ofq6mboa). gc=0.5+T_max=150: val=30.460 diverged ep87 (W&B: 5z8g5420). Both worse. T_max=150 alone doesn't help — benefit requires full noam feature stack (especially ANP + physics). T_max=10 with gc=0.3 remains load-bearing without features.
+
 ## 2026-04-24 00:00 — PR #3193: DM residual-prediction ablation (franky) — CLOSED (dead end)
 
 - Residual-only: best val=15.001% ep36 (W&B: uteqp5p4), crashed ep39 — catastrophic gradient explosion without asinh. Residual+asinh combined: best val=3.999% ep405 (W&B: 6eud1yyg), destabilized ep416 → 4.36%. Key finding: residual-prediction has a HARD dependency on asinh for stability on DM. Even paired, the combo gets to 3.999% (+0.17pp gap) but can't overtake champion. Asinh tames pressure gradients enough for residual to function, but added complexity still introduces late-training instability. Casca #3192 (asinh-only) will be the definitive single-feature test.
