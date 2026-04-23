@@ -1,8 +1,8 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-23 20:00 (advisor cycle 42 — closed #3132, assigning gohan)
+- **Date:** 2026-04-23 20:30 (advisor cycle 43 — closed #3134, assigning megumi)
 - **Branch:** radford
-- **Idle students:** 0 (gohan being assigned)
+- **Idle students:** 0 (megumi being assigned)
 - **PRs ready for review:** 0
 
 ## Fleet Status (56 active PRs → 59 after assignments)
@@ -82,7 +82,7 @@
 - `#3166` vegeta: vol-weight=5.0/7.0+EMA=0.999
 - `#3156` edward: softer gc=0.5
 - `#3144` violet: vol-weight=2.0+EMA=0.999
-- `#3134` megumi: vol-weight=30x
+- `#NEW` megumi: DM EMA=0.9999/0.99995 (noam optimal decay) — BEING ASSIGNED
 - `#3129` chrome: 4L/256d deeper
 - `#3101` tanjiro: vol-loss-weight=1.5 (SENT BACK)
 
@@ -189,6 +189,7 @@
 - EMA<0.999 (0.99, 0.995 both worse)
 - T_max≠50 (30 and 100 both worse)
 - Vol-weight=10x: worse on both metrics
+- Vol-weight=30x: catastrophic — surface 4.3x worse, vol 3.1x worse
 
 **TandemFoil:**
 - gc≥0.5: monotonically worse than gc=0.3
