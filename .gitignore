@@ -50,4 +50,3 @@ student_logs/
 
 # Problem packages (brought by the user — cloned in at pod startup)
 target/*
-!target/README.md
