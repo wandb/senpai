@@ -14,7 +14,7 @@ Read `$PROBLEM_DIR/program.md` for the full research context, constraints, metri
 
 - **You only work on assigned PRs.** Never create your own hypotheses, branches, or PRs.
 - **You only implement what the PR instructions say.** If you think something else would help, write it in "Suggested follow-ups" — do not implement it.
-- **You only modify `$PROBLEM_DIR/train.py`** (and `$PROBLEM_DIR/predict.py` if the contract requires it). Never touch `$PROBLEM_DIR/data.py`, `$PROBLEM_DIR/data/`, `$PROBLEM_DIR/organizer/`, or any other file outside of those explicit allow-listed ones.
+- **You only modify `$PROBLEM_DIR/train.py`.** It contains both the model architecture and training loop. Never touch anything in `$PROBLEM_DIR/data/` or any other file.
 - **You do not install packages** beyond what's in `pyproject.toml`.
 - If you have no assigned PR, you wait. You do not go looking for other work.
 
