@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 01:45 (advisor cycle 56)
+- **Date:** 2026-04-24 02:00 (advisor cycle 57)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -8,8 +8,9 @@
 
 ## Fleet Status (53 active PRs)
 
-### DrivAerML WIP (28 PRs)
+### DrivAerML WIP (29 PRs)
 **Innovation track (new physics-aware/ML ideas per directive):**
+- `#3233` gojo: stochastic depth (LayerDrop) regularization — INNOVATION
 - `#3231` emma: surface pressure gradient smoothness regularization — INNOVATION (physics-informed)
 - `#3224` fern: spectral normalization on attention layers — INNOVATION
 - `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
@@ -45,10 +46,9 @@
 - `#3067` askeladd: 32k surface points (SENT BACK)
 - `#3046` sukuna: WD+gc compound (SENT BACK)
 
-### TandemFoil WIP (4 PRs) — GUARDRAIL ONLY per directive
+### TandemFoil WIP (3 PRs) — GUARDRAIL ONLY per directive
 **New champion config:** ANP+full physics+T_max=150+gc=0.2+EMA=0.999+96sl+Lookahead+compile+re-strat (#3185)
 **Noam-pivot experiments (still running):**
-- `#3197` gojo: residual-prediction alone — NOAM ABLATION
 - `#3196` zenitsu: EMA decay sweep (0.9999/0.99995) — NOAM ABLATION
 - `#3150` yuji: clean test row — PAPER-FACING
 
@@ -69,6 +69,9 @@
 ### AirfRANS WIP (13 PRs)
 **Non-asinh noam feature ablation (highest priority — clean tests):**
 - `#3230` alphonse: residual-prediction + re-stratified sampling (NO asinh) — CLEAN NOAM ABLATION
+
+**Volume closure experiments:**
+- `#3234` jin: lower LR sweep (5e-4/4e-4) on vol-10x champion — AF VOLUME FOCUS
 - `#3232` nezuko: vol-weight warm-up schedule (1x→10x linear ramp over 200ep) — AF VOLUME FOCUS
 
 **Noam-pivot experiments (asinh-dependent — likely to fail):**
@@ -84,7 +87,6 @@
 - `#3222` rei: proximity-weighted volume loss (surface distance) — AF VOLUME FOCUS
 - `#3218` shouko: GradNorm adaptive multi-task loss balancing — AF VOLUME FOCUS
 - `#3215` tanjiro: Huber loss on volume channel (robust to outliers) — AF VOLUME FOCUS
-- `#3212` jin: PCGrad multi-objective gradient surgery — AF VOLUME FOCUS
 - `#3211` spike: AF vol_loss_scale learnable scalar (noam port) — AF VOLUME FOCUS
 - `#3204` gilbert: vol-weight=15x/20x clean control (no extra features) — AF VOLUME FOCUS
 - `#3195` piccolo: Re-stratified sampling
@@ -210,6 +212,7 @@
 
 **AirfRANS:**
 - asinh-pressure: DEFINITIVELY DEAD — 5 independent confirmations (#3191 T1/T2, #3177 T1/T2/T3). sinh() denormalization exponentially amplifies pressure errors. Non-pressure channels fine. Incompatible with AF pressure distribution.
+- PCGrad gradient surgery: 5-6x worse on both metrics (#3212). retain_graph=True disables torch.compile (40% throughput loss). Gradient conflict is NOT the bottleneck.
 - 3L depth (with or without EMA): catastrophic divergence confirmed twice
 - 2L/384d and 3L/384d: catastrophic divergence
 - EMA<0.999 (0.99, 0.995 both worse)
