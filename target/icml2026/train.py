@@ -167,6 +167,7 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
+    vol_weight_warmup_epochs: int = 0
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -1672,6 +1673,11 @@ def main() -> None:
     for epoch in range(1, config.epochs + 1):
         if timeout_seconds is not None and epoch > 1 and (time.monotonic() - start_time) >= timeout_seconds:
             break
+        if config.vol_weight_warmup_epochs > 0 and epoch < config.vol_weight_warmup_epochs:
+            current_vol_weight = 1.0 + (config.volume_loss_weight - 1.0) * (epoch / config.vol_weight_warmup_epochs)
+        else:
+            current_vol_weight = config.volume_loss_weight
+
         train_metrics = train_one_epoch(
             model=forward_model,
             anp_head=anp_head,
@@ -1687,7 +1693,7 @@ def main() -> None:
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
-            volume_loss_weight=config.volume_loss_weight,
+            volume_loss_weight=current_vol_weight,
         )
 
         if ema is not None:
@@ -1736,7 +1742,7 @@ def main() -> None:
         if anp_head is not None and anp_ema is not None:
             anp_ema.restore(anp_head)
 
-        epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
+        epoch_metrics = {"epoch": float(epoch), "current_vol_weight": current_vol_weight, **train_metrics, **eval_metrics}
         epoch_metrics["best_val_metric"] = best_val_metric
         epoch_metrics["best_epoch"] = float(best_epoch)
         history.append(epoch_metrics)
