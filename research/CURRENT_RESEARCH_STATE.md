@@ -1,11 +1,11 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-23 20:30 (advisor cycle 43 — closed #3134, assigning megumi)
+- **Date:** 2026-04-23 (advisor cycle 44 — gilbert assigned af-vol-15x-clean #3204)
 - **Branch:** radford
-- **Idle students:** 0 (megumi being assigned)
+- **Idle students:** 0 (gilbert assigned: #3204 af-vol-15x-clean — vol-weight=15x/20x clean control)
 - **PRs ready for review:** 0
 
-## Fleet Status (56 active PRs → 59 after assignments)
+## Fleet Status (57 active PRs)
 
 ### DrivAerML WIP (30 PRs)
 **Noam-pivot experiments (highest priority):**
@@ -35,7 +35,6 @@
 - `#3110` einar: beta2=0.99/0.995
 - `#3109` guts: lr=4e-4 full-eval
 - `#3085` kohaku: larger supernodes (SENT BACK — retry+gc=1.0)
-- `#3083` jet: max-train-batches=600
 - `#3197` gojo: TF residual-prediction alone — NOAM ABLATION
 - `#3076` frieren: log-cosh loss (SENT BACK — retry+gc=1.0)
 - `#3067` askeladd: 32k surface points (SENT BACK — add max-eval-batches 200)
@@ -55,7 +54,7 @@
 
 ### TandemFoil Paper WIP (10 PRs)
 **Noam-pivot experiments (highest priority):**
-- `#3190` brook: physics features only (wake/vortex/Cp, no ANP) — NOAM ABLATION
+- `#3200` brook: TFP stabilization diagnostic (20-ep probes) — STABILIZATION
 - `#3183` rei: ANP+T_max=150 — NOAM ABLATION
 - `#3179` usopp: T_max=150+wake+96sl+Lookahead — NOAM ABLATION
 - `#3176` mitsuha: full noam stack — NOAM ABLATION
@@ -78,6 +77,7 @@
 **Other:**
 - `#3172` robin: LR warmup (5-ep/10-ep)
 - `#3169` nami: heads sweep 4H/16H
+- `#3204` gilbert: vol-weight=15x/20x clean control (no extra features) — AF VOLUME FOCUS
 - `#3167` gilbert: higher LR (8e-4/1e-3)
 - `#3166` vegeta: vol-weight=5.0/7.0+EMA=0.999
 - `#3156` edward: softer gc=0.5
