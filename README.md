@@ -120,6 +120,15 @@ n_students: 4
 
 If none resolves, `launch.py` exits with instructions. The launch-scoped Secret is labelled with your research tag and is cleaned up by `kubectl delete deployments,configmaps,secrets -l research-tag=<tag>` (see [Running](#running)).
 
+The repo ships an `example.env` template — copy it to `.env` and paste your token:
+
+```bash
+cp example.env .env
+# then edit .env and set GITHUB_TOKEN=ghp_...
+```
+
+`.env` is already gitignored, so the token stays local.
+
 > **Target-repo permissions.** The token you supply must be able to **clone** `target_repo_url` and **push branches + open/merge PRs** against it. `launch.py` preflights this against the GitHub API before spinning up pods and fails loudly if `permissions.push` is false. Same applies to the `CLAUDE_CODE_OAUTH_TOKEN` user (still in `senpai-secrets`) if you rely on `gh auth status` inside the pod.
 
 ### Claude Code OAuth token
