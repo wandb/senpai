@@ -1,11 +1,11 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-23 20:30 (advisor cycle 43 — closed #3134, assigning megumi)
+- **Date:** 2026-04-23 21:00 (advisor cycle 44 — closed #3190/#3167/#3166/#3165, assigning 5 students)
 - **Branch:** radford
-- **Idle students:** 0 (megumi being assigned)
+- **Idle students:** 0 (brook/gilbert/senku/vegeta/jet being assigned)
 - **PRs ready for review:** 0
 
-## Fleet Status (56 active PRs → 59 after assignments)
+## Fleet Status (55 active PRs + 5 pending)
 
 ### DrivAerML WIP (30 PRs)
 **Noam-pivot experiments (highest priority):**
@@ -14,10 +14,14 @@
 - `#3181` himmel: asinh+residual on champion — NOAM ABLATION
 - `#3175` hinata: full noam stack on champion — NOAM ABLATION
 
+**Innovation track (code ports from noam — new directive):**
+- `#NEW` senku: DM GLU preprocess MLP — INNOVATION TRACK
+- `#NEW` vegeta: DM attention temperature annealing — INNOVATION TRACK
+- `#NEW` jet: DM DomainLayerNorm — INNOVATION TRACK
+
 **Pre-pivot champion tuning:**
 - `#3173` kakashi: shorter cosine T_max=15/20
 - `#3171` sanji: LR warmup (5-ep/10-ep) on champion
-- `#3165` senku: 4H heads (128d/head)
 - `#3164` faye: paper-facing full eval (two-phase) — PAPER-FACING
 - `#3163` shouko: attn dropout=0.05
 - `#3161` spike: eta_min=1e-5 (cosine floor)
