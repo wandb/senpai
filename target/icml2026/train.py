@@ -167,6 +167,7 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
+    focal_vol_gamma: float = 0.0
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -763,6 +764,7 @@ def loss_grouped(
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
     volume_loss_weight: float = 1.0,
+    focal_vol_gamma: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.surface_x.device)
     metrics: dict[str, float] = {}
@@ -773,7 +775,16 @@ def loss_grouped(
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
         target = transform.apply(batch.volume_y)
-        vol_loss = F.mse_loss(outputs["volume_preds"][batch.volume_mask], target[batch.volume_mask])
+        pred_masked = outputs["volume_preds"][batch.volume_mask]
+        tgt_masked = target[batch.volume_mask]
+        if focal_vol_gamma > 0.0:
+            per_point_mse = (pred_masked - tgt_masked) ** 2
+            error_max = per_point_mse.detach().max().clamp(min=1e-8)
+            normalized = per_point_mse.detach() / error_max
+            focal_weight = normalized ** focal_vol_gamma
+            vol_loss = (focal_weight * per_point_mse).mean()
+        else:
+            vol_loss = F.mse_loss(pred_masked, tgt_masked)
         total = total + vol_loss * volume_loss_weight
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
@@ -1271,6 +1282,7 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    focal_vol_gamma: float = 0.0,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1326,7 +1338,7 @@ def train_one_epoch(
                             volume_x=batch.volume_x,
                             volume_mask=batch.volume_mask,
                         )
-                        loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                        loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight, focal_vol_gamma=focal_vol_gamma)
 
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
@@ -1688,6 +1700,7 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            focal_vol_gamma=config.focal_vol_gamma,
         )
 
         if ema is not None:
