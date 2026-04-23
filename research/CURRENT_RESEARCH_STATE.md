@@ -82,7 +82,7 @@
 - `#3166` vegeta: vol-weight=5.0/7.0+EMA=0.999
 - `#3156` edward: softer gc=0.5
 - `#3144` violet: vol-weight=2.0+EMA=0.999
-- `#NEW` megumi: DM EMA=0.9999/0.99995 (noam optimal decay) — BEING ASSIGNED
+- `#3199` megumi: DM EMA=0.9999/0.99995 (noam optimal decay) — NOAM ABLATION
 - `#3129` chrome: 4L/256d deeper
 - `#3101` tanjiro: vol-loss-weight=1.5 (SENT BACK)
 
