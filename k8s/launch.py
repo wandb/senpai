@@ -7,36 +7,27 @@
 """Launch senpai advisor and student agents as K8s resources."""
 
 import base64
-import json
-import os
-import subprocess
 import sys
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
 import simple_parsing as sp
 
+from launch_helpers import (
+    STUDENT_NAMES,
+    kubectl_apply,
+    preflight_check_target_repo_access,
+    render_configmap,
+    render_template,
+    render_token_secret,
+    resolve_github_token,
+    target_repo_slug,
+)
+
 STUDENT_TEMPLATE = Path(__file__).parent / "student-deployment.yaml"
 ADVISOR_TEMPLATE = Path(__file__).parent / "advisor-deployment.yaml"
 SENPAI_CONFIG = Path(__file__).parent.parent / "senpai.yaml"
-
-STUDENT_NAMES = [
-    "frieren", "fern", "tanjiro", "nezuko", "alphonse", "edward",
-    "thorfinn", "askeladd", "violet", "gilbert", "senku", "kohaku",
-    "emma", "norman", "chihiro", "haku", "shoya", "shouko",
-    "mitsuha", "taki", "shinji", "rei", "kaneda", "tetsuo",
-    "naruto", "sasuke", "sakura", "kakashi", "hinata", "itachi",
-    "roy", "winry", "eren", "mikasa", "armin", "levi",
-    "historia", "ymir", "zenitsu", "inosuke", "giyu", "shinobu",
-    "chrome", "gen", "ray", "asuka", "kaworu", "luffy",
-    "zoro", "nami", "sanji", "robin", "chopper", "usopp",
-    "franky", "brook", "yuji", "megumi", "nobara", "gojo",
-    "sukuna", "spike", "jet", "faye", "vash", "wolfwood",
-    "guts", "casca", "griffith", "einar", "canute", "stark",
-    "himmel", "mugen", "jin",
-]
+DOTENV_PATH = Path(__file__).parent.parent / ".env"
 
 
 @dataclass
@@ -60,31 +51,6 @@ class Args:
     timeout_minutes: float = 30.0  # training run wall-clock limit (SENPAI_TIMEOUT_MINUTES)
     max_epochs: int = 50  # maximum training epochs (SENPAI_MAX_EPOCHS)
     dry_run: bool = False  # print manifests without applying
-
-
-def render_template(template: str, replacements: dict[str, str]) -> str:
-    """Replace {{PLACEHOLDER}} tokens in a K8s manifest template."""
-    out = template
-    for key, value in replacements.items():
-        out = out.replace(f"{{{{{key}}}}}", value)
-    return out
-
-
-def render_configmap(name: str, labels: dict[str, str], data: dict[str, str]) -> str:
-    """Generate a ConfigMap YAML document."""
-    lines = ["apiVersion: v1", "kind: ConfigMap", "metadata:", f"  name: {name}", "  labels:"]
-    for k, v in labels.items():
-        lines.append(f"    {k}: {v}")
-    lines.append("data:")
-    for k, v in data.items():
-        lines.append(f"  {k}: \"{v}\"")
-    return "\n".join(lines)
-
-
-def target_repo_slug(url: str) -> str:
-    """Extract owner/repo slug from a GitHub URL (for `gh --repo`)."""
-    slug = url.split("github.com", 1)[-1].lstrip(":/").removesuffix(".git")
-    return slug
 
 
 def render_student(template: str, student_name: str, tag: str, secret_name: str, args: Args) -> str:
@@ -152,104 +118,9 @@ def render_advisor(template: str, tag: str, student_list: list[str], secret_name
     return configmap + "\n---\n" + deployment
 
 
-def _load_dotenv(path: Path) -> None:
-    """Read KEY=VAL lines from path into os.environ (doesn't override existing)."""
-    if not path.exists():
-        return
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        v = v.strip().strip('"').strip("'")
-        os.environ.setdefault(k.strip(), v)
-
-
-def resolve_github_token() -> str:
-    """Resolve the GitHub token: $GITHUB_TOKEN → .env → `gh auth token` → hard error."""
-    # Treat empty $GITHUB_TOKEN as unset so .env fallback still kicks in.
-    if not os.environ.get("GITHUB_TOKEN", "").strip():
-        os.environ.pop("GITHUB_TOKEN", None)
-    _load_dotenv(Path(__file__).parent.parent / ".env")
-    tok = os.environ.get("GITHUB_TOKEN", "").strip()
-    if tok:
-        return tok
-    try:
-        res = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True)
-        if res.returncode == 0 and res.stdout.strip():
-            return res.stdout.strip()
-    except FileNotFoundError:
-        pass
-    sys.exit("ERROR: no github token. Set $GITHUB_TOKEN in your shell, add it to .env "
-             "at the senpai repo root, or run `gh auth login`.")
-
-
-def render_token_secret(tag: str, token: str) -> str:
-    """Per-launch k8s Secret holding only the github-token key."""
-    enc = base64.b64encode(token.encode()).decode()
-    return (
-        "apiVersion: v1\n"
-        "kind: Secret\n"
-        "metadata:\n"
-        f"  name: senpai-github-token-{tag}\n"
-        "  labels:\n"
-        "    app: senpai\n"
-        f"    research-tag: {tag}\n"
-        "type: Opaque\n"
-        "data:\n"
-        f"  github-token: {enc}\n"
-    )
-
-
-def preflight_check_target_repo_access(target_repo_url: str, token: str) -> None:
-    """Verify the supplied github token has push access to target_repo_url.
-
-    Catches the 403-on-push scenario before pods spin up.
-    """
-    slug = target_repo_slug(target_repo_url)
-    print(f"Preflight: checking github token against {slug}")
-
-    def gh_api(path: str) -> dict:
-        req = urllib.request.Request(
-            f"https://api.github.com{path}",
-            headers={"Authorization": f"Bearer {token}", "User-Agent": "senpai-launch-preflight"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            sys.exit(f"ERROR: GitHub API {e.code} for {path}: {e.read().decode(errors='replace')}")
-
-    perms = gh_api(f"/repos/{slug}").get("permissions", {})
-    if perms.get("push"):
-        print(f"  OK — token has push access to {slug}")
-        return
-
-    user = gh_api("/user").get("login", "<unknown>")
-    sys.exit(f"ERROR: github token (user '{user}') cannot push to {slug}\n"
-             f"  permissions: {perms}\n"
-             f"  Fix: supply a token with write on {slug} via $GITHUB_TOKEN / .env / gh auth, "
-             f"or grant '{user}' collaborator write on {slug}.")
-
-
-def kubectl_apply(manifest: str, name: str):
-    """Apply a manifest via kubectl."""
-    print(f"Launching: {name}")
-    result = subprocess.run(
-        ["kubectl", "apply", "-f", "-"],
-        input=manifest,
-        text=True,
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        print(f"  ERROR: {result.stderr.strip()}", file=sys.stderr)
-    else:
-        print(f"  {result.stdout.strip()}")
-
-
 def main():
     args = sp.parse(Args, config_path=str(SENPAI_CONFIG))
-    token = resolve_github_token()
+    token = resolve_github_token(DOTENV_PATH)
 
     if not args.dry_run:
         preflight_check_target_repo_access(args.target_repo_url, token)
