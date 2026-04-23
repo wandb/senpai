@@ -1,8 +1,8 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-23 19:30 (advisor cycle 41 — closed #3142/#3115/#3079, assigning zenitsu/gojo/piccolo)
+- **Date:** 2026-04-23 20:00 (advisor cycle 42 — closed #3132, assigning gohan)
 - **Branch:** radford
-- **Idle students:** 0 (zenitsu/gojo/piccolo being assigned)
+- **Idle students:** 0 (gohan being assigned)
 - **PRs ready for review:** 0
 
 ## Fleet Status (56 active PRs → 59 after assignments)
@@ -29,7 +29,7 @@
 - `#3152` eren: EMA decay sweep (0.999 vs 0.9995)
 - `#3146` taki: top-5 checkpoint averaging
 - `#3143` thorfinn: Lookahead(AdamW)
-- `#3132` gohan: eta_min=5e-5+gc=1.0
+- `#NEW` gohan: TFP asinh-pressure isolation — BEING ASSIGNED
 - `#3121` levi: dropout regularization sweep
 - `#3195` piccolo: AF re-stratified sampling alone — NOAM ABLATION
 - `#3110` einar: beta2=0.99/0.995
@@ -168,6 +168,7 @@
 - Bilateral symmetry aug, torch.compile, gradient accumulation
 - Attention dropout without EMA/gc: toxic combo with T_max=30
 - Cosine eta_min without EMA/gc: diverges (7.255-7.918%)
+- eta_min=5e-5+gc (any value): gc=1.0→6.311%, gc=0.5→8.617%, both diverge — 3rd confirmation
 - Surface points ≠50k: 16k=11.672%, 32k=7.558%, 64k=12.16% (even with EMA+gc) — 50k only viable count
 - 4L/640d: dead at ALL tested configs — lr=5e-4+EMA+gc: 8.636% diverge ep82 (#3159); lr=5e-4 no-EMA: 4.516%/6.457%/5.724% all diverge (#3079). Width amplifies gradients beyond gc containment.
 - lr<5e-4 under EMA: steep monotonic cliff (4.5e-4=4.134%, 4e-4=5.924%)
