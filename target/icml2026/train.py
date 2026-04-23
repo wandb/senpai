@@ -86,6 +86,58 @@ class EMAWithWarmup:
         self.backup = None
 
 
+class SAM:
+    """Sharpness-Aware Minimization wrapper (Foret et al. 2021)."""
+
+    def __init__(self, params, base_optimizer_cls, rho: float = 0.05, **kwargs):
+        self.base_optimizer = base_optimizer_cls(params, **kwargs)
+        self.rho = rho
+        self.param_groups = self.base_optimizer.param_groups
+        self._old_params: dict[int, torch.Tensor] = {}
+
+    @torch.no_grad()
+    def first_step(self):
+        grad_norm = self._grad_norm()
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                self._old_params[id(p)] = p.data.clone()
+                e_w = self.rho * p.grad / (grad_norm + 1e-12)
+                p.add_(e_w)
+        self.base_optimizer.zero_grad(set_to_none=True)
+
+    @torch.no_grad()
+    def second_step(self):
+        for group in self.param_groups:
+            for p in group["params"]:
+                pid = id(p)
+                if pid in self._old_params:
+                    p.data.copy_(self._old_params[pid])
+        self._old_params.clear()
+        self.base_optimizer.step()
+        self.base_optimizer.zero_grad(set_to_none=True)
+
+    def zero_grad(self, set_to_none: bool = True):
+        self.base_optimizer.zero_grad(set_to_none=set_to_none)
+
+    def _grad_norm(self) -> torch.Tensor:
+        norms = []
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is not None:
+                    norms.append(p.grad.detach().norm(p=2))
+        if not norms:
+            return torch.tensor(0.0)
+        return torch.norm(torch.stack(norms), p=2)
+
+    def state_dict(self):
+        return self.base_optimizer.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.base_optimizer.load_state_dict(state_dict)
+
+
 LEGACY_VAL_ALIAS = {
     "val_in_dist": "p_in",
     "val_ood_cond": "p_oodc",
@@ -166,6 +218,7 @@ class TrainConfig:
     volume_anchor_points: int = 8_000
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
+    sam_rho: float = 0.05
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
@@ -547,6 +600,15 @@ def build_optimizer(params, config: TrainConfig):
         optimizer = Lion(params, lr=config.lr, weight_decay=config.weight_decay)
     elif config.optimizer == "adamw":
         optimizer = torch.optim.AdamW(params, lr=config.lr, weight_decay=config.weight_decay)
+    elif config.optimizer == "sam-adamw":
+        optimizer = SAM(
+            params,
+            torch.optim.AdamW,
+            rho=config.sam_rho,
+            lr=config.lr,
+            weight_decay=config.weight_decay,
+        )
+        return optimizer
     else:
         raise ValueError(f"Unknown optimizer: {config.optimizer}")
     if config.use_lookahead:
@@ -1281,11 +1343,47 @@ def train_one_epoch(
     batches = loader if max_batches <= 0 else itertools.islice(loader, max_batches)
     batch_iter = iter(batches)
     exhausted = False
+    is_sam = isinstance(optimizer, SAM)
+    clip_max = grad_clip if grad_clip > 0 else float("inf")
+
+    def _forward_loss(b):
+        if model_name == "reference_abupt":
+            with autocast_context(device, amp_mode):
+                outputs = model(
+                    geometry_position=b.geometry_position,
+                    geometry_supernode_idx=b.geometry_supernode_idx,
+                    geometry_batch_idx=b.geometry_batch_idx,
+                    surface_anchor_position=b.surface_anchor_position,
+                    volume_anchor_position=b.volume_anchor_position,
+                )
+                loss, _ = loss_abupt(b, outputs, transform, volume_loss_weight=volume_loss_weight)
+        elif isinstance(transform, TandemTargetTransform):
+            prepared = transform.prepare_batch(b)
+            with autocast_context(device, amp_mode):
+                outputs = model(
+                    surface_x=prepared.surface_x,
+                    surface_mask=prepared.surface_mask,
+                    volume_x=prepared.volume_x,
+                    volume_mask=prepared.volume_mask,
+                )
+                outputs = maybe_apply_anp(outputs, prepared, anp_head)
+                loss, _ = loss_grouped_tandem(prepared, outputs, volume_loss_weight=volume_loss_weight)
+        else:
+            with autocast_context(device, amp_mode):
+                outputs = model(
+                    surface_x=b.surface_x,
+                    surface_mask=b.surface_mask,
+                    volume_x=b.volume_x,
+                    volume_mask=b.volume_mask,
+                )
+                loss, _ = loss_grouped(b, outputs, transform, volume_loss_weight=volume_loss_weight)
+        return loss
 
     while not exhausted:
         optimizer.zero_grad(set_to_none=True)
         accum_loss = 0.0
         micro_count = 0
+        stored_batches: list = [] if is_sam else []
 
         for _ in range(grad_accum_steps):
             try:
@@ -1294,43 +1392,13 @@ def train_one_epoch(
                 exhausted = True
                 break
 
-            if model_name == "reference_abupt":
-                batch = batch.to(device)
-                with autocast_context(device, amp_mode):
-                    outputs = model(
-                        geometry_position=batch.geometry_position,
-                        geometry_supernode_idx=batch.geometry_supernode_idx,
-                        geometry_batch_idx=batch.geometry_batch_idx,
-                        surface_anchor_position=batch.surface_anchor_position,
-                        volume_anchor_position=batch.volume_anchor_position,
-                    )
-                    loss, _ = loss_abupt(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
-            else:
-                batch = batch.to(device)
-                if isinstance(transform, TandemTargetTransform):
-                    prepared = transform.prepare_batch(batch)
-                    with autocast_context(device, amp_mode):
-                        outputs = model(
-                            surface_x=prepared.surface_x,
-                            surface_mask=prepared.surface_mask,
-                            volume_x=prepared.volume_x,
-                            volume_mask=prepared.volume_mask,
-                        )
-                        outputs = maybe_apply_anp(outputs, prepared, anp_head)
-                        loss, _ = loss_grouped_tandem(prepared, outputs, volume_loss_weight=volume_loss_weight)
-                else:
-                    with autocast_context(device, amp_mode):
-                        outputs = model(
-                            surface_x=batch.surface_x,
-                            surface_mask=batch.surface_mask,
-                            volume_x=batch.volume_x,
-                            volume_mask=batch.volume_mask,
-                        )
-                        loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
-
+            batch = batch.to(device)
+            loss = _forward_loss(batch)
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
             micro_count += 1
+            if is_sam:
+                stored_batches.append(batch)
 
         if micro_count == 0:
             break
@@ -1338,13 +1406,27 @@ def train_one_epoch(
         all_params = list(model.parameters())
         if anp_head is not None:
             all_params += list(anp_head.parameters())
-        grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=grad_clip if grad_clip > 0 else float("inf"))
+        grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=clip_max)
         running.setdefault("grad_norm_mean", 0.0)
         running["grad_norm_mean"] += float(grad_norm)
         if grad_clip > 0 and float(grad_norm) > grad_clip:
             running.setdefault("grad_clip_events", 0.0)
             running["grad_clip_events"] += 1.0
-        optimizer.step()
+
+        if is_sam:
+            optimizer.first_step()
+            perturbed_loss = 0.0
+            for b in stored_batches:
+                loss = _forward_loss(b)
+                perturbed_loss += float(loss.detach().cpu().item())
+                (loss / grad_accum_steps).backward()
+            torch.nn.utils.clip_grad_norm_(all_params, max_norm=clip_max)
+            optimizer.second_step()
+            running.setdefault("train/sharpness", 0.0)
+            running["train/sharpness"] += (perturbed_loss / micro_count) - (accum_loss / micro_count)
+        else:
+            optimizer.step()
+
         if scheduler is not None:
             scheduler.step()
         if ema is not None:
@@ -1359,6 +1441,8 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    if "train/sharpness" in running:
+        running["train/sharpness"] /= max(steps, 1)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1629,7 +1713,12 @@ def main() -> None:
     optimizer = build_optimizer(params, config)
     scheduler = None
     if config.cosine_t_max > 0:
-        base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
+        if isinstance(optimizer, SAM):
+            base_optimizer = optimizer.base_optimizer
+        elif isinstance(optimizer, Lookahead):
+            base_optimizer = optimizer.optimizer
+        else:
+            base_optimizer = optimizer
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
 
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
@@ -1642,10 +1731,6 @@ def main() -> None:
     best_model_state: dict[str, torch.Tensor] | None = None
     best_anp_state: dict[str, torch.Tensor] | None = None
 
-    if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
-    else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1719,7 +1804,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(best_val_primary_metric_name)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
