@@ -1,5 +1,17 @@
 # SENPAI Research Results
 
+## 2026-04-23 09:00 — PR #3138: DM 788 batches + T_max=60 (kakashi) — SENT BACK
+
+- val=6.620% ep66, diverged ep72 at second cosine cycle (W&B: `7sa8l03q`). Proportional T_max scaling confirmed (much better than #3084's 11.57%) but gc=1.0 insufficient. Sent back for gc=0.5 + EMA=0.9995.
+
+## 2026-04-23 09:00 — PR #3115: DM batch_size=2 + 25k points (piccolo) — SENT BACK
+
+- val=4.32% ep507 (W&B: `l7np1pv0`). Confounded by bf16 CUBLAS bug → fp16 fallback → 13 gradient spike events. Sent back for 50k pts + gc=0.5 + EMA=0.9995 to fairly test batch-diversity hypothesis.
+
+## 2026-04-23 09:00 — PR #3114: DM T_max=50 + gc (griffith) — CLOSED
+
+- gc=1.0: 12.56% ep42, diverged ep52 (W&B: `4ixc5d0e`). gc=0.5: 7.28% ep107, diverged ep121 (W&B: `0pux5dkr`). Both diverge — T_max=50 gradient explosion intrinsic to long-cycle LR peaks. T_max=30 confirmed as only viable cosine period for DM.
+
 ## 2026-04-23 08:30 — PR #3148: DM 10-ep warmup + gc=1.0 (franky) — CLOSED
 
 - val=11.196% ep80, diverged ep87 (W&B: `rp02hbxl`). gc=1.0 insufficient to prevent cascade divergence with T_max=30 restarts. Grad norms→41.5M. 7.4pp worse than 3.833% baseline.
