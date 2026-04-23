@@ -10,7 +10,7 @@
 
 ### DrivAerML WIP (27 PRs)
 **Innovation track (new physics-aware/ML ideas per directive):**
-- fern: spectral normalization on attention layers — INNOVATION (PR pending)
+- `#3224` fern: spectral normalization on attention layers — INNOVATION
 - `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
 - `#3216` canute: attention distance bias (ALiBi-inspired spatial prior) — INNOVATION
 - `#3214` kakashi: auxiliary gradient prediction (∂p/∂x,y,z) — INNOVATION
