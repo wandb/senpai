@@ -167,6 +167,9 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
+    vol_proximity_mode: str = "none"
+    vol_proximity_eps: float = 0.01
+    vol_proximity_scale: float = 0.1
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -758,11 +761,32 @@ def _named_channel_metrics(prefix: str, values: torch.Tensor, names: tuple[str, 
     return metrics
 
 
+def _proximity_weights(
+    sdf: torch.Tensor,
+    mode: str,
+    eps: float = 0.01,
+    scale: float = 0.1,
+) -> torch.Tensor:
+    d = sdf.abs()
+    if mode == "inverse":
+        w = 1.0 / (d + eps)
+        w = w.clamp(max=w.median() * 20.0)
+    elif mode == "exponential":
+        w = torch.exp(-d / scale)
+    else:
+        raise ValueError(f"Unknown proximity mode: {mode}")
+    w = w / (w.mean() + 1e-12)
+    return w
+
+
 def loss_grouped(
     batch: GroupedBatch,
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
     volume_loss_weight: float = 1.0,
+    vol_proximity_mode: str = "none",
+    vol_proximity_eps: float = 0.01,
+    vol_proximity_scale: float = 0.1,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.surface_x.device)
     metrics: dict[str, float] = {}
@@ -773,7 +797,18 @@ def loss_grouped(
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
         target = transform.apply(batch.volume_y)
-        vol_loss = F.mse_loss(outputs["volume_preds"][batch.volume_mask], target[batch.volume_mask])
+        preds_masked = outputs["volume_preds"][batch.volume_mask]
+        target_masked = target[batch.volume_mask]
+        if vol_proximity_mode != "none" and batch.volume_x is not None and batch.dataset_name == "airfrans":
+            sdf = batch.volume_x[batch.volume_mask][:, 4]
+            w = _proximity_weights(sdf, vol_proximity_mode, vol_proximity_eps, vol_proximity_scale)
+            per_point_mse = ((preds_masked - target_masked) ** 2).mean(dim=-1)
+            vol_loss = (w * per_point_mse).mean()
+            metrics["proximity_weight_max"] = float(w.max().item())
+            metrics["proximity_weight_min"] = float(w.min().item())
+            metrics["proximity_weight_std"] = float(w.std().item())
+        else:
+            vol_loss = F.mse_loss(preds_masked, target_masked)
         total = total + vol_loss * volume_loss_weight
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
@@ -1271,6 +1306,9 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    vol_proximity_mode: str = "none",
+    vol_proximity_eps: float = 0.01,
+    vol_proximity_scale: float = 0.1,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1326,7 +1364,17 @@ def train_one_epoch(
                             volume_x=batch.volume_x,
                             volume_mask=batch.volume_mask,
                         )
-                        loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                        loss, batch_metrics = loss_grouped(
+                            batch, outputs, transform,
+                            volume_loss_weight=volume_loss_weight,
+                            vol_proximity_mode=vol_proximity_mode,
+                            vol_proximity_eps=vol_proximity_eps,
+                            vol_proximity_scale=vol_proximity_scale,
+                        )
+                        if "proximity_weight_max" in batch_metrics:
+                            for k in ("proximity_weight_max", "proximity_weight_min", "proximity_weight_std"):
+                                running.setdefault(k, 0.0)
+                                running[k] += batch_metrics[k]
 
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
@@ -1359,6 +1407,9 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    for k in ("proximity_weight_max", "proximity_weight_min", "proximity_weight_std"):
+        if k in running:
+            running[k] /= max(steps, 1)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1635,17 +1686,9 @@ def main() -> None:
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
     history: list[dict[str, float]] = []
-    best_epoch: int | None = None
     best_val_primary_metric_name = primary_metric_key(bundle, phase="val")
     best_val_primary_metric: float | None = None
     best_val_metrics: dict[str, float] = {}
-    best_model_state: dict[str, torch.Tensor] | None = None
-    best_anp_state: dict[str, torch.Tensor] | None = None
-
-    if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
-    else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1688,6 +1731,9 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            vol_proximity_mode=config.vol_proximity_mode,
+            vol_proximity_eps=config.vol_proximity_eps,
+            vol_proximity_scale=config.vol_proximity_scale,
         )
 
         if ema is not None:
@@ -1719,7 +1765,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(best_val_primary_metric_name)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
