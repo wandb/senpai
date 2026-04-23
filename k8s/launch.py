@@ -43,8 +43,8 @@ class Args:
     n_students: int = 4  # number of students to launch (ignored if --names is provided)
     repo_url: str = "https://github.com/wandb/senpai.git"  # git repo URL (senpai runner)
     repo_branch: str = "main"  # git branch to clone (senpai runner)
-    target_repo_url: str = "https://github.com/morganmcg1/tandemfoil2.git"  # submodule repo agent commits/PRs go to
-    target_working_branch: str = "kagent_royal_rumble"  # integration branch inside the submodule repo
+    target_repo_url: str = "https://github.com/morganmcg1/tandemfoil2.git"  # problem-package repo (entrypoint clones this into $PROBLEM_DIR; agent commits/PRs land here)
+    target_working_branch: str = "kagent_royal_rumble"  # integration branch inside the problem-package repo
     image: str = "ghcr.io/wandb/senpai:latest"  # container image for students
     wandb_entity: str = "wandb-applied-ai-team"  # W&B entity (team or username)
     wandb_project: str = "senpai-v1"  # W&B project name

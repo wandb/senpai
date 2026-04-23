@@ -12,15 +12,15 @@ Autonomous ML research loop powered by Claude Code agents coordinated through Gi
 
 An **advisor** agent (no GPU) creates hypothesis PRs and assigns them to **student** agents (GPU nodes). Students implement the hypothesis, run experiments, and report results. The advisor reviews: merges winners, iterates on promising ideas, closes dead ends. All coordination happens through GitHub labels and PRs. W&B tracks metrics.
 
-The repo is **problem-agnostic** — all problem-specific code (model, training script, data pipeline, instructions) lives in a self-contained folder under `target/`. `senpai.yaml` points to the active problem via a repo-relative path.
+The repo is **problem-agnostic** — `target/` is empty by default. You bring your own problem-package repo (model, training script, data pipeline, instructions) and the pod entrypoint clones it into `target/<name>/` at startup. `senpai.yaml` points `problem:` at that path and `target_repo_url:` at the repo to clone.
 
 ### Current problem: `target/tandemfoil2`
 
-TandemFoilSet 3D velocity-field prediction, seeded from the [`tcapelle/kagent`](https://github.com/tcapelle/kagent/tree/main/tandemfoil-competition) competition as a clean Transolver-based implementation. Lives in [`morganmcg1/tandemfoil2`](https://github.com/morganmcg1/tandemfoil2) on branch `kagent_royal_rumble` and is attached here as a git submodule at `target/tandemfoil2`.
+TandemFoilSet 3D velocity-field prediction, seeded from the [`tcapelle/kagent`](https://github.com/tcapelle/kagent/tree/main/tandemfoil-competition) competition as a clean Transolver-based implementation. Lives in [`morganmcg1/tandemfoil2`](https://github.com/morganmcg1/tandemfoil2) on branch `kagent_royal_rumble`. The entrypoint clones it into `target/tandemfoil2/` at pod startup.
 
 ### Reference problem packages
 
-Problem packages are self-contained repos. `target/` is empty at the senpai level; packages attach as submodules (or plain clones):
+Problem packages are self-contained external repos:
 
 - [`morganmcg1/tandemfoil2`](https://github.com/morganmcg1/tandemfoil2) — **ACTIVE**. TandemFoilSet velocity prediction, kagent-seeded. Default branch `kagent_royal_rumble`.
 - [`morganmcg1/icml2026`](https://github.com/morganmcg1/icml2026) — archival. Full ICML 2026 CFD multi-dataset harness (TandemFoil, AirfRANS, DrivAerML, TandemFoil paper).
@@ -65,10 +65,9 @@ graph TD
 
 ```
 senpai/
-├── senpai.yaml                    # Project config: active problem + submodule repo/branch + launch defaults
-├── .gitmodules                    # Declares the target/* submodules
-├── target/                        # Problem packages live here as submodules (empty by default)
-│   └── <problem>/                 #   (submodule of an external problem-package repo)
+├── senpai.yaml                    # Project config: active problem + problem-package repo/branch + launch defaults
+├── target/                        # Empty by default. Entrypoint clones target_repo_url here at pod startup.
+│   └── <problem>/                 #   (populated at runtime — or cloned manually for local dev)
 │       ├── train.py               #     Training script + model (students modify this)
 │       ├── program.md             #     Research context, metrics, constraints
 │       ├── data.py / data/        #     Data pipeline
@@ -82,24 +81,24 @@ senpai/
 │   ├── launch.py                  #   Deploy advisor + student pods
 │   ├── advisor-deployment.yaml
 │   ├── student-deployment.yaml
-│   ├── entrypoint-advisor.sh      #   Submodule-aware startup (advisor git/PRs scoped to submodule)
-│   └── entrypoint-student.sh      #   Submodule-aware startup (student git/PRs scoped to submodule)
+│   ├── entrypoint-advisor.sh      #   Clones target_repo_url into $PROBLEM_DIR; advisor git/PRs scoped to that repo
+│   └── entrypoint-student.sh      #   Clones target_repo_url into $PROBLEM_DIR; student git/PRs scoped to that repo
 ├── Dockerfile
 └── .claude/                       # Claude Code skills and agents
 ```
 
-**Important**: the senpai parent repo is problem-agnostic. Agent commits and PRs land in the **submodule's origin** (e.g. `morganmcg1/tandemfoil2`) on the submodule's working branch, never in `wandb/senpai`. The submodule pointer is bumped only by humans when pinning a new baseline.
+**Important**: the senpai parent repo is problem-agnostic. Agent commits and PRs land in the **problem-package repo** (e.g. `morganmcg1/tandemfoil2`) on its working branch, never in `wandb/senpai`.
 
 ## Configuration
 
 All project settings live in `senpai.yaml`:
 
 ```yaml
-problem: target/tandemfoil2               # active problem directory (submodule path)
+problem: target/tandemfoil2               # active problem directory (entrypoint clones target_repo_url here)
 repo_url: https://github.com/wandb/senpai.git
 repo_branch: main
-target_repo_url: https://github.com/morganmcg1/tandemfoil2.git   # agent commits/PRs target this repo
-target_working_branch: kagent_royal_rumble                       # integration branch inside the submodule
+target_repo_url: https://github.com/morganmcg1/tandemfoil2.git   # problem-package repo: agent commits/PRs target this
+target_working_branch: kagent_royal_rumble                       # integration branch inside the problem-package repo
 image: ghcr.io/wandb/senpai:latest
 pvc_claim_name: new-pvc
 pvc_mount_path: /mnt/new-pvc
@@ -126,10 +125,10 @@ and push the key to the k8s secrets.
 ## Running
 
 ```bash
-# Initialize the submodule once after cloning senpai
-git submodule update --init --recursive
+# Clone the active problem-package repo into target/ (one-time, for local dev)
+git clone -b kagent_royal_rumble https://github.com/morganmcg1/tandemfoil2.git target/tandemfoil2
 
-# Train locally (inside the active problem submodule)
+# Train locally (inside the active problem package)
 cd target/tandemfoil2 && python train.py --wandb_name "<name>/<description>"
 
 # Deploy to k8s (reads defaults from senpai.yaml, only --tag is required)
@@ -153,12 +152,16 @@ python k8s/launch.py --tag <research-tag> --advisor --extra_instructions "Only c
    - `program.md` — research context, metrics, constraints, file-edit boundaries
    - `instructions/prompt-advisor.md`, `instructions/prompt-student.md`
    - a working branch (e.g. `main` or `royal_rumble`) that advisors merge into
-2. Attach it to senpai as a submodule and point the config at it:
+2. Point senpai's config at it — the pod entrypoint will clone it for you:
    ```bash
-   git submodule add -b <branch> https://github.com/myorg/my_problem.git target/my_problem
-   # edit senpai.yaml: problem=target/my_problem, target_repo_url=<url>, target_working_branch=<branch>, advisor_branch=<branch>
-   git add senpai.yaml .gitmodules target/my_problem && git commit -m "Attach my_problem submodule"
+   # edit senpai.yaml:
+   #   problem: target/my_problem
+   #   target_repo_url: https://github.com/myorg/my_problem.git
+   #   target_working_branch: <branch>
+   #   advisor_branch: <branch>
+   git add senpai.yaml && git commit -m "Point senpai at my_problem"
    ```
+   Or pass on the CLI: `--problem target/my_problem --target_repo_url ... --target_working_branch ... --advisor_branch ...`.
 3. Deploy as usual — `python k8s/launch.py --tag <tag> --advisor`. Agent commits/PRs will land in `myorg/my_problem`, not senpai.
 
 ## References

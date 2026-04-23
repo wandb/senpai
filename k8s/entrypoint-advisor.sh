@@ -19,8 +19,11 @@ echo "Students:     $STUDENT_NAMES"
 # Senpai runner repo already cloned by the deployment args block.
 cd "$WORKDIR"
 
-# Pull the problem-package submodule.
-git submodule update --init --recursive
+# Clone the problem-package repo into $PROBLEM_DIR (bring-your-own-repo model —
+# agent commits/PRs live in $TARGET_REPO_URL, not wandb/senpai).
+if [ ! -d "$PROBLEM_DIR/.git" ]; then
+    git clone --branch "$TARGET_WORKING_BRANCH" "$TARGET_REPO_URL" "$PROBLEM_DIR"
+fi
 
 uv pip install --system -e .
 
@@ -40,17 +43,17 @@ source "$WORKDIR/k8s/install-weave-cc-plugin.sh"
 SENPAI_PLUGIN="$WORKDIR/plugins/senpai"
 source "$SENPAI_PLUGIN/scripts/senpai-gh.sh"
 
-# Gh helpers target the submodule repo, not senpai. Pre-seed the slug cache.
+# Gh helpers target the problem-package repo, not senpai. Pre-seed the slug cache.
 export _SENPAI_REPO="$TARGET_REPO"
 
-# From here on, all git/gh ops happen inside the submodule working tree.
+# From here on, all git/gh ops happen inside the problem-package working tree.
 cd "$WORKDIR/$PROBLEM_DIR"
 
 git config user.name "senpai-advisor"
 git config user.email "senpai-advisor@senpai"
 git remote set-url origin "$TARGET_REPO_URL"
 
-# --- Ensure the advisor integration branch exists in the submodule repo ---
+# --- Ensure the advisor integration branch exists in the problem-package repo ---
 git fetch origin
 if git rev-parse --verify "origin/$ADVISOR_BRANCH" >/dev/null 2>&1; then
     git checkout "$ADVISOR_BRANCH"
@@ -94,7 +97,7 @@ while true; do
     echo "=== Advisor Heartbeat iteration $ITERATION ($(date)) ==="
 
     cd "$WORKDIR/$PROBLEM_DIR"
-    echo "=== Submodule HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) in $PROBLEM_DIR ==="
+    echo "=== Problem-package HEAD: $(git rev-parse --short HEAD) on $(git branch --show-current) in $PROBLEM_DIR ==="
 
     envsubst '$PROBLEM_DIR' < "$WORKDIR/system_instructions/CLAUDE-ADVISOR.md" | sed '/^<!--$/,/^-->$/d' > "$WORKDIR/CLAUDE.md"
 

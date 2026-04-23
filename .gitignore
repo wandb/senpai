@@ -47,3 +47,7 @@ results.tsv
 experiment_log/
 advisor_logs/
 student_logs/
+
+# Problem packages (brought by the user — cloned in at pod startup)
+target/*
+!target/README.md

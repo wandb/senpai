@@ -1,14 +1,15 @@
 # senpai project configuration
 # All fields can be overridden via CLI: python k8s/launch.py --tag <tag> [--field value]
 
-# active problem directory (repo-relative path — points at a submodule under target/)
+# active problem directory (repo-relative path under target/)
+# The entrypoint clones target_repo_url into this path at pod startup.
 problem: target/tandemfoil2
 
 # git (senpai itself)
 repo_url: https://github.com/wandb/senpai.git
 repo_branch: main
 
-# target submodule (agent commits/PRs land here, not in senpai)
+# problem-package repo (agent commits/PRs land here, not in senpai)
 target_repo_url: https://github.com/morganmcg1/tandemfoil2.git
 target_working_branch: kagent_royal_rumble
 
@@ -23,7 +24,7 @@ pvc_mount_path: /mnt/new-pvc
 wandb_entity: wandb-applied-ai-team
 wandb_project: senpai-v1
 
-# advisor — the integration branch inside the target submodule that advisor PRs merge into
+# advisor — the integration branch inside the problem-package repo that advisor PRs merge into
 advisor_branch: kagent_royal_rumble
 
 # training limits

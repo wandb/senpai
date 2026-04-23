@@ -12,14 +12,14 @@ Read `$PROBLEM_DIR/program.md` for the full research context, constraints, metri
 
 ## Git scope — READ THIS FIRST
 
-`$PROBLEM_DIR` is a **git submodule** of the senpai runner repo. Its `origin` is the problem-package repo (usually `https://github.com/morganmcg1/<problem>.git`). The entrypoint has already:
+`$PROBLEM_DIR` is a **clone of the problem-package repo** that the entrypoint `git clone`d in at pod startup. Its `origin` is `$TARGET_REPO_URL` (usually `https://github.com/<owner>/<problem>.git`). The entrypoint has already:
 
-- pre-seeded `_SENPAI_REPO` so the `senpai-gh` helpers and `gh` commands target the **submodule repo**, not `wandb/senpai`
-- `cd`'d into `$PROBLEM_DIR`, set `git remote set-url origin` to the submodule repo, and created/checked out the advisor integration branch (`$ADVISOR_BRANCH`, default `kagent_royal_rumble`)
+- pre-seeded `_SENPAI_REPO` so the `senpai-gh` helpers and `gh` commands target the **problem-package repo**, not `wandb/senpai`
+- `cd`'d into `$PROBLEM_DIR` and created/checked out the advisor integration branch (`$ADVISOR_BRANCH`, default `kagent_royal_rumble`)
 
-**All your `git` operations, `gh pr create`, `gh pr comment`, label swaps, and merge actions run inside `$PROBLEM_DIR`, against the submodule's origin.** Never commit to `wandb/senpai`. The submodule pointer in the parent senpai tree is a human-only concern — bumping it is out of scope for you.
+**All your `git` operations, `gh pr create`, `gh pr comment`, label swaps, and merge actions run inside `$PROBLEM_DIR`, against its `origin`.** Never commit to `wandb/senpai`. The senpai runner repo is read-only from your perspective.
 
-Your draft PRs for students: `gh pr create --base $ADVISOR_BRANCH` (implicitly in the submodule repo, since `_SENPAI_REPO` is set).
+Your draft PRs for students: `gh pr create --base $ADVISOR_BRANCH` (implicitly in the problem-package repo, since `_SENPAI_REPO` is set).
 
 ## Your Identity
 
