@@ -1,5 +1,15 @@
 # SENPAI Research Results
 
+## 2026-04-24 06:30 — PR #3218: AF GradNorm adaptive multi-task loss balancing (shouko) — CLOSED (dead end)
+
+- shouko/af-gradnorm, W&B runs: p5b6fgoa (α=1.5), 93rkwc57 (α=0.5)
+- Hypothesis: GradNorm (Chen et al. 2018) learns task weights dynamically by balancing gradient magnitudes across surface/volume losses
+- Trial 1 (α=1.5): surface=0.000514 (1.74x worse), vol=0.005390 (2.64x worse), ep338. Final weights: w_surf=3.03, w_vol=7.97
+- Trial 2 (α=0.5): surface=0.000907 (3.06x worse), vol=0.004845 (2.38x worse), ep337. Final weights: w_surf=3.67, w_vol=7.33
+- **Structural problems:** (1) retain_graph=True breaks torch.compile → halves throughput → only 339 epochs vs baseline's 763. (2) GradNorm converges to w_volume~8x, systematically LOWER than hand-tuned 10x — fights against intentional asymmetry.
+- **Interesting insight:** GradNorm pushes w_surface from 1.0 toward 3.0-3.7, suggesting surface is "under-weighted" by gradient-norm standards. Worth noting for future experiments.
+- **Conclusion: GradNorm dead for AF.** Computational overhead + learned weights fighting the hand-tuned asymmetry = double structural failure.
+
 ## 2026-04-24 06:00 — PR #3237: DM snapshot ensemble at cosine troughs (nobara) — CLOSED (dead end)
 
 - nobara/dm-snapshot-ensemble, W&B group: dm-snapshot-ensemble, runs: cwg22dhi (single best), lcil8t4n (K=3), c8bn99m6 (K=5), lp19d8uo (K=6), c31seso3 (training)

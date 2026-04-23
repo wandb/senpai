@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 06:00 (advisor cycle 66)
+- **Date:** 2026-04-24 06:30 (advisor cycle 67)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -33,6 +33,7 @@
 - `#3209` sanji: TFP cp_panel bug fix + multi-seed retest — STABILIZATION PRIORITY
 - `#3244` faye: DM Track 1 paper-facing full eval (champion config, NO --max-eval-batches) — PAPER-FACING Track 1
 - `#3160` griffith: 16H heads
+- `#3249` shouko: decaying weight decay schedule (WD=1e-4/5e-5 → 0 over 300ep) — INNOVATION
 - `#3248` nobara: decaying peak LR at cosine restarts (SGDR eta_mult) — INNOVATION
 - `#3152` eren: EMA decay sweep (0.999 vs 0.9995)
 - `#3146` taki: top-5 checkpoint averaging
@@ -86,7 +87,6 @@
 - `#3226` chihiro: volume weight curriculum (20x→10x) — AF VOLUME FOCUS
 - `#3223` norman: volume smoothness regularization — AF VOLUME FOCUS
 - `#3238` rei: WD=0 ablation on vol-10x+EMA champion — AF VOLUME FOCUS
-- `#3218` shouko: GradNorm adaptive multi-task loss balancing — AF VOLUME FOCUS
 - `#3245` tanjiro: per-channel volume loss weighting (upweight nut×4, p×2) — AF VOLUME FOCUS
 - `#3211` spike: AF vol_loss_scale learnable scalar (noam port) — AF VOLUME FOCUS
 - `#3240` gilbert: joint checkpoint selection + vol-weight 11x/12x/13x fine sweep — AF VOLUME FOCUS
@@ -222,6 +222,7 @@
 **AirfRANS:**
 - asinh-pressure: DEFINITIVELY DEAD — 5 independent confirmations (#3191 T1/T2, #3177 T1/T2/T3). sinh() denormalization exponentially amplifies pressure errors. Non-pressure channels fine. Incompatible with AF pressure distribution.
 - PCGrad gradient surgery: 5-6x worse on both metrics (#3212). retain_graph=True disables torch.compile (40% throughput loss). Gradient conflict is NOT the bottleneck.
+- GradNorm adaptive loss balancing: surface 1.74x worse, vol 2.64x worse (#3218). retain_graph=True breaks compile (halves throughput). GradNorm converges to w_vol~8x, LOWER than hand-tuned 10x — fights intentional asymmetry
 - Proximity-weighted volume loss: 118-2516% worse (#3222). Extreme weight ratios starve far-field gradients while overdriving near-surface. Structural failure at scale=0.1/eps=0.01
 - Huber loss on volume channel: no improvement over MSE on either metric (#3215). AF volume residuals are well-behaved, not heavy-tailed — Huber δ threshold adds no benefit
 - 3L depth (with or without EMA): catastrophic divergence confirmed twice
