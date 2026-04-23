@@ -564,12 +564,16 @@ def resolve_num_workers(config: TrainConfig, dataset_name: str) -> int:
 
 
 def autocast_context(device: torch.device, amp_mode: str):
-    if amp_mode != "bf16" or device.type != "cuda":
+    if device.type != "cuda":
         return nullcontext()
-    supports_bf16 = getattr(torch.cuda, "is_bf16_supported", lambda: True)
-    if not supports_bf16():
-        return nullcontext()
-    return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    if amp_mode == "bf16":
+        supports_bf16 = getattr(torch.cuda, "is_bf16_supported", lambda: True)
+        if not supports_bf16():
+            return nullcontext()
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    if amp_mode == "fp16":
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return nullcontext()
 
 
 def float_outputs(outputs: dict[str, torch.Tensor | None]) -> dict[str, torch.Tensor | None]:
@@ -1266,6 +1270,7 @@ def train_one_epoch(
     max_batches: int = 0,
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
+    grad_scaler: torch.amp.GradScaler | None = None,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1324,7 +1329,11 @@ def train_one_epoch(
                         loss, _ = loss_grouped(batch, outputs, transform)
 
             accum_loss += float(loss.detach().cpu().item())
-            (loss / grad_accum_steps).backward()
+            scaled_loss = loss / grad_accum_steps
+            if grad_scaler is not None:
+                grad_scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
             micro_count += 1
 
         if micro_count == 0:
@@ -1333,14 +1342,25 @@ def train_one_epoch(
         all_params = list(model.parameters())
         if anp_head is not None:
             all_params += list(anp_head.parameters())
+        if grad_scaler is not None:
+            grad_scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=grad_clip if grad_clip > 0 else float("inf"))
         running.setdefault("grad_norm_mean", 0.0)
         running["grad_norm_mean"] += float(grad_norm)
         if grad_clip > 0 and float(grad_norm) > grad_clip:
             running.setdefault("grad_clip_events", 0.0)
             running["grad_clip_events"] += 1.0
-        optimizer.step()
-        if scheduler is not None:
+        if grad_scaler is not None:
+            old_scale = grad_scaler.get_scale()
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
+            new_scale = grad_scaler.get_scale()
+            running["grad_scaler_scale"] = new_scale
+            scaler_skipped = new_scale < old_scale
+        else:
+            optimizer.step()
+            scaler_skipped = False
+        if scheduler is not None and not scaler_skipped:
             scheduler.step()
         if ema is not None:
             ema.update(model)
@@ -1629,6 +1649,7 @@ def main() -> None:
 
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
+    grad_scaler = torch.amp.GradScaler() if config.amp_mode == "fp16" and device.type == "cuda" else None
     history: list[dict[str, float]] = []
     best_epoch: int | None = None
     best_val_primary_metric_name = primary_metric_key(bundle, phase="val")
@@ -1671,6 +1692,7 @@ def main() -> None:
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
+            grad_scaler=grad_scaler,
         )
 
         if ema is not None:
