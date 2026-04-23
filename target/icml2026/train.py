@@ -167,6 +167,7 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
+    aux_gradient_weight: float = 0.0
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -821,6 +822,80 @@ def loss_abupt(
     return total, metrics
 
 
+class AuxGradientHead(torch.nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int = 256, output_dim: int = 3):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, output_dim),
+        )
+        torch.nn.init.zeros_(self.net[-1].weight)
+        torch.nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+@torch.no_grad()
+def compute_ground_truth_gradients(
+    positions: torch.Tensor,
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    k: int = 16,
+) -> torch.Tensor:
+    B, N, C = values.shape
+    device = values.device
+    positions = positions.float()
+    values = values.float()
+    gradients = torch.zeros(B, N, 3 * C, device=device)
+
+    for b in range(B):
+        valid = mask[b]
+        pos = positions[b]
+        val = values[b]
+        valid_idx = valid.nonzero(as_tuple=True)[0]
+        n_valid = valid_idx.shape[0]
+        if n_valid < k + 1:
+            continue
+        valid_pos = pos[valid_idx]
+        valid_val = val[valid_idx]
+
+        chunk_size = 2048
+        for start in range(0, n_valid, chunk_size):
+            end = min(start + chunk_size, n_valid)
+            cs = end - start
+            chunk_pos = valid_pos[start:end]
+            chunk_val = valid_val[start:end]
+
+            dists = torch.cdist(chunk_pos, valid_pos)
+            dists[torch.arange(cs, device=device), torch.arange(start, end, device=device)] = float("inf")
+
+            _, nn_idx = dists.topk(k, dim=1, largest=False)
+
+            neighbor_pos = valid_pos[nn_idx]
+            neighbor_val = valid_val[nn_idx]
+
+            delta_pos = neighbor_pos - chunk_pos.unsqueeze(1)
+            delta_val = neighbor_val - chunk_val.unsqueeze(1)
+
+            dist_sq = (delta_pos**2).sum(dim=-1).clamp(min=1e-10)
+            inv_dist = 1.0 / dist_sq.sqrt().clamp(min=1e-8)
+
+            numerator = torch.einsum("bkc,bkd,bk->bcd", delta_val, delta_pos, 1.0 / dist_sq)
+            denom = inv_dist.sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1e-10)
+            grad = numerator / denom
+
+            gradients[b, valid_idx[start:end]] = grad.reshape(cs, 3 * C)
+
+    grad_nonzero = gradients[gradients != 0]
+    if grad_nonzero.numel() > 0:
+        grad_std = grad_nonzero.std().clamp(min=1e-8)
+        gradients = gradients.clamp(-5 * grad_std, 5 * grad_std)
+
+    return gradients
+
+
 def maybe_apply_anp(
     outputs: dict[str, torch.Tensor | None],
     prepared: TandemPreparedBatch,
@@ -854,10 +929,13 @@ def evaluate_grouped(
     *,
     amp_mode: str = "none",
     max_batches: int = 0,
+    aux_grad_head: torch.nn.Module | None = None,
 ) -> dict[str, float]:
     model.eval()
     if anp_head is not None:
         anp_head.eval()
+    if aux_grad_head is not None:
+        aux_grad_head.eval()
 
     dataset_name: str | None = None
     total_surface = 0.0
@@ -878,6 +956,8 @@ def evaluate_grouped(
     paper_volume_nodes = 0
     drivaer_surface_case_sums: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     drivaer_volume_case_sums: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    aux_grad_loss_sum = 0.0
+    aux_grad_loss_count = 0
 
     batches = loader if max_batches <= 0 else itertools.islice(loader, max_batches)
     for batch in batches:
@@ -1018,6 +1098,13 @@ def evaluate_grouped(
                     target=batch.volume_y,
                     mask=batch.volume_mask,
                 )
+            if aux_grad_head is not None and outputs.get("surface_hidden") is not None and batch.surface_y is not None:
+                _target_vals = transform.apply(batch.surface_y) if isinstance(transform, TargetTransform) else batch.surface_y
+                _gt_grads = compute_ground_truth_gradients(batch.surface_x[:, :, :3], _target_vals, batch.surface_mask)
+                _pred_grads = aux_grad_head(outputs["surface_hidden"])
+                _aux_l = F.mse_loss(_pred_grads[batch.surface_mask], _gt_grads[batch.surface_mask])
+                aux_grad_loss_sum += float(_aux_l.cpu().item())
+                aux_grad_loss_count += 1
             continue
 
         if pred_surface is not None:
@@ -1056,6 +1143,8 @@ def evaluate_grouped(
         if volume_rel_l2 is not None:
             metrics["volume_rel_l2"] = volume_rel_l2
             metrics["volume_rel_l2_pct"] = volume_rel_l2 * 100.0
+        if aux_grad_loss_count > 0:
+            metrics["aux_gradient_loss"] = aux_grad_loss_sum / aux_grad_loss_count
         return metrics
     if dataset_name == "tandemfoilset_paper":
         metrics: dict[str, float] = {}
@@ -1271,10 +1360,15 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    aux_grad_head: torch.nn.Module | None = None,
+    aux_grad_ema: EMAWithWarmup | None = None,
+    aux_gradient_weight: float = 0.0,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
         anp_head.train()
+    if aux_grad_head is not None:
+        aux_grad_head.train()
     running = {"loss": 0.0}
     steps = 0
     micro_batches_total = 0
@@ -1327,6 +1421,15 @@ def train_one_epoch(
                             volume_mask=batch.volume_mask,
                         )
                         loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                        if aux_grad_head is not None and aux_gradient_weight > 0 and outputs.get("surface_hidden") is not None:
+                            positions = batch.surface_x[:, :, :3]
+                            target_vals = transform.apply(batch.surface_y)
+                            gt_grads = compute_ground_truth_gradients(positions, target_vals, batch.surface_mask)
+                            pred_grads = aux_grad_head(outputs["surface_hidden"])
+                            aux_loss = F.mse_loss(pred_grads[batch.surface_mask], gt_grads[batch.surface_mask].to(pred_grads.dtype))
+                            loss = loss + aux_gradient_weight * aux_loss
+                            running.setdefault("aux_gradient_loss", 0.0)
+                            running["aux_gradient_loss"] += float(aux_loss.detach().cpu().item())
 
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
@@ -1338,6 +1441,8 @@ def train_one_epoch(
         all_params = list(model.parameters())
         if anp_head is not None:
             all_params += list(anp_head.parameters())
+        if aux_grad_head is not None:
+            all_params += list(aux_grad_head.parameters())
         grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=grad_clip if grad_clip > 0 else float("inf"))
         running.setdefault("grad_norm_mean", 0.0)
         running["grad_norm_mean"] += float(grad_norm)
@@ -1352,6 +1457,8 @@ def train_one_epoch(
             running["ema_decay_actual"] = min(ema.decay, (1 + ema.step_counter) / (10 + ema.step_counter))
         if anp_head is not None and anp_ema is not None:
             anp_ema.update(anp_head)
+        if aux_grad_head is not None and aux_grad_ema is not None:
+            aux_grad_ema.update(aux_grad_head)
         running["loss"] += accum_loss / micro_count
         micro_batches_total += micro_count
         steps += 1
@@ -1359,6 +1466,8 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    if "aux_gradient_loss" in running:
+        running["aux_gradient_loss"] /= max(steps, 1)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1458,6 +1567,7 @@ def evaluate_phase_metrics(
     metric_transform: TargetTransform | None,
     device: torch.device,
     phase: str,
+    aux_grad_head: torch.nn.Module | None = None,
 ) -> dict[str, float]:
     metrics: dict[str, float] = {}
     for split_name, loader in loaders.items():
@@ -1481,6 +1591,7 @@ def evaluate_phase_metrics(
                 device,
                 amp_mode=config.amp_mode,
                 max_batches=config.max_eval_batches,
+                aux_grad_head=aux_grad_head,
             )
         metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
         if phase == "val" and split_name in LEGACY_VAL_ALIAS and "mae_surf_p" in split_metrics:
@@ -1623,9 +1734,20 @@ def main() -> None:
             output_dim=bundle.spec.surface_output_dim,
         ).to(device)
 
+    aux_grad_head = None
+    if config.aux_gradient_weight > 0:
+        n_hidden = getattr(model, "n_hidden", config.model_hidden_dim)
+        aux_grad_head = AuxGradientHead(
+            input_dim=n_hidden,
+            hidden_dim=256,
+            output_dim=3 * bundle.spec.surface_output_dim,
+        ).to(device)
+
     params = list(model.parameters())
     if anp_head is not None:
         params.extend(list(anp_head.parameters()))
+    if aux_grad_head is not None:
+        params.extend(list(aux_grad_head.parameters()))
     optimizer = build_optimizer(params, config)
     scheduler = None
     if config.cosine_t_max > 0:
@@ -1634,6 +1756,7 @@ def main() -> None:
 
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
+    aux_grad_ema = EMAWithWarmup(aux_grad_head, decay=config.ema_decay) if config.use_ema and aux_grad_head is not None else None
     history: list[dict[str, float]] = []
     best_epoch: int | None = None
     best_val_primary_metric_name = primary_metric_key(bundle, phase="val")
@@ -1641,17 +1764,7 @@ def main() -> None:
     best_val_metrics: dict[str, float] = {}
     best_model_state: dict[str, torch.Tensor] | None = None
     best_anp_state: dict[str, torch.Tensor] | None = None
-
-    if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
-    else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
-    best_val_metric = float("inf")
-    best_epoch = 0
-    best_model_state: dict[str, torch.Tensor] | None = None
-    best_anp_state: dict[str, torch.Tensor] | None = None
-    best_ema_shadow: dict[str, torch.Tensor] | None = None
-    best_anp_ema_shadow: dict[str, torch.Tensor] | None = None
+    best_aux_grad_state: dict[str, torch.Tensor] | None = None
 
     run = None
     if config.wandb_name:
@@ -1688,6 +1801,9 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            aux_grad_head=aux_grad_head,
+            aux_grad_ema=aux_grad_ema,
+            aux_gradient_weight=config.aux_gradient_weight,
         )
 
         if ema is not None:
@@ -1696,6 +1812,9 @@ def main() -> None:
         if anp_head is not None and anp_ema is not None:
             anp_ema.store(anp_head)
             anp_ema.copy_to(anp_head)
+        if aux_grad_head is not None and aux_grad_ema is not None:
+            aux_grad_ema.store(aux_grad_head)
+            aux_grad_ema.copy_to(aux_grad_head)
 
         eval_metrics = evaluate_phase_metrics(
             bundle=bundle,
@@ -1707,6 +1826,7 @@ def main() -> None:
             metric_transform=metric_transform,
             device=device,
             phase="val",
+            aux_grad_head=aux_grad_head,
         )
 
         current_primary_metric = eval_metrics.get(best_val_primary_metric_name)
@@ -1718,33 +1838,24 @@ def main() -> None:
             best_val_metrics = dict(eval_metrics)
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
-
-        current_val = eval_metrics.get(primary_metric_key)
-        if current_val is not None and current_val < best_val_metric:
-            best_val_metric = current_val
-            best_epoch = epoch
-            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            if anp_head is not None:
-                best_anp_state = {k: v.cpu().clone() for k, v in anp_head.state_dict().items()}
-            if ema is not None:
-                best_ema_shadow = {k: v.cpu().clone() for k, v in ema.shadow.items()}
-            if anp_ema is not None:
-                best_anp_ema_shadow = {k: v.cpu().clone() for k, v in anp_ema.shadow.items()}
+            best_aux_grad_state = snapshot_module_state(aux_grad_head)
 
         if ema is not None:
             ema.restore(model)
         if anp_head is not None and anp_ema is not None:
             anp_ema.restore(anp_head)
+        if aux_grad_head is not None and aux_grad_ema is not None:
+            aux_grad_ema.restore(aux_grad_head)
 
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
-        epoch_metrics["best_val_metric"] = best_val_metric
+        epoch_metrics["best_val_primary_metric"] = best_val_primary_metric
         epoch_metrics["best_epoch"] = float(best_epoch)
         history.append(epoch_metrics)
         if run is not None:
             wandb.log(epoch_metrics, step=epoch)
             run.summary["epoch"] = epoch
             run.summary["best_epoch"] = best_epoch
-            run.summary["best_val_metric"] = best_val_metric
+            run.summary["best_val_primary_metric"] = best_val_primary_metric
         print(json.dumps(epoch_metrics, sort_keys=True), flush=True)
 
     if best_epoch is not None:
@@ -1765,6 +1876,7 @@ def main() -> None:
     best_test_metrics: dict[str, float] = {}
     terminal_model_state: dict[str, torch.Tensor] | None = None
     terminal_anp_state: dict[str, torch.Tensor] | None = None
+    terminal_aux_grad_state: dict[str, torch.Tensor] | None = None
     if test_loaders:
         if ema is not None:
             ema.store(model)
@@ -1772,6 +1884,9 @@ def main() -> None:
         if anp_head is not None and anp_ema is not None:
             anp_ema.store(anp_head)
             anp_ema.copy_to(anp_head)
+        if aux_grad_head is not None and aux_grad_ema is not None:
+            aux_grad_ema.store(aux_grad_head)
+            aux_grad_ema.copy_to(aux_grad_head)
 
         final_test_metrics = evaluate_phase_metrics(
             bundle=bundle,
@@ -1783,24 +1898,29 @@ def main() -> None:
             metric_transform=metric_transform,
             device=device,
             phase="test",
+            aux_grad_head=aux_grad_head,
         )
 
         if ema is not None:
             ema.restore(model)
         if anp_head is not None and anp_ema is not None:
             anp_ema.restore(anp_head)
+        if aux_grad_head is not None and aux_grad_ema is not None:
+            aux_grad_ema.restore(aux_grad_head)
         terminal_model_state = snapshot_module_state(model)
         terminal_anp_state = snapshot_module_state(anp_head)
+        terminal_aux_grad_state = snapshot_module_state(aux_grad_head)
         if run is not None:
             wandb.log(final_test_metrics, step=int(history[-1]["epoch"]) if history else 0)
             run.summary.update(final_test_metrics)
             run.summary["best_epoch"] = best_epoch
-            run.summary["best_val_metric"] = best_val_metric
-        print(json.dumps({"final_test_metrics": final_test_metrics, "best_epoch": best_epoch, "best_val_metric": best_val_metric}, sort_keys=True), flush=True)
+            run.summary["best_val_primary_metric"] = best_val_primary_metric
+        print(json.dumps({"final_test_metrics": final_test_metrics, "best_epoch": best_epoch, "best_val_primary_metric": best_val_primary_metric}, sort_keys=True), flush=True)
 
         if best_model_state is not None:
             restore_module_state(model, best_model_state)
             restore_module_state(anp_head, best_anp_state)
+            restore_module_state(aux_grad_head, best_aux_grad_state)
             best_test_metrics = evaluate_phase_metrics(
                 bundle=bundle,
                 config=config,
@@ -1811,6 +1931,7 @@ def main() -> None:
                 metric_transform=metric_transform,
                 device=device,
                 phase="test",
+                aux_grad_head=aux_grad_head,
             )
             if run is not None:
                 best_checkpoint_metrics: dict[str, float | int | str] = {
@@ -1841,6 +1962,7 @@ def main() -> None:
             )
             restore_module_state(model, terminal_model_state)
             restore_module_state(anp_head, terminal_anp_state)
+            restore_module_state(aux_grad_head, terminal_aux_grad_state)
 
     output_dir = Path(config.output_dir)
     write_run_summary(
