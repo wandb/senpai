@@ -1,5 +1,9 @@
 # SENPAI Research Results
 
+## 2026-04-23 23:15 — PR #3213: DM surface normal input features (brook) — CLOSED (already implemented)
+
+- No trials ran. Brook discovered surface normals are ALREADY present in DrivAerML input tensor (columns 3-5 of SURFACE_X_DIM=7, loaded from surface_normals.npy in prepare_drivaerml.py). The champion already has full access to normals. Hypothesis moot. Pivot: Fourier encoding of normals (currently only xyz cols 0-2 get Fourier features, not normals) — reassigning brook to this follow-up.
+
 ## 2026-04-23 23:00 — PR #3208: TFP seed stability diagnostic — strip physics flags (brook) — CLOSED (diagnostic complete)
 
 - All 3 trials STABLE at seed=42 with no physics flags. Lion lr=1.25e-4: val=0.04931, test=0.04134 (W&B: confirmed). Lion lr=6.25e-5: val=0.04920, test=0.04302. AdamW lr=1e-4: val=0.08036, test=0.06962. Zero NaN/Inf at any point. **Definitive proof: physics transforms (asinh/sinh pressure) cause TFP instability, not seed sensitivity.** Stable floor ~0.047-0.049 across seeds and optimizers. Path forward: fix pressure transforms (sanji #3209), then reintroduce one at a time.
