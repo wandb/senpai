@@ -31,8 +31,8 @@
 - `#3161` spike: eta_min=1e-5 (cosine floor)
 - `#3160` griffith: 16H heads
 - `#3155` nobara: longer T_max (45/60)
-- `#NEW` historia: DM true monotonic cosine (T_max=393606) — corrected retest
-- `#NEW` jet: DM 600 batches + gc=0.5 + EMA (stabilized retest)
+- `#3207` historia: DM true monotonic cosine (T_max=393606) — corrected retest
+- `#3206` jet: DM 600 batches + gc=0.5 + EMA (stabilized retest)
 - `#3152` eren: EMA decay sweep (0.999 vs 0.9995)
 - `#3146` taki: top-5 checkpoint averaging
 - `#3143` thorfinn: Lookahead(AdamW)
@@ -57,8 +57,8 @@
 
 ### TandemFoil Paper WIP (11 PRs) — STABILIZATION CRISIS
 **Stabilization diagnostic (HIGHEST PRIORITY — baseline unreproducible):**
-- `#NEW` jin: TFP seed sensitivity (seed=0 verify, seed=42 + gc/warmup/asinh probes)
-- `#NEW` brook: TFP pressure stabilization (base config, lower LR, AdamW vs Lion)
+- `#3205` jin: TFP seed sensitivity (seed=0 verify, seed=42 + gc/warmup/asinh probes)
+- `#3208` brook: TFP pressure stabilization (base config, lower LR, AdamW vs Lion)
 
 **Noam-pivot experiments:**
 - `#3183` rei: ANP+T_max=150 — NOAM ABLATION
