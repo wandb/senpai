@@ -12,7 +12,7 @@
 **Innovation track (new physics-aware/ML ideas per directive):**
 - `#3224` fern: spectral normalization on attention layers — INNOVATION
 - `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
-- canute: self-distillation with EMA teacher — INNOVATION (PR pending)
+- `#3225` canute: self-distillation with EMA teacher — INNOVATION
 - `#3214` kakashi: auxiliary gradient prediction (∂p/∂x,y,z) — INNOVATION
 - `#3217` brook: Fourier encoding of surface normals — INNOVATION
 - `#3203` vegeta: attention temperature annealing — INNOVATION
@@ -21,10 +21,10 @@
 
 **Noam-pivot experiments:**
 - `#3199` megumi: EMA=0.9999/0.99995 (noam optimal decay) — NOAM ABLATION
-- casca: → AF focal-MSE volume loss (PR pending)
+- `#3227` casca: → AF focal-MSE volume loss
 - `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
 - `#3194` bulma: higher LR sweep (5.5e-4/6e-4)
-- chihiro: → AF vol-weight curriculum (PR pending)
+- `#3226` chihiro: → AF vol-weight curriculum
 - `#3181` himmel: asinh+residual on champion — NOAM ABLATION
 - `#3219` hinata: SAM optimizer (flat-basin restart robustness) — INNOVATION
 
