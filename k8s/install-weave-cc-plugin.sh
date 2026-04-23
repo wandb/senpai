@@ -20,3 +20,8 @@ git config --global url."https://${GITHUB_TOKEN}@github.com/".insteadOf "git@git
 
 WEAVE_PROJECT="${WANDB_ENTITY}/${WANDB_PROJECT}" \
     weave-claude-plugin install --non-interactive
+
+# `--non-interactive` reads WEAVE_PROJECT from the env for the install flow
+# itself but does NOT persist it into settings.json (weave_project stays null),
+# so the daemon won't actually start tracing. Write it explicitly.
+weave-claude-plugin config set weave_project "${WANDB_ENTITY}/${WANDB_PROJECT}"
