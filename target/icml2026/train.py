@@ -106,6 +106,7 @@ class TrainConfig:
     model_mlp_ratio: int = 4
     model_slices: int = 96
     model_dropout: float = 0.0
+    attn_dropout: float = 0.0
     drivaerml_train_surface_points: int = 0
     drivaerml_eval_surface_points: int = 0
     drivaerml_train_volume_points: int = 0
@@ -502,7 +503,7 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
     transolver_kwargs = {
         "n_layers": config.model_layers,
         "n_hidden": config.model_hidden_dim,
-        "dropout": config.model_dropout,
+        "dropout": config.attn_dropout if config.attn_dropout > 0 else config.model_dropout,
         "n_head": config.model_heads,
         "mlp_ratio": config.model_mlp_ratio,
         "slice_num": config.model_slices,
@@ -1631,16 +1632,13 @@ def main() -> None:
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
     history: list[dict[str, float]] = []
     best_epoch: int | None = None
-    best_val_primary_metric_name = primary_metric_key(bundle, phase="val")
-    best_val_primary_metric: float | None = None
-    best_val_metrics: dict[str, float] = {}
-    best_model_state: dict[str, torch.Tensor] | None = None
-    best_anp_state: dict[str, torch.Tensor] | None = None
-
     if bundle.spec.name == "tandemfoilset":
         primary_metric_key = "val_primary/surface_pressure_mae"
     else:
         primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
+    best_val_primary_metric_name = primary_metric_key
+    best_val_primary_metric: float | None = None
+    best_val_metrics: dict[str, float] = {}
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
