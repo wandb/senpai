@@ -281,6 +281,8 @@ class DrivAerMLCaseDataset(Dataset):
         manifest_path: str | Path = DEFAULT_DRIVAERML_MANIFEST,
         root: str | Path | None = None,
         enable_fourier: bool = False,
+        fourier_encode_normals: bool = False,
+        fourier_normals_half_bands: bool = False,
         surface_only: bool = True,
         max_surface_points: int = 0,
         max_volume_points: int = 0,
@@ -297,6 +299,8 @@ class DrivAerMLCaseDataset(Dataset):
             enable_cp_panel=False,
             enable_wake_deficit=False,
             enable_wake_angle=False,
+            fourier_encode_normals=fourier_encode_normals,
+            fourier_normals_half_bands=fourier_normals_half_bands,
         )
         self.views = self._build_views()
 
@@ -789,6 +793,8 @@ def build_drivaerml_bundle(
     root: str | Path | None = None,
     surface_only: bool = True,
     enable_fourier: bool = False,
+    fourier_encode_normals: bool = False,
+    fourier_normals_half_bands: bool = False,
     train_surface_points: int = 0,
     eval_surface_points: int = 0,
     train_volume_points: int = 0,
@@ -798,11 +804,12 @@ def build_drivaerml_bundle(
     _validate_drivaerml_manifest(manifest, manifest_path)
     train_sampling_mode = "train_random" if train_surface_points > 0 or train_volume_points > 0 else "full"
     eval_sampling_mode = "eval_chunk" if eval_surface_points > 0 or eval_volume_points > 0 else "full"
+    fourier_kwargs = dict(enable_fourier=enable_fourier, fourier_encode_normals=fourier_encode_normals, fourier_normals_half_bands=fourier_normals_half_bands)
     train_dataset = DrivAerMLCaseDataset(
         list(manifest["surface_splits"]["train"]),
         manifest_path=manifest_path,
         root=root,
-        enable_fourier=enable_fourier,
+        **fourier_kwargs,
         surface_only=surface_only,
         max_surface_points=train_surface_points,
         max_volume_points=train_volume_points,
@@ -812,7 +819,7 @@ def build_drivaerml_bundle(
         list(manifest["surface_splits"]["val"]),
         manifest_path=manifest_path,
         root=root,
-        enable_fourier=enable_fourier,
+        **fourier_kwargs,
         surface_only=surface_only,
         max_surface_points=eval_surface_points,
         max_volume_points=eval_volume_points,
@@ -822,7 +829,7 @@ def build_drivaerml_bundle(
         list(manifest["surface_splits"]["test"]),
         manifest_path=manifest_path,
         root=root,
-        enable_fourier=enable_fourier,
+        **fourier_kwargs,
         surface_only=surface_only,
         max_surface_points=eval_surface_points,
         max_volume_points=eval_volume_points,
@@ -838,6 +845,9 @@ def build_drivaerml_bundle(
     base_surface_dim = prepare_drivaerml.SURFACE_X_DIM
     base_volume_dim = 0 if surface_only else prepare_drivaerml.VOLUME_X_DIM
     fourier_extra = 24 if enable_fourier else 0
+    if enable_fourier and fourier_encode_normals:
+        n_normal_freqs = 2 if fourier_normals_half_bands else 4
+        fourier_extra += 3 * n_normal_freqs * 2
     return DatasetBundle(
         train_dataset=train_dataset,
         val_datasets={"val_surface": val_dataset},
@@ -884,6 +894,8 @@ def build_dataset_bundle(
     drivaerml_train_volume_points: int = 0,
     drivaerml_eval_volume_points: int = 0,
     enable_fourier: bool = False,
+    fourier_encode_normals: bool = False,
+    fourier_normals_half_bands: bool = False,
     enable_te_coord_frame: bool = False,
     enable_cp_panel: bool = False,
     enable_wake_deficit: bool = False,
@@ -927,6 +939,8 @@ def build_dataset_bundle(
             root=drivaerml_root,
             surface_only=drivaerml_surface_only,
             enable_fourier=enable_fourier,
+            fourier_encode_normals=fourier_encode_normals,
+            fourier_normals_half_bands=fourier_normals_half_bands,
             train_surface_points=drivaerml_train_surface_points,
             eval_surface_points=drivaerml_eval_surface_points,
             train_volume_points=drivaerml_train_volume_points,

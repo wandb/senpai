@@ -141,6 +141,8 @@ class TrainConfig:
     tandemfoil_paper_manifest: str = ""
     tandemfoil_paper_stats: str = ""
     enable_fourier: bool = False
+    fourier_encode_normals: bool = False
+    fourier_normals_half_bands: bool = False
     enable_te_coord_frame: bool = False
     enable_cp_panel: bool = False
     enable_cp_panel_tandem_only: bool = False
@@ -466,6 +468,8 @@ def build_bundle(config: TrainConfig) -> DatasetBundle:
         "drivaerml_train_volume_points": config.drivaerml_train_volume_points,
         "drivaerml_eval_volume_points": config.drivaerml_eval_volume_points,
         "enable_fourier": config.enable_fourier,
+        "fourier_encode_normals": config.fourier_encode_normals,
+        "fourier_normals_half_bands": config.fourier_normals_half_bands,
         "enable_te_coord_frame": config.enable_te_coord_frame,
         "enable_cp_panel": config.enable_cp_panel,
         "enable_wake_deficit": config.enable_wake_deficit,
@@ -1643,9 +1647,9 @@ def main() -> None:
     best_anp_state: dict[str, torch.Tensor] | None = None
 
     if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
+        _checkpoint_metric_key = "val_primary/surface_pressure_mae"
     else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
+        _checkpoint_metric_key = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1719,7 +1723,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(_checkpoint_metric_key)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch

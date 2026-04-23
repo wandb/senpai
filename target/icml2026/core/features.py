@@ -266,6 +266,8 @@ def augment_case_sample(
     enable_cp_panel: bool = False,
     enable_wake_deficit: bool = False,
     enable_wake_angle: bool = False,
+    fourier_encode_normals: bool = False,
+    fourier_normals_half_bands: bool = False,
 ) -> CaseSample:
     if sample.dataset_name == "tandemfoilset":
         return sample
@@ -277,6 +279,12 @@ def augment_case_sample(
     appended_full: list[torch.Tensor] = []
     if enable_fourier:
         full_x = append_fourier_features(full_x, sample.space_dim, fourier_freqs)
+    if enable_fourier and fourier_encode_normals and full_x.shape[1] >= 2 * sample.space_dim:
+        normal_freqs = fourier_freqs[:len(fourier_freqs) // 2] if fourier_normals_half_bands else fourier_freqs
+        normals = full_x[:, sample.space_dim:2 * sample.space_dim]
+        for freq in normal_freqs:
+            appended_full.append(torch.sin(normals * freq))
+            appended_full.append(torch.cos(normals * freq))
     if enable_cp_panel and sample.dataset_name == "airfrans":
         appended_full.append(_compute_airfrans_cp_panel(full_x))
     if enable_wake_deficit and sample.dataset_name.startswith("tandemfoilset"):
