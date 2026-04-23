@@ -22,8 +22,8 @@
 - `#3163` shouko: attn dropout=0.05
 - `#3161` spike: eta_min=1e-5 (cosine floor)
 - `#3160` griffith: 16H heads
-- `#NEW` franky: DM residual-prediction alone — BEING ASSIGNED
-- `#NEW` bulma: DM higher LR sweep (5.5e-4/6e-4) — BEING ASSIGNED
+- `#3193` franky: DM residual-prediction alone — NOAM ABLATION
+- `#3194` bulma: DM higher LR sweep (5.5e-4/6e-4)
 - `#3155` nobara: longer T_max (45/60)
 - `#3154` historia: monotonic cosine (no restarts)
 - `#3152` eren: EMA decay sweep (0.999 vs 0.9995)
