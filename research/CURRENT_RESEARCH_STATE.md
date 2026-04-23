@@ -1,78 +1,90 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-23 13:00 (advisor cycle 32 — closed #3131/#3124, assigning sanji/robin)
+- **Date:** 2026-04-23 18:00 (advisor cycle 39 — closed #3068/#3066/#3064, assigned brook/alphonse/casca)
 - **Branch:** radford
-- **Idle students:** 0 (sanji/robin being assigned)
+- **Idle students:** 0
 - **PRs ready for review:** 0
 
-## Fleet Status
+## Fleet Status (59 active PRs)
 
-### DrivAerML WIP (~36 students, ~60%)
-- `#3165` senku: EMA+gc+4H heads (128d/head)
+### DrivAerML WIP (30 PRs)
+**Noam-pivot experiments (highest priority):**
+- `#3192` casca: asinh-pressure alone (scale=0.75/0.5 sweep) — NOAM ABLATION
+- `#3188` chihiro: 2H/16H heads sweep on champion — NOAM ABLATION
+- `#3181` himmel: asinh+residual on champion — NOAM ABLATION
+- `#3175` hinata: full noam stack on champion — NOAM ABLATION
+
+**Pre-pivot champion tuning:**
+- `#3173` kakashi: shorter cosine T_max=15/20
+- `#3171` sanji: LR warmup (5-ep/10-ep) on champion
+- `#3165` senku: 4H heads (128d/head)
 - `#3164` faye: paper-facing full eval (two-phase) — PAPER-FACING
-- `#3163` shouko: EMA+gc+attn dropout=0.05
-- `#NEW` himmel: AGC (adaptive gradient clipping) on EMA champion — BEING ASSIGNED
-- `#3161` spike: EMA+gc+eta_min=1e-5 (cosine floor)
-- `#3160` griffith: EMA+gc+16H heads
-- `#3159` franky: EMA+gc+4L/640d (wider)
-- `#3158` bulma: EMA+gc+lr=4e-4
-- `#3155` nobara: EMA+gc+longer T_max (45/60)
-- `#3154` historia: EMA+gc+monotonic cosine (no restarts)
-- `#3153` emma: EMA+gc+light WD (1e-4/5e-4)
+- `#3163` shouko: attn dropout=0.05
+- `#3161` spike: eta_min=1e-5 (cosine floor)
+- `#3160` griffith: 16H heads
+- `#3159` franky: 4L/640d wider
+- `#3158` bulma: lr=4e-4
+- `#3155` nobara: longer T_max (45/60)
+- `#3154` historia: monotonic cosine (no restarts)
 - `#3152` eren: EMA decay sweep (0.999 vs 0.9995)
-- `#3149` fern: stochastic input feature dropout (p=0.05/0.10)
-- `#3147` norman: lighter WD+gc=1.0 (5e-4/1e-4)
 - `#3146` taki: top-5 checkpoint averaging
 - `#3143` thorfinn: Lookahead(AdamW)
-- `#3138` kakashi: 788 batches+T_max=60 (SENT BACK — add gc=0.5+EMA)
-- `#3137` chopper: 5-ep warmup+gc=1.0
 - `#3132` gohan: eta_min=5e-5+gc=1.0
-- `#NEW` sanji: warmup (5-ep/10-ep) + EMA+gc champion — BEING ASSIGNED
 - `#3121` levi: dropout regularization sweep
-- `#3118` hinata: WD alone at champion config
 - `#3115` piccolo: bs2+25k pts (SENT BACK — 50k+gc=0.5+EMA)
-- `#3110` einar: AdamW beta2=0.99/0.995
+- `#3110` einar: beta2=0.99/0.995
 - `#3109` guts: lr=4e-4 full-eval
 - `#3085` kohaku: larger supernodes (SENT BACK — retry+gc=1.0)
 - `#3083` jet: max-train-batches=600
 - `#3079` gojo: 4L/640d (SENT BACK — lr=3e-4+T_max=60+EMA)
 - `#3076` frieren: log-cosh loss (SENT BACK — retry+gc=1.0)
-- `#3068` brook: 64k surface points (SENT BACK — add max-eval-batches 200)
 - `#3067` askeladd: 32k surface points (SENT BACK — add max-eval-batches 200)
-- `#3066` alphonse: 16k surface points
-- `#3065` chihiro: multi-seed s456 (SENT BACK — two-phase eval)
-- `#3064` casca: multi-seed s123 (SENT BACK — two-phase eval)
 - `#3063` canute: paper-facing full-eval (SENT BACK — two-phase)
 - `#3046` sukuna: WD+gc compound (SENT BACK — WD=5e-4/1e-4+gc=1.0)
 
-### TandemFoil Paper WIP (~10 students, ~17%)
-- `#NEW` nami: attention heads sweep (4H/16H) — BEING ASSIGNED (moved from TFP)
-- `#3145` rei: gc=0.4 boundary test
+### TandemFoil WIP (6 PRs)
+**Noam-pivot experiments (highest priority):**
+- `#3189` emma: asinh+physics features (no ANP, no T_max) — NOAM ABLATION
+- `#3186` norman: T_max=150 alone (gc=0.3/0.5) — NOAM ABLATION
+- `#3185` fern: full noam stack (ANP+physics+T_max=150) — NOAM ABLATION
+- `#3180` chopper: ANP decoder alone — NOAM ABLATION
+
+**Other:**
+- `#3150` yuji: clean test row gc=0.3 champion — PAPER-FACING
+- `#3142` zenitsu: gc=0.3+longer budget (480-min)
+
+### TandemFoil Paper WIP (10 PRs)
+**Noam-pivot experiments (highest priority):**
+- `#3190` brook: physics features only (wake/vortex/Cp, no ANP) — NOAM ABLATION
+- `#3183` rei: ANP+T_max=150 — NOAM ABLATION
+- `#3179` usopp: T_max=150+wake+96sl+Lookahead — NOAM ABLATION
+- `#3176` mitsuha: full noam stack — NOAM ABLATION
+
+**Other:**
+- `#3168` jin: multi-seed paper-facing (seeds 42/123/456)
 - `#3133` shinobu: WD sweep (5e-3/2e-2)
-- `#NEW` robin: warmup (5-ep/10-ep) + EMA=0.999 — BEING ASSIGNED (moved from TFP)
-- `#3123` mitsuha: shorter T_max (5/8)
 - `#3098` shoya: clean test evaluation — URGENT PAPER-FACING
 - `#3088` mugen: T_max=20
 - `#3056` haku: Lion+EMA refinement (T_max/gc/LR sweep)
 - `#2949` vash: depth/width sweep (LR=5e-5)
-- `#NEW` jin: multi-seed paper-facing (seeds 42/123/456) — BEING ASSIGNED
 
-### AirfRANS WIP (~10 students, ~17%)
-- `#3156` edward: softer gc=0.5 on EMA champion
+### AirfRANS WIP (13 PRs)
+**Noam-pivot experiments (highest priority):**
+- `#3191` alphonse: noam features on base and vol-10x — NOAM ABLATION
+- `#3187` stark: asinh+residual on vol-10x champion — NOAM ABLATION
+- `#3184` wolfwood: full noam stack — NOAM ABLATION
+- `#3177` nezuko: vol-weight 15x/20x + asinh+residual — NOAM ABLATION
+
+**Other:**
+- `#3172` robin: LR warmup (5-ep/10-ep)
+- `#3169` nami: heads sweep 4H/16H
+- `#3167` gilbert: higher LR (8e-4/1e-3)
+- `#3166` vegeta: vol-weight=5.0/7.0+EMA=0.999
+- `#3156` edward: softer gc=0.5
 - `#3144` violet: vol-weight=2.0+EMA=0.999
-- `#3136` stark: EMA decay higher (0.9995/0.9999)
-- `#3135` nezuko: EMA=0.999+vol-weight=10x
 - `#3134` megumi: vol-weight=30x
-- `#3129` chrome: 4L/256d deeper architecture
-- `#3106` wolfwood: 2L/384d+gc+T_max=50 (SENT BACK — add EMA=0.999)
+- `#3129` chrome: 4L/256d deeper
 - `#3101` tanjiro: vol-loss-weight=1.5 (SENT BACK)
-- `#3166` vegeta: vol-weight=5.0/7.0+EMA=0.999 — JUST ASSIGNED
-- `#NEW` gilbert: lr=8e-4/1e-3+EMA=0.999 — BEING ASSIGNED
-
-### TandemFoil WIP (~3 students, ~5%)
-- `#3150` yuji: clean test row gc=0.3 champion — PAPER-FACING
-- `#3142` zenitsu: gc=0.3+longer budget (480-min)
-- `#3140` usopp: gc=0.2 sweep
 
 ## Steering Anchors
 
@@ -156,6 +168,7 @@
 - Bilateral symmetry aug, torch.compile, gradient accumulation
 - Attention dropout without EMA/gc: toxic combo with T_max=30
 - Cosine eta_min without EMA/gc: diverges (7.255-7.918%)
+- Surface points ≠50k: 16k=11.672%, 32k=7.558%, 64k=12.16% (even with EMA+gc) — 50k only viable count
 
 **TandemFoil Paper:**
 - T_max≠10 (all directions diverge)
