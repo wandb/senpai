@@ -94,39 +94,46 @@
 
 ## Current Research Focus
 
-### Benchmark Sprint Priorities (ICML phase)
+### STRATEGIC PIVOT — "Think Bigger" (Human directive, issue #3174)
 
-1. **DrivAerML** — val=3.833%, gap to AB-UPT only 0.013 pp!
-   - **BREAKTHROUGH:** EMA=0.9995+gc=0.5 works. gc is the stability enabler for EMA. Gap 93% closed.
-   - **Confirmed:** gc=0.5 is sharp optimum (0.25 starves, 1.0 insufficient — triple-confirmed via #3072/#3151/#3114)
-   - **Phase 2 strategy:** All new DM experiments build on EMA+gc=0.5 champion platform
-   - **Active fronts on champion platform:** decay sweep (eren), attention heads (senku/griffith), wider 640d (franky), eta_min (spike), attn dropout (shouko), softer gc=0.3 (himmel), monotonic cosine (historia), WD compound (emma), LR sweep (bulma), longer T_max (nobara)
-   - **Paper-facing:** faye #3164 doing full eval, multi-seed (casca/chihiro/canute sent back for two-phase)
-   - **Throughput experiments:** jet (600 batches), kakashi (788 batches+T_max=60)
-   - **Surface point resolution:** 16k/32k/64k (all sent back with eval fix)
-   - **Other active:** Lookahead (thorfinn), OneCycle (sanji), dropout (levi), checkpoint averaging (taki), feature dropout (fern), beta2 (einar), input feature dropout (fern)
+**Key finding:** The noam branch has ~100 merged PRs with winning techniques. Many are ALREADY PORTED to radford's train.py but UNUSED. We've been doing incremental HP sweeps when major architectural features were available all along.
 
-2. **TFP clean test result** — val=0.002383
-   - **Fully locked config:** Lion lr=1.25e-4, T_max=10, gc=0.5, EMA=0.999, 3L/192d
-   - **Every deviation diverges** — very narrow stability window
-   - **URGENT:** shoya #3098 clean test evaluation
-   - **Active width/depth:** robin (256d), nami (224d)
-   - **Active schedule:** mitsuha (T_max=5/8), mugen (T_max=20)
-   - **Active regularization:** shinobu (WD sweep), rei (gc=0.4)
-   - **Multi-seed:** jin being assigned (seeds 42/123/456)
+**New priority:** Every new assignment should test noam-ported features or bold new approaches. No more incremental tweaks.
 
-3. **AirfRANS volume** — 1.63x gap to target (0.002777 vs 0.0017)
-   - **Surface already 9.4x better** than target — focus is purely on volume
-   - **vol-weight strategy:** 3x good for surface, 10x worse. Now testing 1.5x (tanjiro), 2.0x (violet), 5.0x/7.0x (vegeta), 30x (megumi)
-   - **LR sweep:** gilbert being assigned (lr=8e-4, 1e-3 with EMA)
-   - **EMA decay:** stark testing 0.9995/0.9999
-   - **gc transfer:** edward testing gc=0.5 (from DM success)
-   - **Depth:** chrome testing 4L/256d (2L optimal so far, 3L dead)
-   - **Width:** wolfwood 2L/384d (sent back to add EMA)
+### Available features NOT USED (ready in train.py)
+- `--anp-srf` — ANP cross-attention decoder (-58.9% TF!) — TF/TFP only
+- `--asinh-pressure --asinh-scale 0.75` — asinh pressure norm (-8% ood) — ALL datasets
+- `--residual-prediction` — learned correction to freestream — ALL datasets
+- `--enable-cp-panel`, `--enable-te-coord-frame`, `--enable-wake-deficit`, `--enable-wake-angle`, `--enable-vortex-panel-velocity` — physics features — TF/TFP
+- `--re-stratified-sampling` — OOD Re robustness — TF/TFP/AF
+- `--compile-model` — throughput gain (more epochs in time budget) — ALL
+- 96 slices, 3 heads (at 192d), Lookahead — all defaults we haven't tested
 
-4. **TandemFoil** — gc trend monotonic: 1.0→0.5→0.3
-   - **Active:** gc=0.2 (usopp), gc=0.3+480min (zenitsu)
-   - **Paper-facing:** yuji #3150 clean test from gc=0.3 champion
+### Key config mismatches
+- TF/TFP T_max=10 vs noam optimal T_max=150 (15x longer!)
+- Radford 8 heads vs noam 3 heads (at 192d)
+- Missing: vol_loss_scale, PCGrad, temperature annealing, DomainLayerNorm (need code ports)
+
+### Benchmark Sprint Priorities (revised)
+
+1. **TandemFoil** — HIGHEST PRIORITY for noam feature activation
+   - ANP decoder alone was -58.9% on noam. With full stack: potentially 9-12 range vs our 21.909
+   - **Next assignments:** full noam stack, ANP alone, T_max=150 alone
+   - Paper-facing: yuji #3150 clean test
+
+2. **TandemFoil Paper** — Same noam features apply
+   - T_max=150 could break the "fully locked" constraint — it was locked at the WRONG config
+   - ANP + physics features could transform results
+   - **Next assignments:** full noam stack, ANP + T_max=150
+
+3. **DrivAerML** — val=3.833%, gap to AB-UPT only 0.013 pp
+   - **Applicable noam features:** asinh-pressure, residual-prediction, compile-model, 96 slices
+   - **Bold changes:** Lion optimizer (noam's final choice), higher EMA decay (0.9999)
+   - Existing champion platform still valid as base
+
+4. **AirfRANS volume** — 1.63x gap to target
+   - **Applicable noam features:** asinh-pressure, residual-prediction, re-stratified-sampling
+   - **Bold changes:** 96 slices, compile for throughput, vol_loss_scale (needs code port)
 
 ## Key Dead Ends (Do Not Repeat)
 
