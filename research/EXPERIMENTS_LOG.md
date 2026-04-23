@@ -1,5 +1,13 @@
 # SENPAI Research Results
 
+## 2026-04-23 17:00 — PR #3182: DM compile + 96 slices (norman) — CLOSED (no-op)
+
+- Student correctly identified that model_slices=96 and compile_model=True are ALREADY defaults in train.py. The champion config already uses both. Experiment was vacuous as designed — no runs executed. Important correction to our noam analysis: these features were never "unused."
+
+## 2026-04-23 17:00 — PR #3136: AF EMA decay sweep 0.9995/0.9999 (stark) — CLOSED
+
+- EMA=0.9995: surface=0.000618 (+109%), vol=0.003203 (+57%) vs baseline (W&B: `g2d0fknl`). EMA=0.9999: surface=0.000637 (+115%), vol=0.003433 (+68%) (W&B: `h1y4axao`). Both dramatically worse. Monotonic degradation as decay increases beyond 0.999. EMA=0.999 confirmed optimal for AirfRANS — completes upper sweep.
+
 ## 2026-04-23 16:30 — PR #3170: DM AGC on EMA champion (himmel) — CLOSED
 
 - AGC lambda=0.01: 5.309% ep196, crashed ep204 (W&B: `w3zd1lrl`). lambda=0.02: 6.298% ep138, crashed ep145 (W&B: `ba7s5jrq`). AGC's per-parameter thresholds scale with weight norms — cannot provide absolute ceiling at cosine restart boundaries that gc=0.5 gives. Both 1.5-2.5pp worse than 3.833% baseline. Student diagnosed root cause well.
