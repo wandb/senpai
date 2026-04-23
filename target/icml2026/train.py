@@ -167,6 +167,8 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
+    gradient_reg_weight: float = 0.0
+    gradient_reg_k: int = 8
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -758,11 +760,49 @@ def _named_channel_metrics(prefix: str, values: torch.Tensor, names: tuple[str, 
     return metrics
 
 
+def _compute_surface_gradient_reg(
+    coords: torch.Tensor,
+    preds: torch.Tensor,
+    mask: torch.Tensor,
+    k: int = 8,
+    chunk_size: int = 2048,
+) -> torch.Tensor:
+    """k-NN smoothness regularization: penalizes deviation of each point's
+    prediction from the mean of its k nearest spatial neighbors."""
+    B = coords.shape[0]
+    results = []
+    for b in range(B):
+        m = mask[b]
+        c = coords[b, m, :3].float()
+        p = preds[b, m, 0]
+        n = c.shape[0]
+        if n <= k:
+            continue
+        all_knn_idx = torch.empty(n, k, dtype=torch.long, device=c.device)
+        with torch.no_grad():
+            for i in range(0, n, chunk_size):
+                end = min(i + chunk_size, n)
+                clen = end - i
+                dists = torch.cdist(c[i:end], c)
+                dists[torch.arange(clen, device=dists.device),
+                      torch.arange(i, end, device=dists.device)] = float('inf')
+                _, idx = dists.topk(k, dim=1, largest=False)
+                all_knn_idx[i:end] = idx
+                del dists
+        neighbor_mean = p[all_knn_idx].mean(dim=1)
+        results.append(((p - neighbor_mean) ** 2).mean())
+    if not results:
+        return torch.tensor(0.0, device=coords.device)
+    return torch.stack(results).mean()
+
+
 def loss_grouped(
     batch: GroupedBatch,
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
     volume_loss_weight: float = 1.0,
+    gradient_reg_weight: float = 0.0,
+    gradient_reg_k: int = 8,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.surface_x.device)
     metrics: dict[str, float] = {}
@@ -776,6 +816,12 @@ def loss_grouped(
         vol_loss = F.mse_loss(outputs["volume_preds"][batch.volume_mask], target[batch.volume_mask])
         total = total + vol_loss * volume_loss_weight
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
+    if gradient_reg_weight > 0 and outputs["surface_preds"] is not None:
+        grad_reg = _compute_surface_gradient_reg(
+            batch.surface_x, outputs["surface_preds"], batch.surface_mask, k=gradient_reg_k,
+        )
+        total = total + gradient_reg_weight * grad_reg
+        metrics["gradient_reg_loss"] = float(grad_reg.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
     return total, metrics
 
@@ -1271,6 +1317,8 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    gradient_reg_weight: float = 0.0,
+    gradient_reg_k: int = 8,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1294,6 +1342,7 @@ def train_one_epoch(
                 exhausted = True
                 break
 
+            loss_metrics: dict[str, float] = {}
             if model_name == "reference_abupt":
                 batch = batch.to(device)
                 with autocast_context(device, amp_mode):
@@ -1326,9 +1375,17 @@ def train_one_epoch(
                             volume_x=batch.volume_x,
                             volume_mask=batch.volume_mask,
                         )
-                        loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                        loss, loss_metrics = loss_grouped(
+                            batch, outputs, transform,
+                            volume_loss_weight=volume_loss_weight,
+                            gradient_reg_weight=gradient_reg_weight,
+                            gradient_reg_k=gradient_reg_k,
+                        )
 
             accum_loss += float(loss.detach().cpu().item())
+            if "gradient_reg_loss" in loss_metrics:
+                running.setdefault("gradient_reg_loss", 0.0)
+                running["gradient_reg_loss"] += loss_metrics["gradient_reg_loss"]
             (loss / grad_accum_steps).backward()
             micro_count += 1
 
@@ -1359,6 +1416,8 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    if "gradient_reg_loss" in running:
+        running["gradient_reg_loss"] /= max(steps, 1)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1688,6 +1747,8 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            gradient_reg_weight=config.gradient_reg_weight,
+            gradient_reg_k=config.gradient_reg_k,
         )
 
         if ema is not None:
