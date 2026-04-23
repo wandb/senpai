@@ -1,5 +1,9 @@
 # SENPAI Research Results
 
+## 2026-04-23 20:30 — PR #3134: AF vol-weight=30x (megumi) — CLOSED
+
+- Surface=0.001264 (4.3x worse than 0.000296 baseline), vol=0.006235 (3.1x worse than 0.002039 baseline) (W&B: `wupz6iuj`). 30x volume weighting massively overshoots — optimizer saturates on volume gradients and both metrics collapse. Model diverged post-ep400, terminal surface=0.621 vol=1.533. No Pareto improvement at any epoch. Sweet spot confirmed at 10x (#3135). Adding to dead ends: vol-weight≥30x catastrophic.
+
 ## 2026-04-23 20:00 — PR #3132: DM eta_min=5e-5 + gc compound (gohan) — CLOSED
 
 - gc=1.0+eta_min=5e-5: 6.311% ep149, diverged ep150 → 112.66% (W&B: `h6jblqjq`). gc=0.5+eta_min=5e-5: 8.617% ep70, diverged → 72% (W&B: `7fmjg0cu`). Third confirmation eta_min=5e-5 is dead — alone (#3126), +gc=1.0, +gc=0.5 all diverge catastrophically. Non-zero LR floor prevents gradient momentum dissipation at cosine troughs; gc delays but cannot prevent cumulative drift. gc=0.5 is counterproductive here — clips 288/394 batches (throttles signal), worse than gc=1.0 which clips only 73/394.
