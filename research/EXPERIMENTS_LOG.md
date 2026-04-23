@@ -1,5 +1,13 @@
 # SENPAI Research Results
 
+## 2026-04-23 08:00 — PR #3122: DM polynomial LR decay (nobara) — CLOSED
+
+- Linear (power=1.0): 17.88% ep64, diverged ep69 (W&B: `i1qbv9t4`). Quadratic (power=2.0): 12.20% ep75, diverged ep91 (W&B: `kkuery47`). Both 3-4x worse. Key insight: cosine's periodic low-LR troughs are load-bearing for stability — polynomial keeps LR high without recovery windows. Polynomial LR dead for DM.
+
+## 2026-04-23 08:00 — PR #3066: DM 16k surface points (alphonse) — SENT BACK
+
+- val=24.039% at ep17 only (W&B: `icqb9nla`). Same eval-overhead epoch-starvation: ~21 min/epoch without max-eval-batches. Sent back to add --max-eval-batches 200. Note: 2.88 GB VRAM — very low, opens door for larger model pairing later.
+
 ## 2026-04-23 07:30 — PR #3129: AF 4L/256d deeper architecture (chrome) — SENT BACK
 
 - surface=0.002412 (5.25x worse), vol=0.009138 (3.3x worse). Diverged ep171 at cosine restart (W&B: `9brflieq`). Trajectory was improving before divergence. Sent back to retry with lr=3e-4 + T_max=100.
