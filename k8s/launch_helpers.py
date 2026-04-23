@@ -34,6 +34,22 @@ STUDENT_NAMES = [
 ]
 
 
+def expand_student_names(n: int, names: list[str] = STUDENT_NAMES) -> list[str]:
+    """Return n student names, cycling through `names` with a numeric suffix
+    once the list is exhausted.
+
+    First pass uses bare names; each subsequent pass appends an incrementing
+    suffix (e.g. for `n=3*len(names)`: frieren, ..., jin, frieren2, ..., jin2,
+    frieren3, ..., jin3).
+    """
+    out = []
+    for i in range(n):
+        base = names[i % len(names)]
+        round_num = i // len(names)
+        out.append(base if round_num == 0 else f"{base}{round_num + 1}")
+    return out
+
+
 def render_template(template: str, replacements: dict[str, str]) -> str:
     """Replace {{PLACEHOLDER}} tokens in a K8s manifest template."""
     out = template

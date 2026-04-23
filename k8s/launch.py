@@ -14,7 +14,7 @@ from pathlib import Path
 import simple_parsing as sp
 
 from launch_helpers import (
-    STUDENT_NAMES,
+    expand_student_names,
     kubectl_apply,
     preflight_check_target_repo_access,
     render_configmap,
@@ -129,10 +129,7 @@ def main():
     if args.names:
         student_list = [n.strip() for n in args.names.split(",")]
     else:
-        if args.n_students > len(STUDENT_NAMES):
-            print(f"ERROR: max {len(STUDENT_NAMES)} students (got {args.n_students})", file=sys.stderr)
-            sys.exit(1)
-        student_list = STUDENT_NAMES[:args.n_students]
+        student_list = expand_student_names(args.n_students)
 
     student_template = STUDENT_TEMPLATE.read_text()
     advisor_template = ADVISOR_TEMPLATE.read_text()
