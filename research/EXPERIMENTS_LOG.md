@@ -1,5 +1,29 @@
 # SENPAI Research Results
 
+## 2026-04-23 16:30 — PR #3170: DM AGC on EMA champion (himmel) — CLOSED
+
+- AGC lambda=0.01: 5.309% ep196, crashed ep204 (W&B: `w3zd1lrl`). lambda=0.02: 6.298% ep138, crashed ep145 (W&B: `ba7s5jrq`). AGC's per-parameter thresholds scale with weight norms — cannot provide absolute ceiling at cosine restart boundaries that gc=0.5 gives. Both 1.5-2.5pp worse than 3.833% baseline. Student diagnosed root cause well.
+
+## 2026-04-23 16:30 — PR #3149: DM stochastic feature dropout (fern) — CLOSED
+
+- p=0.05: 7.269% ep190, diverged ep320 (W&B: `75zw9pyt`). p=0.10: 11.723% ep112, diverged ep150 (W&B: `v0hdvf5o`). Both WITHOUT EMA/gc. Zeroing physically interdependent geometric features creates impossible input configurations. Dose-dependent divergence. Student identified UnboundLocalError bug fix.
+
+## 2026-04-23 16:30 — PR #3147: DM lighter WD + gc=1.0 (norman) — CLOSED
+
+- WD=5e-4: 4.449% (W&B: `ecngexlu`). WD=1e-4: 7.057%, diverged (W&B: `0tmfdy74`). Both without EMA, gc=1.0 imposes hard floor ~4.4% regardless of WD. Third confirmation that gc=1.0 alone is insufficient for DM.
+
+## 2026-04-23 16:30 — PR #3145: TFP gc=0.4 boundary test (rei) — CLOSED
+
+- field_mse=Infinity all 533 epochs (W&B: `vxihza4u`). Pressure starvation from epoch 1. Sharp boundary between gc=0.4 (starvation) and gc=0.5 (champion) on stripped-down TFP config. Velocity converged normally — starvation is pressure-specific.
+
+## 2026-04-23 16:30 — PR #3106: AF 2L/384d + gc=0.5 + EMA (wolfwood) — CLOSED
+
+- With EMA: surface=0.000634 (+38%), vol=0.003896 (+40%) vs baseline (W&B: `j9xf3r9i`). Without EMA: surface=0.000564 (+23%), vol=0.005935 (+114%) (W&B: `gccu8a2k`). 384d width doesn't improve over 256d on either metric. Stable training but worse results. 256d confirmed optimal for AF.
+
+## 2026-04-23 16:30 — PR #3067: DM 32k surface points (askeladd) — SENT BACK
+
+- With eval fix: 7.558% ep128, gradient explosion ep128-177 (W&B: `hmhzokbo`). Run without EMA/gc — same failure mode gc=0.5 prevents. 12% throughput advantage (0.68 vs 0.77 min/epoch). Sent back for champion platform retry (EMA=0.9995+gc=0.5).
+
 ## 2026-04-23 16:00 — PR #3135: AF EMA=0.999 + vol-weight=10x (nezuko) — MERGED ★ NEW BEST
 
 - **surface_mse: 0.000296 (-35.5%)**, **vol_mse: 0.002039 (-26.6%)** vs baseline 0.000459/0.002777. W&B: `sh2zyfwr`. Model still improving at ep763 timeout. EMA stabilizes the upweighted volume gradient — without EMA, 10x is worse; with EMA it's dramatic. Vol gap: 1.20x (was 1.63x). New AF champion.
