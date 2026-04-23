@@ -2,7 +2,7 @@
 
 - **Date:** 2026-04-23 23:30 (advisor cycle 50)
 - **Branch:** radford
-- **Idle students:** 0 (shouko being assigned)
+- **Idle students:** 0
 - **PRs ready for review:** 0
 - **CRITICAL:** TFP champion config is BROKEN — code regression since #3025, seed=0 no longer reproduces (#3205). Waiting for sanji #3209 cp_panel bug fix.
 
@@ -29,7 +29,6 @@
 **Champion tuning / paper-facing:**
 - `#3209` sanji: TFP cp_panel bug fix + multi-seed retest — STABILIZATION PRIORITY
 - `#3164` faye: paper-facing full eval (two-phase) — PAPER-FACING Track 1
-- `#3163` shouko: ~~attn dropout=0.05~~ → reassigning to AF GradNorm
 - `#3160` griffith: 16H heads
 - `#3155` nobara: longer T_max (45/60)
 - `#3207` historia: DM true monotonic cosine (T_max=393606) — corrected retest
@@ -80,6 +79,7 @@
 **Other:**
 - `#3172` robin: LR warmup (5-ep/10-ep)
 - `#3169` nami: heads sweep 4H/16H
+- `#3218` shouko: GradNorm adaptive multi-task loss balancing — AF VOLUME FOCUS
 - `#3215` tanjiro: Huber loss on volume channel (robust to outliers) — AF VOLUME FOCUS
 - `#3212` jin: PCGrad multi-objective gradient surgery — AF VOLUME FOCUS
 - `#3211` spike: AF vol_loss_scale learnable scalar (noam port) — AF VOLUME FOCUS
