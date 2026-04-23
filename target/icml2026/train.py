@@ -166,6 +166,7 @@ class TrainConfig:
     volume_anchor_points: int = 8_000
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
+    volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -761,6 +762,8 @@ def loss_grouped(
     batch: GroupedBatch,
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
+    *,
+    volume_loss_weight: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.surface_x.device)
     metrics: dict[str, float] = {}
@@ -772,8 +775,10 @@ def loss_grouped(
     if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
         target = transform.apply(batch.volume_y)
         vol_loss = F.mse_loss(outputs["volume_preds"][batch.volume_mask], target[batch.volume_mask])
-        total = total + vol_loss
+        total = total + volume_loss_weight * vol_loss
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
+        if volume_loss_weight != 1.0:
+            metrics["volume_loss_weighted"] = float((volume_loss_weight * vol_loss).detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
     return total, metrics
 
@@ -1266,6 +1271,7 @@ def train_one_epoch(
     max_batches: int = 0,
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
+    volume_loss_weight: float = 1.0,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1321,9 +1327,14 @@ def train_one_epoch(
                             volume_x=batch.volume_x,
                             volume_mask=batch.volume_mask,
                         )
-                        loss, _ = loss_grouped(batch, outputs, transform)
+                        loss, loss_parts = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
 
             accum_loss += float(loss.detach().cpu().item())
+            if not isinstance(transform, TandemTargetTransform) and model_name != "reference_abupt":
+                for k, v in loss_parts.items():
+                    if k != "loss":
+                        running.setdefault(k, 0.0)
+                        running[k] += v
             (loss / grad_accum_steps).backward()
             micro_count += 1
 
@@ -1352,6 +1363,9 @@ def train_one_epoch(
         steps += 1
 
     running["loss"] /= max(steps, 1)
+    for k in ("surface_loss", "volume_loss", "volume_loss_weighted"):
+        if k in running:
+            running[k] /= max(micro_batches_total, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
     running["train_steps"] = float(steps)
@@ -1682,6 +1696,7 @@ def main() -> None:
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
+            volume_loss_weight=config.volume_loss_weight,
         )
 
         if ema is not None:
