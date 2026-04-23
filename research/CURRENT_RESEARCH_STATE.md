@@ -31,12 +31,12 @@
 - `#3143` thorfinn: Lookahead(AdamW)
 - `#3132` gohan: eta_min=5e-5+gc=1.0
 - `#3121` levi: dropout regularization sweep
-- `#NEW` piccolo: AF re-stratified sampling alone — BEING ASSIGNED
+- `#3195` piccolo: AF re-stratified sampling alone — NOAM ABLATION
 - `#3110` einar: beta2=0.99/0.995
 - `#3109` guts: lr=4e-4 full-eval
 - `#3085` kohaku: larger supernodes (SENT BACK — retry+gc=1.0)
 - `#3083` jet: max-train-batches=600
-- `#NEW` gojo: TF residual-prediction alone — BEING ASSIGNED
+- `#3197` gojo: TF residual-prediction alone — NOAM ABLATION
 - `#3076` frieren: log-cosh loss (SENT BACK — retry+gc=1.0)
 - `#3067` askeladd: 32k surface points (SENT BACK — add max-eval-batches 200)
 - `#3063` canute: paper-facing full-eval (SENT BACK — two-phase)
@@ -50,7 +50,7 @@
 - `#3180` chopper: ANP decoder alone — NOAM ABLATION
 
 **Other:**
-- `#NEW` zenitsu: TF EMA decay sweep (0.9999/0.99995) — BEING ASSIGNED
+- `#3196` zenitsu: TF EMA decay sweep (0.9999/0.99995) — NOAM ABLATION
 - `#3150` yuji: clean test row gc=0.3 champion — PAPER-FACING
 
 ### TandemFoil Paper WIP (10 PRs)
