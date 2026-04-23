@@ -166,6 +166,7 @@ class TrainConfig:
     volume_anchor_points: int = 8_000
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
+    grad_centralization: bool = False
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -451,6 +452,15 @@ def parse_args() -> TrainConfig:
             parser.add_argument(arg_name, type=type(field_value), default=field_value)
     namespace = parser.parse_args()
     return TrainConfig(**vars(namespace))
+
+
+def centralize_gradients(optimizer):
+    for group in optimizer.param_groups:
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            if p.grad.dim() > 1:
+                p.grad.data -= p.grad.data.mean(dim=tuple(range(1, p.grad.dim())), keepdim=True)
 
 
 def build_bundle(config: TrainConfig) -> DatasetBundle:
@@ -1266,6 +1276,7 @@ def train_one_epoch(
     max_batches: int = 0,
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
+    use_grad_centralization: bool = False,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1339,6 +1350,8 @@ def train_one_epoch(
         if grad_clip > 0 and float(grad_norm) > grad_clip:
             running.setdefault("grad_clip_events", 0.0)
             running["grad_clip_events"] += 1.0
+        if use_grad_centralization:
+            centralize_gradients(optimizer)
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
@@ -1671,6 +1684,7 @@ def main() -> None:
             max_batches=config.max_train_batches,
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
+            use_grad_centralization=config.grad_centralization,
         )
 
         if ema is not None:
