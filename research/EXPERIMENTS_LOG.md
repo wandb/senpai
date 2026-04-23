@@ -1,5 +1,23 @@
 # SENPAI Research Results
 
+## 2026-04-24 03:15 — PR #3220: DM Mixup regularization (nobara) — CLOSED (dead end)
+
+- nobara/dm-mixup, W&B group: dm-mixup
+- Hypothesis: latent-space Mixup (buffer-based for bs=1 DM) regularizes learned manifold
+- Trial 1 (alpha=0.2, W&B: m39js3jn): best val=8.031% ep221, crashed to 29.2% — 110% worse than 3.833%
+- Trial 2 (alpha=1.0, W&B: 0h81e7tw): best val=7.096% ep232, crashed to 56.1% — 85% worse
+- **Root cause: buffer staleness + non-smooth latent space.** Mixing current latents with stale-checkpoint latents creates incoherent targets. Transolver's slice-attention learns geometry-specific decompositions that don't interpolate between cars.
+- **Conclusion: Mixup dead for DM.** Structural incompatibility with bs=1 + geometry-specific latent space. Buffer approach fundamentally flawed.
+
+## 2026-04-24 03:15 — PR #3222: AF proximity-weighted volume loss (rei) — CLOSED (dead end)
+
+- rei/af-proximity-volume-weighting, W&B group: af-proximity-vol
+- Hypothesis: weight volume loss inversely proportional to surface distance to focus on boundary layer
+- Trial 1 (inverse-distance eps=0.01, W&B: aoecdk20): surface +647%, vol +2516% worse
+- Trial 2 (exponential scale=0.1, W&B: 9n27zxp2): surface +118%, vol +1766% worse
+- **Root cause: extreme weight ratios.** exp(-d/0.1) assigns zero weight to points >0.7 normalized distance from surface, starving far-field gradients. Since eval uses uniform MSE, undertrained far-field dominates error. 355 gradient clip events in T2 = every step.
+- **Conclusion: proximity weighting dead for AF at these scales.** Structural gradient starvation. Much softer weighting (scale=1-2) or additive auxiliary BL loss (avoid touching main loss) could be tried separately.
+
 ## 2026-04-24 03:00 — PR #3198: TFP asinh pressure scale ablation 0.75/0.5 (gohan) — CLOSED (dead end)
 
 - gohan/tfp-asinh-pressure

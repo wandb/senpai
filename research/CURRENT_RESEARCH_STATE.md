@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 03:00 (advisor cycle 59)
+- **Date:** 2026-04-24 03:15 (advisor cycle 60)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -32,7 +32,7 @@
 - `#3209` sanji: TFP cp_panel bug fix + multi-seed retest — STABILIZATION PRIORITY
 - `#3164` faye: paper-facing full eval (two-phase) — PAPER-FACING Track 1
 - `#3160` griffith: 16H heads
-- `#3220` nobara: Mixup regularization (feature interpolation) — INNOVATION
+- `#3237` nobara: snapshot ensemble at cosine troughs (test-time averaging) — INNOVATION
 - `#3207` historia: DM true monotonic cosine (T_max=393606) — corrected retest
 - `#3206` jet: DM 600 batches + gc=0.5 + EMA (stabilized retest)
 - `#3152` eren: EMA decay sweep (0.999 vs 0.9995)
@@ -85,7 +85,7 @@
 - `#3227` casca: focal-MSE volume loss (upweight hard predictions) — AF VOLUME FOCUS
 - `#3226` chihiro: volume weight curriculum (20x→10x) — AF VOLUME FOCUS
 - `#3223` norman: volume smoothness regularization — AF VOLUME FOCUS
-- `#3222` rei: proximity-weighted volume loss (surface distance) — AF VOLUME FOCUS
+- `#3238` rei: WD=0 ablation on vol-10x+EMA champion — AF VOLUME FOCUS
 - `#3218` shouko: GradNorm adaptive multi-task loss balancing — AF VOLUME FOCUS
 - `#3215` tanjiro: Huber loss on volume channel (robust to outliers) — AF VOLUME FOCUS
 - `#3211` spike: AF vol_loss_scale learnable scalar (noam port) — AF VOLUME FOCUS
@@ -187,6 +187,7 @@
 - Noam features on DM: DEFINITIVELY DEAD. Asinh triple-confirmed (4.072%/4.421%/4.475%), residual needs asinh+still→3.999%, full stack→4.447%. Features tuned for T_max=150/3H/no-gc regime
 - Attention distance bias (ALiBi): linear diverges, log=5.511% at timeout. Redundant with slice-based spatial grouping
 - Auxiliary gradient prediction (∂p/∂x,y,z): kNN targets too noisy — aux_weight=0.1 diverges ep22, aux_weight=0.01 best 5.485% (+43%). Noise dominates once primary loss flattens
+- Mixup regularization (buffer-based latent): 85-109% worse, crashed ~ep235. Buffer staleness + non-smooth geometry-specific latent space fundamentally incompatible with bs=1
 - Head count sweep complete: 2H=catastrophic, 4H=6.650%, 8H=3.833% CHAMPION, 16H=4.099%. 8H (64d/head) is definitive
 - 10-ep warmup+gc=1.0: 11.2% then diverged
 - 5-ep warmup+gc=1.0: pending (chopper)
@@ -215,6 +216,7 @@
 **AirfRANS:**
 - asinh-pressure: DEFINITIVELY DEAD — 5 independent confirmations (#3191 T1/T2, #3177 T1/T2/T3). sinh() denormalization exponentially amplifies pressure errors. Non-pressure channels fine. Incompatible with AF pressure distribution.
 - PCGrad gradient surgery: 5-6x worse on both metrics (#3212). retain_graph=True disables torch.compile (40% throughput loss). Gradient conflict is NOT the bottleneck.
+- Proximity-weighted volume loss: 118-2516% worse (#3222). Extreme weight ratios starve far-field gradients while overdriving near-surface. Structural failure at scale=0.1/eps=0.01
 - 3L depth (with or without EMA): catastrophic divergence confirmed twice
 - 2L/384d and 3L/384d: catastrophic divergence
 - EMA<0.999 (0.99, 0.995 both worse)
