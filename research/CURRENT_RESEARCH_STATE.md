@@ -29,7 +29,7 @@
 - `#3152` eren: EMA decay sweep (0.999 vs 0.9995)
 - `#3146` taki: top-5 checkpoint averaging
 - `#3143` thorfinn: Lookahead(AdamW)
-- `#NEW` gohan: TFP asinh-pressure isolation — BEING ASSIGNED
+- `#3198` gohan: TFP asinh-pressure isolation (scale=0.75/0.5) — NOAM ABLATION
 - `#3121` levi: dropout regularization sweep
 - `#3195` piccolo: AF re-stratified sampling alone — NOAM ABLATION
 - `#3110` einar: beta2=0.99/0.995
