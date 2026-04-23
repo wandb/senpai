@@ -12,6 +12,7 @@
 **Innovation track (new physics-aware/ML ideas per directive):**
 - `#3224` fern: spectral normalization on attention layers — INNOVATION
 - `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
+- `#3228` chopper: stochastic weight perturbation at cosine troughs — INNOVATION
 - `#3225` canute: self-distillation with EMA teacher — INNOVATION
 - `#3214` kakashi: auxiliary gradient prediction (∂p/∂x,y,z) — INNOVATION
 - `#3217` brook: Fourier encoding of surface normals — INNOVATION
@@ -21,10 +22,7 @@
 
 **Noam-pivot experiments:**
 - `#3199` megumi: EMA=0.9999/0.99995 (noam optimal decay) — NOAM ABLATION
-- `#3227` casca: → AF focal-MSE volume loss
-- `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
 - `#3194` bulma: higher LR sweep (5.5e-4/6e-4)
-- `#3226` chihiro: → AF vol-weight curriculum
 - `#3181` himmel: asinh+residual on champion — NOAM ABLATION
 - `#3219` hinata: SAM optimizer (flat-basin restart robustness) — INNOVATION
 
@@ -52,7 +50,6 @@
 - `#3197` gojo: residual-prediction alone — NOAM ABLATION
 - `#3196` zenitsu: EMA decay sweep (0.9999/0.99995) — NOAM ABLATION
 - `#3189` emma: asinh+physics features — NOAM ABLATION
-- chopper: → DM weight perturbation at troughs (PR pending)
 - `#3150` yuji: clean test row — PAPER-FACING
 
 ### TandemFoil Paper WIP (9 PRs) — STABILIZATION CRISIS
@@ -79,6 +76,8 @@
 **Other:**
 - `#3172` robin: LR warmup (5-ep/10-ep)
 - `#3169` nami: heads sweep 4H/16H
+- `#3227` casca: focal-MSE volume loss (upweight hard predictions) — AF VOLUME FOCUS
+- `#3226` chihiro: volume weight curriculum (20x→10x) — AF VOLUME FOCUS
 - `#3223` norman: volume smoothness regularization — AF VOLUME FOCUS
 - `#3222` rei: proximity-weighted volume loss (surface distance) — AF VOLUME FOCUS
 - `#3218` shouko: GradNorm adaptive multi-task loss balancing — AF VOLUME FOCUS
