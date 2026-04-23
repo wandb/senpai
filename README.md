@@ -131,15 +131,33 @@ cp example.env .env
 
 > **Target-repo permissions.** The token you supply must be able to **clone** `target_repo_url` and **push branches + open/merge PRs** against it. `launch.py` preflights this against the GitHub API before spinning up pods and fails loudly if `permissions.push` is false. Same applies to the `CLAUDE_CODE_OAUTH_TOKEN` user (still in `senpai-secrets`) if you rely on `gh auth status` inside the pod.
 
-### Claude Code OAuth token
+### Shared cluster secrets (`senpai-secrets`)
 
-Due to the high cost of running CC with `ANTHROPIC_API_KEY`, use `CLAUDE_CODE_OAUTH_TOKEN` instead. Create it with:
+Every pod also reads three keys from the shared, cluster-wide `senpai-secrets` Secret. Unlike the GitHub token these are not per-launch — set them once on the cluster and every tag reuses them:
 
+| Key in `senpai-secrets` | Used for |
+|---|---|
+| `wandb-api-key` | `WANDB_API_KEY` — all W&B logging from advisor + students |
+| `claude-code-oauth-token` | `CLAUDE_CODE_OAUTH_TOKEN` — Claude Code auth. Prefer this over `ANTHROPIC_API_KEY` (much cheaper) |
+| `exa-api-key` | `EXA_API_KEY` — Exa web search used by the research agent |
+
+Create the secret once with:
+
+```bash
+kubectl create secret generic senpai-secrets \
+  --from-literal=wandb-api-key="$WANDB_API_KEY" \
+  --from-literal=claude-code-oauth-token="$(claude setup-token)" \
+  --from-literal=exa-api-key="$EXA_API_KEY"
 ```
-claude setup-token
+
+Rotate a single key without recreating the whole secret:
+
+```bash
+kubectl patch secret senpai-secrets \
+  --type=merge -p "{\"stringData\":{\"claude-code-oauth-token\":\"$(claude setup-token)\"}}"
 ```
 
-and push the key into the shared `senpai-secrets` k8s Secret. Unlike the GitHub token, this one is cluster-wide and not per-launch.
+`launch.py` does **not** preflight these — if a key is missing, pods will crash-loop on startup. `kubectl get secret senpai-secrets -o jsonpath='{.data}' | jq` confirms all three keys are present.
 
 ## Running
 
