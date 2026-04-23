@@ -1635,18 +1635,14 @@ def main() -> None:
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
     history: list[dict[str, float]] = []
-    best_epoch: int | None = None
-    best_val_primary_metric_name = primary_metric_key(bundle, phase="val")
+    if bundle.spec.name == "tandemfoilset":
+        val_primary_key = "val_primary/surface_pressure_mae"
+    else:
+        val_primary_key = f"val_primary/{bundle.spec.default_metric}"
+    best_val_primary_metric_name = val_primary_key
+    best_val_metric = float("inf")
     best_val_primary_metric: float | None = None
     best_val_metrics: dict[str, float] = {}
-    best_model_state: dict[str, torch.Tensor] | None = None
-    best_anp_state: dict[str, torch.Tensor] | None = None
-
-    if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
-    else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
-    best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
     best_anp_state: dict[str, torch.Tensor] | None = None
@@ -1709,23 +1705,14 @@ def main() -> None:
             phase="val",
         )
 
-        current_primary_metric = eval_metrics.get(best_val_primary_metric_name)
-        if current_primary_metric is not None and (
-            best_val_primary_metric is None or current_primary_metric < best_val_primary_metric
-        ):
-            best_epoch = epoch
-            best_val_primary_metric = current_primary_metric
-            best_val_metrics = dict(eval_metrics)
-            best_model_state = snapshot_module_state(model)
-            best_anp_state = snapshot_module_state(anp_head)
-
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(val_primary_key)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
+            best_val_primary_metric = current_val
+            best_val_metrics = dict(eval_metrics)
             best_epoch = epoch
-            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            if anp_head is not None:
-                best_anp_state = {k: v.cpu().clone() for k, v in anp_head.state_dict().items()}
+            best_model_state = snapshot_module_state(model)
+            best_anp_state = snapshot_module_state(anp_head)
             if ema is not None:
                 best_ema_shadow = {k: v.cpu().clone() for k, v in ema.shadow.items()}
             if anp_ema is not None:
