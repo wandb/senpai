@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 00:00 (advisor cycle 52)
+- **Date:** 2026-04-24 00:15 (advisor cycle 53)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -10,6 +10,8 @@
 
 ### DrivAerML WIP (27 PRs)
 **Innovation track (new physics-aware/ML ideas per directive):**
+- fern: spectral normalization on attention layers — INNOVATION (PR pending)
+- `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
 - `#3216` canute: attention distance bias (ALiBi-inspired spatial prior) — INNOVATION
 - `#3214` kakashi: auxiliary gradient prediction (∂p/∂x,y,z) — INNOVATION
 - `#3217` brook: Fourier encoding of surface normals — INNOVATION
@@ -44,13 +46,12 @@
 - `#3067` askeladd: 32k surface points (SENT BACK)
 - `#3046` sukuna: WD+gc compound (SENT BACK)
 
-### TandemFoil WIP (7 PRs) — GUARDRAIL ONLY per directive
-**Noam-pivot experiments:**
+### TandemFoil WIP (5 PRs) — GUARDRAIL ONLY per directive
+**New champion config:** ANP+full physics+T_max=150+gc=0.2+EMA=0.999+96sl+Lookahead+compile+re-strat (#3185)
+**Noam-pivot experiments (still running):**
 - `#3197` gojo: residual-prediction alone — NOAM ABLATION
 - `#3196` zenitsu: EMA decay sweep (0.9999/0.99995) — NOAM ABLATION
 - `#3189` emma: asinh+physics features — NOAM ABLATION
-- `#3186` norman: T_max=150 alone — NOAM ABLATION
-- `#3185` fern: full noam stack — NOAM ABLATION
 - `#3180` chopper: ANP decoder alone — NOAM ABLATION
 - `#3150` yuji: clean test row — PAPER-FACING
 
@@ -78,6 +79,7 @@
 **Other:**
 - `#3172` robin: LR warmup (5-ep/10-ep)
 - `#3169` nami: heads sweep 4H/16H
+- norman: volume smoothness regularization — AF VOLUME FOCUS (PR pending)
 - `#3222` rei: proximity-weighted volume loss (surface distance) — AF VOLUME FOCUS
 - `#3218` shouko: GradNorm adaptive multi-task loss balancing — AF VOLUME FOCUS
 - `#3215` tanjiro: Huber loss on volume channel (robust to outliers) — AF VOLUME FOCUS
@@ -93,7 +95,7 @@
 
 | Dataset | Metric | Current anchor |
 |---|---|---|
-| TandemFoil | `val_primary/surface_pressure_mae` | **21.350** (#3140 MERGED — gc=0.2+EMA=0.999) |
+| TandemFoil | `val_primary/surface_pressure_mae` | **21.319** (#3185 MERGED — full noam stack: ANP+physics+T_max=150+Lookahead+96sl) |
 | TandemFoil Paper | `val_primary/field_mse` | **0.002383** (#3025) |
 | AirfRANS | `val_primary/surface_mse` + `vol_mse` | **0.000296 / 0.002039** (#3135 MERGED — EMA+vol-weight=10x) |
 | DrivAerML | `val_primary/surface_rel_l2_pct` | **3.833%** (#3072 MERGED — EMA=0.9995+gc=0.5) |
@@ -102,7 +104,7 @@
 
 | Dataset | Metric | Current best | External target | Status |
 |---|---|---|---|---|
-| TandemFoil | `test_primary/surface_pressure_mae` | **23.195** (PR #3140) | (internal) | Improving |
+| TandemFoil | `test_primary/surface_pressure_mae` | **22.868** (PR #3185 MERGED) | (internal) | Improving |
 | TandemFoil Paper | `test_primary/field_mse` | **NO CLEAN ROW YET** | ~0.10-0.36/task | URGENT — #3098 in-progress |
 | AirfRANS | `Surf MSE / Vol MSE` | **0.000296 / 0.002039** | 0.0043 / 0.0017 | Surface 14.5x better, Volume 1.20x gap |
 | DrivAerML | `test_primary/surface_rel_l2_pct` | **4.685%** (#3072, partial eval) | 3.71% | Gap closing — #3164 paper eval in-progress |
@@ -218,7 +220,7 @@
 
 ## Mandatory Config Rules
 
-- **TF:** Lion lr=1.25e-4, T_max=10, gc=0.3, WD=1e-2, `--ema-decay 0.999`, 3L/192d
+- **TF:** Lion lr=1.25e-4, **T_max=150**, gc=0.2, WD=1e-2, `--ema-decay 0.999`, 3L/192d, **96 slices**, ANP+full physics+asinh-scale=0.75+residual+Lookahead+compile+re-strat (**UPDATED post #3185**)
 - **TFP:** Lion lr=1.25e-4, T_max=10, gc=0.5, WD=1e-2, `--ema-decay 0.999`, 3L/192d
 - **AF:** AdamW lr=6e-4, T_max=50, gc=1.0, WD=1e-2, `--ema-decay 0.999`, 2L/256d
 - **DM:** AdamW lr=5e-4, T_max=30, **gc=0.5**, **EMA=0.9995**, no WD, 4L/512d (**UPDATED post #3072**)
