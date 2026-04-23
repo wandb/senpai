@@ -140,7 +140,18 @@ def preflight_check_target_repo_access(target_repo_url: str, token: str) -> None
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
-            sys.exit(f"ERROR: GitHub API {e.code} for {path}: {e.read().decode(errors='replace')}")
+            hint = ""
+            if e.code == 401:
+                hint = (
+                    "\n  Your token is invalid or expired. Grab a fresh one with:\n"
+                    "    gh auth token\n"
+                    "  then paste it into .env at the senpai repo root as GITHUB_TOKEN=<token>\n"
+                    "  (or `export GITHUB_TOKEN=$(gh auth token)` for this shell)."
+                )
+            sys.exit(
+                f"ERROR: GitHub API {e.code} for {path}: "
+                f"{e.read().decode(errors='replace')}{hint}"
+            )
 
     perms = gh_api(f"/repos/{slug}").get("permissions", {})
     if perms.get("push"):
