@@ -159,6 +159,7 @@ class TrainConfig:
     asinh_scale: float = 0.75
     residual_prediction: bool = False
     re_stratified_sampling: bool = False
+    stochastic_depth_rate: float = 0.0
     cosine_t_max: int = 150
     geometry_points: int = 25_000
     geometry_supernodes: int = 4_096
@@ -540,6 +541,35 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
             volume_output_dim=bundle.spec.volume_output_dim,
         )
     raise ValueError(f"Unknown model: {config.model}")
+
+
+_stochastic_depth_active_layers: list[int] = []
+
+
+def patch_stochastic_depth(model: torch.nn.Module, rate: float) -> None:
+    backbone = getattr(model, "backbone", None)
+    if backbone is None:
+        return
+    blocks = getattr(backbone, "blocks", None)
+    if blocks is None:
+        return
+    num_layers = len(blocks)
+
+    def _forward_with_stochastic_depth(
+        x: torch.Tensor, attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        active = 0
+        for layer_idx, block in enumerate(blocks):
+            if backbone.training and rate > 0:
+                layer_keep_prob = 1.0 - (layer_idx / num_layers) * rate
+                if random.random() > layer_keep_prob:
+                    continue
+            x = block(x, attn_mask=attn_mask)
+            active += 1
+        _stochastic_depth_active_layers.append(active)
+        return x
+
+    backbone.forward = _forward_with_stochastic_depth
 
 
 def build_optimizer(params, config: TrainConfig):
@@ -1615,6 +1645,8 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
+    if config.stochastic_depth_rate > 0:
+        patch_stochastic_depth(model, config.stochastic_depth_rate)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
@@ -1737,6 +1769,9 @@ def main() -> None:
             anp_ema.restore(anp_head)
 
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
+        if config.stochastic_depth_rate > 0 and _stochastic_depth_active_layers:
+            epoch_metrics["stochastic_depth_active_layers"] = sum(_stochastic_depth_active_layers) / len(_stochastic_depth_active_layers)
+            _stochastic_depth_active_layers.clear()
         epoch_metrics["best_val_metric"] = best_val_metric
         epoch_metrics["best_epoch"] = float(best_epoch)
         history.append(epoch_metrics)
