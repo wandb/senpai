@@ -169,6 +169,7 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    self_distill_alpha: float = 0.0
 
 
 @dataclass
@@ -1271,6 +1272,7 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    self_distill_alpha: float = 0.0,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1328,6 +1330,46 @@ def train_one_epoch(
                         )
                         loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
 
+            if self_distill_alpha > 0 and ema is not None and model_name != "reference_abupt":
+                with torch.no_grad():
+                    ema.store(model)
+                    ema.copy_to(model)
+                    if isinstance(transform, TandemTargetTransform):
+                        with autocast_context(device, amp_mode):
+                            ema_out = model(
+                                surface_x=prepared.surface_x,
+                                surface_mask=prepared.surface_mask,
+                                volume_x=prepared.volume_x,
+                                volume_mask=prepared.volume_mask,
+                            )
+                        srf_mask = prepared.surface_mask
+                        vol_mask = prepared.volume_mask if prepared.volume_target is not None else None
+                    else:
+                        with autocast_context(device, amp_mode):
+                            ema_out = model(
+                                surface_x=batch.surface_x,
+                                surface_mask=batch.surface_mask,
+                                volume_x=batch.volume_x,
+                                volume_mask=batch.volume_mask,
+                            )
+                        srf_mask = batch.surface_mask
+                        vol_mask = batch.volume_mask if batch.volume_y is not None else None
+                    ema.restore(model)
+                distill = torch.tensor(0.0, device=loss.device)
+                if outputs["surface_preds"] is not None and ema_out["surface_preds"] is not None:
+                    distill = distill + F.mse_loss(
+                        outputs["surface_preds"][srf_mask],
+                        ema_out["surface_preds"][srf_mask],
+                    )
+                if vol_mask is not None and outputs.get("volume_preds") is not None and ema_out.get("volume_preds") is not None:
+                    distill = distill + F.mse_loss(
+                        outputs["volume_preds"][vol_mask],
+                        ema_out["volume_preds"][vol_mask],
+                    )
+                loss = (1 - self_distill_alpha) * loss + self_distill_alpha * distill
+                running.setdefault("distill_loss", 0.0)
+                running["distill_loss"] += float(distill.detach().cpu().item())
+
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
             micro_count += 1
@@ -1359,6 +1401,8 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    if "distill_loss" in running:
+        running["distill_loss"] /= max(steps, 1)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1688,6 +1732,7 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            self_distill_alpha=config.self_distill_alpha,
         )
 
         if ema is not None:
