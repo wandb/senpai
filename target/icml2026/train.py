@@ -167,6 +167,7 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
+    use_pcgrad: bool = False
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -763,9 +764,12 @@ def loss_grouped(
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
     volume_loss_weight: float = 1.0,
-) -> tuple[torch.Tensor, dict[str, float]]:
+    split_losses: bool = False,
+) -> tuple[torch.Tensor, dict[str, float]] | tuple[torch.Tensor, torch.Tensor | None, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.surface_x.device)
     metrics: dict[str, float] = {}
+    surf_loss = None
+    vol_loss = None
     if batch.surface_y is not None and outputs["surface_preds"] is not None:
         target = transform.apply(batch.surface_y)
         surf_loss = F.mse_loss(outputs["surface_preds"][batch.surface_mask], target[batch.surface_mask])
@@ -777,6 +781,8 @@ def loss_grouped(
         total = total + vol_loss * volume_loss_weight
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
+    if split_losses:
+        return surf_loss, vol_loss, metrics
     return total, metrics
 
 
@@ -1254,6 +1260,78 @@ def evaluate_abupt(
     return {"surface_mae": total_surface / max(count_surface, 1), "volume_mae": total_volume / max(count_volume, 1)}
 
 
+def _pcgrad_project(
+    all_params: list[torch.nn.Parameter],
+    surf_loss: torch.Tensor,
+    vol_loss: torch.Tensor,
+    volume_loss_weight: float,
+    grad_accum_scale: float,
+) -> float:
+    """PCGrad gradient surgery for 2 tasks. Returns conflict indicator (1.0 if conflicting, 0.0 otherwise)."""
+    grads_surf: list[torch.Tensor | None] = []
+    grads_vol: list[torch.Tensor | None] = []
+    saved_grads: list[torch.Tensor | None] = []
+
+    for p in all_params:
+        saved_grads.append(p.grad.clone().detach() if p.grad is not None else None)
+        p.grad = None
+    (surf_loss * grad_accum_scale).backward(retain_graph=True)
+    for p in all_params:
+        grads_surf.append(p.grad.clone().detach() if p.grad is not None else None)
+
+    for p in all_params:
+        p.grad = None
+    (vol_loss * volume_loss_weight * grad_accum_scale).backward()
+    for p in all_params:
+        grads_vol.append(p.grad.clone().detach() if p.grad is not None else None)
+
+    shared_s = []
+    shared_v = []
+    for g_s, g_v in zip(grads_surf, grads_vol):
+        if g_s is not None and g_v is not None:
+            shared_s.append(g_s.flatten())
+            shared_v.append(g_v.flatten())
+
+    conflict = 0.0
+    if shared_s:
+        flat_s = torch.cat(shared_s)
+        flat_v = torch.cat(shared_v)
+        dot = torch.dot(flat_s, flat_v)
+        conflict = float(dot < 0)
+
+        if dot < 0:
+            proj_s = flat_s - (torch.dot(flat_s, flat_v) / (torch.dot(flat_v, flat_v) + 1e-12)) * flat_v
+            proj_v = flat_v - (torch.dot(flat_v, flat_s) / (torch.dot(flat_s, flat_s) + 1e-12)) * flat_s
+        else:
+            proj_s = flat_s
+            proj_v = flat_v
+
+        combined = proj_s + proj_v
+        offset = 0
+        for i, (g_s, g_v) in enumerate(zip(grads_surf, grads_vol)):
+            if g_s is not None and g_v is not None:
+                numel = g_s.numel()
+                chunk = combined[offset : offset + numel].reshape(g_s.shape)
+                grads_surf[i] = chunk
+                grads_vol[i] = None
+                offset += numel
+
+    for p, g_s, g_v, g_saved in zip(all_params, grads_surf, grads_vol, saved_grads):
+        new_grad = None
+        if g_s is not None and g_v is None:
+            new_grad = g_s
+        elif g_s is not None and g_v is not None:
+            new_grad = g_s + g_v
+        elif g_v is not None:
+            new_grad = g_v
+        if new_grad is not None:
+            p.grad = new_grad if g_saved is None else (g_saved + new_grad)
+        else:
+            p.grad = g_saved
+
+    return conflict
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     anp_head: ANPSurfaceDecoder | None,
@@ -1271,6 +1349,7 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    use_pcgrad: bool = False,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1326,10 +1405,32 @@ def train_one_epoch(
                             volume_x=batch.volume_x,
                             volume_mask=batch.volume_mask,
                         )
-                        loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                        if use_pcgrad:
+                            surf_loss, vol_loss, _metrics = loss_grouped(
+                                batch, outputs, transform, volume_loss_weight=volume_loss_weight, split_losses=True,
+                            )
+                            combined_loss_val = _metrics["loss"]
+                        else:
+                            loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
 
-            accum_loss += float(loss.detach().cpu().item())
-            (loss / grad_accum_steps).backward()
+            if use_pcgrad and not isinstance(transform, TandemTargetTransform) and model_name != "reference_abupt":
+                accum_loss += combined_loss_val
+                if surf_loss is not None and vol_loss is not None:
+                    pcgrad_params = list(model.parameters())
+                    if anp_head is not None:
+                        pcgrad_params += list(anp_head.parameters())
+                    c = _pcgrad_project(pcgrad_params, surf_loss, vol_loss, volume_loss_weight, 1.0 / grad_accum_steps)
+                    running.setdefault("pcgrad_conflict_rate", 0.0)
+                    running["pcgrad_conflict_rate"] += c
+                    running.setdefault("pcgrad_steps", 0.0)
+                    running["pcgrad_steps"] += 1.0
+                elif surf_loss is not None:
+                    (surf_loss / grad_accum_steps).backward()
+                elif vol_loss is not None:
+                    (vol_loss * volume_loss_weight / grad_accum_steps).backward()
+            else:
+                accum_loss += float(loss.detach().cpu().item())
+                (loss / grad_accum_steps).backward()
             micro_count += 1
 
         if micro_count == 0:
@@ -1359,6 +1460,8 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    if "pcgrad_conflict_rate" in running and "pcgrad_steps" in running:
+        running["pcgrad_conflict_rate"] /= max(running["pcgrad_steps"], 1.0)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1615,7 +1718,8 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
-    forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
+    use_compile = config.compile_model and device.type == "cuda" and not config.use_pcgrad
+    forward_model = torch.compile(model) if use_compile else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
         anp_head = ANPSurfaceDecoder(
@@ -1643,9 +1747,9 @@ def main() -> None:
     best_anp_state: dict[str, torch.Tensor] | None = None
 
     if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
+        primary_metric_str = "val_primary/surface_pressure_mae"
     else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
+        primary_metric_str = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1688,6 +1792,7 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            use_pcgrad=config.use_pcgrad,
         )
 
         if ema is not None:
@@ -1719,7 +1824,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(primary_metric_str)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
