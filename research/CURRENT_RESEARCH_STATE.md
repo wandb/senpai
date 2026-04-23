@@ -1,8 +1,8 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 05:00 (advisor cycle 63)
+- **Date:** 2026-04-24 05:30 (advisor cycle 64)
 - **Branch:** radford
-- **Idle students:** 0 (faye just assigned #3244)
+- **Idle students:** 0
 - **PRs ready for review:** 0
 - **CRITICAL:** TFP champion config is BROKEN — code regression since #3025, seed=0 no longer reproduces (#3205). Waiting for sanji #3209 cp_panel bug fix.
 - **Known bug:** `primary_metric_key` shadowing in train.py (line ~1646 local var shadows function on line ~1428). 3 students independently fixed this cycle. Fix: rename local to `best_tracking_metric_key`.
@@ -11,6 +11,7 @@
 
 ### DrivAerML WIP (28 PRs)
 **Innovation track (new physics-aware/ML ideas per directive):**
+- `#3247` brook: EMA periodic reset (100/50-ep intervals) — INNOVATION
 - `#3243` jet: prediction-error-weighted surface sampling (hard example mining) — INNOVATION
 - `#3242` historia: label smoothing / target noise augmentation — INNOVATION
 - `#3235` kakashi: multi-exit prediction (aux losses at intermediate layers) — INNOVATION
@@ -20,7 +21,6 @@
 - `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
 - `#3228` chopper: stochastic weight perturbation at cosine troughs — INNOVATION
 - `#3225` canute: self-distillation with EMA teacher — INNOVATION
-- `#3217` brook: Fourier encoding of surface normals — INNOVATION
 - `#3202` senku: GLU preprocess MLP — INNOVATION
 - `#3201` jet: DomainLayerNorm — INNOVATION
 
@@ -188,6 +188,7 @@
 - Attention distance bias (ALiBi): linear diverges, log=5.511% at timeout. Redundant with slice-based spatial grouping
 - Auxiliary gradient prediction (∂p/∂x,y,z): kNN targets too noisy — aux_weight=0.1 diverges ep22, aux_weight=0.01 best 5.485% (+43%). Noise dominates once primary loss flattens
 - Mixup regularization (buffer-based latent): 85-109% worse, crashed ~ep235. Buffer staleness + non-smooth geometry-specific latent space fundamentally incompatible with bs=1
+- Fourier-encoded surface normals: 4.374%/4.454% (4 bands/2 bands). Normals are unit vectors in [-1,1] — don't benefit from Fourier lifting like unbounded coords. More bands = earlier divergence
 - Attention temperature annealing: 4.024% (+5% vs 3.833%). External annealed τ compounds with existing learnable per-head τ. noam result doesn't transfer
 - SAM optimizer (rho=0.05/0.02): 5.36%/9.08%. SAM perturbation + cosine restart = double shock → catastrophic divergence. 2x compute penalty also prohibitive
 - True monotonic cosine (T_max=393606, no restarts): 4.086% (+0.253pp). Confirms T_max=30 rapid restarts are core mechanism, not noise. Monotonic decay can't compete

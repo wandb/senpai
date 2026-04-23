@@ -1,5 +1,14 @@
 # SENPAI Research Results
 
+## 2026-04-24 05:30 — PR #3217: DM Fourier-encoded surface normals (brook) — CLOSED (dead end)
+
+- brook/dm-fourier-normals, W&B group: dm-fourier-normals
+- Hypothesis: Fourier encoding of surface normals (like positional encoding for coordinates) gives richer geometric info for high-curvature regions
+- Trial 1 (4 bands, +24 dims, W&B: xwcdmp8k): val=4.374% ep274, test=5.103%. Diverged catastrophically after ep274, terminal val ~53.7%
+- Trial 2 (2 bands, +12 dims, W&B: jiaqu42c): val=4.454% ep317, test=5.021%. Diverged after ep317, terminal val ~75.0%
+- **Root cause: surface normals are unit vectors in [-1,1] with angular semantics — unlike unbounded spatial coordinates, they don't benefit from Fourier lifting.** The NeRF analogy doesn't transfer. More bands = earlier divergence (expanded input dims amplify gradients at cosine restart peaks).
+- **Conclusion: Fourier normals dead for DM.** Raw float normals already carry the geometric curvature information. No path to recovery.
+
 ## 2026-04-24 05:00 — PR #3164: DM paper-facing full eval two-phase (faye) — CLOSED (did not reproduce champion)
 
 - faye/dm-ema-paper-fulleval, W&B: qd7g8npf (Phase 1 training), 37gsknn6 (Phase 2 full eval)
