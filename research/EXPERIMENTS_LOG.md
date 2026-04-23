@@ -1,5 +1,13 @@
 # SENPAI Research Results
 
+## 2026-04-24 00:00 — PR #3193: DM residual-prediction ablation (franky) — CLOSED (dead end)
+
+- Residual-only: best val=15.001% ep36 (W&B: uteqp5p4), crashed ep39 — catastrophic gradient explosion without asinh. Residual+asinh combined: best val=3.999% ep405 (W&B: 6eud1yyg), destabilized ep416 → 4.36%. Key finding: residual-prediction has a HARD dependency on asinh for stability on DM. Even paired, the combo gets to 3.999% (+0.17pp gap) but can't overtake champion. Asinh tames pressure gradients enough for residual to function, but added complexity still introduces late-training instability. Casca #3192 (asinh-only) will be the definitive single-feature test.
+
+## 2026-04-24 00:00 — PR #3183: TFP ANP+T_max=150 noam combo (rei) — CLOSED (dead end — TFP crisis)
+
+- ANP alone (T_max=10): field_mse=Inf every epoch, 548 epochs (W&B: bpqbwp3g). ANP+T_max=150: field_mse=3.1e+30 at best ep215, grad norms→62K, then NaN from ep400+ (W&B: 7uq11zww). Velocity channels healthy in both (Ux~0.0013-0.0015) — pathology isolated to pressure. ANP corrections in asinh-transformed space amplify exponentially on sinh inverse transform. Another manifestation of TFP physics-flag instability pattern. Entire TFP optimization blocked on sanji #3209 cp_panel bug fix.
+
 ## 2026-04-23 23:45 — PR #3175: DM full noam stack + individual ablations (hinata) — CLOSED (dead end)
 
 - Full stack (asinh+residual+compile+96sl+srf): best val=4.447% ep342 (W&B: vddf3qle), diverged → 64%. Asinh-only (scale=0.75): best val=4.421% ep303 (W&B: 0ks1aaz5), diverged → 61%. Residual-only: best val=4.651% ep242 (W&B: xmx6y3ws), diverged → NaN. All 0.6-0.8pp worse than 3.833%. Root cause: noam features were tuned for T_max=150/3H/no-gc regime — cosine T_max=30 restarts amplify gradient instability through these features despite gc=0.5. Asinh least harmful, residual most harmful. Individual ablations (casca #3192, franky #3193) may find narrower windows. Bug fix: primary_metric_key scoping.
