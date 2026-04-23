@@ -1,5 +1,44 @@
 # SENPAI Research Results
 
+## 2026-04-23 07:00 — PR #3072: DrivAerML EMA=0.9995+gc=0.5 (eren) — MERGED ✓
+
+- **Branch:** eren/dm-ema-9995-gc05
+- **Hypothesis:** EMA requires gc as a stability guard — previous EMA failures on DM lacked clipping
+- **Results:**
+
+| Run | Config | W&B | Best val surface_rel_l2_pct | Epoch | Status |
+|---|---|---|---|---|---|
+| Run 1 | EMA=0.9995, no gc | `64jrja7q` | 18.05% | 27 | Diverged ep28 |
+| Run 2 | EMA=0.9995 + gc=0.5 | `ncl1dh88` | **3.833%** | 511 | Still converging |
+
+- **vs Baseline:** -4.1% (3.833% vs 3.997%). Test=4.685%. Gap to AB-UPT: 0.013 pp (93% closed)
+- **Key insight:** gc=0.5 is the stability enabler for EMA on DrivAerML. The periodic loss spikes at cosine restart peaks (every ~30 epochs) disturb the EMA trajectory without clipping. EMA was previously thought dead for DM — the 3 prior failures all lacked gc. Run still converging at ep517 timeout.
+- **Decision:** MERGED — new DM champion
+
+## 2026-04-23 07:00 — PR #3077: DrivAerML 5L/512d (gilbert) — CLOSED
+
+- Best val 4.172% ep347, diverged ep405 (W&B: `ox918q66`). 4.4% worse then unrecoverable. 4L/512d confirmed as optimal depth.
+
+## 2026-04-23 07:00 — PR #3106: AF 2L/384d+gc=0.5+T_max=50 (wolfwood) — SENT BACK
+
+- surface=0.000564, vol=0.005935 (W&B: `gccu8a2k`). Stability confirmed (gc=0.5 fixes prior divergence) but both metrics worse than EMA champion (0.000459/0.002777). Sent back to add EMA=0.999 — the capacity of 384d needs EMA to realize its advantage.
+
+## 2026-04-23 07:00 — PR #3068: DM 64k surface points (brook) — SENT BACK
+
+- val=12.10% at ep62 (W&B: `ekrddnwe`). Epoch-starved: 64k eval without max-eval-batches costs ~6 min/ep → only 62 epochs in budget. Trajectory healthy and descending. Sent back to add --max-eval-batches 200.
+
+## 2026-04-23 07:00 — PR #3067: DM 32k surface points (askeladd) — SENT BACK
+
+- val=17.48% at ep33 (W&B: `8jvflw2w`). Same epoch-starvation. 32k creates 8,670 eval batches/epoch. Sent back to add --max-eval-batches 200.
+
+## 2026-04-23 07:00 — PR #3065: DM multi-seed seed=456 (chihiro) — SENT BACK
+
+- val=12.544% at ep50, test=12.096% (W&B: `pvkrr76j`). Full-eval timeout: ~7.7 min/ep → 50 epochs vs 467 needed. Sent back for two-phase approach (train with max-eval-batches, then single full-eval at best checkpoint).
+
+## 2026-04-23 07:00 — PR #3064: DM multi-seed seed=123 (casca) — SENT BACK
+
+- val=14.027% at ep40, test=15.580% (W&B: `7acr9vfr`). Same root cause. Sent back for two-phase eval.
+
 ## 2026-04-23 06:15 — PR #2974: Best-checkpoint saving infrastructure (mugen) — MERGED ✓
 
 - **Branch:** mugen/best-checkpoint-saving
