@@ -1,5 +1,9 @@
 # SENPAI Research Results
 
+## 2026-04-23 14:00 — PR #3138: DM 788 batches + T_max=60 (kakashi) — CLOSED
+
+- Run 1 (gc=1.0, no EMA): 6.620% ep66, diverged ep72 (W&B: `7sa8l03q`). Run 2 (gc=0.5+EMA=0.9995): 4.661% ep141, diverged ep143 (W&B: `jzg8os84`). Champion platform extended stability from ep72→ep143 and improved 6.62%→4.66%, but divergence is structural. 788 batches accumulate only 111k steps before dying vs baseline's 201k — throughput advantage completely erased by shorter training horizon. Three attempts (incl #3084) all diverge within 2 cosine cycles. Higher batch count per epoch dead for DM.
+
 ## 2026-04-23 13:30 — PR #3068: DM 64k surface points (brook) — SENT BACK
 
 - Original run (no fix): 12.10% ep55, timeout (W&B: `ekrddnwe`). Retry no-gc: 16.91% ep30, diverged (W&B: `7gg7iqw8`). Retry gc=1.0: **5.26% ep236**, terminal diverge ep277 (W&B: `7uvkow6r`). All runs WITHOUT EMA — unfair comparison to 3.833% champion. gc=1.0 insufficient (diverged); need gc=0.5+EMA=0.9995. Sent back for re-run on champion platform. 64k direction not dead — 28% more surface coverage per sample may still improve quality.
