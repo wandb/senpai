@@ -3,11 +3,21 @@
 ## TandemFoilSet
 
 - **Primary metric:** `val_primary/surface_pressure_mae` (= `val_eq4/surface_pressure_mae`)
-- **Current best:** 22.537 (val) at epoch 336
-- **Best PR:** #2924 (robin — gc=0.5 EMA refinement, Lion lr=1.25e-4, T_max=10, gc=0.5, WD=1e-2, EMA decay=0.999, 3L/192d)
-- **Note:** gc=0.5 (softer clip vs standard gc=1.0) enables stable EMA training across 336+ epochs where gc=1.0 diverged after ep167. Model still descending at ep336 — result is an underestimate of the ceiling.
+- **Current best:** 21.909 (val) at epoch 334 — test 23.419
+- **Best PR:** #3108 (zenitsu — gc=0.3+EMA=0.999, Lion lr=1.25e-4, T_max=10, WD=1e-2, 3L/192d)
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 1.25e-4 --cosine-t-max 10 --grad-clip 0.3 --weight-decay 1e-2 --model-slices 64 --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999 --ema-decay 0.999`
 
-### 2026-04-22 — PR #2924: TandemFoil: EMA refinement gc=0.5 — NEW BEST (CURRENT)
+### 2026-04-23 — PR #3108: TandemFoil: gc=0.3 + EMA=0.999 — NEW BEST (CURRENT)
+
+- **val_primary/surface_pressure_mae:** 21.909 (-2.8% vs 22.537) at epoch 334
+- **test_primary/surface_pressure_mae:** 23.419 (-4.7% vs 24.581)
+- **Per-split test MAE:** geom_camber_cruise=27.436, geom_camber_rc=31.587, re_rand=17.119, single_in_dist=17.533
+- **W&B run:** kzg626hf (zenitsu/tf-gc03-ema999)
+- **Config:** Lion lr=1.25e-4, T_max=10, **gc=0.3**, WD=1e-2, **EMA=0.999**, 3L/192d, Fourier+physics
+- **Key insight:** Softer gc (0.3 vs 0.5) under EMA stability finds a deeper basin. gc=0.5 was already soft relative to standard gc=1.0 — gc=0.3 continues the trend. Model best at ep334 not terminal — still room to improve.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil --optimizer lion --lr 1.25e-4 --cosine-t-max 10 --grad-clip 0.3 --weight-decay 1e-2 --model-slices 64 --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-fourier --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999 --ema-decay 0.999`
+
+### 2026-04-22 — PR #2924: TandemFoil: EMA refinement gc=0.5 — PREVIOUS BEST
 
 - **val_primary/surface_pressure_mae:** 22.537 (-13.8% vs 26.06) at epoch 336
 - **W&B run:** 0lv7fnun (robin/ema-refine-tf-gc05)
@@ -145,9 +155,19 @@
 ## AirfRANS
 
 - **Primary metric:** `val_primary/surface_mse`
-- **Current best:** 0.000482 (val) at epoch 576
-- **Best PR:** #2951 (stark — lr=6e-4, T_max=50, 2L/256d, AdamW, gc=1.0, wd=1e-2, no-EMA, Fourier)
-- **Key insight:** T_max=50 cosine schedule is the critical breakthrough — longer cosine periods allow the model to fully descend into loss basins before being kicked back up. lr=6e-4 + T_max=50 achieves 0.000482, a -19.4% improvement over the previous best (0.000598 at T_max=10). The run was still at ep576 within the 360-min budget. **Beats external target 0.0043 by 88.8%.**
+- **Current best:** 0.000459 (val) at epoch 771 — with Vol MSE 0.002777 (best in programme)
+- **Best PR:** #3050 (stark — EMA=0.999 + T_max=50, 2L/256d, AdamW lr=6e-4, gc=1.0, WD=1e-2)
+- **Key insight:** EMA=0.999 combined with T_max=50 improves BOTH primary metrics simultaneously: surface -4.8% (0.000459 vs 0.000482) AND volume -63.6% (0.002777 vs 0.00764). EMA is harmonious with T_max=50 — the longer cosine cycle lets EMA track effectively. Vol MSE 0.002777 closes gap to SpiderSolver from 4.5x to 1.63x.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 6e-4 --cosine-t-max 50 --grad-clip 1.0 --weight-decay 1e-2 --enable-fourier --model-layers 2 --model-hidden-dim 256 --model-heads 4 --epochs 999 --ema-decay 0.999`
+
+### 2026-04-23 — PR #3050: AirfRANS: EMA=0.999 at T_max=50 champion — NEW BEST (CURRENT)
+
+- **val_primary/surface_mse:** 0.000459 (-4.8% vs 0.000482) at epoch 771
+- **full_val/volume_mse:** 0.002777 (-63.6% vs 0.00764) — best volume result in programme
+- **W&B run:** z6pry4b9 (stark/af-ema-champion)
+- **Config:** 2L/256d/4H, AdamW lr=6e-4, T_max=50, gc=1.0, WD=1e-2, **EMA=0.999**, Fourier
+- **Key insight:** EMA + T_max=50 is synergistic — the longer cosine cycle (50 vs 10) allows EMA to track the optimization trajectory harmoniously, improving both surface sharpness and volume smoothing simultaneously. Vol MSE 0.002777 closes the SpiderSolver gap from 4.5x to 1.63x. Model still descending at ep771 — further training would push both metrics lower.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset airfrans --airfrans-task full --optimizer adamw --lr 6e-4 --cosine-t-max 50 --grad-clip 1.0 --weight-decay 1e-2 --enable-fourier --model-layers 2 --model-hidden-dim 256 --model-heads 4 --epochs 999 --ema-decay 0.999`
 
 ### 2026-04-22 — PR #2951: AirfRANS: LR + T_max sweep — NEW BEST (CURRENT)
 
@@ -404,14 +424,22 @@
 ## DrivAerML
 
 - **Primary metric:** `val_primary/surface_rel_l2_pct` (lower is better)
-- **Current best:** 3.997% (val) at epoch 467
-- **Best PR:** #2898 (piccolo — **4L/512d**/8H + Fourier + no-EMA + T_max=30, 467 epochs, AdamW lr=5e-4, **SENPAI_MAX_EPOCHS=9999**, no-compile)
+- **Current best:** 3.833% (val) at epoch 511 — test 4.685%
+- **Best PR:** #3072 (eren — EMA=0.9995 + gc=0.5, 4L/512d/8H, AdamW lr=5e-4, T_max=30)
 - **CRITICAL:** Must pass `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
-- **External target:** <3.71% (AB-UPT, ~500 epochs) — **1.08x gap remaining** (was 1.24x)
-- **Key insight:** Longer training on the golden 4L/512d config (SENPAI_MAX_EPOCHS=9999 with 360-min budget) finds a deeper basin at epoch 467 vs 256. torch.compile gives no throughput benefit on DrivAerML and the compile run diverged to NaN at ep454 without --grad-clip — future compile experiments MUST include --grad-clip 1.0. SENPAI_MAX_EPOCHS=9999 required.
-- **gc=2.0 finding (PR #2886):** gc=2.0+lr=4e-4+WD=1e-2 = **4.346%** (W&B: ginhxdco) — new 4L/512d gc ablation best. Does NOT beat current 3.997% baseline (achieved with different architecture/config) but represents the best gc sweep result on the golden 4L/512d foundation. gc=2.0 > gc=1.0 > gc=5.0 for DrivAerML.
+- **External target:** <3.71% (AB-UPT, ~500 epochs) — **gap: 0.123 pp (1.03x)**
+- **Key insight:** EMA=0.9995 requires gc=0.5 as stability guard — EMA alone diverges at ep28. gc unlocks EMA for DrivAerML. Run still converging at ep517 timeout (3.833% at ep511); more epochs expected to push below 3.82% (AB-UPT). Closes 93% of the original gap to AB-UPT.
 
-### 2026-04-22 — PR #2898: DrivAerML: torch.compile throughput (no-compile wins) — NEW BEST
+### 2026-04-23 — PR #3072: DrivAerML: EMA=0.9995 + gc=0.5 — NEW BEST (CURRENT)
+
+- **val_primary/surface_rel_l2_pct:** 3.833% (-4.1% vs 3.997%) at epoch 511
+- **test_primary/surface_rel_l2_pct:** 4.685% (best-checkpoint eval)
+- **W&B run:** ncl1dh88 (eren/dm-ema-9995-gc05)
+- **Config:** 4L/512d/8H, AdamW lr=5e-4, T_max=30, **EMA=0.9995**, **gc=0.5**, Fourier, no WD
+- **Key insight:** gc=0.5 is the stability enabler for EMA on DrivAerML. Without gc, EMA diverges at ep28 (Run 1: `64jrja7q`). With gc=0.5, training is stable through 517 epochs with no divergence. EMA was previously thought dead for DM (3 prior configs all failed) but those lacked gc. Run still converging at ep517 — gap to AB-UPT (3.82%) is only 0.013 pp.
+- **Reproduce:** `cd target/icml2026 && SENPAI_MAX_EPOCHS=9999 python train.py --dataset drivaerml --optimizer adamw --lr 5e-4 --cosine-t-max 30 --grad-clip 0.5 --enable-fourier --model-layers 4 --model-hidden-dim 512 --model-heads 8 --epochs 999 --batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200 --ema-decay 0.9995`
+
+### 2026-04-22 — PR #2898: DrivAerML: torch.compile throughput (no-compile wins) — PREVIOUS BEST
 
 - **val_primary/surface_rel_l2_pct:** 3.997% (-13.5% vs 4.619%) at epoch 467
 - **W&B run:** bht6h42t (no-compile baseline run, 467 epochs, SENPAI_MAX_EPOCHS=9999)

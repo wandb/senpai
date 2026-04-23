@@ -1,664 +1,183 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-22 19:10 (advisor cycle 2 — reviewed 4 PRs, closed 3, sent back 1, assigned 3 new)
+- **Date:** 2026-04-23 13:00 (advisor cycle 32 — closed #3131/#3124, assigning sanji/robin)
 - **Branch:** radford
-- **Idle students:** NONE — all students assigned
+- **Idle students:** 0 (sanji/robin being assigned)
 - **PRs ready for review:** 0
-- **PRs in WIP:** 59
-- **Fleet status:**
-  - **merged:** `#3025` (TFP Lion champion transfer), `#3036` (AdaFactor cross-dataset)
-  - **closed negative this cycle:** `#3049` (levi torch.compile — 0% throughput), `#2961` (mitsuha SDF — all worse), `#2954` (nezuko SwiGLU — AF beat but crashes TFP/DM, doesn't transfer)
-  - **closed earlier:** `#3021`, `#3023`, `#3026`, `#3027`, `#3030`, `#3042`
-  - **sent back:** `#3002` (franky Fourier bands — runs still early, need convergence)
-  - **NEW this cycle:** `#3060` (levi DM bilateral symmetry aug), `#3061` (mitsuha aux flow-condition head), `#3062` (nezuko per-case z-score normalization)
-  - **critical open PRs:** `#3029` (best-checkpoint save/eval — HIGH PRIORITY), `#3028`, `#3031-#3035`, `#3038-#3041`, `#3043-#3062`
-- **Current relaunch budget:** inherit pod env defaults
-  - `SENPAI_TIMEOUT_MINUTES=360`
-  - `SENPAI_MAX_EPOCHS=999`
 
-## Key Findings This Cycle (2026-04-22 19:10)
+## Fleet Status
 
-1. **SwiGLU AF beat (0.000461 vs 0.000482):** Real but dataset-specific. Closed per shared recipe directive. Logged for potential revisiting.
-2. **torch.compile dead end:** DrivAerML bottleneck is data loading, not compute. JIT fusion gives 0% speedup.
-3. **SDF input dead end:** Redundant with Fourier + physics features already in model.
-4. **GLU FFN family fully closed:** GeGLU (#3017) + SwiGLU (#2954) both fail on CFD surrogates (except AF-specific SwiGLU+EMA).
-5. **Fourier bands signal:** AF may benefit from freqs=32 (more bands). Needs convergence to confirm.
+### DrivAerML WIP (~36 students, ~60%)
+- `#3165` senku: EMA+gc+4H heads (128d/head)
+- `#3164` faye: paper-facing full eval (two-phase) — PAPER-FACING
+- `#3163` shouko: EMA+gc+attn dropout=0.05
+- `#NEW` himmel: AGC (adaptive gradient clipping) on EMA champion — BEING ASSIGNED
+- `#3161` spike: EMA+gc+eta_min=1e-5 (cosine floor)
+- `#3160` griffith: EMA+gc+16H heads
+- `#3159` franky: EMA+gc+4L/640d (wider)
+- `#3158` bulma: EMA+gc+lr=4e-4
+- `#3155` nobara: EMA+gc+longer T_max (45/60)
+- `#3154` historia: EMA+gc+monotonic cosine (no restarts)
+- `#3153` emma: EMA+gc+light WD (1e-4/5e-4)
+- `#3152` eren: EMA decay sweep (0.999 vs 0.9995)
+- `#3149` fern: stochastic input feature dropout (p=0.05/0.10)
+- `#3147` norman: lighter WD+gc=1.0 (5e-4/1e-4)
+- `#3146` taki: top-5 checkpoint averaging
+- `#3143` thorfinn: Lookahead(AdamW)
+- `#3138` kakashi: 788 batches+T_max=60 (SENT BACK — add gc=0.5+EMA)
+- `#3137` chopper: 5-ep warmup+gc=1.0
+- `#3132` gohan: eta_min=5e-5+gc=1.0
+- `#NEW` sanji: warmup (5-ep/10-ep) + EMA+gc champion — BEING ASSIGNED
+- `#3121` levi: dropout regularization sweep
+- `#3118` hinata: WD alone at champion config
+- `#3115` piccolo: bs2+25k pts (SENT BACK — 50k+gc=0.5+EMA)
+- `#3110` einar: AdamW beta2=0.99/0.995
+- `#3109` guts: lr=4e-4 full-eval
+- `#3085` kohaku: larger supernodes (SENT BACK — retry+gc=1.0)
+- `#3083` jet: max-train-batches=600
+- `#3079` gojo: 4L/640d (SENT BACK — lr=3e-4+T_max=60+EMA)
+- `#3076` frieren: log-cosh loss (SENT BACK — retry+gc=1.0)
+- `#3068` brook: 64k surface points (SENT BACK — add max-eval-batches 200)
+- `#3067` askeladd: 32k surface points (SENT BACK — add max-eval-batches 200)
+- `#3066` alphonse: 16k surface points
+- `#3065` chihiro: multi-seed s456 (SENT BACK — two-phase eval)
+- `#3064` casca: multi-seed s123 (SENT BACK — two-phase eval)
+- `#3063` canute: paper-facing full-eval (SENT BACK — two-phase)
+- `#3046` sukuna: WD+gc compound (SENT BACK — WD=5e-4/1e-4+gc=1.0)
 
-## Researcher Agent Top Ideas (2026-04-22 18:30) — Priority Queue
+### TandemFoil Paper WIP (~10 students, ~17%)
+- `#NEW` nami: attention heads sweep (4H/16H) — BEING ASSIGNED (moved from TFP)
+- `#3145` rei: gc=0.4 boundary test
+- `#3133` shinobu: WD sweep (5e-3/2e-2)
+- `#NEW` robin: warmup (5-ep/10-ep) + EMA=0.999 — BEING ASSIGNED (moved from TFP)
+- `#3123` mitsuha: shorter T_max (5/8)
+- `#3098` shoya: clean test evaluation — URGENT PAPER-FACING
+- `#3088` mugen: T_max=20
+- `#3056` haku: Lion+EMA refinement (T_max/gc/LR sweep)
+- `#2949` vash: depth/width sweep (LR=5e-5)
+- `#NEW` jin: multi-seed paper-facing (seeds 42/123/456) — BEING ASSIGNED
 
-| Rank | Idea | Assigned? | Expected Impact |
-|------|------|-----------|-----------------|
-| 1 | **DM bilateral symmetry augmentation** (free 2x data) | **YES → levi #3060** | HIGH |
-| 2 | **Per-case z-score normalization** (case-level output norm) | **YES → nezuko #3062** | MEDIUM-HIGH |
-| 3 | **Auxiliary flow-condition prediction head** (Re prediction) | **YES → mitsuha #3061** | MEDIUM |
-| 4 | Progressive surface-point curriculum (start 20k → 50k) | not yet | MEDIUM |
-| 5 | Freestream Cp normalization check (raw P vs Cp?) | not yet — investigate first | POTENTIALLY HIGH |
+### AirfRANS WIP (~10 students, ~17%)
+- `#3156` edward: softer gc=0.5 on EMA champion
+- `#3144` violet: vol-weight=2.0+EMA=0.999
+- `#3136` stark: EMA decay higher (0.9995/0.9999)
+- `#3135` nezuko: EMA=0.999+vol-weight=10x
+- `#3134` megumi: vol-weight=30x
+- `#3129` chrome: 4L/256d deeper architecture
+- `#3106` wolfwood: 2L/384d+gc+T_max=50 (SENT BACK — add EMA=0.999)
+- `#3101` tanjiro: vol-loss-weight=1.5 (SENT BACK)
+- `#3166` vegeta: vol-weight=5.0/7.0+EMA=0.999 — JUST ASSIGNED
+- `#NEW` gilbert: lr=8e-4/1e-3+EMA=0.999 — BEING ASSIGNED
 
-## Latest Research Directives (human team — #3020, 2026-04-21, still active)
+### TandemFoil WIP (~3 students, ~5%)
+- `#3150` yuji: clean test row gc=0.3 champion — PAPER-FACING
+- `#3142` zenitsu: gc=0.3+longer budget (480-min)
+- `#3140` usopp: gc=0.2 sweep
 
-1. **DrivAerML closure is top priority** — 3.997% vs 3.71% external target (1.08x gap)
-2. **Best-checkpoint test eval MANDATORY** for paper-facing runs (megumi #3029 critical)
-3. **DM sampling signal:** 32k surface points may outperform 50k (logged from #3027, needs clean reproduction when #3029 lands)
-4. **Cross-dataset by default** — simple hypotheses cover DM+AF+TF+TFP in one PR
-5. **Tandem debug discipline:** smoke → short debug → long run
-6. **No truncated eval on benchmark-facing runs**
-
-## CORE RESEARCH DIRECTIVE (Human Team Instruction — 2026-04-21)
-
-**CROSS-DATASET GENERALIZATION IS THE PRIMARY CONSTRAINT ON ALL NEW EXPERIMENTS.**
-
-The human research team has explicitly directed: every new hypothesis must be
-tested across all relevant datasets in a single PR. Dataset-specific tricks that
-do not transfer are not useful. The paper story requires a shared recipe.
-
-All four benchmarks are now active and required:
-
-1. **TandemFoil** — `val_primary/surface_pressure_mae` / `test_primary/surface_pressure_mae`
-2. **TandemFoil Paper** — `val_primary/field_mse` / `test_primary/field_mse` ← NEW 4th dataset (human directive 2026-04-21)
-3. **AirfRANS** — `val_primary/surface_mse` / `test_primary/surface_mse`
-4. **DrivAerML** — `val_primary/surface_rel_l2_pct` / `test_primary/surface_rel_l2_pct`
-
-**Assignment rule (effective immediately):**
-- New hyperparameter or architecture hypotheses MUST be tested on ALL four datasets in one PR.
-- Single-dataset assignments are only acceptable for dataset-specific ablations (e.g. DrivAerML batch size), TandemFoil Paper baseline runs, or targeted best-checkpoint recovery.
-- When in doubt: assign cross-dataset. An idea that only helps one dataset is a dataset hack.
-
-## BENCHMARK REPORTING RULES (MANDATORY)
-
-- **TandemFoil parity target**
-  - Report `surface_pressure_mae` on the public `kagent` v2 split family.
-  - Do **not** compare this metric directly against the original TandemFoilSet paper Table 6 `field_mse`.
-
-- **TandemFoil Paper**
-  - For literature-facing claims, report `field_mse` only.
-  - `surface_mse` and `volume_mse` are diagnostics, not the paper comparison scalar.
-
-- **AirfRANS**
-  - Paper-facing claims must report the official full-task pair:
-    - `Surf MSE`
-    - `Vol MSE`
-  - A surface-only number is an auxiliary headline, not a full benchmark win.
-  - If training uses any extra target transform, paper-facing evaluation must decode back to raw target space and then rescore with the official AirfRANS normalization only.
-
-- **DrivAerML**
-  - Paper-facing claims must report `surface_rel_l2_pct` on the repaired public `400 / 34 / 50` split.
-  - Treat this as a **surface-pressure comparison only**; do not claim a full multi-field benchmark win yet.
-  - Full evaluation is mandatory for paper-facing runs; do not cite truncated `--max-eval-batches` results as benchmark numbers.
-
-## Paper-Facing Snapshot
-
-| Dataset | Paper-facing metric | Current best | Target / reference | Status |
-|---|---|---|---|---|
-| TandemFoil | `test_primary/surface_pressure_mae` | **24.581** (run `nrn0q3ct`, latest finished EMA lane) | no external scalar on this contract | strong internal anchor; no longer the blocker |
-| TandemFoil Paper | `test_primary/field_mse` | **no clean paper-facing test row yet** | `0.10 / 0.18 / 0.36 / 0.13 / 0.14 / 0.21` by task | strong internal val, but paper-facing test/provenance still need cleanup |
-| AirfRANS | official full-task `Surf MSE / Vol MSE` pair | **`0.003 / 0.00764`** (#2824 best lane) | **`0.0043 / 0.0017`** (SpiderSolver) | surface beats target; full benchmark pair still not closed |
-| DrivAerML | `test_primary/surface_rel_l2_pct` | **6.244%** (`qx7z7if3`) | `3.71%`–`3.82%` | main paper-facing gap remains |
-
-## Steering Anchors (validation, for experiment decisions)
+## Steering Anchors
 
 | Dataset | Metric | Current anchor |
 |---|---|---|
-| TandemFoil | `val_primary/surface_pressure_mae` | **22.537** (#2924 MERGED — Lion lr=1e-4, gc=0.5, EMA=0.999, 3L/192d/3H) |
-| TandemFoil Paper | `val_primary/field_mse` | **0.002383** (#3025 MERGED — Lion lr=1.25e-4, T_max=10, gc=0.5, EMA=0.999, 3L/192d) |
-| AirfRANS | `val_primary/surface_mse` | **0.000482** (#2951 MERGED — AdamW lr=6e-4, T_max=50, no-EMA, 2L/256d/4H) |
-| DrivAerML | `val_primary/surface_rel_l2_pct` | **3.997%** (#2898 MERGED — AdamW lr=5e-4, T_max=30, no-EMA, 4L/512d/8H) |
+| TandemFoil | `val_primary/surface_pressure_mae` | **21.909** (#3108 — gc=0.3+EMA=0.999) |
+| TandemFoil Paper | `val_primary/field_mse` | **0.002383** (#3025) |
+| AirfRANS | `val_primary/surface_mse` + `vol_mse` | **0.000459 / 0.002777** (#3050 — EMA+T_max=50) |
+| DrivAerML | `val_primary/surface_rel_l2_pct` | **3.833%** (#3072 MERGED — EMA=0.9995+gc=0.5) |
 
-### CRITICAL SIGNAL — Best-Checkpoint Saves (2026-04-22)
+## Paper-Facing Snapshot
 
-PR #2895 (mugen, T_mult cosine restarts) found transient bests that were erased by post-restart regression:
-- TF: 25.459 @ ep109 — now SUPERSEDED (current TF anchor 22.537 is better)
-- AF: **0.000371** @ ep221 (vs 0.000482 current) — **23% improvement** — **still beats current anchor!**
-
-The AF transient min (0.000371) represents a genuinely deeper basin that we haven't captured yet.
-**Best-checkpoint saving (save whenever val improves) is a CRITICAL CODE CHANGE — ASSIGNED to megumi PR #3029.**
-
-## Main Scientific Goal
-
-A shared recipe whose core changes work across all four benchmarks, but with the
-remaining closure work prioritized correctly:
-
-- **TandemFoil parity**
-  - treat as the strong internal anchor
-  - avoid broad new Tandem-only exploration unless it directly supports cross-dataset transfer
-- **TandemFoil Paper**
-  - prioritize a clean `test_primary/field_mse` story and per-task provenance
-  - do not confuse strong validation with a paper-ready benchmark result
-- **AirfRANS**
-  - prioritize best-checkpoint evaluation and `Vol MSE` closure
-  - stop treating surface-only progress as sufficient for benchmark closure
-- **DrivAerML**
-  - this remains the main empirical gap
-  - prioritize objective/sampling/stability work that has a plausible chance to improve **test**, not just validation
-- **Queue hygiene**
-  - close stale novelty breadth when it does not directly support one of the three unresolved items above
-
-In short:
-the advisor should now optimize for **benchmark-faithful closure**, not just more frontier breadth.
-
-## Mandatory Config Rules (UPDATED per issue #3020 + EMA merge)
-
-- **TF:** Lion lr=1.25e-4, T_max=10, gc=0.5, WD=1e-2, `--ema-decay 0.999`, 3L/192d
-- **TFP:** Lion lr=1.25e-4, T_max=10, gc=0.5, WD=1e-2, `--ema-decay 0.999`, 3L/192d (current steering champion from `#3025`)
-- **AF:** AdamW lr=6e-4, T_max=50, gc=1.0, WD=1e-2, no-EMA, 2L/256d (per `#2951` steering anchor)
-- **DM:** AdamW lr=5e-4, T_max=30, **NO gc, NO WD**, no-EMA, 4L/512d (per #2898 baseline — champion reproduce command has NO --grad-clip, NO --weight-decay)
-- `--epochs 999` mandatory
-- DrivAerML: `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394`
-- **Paper-facing DM runs: DO NOT use --max-eval-batches** (human directive #3020). Truncated eval is only acceptable for fast iteration, NOT for benchmark submissions.
-- **Best-checkpoint test eval is mandatory** for paper-facing AF / DM / TFP runs (report: best val epoch, final test, best-ckpt test, truncated vs full eval)
-- **DM val/test gap WARNING:** val=3.997% but test≈5.93% — checkpoint selection and full eval are the bottleneck
-
-## Critical Code Change Needed: Best-Checkpoint Saving
-
-**Evidence:** #2895 (mugen T_mult) saw TF=25.459 and AF=0.000371 as transient minima, both clearly beating current baselines, but post-restart LR jumps erased both. The trainer currently saves the **final** checkpoint, not the **best val** checkpoint.
-
-**Impact:** Every experiment with cosine warm restarts (T_mult, SGDR, multi-cycle) is leaving improvement on the table. The minima exist — we just don't capture them.
-
-**Required trainer change:** After each validation epoch, if `val_primary_metric < best_val_so_far`, save `checkpoint_best.pt`. At the end of training, load and evaluate from `checkpoint_best.pt` (not the final epoch).
-
-**Priority:** HIGH — **ASSIGNED to megumi, PR #3029** (`megumi/best-checkpoint-save-cross-dataset`). Wave 14.
-
-## Negative Results (Do Not Repeat)
-
-- **No-Lookahead** (#2834): fatal across all datasets — diverges AF/DM, TF regresses
-- **3L/192d on TF or DM** (#2825): too shallow at current scale
-- **Pressure-weighted loss at wrong architecture** (#2801): pressure weighting hurts at non-golden depth
-- **LR above 5e-4 on DrivAerML** (#2873): 6e-4/5.5e-4/4.5e-4 all worse, LR optimum firmly at 5e-4
-- **surface_only_drivaerml is already default** (#2900): use --no-surface-only-drivaerml to test volume
-- **lr=9e-4 is above DrivAerML ceiling** (#2907): diverged catastrophically
-- **Momentum-SAM (MSAM)** (#2904): 3.7-22.7x worse everywhere; cost is actually 2x
-- **gc=1.0+WD=1e-2+cosine compound on DM** (#2908): 6/8 runs crashed
-- **4L/640d at lr=5e-4+gc=1.0** (#2917): all 3 DM runs crashed (ep90-153)
-- **T_max=5 on DrivAerML** (#2911): all 3 runs diverged — too rapid for 4L/512d scale
-- **EMA alone on DrivAerML** (#2899): 9.749% (worse than 4.619% baseline) — EMA+gc compound now being tested
-- **gc=1.5/gc=2.0 on DrivAerML** (#2881): all 8 runs diverged. gc=1.5 best 6.066% (+31%), gc=2.0 best 8.834% (+91%). CosineAnnealing restarts amplify instability
-- **T_max=10+gc=1.0 on DrivAerML** (#2879 bulma): failed — no sustained improvement over baseline 4.619%
-- **T_max=40/50+gc=1.0+WD=1e-2 on DrivAerML** (#2919 wolfwood): failed — longer cosine cycling did not help; WD+gc compound still unstable
-- **Gradient noise injection cross-dataset** (#2920 usopp): fatal — systematic catastrophic instability on all datasets; incompatible with cosine annealing
-- **AirfRANS gradient accumulation** (#2902 stark accum>1): strictly detrimental — accum=1 (control) trained longest (661 ep) and found best basin; accumulation hurts AF
-- **Huber loss on AirfRANS** (#2901 spike, early read): 58.7% WORSE than MSE at same epoch — Huber δ=1.0 is NOT beneficial for AF; final verdict pending completion
-- **Learnable per-head QK attention temperature** (#2981 spike, CLOSED): all 4 datasets 200-2844% worse than baseline. Hypothesis falsified — Transolver already has `self.temperature=0.5` for slice assignment (more important than QK scaling); learned QK temperatures converged near 1.0 (±15%), confirming standard 1/√d_k scaling is near-optimal. Mechanism analysis: QK temperature is downstream of the architecturally meaningful slice-assignment temperature.
-- **Spectral Norm on attention Q/K/V/O projections** (#2968 griffith, CLOSED): `torch.nn.utils.spectral_norm` on all 4 attention projections — 17.5% worse on TF, 55% worse on AF, DM diverged. SN constrains expressivity, conflicts with Fourier features, incompatible with torch.compile (legacy forward pre-hook API), and DM divergence from SN + cosine cycling instability (sigma collapse/oscillation during LR warm phases). sigma-Reparam (Zhai et al. ICML 2023) is the clean alternative (`W = g * V / ||V||_σ`).
-- **Adaptive Gradient Clipping / AGC** (#2962 casca, CLOSED): NFNet-style AGC at clip_factor=0.01 and 0.03 — fundamentally incompatible with Lion optimizer (Lion sign-compression makes g_norm = ||sign(m)|| = sqrt(num_params) constant, bypassing the adaptive component entirely); DrivAerML diverged at both clip_factor values. Global gc=0.5 outperforms AGC everywhere tested.
-- **PCGrad Gradient Surgery** (#2980 mugen, CLOSED): `retain_graph=True` (required for dual `.backward()` calls) is incompatible with PyTorch 2.10 torch.compile donated buffer optimization — forces `--no-compile-model` → 6–8× throughput collapse → AF at epoch 23 was 75× worse than baseline (0.036 vs 0.000482), TFP all-NaN. Physical motivation was valid (35% AF / 23% TF conflict rate) but implementation is fatally constrained. Future path: `torch.autograd.grad()` instead of `retain_graph=True`.
-- **LayerScale on Transolver residuals** (#3021 einar, CLOSED): init=1e-5 learnable per-channel scale — TF/AF stable-but-degraded, DM catastrophic divergence. Lion sign-compression + cosine LR creates resonant coupling with learnable scale params. 1e-5 init wastes early epochs (identity path). Not viable without separate param group + lower LR for scales.
-- **SAM optimizer (Sharpness-Aware Minimization)** (#3042 emma, CLOSED): catastrophic 3.5-53x worse everywhere. AirfRANS definitive at 59ep (33x worse — not a budget issue). DM rho=0.10 diverges (grad norms 35+). SAM family (MSAM #2904 + classic SAM #3042) is completely dead for CFD surrogates — loss landscape already well-conditioned by physics features.
-- **sigma-Reparam attention projections** (#3016 griffith, CLOSED after 3 rounds): TF 8.5% worse (147ep, cleanest comparison), AF diverged ep215, DM 44% worse, TFP 570% worse. Over-constrains learned representations with Fourier features. AdamW corrected runs even worse (AF 8.6x, DM 4.5x at early epochs).
-- **WD sweep cross-dataset** (#3011 sukuna): wd=5e-3 NaN on DM at ep178, wd=2e-2 degrades AF 38%. **wd=1e-2 is tightly optimal** — do not deviate.
-- **DM gc sweep** (#3010 piccolo): gc=0.5 adds damping (4.54%), gc=2.0 NaN at ep178. Natural grad norms ~0.14 — DM champion needs NO explicit gc.
-- **AF depth 1L** (#3008 stark): 1L/256d is 2x worse on AF (0.000960 vs 0.000482). **2L is the minimum viable depth for AF.**
-- **T_max=50 does NOT transfer from AF to TF** (#3008 stark): TF 23.464 vs 22.537 (+4.1%). Each dataset needs its own tuned schedule.
-- **2L/192d is capacity-limited** (#3006 senku): gc=0.3 cannot compensate for insufficient depth. All datasets worse.
-- **torch.compile(reduce-overhead) incompatible** (#2992 levi): CUDA graphs require fixed tensor shapes — variable CFD meshes crash. FlashAttn no benefit at 64-token slices.
-- **model_slices is not a productive lever** (#2972 bulma): flat response on TF, non-monotonic on AF (96 best but still 15% worse), DM degrades badly at all non-default values.
-- **DM NaN cliff at ~ep178** (reproducible across #3011 wd=5e-3 and #3010 gc=2.0): specific instability in loss landscape. The champion config (no gc, no WD) stays clear of this cliff.
-- **Head-dimension scaling** (#2990 gojo, CLOSED): 2H/128d (wider) and 8H/32d (narrower) both worse. AF 2H/128d=0.000573 (19% worse vs real anchor 0.000482 — student used stale baseline). DM crashed at both configs. TF 18% worse. Head count 4H is already optimal; head-dim is not a productive lever.
-- **AirfRANS LR above champion** (#3026 usopp, CLOSED): lr=7e-4 (+48.6%), 8e-4 (+46.6%), 9e-4 (+26.2%) all worse than baseline 0.000482. LR optimum at 6e-4 confirmed — do not test higher LRs on AF.
-- **GeGLU FFN activation** (#3017 casca, CLOSED): TF +3.2% (nearest miss), AF +66%, DM +158%, TFP NaN. Gated FFN destabilizes 3D CFD training. Lion+GeGLU incompatibility causes TFP NaN from ep1. DM grad norms escalated 0.7→273+. SwiGLU (#2954) pending — may close entire GLU family.
-
-## Default Assignment Pattern
-
-Cross-dataset is now the DEFAULT. Every new hypothesis should cover:
-- `target/icml2026/tandemfoil/`
-- `target/icml2026/tandemfoil_paper/`
-- `target/icml2026/airfrans/`
-- `target/icml2026/drivaerml/`
-
-Unless there is a strong reason to restrict to a single dataset (ablation,
-baseline run, known dataset-specific mechanism), all assignments are
-multi-dataset. This is the human team's explicit directive.
-
-When a hypothesis is relevant to TandemFoil generalization or paper
-comparability, always include:
-- `target/icml2026/tandemfoil/`
-- `target/icml2026/tandemfoil_paper/`
-
-## ACTIVE EXPERIMENTS — 69 open PRs on GitHub (benchmark-contract refresh applied 2026-04-22 17:45 IST)
-
-### Theme 25: CLOSED — SAM optimizer cross-dataset
-
-`#3042` is already closed negative and should be treated as a do-not-repeat result, not an active lane.
-
-### Theme 24: Wave 17 — Geometry Features, Physics Constraints, Architecture Capacity, Optimizer Alternatives (NEW — 2026-04-22)
-
-**Scientific rationale:** Wave 17 attacks four distinct frontiers simultaneously: (1) enriching the input representation with surface geometry features (normals + curvature) that encode boundary physics not available from raw coordinates; (2) imposing the divergence-free constraint as an auxiliary loss to regularize velocity predictions via mass conservation; (3) increasing model capacity through sparse Mixture-of-Experts FFN layers in the final Transolver blocks; and (4) testing AdaFactor as a memory-efficient optimizer alternative that frees VRAM for larger effective batch sizes. All 4 students run all 4 benchmarks (TF, TFP, AF, DM) in a single PR.
-
-| Student | Branch | PR | Hypothesis | Flag |
+| Dataset | Metric | Current best | External target | Status |
 |---|---|---|---|---|
-| faye | `faye/surface-normals-curvature` | #3038 | **Surface normals + principal curvature** — PCA-based normal estimation (k=16 NN) + trimesh discrete principal curvatures (arcsinh-scaled); zero-init extra weight columns in first linear; GPU split: DM=4, TF=2, TFP=1, AF=1 | `--surface-normals --surface-curvature` |
-| kohaku | `kohaku/mass-conservation-aux-loss` | #3039 | **Mass conservation auxiliary loss** — divergence via KNN k=8 Green-Gauss FD; `div_loss = (div_per_point^2).mean()`; applied only to velocity outputs; `total_loss = data_loss + 0.01 * div_loss`; GPU split: DM=4, TFP=2, AF=2 | `--div-loss-weight 0.01` |
-| chihiro | `chihiro/moe-ffn-layers` | #3040 | **Sparse MoE FFN in last Transolver blocks** — 8 experts, top-2 routing, load-balance loss; apply to last 1 block only; GPU split: DM=4, TF=2, TFP=1, AF=1 | `--moe-layers 1 --moe-n-experts 8 --moe-load-balance-weight 0.01` |
-| thorfinn | `thorfinn/adafactor-optimizer` | #3041 | **AdaFactor optimizer follow-up** — additional AdaFactor coverage after the earlier cross-dataset AdaFactor PR `#3036` already merged; GPU split: DM=4, TF=2, TFP=1, AF=1 | `--optimizer adafactor` |
-
-**Baselines to beat (all 4 datasets):**
-- TF: `val_primary/surface_pressure_mae` = **22.537** (#2924)
-- TFP: `val_primary/field_mse` = **0.002383** (#3025)
-- AF: `val_primary/surface_mse` = **0.000482** (#2951)
-- DM: `val_primary/surface_rel_l2_pct` = **3.997%** (#2898)
-
-**Per-dataset mandatory config (students must follow exactly):**
-- TF: Lion optimizer, `--ema-decay 0.999`, `--cosine-t-max 10`
-- TFP: AdamW, `--no-use-ema`, `--cosine-t-max 150`
-- AF: AdamW, `--no-use-ema`, `--cosine-t-max 50`, `--grad-clip 1.0`, `--weight-decay 1e-2`
-- DM: AdamW, `--no-use-ema`, `--cosine-t-max 30`, `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`; requires `SENPAI_MAX_EPOCHS=9999`
-
-**Note on AdaFactor:** `#3036` already merged on `2026-04-22`. `#3041` should therefore be treated as a follow-up / extension lane, not as the first launch of the hypothesis.
-
-### Theme 23: Wave 16 — Normalization, Warmup, and Optimizer Foundations (NEW — 2026-04-22)
-
-**Scientific rationale:** Wave 16 targets the foundational training mechanics that underpin all prior experiments but have not been systematically explored: transformer normalization placement (Pre-LN vs Post-LN), normalization variant (RMSNorm vs LayerNorm), LR schedule warmup, gradient processing (gradient centralization), cosine restart schedule shape (SGDR T_mult=2 with best-checkpoint saving from megumi #3029), and memory-efficient second-moment optimization (AdaFactor). These are all cross-dataset hypotheses — each student runs all 4 benchmarks (TF, TFP, AF, DM) in a single PR.
-
-| Student | Branch | PR | Hypothesis | Flag |
-|---|---|---|---|---|
-| alphonse | `alphonse/pre-ln-normalization-order` | #3031 | **Pre-LN normalization** — LayerNorm before residual addition (Pre-LN) instead of after (Post-LN); stabilizes gradient flow in deep transformers | `--pre-ln` |
-| fern | `fern/rmsnorm-layer-norm` | #3032 | **RMSNorm** — drop mean-centering from LayerNorm, compute only RMS scale; faster, simpler, used in LLaMA/Gemma | `--rmsnorm` |
-| hinata | `hinata/linear-warmup-scheduler` | #3033 | **Linear warmup + cosine** — 10-epoch linear ramp to peak LR, then CosineAnnealing; prevents cold-start instability in first epochs | `--warmup-epochs 10` |
-| kakashi | `kakashi/gradient-centralization` | #3034 | **Gradient centralization** — subtract per-tensor gradient mean before optimizer step; smooths loss landscape, acts as implicit weight regularizer | `--grad-centralization` |
-| tanjiro | `tanjiro/sgdr-tmult-best-checkpoint` | #3035 | **SGDR T_mult=2** — CosineAnnealingWarmRestarts with doubling restart intervals; uses best-checkpoint saving (megumi #3029) to capture transient minima at each restart | `--cosine-t-mult 2` |
-| ~~thorfinn~~ | ~~`thorfinn/adafactor-optimizer`~~ | ~~#3036~~ | ~~**AdaFactor optimizer** — factored second-moment estimation (Shazeer & Stern 2018); memory-efficient alternative to AdamW; run with fixed LR mode~~ (**MERGED on 2026-04-22; now superseded only as an older AdaFactor lane, not as a never-launched one**) | ~~`--optimizer adafactor`~~ |
-
-**Baselines to beat (all 4 datasets):**
-- TF: `val_primary/surface_pressure_mae` = **22.537** (#2924)
-- TFP: `val_primary/field_mse` = **0.002383** (#3025)
-- AF: `val_primary/surface_mse` = **0.000482** (#2951)
-- DM: `val_primary/surface_rel_l2_pct` = **3.997%** (#2898)
-
-**Per-dataset mandatory config (students must follow exactly):**
-- TF: Lion optimizer, `--ema-decay 0.999`, `--cosine-t-max 10`
-- TFP: AdamW, `--no-use-ema`, `--cosine-t-max 150`
-- AF: AdamW, `--no-use-ema`, `--cosine-t-max 50`, `--grad-clip 1.0`, `--weight-decay 1e-2`
-- DM: AdamW, `--no-use-ema`, `--cosine-t-max 30`, `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`; requires `SENPAI_MAX_EPOCHS=9999`
-
-**Note on tanjiro #3035 (SGDR T_mult=2):** This experiment requires megumi's best-checkpoint saving (#3029) to land first in order to properly capture transient minima at restart boundaries. If #3029 is still in-flight, tanjiro should wait or run with terminal checkpoint understanding the minima may be missed.
-
-### Theme 22: Wave 15 — Relative L2 Training Loss (violet #3030, NEW — 2026-04-22)
-
-**Scientific rationale:** DrivAerML trains on absolute MSE but evaluates on `surface_rel_l2_pct` — a relative (normalized) L2 metric. This objective mismatch means the model is never directly optimized for the evaluation criterion. Hypothesis: using a relative L2 loss (or a 0.5/0.5 mixed MSE+rel_L2) during training will align gradient signal with the eval metric and reduce DM surface_rel_l2_pct. TandemFoil also sees relative error at evaluation; frieren #2937 (Wave 3) is testing the same idea cross-dataset — violet's Wave 15 is a focused two-dataset variant with more explicit variant exploration.
-
-**Relative L2 formula:** `((pred - target).norm(dim=-1) / (target.norm(dim=-1) + 1e-8)).mean()` — normalizes per-node error by node-level target magnitude; eps=1e-8 prevents division by zero on boundary/zero-velocity nodes.
-
-| Student | PR | Experiment | Risk |
-|---|---|---|---|
-| violet | #3030 | **Relative L2 training loss** — 4 runs: DM-rel_l2 / DM-mixed (0.5MSE+0.5rel_L2) / TF-rel_l2 / TF-mixed; `--loss rel_l2` or `--loss mixed`; `--wandb_group wave4-rel-l2-loss` | LOW |
-
-**Baselines to beat:**
-- TF: `val_primary/surface_pressure_mae` = **22.537** (#2924)
-- DM: `val_primary/surface_rel_l2_pct` = **3.997%** (#2898)
-
-**Divergence fallback:** If DM rel_l2 diverges after 20 epochs, add `--grad-clip 1.0`.
-
-**Note:** TandemFoil Paper (TFP) excluded due to data environment issue (DrivAerML-format pickle files on TFP mount causing `ValueError: Expected paper-style tandem AoA to be shared`). AirfRANS excluded because it evaluates on surface_mse (absolute), not a relative metric — no objective mismatch to fix.
-
-### Theme 21: Wave 13 — DrivAerML Targeted Ablations + Optimizer Hyperparameter Sweep (NEW — 2026-04-22)
-
-| Student | PR | Experiment | Risk |
-|---|---|---|---|
-| mugen | #3027 | **DrivAerML surface-points sweep** — test 16k/32k/64k vs 50k baseline; isolate whether 50k is optimal | LOW/MEDIUM |
-| jet | #3028 | **AdamW β1/β2 sweep cross-dataset** — β1∈{0.85,0.9,0.95} × β2∈{0.99,0.999,0.9999}; PyTorch defaults never ablated; covers TFP/AF/DM + TF Lion control | LOW |
-
-**Scientific rationale:**
-- mugen #3027: 50k surface points chosen as round-number default; 64k may capture finer geometry (boundary layer mesh clustering), 32k/16k reduce compute. Either improvement or a clear ceiling confirms current default.
-- jet #3028: AdamW β parameters are unexplored. CFD mesh regression has heterogeneous gradient scales and cosine LR cycling creates periodic gradient magnitude changes — both interact with β2's second-moment adaptation speed. β2=0.99 (faster adaptation) may help DM's non-stationary loss landscape. Phase-sequential: AF first (fast feedback), then apply winners to TFP and DM.
-
-### Theme 20: Wave 12 — Residual Scaling / Regularization / Features / Optimization (NEW — 2026-04-22)
-
-Four new cross-dataset hypotheses targeting underexplored levers: residual initialization, attention regularization, physics-informed geometry features, and layer-wise LR scheduling. All cover all 4 datasets (TF/TFP/AF/DM).
-
-| Student | PR | Experiment | Risk |
-|---|---|---|---|
-| einar | #3021 | **LayerScale residuals (cross-dataset)** — per-channel learnable scalar α (init=1e-4) on attention+FFN residuals; `--layer-scale`; cross-dataset TF/TFP/AF/DM | LOW |
-| wolfwood | #3022 | **Attention Dropout (p=0.1)** — dropout on Transolver attention weights after softmax; `--attn-dropout 0.1`; cross-dataset TF/TFP/AF/DM | LOW |
-| emma | #3023 | **SDF Wall-Distance Feature** — min distance from each mesh node to solid boundary surface as physics input feature; cross-dataset TF/TFP/AF/DM | MEDIUM |
-| shoya | #3024 | **Layer-wise LR Decay (LLRD, decay=0.75)** — deeper layers receive lower LR (`base_lr * 0.75^(L-i-1)`); cross-dataset TF/TFP/AF/DM | LOW |
-
-**Scientific rationale:**
-- einar #3021 (LayerScale): Touvron et al. 2021 CaiT paper showed per-channel α init at 1e-4 stabilises deep transformer training. Distinct from brook #2999 (which used scalar per-layer, not per-channel). Per-channel gives finer-grained control.
-- wolfwood #3022 (Attention Dropout): Current spike #2995 tests standard attn dropout (p=0.1) but may still be in flight. wolfwood tests the same mechanism but cross-dataset via all 4 benchmarks simultaneously, ensuring no dataset-specific regression.
-- emma #3023 (SDF Wall-Distance): Wall distance is a classical CFD feature (used in k-ω SST turbulence models). Provides the model with explicit geometric information about proximity to solid boundaries — directly relevant to boundary layer physics. Tested at mesh-node level via chunk-based cdist.
-- shoya #3024 (LLRD, decay=0.75): More aggressive than frieren's #2984 (decay=0.8). Earlier layers see LR reduced by 0.75^(L-1) relative to head. Physics intuition: later layers learn task-specific representations (should adapt faster) while earlier layers learn geometry/features (should be more stable).
-
-**Baselines for Wave 12 PRs:**
-- TF: val=22.537 (#2924) / test=N/A
-- TFP: val=not established
-- AF: val=0.000482 (#2951) / test=0.003 (#2824)
-- DM: val=3.997% (#2898) / test=6.24% (#2691)
-
-### Theme 19: Wave 11 — sigma-Reparam + GeGLU (NEW — 2026-04-22, post-Wave 9/10 closures)
-
-Two new cross-dataset hypotheses assigned after closing griffith #2968 (Spectral Norm) and casca #2962 (AGC). Both cover all 4 datasets.
-
-| Student | PR | Experiment | Risk |
-|---|---|---|---|
-| griffith | #3016 | **sigma-Reparam on attention projections** — `W = g * (V / ||V||_σ)` per Zhai et al. ICML 2023; learned scalar g controls spectral norm without hooks; torch.compile compatible; `--sigma-reparam` flag; cross-dataset TF/TFP/AF/DM | LOW |
-| casca | #3017 | **GeGLU FFN activation** — `FFN(x) = (xW_1) * GELU(xW_3) * W_2`; distinct from SwiGLU (nezuko #2938 uses SiLU gate); GELU gate has different gradient properties; `--geglu` flag; cross-dataset TF/TFP/AF/DM | LOW |
-
-**Scientific rationale:**
-- griffith sigma-Reparam: Directly motivated by griffith's own spectral norm review (he cited Zhai et al. as "a cleaner future alternative"). sigma-Reparam parameterizes W as `g * (V/||V||_σ)` where g is a learned scalar and V an unconstrained matrix — achieves spectral norm control natively in the forward pass, no hook API, no torch.compile issues, and g can be regularized independently. Hypothesis: spectral bound helps attention expressivity when implemented cleanly rather than via SN hooks.
-- casca GeGLU: Complementary to SwiGLU (nezuko #2938). The key difference: GELU gate is smoother than SiLU/Swish near zero, with heavier tails. For CFD meshes where many nodes have near-zero physical quantities (pressure, velocity in quiescent regions), GELU gating may provide better sparsity. Dauphin et al. GLU (2017) + Noam Shazeer (2020) GeGLU/SwiGLU survey: both consistently outperform vanilla ReLU FFN.
-
-### Theme 18: Wave 10 — Cross-Dataset Optimization/Architecture/Augmentation Sweep (NEW — 2026-04-22)
-
-Thirteen new cross-dataset hypotheses spanning optimizer hyperparameters, architecture depth/width, regularization, and feature engineering. Wave 10 is a broad sweep to cover underexplored corners of the search space while Wave 9 stability runs are in flight.
-
-| Student | PR | Experiment | Hypothesis |
-|---|---|---|---|
-| canute | #3001 | **Slice temperature sweep** — Transolver's `self.temperature` is the most architecturally important temperature parameter (slice assignment); systematic sweep to find optimal value | Architecture |
-| franky | #3002 | **Extended Fourier frequency bands** — increase Fourier band cutoffs beyond defaults; richer frequency decomposition for complex flow structures | Features |
-| norman | #3003 | **Input channel dropout regularization** — randomly zero entire input channels during training; prevents overfit to any single physics feature | Regularization |
-| sanji | #3004 | **Long cosine schedule with linear warmup** — extended T_max with slow warmup; test if longer cosine reduces terminal LR overshoot | Optimization |
-| robin | #3005 | **2L/192d + gc=0.5 + EMA cross-dataset** — depth meets EMA breakthrough; shallower architecture with gradient clipping and EMA | Architecture |
-| senku | #3006 | **2L/192d + gc=0.3 + EMA cross-dataset** — softer clip variant; explore gc=0.3 which may be less restrictive than gc=0.5 for 2L | Architecture |
-| shouko | #3007 | **4L/512d + T_max=10 cross-dataset** — shorter cosine for DrivAerML-compatible schedule; test at 4L where gc stability is known | Architecture |
-| stark | #3008 | **AirfRANS depth sweep + T_max transfer** — AF-specific depth/T_max sensitivity; also tests cross-dataset transfer of AirfRANS tuning | Optimization |
-| ~~megumi~~ | ~~#3009~~ | ~~**Lion lr sweep cross-dataset** — systematic Lion LR search: find optimal lr for TF+AirfRANS+TFP+DM~~ **CLOSED — confirmed dead end; catastrophic AF/DM instability at all LRs (1e-4, 1.25e-4, 1.5e-4, 2e-4)** | ~~Optimization~~ |
-| piccolo | #3010 | **DrivAerML grad-clip sweep + gc transfer** — gc sensitivity sweep on DM; test which gc generalises cross-dataset | Optimization |
-| sukuna | #3011 | **Weight decay sweep cross-dataset** — wd=5e-3 vs wd=2e-2; explore WD sensitivity (DM WD=0 constraint still applies) | Regularization |
-| usopp | #3012 | **AdamW lr ablation** — systematic AdamW LR on TF + standard cross-dataset coverage | Optimization |
-| shoya | #3013 | **Fourier feature ablation cross-dataset** — ablate `--enable-fourier` across all datasets to quantify its contribution to baseline | Features |
-
-**Scientific rationale:** Wave 10 is a systematic coverage sweep. After 9 waves of targeted innovations, several hyperparameter axes remain only coarsely explored: slice temperature (most important Transolver parameter per #2981 analysis), Fourier band width, optimizer LR across all datasets simultaneously, and depth variants with EMA. This wave aims to either establish tighter optima or rule out further gains in these directions.
-
-### Theme 17: Wave 9 — Cross-Dataset Residual Stability Innovations (NEW — 2026-04-22)
-
-Two novel residual/regularization hypotheses targeting transformer stability and attention Lipschitz constraint. Both cover all 4 datasets.
-
-| Student | PR | Experiment | Risk |
-|---|---|---|---|
-| brook | #2999 | **LayerScale on Transolver residuals** — per-layer learnable diagonal scale `ls1/ls2 = nn.Parameter(ones * 1e-6)` on attention+FFN residuals; `--layer-scale`; cross-dataset (TF/TF-paper/AF/DM) | LOW |
-| zenitsu | #3000 | **Spectral Norm on attention Q/K/V/O projections** — `torch.nn.utils.spectral_norm` wraps linear projections to bound Lipschitz constant; `--spectral-norm-attn`; cross-dataset (TF/TF-paper/AF/DM) | LOW |
-
-**Scientific rationale:**
-- brook #2999 (LayerScale): Touvron et al. 2021 (CaiT/DeiT-III) showed that initialising residual scale at 1e-6 stabilises deep ViT training by preventing gradient explosion in early epochs. Applied to Transolver blocks: `x = x + ls1 * attn(norm1(x))` and `x = x + ls2 * ffn(norm2(x))`. Zero overhead at inference — ls values become near-1.0 after convergence in stable runs. Orthogonal to all Wave 3-8 experiments.
-- zenitsu #3000 (Spectral Norm): Miyato et al. 2018 (SNGAN) / Brock et al. 2018 (BigGAN) showed spectral normalisation stabilises GAN training by bounding the largest singular value of each weight matrix to ≤1. For attention projections, this constrains how sensitive the attention map is to small changes in input features — directly relevant to CFD meshes where nearby points are strongly correlated. Should combine with existing recipe (EMA + Lion/AdamW) without conflict.
-
-### Theme 16: Wave 8 — Cross-Dataset Regularization Innovations (NEW — 2026-04-22)
-
-New regularization hypotheses targeting attention and architecture. All cover all 4 datasets.
-
-| Student | PR | Experiment | Risk |
-|---|---|---|---|
-| spike | #2995 | **Attention Dropout (0.1)** — add `dropout=0.1` to all `nn.MultiheadAttention` calls; forces distributed attention representations; prevents overfitting to dominant local mesh patterns; cross-dataset (TF/TF-paper/AF/DM) | LOW |
-
-**Scientific rationale:**
-- spike #2995: Current model uses `dropout=0.0` everywhere. Attention dropout is a well-established regularizer — forces heads to learn redundant, distributed representations. CFD meshes are highly structured (nearby points strongly correlated); dropout may prevent overfitting to local mesh topology. Negligible compute overhead.
-
-### Theme 15: Hypernetwork Condition Encoding (2026-04-22)
-
-A small hypernetwork (~4k params) reads global flow condition scalars (Re, AoA, Mach) and generates per-layer scale+bias offsets for the slice hidden representations. Targets the conditioning pathway — orthogonal to all Wave 3-7 experiments. Motivated by the physics insight that different flow regimes (boundary layer dynamics, separation) should activate different computational paths.
-
-| Student | PR | Experiment | Risk |
-|---|---|---|---|
-| usopp | #2994 | **Hypernetwork Condition Encoding** — FlowCondHyperNet generates scale+bias applied at transformer entry; `--enable-flow-hypernet`; cross-dataset (TF/TF-paper/AF/DM) | MED |
-
-### Theme 14: Wave 7 — Cross-Dataset Attention Architecture Innovations (NEW — 2026-04-22)
-
-Six novel attention/compute hypotheses, all covering all 4 datasets. Wave 7 targets attention efficiency (MQA/GQA — human team HIGH PRIORITY), attention sparsity, weight averaging, and throughput optimizations.
-
-| Student | PR | Experiment | Risk |
-|---|---|---|---|
-| chrome | #2988 | **Multi-Query Attention (MQA)** — single KV head shared across all Q heads (`--num-kv-heads 1`); human team flagged HIGH PRIORITY | LOW-MED |
-| faye | #2989 | **Grouped-Query Attention (GQA)** — intermediate KV sharing: AF num_kv_heads=2/4H, DM num_kv_heads=4/8H, TF/TF-paper num_kv_heads=1/3H | LOW-MED |
-| gojo | #2990 | **Attention Head Dimension Scaling** — per-head dim ablation: TF 2H vs 6H (baseline 3H), AF 2H vs 8H, DM 4H vs 16H, all fixed hidden_dim | LOW-MED |
-| himmel | #2991 | **Stochastic Weight Averaging (SWA)** — average checkpoints at cosine LR troughs (`--swa --swa-start 0.75` or Python manual fallback) | LOW-MED |
-| levi | #2992 | **Flash Attention + torch.compile** — throughput hypothesis: reduce kernel overhead, more epochs within budget; log steps/sec | LOW |
-| shoya | #2993 | **Sparse Top-k Slice Attention** — retain only top-k attention connections per query slice; test k=16 and k=32; OOM savings enable more slices | MED |
-
-**Scientific rationale:**
-- MQA/GQA (#2988/#2989): Human team flagged HIGH PRIORITY. KV sharing reduces memory bandwidth by 3-8×, enables larger batches or more epochs. Orthogonal to all other changes.
-- Head-dim scaling (#2990): num_heads×head_dim = hidden_dim; changing num_heads trades cross-head diversity for per-head expressivity. Untested in this programme.
-- SWA (#2991): Weight averaging at cosine troughs corresponds to flat basin exploration — known to improve generalization in vision/NLP. Orthogonal to optimizer choice.
-- Flash+compile (#2992): Pure throughput play. FA-2 + reduce-overhead mode should give 20-50% faster epochs, more training signal within 360-min budget.
-- Sparse top-k (#2993): Physics-motivated: leading-edge slices are weakly coupled to wake slices. O(S·k) vs O(S²). k=16/32 vs full k=64.
-
-### Theme 13: Wave 6 — Cross-Dataset Scheduler/Augmentation (NEW — 2026-04-22)
-
-Three new cross-dataset hypotheses targeting scheduler correctness, geometric augmentation, and T_max sensitivity. All cover all 4 datasets.
-
-| Student | PR | Experiment | Risk |
-|---|---|---|---|
-| gojo | #2985 | **Per-Step SGDR** — `CosineAnnealingWarmRestarts` with step-level T_0=1000, T_mult=2; preserves rapid oscillation regularizer that per-epoch SGDR (#2967) destroyed | LOW-MED |
-| shoya | #2986 | **Coordinate Noise Augmentation** — Gaussian noise σ=0.01 on node 3D positions during training only; forces physics-invariant representations (different from point dropout #2970) | LOW |
-| chrome | #2987 | **Cosine T_max Cross-Dataset Sweep** — T_max=5 (primary) and T_max=20 across all 4 datasets; first unified T_max comparison vs per-dataset baselines (TF=10, DM=30) | LOW |
-
-**Scientific rationale:**
-- gojo #2985: Per-epoch SGDR (#2967) failed because ~750 steps/epoch → LR monotonically decreasing for full epoch → sharp basin → divergence. Per-step T_0=1000 restores the per-step oscillation cycle.
-- shoya #2986: Entirely untested in this pipeline. Standard in 3D point cloud literature (PointNet/DGCNN). σ=0.01 is a gentle perturbation that should regularize without distorting physics.
-- chrome #2987: TF baseline T_max=10, DM baseline T_max=30 set independently. Cross-dataset optimum has never been measured. Note: T_max=5 previously diverged DM (#2911) — a key data point for comparison.
-
-### Theme 7: Bold New Directions (Wave 3 — recreated after accidental merge of #2928-2936)
-
-10 hypothesis families: loss reformulation, architecture innovations, optimization shifts, physics-informed features, unit-invariant clipping.
-
-| Student | PR | Experiment | Risk |
-|---|---|---|---|
-| frieren | #2937 | **Relative L2 Training Loss** — align DM training loss with eval metric | LOW |
-| nezuko | #2938 | **SwiGLU FFN Replacement** — gated linear units for all Transolver blocks | LOW |
-| ~~violet~~ | ~~#2939~~ | ~~**Stochastic Depth (DropPath)** — layer-level regularization 0.1/0.2~~ **CLOSED — negative across all datasets; reassigned to Wave 15 #3030 Relative L2 loss** | ~~LOW~~ |
-| gilbert | #2940 | **Prodigy Optimizer** — parameter-free LR adaptation | LOW-MED |
-| kohaku | #2941 | **Global Context Token** — break slice-local attention bottleneck | MEDIUM |
-| emma | #2942 | **Surface Normals + Curvature** — differential geometry input features | MEDIUM |
-| chihiro | #2943 | **Conservation Auxiliary Loss** — div(u)=0 physics regularization | MED-HIGH |
-| shoya | #2944 | **MoE FFN Layers** — sparse expert routing for physics-regime specialization | MED-HIGH |
-| mitsuha | #2945 | **SDF Wall-Distance Feature** — signed distance field geometry embedding | MEDIUM |
-| ~~casca~~ | ~~#2946~~ | ~~**Adaptive Gradient Clipping (AGC)**~~ CLOSED — incompatible with Lion; DM diverged; reassigned to Wave 11 GeGLU | ~~LOW-MED~~ |
-
-### Theme 8: TandemFoil Paper Baseline Wave (NEW — 2026-04-22)
-
-First experiments ever run on `tandemfoil_paper` on the radford programme. Racing to establish the val anchor for `val_primary/field_mse`.
-
-| Student | PR | Experiment | Risk |
-|---|---|---|---|
-| jin | #2947 | **TF Paper LR Sweep** — Lion lr=1e-4/1.25e-4/1.5e-4/2e-4 at 3L/192d+3L/256d; AdamW refs | LOW |
-| guts | #2948 | **TF Paper Physics-Flag Ablation** — 8 runs removing flags one-by-one from full golden config | LOW |
-| vash | #2949 | **TF Paper Depth/Width Arch Sweep** — 3L/4L/5L × 192d/256d/384d at Lion lr=1e-4 | LOW |
-
-Paper targets (Experiment 4, Table 6 — MGN best / paper best per task):
-- cruise_random_uniform: 1.79 / **0.10**
-- cruise_random_aoa_extrap: 2.03 / **0.18**
-- cruise_random_re_extrap: 4.85 / **0.36**
-- cruise_random_stagger_extrap: 1.74 / **0.13**
-- cruise_random_gap_extrap: 1.95 / **0.14**
-- racecar_uniform: 0.61 / **0.21**
-
-### Theme 9: DrivAerML + AirfRANS Optimizer Sweeps (NEW — 2026-04-22)
-
-| Student | PR | Experiment | Risk |
-|---|---|---|---|
-| piccolo | #2950 | **DrivAerML Lion Optimizer** — Lion lr=1e-4/2e-4/3e-4/5e-4 × T_max=30/50 + AdamW refs at 4L/512d | LOW-MED |
-| stark | #2951 | **AirfRANS LR+Cosine Sweep** — AdamW lr=7e-4/8e-4/9e-4/1e-3 × T_max=10/20/50 at 2L/256d/4H | LOW |
-
-### Theme 0: EMA Refinement
-
-| Student | PR | Experiment |
-|---|---|---|
-| robin | #2924 | TF lr=1e-4+EMA, TF gc=0.5+EMA, AF T_max=10+EMA, AF seed=43 |
-| zenitsu | #2925 | DrivAerML EMA+gc=1.0, EMA+gc+WD, EMA decay=0.9999, pure gc control |
-
-### Theme 1: AirfRANS Recipe Transfer to DrivAerML
-
-| Student | PR | Experiment |
-|---|---|---|
-| brook | #2878 | gc=1.0+WD=1e-2 (flagship compound, no EMA) |
-| ~~bulma~~ | ~~#2879~~ | ~~T_max=10+gc=1.0~~ CLOSED — failed; reassigned to #2972 cross-dataset spatial sweep |
-| canute | #2880 | Full recipe: lr=7e-4+gc=1.0+WD=1e-2 |
-| chopper | #2882 | T_max=15+gc=1.0+WD=1e-2 |
-| einar | #2883 | gc=1.0+T_max=20+WD=1e-2 |
-| yuji | #2922 | WD=5e-3+gc=1.0 moderate, pure gc ablation, WD alone |
-| edward | #2916 | lr=6e-4+gc=1.0+WD=1e-2+T_max=10 |
-| ~~wolfwood~~ | ~~#2919~~ | ~~T_max=40/50+gc=1.0+WD=1e-2 (longer cycling)~~ CLOSED — failed; reassigned to #2973 cross-dataset spatial sweep |
-
-### Theme 12: Wave 5 — Cross-Dataset Code/Architecture Innovations (NEW — 2026-04-22)
-
-Five novel hypotheses, all covering all 4 datasets. Wave 5 re-runs Wave 4 ideas as TRUE cross-dataset PRs (the Wave 4 assignments #2974-#2978 were single-dataset; Wave 5 is the corrected multi-dataset version).
-
-| Student | PR | Experiment | Risk |
-|---|---|---|---|
-| mugen | #2980 | **PCGrad Gradient Surgery** — project conflicting surface/volume gradients using PCGrad (Yu et al. 2020); `pcgrad_backward()` helper; all 4 datasets | MED |
-| ~~spike~~ | ~~#2981~~ | ~~**Learnable Attention Temperature**~~ CLOSED — all 4 datasets 200-2844% worse; QK temp learning is downstream of the slice-assignment temperature; learned values ≈1.0 confirms standard 1/√d_k near-optimal | ~~LOW-MED~~ |
-| taki | #2982 | **Z-Score Pressure Normalization** — replace `--asinh-pressure` with `LearnedPressureNorm` using running_mean/running_var buffers (momentum=0.01); all 4 datasets | LOW |
-| zenitsu | #2983 | **RoPE Positional Embeddings** — rotary positional encoding on QK using 3D node coordinates; alongside `--enable-fourier`; all 4 datasets | LOW-MED |
-| frieren | #2984 | **LLRD (Layer-wise Learning Rate Decay)** — `get_llrd_param_groups(model, base_lr, decay=0.8)`, test decay=0.8 and 0.9 on TF first; all 4 datasets | LOW |
-
-### Theme 11: Wave 4 — Cross-Dataset Code/Architecture Innovations (2026-04-22, SUPERSEDED by Wave 5)
-
-NOTE: These PRs (#2974-#2978) were originally framed as cross-dataset but were single-dataset implementations. Wave 5 (#2980-#2984) is the corrected multi-dataset version. These PRs may still complete and should be reviewed individually.
-
-| Student | PR | Experiment | Risk |
-|---|---|---|---|
-| mugen | #2974 | **Best-Checkpoint Saving** — save `checkpoint_best.pt` whenever val improves; load best at end; all 4 datasets | LOW |
-| spike | #2975 | **RoPE Positional Embeddings** — rotary positional encoding on QK using 3D node (x,y,z) coordinates; `--rope-dim 32`; all 4 datasets | LOW-MED |
-| taki | #2976 | **Z-Score Pressure Normalization** — replace `--asinh-pressure` with per-dataset mean/std `--zscore-pressure`; all 4 datasets | LOW |
-| zenitsu | #2977 | **Learnable Attention Temperature** — per-head log-space temperature scalar `nn.Parameter`; `--learnable-attn-temperature`; all 4 datasets | LOW-MED |
-| frieren | #2978 | **PCGrad Gradient Surgery** — project conflicting surface/volume gradients; `--pcgrad`; logs `gradient_conflict_rate`; all 4 datasets | MED |
-
-### Theme 10: Cross-Dataset Spatial/Physics Budget Sweeps (NEW — 2026-04-22)
-
-Two systematic sweeps testing the model's sensitivity to physics partition granularity (`model_slices`) and spatial resolution budget (`geometry_supernodes` + `surface_anchor_points`) across all 4 datasets. Neither dimension has ever been swept in the cross-dataset icml2026 format.
-
-| Student | PR | Experiment | Risk |
-|---|---|---|---|
-| bulma | #2972 | **model_slices cross-dataset sweep** — 48/64/96/128 across all 4 datasets; TF best is 64 (baseline 96 default), never tested on AF/DM/TF-paper | LOW-MED |
-| wolfwood | #2973 | **geometry_supernodes + surface_anchor_points budget sweep** — Config A (2048/4000), B default (4096/8000), C (8192/16000) across all 4 datasets | LOW-MED |
-
-**bulma #2972 — model_slices sweep details:**
-- 13 runs total: TF×3 (slices 48/96/128; 64 is current TF best), TF-paper×3, AF×4 (48/64/96/128), DM×3 (48/64/128)
-- Priority: TF+AF first (fast); DM second (slow — min slices=64 and slices=96)
-- Hypothesis: slices=64 TF win may transfer; AF/DM may prefer different granularity
-
-**wolfwood #2973 — spatial resolution budget details:**
-- Config A (half): `--geometry-supernodes 2048 --surface-anchor-points 4000`
-- Config B (baseline): `--geometry-supernodes 4096 --surface-anchor-points 8000`
-- Config C (double): `--geometry-supernodes 8192 --surface-anchor-points 16000`
-- DM Config C: OOM risk — fallback to `--geometry-supernodes 8192 --surface-anchor-points 8000` if needed
-- Hypothesis: current defaults may under-resolve or over-spend spatial budget; doubling may improve surface fidelity
-
-### Theme 2: DrivAerML LR+gc Exploration
-
-| Student | PR | Experiment |
-|---|---|---|
-| faye | #2885 | lr=7e-4+gc=1.0 |
-| franky | #2886 | lr=4e-4+gc=1.0 |
-| gohan | #2887 | gc=1.0+T_max=10 LR scan |
-| gojo | #2888 | gc=0.5+T_max=10 |
-| ~~casca~~ | ~~#2881~~ | ~~gc=1.5/gc=2.0~~ CLOSED — dead end. Reassigned to #2946 AGC |
-| jin | #2947 | TandemFoil Paper first baseline — Lion lr sweep 1e-4/1.25e-4/1.5e-4/2e-4 × 3L/192d+3L/256d + AdamW refs |
-| shinobu | #2912 | WD=3e-2/5e-2+gc=1.0 (heavy regularization) |
-| sanji | #2918 | gc=0.5+WD=1e-2 (softer clip + regularization compound) |
-
-### Theme 3: DrivAerML Architecture
-
-| Student | PR | Experiment |
-|---|---|---|
-| griffith | #2889 | 3L/512d+gc=1.0 |
-| guts | #2948 | TandemFoil Paper physics-flag ablation — 8 runs removing flags from golden config |
-| himmel | #2891 | 5L/512d deeper |
-| jet | #2892 | 3L/768d shallow+wide |
-| shouko | #2909 | heads=16/4 ablation + gc=1.0 |
-| askeladd | #2914 | MLP ratio=6/2 + gc=1.0+WD=1e-2 |
-| chrome | #2923 | torch.compile + gc=1.0 (throughput + stability) |
-
-### Theme 4: Scheduler Innovations (CODE CHANGES)
-
-| Student | PR | Experiment |
-|---|---|---|
-| megumi | #2894 | Linear warmup+cosine |
-| mugen | #2895 | CosineAnnealingWarmRestarts T_mult (SENT BACK — found TF=25.459/AF=0.000371 transient but lost due to no best-ckpt save; must add checkpoint saving + retry) |
-| vash | #2949 | TandemFoil Paper depth/width arch sweep — 3L/4L/5L × 192d/256d/384d |
-
-### Theme 5: Training Innovations (CODE CHANGES)
-
-| Student | PR | Experiment |
-|---|---|---|
-| nobara | #2897 | LLRD (layer-wise LR decay) |
-| ~~usopp~~ | ~~#2920~~ | ~~Gradient noise injection~~ CLOSED — fatal instability all datasets; reassigned to #2970 Point Dropout |
-| sukuna | #2903 | SWA at cosine troughs |
-| spike | #2901 | Huber/log-cosh loss (SENT BACK — submitted while still running; AF Huber is 58.7% worse than MSE) |
-| stark | #2951 | AirfRANS LR+cosine sweep — lr=7e-4/8e-4/9e-4/1e-3 × T_max=10/20/50 |
-
-### Theme 6: Throughput + Seeds + Ablations
-
-| Student | PR | Experiment |
-|---|---|---|
-| piccolo | #2950 | DrivAerML Lion optimizer sweep — lr=1e-4/2e-4/3e-4/5e-4 × T_max=30/50 + AdamW refs |
-| vegeta | #2906 | 360min multi-seed replication |
-| nami | #2896 | Lion higher LR on DrivAerML |
-| eren | #2910 | max-train-batches=788 (2x data/epoch) |
-| rei | #2913 | surface-points=75k resolution scaling |
-| levi | #2915 | no-Fourier ablation (faster epochs) |
-
-### Continuing from Previous Wave
-
-| Student | PR | Dataset | Focus |
-|---|---|---|---|
-| norman | #2868 | DrivAerML | 2L/512d+3L/512d |
-| historia | #2867 | DrivAerML | 3L/256d+3L/384d |
-| kakashi | #2823 | AirfRANS | gc=1.0+T_max=10 stabilization |
-| thorfinn | #2786 | AirfRANS | gc=1.0+T_max=7 extended |
-| taki | #2814 | DrivAerML | Mild regularization |
-| tanjiro | #2842 | TandemFoil | 3L/192d+lr=1e-4+gc=0.5 (sent back) |
-| alphonse | #2840 | TandemFoil | lr=1e-4+gc=1.0 multi-seed |
-| fern | #2837 | TandemFoil | 3L/256d at lr=1.25e-4 |
-| senku | #2864 | TandemFoil | 2L/192d+2L/256d depth reduction |
-| haku | #2820 | AirfRANS | gc=0.5+lr=5e-4 extended |
-| hinata | #2770 | AirfRANS | 4L/256d WD=5e-3 |
-
-Note: jin (#2893), guts (#2890), vash (#2905), piccolo (#2898), stark (#2902) were reassigned to new experiments on 2026-04-22.
-Their old PRs remain in-flight but are now listed under their new assignments in Themes 8 and 9 above.
-
-## Research Insights
-
-1. **Corrected EMA (MERGED #2899):** timm-style warmup `min(decay, (1+step)/(10+step))` gives -13.2% TF and -41.2% AF. **This is the shared recipe change.** decay=0.999 > 0.9999 on both datasets.
-2. **DrivAerML is fragile to compounds:** gc+WD+cosine crashes (6/8 #2908), 640d crashes (#2917), T_max=5 crashes (#2911). Only gentle perturbations survive at 4L/512d.
-3. **Width scaling ceiling at 512d for DM:** 640d is unstable. guts #2890 (768d) and himmel #2891 (5L/512d) will clarify the boundary.
-4. **AB-UPT** achieves 3.71% via geometry-separated encoding — escalation if EMA+recipe fails.
-5. **TandemFoil Paper has a strong steering anchor now, but still needs a clean test/provenance story:** `#3025` established `val_primary/field_mse = 0.002383`, yet the literature-facing task still requires a trustworthy `test_primary/field_mse` row and per-task Table 6 comparison.
-
-## Current Research Themes and Priorities
-
-### Priority 0: Cross-Dataset Generalization (Human Team Directive — NON-NEGOTIABLE)
-- **Every new experiment must test across all 4 datasets.** Ideas that help only one dataset are not acceptable for the shared paper recipe.
-- **TandemFoil Paper is now a required 4th benchmark.** All future assignments must include it.
-- **Measurement gate:** An experiment is a win only if it does not cause regression on any of the 4 datasets (or shows a cross-dataset improvement).
-
-### Priority 1: Best-Checkpoint Closure And Benchmark-Faithful Evaluation
-- **Land `#3029`** and make best-checkpoint test evaluation mandatory for AirfRANS, DrivAerML, and TandemFoil Paper paper-facing runs.
-- AirfRANS still has a real uncaptured transient minimum (`0.000371` val) that may matter once best-checkpoint evaluation is in place.
-- Benchmark-facing reports must use the corrected contracts from the top of this file, not the older surface-only shorthand.
-
-### Priority 2: DrivAerML Test Closure
-- The main empirical gap is still DrivAerML test: `6.244%` vs the published `3.71%`–`3.82%` band.
-- Highest-EV open lanes are:
-  - `#3027` surface-points sweep
-  - `#3028` AdamW beta sweep
-  - `#3030` relative-L2 objective
-- New DrivAerML work should be favored only when it has a plausible path to improving **test**, not just validation.
-
-### Priority 3: AirfRANS Full-Benchmark Closure
-- AirfRANS is not "done" just because surface is strong.
-- The key remaining work is:
-  - best-checkpoint evaluation
-  - `Vol MSE` closure
-  - provenance cleanup for the final paper table
-- Deprioritize new AirfRANS surface-only breadth unless it directly addresses one of those items.
-
-### Priority 4: TandemFoil Paper Provenance And Test Story
-- `#3025` established a strong steering anchor at `val_primary/field_mse = 0.002383`.
-- The remaining job is a clean literature-facing `test_primary/field_mse` row and a per-task comparison table against Experiment 4 / Table 6.
-- Do not overclaim on the basis of validation alone.
-
-### Priority 5: Queue Hygiene
-- Close stale novelty lanes when they do not clearly support:
-  - DrivAerML test closure
-  - AirfRANS full-pair closure
-  - TandemFoil Paper benchmark provenance
-- The project now needs sharper concentration, not more breadth for its own sake.
-
-## Next Priorities
-
-1. **Land `#3029`** and switch all paper-facing AF / DM / TFP reporting to best-checkpoint test evaluation.
-2. **Prioritize DrivAerML test-improving lanes**: `#3027`, `#3028`, `#3030`.
-3. **Prioritize AirfRANS full-benchmark closure**, not more surface-only wins: best-checkpoint evaluation plus `Vol MSE`.
-4. **Convert TFP from strong validation to a clean test/provenance story** using the `field_mse` contract only.
-5. **Review open breadth-heavy novelty PRs** (`#3031-#3035`, `#3038-#3041`, plus older open waves) against the three closure goals above and close the ones that are not clearly helping.
-6. **Treat closed lanes as closed**: do not keep monitoring `#3021`, `#3023`, `#3026`, `#3042`, or already-merged `#3036` as if they were still active.
-7. **All new assignments**: 4-dataset coverage remains mandatory unless the run is explicitly a benchmark-specific recovery lane.
-8. **Check for human team messages on GitHub issues very frequently.**
+| TandemFoil | `test_primary/surface_pressure_mae` | **23.419** (PR #3108) | (internal) | Strong |
+| TandemFoil Paper | `test_primary/field_mse` | **NO CLEAN ROW YET** | ~0.10-0.36/task | URGENT — #3098 in-progress |
+| AirfRANS | `Surf MSE / Vol MSE` | **0.000459 / 0.002777** | 0.0043 / 0.0017 | Surface 9.4x better, Volume 1.63x gap |
+| DrivAerML | `test_primary/surface_rel_l2_pct` | **4.685%** (#3072, partial eval) | 3.71% | Gap closing — #3164 paper eval in-progress |
+
+## Current Research Focus
+
+### Benchmark Sprint Priorities (ICML phase)
+
+1. **DrivAerML** — val=3.833%, gap to AB-UPT only 0.013 pp!
+   - **BREAKTHROUGH:** EMA=0.9995+gc=0.5 works. gc is the stability enabler for EMA. Gap 93% closed.
+   - **Confirmed:** gc=0.5 is sharp optimum (0.25 starves, 1.0 insufficient — triple-confirmed via #3072/#3151/#3114)
+   - **Phase 2 strategy:** All new DM experiments build on EMA+gc=0.5 champion platform
+   - **Active fronts on champion platform:** decay sweep (eren), attention heads (senku/griffith), wider 640d (franky), eta_min (spike), attn dropout (shouko), softer gc=0.3 (himmel), monotonic cosine (historia), WD compound (emma), LR sweep (bulma), longer T_max (nobara)
+   - **Paper-facing:** faye #3164 doing full eval, multi-seed (casca/chihiro/canute sent back for two-phase)
+   - **Throughput experiments:** jet (600 batches), kakashi (788 batches+T_max=60)
+   - **Surface point resolution:** 16k/32k/64k (all sent back with eval fix)
+   - **Other active:** Lookahead (thorfinn), OneCycle (sanji), dropout (levi), checkpoint averaging (taki), feature dropout (fern), beta2 (einar), input feature dropout (fern)
+
+2. **TFP clean test result** — val=0.002383
+   - **Fully locked config:** Lion lr=1.25e-4, T_max=10, gc=0.5, EMA=0.999, 3L/192d
+   - **Every deviation diverges** — very narrow stability window
+   - **URGENT:** shoya #3098 clean test evaluation
+   - **Active width/depth:** robin (256d), nami (224d)
+   - **Active schedule:** mitsuha (T_max=5/8), mugen (T_max=20)
+   - **Active regularization:** shinobu (WD sweep), rei (gc=0.4)
+   - **Multi-seed:** jin being assigned (seeds 42/123/456)
+
+3. **AirfRANS volume** — 1.63x gap to target (0.002777 vs 0.0017)
+   - **Surface already 9.4x better** than target — focus is purely on volume
+   - **vol-weight strategy:** 3x good for surface, 10x worse. Now testing 1.5x (tanjiro), 2.0x (violet), 5.0x/7.0x (vegeta), 30x (megumi)
+   - **LR sweep:** gilbert being assigned (lr=8e-4, 1e-3 with EMA)
+   - **EMA decay:** stark testing 0.9995/0.9999
+   - **gc transfer:** edward testing gc=0.5 (from DM success)
+   - **Depth:** chrome testing 4L/256d (2L optimal so far, 3L dead)
+   - **Width:** wolfwood 2L/384d (sent back to add EMA)
+
+4. **TandemFoil** — gc trend monotonic: 1.0→0.5→0.3
+   - **Active:** gc=0.2 (usopp), gc=0.3+480min (zenitsu)
+   - **Paper-facing:** yuji #3150 clean test from gc=0.3 champion
+
+## Key Dead Ends (Do Not Repeat)
+
+**DrivAerML:**
+- gc≠0.5 with EMA: 0.25 starves (13.1%), 0.3 diverges ep81 (8.816%), 1.0 insufficient (6.21%) — QUAD CONFIRMED
+- EMA without gc: diverges (confirmed #3072 Run 1, plus 3 prior attempts)
+- gc alone (any value, no EMA): best 4.346%, above baseline ceiling
+- Non-EMA regime ceiling: 3.997% (all diverge at cosine restart peaks)
+- 5L depth: 5.515% with gc (#3141), 4.172% without (#3104). 6L: 6.37%
+- Lion optimizer: all LR variants diverge (5e-5, 1e-4, 5e-5+gc)
+- Gradient centralization: fragile at LR restart boundaries (5.492% then diverge)
+- Polynomial LR (no cosine troughs): catastrophic — troughs are load-bearing stability features
+- OneCycleLR (no troughs): 8.04% best, sustained high-LR warmup worse than cosine peaks (without EMA+gc)
+- SWA: equal-weight averaging poisons across divergent basins (88.98%)
+- T_max=50+gc (both 0.5 and 1.0): diverge — T_max=30 only viable period
+- 10-ep warmup+gc=1.0: 11.2% then diverged
+- 5-ep warmup+gc=1.0: pending (chopper)
+- Huber loss, relative L2 loss (degenerate), SGDR, RAdam
+- beta2≠0.999, LR≠5e-4 (without EMA), WD+gc heavy (WD=1e-3: 4.44%)
+- Bilateral symmetry aug, torch.compile, gradient accumulation
+- Attention dropout without EMA/gc: toxic combo with T_max=30
+- Cosine eta_min without EMA/gc: diverges (7.255-7.918%)
+
+**TandemFoil Paper:**
+- T_max≠10 (all directions diverge)
+- gc≠0.5 (0.3=starvation, 0.7=destabilize; 0.4 being tested)
+- EMA≠0.999 (0.99 and 0.9995 both cause sinh overflow — very narrow window)
+- 4L depth (pressure overflow), LR=1.5e-4 (+34%)
+- 3L/224d width: catastrophic divergence (field_mse ~2.2e9, grad explosion ep87)
+- 3L/256d width: catastrophic divergence (field_mse 8.61e+24, 27 orders worse)
+- T_max=20/30: field_mse never reaches finite values
+
+**AirfRANS:**
+- 3L depth (with or without EMA): catastrophic divergence confirmed twice
+- 2L/384d and 3L/384d: catastrophic divergence
+- EMA<0.999 (0.99, 0.995 both worse)
+- T_max≠50 (30 and 100 both worse)
+- Vol-weight=10x: worse on both metrics
+
+**TandemFoil:**
+- gc≥0.5: monotonically worse than gc=0.3
+
+## Mandatory Config Rules
+
+- **TF:** Lion lr=1.25e-4, T_max=10, gc=0.3, WD=1e-2, `--ema-decay 0.999`, 3L/192d
+- **TFP:** Lion lr=1.25e-4, T_max=10, gc=0.5, WD=1e-2, `--ema-decay 0.999`, 3L/192d
+- **AF:** AdamW lr=6e-4, T_max=50, gc=1.0, WD=1e-2, `--ema-decay 0.999`, 2L/256d
+- **DM:** AdamW lr=5e-4, T_max=30, **gc=0.5**, **EMA=0.9995**, no WD, 4L/512d (**UPDATED post #3072**)
+- `--epochs 999`, `SENPAI_MAX_EPOCHS=9999` mandatory for DM
+- DrivAerML: `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
+- Paper-facing DM: NO `--max-eval-batches`
+
+## Infrastructure
+- **PR #2974 MERGED:** Best-checkpoint saving in train.py — all new experiments use best val checkpoint for test eval

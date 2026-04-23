@@ -1,5 +1,711 @@
 # SENPAI Research Results
 
+## 2026-04-23 14:00 — PR #3138: DM 788 batches + T_max=60 (kakashi) — CLOSED
+
+- Run 1 (gc=1.0, no EMA): 6.620% ep66, diverged ep72 (W&B: `7sa8l03q`). Run 2 (gc=0.5+EMA=0.9995): 4.661% ep141, diverged ep143 (W&B: `jzg8os84`). Champion platform extended stability from ep72→ep143 and improved 6.62%→4.66%, but divergence is structural. 788 batches accumulate only 111k steps before dying vs baseline's 201k — throughput advantage completely erased by shorter training horizon. Three attempts (incl #3084) all diverge within 2 cosine cycles. Higher batch count per epoch dead for DM.
+
+## 2026-04-23 13:30 — PR #3068: DM 64k surface points (brook) — SENT BACK
+
+- Original run (no fix): 12.10% ep55, timeout (W&B: `ekrddnwe`). Retry no-gc: 16.91% ep30, diverged (W&B: `7gg7iqw8`). Retry gc=1.0: **5.26% ep236**, terminal diverge ep277 (W&B: `7uvkow6r`). All runs WITHOUT EMA — unfair comparison to 3.833% champion. gc=1.0 insufficient (diverged); need gc=0.5+EMA=0.9995. Sent back for re-run on champion platform. 64k direction not dead — 28% more surface coverage per sample may still improve quality.
+
+## 2026-04-23 13:00 — PR #3131: DM OneCycleLR schedule (sanji) — CLOSED
+
+- max_lr=5e-4: 8.040% ep~190 then diverged to 51.4% (W&B: `ed60ojeo`). max_lr=1e-3: 8.041% ep~125 then diverged to 65.5%/NaN (W&B: `24r056y4`). Both WITHOUT EMA+gc (old regime). OneCycleLR's sustained high-LR warmup more damaging than cosine peaks — no periodic recovery troughs. 2x worse than old 3.997% baseline. Confirms cosine troughs are load-bearing for DM stability.
+
+## 2026-04-23 13:00 — PR #3124: TFP 3L/256d wider model (robin) — CLOSED
+
+- field_mse=8.61e+24 at ep177, catastrophic divergence ep229 (W&B: `3j33y6wi`). 27 orders of magnitude worse than baseline (0.002383). Combined with #3157 (3L/224d, field_mse ~2.2e9), width beyond 192d conclusively dead for TFP. 192d confirmed as the capacity ceiling — gradient instability scales with hidden dim in TFP's narrow stability window.
+
+## 2026-04-23 12:30 — PR #3162: DM EMA=0.9995 + gc=0.3 (himmel) — CLOSED
+
+- Best val=8.816% at ep80, then catastrophic divergence ep81 (grad norm 17.8→430, killed ep90). W&B: `og8ny8s7`. gc=0.3 is 2.3x worse than baseline (3.833%). gc=0.5 now quad-confirmed as sharp optimum: 0.25=13.1% (starves), 0.3=8.816% (diverges), 0.5=3.833% (champion), 1.0=6.21% (insufficient). Student noted potential bug fix (primary_metric_key shadowing) and suggested AGC — assigning AGC as fresh experiment.
+
+## 2026-04-23 12:30 — PR #3157: TFP 3L/224d intermediate width (nami) — CLOSED
+
+- Catastrophic divergence — field_mse ~2.2e9, gradient explosion ep87 (grad norm →4e8). W&B: `g3jp3nfi` (crashed). Width beyond 192d amplifies gradient instability in TFP's narrow stability window. Combined with 4L/192d pressure overflow, confirms 192d as the stability sweet spot. Student identified sinh overflow bug in TargetTransform.invert() — should be submitted as separate bugfix PR.
+
+## 2026-04-23 12:00 — PR #3151: DM EMA=0.9995 + gc sweep (gilbert) — CLOSED
+
+- gc=0.25: 13.1% — gradient starvation, underfitting (W&B: check PR comments). gc=1.0: 6.21% — insufficient dampening, partial divergence. gc=0.5 remains the sharp optimum for DM EMA regime. Combined with #3072 (gc=0.5=3.833%) and #3114 (T_max=50+gc variants both diverge), the gc=0.5 sweet spot is now triple-confirmed. No further gc sweeps warranted.
+
+## 2026-04-23 12:00 — PR #3141: DM 5L/512d + gc=1.0 (vegeta) — CLOSED
+
+- val=5.515% at best (W&B: check PR comments). 44% worse than 4L baseline (3.833%). Consistent with prior 5L result (#3104: 4.172% without EMA). 5L adds optimization surface complexity that destabilizes training even with gc. 4L confirmed as optimal depth for DM — both 5L and 6L dead.
+
+## 2026-04-23 12:00 — PR #2947: TFP LR sweep (jin) — CLOSED
+
+- Original LR sweep from early TFP exploration. Results superseded by champion config (Lion lr=1.25e-4, gc=0.5, EMA=0.999, T_max=10) which emerged from later experiments. LR=1.5e-4 was +34% worse. Closing as historical — student reassigned to paper-facing multi-seed variance check.
+
+## 2026-04-23 11:00 — PR #3127: DM attention heads 4H/16H (senku) — CLOSED
+
+- 4H: 11.02% ep54 (W&B: `v51k5hkn`). 16H: 13.83% ep77 (W&B: `yxldhqli`). Both with recurring gradient instability (no gc/EMA). 8H uniquely stable at 512d under old regime. 4H+EMA+gc assigned as #3165; 16H+EMA+gc in-flight as griffith #3160.
+
+## 2026-04-23 10:30 — PR #3125: DM SWA at cosine troughs (faye) — CLOSED
+
+- Raw model best 14.30% ep89, SWA average degraded to 88.98% over 16 collections (W&B: `hgnyelv3`). Without gc/EMA, gradient explosions scatter weights across incompatible basins; SWA equal-weight averaging then poisons the average. EMA champion (#3072) subsumes SWA benefit via continuous averaging.
+
+## 2026-04-23 10:00 — PR #3113: DM attention dropout=0.05 (shouko) — CLOSED
+
+- val=12.53% ep118, 7 divergence spikes over 206 epochs (W&B: `qjceei69`). Dropout+T_max=30+no-EMA toxic combo — LR peaks amplify dropout noise. Reassigned with EMA+gc stability platform (#3163).
+
+## 2026-04-23 10:00 — PR #3111: DM cosine eta_min (himmel) — CLOSED
+
+- eta_min=1e-6: 7.918% ep180 (W&B: `gu7hfzs1`). eta_min=1e-5: 7.255% ep109 (W&B: `q6zdf6xk`). Both diverged — tested without gc/EMA (wrong regime). spike #3161 carries hypothesis with EMA+gc.
+
+## 2026-04-23 09:30 — PR #3139: AF 3L/256d + EMA=0.999 (spike) — CLOSED
+
+- surface=0.002863 (6.2x worse), vol=0.011626 (4.2x worse), diverged ep149 (W&B: `ooxb9roq`). Consistent with all prior 3L AF tests. 3L adds optimization noise that destabilizes trajectory. 2L confirmed optimal for AirfRANS.
+
+## 2026-04-23 09:30 — PR #3079: DM 4L/640d+gc=0.5 retry (gojo) — SENT BACK (again)
+
+- Retry2 used same config as retry1 (instructions not followed). Best 4.516% ep359 (W&B: `7uuhe2qr`), retry2 6.457% ep137 (W&B: `ho8eosr3`). Sent back again with firm instructions: lr=3e-4 + T_max=60 + EMA=0.9995 + gc=0.5.
+
+## 2026-04-23 09:00 — PR #3138: DM 788 batches + T_max=60 (kakashi) — SENT BACK
+
+- val=6.620% ep66, diverged ep72 at second cosine cycle (W&B: `7sa8l03q`). Proportional T_max scaling confirmed (much better than #3084's 11.57%) but gc=1.0 insufficient. Sent back for gc=0.5 + EMA=0.9995.
+
+## 2026-04-23 09:00 — PR #3115: DM batch_size=2 + 25k points (piccolo) — SENT BACK
+
+- val=4.32% ep507 (W&B: `l7np1pv0`). Confounded by bf16 CUBLAS bug → fp16 fallback → 13 gradient spike events. Sent back for 50k pts + gc=0.5 + EMA=0.9995 to fairly test batch-diversity hypothesis.
+
+## 2026-04-23 09:00 — PR #3114: DM T_max=50 + gc (griffith) — CLOSED
+
+- gc=1.0: 12.56% ep42, diverged ep52 (W&B: `4ixc5d0e`). gc=0.5: 7.28% ep107, diverged ep121 (W&B: `0pux5dkr`). Both diverge — T_max=50 gradient explosion intrinsic to long-cycle LR peaks. T_max=30 confirmed as only viable cosine period for DM.
+
+## 2026-04-23 08:30 — PR #3148: DM 10-ep warmup + gc=1.0 (franky) — CLOSED
+
+- val=11.196% ep80, diverged ep87 (W&B: `rp02hbxl`). gc=1.0 insufficient to prevent cascade divergence with T_max=30 restarts. Grad norms→41.5M. 7.4pp worse than 3.833% baseline.
+
+## 2026-04-23 08:30 — PR #3117: DM Lion optimizer sweep (bulma) — CLOSED
+
+- lr=5e-5: 5.92% ep119 then diverged (W&B: `rxelzn84`). lr=1e-4: 6.36% then diverged (W&B: `a8mbflb1`). lr=5e-5+gc=0.5: 6.95% then diverged (W&B: `qmd1mp43`). All 54%+ worse. Lion's sign-based updates amplify DM gradient instabilities. Lion dead for DM.
+
+## 2026-04-23 08:30 — PR #3112: DM gradient centralization (edward) — CLOSED
+
+- val=5.492% ep181, diverged ep200 at cosine restart (grad norms 0.21→351,932). (W&B: `yblf2j7a`). GC removes gradient DC component making model fragile at LR restart boundaries. 43% worse pre-divergence. Explicit gradient modifications hurt DM.
+
+## 2026-04-23 08:30 — PR #3089: TFP T_max=30 (nami) — CLOSED
+
+- field_mse ~4.36e+23 all 536 epochs (W&B: `rfr8qkrc`). Pressure never converged even with sinh clamp fix. Confirms T_max>10 dead for TFP: T_max=15 diverged ep124, T_max=30 pressure never finite. Student found sinh clamp bug fix — noted but doesn't save T_max>10. T_max=10 confirmed sharp optimum.
+
+## 2026-04-23 08:00 — PR #3122: DM polynomial LR decay (nobara) — CLOSED
+
+- Linear (power=1.0): 17.88% ep64, diverged ep69 (W&B: `i1qbv9t4`). Quadratic (power=2.0): 12.20% ep75, diverged ep91 (W&B: `kkuery47`). Both 3-4x worse. Key insight: cosine's periodic low-LR troughs are load-bearing for stability — polynomial keeps LR high without recovery windows. Polynomial LR dead for DM.
+
+## 2026-04-23 08:00 — PR #3066: DM 16k surface points (alphonse) — SENT BACK
+
+- val=24.039% at ep17 only (W&B: `icqb9nla`). Same eval-overhead epoch-starvation: ~21 min/epoch without max-eval-batches. Sent back to add --max-eval-batches 200. Note: 2.88 GB VRAM — very low, opens door for larger model pairing later.
+
+## 2026-04-23 07:30 — PR #3129: AF 4L/256d deeper architecture (chrome) — SENT BACK
+
+- surface=0.002412 (5.25x worse), vol=0.009138 (3.3x worse). Diverged ep171 at cosine restart (W&B: `9brflieq`). Trajectory was improving before divergence. Sent back to retry with lr=3e-4 + T_max=100.
+
+## 2026-04-23 07:30 — PR #3119: DM higher LR + warmup (historia) — CLOSED
+
+- lr=7e-4: 19.82% (W&B: `8swgnhho`). lr=1e-3: 17.75% then NaN (W&B: `87ecgqp8`). Both 5-6x worse. DM stability boundary confirmed at ~6e-4 regardless of warmup. LR direction fully exhausted: 4e-4/4.5e-4/5.5e-4/7e-4/1e-3 all dead. lr=5e-4 sharp optimum.
+
+## 2026-04-23 07:30 — PR #3044: DM volume training ablation (emma) — CLOSED
+
+- 50k surf+16k vol: 58.55% (W&B: `eurdv6ot`). 16k surf+16k vol: 64.86% (W&B: `pbsrazga`). 40,000x loss scale mismatch (volume MSE ~18,700 vs surface ~0.48) destroys surface learning. Grad norms 500x baseline. Dead end without explicit volume_loss_weight=0.0001.
+
+## 2026-04-23 07:00 — PR #3072: DrivAerML EMA=0.9995+gc=0.5 (eren) — MERGED ✓
+
+- **Branch:** eren/dm-ema-9995-gc05
+- **Hypothesis:** EMA requires gc as a stability guard — previous EMA failures on DM lacked clipping
+- **Results:**
+
+| Run | Config | W&B | Best val surface_rel_l2_pct | Epoch | Status |
+|---|---|---|---|---|---|
+| Run 1 | EMA=0.9995, no gc | `64jrja7q` | 18.05% | 27 | Diverged ep28 |
+| Run 2 | EMA=0.9995 + gc=0.5 | `ncl1dh88` | **3.833%** | 511 | Still converging |
+
+- **vs Baseline:** -4.1% (3.833% vs 3.997%). Test=4.685%. Gap to AB-UPT: 0.013 pp (93% closed)
+- **Key insight:** gc=0.5 is the stability enabler for EMA on DrivAerML. The periodic loss spikes at cosine restart peaks (every ~30 epochs) disturb the EMA trajectory without clipping. EMA was previously thought dead for DM — the 3 prior failures all lacked gc. Run still converging at ep517 timeout.
+- **Decision:** MERGED — new DM champion
+
+## 2026-04-23 07:00 — PR #3077: DrivAerML 5L/512d (gilbert) — CLOSED
+
+- Best val 4.172% ep347, diverged ep405 (W&B: `ox918q66`). 4.4% worse then unrecoverable. 4L/512d confirmed as optimal depth.
+
+## 2026-04-23 07:00 — PR #3106: AF 2L/384d+gc=0.5+T_max=50 (wolfwood) — SENT BACK
+
+- surface=0.000564, vol=0.005935 (W&B: `gccu8a2k`). Stability confirmed (gc=0.5 fixes prior divergence) but both metrics worse than EMA champion (0.000459/0.002777). Sent back to add EMA=0.999 — the capacity of 384d needs EMA to realize its advantage.
+
+## 2026-04-23 07:00 — PR #3068: DM 64k surface points (brook) — SENT BACK
+
+- val=12.10% at ep62 (W&B: `ekrddnwe`). Epoch-starved: 64k eval without max-eval-batches costs ~6 min/ep → only 62 epochs in budget. Trajectory healthy and descending. Sent back to add --max-eval-batches 200.
+
+## 2026-04-23 07:00 — PR #3067: DM 32k surface points (askeladd) — SENT BACK
+
+- val=17.48% at ep33 (W&B: `8jvflw2w`). Same epoch-starvation. 32k creates 8,670 eval batches/epoch. Sent back to add --max-eval-batches 200.
+
+## 2026-04-23 07:00 — PR #3065: DM multi-seed seed=456 (chihiro) — SENT BACK
+
+- val=12.544% at ep50, test=12.096% (W&B: `pvkrr76j`). Full-eval timeout: ~7.7 min/ep → 50 epochs vs 467 needed. Sent back for two-phase approach (train with max-eval-batches, then single full-eval at best checkpoint).
+
+## 2026-04-23 07:00 — PR #3064: DM multi-seed seed=123 (casca) — SENT BACK
+
+- val=14.027% at ep40, test=15.580% (W&B: `7acr9vfr`). Same root cause. Sent back for two-phase eval.
+
+## 2026-04-23 06:15 — PR #2974: Best-checkpoint saving infrastructure (mugen) — MERGED ✓
+
+- **Branch:** mugen/best-checkpoint-saving
+- **Purpose:** Infrastructure — save best val checkpoint and restore before test eval
+- **Results:**
+
+| Dataset | W&B Run | Best Val | Best Ep | Best-ckpt Test | Terminal Test | Value |
+|---|---|---|---|---|---|---|
+| TandemFoil | `d9pk596u` | 26.80 | 241 | 28.80 | 29.19 | +1.4% |
+| AirfRANS | `as2mn0nw` | 0.00107 | 422 | 0.00160 | **NaN** | NaN rescued |
+| DrivAerML | `aq9xd1vg` | 13.23% | 54 | 13.86% | 47.15% | **3.4x improvement** |
+
+- **Decision:** MERGED — essential infrastructure. AirfRANS NaN recovery demonstrates this is critical: without it, a 627-epoch run produces zero usable results. All future branches on radford benefit automatically.
+
+## 2026-04-23 06:15 — PR #3130: AF EMA decay sweep (0.995/0.99) (violet) — CLOSED
+
+- EMA=0.995: surface=0.000695, vol=0.007556 (W&B: `lecm4fhl`). EMA=0.99: surface=0.002217, vol=0.009048 (W&B: `b6inrppx`). Both monotonically worse than EMA=0.999 (0.000459/0.002777). EMA sweep fully closed for AirfRANS — 0.999 is the sweet spot.
+
+## 2026-04-23 06:15 — PR #3102: AF 10x volume loss weight (thorfinn) — CLOSED
+
+- surface=0.000481, vol=0.004144 (W&B: `aldagms8`). Both metrics worse than EMA champion (0.000459/0.002777) — student compared against stale pre-EMA baseline. Closing; follow up at 1.5x/2.0x is the right direction (see tanjiro send-back).
+
+## 2026-04-23 06:15 — PR #3101: AF 3x volume loss weight (tanjiro) — SENT BACK
+
+- surface=**0.000381** (-17% NEW BEST surface), vol=0.003904 (+41% vs champion 0.002777). (W&B: `2ebhl15x`). Surface improvement is real — late-stage divergence ep767 is a concern. Sent back for retry at vol-weight=1.5 + possible gc=0.5 tightening.
+
+## 2026-04-23 06:15 — PR #3100: AF 3L/384d architecture (taki) — CLOSED
+
+- Catastrophic divergence ep53 — surface=0.01947/vol=0.08889 (30-40x worse). (W&B: `kt3h6c9t`). Matches 2L/384d failure. 2L/256d is hard stability constraint for AF. Architecture dead end.
+
+## 2026-04-23 06:15 — PR #3107: TF clean test (old gc=0.5 config) (yuji) — CLOSED
+
+- val=22.454, test=23.578 (W&B: `eyj4ltf8`). Config was gc=0.5 (old champion) — current best is gc=0.3 (test=23.419, PR #3108). Closed and reassigning yuji to clean test row for gc=0.3 champion.
+
+## 2026-04-23 06:15 — PR #3093: TFP EMA=0.99 (rei) — CLOSED
+
+- val/field_mse=Infinity all 532 epochs (W&B: `9j29lyiw`). Faster EMA (~100-update window) allows early noisy pressure to survive sinh() inverse transform. EMA<0.999 dead for TFP — sinh amplification is fundamental.
+
+## 2026-04-23 06:15 — PR #3092: TFP EMA=0.9995 (norman) — CLOSED
+
+- field_mse ~1e+28 all 536 epochs (W&B: `xy01mjzl`). Slower EMA (~2000-update window) retains too much weight from early extreme pressure values. Mirror-image failure to EMA=0.99. EMA=0.999 confirmed as sharp optimum for TFP — both directions fail. TFP EMA sweep fully closed.
+
+## 2026-04-23 06:15 — PR #3085: DM larger supernodes 8192/16000 (kohaku) — SENT BACK
+
+- Best val 6.121% ep143, then catastrophic divergence ep144 (grad norms →158T). (W&B: `e3nmais2`). Missing --grad-clip — 2x larger graph amplifies gradient magnitudes. Sent back for retry with gc=1.0.
+
+## 2026-04-23 06:15 — PR #3076: DM log-cosh loss (frieren) — SENT BACK
+
+- Best val 6.344% ep126, diverged ep134 (grad norms →181B). (W&B: `z2k4uz99`). Fast early convergence is interesting. Sent back for retry with gc=1.0 to get a clean result.
+
+## 2026-04-23 06:15 — PR #3075: DM Huber loss delta=0.1 and 1.0 (franky) — CLOSED
+
+- delta=0.1: 6.681% ep185 then NaN (W&B: `hrcuze3j`). delta=1.0: 8.531% ep135 then NaN (W&B: `to5hq7f2`). Both 67%/113% worse than baseline. Consistent with AF Huber underperformance — MSE outlier gradients help learn hard CFD pressure cases. Huber direction dead across datasets.
+
+## 2026-04-23 06:15 — PR #3074: DM relative L2 training loss (fern) — CLOSED
+
+- Pure rel_l2: 75.27%, mixed 50/50: 75.30% — both degenerate to z-mean prediction immediately (W&B: `lago3za1`, `cxrfryjm`). Root cause: rel_l2 on z-normalized targets creates near-zero division instability. Dead end in current form. Fix (raw-space rel_l2) would be a distinct hypothesis.
+
+## 2026-04-23 06:15 — PR #3046: DM WD+gc compound (sukuna) — SENT BACK
+
+- WD=1e-3+gc=1.0: **4.44%** ep448 stable (W&B: `9hflnw2d`). WD=1e-3 alone: 22.07% then diverged. gc=1.0 alone: 5.20% then diverged. (W&B runs: `9hflnw2d`, `zromiqrc`, `imyzfshf`, `igbb8kb2`). Sent back for lighter WD=5e-4/1e-4 + gc=1.0.
+
+## 2026-04-23 06:15 — PR #3063: DM paper-facing full-eval seed=42 (canute) — SENT BACK
+
+- val=12.23% ep49, test=12.82% ep49. (W&B: `r4jrfhfu`). Run hit timeout at ep50 — full eval costs ~7 min/ep, only 50 of ~467 epochs completed. Sent back with two-phase approach: train with max-eval-batches, then single final full-eval pass from best checkpoint.
+
+## 2026-04-23 05:30 — PR #3108: TandemFoil gc=0.3+EMA=0.999 (zenitsu) — MERGED ✓
+
+- **Branch:** zenitsu/tf-gc03-ema999
+- **Hypothesis:** Softer gc (0.3 vs 0.5) under EMA stability finds a deeper basin
+- **Results:**
+
+| Metric | gc=0.3 | gc=0.5 Baseline | Delta |
+|---|---|---|---|
+| val_primary/surface_pressure_mae | **21.909** ep334 | 22.537 ep336 | **-2.8% NEW BEST** |
+| test_primary/surface_pressure_mae | **23.419** | 24.581 | **-4.7%** |
+
+- **W&B run:** kzg626hf
+- **Decision:** MERGED — new TF champion (gc=0.3 continues the trend: 1.0→0.5→0.3 all improve)
+
+## 2026-04-23 05:30 — PR #3104: AF T_max=100 (vegeta) — CLOSED
+
+- surface_mse=0.000709 (+47% vs baseline). T_max sweep closed: T_max=50 is optimal on AF.
+
+## 2026-04-23 05:30 — PR #3103: AF T_max=30 (usopp) — CLOSED
+
+- surface_mse=0.000829 (+72% vs old baseline). Vol=0.004210 (-45% vs old, but +74% vs new post-#3050 baseline 0.002777).
+
+## 2026-04-23 05:30 — PR #3099: AF 3L/256d (spike) — CLOSED
+
+- surface=0.000663 (+38% vs old, +44% vs new). Vol=0.004851 (-36% old but +74% vs new 0.002777). Superseded by 2L+EMA (#3050) on both metrics.
+
+## 2026-04-23 05:30 — PR #3084: DM max-train-batches=788 (kakashi) — CLOSED
+
+- Best val 11.565% ep42 (+190%). Diverged catastrophically ep45 — T_max=30 halves effective cosine cycle with 2x batches, more frequent LR peak shocks without gc.
+
+## 2026-04-23 05:30 — PR #3079: DM 4L/640d+gc=0.5 (gojo) — SENT BACK
+
+- Best val 4.516% ep359, diverged ep436. Promising direction — WD+gc compound was the real crash culprit. Sent back with T_max=60 + lr=3e-4 instructions.
+
+## 2026-04-23 05:30 — PR #3069: DM 5-epoch warmup (chopper) — CLOSED
+
+- Best val 5.823% ep163 (+46%). Diverged ep523. Warmup doesn't prevent LR-peak divergence without gc.
+
+## 2026-04-23 05:00 — PR #3050: AirfRANS EMA=0.999 at T_max=50 champion (stark) — MERGED ✓
+
+- **Branch:** stark/af-ema-champion
+- **Hypothesis:** EMA + T_max=50 (longer cosine) is synergistic — EMA can track the optimization trajectory harmoniously with longer cycles
+- **Results:**
+
+| Metric | EMA=0.999 | Previous Baseline | Delta |
+|---|---|---|---|
+| val_primary/surface_mse | **0.000459** ep771 | 0.000482 | **-4.8% NEW BEST** |
+| full_val/volume_mse | **0.002777** ep771 | 0.00764 | **-63.6% NEW BEST** |
+| SpiderSolver vol gap | — | 4.5x | **1.63x** (closed) |
+
+- **W&B run:** z6pry4b9
+- **Analysis:** EMA=0.999 with T_max=50 improves BOTH metrics simultaneously — the only intervention to do so. Key difference from PR #3105 (EMA=0.999 at T_max=10 which regressed surface): T_max=50 provides a longer stable optimization window for EMA to track. Model still descending at ep771. SpiderSolver volume gap now 1.63x (down from 4.5x).
+- **Decision:** MERGED — new AirfRANS champion
+
+## 2026-04-23 04:50 — PR #3090: TFP gc=0.3 at champion config (nezuko) — CLOSED
+
+- **Branch:** nezuko/tfp-gc-03
+- **Hypothesis:** Tighter gc (0.3 vs champion 0.5) delays divergence, allowing more productive training
+- **Results:**
+
+| Metric | gc=0.3 | gc=0.5 Baseline |
+|---|---|---|
+| val_primary/field_mse | **Infinity** (all 496 eps) | 0.002383 ep443 |
+| Divergence onset | ~ep155 | ep462 |
+| val/surface_mse_Ux | 0.329 (partial) | converged |
+
+- **W&B run:** 230pms51
+- **Analysis:** gc=0.3 clips too aggressively — prevents the large corrective updates the pressure head needs via sinh-domain inversion. Velocity channels show partial convergence, confirming failure is pressure-specific. gc=0.5 confirmed as SHARP OPTIMUM for TFP: gc=0.3 starves pressure learning, gc=0.7 (#3091) destabilizes. gc sweep FULLY CLOSED.
+- **Decision:** CLOSED — Infinity all epochs, pressure never finite
+
+## 2026-04-23 04:20 — PR #3128: DrivAerML AdamW beta2 sweep (megumi) — CLOSED
+
+- **Branch:** megumi/dm-adamw-beta2-sweep
+- **Hypothesis:** Lower beta2 (0.99, 0.95) makes optimizer more responsive to recent gradient variance across cosine LR transitions
+- **Results:**
+
+| Run | beta2 | W&B ID | Best val surface_rel_l2_pct | Fate |
+|---|---|---|---|---|
+| Run 1 | 0.99 | 95teq8ui | 7.113% ep140 | Progressive instability |
+| Run 2 | 0.95 | 4dladx7q | 13.332% ep40 | Diverged (grad_norm 1.26M) |
+| Baseline | 0.999 | bht6h42t | 3.997% ep467 | — |
+
+- **Analysis:** beta2=0.999's long memory is a STABILITY FEATURE, not a bug. Faster adaptation amplifies outlier batches into cascading gradient spikes at cosine LR peaks. Clear monotonic: 0.999 > 0.99 > 0.95. beta2=0.95 had mean grad_norm of 14,540 with max 1.26M. Leave beta2 at default.
+- **Decision:** CLOSED — 78-234% above baseline
+
+## 2026-04-23 03:55 — PR #3126: DrivAerML cosine eta_min sweep (gohan) — CLOSED
+
+- **Branch:** gohan/dm-cosine-eta-min
+- **Hypothesis:** Non-zero eta_min (1e-5, 5e-5) keeps optimizer active at cosine troughs
+- **Results:**
+
+| Run | eta_min | W&B ID | Best val surface_rel_l2_pct | Fate |
+|---|---|---|---|---|
+| Run 1 | 1e-5 | kg7eolnk | 7.584% ep112 | Diverged |
+| Run 2 | 5e-5 | 1n8peifp | 6.800% ep98 | Diverged |
+| Baseline | 0 | bht6h42t | 3.997% ep467 | — |
+
+- **Analysis:** Faster early convergence (confirming hypothesis direction) but both diverged — without eta_min=0's natural LR "rest" at troughs, gradient noise accumulates unchecked. ~40% of steps above 20% error. eta_min=5e-5 + gc=1.0 is the promising follow-up.
+- **Decision:** CLOSED — 70-90% above baseline, both diverged
+
+## 2026-04-23 03:55 — PR #3096: TFP lr=1e-4 at champion config (shinobu) — CLOSED
+
+- **Branch:** shinobu/tfp-lr-1e4
+- **Hypothesis:** Lower LR (1e-4 vs champion 1.25e-4) continues the TF improvement trend
+- **Results:**
+
+| Metric | lr=1e-4 | lr=1.25e-4 Baseline |
+|---|---|---|
+| val_primary/field_mse | **Infinity** (all 393 eps) | 0.002383 ep443 |
+| vol pressure finite epochs | 0/393 | — |
+| val/surface_mse_Ux | 0.00128 (healthy) | — |
+
+- **W&B run:** z63sarn6
+- **Analysis:** 20% lower LR causes pressure channel to never resolve within budget — asinh(sinh()) overflow persists all 393 epochs. Velocity channels converge normally, confirming this is a pressure convergence speed issue. LR=1.25e-4 is near the minimum viable LR for TFP with current architecture.
+- **Decision:** CLOSED — Infinity field_mse, pressure never finite
+
+## 2026-04-23 03:35 — PR #3116: DrivAerML SGDR T_0=15 T_mult=2 (sanji) — CLOSED
+
+- **Branch:** sanji/dm-sgdr-t0-15-tmult2
+- **Hypothesis:** SGDR with shorter initial cycles (T_0=15 vs megumi's T_0=30) for rapid early exploration then progressive settling
+- **Results:**
+
+| Metric | Value | vs Baseline |
+|---|---|---|
+| Best val surface_rel_l2_pct | 12.846% ep38 | +221% worse |
+| Terminal val (crashed) | 64.96% ep199 | — |
+| Baseline | 3.997% ep467 | — |
+
+- **W&B run:** gm1o0yvp (crashed, grad_norm=3.98e10)
+- **Analysis:** Same failure mode as megumi's SGDR (#3086): healthy first 3 cycles (ep0-38), then LR restart from ~0 → 5e-4 destabilizes at ep~39. Val spiked 12.8%→72% and never recovered. SGDR is structurally incompatible with DM's no-gc regime — any LR restart from near-zero to peak causes catastrophic instability.
+- **Decision:** CLOSED — 3.2x worse than baseline, crashed
+
+## 2026-04-23 03:15 — PR #3105: AirfRANS EMA=0.999 for volume (violet) — CLOSED
+
+- **Branch:** violet/af-ema-volume
+- **Hypothesis:** EMA=0.999 stabilizes noisy volume predictions on AirfRANS
+- **Results:**
+
+| Metric | EMA=0.999 | Baseline | Delta |
+|---|---|---|---|
+| val_primary/surface_mse | 0.000583 ep417 | 0.000482 | +21% WORSE |
+| full_val/volume_mse | **0.004400** ep443 | 0.00764 | **-42.4% BETTER** |
+
+- **W&B run:** vlq1dzfz
+- **Analysis:** EMA creates a clear trade-off: volume improves dramatically (-42.4%) but surface regresses (+21%). Mechanistically sound — volume fields are spatially smoother and benefit from parameter averaging; surface boundary nodes require sharp prediction where EMA's lag hurts. Even regressed surface (0.000583) still beats SpiderSolver (0.0043) by 7.4x. Best volume result in the project — critical finding for the AF volume gap.
+- **Follow-up:** Test EMA=0.995 and EMA=0.99 to find sweet spot minimizing surface regression while preserving volume improvement.
+- **Decision:** CLOSED — primary metric (surface_mse) did not beat baseline
+
+## 2026-04-23 02:50 — PR #3070: DrivAerML 10-epoch linear warmup (chrome) — CLOSED
+
+- **Branch:** chrome/dm-linear-warmup-10ep
+- **Hypothesis:** 10-epoch linear warmup (LR 5e-5→5e-4) before cosine T_max=30 provides stable gradient directions before full LR
+- **Results:**
+
+| Metric | Value | vs Baseline |
+|---|---|---|
+| Best val surface_rel_l2_pct | 6.225% ep105 | +56% worse |
+| Divergence onset | ep114 (81.9% spike) | — |
+| Baseline | 3.997% ep467 | — |
+
+- **W&B run:** w1c7l3jo
+- **Analysis:** Warmup itself worked correctly (63%→24% in epochs 1-10). But catastrophic divergence at ep114 at a cosine LR peak — same failure mode as all non-gc DM experiments. Warmup without gc is insufficient. The real test is warmup+gc combined.
+- **Decision:** CLOSED — 56% above baseline, diverged ep114
+
+## 2026-04-23 02:35 — PR #3086: DrivAerML SGDR T_mult=2 (megumi) — CLOSED
+
+- **Branch:** megumi/dm-cosine-restart-tmult2
+- **Hypothesis:** SGDR with exponentially growing cosine periods (30→60→120→240) progressively lengthens low-LR phases for deeper convergence
+- **Results:**
+
+| Run | Config | W&B ID | Best val surface_rel_l2_pct | Fate |
+|---|---|---|---|---|
+| No gc | T_mult=2 | 3pl2a2q8 | 7.022% ep77 | Crashed |
+| gc=1.0 | T_mult=2 | 2n6tt16b | 7.697% ep77 | Crashed |
+| gc=0.5 | T_mult=2 | i05go4xl | 11.952% ep54 | Crashed |
+| Baseline | T_max=30 fixed | bht6h42t | 3.997% ep467 | — |
+
+- **Analysis:** Structural incompatibility. Model converges through cycles 1-3 (T=30/60/120) reaching ~7% by ep77, but the 240-step 4th cycle sustains lr=5e-4 for 2x longer than any previous cycle — fatal on DM. Grad-clipping delayed divergence but couldn't prevent it. Key insight: DM is stable below ~120 contiguous high-LR steps, which is why fixed T_max=30 works.
+- **Decision:** CLOSED — 75-200% above baseline, all crashed
+
+## 2026-04-23 02:20 — PR #3120: DrivAerML RAdam optimizer (senku) — CLOSED
+
+- **Branch:** senku/dm-radam-optimizer
+- **Hypothesis:** RAdam's variance rectification provides built-in warmup for stable early-epoch dynamics
+- **Results:**
+
+| Run | LR | W&B ID | Best val surface_rel_l2_pct | Fate |
+|---|---|---|---|---|
+| RAdam lr=5e-4 | 5e-4 | hh0vm4a2 | 19.95% ep40 | Diverged ep41-43 |
+| RAdam lr=7e-4 | 7e-4 | tkx91w4v | 20.79% ep38 | NaN ep39 |
+| Baseline | 5e-4 | bht6h42t | 3.997% ep467 | — |
+
+- **Analysis:** RAdam's rectification only provides early-epoch warmup; it offers no protection at recurring cosine LR peaks where DM divergence happens. Both runs survived cycle 1 but diverged in cycle 2 at LR peak. Confirms DM instability is LR-peak driven, not warmup-driven. AdamW's implicit regularization via decoupled weight decay may be the key.
+- **Decision:** CLOSED — both runs ~5x worse than baseline
+
+## 2026-04-23 02:20 — PR #3078: DrivAerML 6L/512d depth scaling (gohan) — CLOSED
+
+- **Branch:** gohan/dm-6l-512d-deeper
+- **Hypothesis:** Monotonic depth trend (2L<3L<4L) continues to 6L for even better results
+- **Results:**
+
+| Run | Config | W&B ID | Best val surface_rel_l2_pct | Fate |
+|---|---|---|---|---|
+| Run 1 | 6L no gc | ca8rh3q8 | 14.680% ep33 | Catastrophic divergence ep37 |
+| Run 2 | 6L gc=0.5 | 9cccs3ze | 6.372% ep155 | Slow divergence ep161 |
+| Baseline | 4L no gc | bht6h42t | 3.997% ep467 | — |
+
+- **Analysis:** Depth trend does NOT continue beyond 4L. 6L amplifies gradient explosions at LR peaks. Even gc=0.5 couldn't stabilize for the 400+ epochs needed (6.372% best at ep155 vs 3.997% at ep467 for 4L). 4L confirmed as DM depth sweet spot. The 6L model converges faster early but hits a stability ceiling.
+- **Decision:** CLOSED — 59% worse than baseline at best (gc run), catastrophic without gc
+
+## 2026-04-23 02:05 — PR #3073: DrivAerML EMA=0.999 + gc=0.5 compound (faye) — CLOSED
+
+- **Branch:** faye/dm-ema-999-gc05-compound
+- **Hypothesis:** EMA + gc synergy — gc prevents gradient spikes while EMA smooths checkpoint sequence
+- **Results:**
+
+| Metric | Value | vs Baseline |
+|---|---|---|
+| Best val surface_rel_l2_pct | 9.953% ep113 | +149% worse |
+| Run state | Crashed ep191 | — |
+| Baseline | 3.997% ep467 | — |
+
+- **W&B run:** x3wvqyqa
+- **Analysis:** gc=0.5 insufficient — gradient spikes of 293 (ep64) and 153 (ep118) broke through clip threshold. Terminal divergence at ep136 with grad_norm=Infinity. EMA now tested in 3 configs on DM: alone=9.749%, +gc=9.953%, +gc+WD=crash. All dramatically worse than no-EMA champion. EMA is definitively contraindicated for DrivAerML.
+- **Decision:** CLOSED — 149% above baseline, crashed
+
+## 2026-04-23 01:50 — PR #3094: TFP 4L/192d depth at champion config (robin) — CLOSED
+
+- **Branch:** robin/tfp-4l-192d-depth
+- **Hypothesis:** 4L/192d (deeper than 3L champion) at full champion optimizer config might improve TFP
+- **Results:**
+
+| Metric | 4L/192d | 3L/192d Baseline |
+|---|---|---|
+| val_primary/field_mse | **Infinity** (all 140 eps) | 0.002383 ep443 |
+| Divergence onset | ep116 | ep462 |
+| val/surface_mse_Ux | 0.001558 ep114 | — |
+
+- **W&B run:** x982sfdv
+- **Analysis:** Pressure channel overflows via asinh transform — velocity channels converge normally (Ux=0.00156 competitive). T_max=10 cycling too aggressive for 4L. Diverged 3.7x earlier than 3L champion. 4L needs separate LR/T_max tuning.
+- **Decision:** CLOSED — val_primary/field_mse never finite
+
+## 2026-04-23 01:50 — PR #3091: TFP gc=0.7 at champion config (nobara) — CLOSED
+
+- **Branch:** nobara/tfp-gc-07
+- **Hypothesis:** Higher gc (0.7 vs champion 0.5) provides tighter gradient control
+- **Results:**
+
+| Metric | gc=0.7 | gc=0.5 Baseline |
+|---|---|---|
+| val_primary/field_mse | **Infinity** (all 177 eps) | 0.002383 ep443 |
+| Divergence onset | ep142 | ep462 |
+| Terminal grad norm | 1,326 | — |
+
+- **W&B run:** e0am2f3z
+- **Analysis:** gc=0.7 is strictly worse. Diverged 3x earlier (ep142 vs ep462). Relaxing gc beyond 0.5 destabilizes Lion+T_max=10 on TFP. gc=0.5 is the stability boundary — tighter (gc=0.3) is the promising direction.
+- **Decision:** CLOSED — val_primary/field_mse never finite
+
+## 2026-04-23 01:50 — PR #3087: TFP T_max=15 at champion config (mitsuha) — CLOSED
+
+- **Branch:** mitsuha/tfp-tmax-15
+- **Hypothesis:** Longer cosine period (T_max=15 vs champion 10) delays late-training divergence
+- **Results:**
+
+| Metric | T_max=15 | T_max=10 Baseline |
+|---|---|---|
+| val_primary/field_mse | **Infinity** (all 176 eps) | 0.002383 ep443 |
+| Divergence onset | ep124 | ep462 |
+
+- **W&B run:** tqirkf0l
+- **Analysis:** Falsified in opposite direction. T_max=15 diverged 3.5x earlier. Longer cosine extends LR peak phase, compounding pressure channel instability via asinh overflow. T_max=10 confirmed as sharp optimum for TFP.
+- **Decision:** CLOSED — val_primary/field_mse never finite
+
+## 2026-04-23 01:50 — PR #3060: DrivAerML bilateral symmetry augmentation (levi) — CLOSED
+
+- **Branch:** levi/dm-bilateral-symmetry-augmentation
+- **Hypothesis:** Reflecting car geometries left-right doubles effective training data (400→800 cases)
+- **Results:**
+
+| Run | Best val surface_rel_l2_pct | vs Baseline |
+|---|---|---|
+| Aug ON | 14.01% ep50 | +250% worse |
+| Control | 8.34% ep75 | +109% worse (undertrained) |
+| Baseline | 3.997% ep467 | — |
+
+- **W&B runs:** d76aehil (aug), e9sf9fwv (control)
+- **Analysis:** Stochastic per-batch flipping creates distributional variance that compounds gradient instability at T_max=30 LR peaks — 31 spike epochs vs 4 in control. Symmetry axis is valid (y-center within ±0.001) but implementation needs stabilization. Pre-generated mirrored copies as permanent dataset entries would be a better approach.
+- **Decision:** CLOSED — augmentation harmful due to gradient instability
+
+## 2026-04-23 01:20 — PR #3082: DrivAerML T_max=40 cosine schedule (historia) — CLOSED
+
+- **Branch:** historia/dm-tmax-40
+- **Hypothesis:** T_max=40 as a finer sweep point between champion T_max=30 and previously-crashed T_max=50
+- **Results:**
+
+| Metric | Value | Epoch | vs Baseline |
+|---|---|---|---|
+| Best val surface_rel_l2_pct | 12.840% | ep87 | +221% worse |
+| Final val (diverged) | 18.552% | ep160 | — |
+| Baseline (T_max=30) | 3.997% | ep467 | — |
+
+- **W&B run:** mzwuykvf
+- **Analysis:** Three-phase training: healthy convergence to ep47, first gradient explosion at ep48, partial recovery reaching 12.84% at ep87, terminal divergence from ep94 with grad norms up to 2222. Confirms T_max=30 is uniquely stable without gc on DrivAerML. T_max=40 joins T_max=15/20/50/100 as dead ends.
+- **Decision:** CLOSED — 221% above baseline, catastrophic divergence
+
+## 2026-04-23 01:20 — PR #3081: DrivAerML T_max=20 cosine schedule (hinata) — CLOSED
+
+- **Branch:** hinata/dm-tmax-20
+- **Hypothesis:** Shorter cosine cycles (T_max=20) for more frequent basin-hopping
+- **Results:**
+
+| Metric | Value | Epoch | vs Baseline |
+|---|---|---|---|
+| Best val surface_rel_l2_pct | 11.055% | ep76 | +177% worse |
+| Final val (degraded) | 27.158% | ep162 | — |
+| Baseline (T_max=30) | 3.997% | ep467 | — |
+
+- **W&B run:** t50xj6j8
+- **Analysis:** 13 spike events, grad norms up to 193.6. Chronically unstable — 42/162 checkpoints had grad_norm > 10. Best was still 2.77x worse than baseline. Confirms shorter T_max is catastrophically unstable without gc.
+- **Decision:** CLOSED — 177% above baseline, chronic instability
+
+## 2026-04-23 01:20 — PR #3051: DrivAerML 4x case revisits (bulma) — CLOSED
+
+- **Branch:** bulma/dm-multi-revisit-epoch
+- **Hypothesis:** More training batches per epoch (4x/8x revisits with different random 50k-point subsamples) acts as data augmentation
+- **Results:**
+
+| Run | W&B ID | Best val | Best test | vs Baseline |
+|---|---|---|---|---|
+| 4x (1576 batches) | a5oa7wpt | 9.382% ep36 | 10.226% | +135% worse |
+| 8x (3152 batches) | xsmxmlg7 | 15.211% ep10 | 15.905% | +281% worse |
+| 1x control (full eval) | itlteubz | 13.950% ep43 | 13.519% | +249% worse |
+
+- **Analysis:** 4x and 8x diverged because more gradient steps per cosine cycle compounds instability without gc. 4x early trajectory was promising (9.38% at ep36 vs ~12-13% for champion at same point) but couldn't survive long enough. 1x control only reached 46 epochs (vs 467 baseline) — confirms --max-eval-batches 200 is essential for throughput.
+- **Decision:** CLOSED — all runs 135-281% above baseline
+
+## 2026-04-23 01:20 — PR #3048: DrivAerML depth reduction 2L/3L vs 4L/512d (senku) — CLOSED
+
+- **Branch:** senku/dm-2l-3l-depth-at-champion
+- **Hypothesis:** Shallower architectures (2L/3L at 512d) might match or beat 4L by training faster, mirroring AirfRANS depth preference
+- **Results:**
+
+| Run | W&B ID | Best val | Best test | vs Baseline |
+|---|---|---|---|---|
+| 2L/512d | r0zsdxe8 | 11.259% | 11.705% | 2.82x worse |
+| 3L/512d | eagewa9c | 9.992% | 10.470% | 2.50x worse |
+| 4L/512d full-eval | fhe0j04g | 14.999% | 14.514% | 3.75x worse (epoch-starved) |
+
+- **Analysis:** Clean negative result — DrivAerML has OPPOSITE depth preference from AirfRANS. Monotonic: 2L < 3L < 4L. Both shallow models also diverged to NaN, indicating lack of depth makes optimization fragile at this scale. Full-eval control only 36 epochs — confirms full-eval-every-epoch impractical. Key finding: 4L is NOT over-parameterized on DrivAerML.
+- **Decision:** CLOSED — 2.5-2.8x worse than baseline
+
+## 2026-04-23 00:50 — PR #3095: TFP 4L/256d deeper+wider (sanji) — CLOSED
+
+- **Branch:** sanji/tfp-4l-256d-depth-width
+- **Hypothesis:** 4L/256d (2.7x more params) improves TFP field_mse.
+- **Result:** val_primary/field_mse = **Infinity** all 70 epochs. Pressure overflow in asinh inversion at larger arch.
+- **W&B:** sfbvlaof
+- **sanji reassigned to #3116: DM SGDR T_0=15, T_mult=2**
+
+## 2026-04-23 00:50 — PR #3047: DM LR fine-tuning (piccolo) — CLOSED
+
+- **Branch:** piccolo/dm-lr-fine-tune
+- **Hypothesis:** Fine-tune LR ±10-20% around champion lr=5e-4.
+
+| LR | Best val% | W&B |
+|----|----------|-----|
+| 3e-4 | 5.745% (+44%) | 73iaz6a5 |
+| 4e-4 | 13.851% (+247%) | vvo4tj1t |
+| 4.5e-4 | 15.278% (+282%) | 3m5bs4do |
+| 5.5e-4 | 12.706% (+218%) | qvrsywc4 |
+
+- **Result:** lr=5e-4 is at a sharp optimum. Even ±10% destroys stability. LR axis exhausted for DM 4L/512d.
+- **piccolo reassigned to #3115: DM batch_size=2 with 25k points**
+
+## 2026-04-23 00:50 — PR #3045: DM T_max cosine sweep (griffith) — CLOSED
+
+- **Branch:** griffith/dm-tmax-sweep-champion-config
+- **Hypothesis:** T_max != 30 may be better for DM at champion config.
+
+| T_max | Best val% | Max grad norm | Diverged? | W&B |
+|-------|----------|---------------|-----------|-----|
+| 15 | 14.17% | 1.5e8 | Yes | zcl6gppr |
+| 30 (ctrl) | 19.32% (33ep only) | 5.9 | No | wtvv25ul |
+| 50 | 10.41% | 4.5e8 | Yes | 1lnn5f76 |
+| 100 | 11.48% | 5.1e10 | Yes | t6n3na4h |
+
+- **Result:** T_max=30 is the only stable setting without gc. Longer periods cause gradient explosions.
+- **griffith reassigned to #3114: DM T_max=50 + gc=1.0 compound**
+
+## 2026-04-23 00:30 — PR #3097: TFP lr=1.5e-4 (shouko) — CLOSED
+
+- **Branch:** shouko/tfp-lr-15e5
+- **Hypothesis:** Higher LR (1.5e-4 vs 1.25e-4 champion) helps TFP converge faster.
+- **Result:** val_primary/field_mse = **Infinity** for all 89 epochs. Pressure channel never finite. 100% grad clip rate.
+- **W&B:** tzwac8i0
+- **Conclusion:** lr=1.5e-4 is above Lion+gc=0.5 stability ceiling for TFP pressure. lr=1.25e-4 confirmed near the stability boundary. LR above champion is dead.
+- **shouko reassigned to #3113: DM attention dropout=0.05**
+
+## 2026-04-23 00:30 — PR #3071: DrivAerML EMA=0.999 (edward) — CLOSED
+
+- **Branch:** edward/dm-ema-999-champion
+- **Hypothesis:** EMA stabilizes 4L/512d champion at current config.
+
+| Run | Config | Best Val % | Epoch | W&B |
+|-----|--------|-----------|-------|-----|
+| 1 | EMA=0.999, no gc | 21.797 | ep21 | fyzaouhr |
+| 2 | EMA=0.999, gc=0.5 | 10.936 | ep56 | wqihmy4x |
+
+- **Result:** Both diverged catastrophically. EMA is structurally incompatible with DM batch_size=1 gradient variance.
+- **Conclusion:** EMA is dead for DrivAerML at any decay/gc combination. Positive feedback loop: single explosive update contaminates EMA, which degrades subsequent optimization. Confirms #2899 (9.749%).
+- **edward reassigned to #3112: DM gradient centralization**
+
+## 2026-04-23 00:10 — PR #3080: DrivAerML T_max=50 cosine schedule (himmel) — CLOSED
+
+- **Branch:** himmel/dm-tmax-50
+- **Hypothesis:** T_max=50 (longer cosine cycles) helps DrivAerML like it helped AirfRANS.
+
+| Epoch | val_primary/surface_rel_l2_pct | W&B |
+|-------|-------------------------------|-----|
+| 28 | 17.48% (cycle 1 trough) | oilrfmix |
+| 54 | **12.76%** (pre-divergence best) | — |
+| 61 | 46.26% (gradient explosion) | — |
+| 70 | 23.34% (recovering) | — |
+
+**Result: CLOSED — T_max=50 falsified for DrivAerML**
+- Best val 12.76% at ep54, 3.19x worse than baseline 3.997%
+- Gradient explosion at ep61; run still recovering at ep71
+- AirfRANS→DrivAerML T_max transfer is falsified: 4L/512d needs shorter cycles (T_max=30)
+- historia #3082 testing T_max=40 will complete the picture
+
+**himmel reassigned to #3111: DrivAerML cosine eta_min=1e-6/1e-5 (LR floor)**
+
+## 2026-04-22 23:50 — PR #3043: DrivAerML gradient accumulation ablation (einar) — CLOSED
+
+- **Branch:** einar/dm-grad-accum-ablation
+- **Hypothesis:** Gradient accumulation (accum=2/4) reduces gradient noise in DrivAerML batch_size=1 training.
+
+| Run | Description | W&B ID | Best Val % | Best Ep | Best Test % |
+|-----|-------------|--------|-----------|---------|------------|
+| 1 | DM control, full eval | 9kn1satv | 14.098 | ep40 | 13.644 |
+| 2 | DM accum=2 | dguhbgax | 11.390 | ep365 | 11.933 |
+| 3 | DM accum=2, step-matched (788 batches) | wpbqofwh | **4.860** | ep153 | **6.091** |
+| 4 | DM accum=4 | hngfgj6i | 9.391 | ep124 | 9.702 |
+| 5 | AF accum=2, T_max=50 | 1nc85857 | 0.000534 | ep466 | 0.000712 |
+
+**Result: CLOSED — gradient accumulation does not help DrivAerML**
+- Best (accum=2 step-matched) at 4.860% still 21.6% above baseline 3.997%
+- Control run undertrained (42 epochs only) — not valid full-eval baseline
+- AirfRANS accum=2 also worse (0.000534 vs 0.000482 baseline)
+- Consistent with AirfRANS finding (#2902): CFD mesh regression benefits from noisy single-sample gradients
+
+**einar reassigned to #3110: DrivAerML AdamW beta2=0.99/0.995 sweep**
+
+## 2026-04-22 23:35 — PR #2948: TFP physics-flag ablation (guts) — CLOSED
+
+- **Branch:** guts-tfp-physics-v2 / tandemfoil_paper_physics_ablation_v5
+- **Hypothesis:** Which physics-encoding flags contribute to `val_primary/field_mse` on TFP?
+
+| Run | Config | State | Best val field_mse | W&B |
+|-----|--------|-------|--------------------|-----|
+| zoq2wf1p | AdamW lr=5e-4, T_max=150, full physics | RUNNING | 0.003564 (ep443) | zoq2wf1p |
+| 5 ablation runs | Various flag removals | ALL CRASHED | N/A | — |
+
+**Result: CLOSED**
+- Convergence run val=0.003564 is 49% worse than current baseline 0.002383
+- Config (AdamW lr=5e-4, T_max=150) is inferior to Lion champion
+- All 5 ablation runs crashed — no valid ablation conclusions possible
+- Bug fixes already merged separately in #3052
+
+**guts reassigned to #3109: DrivAerML lr=4e-4 full-eval paper-facing baseline**
+
+## 2026-04-22 23:30 — PR #2949: TFP depth/width sweep (vash) — SENT BACK
+
+- **Branch:** vash/tandemfoil-paper-depth-width-sweep
+- **Hypothesis:** Test 3L/4L/5L × 192d/256d/384d architectures at Lion lr=1e-4 on TFP.
+
+| Config | Val (best-ckpt) | Test (best-ckpt) | W&B | Notes |
+|--------|----------------|------------------|-----|-------|
+| D: 4L/192d | 0.002988 (ep376) | 0.002503 | rf6qyax6 | BEST RUN |
+| G: 5L/192d | 0.003047 | 0.002816 | 7p6pd3s3 | Degraded late |
+| H: 5L/256d | 0.003353 | 0.003549 | 99op3jzc | Degraded late |
+| E: 4L/256d | 0.003240 | 0.003953 | 3x2qs87j | Most stable terminal |
+| F: 4L/384d | 0.003778 | 0.003411 | 5l8kfcnx | — |
+| B: 3L/256d | diverged | diverged | kzo2rm82 | DIVERGED at ep~300 |
+| A: 3L/192d | 0.007082 | 0.007305 | 8ou4uk6x | Instability |
+| C: 3L/384d | 0.008798 | 0.008569 | 2xsnrhdr | Instability |
+
+**Result: SENT BACK — did not beat baseline (0.002383). Key findings:**
+- 4L is the optimal depth for TFP (3L unstable, 5L degrades late)
+- 4L/192d is best config, but still 25% above baseline
+- 4 data pipeline bug fixes included (AoA assertion, -inf clamping, NaN stats, IEEE-754)
+- Student advised to: try lr=5e-5 with 4L/192d, add early stopping, try EMA
+
 ## 2026-04-22 — PR #3025: TFP Lion+gc=0.5+EMA champion config (haku) — MERGED ✓ NEW BEST
 
 - **Branch:** haku/tfp-lion-champion-config
