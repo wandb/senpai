@@ -1,13 +1,13 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 04:30 (advisor cycle 62)
+- **Date:** 2026-04-24 05:00 (advisor cycle 63)
 - **Branch:** radford
-- **Idle students:** 0
+- **Idle students:** 0 (faye just assigned #3244)
 - **PRs ready for review:** 0
 - **CRITICAL:** TFP champion config is BROKEN — code regression since #3025, seed=0 no longer reproduces (#3205). Waiting for sanji #3209 cp_panel bug fix.
 - **Known bug:** `primary_metric_key` shadowing in train.py (line ~1646 local var shadows function on line ~1428). 3 students independently fixed this cycle. Fix: rename local to `best_tracking_metric_key`.
 
-## Fleet Status (53 active PRs)
+## Fleet Status (58 active PRs)
 
 ### DrivAerML WIP (28 PRs)
 **Innovation track (new physics-aware/ML ideas per directive):**
@@ -31,7 +31,7 @@
 
 **Champion tuning / paper-facing:**
 - `#3209` sanji: TFP cp_panel bug fix + multi-seed retest — STABILIZATION PRIORITY
-- `#3164` faye: paper-facing full eval (two-phase) — PAPER-FACING Track 1
+- `#3244` faye: DM Track 1 paper-facing full eval (champion config, NO --max-eval-batches) — PAPER-FACING Track 1
 - `#3160` griffith: 16H heads
 - `#3237` nobara: snapshot ensemble at cosine troughs (test-time averaging) — INNOVATION
 - `#3152` eren: EMA decay sweep (0.999 vs 0.9995)
@@ -112,7 +112,7 @@
 | TandemFoil | `test_primary/surface_pressure_mae` | **22.868** (PR #3185 MERGED) | (internal) | Improving |
 | TandemFoil Paper | `test_primary/field_mse` | **NO CLEAN ROW YET** | ~0.10-0.36/task | URGENT — #3098 in-progress |
 | AirfRANS | `Surf MSE / Vol MSE` | **0.000296 / 0.002039** | 0.0043 / 0.0017 | Surface 14.5x better, Volume 1.20x gap |
-| DrivAerML | `test_primary/surface_rel_l2_pct` | **4.685%** (#3072, partial eval) | 3.71% | Gap closing — #3164 paper eval in-progress |
+| DrivAerML | `test_primary/surface_rel_l2_pct` | **4.685%** (#3072, partial eval) | 3.71% | Gap closing — #3244 paper eval in-progress (faye) |
 
 ## Current Research Focus
 
