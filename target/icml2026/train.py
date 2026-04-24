@@ -169,6 +169,7 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    weight_perturbation_sigma: float = 0.0
 
 
 @dataclass
@@ -1254,6 +1255,17 @@ def evaluate_abupt(
     return {"surface_mae": total_surface / max(count_surface, 1), "volume_mae": total_volume / max(count_volume, 1)}
 
 
+def _apply_weight_perturbation(model: torch.nn.Module, sigma: float) -> int:
+    perturbed = 0
+    with torch.no_grad():
+        for p in model.parameters():
+            if p.requires_grad:
+                noise_scale = sigma * p.data.abs().mean()
+                p.data += torch.randn_like(p.data) * noise_scale
+                perturbed += 1
+    return perturbed
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     anp_head: ANPSurfaceDecoder | None,
@@ -1746,6 +1758,22 @@ def main() -> None:
             run.summary["best_epoch"] = best_epoch
             run.summary["best_val_metric"] = best_val_metric
         print(json.dumps(epoch_metrics, sort_keys=True), flush=True)
+
+        if (
+            config.cosine_t_max > 0
+            and config.weight_perturbation_sigma > 0
+            and epoch % config.cosine_t_max == config.cosine_t_max - 1
+        ):
+            n_perturbed = _apply_weight_perturbation(model, config.weight_perturbation_sigma)
+            swp_log = {
+                "weight_perturbation/fired": 1,
+                "weight_perturbation/sigma": config.weight_perturbation_sigma,
+                "weight_perturbation/epoch": epoch,
+                "weight_perturbation/params_perturbed": n_perturbed,
+            }
+            if run is not None:
+                wandb.log(swp_log, step=epoch)
+            print(json.dumps(swp_log), flush=True)
 
     if best_epoch is not None:
         print(
