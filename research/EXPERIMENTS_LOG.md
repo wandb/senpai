@@ -1,5 +1,18 @@
 # SENPAI Research Results
 
+## 2026-04-24 11:00 — PR #3258: DM auxiliary surface normal prediction (emma) — CLOSED (dead end)
+
+- emma/dm-aux-normal-prediction, W&B runs: fkiz67ki (w=0.1), g9zs1wsh (w=0.01), group: dm-aux-normal-prediction
+- Hypothesis: multi-task regularization via predicting surface normals as auxiliary target
+
+| Trial | Aux weight | best val_pct | vs baseline | Epochs |
+|-------|-----------|-------------|-------------|--------|
+| T1 | 0.1 | 4.724% | +23% | 202 (timeout) |
+| T2 | 0.01 | 4.661% | +22% | 212 (timeout) |
+
+- **Root cause (dual):** (1) Input leakage — normals already in input features, aux head learns trivial reconstruction (aux_loss collapses to <0.001 in 30-50ep). (2) Epoch starvation — aux head overhead limits runs to ~200 vs 511 epochs.
+- **Conceptual flaw:** Predicting inputs from latent ≠ meaningful information bottleneck. The task is trivially solvable and provides no regularization signal.
+
 ## 2026-04-24 10:45 — PR #3244: DM paper-facing full eval (faye) — SENT BACK (strategy change)
 
 - faye/dm-paper-facing-full-eval, W&B run: l7jxns6d, group: dm-paper-facing
