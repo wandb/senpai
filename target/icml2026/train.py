@@ -96,6 +96,40 @@ AIRFRANS_FIELD_NAMES = ("Ux", "Uy", "p", "nut")
 TANDEM_FIELD_NAMES = ("Ux", "Uy", "p")
 
 
+class LearnableFourierWrapper(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module, space_dim: int, freq_init: list[float]):
+        super().__init__()
+        self.model = model
+        self.space_dim = space_dim
+        self.fourier_freqs = torch.nn.Parameter(torch.tensor(freq_init, dtype=torch.float32))
+        self.fourier_dim = space_dim * len(freq_init) * 2
+
+    def _replace_fourier(self, x: torch.Tensor) -> torch.Tensor:
+        coords = x[..., : self.space_dim]
+        base = x[..., : -self.fourier_dim]
+        scaled = coords.unsqueeze(-1) * self.fourier_freqs
+        fourier = torch.cat([scaled.sin().flatten(-2), scaled.cos().flatten(-2)], dim=-1)
+        return torch.cat([base, fourier], dim=-1)
+
+    def forward(
+        self,
+        *,
+        surface_x: torch.Tensor,
+        surface_mask: torch.Tensor,
+        volume_x: torch.Tensor | None = None,
+        volume_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor | None]:
+        surface_x = self._replace_fourier(surface_x)
+        if volume_x is not None:
+            volume_x = self._replace_fourier(volume_x)
+        return self.model(
+            surface_x=surface_x,
+            surface_mask=surface_mask,
+            volume_x=volume_x,
+            volume_mask=volume_mask,
+        )
+
+
 @dataclass
 class TrainConfig:
     dataset: str = "tandemfoil"
@@ -141,6 +175,8 @@ class TrainConfig:
     tandemfoil_paper_manifest: str = ""
     tandemfoil_paper_stats: str = ""
     enable_fourier: bool = False
+    learnable_fourier_freqs: bool = False
+    fourier_freq_init: str = ""
     enable_te_coord_frame: bool = False
     enable_cp_panel: bool = False
     enable_cp_panel_tandem_only: bool = False
@@ -1615,6 +1651,11 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
+    if config.learnable_fourier_freqs and config.enable_fourier:
+        freq_init = [0.5, 2.0, 8.0, 32.0]
+        if config.fourier_freq_init:
+            freq_init = [float(v) for v in config.fourier_freq_init.split(",")]
+        model = LearnableFourierWrapper(model, bundle.spec.space_dim, freq_init).to(device)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
@@ -1657,6 +1698,8 @@ def main() -> None:
     if config.wandb_name:
         run_config = asdict(config)
         run_config["effective_batch_size"] = config.batch_size * config.grad_accum_steps
+        if isinstance(model, LearnableFourierWrapper):
+            run_config["fourier_freq_init"] = model.fourier_freqs.detach().cpu().tolist()
         run = wandb.init(
             project=os.getenv("WANDB_PROJECT", "senpai-v1"),
             entity=os.getenv("WANDB_ENTITY"),
@@ -1745,7 +1788,19 @@ def main() -> None:
             run.summary["epoch"] = epoch
             run.summary["best_epoch"] = best_epoch
             run.summary["best_val_metric"] = best_val_metric
+            if isinstance(model, LearnableFourierWrapper) and epoch % 50 == 0:
+                freqs = model.fourier_freqs.detach().cpu().tolist()
+                freq_log = {f"fourier_freq/{i}": v for i, v in enumerate(freqs)}
+                wandb.log(freq_log, step=epoch)
         print(json.dumps(epoch_metrics, sort_keys=True), flush=True)
+
+    if isinstance(model, LearnableFourierWrapper):
+        final_freqs = model.fourier_freqs.detach().cpu().tolist()
+        print(json.dumps({"final_learned_fourier_freqs": final_freqs}), flush=True)
+        if run is not None:
+            freq_log = {f"final_fourier_freq/{i}": v for i, v in enumerate(final_freqs)}
+            run.summary.update(freq_log)
+            run.summary["final_learned_fourier_freqs"] = final_freqs
 
     if best_epoch is not None:
         print(
