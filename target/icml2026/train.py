@@ -169,6 +169,7 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    layer_lr_decay: float = 1.0
 
 
 @dataclass
@@ -548,7 +549,26 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
     raise ValueError(f"Unknown model: {config.model}")
 
 
-def build_optimizer(params, config: TrainConfig):
+def build_optimizer(params, config: TrainConfig, *, model: torch.nn.Module | None = None):
+    if config.layer_lr_decay < 1.0 and model is not None:
+        blocks = model.backbone.blocks
+        num_layers = len(blocks)
+        transformer_param_ids: set[int] = set()
+        param_groups = []
+        for i, block in enumerate(blocks):
+            layer_lr = config.lr * (config.layer_lr_decay ** (num_layers - 1 - i))
+            block_params = list(block.parameters())
+            transformer_param_ids.update(id(p) for p in block_params)
+            param_groups.append({"params": block_params, "lr": layer_lr, "layer_index": i})
+        other_params = [p for p in params if id(p) not in transformer_param_ids]
+        if other_params:
+            param_groups.append({"params": other_params, "lr": config.lr, "layer_index": -1})
+        for i, pg in enumerate(param_groups):
+            li = pg.pop("layer_index")
+            label = f"layer_{li}" if li >= 0 else "other"
+            print(f"  LLRD param group {i} ({label}): lr={pg['lr']:.6e}, params={sum(p.numel() for p in pg['params'])}")
+        params = param_groups
+
     if config.optimizer == "lion":
         optimizer = Lion(params, lr=config.lr, weight_decay=config.weight_decay)
     elif config.optimizer == "adamw":
@@ -1369,6 +1389,9 @@ def train_one_epoch(
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
         running["lr"] = float(optimizer.param_groups[0]["lr"])
+        if len(optimizer.param_groups) > 1:
+            for gi, pg in enumerate(optimizer.param_groups):
+                running[f"lr/group_{gi}"] = float(pg["lr"])
     return running
 
 
@@ -1632,7 +1655,7 @@ def main() -> None:
     params = list(model.parameters())
     if anp_head is not None:
         params.extend(list(anp_head.parameters()))
-    optimizer = build_optimizer(params, config)
+    optimizer = build_optimizer(params, config, model=model)
     scheduler = None
     if config.cosine_t_max > 0:
         base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
