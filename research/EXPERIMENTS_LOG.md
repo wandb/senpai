@@ -1,5 +1,22 @@
 # SENPAI Research Results
 
+## 2026-04-24 18:30 — PR #3301: DrivAerML Breakout 3 domain-normalized volume auxiliary (brook) — SENT BACK (round 2)
+
+- brook/dm-domain-normalized-volume-aux
+- Hypothesis: Fix volume target normalization bug (surface cp stats applied to 4-channel volume data caused 40,000:1 loss ratio in #3044), then use volume as auxiliary representation objective
+- **Normalization fix confirmed:** vol/surface loss ratio 0.95-0.98 at epoch 1 (was ~40,000:1 before). Also fixed pre-existing bug in core/features.py:augment_case_sample (surface_x 7-dim vs volume_x 4-dim concat crash).
+
+| Trial | vol_loss_weight | vol_pts | best val surface_rel_l2_pct | best ep | W&B | status |
+|-------|----------------|---------|---------------------------|---------|-----|--------|
+| A | 0.1 | 16k | 9.69% | 99 | pttzba44 | killed ep100 |
+| B | 0.03 | 16k | 9.63% | 100 | j5s3yre4 | killed ep100 |
+| C | 0.3 | 8k | 18.17% | 100 | dvbqs5bs | killed ep100 |
+
+- All killed by --kill-if-best-val-above 100:8.0, BUT champion was likely ~8-10% at ep100 too (reached 3.833% at ep511). Kill gate was too aggressive.
+- **Sent back:** Re-run Trial B (w=0.03) and new Trial E (w=0.01) with relaxed kill gate (250:7.0, no-improvement 200:0.05), plus surface-only control. Need 500+ epochs to evaluate properly.
+
+---
+
 ## 2026-04-24 17:30 — PR #3270: DrivAerML FiLM conditioning (brook) — CLOSED dead end
 
 - brook/dm-geometry-film-conditioning
