@@ -86,6 +86,16 @@ class EMAWithWarmup:
         self.backup = None
 
 
+def _cat_quadratic(x: torch.Tensor, space_dim: int) -> torch.Tensor:
+    """Append pairwise coordinate products (x², y², z², xy, xz, yz) to features."""
+    coords = x[..., :space_dim]
+    quads = []
+    for i in range(space_dim):
+        for j in range(i, space_dim):
+            quads.append(coords[..., i : i + 1] * coords[..., j : j + 1])
+    return torch.cat([x] + quads, dim=-1)
+
+
 LEGACY_VAL_ALIAS = {
     "val_in_dist": "p_in",
     "val_ood_cond": "p_oodc",
@@ -169,6 +179,7 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    quadratic_pos_features: bool = False
 
 
 @dataclass
@@ -860,6 +871,7 @@ def evaluate_grouped(
     *,
     amp_mode: str = "none",
     max_batches: int = 0,
+    quadratic_pos_features: bool = False,
 ) -> dict[str, float]:
     model.eval()
     if anp_head is not None:
@@ -889,6 +901,10 @@ def evaluate_grouped(
     for batch in batches:
         batch = batch.to(device)
         dataset_name = batch.dataset_name
+        if quadratic_pos_features:
+            batch.surface_x = _cat_quadratic(batch.surface_x, batch.space_dim)
+            if batch.volume_x is not None:
+                batch.volume_x = _cat_quadratic(batch.volume_x, batch.space_dim)
 
         if isinstance(transform, TandemTargetTransform):
             prepared = transform.prepare_batch(batch)
@@ -1277,6 +1293,7 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    quadratic_pos_features: bool = False,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1313,6 +1330,10 @@ def train_one_epoch(
                     loss, _ = loss_abupt(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
             else:
                 batch = batch.to(device)
+                if quadratic_pos_features:
+                    batch.surface_x = _cat_quadratic(batch.surface_x, batch.space_dim)
+                    if batch.volume_x is not None:
+                        batch.volume_x = _cat_quadratic(batch.volume_x, batch.space_dim)
                 if isinstance(transform, TandemTargetTransform):
                     prepared = transform.prepare_batch(batch)
                     with autocast_context(device, amp_mode):
@@ -1487,6 +1508,7 @@ def evaluate_phase_metrics(
                 device,
                 amp_mode=config.amp_mode,
                 max_batches=config.max_eval_batches,
+                quadratic_pos_features=config.quadratic_pos_features,
             )
         metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
         if phase == "val" and split_name in LEGACY_VAL_ALIAS and "mae_surf_p" in split_metrics:
@@ -1619,6 +1641,13 @@ def main() -> None:
                 asinh_scale=config.asinh_scale,
             )
 
+    if config.quadratic_pos_features:
+        quad_dim = bundle.spec.space_dim * (bundle.spec.space_dim + 1) // 2
+        bundle.spec.surface_input_dim += quad_dim
+        if bundle.spec.volume_input_dim > 0:
+            bundle.spec.volume_input_dim += quad_dim
+        print(f"[QuadPos] Adding {quad_dim} quadratic position features (space_dim={bundle.spec.space_dim})")
+
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
@@ -1694,6 +1723,7 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            quadratic_pos_features=config.quadratic_pos_features,
         )
 
         if ema is not None:
