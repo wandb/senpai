@@ -167,6 +167,7 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
+    progressive_points_schedule: str = ""
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -452,6 +453,27 @@ def parse_args() -> TrainConfig:
             parser.add_argument(arg_name, type=type(field_value), default=field_value)
     namespace = parser.parse_args()
     return TrainConfig(**vars(namespace))
+
+
+def parse_progressive_points_schedule(schedule: str) -> list[tuple[int, int]]:
+    if not schedule.strip():
+        return []
+    stages: list[tuple[int, int]] = []
+    for part in schedule.split(","):
+        part = part.strip()
+        points_str, epoch_str = part.split(":")
+        stages.append((int(points_str), int(epoch_str)))
+    stages.sort(key=lambda s: s[1])
+    return stages
+
+
+def get_progressive_train_points(stages: list[tuple[int, int]], epoch: int) -> int | None:
+    if not stages:
+        return None
+    for points, until_epoch in stages:
+        if epoch <= until_epoch:
+            return points
+    return stages[-1][0]
 
 
 def build_bundle(config: TrainConfig) -> DatasetBundle:
@@ -1643,13 +1665,13 @@ def main() -> None:
     best_anp_state: dict[str, torch.Tensor] | None = None
 
     if bundle.spec.name == "tandemfoilset":
-        val_primary_key = "val_primary/surface_pressure_mae"
+        best_tracking_metric_key = "val_primary/surface_pressure_mae"
     else:
-        val_primary_key = f"val_primary/{bundle.spec.default_metric}"
+        best_tracking_metric_key = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
     best_epoch = 0
-    best_model_state: dict[str, torch.Tensor] | None = None
-    best_anp_state: dict[str, torch.Tensor] | None = None
+    best_model_state = None
+    best_anp_state = None
     best_ema_shadow: dict[str, torch.Tensor] | None = None
     best_anp_ema_shadow: dict[str, torch.Tensor] | None = None
 
@@ -1666,12 +1688,25 @@ def main() -> None:
             tags=[config.dataset, config.model],
         )
 
+    progressive_stages = parse_progressive_points_schedule(config.progressive_points_schedule)
+    prev_train_points: int | None = None
+
     start_time = time.monotonic()
     timeout_seconds = None if not timeout_env else float(timeout_env) * 60.0
 
     for epoch in range(1, config.epochs + 1):
         if timeout_seconds is not None and epoch > 1 and (time.monotonic() - start_time) >= timeout_seconds:
             break
+
+        current_train_points = get_progressive_train_points(progressive_stages, epoch)
+        if current_train_points is not None:
+            train_ds = bundle.train_dataset
+            if hasattr(train_ds, "max_surface_points"):
+                if current_train_points != prev_train_points:
+                    print(f"[progressive] epoch {epoch}: train surface points {prev_train_points} -> {current_train_points}", flush=True)
+                    prev_train_points = current_train_points
+                train_ds.max_surface_points = current_train_points
+
         train_metrics = train_one_epoch(
             model=forward_model,
             anp_head=anp_head,
@@ -1719,7 +1754,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(val_primary_key)
+        current_val = eval_metrics.get(best_tracking_metric_key)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
@@ -1739,6 +1774,8 @@ def main() -> None:
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
         epoch_metrics["best_val_metric"] = best_val_metric
         epoch_metrics["best_epoch"] = float(best_epoch)
+        if current_train_points is not None:
+            epoch_metrics["current_train_points"] = float(current_train_points)
         history.append(epoch_metrics)
         if run is not None:
             wandb.log(epoch_metrics, step=epoch)
