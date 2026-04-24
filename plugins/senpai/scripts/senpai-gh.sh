@@ -124,6 +124,38 @@ print(max(ts) if ts else '')
 " "$@"
 }
 
+# Merge the JSON values emitted by `gh api --paginate --jq '[...]' into one
+# array. `gh` applies --jq once per page, so a multi-page call emits multiple
+# top-level arrays.
+json_merge_arrays_from_stream() {
+    python3 -c '
+import json
+import sys
+
+text = sys.stdin.read()
+decoder = json.JSONDecoder()
+idx = 0
+items = []
+while idx < len(text):
+    while idx < len(text) and text[idx].isspace():
+        idx += 1
+    if idx >= len(text):
+        break
+    value, idx = decoder.raw_decode(text, idx)
+    if isinstance(value, list):
+        items.extend(value)
+    else:
+        items.append(value)
+print(json.dumps(items))
+'
+}
+
+gh_api_paginated_array() {
+    local path="$1" jq_expr="$2" raw
+    raw=$(gh_retry gh api --paginate "$path" --jq "$jq_expr") || return
+    printf '%s\n' "$raw" | json_merge_arrays_from_stream
+}
+
 # ---------------------------------------------------------------------------
 # PR reads
 # ---------------------------------------------------------------------------
@@ -138,20 +170,20 @@ pr_body() {
 
 pr_issue_comments() {
     local num="$1"
-    gh_retry gh api "repos/${GH_REPO}/issues/${num}/comments?per_page=100" \
-        --jq '[.[] | {kind:"issue",author:.user.login,createdAt:.created_at,updatedAt:.updated_at,body}]'
+    gh_api_paginated_array "repos/${GH_REPO}/issues/${num}/comments?per_page=100" \
+        '[.[] | {kind:"issue",author:.user.login,createdAt:.created_at,updatedAt:.updated_at,body}]'
 }
 
 pr_reviews() {
     local num="$1"
-    gh_retry gh api "repos/${GH_REPO}/pulls/${num}/reviews?per_page=100" \
-        --jq '[.[] | {kind:"review",author:.user.login,state,submittedAt:.submitted_at,body}]'
+    gh_api_paginated_array "repos/${GH_REPO}/pulls/${num}/reviews?per_page=100" \
+        '[.[] | {kind:"review",author:.user.login,state,submittedAt:.submitted_at,body}]'
 }
 
 pr_review_comments() {
     local num="$1"
-    gh_retry gh api "repos/${GH_REPO}/pulls/${num}/comments?per_page=100" \
-        --jq '[.[] | {kind:"inline",author:.user.login,path,line,createdAt:.created_at,updatedAt:.updated_at,body}]'
+    gh_api_paginated_array "repos/${GH_REPO}/pulls/${num}/comments?per_page=100" \
+        '[.[] | {kind:"inline",author:.user.login,path,line,createdAt:.created_at,updatedAt:.updated_at,body}]'
 }
 
 pr_all_comments() {
@@ -159,8 +191,38 @@ pr_all_comments() {
     issues=$(pr_issue_comments "$num") || return
     reviews=$(pr_reviews "$num") || return
     inline=$(pr_review_comments "$num") || return
-    python3 -c "import json,sys; print(json.dumps([x for blob in sys.argv[1:] for x in json.loads(blob)]))" \
-        "$issues" "$reviews" "$inline"
+    printf '%s\0%s\0%s' "$issues" "$reviews" "$inline" | python3 -c '
+import json
+import sys
+
+blobs = sys.stdin.buffer.read().split(b"\0")
+print(json.dumps([item for blob in blobs if blob for item in json.loads(blob)]))
+'
+}
+
+issue_body() {
+    local num="$1"
+    gh_retry gh api "repos/${GH_REPO}/issues/${num}" \
+        --jq '{number,title,state,author:.user.login,createdAt:.created_at,updatedAt:.updated_at,body}'
+}
+
+issue_comments() {
+    local num="$1"
+    gh_api_paginated_array "repos/${GH_REPO}/issues/${num}/comments?per_page=100" \
+        '[.[] | {kind:"issue",author:.user.login,createdAt:.created_at,updatedAt:.updated_at,body}]'
+}
+
+issue_with_comments() {
+    local num="$1" issue comments
+    issue=$(issue_body "$num") || return
+    comments=$(issue_comments "$num") || return
+    printf '%s\0%s' "$issue" "$comments" | python3 -c '
+import json
+import sys
+
+issue, comments = sys.stdin.buffer.read().split(b"\0", 1)
+print(json.dumps({"issue": json.loads(issue), "comments": json.loads(comments)}))
+'
 }
 
 # Summarize recent training logs after a sparse wakeup. This is deliberately

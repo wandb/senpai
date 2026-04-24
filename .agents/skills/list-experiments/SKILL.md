@@ -24,8 +24,23 @@ def get_repo_info():
     info = json.loads(r.stdout)
     return info["owner"]["login"], info["name"]
 
+def fetch_issue_comments(owner, name, number):
+    """Fetch all PR conversation comments for a PR, across every REST page."""
+    comments = []
+    page = 1
+    while True:
+        endpoint = f"repos/{owner}/{name}/issues/{number}/comments?per_page=100&page={page}"
+        r = subprocess.run(["gh", "api", endpoint], capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError(r.stderr)
+        batch = json.loads(r.stdout)
+        comments.extend((comment.get("body") or "") for comment in batch)
+        if len(batch) < 100:
+            return comments
+        page += 1
+
 def fetch():
-    """Fetch PRs with comments via GraphQL (single API call, paginated)."""
+    """Fetch PRs with complete comments via GraphQL plus REST overflow pages."""
     owner, name = get_repo_info()
     prs = []
     cursor = None
@@ -38,7 +53,10 @@ def fetch():
               nodes {{
                 number title body state mergedAt url
                 labels(first: 10) {{ nodes {{ name }} }}
-                comments(first: 100) {{ nodes {{ body }} }}
+                comments(first: 100) {{
+                  pageInfo {{ hasNextPage }}
+                  nodes {{ body }}
+                }}
               }}
             }}
           }}
@@ -48,6 +66,12 @@ def fetch():
             raise RuntimeError(r.stderr)
         data = json.loads(r.stdout)["data"]["repository"]["pullRequests"]
         for node in data["nodes"]:
+            first_comments = [c["body"] or "" for c in node["comments"]["nodes"]]
+            comments = (
+                fetch_issue_comments(owner, name, node["number"])
+                if node["comments"]["pageInfo"]["hasNextPage"]
+                else first_comments
+            )
             prs.append({
                 "number": node["number"],
                 "title": node["title"],
@@ -56,7 +80,7 @@ def fetch():
                 "mergedAt": node["mergedAt"],
                 "url": node["url"],
                 "labels": [{"name": l["name"]} for l in node["labels"]["nodes"]],
-                "comments": [c["body"] for c in node["comments"]["nodes"]],
+                "comments": comments,
             })
         if not data["pageInfo"]["hasNextPage"]:
             break
