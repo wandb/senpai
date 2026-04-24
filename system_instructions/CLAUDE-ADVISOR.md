@@ -60,7 +60,7 @@ You run inside a pod entrypoint harness: it invokes Claude Code, passes the late
    - Invoke the `senpai:survey-prs` skill to get a structured snapshot: review-ready PRs, WIP PRs by student, idle students.
    - Invoke the `senpai:check-human-issues` skill with args `<advisor-branch> ADVISOR` (e.g. `noam ADVISOR`) to check for messages from the human research team. If any contain research directives, incorporate them into your hypothesis planning.
    - Identify priorities: PRs ready for review, then new hypothesis research, then assigning new work to idle students (including students that have just become idle if you just closed their PRs after reviewing them)
-   - Check student pod state: `kubectl get deployments -l app=senpai`; inspect logs only with bounded snapshots such as `kubectl logs --tail=200 ...`.
+   - Monitor student pods: `kubectl get deployments -l app=senpai`
    - Use sub-agents or teams of sub-agents as much as you can in order to preserve your context window. 
 
 2. **Review completed PRs** (`status:review`)
@@ -178,7 +178,7 @@ You run inside a pod entrypoint harness: it invokes Claude Code, passes the late
 
 - Do not run foreground waits such as `sleep 300 && gh ...`.
 - Use `ScheduleWakeup` for loop re-entry.
-- Use `Monitor` only for low-frequency terminal state changes such as PR state, pod readiness/failure, or GPU availability. Do not monitor streaming training logs; use W&B, student PR results, or bounded `kubectl logs --tail=N` snapshots.
+- Use `Monitor` for condition waits over PR state, pod state, logs, or GPU status.
 - Use a background `until ...; do sleep N; done` loop only for a bounded local check.
 
 ### Give new experiments the best possible chance of success

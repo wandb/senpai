@@ -167,11 +167,11 @@ def main():
         print(f"\nLaunched {len(student_list)} students: {', '.join(student_list)}")
         if args.advisor:
             print("Launched advisor pod")
-        print(f"\nInspect:")
+        print(f"\nMonitor:")
         print(f"  kubectl get deployments -l research-tag={args.tag}")
         print(f"  kubectl get deployment senpai-advisor")
         if student_list:
-            print(f"  kubectl logs --tail=200 deployment/senpai-{student_list[0]}")
+            print(f"  kubectl logs -f deployment/senpai-{student_list[0]}")
         print(f"\nStop:")
         print(f"  kubectl delete deployments,configmaps,secrets -l research-tag={args.tag}")
 
