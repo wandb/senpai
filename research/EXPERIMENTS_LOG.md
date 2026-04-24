@@ -1,5 +1,25 @@
 # SENPAI Research Results
 
+## 2026-04-24 20:30 — PR #3301: DrivAerML Breakout 3 volume-aux Round 2 (brook) — CLOSED dead end
+
+- brook/dm-domain-normalized-volume-aux
+- Hypothesis: domain-normalized volume auxiliary loss improves surface prediction by teaching flow physics
+
+| Trial | Config | val_primary | Best Epoch | Kill Reason |
+|-------|--------|-------------|-----------|-------------|
+| D | vol w=0.03, 16k vol pts | 5.217% | ep808 | patience (200ep) |
+| E | vol w=0.01, 16k vol pts | 8.172% | ep246 | val>7.0 gate |
+| F | surface-only control | **4.163%** | ep722 | patience (200ep) |
+
+- W&B: 0zwq3blb (D), kvr6jvln (E), fxc0d9rv (F). Baseline: 3.833%
+- **Volume co-training is conclusively negative:** Trial D (5.22%) is 1.05pp worse than surface-only control (4.16%). Lower weight (Trial E, 0.01) paradoxically worse.
+- Normalization fix confirmed correct: loss ratio ~1:1 at ep1 (vs ~40,000:1 pre-fix). Infrastructure works, but volume and surface tasks compete for model capacity at 4L/512d.
+- Control run (4.16%) validates harness patches (fixed EMA, no-compile, save-checkpoint) don't regress from champion.
+- Bug fixes: augment_case_sample dimension mismatch (surface 7-feat vs volume 4-feat), skip-update-grad-norm incompatible with volume training.
+- **Brook assigned to #3320: DM lr=3e-4 with full champion EMA+gc stack**
+
+---
+
 ## 2026-04-24 20:10 — PR #3202: DrivAerML GLU preprocess (senku) — CLOSED dead end
 
 - senku/dm-glu-preprocess

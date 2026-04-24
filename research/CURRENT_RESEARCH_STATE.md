@@ -32,7 +32,7 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 **Breakout lanes:**
 - `#3300` vegeta: **Breakout 1** — AB-UPT-style anchored decoder (geometry supernodes → surface anchor cross-attention → point decoding)
 - ~~`#3299` zenitsu~~ **Breakout 4 CLOSED** — coord normalization destroys spatial encoding. KEY FINDING: geometry features (log_area, front_facing) alone showed strong regularization (grad norm 9-11 vs 28-35) — worth adding WITHOUT coord norm in future.
-- `#3301` brook: **Breakout 3** — domain-normalized volume auxiliary (round 2: relaxed kill gate, w=0.03/0.01 + surface-only control)
+- ~~`#3301` brook~~ **Breakout 3 CLOSED** — volume co-training conclusively negative (5.22% vs 4.16% surface-only control). Reassigned to #3320 DM lr=3e-4
 - `#3302` canute: **Breakout 2** — metric-aware MSE + raw-rel-L2 loss (dm_rel_l2_weight 0.02/0.05/0.1)
 - **Breakout 5** (train+val retrain) — NOT YET ASSIGNED (only +8.5% data: 400→434 cases)
 
