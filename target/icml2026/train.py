@@ -178,6 +178,8 @@ class TrainConfig:
     kill_if_no_improvement: str = ""
     kill_if_grad_nonfinite_steps: int = 0
     seed: int = 0
+    dm_loss: str = "mse"
+    dm_rel_l2_weight: float = 0.05
 
 
 @dataclass
@@ -778,6 +780,8 @@ def loss_grouped(
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
     volume_loss_weight: float = 1.0,
+    dm_loss: str = "mse",
+    dm_rel_l2_weight: float = 0.05,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.surface_x.device)
     metrics: dict[str, float] = {}
@@ -786,6 +790,21 @@ def loss_grouped(
         surf_loss = F.mse_loss(outputs["surface_preds"][batch.surface_mask], target[batch.surface_mask])
         total = total + surf_loss
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
+        if dm_loss == "mse_plus_raw_rel_l2":
+            raw_pred = transform.invert(outputs["surface_preds"])
+            raw_target = batch.surface_y
+            mask = batch.surface_mask
+            B = raw_pred.shape[0]
+            rel_l2_sum = raw_pred.new_zeros(())
+            for b in range(B):
+                m = mask[b]
+                err = (raw_pred[b][m] - raw_target[b][m]).pow(2).sum()
+                ref = raw_target[b][m].pow(2).sum().clamp(min=1e-8)
+                rel_l2_sum = rel_l2_sum + (err / ref).sqrt()
+            raw_rel_l2 = rel_l2_sum / max(B, 1)
+            total = total + dm_rel_l2_weight * raw_rel_l2
+            metrics["raw_rel_l2_loss"] = float(raw_rel_l2.detach().cpu().item())
+            metrics["rel_l2_contribution"] = float((dm_rel_l2_weight * raw_rel_l2).detach().cpu().item())
     if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
         target = transform.apply(batch.volume_y)
         vol_loss = F.mse_loss(outputs["volume_preds"][batch.volume_mask], target[batch.volume_mask])
@@ -1287,6 +1306,8 @@ def train_one_epoch(
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
     skip_update_grad_norm: float = 0.0,
+    dm_loss: str = "mse",
+    dm_rel_l2_weight: float = 0.05,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1342,7 +1363,11 @@ def train_one_epoch(
                             volume_x=batch.volume_x,
                             volume_mask=batch.volume_mask,
                         )
-                        loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                        loss, loss_metrics = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight, dm_loss=dm_loss, dm_rel_l2_weight=dm_rel_l2_weight)
+                        for k in ("raw_rel_l2_loss", "rel_l2_contribution"):
+                            if k in loss_metrics:
+                                running.setdefault(k, 0.0)
+                                running[k] += loss_metrics[k]
 
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
@@ -1389,6 +1414,9 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    for k in ("raw_rel_l2_loss", "rel_l2_contribution"):
+        if k in running:
+            running[k] /= max(steps, 1)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1754,6 +1782,8 @@ def main() -> None:
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
             skip_update_grad_norm=config.skip_update_grad_norm,
+            dm_loss=config.dm_loss,
+            dm_rel_l2_weight=config.dm_rel_l2_weight,
         )
 
         grad_nonfinite_count += int(train_metrics.get("grad_nonfinite", 0))
