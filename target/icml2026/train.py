@@ -169,6 +169,7 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    moe_output_experts: int = 0
 
 
 @dataclass
@@ -505,6 +506,35 @@ def cp_panel_prior_index(config: TrainConfig, bundle: DatasetBundle) -> int | No
     return None
 
 
+class MoEOutputHead(torch.nn.Module):
+    def __init__(self, hidden_dim: int, output_dim: int, num_experts: int = 3):
+        super().__init__()
+        self.num_experts = num_experts
+        self.experts = torch.nn.ModuleList([
+            torch.nn.Sequential(
+                torch.nn.Linear(hidden_dim, 256),
+                torch.nn.GELU(),
+                torch.nn.Linear(256, output_dim),
+            )
+            for _ in range(num_experts)
+        ])
+        self.gate = torch.nn.Sequential(
+            torch.nn.Linear(hidden_dim, 64),
+            torch.nn.GELU(),
+            torch.nn.Linear(64, num_experts),
+        )
+        self._last_gate_weights: torch.Tensor | None = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_logits = self.gate(x)
+        gate_weights = F.softmax(gate_logits, dim=-1)
+        self._last_gate_weights = gate_weights.detach()
+        expert_outputs = torch.stack(
+            [expert(x) for expert in self.experts], dim=-2
+        )
+        return (gate_weights.unsqueeze(-1) * expert_outputs).sum(dim=-2)
+
+
 def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
     transolver_kwargs = {
         "n_layers": config.model_layers,
@@ -525,7 +555,7 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
         )
     if config.model == "senpai_transolver":
         prior_idx = cp_panel_prior_index(config, bundle)
-        return SenpaiTransolver(
+        model = SenpaiTransolver(
             space_dim=bundle.spec.space_dim,
             surface_input_dim=bundle.spec.surface_input_dim,
             surface_output_dim=bundle.spec.surface_output_dim,
@@ -539,6 +569,14 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
             volume_pressure_prior_idx=prior_idx,
             **transolver_kwargs,
         )
+        if config.moe_output_experts > 0:
+            total_output_dim = bundle.spec.surface_output_dim + bundle.spec.volume_output_dim
+            model.out = MoEOutputHead(
+                hidden_dim=config.model_hidden_dim,
+                output_dim=total_output_dim,
+                num_experts=config.moe_output_experts,
+            )
+        return model
     if config.model == "reference_abupt":
         return ABUPTReference(
             space_dim=bundle.spec.space_dim,
@@ -1745,6 +1783,12 @@ def main() -> None:
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
         epoch_metrics["best_val_metric"] = best_val_metric
         epoch_metrics["best_epoch"] = float(best_epoch)
+
+        moe_out = getattr(model, "out", None)
+        if isinstance(moe_out, MoEOutputHead) and moe_out._last_gate_weights is not None:
+            gw = moe_out._last_gate_weights.mean(dim=tuple(range(moe_out._last_gate_weights.ndim - 1)))
+            for ei in range(gw.shape[0]):
+                epoch_metrics[f"moe_gate/expert_{ei}"] = float(gw[ei])
         history.append(epoch_metrics)
         if run is not None:
             wandb.log(epoch_metrics, step=epoch)
