@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 17:30 (advisor cycle 94)
+- **Date:** 2026-04-24 19:00 (advisor cycle 97)
 - **Branch:** radford
 - **ACTIVE DIRECTIVE: Issue #3283 — Last Ditch Benchmark Push (~6-7 hours remaining)**
 - **Fleet:** 59 students active. 36 DM / 12 AF / 11 TFP / 0 TF.
@@ -30,9 +30,9 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 **Breakout lanes:**
 - `#3300` vegeta: **Breakout 1** — AB-UPT-style anchored decoder (geometry supernodes → surface anchor cross-attention → point decoding)
 - `#3299` zenitsu: **Breakout 4** — coordinate normalization + geometry features (xyz_norm using geometry_center/scale, normals, log_area, front-facing indicator)
-- `#3301` brook: **Breakout 3** — domain-normalized volume auxiliary (fix normalization bug at line 790, separate surface/volume TargetTransform, vol_loss_weight 0.03/0.1/0.3)
-- **Breakout 2** (metric-aware fine-tune: mse_z + raw rel-L2) — NOT YET ASSIGNED
-- **Breakout 5** (train+val retrain) — NOT YET ASSIGNED
+- `#3301` brook: **Breakout 3** — domain-normalized volume auxiliary (round 2: relaxed kill gate, w=0.03/0.01 + surface-only control)
+- `#3302` canute: **Breakout 2** — metric-aware MSE + raw-rel-L2 loss (dm_rel_l2_weight 0.02/0.05/0.1)
+- **Breakout 5** (train+val retrain) — NOT YET ASSIGNED (only +8.5% data: 400→434 cases)
 
 **Champion recovery / truth lanes:**
 - `#3293` norman: champion recovery seed=0 no-compile (Bucket A)
@@ -51,7 +51,7 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 - `#3267` mitsuha: SwiGLU FFN
 - `#3265` alphonse: hidden-space noise
 - ~~`#3276` zenitsu: cosine similarity loss~~ CLOSED dead end
-- `#3275` canute: local attention
+- ~~`#3275` canute: local attention~~ CLOSED dead end → reassigned to Breakout 2 (#3302)
 - `#3271` nobara: LLRD
 - `#3251` fern: Pre-LayerNorm
 - `#3249` shouko: decaying WD
