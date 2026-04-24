@@ -169,6 +169,7 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    num_register_tokens: int = 0
 
 
 @dataclass
@@ -499,6 +500,26 @@ def cp_panel_prior_index(config: TrainConfig, bundle: DatasetBundle) -> int | No
     return None
 
 
+class BackboneWithRegisters(torch.nn.Module):
+    def __init__(self, backbone: torch.nn.Module, num_tokens: int, hidden_dim: int):
+        super().__init__()
+        self.backbone = backbone
+        self.num_tokens = num_tokens
+        self.register_tokens = torch.nn.Parameter(
+            torch.randn(num_tokens, hidden_dim) * 0.02
+        )
+
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+        B = x.shape[0]
+        reg = self.register_tokens.unsqueeze(0).expand(B, -1, -1)
+        x = torch.cat([reg, x], dim=1)
+        if attn_mask is not None:
+            reg_mask = torch.ones(B, self.num_tokens, device=attn_mask.device, dtype=attn_mask.dtype)
+            attn_mask = torch.cat([reg_mask, attn_mask], dim=1)
+        x = self.backbone(x, attn_mask=attn_mask)
+        return x[:, self.num_tokens:, :]
+
+
 def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
     transolver_kwargs = {
         "n_layers": config.model_layers,
@@ -540,6 +561,14 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
             volume_output_dim=bundle.spec.volume_output_dim,
         )
     raise ValueError(f"Unknown model: {config.model}")
+
+
+def _maybe_wrap_register_tokens(model: torch.nn.Module, config: TrainConfig) -> torch.nn.Module:
+    if config.num_register_tokens > 0 and hasattr(model, "backbone"):
+        model.backbone = BackboneWithRegisters(
+            model.backbone, config.num_register_tokens, model.n_hidden
+        )
+    return model
 
 
 def build_optimizer(params, config: TrainConfig):
@@ -1614,7 +1643,7 @@ def main() -> None:
             )
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
-    model = build_model(config, bundle).to(device)
+    model = _maybe_wrap_register_tokens(build_model(config, bundle), config).to(device)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
@@ -1739,6 +1768,9 @@ def main() -> None:
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
         epoch_metrics["best_val_metric"] = best_val_metric
         epoch_metrics["best_epoch"] = float(best_epoch)
+        if config.num_register_tokens > 0 and hasattr(model, "backbone") and isinstance(model.backbone, BackboneWithRegisters):
+            reg_norm = float(model.backbone.register_tokens.data.norm().item())
+            epoch_metrics["register_tokens/l2_norm"] = reg_norm
         history.append(epoch_metrics)
         if run is not None:
             wandb.log(epoch_metrics, step=epoch)
