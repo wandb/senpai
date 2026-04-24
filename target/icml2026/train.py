@@ -160,6 +160,7 @@ class TrainConfig:
     residual_prediction: bool = False
     re_stratified_sampling: bool = False
     cosine_t_max: int = 150
+    cosine_eta_mult: float = 1.0
     geometry_points: int = 25_000
     geometry_supernodes: int = 4_096
     surface_anchor_points: int = 8_000
@@ -1628,9 +1629,20 @@ def main() -> None:
         params.extend(list(anp_head.parameters()))
     optimizer = build_optimizer(params, config)
     scheduler = None
+    cosine_restart_count = 0
     if config.cosine_t_max > 0:
         base_optimizer = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
+        if config.cosine_eta_mult < 1.0:
+            t_max = config.cosine_t_max
+            eta_mult = config.cosine_eta_mult
+            def _sgdr_lambda(step: int) -> float:
+                cycle = step // t_max
+                t_cur = step % t_max
+                peak_factor = eta_mult ** cycle
+                return peak_factor * 0.5 * (1.0 + math.cos(math.pi * t_cur / t_max))
+            scheduler = torch.optim.lr_scheduler.LambdaLR(base_optimizer, _sgdr_lambda)
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(base_optimizer, T_max=config.cosine_t_max)
 
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
@@ -1739,6 +1751,12 @@ def main() -> None:
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
         epoch_metrics["best_val_metric"] = best_val_metric
         epoch_metrics["best_epoch"] = float(best_epoch)
+        if scheduler is not None and config.cosine_eta_mult < 1.0 and config.cosine_t_max > 0:
+            total_steps = scheduler.last_epoch
+            restart_count = total_steps // config.cosine_t_max
+            current_peak_lr = config.lr * (config.cosine_eta_mult ** restart_count)
+            epoch_metrics["sgdr_restart_count"] = float(restart_count)
+            epoch_metrics["sgdr_current_peak_lr"] = current_peak_lr
         history.append(epoch_metrics)
         if run is not None:
             wandb.log(epoch_metrics, step=epoch)
