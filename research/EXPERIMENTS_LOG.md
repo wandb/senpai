@@ -1,5 +1,16 @@
 # SENPAI Research Results
 
+## 2026-04-25 01:30 — Cycle 124 (1 PR)
+
+### PR #3341: AF vol-13x + eval-every-3 (casca) — CLOSED
+- casca/af-vol13x-eval3
+- surface_mse=0.00797 (27x worse), vol_mse=0.0393 (19x worse), 51 epochs before instability
+- W&B: rnbtzz57
+- Possible flag error (--volume-loss-weight vs --vol-loss-weight). Vol-13x too aggressive regardless.
+- Casca reassigned to vol-11x + eval-3 + seed=42 (#3354)
+
+---
+
 ## 2026-04-25 01:15 — Cycle 123 (1 PR)
 
 ### PR #3311: DM champion recovery seed=1024 (franky) — CLOSED
