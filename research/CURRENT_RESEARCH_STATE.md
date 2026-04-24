@@ -58,12 +58,12 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 - `#3265` alphonse: hidden-space noise
 - ~~`#3276` zenitsu: cosine similarity loss~~ CLOSED dead end
 - ~~`#3275` canute: local attention~~ CLOSED dead end → reassigned to Breakout 2 (#3302)
-- `#3271` nobara: LLRD
+- ~~`#3271` nobara~~ CLOSED dead end (4.446% val, diverged at cosine restart) → reassigned to #3317 DM 4H/128d wide heads
 - `#3251` fern: Pre-LayerNorm
-- `#3249` shouko: decaying WD
+- ~~`#3249` shouko~~ CLOSED dead end (4.602% val, diverged when WD→0) → reassigned to #3318 DM lr=4e-4 with EMA+gc
 - `#3242` historia: label smoothing
 - `#3235` kakashi: multi-exit prediction
-- `#3228` chopper: stochastic weight perturbation
+- ~~`#3228` chopper~~ CLOSED dead end (4.538% val, gradient explosion ep294) → reassigned to #3316 DM 3L/512d depth reduction
 - ~~`#3221` franky~~ CLOSED dead end (10.75%/6.26% val — gc=0.5 already stabilizes restarts) → reassigned to #3311 champion recovery seed=1024
 - `#3202` senku: GLU preprocess
 - `#3194` bulma: probe LR above 5e-4

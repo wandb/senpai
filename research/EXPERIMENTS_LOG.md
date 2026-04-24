@@ -1,5 +1,53 @@
 # SENPAI Research Results
 
+## 2026-04-24 19:45 — PR #3271: DrivAerML LLRD (nobara) — CLOSED dead end
+
+- nobara/dm-layer-lr-decay
+- Hypothesis: layer-wise learning rate decay (lower LR for earlier layers) improves DM training
+
+| Trial | decay | val_primary | Epochs | Status |
+|-------|-------|-------------|--------|--------|
+| 1 | 0.80 | 6.003% @ep117 | 225 | Diverged ep120 (cosine restart) |
+| 2 | 0.65 | 4.446% @ep292 | 300 | Diverged ep298 (cosine restart) |
+
+- W&B: 6ekne3bv (T1), 0bf7g3ck (T2). Baseline: 3.833%
+- LLRD incompatible with cosine restarts — top-layer full-LR jumps cascade instability at restart boundaries. Stronger decay delays but doesn't prevent divergence.
+- **Nobara assigned to #3317: DM 4H/128d wide attention heads**
+
+---
+
+## 2026-04-24 19:45 — PR #3249: DrivAerML decaying WD (shouko) — CLOSED dead end
+
+- shouko/dm-decaying-wd
+- Hypothesis: WD linearly decaying to 0 provides early regularization then relaxes constraints
+
+| Trial | WD start | val_primary | Epochs | Status |
+|-------|----------|-------------|--------|--------|
+| 1 | 1e-4 → 0 | 4.602% @ep230 | 300 | Diverged ~ep235 (WD below ~2e-5) |
+| 2 | 5e-5 → 0 | 12.253% @ep52 | 77 | Diverged ep53 |
+
+- W&B: 82v9rvo6 (T1), s7gezo80 (T2). Baseline: 3.833%
+- Useful finding: constant WD=1e-4 gave good early convergence (smooth grad norms, monotonic val improvement). Critical WD floor for stability is ~2e-5. Decaying to zero is fatal.
+- **Shouko assigned to #3318: DM lr=4e-4 with full champion EMA+gc stack**
+
+---
+
+## 2026-04-24 19:45 — PR #3228: DrivAerML stochastic weight perturbation (chopper) — CLOSED dead end
+
+- chopper/dm-weight-perturbation
+- Hypothesis: periodic weight perturbation at cosine troughs breaks through plateaus
+
+| Trial | sigma | val_primary | Epochs | Status |
+|-------|-------|-------------|--------|--------|
+| 1 | 0.01 | 4.538% @ep291 | 300 | Diverged ep294 (grad explosion) |
+| 2 | 0.001 | 11.633% @ep53 | 179 | Diverged ep54 |
+
+- W&B: 6azffysi (T1), nqyli13p (T2). Baseline: 3.833%
+- Sigma=0.01 showed 10 successful plateau-breaking events but eventually hit gradient explosion. Perturbation mechanism works locally but DM loss landscape too unstable for reliable repeated perturbation.
+- **Chopper assigned to #3316: DM 3L/512d depth reduction with champion stack**
+
+---
+
 ## 2026-04-24 19:30 — PR #3269: DrivAerML error correction head (emma) — CLOSED dead end
 
 - emma/dm-error-correction-head
