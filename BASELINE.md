@@ -561,14 +561,22 @@
 ## TandemFoil Paper
 
 - **Primary metric:** `val_primary/field_mse` (lower is better)
-- **Current best:** 0.002383 (val) at epoch 443 — **45.1% improvement over previous best**
-- **Best PR:** #3025 (haku — Lion lr=1.25e-4, T_max=10, gc=0.5, EMA=0.999, 3L/192d, Fourier+physics)
+- **Current best:** 0.002344 (val) at epoch 436 — **1.7% improvement over 0.002383**
+- **Best PR:** #3056 (haku — Lion lr=1e-4, T_max=10, gc=0.5, EMA=0.999, 3L/192d, Fourier+physics)
 - **External target:** Paper MGN ~1.79 (crushed by >99% — internal frontier is the only meaningful target)
-- **Key insight:** The TF champion recipe (Lion+gc=0.5+EMA) transfers strongly to TFP. Lion+EMA at T_max=10 is the decisive combination — both the optimizer and the weight averaging contribute. Divergence at ep462 (known T_max=10 instability) but EMA preserves the best checkpoint.
-- **Critical flags:** Must use `--tandemfoil-paper` dataset key (see train.py for exact flag)
-- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil_paper --optimizer lion --lr 1.25e-4 --cosine-t-max 10 --grad-clip 0.5 --weight-decay 1e-2 --enable-fourier --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999 --ema-decay 0.999`
+- **Key insight:** Reducing LR from 1.25e-4 to 1e-4 is the decisive lever for TFP. TF champion LR (1.25e-4) does not transfer optimally to TFP. T_max=10+gc=0.5+EMA=0.999 structure is unchanged. gc=0.3 catastrophically diverges at ep64. Also includes bug fix: metric_transform exclusion set misspelling ('tandemfoilset_paper' → correct 'tandemfoil_paper' excluded only for airfrans).
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil_paper --optimizer lion --lr 1e-4 --cosine-t-max 10 --grad-clip 0.5 --weight-decay 1e-2 --enable-fourier --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999 --ema-decay 0.999`
 
-### 2026-04-22 — PR #3025: TandemFoil Paper: Lion+gc=0.5+EMA champion config — NEW BEST (CURRENT)
+### 2026-04-24 15:15 — PR #3056: TandemFoil Paper: lr=1e-4 at T_max=10+gc=0.5+EMA — NEW BEST (CURRENT)
+
+- **val_primary/field_mse:** 0.002344 (-1.7% vs 0.002383) at epoch 436
+- **test_primary/field_mse:** 0.002221
+- **W&B run:** z15oq0s8 (haku/tfp-t10-gc05-lr1e4)
+- **Config:** Lion lr=**1e-4**, T_max=10, gc=0.5, WD=1e-2, EMA=0.999, 3L/192d, Fourier+physics
+- **Key insight:** lr=1e-4 (not 1.25e-4) is the TFP optimum. TF champion LR doesn't transfer. Same T_max=10 divergence pattern (ep~489 divergence, EMA preserves ep436 best). gc=0.3 catastrophically fails (Run 3: val=0.008 at ep64). T_max=20/30 with 1.25e-4 all worse (~0.003). Bug fix: metric_transform exclusion was misspelled ('tandemfoilset_paper' instead of 'tandemfoil_paper'), now corrected.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil_paper --optimizer lion --lr 1e-4 --cosine-t-max 10 --grad-clip 0.5 --weight-decay 1e-2 --enable-fourier --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999 --ema-decay 0.999`
+
+### 2026-04-22 — PR #3025: TandemFoil Paper: Lion+gc=0.5+EMA champion config — PREVIOUS BEST
 
 - **val_primary/field_mse:** 0.002383 (-45.1% vs 0.00434) at epoch 443
 - **val/surface_mse:** 0.001517
