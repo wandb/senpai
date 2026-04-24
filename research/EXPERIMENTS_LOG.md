@@ -1,5 +1,25 @@
 # SENPAI Research Results
 
+## 2026-04-24 19:30 — PR #3244: DrivAerML paper-facing full eval (faye) — CLOSED (critical finding)
+
+- faye/dm-paper-facing-champion-full-eval
+- **AUTHORITATIVE PAPER-FACING TEST: 4.324%** (W&B run zx5syby1, full eval on ep517 checkpoint from w4ufs8m1)
+- Phase 1: champion recovery with --save-checkpoint, 524 epochs, best batch-limited val 3.900% at ep517 (vs champion 3.833% at ep511). Zero grad-skip events (threshold=500).
+- Phase 2: --load-checkpoint full eval (no --max-eval-batches): val=4.698%, test=4.324%
+- Batch-limited eval bias: val is ~0.8pp optimistic (3.900→4.698%), test is ~0.5pp PESSIMISTIC (4.859→4.324%)
+- Does not beat baseline val (3.900% > 3.833%), but provides the authoritative full-eval methodology.
+- **Faye assigned to #3303: compile-mode champion recovery**
+
+## 2026-04-24 19:30 — PR #3295: AF vol-weight=8 (jin) — CLOSED dead end
+
+- jin/af-vol-weight-8, W&B: kazfrlg7
+- surface_mse=0.000288 (-2.7% vs baseline 0.000296) but vol_mse=0.003171 (+55% vs 0.002039)
+- Trade-off non-linear: reducing vol-weight below 10 loses far more volume accuracy than it gains surface. Confirms vol-weight=10 is near Pareto front.
+- Lower bound of AF vol-weight sweep established at 8: no need to test below.
+- **Jin assigned to #3304: AF extended 600-min champion training**
+
+---
+
 ## 2026-04-24 19:00 — PR #3275: DrivAerML local/windowed attention (canute) — CLOSED dead end
 
 - canute/dm-local-attention
