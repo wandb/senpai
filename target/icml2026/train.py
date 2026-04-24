@@ -169,6 +169,8 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    geometry_film: bool = False
+    geometry_film_additive_only: bool = False
 
 
 @dataclass
@@ -454,6 +456,123 @@ def parse_args() -> TrainConfig:
     return TrainConfig(**vars(namespace))
 
 
+class FiLMLayer(torch.nn.Module):
+    def __init__(self, geo_dim: int, hidden_dim: int, additive_only: bool = False):
+        super().__init__()
+        self.additive_only = additive_only
+        out_dim = hidden_dim if additive_only else hidden_dim * 2
+        self.geo_norm = torch.nn.LayerNorm(geo_dim)
+        self.film_mlp = torch.nn.Sequential(
+            torch.nn.Linear(geo_dim, hidden_dim),
+            torch.nn.GELU(),
+            torch.nn.Linear(hidden_dim, out_dim),
+        )
+        torch.nn.init.zeros_(self.film_mlp[-1].weight)
+        torch.nn.init.zeros_(self.film_mlp[-1].bias)
+
+    def forward(self, h: torch.Tensor, geo_features: torch.Tensor) -> torch.Tensor:
+        params = self.film_mlp(self.geo_norm(geo_features))
+        if self.additive_only:
+            return h + params.unsqueeze(1)
+        delta_gamma, delta_beta = params.chunk(2, dim=-1)
+        return (1 + delta_gamma.unsqueeze(1)) * h + delta_beta.unsqueeze(1)
+
+
+class FiLMSenpaiTransolver(SenpaiTransolver):
+    GEO_DIM = 15
+
+    def __init__(self, *, additive_only: bool = False, **kwargs):
+        super().__init__(**kwargs)
+        self.film_additive_only = additive_only
+        n_layers = len(self.backbone.blocks)
+        self.film_layers = torch.nn.ModuleList([
+            FiLMLayer(self.GEO_DIM, self.n_hidden, additive_only=additive_only)
+            for _ in range(n_layers)
+        ])
+        self._last_film_stats: dict[str, float] = {}
+
+    def _compute_geo_features(self, surface_x: torch.Tensor) -> torch.Tensor:
+        coords = surface_x[:, :, :self.space_dim]
+        geo_min = coords.min(dim=1).values
+        geo_max = coords.max(dim=1).values
+        geo_range = geo_max - geo_min
+        geo_center = coords.mean(dim=1)
+        geo_std = coords.std(dim=1)
+        return torch.cat([geo_min, geo_max, geo_range, geo_center, geo_std], dim=-1)
+
+    def _record_film_stats(self) -> None:
+        stats: dict[str, float] = {}
+        for i, layer in enumerate(self.film_layers):
+            w = layer.film_mlp[-1].weight.detach()
+            b = layer.film_mlp[-1].bias.detach()
+            if self.film_additive_only:
+                stats[f"film/layer{i}_beta_weight_norm"] = float(w.norm().item())
+                stats[f"film/layer{i}_beta_bias_mean"] = float(b.mean().item())
+                stats[f"film/layer{i}_beta_bias_std"] = float(b.std().item())
+            else:
+                dg_w = w[:self.n_hidden]
+                db_w = w[self.n_hidden:]
+                dg_b = b[:self.n_hidden]
+                db_b = b[self.n_hidden:]
+                stats[f"film/layer{i}_dgamma_weight_norm"] = float(dg_w.norm().item())
+                stats[f"film/layer{i}_dgamma_bias_mean"] = float(dg_b.mean().item())
+                stats[f"film/layer{i}_dbeta_weight_norm"] = float(db_w.norm().item())
+                stats[f"film/layer{i}_dbeta_bias_mean"] = float(db_b.mean().item())
+        self._last_film_stats = stats
+
+    def forward(
+        self,
+        *,
+        surface_x: torch.Tensor,
+        surface_mask: torch.Tensor,
+        volume_x: torch.Tensor | None = None,
+        volume_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor | None]:
+        geo_features = self._compute_geo_features(surface_x)
+
+        surface_hidden = self._group_hidden(surface_x, self.project_surface_features, self.surface_bias)
+        hidden_parts = [surface_hidden]
+        mask_parts = [surface_mask]
+        volume_hidden = None
+        if volume_x is not None and volume_mask is not None and self.volume_output_dim > 0:
+            volume_hidden = self._group_hidden(volume_x, self.project_volume_features, self.volume_bias)
+            hidden_parts.append(volume_hidden)
+            mask_parts.append(volume_mask)
+        hidden = torch.cat(hidden_parts, dim=1) + self.placeholder
+        attn_mask = torch.cat(mask_parts, dim=1)
+
+        for block, film in zip(self.backbone.blocks, self.film_layers):
+            hidden = block(hidden, attn_mask=attn_mask)
+            hidden = film(hidden, geo_features)
+
+        raw_output = self.out(self.norm(hidden))
+
+        surface_tokens = surface_x.shape[1]
+        surface_preds = raw_output[:, :surface_tokens, :self.surface_output_dim]
+        volume_preds = None
+        if self.volume_output_dim > 0 and volume_x is not None:
+            volume_tokens = volume_x.shape[1]
+            start = self.surface_output_dim
+            volume_preds = raw_output[:, surface_tokens:surface_tokens + volume_tokens, start:start + self.volume_output_dim]
+
+        surface_preds = surface_preds * surface_mask.unsqueeze(-1)
+        if volume_preds is not None and volume_mask is not None:
+            volume_preds = volume_preds * volume_mask.unsqueeze(-1)
+
+        surface_preds = self._apply_pressure_prior_addition(surface_preds, surface_x, self.surface_pressure_prior_idx)
+        if self.surface_head is not None and surface_preds is not None:
+            surface_preds = surface_preds + self.surface_head(hidden[:, :surface_tokens], surface_preds)
+            surface_preds = surface_preds * surface_mask.unsqueeze(-1)
+        volume_preds = self._apply_pressure_prior_addition(volume_preds, volume_x, self.volume_pressure_prior_idx)
+
+        return {
+            "surface_hidden": hidden[:, :surface_tokens],
+            "surface_preds": surface_preds,
+            "volume_hidden": None if volume_hidden is None else hidden[:, surface_tokens:],
+            "volume_preds": volume_preds,
+        }
+
+
 def build_bundle(config: TrainConfig) -> DatasetBundle:
     bundle_kwargs = {
         "dataset_name": config.dataset,
@@ -525,7 +644,7 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
         )
     if config.model == "senpai_transolver":
         prior_idx = cp_panel_prior_index(config, bundle)
-        return SenpaiTransolver(
+        senpai_kwargs = dict(
             space_dim=bundle.spec.space_dim,
             surface_input_dim=bundle.spec.surface_input_dim,
             surface_output_dim=bundle.spec.surface_output_dim,
@@ -539,6 +658,12 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
             volume_pressure_prior_idx=prior_idx,
             **transolver_kwargs,
         )
+        if config.geometry_film:
+            return FiLMSenpaiTransolver(
+                additive_only=config.geometry_film_additive_only,
+                **senpai_kwargs,
+            )
+        return SenpaiTransolver(**senpai_kwargs)
     if config.model == "reference_abupt":
         return ABUPTReference(
             space_dim=bundle.spec.space_dim,
@@ -1361,6 +1486,13 @@ def train_one_epoch(
         running["loss"] += accum_loss / micro_count
         micro_batches_total += micro_count
         steps += 1
+
+        if steps % 50 == 0:
+            raw = model._orig_mod if hasattr(model, "_orig_mod") else model
+            if isinstance(raw, FiLMSenpaiTransolver):
+                raw._record_film_stats()
+                if wandb.run is not None:
+                    wandb.log(raw._last_film_stats, commit=False)
 
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
