@@ -20,6 +20,7 @@ dependencies = [
     "weave",
     "tqdm",
     "matplotlib",
+    "scipy",
 ]
 
 [tool.setuptools.packages.find]

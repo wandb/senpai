@@ -15,6 +15,7 @@ from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import wandb
@@ -167,6 +168,7 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
+    curvature_loss_weight: float = 0.0
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -607,6 +609,9 @@ def build_loaders(
         train_collate = collate_grouped
         eval_collate = collate_grouped
 
+    if config.curvature_loss_weight > 0 and config.model != "reference_abupt":
+        train_collate = CurvatureCollateWrapper(train_collate, config.curvature_loss_weight)
+
     train_sampler = None
     shuffle = True
     if config.re_stratified_sampling and bundle.sample_weights is not None:
@@ -758,6 +763,50 @@ def _named_channel_metrics(prefix: str, values: torch.Tensor, names: tuple[str, 
     return metrics
 
 
+def _compute_curvature_weights(
+    positions: np.ndarray, normals: np.ndarray, k: int = 8, alpha: float = 1.0,
+) -> np.ndarray:
+    from scipy.spatial import cKDTree
+
+    n = positions.shape[0]
+    if n <= k:
+        return np.ones(n, dtype=np.float32)
+    tree = cKDTree(positions)
+    _, indices = tree.query(positions, k=k + 1)
+    indices = indices[:, 1:]
+    neighbor_normals = normals[indices]
+    normal_var = np.var(neighbor_normals, axis=1).sum(axis=1)
+    curvature = np.sqrt(normal_var + 1e-10)
+    p95 = np.percentile(curvature, 95)
+    curvature = np.minimum(curvature, p95)
+    mean_curv = curvature.mean() + 1e-8
+    weights = 1.0 + alpha * (curvature / mean_curv)
+    return weights.astype(np.float32)
+
+
+class CurvatureCollateWrapper:
+    def __init__(self, inner_collate, curvature_loss_weight: float, curvature_k: int = 8):
+        self.inner = inner_collate
+        self.curvature_loss_weight = curvature_loss_weight
+        self.curvature_k = curvature_k
+
+    def __call__(self, samples):
+        batch = self.inner(samples)
+        if self.curvature_loss_weight <= 0:
+            return batch
+        B = len(samples)
+        max_n = batch.surface_x.shape[1]
+        weights = torch.ones(B, max_n, dtype=torch.float32)
+        for i, sample in enumerate(samples):
+            n = sample.surface_x.shape[0]
+            pos = sample.surface_x[:, :3].numpy()
+            nrm = sample.surface_x[:, 3:6].numpy()
+            w = _compute_curvature_weights(pos, nrm, self.curvature_k, self.curvature_loss_weight)
+            weights[i, :n] = torch.from_numpy(w)
+        batch.curvature_weights = weights
+        return batch
+
+
 def loss_grouped(
     batch: GroupedBatch,
     outputs: dict[str, torch.Tensor | None],
@@ -768,7 +817,17 @@ def loss_grouped(
     metrics: dict[str, float] = {}
     if batch.surface_y is not None and outputs["surface_preds"] is not None:
         target = transform.apply(batch.surface_y)
-        surf_loss = F.mse_loss(outputs["surface_preds"][batch.surface_mask], target[batch.surface_mask])
+        preds = outputs["surface_preds"][batch.surface_mask]
+        target_valid = target[batch.surface_mask]
+        curvature_weights = getattr(batch, "curvature_weights", None)
+        if curvature_weights is not None:
+            w = curvature_weights[batch.surface_mask]
+            pointwise_mse = (preds - target_valid).pow(2)
+            surf_loss = (w.unsqueeze(-1) * pointwise_mse).mean()
+            metrics["mean_curvature_weight"] = float(w.mean().item())
+            metrics["max_curvature_weight"] = float(w.max().item())
+        else:
+            surf_loss = F.mse_loss(preds, target_valid)
         total = total + surf_loss
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
@@ -1306,7 +1365,10 @@ def train_one_epoch(
                     )
                     loss, _ = loss_abupt(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
             else:
+                curv_w = getattr(batch, "curvature_weights", None)
                 batch = batch.to(device)
+                if curv_w is not None:
+                    batch.curvature_weights = curv_w.to(device)
                 if isinstance(transform, TandemTargetTransform):
                     prepared = transform.prepare_batch(batch)
                     with autocast_context(device, amp_mode):
@@ -1326,7 +1388,12 @@ def train_one_epoch(
                             volume_x=batch.volume_x,
                             volume_mask=batch.volume_mask,
                         )
-                        loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                        loss, loss_metrics = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                    if "mean_curvature_weight" in loss_metrics:
+                        running.setdefault("mean_curvature_weight", 0.0)
+                        running["mean_curvature_weight"] += loss_metrics["mean_curvature_weight"]
+                        running.setdefault("max_curvature_weight", 0.0)
+                        running["max_curvature_weight"] = max(running["max_curvature_weight"], loss_metrics["max_curvature_weight"])
 
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
@@ -1359,6 +1426,8 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    if "mean_curvature_weight" in running:
+        running["mean_curvature_weight"] /= max(micro_batches_total, 1)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1635,18 +1704,14 @@ def main() -> None:
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
     history: list[dict[str, float]] = []
-    best_epoch: int | None = None
-    best_val_primary_metric_name = primary_metric_key(bundle, phase="val")
-    best_val_primary_metric: float | None = None
-    best_val_metrics: dict[str, float] = {}
-    best_model_state: dict[str, torch.Tensor] | None = None
-    best_anp_state: dict[str, torch.Tensor] | None = None
-
     if bundle.spec.name == "tandemfoilset":
         val_primary_key = "val_primary/surface_pressure_mae"
     else:
         val_primary_key = f"val_primary/{bundle.spec.default_metric}"
+    best_val_primary_metric_name = val_primary_key
     best_val_metric = float("inf")
+    best_val_primary_metric: float | None = None
+    best_val_metrics: dict[str, float] = {}
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
     best_anp_state: dict[str, torch.Tensor] | None = None
@@ -1709,23 +1774,14 @@ def main() -> None:
             phase="val",
         )
 
-        current_primary_metric = eval_metrics.get(best_val_primary_metric_name)
-        if current_primary_metric is not None and (
-            best_val_primary_metric is None or current_primary_metric < best_val_primary_metric
-        ):
-            best_epoch = epoch
-            best_val_primary_metric = current_primary_metric
-            best_val_metrics = dict(eval_metrics)
-            best_model_state = snapshot_module_state(model)
-            best_anp_state = snapshot_module_state(anp_head)
-
         current_val = eval_metrics.get(val_primary_key)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
+            best_val_primary_metric = current_val
+            best_val_metrics = dict(eval_metrics)
             best_epoch = epoch
-            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            if anp_head is not None:
-                best_anp_state = {k: v.cpu().clone() for k, v in anp_head.state_dict().items()}
+            best_model_state = snapshot_module_state(model)
+            best_anp_state = snapshot_module_state(anp_head)
             if ema is not None:
                 best_ema_shadow = {k: v.cpu().clone() for k, v in ema.shadow.items()}
             if anp_ema is not None:
