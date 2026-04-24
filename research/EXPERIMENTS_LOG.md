@@ -1,5 +1,25 @@
 # SENPAI Research Results
 
+## 2026-04-24 10:15 — PR #3209: TFP cp_panel_prior_index bug fix + multi-seed reproducibility (sanji) — MERGED (bug fix)
+
+- sanji/bugfix/cp-panel-prior-index-tandemfoil-paper, W&B runs: hduq51jw (seed=0, 20ep), 9dodz26x (seed=42, 20ep), xgt4c9oc (seed=123, 20ep), xsk8r0rm (seed=0, 999ep stripped config)
+- **Bug fix:** cp_panel_prior_index() returned non-None for tandemfoil_paper even though build_tandem_paper_bundle() never populates cp_panel → sinh() applied to Fourier feature column → Inf overflow. Fix: guard with dataset name check. Also fixes primary_metric_key shadowing.
+- **Multi-seed reproducibility CONFIRMED:** seeds 0/42/123 all produce finite metrics (cross-seed std ≈ 0.0016 at ep20). Pre-fix, seeds 42/123 diverged to Inf.
+- **999-ep stripped config result:** val_primary/field_mse = 0.003615 (ep353). Expected worse than 0.002383 baseline since champion flags were deliberately omitted.
+- **TFP STABILIZATION CRISIS RESOLVED.** Normal TFP experiments can resume. Next step: re-run with full champion config to confirm 0.002383 is recoverable.
+
+## 2026-04-24 10:15 — PR #3252: DM progressive surface point training (mitsuha) — CLOSED (dead end)
+
+- mitsuha/dm-progressive-resolution, W&B runs: u94n7qjo (25k→50k@200), 972xv0ty (30k→50k@100), group: dm-progressive-resolution
+- Hypothesis: train on fewer surface points initially, transition to 50k later for speed + curriculum effect
+
+| Trial | Config | best val_pct | vs baseline | Status |
+|-------|--------|-------------|-------------|--------|
+| T1 | 25k→50k@200 | 8.147% | +113% | Crashed ep112, grad explosion |
+| T2 | 30k→50k@100 | 4.711% | +23% | Stable but converging deficit |
+
+- **Root cause:** DM requires full 50k-point context from epoch 1. 30k warmup imposes ~0.6pp persistent deficit vs baseline at same epoch. Speed gain from fewer points doesn't compensate. Consistent with 50k being only viable surface count.
+
 ## 2026-04-24 10:00 — PR #3256: DM coordinate noise augmentation (alphonse) — CLOSED (dead end)
 
 - alphonse/dm-coord-noise-augmentation, W&B runs: hapy2g9k (σ=0.001), qfu1j89b (σ=0.005), group: dm-coord-noise-aug
