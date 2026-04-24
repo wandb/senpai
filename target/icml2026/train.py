@@ -96,6 +96,141 @@ AIRFRANS_FIELD_NAMES = ("Ux", "Uy", "p", "nut")
 TANDEM_FIELD_NAMES = ("Ux", "Uy", "p")
 
 
+class MultiExitWrapper(torch.nn.Module):
+    """Wraps a SenpaiTransolver with auxiliary prediction heads at intermediate layers.
+
+    Provides gradient highways by adding lightweight exit heads after specified
+    backbone blocks.  During training the auxiliary predictions contribute to the
+    loss; during evaluation they are skipped.
+    """
+
+    def __init__(self, base_model: torch.nn.Module, exit_weights: list[float]):
+        super().__init__()
+        self.base = base_model
+        self.exit_weights = exit_weights
+        n_exits = len(exit_weights)
+        n_layers = len(base_model.backbone.blocks)
+        assert n_exits < n_layers, (
+            f"Need fewer exits ({n_exits}) than layers ({n_layers})"
+        )
+        # Place exits at the last N intermediate layers (excluding the final layer).
+        # For 4 layers, 2 exits → 0-indexed [1, 2] = layers 2 and 3.
+        self.exit_layer_indices = list(range(n_layers - n_exits - 1, n_layers - 1))
+
+        n_hidden = base_model.n_hidden
+        total_output_dim = base_model.surface_output_dim + base_model.volume_output_dim
+
+        self.aux_norms = torch.nn.ModuleList(
+            [torch.nn.LayerNorm(n_hidden, eps=1e-6) for _ in range(n_exits)]
+        )
+        self.aux_heads = torch.nn.ModuleList(
+            [torch.nn.Linear(n_hidden, total_output_dim) for _ in range(n_exits)]
+        )
+        for head in self.aux_heads:
+            torch.nn.init.xavier_uniform_(head.weight)
+            torch.nn.init.zeros_(head.bias)
+
+        self.n_hidden = base_model.n_hidden
+
+    def forward(
+        self,
+        *,
+        surface_x: torch.Tensor,
+        surface_mask: torch.Tensor,
+        volume_x: torch.Tensor | None = None,
+        volume_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor | None]:
+        base = self.base
+
+        # --- Embedding (replicates ReferenceTransolver.forward) ---
+        surface_hidden = base._group_hidden(
+            surface_x, base.project_surface_features, base.surface_bias,
+        )
+        hidden_parts = [surface_hidden]
+        mask_parts = [surface_mask]
+        has_volume = (
+            volume_x is not None
+            and volume_mask is not None
+            and base.volume_output_dim > 0
+        )
+        if has_volume:
+            vol_hidden_embed = base._group_hidden(
+                volume_x, base.project_volume_features, base.volume_bias,
+            )
+            hidden_parts.append(vol_hidden_embed)
+            mask_parts.append(volume_mask)
+
+        hidden = torch.cat(hidden_parts, dim=1) + base.placeholder
+        attn_mask = torch.cat(mask_parts, dim=1)
+        surface_tokens = surface_x.shape[1]
+
+        # --- Backbone blocks with intermediate exits ---
+        aux_exit_outputs: list[dict[str, torch.Tensor | None]] = []
+        exit_set = set(self.exit_layer_indices)
+        exit_idx = 0
+
+        for i, block in enumerate(base.backbone.blocks):
+            hidden = block(hidden, attn_mask=attn_mask)
+            if self.training and i in exit_set:
+                aux_raw = self.aux_heads[exit_idx](self.aux_norms[exit_idx](hidden))
+                aux_surface = aux_raw[:, :surface_tokens, :base.surface_output_dim]
+                aux_surface = aux_surface * surface_mask.unsqueeze(-1)
+                aux_volume = None
+                if has_volume:
+                    vol_tokens = volume_x.shape[1]
+                    start = base.surface_output_dim
+                    aux_volume = aux_raw[
+                        :, surface_tokens : surface_tokens + vol_tokens,
+                        start : start + base.volume_output_dim,
+                    ]
+                    if volume_mask is not None:
+                        aux_volume = aux_volume * volume_mask.unsqueeze(-1)
+                aux_exit_outputs.append({
+                    "surface_preds": aux_surface,
+                    "volume_preds": aux_volume,
+                })
+                exit_idx += 1
+
+        # --- Final prediction head (replicates ReferenceTransolver.forward) ---
+        raw_output = base.out(base.norm(hidden))
+        surface_preds = raw_output[:, :surface_tokens, :base.surface_output_dim]
+        volume_preds = None
+        if has_volume:
+            vol_tokens = volume_x.shape[1]
+            start = base.surface_output_dim
+            volume_preds = raw_output[
+                :, surface_tokens : surface_tokens + vol_tokens,
+                start : start + base.volume_output_dim,
+            ]
+        surface_preds = surface_preds * surface_mask.unsqueeze(-1)
+        if volume_preds is not None and volume_mask is not None:
+            volume_preds = volume_preds * volume_mask.unsqueeze(-1)
+
+        outputs: dict[str, torch.Tensor | None] = {
+            "surface_hidden": hidden[:, :surface_tokens],
+            "surface_preds": surface_preds,
+            "volume_hidden": hidden[:, surface_tokens:] if has_volume else None,
+            "volume_preds": volume_preds,
+        }
+
+        # --- SenpaiTransolver refinement (pressure prior + surface head) ---
+        surface_preds = base._apply_pressure_prior_addition(
+            outputs["surface_preds"], surface_x, base.surface_pressure_prior_idx,
+        )
+        if base.surface_head is not None and surface_preds is not None:
+            surface_preds = surface_preds + base.surface_head(
+                outputs["surface_hidden"], surface_preds,
+            )
+            surface_preds = surface_preds * surface_mask.unsqueeze(-1)
+        volume_preds = base._apply_pressure_prior_addition(
+            outputs["volume_preds"], volume_x, base.volume_pressure_prior_idx,
+        )
+        outputs["surface_preds"] = surface_preds
+        outputs["volume_preds"] = volume_preds
+        outputs["aux_exit_outputs"] = aux_exit_outputs
+        return outputs
+
+
 @dataclass
 class TrainConfig:
     dataset: str = "tandemfoil"
@@ -169,6 +304,8 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    multi_exit: bool = False
+    multi_exit_weights: str = "0.1,0.3"
 
 
 @dataclass
@@ -1271,6 +1408,8 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    multi_exit_weights: list[float] | None = None,
+    multi_exit_layer_indices: list[int] | None = None,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1286,6 +1425,7 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         accum_loss = 0.0
         micro_count = 0
+        step_aux: dict[str, float] = {}
 
         for _ in range(grad_accum_steps):
             try:
@@ -1318,6 +1458,12 @@ def train_one_epoch(
                         )
                         outputs = maybe_apply_anp(outputs, prepared, anp_head)
                         loss, _ = loss_grouped_tandem(prepared, outputs, volume_loss_weight=volume_loss_weight)
+                        if multi_exit_weights is not None:
+                            for _eidx, _aux_out in enumerate(outputs.get("aux_exit_outputs", [])):
+                                _aux_loss, _ = loss_grouped_tandem(prepared, _aux_out, volume_loss_weight=volume_loss_weight)
+                                loss = loss + multi_exit_weights[_eidx] * _aux_loss
+                                _lname = f"aux_loss_layer{multi_exit_layer_indices[_eidx] + 1}" if multi_exit_layer_indices else f"aux_loss_{_eidx}"
+                                step_aux[_lname] = step_aux.get(_lname, 0.0) + float(_aux_loss.detach().cpu().item())
                 else:
                     with autocast_context(device, amp_mode):
                         outputs = model(
@@ -1327,6 +1473,12 @@ def train_one_epoch(
                             volume_mask=batch.volume_mask,
                         )
                         loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                        if multi_exit_weights is not None:
+                            for _eidx, _aux_out in enumerate(outputs.get("aux_exit_outputs", [])):
+                                _aux_loss, _ = loss_grouped(batch, _aux_out, transform, volume_loss_weight=volume_loss_weight)
+                                loss = loss + multi_exit_weights[_eidx] * _aux_loss
+                                _lname = f"aux_loss_layer{multi_exit_layer_indices[_eidx] + 1}" if multi_exit_layer_indices else f"aux_loss_{_eidx}"
+                                step_aux[_lname] = step_aux.get(_lname, 0.0) + float(_aux_loss.detach().cpu().item())
 
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
@@ -1353,12 +1505,18 @@ def train_one_epoch(
         if anp_head is not None and anp_ema is not None:
             anp_ema.update(anp_head)
         running["loss"] += accum_loss / micro_count
+        for _aname, _aval in step_aux.items():
+            running.setdefault(_aname, 0.0)
+            running[_aname] += _aval / micro_count
         micro_batches_total += micro_count
         steps += 1
 
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    for _key in list(running.keys()):
+        if _key.startswith("aux_loss_"):
+            running[_key] /= max(steps, 1)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1615,7 +1773,17 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
-    forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
+    multi_exit_weights: list[float] | None = None
+    multi_exit_layer_indices: list[int] | None = None
+    if config.multi_exit:
+        multi_exit_weights = [float(w) for w in config.multi_exit_weights.split(",")]
+        model = MultiExitWrapper(model, multi_exit_weights).to(device)
+        multi_exit_layer_indices = model.exit_layer_indices
+    forward_model = (
+        torch.compile(model)
+        if config.compile_model and device.type == "cuda" and not config.multi_exit
+        else model
+    )
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
         anp_head = ANPSurfaceDecoder(
@@ -1657,6 +1825,9 @@ def main() -> None:
     if config.wandb_name:
         run_config = asdict(config)
         run_config["effective_batch_size"] = config.batch_size * config.grad_accum_steps
+        if multi_exit_weights is not None:
+            run_config["multi_exit_weights_parsed"] = multi_exit_weights
+            run_config["multi_exit_layer_indices"] = multi_exit_layer_indices
         run = wandb.init(
             project=os.getenv("WANDB_PROJECT", "senpai-v1"),
             entity=os.getenv("WANDB_ENTITY"),
@@ -1688,6 +1859,8 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            multi_exit_weights=multi_exit_weights,
+            multi_exit_layer_indices=multi_exit_layer_indices,
         )
 
         if ema is not None:
