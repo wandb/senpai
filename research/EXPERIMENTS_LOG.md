@@ -1,5 +1,18 @@
 # SENPAI Research Results
 
+## 2026-04-24 10:00 — PR #3256: DM coordinate noise augmentation (alphonse) — CLOSED (dead end)
+
+- alphonse/dm-coord-noise-augmentation, W&B runs: hapy2g9k (σ=0.001), qfu1j89b (σ=0.005), group: dm-coord-noise-aug
+- Hypothesis: Gaussian noise on input coordinates provides regularization against overfitting to exact point positions
+
+| Trial | σ | best val_pct | vs baseline | Status |
+|-------|---|-------------|-------------|--------|
+| T1 | 0.001 | 6.450% | +68% | Crashed ep172, grad norm peaked 732,950 |
+| T2 | 0.005 | 21.445% | +459% | 117/168 grad norms = Infinity |
+
+- **Root cause: Fourier frequency amplification.** Frequencies up to 32.0 amplify σ=0.001 to σ=0.032 in feature space, σ=0.005 to σ=0.16. Structural incompatibility with Fourier PE — not a tuning issue.
+- **Follow-up assigned:** Hidden-space noise (post-Fourier perturbation) avoids the amplification entirely.
+
 ## 2026-04-24 09:45 — PR #3239: AF additive boundary-layer auxiliary volume loss (vegeta) — CLOSED (dead end)
 
 - vegeta/af-bl-auxiliary-loss, W&B runs: 6y7xod45 (bl-w=1.0,t=0.05), 7w4btwaj (bl-w=0.5,t=0.05), pjrv0090 (bl-w=1.0,t=0.10)
