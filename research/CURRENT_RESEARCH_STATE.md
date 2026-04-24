@@ -1,14 +1,14 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-25 00:00 (advisor cycle 119)
+- **Date:** 2026-04-25 00:30 (advisor cycle 120)
 - **Branch:** radford
 - **ACTIVE DIRECTIVE: Issue #3283 — Last Ditch Benchmark Push (final hours)**
 - **TFP BEST: 0.002344** (PR #3056 merged, haku lr=1e-4)
 - **DM NEW VAL BEST: 3.700%** (canute #3302 metric-aware loss, MERGED). **BREAKS AB-UPT SOTA VAL TARGET (3.71%)!**
-- **DM authoritative TEST: 4.324%** (faye full-eval run zx5syby1). Best batch-limited TEST: 4.250% (norman seed=0). Full-eval of #3302 Trial A/B PENDING (#3322).
+- **DM authoritative TEST: 4.218%** (canute full-eval run n2t1nzsb, Trial B w=0.05 ep780 checkpoint). Beats previous 4.324% by 0.106pp. Batch-limited val (3.700%) has ~24% optimistic bias vs full-eval (4.652%).
 - **Fleet:** 59 students active. All assigned. Zero idle GPUs.
 - **Harness patches (#3284): MERGED.** All DM runs use --no-compile-model, --save-checkpoint, --ema-mode fixed
-- **Cycle 119:** 16 dead-end PRs closed, 3 sent back, 0 winners. 16 new experiments assigned. Key AF breakthrough: eval-every-3 throughput trick.
+- **Cycle 120:** canute full-eval TEST=4.218% (NEW PROGRAMME BEST). 3 PRs closed, 3 new assignments. Multi-exit and ckpt averaging dead ends.
 - **AF BREAKTHROUGH:** eval-every-3 + vol-weight=12x yields programme-best surface (0.000228). 8-student sweep launched to find vol-weight where both metrics beat baseline simultaneously.
 
 ## BINDING DIRECTIVE — Issue #3283 (2026-04-24)
@@ -33,7 +33,7 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 
 ### DM Metric-Aware Sweep (HIGHEST PRIORITY)
 **Paper-critical:**
-- `#3322` canute: **full-eval TEST** on Trial A (w=0.02) and Trial B (w=0.05) checkpoints — PAPER-CRITICAL
+- `#3348` canute: w=0.05 seed=0 + **mandatory full-eval TEST** — PAPER-FACING RUN
 
 **Weight sweep (cycle 118):**
 - `#3323` einar: w=0.03 seed=42
@@ -46,13 +46,15 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 - `#3330` shinobu: w=0.015 seed=42
 - `#3331` stark: w=0.05 + EMA=0.999
 
-**Schedule + seed variations (cycle 119):**
+**Schedule + seed + hyperparameter variations (cycles 119-120):**
 - `#3332` mitsuha: w=0.05 + T_max=20 (shorter schedule)
 - `#3333` alphonse: w=0.05 + T_max=40 (longer schedule)
 - `#3334` fern: w=0.04 + WD=1e-3
 - `#3335` historia: w=0.05 seed=13
 - `#3336` bulma: w=0.03 + EMA=0.999
 - `#3337` guts: w=0.08 (high-weight probe)
+- `#3349` kakashi: w=0.05 + gc=0.3 (softer clipping)
+- `#3350` taki: w=0.05 + lr=4.5e-4 (narrow LR probe)
 
 ### DM Breakout Lane
 - `#3300` vegeta: **Breakout 1** — AB-UPT-style anchored decoder (last remaining)
@@ -128,7 +130,7 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 | TandemFoil | `test_primary/surface_pressure_mae` | **22.868** (PR #3185 MERGED) | (internal) | Improving |
 | TandemFoil Paper | `test_primary/field_mse` | **NO CLEAN ROW YET** | ~0.10-0.36/task | URGENT — #3098 in-progress |
 | AirfRANS | `Surf MSE / Vol MSE` | **0.000296 / 0.002039** | 0.0043 / 0.0017 | Surface 14.5x better, Volume 1.20x gap |
-| DrivAerML | `test_primary/surface_rel_l2_pct` | **4.324%** (full-eval, faye zx5syby1) / batch-limited: 4.250% (norman seed=0), 4.320% (Trial A w=0.02) | 3.71% | **Full-eval of metric-aware #3302 Trial A/B checkpoints PENDING (#3322 canute).** Val 3.700% already breaks SOTA target. |
+| DrivAerML | `test_primary/surface_rel_l2_pct` | **4.218%** (full-eval, canute n2t1nzsb, Trial B w=0.05) | 3.71% | **NEW PROGRAMME BEST.** Full-eval confirmed. ~14% relative gap to SOTA. Metric-aware sweep (19 students) + canute seed=0 paper run in progress. |
 
 ## Current Research Focus
 
@@ -246,6 +248,8 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 - Post-LayerNorm: 9.515% catastrophic (#3251). Pre-LN is load-bearing.
 - Label smoothing / target noise: 4.087% (σ=0.001), 4.442% (σ=0.01 → NaN) (#3242). Label noise degrades CFD precision.
 - lr>5e-4 with EMA+gc: 5.5e-4→4.390% diverged, 6e-4→4.227% (#3194). lr=5e-4 confirmed champion.
+- Multi-exit prediction (aux losses at intermediate layers): 4.278%/4.438%/4.302% (#3235). All configs worse. Aux losses degrade primary even when converged.
+- Checkpoint averaging (top-5): -1.6% relative only (#3146). EMA=0.9995 already provides implicit averaging.
 - Bilateral symmetry aug, torch.compile, gradient accumulation
 - Attention dropout=0.05: incompatible at any stability level. Without EMA/gc→12.533%, with EMA+gc→10.118% (delayed divergence ep74 but same fate). Dropout noise compounds faster than gc clips.
 - Cosine eta_min without EMA/gc: diverges (7.255-7.918%)

@@ -1,5 +1,41 @@
 # SENPAI Research Results
 
+## 2026-04-25 00:30 — Cycle 120 Reviews (3 PRs)
+
+### PR #3322: DM full-eval TEST on metric-aware checkpoints (canute) — CLOSED (NEW TEST RECORD)
+- canute/dm-metric-aware-full-eval
+- Hypothesis: authoritative full-eval TEST on Trial B (w=0.05) checkpoint from #3302
+- W&B eval run: n2t1nzsb
+
+| Metric | Full-eval | Batch-limited | Previous best |
+|--------|-----------|---------------|---------------|
+| test_primary/surface_rel_l2_pct | **4.218%** | 4.500% | 4.324% (faye zx5syby1) |
+| val_primary/surface_rel_l2_pct | 4.652% | 3.700% | — |
+
+- **NEW PROGRAMME BEST full-eval TEST: 4.218%** (-0.106pp vs 4.324%)
+- Batch-limited val (3.700%) has ~24% optimistic bias vs full-eval (4.652%) — confirmed
+- Trial A checkpoint was overwritten during multi-trial run — only Trial B survived
+- **BASELINE.md updated with authoritative full-eval TEST number**
+
+### PR #3235: DM multi-exit prediction (kakashi) — CLOSED
+- kakashi/dm-multi-exit
+- Hypothesis: auxiliary losses at intermediate transformer layers
+- All 3 weight configs worse than baseline (4.278%/4.438%/4.302% vs 3.700%)
+- Auxiliary losses degraded primary metric despite converging. DM layers must focus on surface task.
+
+### PR #3146: DM checkpoint averaging (taki) — CLOSED
+- taki/dm-checkpoint-averaging
+- 50 epochs (10x slower due to NFS I/O bottleneck, not comparable)
+- Top-5 averaging: -1.6% relative improvement over single best — marginal
+- EMA=0.9995 already provides adequate implicit averaging
+
+### Cycle 120 New Assignments (3)
+- #3348 canute: metric-aware w=0.05 seed=0 + mandatory full-eval TEST (paper-facing)
+- #3349 kakashi: metric-aware w=0.05 + gc=0.3 (softer clipping)
+- #3350 taki: metric-aware w=0.05 + lr=4.5e-4 (narrow LR probe)
+
+---
+
 ## 2026-04-25 00:00 — Cycle 119 Batch Reviews (19 PRs)
 
 ### DrivAerML Closures (6 PRs)

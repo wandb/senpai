@@ -451,20 +451,22 @@
 ## DrivAerML
 
 - **Primary metric:** `val_primary/surface_rel_l2_pct` (lower is better)
-- **Current best:** 3.700% (val) at epoch 780 — test 4.500% (batch-limited; full-eval TEST PENDING)
+- **Current best:** 3.700% (val) at epoch 780 — **full-eval TEST 4.218%** (NEW PROGRAMME BEST)
 - **Best PR:** #3302 (canute — metric-aware MSE+raw-rel-L2 loss, w=0.05, 4L/512d/8H, AdamW lr=5e-4, T_max=30, EMA=0.9995, gc=0.5)
 - **CRITICAL:** Must pass `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
 - **External target:** <3.71% (AB-UPT, ~500 epochs) — **val 3.700% BREAKS BELOW SOTA TARGET**
-- **Key insight:** Metric-aware auxiliary loss (MSE + raw-rel-L2 with w=0.05) aligns optimization with the evaluation metric while MSE anchors stability. Trial A (w=0.02) achieved best batch-limited test (4.320%). Full-eval TEST on both checkpoints pending.
+- **Key insight:** Metric-aware auxiliary loss (MSE + raw-rel-L2 with w=0.05) aligns optimization with the evaluation metric while MSE anchors stability. Full-eval TEST=4.218% (canute run n2t1nzsb) confirms improvement over previous 4.324%. Batch-limited val (3.700%) is optimistic vs full-eval val (4.652%) — ~24% bias confirmed.
 - **Reproduce (Trial B, best val):** `cd target/icml2026 && SENPAI_TIMEOUT_MINUTES=600 python train.py --dataset drivaerml --dm-loss mse_plus_raw_rel_l2 --dm-rel-l2-weight 0.05 --optimizer adamw --lr 5e-4 --cosine-t-max 30 --grad-clip 0.5 --enable-fourier --model-layers 4 --model-hidden-dim 512 --model-heads 8 --epochs 999 --batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200 --ema-decay 0.9995 --ema-mode fixed --no-compile-model --save-checkpoint`
 
 ### 2026-04-24 21:30 — PR #3302: DrivAerML: metric-aware MSE+raw-rel-L2 loss — NEW BEST (CURRENT)
 
 - **val_primary/surface_rel_l2_pct (Trial B, w=0.05):** 3.700% (-3.5% vs 3.833%) at epoch 780
 - **val_primary/surface_rel_l2_pct (Trial A, w=0.02):** 3.935% at epoch 785
-- **test_primary/surface_rel_l2_pct (batch-limited, Trial A):** 4.320% (best test in programme)
+- **test_primary/surface_rel_l2_pct (batch-limited, Trial A):** 4.320%
 - **test_primary/surface_rel_l2_pct (batch-limited, Trial B):** 4.500%
-- **Full-eval TEST:** PENDING (canute running full-eval on both checkpoints)
+- **FULL-EVAL TEST (Trial B, w=0.05):** **4.218%** — NEW PROGRAMME BEST (canute run `n2t1nzsb`, #3322)
+- **FULL-EVAL VAL (Trial B):** 4.652% (confirms batch-limited 3.700% has ~24% optimistic bias)
+- **Trial A checkpoint:** overwritten during multi-trial run — only Trial B checkpoint survived
 - **W&B runs:** Trial A `u0lt10dh` (w=0.02), Trial B `hcnke5hj` (w=0.05), Trial C `xnoeujkg` (w=0.10)
 - **Config:** 4L/512d/8H, AdamW lr=5e-4, T_max=30, EMA=0.9995, gc=0.5, Fourier, no WD, **--dm-loss mse_plus_raw_rel_l2**
 - **Key insight:** Auxiliary raw-space relative-L2 loss aligns MSE training toward the actual evaluation metric. w=0.05 finds best val (3.700%), w=0.02 finds best test (4.320% batch-limited). First result to break below AB-UPT SOTA target on val (3.71%). MSE stability preserved — raw_rel_l2_loss decreases monotonically without destabilizing primary training.
