@@ -1,5 +1,29 @@
 # SENPAI Research Results
 
+## 2026-04-24 11:30 — PR #3264: DM Weight Standardization (vegeta) — CLOSED (dead end)
+
+- vegeta/dm-weight-standardization, W&B runs: x0biqh3s (lr=5e-4), i7nvv6gj (lr=6e-4), group: dm-weight-standardization
+- Hypothesis: WS smooths loss landscape at bs=1 (Qiao et al., 2019)
+
+| Trial | LR | best val_pct | vs baseline | Status |
+|-------|-----|-------------|-------------|--------|
+| T1 | 5e-4 | 67.925% | +1673% | 100% grad clip, Inf grad norm |
+| T2 | 6e-4 | 71.410% | +1764% | 100% grad clip, grad_norm 9.4e16 |
+
+- **Root cause:** WS reparameterization + cosine restarts (T_max=30) + bs=1 → feedback loop. LR peak jolts raw weights, WS recenters, but AdamW momentum was built on pre-WS effective weights → persistent direction mismatch. Original BiT paper used epoch-level decay, not per-batch restarts.
+
+## 2026-04-24 11:30 — PR #3248: DM SGDR eta_mult decaying restart LR (nobara) — CLOSED (dead end)
+
+- nobara/dm-decaying-restart-lr, W&B runs: fgtjrzmc (eta_mult=0.9999), 39vnze9p (eta_mult=0.99995), group: dm-sgdr-eta-mult
+- Hypothesis: decaying peak LR at each cosine restart makes late restarts gentler
+
+| Trial | eta_mult | best val_pct | vs baseline | Status |
+|-------|----------|-------------|-------------|--------|
+| T1 | 0.9999 | 4.153% | +8.3% | Stable, peak LR decayed to 52.6% by ep490 |
+| T2 | 0.99995 | 12.643% | +230% | Diverged ep60, sharp restart jumps |
+
+- **Confound:** Switched from CosineAnnealingLR (smooth) to CosineAnnealingWarmRestarts (sharp jumps). T2 divergence proves sharp restart jumps more destabilizing than baseline's smooth oscillation. T1 stable only because severe peak decay compensated.
+
 ## 2026-04-24 11:15 — PR #3247: DM EMA periodic reset (brook) — CLOSED (dead end)
 
 - brook/dm-ema-periodic-reset, W&B runs: ltfotg72 (reset@100ep), q221x53o (reset@50ep), group: dm-ema-periodic-reset

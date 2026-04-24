@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 11:15 (advisor cycle 81)
+- **Date:** 2026-04-24 11:30 (advisor cycle 82)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -38,8 +38,9 @@
 - `#3266` sanji: TFP champion config re-verification post cp_panel fix (seed=0/42) — STABILIZATION VERIFY
 - `#3244` faye: DM Track 1 paper-facing full eval (champion config, NO --max-eval-batches) — PAPER-FACING Track 1
 - `#3160` griffith: 16H heads
+- `#3271` nobara: layer-wise LR decay (LLRD, decay=0.8/0.65 across 4 layers) — INNOVATION
+- `#3272` vegeta: quadratic position features (x², y², z², xy, xz, yz for implicit curvature) — INNOVATION
 - `#3249` shouko: decaying weight decay schedule (WD=1e-4/5e-5 → 0 over 300ep) — INNOVATION
-- `#3248` nobara: decaying peak LR at cosine restarts (SGDR eta_mult) — INNOVATION
 - `#3152` eren: EMA decay sweep (0.999 vs 0.9995)
 - `#3146` taki: top-5 checkpoint averaging
 - `#3143` thorfinn: Lookahead(AdamW)
@@ -197,6 +198,8 @@
 - Progressive resolution (25k→50k / 30k→50k): 25k crashed ep112, 30k→4.711% +23% (#3252). Full 50k context needed from epoch 1. Reduced resolution creates irrecoverable representation deficit
 - Auxiliary surface normal prediction: w=0.1→4.724%, w=0.01→4.661% (#3258). Input leakage — normals already in features, aux head learns trivial reconstruction. Also epoch starvation (200 vs 511)
 - EMA periodic reset: 100ep→4.426% cascade ep335, 50ep→6.818% diverge ep108 (#3247). EMA is primary gradient stabilizer — reset removes protective smoothing at high-curvature basin point
+- Weight Standardization: 67.9%/71.4% catastrophic (#3264). WS × cosine restarts × bs=1 feedback loop. Original BiT paper used epoch-level decay not per-batch restarts
+- SGDR eta_mult (decaying restart LR): 4.153%/12.64% (#3248). Confounded by switching to warm restarts. Sharp restart jumps more destabilizing than baseline's smooth cosine
 - EMA>0.9995: 0.9999→7.106% NaN ep171, 0.99995→7.095% collapse ep120 (#3199). EMA=0.9995 sharp optimum bracketed both directions
 - SAM optimizer (rho=0.05/0.02): 5.36%/9.08%. SAM perturbation + cosine restart = double shock → catastrophic divergence. 2x compute penalty also prohibitive
 - True monotonic cosine (T_max=393606, no restarts): 4.086% (+0.253pp). Confirms T_max=30 rapid restarts are core mechanism, not noise. Monotonic decay can't compete
