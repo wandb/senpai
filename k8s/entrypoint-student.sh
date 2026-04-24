@@ -59,7 +59,7 @@ PROMPT="${TASK_INSTRUCTIONS}"
 KEY_INFO=$'\n\nKey information:\n\nStudent: '"$STUDENT_NAME"' | Target repo: '"$GH_REPO"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
-HEARTBEAT_PROMPT="Continue your student loop using the assigned PRs and GitHub issues listed in the Student research state below. The entrypoint owns assignment polling; do not start persistent GitHub polling monitors."
+HEARTBEAT_PROMPT="Continue your student loop using the assigned PRs and GitHub issues listed in the Student research state below. The entrypoint owns assignment polling; do not start persistent GitHub polling monitors. For active training, use sparse wakeups plus training_log_status; do not stream per-epoch logs into Monitor."
 
 # --- Launch Claude Code Loop ---
 export IS_SANDBOX=1

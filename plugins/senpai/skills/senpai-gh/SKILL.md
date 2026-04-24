@@ -63,6 +63,7 @@ The default repo for `gh` is set via the injected `GH_REPO` env var, so no `--re
 | `list_all_prs <branch>` | List all open PRs on a branch (any status). Returns JSON array. |
 | `student_poll_for_work <student_name>` | List WIP PRs assigned to a student. Returns JSON array. |
 | `list_idle_students <names_csv> <branch>` | Print names of students with no `status:wip` PR, one per line. |
+| `training_log_status <logfile> [more-logfiles...]` | Summarize recent training-log state after a sparse wakeup. Use this instead of `tail -f` or Monitor callbacks for epoch progress. |
 
 ## Usage examples
 

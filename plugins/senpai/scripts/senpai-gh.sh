@@ -163,6 +163,48 @@ pr_all_comments() {
         "$issues" "$reviews" "$inline"
 }
 
+# Summarize recent training logs after a sparse wakeup. This is deliberately
+# not a streaming watcher: per-epoch Monitor callbacks reload too much context.
+training_log_status() {
+    SENPAI_LOG_STATUS_LINES="${SENPAI_LOG_STATUS_LINES:-2000}" python3 - "$@" <<'PY'
+import json
+import os
+import re
+import sys
+from collections import deque
+from pathlib import Path
+
+ERROR_RE = re.compile(r"Traceback|RuntimeError|Exception|CUDA out of memory|out of memory|OOM|NaN|Killed|FAILED", re.I)
+DONE_RE = re.compile(r"best_test_metrics|Best model at epoch|Training complete|Finished|DONE", re.I)
+EPOCH_RE = re.compile(r'"epoch"\s*:|(^|\s)Epoch\s+\d+', re.I)
+tail_lines = int(os.environ["SENPAI_LOG_STATUS_LINES"])
+
+rows = []
+for raw_path in sys.argv[1:]:
+    path = Path(raw_path)
+    if not path.exists():
+        rows.append({"path": str(path), "state": "not_started"})
+        continue
+    lines = [line.rstrip() for line in deque(path.open(encoding="utf-8", errors="replace"), maxlen=tail_lines)]
+    if not lines:
+        rows.append({"path": str(path), "state": "running_no_metric"})
+        continue
+    errors = [line for line in lines if ERROR_RE.search(line)]
+    done = [line for line in lines if DONE_RE.search(line)]
+    epochs = [line for line in lines if EPOCH_RE.search(line)]
+    state = "failed" if errors else "complete" if done else "metric_seen" if epochs else "running_no_metric"
+    rows.append({
+        "path": str(path),
+        "state": state,
+        "last_epoch": epochs[-1] if epochs else None,
+        "latest_events": (errors or done)[-3:],
+        "scanned_tail_lines": len(lines),
+    })
+
+print(json.dumps(rows, indent=2))
+PY
+}
+
 # ---------------------------------------------------------------------------
 # Queries
 # ---------------------------------------------------------------------------
