@@ -1,5 +1,14 @@
 # SENPAI Research Results
 
+## 2026-04-24 16:45 — PR #3284: Harness patches (vegeta) — MERGED (infrastructure)
+
+- vegeta/harness-patches-last-ditch, train.py +218/-53
+- Merged after bug fix: double best-tracking consolidated into single atomic chain, min_delta applied in kill_if_no_improvement
+- **Patches now live:** --load-checkpoint (eval-only), --eval-interval N, --ema-mode fixed|warmup, --skip-update-grad-norm, --save-checkpoint, kill gates (--kill-if-best-val-above, --kill-if-no-improvement, --kill-if-grad-nonfinite-steps)
+- All subsequent DM champion recovery runs should use: --save-checkpoint --skip-update-grad-norm 100 --ema-mode fixed --ema-start-step 50
+
+---
+
 ## 2026-04-24 16:15 — PR #3276: DM cosine similarity auxiliary loss (zenitsu) — CLOSED (dead end)
 
 - zenitsu/dm-cosine-sim-aux-loss, W&B runs: ry1lq2vw (w=0.1), flnnss55 (w=0.5), group: dm-cosine-sim-loss
