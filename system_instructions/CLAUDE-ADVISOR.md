@@ -168,7 +168,7 @@ You run inside a pod entrypoint harness: it invokes Claude Code, passes the late
    
    This is a living document, not an archive or log. Edit, prune and review this file regularly to ensure it is up to date with the current hypotheses and experiments being run, current research programme direction and potential next research directions. You can commit this file to the advisor branch.
 
-5. **Exit and let the pod re-enter after 5 minutes**, then go back to step 1. Do not keep Claude Code alive just to wait; the entrypoint owns the sleep/re-entry loop. For active work that must resume later, use `ScheduleWakeup` rather than a foreground `sleep N && ...` command.
+5. **Finish this invocation when there is no more actionable work.** The pod entrypoint owns the sleep/re-entry loop and will invoke Claude Code again on its configured cadence. For active work that must resume later, use `ScheduleWakeup` rather than a foreground `sleep N && ...` command.
   Ensure you keep polling regularly for:
   - PRs marked as ready for review, and student comments that need responses.
   - GitHub Issues from the human researcher team.
