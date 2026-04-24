@@ -1,10 +1,10 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 16:15 (advisor cycle 92)
+- **Date:** 2026-04-24 17:30 (advisor cycle 94)
 - **Branch:** radford
-- **ACTIVE DIRECTIVE: Issue #3283 — Last Ditch Benchmark Push (~8 hours remaining)**
-- **Fleet restructured.** 36 DM / 12 AF / 11 TFP / 0 TF.
-- **Harness patches (#3284):** 5/6 implemented, sent back for merge-blocking bug fix. HIGHEST PRIORITY.
+- **ACTIVE DIRECTIVE: Issue #3283 — Last Ditch Benchmark Push (~6-7 hours remaining)**
+- **Fleet:** 59 students active. 36 DM / 12 AF / 11 TFP / 0 TF.
+- **Harness patches (#3284): MERGED.** All new DM runs use --save-checkpoint --skip-update-grad-norm 100 --ema-mode fixed --ema-start-step 50
 
 ## BINDING DIRECTIVE — Issue #3283 (2026-04-24)
 
@@ -26,31 +26,31 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 
 ## Fleet Status (restructuring in progress)
 
-### INFRASTRUCTURE (1 PR)
-- `#3284` vegeta: HARNESS PATCHES — SENT BACK for merge-blocking bug (double best-tracking). 5/6 patches implemented. **HIGHEST PRIORITY — awaiting fix.**
+### DrivAerML WIP (36 students)
+**Breakout lanes:**
+- `#3300` vegeta: **Breakout 1** — AB-UPT-style anchored decoder (geometry supernodes → surface anchor cross-attention → point decoding)
+- `#3299` zenitsu: **Breakout 4** — coordinate normalization + geometry features (xyz_norm using geometry_center/scale, normals, log_area, front-facing indicator)
+- `#3301` brook: **Breakout 3** — domain-normalized volume auxiliary (fix normalization bug at line 790, separate surface/volume TargetTransform, vol_loss_weight 0.03/0.1/0.3)
+- **Breakout 2** (metric-aware fine-tune: mse_z + raw rel-L2) — NOT YET ASSIGNED
+- **Breakout 5** (train+val retrain) — NOT YET ASSIGNED
 
-### DrivAerML WIP (~28 continuing + 8 new = 36 target)
-**Champion recovery / truth lanes (newly assigned):**
-- norman: champion recovery seed=0 no-compile (Bucket A)
-- jet: champion recovery seed=42 no-compile (Bucket A)
-- megumi: champion recovery seed=7 no-compile (Bucket A)
-- himmel: 64k surface points (Bucket C)
-- askeladd: 96k surface points (Bucket C)
-- robin: gradient-spike-safe gc=0.25 (Bucket D)
-- nami: T_max=24 narrow schedule (Bucket E)
-- chrome: T_max=36 narrow schedule (Bucket E)
-
-**Breakout lanes (newly assigned):**
-- `#3299` zenitsu: Breakout 4 — coordinate normalization + geometry features (xyz_norm, normals, log_area, front-facing)
+**Champion recovery / truth lanes:**
+- `#3293` norman: champion recovery seed=0 no-compile (Bucket A)
+- `#3285` jet: champion recovery seed=42 no-compile fixed-EMA (Bucket A)
+- `#3286` megumi: champion recovery seed=7 no-compile (Bucket A)
+- `#3289` himmel: 64k surface points (Bucket C)
+- `#3290` askeladd: 96k surface points (Bucket C)
+- `#3294` robin: gradient-spike-safe gc=0.25 (Bucket D)
+- `#3297` nami: T_max=24 narrow schedule (Bucket E)
+- `#3298` chrome: T_max=36 narrow schedule (Bucket E)
 
 **Continuing DM experiments (from pre-restructure):**
-- `#3244` faye: paper-facing full eval (SENT BACK for champion ckpt eval)
+- `#3244` faye: paper-facing full eval (SENT BACK for champion ckpt eval using --load-checkpoint)
 - `#3279` gojo: ReLU² activation
-- `#3270` brook: FiLM conditioning
 - `#3269` emma: error correction head
 - `#3267` mitsuha: SwiGLU FFN
 - `#3265` alphonse: hidden-space noise
-- `#3276` zenitsu: cosine similarity loss
+- ~~`#3276` zenitsu: cosine similarity loss~~ CLOSED dead end
 - `#3275` canute: local attention
 - `#3271` nobara: LLRD
 - `#3251` fern: Pre-LayerNorm
