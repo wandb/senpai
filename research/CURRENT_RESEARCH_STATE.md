@@ -39,7 +39,7 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 **Champion recovery / truth lanes:**
 - `#3293` norman: champion recovery seed=0 no-compile (Bucket A)
 - `#3285` jet: champion recovery seed=42 no-compile fixed-EMA (Bucket A)
-- `#3286` megumi: champion recovery seed=7 no-compile (Bucket A)
+- ~~`#3286` megumi~~ CLOSED (seed=7 reproduced 3.832% val = ceiling confirmed) → reassigned to #3313 DM weight decay sweep (WD=1e-3/1e-2)
 - `#3305` faye: champion recovery seed=13 eval-interval=5 (Bucket A)
 - `#3310` zenitsu: champion recovery seed=456/789 (Bucket A)
 - `#3311` franky: champion recovery seed=1024 eval-interval=10 (Bucket A) ← NEW

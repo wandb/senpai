@@ -1,5 +1,23 @@
 # SENPAI Research Results
 
+## 2026-04-24 19:00 — PR #3286: DrivAerML champion recovery seed=7 (megumi) — CLOSED (ceiling confirmed)
+
+- megumi/dm-champion-recovery-seed7
+- Hypothesis: different seed (7) may find a deeper basin than champion seed
+- W&B: 5utwhkv0
+
+| Metric | Champion (ncl1dh88) | Seed=7 (5utwhkv0) | Delta |
+|--------|--------------------|--------------------|-------|
+| val_primary/surface_rel_l2_pct | 3.833% @ep511 | 3.832% @ep867 | -0.001pp (noise) |
+| test (batch-limited) | 4.685% | 4.832% | +0.147pp (worse) |
+| Epochs | 511 | 874 (600-min timeout) | +363 |
+
+- **Key finding:** Champion config has a val CEILING of ~3.83% regardless of seed. Seed=7 took 867 epochs to reach the same point the champion found at ep511. The 0.49pp val-test gap (3.83→4.83% batch-limited) confirms overfitting on the 400-sample training set.
+- **Implication:** Further champion recovery seeds will converge to the same ~3.83% val ceiling. Breaking past requires a config change, not more seeds.
+- **Megumi assigned to #3313: DM weight decay sweep (WD=1e-3, WD=1e-2)** — testing whether WD regularization can break the 3.83% ceiling and reduce the val-test generalization gap.
+
+---
+
 ## 2026-04-24 18:50 — PR #3291: TFP haku seed=7 replication (wolfwood) — SENT BACK (config error)
 
 - wolfwood/tfp-haku-seed7
