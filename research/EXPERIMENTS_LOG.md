@@ -1,5 +1,16 @@
 # SENPAI Research Results
 
+## 2026-04-24 22:45 — PR #3303: DrivAerML compile-mode champion recovery (faye) — CLOSED (critical bug finding)
+
+- faye/dm-compile-champion-recovery
+- **CRITICAL BUG:** torch.compile + FixedEMA is broken on PyTorch 2.10.0 + Blackwell GPUs. Compiled model caches parameter data — in-place param.data.copy_() from EMA swap NOT reflected in compiled forward pass. Val metrics frozen to 15+ decimal places. Training loss drops normally but eval never updates.
+- compile also incompatible with --skip-update-grad-norm 100 (compile grad norms 128-378 vs surface-only ~2-10)
+- Implication: ALL DM runs must use --no-compile-model with EMA. Original champion ncl1dh88 may have had incorrect EMA eval if it ran with compile default.
+- W&B runs: 89o7idav (v1 seed0, killed), scjbssye (v1 seed42, killed), v2 seed0/seed42 (broken eval), no-compile diagnostic (working)
+- **Faye assigned to #3305: champion recovery seed=13 + eval-interval=5**
+
+---
+
 ## 2026-04-24 19:30 — PR #3244: DrivAerML paper-facing full eval (faye) — CLOSED (critical finding)
 
 - faye/dm-paper-facing-champion-full-eval
