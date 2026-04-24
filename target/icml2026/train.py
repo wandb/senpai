@@ -167,6 +167,8 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
+    vol_cross_attn: bool = False
+    vol_cross_attn_heads: int = 4
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -505,6 +507,88 @@ def cp_panel_prior_index(config: TrainConfig, bundle: DatasetBundle) -> int | No
     return None
 
 
+class VolumeSurfaceCrossAttention(torch.nn.Module):
+    """Cross-attention where volume points attend to surface point representations."""
+
+    def __init__(self, hidden_dim: int, num_heads: int = 4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.hidden_dim = hidden_dim
+        self.norm_q = torch.nn.LayerNorm(hidden_dim)
+        self.norm_kv = torch.nn.LayerNorm(hidden_dim)
+        self.q_proj = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = torch.nn.Linear(hidden_dim, hidden_dim)
+        torch.nn.init.zeros_(self.out_proj.weight)
+        torch.nn.init.zeros_(self.out_proj.bias)
+
+    def forward(
+        self,
+        volume_features: torch.Tensor,
+        surface_features: torch.Tensor,
+        volume_mask: torch.Tensor,
+        surface_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        B = volume_features.shape[0]
+        H, D = self.num_heads, self.head_dim
+        output = torch.zeros_like(volume_features)
+        vol_normed = self.norm_q(volume_features)
+        surf_normed = self.norm_kv(surface_features)
+        for b in range(B):
+            vol_idx = volume_mask[b].bool()
+            surf_idx = surface_mask[b].bool()
+            if not vol_idx.any() or not surf_idx.any():
+                continue
+            vol = vol_normed[b, vol_idx]
+            surf = surf_normed[b, surf_idx]
+            n_vol, n_surf = vol.shape[0], surf.shape[0]
+            q = self.q_proj(vol).view(n_vol, H, D).transpose(0, 1).unsqueeze(0)
+            k = self.k_proj(surf).view(n_surf, H, D).transpose(0, 1).unsqueeze(0)
+            v = self.v_proj(surf).view(n_surf, H, D).transpose(0, 1).unsqueeze(0)
+            attn_out = F.scaled_dot_product_attention(q, k, v)
+            attn_out = attn_out.squeeze(0).transpose(0, 1).contiguous().view(n_vol, self.hidden_dim)
+            output[b, vol_idx] = self.out_proj(attn_out).to(output.dtype)
+        return volume_features + output
+
+
+class VolumeCrossAttentionWrapper(torch.nn.Module):
+    """Wraps a base model and adds volume→surface cross-attention post-processing."""
+
+    def __init__(self, base_model: torch.nn.Module, hidden_dim: int, num_heads: int = 4):
+        super().__init__()
+        self.base = base_model
+        self.vol_surf_cross_attn = VolumeSurfaceCrossAttention(hidden_dim, num_heads)
+        vol_out_dim = base_model.volume_output_dim
+        self.vol_correction = torch.nn.Linear(hidden_dim, vol_out_dim)
+        torch.nn.init.zeros_(self.vol_correction.weight)
+        torch.nn.init.zeros_(self.vol_correction.bias)
+
+    def forward(
+        self,
+        *,
+        surface_x: torch.Tensor,
+        surface_mask: torch.Tensor,
+        volume_x: torch.Tensor | None = None,
+        volume_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor | None]:
+        outputs = self.base(
+            surface_x=surface_x,
+            surface_mask=surface_mask,
+            volume_x=volume_x,
+            volume_mask=volume_mask,
+        )
+        vol_hidden = outputs.get("volume_hidden")
+        surf_hidden = outputs.get("surface_hidden")
+        if vol_hidden is not None and surf_hidden is not None and volume_mask is not None:
+            enriched = self.vol_surf_cross_attn(vol_hidden, surf_hidden, volume_mask, surface_mask)
+            correction = self.vol_correction(enriched) * volume_mask.unsqueeze(-1)
+            outputs = dict(outputs)
+            outputs["volume_preds"] = outputs["volume_preds"] + correction
+        return outputs
+
+
 def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
     transolver_kwargs = {
         "n_layers": config.model_layers,
@@ -514,8 +598,9 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
         "mlp_ratio": config.model_mlp_ratio,
         "slice_num": config.model_slices,
     }
+    model: torch.nn.Module
     if config.model == "reference_transolver":
-        return ReferenceTransolver(
+        model = ReferenceTransolver(
             space_dim=bundle.spec.space_dim,
             surface_input_dim=bundle.spec.surface_input_dim,
             surface_output_dim=bundle.spec.surface_output_dim,
@@ -523,9 +608,9 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
             volume_output_dim=bundle.spec.volume_output_dim,
             **transolver_kwargs,
         )
-    if config.model == "senpai_transolver":
+    elif config.model == "senpai_transolver":
         prior_idx = cp_panel_prior_index(config, bundle)
-        return SenpaiTransolver(
+        model = SenpaiTransolver(
             space_dim=bundle.spec.space_dim,
             surface_input_dim=bundle.spec.surface_input_dim,
             surface_output_dim=bundle.spec.surface_output_dim,
@@ -539,13 +624,19 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
             volume_pressure_prior_idx=prior_idx,
             **transolver_kwargs,
         )
-    if config.model == "reference_abupt":
-        return ABUPTReference(
+    elif config.model == "reference_abupt":
+        model = ABUPTReference(
             space_dim=bundle.spec.space_dim,
             surface_output_dim=bundle.spec.surface_output_dim,
             volume_output_dim=bundle.spec.volume_output_dim,
         )
-    raise ValueError(f"Unknown model: {config.model}")
+    else:
+        raise ValueError(f"Unknown model: {config.model}")
+    if config.vol_cross_attn and bundle.spec.volume_output_dim > 0:
+        model = VolumeCrossAttentionWrapper(
+            model, hidden_dim=config.model_hidden_dim, num_heads=config.vol_cross_attn_heads,
+        )
+    return model
 
 
 def build_optimizer(params, config: TrainConfig):
