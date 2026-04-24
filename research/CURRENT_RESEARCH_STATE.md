@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 11:30 (advisor cycle 82)
+- **Date:** 2026-04-24 11:45 (advisor cycle 83)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -17,7 +17,7 @@
 - `#3243` jet: prediction-error-weighted surface sampling (hard example mining) — INNOVATION
 - `#3242` historia: label smoothing / target noise augmentation — INNOVATION
 - `#3235` kakashi: multi-exit prediction (aux losses at intermediate layers) — INNOVATION
-- `#3263` gojo: Sparse MoE FFN (K=4/8 experts, top-2 routing, regime-specific computation) — INNOVATION
+- `#3273` gojo: Grouped Query Attention (GQA, 2/4 KV heads) — throughput-focused INNOVATION
 - `#3251` fern: Pre-LayerNorm architecture ablation (+ RMSNorm variant) — INNOVATION
 - `#3259` zenitsu: curvature-weighted loss (per-point weighting by local curvature) — INNOVATION
 - `#3269` emma: learned error correction head (boosting-inspired self-correction) — INNOVATION
@@ -200,6 +200,7 @@
 - EMA periodic reset: 100ep→4.426% cascade ep335, 50ep→6.818% diverge ep108 (#3247). EMA is primary gradient stabilizer — reset removes protective smoothing at high-curvature basin point
 - Weight Standardization: 67.9%/71.4% catastrophic (#3264). WS × cosine restarts × bs=1 feedback loop. Original BiT paper used epoch-level decay not per-batch restarts
 - SGDR eta_mult (decaying restart LR): 4.153%/12.64% (#3248). Confounded by switching to warm restarts. Sharp restart jumps more destabilizing than baseline's smooth cosine
+- Sparse MoE FFN (K=4/8, top-2): 5.09%/5.35% (#3263). 1.7-2.2x throughput penalty → epoch starvation. Routing collapses to uniform. Per-epoch curve parallel to dense — FFN is not the bottleneck
 - EMA>0.9995: 0.9999→7.106% NaN ep171, 0.99995→7.095% collapse ep120 (#3199). EMA=0.9995 sharp optimum bracketed both directions
 - SAM optimizer (rho=0.05/0.02): 5.36%/9.08%. SAM perturbation + cosine restart = double shock → catastrophic divergence. 2x compute penalty also prohibitive
 - True monotonic cosine (T_max=393606, no restarts): 4.086% (+0.253pp). Confirms T_max=30 rapid restarts are core mechanism, not noise. Monotonic decay can't compete
