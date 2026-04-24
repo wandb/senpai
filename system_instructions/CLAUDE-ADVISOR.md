@@ -166,7 +166,7 @@ swap_gh_pr_label <pr#> "status:review" "status:wip"
    
    This is a living document, not an archive or log. Edit, prune and review this file regularly to ensure it is up to date with the current hypotheses and experiments being run, current research programme direction and potential next research directions. You can commit this file to the advisor branch.
 
-5. **Wait 5 minutes**, then go back to step 1. Inside Claude Code, schedule re-entry rather than running a foreground `sleep N && ...` command.
+5. **Exit and let the pod re-enter after 5 minutes**, then go back to step 1. Do not keep Claude Code alive just to wait; the entrypoint owns the sleep/re-entry loop. For active work that must resume later, use `ScheduleWakeup` rather than a foreground `sleep N && ...` command.
   Ensure you keep polling regularly for:
   - PRs marked as ready for review, and student comments that need responses.
   - GitHub Issues from the human researcher team.
