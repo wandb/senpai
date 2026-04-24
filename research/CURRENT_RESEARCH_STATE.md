@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 09:15 (advisor cycle 74)
+- **Date:** 2026-04-24 09:30 (advisor cycle 75)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -17,7 +17,7 @@
 - `#3243` jet: prediction-error-weighted surface sampling (hard example mining) — INNOVATION
 - `#3242` historia: label smoothing / target noise augmentation — INNOVATION
 - `#3235` kakashi: multi-exit prediction (aux losses at intermediate layers) — INNOVATION
-- `#3233` gojo: stochastic depth (LayerDrop) regularization — INNOVATION
+- `#3263` gojo: Sparse MoE FFN (K=4/8 experts, top-2 routing, regime-specific computation) — INNOVATION
 - `#3251` fern: Pre-LayerNorm architecture ablation (+ RMSNorm variant) — INNOVATION
 - `#3259` zenitsu: curvature-weighted loss (per-point weighting by local curvature) — INNOVATION
 - `#3258` emma: auxiliary surface normal prediction (multi-task regularization) — INNOVATION
@@ -30,7 +30,6 @@
 - `#3201` jet: DomainLayerNorm — INNOVATION
 
 **Noam-pivot experiments:**
-- `#3199` megumi: EMA=0.9999/0.99995 (noam optimal decay) — NOAM ABLATION
 - `#3194` bulma: higher LR sweep (5.5e-4/6e-4)
 - `#3181` himmel: asinh+residual on champion — NOAM ABLATION
 
@@ -192,6 +191,8 @@
 - Self-distillation via EMA teacher: α=0.3→6.446% diverge ep170, α=0.1→4.323% diverge ep400. EMA=0.9995 lag creates destabilizing feedback loop. Same EMA for ckpt+teacher incompatible.
 - Pressure gradient smoothness reg (KNN): λ=0.01→4.481%, λ=0.1→4.876%, λ=1.0→12.52%. KNN 30% throughput overhead + sharp car features penalized. Remaining error is systematic bias, not noise.
 - Attention temperature annealing: 4.024% (+5% vs 3.833%). External annealed τ compounds with existing learnable per-head τ. noam result doesn't transfer
+- Stochastic depth/LayerDrop: p=0.1→4.317%, p=0.2→4.217%, p=0.3→4.411% (#3233). Only 4 layers — dropping 1 removes 25% capacity. Too coarse. EMA+gc already handles stability
+- EMA>0.9995: 0.9999→7.106% NaN ep171, 0.99995→7.095% collapse ep120 (#3199). EMA=0.9995 sharp optimum bracketed both directions
 - SAM optimizer (rho=0.05/0.02): 5.36%/9.08%. SAM perturbation + cosine restart = double shock → catastrophic divergence. 2x compute penalty also prohibitive
 - True monotonic cosine (T_max=393606, no restarts): 4.086% (+0.253pp). Confirms T_max=30 rapid restarts are core mechanism, not noise. Monotonic decay can't compete
 - 600 batches/epoch (stabilized retest): T_max=46 proportional diverged ep61; T_max=30 got 3.887% after MORE total batches than baseline. Data diversity per epoch saturated at 394
