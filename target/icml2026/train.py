@@ -120,6 +120,7 @@ class TrainConfig:
     batch_size: int = 2
     lr: float = 3e-4
     weight_decay: float = 1e-4
+    wd_decay_epochs: int = 0
     optimizer: str = "lion"
     use_lookahead: bool = True
     use_ema: bool = True
@@ -1669,9 +1670,18 @@ def main() -> None:
     start_time = time.monotonic()
     timeout_seconds = None if not timeout_env else float(timeout_env) * 60.0
 
+    initial_wd = config.weight_decay
+
     for epoch in range(1, config.epochs + 1):
         if timeout_seconds is not None and epoch > 1 and (time.monotonic() - start_time) >= timeout_seconds:
             break
+
+        if config.wd_decay_epochs > 0:
+            current_wd = initial_wd * max(0.0, 1.0 - epoch / config.wd_decay_epochs)
+            opt = optimizer.optimizer if isinstance(optimizer, Lookahead) else optimizer
+            for pg in opt.param_groups:
+                pg["weight_decay"] = current_wd
+
         train_metrics = train_one_epoch(
             model=forward_model,
             anp_head=anp_head,
@@ -1737,6 +1747,8 @@ def main() -> None:
             anp_ema.restore(anp_head)
 
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
+        if config.wd_decay_epochs > 0:
+            epoch_metrics["current_wd"] = initial_wd * max(0.0, 1.0 - epoch / config.wd_decay_epochs)
         epoch_metrics["best_val_metric"] = best_val_metric
         epoch_metrics["best_epoch"] = float(best_epoch)
         history.append(epoch_metrics)
