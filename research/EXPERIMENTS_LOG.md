@@ -1,5 +1,16 @@
 # SENPAI Research Results
 
+## 2026-04-24 17:20 — PR #3299: DrivAerML Breakout 4 coord normalization (zenitsu) — CLOSED dead end
+
+- zenitsu/dm-coord-normalization
+- Trial 1 (coord norm only): 45.91% val ep136 (12x worse). Trial 2 (coord norm + geo features): 36.78% (10x worse). Both killed at ep137.
+- Root cause: ContinuousSincosEmbed + Fourier frequencies (0.5-32.0) calibrated for raw ~37k scale. Normalizing to [0,1] destroys high-frequency spatial encoding.
+- **Valuable finding:** Geometry features (log_area, front_facing, abs_y) alone showed strong regularization — grad norms 9-11 vs 28-35, 9pp better convergence. Worth adding WITHOUT coord normalization in future.
+- W&B: hy8fp32q (Trial 1), f1zihknp (Trial 2)
+- **Zenitsu assigned to #3310: DM champion recovery seed=456/789**
+
+---
+
 ## 2026-04-24 17:00 — PR #3211: AF learned vol_loss_scale (spike) — CLOSED dead end
 
 - spike/af-vol-loss-scale, W&B: 72umacmm (v2, softplus), rig961jf (v1, diverged)
