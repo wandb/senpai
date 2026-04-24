@@ -95,20 +95,16 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 - `#3195` piccolo: re-stratified sampling
 - `#3156` edward: softer gc=0.5
 
-### TandemFoil Paper WIP (7 continuing + 4 new = 11 target)
-**Newly assigned (haku config replication):**
-- nezuko: haku seed=0
-- stark: haku seed=42
-- wolfwood: haku seed=7
-- yuji: haku seed=123
+### TandemFoil Paper WIP (7 continuing + 4 seed replication = 11 target)
+**⚠️ CONFIG ERROR on seed replication PRs:** All 4 seed PRs below were assigned WITHOUT physics features — they will all fail (~0.014 field_mse, 5.8x worse). Corrected commands sent. Waiting for re-runs.
+- `#3287` nezuko: haku seed=0 — ⚠️ MISSING PHYSICS, corrected config commented
+- `#3288` stark: haku seed=42 — ⚠️ MISSING PHYSICS, corrected config commented
+- `#3291` wolfwood: haku seed=7 — SENT BACK with corrected full champion config (T_max=10 + physics)
+- `#3292` yuji: haku seed=123 — ⚠️ MISSING PHYSICS, corrected config commented
 
-**TFP baseline updated: val=0.002344 (PR #3056 merged)**
+**TFP baseline: val=0.002344 / test=0.002221 (PR #3056 merged, haku lr=1e-4)**
 **Continuing TFP experiments:**
 - `#3307` haku: LR lower sweep — 9e-5/8e-5/7e-5 + T_max=20 extended
-- `#3292` yuji: haku near-winner replication seed=123
-- `#3291` wolfwood: haku near-winner replication seed=7
-- `#3288` stark: haku near-winner replication seed=42
-- `#3287` nezuko: haku near-winner replication seed=0
 - `#3266` sanji: champion re-verify
 - `#3179` usopp: T_max=150+wake+96sl+Lookahead
 - `#3133` shinobu: WD sweep

@@ -1,5 +1,18 @@
 # SENPAI Research Results
 
+## 2026-04-24 18:50 — PR #3291: TFP haku seed=7 replication (wolfwood) — SENT BACK (config error)
+
+- wolfwood/tfp-haku-seed7
+- Hypothesis: replicate haku near-winner TFP config with seed=7
+- **CONFIG ERROR:** Original assignment was missing ALL physics features (--enable-te-coord-frame, --enable-cp-panel, --enable-cp-panel-tandem-only, --asinh-pressure, --residual-prediction, --enable-pressure-prior-addition). Without physics features, TFP cannot reach below ~0.014 field_mse.
+- Result: 0.014247 val_primary/field_mse (5.8x worse than baseline 0.002344), killed at ep220 by kill gate
+- W&B: jgwtzegj (wolfwood/tfp-haku-seed7)
+- Also used T_max=20 (near-winner config) instead of T_max=10 (champion config)
+- **Action:** Sent back with corrected full champion config (T_max=10 + all physics features). Also commented corrected config on #3287, #3288, #3292 which have the same missing-features bug.
+- **SYSTEMIC ISSUE:** All 4 TFP seed replication PRs (#3287 nezuko, #3288 stark, #3291 wolfwood, #3292 yuji) were assigned with incomplete commands. All will need re-runs.
+
+---
+
 ## 2026-04-24 18:30 — PR #3160: DrivAerML 16H attention heads (griffith) — CLOSED dead end
 
 - griffith/dm-16h-heads
