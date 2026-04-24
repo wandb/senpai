@@ -121,6 +121,7 @@ class TrainConfig:
     lr: float = 3e-4
     weight_decay: float = 1e-4
     optimizer: str = "lion"
+    adam_beta2: float = 0.999
     use_lookahead: bool = True
     use_ema: bool = True
     ema_decay: float = 0.9999
@@ -545,7 +546,7 @@ def build_optimizer(params, config: TrainConfig):
     if config.optimizer == "lion":
         optimizer = Lion(params, lr=config.lr, weight_decay=config.weight_decay)
     elif config.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(params, lr=config.lr, weight_decay=config.weight_decay)
+        optimizer = torch.optim.AdamW(params, lr=config.lr, weight_decay=config.weight_decay, betas=(0.9, config.adam_beta2))
     else:
         raise ValueError(f"Unknown optimizer: {config.optimizer}")
     if config.use_lookahead:
