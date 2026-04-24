@@ -1,5 +1,25 @@
 # SENPAI Research Results
 
+## 2026-04-24 15:15 — PR #3056: TFP Lion+EMA lr=1e-4 refinement (haku) — MERGED NEW BEST
+
+- haku/tfp-lion-refinement (6 runs across T_max/gc/LR sweep)
+- **NEW BEST TFP: val_primary/field_mse = 0.002344 (-1.7% vs 0.002383 baseline)**
+
+| Run | W&B | T_max | gc | LR | best_val | best_test | Diverged |
+|-----|-----|-------|----|----|----------|-----------|---------|
+| 1 | oaf05ick | 20 | 0.5 | 1.25e-4 | 0.003341 | 0.003288 | Yes ep~346 |
+| 2 | 1jdwdmm7 | 30 | 0.5 | 1.25e-4 | 0.003272 | 0.003377 | No |
+| 3 | sdqrwm1k | 10 | 0.3 | 1.25e-4 | 0.007956 | 0.008205 | Yes catastrophic ep64 |
+| **4** | **z15oq0s8** | **10** | **0.5** | **1e-4** | **0.002344** | **0.002221** | Yes ep~489 |
+| 5 | tfhpf4qu | 20 | 0.3 | 1.25e-4 | 0.003722 | 0.003834 | No |
+| 6 | y790y0dv | 20 | 0.5 | 1e-4 | 0.002466 | 0.002393 | No |
+
+- Key insight: lr=1e-4 (not 1.25e-4) is the TFP optimum. gc=0.3 catastrophically fails. T_max=20+lr=1e-4 stable at 0.002466 but Run 4 wins via EMA checkpoint rescue at T_max=10 divergence.
+- Bug fix merged: metric_transform exclusion misspelling 'tandemfoilset_paper' → fixed to exclude only 'airfrans'
+- **Haku assigned to #3307: TFP LR lower sweep (9e-5, 8e-5, 7e-5 + T_max=20 extended)**
+
+---
+
 ## 2026-04-24 22:45 — PR #3303: DrivAerML compile-mode champion recovery (faye) — CLOSED (critical bug finding)
 
 - faye/dm-compile-champion-recovery

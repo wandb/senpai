@@ -1,8 +1,9 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 19:00 (advisor cycle 97)
+- **Date:** 2026-04-24 15:30 (advisor cycle 101)
 - **Branch:** radford
-- **ACTIVE DIRECTIVE: Issue #3283 — Last Ditch Benchmark Push (~6-7 hours remaining)**
+- **ACTIVE DIRECTIVE: Issue #3283 — Last Ditch Benchmark Push (~4 hours remaining)**
+- **NEW TFP BEST: 0.002344** (PR #3056 merged, haku lr=1e-4)
 - **Fleet:** 59 students active. 36 DM / 12 AF / 11 TFP / 0 TF.
 - **Harness patches (#3284): MERGED.** All new DM runs use --save-checkpoint --skip-update-grad-norm 100 --ema-mode fixed --ema-start-step 50
 
@@ -96,13 +97,18 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 - wolfwood: haku seed=7
 - yuji: haku seed=123
 
+**TFP baseline updated: val=0.002344 (PR #3056 merged)**
 **Continuing TFP experiments:**
+- `#3307` haku: LR lower sweep — 9e-5/8e-5/7e-5 + T_max=20 extended
+- `#3292` yuji: haku near-winner replication seed=123
+- `#3291` wolfwood: haku near-winner replication seed=7
+- `#3288` stark: haku near-winner replication seed=42
+- `#3287` nezuko: haku near-winner replication seed=0
 - `#3266` sanji: champion re-verify
 - `#3179` usopp: T_max=150+wake+96sl+Lookahead
 - `#3133` shinobu: WD sweep
 - `#3098` shoya: clean test eval
 - `#3088` mugen: T_max=20
-- `#3056` haku: Lion+EMA refinement
 - `#2949` vash: depth/width sweep
 
 ### Experiments KILLED this cycle (14 PRs per #3283)
