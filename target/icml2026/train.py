@@ -169,6 +169,7 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    local_attention_k: int = 0
 
 
 @dataclass
@@ -1551,6 +1552,129 @@ def compute_tandem_phys_stats(
     return TargetTransformStats(y_mean=mean, y_std=std)
 
 
+@torch.no_grad()
+def compute_knn_chunked(coords: torch.Tensor, k: int, chunk_size: int = 4096) -> torch.Tensor:
+    """Compute K nearest neighbor indices using chunked GPU cdist."""
+    B, N, _ = coords.shape
+    device = coords.device
+    coords_f32 = coords.float()
+    knn_indices = torch.empty(B, N, k, dtype=torch.long, device=device)
+    for b in range(B):
+        c = coords_f32[b]
+        for start in range(0, N, chunk_size):
+            end = min(start + chunk_size, N)
+            dists = torch.cdist(c[start:end].unsqueeze(0), c.unsqueeze(0)).squeeze(0)
+            _, idx = dists.topk(k, dim=-1, largest=False)
+            knn_indices[b, start:end] = idx
+    return knn_indices
+
+
+class KNNLocalAttention(torch.nn.Module):
+    """Single-head local attention restricted to K nearest spatial neighbors.
+    Output projection is zero-initialized so it starts as a no-op."""
+
+    def __init__(self, hidden_dim: int, proj_dim: int = 64):
+        super().__init__()
+        self.proj_dim = proj_dim
+        self.scale = proj_dim ** -0.5
+        self.norm = torch.nn.LayerNorm(hidden_dim, eps=1e-6)
+        self.q_proj = torch.nn.Linear(hidden_dim, proj_dim)
+        self.k_proj = torch.nn.Linear(hidden_dim, proj_dim)
+        self.v_proj = torch.nn.Linear(hidden_dim, proj_dim)
+        self.out_proj = torch.nn.Linear(proj_dim, hidden_dim)
+        torch.nn.init.zeros_(self.out_proj.weight)
+        torch.nn.init.zeros_(self.out_proj.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        knn_indices: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        B, N, _ = x.shape
+        K = knn_indices.shape[-1]
+        pd = self.proj_dim
+        x_n = self.norm(x)
+        q = self.q_proj(x_n)
+        k = self.k_proj(x_n)
+        v = self.v_proj(x_n)
+        flat_idx = knn_indices.reshape(B, N * K)
+        idx_exp = flat_idx.unsqueeze(-1).expand(B, N * K, pd)
+        k_local = torch.gather(k, 1, idx_exp).reshape(B, N, K, pd)
+        v_local = torch.gather(v, 1, idx_exp).reshape(B, N, K, pd)
+        scores = torch.einsum("bnd,bnkd->bnk", q, k_local) * self.scale
+        if attn_mask is not None:
+            nbr_valid = torch.gather(attn_mask.float(), 1, flat_idx).reshape(B, N, K)
+            scores = scores.masked_fill(nbr_valid == 0, float("-inf"))
+        weights = F.softmax(scores, dim=-1).nan_to_num(0.0)
+        out = torch.einsum("bnk,bnkd->bnd", weights, v_local)
+        return self.out_proj(out)
+
+
+class LocalAttentionWrapper(torch.nn.Module):
+    """Wraps a SenpaiTransolver to add KNN-restricted local attention after each block."""
+
+    def __init__(
+        self,
+        base_model: torch.nn.Module,
+        local_k: int,
+        hidden_dim: int,
+        n_layers: int,
+        space_dim: int = 3,
+    ):
+        super().__init__()
+        self.base = base_model
+        self.local_k = local_k
+        self.space_dim = space_dim
+        self.n_hidden = getattr(base_model, "n_hidden", hidden_dim)
+        self.knn_attns = torch.nn.ModuleList(
+            [KNNLocalAttention(hidden_dim) for _ in range(n_layers)]
+        )
+        self._current_knn: torch.Tensor | None = None
+
+        backbone = base_model.backbone
+        blocks = backbone.blocks
+        knn_attns = self.knn_attns
+        wrapper = self
+
+        def _patched_backbone_forward(
+            x: torch.Tensor, attn_mask: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            knn_idx = wrapper._current_knn
+            for i, block in enumerate(blocks):
+                x = block(x, attn_mask=attn_mask)
+                if knn_idx is not None:
+                    x = x + torch.utils.checkpoint.checkpoint(
+                        knn_attns[i], x, knn_idx, attn_mask, use_reentrant=False,
+                    )
+            return x
+
+        backbone.forward = _patched_backbone_forward
+
+    def forward(
+        self,
+        *,
+        surface_x: torch.Tensor,
+        surface_mask: torch.Tensor,
+        volume_x: torch.Tensor | None = None,
+        volume_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor | None]:
+        coords = surface_x[:, :, : self.space_dim].float()
+        if volume_x is not None:
+            vol_coords = volume_x[:, :, : self.space_dim].float()
+            coords = torch.cat([coords, vol_coords], dim=1)
+        self._current_knn = compute_knn_chunked(coords, self.local_k)
+        try:
+            return self.base(
+                surface_x=surface_x,
+                surface_mask=surface_mask,
+                volume_x=volume_x,
+                volume_mask=volume_mask,
+            )
+        finally:
+            self._current_knn = None
+
+
 def main() -> None:
     config = parse_args()
     if config.seed != 0:
@@ -1621,6 +1745,12 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
+    if config.local_attention_k > 0:
+        model = LocalAttentionWrapper(
+            model, config.local_attention_k, config.model_hidden_dim,
+            config.model_layers, space_dim=bundle.spec.space_dim,
+        ).to(device)
+        config.compile_model = False
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
