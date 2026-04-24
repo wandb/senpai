@@ -1,5 +1,25 @@
 # SENPAI Research Results
 
+## 2026-04-24 19:30 — PR #3269: DrivAerML error correction head (emma) — CLOSED dead end
+
+- emma/dm-error-correction-head
+- Hypothesis: learned correction head predicts and fixes primary model errors
+
+| Trial | correction_weight | val_primary | Epochs | Status |
+|-------|-------------------|-------------|--------|--------|
+| 1 | 0.1 | 9.169% @ep79 | 225 | DIVERGED ep80, grad→Inf |
+| 2 | 0.5 | 4.700% @ep227 | 228 | 180-min timeout, converging |
+
+- W&B: vvh651d8 (T1), riq65o1p (T2)
+- Baseline: 3.833% @ep511
+- Trial 2 at 4.700% after 227 epochs is epoch-matched identical to baseline (~4.66-4.72% at ep200). Correction head adds overhead without improving convergence rate.
+- Trial 1 diverged — correction-primary gradient interaction fragile at cosine restart peaks.
+- Correction loss staying active (0.006) shows the head learns residual patterns, but this doesn't translate to primary metric improvement.
+- Conclusion: Error correction head architecture is neutral-to-harmful for DM. Not worth the complexity.
+- **Emma assigned to #3315: DM cosine T_max=50 with champion EMA+gc stack**
+
+---
+
 ## 2026-04-24 19:15 — PR #3143: DrivAerML Lookahead-AdamW k=6 (thorfinn) — CLOSED dead end
 
 - thorfinn/dm-lookahead-adamw

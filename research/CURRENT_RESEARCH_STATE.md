@@ -53,7 +53,7 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 **Continuing DM experiments (from pre-restructure):**
 - `#3244` faye: paper-facing full eval (SENT BACK for champion ckpt eval using --load-checkpoint)
 - ~~`#3279` gojo~~ CLOSED dead end (diverged ep73, 8.832% val) → reassigned to #3308 narrow LR sweep (lr=4.8e-4, 5.2e-4)
-- `#3269` emma: error correction head
+- ~~`#3269` emma~~ CLOSED dead end (4.700% val ep-matched = no improvement) → reassigned to #3315 DM T_max=50 with EMA+gc stack
 - `#3267` mitsuha: SwiGLU FFN
 - `#3265` alphonse: hidden-space noise
 - ~~`#3276` zenitsu: cosine similarity loss~~ CLOSED dead end
