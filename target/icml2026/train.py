@@ -168,6 +168,7 @@ class TrainConfig:
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
+    load_checkpoint: str = ""
     seed: int = 0
 
 
@@ -1641,6 +1642,61 @@ def main() -> None:
     best_val_metrics: dict[str, float] = {}
     best_model_state: dict[str, torch.Tensor] | None = None
     best_anp_state: dict[str, torch.Tensor] | None = None
+
+    if config.load_checkpoint:
+        checkpoint_path = Path(config.load_checkpoint)
+        print(f"Loading checkpoint from {checkpoint_path}", flush=True)
+        state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        model.load_state_dict(state_dict)
+        anp_path = checkpoint_path.parent / checkpoint_path.name.replace(".pt", "_anp.pt")
+        if anp_head is not None and anp_path.exists():
+            anp_state = torch.load(anp_path, map_location=device, weights_only=True)
+            anp_head.load_state_dict(anp_state)
+        forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
+
+        run = None
+        if config.wandb_name:
+            run_config = asdict(config)
+            run = wandb.init(
+                project=os.getenv("WANDB_PROJECT", "senpai-v1"),
+                entity=os.getenv("WANDB_ENTITY"),
+                name=config.wandb_name,
+                group=config.wandb_group or None,
+                config=run_config,
+                tags=[config.dataset, config.model, "eval-only"],
+            )
+
+        eval_metrics: dict[str, float] = {}
+        if val_loaders:
+            eval_metrics.update(evaluate_phase_metrics(
+                bundle=bundle, config=config, forward_model=forward_model,
+                anp_head=anp_head, loaders=val_loaders, transform=transform,
+                metric_transform=metric_transform, device=device, phase="val",
+            ))
+        test_metrics: dict[str, float] = {}
+        if test_loaders:
+            test_metrics = evaluate_phase_metrics(
+                bundle=bundle, config=config, forward_model=forward_model,
+                anp_head=anp_head, loaders=test_loaders, transform=transform,
+                metric_transform=metric_transform, device=device, phase="test",
+            )
+        all_metrics = {**eval_metrics, **test_metrics}
+        print(json.dumps({"eval_only_metrics": all_metrics}, sort_keys=True), flush=True)
+        if run is not None:
+            wandb.log(all_metrics, step=0)
+            run.summary.update(all_metrics)
+            run.finish()
+
+        output_dir = Path(config.output_dir)
+        write_run_summary(
+            output_dir / f"{config.dataset}_{config.model}_summary.json",
+            config, bundle, [], best_epoch=0,
+            best_val_primary_metric_name=best_val_primary_metric_name,
+            best_val_primary_metric=None,
+            best_val_metrics=eval_metrics, best_test_metrics=test_metrics,
+            final_test_metrics=test_metrics,
+        )
+        return
 
     if bundle.spec.name == "tandemfoilset":
         val_primary_key = "val_primary/surface_pressure_mae"
