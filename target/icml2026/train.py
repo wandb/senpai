@@ -167,6 +167,7 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
+    input_feature_dropout: float = 0.0
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -1271,6 +1272,8 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    input_feature_dropout: float = 0.0,
+    fourier_start_idx: int = 0,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1319,11 +1322,25 @@ def train_one_epoch(
                         outputs = maybe_apply_anp(outputs, prepared, anp_head)
                         loss, _ = loss_grouped_tandem(prepared, outputs, volume_loss_weight=volume_loss_weight)
                 else:
+                    train_surface_x = batch.surface_x
+                    train_volume_x = batch.volume_x
+                    if input_feature_dropout > 0 and fourier_start_idx > 0:
+                        B = train_surface_x.shape[0]
+                        n_fourier = train_surface_x.shape[-1] - fourier_start_idx
+                        mask = (torch.rand(B, 1, n_fourier, device=train_surface_x.device) >= input_feature_dropout).to(train_surface_x.dtype)
+                        scale = 1.0 / (1.0 - input_feature_dropout)
+                        fourier_part = train_surface_x[..., fourier_start_idx:] * mask * scale
+                        train_surface_x = torch.cat([train_surface_x[..., :fourier_start_idx], fourier_part], dim=-1)
+                        if train_volume_x is not None and train_volume_x.shape[-1] > fourier_start_idx:
+                            vol_fourier = train_volume_x[..., fourier_start_idx:] * mask * scale
+                            train_volume_x = torch.cat([train_volume_x[..., :fourier_start_idx], vol_fourier], dim=-1)
+                        running.setdefault("input_feat_dropout_active_channels", 0.0)
+                        running["input_feat_dropout_active_channels"] += float(mask.sum() / B)
                     with autocast_context(device, amp_mode):
                         outputs = model(
-                            surface_x=batch.surface_x,
+                            surface_x=train_surface_x,
                             surface_mask=batch.surface_mask,
-                            volume_x=batch.volume_x,
+                            volume_x=train_volume_x,
                             volume_mask=batch.volume_mask,
                         )
                         loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
@@ -1359,6 +1376,8 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    if "input_feat_dropout_active_channels" in running:
+        running["input_feat_dropout_active_channels"] /= max(steps, 1)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1653,6 +1672,11 @@ def main() -> None:
     best_ema_shadow: dict[str, torch.Tensor] | None = None
     best_anp_ema_shadow: dict[str, torch.Tensor] | None = None
 
+    fourier_start_idx = 0
+    if config.enable_fourier and config.input_feature_dropout > 0:
+        n_fourier = bundle.spec.space_dim * len((0.5, 2.0, 8.0, 32.0)) * 2
+        fourier_start_idx = bundle.spec.surface_input_dim - n_fourier
+
     run = None
     if config.wandb_name:
         run_config = asdict(config)
@@ -1688,6 +1712,8 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            input_feature_dropout=config.input_feature_dropout,
+            fourier_start_idx=fourier_start_idx,
         )
 
         if ema is not None:
