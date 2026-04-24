@@ -1,5 +1,15 @@
 # SENPAI Research Results
 
+## 2026-04-24 17:00 — PR #3211: AF learned vol_loss_scale (spike) — CLOSED dead end
+
+- spike/af-vol-loss-scale, W&B: 72umacmm (v2, softplus), rig961jf (v1, diverged)
+- Learned scale drifted 1.0→0.027 (effective vol weight 10x→0.27x). Optimizer aggressively reduces vol weight in early training.
+- surface_mse=0.001525 (5.2x worse than baseline 0.000296), vol_mse=0.022 (10.8x worse than 0.002039) at ep111/150
+- Bug fix: primary_metric_key variable shadowing (noted for future)
+- **Spike assigned to #3309: AF champion seed=42 extended 600-min replication**
+
+---
+
 ## 2026-04-24 16:40 — PR #3279: DrivAerML ReLU² activation (gojo) — CLOSED dead end
 
 - gojo/dm-relu-squared, W&B: 2k52eunu
