@@ -169,6 +169,8 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    bypass_mlp: bool = False
+    bypass_mlp_hidden: int = 128
 
 
 @dataclass
@@ -503,6 +505,40 @@ def cp_panel_prior_index(config: TrainConfig, bundle: DatasetBundle) -> int | No
         base_dim -= 1
         return base_dim
     return None
+
+
+class CoordinateBypassWrapper(torch.nn.Module):
+    """Wraps a Transolver with a parallel point-local bypass MLP (zero-init output)."""
+
+    def __init__(self, base_model: torch.nn.Module, bypass_input_dim: int, output_dim: int, hidden_dim: int = 128):
+        super().__init__()
+        self.base = base_model
+        self.space_dim = base_model.space_dim
+        self.bypass_mlp = torch.nn.Sequential(
+            torch.nn.Linear(bypass_input_dim, hidden_dim),
+            torch.nn.GELU(),
+            torch.nn.Linear(hidden_dim, hidden_dim),
+            torch.nn.GELU(),
+            torch.nn.Linear(hidden_dim, output_dim),
+        )
+        torch.nn.init.zeros_(self.bypass_mlp[-1].weight)
+        torch.nn.init.zeros_(self.bypass_mlp[-1].bias)
+
+    def forward(self, *, surface_x: torch.Tensor, surface_mask: torch.Tensor,
+                volume_x: torch.Tensor | None = None, volume_mask: torch.Tensor | None = None) -> dict:
+        outputs = self.base(surface_x=surface_x, surface_mask=surface_mask,
+                            volume_x=volume_x, volume_mask=volume_mask)
+        bypass_input = surface_x[:, :, self.space_dim:]
+        bypass_correction = self.bypass_mlp(bypass_input)
+        if outputs["surface_preds"] is not None:
+            outputs["surface_preds"] = outputs["surface_preds"] + bypass_correction * surface_mask.unsqueeze(-1)
+        return outputs
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.base, name)
 
 
 def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
@@ -1621,6 +1657,12 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
+    if config.bypass_mlp:
+        bypass_input_dim = max(0, bundle.spec.surface_input_dim - bundle.spec.space_dim)
+        bypass_output_dim = bundle.spec.surface_output_dim
+        model = CoordinateBypassWrapper(model, bypass_input_dim, bypass_output_dim, config.bypass_mlp_hidden).to(device)
+        n_bypass = sum(p.numel() for p in model.bypass_mlp.parameters())
+        print(f"[BypassMLP] {bypass_input_dim}→{config.bypass_mlp_hidden}→{bypass_output_dim}, {n_bypass:,} params (zero-init output)")
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
