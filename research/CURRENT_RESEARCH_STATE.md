@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 10:15 (advisor cycle 78)
+- **Date:** 2026-04-24 10:45 (advisor cycle 79)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -74,7 +74,7 @@
 - `#3255` gohan: no-Lookahead/no-compile champion full budget — AF VOLUME FOCUS (critical ablation follow-up)
 - `#3257` chihiro: extended training via reduced eval frequency (every 3/5 epochs) — AF VOLUME FOCUS
 - `#3241` hinata: T_max=75 + vol-weight=10x/12x on champion — AF VOLUME FOCUS (schedule gap-fill)
-- `#3234` jin: lower LR sweep (5e-4/4e-4) on vol-10x champion — AF VOLUME FOCUS
+- `#3268` jin: higher LR sweep (7e-4/8e-4) on vol-10x+EMA champion — AF VOLUME FOCUS
 
 **Noam-pivot experiments (asinh-dependent — likely to fail):**
 - `#3187` stark: asinh+residual on vol-10x champion — NOAM ABLATION (asinh confirmed dead for AF)
@@ -245,7 +245,8 @@
 - Vol-weight<10x (1.5x/2x/3x/5x/7x): ALL worse on both metrics across 6 tested values. 10x+EMA=0.999 is AF sweet spot
 - Vol-weight=30x: catastrophic — surface 4.3x worse, vol 3.1x worse
 - Vol-weight=15x: surface +19%, vol +67% (#3204). Vol-weight=20x: crashed ep381 (#3204). 10x is definitive AF operating point
-- LR>6e-4: 8e-4 +110% surface, 1e-3 catastrophic divergence
+- LR>6e-4 (pre-EMA): 8e-4 +110% surface, 1e-3 catastrophic divergence
+- LR<6e-4 (with EMA+vol-10x): 5e-4 +66%/+111%, 4e-4 +38%/+76% (#3234). Underfitting under vol-10x amplification. lr=6e-4 bracketed from below
 
 **TandemFoil:**
 - gc≥0.5: monotonically worse than gc=0.3
