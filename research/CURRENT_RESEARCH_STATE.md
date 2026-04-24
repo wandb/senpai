@@ -1,14 +1,14 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-25 00:30 (advisor cycle 120)
+- **Date:** 2026-04-25 01:00 (advisor cycle 122)
 - **Branch:** radford
 - **ACTIVE DIRECTIVE: Issue #3283 — Last Ditch Benchmark Push (final hours)**
-- **TFP BEST: 0.002344** (PR #3056 merged, haku lr=1e-4)
+- **TFP NEW BEST: val=0.002180, test=0.001931** (PR #3307 MERGED, haku lr=7e-5, -7%/-13% vs previous)
 - **DM NEW VAL BEST: 3.700%** (canute #3302 metric-aware loss, MERGED). **BREAKS AB-UPT SOTA VAL TARGET (3.71%)!**
 - **DM authoritative TEST: 4.218%** (canute full-eval run n2t1nzsb, Trial B w=0.05 ep780 checkpoint). Beats previous 4.324% by 0.106pp. Batch-limited val (3.700%) has ~24% optimistic bias vs full-eval (4.652%).
 - **Fleet:** 59 students active. All assigned. Zero idle GPUs.
 - **Harness patches (#3284): MERGED.** All DM runs use --no-compile-model, --save-checkpoint, --ema-mode fixed
-- **Cycle 120:** canute full-eval TEST=4.218% (NEW PROGRAMME BEST). 3 PRs closed, 3 new assignments. Multi-exit and ckpt averaging dead ends.
+- **Cycle 122:** TFP lr=7e-5 MERGED (val=0.002180, test=0.001931, -7%/-13%). DM metric-aware seed robustness confirmed (seeds 0+42 identical). Canute on w=0.04 paper run, haku on TFP lr bracket.
 - **AF BREAKTHROUGH:** eval-every-3 + vol-weight=12x yields programme-best surface (0.000228). 8-student sweep launched to find vol-weight where both metrics beat baseline simultaneously.
 
 ## BINDING DIRECTIVE — Issue #3283 (2026-04-24)
@@ -33,7 +33,7 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 
 ### DM Metric-Aware Sweep (HIGHEST PRIORITY)
 **Paper-critical:**
-- `#3348` canute: w=0.05 seed=0 + **mandatory full-eval TEST** — PAPER-FACING RUN
+- `#3351` canute: w=0.04 + **mandatory full-eval TEST** — PAPER-FACING RUN
 
 **Weight sweep (cycle 118):**
 - `#3323` einar: w=0.03 seed=42
@@ -87,14 +87,16 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 - `#3309` spike: champion seed=42 extended 600-min
 
 ### TandemFoil Paper WIP
-**TFP baseline: val=0.002344 / test=0.002221 (PR #3056)**
-**4L depth direction (promising — vash test=0.002396, only +0.5%):**
+**TFP NEW baseline: val=0.002180 / test=0.001931 (PR #3307 MERGED, haku lr=7e-5)**
+**LR bracket (narrowing optimum):**
+- `#3352` haku: lr bracket 6e-5 / 7.5e-5 around new champion
+
+**4L depth direction:**
 - `#3346` yuji: 4L/192d lr=4e-5 T_max=15
 - `#3347` usopp: 4L/192d lr=5e-5 T_max=20
 - `#2949` vash: SENT BACK for lr=3e-5/7e-5 bracket
 
 **Continuing TFP:**
-- `#3307` haku: LR lower sweep
 - `#3287` nezuko: haku seed=0
 - `#3098` shoya: clean test eval
 
@@ -119,7 +121,7 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 | Dataset | Metric | Current anchor |
 |---|---|---|
 | TandemFoil | `val_primary/surface_pressure_mae` | **21.319** (#3185 MERGED — full noam stack: ANP+physics+T_max=150+Lookahead+96sl) |
-| TandemFoil Paper | `val_primary/field_mse` | **0.002383** (#3025) |
+| TandemFoil Paper | `val_primary/field_mse` | **0.002180** (#3307 MERGED — haku lr=7e-5, -7% val / -13% test) |
 | AirfRANS | `val_primary/surface_mse` + `vol_mse` | **0.000296 / 0.002039** (#3135 MERGED — EMA+vol-weight=10x) |
 | DrivAerML | `val_primary/surface_rel_l2_pct` | **3.700%** (#3302 MERGED — metric-aware MSE+raw-rel-L2, w=0.05) |
 
@@ -128,7 +130,7 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 | Dataset | Metric | Current best | External target | Status |
 |---|---|---|---|---|
 | TandemFoil | `test_primary/surface_pressure_mae` | **22.868** (PR #3185 MERGED) | (internal) | Improving |
-| TandemFoil Paper | `test_primary/field_mse` | **NO CLEAN ROW YET** | ~0.10-0.36/task | URGENT — #3098 in-progress |
+| TandemFoil Paper | `test_primary/field_mse` | **0.001931** (PR #3307 haku lr=7e-5) | ~0.10-0.36/task | **New programme best.** Bracket 6e-5/7.5e-5 in progress. |
 | AirfRANS | `Surf MSE / Vol MSE` | **0.000296 / 0.002039** | 0.0043 / 0.0017 | Surface 14.5x better, Volume 1.20x gap |
 | DrivAerML | `test_primary/surface_rel_l2_pct` | **4.218%** (full-eval, canute n2t1nzsb, Trial B w=0.05) | 3.71% | **NEW PROGRAMME BEST.** Full-eval confirmed. ~14% relative gap to SOTA. Metric-aware sweep (19 students) + canute seed=0 paper run in progress. |
 

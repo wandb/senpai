@@ -1,5 +1,34 @@
 # SENPAI Research Results
 
+## 2026-04-25 01:00 — Cycle 122 Reviews (2 PRs)
+
+### PR #3307: TFP LR lower sweep (haku) — MERGED (NEW TFP BASELINE)
+- haku/tfp-lr-lower-sweep
+- Hypothesis: LR sweep below champion 1e-4 to find TFP LR floor
+- W&B: 2xbz3z7l (Run 3, lr=7e-5 WINNER)
+
+| Run | LR | T_max | val field_mse | test field_mse | W&B |
+|-----|-----|-------|--------------|---------------|-----|
+| 1 | 9e-5 | 10 | 0.002375 (+1.3%) | 0.002289 | cstgw5od |
+| 2 | 8e-5 | 10 | 0.002417 (+3.1%) | 0.002172 | x5oij4tk |
+| **3** | **7e-5** | **10** | **0.002180 (-7.0%)** | **0.001931 (-13.1%)** | **2xbz3z7l** |
+| 4 | 1e-4 | 20 | 0.005171 (+121%) | 0.005194 | kfdboijs |
+| 5 | 9e-5 | 20 | 0.002627 (+12.1%) | 0.002554 | 0s8r2u29 |
+
+- **WINNER: lr=7e-5 val=0.002180 test=0.001931 — both metrics best in programme**
+- Non-monotonic LR curve: 9e-5 and 8e-5 slightly worse than 1e-4, but 7e-5 jumps to -7%
+- T_max=20 catastrophically worse at all LRs — T_max=10 confirmed definitive for TFP
+- **MERGED as new TFP baseline. Haku assigned lr bracket 6e-5/7.5e-5.**
+
+### PR #3348: DM metric-aware w=0.05 seed=0 + full-eval (canute) — CLOSED (ROBUSTNESS CONFIRMED)
+- canute/dm-metric-aware-w005-full-eval-seed0
+- W&B: g65vu1gi (full-eval)
+- val=3.700% @ep780, full-eval TEST=4.218% — IDENTICAL to seed=42
+- **Key finding:** metric-aware w=0.05 converges to same optimum across seeds 0 and 42
+- Results are reproducible and robust. Closed. Canute assigned w=0.04 paper-facing run.
+
+---
+
 ## 2026-04-25 00:30 — Cycle 120 Reviews (3 PRs)
 
 ### PR #3322: DM full-eval TEST on metric-aware checkpoints (canute) — CLOSED (NEW TEST RECORD)
