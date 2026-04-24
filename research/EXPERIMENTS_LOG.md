@@ -1,5 +1,34 @@
 # SENPAI Research Results
 
+## 2026-04-24 21:00 — PR #3293: DrivAerML champion recovery seed=0 (norman) — SENT BACK for full-eval
+
+- norman/dm-champion-recovery-seed0
+- Hypothesis: champion recovery with seed=0, no-compile, 600-min budget
+- W&B: omv699xg
+
+| Metric | Seed=0 (omv699xg) | Baseline (ncl1dh88) | Delta |
+|--------|--------------------|--------------------|-------|
+| val_primary | 3.886% @ep866 | 3.833% @ep511 | +0.053pp (slightly worse) |
+| test (batch-limited) | **4.250%** | 4.685% | **-0.435pp (9.3% BETTER)** |
+| Epochs | 868 (600-min timeout) | ~517 | +351 |
+
+- **KEY FINDING:** Batch-limited TEST of 4.250% is the BEST TEST result across all DM runs. Previous authoritative full-eval TEST was 4.324% (faye zx5syby1). Val plateaus at ~3.83-3.89% but TEST keeps improving with longer training.
+- Still converging at ep866 — model finding better checkpoints at timeout.
+- Sent back for mandatory full-eval on best checkpoint. If full-eval TEST < 4.324%, this is a new DM TEST champion.
+
+---
+
+## 2026-04-24 21:00 — PR #3291: TFP seed=7 re-run with physics features (wolfwood) — CLOSED (seed unstable)
+
+- wolfwood/tfp-champion-seed7
+- Re-run with corrected full champion config (T_max=10, all physics features)
+- W&B: e59108sw
+- Result: field_mse=19,618 at ep11 — catastrophic divergence from ep1. 8.4 million times worse than baseline.
+- Both seed=7 runs failed: without physics (0.014247) and with physics (19,618). Seed=7 is unstable for TFP.
+- **Wolfwood assigned to #3321: DM champion extended seed=99 with mandatory full-eval**
+
+---
+
 ## 2026-04-24 20:30 — PR #3301: DrivAerML Breakout 3 volume-aux Round 2 (brook) — CLOSED dead end
 
 - brook/dm-domain-normalized-volume-aux
