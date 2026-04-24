@@ -1,5 +1,19 @@
 # SENPAI Research Results
 
+## 2026-04-24 09:45 — PR #3239: AF additive boundary-layer auxiliary volume loss (vegeta) — CLOSED (dead end)
+
+- vegeta/af-bl-auxiliary-loss, W&B runs: 6y7xod45 (bl-w=1.0,t=0.05), 7w4btwaj (bl-w=0.5,t=0.05), pjrv0090 (bl-w=1.0,t=0.10)
+- Hypothesis: auxiliary volume loss targeting near-wall cells (SDF < threshold) provides focused BL supervision
+
+| Trial | Config | surface_mse | vs baseline | vol_mse | vs baseline |
+|-------|--------|-------------|-------------|---------|-------------|
+| T1 | bl-w=1.0, t=0.05 | 0.000448 | +51% | 0.004213 | +107% |
+| T2 | bl-w=0.5, t=0.05 | 0.000494 | +67% | 0.002664 | +31% |
+| T3 | bl-w=1.0, t=0.10 | 0.000972 | +228% | 0.006162 | +202% |
+
+- **Root cause:** AF wall-resolved meshes have SDF<0.05 covering 61% of ALL volume points, SDF<0.10 covering 68%. "BL targeting" becomes near-uniform volume upscaling. Same failure mode as proximity-weighting (#3222).
+- **Pattern confirmed:** Any SDF-based volume re-weighting fails on AF meshes because the mesh itself is already an SDF-weighted sampler. Two independent confirmations now (#3222 + #3239).
+
 ## 2026-04-24 09:30 — PR #3238: AF WD=0 ablation on vol-10x+EMA champion (rei) — SENT BACK
 
 - rei/af-wd0-ablation, W&B runs: sqotwbxs (WD=0), cjcftqo8 (WD=5e-3), group: af-no-wd
