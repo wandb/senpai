@@ -169,6 +169,7 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    swiglu_ffn: bool = False
 
 
 @dataclass
@@ -513,6 +514,7 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
         "n_head": config.model_heads,
         "mlp_ratio": config.model_mlp_ratio,
         "slice_num": config.model_slices,
+        "swiglu_ffn": config.swiglu_ffn,
     }
     if config.model == "reference_transolver":
         return ReferenceTransolver(

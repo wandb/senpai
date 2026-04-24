@@ -84,6 +84,20 @@ class UpActDownMlp(nn.Module):
         return self.fc2(self.act(self.fc1(x)))
 
 
+class SwiGLUFFN(nn.Module):
+    def __init__(self, hidden_dim: int, mlp_hidden_dim: int):
+        super().__init__()
+        swiglu_hidden = int(mlp_hidden_dim * 2 / 3)
+        swiglu_hidden = ((swiglu_hidden + 63) // 64) * 64
+        self.w_gate = nn.Linear(hidden_dim, swiglu_hidden, bias=False)
+        self.w_up = nn.Linear(hidden_dim, swiglu_hidden, bias=False)
+        self.w_down = nn.Linear(swiglu_hidden, hidden_dim, bias=False)
+        self.apply(_init_linear)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
+
+
 class TransolverAttention(nn.Module):
     def __init__(self, hidden_dim: int, num_heads: int, num_slices: int, dropout: float = 0.0):
         super().__init__()
@@ -139,6 +153,7 @@ class TransformerBlock(nn.Module):
         mlp_expansion_factor: int | float,
         num_slices: int,
         dropout: float = 0.0,
+        swiglu_ffn: bool = False,
     ):
         super().__init__()
         mlp_hidden_dim = int(math.ceil(hidden_dim * mlp_expansion_factor))
@@ -150,7 +165,10 @@ class TransformerBlock(nn.Module):
             dropout=dropout,
         )
         self.norm2 = nn.LayerNorm(hidden_dim, eps=1e-6)
-        self.mlp = UpActDownMlp(hidden_dim=hidden_dim, mlp_hidden_dim=mlp_hidden_dim)
+        if swiglu_ffn:
+            self.mlp = SwiGLUFFN(hidden_dim=hidden_dim, mlp_hidden_dim=mlp_hidden_dim)
+        else:
+            self.mlp = UpActDownMlp(hidden_dim=hidden_dim, mlp_hidden_dim=mlp_hidden_dim)
 
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
         x = x + self.attention(self.norm1(x), attn_mask=attn_mask)
@@ -167,6 +185,7 @@ class Transformer(nn.Module):
         mlp_expansion_factor: int | float,
         num_slices: int,
         dropout: float = 0.0,
+        swiglu_ffn: bool = False,
     ):
         super().__init__()
         self.blocks = nn.ModuleList(
@@ -177,6 +196,7 @@ class Transformer(nn.Module):
                     mlp_expansion_factor=mlp_expansion_factor,
                     num_slices=num_slices,
                     dropout=dropout,
+                    swiglu_ffn=swiglu_ffn,
                 )
                 for _ in range(depth)
             ]
@@ -205,6 +225,7 @@ class ReferenceTransolver(nn.Module):
         n_head: int = 3,
         mlp_ratio: int = 4,
         slice_num: int = 96,
+        swiglu_ffn: bool = False,
     ):
         super().__init__()
         self.space_dim = space_dim
@@ -233,6 +254,7 @@ class ReferenceTransolver(nn.Module):
             mlp_expansion_factor=mlp_ratio,
             num_slices=slice_num,
             dropout=dropout,
+            swiglu_ffn=swiglu_ffn,
         )
         self.norm = nn.LayerNorm(n_hidden, eps=1e-6)
         self.out = LinearProjection(n_hidden, surface_output_dim + volume_output_dim)
