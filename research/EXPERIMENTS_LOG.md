@@ -1,5 +1,17 @@
 # SENPAI Research Results
 
+## 2026-04-25 01:15 — Cycle 123 (1 PR)
+
+### PR #3311: DM champion recovery seed=1024 (franky) — CLOSED
+- franky/dm-champion-recovery-seed1024
+- MSE-only champion, seed=1024: val=4.103% @ep640 (killed by patience)
+- W&B: nudhbnl2
+- Doesn't beat MSE baseline (3.833%) or metric-aware baseline (3.700%)
+- MSE-only champion has significant seed sensitivity (1024 misses, 0/42 hit 3.83%)
+- Franky reassigned to metric-aware w=0.05 seed=1024 (#3353)
+
+---
+
 ## 2026-04-25 01:00 — Cycle 122 Reviews (2 PRs)
 
 ### PR #3307: TFP LR lower sweep (haku) — MERGED (NEW TFP BASELINE)
