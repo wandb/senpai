@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import heapq
 import itertools
 import json
 import math
@@ -167,6 +168,7 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     save_checkpoint: bool = False
+    checkpoint_averaging_k: int = 1
     seed: int = 0
 
 
@@ -1638,15 +1640,18 @@ def main() -> None:
     best_anp_state: dict[str, torch.Tensor] | None = None
 
     if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
+        val_primary_key = "val_primary/surface_pressure_mae"
     else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
+        val_primary_key = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
     best_anp_state: dict[str, torch.Tensor] | None = None
     best_ema_shadow: dict[str, torch.Tensor] | None = None
     best_anp_ema_shadow: dict[str, torch.Tensor] | None = None
+
+    # Top-k checkpoint heap for averaging: entries are (-metric, epoch, model_state, anp_state)
+    topk_heap: list[tuple[float, int, dict[str, torch.Tensor], dict[str, torch.Tensor] | None]] = []
 
     run = None
     if config.wandb_name:
@@ -1713,7 +1718,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(val_primary_key)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
@@ -1724,6 +1729,17 @@ def main() -> None:
                 best_ema_shadow = {k: v.cpu().clone() for k, v in ema.shadow.items()}
             if anp_ema is not None:
                 best_anp_ema_shadow = {k: v.cpu().clone() for k, v in anp_ema.shadow.items()}
+
+        if current_val is not None and config.checkpoint_averaging_k > 1:
+            should_add = len(topk_heap) < config.checkpoint_averaging_k or current_val < -topk_heap[0][0]
+            if should_add:
+                ckpt_model = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                ckpt_anp = {k: v.cpu().clone() for k, v in anp_head.state_dict().items()} if anp_head is not None else None
+                entry = (-current_val, epoch, ckpt_model, ckpt_anp)
+                if len(topk_heap) < config.checkpoint_averaging_k:
+                    heapq.heappush(topk_heap, entry)
+                else:
+                    heapq.heapreplace(topk_heap, entry)
 
         if ema is not None:
             ema.restore(model)
@@ -1833,6 +1849,55 @@ def main() -> None:
                     sort_keys=True,
                 )
             )
+            restore_module_state(model, terminal_model_state)
+            restore_module_state(anp_head, terminal_anp_state)
+
+        if len(topk_heap) > 1 and config.checkpoint_averaging_k > 1:
+            heap_epochs = sorted([-neg_m for neg_m, ep, _, _ in topk_heap])
+            avg_epochs = [ep for _, ep, _, _ in topk_heap]
+            print(
+                json.dumps(
+                    {"checkpoint_averaging": {"k": len(topk_heap), "epochs": sorted(avg_epochs), "metrics": heap_epochs}},
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            model_states = [entry[2] for entry in topk_heap]
+            averaged_model_state: dict[str, torch.Tensor] = {}
+            for key in model_states[0]:
+                averaged_model_state[key] = (
+                    torch.stack([s[key].float() for s in model_states]).mean(dim=0).to(model_states[0][key].dtype)
+                )
+            restore_module_state(model, averaged_model_state)
+
+            anp_states = [entry[3] for entry in topk_heap if entry[3] is not None]
+            if anp_states and anp_head is not None:
+                averaged_anp_state: dict[str, torch.Tensor] = {}
+                for key in anp_states[0]:
+                    averaged_anp_state[key] = (
+                        torch.stack([s[key].float() for s in anp_states]).mean(dim=0).to(anp_states[0][key].dtype)
+                    )
+                restore_module_state(anp_head, averaged_anp_state)
+
+            avg_test_metrics = evaluate_phase_metrics(
+                bundle=bundle,
+                config=config,
+                forward_model=forward_model,
+                anp_head=anp_head,
+                loaders=test_loaders,
+                transform=transform,
+                metric_transform=metric_transform,
+                device=device,
+                phase="test",
+            )
+            avg_prefixed = {f"avg_ckpt_{key}": value for key, value in avg_test_metrics.items()}
+            print(json.dumps({"averaged_checkpoint_test_metrics": avg_test_metrics}, sort_keys=True), flush=True)
+            if run is not None:
+                wandb.log(avg_prefixed, step=int(history[-1]["epoch"]) if history else 0)
+                run.summary.update(avg_prefixed)
+                run.summary["checkpoint_averaging_k"] = len(topk_heap)
+                run.summary["checkpoint_averaging_epochs"] = sorted(avg_epochs)
+
             restore_module_state(model, terminal_model_state)
             restore_module_state(anp_head, terminal_anp_state)
 
