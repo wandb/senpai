@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 09:30 (advisor cycle 75)
+- **Date:** 2026-04-24 09:45 (advisor cycle 76)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -26,6 +26,7 @@
 - `#3228` chopper: stochastic weight perturbation at cosine troughs — INNOVATION
 - `#3256` alphonse: coordinate noise augmentation (σ=0.001/0.005 input perturbation) — INNOVATION
 - `#3253` canute: input feature dropout (Fourier channel dropout 10%/20%) — INNOVATION
+- `#3264` vegeta: Weight Standardization on linear layers (bs=1 loss smoothing, Qiao 2019) — INNOVATION
 - `#3202` senku: GLU preprocess MLP — INNOVATION
 - `#3201` jet: DomainLayerNorm — INNOVATION
 
@@ -87,7 +88,6 @@
 - `#3245` tanjiro: per-channel volume loss weighting (upweight nut×4, p×2) — AF VOLUME FOCUS
 - `#3211` spike: AF vol_loss_scale learnable scalar (noam port) — AF VOLUME FOCUS
 - `#3240` gilbert: joint checkpoint selection + vol-weight 11x/12x/13x fine sweep — AF VOLUME FOCUS
-- `#3239` vegeta: additive boundary layer auxiliary volume loss — AF VOLUME FOCUS
 - `#3195` piccolo: Re-stratified sampling
 - `#3156` edward: softer gc=0.5
 - `#3144` violet: vol-weight=2.0+EMA=0.999
@@ -233,6 +233,7 @@
 - Huber loss on volume channel: no improvement over MSE on either metric (#3215). AF volume residuals are well-behaved, not heavy-tailed — Huber δ threshold adds no benefit
 - Vol-weight warm-up (1x→10x ramp): 2/3 collapsed, best stable +28% surface/+69% vol (#3232). Cosine restarts inject LR peak when vol-weight ramps — destructive. Static 10x TRIPLE-CONFIRMED
 - Focal-MSE volume loss (error-based reweighting): gamma=2 +392%/+3993%, gamma=1 +222%/+320% (#3227). Batch-max normalization non-stationary + freestream scaffolding destroyed
+- Additive BL auxiliary volume loss (SDF targeting): all 3 trials +31-228% both metrics (#3239). SDF<0.05 captures 61% of vol points on AF meshes — "BL targeting" ≈ uniform upscaling. Pattern confirmed with #3222
 - 3L depth (with or without EMA): catastrophic divergence confirmed twice
 - 2L/384d and 3L/384d: catastrophic divergence
 - EMA>0.9995 (0.9999/0.99995 both ~85% worse, diverge early, #3199). EMA=0.9995 bracketed as sharp optimum with steep cliffs both directions
