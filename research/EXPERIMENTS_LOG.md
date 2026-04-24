@@ -1,5 +1,18 @@
 # SENPAI Research Results
 
+## 2026-04-24 11:15 — PR #3247: DM EMA periodic reset (brook) — CLOSED (dead end)
+
+- brook/dm-ema-periodic-reset, W&B runs: ltfotg72 (reset@100ep), q221x53o (reset@50ep), group: dm-ema-periodic-reset
+- Hypothesis: periodic EMA reset prevents multi-basin dilution from cosine restarts
+
+| Trial | Reset interval | best val_pct | vs baseline | Outcome |
+|-------|---------------|-------------|-------------|---------|
+| T1 | 100 ep | 4.426% | +15% | Cascade diverged ep335 after reset #3 |
+| T2 | 50 ep | 6.818% | +78% | Diverged ep108 after reset #2 |
+
+- **Key insight:** EMA=0.9995 on DM is the PRIMARY gradient stabilization mechanism. Model enters progressively sharper basins — by ep300, resetting EMA removes protective smoothing at highest-curvature point → immediate cascade. Multi-basin averaging IS the feature, not a bug.
+- **Constraint for future work:** Any EMA modification must preserve the continuous shadow trajectory.
+
 ## 2026-04-24 11:00 — PR #3258: DM auxiliary surface normal prediction (emma) — CLOSED (dead end)
 
 - emma/dm-aux-normal-prediction, W&B runs: fkiz67ki (w=0.1), g9zs1wsh (w=0.01), group: dm-aux-normal-prediction
