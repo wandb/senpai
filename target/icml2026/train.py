@@ -33,6 +33,37 @@ from core.features import (
 from core.optim import Lion, Lookahead
 
 
+class ReLUSquared(torch.nn.Module):
+    """Squared ReLU activation from Primer (So et al., 2021): relu(x)^2.
+
+    Produces sparser activations than GELU: zero for all negative inputs and
+    quadratically suppressed for small positive inputs.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.relu(x).square()
+
+
+def apply_ffn_activation(model: torch.nn.Module, activation: str) -> None:
+    """Replace UpActDownMlp.act in all transformer FFN layers with the chosen activation.
+
+    Only patches the transformer backbone FFN blocks (UpActDownMlp); leaves
+    ZeroInitSurfaceRefinementHead and MLP bias modules untouched.
+    """
+    if activation == "gelu":
+        return
+    from core.architectures.transolver_reference import UpActDownMlp
+
+    if activation == "relu_squared":
+        act_module: torch.nn.Module = ReLUSquared()
+    else:
+        raise ValueError(f"Unknown ffn_activation: {activation!r}. Expected 'gelu' or 'relu_squared'.")
+
+    for module in model.modules():
+        if isinstance(module, UpActDownMlp):
+            module.act = act_module
+
+
 class EMAWithWarmup:
     """EMA with timm-style adaptive decay warmup: min(target, (1+step)/(10+step))."""
 
@@ -169,6 +200,7 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    ffn_activation: str = "gelu"
 
 
 @dataclass
@@ -1621,6 +1653,7 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
+    apply_ffn_activation(model, config.ffn_activation)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
