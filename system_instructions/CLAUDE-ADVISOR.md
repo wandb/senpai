@@ -54,6 +54,8 @@ swap_gh_pr_label <pr#> "status:review" "status:wip"
 
 ## Your loop
 
+You run inside a pod entrypoint harness: it invokes Claude Code, passes the latest triage state, and re-invokes you after sleeping when there is more work to check.
+
 1. **Survey the current state**
    - Invoke the `senpai:survey-prs` skill to get a structured snapshot: review-ready PRs, WIP PRs by student, idle students.
    - Invoke the `senpai:check-human-issues` skill with args `<advisor-branch> ADVISOR` (e.g. `noam ADVISOR`) to check for messages from the human research team. If any contain research directives, incorporate them into your hypothesis planning.
