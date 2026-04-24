@@ -169,6 +169,9 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    moe_num_experts: int = 0
+    moe_top_k: int = 2
+    moe_balance_coeff: float = 0.01
 
 
 @dataclass
@@ -497,6 +500,107 @@ def cp_panel_prior_index(config: TrainConfig, bundle: DatasetBundle) -> int | No
         base_dim -= 1
         return base_dim
     return None
+
+
+class MoEFFN(torch.nn.Module):
+    """Sparse Mixture-of-Experts FFN: each token routed to top-k of K experts."""
+
+    def __init__(self, hidden_dim: int, ffn_dim: int, num_experts: int, top_k: int = 2):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.router = torch.nn.Linear(hidden_dim, num_experts, bias=False)
+        torch.nn.init.normal_(self.router.weight, std=0.01)
+        self.experts = torch.nn.ModuleList([
+            torch.nn.Sequential(
+                torch.nn.Linear(hidden_dim, ffn_dim),
+                torch.nn.GELU(),
+                torch.nn.Linear(ffn_dim, hidden_dim),
+            )
+            for _ in range(num_experts)
+        ])
+        self.balance_loss = torch.tensor(0.0)
+        self.register_buffer("_routing_counts", torch.zeros(num_experts), persistent=False)
+        self.jitter_noise = 1.0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, D = x.shape
+        x_flat = x.reshape(B * N, D)
+        router_logits = self.router(x_flat)  # [B*N, K]
+
+        if self.training and self.jitter_noise > 0:
+            noise = torch.randn_like(router_logits) * self.jitter_noise
+            router_logits = router_logits + noise
+
+        top_k_logits, top_k_indices = router_logits.topk(self.top_k, dim=-1)
+        top_k_weights = F.softmax(top_k_logits, dim=-1)  # [B*N, top_k]
+
+        output = torch.zeros_like(x_flat)
+        for k_idx in range(self.top_k):
+            indices = top_k_indices[:, k_idx]  # [B*N]
+            weights = top_k_weights[:, k_idx].unsqueeze(-1)  # [B*N, 1]
+            for e in range(self.num_experts):
+                mask = indices == e
+                if mask.any():
+                    expert_out = self.experts[e](x_flat[mask])
+                    output[mask] = output[mask] + weights[mask] * expert_out
+
+        routing_probs = F.softmax(router_logits, dim=-1)  # [B*N, K]
+        tokens_per_expert = F.one_hot(top_k_indices[:, 0], self.num_experts).float().mean(dim=0)
+        avg_prob = routing_probs.mean(dim=0)
+        # Switch Transformer load balance + entropy regularization for anti-collapse
+        switch_loss = (tokens_per_expert * avg_prob * self.num_experts).sum()
+        entropy = -(avg_prob * (avg_prob + 1e-8).log()).sum()
+        max_entropy = math.log(self.num_experts)
+        entropy_penalty = max_entropy - entropy
+        self.balance_loss = switch_loss + entropy_penalty
+
+        self._routing_counts = tokens_per_expert.detach()
+
+        return output.reshape(B, N, D)
+
+
+def _replace_ffn_with_moe(model: torch.nn.Module, config: TrainConfig) -> None:
+    """Replace UpActDownMlp in each TransformerBlock with MoEFFN."""
+    if config.moe_num_experts <= 0:
+        return
+    backbone = model.backbone
+    hidden_dim = model.n_hidden
+    ffn_dim = int(math.ceil(hidden_dim * config.model_mlp_ratio))
+    for block in backbone.blocks:
+        block.mlp = MoEFFN(hidden_dim, ffn_dim, config.moe_num_experts, config.moe_top_k)
+
+
+def _collect_moe_balance_loss(model: torch.nn.Module) -> torch.Tensor:
+    """Sum balance losses from all MoE layers."""
+    total = torch.tensor(0.0, device=next(model.parameters()).device)
+    raw = model._orig_mod if hasattr(model, '_orig_mod') else model
+    backbone = getattr(raw, 'backbone', None)
+    if backbone is None:
+        return total
+    for block in backbone.blocks:
+        if isinstance(block.mlp, MoEFFN):
+            total = total + block.mlp.balance_loss
+    return total
+
+
+def _log_moe_routing_stats(model: torch.nn.Module, run, epoch: int) -> dict[str, float]:
+    """Log per-layer expert routing distribution and router norms to W&B."""
+    raw = model._orig_mod if hasattr(model, '_orig_mod') else model
+    backbone = getattr(raw, 'backbone', None)
+    if backbone is None:
+        return {}
+    metrics: dict[str, float] = {}
+    for i, block in enumerate(backbone.blocks):
+        if not isinstance(block.mlp, MoEFFN):
+            continue
+        counts = block.mlp._routing_counts.detach().cpu()
+        for e in range(block.mlp.num_experts):
+            metrics[f"moe/layer{i}_expert{e}_frac"] = float(counts[e])
+        metrics[f"moe/layer{i}_routing_entropy"] = float(
+            -(counts * (counts + 1e-8).log()).sum()
+        )
+    return metrics
 
 
 def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
@@ -1271,11 +1375,14 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    moe_balance_coeff: float = 0.0,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
         anp_head.train()
     running = {"loss": 0.0}
+    if moe_balance_coeff > 0:
+        running["moe_balance_loss"] = 0.0
     steps = 0
     micro_batches_total = 0
     batches = loader if max_batches <= 0 else itertools.islice(loader, max_batches)
@@ -1328,6 +1435,10 @@ def train_one_epoch(
                         )
                         loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
 
+            if moe_balance_coeff > 0:
+                bal = _collect_moe_balance_loss(model)
+                loss = loss + moe_balance_coeff * bal
+                running["moe_balance_loss"] += float(bal.detach().cpu().item())
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
             micro_count += 1
@@ -1359,6 +1470,8 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    if "moe_balance_loss" in running:
+        running["moe_balance_loss"] /= max(micro_batches_total, 1)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1614,8 +1727,11 @@ def main() -> None:
             )
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
-    model = build_model(config, bundle).to(device)
-    forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
+    model = build_model(config, bundle)
+    _replace_ffn_with_moe(model, config)
+    model = model.to(device)
+    use_compile = config.compile_model and device.type == "cuda" and config.moe_num_experts <= 0
+    forward_model = torch.compile(model) if use_compile else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
         anp_head = ANPSurfaceDecoder(
@@ -1663,7 +1779,7 @@ def main() -> None:
             name=config.wandb_name,
             group=config.wandb_group or None,
             config=run_config,
-            tags=[config.dataset, config.model],
+            tags=[config.dataset, config.model] + ([f"moe-{config.moe_num_experts}experts"] if config.moe_num_experts > 0 else []),
         )
 
     start_time = time.monotonic()
@@ -1688,6 +1804,7 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            moe_balance_coeff=config.moe_balance_coeff if config.moe_num_experts > 0 else 0.0,
         )
 
         if ema is not None:
@@ -1739,6 +1856,9 @@ def main() -> None:
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
         epoch_metrics["best_val_metric"] = best_val_metric
         epoch_metrics["best_epoch"] = float(best_epoch)
+        if config.moe_num_experts > 0:
+            moe_stats = _log_moe_routing_stats(forward_model, run, epoch)
+            epoch_metrics.update(moe_stats)
         history.append(epoch_metrics)
         if run is not None:
             wandb.log(epoch_metrics, step=epoch)
