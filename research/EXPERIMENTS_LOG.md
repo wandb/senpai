@@ -1,5 +1,35 @@
 # SENPAI Research Results
 
+## 2026-04-24 14:30 — PR #3260: DM learnable Fourier encoding frequencies (casca) — CLOSED (dead end)
+
+- casca/dm-learnable-fourier-freqs, W&B runs: wss8o89v (T1 default init), 6cg34qtr (T2 wide init), group: dm-learnable-fourier
+- Hypothesis: making Fourier encoding frequencies learnable (nn.Parameter) lets the model adapt spatial encoding to DrivAerML's specific scale structure
+
+| Trial | Init | best val_pct | Epoch at best | Outcome |
+|-------|------|-------------|---------------|---------|
+| T1 default [0.5,2,8,32] | baseline | 5.262% (ep179) | 179 | Diverged post-cosine-restart, terminal 53.1% |
+| T2 wide [0.1,1,10,100] | wider | 4.252% (ep371) | 371 | Diverged post-cosine-restart, terminal 72.2% |
+
+**Conclusion:** Both diverge catastrophically. Key diagnostic: frequencies barely moved from initialization in T2 (terminal [0.05,1.53,10.03,99.73] vs init [0.1,1,10,100]). Fixed frequencies are already near-optimal for DrivAerML. Learnable freq + cosine LR restarts = cascading perturbation feedback loop. No variant worth pursuing.
+
+---
+
+## 2026-04-24 14:30 — PR #3244: DM paper-facing full eval (faye) — SENT BACK (need champion checkpoint eval)
+
+- faye/dm-paper-eval, W&B runs: l7jxns6d (naive full-eval), rzx46x2j (Phase 1 batch-limited), f7f1kmcz (Phase 2 full-eval)
+- Purpose: obtain paper-facing full-eval metrics for DM champion (no --max-eval-batches)
+
+| Phase | W&B run | val_pct | test_pct | eval method | Outcome |
+|-------|---------|---------|----------|------------|---------|
+| Phase 0 (naive) | l7jxns6d | 12.356% (ep50) | 11.881% | full eval | Timeout after 50 epochs |
+| Phase 1 (train) | rzx46x2j | 3.966% (ep403) | — | batch-limited 200 | Crashed ep417 (grad norm 7449) |
+| Phase 2 (eval) | f7f1kmcz | 4.933% | 4.496% | full eval | Checkpoint from Phase 1 ep403 |
+| Champion | ncl1dh88 | 3.833% (ep511) | 4.685% | batch-limited 200 | Reference |
+
+**CRITICAL FINDING:** Batch-limited eval is ~24% optimistic for val (3.966% batch-limited → 4.933% full-eval). This means our 3.833% baseline is likely ~4.8% under full eval. Sent back to run full eval on the actual champion ep511 checkpoint (not the ep403 crash-truncated version).
+
+---
+
 ## 2026-04-24 14:00 — PR #3262: DM learnable register tokens (megumi) — CLOSED (dead end)
 
 - megumi/dm-register-tokens, W&B runs: x2dp3s92 (N=2), jr1s77um (N=4), 3ftciy41 (N=8), group: dm-register-tokens

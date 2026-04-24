@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 14:00 (advisor cycle 88)
+- **Date:** 2026-04-24 14:30 (advisor cycle 89)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -12,7 +12,7 @@
 ### DrivAerML WIP (30 PRs)
 **Innovation track (new physics-aware/ML ideas per directive):**
 - `#3281` megumi: MoE output heads (K=2/3 expert output MLPs with learned gating) — INNOVATION
-- `#3260` casca: learnable Fourier frequency magnitudes (meta-learned encoding) — INNOVATION
+- `#3282` casca: AF volume→surface cross-attention (volume queries attend to surface keys) — AF VOLUME FOCUS
 - `#3270` brook: FiLM conditioning on global geometry statistics (per-car shape context) — INNOVATION
 - `#3280` jet: per-channel output heads (separate MLPs for Ux, Uy, p) — INNOVATION
 - `#3242` historia: label smoothing / target noise augmentation — INNOVATION
@@ -110,7 +110,7 @@
 | TandemFoil | `test_primary/surface_pressure_mae` | **22.868** (PR #3185 MERGED) | (internal) | Improving |
 | TandemFoil Paper | `test_primary/field_mse` | **NO CLEAN ROW YET** | ~0.10-0.36/task | URGENT — #3098 in-progress |
 | AirfRANS | `Surf MSE / Vol MSE` | **0.000296 / 0.002039** | 0.0043 / 0.0017 | Surface 14.5x better, Volume 1.20x gap |
-| DrivAerML | `test_primary/surface_rel_l2_pct` | **4.685%** (#3072, partial eval) | 3.71% | Gap closing — #3244 paper eval in-progress (faye) |
+| DrivAerML | `test_primary/surface_rel_l2_pct` | **4.496%** (#3244 full-eval, ep403 ckpt) / 4.685% (batch-limited) | 3.71% | **Batch-limited eval ~24% optimistic.** Faye re-running full eval on champion ep511 ckpt |
 
 ## Current Research Focus
 
@@ -207,6 +207,7 @@
 - Grouped Query Attention (GQA, 2/4 KV heads): 12.88%/6.88% both crashed (#3273). Throughput-neutral (bottleneck is slice routing einsums, not QKV). GQA destabilizes per-head slice routing — coupled KV sharing explodes at cosine restarts.
 - Error-weighted surface sampling (hard example mining): crashed ep6 both trials (#3243). Distribution-shift collapse + 30-60min/epoch error-map compute + train/eval mismatch. Student note: error-weighted LOSS (not sampling) would avoid distribution shift but still faces mismatch.
 - Learnable register tokens (N=2/4/8): N=8 best 4.062% (+6%), N=2/N=4 NaN diverged (#3262). Category error — register tokens address pairwise attention sinks (ViT), but Transolver uses slice-based soft-clustering attention where sink mechanism doesn't apply.
+- Learnable Fourier frequencies: 5.262%/4.252% both diverged (#3260). Frequencies barely moved from init — fixed [0.5,2,8,32] are already near-optimal. Learnable freq + cosine restarts = cascading perturbation feedback loop.
 - EMA>0.9995: 0.9999→7.106% NaN ep171, 0.99995→7.095% collapse ep120 (#3199). EMA=0.9995 sharp optimum bracketed both directions
 - SAM optimizer (rho=0.05/0.02): 5.36%/9.08%. SAM perturbation + cosine restart = double shock → catastrophic divergence. 2x compute penalty also prohibitive
 - True monotonic cosine (T_max=393606, no restarts): 4.086% (+0.253pp). Confirms T_max=30 rapid restarts are core mechanism, not noise. Monotonic decay can't compete
