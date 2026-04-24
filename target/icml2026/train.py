@@ -94,6 +94,8 @@ LEGACY_VAL_ALIAS = {
 }
 AIRFRANS_FIELD_NAMES = ("Ux", "Uy", "p", "nut")
 TANDEM_FIELD_NAMES = ("Ux", "Uy", "p")
+ERROR_SAMPLING_WARMUP = 5
+ERROR_WEIGHT_EMA = 0.9
 
 
 @dataclass
@@ -169,6 +171,8 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    error_weighted_sampling: bool = False
+    error_sampling_temperature: float = 1.0
 
 
 @dataclass
@@ -1254,6 +1258,107 @@ def evaluate_abupt(
     return {"surface_mae": total_surface / max(count_surface, 1), "volume_mae": total_volume / max(count_volume, 1)}
 
 
+@torch.no_grad()
+def compute_training_error_maps(
+    forward_model: torch.nn.Module,
+    dataset,
+    transform: TargetTransform,
+    device: torch.device,
+    amp_mode: str,
+    chunk_size: int,
+) -> dict[str, torch.Tensor]:
+    """Per-point squared errors over the full training set for error-weighted sampling."""
+    forward_model.eval()
+    error_maps: dict[str, torch.Tensor] = {}
+    with torch.no_grad():
+        for idx in range(len(dataset)):
+            sample = dataset[idx]
+            case_id = sample.case_id
+            sx = sample.surface_x
+            sy = sample.surface_y
+            n = sx.shape[0]
+            all_errors: list[torch.Tensor] = []
+            for start in range(0, n, chunk_size):
+                end = min(start + chunk_size, n)
+                chunk_sx = sx[start:end].unsqueeze(0).to(device)
+                chunk_sy = sy[start:end].unsqueeze(0).to(device)
+                chunk_mask = torch.ones(1, end - start, dtype=torch.bool, device=device)
+                outputs = forward_model(
+                    surface_x=chunk_sx,
+                    surface_mask=chunk_mask,
+                    volume_x=None,
+                    volume_mask=None,
+                )
+                outputs = float_outputs(outputs)
+                pred = outputs["surface_preds"]
+                if pred is not None:
+                    target_norm = transform.apply(chunk_sy)
+                    chunk_errors = (pred - target_norm).square().mean(dim=-1).squeeze(0)
+                    all_errors.append(chunk_errors.cpu())
+                del chunk_sx, chunk_sy, chunk_mask, outputs, pred
+            if all_errors:
+                error_maps[case_id] = torch.cat(all_errors)
+    torch.cuda.empty_cache()
+    return error_maps
+
+
+def subsample_batch_by_error(
+    batch: GroupedBatch,
+    error_maps: dict[str, torch.Tensor],
+    subsample_size: int,
+    temperature: float,
+) -> GroupedBatch:
+    """Subsample surface points using error-weighted probabilities."""
+    B = batch.surface_x.shape[0]
+    new_sx: list[torch.Tensor] = []
+    new_sy: list[torch.Tensor | None] = []
+    new_mask: list[torch.Tensor] = []
+    for i in range(B):
+        case_id = batch.case_ids[i]
+        mask_i = batch.surface_mask[i]
+        n_valid = int(mask_i.sum().item())
+        if n_valid <= subsample_size:
+            new_sx.append(batch.surface_x[i, :n_valid])
+            new_sy.append(batch.surface_y[i, :n_valid] if batch.surface_y is not None else None)
+            new_mask.append(torch.ones(n_valid, dtype=torch.bool))
+            continue
+        if case_id in error_maps and len(error_maps[case_id]) >= n_valid:
+            weights = error_maps[case_id][:n_valid]
+            log_weights = torch.log(weights.clamp(min=1e-8))
+            probs = F.softmax(log_weights / temperature, dim=0)
+            indices = torch.multinomial(probs, subsample_size, replacement=False).sort().values
+        else:
+            indices = torch.randperm(n_valid)[:subsample_size].sort().values
+        new_sx.append(batch.surface_x[i, indices])
+        new_sy.append(batch.surface_y[i, indices] if batch.surface_y is not None else None)
+        new_mask.append(torch.ones(subsample_size, dtype=torch.bool))
+    max_n = max(t.shape[0] for t in new_sx)
+    D = batch.surface_x.shape[-1]
+    padded_sx = batch.surface_x.new_zeros(B, max_n, D)
+    padded_mask = torch.zeros(B, max_n, dtype=torch.bool)
+    padded_sy = None
+    if batch.surface_y is not None:
+        padded_sy = batch.surface_y.new_zeros(B, max_n, batch.surface_y.shape[-1])
+    for i in range(B):
+        n = new_sx[i].shape[0]
+        padded_sx[i, :n] = new_sx[i]
+        padded_mask[i, :n] = new_mask[i]
+        if padded_sy is not None and new_sy[i] is not None:
+            padded_sy[i, :n] = new_sy[i]
+    return GroupedBatch(
+        case_ids=batch.case_ids,
+        dataset_name=batch.dataset_name,
+        space_dim=batch.space_dim,
+        surface_x=padded_sx,
+        surface_y=padded_sy,
+        surface_mask=padded_mask,
+        volume_x=batch.volume_x,
+        volume_y=batch.volume_y,
+        volume_mask=batch.volume_mask,
+        metadata=batch.metadata,
+    )
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     anp_head: ANPSurfaceDecoder | None,
@@ -1271,6 +1376,9 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    error_maps: dict[str, torch.Tensor] | None = None,
+    error_subsample_size: int = 0,
+    error_temperature: float = 1.0,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1306,6 +1414,8 @@ def train_one_epoch(
                     )
                     loss, _ = loss_abupt(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
             else:
+                if error_subsample_size > 0 and hasattr(batch, "dataset_name") and batch.dataset_name == "drivaerml":
+                    batch = subsample_batch_by_error(batch, error_maps or {}, error_subsample_size, error_temperature)
                 batch = batch.to(device)
                 if isinstance(transform, TandemTargetTransform):
                     prepared = transform.prepare_batch(batch)
@@ -1558,6 +1668,11 @@ def main() -> None:
     if max_epochs_env:
         config.epochs = min(config.epochs, int(max_epochs_env))
 
+    error_subsample_size = 0
+    if config.error_weighted_sampling and config.dataset == "drivaerml":
+        error_subsample_size = config.drivaerml_train_surface_points or 50000
+        config.drivaerml_train_surface_points = 0
+
     import core.datasets as _ds
     _ds.RUNTIME_CACHE_CASES = 3000
 
@@ -1578,6 +1693,8 @@ def main() -> None:
 
     bundle = build_bundle(config)
     resolved_num_workers = resolve_num_workers(config, bundle.spec.name)
+    if error_subsample_size > 0:
+        resolved_num_workers = 0
     if bundle.spec.name == "tandemfoilset":
         phys_stats = compute_tandem_phys_stats(
             bundle.train_dataset,
@@ -1634,6 +1751,7 @@ def main() -> None:
 
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
+    ema_error_maps: dict[str, torch.Tensor] = {}
     history: list[dict[str, float]] = []
     best_epoch: int | None = None
     best_val_primary_metric_name = primary_metric_key(bundle, phase="val")
@@ -1643,9 +1761,9 @@ def main() -> None:
     best_anp_state: dict[str, torch.Tensor] | None = None
 
     if bundle.spec.name == "tandemfoilset":
-        val_primary_key = "val_primary/surface_pressure_mae"
+        best_tracking_metric_key = "val_primary/surface_pressure_mae"
     else:
-        val_primary_key = f"val_primary/{bundle.spec.default_metric}"
+        best_tracking_metric_key = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1657,6 +1775,9 @@ def main() -> None:
     if config.wandb_name:
         run_config = asdict(config)
         run_config["effective_batch_size"] = config.batch_size * config.grad_accum_steps
+        if error_subsample_size > 0:
+            run_config["error_subsample_size"] = error_subsample_size
+            run_config["error_sampling_warmup_epochs"] = ERROR_SAMPLING_WARMUP
         run = wandb.init(
             project=os.getenv("WANDB_PROJECT", "senpai-v1"),
             entity=os.getenv("WANDB_ENTITY"),
@@ -1688,6 +1809,9 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            error_maps=ema_error_maps,
+            error_subsample_size=error_subsample_size,
+            error_temperature=config.error_sampling_temperature,
         )
 
         if ema is not None:
@@ -1719,7 +1843,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(val_primary_key)
+        current_val = eval_metrics.get(best_tracking_metric_key)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
@@ -1730,6 +1854,29 @@ def main() -> None:
                 best_ema_shadow = {k: v.cpu().clone() for k, v in ema.shadow.items()}
             if anp_ema is not None:
                 best_anp_ema_shadow = {k: v.cpu().clone() for k, v in anp_ema.shadow.items()}
+
+        if error_subsample_size > 0 and bundle.spec.name == "drivaerml" and epoch >= ERROR_SAMPLING_WARMUP:
+            new_error_maps = compute_training_error_maps(
+                model, bundle.train_dataset, transform, device,
+                config.amp_mode, error_subsample_size,
+            )
+            for cid, new_errors in new_error_maps.items():
+                if cid in ema_error_maps:
+                    ema_error_maps[cid] = ERROR_WEIGHT_EMA * ema_error_maps[cid] + (1 - ERROR_WEIGHT_EMA) * new_errors
+                else:
+                    ema_error_maps[cid] = new_errors
+            if run is not None:
+                entropies = []
+                for weights in ema_error_maps.values():
+                    log_w = torch.log(weights.clamp(min=1e-8))
+                    probs = F.softmax(log_w / config.error_sampling_temperature, dim=0)
+                    ent = -(probs * probs.clamp(min=1e-10).log()).sum().item()
+                    max_ent = math.log(len(weights))
+                    entropies.append(ent / max_ent if max_ent > 0 else 1.0)
+                wandb.log({
+                    "error_sampling/mean_normalized_entropy": sum(entropies) / len(entropies),
+                    "error_sampling/num_cases_mapped": float(len(ema_error_maps)),
+                }, step=epoch)
 
         if ema is not None:
             ema.restore(model)
