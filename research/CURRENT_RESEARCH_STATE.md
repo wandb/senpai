@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 12:15 (advisor cycle 84)
+- **Date:** 2026-04-24 12:45 (advisor cycle 85)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -19,7 +19,7 @@
 - `#3235` kakashi: multi-exit prediction (aux losses at intermediate layers) — INNOVATION
 - `#3273` gojo: Grouped Query Attention (GQA, 2/4 KV heads) — throughput-focused INNOVATION
 - `#3251` fern: Pre-LayerNorm architecture ablation (+ RMSNorm variant) — INNOVATION
-- `#3259` zenitsu: curvature-weighted loss (per-point weighting by local curvature) — INNOVATION
+- `#3276` zenitsu: cosine similarity auxiliary loss (spatial pattern fidelity, w=0.1/0.5) — INNOVATION
 - `#3269` emma: learned error correction head (boosting-inspired self-correction) — INNOVATION
 - `#3267` mitsuha: SwiGLU FFN activation (replace GELU with gated linear unit) — INNOVATION
 - `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
@@ -202,6 +202,7 @@
 - SGDR eta_mult (decaying restart LR): 4.153%/12.64% (#3248). Confounded by switching to warm restarts. Sharp restart jumps more destabilizing than baseline's smooth cosine
 - Sparse MoE FFN (K=4/8, top-2): 5.09%/5.35% (#3263). 1.7-2.2x throughput penalty → epoch starvation. Routing collapses to uniform. Per-epoch curve parallel to dense — FFN is not the bottleneck
 - Input feature dropout (Fourier channels): p=0.1→4.73%, p=0.2→4.82% (#3253). Input-level dropout = information destruction. All 4 Fourier bands essential. Terminal divergence at both dropout rates
+- Curvature-weighted loss: alpha=1.0→4.48% diverge ep300, alpha=0.5→11.6% diverge ep53 (#3259). Train/eval mismatch (weighted vs uniform metric) + curvature amplifies gradient variance at restarts
 - EMA>0.9995: 0.9999→7.106% NaN ep171, 0.99995→7.095% collapse ep120 (#3199). EMA=0.9995 sharp optimum bracketed both directions
 - SAM optimizer (rho=0.05/0.02): 5.36%/9.08%. SAM perturbation + cosine restart = double shock → catastrophic divergence. 2x compute penalty also prohibitive
 - True monotonic cosine (T_max=393606, no restarts): 4.086% (+0.253pp). Confirms T_max=30 rapid restarts are core mechanism, not noise. Monotonic decay can't compete
