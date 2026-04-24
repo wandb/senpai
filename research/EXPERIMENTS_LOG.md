@@ -1,5 +1,24 @@
 # SENPAI Research Results
 
+## 2026-04-24 15:30 — FLEET RESTRUCTURING per Issue #3283 (Last Ditch Benchmark Push)
+
+**14 experiments KILLED to reallocate fleet to 36 DM / 12 AF / 11 TFP / 0 TF:**
+
+DM kills: #3280 jet (per-channel heads, surface is single cp), #3281 megumi (MoE output, directive), #3181 himmel (asinh+residual, noam dead), #3067 askeladd (32k surface, directive says denser only)
+AF kills: #3274 norman (Lion), #3172 robin (warmup), #3169 nami (heads sweep), #3129 chrome (4L/256d depth), #3261 nezuko (2L/320d width), #3187 stark (asinh), #3184 wolfwood (noam stack), #3268 jin (higher LR), #3144 violet (vol-weight=2)
+TF kills: #3150 yuji (TF frozen)
+
+**15 new assignments:**
+- vegeta #3284: HARNESS PATCHES (highest priority infrastructure)
+- DM champion recovery: jet #3285 (seed=42), megumi #3286 (seed=7), norman #3293 (seed=0 ncl1dh88 replica)
+- DM surface density: himmel #3289 (64k), askeladd #3290 (96k)
+- DM gradient-safe: robin #3294 (gc=0.25)
+- DM narrow schedule: nami #3297 (T_max=24), chrome #3298 (T_max=36)
+- TFP haku replication: nezuko #3287 (seed=0), stark #3288 (seed=42), wolfwood #3291 (seed=7), yuji #3292 (seed=123)
+- AF vol-weight sweep: jin #3295 (vol-weight=8), violet #3296 (vol-weight=9)
+
+---
+
 ## 2026-04-24 14:30 — PR #3260: DM learnable Fourier encoding frequencies (casca) — CLOSED (dead end)
 
 - casca/dm-learnable-fourier-freqs, W&B runs: wss8o89v (T1 default init), 6cg34qtr (T2 wide init), group: dm-learnable-fourier
