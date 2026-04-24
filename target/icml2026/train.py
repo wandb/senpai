@@ -1345,13 +1345,19 @@ def train_one_epoch(
         if grad_clip > 0 and float(grad_norm) > grad_clip:
             running.setdefault("grad_clip_events", 0.0)
             running["grad_clip_events"] += 1.0
-        optimizer.step()
+        skip_threshold = 500.0
+        if float(grad_norm) > skip_threshold:
+            running.setdefault("grad_skip_events", 0.0)
+            running["grad_skip_events"] += 1.0
+            optimizer.zero_grad()
+        else:
+            optimizer.step()
         if scheduler is not None:
             scheduler.step()
-        if ema is not None:
+        if ema is not None and float(grad_norm) <= skip_threshold:
             ema.update(model)
             running["ema_decay_actual"] = min(ema.decay, (1 + ema.step_counter) / (10 + ema.step_counter))
-        if anp_head is not None and anp_ema is not None:
+        if anp_head is not None and anp_ema is not None and float(grad_norm) <= skip_threshold:
             anp_ema.update(anp_head)
         running["loss"] += accum_loss / micro_count
         micro_batches_total += micro_count
