@@ -168,6 +168,7 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
+    dm_domain_normalized_volume: bool = False
     save_checkpoint: bool = False
     load_checkpoint: str = ""
     eval_interval: int = 1
@@ -778,6 +779,7 @@ def loss_grouped(
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
     volume_loss_weight: float = 1.0,
+    volume_transform: TargetTransform | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.surface_x.device)
     metrics: dict[str, float] = {}
@@ -787,7 +789,8 @@ def loss_grouped(
         total = total + surf_loss
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
-        target = transform.apply(batch.volume_y)
+        vol_xform = volume_transform if volume_transform is not None else transform
+        target = vol_xform.apply(batch.volume_y)
         vol_loss = F.mse_loss(outputs["volume_preds"][batch.volume_mask], target[batch.volume_mask])
         total = total + vol_loss * volume_loss_weight
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
@@ -819,6 +822,7 @@ def loss_abupt(
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
     volume_loss_weight: float = 1.0,
+    volume_transform: TargetTransform | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.geometry_position.device)
     metrics: dict[str, float] = {}
@@ -828,7 +832,8 @@ def loss_abupt(
         total = total + surf_loss
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if batch.volume_anchor_target is not None and outputs["volume_preds"] is not None:
-        vol_target = transform.apply(batch.volume_anchor_target)
+        vol_xform = volume_transform if volume_transform is not None else transform
+        vol_target = vol_xform.apply(batch.volume_anchor_target)
         vol_loss = F.mse_loss(outputs["volume_preds"], vol_target)
         total = total + vol_loss * volume_loss_weight
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
@@ -869,6 +874,7 @@ def evaluate_grouped(
     *,
     amp_mode: str = "none",
     max_batches: int = 0,
+    volume_transform: TargetTransform | None = None,
 ) -> dict[str, float]:
     model.eval()
     if anp_head is not None:
@@ -1014,7 +1020,8 @@ def evaluate_grouped(
         if batch.surface_y is not None and outputs["surface_preds"] is not None:
             pred_surface = transform.invert(outputs["surface_preds"])
         if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
-            pred_volume = transform.invert(outputs["volume_preds"])
+            vol_inv = volume_transform if volume_transform is not None else transform
+            pred_volume = vol_inv.invert(outputs["volume_preds"])
 
         if dataset_name == "drivaerml":
             if pred_surface is not None and batch.surface_y is not None:
@@ -1120,6 +1127,7 @@ def evaluate_abupt(
     *,
     amp_mode: str = "none",
     max_batches: int = 0,
+    volume_transform: TargetTransform | None = None,
 ) -> dict[str, float]:
     model.eval()
     dataset_name: str | None = None
@@ -1215,7 +1223,8 @@ def evaluate_abupt(
                 total_surface += float((pred - batch.surface_anchor_target).abs().mean().cpu().item())
                 count_surface += 1
         if batch.volume_anchor_target is not None and outputs["volume_preds"] is not None:
-            pred = transform.invert(outputs["volume_preds"])
+            vol_inv = volume_transform if volume_transform is not None else transform
+            pred = vol_inv.invert(outputs["volume_preds"])
             if dataset_name == "drivaerml":
                 value = _case_masked_rel_l2(
                     pred[0],
@@ -1287,6 +1296,7 @@ def train_one_epoch(
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
     skip_update_grad_norm: float = 0.0,
+    volume_transform: TargetTransform | None = None,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1320,7 +1330,7 @@ def train_one_epoch(
                         surface_anchor_position=batch.surface_anchor_position,
                         volume_anchor_position=batch.volume_anchor_position,
                     )
-                    loss, _ = loss_abupt(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                    loss, step_metrics = loss_abupt(batch, outputs, transform, volume_loss_weight=volume_loss_weight, volume_transform=volume_transform)
             else:
                 batch = batch.to(device)
                 if isinstance(transform, TandemTargetTransform):
@@ -1333,7 +1343,7 @@ def train_one_epoch(
                             volume_mask=prepared.volume_mask,
                         )
                         outputs = maybe_apply_anp(outputs, prepared, anp_head)
-                        loss, _ = loss_grouped_tandem(prepared, outputs, volume_loss_weight=volume_loss_weight)
+                        loss, step_metrics = loss_grouped_tandem(prepared, outputs, volume_loss_weight=volume_loss_weight)
                 else:
                     with autocast_context(device, amp_mode):
                         outputs = model(
@@ -1342,9 +1352,13 @@ def train_one_epoch(
                             volume_x=batch.volume_x,
                             volume_mask=batch.volume_mask,
                         )
-                        loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                        loss, step_metrics = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight, volume_transform=volume_transform)
 
             accum_loss += float(loss.detach().cpu().item())
+            for mk, mv in step_metrics.items():
+                if mk != "loss":
+                    running.setdefault(mk, 0.0)
+                    running[mk] += mv
             (loss / grad_accum_steps).backward()
             micro_count += 1
 
@@ -1389,6 +1403,12 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    if "surface_loss" in running:
+        running["surface_loss"] /= max(micro_batches_total, 1)
+    if "volume_loss" in running:
+        running["volume_loss"] /= max(micro_batches_total, 1)
+    if "surface_loss" in running and "volume_loss" in running and running["surface_loss"] > 0:
+        running["volume_surface_loss_ratio"] = running["volume_loss"] / running["surface_loss"]
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1488,6 +1508,7 @@ def evaluate_phase_metrics(
     metric_transform: TargetTransform | None,
     device: torch.device,
     phase: str,
+    volume_transform: TargetTransform | None = None,
 ) -> dict[str, float]:
     metrics: dict[str, float] = {}
     for split_name, loader in loaders.items():
@@ -1500,6 +1521,7 @@ def evaluate_phase_metrics(
                 device,
                 amp_mode=config.amp_mode,
                 max_batches=config.max_eval_batches,
+                volume_transform=volume_transform,
             )
         else:
             split_metrics = evaluate_grouped(
@@ -1510,6 +1532,7 @@ def evaluate_phase_metrics(
                 metric_transform,
                 device,
                 amp_mode=config.amp_mode,
+                volume_transform=volume_transform,
                 max_batches=config.max_eval_batches,
             )
         metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
@@ -1643,6 +1666,33 @@ def main() -> None:
                 asinh_scale=config.asinh_scale,
             )
 
+    volume_transform: TargetTransform | None = None
+    if config.dm_domain_normalized_volume and config.drivaerml_train_volume_points > 0:
+        train_ds = bundle.train_dataset
+        store = getattr(train_ds, 'store', None)
+        case_ids = getattr(train_ds, 'case_ids', None)
+        if store is not None and case_ids is not None:
+            vol_ys = []
+            for cid in case_ids:
+                case = store.load_case(cid)
+                if case.volume_y is not None:
+                    vy = case.volume_y
+                    if vy.ndim == 2 and vy.shape[0] > 10000:
+                        idx = torch.randperm(vy.shape[0])[:10000]
+                        vy = vy[idx]
+                    vol_ys.append(vy.reshape(-1, vy.shape[-1]))
+            if vol_ys:
+                all_vol = torch.cat(vol_ys, dim=0)
+                volume_y_mean = all_vol.mean(dim=0)
+                volume_y_std = all_vol.std(dim=0).clamp(min=1e-6)
+                volume_transform = TargetTransform(
+                    pressure_index=None,
+                    stats_mean=volume_y_mean,
+                    stats_std=volume_y_std,
+                )
+                print(f"[VolumeNorm] channels={volume_y_mean.shape[0]} "
+                      f"mean={volume_y_mean.tolist()} std={volume_y_std.tolist()}")
+
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
@@ -1694,6 +1744,9 @@ def main() -> None:
     if config.wandb_name:
         run_config = asdict(config)
         run_config["effective_batch_size"] = config.batch_size * config.grad_accum_steps
+        if volume_transform is not None and volume_transform.stats_mean is not None:
+            run_config["volume_norm_mean"] = volume_transform.stats_mean.tolist()
+            run_config["volume_norm_std"] = volume_transform.stats_std.tolist()
         run = wandb.init(
             project=os.getenv("WANDB_PROJECT", "senpai-v1"),
             entity=os.getenv("WANDB_ENTITY"),
@@ -1715,6 +1768,7 @@ def main() -> None:
                 bundle=bundle, config=config, forward_model=forward_model,
                 anp_head=anp_head, loaders=loaders, transform=transform,
                 metric_transform=metric_transform, device=device, phase=phase,
+                volume_transform=volume_transform,
             )
             print(json.dumps({f"load_checkpoint_{phase}": metrics}, sort_keys=True), flush=True)
             if run is not None:
@@ -1754,6 +1808,7 @@ def main() -> None:
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
             skip_update_grad_norm=config.skip_update_grad_norm,
+            volume_transform=volume_transform,
         )
 
         grad_nonfinite_count += int(train_metrics.get("grad_nonfinite", 0))
@@ -1777,6 +1832,7 @@ def main() -> None:
                 metric_transform=metric_transform,
                 device=device,
                 phase="val",
+                volume_transform=volume_transform,
             )
 
             current_val = eval_metrics.get(val_primary_key)
@@ -1873,6 +1929,7 @@ def main() -> None:
             bundle=bundle, config=config, forward_model=forward_model,
             anp_head=anp_head, loaders=val_loaders, transform=transform,
             metric_transform=metric_transform, device=device, phase="val",
+            volume_transform=volume_transform,
         )
         current_val = eval_metrics.get(val_primary_key)
         if current_val is not None and current_val < best_val_metric:
@@ -1933,6 +1990,7 @@ def main() -> None:
             metric_transform=metric_transform,
             device=device,
             phase="test",
+            volume_transform=volume_transform,
         )
 
         if ema is not None:
@@ -1961,6 +2019,7 @@ def main() -> None:
                 metric_transform=metric_transform,
                 device=device,
                 phase="test",
+                volume_transform=volume_transform,
             )
             if run is not None:
                 best_checkpoint_metrics: dict[str, float | int | str] = {
