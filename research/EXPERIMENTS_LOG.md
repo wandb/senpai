@@ -1,5 +1,24 @@
 # SENPAI Research Results
 
+## 2026-04-24 10:45 — PR #3244: DM paper-facing full eval (faye) — SENT BACK (strategy change)
+
+- faye/dm-paper-facing-full-eval, W&B run: l7jxns6d, group: dm-paper-facing
+- Goal: get authoritative DM test metric over full evaluation set (no --max-eval-batches)
+- **Result: timeout at ep50, val=12.855%.** Full eval is 10x slower per epoch (~7min vs ~0.7min). Only 50/511 epochs completed.
+- **Sent back with two-phase strategy:** (1) train to convergence with --max-eval-batches 200, (2) load best checkpoint for a single full-eval pass.
+
+## 2026-04-24 10:45 — PR #3234: AF lower LR sweep (jin) — CLOSED (dead end)
+
+- jin/af-lower-lr-vol, W&B runs: yvct2fd1 (lr=5e-4), 9fv1p8bx (lr=4e-4), group: af-lower-lr-vol10x
+- Hypothesis: lower LR reduces gradient oscillations under vol-weight=10x
+
+| Trial | LR | surface_mse | vs baseline | vol_mse | vs baseline |
+|-------|-----|-------------|-------------|---------|-------------|
+| T1 | 5e-4 | 0.000492 | +66% | 0.004293 | +111% |
+| T2 | 4e-4 | 0.000408 | +38% | 0.003594 | +76% |
+
+- **Root cause:** lower LR → underfitting under vol-10x loss amplification. Both runs also diverged late (grad_norm → Infinity). lr=6e-4 now bracketed from below as optimum.
+
 ## 2026-04-24 10:15 — PR #3209: TFP cp_panel_prior_index bug fix + multi-seed reproducibility (sanji) — MERGED (bug fix)
 
 - sanji/bugfix/cp-panel-prior-index-tandemfoil-paper, W&B runs: hduq51jw (seed=0, 20ep), 9dodz26x (seed=42, 20ep), xgt4c9oc (seed=123, 20ep), xsk8r0rm (seed=0, 999ep stripped config)
