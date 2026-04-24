@@ -167,6 +167,8 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
+    separate_volume_head: bool = False
+    vol_head_width_mult: int = 2
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -505,6 +507,93 @@ def cp_panel_prior_index(config: TrainConfig, bundle: DatasetBundle) -> int | No
     return None
 
 
+class SeparateHeadTransolver(SenpaiTransolver):
+    """SenpaiTransolver with separate surface/volume output projections.
+
+    Replaces the shared LinearProjection with two MLP heads:
+    - Surface: hidden_dim -> hidden_dim -> surface_output_dim
+    - Volume:  hidden_dim -> hidden_dim*mult -> volume_output_dim (extra capacity)
+    """
+
+    def __init__(self, *, vol_head_width_mult: int = 2, **kwargs):
+        super().__init__(**kwargs)
+        n_h = self.n_hidden
+        self.surface_out_mlp = torch.nn.Sequential(
+            torch.nn.Linear(n_h, n_h),
+            torch.nn.GELU(),
+            torch.nn.Linear(n_h, self.surface_output_dim),
+        )
+        vol_hidden = n_h * vol_head_width_mult
+        self.volume_out_mlp = torch.nn.Sequential(
+            torch.nn.Linear(n_h, vol_hidden),
+            torch.nn.GELU(),
+            torch.nn.Linear(vol_hidden, self.volume_output_dim),
+        )
+        del self.out
+
+    def forward(
+        self,
+        *,
+        surface_x: torch.Tensor,
+        surface_mask: torch.Tensor,
+        volume_x: torch.Tensor | None = None,
+        volume_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor | None]:
+        surface_hidden = self._group_hidden(
+            surface_x, self.project_surface_features, self.surface_bias
+        )
+        hidden_parts = [surface_hidden]
+        mask_parts = [surface_mask]
+        has_volume = (
+            volume_x is not None
+            and volume_mask is not None
+            and self.volume_output_dim > 0
+        )
+        if has_volume:
+            vol_hidden = self._group_hidden(
+                volume_x, self.project_volume_features, self.volume_bias
+            )
+            hidden_parts.append(vol_hidden)
+            mask_parts.append(volume_mask)
+
+        hidden = torch.cat(hidden_parts, dim=1) + self.placeholder
+        attn_mask = torch.cat(mask_parts, dim=1)
+        hidden = self.backbone(hidden, attn_mask=attn_mask)
+        normed = self.norm(hidden)
+
+        surface_tokens = surface_x.shape[1]
+        surface_preds = self.surface_out_mlp(normed[:, :surface_tokens])
+        surface_preds = surface_preds * surface_mask.unsqueeze(-1)
+
+        volume_preds = None
+        if has_volume:
+            volume_tokens = volume_x.shape[1]
+            volume_preds = self.volume_out_mlp(
+                normed[:, surface_tokens : surface_tokens + volume_tokens]
+            )
+            if volume_mask is not None:
+                volume_preds = volume_preds * volume_mask.unsqueeze(-1)
+
+        surface_preds = self._apply_pressure_prior_addition(
+            surface_preds, surface_x, self.surface_pressure_prior_idx
+        )
+        if self.surface_head is not None and surface_preds is not None:
+            surface_preds = surface_preds + self.surface_head(
+                hidden[:, :surface_tokens], surface_preds
+            )
+            surface_preds = surface_preds * surface_mask.unsqueeze(-1)
+        volume_preds = self._apply_pressure_prior_addition(
+            volume_preds, volume_x, self.volume_pressure_prior_idx
+        )
+
+        return {
+            "surface_hidden": hidden[:, :surface_tokens],
+            "surface_preds": surface_preds,
+            "volume_hidden": None if not has_volume else hidden[:, surface_tokens:],
+            "volume_preds": volume_preds,
+        }
+
+
 def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
     transolver_kwargs = {
         "n_layers": config.model_layers,
@@ -525,7 +614,7 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
         )
     if config.model == "senpai_transolver":
         prior_idx = cp_panel_prior_index(config, bundle)
-        return SenpaiTransolver(
+        senpai_kwargs = dict(
             space_dim=bundle.spec.space_dim,
             surface_input_dim=bundle.spec.surface_input_dim,
             surface_output_dim=bundle.spec.surface_output_dim,
@@ -539,6 +628,12 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
             volume_pressure_prior_idx=prior_idx,
             **transolver_kwargs,
         )
+        if config.separate_volume_head:
+            return SeparateHeadTransolver(
+                vol_head_width_mult=config.vol_head_width_mult,
+                **senpai_kwargs,
+            )
+        return SenpaiTransolver(**senpai_kwargs)
     if config.model == "reference_abupt":
         return ABUPTReference(
             space_dim=bundle.spec.space_dim,
@@ -1663,6 +1758,8 @@ def main() -> None:
     if config.wandb_name:
         run_config = asdict(config)
         run_config["effective_batch_size"] = config.batch_size * config.grad_accum_steps
+        run_config["model_params"] = sum(p.numel() for p in model.parameters())
+        run_config["model_trainable_params"] = sum(p.numel() for p in model.parameters() if p.requires_grad)
         run = wandb.init(
             project=os.getenv("WANDB_PROJECT", "senpai-v1"),
             entity=os.getenv("WANDB_ENTITY"),
