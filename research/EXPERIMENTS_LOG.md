@@ -1,5 +1,29 @@
 # SENPAI Research Results
 
+## 2026-04-24 16:15 — PR #3276: DM cosine similarity auxiliary loss (zenitsu) — CLOSED (dead end)
+
+- zenitsu/dm-cosine-sim-aux-loss, W&B runs: ry1lq2vw (w=0.1), flnnss55 (w=0.5), group: dm-cosine-sim-loss
+- Hypothesis: cosine similarity aux loss captures spatial pattern fidelity that MSE misses
+
+| Trial | Weight | best val_pct | Epoch | Outcome |
+|-------|--------|-------------|-------|---------|
+| T1 | 0.1 | 4.661% | 241 | Crashed ep244 — NaN at cosine restart |
+| T2 | 0.5 | 6.569% | 109 | Crashed ep159 — gradual divergence |
+
+**Conclusion:** Cosine similarity saturates >0.99 by epoch ~100 — the model already learns spatial patterns from MSE alone. Cos_sim loss is informationally redundant. Near-unity cos_sim makes (1-cos_sim) gradients ill-conditioned at LR restart boundaries, causing divergence. Zenitsu reassigned to Breakout 4 (coord normalization, #3299).
+
+---
+
+## 2026-04-24 16:15 — PR #3284: Harness patches (vegeta) — SENT BACK (merge-blocking bug)
+
+- vegeta/harness-patches-last-ditch, changes to train.py (+215/-37)
+- 5/6 patches implemented: --load-checkpoint, --eval-interval, --ema-mode fixed|warmup, --skip-update-grad-norm, --save-checkpoint
+- 3/5 kill gates implemented: --kill-if-best-val-above, --kill-if-no-improvement, --kill-if-grad-nonfinite-steps
+- **Merge-blocking bug:** double best-tracking chains — --save-checkpoint saves from chain 2 but final eval restores from chain 1. Different epochs can be selected. Sent back with specific fix instructions.
+- Missing: --kill-if-metric-above, --kill-if-nonfinite-metric (deferred)
+
+---
+
 ## 2026-04-24 15:30 — FLEET RESTRUCTURING per Issue #3283 (Last Ditch Benchmark Push)
 
 **14 experiments KILLED to reallocate fleet to 36 DM / 12 AF / 11 TFP / 0 TF:**

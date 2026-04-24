@@ -1,9 +1,10 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 15:30 (advisor cycle 90 — LAST DITCH RESTRUCTURING)
+- **Date:** 2026-04-24 16:15 (advisor cycle 92)
 - **Branch:** radford
-- **ACTIVE DIRECTIVE: Issue #3283 — Last Ditch Benchmark Push (~10 hours remaining)**
-- **Fleet restructuring IN PROGRESS:** killed 14 misaligned experiments, reassigning 15 students
+- **ACTIVE DIRECTIVE: Issue #3283 — Last Ditch Benchmark Push (~8 hours remaining)**
+- **Fleet restructured.** 36 DM / 12 AF / 11 TFP / 0 TF.
+- **Harness patches (#3284):** 5/6 implemented, sent back for merge-blocking bug fix. HIGHEST PRIORITY.
 
 ## BINDING DIRECTIVE — Issue #3283 (2026-04-24)
 
@@ -26,7 +27,7 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 ## Fleet Status (restructuring in progress)
 
 ### INFRASTRUCTURE (1 PR)
-- `#3284` vegeta: HARNESS PATCHES (--load-checkpoint, --eval-interval, --ema-mode, --skip-update-grad-norm, --save-checkpoint, kill gates) — **HIGHEST PRIORITY**
+- `#3284` vegeta: HARNESS PATCHES — SENT BACK for merge-blocking bug (double best-tracking). 5/6 patches implemented. **HIGHEST PRIORITY — awaiting fix.**
 
 ### DrivAerML WIP (~28 continuing + 8 new = 36 target)
 **Champion recovery / truth lanes (newly assigned):**
@@ -38,6 +39,9 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 - robin: gradient-spike-safe gc=0.25 (Bucket D)
 - nami: T_max=24 narrow schedule (Bucket E)
 - chrome: T_max=36 narrow schedule (Bucket E)
+
+**Breakout lanes (newly assigned):**
+- `#3299` zenitsu: Breakout 4 — coordinate normalization + geometry features (xyz_norm, normals, log_area, front-facing)
 
 **Continuing DM experiments (from pre-restructure):**
 - `#3244` faye: paper-facing full eval (SENT BACK for champion ckpt eval)
@@ -231,6 +235,7 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 - Error-weighted surface sampling (hard example mining): crashed ep6 both trials (#3243). Distribution-shift collapse + 30-60min/epoch error-map compute + train/eval mismatch. Student note: error-weighted LOSS (not sampling) would avoid distribution shift but still faces mismatch.
 - Learnable register tokens (N=2/4/8): N=8 best 4.062% (+6%), N=2/N=4 NaN diverged (#3262). Category error — register tokens address pairwise attention sinks (ViT), but Transolver uses slice-based soft-clustering attention where sink mechanism doesn't apply.
 - Learnable Fourier frequencies: 5.262%/4.252% both diverged (#3260). Frequencies barely moved from init — fixed [0.5,2,8,32] are already near-optimal. Learnable freq + cosine restarts = cascading perturbation feedback loop.
+- Cosine similarity auxiliary loss: w=0.1→4.661% crashed ep244, w=0.5→6.569% crashed ep159 (#3276). Cos_sim saturates >0.99 by ep100 — spatially redundant with MSE. Near-unity cos_sim makes gradients ill-conditioned at LR restarts.
 - EMA>0.9995: 0.9999→7.106% NaN ep171, 0.99995→7.095% collapse ep120 (#3199). EMA=0.9995 sharp optimum bracketed both directions
 - SAM optimizer (rho=0.05/0.02): 5.36%/9.08%. SAM perturbation + cosine restart = double shock → catastrophic divergence. 2x compute penalty also prohibitive
 - True monotonic cosine (T_max=393606, no restarts): 4.086% (+0.253pp). Confirms T_max=30 rapid restarts are core mechanism, not noise. Monotonic decay can't compete
