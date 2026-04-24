@@ -1597,7 +1597,7 @@ def main() -> None:
             asinh_scale=config.asinh_scale,
         )
         metric_transform = None
-        if bundle.spec.name in {"airfrans", "tandemfoilset_paper"}:
+        if bundle.spec.name in {"airfrans"}:
             # Keep literature-facing metrics in the dataset's raw z-score space
             # even when training applies an auxiliary target transform.
             metric_transform = TargetTransform(
