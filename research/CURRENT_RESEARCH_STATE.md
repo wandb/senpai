@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 13:15 (advisor cycle 86)
+- **Date:** 2026-04-24 13:35 (advisor cycle 87)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -14,10 +14,10 @@
 - `#3262` megumi: learnable register tokens N=2/4/8 (attention sink absorption, Darcet NeurIPS 2024) — INNOVATION
 - `#3260` casca: learnable Fourier frequency magnitudes (meta-learned encoding) — INNOVATION
 - `#3270` brook: FiLM conditioning on global geometry statistics (per-car shape context) — INNOVATION
-- `#3243` jet: prediction-error-weighted surface sampling (hard example mining) — INNOVATION
+- `#3280` jet: per-channel output heads (separate MLPs for Ux, Uy, p) — INNOVATION
 - `#3242` historia: label smoothing / target noise augmentation — INNOVATION
 - `#3235` kakashi: multi-exit prediction (aux losses at intermediate layers) — INNOVATION
-- `#3273` gojo: Grouped Query Attention (GQA, 2/4 KV heads) — throughput-focused INNOVATION
+- `#3279` gojo: ReLU² activation in FFN (Primer-style squared ReLU for sparser features) — INNOVATION
 - `#3251` fern: Pre-LayerNorm architecture ablation (+ RMSNorm variant) — INNOVATION
 - `#3276` zenitsu: cosine similarity auxiliary loss (spatial pattern fidelity, w=0.1/0.5) — INNOVATION
 - `#3269` emma: learned error correction head (boosting-inspired self-correction) — INNOVATION
@@ -204,6 +204,8 @@
 - Input feature dropout (Fourier channels): p=0.1→4.73%, p=0.2→4.82% (#3253). Input-level dropout = information destruction. All 4 Fourier bands essential. Terminal divergence at both dropout rates
 - Curvature-weighted loss: alpha=1.0→4.48% diverge ep300, alpha=0.5→11.6% diverge ep53 (#3259). Train/eval mismatch (weighted vs uniform metric) + curvature amplifies gradient variance at restarts
 - Quadratic position features (x²/y²/z²/xy/xz/yz): 6.643% at ep168 timeout (#3272). Fatal 3x throughput penalty (168 vs 511 baseline epochs). Quad-only diverged ep63 — Fourier PE irreplaceable. Same epoch-starvation pattern as MoE (#3263).
+- Grouped Query Attention (GQA, 2/4 KV heads): 12.88%/6.88% both crashed (#3273). Throughput-neutral (bottleneck is slice routing einsums, not QKV). GQA destabilizes per-head slice routing — coupled KV sharing explodes at cosine restarts.
+- Error-weighted surface sampling (hard example mining): crashed ep6 both trials (#3243). Distribution-shift collapse + 30-60min/epoch error-map compute + train/eval mismatch. Student note: error-weighted LOSS (not sampling) would avoid distribution shift but still faces mismatch.
 - EMA>0.9995: 0.9999→7.106% NaN ep171, 0.99995→7.095% collapse ep120 (#3199). EMA=0.9995 sharp optimum bracketed both directions
 - SAM optimizer (rho=0.05/0.02): 5.36%/9.08%. SAM perturbation + cosine restart = double shock → catastrophic divergence. 2x compute penalty also prohibitive
 - True monotonic cosine (T_max=393606, no restarts): 4.086% (+0.253pp). Confirms T_max=30 rapid restarts are core mechanism, not noise. Monotonic decay can't compete
