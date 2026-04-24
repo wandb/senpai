@@ -1,5 +1,33 @@
 # SENPAI Research Results
 
+## 2026-04-24 18:30 — PR #3160: DrivAerML 16H attention heads (griffith) — CLOSED dead end
+
+- griffith/dm-16h-heads
+- Hypothesis: 16H/32d/head would improve attention expressiveness vs champion 8H/64d/head
+- Best: 5.358% val at ep156, then diverged at ep159 (cosine LR peak gradient instability). +1.525pp vs baseline 3.833%.
+- Root cause: 32d/head is too narrow — halved per-head capacity amplifies gradient spikes at T_max=30 cosine peaks. Champion 8H/64d is stable through 511+ epochs; 16H can't survive that long.
+- Conclusion: 8H/64d is the right head configuration for DM. Head count is not a lever here.
+- **Griffith assigned to #3312: DM champion recovery seed=777**
+
+---
+
+## 2026-04-24 18:25 — PR #3221: DrivAerML gradient noise injection (franky) — CLOSED dead end
+
+- franky/dm-gradient-noise
+- Hypothesis: injecting gradient noise (eta=0.1, gamma=0.55) helps escape sharp minima at cosine LR restart peaks
+
+| Trial | eta | gamma | best_val | best_test | Epochs |
+|-------|-----|-------|----------|-----------|--------|
+| 1 | 0.1 | 0.55 | 10.750% | 11.095% | 166 (120-min timeout) |
+| 2 | 0.01 | 0.55 | 6.26% | — | — |
+
+- W&B: pepltfz7 (Trial 1)
+- Both trials well above baseline 3.833%. gc=0.5 already stabilizes cosine restarts effectively — gradient noise on top adds instability rather than helpful exploration.
+- Conclusion: gradient noise is harmful when gc=0.5 is already in place. Not a direction to pursue.
+- **Franky assigned to #3311: DM champion recovery seed=1024**
+
+---
+
 ## 2026-04-24 17:20 — PR #3299: DrivAerML Breakout 4 coord normalization (zenitsu) — CLOSED dead end
 
 - zenitsu/dm-coord-normalization

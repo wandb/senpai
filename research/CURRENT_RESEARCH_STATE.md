@@ -1,11 +1,12 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 15:30 (advisor cycle 101)
+- **Date:** 2026-04-24 18:45 (advisor cycle 108)
 - **Branch:** radford
-- **ACTIVE DIRECTIVE: Issue #3283 — Last Ditch Benchmark Push (~4 hours remaining)**
-- **NEW TFP BEST: 0.002344** (PR #3056 merged, haku lr=1e-4)
-- **Fleet:** 59 students active. 36 DM / 12 AF / 11 TFP / 0 TF.
-- **Harness patches (#3284): MERGED.** All new DM runs use --save-checkpoint --skip-update-grad-norm 100 --ema-mode fixed --ema-start-step 50
+- **ACTIVE DIRECTIVE: Issue #3283 — Last Ditch Benchmark Push (final hours)**
+- **TFP BEST: 0.002344** (PR #3056 merged, haku lr=1e-4)
+- **DM authoritative TEST: 4.324%** (faye full-eval run zx5syby1 on ep517 ckpt). Target: <3.71% (AB-UPT). Gap: 0.614pp.
+- **Fleet:** 59 students active. 36 DM / 12 AF / 11 TFP / 0 TF. All students assigned.
+- **Harness patches (#3284): MERGED.** All DM runs use --no-compile-model (torch.compile + EMA bug), --save-checkpoint, --ema-mode fixed
 
 ## BINDING DIRECTIVE — Issue #3283 (2026-04-24)
 
@@ -30,7 +31,7 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 ### DrivAerML WIP (36 students)
 **Breakout lanes:**
 - `#3300` vegeta: **Breakout 1** — AB-UPT-style anchored decoder (geometry supernodes → surface anchor cross-attention → point decoding)
-- `#3299` zenitsu: **Breakout 4** — coordinate normalization + geometry features (xyz_norm using geometry_center/scale, normals, log_area, front-facing indicator)
+- ~~`#3299` zenitsu~~ **Breakout 4 CLOSED** — coord normalization destroys spatial encoding. KEY FINDING: geometry features (log_area, front_facing) alone showed strong regularization (grad norm 9-11 vs 28-35) — worth adding WITHOUT coord norm in future.
 - `#3301` brook: **Breakout 3** — domain-normalized volume auxiliary (round 2: relaxed kill gate, w=0.03/0.01 + surface-only control)
 - `#3302` canute: **Breakout 2** — metric-aware MSE + raw-rel-L2 loss (dm_rel_l2_weight 0.02/0.05/0.1)
 - **Breakout 5** (train+val retrain) — NOT YET ASSIGNED (only +8.5% data: 400→434 cases)
@@ -39,6 +40,10 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 - `#3293` norman: champion recovery seed=0 no-compile (Bucket A)
 - `#3285` jet: champion recovery seed=42 no-compile fixed-EMA (Bucket A)
 - `#3286` megumi: champion recovery seed=7 no-compile (Bucket A)
+- `#3305` faye: champion recovery seed=13 eval-interval=5 (Bucket A)
+- `#3310` zenitsu: champion recovery seed=456/789 (Bucket A)
+- `#3311` franky: champion recovery seed=1024 eval-interval=10 (Bucket A) ← NEW
+- `#3312` griffith: champion recovery seed=777 eval-interval=10 (Bucket A) ← NEW
 - `#3289` himmel: 64k surface points (Bucket C)
 - `#3290` askeladd: 96k surface points (Bucket C)
 - `#3294` robin: gradient-spike-safe gc=0.25 (Bucket D)
@@ -47,7 +52,7 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 
 **Continuing DM experiments (from pre-restructure):**
 - `#3244` faye: paper-facing full eval (SENT BACK for champion ckpt eval using --load-checkpoint)
-- `#3279` gojo: ReLU² activation
+- ~~`#3279` gojo~~ CLOSED dead end (diverged ep73, 8.832% val) → reassigned to #3308 narrow LR sweep (lr=4.8e-4, 5.2e-4)
 - `#3269` emma: error correction head
 - `#3267` mitsuha: SwiGLU FFN
 - `#3265` alphonse: hidden-space noise
@@ -59,10 +64,10 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 - `#3242` historia: label smoothing
 - `#3235` kakashi: multi-exit prediction
 - `#3228` chopper: stochastic weight perturbation
-- `#3221` franky: gradient noise injection
+- ~~`#3221` franky~~ CLOSED dead end (10.75%/6.26% val — gc=0.5 already stabilizes restarts) → reassigned to #3311 champion recovery seed=1024
 - `#3202` senku: GLU preprocess
 - `#3194` bulma: probe LR above 5e-4
-- `#3160` griffith: 16H heads
+- ~~`#3160` griffith~~ CLOSED dead end (5.358% val, diverged ep159) → reassigned to #3312 champion recovery seed=777
 - `#3152` eren: EMA sweep
 - `#3146` taki: checkpoint averaging
 - `#3143` thorfinn: Lookahead
