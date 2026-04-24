@@ -166,6 +166,8 @@ class TrainConfig:
     volume_anchor_points: int = 8_000
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
+    gn_eta: float = 0.0
+    gn_gamma: float = 0.55
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
@@ -1271,6 +1273,9 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    gn_eta: float = 0.0,
+    gn_gamma: float = 0.55,
+    gn_global_step: int = 0,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1344,6 +1349,14 @@ def train_one_epoch(
         if grad_clip > 0 and float(grad_norm) > grad_clip:
             running.setdefault("grad_clip_events", 0.0)
             running["grad_clip_events"] += 1.0
+        if gn_eta > 0:
+            noise_scale = gn_eta / (1 + gn_global_step) ** gn_gamma
+            for p in all_params:
+                if p.grad is not None:
+                    p.grad.add_(torch.randn_like(p.grad) * noise_scale)
+            running.setdefault("gradient_noise_scale_sum", 0.0)
+            running["gradient_noise_scale_sum"] += noise_scale
+            gn_global_step += 1
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
@@ -1363,6 +1376,9 @@ def train_one_epoch(
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
         running["lr"] = float(optimizer.param_groups[0]["lr"])
+    if gn_eta > 0 and steps > 0:
+        running["train/gradient_noise_scale"] = running.pop("gradient_noise_scale_sum") / steps
+    running["_gn_global_step"] = gn_global_step
     return running
 
 
@@ -1643,9 +1659,9 @@ def main() -> None:
     best_anp_state: dict[str, torch.Tensor] | None = None
 
     if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
+        val_primary_key = "val_primary/surface_pressure_mae"
     else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
+        val_primary_key = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1668,6 +1684,7 @@ def main() -> None:
 
     start_time = time.monotonic()
     timeout_seconds = None if not timeout_env else float(timeout_env) * 60.0
+    gn_global_step = 0
 
     for epoch in range(1, config.epochs + 1):
         if timeout_seconds is not None and epoch > 1 and (time.monotonic() - start_time) >= timeout_seconds:
@@ -1688,7 +1705,11 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            gn_eta=config.gn_eta,
+            gn_gamma=config.gn_gamma,
+            gn_global_step=gn_global_step,
         )
+        gn_global_step = train_metrics.pop("_gn_global_step", gn_global_step)
 
         if ema is not None:
             ema.store(model)
@@ -1719,7 +1740,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(val_primary_key)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
