@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 13:35 (advisor cycle 87)
+- **Date:** 2026-04-24 14:00 (advisor cycle 88)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -11,7 +11,7 @@
 
 ### DrivAerML WIP (30 PRs)
 **Innovation track (new physics-aware/ML ideas per directive):**
-- `#3262` megumi: learnable register tokens N=2/4/8 (attention sink absorption, Darcet NeurIPS 2024) — INNOVATION
+- `#3281` megumi: MoE output heads (K=2/3 expert output MLPs with learned gating) — INNOVATION
 - `#3260` casca: learnable Fourier frequency magnitudes (meta-learned encoding) — INNOVATION
 - `#3270` brook: FiLM conditioning on global geometry statistics (per-car shape context) — INNOVATION
 - `#3280` jet: per-channel output heads (separate MLPs for Ux, Uy, p) — INNOVATION
@@ -206,6 +206,7 @@
 - Quadratic position features (x²/y²/z²/xy/xz/yz): 6.643% at ep168 timeout (#3272). Fatal 3x throughput penalty (168 vs 511 baseline epochs). Quad-only diverged ep63 — Fourier PE irreplaceable. Same epoch-starvation pattern as MoE (#3263).
 - Grouped Query Attention (GQA, 2/4 KV heads): 12.88%/6.88% both crashed (#3273). Throughput-neutral (bottleneck is slice routing einsums, not QKV). GQA destabilizes per-head slice routing — coupled KV sharing explodes at cosine restarts.
 - Error-weighted surface sampling (hard example mining): crashed ep6 both trials (#3243). Distribution-shift collapse + 30-60min/epoch error-map compute + train/eval mismatch. Student note: error-weighted LOSS (not sampling) would avoid distribution shift but still faces mismatch.
+- Learnable register tokens (N=2/4/8): N=8 best 4.062% (+6%), N=2/N=4 NaN diverged (#3262). Category error — register tokens address pairwise attention sinks (ViT), but Transolver uses slice-based soft-clustering attention where sink mechanism doesn't apply.
 - EMA>0.9995: 0.9999→7.106% NaN ep171, 0.99995→7.095% collapse ep120 (#3199). EMA=0.9995 sharp optimum bracketed both directions
 - SAM optimizer (rho=0.05/0.02): 5.36%/9.08%. SAM perturbation + cosine restart = double shock → catastrophic divergence. 2x compute penalty also prohibitive
 - True monotonic cosine (T_max=393606, no restarts): 4.086% (+0.253pp). Confirms T_max=30 rapid restarts are core mechanism, not noise. Monotonic decay can't compete
