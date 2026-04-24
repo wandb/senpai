@@ -169,6 +169,7 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    glu_preprocess: bool = False
 
 
 @dataclass
@@ -499,6 +500,19 @@ def cp_panel_prior_index(config: TrainConfig, bundle: DatasetBundle) -> int | No
     return None
 
 
+class GLUProjection(torch.nn.Module):
+    def __init__(self, input_dim: int, output_dim: int):
+        super().__init__()
+        self.value = torch.nn.Linear(input_dim, output_dim)
+        self.gate = torch.nn.Linear(input_dim, output_dim)
+        for lin in (self.value, self.gate):
+            torch.nn.init.trunc_normal_(lin.weight, std=0.02)
+            torch.nn.init.zeros_(lin.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.value(x) * torch.sigmoid(self.gate(x))
+
+
 def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
     transolver_kwargs = {
         "n_layers": config.model_layers,
@@ -519,7 +533,7 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
         )
     if config.model == "senpai_transolver":
         prior_idx = cp_panel_prior_index(config, bundle)
-        return SenpaiTransolver(
+        model = SenpaiTransolver(
             space_dim=bundle.spec.space_dim,
             surface_input_dim=bundle.spec.surface_input_dim,
             surface_output_dim=bundle.spec.surface_output_dim,
@@ -533,6 +547,11 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
             volume_pressure_prior_idx=prior_idx,
             **transolver_kwargs,
         )
+        if config.glu_preprocess and model.project_surface_features is not None:
+            model.project_surface_features = GLUProjection(
+                model.surface_extra_dim, config.model_hidden_dim,
+            )
+        return model
     if config.model == "reference_abupt":
         return ABUPTReference(
             space_dim=bundle.spec.space_dim,
@@ -1643,9 +1662,9 @@ def main() -> None:
     best_anp_state: dict[str, torch.Tensor] | None = None
 
     if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
+        val_metric_key = "val_primary/surface_pressure_mae"
     else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
+        val_metric_key = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1719,7 +1738,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(val_metric_key)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
