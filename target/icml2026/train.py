@@ -169,6 +169,7 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    label_noise_std: float = 0.0
 
 
 @dataclass
@@ -804,16 +805,21 @@ def loss_abupt(
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
     volume_loss_weight: float = 1.0,
+    label_noise_std: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.geometry_position.device)
     metrics: dict[str, float] = {}
     if batch.surface_anchor_target is not None and outputs["surface_preds"] is not None:
         surf_target = transform.apply(batch.surface_anchor_target)
+        if label_noise_std > 0:
+            surf_target = surf_target + torch.randn_like(surf_target) * label_noise_std
         surf_loss = F.mse_loss(outputs["surface_preds"], surf_target)
         total = total + surf_loss
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if batch.volume_anchor_target is not None and outputs["volume_preds"] is not None:
         vol_target = transform.apply(batch.volume_anchor_target)
+        if label_noise_std > 0:
+            vol_target = vol_target + torch.randn_like(vol_target) * label_noise_std
         vol_loss = F.mse_loss(outputs["volume_preds"], vol_target)
         total = total + vol_loss * volume_loss_weight
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
@@ -1271,6 +1277,7 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    label_noise_std: float = 0.0,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1304,7 +1311,7 @@ def train_one_epoch(
                         surface_anchor_position=batch.surface_anchor_position,
                         volume_anchor_position=batch.volume_anchor_position,
                     )
-                    loss, _ = loss_abupt(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                    loss, _ = loss_abupt(batch, outputs, transform, volume_loss_weight=volume_loss_weight, label_noise_std=label_noise_std)
             else:
                 batch = batch.to(device)
                 if isinstance(transform, TandemTargetTransform):
@@ -1688,6 +1695,7 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            label_noise_std=config.label_noise_std,
         )
 
         if ema is not None:
