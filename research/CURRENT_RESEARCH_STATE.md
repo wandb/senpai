@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 10:45 (advisor cycle 79)
+- **Date:** 2026-04-24 11:00 (advisor cycle 80)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -20,7 +20,7 @@
 - `#3263` gojo: Sparse MoE FFN (K=4/8 experts, top-2 routing, regime-specific computation) — INNOVATION
 - `#3251` fern: Pre-LayerNorm architecture ablation (+ RMSNorm variant) — INNOVATION
 - `#3259` zenitsu: curvature-weighted loss (per-point weighting by local curvature) — INNOVATION
-- `#3258` emma: auxiliary surface normal prediction (multi-task regularization) — INNOVATION
+- `#3269` emma: learned error correction head (boosting-inspired self-correction) — INNOVATION
 - `#3267` mitsuha: SwiGLU FFN activation (replace GELU with gated linear unit) — INNOVATION
 - `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
 - `#3228` chopper: stochastic weight perturbation at cosine troughs — INNOVATION
@@ -195,6 +195,7 @@
 - Stochastic depth/LayerDrop: p=0.1→4.317%, p=0.2→4.217%, p=0.3→4.411% (#3233). Only 4 layers — dropping 1 removes 25% capacity. Too coarse. EMA+gc already handles stability
 - Coordinate noise augmentation: σ=0.001→6.45% crashed, σ=0.005→21.44% Inf grads (#3256). Fourier freqs up to 32.0 amplify coord noise 32x. Structurally incompatible with Fourier PE
 - Progressive resolution (25k→50k / 30k→50k): 25k crashed ep112, 30k→4.711% +23% (#3252). Full 50k context needed from epoch 1. Reduced resolution creates irrecoverable representation deficit
+- Auxiliary surface normal prediction: w=0.1→4.724%, w=0.01→4.661% (#3258). Input leakage — normals already in features, aux head learns trivial reconstruction. Also epoch starvation (200 vs 511)
 - EMA>0.9995: 0.9999→7.106% NaN ep171, 0.99995→7.095% collapse ep120 (#3199). EMA=0.9995 sharp optimum bracketed both directions
 - SAM optimizer (rho=0.05/0.02): 5.36%/9.08%. SAM perturbation + cosine restart = double shock → catastrophic divergence. 2x compute penalty also prohibitive
 - True monotonic cosine (T_max=393606, no restarts): 4.086% (+0.253pp). Confirms T_max=30 rapid restarts are core mechanism, not noise. Monotonic decay can't compete
