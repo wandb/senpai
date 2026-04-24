@@ -1,5 +1,32 @@
 # SENPAI Research Results
 
+## 2026-04-24 12:15 — PR #3254: AF multi-seed champion run (norman) — CLOSED (diagnostic, no winner)
+
+- norman/af-multi-seed-champion, W&B runs: 69bgiyis (seed=42), v3bl8pgv (seed=123), cv4fdye6 (seed=789), group: af-multi-seed
+- Hypothesis: a different seed might find vol_mse < 0.0017 under the champion config
+
+| Seed | surface_mse | vs baseline | vol_mse | vs baseline | Status |
+|------|-------------|-------------|---------|-------------|--------|
+| 0 (baseline) | **0.000296** | — | **0.002039** | — | Stable |
+| 42 | 0.000869 | +194% | 0.007117 | +249% | Diverged ep300 |
+| 123 | 0.000535 | +81% | 0.002831 | +39% | Stable |
+| 789 | 0.000532 | +80% | 0.003585 | +76% | Diverged at end |
+
+- **Diagnostic finding: Champion config has HIGH seed sensitivity.** Seed=0 significantly outperforms all 3 tested seeds. Cross-seed vol std=0.002200 (151% spread). The baseline benefits from initialization luck.
+- **Implication:** Config improvements must be tested multi-seed to confirm robustness.
+
+## 2026-04-24 12:15 — PR #3253: DM input feature dropout (canute) — CLOSED (dead end)
+
+- canute/dm-input-feature-dropout, W&B runs: 5kpd4fu0 (p=0.1), rso1a99o (p=0.2), group: dm-fourier-dropout
+- Hypothesis: Fourier channel dropout forces redundant representations
+
+| Trial | Dropout p | best val_pct | vs baseline | Terminal divergence |
+|-------|-----------|-------------|-------------|-------------------|
+| T1 | 0.1 | 4.732% | +23% | final 18.27% |
+| T2 | 0.2 | 4.821% | +26% | final 67.97% |
+
+- **Root cause:** Input-level dropout = information destruction, not regularization. All 4 Fourier frequency bands carry essential geometric information. Network can't route around absent INPUT features like it can with hidden-layer dropout. Dose-dependent degradation confirms smooth information loss.
+
 ## 2026-04-24 11:45 — PR #3263: DM Sparse MoE FFN (gojo) — CLOSED (dead end)
 
 - gojo/dm-moe-ffn, W&B runs: rei05zxk (K=4), hjkzjnn8 (K=8), group: dm-moe-ffn
