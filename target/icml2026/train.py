@@ -85,6 +85,14 @@ class EMAWithWarmup:
                 param.data.copy_(self.backup[key])
         self.backup = None
 
+    @torch.no_grad()
+    def reset_to_model(self, model: torch.nn.Module) -> None:
+        """Reset EMA shadow weights to current model weights, restarting the running average."""
+        for name, param in model.named_parameters():
+            key = self._clean(name)
+            if param.requires_grad and key in self.shadow:
+                self.shadow[key].copy_(param.detach())
+
 
 LEGACY_VAL_ALIAS = {
     "val_in_dist": "p_in",
@@ -124,6 +132,7 @@ class TrainConfig:
     use_lookahead: bool = True
     use_ema: bool = True
     ema_decay: float = 0.9999
+    ema_reset_interval: int = 0
     num_workers: int = -1
     pin_memory: bool = True
     persistent_workers: bool = True
@@ -1634,6 +1643,7 @@ def main() -> None:
 
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
+    ema_reset_count: int = 0
     history: list[dict[str, float]] = []
     best_epoch: int | None = None
     best_val_primary_metric_name = primary_metric_key(bundle, phase="val")
@@ -1736,9 +1746,19 @@ def main() -> None:
         if anp_head is not None and anp_ema is not None:
             anp_ema.restore(anp_head)
 
+        # Periodic EMA reset: copy current training model weights into the EMA shadow,
+        # allowing the EMA to track only the current optimization basin going forward.
+        if config.ema_reset_interval > 0 and epoch % config.ema_reset_interval == 0:
+            if ema is not None:
+                ema.reset_to_model(model)
+            if anp_head is not None and anp_ema is not None:
+                anp_ema.reset_to_model(anp_head)
+            ema_reset_count += 1
+
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
         epoch_metrics["best_val_metric"] = best_val_metric
         epoch_metrics["best_epoch"] = float(best_epoch)
+        epoch_metrics["ema_reset_count"] = float(ema_reset_count)
         history.append(epoch_metrics)
         if run is not None:
             wandb.log(epoch_metrics, step=epoch)
