@@ -168,6 +168,7 @@ class TrainConfig:
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
+    eval_every_n_epochs: int = 1
     seed: int = 0
 
 
@@ -1669,6 +1670,8 @@ def main() -> None:
     start_time = time.monotonic()
     timeout_seconds = None if not timeout_env else float(timeout_env) * 60.0
 
+    last_eval_epoch = 0
+
     for epoch in range(1, config.epochs + 1):
         if timeout_seconds is not None and epoch > 1 and (time.monotonic() - start_time) >= timeout_seconds:
             break
@@ -1690,6 +1693,77 @@ def main() -> None:
             volume_loss_weight=config.volume_loss_weight,
         )
 
+        should_eval = (
+            config.eval_every_n_epochs <= 1
+            or epoch % config.eval_every_n_epochs == 0
+            or epoch == config.epochs
+        )
+
+        eval_metrics: dict[str, float] = {}
+        if should_eval:
+            if ema is not None:
+                ema.store(model)
+                ema.copy_to(model)
+            if anp_head is not None and anp_ema is not None:
+                anp_ema.store(anp_head)
+                anp_ema.copy_to(anp_head)
+
+            eval_metrics = evaluate_phase_metrics(
+                bundle=bundle,
+                config=config,
+                forward_model=forward_model,
+                anp_head=anp_head,
+                loaders=val_loaders,
+                transform=transform,
+                metric_transform=metric_transform,
+                device=device,
+                phase="val",
+            )
+
+            current_primary_metric = eval_metrics.get(best_val_primary_metric_name)
+            if current_primary_metric is not None and (
+                best_val_primary_metric is None or current_primary_metric < best_val_primary_metric
+            ):
+                best_epoch = epoch
+                best_val_primary_metric = current_primary_metric
+                best_val_metrics = dict(eval_metrics)
+                best_model_state = snapshot_module_state(model)
+                best_anp_state = snapshot_module_state(anp_head)
+
+            current_val = eval_metrics.get(val_primary_key)
+            if current_val is not None and current_val < best_val_metric:
+                best_val_metric = current_val
+                best_epoch = epoch
+                best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                if anp_head is not None:
+                    best_anp_state = {k: v.cpu().clone() for k, v in anp_head.state_dict().items()}
+                if ema is not None:
+                    best_ema_shadow = {k: v.cpu().clone() for k, v in ema.shadow.items()}
+                if anp_ema is not None:
+                    best_anp_ema_shadow = {k: v.cpu().clone() for k, v in anp_ema.shadow.items()}
+
+            if ema is not None:
+                ema.restore(model)
+            if anp_head is not None and anp_ema is not None:
+                anp_ema.restore(anp_head)
+
+            last_eval_epoch = epoch
+
+        epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
+        epoch_metrics["best_val_metric"] = best_val_metric
+        epoch_metrics["best_epoch"] = float(best_epoch)
+        history.append(epoch_metrics)
+        if run is not None:
+            wandb.log(epoch_metrics, step=epoch)
+            run.summary["epoch"] = epoch
+            run.summary["best_epoch"] = best_epoch
+            run.summary["best_val_metric"] = best_val_metric
+        print(json.dumps(epoch_metrics, sort_keys=True), flush=True)
+
+    # Catch-up eval: if the last trained epoch wasn't evaluated (e.g. timeout),
+    # run one final validation pass to capture terminal metrics.
+    if history and last_eval_epoch < int(history[-1]["epoch"]):
+        catchup_epoch = int(history[-1]["epoch"])
         if ema is not None:
             ema.store(model)
             ema.copy_to(model)
@@ -1713,7 +1787,7 @@ def main() -> None:
         if current_primary_metric is not None and (
             best_val_primary_metric is None or current_primary_metric < best_val_primary_metric
         ):
-            best_epoch = epoch
+            best_epoch = catchup_epoch
             best_val_primary_metric = current_primary_metric
             best_val_metrics = dict(eval_metrics)
             best_model_state = snapshot_module_state(model)
@@ -1722,7 +1796,7 @@ def main() -> None:
         current_val = eval_metrics.get(val_primary_key)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
-            best_epoch = epoch
+            best_epoch = catchup_epoch
             best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             if anp_head is not None:
                 best_anp_state = {k: v.cpu().clone() for k, v in anp_head.state_dict().items()}
@@ -1736,16 +1810,10 @@ def main() -> None:
         if anp_head is not None and anp_ema is not None:
             anp_ema.restore(anp_head)
 
-        epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
-        epoch_metrics["best_val_metric"] = best_val_metric
-        epoch_metrics["best_epoch"] = float(best_epoch)
-        history.append(epoch_metrics)
         if run is not None:
-            wandb.log(epoch_metrics, step=epoch)
-            run.summary["epoch"] = epoch
+            wandb.log(eval_metrics, step=catchup_epoch)
             run.summary["best_epoch"] = best_epoch
             run.summary["best_val_metric"] = best_val_metric
-        print(json.dumps(epoch_metrics, sort_keys=True), flush=True)
 
     if best_epoch is not None:
         print(
