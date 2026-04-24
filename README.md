@@ -129,7 +129,7 @@ cp example.env .env
 
 `.env` is already gitignored, so the token stays local.
 
-> **Target-repo permissions.** The token you supply must be able to **clone** `target_repo_url` and **push branches + open/merge PRs** against it. `launch.py` preflights this against the GitHub API before spinning up pods and fails loudly if `permissions.push` is false. Same applies to the `CLAUDE_CODE_OAUTH_TOKEN` user (still in `senpai-secrets`) if you rely on `gh auth status` inside the pod.
+> **Target-repo permissions.** Prefer a deliberately created classic PAT (`ghp_...`) with `repo` and `read:org`; copied GitHub CLI OAuth tokens (`gho_...`) are easy to launch with stale or insufficient scopes. The token must be able to **clone** `target_repo_url` and **push branches + open/merge PRs** against it. `launch.py` preflights this against the GitHub API before spinning up pods and fails loudly if `permissions.push` is false. Same applies to the `CLAUDE_CODE_OAUTH_TOKEN` user (still in `senpai-secrets`) if you rely on `gh auth status` inside the pod.
 
 ### Shared cluster secrets (`senpai-secrets`)
 
@@ -171,7 +171,8 @@ kubectl patch secret senpai-secrets \
 # Clone the active problem-package repo into target/ (one-time, for local dev)
 git clone -b kagent_royal_rumble https://github.com/morganmcg1/tandemfoil2.git target/
 
-# Train locally (inside the active problem package)
+# Train locally (inside the active problem package; copy exact flags from --help)
+cd target/ && python train.py --help
 cd target/ && python train.py --wandb_name "<name>/<description>"
 
 # Deploy to k8s (reads defaults from senpai.yaml, only --tag is required)

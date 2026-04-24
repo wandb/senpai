@@ -92,6 +92,18 @@ mark_ready_for_review() {
     swap_gh_pr_label "$num" "status:wip" "status:review"  # swap_gh_pr_label uses gh_retry internally
 }
 
+# Create a real assignment branch before opening a PR.
+#   create_assignment_branch <student> <hypothesis-slug>
+create_assignment_branch() {
+    local student="$1" slug="$2" branch="${student}/${slug}"
+    git checkout "$ADVISOR_BRANCH"
+    git pull origin "$ADVISOR_BRANCH"
+    git checkout -b "$branch"
+    git commit --allow-empty -m "assign ${student}: ${slug}"
+    git push -u origin "$branch"
+    git rev-list --count "${ADVISOR_BRANCH}..HEAD" | grep -vq '^0$'
+}
+
 # ---------------------------------------------------------------------------
 # JSON helpers
 # ---------------------------------------------------------------------------
@@ -110,6 +122,45 @@ items = [i for blob in sys.argv[1:] if blob for i in json.loads(blob)]
 ts = [i['updatedAt'] for i in items if 'updatedAt' in i]
 print(max(ts) if ts else '')
 " "$@"
+}
+
+# ---------------------------------------------------------------------------
+# PR reads
+# ---------------------------------------------------------------------------
+
+# REST-backed PR reads avoid `gh pr view --comments`, whose GraphQL query can
+# require org scopes that repo-only launch tokens do not have.
+pr_body() {
+    local num="$1"
+    gh_retry gh api "repos/${GH_REPO}/pulls/${num}" \
+        --jq '{number,title,headRefName:.head.ref,baseRefName:.base.ref,isDraft:.draft,body}'
+}
+
+pr_issue_comments() {
+    local num="$1"
+    gh_retry gh api "repos/${GH_REPO}/issues/${num}/comments?per_page=100" \
+        --jq '[.[] | {kind:"issue",author:.user.login,createdAt:.created_at,updatedAt:.updated_at,body}]'
+}
+
+pr_reviews() {
+    local num="$1"
+    gh_retry gh api "repos/${GH_REPO}/pulls/${num}/reviews?per_page=100" \
+        --jq '[.[] | {kind:"review",author:.user.login,state,submittedAt:.submitted_at,body}]'
+}
+
+pr_review_comments() {
+    local num="$1"
+    gh_retry gh api "repos/${GH_REPO}/pulls/${num}/comments?per_page=100" \
+        --jq '[.[] | {kind:"inline",author:.user.login,path,line,createdAt:.created_at,updatedAt:.updated_at,body}]'
+}
+
+pr_all_comments() {
+    local num="$1" issues reviews inline
+    issues=$(pr_issue_comments "$num") || return
+    reviews=$(pr_reviews "$num") || return
+    inline=$(pr_review_comments "$num") || return
+    python3 -c "import json,sys; print(json.dumps([x for blob in sys.argv[1:] for x in json.loads(blob)]))" \
+        "$issues" "$reviews" "$inline"
 }
 
 # ---------------------------------------------------------------------------

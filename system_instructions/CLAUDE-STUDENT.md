@@ -28,6 +28,10 @@ source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 # Mark a PR ready for advisor review (if not using /senpai:submit-experiment-results)
 mark_ready_for_review <pr#>
 
+# Read PR bodies and comments through REST-backed helpers.
+pr_body <pr#>
+pr_all_comments <pr#>
+
 # Swap a label (e.g. to ask the advisor a question)
 swap_gh_pr_label <pr#> "status:wip" "status:review"
 ```
@@ -35,14 +39,18 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
 ## Your loop
 
 1. **Poll for work**
-   Invoke the `senpai:poll-for-work` skill with args `<your-name>` to check for assigned PRs. If nothing is assigned, wait 60 seconds and poll again.
+   The pod entrypoint polls before invoking you. The `## Student research state` block in your prompt is the source of truth for the current assignment.
+   - PR assignments are label-based: assigned work has both `student:<your-name>` and `status:wip`.
+   - GitHub assignees are not used for assignment. Never use `gh pr list --assignee ...` to find your work.
+   - Do not create persistent GitHub polling monitors. If no PRs or issues are listed, exit; the entrypoint will sleep and re-invoke you when work appears.
+   - If you need to manually re-check during a live session, invoke the `senpai:poll-for-work` skill with args `<your-name>` or run `student_poll_for_work "<your-name>"` after sourcing `senpai-gh.sh`.
    - Invoke the `senpai:check-human-issues` skill with args `<your-name> STUDENT` (e.g. `fern STUDENT`) to check for messages from the human research team. Human issues with urgent instructions take priority over existing experimental work — that includes killing experiments that are currently running if instructed.
 
 2. **Pick up a PR**
    - Read the PR body — it contains the hypothesis, instructions, and baseline metrics.
    - Check for review comments (this may be a revision):
      ```bash
-     gh pr view <number> --comments
+     pr_all_comments <number>
      ```
    - Check out the branch:
      ```bash
@@ -71,12 +79,13 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
    ```bash
    cd "$PROBLEM_DIR" && python train.py --dataset <dataset> --agent <your-name> --wandb_name "<your-name>/<description>" [--wandb_group "<idea>"]
    ```
+   - Before the first run in a target, read `python train.py --help` and use the exact flag names it exposes.
    - **Timeout**: The `SENPAI_MAX_EPOCHS` and `SENPAI_TIMEOUT_MINUTES` env vars control the max epochs and timeout for each training run in train.py. Ensure training runs do not exceed these limits.
    - Use `--wandb_group` only when the PR instructions say to (the advisor sets this for multi-iteration ideas).
    - Only run multiple variations if the PR instructions explicitly ask for it (e.g. "try surface weight 5, 10, 20"). Otherwise, run the single experiment described.
    - **After each run finishes**, check for new advisor comments before continuing:
      ```bash
-     gh pr view <number> --comments
+     pr_all_comments <number>
      ```
      If the advisor has left new instructions (e.g. to try a different variant, abort the current direction, or adjust parameters), follow them instead of proceeding with the original plan.
    - If the PR is intentionally cross-dataset, use your 8 GPUs to cover the
@@ -107,7 +116,17 @@ swap_gh_pr_label <pr#> "status:wip" "status:review"
 6. **Submit for review**
    Invoke the `senpai:submit-experiment-results` skill with args `<pr-number> $PROBLEM_DIR` to commit, push, mark ready, and swap the status label.
 
-7. **Go back to step 1** and poll for the next assignment.
+7. **Finish this invocation**
+   After the assigned PR or human issue is resolved, stop. The entrypoint will return to step 1, poll for the next assignment, and invoke you again when there is work.
+
+## Wait idioms inside Claude Code
+
+- Do not run foreground waits such as `sleep 60 && gh ...`.
+- If you are only waiting for new work, exit and let the entrypoint re-enter.
+- Use `ScheduleWakeup` only for bounded continuation of active local work, such as checking a training run you already launched.
+- Use `Monitor` for condition waits over logs, PIDs, or GPU status.
+- Do not use `Monitor` for GitHub assignment polling. Assignment polling belongs to the entrypoint and the `senpai:poll-for-work` helper.
+- Use a background `until ...; do sleep N; done` loop only for a bounded local check.
 
 ### Give new experiments the best possible chance of success
 

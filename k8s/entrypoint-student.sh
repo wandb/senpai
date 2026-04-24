@@ -59,7 +59,7 @@ PROMPT="${TASK_INSTRUCTIONS}"
 KEY_INFO=$'\n\nKey information:\n\nStudent: '"$STUDENT_NAME"' | Target repo: '"$GH_REPO"' | Advisor Branch: '"$ADVISOR_BRANCH"' | W&B entity/project: '"$WANDB_ENTITY"'/'"$WANDB_PROJECT"$'\n'
 FULL_PROMPT="${PROMPT}"$'\n\n'"${KEY_INFO}"
 
-HEARTBEAT_PROMPT="Continue your student loop. Check for assigned PRs, check for GitHub issues, and resume any in-progress work."
+HEARTBEAT_PROMPT="Continue your student loop using the assigned PRs and GitHub issues listed in the Student research state below. The entrypoint owns assignment polling; do not start persistent GitHub polling monitors."
 
 # --- Launch Claude Code Loop ---
 export IS_SANDBOX=1
@@ -111,6 +111,15 @@ while true; do
     echo "=== Log: $LOGFILE ==="
     echo "$TRIAGE_INFO" > "$LOGFILE"
 
+    # The shell loop is the source of truth for assignment polling. If there
+    # is no work, do not enter Claude Code; idle model sessions tend to invent
+    # their own polling loops and can miss the label-based assignment contract.
+    if [ "$ASSIGNED_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ]; then
+        echo "=== No work assigned, sleeping $SLEEP_TIME_S seconds without invoking Claude ==="
+        sleep "$SLEEP_TIME_S"
+        continue
+    fi
+
     START_TS=$(date +%s)
     EXIT_CODE=0
     if [ "$ITERATION" -eq 1 ]; then
@@ -119,13 +128,6 @@ while true; do
         echo "$TRIAGE_INFO"
         run_senpai_claude $MAX_TURNS "${FULL_PROMPT}"$'\n\n'"${TRIAGE_INFO}" || EXIT_CODE=$?
     else
-        # --- Skip if nothing to do ---
-        if [ "$ASSIGNED_COUNT" -eq 0 ] && [ "$ISSUE_COUNT" -eq 0 ]; then
-            echo "=== No work assigned, sleeping $SLEEP_TIME_S seconds ==="
-            sleep "$SLEEP_TIME_S"
-            continue
-        fi
-
         echo "=== Iteration $ITERATION: Using heartbeat prompt ==="
         echo "$HEARTBEAT_PROMPT"
         echo "$TRIAGE_INFO"

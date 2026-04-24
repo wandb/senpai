@@ -32,16 +32,15 @@ The hypothesis details, instructions, and baseline metrics come from your own re
 1. **Start from the latest advisor branch:**
 
 ```bash
+source "${CLAUDE_PLUGIN_ROOT}/scripts/senpai-gh.sh"
 ADVISOR_BRANCH="${ADVISOR_BRANCH}"  # from environment
-git checkout "$ADVISOR_BRANCH" && git pull origin "$ADVISOR_BRANCH"
 ```
 
-2. **Create the experiment branch:**
+2. **Create the experiment branch with a real assignment commit:**
 
 ```bash
 BRANCH="$0/$1"
-git checkout -b "$BRANCH"
-git push -u origin "$BRANCH"
+create_assignment_branch "$0" "$1"
 ```
 
 3. **Create the draft PR** with the template below. Replace the placeholders with your actual hypothesis, instructions, and baseline data:
@@ -76,6 +75,7 @@ PREOF
 ## Important details
 
 - **Read BASELINE.md** before creating the PR take the most recent metrics from the file. The student needs concrete metrics to compare against.
+- **Do not skip `create_assignment_branch`.** GitHub rejects PRs with no commits between the advisor branch and head.
 - **Pass the active problem dir as the third argument.** Example: `senpai:assign-experiment fern cosine-annealing target/cfd_tandemfoil`.
 - **Be specific in instructions.** The student implements exactly what you write. Vague instructions waste GPU time.
 - **Use `--wandb_group`** in instructions when a hypothesis needs multiple iterations (e.g. "try surface weight 5, 10, 20") so related runs are grouped in W&B.

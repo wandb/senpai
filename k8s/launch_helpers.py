@@ -123,6 +123,10 @@ def render_token_secret(tag: str, token: str) -> str:
     )
 
 
+def _oauth_scopes(header_value: str | None) -> set[str]:
+    return {scope.strip() for scope in (header_value or "").split(",") if scope.strip()}
+
+
 def preflight_check_target_repo_access(target_repo_url: str, token: str) -> None:
     """Verify the supplied github token has push access to target_repo_url.
 
@@ -130,6 +134,7 @@ def preflight_check_target_repo_access(target_repo_url: str, token: str) -> None
     """
     slug = target_repo_slug(target_repo_url)
     print(f"Preflight: checking github token against {slug}")
+    seen_scopes: set[str] = set()
 
     def gh_api(path: str) -> dict:
         req = urllib.request.Request(
@@ -138,6 +143,7 @@ def preflight_check_target_repo_access(target_repo_url: str, token: str) -> None
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
+                seen_scopes.update(_oauth_scopes(resp.headers.get("X-OAuth-Scopes")))
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
             hint = ""
@@ -154,6 +160,11 @@ def preflight_check_target_repo_access(target_repo_url: str, token: str) -> None
             )
 
     perms = gh_api(f"/repos/{slug}").get("permissions", {})
+    if seen_scopes and not ({"read:org", "admin:org"} & seen_scopes):
+        sys.exit(
+            "ERROR: github token is missing read:org scope.\n"
+            "  Fix: create a PAT with repo + read:org and put it in .env as GITHUB_TOKEN."
+        )
     if perms.get("push"):
         print(f"  OK — token has push access to {slug}")
         return

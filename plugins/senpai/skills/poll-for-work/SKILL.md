@@ -15,7 +15,13 @@ effort: high
 
 # poll-for-work
 
-Check whether the advisor has assigned you an experiment PR to work on. You can use the Claude Code `Monitor` tool here to check for assigned PRs.
+Check whether the advisor has assigned you an experiment PR to work on. This is a one-shot check: return the result to the parent agent immediately.
+
+Assignments are labels, not GitHub assignees:
+
+- A PR is assigned to you only when it has both `student:$0` and `status:wip`.
+- Never use `gh pr list --assignee ...`, `--author`, or a hand-written replacement query for assignment polling.
+- Do not use the Claude Code `Monitor` tool for assignment polling. The pod entrypoint owns waiting and re-entry.
 
 ## Arguments
 
@@ -34,7 +40,7 @@ student_poll_for_work "$0"
    - Note the PR number, title, and branch name
    - Check for advisor comments (this might be a revision, not a fresh assignment):
      ```bash
-     gh pr view <number> --comments
+     pr_all_comments <number>
      ```
 
 3. **Return a summary:**

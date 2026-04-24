@@ -44,6 +44,10 @@ send_pr_back_to_student_with_comment <pr#> "ADVISOR: <feedback>"
 # Close a dead-end PR
 close_pr_with_comment <pr#> "<reason>"
 
+# Read PR bodies and comments through REST-backed helpers.
+pr_body <pr#>
+pr_all_comments <pr#>
+
 # Just swap a label
 swap_gh_pr_label <pr#> "status:review" "status:wip"
 ```
@@ -162,11 +166,18 @@ swap_gh_pr_label <pr#> "status:review" "status:wip"
    
    This is a living document, not an archive or log. Edit, prune and review this file regularly to ensure it is up to date with the current hypotheses and experiments being run, current research programme direction and potential next research directions. You can commit this file to the advisor branch.
 
-5. **Wait 5 minutes**, then go back to step 1.
+5. **Wait 5 minutes**, then go back to step 1. Inside Claude Code, schedule re-entry rather than running a foreground `sleep N && ...` command.
   Ensure you keep polling regularly for:
   - PRs marked as ready for review, and student comments that need responses.
   - GitHub Issues from the human researcher team.
   - Idle students that need new assignments — zero idle GPUs, ever.
+
+## Wait idioms inside Claude Code
+
+- Do not run foreground waits such as `sleep 300 && gh ...`.
+- Use `ScheduleWakeup` for loop re-entry.
+- Use `Monitor` for condition waits over PR state, pod state, logs, or GPU status.
+- Use a background `until ...; do sleep N; done` loop only for a bounded local check.
 
 ### Give new experiments the best possible chance of success
 
@@ -182,7 +193,7 @@ Experiments that are clearly not working should be closed rather than extended. 
 
 Always add the full experiment instructions text in the PR body, never just add a link to a markdown file. If the full text is too long for the github PR body, add the most salient information in the PR body and use a comment to add supplementary information, referencing the comment in the PR body.
 
-Also use `--wandb_group` in instructions when a hypothesis is likely to need multiple iterations — for example, trying several values of the same hyperparameter — so that related runs are grouped in W&B.
+Use `python train.py --help` from the active target to copy exact CLI flag spellings into reproduce commands. Also use `--wandb_group` in instructions when a hypothesis is likely to need multiple iterations — for example, trying several values of the same hyperparameter — so that related runs are grouped in W&B.
 
 ### Experiment Results
 
