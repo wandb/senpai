@@ -86,6 +86,23 @@ class EMAWithWarmup:
         self.backup = None
 
 
+class AuxNormalHead(torch.nn.Module):
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.LayerNorm(hidden_dim),
+            torch.nn.Linear(hidden_dim, 256),
+            torch.nn.GELU(),
+            torch.nn.Linear(256, 3),
+        )
+        torch.nn.init.zeros_(self.net[-1].weight)
+        torch.nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        out = self.net(hidden)
+        return F.normalize(out, dim=-1)
+
+
 LEGACY_VAL_ALIAS = {
     "val_in_dist": "p_in",
     "val_ood_cond": "p_oodc",
@@ -169,6 +186,7 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    aux_normal_weight: float = 0.0
 
 
 @dataclass
@@ -1271,10 +1289,15 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    aux_normal_head: AuxNormalHead | None = None,
+    aux_normal_weight: float = 0.0,
+    aux_normal_ema: EMAWithWarmup | None = None,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
         anp_head.train()
+    if aux_normal_head is not None:
+        aux_normal_head.train()
     running = {"loss": 0.0}
     steps = 0
     micro_batches_total = 0
@@ -1327,6 +1350,14 @@ def train_one_epoch(
                             volume_mask=batch.volume_mask,
                         )
                         loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                        if aux_normal_head is not None and aux_normal_weight > 0 and outputs.get("surface_hidden") is not None:
+                            pred_normals = aux_normal_head(outputs["surface_hidden"])
+                            target_normals = F.normalize(batch.surface_x[:, :, 3:6], dim=-1)
+                            cos_sim = F.cosine_similarity(pred_normals, target_normals, dim=-1)
+                            aux_loss = ((1.0 - cos_sim) * batch.surface_mask).sum() / batch.surface_mask.sum().clamp(min=1)
+                            loss = loss + aux_loss * aux_normal_weight
+                            running.setdefault("aux_normal_loss", 0.0)
+                            running["aux_normal_loss"] += float(aux_loss.detach().cpu().item())
 
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
@@ -1338,6 +1369,8 @@ def train_one_epoch(
         all_params = list(model.parameters())
         if anp_head is not None:
             all_params += list(anp_head.parameters())
+        if aux_normal_head is not None:
+            all_params += list(aux_normal_head.parameters())
         grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=grad_clip if grad_clip > 0 else float("inf"))
         running.setdefault("grad_norm_mean", 0.0)
         running["grad_norm_mean"] += float(grad_norm)
@@ -1352,6 +1385,8 @@ def train_one_epoch(
             running["ema_decay_actual"] = min(ema.decay, (1 + ema.step_counter) / (10 + ema.step_counter))
         if anp_head is not None and anp_ema is not None:
             anp_ema.update(anp_head)
+        if aux_normal_head is not None and aux_normal_ema is not None:
+            aux_normal_ema.update(aux_normal_head)
         running["loss"] += accum_loss / micro_count
         micro_batches_total += micro_count
         steps += 1
@@ -1359,6 +1394,8 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    if "aux_normal_loss" in running:
+        running["aux_normal_loss"] /= max(steps, 1)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1623,9 +1660,15 @@ def main() -> None:
             output_dim=bundle.spec.surface_output_dim,
         ).to(device)
 
+    aux_normal_head = None
+    if config.aux_normal_weight > 0:
+        aux_normal_head = AuxNormalHead(getattr(model, "n_hidden", 192)).to(device)
+
     params = list(model.parameters())
     if anp_head is not None:
         params.extend(list(anp_head.parameters()))
+    if aux_normal_head is not None:
+        params.extend(list(aux_normal_head.parameters()))
     optimizer = build_optimizer(params, config)
     scheduler = None
     if config.cosine_t_max > 0:
@@ -1634,6 +1677,7 @@ def main() -> None:
 
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
+    aux_normal_ema = EMAWithWarmup(aux_normal_head, decay=config.ema_decay) if config.use_ema and aux_normal_head is not None else None
     history: list[dict[str, float]] = []
     best_epoch: int | None = None
     best_val_primary_metric_name = primary_metric_key(bundle, phase="val")
@@ -1688,6 +1732,9 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            aux_normal_head=aux_normal_head,
+            aux_normal_weight=config.aux_normal_weight,
+            aux_normal_ema=aux_normal_ema,
         )
 
         if ema is not None:
@@ -1696,6 +1743,9 @@ def main() -> None:
         if anp_head is not None and anp_ema is not None:
             anp_ema.store(anp_head)
             anp_ema.copy_to(anp_head)
+        if aux_normal_head is not None and aux_normal_ema is not None:
+            aux_normal_ema.store(aux_normal_head)
+            aux_normal_ema.copy_to(aux_normal_head)
 
         eval_metrics = evaluate_phase_metrics(
             bundle=bundle,
@@ -1735,6 +1785,8 @@ def main() -> None:
             ema.restore(model)
         if anp_head is not None and anp_ema is not None:
             anp_ema.restore(anp_head)
+        if aux_normal_head is not None and aux_normal_ema is not None:
+            aux_normal_ema.restore(aux_normal_head)
 
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
         epoch_metrics["best_val_metric"] = best_val_metric
