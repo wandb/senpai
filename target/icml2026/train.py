@@ -86,6 +86,45 @@ class EMAWithWarmup:
         self.backup = None
 
 
+class WSLinear(torch.nn.Linear):
+    """Weight Standardization applied to nn.Linear (Qiao et al., 2019)."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = self.weight
+        mean = weight.mean(dim=1, keepdim=True)
+        std = weight.std(dim=1, keepdim=True).clamp(min=1e-5)
+        weight = (weight - mean) / std
+        return F.linear(x, weight, self.bias)
+
+
+def apply_weight_standardization(model: torch.nn.Module) -> int:
+    """Replace nn.Linear with WSLinear in transformer layers, skipping output heads."""
+    exclude = {"out.project", "surface_head"}
+    count = 0
+    for name, module in list(model.named_modules()):
+        if any(ex in name for ex in exclude):
+            continue
+        if not isinstance(module, torch.nn.Linear) or isinstance(module, WSLinear):
+            continue
+        ws = WSLinear(module.in_features, module.out_features, bias=module.bias is not None)
+        ws.weight = module.weight
+        if module.bias is not None:
+            ws.bias = module.bias
+        parts = name.rsplit(".", 1)
+        if len(parts) == 2:
+            parent_name, attr_name = parts
+            parent = dict(model.named_modules())[parent_name]
+        else:
+            parent = model
+            attr_name = parts[0]
+        if isinstance(parent, torch.nn.Sequential):
+            parent[int(attr_name)] = ws
+        else:
+            setattr(parent, attr_name, ws)
+        count += 1
+    return count
+
+
 LEGACY_VAL_ALIAS = {
     "val_in_dist": "p_in",
     "val_ood_cond": "p_oodc",
@@ -169,6 +208,7 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    weight_standardization: bool = False
 
 
 @dataclass
@@ -1615,6 +1655,9 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
+    if config.weight_standardization:
+        ws_count = apply_weight_standardization(model)
+        print(f"[WS] Replaced {ws_count} Linear layers with WSLinear")
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
