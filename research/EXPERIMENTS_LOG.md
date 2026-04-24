@@ -1,5 +1,18 @@
 # SENPAI Research Results
 
+## 2026-04-24 12:45 — PR #3259: DM curvature-weighted loss (zenitsu) — CLOSED (dead end)
+
+- zenitsu/dm-curvature-weighted-loss, W&B runs: rwkptewj (alpha=1.0), 434enoo9 (alpha=0.5), group: dm-curvature-weighted-loss
+- Hypothesis: weighting MSE by local surface curvature focuses learning on high-curvature regions (edges, junctions)
+
+| Trial | alpha | best val_pct | vs baseline | Outcome |
+|-------|-------|-------------|-------------|---------|
+| T1 | 1.0 | 4.482% | +17% | Catastrophic divergence ep300 (final 70.75%) |
+| T2 | 0.5 | 11.602% | +203% | Diverged ep53 (final 72.44%) |
+
+- **Dual root cause:** (1) Train/eval mismatch — curvature weighting optimizes a different objective than the uniform relative-L2 metric. (2) Curvature weights amplify gradient variance at cosine restarts → explosive divergence. Lighter alpha diverged FASTER (shallower basin, less restart-tolerant).
+- **Conclusion:** Any static geometry-based per-point loss weighting creates structural misalignment with the uniform evaluation metric.
+
 ## 2026-04-24 12:15 — PR #3254: AF multi-seed champion run (norman) — CLOSED (diagnostic, no winner)
 
 - norman/af-multi-seed-champion, W&B runs: 69bgiyis (seed=42), v3bl8pgv (seed=123), cv4fdye6 (seed=789), group: af-multi-seed
