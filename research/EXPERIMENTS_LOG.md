@@ -1,5 +1,18 @@
 # SENPAI Research Results
 
+## 2026-04-24 11:45 — PR #3263: DM Sparse MoE FFN (gojo) — CLOSED (dead end)
+
+- gojo/dm-moe-ffn, W&B runs: rei05zxk (K=4), hjkzjnn8 (K=8), group: dm-moe-ffn
+- Hypothesis: sparse MoE FFN allows regime-specific computation (different experts for stagnation/wake/underbody)
+
+| Trial | K experts | best val_pct | vs baseline | Epochs (vs 511) |
+|-------|-----------|-------------|-------------|-----------------|
+| T1 | 4 | 5.092% | +33% | 173 (timeout) |
+| T2 | 8 | 5.348% | +40% | 136 (timeout) |
+
+- **Dual failure:** (1) 1.7-2.2x throughput penalty — expert loop not compile-friendly → epoch starvation to 136-173 vs 511. (2) Routing collapse — balance_coeff=0.1 forces uniform routing (99-100% max entropy), preventing regime specialization. balance_coeff=0.01 causes full collapse at bs=1.
+- **Key finding:** Per-epoch learning curve is parallel to dense model — MoE adds zero sample-efficiency benefit. FFN is not the bottleneck for the 3.833% error floor. Any future DM modification MUST preserve throughput or show per-epoch quality gain.
+
 ## 2026-04-24 11:30 — PR #3264: DM Weight Standardization (vegeta) — CLOSED (dead end)
 
 - vegeta/dm-weight-standardization, W&B runs: x0biqh3s (lr=5e-4), i7nvv6gj (lr=6e-4), group: dm-weight-standardization
