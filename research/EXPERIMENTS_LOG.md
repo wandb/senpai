@@ -1,5 +1,23 @@
 # SENPAI Research Results
 
+## 2026-04-24 19:15 — PR #3143: DrivAerML Lookahead-AdamW k=6 (thorfinn) — CLOSED dead end
+
+- thorfinn/dm-lookahead-adamw
+- Hypothesis: Lookahead optimizer (k=6, alpha=0.5) wrapping AdamW improves DM convergence
+- W&B: n4sbafwr
+
+| Metric | Lookahead-AdamW | Baseline (AdamW) | Delta |
+|--------|----------------|-----------------|-------|
+| val_primary/surface_rel_l2_pct | 5.75% @ep183 | 3.997% @ep467 | +1.75pp (44% worse) |
+
+- Pre-collapse convergence ep1-183 was OK but slower than vanilla AdamW. Catastrophic collapse at ep195: val → 53%, grad_norm → 13.8. Never recovered — oscillated 20-45% after ep205.
+- Lookahead's slow-weight interpolation amplifies DM's per-car subsampling noise instead of smoothing it. Warning spikes visible at ep94, 122, 154, 170 before catastrophic failure.
+- Also fixed a bug (UnboundLocalError from merge artifact — `primary_metric_key` used as both function and variable).
+- Conclusion: Lookahead is harmful for DM's stochastic surface sampling. AdamW + EMA is the correct optimizer strategy.
+- **Thorfinn assigned to #3314: DM EMA decay=0.999 vs champion 0.9995**
+
+---
+
 ## 2026-04-24 19:00 — PR #3286: DrivAerML champion recovery seed=7 (megumi) — CLOSED (ceiling confirmed)
 
 - megumi/dm-champion-recovery-seed7

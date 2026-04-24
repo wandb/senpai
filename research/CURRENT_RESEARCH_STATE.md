@@ -70,7 +70,7 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 - ~~`#3160` griffith~~ CLOSED dead end (5.358% val, diverged ep159) → reassigned to #3312 champion recovery seed=777
 - `#3152` eren: EMA sweep
 - `#3146` taki: checkpoint averaging
-- `#3143` thorfinn: Lookahead
+- ~~`#3143` thorfinn~~ CLOSED dead end (5.75% val, catastrophic collapse ep195) → reassigned to #3314 DM EMA=0.999 vs champion 0.9995
 - `#3121` levi: dropout sweep
 - `#3110` einar: beta2 sweep
 - `#3109` guts: lr=4e-4
