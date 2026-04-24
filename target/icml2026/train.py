@@ -167,6 +167,8 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
+    bl_aux_weight: float = 0.0
+    bl_threshold: float = 0.05
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -763,6 +765,8 @@ def loss_grouped(
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
     volume_loss_weight: float = 1.0,
+    bl_aux_weight: float = 0.0,
+    bl_threshold: float = 0.05,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.surface_x.device)
     metrics: dict[str, float] = {}
@@ -776,6 +780,18 @@ def loss_grouped(
         vol_loss = F.mse_loss(outputs["volume_preds"][batch.volume_mask], target[batch.volume_mask])
         total = total + vol_loss * volume_loss_weight
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
+
+        if bl_aux_weight > 0 and batch.volume_x is not None:
+            # AirfRANS: SDF (positive in fluid, zero at wall) at feature index 4
+            sdf = batch.volume_x[..., 4]
+            bl_mask = batch.volume_mask & (sdf < bl_threshold)
+            bl_frac = float(bl_mask.sum().item()) / max(float(batch.volume_mask.sum().item()), 1.0)
+            metrics["bl_point_fraction"] = bl_frac
+            if bl_mask.any():
+                bl_loss = F.mse_loss(outputs["volume_preds"][bl_mask], target[bl_mask])
+                total = total + bl_aux_weight * bl_loss
+                metrics["bl_aux_loss"] = float(bl_loss.detach().cpu().item())
+
     metrics["loss"] = float(total.detach().cpu().item())
     return total, metrics
 
@@ -1271,6 +1287,8 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    bl_aux_weight: float = 0.0,
+    bl_threshold: float = 0.05,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1326,7 +1344,20 @@ def train_one_epoch(
                             volume_x=batch.volume_x,
                             volume_mask=batch.volume_mask,
                         )
-                        loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                        loss, batch_metrics = loss_grouped(
+                            batch, outputs, transform,
+                            volume_loss_weight=volume_loss_weight,
+                            bl_aux_weight=bl_aux_weight,
+                            bl_threshold=bl_threshold,
+                        )
+                    if "bl_aux_loss" in batch_metrics:
+                        running.setdefault("bl_aux_loss", 0.0)
+                        running["bl_aux_loss"] += batch_metrics["bl_aux_loss"]
+                    if "bl_point_fraction" in batch_metrics:
+                        running.setdefault("bl_point_fraction_sum", 0.0)
+                        running.setdefault("bl_point_fraction_count", 0.0)
+                        running["bl_point_fraction_sum"] += batch_metrics["bl_point_fraction"]
+                        running["bl_point_fraction_count"] += 1.0
 
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
@@ -1359,6 +1390,10 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    if "bl_aux_loss" in running:
+        running["bl_aux_loss"] /= max(micro_batches_total, 1)
+    if "bl_point_fraction_sum" in running:
+        running["bl_point_fraction"] = running.pop("bl_point_fraction_sum") / max(running.pop("bl_point_fraction_count"), 1.0)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1688,6 +1723,8 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            bl_aux_weight=config.bl_aux_weight,
+            bl_threshold=config.bl_threshold,
         )
 
         if ema is not None:
