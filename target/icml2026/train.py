@@ -167,6 +167,7 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
+    checkpoint_metric: str = "surface"
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -1713,13 +1714,16 @@ def main() -> None:
         if current_primary_metric is not None and (
             best_val_primary_metric is None or current_primary_metric < best_val_primary_metric
         ):
-            best_epoch = epoch
             best_val_primary_metric = current_primary_metric
             best_val_metrics = dict(eval_metrics)
-            best_model_state = snapshot_module_state(model)
-            best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(val_primary_key)
+        if config.checkpoint_metric == "joint":
+            _surf = next((v for k, v in eval_metrics.items() if k.endswith("/surface_mse")), None)
+            _vol = next((v for k, v in eval_metrics.items() if k.endswith("/volume_mse")), None)
+            current_val = (_surf + _vol) if (_surf is not None and _vol is not None) else eval_metrics.get(val_primary_key)
+        else:
+            current_val = eval_metrics.get(val_primary_key)
+
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
@@ -1737,6 +1741,8 @@ def main() -> None:
             anp_ema.restore(anp_head)
 
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
+        if config.checkpoint_metric == "joint" and current_val is not None:
+            epoch_metrics["joint_checkpoint_metric"] = current_val
         epoch_metrics["best_val_metric"] = best_val_metric
         epoch_metrics["best_epoch"] = float(best_epoch)
         history.append(epoch_metrics)
