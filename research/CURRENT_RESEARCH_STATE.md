@@ -1,13 +1,13 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 12:45 (advisor cycle 85)
+- **Date:** 2026-04-24 13:15 (advisor cycle 86)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
 - **TFP UNBLOCKED:** cp_panel bug fix merged (#3209). Multi-seed reproducibility confirmed. Sanji #3266 re-running champion config to verify 0.002383 is recoverable.
 - **Both bugs fixed in codebase:** cp_panel_prior_index() guard (#3209 MERGED) + primary_metric_key shadowing (#3209 MERGED).
 
-## Fleet Status (58 active PRs)
+## Fleet Status (59 active PRs)
 
 ### DrivAerML WIP (30 PRs)
 **Innovation track (new physics-aware/ML ideas per directive):**
@@ -26,7 +26,7 @@
 - `#3228` chopper: stochastic weight perturbation at cosine troughs — INNOVATION
 - `#3265` alphonse: hidden-space noise regularization (post-Fourier perturbation σ=0.01/0.05) — INNOVATION
 - `#3275` canute: local/windowed attention (KNN-restricted, K=512/2048 neighbors) — INNOVATION
-- `#3264` vegeta: Weight Standardization on linear layers (bs=1 loss smoothing, Qiao 2019) — INNOVATION
+- `#3277` vegeta: coordinate residual branch (parallel bypass MLP for spatial bias correction) — INNOVATION
 - `#3202` senku: GLU preprocess MLP — INNOVATION
 - `#3201` jet: DomainLayerNorm — INNOVATION
 
@@ -72,7 +72,7 @@
 ### AirfRANS WIP (13 PRs)
 **Volume closure experiments:**
 - `#3261` nezuko: 2L/320d wider model (width scaling for vol closure) — AF VOLUME FOCUS
-- `#3255` gohan: no-Lookahead/no-compile champion full budget — AF VOLUME FOCUS (critical ablation follow-up)
+- `#3278` gohan: separate volume prediction head with extra capacity (256→512→out) — AF VOLUME FOCUS
 - `#3257` chihiro: extended training via reduced eval frequency (every 3/5 epochs) — AF VOLUME FOCUS
 - `#3241` hinata: T_max=75 + vol-weight=10x/12x on champion — AF VOLUME FOCUS (schedule gap-fill)
 - `#3268` jin: higher LR sweep (7e-4/8e-4) on vol-10x+EMA champion — AF VOLUME FOCUS
@@ -203,6 +203,7 @@
 - Sparse MoE FFN (K=4/8, top-2): 5.09%/5.35% (#3263). 1.7-2.2x throughput penalty → epoch starvation. Routing collapses to uniform. Per-epoch curve parallel to dense — FFN is not the bottleneck
 - Input feature dropout (Fourier channels): p=0.1→4.73%, p=0.2→4.82% (#3253). Input-level dropout = information destruction. All 4 Fourier bands essential. Terminal divergence at both dropout rates
 - Curvature-weighted loss: alpha=1.0→4.48% diverge ep300, alpha=0.5→11.6% diverge ep53 (#3259). Train/eval mismatch (weighted vs uniform metric) + curvature amplifies gradient variance at restarts
+- Quadratic position features (x²/y²/z²/xy/xz/yz): 6.643% at ep168 timeout (#3272). Fatal 3x throughput penalty (168 vs 511 baseline epochs). Quad-only diverged ep63 — Fourier PE irreplaceable. Same epoch-starvation pattern as MoE (#3263).
 - EMA>0.9995: 0.9999→7.106% NaN ep171, 0.99995→7.095% collapse ep120 (#3199). EMA=0.9995 sharp optimum bracketed both directions
 - SAM optimizer (rho=0.05/0.02): 5.36%/9.08%. SAM perturbation + cosine restart = double shock → catastrophic divergence. 2x compute penalty also prohibitive
 - True monotonic cosine (T_max=393606, no restarts): 4.086% (+0.253pp). Confirms T_max=30 rapid restarts are core mechanism, not noise. Monotonic decay can't compete
@@ -246,6 +247,7 @@
 - Focal-MSE volume loss (error-based reweighting): gamma=2 +392%/+3993%, gamma=1 +222%/+320% (#3227). Batch-max normalization non-stationary + freestream scaffolding destroyed
 - Additive BL auxiliary volume loss (SDF targeting): all 3 trials +31-228% both metrics (#3239). SDF<0.05 captures 61% of vol points on AF meshes — "BL targeting" ≈ uniform upscaling. Pattern confirmed with #3222
 - Multi-seed champion (seeds 42/123/789): all worse than seed=0 baseline (#3254). Seed 42 diverged, 123/789 +39-76% vol. Champion config has high seed sensitivity — seed=0 is lucky initialization
+- No-Lookahead + no-compile at full budget: surface +575%, vol +84% (#3255). Lookahead slow-weight averaging is load-bearing for long-run convergence. compile gives meaningful throughput within timeout. Short-run ablation that showed these removable was misleading (epoch-count confound).
 - 3L depth (with or without EMA): catastrophic divergence confirmed twice
 - 2L/384d and 3L/384d: catastrophic divergence
 - EMA>0.9995 (0.9999/0.99995 both ~85% worse, diverge early, #3199). EMA=0.9995 bracketed as sharp optimum with steep cliffs both directions

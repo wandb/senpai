@@ -1,5 +1,33 @@
 # SENPAI Research Results
 
+## 2026-04-24 13:15 — PR #3272: DM quadratic position features (vegeta) — CLOSED (dead end)
+
+- vegeta/dm-quadratic-pos-encoding, W&B runs: equlqwg4 (quad+Fourier), qm4gk9bi (quad-only)
+- Hypothesis: x², y², z², xy, xz, yz features alongside Fourier PE provide implicit surface curvature information
+
+| Trial | Config | best val_pct | Epochs | Outcome |
+|-------|--------|-------------|--------|---------|
+| T1 | quad + Fourier | 6.643% (ep128) | 168 (timeout) | Timeout at ~3x throughput penalty |
+| T2 | quad only | 10.736% (ep63) | 163 | Diverged ep63, inf gradients |
+
+**Conclusion:** Fatal throughput penalty (168 vs 511 epochs baseline). Quad-only diverged at ep63, confirming Fourier PE is irreplaceable. Even with T_max adjustments, structural 3x throughput hit from expanded input dimension means epoch starvation. Late-epoch grad-clip rate 74% suggests cosine restart instability. Pattern matches #3263 (MoE FFN): any input expansion that slows per-epoch throughput gets epoch-starved on DM.
+
+---
+
+## 2026-04-24 13:15 — PR #3255: AF no-Lookahead/no-compile (gohan) — CLOSED (dead end)
+
+- gohan/af-no-lookahead-compile, W&B run: 4auwwy2g, group: af-no-lookahead-compile
+- Hypothesis: removing Lookahead + torch.compile (confirmed as individually removable in short ablation) would hold at full budget
+
+| Metric | Baseline | This run | Delta |
+|--------|----------|----------|-------|
+| val surface_mse | 0.000296 | 0.001999 | +575% |
+| val vol_mse | 0.002039 | 0.003754 | +84% |
+
+**Conclusion:** Catastrophically worse. Lookahead's slow-weight averaging is load-bearing for long-run convergence (not just early-training noise). torch.compile provides meaningful throughput gains within the 360-min timeout budget. Short-run ablation #3236 was misleading due to epoch-count confound. Both optimizations are non-negotiable for AF champion config.
+
+---
+
 ## 2026-04-24 12:45 — PR #3259: DM curvature-weighted loss (zenitsu) — CLOSED (dead end)
 
 - zenitsu/dm-curvature-weighted-loss, W&B runs: rwkptewj (alpha=1.0), 434enoo9 (alpha=0.5), group: dm-curvature-weighted-loss
