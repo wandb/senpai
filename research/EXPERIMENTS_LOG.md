@@ -1,5 +1,16 @@
 # SENPAI Research Results
 
+## 2026-04-24 19:00 — PR #3275: DrivAerML local/windowed attention (canute) — CLOSED dead end
+
+- canute/dm-local-attention
+- Hypothesis: KNN-restricted local attention provides physics-aligned spatial inductive bias for surface pressure prediction
+- Trial 1 (K=512): 5.81% val at ep89, only 89 epochs due to 3-4x throughput collapse (19GB VRAM). W&B: 9a3yodiw.
+- Trial 2 (K=2048): 13.59% val at ep29, only 29 epochs (60GB VRAM). W&B: 7shsfomx.
+- Architecture mismatch: Transolver routes 50k tokens → 96 physics-aware slices, NOT point-to-point attention. Adding parallel KNN O(N·K) pathway is redundant with slice mechanism and destroys throughput. At matched epochs, K=512 and K=2048 show similar val metrics — local attention adds no signal beyond what slicing already captures.
+- **Canute assigned to Breakout 2 (#3302): metric-aware MSE + raw-rel-L2 loss**
+
+---
+
 ## 2026-04-24 18:30 — PR #3301: DrivAerML Breakout 3 domain-normalized volume auxiliary (brook) — SENT BACK (round 2)
 
 - brook/dm-domain-normalized-volume-aux
