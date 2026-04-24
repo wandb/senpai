@@ -1,5 +1,47 @@
 # SENPAI Research Results
 
+## 2026-04-25 00:00 — Cycle 119 Batch Reviews (19 PRs)
+
+### DrivAerML Closures (6 PRs)
+| PR | Student | Best val | vs 3.700% | W&B | Verdict |
+|----|---------|----------|-----------|-----|---------|
+| #3267 | mitsuha | 4.454% | +20% | uc5c2hzw | CLOSED — SwiGLU diverged, Inf grads |
+| #3265 | alphonse | 4.236% | +14% | (see PR) | CLOSED — hidden noise, all 3 configs diverged |
+| #3251 | fern | 9.515% | +157% | aix26jjn | CLOSED — Post-LN catastrophic. Pre-LN load-bearing |
+| #3242 | historia | 4.087% | +10% | uac1rd7a | CLOSED — label smoothing degrades CFD precision |
+| #3194 | bulma | 4.227% | +14% | kqadbq1x | CLOSED — lr>5e-4 confirmed worse |
+| #3109 | guts | 12.03% | n/a | 9797m5c5 | CLOSED — full-eval 10x slower, only 50 epochs |
+
+### AirfRANS Reviews (10 PRs)
+| PR | Student | surface_mse | vol_mse | vs baseline (0.000296/0.002039) | Verdict |
+|----|---------|------------|---------|--------------------------------|---------|
+| #3257 | chihiro | **0.000266** | 0.002193 | surface -10.1%! vol +7.6% | SENT BACK — eval-every-3 works, try vol-12x |
+| #3240 | gilbert | **0.000228** | 0.003003 | surface -23%! vol +47% | SENT BACK — programme-best surface, vol too high |
+| #3238 | rei | 0.000249 | 0.002414 | surface -16%, vol +18% | CLOSED — 3 vol follow-ups failed |
+| #3241 | hinata | 0.000330 | 0.002559 | +11.5%, +25.5% | CLOSED — T_max=75 strictly worse |
+| #3296 | violet | 0.000876 | 0.004825 | +196%, +137% | CLOSED — vol-9x catastrophic |
+| #3282 | casca | 0.001007 | 0.003032 | 3.4x, 1.5x worse | CLOSED — cross-attention failed |
+| #3278 | gohan | 0.001580 | 0.002537 | +433%, +24% | CLOSED — separate vol head detrimental |
+| #3250 | tanjiro | 0.000410 | 0.004439 | +38%, +118% | CLOSED — per-channel disrupts optimization |
+| #3195 | piccolo | 0.000582 | 0.003425 | ~2x, +68% | CLOSED — re-strat sampling harms convergence |
+| #3156 | edward | 0.000451 | 0.005850 | +52%, +187% | CLOSED — gc=0.5 degrades AF volume |
+
+**AF key insight:** eval-every-3 throughput trick is the breakthrough. 8 students assigned to vol-weight sweep (10-14x) × eval-every-3.
+
+### TFP Reviews (3 PRs)
+| PR | Student | val field_mse | vs baseline (0.002344) | Verdict |
+|----|---------|--------------|----------------------|---------|
+| #3292 | yuji | 6307.66 | catastrophic | CLOSED — seed=123+physics numerically unstable |
+| #3179 | usopp | 0.005048 | +115% | CLOSED — noam stack doesn't transfer to TFP |
+| #2949 | vash | 0.002555 | +9% val, test=0.002396 (+0.5%) | SENT BACK — 4L near baseline, try lr=3e-5/7e-5 |
+
+### Cycle 119 New Assignments (16 students)
+**DM metric-aware extensions (6):** #3332 mitsuha T_max=20, #3333 alphonse T_max=40, #3334 fern w=0.04+WD, #3335 historia seed=13, #3336 bulma w=0.03+EMA=0.999, #3337 guts w=0.08
+**AF eval-every-3 sweep (8):** #3338 rei vol-10x, #3339 hinata vol-11x, #3340 violet vol-12x, #3341 casca vol-13x, #3342 gohan vol-14x, #3343 tanjiro vol-12x seed=42, #3344 piccolo vol-10x T_max=75, #3345 edward vol-12x WD=5e-3
+**TFP 4L depth (2):** #3346 yuji lr=4e-5 T_max=15, #3347 usopp lr=5e-5 T_max=20
+
+---
+
 ## 2026-04-24 23:00 — Cycle 118 Batch Closures (9 PRs)
 
 ### PR #3304: AF extended 600-min champion training (jin) — CLOSED
