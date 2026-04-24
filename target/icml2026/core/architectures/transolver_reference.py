@@ -85,7 +85,7 @@ class UpActDownMlp(nn.Module):
 
 
 class TransolverAttention(nn.Module):
-    def __init__(self, hidden_dim: int, num_heads: int, num_slices: int, dropout: float = 0.0):
+    def __init__(self, hidden_dim: int, num_heads: int, num_slices: int, dropout: float = 0.0, num_kv_heads: int = 0):
         super().__init__()
         if hidden_dim % num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads")
@@ -94,32 +94,66 @@ class TransolverAttention(nn.Module):
         self.dim_head = hidden_dim // num_heads
         self.num_slices = num_slices
         self.dropout = dropout
+        self.num_kv_heads = num_kv_heads if num_kv_heads > 0 else num_heads
+        if num_heads % self.num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads")
+        self.kv_group_size = num_heads // self.num_kv_heads
+        self.use_gqa = self.num_kv_heads < num_heads
 
         self.temperature = nn.Parameter(torch.full((1, num_heads, 1, 1), 0.5))
         self.in_project_x = LinearProjection(hidden_dim, hidden_dim)
-        self.in_project_fx = LinearProjection(hidden_dim, hidden_dim)
         self.in_project_slice = LinearProjection(self.dim_head, num_slices)
-        self.qkv = LinearProjection(self.dim_head, self.dim_head * 3, bias=False)
         self.proj = LinearProjection(hidden_dim, hidden_dim)
         self.proj_dropout = nn.Dropout(dropout)
 
+        if self.use_gqa:
+            kv_hidden = self.num_kv_heads * self.dim_head
+            self.in_project_fx = LinearProjection(hidden_dim, kv_hidden)
+            self.q_proj = LinearProjection(self.dim_head, self.dim_head, bias=False)
+            self.kv_proj = LinearProjection(self.dim_head, self.dim_head * 2, bias=False)
+        else:
+            self.in_project_fx = LinearProjection(hidden_dim, hidden_dim)
+            self.qkv = LinearProjection(self.dim_head, self.dim_head * 3, bias=False)
+
     def create_slices(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, num_tokens, _ = x.shape
-        fx_mid = self.in_project_fx(x).view(batch_size, num_tokens, self.num_heads, self.dim_head).permute(0, 2, 1, 3)
+        fx_mid = self.in_project_fx(x).view(batch_size, num_tokens, self.num_heads if not self.use_gqa else self.num_kv_heads, self.dim_head).permute(0, 2, 1, 3)
         x_mid = self.in_project_x(x).view(batch_size, num_tokens, self.num_heads, self.dim_head).permute(0, 2, 1, 3)
         slice_logits = self.in_project_slice(x_mid) / self.temperature
         slice_weights = F.softmax(slice_logits, dim=-1)
         if attn_mask is not None:
             mask = attn_mask[:, None, :, None].float()
             slice_weights = slice_weights * mask
-        slice_norm = slice_weights.sum(dim=2, keepdim=False).unsqueeze(-1)
-        slice_tokens = torch.einsum("bhnc,bhns->bhsc", fx_mid, slice_weights) / (slice_norm + 1e-5)
-        return slice_tokens, slice_weights
+        if not self.use_gqa:
+            slice_norm = slice_weights.sum(dim=2, keepdim=False).unsqueeze(-1)
+            slice_tokens = torch.einsum("bhnc,bhns->bhsc", fx_mid, slice_weights) / (slice_norm + 1e-5)
+            return slice_tokens, slice_weights
+        return (x_mid, fx_mid), slice_weights
 
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
-        slice_tokens, slice_weights = self.create_slices(x, attn_mask=attn_mask)
-        qkv = self.qkv(slice_tokens)
-        q, k, v = qkv.chunk(3, dim=-1)
+        slices_out, slice_weights = self.create_slices(x, attn_mask=attn_mask)
+
+        if not self.use_gqa:
+            slice_tokens = slices_out
+            qkv = self.qkv(slice_tokens)
+            q, k, v = qkv.chunk(3, dim=-1)
+        else:
+            x_mid, fx_mid = slices_out
+            q_norm = slice_weights.sum(dim=2).unsqueeze(-1)
+            q_slice_tokens = torch.einsum("bhnc,bhns->bhsc", x_mid, slice_weights) / (q_norm + 1e-5)
+            q = self.q_proj(q_slice_tokens)
+
+            kv_slice_weights = slice_weights.view(
+                slice_weights.shape[0], self.num_kv_heads, self.kv_group_size,
+                slice_weights.shape[2], slice_weights.shape[3],
+            ).mean(dim=2)
+            kv_norm = kv_slice_weights.sum(dim=2).unsqueeze(-1)
+            kv_slice_tokens = torch.einsum("bhnc,bhns->bhsc", fx_mid, kv_slice_weights) / (kv_norm + 1e-5)
+            kv = self.kv_proj(kv_slice_tokens)
+            k, v = kv.chunk(2, dim=-1)
+            k = k.repeat_interleave(self.kv_group_size, dim=1)
+            v = v.repeat_interleave(self.kv_group_size, dim=1)
+
         out_slice = F.scaled_dot_product_attention(
             q,
             k,
@@ -139,6 +173,7 @@ class TransformerBlock(nn.Module):
         mlp_expansion_factor: int | float,
         num_slices: int,
         dropout: float = 0.0,
+        num_kv_heads: int = 0,
     ):
         super().__init__()
         mlp_hidden_dim = int(math.ceil(hidden_dim * mlp_expansion_factor))
@@ -148,6 +183,7 @@ class TransformerBlock(nn.Module):
             num_heads=num_heads,
             num_slices=num_slices,
             dropout=dropout,
+            num_kv_heads=num_kv_heads,
         )
         self.norm2 = nn.LayerNorm(hidden_dim, eps=1e-6)
         self.mlp = UpActDownMlp(hidden_dim=hidden_dim, mlp_hidden_dim=mlp_hidden_dim)
@@ -167,6 +203,7 @@ class Transformer(nn.Module):
         mlp_expansion_factor: int | float,
         num_slices: int,
         dropout: float = 0.0,
+        num_kv_heads: int = 0,
     ):
         super().__init__()
         self.blocks = nn.ModuleList(
@@ -177,6 +214,7 @@ class Transformer(nn.Module):
                     mlp_expansion_factor=mlp_expansion_factor,
                     num_slices=num_slices,
                     dropout=dropout,
+                    num_kv_heads=num_kv_heads,
                 )
                 for _ in range(depth)
             ]
@@ -205,6 +243,7 @@ class ReferenceTransolver(nn.Module):
         n_head: int = 3,
         mlp_ratio: int = 4,
         slice_num: int = 96,
+        n_kv_head: int = 0,
     ):
         super().__init__()
         self.space_dim = space_dim
@@ -233,6 +272,7 @@ class ReferenceTransolver(nn.Module):
             mlp_expansion_factor=mlp_ratio,
             num_slices=slice_num,
             dropout=dropout,
+            num_kv_heads=n_kv_head,
         )
         self.norm = nn.LayerNorm(n_hidden, eps=1e-6)
         self.out = LinearProjection(n_hidden, surface_output_dim + volume_output_dim)

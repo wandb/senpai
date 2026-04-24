@@ -169,6 +169,7 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    num_kv_heads: int = 0
 
 
 @dataclass
@@ -513,6 +514,7 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
         "n_head": config.model_heads,
         "mlp_ratio": config.model_mlp_ratio,
         "slice_num": config.model_slices,
+        "n_kv_head": config.num_kv_heads,
     }
     if config.model == "reference_transolver":
         return ReferenceTransolver(
@@ -1678,6 +1680,7 @@ def main() -> None:
     for epoch in range(1, config.epochs + 1):
         if timeout_seconds is not None and epoch > 1 and (time.monotonic() - start_time) >= timeout_seconds:
             break
+        epoch_start = time.monotonic()
         train_metrics = train_one_epoch(
             model=forward_model,
             anp_head=anp_head,
@@ -1742,7 +1745,10 @@ def main() -> None:
         if anp_head is not None and anp_ema is not None:
             anp_ema.restore(anp_head)
 
+        epoch_elapsed = time.monotonic() - epoch_start
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
+        epoch_metrics["epoch_time_sec"] = epoch_elapsed
+        epoch_metrics["epoch_time_min"] = epoch_elapsed / 60.0
         epoch_metrics["best_val_metric"] = best_val_metric
         epoch_metrics["best_epoch"] = float(best_epoch)
         history.append(epoch_metrics)
