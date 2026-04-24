@@ -1,11 +1,11 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 10:00 (advisor cycle 77)
+- **Date:** 2026-04-24 10:15 (advisor cycle 78)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
-- **CRITICAL:** TFP champion config is BROKEN — code regression since #3025, seed=0 no longer reproduces (#3205). Waiting for sanji #3209 cp_panel bug fix.
-- **Known bug:** `primary_metric_key` shadowing in train.py (line ~1646 local var shadows function on line ~1428). 3 students independently fixed this cycle. Fix: rename local to `best_tracking_metric_key`.
+- **TFP UNBLOCKED:** cp_panel bug fix merged (#3209). Multi-seed reproducibility confirmed. Sanji #3266 re-running champion config to verify 0.002383 is recoverable.
+- **Both bugs fixed in codebase:** cp_panel_prior_index() guard (#3209 MERGED) + primary_metric_key shadowing (#3209 MERGED).
 
 ## Fleet Status (58 active PRs)
 
@@ -21,7 +21,7 @@
 - `#3251` fern: Pre-LayerNorm architecture ablation (+ RMSNorm variant) — INNOVATION
 - `#3259` zenitsu: curvature-weighted loss (per-point weighting by local curvature) — INNOVATION
 - `#3258` emma: auxiliary surface normal prediction (multi-task regularization) — INNOVATION
-- `#3252` mitsuha: progressive surface point training (resolution curriculum) — INNOVATION
+- `#3267` mitsuha: SwiGLU FFN activation (replace GELU with gated linear unit) — INNOVATION
 - `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
 - `#3228` chopper: stochastic weight perturbation at cosine troughs — INNOVATION
 - `#3265` alphonse: hidden-space noise regularization (post-Fourier perturbation σ=0.01/0.05) — INNOVATION
@@ -35,7 +35,7 @@
 - `#3181` himmel: asinh+residual on champion — NOAM ABLATION
 
 **Champion tuning / paper-facing:**
-- `#3209` sanji: TFP cp_panel bug fix + multi-seed retest — STABILIZATION PRIORITY
+- `#3266` sanji: TFP champion config re-verification post cp_panel fix (seed=0/42) — STABILIZATION VERIFY
 - `#3244` faye: DM Track 1 paper-facing full eval (champion config, NO --max-eval-batches) — PAPER-FACING Track 1
 - `#3160` griffith: 16H heads
 - `#3249` shouko: decaying weight decay schedule (WD=1e-4/5e-5 → 0 over 300ep) — INNOVATION
@@ -55,8 +55,8 @@
 **New champion config:** ANP+full physics+T_max=150+gc=0.2+EMA=0.999+96sl+Lookahead+compile+re-strat (#3185)
 - `#3150` yuji: clean test row — PAPER-FACING
 
-### TandemFoil Paper WIP (9 PRs) — STABILIZATION CRISIS
-**Stabilization status: CODE REGRESSION CONFIRMED — seed=0 broken, waiting for sanji #3209 bug fix**
+### TandemFoil Paper WIP (9 PRs) — STABILIZATION RESOLVED
+**Bug fix merged (#3209). Sanji #3266 verifying champion config reproducibility.**
 
 **Noam-pivot experiments:**
 - `#3179` usopp: T_max=150+wake+96sl+Lookahead — NOAM ABLATION
@@ -163,9 +163,10 @@
 - vol_loss_scale learnable scalar (noam port, -15.9%) — spike #3211
 - Per-channel volume loss weighting (upweight nut×4, p×2) — tanjiro #3245
 
-### Critical Known Bug
-- **`cp_panel_prior_index()` broken for tandemfoil_paper** (PR #3200): Fix in progress (sanji #3209).
-- **TFP champion config BROKEN in current codebase** — code regression confirmed (#3205). Seed=0 no longer reproduces. Base config without physics is stable (#3208). Root cause: pressure transform path (sinh inverse).
+### Bug Fixes (RESOLVED)
+- **`cp_panel_prior_index()` FIXED** (#3209 MERGED): Guard returns None for tandemfoil_paper. No more sinh overflow.
+- **`primary_metric_key` shadowing FIXED** (#3209 MERGED): Local variable at line ~1652 renamed, no longer shadows function at line ~1434.
+- **TFP champion config recovery in progress** — sanji #3266 verifying that 0.002383 baseline is reproducible under the fixed codebase.
 
 ## Key Dead Ends (Do Not Repeat)
 
@@ -193,6 +194,7 @@
 - Attention temperature annealing: 4.024% (+5% vs 3.833%). External annealed τ compounds with existing learnable per-head τ. noam result doesn't transfer
 - Stochastic depth/LayerDrop: p=0.1→4.317%, p=0.2→4.217%, p=0.3→4.411% (#3233). Only 4 layers — dropping 1 removes 25% capacity. Too coarse. EMA+gc already handles stability
 - Coordinate noise augmentation: σ=0.001→6.45% crashed, σ=0.005→21.44% Inf grads (#3256). Fourier freqs up to 32.0 amplify coord noise 32x. Structurally incompatible with Fourier PE
+- Progressive resolution (25k→50k / 30k→50k): 25k crashed ep112, 30k→4.711% +23% (#3252). Full 50k context needed from epoch 1. Reduced resolution creates irrecoverable representation deficit
 - EMA>0.9995: 0.9999→7.106% NaN ep171, 0.99995→7.095% collapse ep120 (#3199). EMA=0.9995 sharp optimum bracketed both directions
 - SAM optimizer (rho=0.05/0.02): 5.36%/9.08%. SAM perturbation + cosine restart = double shock → catastrophic divergence. 2x compute penalty also prohibitive
 - True monotonic cosine (T_max=393606, no restarts): 4.086% (+0.253pp). Confirms T_max=30 rapid restarts are core mechanism, not noise. Monotonic decay can't compete
