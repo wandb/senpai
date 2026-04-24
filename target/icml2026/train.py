@@ -86,6 +86,21 @@ class EMAWithWarmup:
         self.backup = None
 
 
+class ErrorCorrectionHead(torch.nn.Module):
+    def __init__(self, hidden_dim: int, output_dim: int):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(hidden_dim + output_dim, hidden_dim // 4),
+            torch.nn.GELU(),
+            torch.nn.Linear(hidden_dim // 4, output_dim),
+        )
+        torch.nn.init.zeros_(self.net[-1].weight)
+        torch.nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, hidden: torch.Tensor, primary_pred_detached: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat([hidden, primary_pred_detached], dim=-1))
+
+
 LEGACY_VAL_ALIAS = {
     "val_in_dist": "p_in",
     "val_ood_cond": "p_oodc",
@@ -169,6 +184,8 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    error_correction_head: bool = False
+    correction_loss_weight: float = 0.1
 
 
 @dataclass
@@ -860,10 +877,13 @@ def evaluate_grouped(
     *,
     amp_mode: str = "none",
     max_batches: int = 0,
+    correction_head: ErrorCorrectionHead | None = None,
 ) -> dict[str, float]:
     model.eval()
     if anp_head is not None:
         anp_head.eval()
+    if correction_head is not None:
+        correction_head.eval()
 
     dataset_name: str | None = None
     total_surface = 0.0
@@ -931,6 +951,10 @@ def evaluate_grouped(
                 volume_x=batch.volume_x,
                 volume_mask=batch.volume_mask,
             )
+            if correction_head is not None and outputs.get("surface_hidden") is not None and outputs["surface_preds"] is not None:
+                primary_pred = outputs["surface_preds"]
+                correction = correction_head(outputs["surface_hidden"], primary_pred)
+                outputs["surface_preds"] = primary_pred + correction * batch.surface_mask.unsqueeze(-1)
         outputs = float_outputs(outputs)
         if dataset_name == "airfrans":
             if not isinstance(transform, TargetTransform):
@@ -1277,10 +1301,15 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    correction_head: ErrorCorrectionHead | None = None,
+    correction_loss_weight: float = 0.0,
+    correction_ema: EMAWithWarmup | None = None,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
         anp_head.train()
+    if correction_head is not None:
+        correction_head.train()
     running = {"loss": 0.0}
     steps = 0
     micro_batches_total = 0
@@ -1332,7 +1361,20 @@ def train_one_epoch(
                             volume_x=batch.volume_x,
                             volume_mask=batch.volume_mask,
                         )
+                        if correction_head is not None and outputs.get("surface_hidden") is not None and outputs["surface_preds"] is not None:
+                            primary_pred = outputs["surface_preds"]
+                            correction = correction_head(outputs["surface_hidden"], primary_pred.detach())
+                            corrected_pred = primary_pred + correction * batch.surface_mask.unsqueeze(-1)
+                            outputs["surface_preds"] = corrected_pred
                         loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                        if correction_head is not None and correction_loss_weight > 0 and outputs.get("surface_hidden") is not None:
+                            target = transform.apply(batch.surface_y)
+                            with torch.no_grad():
+                                error_target = target - primary_pred.detach()
+                            corr_loss = F.mse_loss(correction[batch.surface_mask], error_target[batch.surface_mask])
+                            loss = loss + corr_loss * correction_loss_weight
+                            running.setdefault("correction_loss", 0.0)
+                            running["correction_loss"] += float(corr_loss.detach().cpu().item())
 
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
@@ -1344,6 +1386,8 @@ def train_one_epoch(
         all_params = list(model.parameters())
         if anp_head is not None:
             all_params += list(anp_head.parameters())
+        if correction_head is not None:
+            all_params += list(correction_head.parameters())
         grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=grad_clip if grad_clip > 0 else float("inf"))
         running.setdefault("grad_norm_mean", 0.0)
         running["grad_norm_mean"] += float(grad_norm)
@@ -1358,6 +1402,8 @@ def train_one_epoch(
             running["ema_decay_actual"] = min(ema.decay, (1 + ema.step_counter) / (10 + ema.step_counter))
         if anp_head is not None and anp_ema is not None:
             anp_ema.update(anp_head)
+        if correction_head is not None and correction_ema is not None:
+            correction_ema.update(correction_head)
         running["loss"] += accum_loss / micro_count
         micro_batches_total += micro_count
         steps += 1
@@ -1365,6 +1411,8 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    if "correction_loss" in running:
+        running["correction_loss"] /= max(steps, 1)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1464,6 +1512,7 @@ def evaluate_phase_metrics(
     metric_transform: TargetTransform | None,
     device: torch.device,
     phase: str,
+    correction_head: ErrorCorrectionHead | None = None,
 ) -> dict[str, float]:
     metrics: dict[str, float] = {}
     for split_name, loader in loaders.items():
@@ -1487,6 +1536,7 @@ def evaluate_phase_metrics(
                 device,
                 amp_mode=config.amp_mode,
                 max_batches=config.max_eval_batches,
+                correction_head=correction_head,
             )
         metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
         if phase == "val" and split_name in LEGACY_VAL_ALIAS and "mae_surf_p" in split_metrics:
@@ -1629,9 +1679,18 @@ def main() -> None:
             output_dim=bundle.spec.surface_output_dim,
         ).to(device)
 
+    correction_head = None
+    if config.error_correction_head:
+        correction_head = ErrorCorrectionHead(
+            hidden_dim=getattr(model, "n_hidden", 192),
+            output_dim=bundle.spec.surface_output_dim,
+        ).to(device)
+
     params = list(model.parameters())
     if anp_head is not None:
         params.extend(list(anp_head.parameters()))
+    if correction_head is not None:
+        params.extend(list(correction_head.parameters()))
     optimizer = build_optimizer(params, config)
     scheduler = None
     if config.cosine_t_max > 0:
@@ -1640,6 +1699,7 @@ def main() -> None:
 
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
+    correction_ema = EMAWithWarmup(correction_head, decay=config.ema_decay) if config.use_ema and correction_head is not None else None
     history: list[dict[str, float]] = []
     best_epoch: int | None = None
     best_val_primary_metric_name = primary_metric_key(bundle, phase="val")
@@ -1694,6 +1754,9 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            correction_head=correction_head,
+            correction_loss_weight=config.correction_loss_weight,
+            correction_ema=correction_ema,
         )
 
         if ema is not None:
@@ -1702,6 +1765,9 @@ def main() -> None:
         if anp_head is not None and anp_ema is not None:
             anp_ema.store(anp_head)
             anp_ema.copy_to(anp_head)
+        if correction_head is not None and correction_ema is not None:
+            correction_ema.store(correction_head)
+            correction_ema.copy_to(correction_head)
 
         eval_metrics = evaluate_phase_metrics(
             bundle=bundle,
@@ -1713,6 +1779,7 @@ def main() -> None:
             metric_transform=metric_transform,
             device=device,
             phase="val",
+            correction_head=correction_head,
         )
 
         current_primary_metric = eval_metrics.get(best_val_primary_metric_name)
@@ -1741,6 +1808,8 @@ def main() -> None:
             ema.restore(model)
         if anp_head is not None and anp_ema is not None:
             anp_ema.restore(anp_head)
+        if correction_head is not None and correction_ema is not None:
+            correction_ema.restore(correction_head)
 
         epoch_metrics = {"epoch": float(epoch), **train_metrics, **eval_metrics}
         epoch_metrics["best_val_metric"] = best_val_metric
@@ -1778,6 +1847,9 @@ def main() -> None:
         if anp_head is not None and anp_ema is not None:
             anp_ema.store(anp_head)
             anp_ema.copy_to(anp_head)
+        if correction_head is not None and correction_ema is not None:
+            correction_ema.store(correction_head)
+            correction_ema.copy_to(correction_head)
 
         final_test_metrics = evaluate_phase_metrics(
             bundle=bundle,
@@ -1789,12 +1861,15 @@ def main() -> None:
             metric_transform=metric_transform,
             device=device,
             phase="test",
+            correction_head=correction_head,
         )
 
         if ema is not None:
             ema.restore(model)
         if anp_head is not None and anp_ema is not None:
             anp_ema.restore(anp_head)
+        if correction_head is not None and correction_ema is not None:
+            correction_ema.restore(correction_head)
         terminal_model_state = snapshot_module_state(model)
         terminal_anp_state = snapshot_module_state(anp_head)
         if run is not None:
@@ -1817,6 +1892,7 @@ def main() -> None:
                 metric_transform=metric_transform,
                 device=device,
                 phase="test",
+                correction_head=correction_head,
             )
             if run is not None:
                 best_checkpoint_metrics: dict[str, float | int | str] = {
