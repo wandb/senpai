@@ -65,7 +65,7 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 - `#3235` kakashi: multi-exit prediction
 - ~~`#3228` chopper~~ CLOSED dead end (4.538% val, gradient explosion ep294) → reassigned to #3316 DM 3L/512d depth reduction
 - ~~`#3221` franky~~ CLOSED dead end (10.75%/6.26% val — gc=0.5 already stabilizes restarts) → reassigned to #3311 champion recovery seed=1024
-- `#3202` senku: GLU preprocess
+- ~~`#3202` senku~~ CLOSED dead end (4.411% val, diverged ep330) → reassigned to #3319 DM champion dense-eval seed=2024
 - `#3194` bulma: probe LR above 5e-4
 - ~~`#3160` griffith~~ CLOSED dead end (5.358% val, diverged ep159) → reassigned to #3312 champion recovery seed=777
 - `#3152` eren: EMA sweep

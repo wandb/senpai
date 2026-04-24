@@ -1,5 +1,27 @@
 # SENPAI Research Results
 
+## 2026-04-24 20:10 — PR #3202: DrivAerML GLU preprocess (senku) — CLOSED dead end
+
+- senku/dm-glu-preprocess
+- Hypothesis: GLU (gated linear unit) preprocess MLP for gated input feature selection
+- W&B: 0wbhzbbd (senku/dm-glu-preprocess)
+- Result: 4.411% val at ep313 (+0.578pp vs baseline 3.833%), then catastrophic divergence at ep330 (grad norms → 636)
+- GLU gate sigmoid saturation creates instability at cosine restart LR peaks — same late-training divergence pattern as LLRD, SWP, error correction, Lookahead, gradient noise
+- Convergence curve was always behind baseline even before divergence
+- Also fixed primary_metric_key shadowing bug (same bug as chopper found)
+- **Senku assigned to #3319: DM champion dense-eval seed=2024 (eval-interval=5)**
+
+---
+
+## 2026-04-24 20:05 — PR #3292: TFP seed=123 replication (yuji) — SENT BACK (config error)
+
+- yuji/tfp-haku-seed123
+- This run used broken config (missing physics features) — killed at ep393 (best 0.004257, 72.6% worse than baseline 0.002466)
+- W&B: f9vsnv6f — smooth convergence to a shallow basin (no instability, just wrong config)
+- Sent back with corrected full TFP champion config (T_max=10, all physics features)
+
+---
+
 ## 2026-04-24 19:45 — PR #3271: DrivAerML LLRD (nobara) — CLOSED dead end
 
 - nobara/dm-layer-lr-decay
