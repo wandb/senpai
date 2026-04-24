@@ -1,5 +1,32 @@
 # SENPAI Research Results
 
+## 2026-04-24 09:30 — PR #3238: AF WD=0 ablation on vol-10x+EMA champion (rei) — SENT BACK
+
+- rei/af-wd0-ablation, W&B runs: sqotwbxs (WD=0), cjcftqo8 (WD=5e-3), group: af-no-wd
+- Hypothesis: WD may be over-regularizing the AF model; removing or reducing it could unlock precision
+
+| Trial | WD | surface_mse | vs baseline | vol_mse (at best-surface ckpt) | vs baseline |
+|-------|------|-------------|-------------|-------------------------------|-------------|
+| T1 | 0 | 0.000384 | +29.7% | 0.002997 | +47.0% |
+| T2 | 5e-3 | **0.000249** | **-15.9% NEW BEST** | 0.002679 | +31.4% |
+
+- **WD=0 is a clear dead end** — both metrics regress substantially. EMA=0.999 insufficient implicit regularization for 2L/256d.
+- **WD=5e-3 reveals a genuine surface/volume tradeoff** — surface_mse=0.000249 is the best surface result in the entire AF programme. But vol_mse=0.002679 is far from 0.0017 target.
+- **Sent back for follow-up:** WD=5e-3 + vol-loss-weight=15x and 20x, testing whether increased vol emphasis can recover vol_mse while preserving the surface precision gain.
+
+## 2026-04-24 09:30 — PR #3233: DM stochastic depth/LayerDrop (gojo) — CLOSED (dead end)
+
+- gojo/dm-stochastic-depth, W&B runs: sx8t4fq8 (p=0.1), cs1l7yye (p=0.2), wwbkzvoy (p=0.3), group: dm-stochastic-depth
+- Hypothesis: stochastic depth (randomly dropping transformer layers) provides regularization against late-training divergence
+
+| Trial | Drop prob | val_pct | vs baseline |
+|-------|-----------|---------|-------------|
+| T1 | p=0.1 | 4.317% | +12.6% |
+| T2 | p=0.2 | 4.217% | +10.0% |
+| T3 | p=0.3 | 4.411% | +15.1% |
+
+- **Root cause:** Only 4 layers — dropping 1 removes 25% capacity. Stochastic depth designed for 50-110+ layer networks. Too coarse for shallow architecture. EMA+gc already handles stability.
+
 ## 2026-04-24 09:15 — PR #3199: DM EMA=0.9999/0.99995 upward sweep (megumi) — CLOSED (dead end)
 
 - megumi/dm-ema-0.9999, W&B runs: c168t4dq (EMA=0.9999), 26n0lcmg (EMA=0.99995)
