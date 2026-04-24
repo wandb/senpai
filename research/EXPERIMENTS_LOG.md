@@ -1,5 +1,15 @@
 # SENPAI Research Results
 
+## 2026-04-24 17:30 — PR #3270: DrivAerML FiLM conditioning (brook) — CLOSED dead end
+
+- brook/dm-geometry-film-conditioning
+- Hypothesis: FiLM conditioning on global geometry stats (bounding box, centroid, std) helps the Transolver adapt per-point predictions to car shape
+- Trial 1 (gamma+beta): 5.221% val at ep135, diverged at ep150 (grad norm 0.5→53,000+). Trial 2 (additive-only beta): 5.369% val at ep174, diverged at ep178.
+- Both ~35-40% worse than baseline (3.833%). Catastrophic gradient explosion from FiLM MLP amplifying gradients through cosine LR restarts. Dead end — conditioning pathway interferes with Transolver routing.
+- **Brook assigned to Breakout 3 (#3301): domain-normalized volume auxiliary**
+
+---
+
 ## 2026-04-24 16:45 — PR #3284: Harness patches (vegeta) — MERGED (infrastructure)
 
 - vegeta/harness-patches-last-ditch, train.py +218/-53
