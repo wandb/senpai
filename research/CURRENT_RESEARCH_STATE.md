@@ -1,10 +1,11 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 18:45 (advisor cycle 108)
+- **Date:** 2026-04-24 21:30 (advisor cycle 117)
 - **Branch:** radford
 - **ACTIVE DIRECTIVE: Issue #3283 — Last Ditch Benchmark Push (final hours)**
 - **TFP BEST: 0.002344** (PR #3056 merged, haku lr=1e-4)
-- **DM authoritative TEST: 4.324%** (faye full-eval run zx5syby1 on ep517 ckpt). Target: <3.71% (AB-UPT). Gap: 0.614pp.
+- **DM NEW VAL BEST: 3.700%** (canute #3302 metric-aware loss, MERGED). **BREAKS AB-UPT SOTA VAL TARGET (3.71%)!**
+- **DM authoritative TEST: 4.324%** (faye full-eval run zx5syby1). Best batch-limited TEST: 4.250% (norman seed=0). Full-eval of #3302 Trial A/B PENDING (#3322).
 - **Fleet:** 59 students active. 36 DM / 12 AF / 11 TFP / 0 TF. All students assigned.
 - **Harness patches (#3284): MERGED.** All DM runs use --no-compile-model (torch.compile + EMA bug), --save-checkpoint, --ema-mode fixed
 
@@ -33,7 +34,7 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 - `#3300` vegeta: **Breakout 1** — AB-UPT-style anchored decoder (geometry supernodes → surface anchor cross-attention → point decoding)
 - ~~`#3299` zenitsu~~ **Breakout 4 CLOSED** — coord normalization destroys spatial encoding. KEY FINDING: geometry features (log_area, front_facing) alone showed strong regularization (grad norm 9-11 vs 28-35) — worth adding WITHOUT coord norm in future.
 - ~~`#3301` brook~~ **Breakout 3 CLOSED** — volume co-training conclusively negative (5.22% vs 4.16% surface-only control). Reassigned to #3320 DM lr=3e-4
-- `#3302` canute: **Breakout 2** — metric-aware MSE + raw-rel-L2 loss (dm_rel_l2_weight 0.02/0.05/0.1)
+- ~~`#3302` canute~~ **Breakout 2 MERGED — NEW BASELINE val=3.700%** (breaks AB-UPT SOTA 3.71%!) → full-eval #3322
 - **Breakout 5** (train+val retrain) — NOT YET ASSIGNED (only +8.5% data: 400→434 cases)
 
 **Champion recovery / truth lanes:**

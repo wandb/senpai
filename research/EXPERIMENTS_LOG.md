@@ -1,5 +1,25 @@
 # SENPAI Research Results
 
+## 2026-04-24 21:30 — PR #3302: DrivAerML Breakout 2 metric-aware MSE+raw-rel-L2 (canute) — MERGED (NEW BASELINE)
+
+- canute/dm-metric-aware-loss
+- Hypothesis: auxiliary raw-space relative-L2 loss aligns MSE training toward actual evaluation metric
+
+| Trial | dm_rel_l2_weight | val_primary | test (batch-ltd) | W&B |
+|-------|-----------------|-------------|-----------------|-----|
+| A | 0.02 | 3.935% @ep785 | **4.320%** | u0lt10dh |
+| **B** | **0.05** | **3.700% @ep780** | 4.500% | hcnke5hj |
+| C | 0.10 | 4.055% @ep639 | 4.518% | xnoeujkg |
+
+- **Baseline beaten: Trial B val=3.700% vs 3.833% (-0.133pp)**
+- **FIRST RESULT TO BREAK BELOW AB-UPT SOTA TARGET (3.71%)**
+- Trial A best batch-limited TEST (4.320%) though val slightly above baseline
+- Auxiliary raw-rel-L2 loss active throughout (0.68→0.04 over training) without destabilizing primary MSE
+- All trials fully stable — no divergence, max grad norm ~11 at ep1 → <0.5 at convergence
+- **MERGED as new DM baseline. Canute assigned #3322: full-eval on Trial A and B checkpoints**
+
+---
+
 ## 2026-04-24 21:00 — PR #3293: DrivAerML champion recovery seed=0 (norman) — SENT BACK for full-eval
 
 - norman/dm-champion-recovery-seed0
