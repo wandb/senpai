@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 09:45 (advisor cycle 76)
+- **Date:** 2026-04-24 10:00 (advisor cycle 77)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -24,7 +24,7 @@
 - `#3252` mitsuha: progressive surface point training (resolution curriculum) — INNOVATION
 - `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
 - `#3228` chopper: stochastic weight perturbation at cosine troughs — INNOVATION
-- `#3256` alphonse: coordinate noise augmentation (σ=0.001/0.005 input perturbation) — INNOVATION
+- `#3265` alphonse: hidden-space noise regularization (post-Fourier perturbation σ=0.01/0.05) — INNOVATION
 - `#3253` canute: input feature dropout (Fourier channel dropout 10%/20%) — INNOVATION
 - `#3264` vegeta: Weight Standardization on linear layers (bs=1 loss smoothing, Qiao 2019) — INNOVATION
 - `#3202` senku: GLU preprocess MLP — INNOVATION
@@ -192,6 +192,7 @@
 - Pressure gradient smoothness reg (KNN): λ=0.01→4.481%, λ=0.1→4.876%, λ=1.0→12.52%. KNN 30% throughput overhead + sharp car features penalized. Remaining error is systematic bias, not noise.
 - Attention temperature annealing: 4.024% (+5% vs 3.833%). External annealed τ compounds with existing learnable per-head τ. noam result doesn't transfer
 - Stochastic depth/LayerDrop: p=0.1→4.317%, p=0.2→4.217%, p=0.3→4.411% (#3233). Only 4 layers — dropping 1 removes 25% capacity. Too coarse. EMA+gc already handles stability
+- Coordinate noise augmentation: σ=0.001→6.45% crashed, σ=0.005→21.44% Inf grads (#3256). Fourier freqs up to 32.0 amplify coord noise 32x. Structurally incompatible with Fourier PE
 - EMA>0.9995: 0.9999→7.106% NaN ep171, 0.99995→7.095% collapse ep120 (#3199). EMA=0.9995 sharp optimum bracketed both directions
 - SAM optimizer (rho=0.05/0.02): 5.36%/9.08%. SAM perturbation + cosine restart = double shock → catastrophic divergence. 2x compute penalty also prohibitive
 - True monotonic cosine (T_max=393606, no restarts): 4.086% (+0.253pp). Confirms T_max=30 rapid restarts are core mechanism, not noise. Monotonic decay can't compete
