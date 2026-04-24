@@ -134,6 +134,8 @@ class TrainConfig:
     max_train_batches: int = 0
     max_eval_batches: int = 0
     surface_only_drivaerml: bool = True
+    drivaerml_coord_norm: bool = False
+    drivaerml_geo_features: bool = False
     airfrans_task: str = "full"
     tandem_manifest: str = ""
     tandem_stats: str = ""
@@ -586,6 +588,56 @@ def float_outputs(outputs: dict[str, torch.Tensor | None]) -> dict[str, torch.Te
     }
 
 
+def preprocess_drivaerml_coords(
+    batch: GroupedBatch,
+    geometry_center: torch.Tensor,
+    geometry_scale: torch.Tensor,
+    *,
+    geo_features: bool = False,
+    enable_fourier: bool = False,
+    fourier_freqs: tuple[float, ...] = (0.5, 2.0, 8.0, 32.0),
+) -> GroupedBatch:
+    if batch.dataset_name != "drivaerml":
+        return batch
+
+    space_dim = batch.space_dim
+    sx = batch.surface_x
+    xyz = sx[:, :, :space_dim]
+    center = geometry_center.to(xyz.device)
+    scale = geometry_scale.to(xyz.device)
+    xyz_norm = (xyz - center) / scale
+
+    normals = sx[:, :, 3:6]
+    area = sx[:, :, 6:7]
+
+    parts: list[torch.Tensor] = [xyz_norm, normals, area]
+
+    if enable_fourier:
+        for freq in fourier_freqs:
+            parts.append(torch.sin(xyz_norm * freq))
+            parts.append(torch.cos(xyz_norm * freq))
+
+    if geo_features:
+        log_area = torch.log(area.abs() + 1e-8)
+        front_facing = (normals[:, :, 0:1] > 0).float()
+        abs_y = xyz_norm[:, :, 1:2].abs()
+        parts.extend([log_area, front_facing, abs_y])
+
+    new_surface_x = torch.cat(parts, dim=-1)
+
+    return GroupedBatch(
+        case_ids=batch.case_ids,
+        dataset_name=batch.dataset_name,
+        space_dim=batch.space_dim,
+        surface_x=new_surface_x,
+        surface_y=batch.surface_y,
+        surface_mask=batch.surface_mask,
+        volume_x=batch.volume_x,
+        volume_y=batch.volume_y,
+        volume_mask=batch.volume_mask,
+    )
+
+
 def build_loaders(
     config: TrainConfig,
     bundle: DatasetBundle,
@@ -860,6 +912,7 @@ def evaluate_grouped(
     *,
     amp_mode: str = "none",
     max_batches: int = 0,
+    batch_preprocess: callable | None = None,
 ) -> dict[str, float]:
     model.eval()
     if anp_head is not None:
@@ -888,6 +941,8 @@ def evaluate_grouped(
     batches = loader if max_batches <= 0 else itertools.islice(loader, max_batches)
     for batch in batches:
         batch = batch.to(device)
+        if batch_preprocess is not None:
+            batch = batch_preprocess(batch)
         dataset_name = batch.dataset_name
 
         if isinstance(transform, TandemTargetTransform):
@@ -1277,6 +1332,7 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    batch_preprocess: callable | None = None,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1313,6 +1369,8 @@ def train_one_epoch(
                     loss, _ = loss_abupt(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
             else:
                 batch = batch.to(device)
+                if batch_preprocess is not None:
+                    batch = batch_preprocess(batch)
                 if isinstance(transform, TandemTargetTransform):
                     prepared = transform.prepare_batch(batch)
                     with autocast_context(device, amp_mode):
@@ -1464,6 +1522,7 @@ def evaluate_phase_metrics(
     metric_transform: TargetTransform | None,
     device: torch.device,
     phase: str,
+    batch_preprocess: callable | None = None,
 ) -> dict[str, float]:
     metrics: dict[str, float] = {}
     for split_name, loader in loaders.items():
@@ -1487,6 +1546,7 @@ def evaluate_phase_metrics(
                 device,
                 amp_mode=config.amp_mode,
                 max_batches=config.max_eval_batches,
+                batch_preprocess=batch_preprocess,
             )
         metrics.update({f"{split_name}/{name}": value for name, value in split_metrics.items()})
         if phase == "val" and split_name in LEGACY_VAL_ALIAS and "mae_surf_p" in split_metrics:
@@ -1583,6 +1643,24 @@ def main() -> None:
         _ds.TandemFoilCaseDataset.__init__ = _patched_init
 
     bundle = build_bundle(config)
+
+    batch_preprocess = None
+    if config.drivaerml_coord_norm and bundle.spec.name == "drivaerml":
+        geo_extra = 3 if config.drivaerml_geo_features else 0
+        if geo_extra:
+            bundle.spec.surface_input_dim += geo_extra
+        gc = bundle.target_stats.geometry_center
+        gs = bundle.target_stats.geometry_scale
+        if gc is not None and gs is not None:
+            from functools import partial
+            batch_preprocess = partial(
+                preprocess_drivaerml_coords,
+                geometry_center=gc,
+                geometry_scale=gs,
+                geo_features=config.drivaerml_geo_features,
+                enable_fourier=config.enable_fourier,
+            )
+
     resolved_num_workers = resolve_num_workers(config, bundle.spec.name)
     if bundle.spec.name == "tandemfoilset":
         phys_stats = compute_tandem_phys_stats(
@@ -1694,6 +1772,7 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            batch_preprocess=batch_preprocess,
         )
 
         if ema is not None:
@@ -1713,6 +1792,7 @@ def main() -> None:
             metric_transform=metric_transform,
             device=device,
             phase="val",
+            batch_preprocess=batch_preprocess,
         )
 
         current_primary_metric = eval_metrics.get(best_val_primary_metric_name)
@@ -1789,6 +1869,7 @@ def main() -> None:
             metric_transform=metric_transform,
             device=device,
             phase="test",
+            batch_preprocess=batch_preprocess,
         )
 
         if ema is not None:
@@ -1817,6 +1898,7 @@ def main() -> None:
                 metric_transform=metric_transform,
                 device=device,
                 phase="test",
+                batch_preprocess=batch_preprocess,
             )
             if run is not None:
                 best_checkpoint_metrics: dict[str, float | int | str] = {
