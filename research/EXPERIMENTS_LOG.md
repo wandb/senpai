@@ -1,5 +1,13 @@
 # SENPAI Research Results
 
+## 2026-04-24 16:40 — PR #3279: DrivAerML ReLU² activation (gojo) — CLOSED dead end
+
+- gojo/dm-relu-squared, W&B: 2k52eunu
+- 8.832% val at ep72, then catastrophic divergence at ep73 (grad norm 0.71→20.86). Irrecoverable — val regressed to 27% by ep81. ReLU² sparse activations amplify gradient instability at cosine LR peaks where GELU stays stable.
+- **Gojo assigned to #3308: DM narrow LR sweep (lr=4.8e-4, 5.2e-4, Bucket E)**
+
+---
+
 ## 2026-04-24 15:15 — PR #3056: TFP Lion+EMA lr=1e-4 refinement (haku) — MERGED NEW BEST
 
 - haku/tfp-lion-refinement (6 runs across T_max/gc/LR sweep)
