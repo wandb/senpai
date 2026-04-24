@@ -1,98 +1,121 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 14:30 (advisor cycle 89)
+- **Date:** 2026-04-24 15:30 (advisor cycle 90 — LAST DITCH RESTRUCTURING)
 - **Branch:** radford
-- **Idle students:** 0
-- **PRs ready for review:** 0
-- **TFP UNBLOCKED:** cp_panel bug fix merged (#3209). Multi-seed reproducibility confirmed. Sanji #3266 re-running champion config to verify 0.002383 is recoverable.
-- **Both bugs fixed in codebase:** cp_panel_prior_index() guard (#3209 MERGED) + primary_metric_key shadowing (#3209 MERGED).
+- **ACTIVE DIRECTIVE: Issue #3283 — Last Ditch Benchmark Push (~10 hours remaining)**
+- **Fleet restructuring IN PROGRESS:** killed 14 misaligned experiments, reassigning 15 students
 
-## Fleet Status (59 active PRs)
+## BINDING DIRECTIVE — Issue #3283 (2026-04-24)
 
-### DrivAerML WIP (30 PRs)
-**Innovation track (new physics-aware/ML ideas per directive):**
-- `#3281` megumi: MoE output heads (K=2/3 expert output MLPs with learned gating) — INNOVATION
-- `#3282` casca: AF volume→surface cross-attention (volume queries attend to surface keys) — AF VOLUME FOCUS
-- `#3270` brook: FiLM conditioning on global geometry statistics (per-car shape context) — INNOVATION
-- `#3280` jet: per-channel output heads (separate MLPs for Ux, Uy, p) — INNOVATION
-- `#3242` historia: label smoothing / target noise augmentation — INNOVATION
-- `#3235` kakashi: multi-exit prediction (aux losses at intermediate layers) — INNOVATION
-- `#3279` gojo: ReLU² activation in FFN (Primer-style squared ReLU for sparser features) — INNOVATION
-- `#3251` fern: Pre-LayerNorm architecture ablation (+ RMSNorm variant) — INNOVATION
-- `#3276` zenitsu: cosine similarity auxiliary loss (spatial pattern fidelity, w=0.1/0.5) — INNOVATION
-- `#3269` emma: learned error correction head (boosting-inspired self-correction) — INNOVATION
-- `#3267` mitsuha: SwiGLU FFN activation (replace GELU with gated linear unit) — INNOVATION
-- `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
-- `#3228` chopper: stochastic weight perturbation at cosine troughs — INNOVATION
-- `#3265` alphonse: hidden-space noise regularization (post-Fourier perturbation σ=0.01/0.05) — INNOVATION
-- `#3275` canute: local/windowed attention (KNN-restricted, K=512/2048 neighbors) — INNOVATION
-- `#3277` vegeta: coordinate residual branch (parallel bypass MLP for spatial bias correction) — INNOVATION
-- `#3202` senku: GLU preprocess MLP — INNOVATION
-- `#3201` jet: DomainLayerNorm — INNOVATION
+**Capacity split (59-student fleet):** 36 DM / 12 AF / 11 TFP / 0 TF
+**DM full-test gap: ~4.39-4.50% → 3.71% target (15% relative)**
+**Harness patches CRITICAL (vegeta #3284):** --load-checkpoint, --eval-interval, --ema-mode fixed, --skip-update-grad-norm, --save-checkpoint, kill gates
 
-**Noam-pivot experiments:**
-- `#3194` bulma: higher LR sweep (5.5e-4/6e-4)
-- `#3181` himmel: asinh+residual on champion — NOAM ABLATION
+### DM Strategy (36 students)
+**Truth/recovery (~40%):** champion replicas (seeds, no-compile, fixed EMA), checkpoint recovery, high-density surface (64k/96k/128k), gradient-spike-safe (gc=0.25, skip-update-grad-norm), narrow schedule (T_max=24/30/36, lr=4.8-5.2e-4), checkpoint soup/ensemble
+**Breakout (~60%):** AB-UPT-style anchored decoder, metric-aware fine-tune (mse_z + raw rel-L2), domain-normalized volume auxiliary, coordinate normalization + geometry features, final train+val retrain
 
-**Champion tuning / paper-facing:**
-- `#3266` sanji: TFP champion config re-verification post cp_panel fix (seed=0/42) — STABILIZATION VERIFY
-- `#3244` faye: DM Track 1 paper-facing full eval (champion config, NO --max-eval-batches) — PAPER-FACING Track 1
+### AF Strategy (12 students)
+vol-weight sweep 8-13, extended champion training, joint checkpoint selection, 1-2 architecture rescue lanes max. Kill: surface>0.001 at ep180, vol>0.004 at ep180, vol>0.003 at ep300.
+
+### TFP Strategy (11 students)
+Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002393). Kill: field_mse>0.006 at ep220, >0.004 at ep350, no improvement for 160 epochs.
+
+### TF: FROZEN (only #3185 as guardrail)
+
+## Fleet Status (restructuring in progress)
+
+### INFRASTRUCTURE (1 PR)
+- `#3284` vegeta: HARNESS PATCHES (--load-checkpoint, --eval-interval, --ema-mode, --skip-update-grad-norm, --save-checkpoint, kill gates) — **HIGHEST PRIORITY**
+
+### DrivAerML WIP (~28 continuing + 8 new = 36 target)
+**Champion recovery / truth lanes (newly assigned):**
+- norman: champion recovery seed=0 no-compile (Bucket A)
+- jet: champion recovery seed=42 no-compile (Bucket A)
+- megumi: champion recovery seed=7 no-compile (Bucket A)
+- himmel: 64k surface points (Bucket C)
+- askeladd: 96k surface points (Bucket C)
+- robin: gradient-spike-safe gc=0.25 (Bucket D)
+- nami: T_max=24 narrow schedule (Bucket E)
+- chrome: T_max=36 narrow schedule (Bucket E)
+
+**Continuing DM experiments (from pre-restructure):**
+- `#3244` faye: paper-facing full eval (SENT BACK for champion ckpt eval)
+- `#3279` gojo: ReLU² activation
+- `#3270` brook: FiLM conditioning
+- `#3269` emma: error correction head
+- `#3267` mitsuha: SwiGLU FFN
+- `#3265` alphonse: hidden-space noise
+- `#3276` zenitsu: cosine similarity loss
+- `#3275` canute: local attention
+- `#3271` nobara: LLRD
+- `#3251` fern: Pre-LayerNorm
+- `#3249` shouko: decaying WD
+- `#3242` historia: label smoothing
+- `#3235` kakashi: multi-exit prediction
+- `#3228` chopper: stochastic weight perturbation
+- `#3221` franky: gradient noise injection
+- `#3202` senku: GLU preprocess
+- `#3194` bulma: probe LR above 5e-4
 - `#3160` griffith: 16H heads
-- `#3271` nobara: layer-wise LR decay (LLRD, decay=0.8/0.65 across 4 layers) — INNOVATION
-- `#3272` vegeta: quadratic position features (x², y², z², xy, xz, yz for implicit curvature) — INNOVATION
-- `#3249` shouko: decaying weight decay schedule (WD=1e-4/5e-5 → 0 over 300ep) — INNOVATION
-- `#3152` eren: EMA decay sweep (0.999 vs 0.9995)
-- `#3146` taki: top-5 checkpoint averaging
-- `#3143` thorfinn: Lookahead(AdamW)
-- `#3121` levi: dropout regularization sweep
-- `#3110` einar: beta2=0.99/0.995
-- `#3109` guts: lr=4e-4 full-eval
-- `#3085` kohaku: larger supernodes (SENT BACK)
-- `#3076` frieren: log-cosh loss (SENT BACK)
-- `#3067` askeladd: 32k surface points (SENT BACK)
-- `#3046` sukuna: WD+gc compound (SENT BACK)
+- `#3152` eren: EMA sweep
+- `#3146` taki: checkpoint averaging
+- `#3143` thorfinn: Lookahead
+- `#3121` levi: dropout sweep
+- `#3110` einar: beta2 sweep
+- `#3109` guts: lr=4e-4
+- `#3085` kohaku: larger supernodes
+- `#3076` frieren: log-cosh loss
+- `#3046` sukuna: WD+gc compound
 
-### TandemFoil WIP (2 PRs) — GUARDRAIL ONLY per directive
-**New champion config:** ANP+full physics+T_max=150+gc=0.2+EMA=0.999+96sl+Lookahead+compile+re-strat (#3185)
-- `#3150` yuji: clean test row — PAPER-FACING
+### AirfRANS WIP (10 continuing + 2 new = 12 target)
+**Newly assigned:**
+- jin: vol-weight=8 sweep
+- violet: vol-weight=9 sweep
 
-### TandemFoil Paper WIP (9 PRs) — STABILIZATION RESOLVED
-**Bug fix merged (#3209). Sanji #3266 verifying champion config reproducibility.**
-
-**Noam-pivot experiments:**
-- `#3179` usopp: T_max=150+wake+96sl+Lookahead — NOAM ABLATION
-
-**Other:**
-- `#3133` shinobu: WD sweep (5e-3/2e-2)
-- `#3098` shoya: clean test evaluation — URGENT PAPER-FACING
-- `#3088` mugen: T_max=20
-- `#3056` haku: Lion+EMA refinement (T_max/gc/LR sweep)
-- `#2949` vash: depth/width sweep (LR=5e-5)
-
-### AirfRANS WIP (13 PRs)
-**Volume closure experiments:**
-- `#3261` nezuko: 2L/320d wider model (width scaling for vol closure) — AF VOLUME FOCUS
-- `#3278` gohan: separate volume prediction head with extra capacity (256→512→out) — AF VOLUME FOCUS
-- `#3257` chihiro: extended training via reduced eval frequency (every 3/5 epochs) — AF VOLUME FOCUS
-- `#3241` hinata: T_max=75 + vol-weight=10x/12x on champion — AF VOLUME FOCUS (schedule gap-fill)
-- `#3268` jin: higher LR sweep (7e-4/8e-4) on vol-10x+EMA champion — AF VOLUME FOCUS
-
-**Noam-pivot experiments (asinh-dependent — likely to fail):**
-- `#3187` stark: asinh+residual on vol-10x champion — NOAM ABLATION (asinh confirmed dead for AF)
-- `#3184` wolfwood: full noam stack — NOAM ABLATION (asinh confirmed dead for AF)
-
-**Other:**
-- `#3172` robin: LR warmup — SENT BACK (confounded config, re-running with correct champion config)
-- `#3169` nami: heads sweep 4H/16H
-- `#3274` norman: Lion optimizer under vol-10x+EMA (lr=5e-5/1e-4/2e-4 sweep) — AF VOLUME FOCUS
-- `#3238` rei: WD=0 ablation on vol-10x+EMA champion — AF VOLUME FOCUS
-- `#3245` tanjiro: per-channel volume loss weighting (upweight nut×4, p×2) — AF VOLUME FOCUS
-- `#3211` spike: AF vol_loss_scale learnable scalar (noam port) — AF VOLUME FOCUS
-- `#3240` gilbert: joint checkpoint selection + vol-weight 11x/12x/13x fine sweep — AF VOLUME FOCUS
-- `#3195` piccolo: Re-stratified sampling
+**Continuing AF experiments:**
+- `#3282` casca: vol cross-attention (architectural rescue)
+- `#3278` gohan: separate vol head (architectural rescue)
+- `#3257` chihiro: extended training
+- `#3250` tanjiro: per-channel vol loss
+- `#3241` hinata: T_max=75
+- `#3240` gilbert: vol-weight 11x/12x/13x fine sweep
+- `#3238` rei: WD follow-up
+- `#3211` spike: learned vol_loss_scale
+- `#3195` piccolo: re-stratified sampling
 - `#3156` edward: softer gc=0.5
-- `#3144` violet: vol-weight=2.0+EMA=0.999
-- `#3129` chrome: 4L/256d deeper
+
+### TandemFoil Paper WIP (7 continuing + 4 new = 11 target)
+**Newly assigned (haku config replication):**
+- nezuko: haku seed=0
+- stark: haku seed=42
+- wolfwood: haku seed=7
+- yuji: haku seed=123
+
+**Continuing TFP experiments:**
+- `#3266` sanji: champion re-verify
+- `#3179` usopp: T_max=150+wake+96sl+Lookahead
+- `#3133` shinobu: WD sweep
+- `#3098` shoya: clean test eval
+- `#3088` mugen: T_max=20
+- `#3056` haku: Lion+EMA refinement
+- `#2949` vash: depth/width sweep
+
+### Experiments KILLED this cycle (14 PRs per #3283)
+- #3280 jet: DM per-channel heads (surface is single channel cp)
+- #3281 megumi: DM MoE output (directive: no MoE)
+- #3181 himmel: DM asinh+residual (noam dead for DM)
+- #3067 askeladd: DM 32k surface points (directive: only test denser)
+- #3274 norman: AF Lion (directive: stop Lion)
+- #3172 robin: AF LR warmup (directive: stop warmup)
+- #3169 nami: AF heads sweep (directive: stop broad heads)
+- #3129 chrome: AF 4L/256d (directive: stop broad depth)
+- #3261 nezuko: AF 2L/320d (directive: stop broad width)
+- #3187 stark: AF asinh+residual (asinh dead)
+- #3184 wolfwood: AF full noam stack (noam dead)
+- #3268 jin: AF higher LR (directive: stop higher-LR arms)
+- #3144 violet: AF vol-weight=2 (below directive range 8-13)
+- #3150 yuji: TF clean test (TF frozen)
 
 ## Steering Anchors
 
