@@ -1,5 +1,20 @@
 # SENPAI Research Results
 
+## 2026-04-24 14:00 — PR #3262: DM learnable register tokens (megumi) — CLOSED (dead end)
+
+- megumi/dm-register-tokens, W&B runs: x2dp3s92 (N=2), jr1s77um (N=4), 3ftciy41 (N=8), group: dm-register-tokens
+- Hypothesis: register tokens (Darcet et al. 2024) absorb attention sinks, reducing systematic spatial bias
+
+| Trial | N | best val_pct | Epoch at best | Total epochs | Outcome |
+|-------|---|-------------|---------------|--------------|---------|
+| N=2 | 2 | 13.143% | 49 | 482 | NaN diverged ep114 |
+| N=4 | 4 | 10.010% | 62 | 481 | NaN diverged ep163 |
+| N=8 | 8 | 4.062% | 470 | 474 | Finished |
+
+**Conclusion:** Register tokens are a category error for Transolver. Darcet et al. documented attention sinks in ViTs with dense pairwise attention, but Transolver uses slice-based soft-clustering attention where the sink mechanism doesn't apply. N=8 preserved throughput (474 epochs) but converged to a 6% worse optimum. N=2/N=4 diverged to NaN at cosine restart boundaries. Student correctly identified the architectural mismatch.
+
+---
+
 ## 2026-04-24 13:35 — PR #3273: DM Grouped Query Attention (gojo) — CLOSED (dead end)
 
 - gojo/dm-grouped-query-attention, W&B runs: rq2tz9hh (2KV), wbygalr3 (4KV), group: dm-gqa
