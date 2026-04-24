@@ -169,6 +169,11 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    # Kill gates: comma-separated "epoch:threshold" pairs (e.g. "220:0.006,350:0.004")
+    # kill_if_best_val_above: kill if best_val_metric > threshold at or after epoch
+    kill_if_best_val_above: str = ""
+    # kill_if_no_improvement: "N:delta" — kill if no improvement > delta for N consecutive epochs
+    kill_if_no_improvement: str = ""
 
 
 @dataclass
@@ -443,15 +448,25 @@ class TandemTargetTransform:
 
 def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser(description="Unified ICML 2026 CFD trainer")
+    # Fields that support multiple invocations (nargs='append'), stored as comma-joined string
+    _multi_value_fields = {"kill_if_best_val_above", "kill_if_no_improvement"}
     for field_name, field_value in TrainConfig().__dict__.items():
         arg_name = f"--{field_name.replace('_', '-')}"
-        if isinstance(field_value, bool):
+        if field_name in _multi_value_fields:
+            # Allow repeated flags: --kill-if-best-val-above 220:0.006 --kill-if-best-val-above 350:0.004
+            parser.add_argument(arg_name, dest=field_name, action="append", default=None)
+        elif isinstance(field_value, bool):
             parser.add_argument(arg_name, action="store_true", default=field_value)
             parser.add_argument(f"--no-{field_name.replace('_', '-')}", action="store_false", dest=field_name)
         else:
             parser.add_argument(arg_name, type=type(field_value), default=field_value)
     namespace = parser.parse_args()
-    return TrainConfig(**vars(namespace))
+    ns_dict = vars(namespace)
+    # Join multi-value lists into comma-separated strings for TrainConfig
+    for field_name in _multi_value_fields:
+        val = ns_dict.get(field_name)
+        ns_dict[field_name] = ",".join(val) if val else ""
+    return TrainConfig(**ns_dict)
 
 
 def build_bundle(config: TrainConfig) -> DatasetBundle:
@@ -1551,6 +1566,56 @@ def compute_tandem_phys_stats(
     return TargetTransformStats(y_mean=mean, y_std=std)
 
 
+def parse_kill_gates(spec: str) -> list[tuple[int, float]]:
+    """Parse 'epoch:threshold,epoch:threshold,...' into list of (epoch, threshold) tuples."""
+    gates = []
+    if not spec:
+        return gates
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        ep_str, thresh_str = part.split(":")
+        gates.append((int(ep_str), float(thresh_str)))
+    return gates
+
+
+def check_kill_gates(
+    epoch: int,
+    best_val_metric: float,
+    best_epoch: int,
+    kill_if_best_val_above: str,
+    kill_if_no_improvement: str,
+) -> str | None:
+    """
+    Check whether any kill gate condition is met.
+    Returns a string reason if training should stop, else None.
+    """
+    # Check absolute threshold gates: kill if best_val_metric > threshold at or after epoch
+    for gate_epoch, threshold in parse_kill_gates(kill_if_best_val_above):
+        if epoch >= gate_epoch and best_val_metric > threshold:
+            return (
+                f"kill gate: best_val_metric {best_val_metric:.6f} > {threshold} at epoch {epoch} "
+                f"(gate threshold at ep{gate_epoch})"
+            )
+    # Check no-improvement gate: kill if no improvement for N consecutive epochs
+    if kill_if_no_improvement:
+        parts = kill_if_no_improvement.strip().split(",")
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            n_str, delta_str = part.split(":")
+            n_epochs = int(n_str)
+            # delta is minimum required improvement (not used in simple staleness check)
+            if epoch - best_epoch >= n_epochs:
+                return (
+                    f"kill gate: no improvement for {epoch - best_epoch} consecutive epochs "
+                    f"(gate: {n_epochs} epochs, last improved at ep{best_epoch})"
+                )
+    return None
+
+
 def main() -> None:
     config = parse_args()
     if config.seed != 0:
@@ -1752,6 +1817,21 @@ def main() -> None:
             run.summary["best_epoch"] = best_epoch
             run.summary["best_val_metric"] = best_val_metric
         print(json.dumps(epoch_metrics, sort_keys=True), flush=True)
+
+        # Check kill gates
+        kill_reason = check_kill_gates(
+            epoch=epoch,
+            best_val_metric=best_val_metric,
+            best_epoch=best_epoch,
+            kill_if_best_val_above=config.kill_if_best_val_above,
+            kill_if_no_improvement=config.kill_if_no_improvement,
+        )
+        if kill_reason:
+            print(json.dumps({"kill_gate_triggered": kill_reason, "epoch": epoch}), flush=True)
+            if run is not None:
+                run.summary["kill_gate_triggered"] = kill_reason
+                run.summary["kill_gate_epoch"] = epoch
+            break
 
     if best_epoch is not None:
         print(
