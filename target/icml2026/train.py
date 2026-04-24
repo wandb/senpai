@@ -454,6 +454,29 @@ def parse_args() -> TrainConfig:
     return TrainConfig(**vars(namespace))
 
 
+def _compute_airfrans_re_stratified_weights(bundle: DatasetBundle, n_bins: int = 10) -> torch.Tensor:
+    """Compute inverse-frequency weights binned by freestream velocity (Re proxy)."""
+    case_ids = bundle.train_dataset.base.case_ids
+    velocities = []
+    for cid in case_ids:
+        parts = cid.split("_")
+        try:
+            velocities.append(float(parts[2]))
+        except (IndexError, ValueError):
+            velocities.append(0.0)
+    v_min, v_max = min(velocities), max(velocities)
+    bin_width = (v_max - v_min + 1e-6) / n_bins
+    bin_indices = [int((v - v_min) / bin_width) for v in velocities]
+    bin_indices = [min(b, n_bins - 1) for b in bin_indices]
+    from collections import Counter
+    bin_counts = Counter(bin_indices)
+    weights = torch.tensor(
+        [1.0 / bin_counts[b] for b in bin_indices],
+        dtype=torch.float32,
+    )
+    return weights
+
+
 def build_bundle(config: TrainConfig) -> DatasetBundle:
     bundle_kwargs = {
         "dataset_name": config.dataset,
@@ -1577,6 +1600,8 @@ def main() -> None:
         _ds.TandemFoilCaseDataset.__init__ = _patched_init
 
     bundle = build_bundle(config)
+    if config.re_stratified_sampling and bundle.spec.name == "airfrans":
+        bundle.sample_weights = _compute_airfrans_re_stratified_weights(bundle)
     resolved_num_workers = resolve_num_workers(config, bundle.spec.name)
     if bundle.spec.name == "tandemfoilset":
         phys_stats = compute_tandem_phys_stats(
@@ -1635,17 +1660,10 @@ def main() -> None:
     ema = EMAWithWarmup(model, decay=config.ema_decay) if config.use_ema else None
     anp_ema = EMAWithWarmup(anp_head, decay=config.ema_decay) if config.use_ema and anp_head is not None else None
     history: list[dict[str, float]] = []
-    best_epoch: int | None = None
     best_val_primary_metric_name = primary_metric_key(bundle, phase="val")
     best_val_primary_metric: float | None = None
     best_val_metrics: dict[str, float] = {}
-    best_model_state: dict[str, torch.Tensor] | None = None
-    best_anp_state: dict[str, torch.Tensor] | None = None
-
-    if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
-    else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
+    val_primary_key = best_val_primary_metric_name
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1719,7 +1737,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(val_primary_key)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
