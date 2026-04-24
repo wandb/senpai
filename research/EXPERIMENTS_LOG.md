@@ -1,5 +1,116 @@
 # SENPAI Research Results
 
+## 2026-04-24 23:00 — Cycle 118 Batch Closures (9 PRs)
+
+### PR #3304: AF extended 600-min champion training (jin) — CLOSED
+- jin/af-extended-champion-600min
+- Hypothesis: longer AF training (600-min budget) could close gap to baseline
+- W&B: whdy9qox
+
+| Metric | Result | Baseline | Delta |
+|--------|--------|----------|-------|
+| val_primary/surface_mse | 0.000310 @ep584 | 0.000296 | +4.7% worse |
+| vol_mse @best-surface | 0.003716 | 0.002039 | +82.2% worse |
+
+- 884 epochs trained, marginal improvement but doesn't beat baseline
+- **Conclusion:** Extended training insufficient for AF. Closed.
+
+### PR #3288: TFP haku seed=42 replication (stark) — CLOSED
+- stark/tfp-haku-seed42
+- Hypothesis: seed=42 replication of TFP haku near-winner
+- W&B: (see PR comments)
+
+| Metric | seed=42 | Baseline (#3056) | Delta |
+|--------|---------|-----------------|-------|
+| val_primary/field_mse | 0.002428 @ep574 | 0.002344 | +3.6% worse |
+| test_primary/field_mse | 0.002250 @ep574 | 0.002221 | +1.3% worse |
+
+- No-physics T_max=20 + slices=64 + seed=42 competitive but doesn't beat baseline
+- **Conclusion:** TFP seed=42 doesn't beat seed=0 baseline. Closed.
+
+### PR #3266: TFP champion config re-verification (sanji) — CLOSED
+- sanji/tfp-champion-rerun
+- Hypothesis: verify champion config post cp_panel fix
+- W&B: rglchxrv
+
+| Metric | Result | Baseline | Delta |
+|--------|--------|----------|-------|
+| val_primary/field_mse | 0.00474 @ep287 | 0.002344 | +102% worse |
+
+- Post-fix config dramatically worse — cp_panel fix may have altered dynamics
+- **Conclusion:** Re-verification confirms config needs adjustment. Closed.
+
+### PR #3133: TFP weight decay sweep WD=5e-3/2e-2 (shinobu) — CLOSED
+- shinobu/tfp-wd-sweep
+- Hypothesis: WD=5e-3 (halved) and WD=2e-2 (doubled) vs WD=1e-2 baseline
+
+| Metric | WD=5e-3 | Baseline (WD=1e-2) |
+|--------|---------|-------------------|
+| val_primary/field_mse | Infinity | 0.002383 |
+
+- WD=5e-3: pressure channel diverged to Infinity. Never resolved.
+- **Conclusion:** WD=1e-2 confirmed as correct TFP value. Closed.
+
+### PR #3110: DM AdamW beta2=0.99/0.995 (einar) — CLOSED
+- einar/dm-adamw-beta2-099
+- Hypothesis: faster second-moment adaptation improves DM training
+
+| Variant | beta2 | Best Val | Diverged? |
+|---------|-------|----------|-----------|
+| Run 1 | 0.99 | worse than baseline | Yes |
+| Run 2 | 0.995 | worse than baseline | Yes |
+
+- Both beta2 variants overreact at cosine restart boundaries, causing instability
+- **Conclusion:** beta2=0.999 (default) confirmed correct for DM. Closed.
+
+### PR #3088: TFP T_max=20 (mugen) — CLOSED
+- mugen/tfp-tmax-20
+- Hypothesis: T_max=20 cosine schedule for TFP
+
+| Metric | T_max=20 | T_max=10 baseline | Delta |
+|--------|----------|-------------------|-------|
+| val_primary/field_mse | 0.004359 @ep203 | 0.002383 | +82.9% worse |
+
+- Diverged at ep204. T_max=10 confirmed as TFP optimum.
+- **Conclusion:** Longer cosine cycles worse for TFP. Closed.
+
+### PR #3085: DM larger supernodes 8192/16000 (kohaku) — CLOSED
+- kohaku/dm-larger-supernode-budget
+- Hypothesis: larger geometry supernodes closer to AB-UPT improve DM
+
+| Metric | 8192 supernodes | Baseline (old) | Delta |
+|--------|----------------|----------------|-------|
+| val surface_rel_l2_pct | 5.531% @ep169 | 3.997% | +38.4% worse |
+
+- Even with champion config (gc=0.5, EMA=0.9995), larger supernodes underperform
+- **Conclusion:** Default supernode budget is superior. Closed.
+
+### PR #3076: DM log-cosh loss (frieren) — CLOSED
+- frieren/dm-log-cosh-loss
+- Hypothesis: log-cosh as smooth robust alternative to MSE
+
+| Variant | Val surface_rel_l2_pct | Baseline |
+|---------|----------------------|----------|
+| Log-cosh (no gc) | 6.344% @ep126 | 3.700% |
+| Log-cosh + gc=1.0 | 4.599% @ep287 | 3.700% |
+
+- gc=1.0 helps but still 0.9pp worse. MSE + metric-aware rel-L2 is the winning loss.
+- **Conclusion:** Log-cosh not competitive with metric-aware MSE. Closed.
+
+### PR #3046: DM WD+gc compound sweep (sukuna) — CLOSED
+- sukuna/dm-wd-gc-compound-sweep
+- Hypothesis: gentle regularization via WD + gc combination
+
+| Config | Best Val | Best Test |
+|--------|----------|-----------|
+| WD=1e-3 + gc=1.0 | 4.44% | 5.30% |
+| WD=5e-4 + gc=1.0 | ~similar | ~similar |
+
+- All runs lacked EMA (now standard). Best val=4.44% doesn't beat 3.700%.
+- **Conclusion:** WD+gc without EMA or metric-aware loss is not competitive. Closed.
+
+---
+
 ## 2026-04-24 21:30 — PR #3302: DrivAerML Breakout 2 metric-aware MSE+raw-rel-L2 (canute) — MERGED (NEW BASELINE)
 
 - canute/dm-metric-aware-loss

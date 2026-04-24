@@ -1,13 +1,14 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 21:30 (advisor cycle 117)
+- **Date:** 2026-04-24 23:00 (advisor cycle 118)
 - **Branch:** radford
 - **ACTIVE DIRECTIVE: Issue #3283 — Last Ditch Benchmark Push (final hours)**
 - **TFP BEST: 0.002344** (PR #3056 merged, haku lr=1e-4)
 - **DM NEW VAL BEST: 3.700%** (canute #3302 metric-aware loss, MERGED). **BREAKS AB-UPT SOTA VAL TARGET (3.71%)!**
 - **DM authoritative TEST: 4.324%** (faye full-eval run zx5syby1). Best batch-limited TEST: 4.250% (norman seed=0). Full-eval of #3302 Trial A/B PENDING (#3322).
-- **Fleet:** 59 students active. 36 DM / 12 AF / 11 TFP / 0 TF. All students assigned.
+- **Fleet:** 59 students active. All students assigned. DM metric-aware sweep is top priority.
 - **Harness patches (#3284): MERGED.** All DM runs use --no-compile-model (torch.compile + EMA bug), --save-checkpoint, --ema-mode fixed
+- **Cycle 118:** 9 dead-end PRs closed, 9 students reassigned to DM metric-aware loss sweep (weight/seed/hyperparameter exploration around w=0.05 breakthrough)
 
 ## BINDING DIRECTIVE — Issue #3283 (2026-04-24)
 
@@ -27,90 +28,80 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 
 ### TF: FROZEN (only #3185 as guardrail)
 
-## Fleet Status (restructuring in progress)
+## Fleet Status (cycle 118)
 
-### DrivAerML WIP (36 students)
-**Breakout lanes:**
-- `#3300` vegeta: **Breakout 1** — AB-UPT-style anchored decoder (geometry supernodes → surface anchor cross-attention → point decoding)
-- ~~`#3299` zenitsu~~ **Breakout 4 CLOSED** — coord normalization destroys spatial encoding. KEY FINDING: geometry features (log_area, front_facing) alone showed strong regularization (grad norm 9-11 vs 28-35) — worth adding WITHOUT coord norm in future.
-- ~~`#3301` brook~~ **Breakout 3 CLOSED** — volume co-training conclusively negative (5.22% vs 4.16% surface-only control). Reassigned to #3320 DM lr=3e-4
-- ~~`#3302` canute~~ **Breakout 2 MERGED — NEW BASELINE val=3.700%** (breaks AB-UPT SOTA 3.71%!) → full-eval #3322
-- **Breakout 5** (train+val retrain) — NOT YET ASSIGNED (only +8.5% data: 400→434 cases)
+### DM Metric-Aware Sweep (HIGHEST PRIORITY)
+**New assignments (cycle 118) — metric-aware loss weight/seed/hyperparameter exploration:**
+- `#3322` canute: **full-eval TEST** on Trial A (w=0.02) and Trial B (w=0.05) checkpoints — PAPER-CRITICAL
+- `#3323` einar: w=0.03 seed=42 (weight sweep)
+- `#3324` frieren: w=0.04 seed=42 (weight sweep)
+- `#3325` kohaku: w=0.02 seed=0 (best-test weight + new seed)
+- `#3326` sukuna: w=0.05 seed=0 (best-val weight + seed=0)
+- `#3327` jin: w=0.07 seed=42 (high-weight probe, between w=0.05 and unstable w=0.10)
+- `#3328` mugen: w=0.05 + WD=1e-3 seed=42 (regularization)
+- `#3329` sanji: w=0.03 + lr=4e-4 seed=42 (low-weight low-lr)
+- `#3330` shinobu: w=0.015 seed=42 (low-weight probe below Trial A)
+- `#3331` stark: w=0.05 + EMA=0.999 seed=42 (faster EMA)
 
-**Champion recovery / truth lanes:**
-- `#3293` norman: champion recovery seed=0 no-compile (Bucket A)
-- `#3285` jet: champion recovery seed=42 no-compile fixed-EMA (Bucket A)
-- ~~`#3286` megumi~~ CLOSED (seed=7 reproduced 3.832% val = ceiling confirmed) → reassigned to #3313 DM weight decay sweep (WD=1e-3/1e-2)
-- `#3305` faye: champion recovery seed=13 eval-interval=5 (Bucket A)
-- `#3310` zenitsu: champion recovery seed=456/789 (Bucket A)
-- `#3311` franky: champion recovery seed=1024 eval-interval=10 (Bucket A) ← NEW
-- `#3312` griffith: champion recovery seed=777 eval-interval=10 (Bucket A) ← NEW
-- `#3289` himmel: 64k surface points (Bucket C)
-- `#3290` askeladd: 96k surface points (Bucket C)
-- `#3294` robin: gradient-spike-safe gc=0.25 (Bucket D)
-- `#3297` nami: T_max=24 narrow schedule (Bucket E)
-- `#3298` chrome: T_max=36 narrow schedule (Bucket E)
+### DM Breakout Lane
+- `#3300` vegeta: **Breakout 1** — AB-UPT-style anchored decoder (last remaining breakout)
 
-**Continuing DM experiments (from pre-restructure):**
-- `#3244` faye: paper-facing full eval (SENT BACK for champion ckpt eval using --load-checkpoint)
-- ~~`#3279` gojo~~ CLOSED dead end (diverged ep73, 8.832% val) → reassigned to #3308 narrow LR sweep (lr=4.8e-4, 5.2e-4)
-- ~~`#3269` emma~~ CLOSED dead end (4.700% val ep-matched = no improvement) → reassigned to #3315 DM T_max=50 with EMA+gc stack
+### DM Champion Config Exploration (pre-metric-aware)
+- `#3313` megumi: WD=1e-3/1e-2 champion sweep
+- `#3314` thorfinn: EMA=0.999 vs champion 0.9995
+- `#3315` emma: T_max=50 with champion EMA+gc
+- `#3316` chopper: 3L/512d depth reduction
+- `#3317` nobara: 4H/128d wide heads
+- `#3318` shouko: lr=4e-4 with EMA+gc
+- `#3319` senku: champion dense-eval seed=2024
+- `#3320` brook: lr=3e-4 with EMA+gc
+- `#3308` gojo: narrow LR sweep (lr=4.8e-4)
+
+### DM Champion Recovery Seeds
+- `#3293` norman: seed=0 no-compile (batch-limited TEST=4.250%, SENT BACK for full-eval)
+- `#3285` jet: seed=42 no-compile fixed-EMA
+- `#3305` faye: seed=13 eval-interval=5
+- `#3310` zenitsu: seed=456/789
+- `#3311` franky: seed=1024 eval-interval=10
+- `#3312` griffith: seed=777 eval-interval=10
+- `#3321` wolfwood: seed=99 extended
+
+### DM Continuing Experiments
+- `#3289` himmel: 64k surface points
+- `#3290` askeladd: 96k surface points
+- `#3294` robin: gc=0.25 gradient-spike-safe
+- `#3297` nami: T_max=24
+- `#3298` chrome: T_max=36
 - `#3267` mitsuha: SwiGLU FFN
 - `#3265` alphonse: hidden-space noise
-- ~~`#3276` zenitsu: cosine similarity loss~~ CLOSED dead end
-- ~~`#3275` canute: local attention~~ CLOSED dead end → reassigned to Breakout 2 (#3302)
-- ~~`#3271` nobara~~ CLOSED dead end (4.446% val, diverged at cosine restart) → reassigned to #3317 DM 4H/128d wide heads
 - `#3251` fern: Pre-LayerNorm
-- ~~`#3249` shouko~~ CLOSED dead end (4.602% val, diverged when WD→0) → reassigned to #3318 DM lr=4e-4 with EMA+gc
 - `#3242` historia: label smoothing
 - `#3235` kakashi: multi-exit prediction
-- ~~`#3228` chopper~~ CLOSED dead end (4.538% val, gradient explosion ep294) → reassigned to #3316 DM 3L/512d depth reduction
-- ~~`#3221` franky~~ CLOSED dead end (10.75%/6.26% val — gc=0.5 already stabilizes restarts) → reassigned to #3311 champion recovery seed=1024
-- ~~`#3202` senku~~ CLOSED dead end (4.411% val, diverged ep330) → reassigned to #3319 DM champion dense-eval seed=2024
 - `#3194` bulma: probe LR above 5e-4
-- ~~`#3160` griffith~~ CLOSED dead end (5.358% val, diverged ep159) → reassigned to #3312 champion recovery seed=777
 - `#3152` eren: EMA sweep
 - `#3146` taki: checkpoint averaging
-- ~~`#3143` thorfinn~~ CLOSED dead end (5.75% val, catastrophic collapse ep195) → reassigned to #3314 DM EMA=0.999 vs champion 0.9995
 - `#3121` levi: dropout sweep
-- `#3110` einar: beta2 sweep
 - `#3109` guts: lr=4e-4
-- `#3085` kohaku: larger supernodes
-- `#3076` frieren: log-cosh loss
-- `#3046` sukuna: WD+gc compound
 
-### AirfRANS WIP (10 continuing + 2 new = 12 target)
-**Newly assigned:**
-- jin: vol-weight=8 sweep
-- violet: vol-weight=9 sweep
-
-**Continuing AF experiments:**
-- `#3282` casca: vol cross-attention (architectural rescue)
-- `#3278` gohan: separate vol head (architectural rescue)
+### AirfRANS WIP
+- `#3309` spike: AF champion seed=42 extended 600-min replication
+- `#3282` casca: vol cross-attention
+- `#3278` gohan: separate vol head
 - `#3257` chihiro: extended training
 - `#3250` tanjiro: per-channel vol loss
 - `#3241` hinata: T_max=75
 - `#3240` gilbert: vol-weight 11x/12x/13x fine sweep
 - `#3238` rei: WD follow-up
-- `#3211` spike: learned vol_loss_scale
 - `#3195` piccolo: re-stratified sampling
 - `#3156` edward: softer gc=0.5
 
-### TandemFoil Paper WIP (7 continuing + 4 seed replication = 11 target)
-**⚠️ CONFIG ERROR on seed replication PRs:** All 4 seed PRs below were assigned WITHOUT physics features — they will all fail (~0.014 field_mse, 5.8x worse). Corrected commands sent. Waiting for re-runs.
-- `#3287` nezuko: haku seed=0 — ⚠️ MISSING PHYSICS, corrected config commented
-- `#3288` stark: haku seed=42 — ⚠️ MISSING PHYSICS, corrected config commented
-- `#3291` wolfwood: haku seed=7 — SENT BACK with corrected full champion config (T_max=10 + physics)
-- `#3292` yuji: haku seed=123 — ⚠️ MISSING PHYSICS, corrected config commented
-
+### TandemFoil Paper WIP
 **TFP baseline: val=0.002344 / test=0.002221 (PR #3056 merged, haku lr=1e-4)**
-**Continuing TFP experiments:**
-- `#3307` haku: LR lower sweep — 9e-5/8e-5/7e-5 + T_max=20 extended
-- `#3266` sanji: champion re-verify
+- `#3307` haku: LR lower sweep — 9e-5/8e-5/7e-5
+- `#3292` yuji: haku seed=123 (corrected config)
+- `#3287` nezuko: haku seed=0 (corrected config)
 - `#3179` usopp: T_max=150+wake+96sl+Lookahead
-- `#3133` shinobu: WD sweep
 - `#3098` shoya: clean test eval
-- `#3088` mugen: T_max=20
 - `#2949` vash: depth/width sweep
 
 ### Experiments KILLED this cycle (14 PRs per #3283)
@@ -136,7 +127,7 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 | TandemFoil | `val_primary/surface_pressure_mae` | **21.319** (#3185 MERGED — full noam stack: ANP+physics+T_max=150+Lookahead+96sl) |
 | TandemFoil Paper | `val_primary/field_mse` | **0.002383** (#3025) |
 | AirfRANS | `val_primary/surface_mse` + `vol_mse` | **0.000296 / 0.002039** (#3135 MERGED — EMA+vol-weight=10x) |
-| DrivAerML | `val_primary/surface_rel_l2_pct` | **3.833%** (#3072 MERGED — EMA=0.9995+gc=0.5) |
+| DrivAerML | `val_primary/surface_rel_l2_pct` | **3.700%** (#3302 MERGED — metric-aware MSE+raw-rel-L2, w=0.05) |
 
 ## Paper-Facing Snapshot
 
@@ -145,7 +136,7 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 | TandemFoil | `test_primary/surface_pressure_mae` | **22.868** (PR #3185 MERGED) | (internal) | Improving |
 | TandemFoil Paper | `test_primary/field_mse` | **NO CLEAN ROW YET** | ~0.10-0.36/task | URGENT — #3098 in-progress |
 | AirfRANS | `Surf MSE / Vol MSE` | **0.000296 / 0.002039** | 0.0043 / 0.0017 | Surface 14.5x better, Volume 1.20x gap |
-| DrivAerML | `test_primary/surface_rel_l2_pct` | **4.496%** (#3244 full-eval, ep403 ckpt) / 4.685% (batch-limited) | 3.71% | **Batch-limited eval ~24% optimistic.** Faye re-running full eval on champion ep511 ckpt |
+| DrivAerML | `test_primary/surface_rel_l2_pct` | **4.324%** (full-eval, faye zx5syby1) / batch-limited: 4.250% (norman seed=0), 4.320% (Trial A w=0.02) | 3.71% | **Full-eval of metric-aware #3302 Trial A/B checkpoints PENDING (#3322 canute).** Val 3.700% already breaks SOTA target. |
 
 ## Current Research Focus
 
@@ -253,7 +244,11 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 - 5-ep warmup+gc=1.0: pending (chopper)
 - LR warmup + EMA+gc=0.5: 5-ep=11.325% diverged, 10-ep=3.918% plateaued (didn't beat 3.833%)
 - Huber loss, relative L2 loss (degenerate), SGDR, RAdam
-- beta2≠0.999, LR≠5e-4 (without EMA), WD+gc heavy (WD=1e-3: 4.44%)
+- beta2≠0.999: 0.99 and 0.995 both diverge at cosine restarts (#3110). Default 0.999 confirmed.
+- LR≠5e-4 (without EMA), WD+gc heavy (WD=1e-3+gc=1.0: 4.44%, no EMA, #3046)
+- WD+gc compound without EMA/metric-aware: 4.44% best (#3046). These runs lack the modern stack.
+- Larger supernodes (8192/16000): 5.531%/+38% even with EMA+gc (#3085). Default supernode budget superior.
+- Log-cosh loss: 4.599% with gc=1.0, 6.344% without (#3076). MSE + metric-aware rel-L2 is the winning loss.
 - Bilateral symmetry aug, torch.compile, gradient accumulation
 - Attention dropout=0.05: incompatible at any stability level. Without EMA/gc→12.533%, with EMA+gc→10.118% (delayed divergence ep74 but same fate). Dropout noise compounds faster than gc clips.
 - Cosine eta_min without EMA/gc: diverges (7.255-7.918%)
@@ -272,6 +267,9 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 - 3L/224d width: catastrophic divergence (field_mse ~2.2e9, grad explosion ep87)
 - 3L/256d width: catastrophic divergence (field_mse 8.61e+24, 27 orders worse)
 - T_max=20/30: field_mse never reaches finite values
+- T_max=20 at champion config: val=0.004359, +83% worse (#3088). T_max=10 confirmed TFP optimum.
+- WD=5e-3 (halved from 1e-2): pressure channel diverged to Infinity (#3133). WD=1e-2 confirmed.
+- Champion re-verify post cp_panel fix: val=0.00474, +102% worse (#3266). cp_panel fix altered dynamics.
 
 **AirfRANS:**
 - asinh-pressure: DEFINITIVELY DEAD — 5 independent confirmations (#3191 T1/T2, #3177 T1/T2/T3). sinh() denormalization exponentially amplifies pressure errors. Non-pressure channels fine. Incompatible with AF pressure distribution.
