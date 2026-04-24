@@ -169,6 +169,8 @@ class TrainConfig:
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
     seed: int = 0
+    hidden_noise_std: float = 0.0
+    hidden_noise_layers: str = "all"
 
 
 @dataclass
@@ -540,6 +542,32 @@ def build_model(config: TrainConfig, bundle: DatasetBundle) -> torch.nn.Module:
             volume_output_dim=bundle.spec.volume_output_dim,
         )
     raise ValueError(f"Unknown model: {config.model}")
+
+
+def register_hidden_noise(model: torch.nn.Module, config: TrainConfig):
+    if config.hidden_noise_std <= 0:
+        return
+    backbone = getattr(model, "backbone", None)
+    if backbone is None:
+        return
+    blocks = list(backbone.blocks)
+    num_layers = len(blocks)
+    if config.hidden_noise_layers == "all":
+        apply_at = [True] * num_layers
+    elif config.hidden_noise_layers == "first":
+        apply_at = [True] + [False] * (num_layers - 1)
+    elif config.hidden_noise_layers == "last":
+        apply_at = [False] * (num_layers - 1) + [True]
+    else:
+        indices = {int(i) for i in config.hidden_noise_layers.split(",")}
+        apply_at = [i in indices for i in range(num_layers)]
+    std = config.hidden_noise_std
+    for i, block in enumerate(blocks):
+        if apply_at[i]:
+            def _hook(mod, inp, out, _std=std):
+                if mod.training:
+                    return out + torch.randn_like(out) * _std
+            block.register_forward_hook(_hook)
 
 
 def build_optimizer(params, config: TrainConfig):
@@ -1615,6 +1643,7 @@ def main() -> None:
 
     train_loader, val_loaders, test_loaders = build_loaders(config, bundle, num_workers=resolved_num_workers)
     model = build_model(config, bundle).to(device)
+    register_hidden_noise(model, config)
     forward_model = torch.compile(model) if config.compile_model and device.type == "cuda" else model
     anp_head = None
     if bundle.spec.name == "tandemfoilset" and config.anp_srf:
