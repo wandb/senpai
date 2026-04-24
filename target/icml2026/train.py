@@ -165,6 +165,7 @@ class TrainConfig:
     surface_anchor_points: int = 8_000
     volume_anchor_points: int = 8_000
     grad_clip: float = 0.0
+    coord_noise_std: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
     save_checkpoint: bool = False
@@ -1254,6 +1255,27 @@ def evaluate_abupt(
     return {"surface_mae": total_surface / max(count_surface, 1), "volume_mae": total_volume / max(count_volume, 1)}
 
 
+def _apply_coord_noise(
+    surface_x: torch.Tensor,
+    noise_std: float,
+    space_dim: int,
+    enable_fourier: bool,
+    fourier_freqs: tuple[float, ...] = (0.5, 2.0, 8.0, 32.0),
+) -> torch.Tensor:
+    surface_x = surface_x.clone()
+    surface_x[..., :space_dim] = surface_x[..., :space_dim] + torch.randn_like(surface_x[..., :space_dim]) * noise_std
+    if enable_fourier:
+        fourier_dim = space_dim * len(fourier_freqs) * 2
+        base_dim = surface_x.shape[-1] - fourier_dim
+        noisy_coords = surface_x[..., :space_dim]
+        fourier_pieces = []
+        for freq in fourier_freqs:
+            fourier_pieces.append(torch.sin(noisy_coords * freq))
+            fourier_pieces.append(torch.cos(noisy_coords * freq))
+        surface_x = torch.cat([surface_x[..., :base_dim], torch.cat(fourier_pieces, dim=-1)], dim=-1)
+    return surface_x
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     anp_head: ANPSurfaceDecoder | None,
@@ -1271,6 +1293,9 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    coord_noise_std: float = 0.0,
+    space_dim: int = 3,
+    enable_fourier: bool = False,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1319,9 +1344,14 @@ def train_one_epoch(
                         outputs = maybe_apply_anp(outputs, prepared, anp_head)
                         loss, _ = loss_grouped_tandem(prepared, outputs, volume_loss_weight=volume_loss_weight)
                 else:
+                    noisy_surface_x = (
+                        _apply_coord_noise(batch.surface_x, coord_noise_std, space_dim, enable_fourier)
+                        if coord_noise_std > 0
+                        else batch.surface_x
+                    )
                     with autocast_context(device, amp_mode):
                         outputs = model(
-                            surface_x=batch.surface_x,
+                            surface_x=noisy_surface_x,
                             surface_mask=batch.surface_mask,
                             volume_x=batch.volume_x,
                             volume_mask=batch.volume_mask,
@@ -1688,6 +1718,9 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            coord_noise_std=config.coord_noise_std,
+            space_dim=bundle.spec.space_dim,
+            enable_fourier=config.enable_fourier,
         )
 
         if ema is not None:
