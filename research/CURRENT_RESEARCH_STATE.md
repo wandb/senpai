@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-24 11:45 (advisor cycle 83)
+- **Date:** 2026-04-24 12:15 (advisor cycle 84)
 - **Branch:** radford
 - **Idle students:** 0
 - **PRs ready for review:** 0
@@ -25,7 +25,7 @@
 - `#3221` franky: gradient noise injection (Neelakantan et al.) — INNOVATION
 - `#3228` chopper: stochastic weight perturbation at cosine troughs — INNOVATION
 - `#3265` alphonse: hidden-space noise regularization (post-Fourier perturbation σ=0.01/0.05) — INNOVATION
-- `#3253` canute: input feature dropout (Fourier channel dropout 10%/20%) — INNOVATION
+- `#3275` canute: local/windowed attention (KNN-restricted, K=512/2048 neighbors) — INNOVATION
 - `#3264` vegeta: Weight Standardization on linear layers (bs=1 loss smoothing, Qiao 2019) — INNOVATION
 - `#3202` senku: GLU preprocess MLP — INNOVATION
 - `#3201` jet: DomainLayerNorm — INNOVATION
@@ -84,7 +84,7 @@
 **Other:**
 - `#3172` robin: LR warmup — SENT BACK (confounded config, re-running with correct champion config)
 - `#3169` nami: heads sweep 4H/16H
-- `#3254` norman: multi-seed champion run (seeds 42/123/789) — AF VOLUME FOCUS
+- `#3274` norman: Lion optimizer under vol-10x+EMA (lr=5e-5/1e-4/2e-4 sweep) — AF VOLUME FOCUS
 - `#3238` rei: WD=0 ablation on vol-10x+EMA champion — AF VOLUME FOCUS
 - `#3245` tanjiro: per-channel volume loss weighting (upweight nut×4, p×2) — AF VOLUME FOCUS
 - `#3211` spike: AF vol_loss_scale learnable scalar (noam port) — AF VOLUME FOCUS
@@ -201,6 +201,7 @@
 - Weight Standardization: 67.9%/71.4% catastrophic (#3264). WS × cosine restarts × bs=1 feedback loop. Original BiT paper used epoch-level decay not per-batch restarts
 - SGDR eta_mult (decaying restart LR): 4.153%/12.64% (#3248). Confounded by switching to warm restarts. Sharp restart jumps more destabilizing than baseline's smooth cosine
 - Sparse MoE FFN (K=4/8, top-2): 5.09%/5.35% (#3263). 1.7-2.2x throughput penalty → epoch starvation. Routing collapses to uniform. Per-epoch curve parallel to dense — FFN is not the bottleneck
+- Input feature dropout (Fourier channels): p=0.1→4.73%, p=0.2→4.82% (#3253). Input-level dropout = information destruction. All 4 Fourier bands essential. Terminal divergence at both dropout rates
 - EMA>0.9995: 0.9999→7.106% NaN ep171, 0.99995→7.095% collapse ep120 (#3199). EMA=0.9995 sharp optimum bracketed both directions
 - SAM optimizer (rho=0.05/0.02): 5.36%/9.08%. SAM perturbation + cosine restart = double shock → catastrophic divergence. 2x compute penalty also prohibitive
 - True monotonic cosine (T_max=393606, no restarts): 4.086% (+0.253pp). Confirms T_max=30 rapid restarts are core mechanism, not noise. Monotonic decay can't compete
@@ -243,6 +244,7 @@
 - Vol-weight warm-up (1x→10x ramp): 2/3 collapsed, best stable +28% surface/+69% vol (#3232). Cosine restarts inject LR peak when vol-weight ramps — destructive. Static 10x TRIPLE-CONFIRMED
 - Focal-MSE volume loss (error-based reweighting): gamma=2 +392%/+3993%, gamma=1 +222%/+320% (#3227). Batch-max normalization non-stationary + freestream scaffolding destroyed
 - Additive BL auxiliary volume loss (SDF targeting): all 3 trials +31-228% both metrics (#3239). SDF<0.05 captures 61% of vol points on AF meshes — "BL targeting" ≈ uniform upscaling. Pattern confirmed with #3222
+- Multi-seed champion (seeds 42/123/789): all worse than seed=0 baseline (#3254). Seed 42 diverged, 123/789 +39-76% vol. Champion config has high seed sensitivity — seed=0 is lucky initialization
 - 3L depth (with or without EMA): catastrophic divergence confirmed twice
 - 2L/384d and 3L/384d: catastrophic divergence
 - EMA>0.9995 (0.9999/0.99995 both ~85% worse, diverge early, #3199). EMA=0.9995 bracketed as sharp optimum with steep cliffs both directions
