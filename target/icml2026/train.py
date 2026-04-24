@@ -167,6 +167,7 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
+    vol_channel_weights: list[float] | None = None
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -444,12 +445,15 @@ class TandemTargetTransform:
 def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser(description="Unified ICML 2026 CFD trainer")
     for field_name, field_value in TrainConfig().__dict__.items():
+        if field_name == "vol_channel_weights":
+            continue
         arg_name = f"--{field_name.replace('_', '-')}"
         if isinstance(field_value, bool):
             parser.add_argument(arg_name, action="store_true", default=field_value)
             parser.add_argument(f"--no-{field_name.replace('_', '-')}", action="store_false", dest=field_name)
         else:
             parser.add_argument(arg_name, type=type(field_value), default=field_value)
+    parser.add_argument("--vol-channel-weights", nargs=4, type=float, default=None, dest="vol_channel_weights")
     namespace = parser.parse_args()
     return TrainConfig(**vars(namespace))
 
@@ -763,6 +767,7 @@ def loss_grouped(
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
     volume_loss_weight: float = 1.0,
+    vol_channel_weights: list[float] | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.surface_x.device)
     metrics: dict[str, float] = {}
@@ -773,7 +778,18 @@ def loss_grouped(
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
         target = transform.apply(batch.volume_y)
-        vol_loss = F.mse_loss(outputs["volume_preds"][batch.volume_mask], target[batch.volume_mask])
+        preds = outputs["volume_preds"][batch.volume_mask]
+        tgt = target[batch.volume_mask]
+        if vol_channel_weights is not None:
+            ch_w = torch.tensor(vol_channel_weights, device=preds.device, dtype=preds.dtype)
+            per_ch = ((preds - tgt) ** 2).mean(dim=0)
+            vol_loss = (per_ch * ch_w).sum() / ch_w.sum()
+            metrics["vol_ch_mse_ux"] = float(per_ch[0].detach().cpu().item())
+            metrics["vol_ch_mse_uy"] = float(per_ch[1].detach().cpu().item())
+            metrics["vol_ch_mse_p"] = float(per_ch[2].detach().cpu().item())
+            metrics["vol_ch_mse_nut"] = float(per_ch[3].detach().cpu().item())
+        else:
+            vol_loss = F.mse_loss(preds, tgt)
         total = total + vol_loss * volume_loss_weight
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
@@ -804,6 +820,7 @@ def loss_abupt(
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
     volume_loss_weight: float = 1.0,
+    vol_channel_weights: list[float] | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.geometry_position.device)
     metrics: dict[str, float] = {}
@@ -814,7 +831,17 @@ def loss_abupt(
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if batch.volume_anchor_target is not None and outputs["volume_preds"] is not None:
         vol_target = transform.apply(batch.volume_anchor_target)
-        vol_loss = F.mse_loss(outputs["volume_preds"], vol_target)
+        if vol_channel_weights is not None:
+            preds = outputs["volume_preds"]
+            ch_w = torch.tensor(vol_channel_weights, device=preds.device, dtype=preds.dtype)
+            per_ch = ((preds - vol_target) ** 2).mean(dim=0)
+            vol_loss = (per_ch * ch_w).sum() / ch_w.sum()
+            metrics["vol_ch_mse_ux"] = float(per_ch[0].detach().cpu().item())
+            metrics["vol_ch_mse_uy"] = float(per_ch[1].detach().cpu().item())
+            metrics["vol_ch_mse_p"] = float(per_ch[2].detach().cpu().item())
+            metrics["vol_ch_mse_nut"] = float(per_ch[3].detach().cpu().item())
+        else:
+            vol_loss = F.mse_loss(outputs["volume_preds"], vol_target)
         total = total + vol_loss * volume_loss_weight
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
@@ -1271,6 +1298,7 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    vol_channel_weights: list[float] | None = None,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1304,7 +1332,11 @@ def train_one_epoch(
                         surface_anchor_position=batch.surface_anchor_position,
                         volume_anchor_position=batch.volume_anchor_position,
                     )
-                    loss, _ = loss_abupt(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                    loss, loss_metrics = loss_abupt(batch, outputs, transform, volume_loss_weight=volume_loss_weight, vol_channel_weights=vol_channel_weights)
+                    for k, v in loss_metrics.items():
+                        if k.startswith("vol_ch_mse_"):
+                            running.setdefault(k, 0.0)
+                            running[k] += v
             else:
                 batch = batch.to(device)
                 if isinstance(transform, TandemTargetTransform):
@@ -1326,7 +1358,11 @@ def train_one_epoch(
                             volume_x=batch.volume_x,
                             volume_mask=batch.volume_mask,
                         )
-                        loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                        loss, loss_metrics = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight, vol_channel_weights=vol_channel_weights)
+                        for k, v in loss_metrics.items():
+                            if k.startswith("vol_ch_mse_"):
+                                running.setdefault(k, 0.0)
+                                running[k] += v
 
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
@@ -1359,6 +1395,9 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    for k in list(running.keys()):
+        if k.startswith("vol_ch_mse_"):
+            running[k] /= max(steps, 1)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1688,6 +1727,7 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            vol_channel_weights=config.vol_channel_weights,
         )
 
         if ema is not None:
