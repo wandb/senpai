@@ -167,6 +167,7 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
+    cosine_sim_weight: float = 0.0
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -1277,6 +1278,7 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    cosine_sim_weight: float = 0.0,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1334,6 +1336,19 @@ def train_one_epoch(
                         )
                         loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
 
+                    if cosine_sim_weight > 0 and batch.surface_y is not None and outputs["surface_preds"] is not None:
+                        pred_masked = outputs["surface_preds"][batch.surface_mask].float()
+                        target_masked = transform.apply(batch.surface_y)[batch.surface_mask].float()
+                        pred_flat = pred_masked.reshape(1, -1)
+                        target_flat = target_masked.reshape(1, -1)
+                        cos_sim = F.cosine_similarity(pred_flat, target_flat, dim=-1)
+                        cosine_loss = (1.0 - cos_sim).mean()
+                        loss = loss + cosine_sim_weight * cosine_loss
+                        running.setdefault("cosine_similarity", 0.0)
+                        running["cosine_similarity"] += float(cos_sim.mean().detach().cpu().item())
+                        running.setdefault("cosine_loss", 0.0)
+                        running["cosine_loss"] += float(cosine_loss.detach().cpu().item())
+
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
             micro_count += 1
@@ -1365,6 +1380,10 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    if "cosine_similarity" in running:
+        running["cosine_similarity"] /= max(steps, 1)
+    if "cosine_loss" in running:
+        running["cosine_loss"] /= max(steps, 1)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
@@ -1694,6 +1713,7 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            cosine_sim_weight=config.cosine_sim_weight,
         )
 
         if ema is not None:
