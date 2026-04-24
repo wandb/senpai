@@ -1,5 +1,33 @@
 # SENPAI Research Results
 
+## 2026-04-24 13:35 — PR #3273: DM Grouped Query Attention (gojo) — CLOSED (dead end)
+
+- gojo/dm-grouped-query-attention, W&B runs: rq2tz9hh (2KV), wbygalr3 (4KV), group: dm-gqa
+- Hypothesis: GQA reduces KV heads (8→2 or 4) for throughput gain, enabling more epochs within timeout
+
+| Trial | KV heads | best val_pct | Epochs | Outcome |
+|-------|----------|-------------|--------|---------|
+| 2KV | 2 | 12.882% (ep57) | ~131 | Crashed — gradient explosion |
+| 4KV | 4 | 6.884% (ep114) | ~128 | Crashed — gradient explosion |
+
+**Conclusion:** GQA is throughput-NEUTRAL on Transolver — the bottleneck is the 50k-token slice-routing einsums, not QKV projections (which only operate on 96 slice tokens). GQA also destabilizes per-head slice routing: KV sharing forces coupled routing dynamics that explode at cosine restart peaks. Both configs diverged before reaching 511 epochs. Key insight: future throughput experiments should target slice routing, not attention projections.
+
+---
+
+## 2026-04-24 13:35 — PR #3243: DM error-weighted surface sampling (jet) — CLOSED (dead end)
+
+- jet/dm-error-weighted-sampling, W&B runs: 7amzkwq3 (T=1.0), 62zxlf2x (T=0.5), group: dm-error-weighted-sampling
+- Hypothesis: importance-sample surface points by prediction error to focus on hard regions
+
+| Trial | Temperature | best val_pct | Epochs | Outcome |
+|-------|------------|-------------|--------|---------|
+| T=1.0 | 1.0 | 40.79% (ep5) | 6 | Crashed — distribution shift collapse |
+| T=0.5 | 0.5 | 39.31% (ep5) | 6 | Crashed — distribution shift collapse |
+
+**Conclusion:** Classic importance-sampling distribution-shift collapse. Both crashed on the first epoch where error-weighted sampling activated. Gradient norms exploded 15-29x as hard points got massively overweighted and smooth regions starved. Additional blockers: fp32 error-map computation costs 30-60 min/epoch (throughput-prohibitive), and weighted sampling creates train/eval mismatch (same as #3259). Student's suggestion of error-weighted LOSS (not sampling) avoids distribution shift but still faces train/eval mismatch.
+
+---
+
 ## 2026-04-24 13:15 — PR #3272: DM quadratic position features (vegeta) — CLOSED (dead end)
 
 - vegeta/dm-quadratic-pos-encoding, W&B runs: equlqwg4 (quad+Fourier), qm4gk9bi (quad-only)
