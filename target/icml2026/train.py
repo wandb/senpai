@@ -167,6 +167,7 @@ class TrainConfig:
     grad_clip: float = 0.0
     grad_accum_steps: int = 1
     volume_loss_weight: float = 1.0
+    vol_loss_scale: bool = False
     save_checkpoint: bool = False
     seed: int = 0
 
@@ -763,6 +764,7 @@ def loss_grouped(
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
     volume_loss_weight: float = 1.0,
+    vol_loss_scale: torch.nn.Parameter | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.surface_x.device)
     metrics: dict[str, float] = {}
@@ -774,7 +776,8 @@ def loss_grouped(
     if batch.volume_y is not None and outputs["volume_preds"] is not None and batch.volume_mask is not None:
         target = transform.apply(batch.volume_y)
         vol_loss = F.mse_loss(outputs["volume_preds"][batch.volume_mask], target[batch.volume_mask])
-        total = total + vol_loss * volume_loss_weight
+        effective_weight = volume_loss_weight * F.softplus(vol_loss_scale) if vol_loss_scale is not None else volume_loss_weight
+        total = total + vol_loss * effective_weight
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
     return total, metrics
@@ -784,6 +787,7 @@ def loss_grouped_tandem(
     prepared: TandemPreparedBatch,
     outputs: dict[str, torch.Tensor | None],
     volume_loss_weight: float = 1.0,
+    vol_loss_scale: torch.nn.Parameter | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=prepared.surface_x.device)
     metrics: dict[str, float] = {}
@@ -793,7 +797,8 @@ def loss_grouped_tandem(
         metrics["surface_loss"] = float(surf_loss.detach().cpu().item())
     if prepared.volume_target is not None and outputs["volume_preds"] is not None and prepared.volume_mask is not None:
         vol_loss = F.mse_loss(outputs["volume_preds"][prepared.volume_mask], prepared.volume_target[prepared.volume_mask])
-        total = total + vol_loss * volume_loss_weight
+        effective_weight = volume_loss_weight * F.softplus(vol_loss_scale) if vol_loss_scale is not None else volume_loss_weight
+        total = total + vol_loss * effective_weight
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
     return total, metrics
@@ -804,6 +809,7 @@ def loss_abupt(
     outputs: dict[str, torch.Tensor | None],
     transform: TargetTransform,
     volume_loss_weight: float = 1.0,
+    vol_loss_scale: torch.nn.Parameter | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = torch.tensor(0.0, device=batch.geometry_position.device)
     metrics: dict[str, float] = {}
@@ -815,7 +821,8 @@ def loss_abupt(
     if batch.volume_anchor_target is not None and outputs["volume_preds"] is not None:
         vol_target = transform.apply(batch.volume_anchor_target)
         vol_loss = F.mse_loss(outputs["volume_preds"], vol_target)
-        total = total + vol_loss * volume_loss_weight
+        effective_weight = volume_loss_weight * F.softplus(vol_loss_scale) if vol_loss_scale is not None else volume_loss_weight
+        total = total + vol_loss * effective_weight
         metrics["volume_loss"] = float(vol_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
     return total, metrics
@@ -1271,6 +1278,7 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     grad_accum_steps: int = 1,
     volume_loss_weight: float = 1.0,
+    vol_loss_scale: torch.nn.Parameter | None = None,
 ) -> dict[str, float]:
     model.train()
     if anp_head is not None:
@@ -1304,7 +1312,7 @@ def train_one_epoch(
                         surface_anchor_position=batch.surface_anchor_position,
                         volume_anchor_position=batch.volume_anchor_position,
                     )
-                    loss, _ = loss_abupt(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                    loss, _ = loss_abupt(batch, outputs, transform, volume_loss_weight=volume_loss_weight, vol_loss_scale=vol_loss_scale)
             else:
                 batch = batch.to(device)
                 if isinstance(transform, TandemTargetTransform):
@@ -1317,7 +1325,7 @@ def train_one_epoch(
                             volume_mask=prepared.volume_mask,
                         )
                         outputs = maybe_apply_anp(outputs, prepared, anp_head)
-                        loss, _ = loss_grouped_tandem(prepared, outputs, volume_loss_weight=volume_loss_weight)
+                        loss, _ = loss_grouped_tandem(prepared, outputs, volume_loss_weight=volume_loss_weight, vol_loss_scale=vol_loss_scale)
                 else:
                     with autocast_context(device, amp_mode):
                         outputs = model(
@@ -1326,7 +1334,7 @@ def train_one_epoch(
                             volume_x=batch.volume_x,
                             volume_mask=batch.volume_mask,
                         )
-                        loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight)
+                        loss, _ = loss_grouped(batch, outputs, transform, volume_loss_weight=volume_loss_weight, vol_loss_scale=vol_loss_scale)
 
             accum_loss += float(loss.detach().cpu().item())
             (loss / grad_accum_steps).backward()
@@ -1338,6 +1346,8 @@ def train_one_epoch(
         all_params = list(model.parameters())
         if anp_head is not None:
             all_params += list(anp_head.parameters())
+        if vol_loss_scale is not None:
+            all_params.append(vol_loss_scale)
         grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=grad_clip if grad_clip > 0 else float("inf"))
         running.setdefault("grad_norm_mean", 0.0)
         running["grad_norm_mean"] += float(grad_norm)
@@ -1361,6 +1371,8 @@ def train_one_epoch(
         running["grad_norm_mean"] /= max(steps, 1)
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
+    if vol_loss_scale is not None:
+        running["train/vol_loss_scale"] = float(F.softplus(vol_loss_scale).item())
     if scheduler is not None:
         running["lr"] = float(optimizer.param_groups[0]["lr"])
     return running
@@ -1623,9 +1635,15 @@ def main() -> None:
             output_dim=bundle.spec.surface_output_dim,
         ).to(device)
 
+    vol_loss_scale_param: torch.nn.Parameter | None = None
+    if config.vol_loss_scale:
+        vol_loss_scale_param = torch.nn.Parameter(torch.tensor([0.5413], device=device))
+
     params = list(model.parameters())
     if anp_head is not None:
         params.extend(list(anp_head.parameters()))
+    if vol_loss_scale_param is not None:
+        params.append(vol_loss_scale_param)
     optimizer = build_optimizer(params, config)
     scheduler = None
     if config.cosine_t_max > 0:
@@ -1642,10 +1660,7 @@ def main() -> None:
     best_model_state: dict[str, torch.Tensor] | None = None
     best_anp_state: dict[str, torch.Tensor] | None = None
 
-    if bundle.spec.name == "tandemfoilset":
-        primary_metric_key = "val_primary/surface_pressure_mae"
-    else:
-        primary_metric_key = f"val_primary/{bundle.spec.default_metric}"
+    ckpt_metric_key = best_val_primary_metric_name
     best_val_metric = float("inf")
     best_epoch = 0
     best_model_state: dict[str, torch.Tensor] | None = None
@@ -1688,6 +1703,7 @@ def main() -> None:
             grad_clip=config.grad_clip,
             grad_accum_steps=config.grad_accum_steps,
             volume_loss_weight=config.volume_loss_weight,
+            vol_loss_scale=vol_loss_scale_param,
         )
 
         if ema is not None:
@@ -1719,7 +1735,7 @@ def main() -> None:
             best_model_state = snapshot_module_state(model)
             best_anp_state = snapshot_module_state(anp_head)
 
-        current_val = eval_metrics.get(primary_metric_key)
+        current_val = eval_metrics.get(ckpt_metric_key)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
             best_epoch = epoch
