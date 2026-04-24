@@ -1677,17 +1677,14 @@ def main() -> None:
     history: list[dict[str, float]] = []
     best_epoch: int | None = None
     best_val_primary_metric_name = primary_metric_key(bundle, phase="val")
-    best_val_primary_metric: float | None = None
-    best_val_metrics: dict[str, float] = {}
-    best_model_state: dict[str, torch.Tensor] | None = None
-    best_anp_state: dict[str, torch.Tensor] | None = None
-
     if bundle.spec.name == "tandemfoilset":
         val_primary_key = "val_primary/surface_pressure_mae"
     else:
         val_primary_key = f"val_primary/{bundle.spec.default_metric}"
     best_val_metric = float("inf")
-    best_epoch = 0
+    best_val_primary_metric: float | None = None
+    best_val_metrics: dict[str, float] = {}
+    best_epoch: int = 0
     best_model_state: dict[str, torch.Tensor] | None = None
     best_anp_state: dict[str, torch.Tensor] | None = None
     best_ema_shadow: dict[str, torch.Tensor] | None = None
@@ -1731,6 +1728,11 @@ def main() -> None:
     timeout_seconds = None if not timeout_env else float(timeout_env) * 60.0
     grad_nonfinite_count = 0
     last_eval_epoch = 0
+    kill_patience, kill_min_delta = 0, 0.0
+    kill_ref_metric, kill_ref_epoch = float("inf"), 0
+    if config.kill_if_no_improvement:
+        _p, _d = config.kill_if_no_improvement.split(":")
+        kill_patience, kill_min_delta = int(_p), float(_d)
 
     for epoch in range(1, config.epochs + 1):
         if timeout_seconds is not None and epoch > 1 and (time.monotonic() - start_time) >= timeout_seconds:
@@ -1777,27 +1779,22 @@ def main() -> None:
                 phase="val",
             )
 
-            current_primary_metric = eval_metrics.get(best_val_primary_metric_name)
-            if current_primary_metric is not None and (
-                best_val_primary_metric is None or current_primary_metric < best_val_primary_metric
-            ):
-                best_epoch = epoch
-                best_val_primary_metric = current_primary_metric
-                best_val_metrics = dict(eval_metrics)
-                best_model_state = snapshot_module_state(model)
-                best_anp_state = snapshot_module_state(anp_head)
-
             current_val = eval_metrics.get(val_primary_key)
             if current_val is not None and current_val < best_val_metric:
                 best_val_metric = current_val
+                best_val_primary_metric = current_val
+                best_val_metrics = dict(eval_metrics)
                 best_epoch = epoch
                 best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                if anp_head is not None:
-                    best_anp_state = {k: v.cpu().clone() for k, v in anp_head.state_dict().items()}
+                best_anp_state = snapshot_module_state(anp_head)
                 if ema is not None:
                     best_ema_shadow = {k: v.cpu().clone() for k, v in ema.shadow.items()}
                 if anp_ema is not None:
                     best_anp_ema_shadow = {k: v.cpu().clone() for k, v in anp_ema.shadow.items()}
+
+            if current_val is not None and current_val < kill_ref_metric - kill_min_delta:
+                kill_ref_metric = current_val
+                kill_ref_epoch = epoch
 
             kill_reason = None
             if config.kill_if_best_val_above and best_val_metric is not None:
@@ -1808,13 +1805,11 @@ def main() -> None:
                         f"best_val {best_val_metric:.4f} exceeded kill gate {gate_threshold} "
                         f"after epoch {gate_epoch}"
                     )
-            if kill_reason is None and config.kill_if_no_improvement and best_epoch is not None:
-                patience_str, min_delta_str = config.kill_if_no_improvement.split(":")
-                patience, min_delta = int(patience_str), float(min_delta_str)
-                if epoch - best_epoch >= patience:
+            if kill_reason is None and config.kill_if_no_improvement:
+                if epoch - kill_ref_epoch >= kill_patience:
                     kill_reason = (
-                        f"no improvement for {epoch - best_epoch} epochs "
-                        f"(patience={patience}, min_delta={min_delta})"
+                        f"no significant improvement (>{kill_min_delta}) for "
+                        f"{epoch - kill_ref_epoch} epochs (patience={kill_patience})"
                     )
             if kill_reason is None and config.kill_if_grad_nonfinite_steps > 0:
                 if grad_nonfinite_count >= config.kill_if_grad_nonfinite_steps:
@@ -1879,22 +1874,14 @@ def main() -> None:
             anp_head=anp_head, loaders=val_loaders, transform=transform,
             metric_transform=metric_transform, device=device, phase="val",
         )
-        current_primary_metric = eval_metrics.get(best_val_primary_metric_name)
-        if current_primary_metric is not None and (
-            best_val_primary_metric is None or current_primary_metric < best_val_primary_metric
-        ):
-            best_epoch = final_trained_epoch
-            best_val_primary_metric = current_primary_metric
-            best_val_metrics = dict(eval_metrics)
-            best_model_state = snapshot_module_state(model)
-            best_anp_state = snapshot_module_state(anp_head)
         current_val = eval_metrics.get(val_primary_key)
         if current_val is not None and current_val < best_val_metric:
             best_val_metric = current_val
+            best_val_primary_metric = current_val
+            best_val_metrics = dict(eval_metrics)
             best_epoch = final_trained_epoch
             best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            if anp_head is not None:
-                best_anp_state = {k: v.cpu().clone() for k, v in anp_head.state_dict().items()}
+            best_anp_state = snapshot_module_state(anp_head)
             if ema is not None:
                 best_ema_shadow = {k: v.cpu().clone() for k, v in ema.shadow.items()}
             if anp_ema is not None:
