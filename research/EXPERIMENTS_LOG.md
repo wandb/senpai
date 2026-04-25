@@ -1,5 +1,44 @@
 # SENPAI Research Results
 
+## 2026-04-25 08:00 — Cycle 158 (5 closures, 1 send-back, 5 new assignments)
+
+### PR #3257: AF eval-every-3 AdamW 2L champion (chihiro) — SENT BACK (NEW AF BEST PENDING)
+- val surface_mse=0.000266 @ep792 (-10.1% vs 0.000296 baseline!) — eval-every-3 = throughput win
+- Trial 2 (eval-every-5): val=0.000288 (-2.7%) but diverged ep745. eval-every-3 is the sweet spot.
+- vol_mse=0.002193 (+7.6% regression). test/surface_mse=0.000451 (full-eval pending)
+- Sent back to request full-eval TEST metrics before merging. W&B: gtwobpiy (Trial 1), p4tkm502 (Trial 2)
+- **INSIGHT: AF eval-every-3 with correct AdamW 2L config gives NEW AF BEST on primary metric**
+
+### PR #3312: DM champion recovery seed=777 (griffith) — CLOSED
+- val=3.959% @T_max=30 — above 3.622% baseline. full-eval TEST=4.196% (2nd place behind gojo's 4.117%)
+- **BONUS: Checkpoint bug fix** — kill-if-no-improvement now saves checkpoint before RuntimeError
+- W&B train: u9qdc7v1, full-eval: qdyckkgz
+
+### PR #3353: DM metric-aware w=0.05 seed=1024 (franky) — CLOSED
+- val=4.073% @ep830 @T_max=30. seed=1024 underperforms (MSE-only seed=1024: 4.103% → 4.073% marginal)
+- Confirms seed sensitivity: seeds 0+42 converge to 3.700%, seed=1024 stuck at 4.073%
+- W&B: 46p9qaqc
+
+### PR #2949: TFP architecture sweep (vash) — CLOSED
+- Best follow-up (lr=5e-5 4L/192d): test_primary/field_mse=0.002396 — +34% above TFP baseline 0.001789
+- Architecture finding: 4L min for stability; 3L all diverge; width hurts (192d>256d>384d)
+- W&B: rf6qyax6 (best arch), 5qv7i3po (lr=5e-5 follow-up)
+
+### PR #3121: DM dropout (levi) — CLOSED
+- 3 days, no results, student agent stuck. Config superseded by T_max=36+lr=4.8e-4 direction.
+
+### PR #3290: DM 96k surface points (askeladd) — CLOSED
+- Student agent failed setup (6 min session, 0 lines). Superseded by compound fleet.
+
+### Cycle 158 Assignments
+- #3396 franky: DM T_max=36 + lr=4.8e-4 + gc=0.3 MSE-only (softer clipping compound)
+- #3397 vash: TFP lr=7.5e-5 + T_max=15 (longer schedule at optimal LR)
+- #3398 griffith: DM T_max=36 + lr=5.2e-4 MSE-only (fine LR probe above 5e-4)
+- #3399 levi: DM T_max=34 + lr=4.8e-4 MSE-only (fine schedule probe below T_max=36)
+- #3400 askeladd: TFP lr=7.5e-5 + T_max=20 + seed=42 (schedule+seed compound)
+
+---
+
 ## 2026-04-25 07:40 — Cycle 157 (2 PRs)
 
 ### PR #3350: DM metric-aware w=0.05 + lr=4.5e-4 (taki) — CLOSED
