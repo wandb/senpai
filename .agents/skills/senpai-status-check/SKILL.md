@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-PackageName: skills
 
-name: experiment-status-check
+name: senpai-status-check
 description: >
   Produce a fresh status report for the senpai ML experiment fleet. Use when the
   user asks for an experiment status, final status, PR/W&B/pod health check,
