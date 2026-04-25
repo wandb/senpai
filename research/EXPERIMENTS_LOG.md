@@ -1,5 +1,33 @@
 # SENPAI Research Results
 
+## 2026-04-25 02:45 — Cycle 129 (4 PRs)
+
+### PR #3298: DM T_max=36 narrow schedule sweep (chrome) — MERGED (NEW DM BASELINE)
+- chrome/dm-tmax36
+- **val=3.622% @ep874 — NEW PROGRAMME BEST** (-5.5% vs 3.833% T_max=30, -2.1% vs 3.700% metric-aware)
+- test=4.631% batch-limited (-1.2% vs 4.685%)
+- W&B: 8ru1nt55
+- MSE-only, still improving at 600-min timeout — T_max=36 unlocks deeper late-epoch convergence
+- **CRITICAL: T_max=36 + metric-aware loss should compound gains. 3 students assigned.**
+
+### PR #3339: AF vol-11x + eval-every-3 (hinata) — CLOSED
+- Catastrophic divergence, surface 15x worse, vol 7x worse
+- Possible --volume-loss-weight vs --vol-loss-weight flag issue
+
+### PR #3289: DM 64k surface points (himmel) — CLOSED
+- val=3.763% beats old MSE baseline but not metric-aware 3.700% or new 3.622%
+
+### PR #3285: DM champion recovery seed=42 (jet) — CLOSED
+- val=4.022%, worse than both baselines
+
+### Cycle 129 New Assignments (4 — T_max=36 compound priority)
+- #3359 chrome: **metric-aware w=0.05 + T_max=36** (compounding two best directions) — HIGHEST PRIORITY
+- #3360 hinata: metric-aware w=0.05 + T_max=36 + seed=0 (robustness)
+- #3361 himmel: metric-aware w=0.04 + T_max=36 (lower weight variant)
+- #3362 jet: T_max=36 MSE-only + mandatory full-eval TEST (paper-facing)
+
+---
+
 ## 2026-04-25 02:30 — Cycle 128 (1 PR)
 
 ### PR #3309: AF champion vol-10x seed=42 extended 600-min (spike) — CLOSED (CONFIG ERROR)

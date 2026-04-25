@@ -1,14 +1,15 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-25 01:00 (advisor cycle 122)
+- **Date:** 2026-04-25 02:45 (advisor cycle 129)
 - **Branch:** radford
 - **ACTIVE DIRECTIVE: Issue #3283 — Last Ditch Benchmark Push (final hours)**
 - **TFP NEW BEST: val=0.002180, test=0.001931** (PR #3307 MERGED, haku lr=7e-5, -7%/-13% vs previous)
-- **DM NEW VAL BEST: 3.700%** (canute #3302 metric-aware loss, MERGED). **BREAKS AB-UPT SOTA VAL TARGET (3.71%)!**
-- **DM authoritative TEST: 4.218%** (canute full-eval run n2t1nzsb, Trial B w=0.05 ep780 checkpoint). Beats previous 4.324% by 0.106pp. Batch-limited val (3.700%) has ~24% optimistic bias vs full-eval (4.652%).
+- **DM NEW VAL BEST: 3.622%** (chrome #3298 T_max=36 MSE-only, MERGED). **BREAKS AB-UPT SOTA by 0.088pp!** Still improving at ep874 timeout.
+- **DM authoritative TEST: 4.218%** (canute full-eval run n2t1nzsb, metric-aware w=0.05 T_max=30). T_max=36 full-eval PENDING (#3362 jet).
+- **CRITICAL COMPOUND: T_max=36 + metric-aware loss** — 3 students assigned (#3359-#3361). If orthogonal, val could drop below 3.5%.
 - **Fleet:** 59 students active. All assigned. Zero idle GPUs.
 - **Harness patches (#3284): MERGED.** All DM runs use --no-compile-model, --save-checkpoint, --ema-mode fixed
-- **Cycle 122:** TFP lr=7e-5 MERGED (val=0.002180, test=0.001931, -7%/-13%). DM metric-aware seed robustness confirmed (seeds 0+42 identical). Canute on w=0.04 paper run, haku on TFP lr bracket.
+- **Cycle 129:** DM T_max=36 MERGED (val=3.622% NEW BEST). T_max=36 + metric-aware compound is highest priority. TFP lr=7e-5 MERGED earlier (val=0.002180, test=0.001931).
 - **AF BREAKTHROUGH:** eval-every-3 + vol-weight=12x yields programme-best surface (0.000228). 8-student sweep launched to find vol-weight where both metrics beat baseline simultaneously.
 
 ## BINDING DIRECTIVE — Issue #3283 (2026-04-24)
@@ -123,7 +124,7 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 | TandemFoil | `val_primary/surface_pressure_mae` | **21.319** (#3185 MERGED — full noam stack: ANP+physics+T_max=150+Lookahead+96sl) |
 | TandemFoil Paper | `val_primary/field_mse` | **0.002180** (#3307 MERGED — haku lr=7e-5, -7% val / -13% test) |
 | AirfRANS | `val_primary/surface_mse` + `vol_mse` | **0.000296 / 0.002039** (#3135 MERGED — EMA+vol-weight=10x) |
-| DrivAerML | `val_primary/surface_rel_l2_pct` | **3.700%** (#3302 MERGED — metric-aware MSE+raw-rel-L2, w=0.05) |
+| DrivAerML | `val_primary/surface_rel_l2_pct` | **3.622%** (#3298 MERGED — MSE-only T_max=36, still improving at timeout) |
 
 ## Paper-Facing Snapshot
 
@@ -132,7 +133,7 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 | TandemFoil | `test_primary/surface_pressure_mae` | **22.868** (PR #3185 MERGED) | (internal) | Improving |
 | TandemFoil Paper | `test_primary/field_mse` | **0.001931** (PR #3307 haku lr=7e-5) | ~0.10-0.36/task | **New programme best.** Bracket 6e-5/7.5e-5 in progress. |
 | AirfRANS | `Surf MSE / Vol MSE` | **0.000296 / 0.002039** | 0.0043 / 0.0017 | Surface 14.5x better, Volume 1.20x gap |
-| DrivAerML | `test_primary/surface_rel_l2_pct` | **4.218%** (full-eval, canute n2t1nzsb, Trial B w=0.05) | 3.71% | **NEW PROGRAMME BEST.** Full-eval confirmed. ~14% relative gap to SOTA. Metric-aware sweep (19 students) + canute seed=0 paper run in progress. |
+| DrivAerML | `test_primary/surface_rel_l2_pct` | **4.218%** (full-eval, canute n2t1nzsb, metric-aware T_max=30) | 3.71% | T_max=36 full-eval PENDING (#3362 jet). T_max=36+metric-aware compound (#3359-#3361) in progress. |
 
 ## Current Research Focus
 

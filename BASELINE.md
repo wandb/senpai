@@ -451,14 +451,24 @@
 ## DrivAerML
 
 - **Primary metric:** `val_primary/surface_rel_l2_pct` (lower is better)
-- **Current best:** 3.700% (val) at epoch 780 — **full-eval TEST 4.218%** (NEW PROGRAMME BEST)
-- **Best PR:** #3302 (canute — metric-aware MSE+raw-rel-L2 loss, w=0.05, 4L/512d/8H, AdamW lr=5e-4, T_max=30, EMA=0.9995, gc=0.5)
+- **Current best:** 3.622% (val) at epoch 874 — test 4.631% (batch-limited; full-eval TEST PENDING)
+- **Best PR:** #3298 (chrome — MSE-only, T_max=36, 4L/512d/8H, AdamW lr=5e-4, EMA=0.9995, gc=0.5)
 - **CRITICAL:** Must pass `--batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200`
-- **External target:** <3.71% (AB-UPT, ~500 epochs) — **val 3.700% BREAKS BELOW SOTA TARGET**
-- **Key insight:** Metric-aware auxiliary loss (MSE + raw-rel-L2 with w=0.05) aligns optimization with the evaluation metric while MSE anchors stability. Full-eval TEST=4.218% (canute run n2t1nzsb) confirms improvement over previous 4.324%. Batch-limited val (3.700%) is optimistic vs full-eval val (4.652%) — ~24% bias confirmed.
-- **Reproduce (Trial B, best val):** `cd target/icml2026 && SENPAI_TIMEOUT_MINUTES=600 python train.py --dataset drivaerml --dm-loss mse_plus_raw_rel_l2 --dm-rel-l2-weight 0.05 --optimizer adamw --lr 5e-4 --cosine-t-max 30 --grad-clip 0.5 --enable-fourier --model-layers 4 --model-hidden-dim 512 --model-heads 8 --epochs 999 --batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200 --ema-decay 0.9995 --ema-mode fixed --no-compile-model --save-checkpoint`
+- **External target:** <3.71% (AB-UPT, ~500 epochs) — **val 3.622% BREAKS BELOW SOTA TARGET by 0.088pp**
+- **Key insight:** T_max=36 beats T_max=30 by -5.5% on MSE-only config, and beats metric-aware w=0.05 T_max=30 (3.700%) by -2.1%. Still improving at ep874 (600-min timeout). T_max=36 + metric-aware loss is the obvious compounding experiment. Full-eval TEST pending.
+- **Reproduce:** `cd target/icml2026 && SENPAI_TIMEOUT_MINUTES=600 python train.py --dataset drivaerml --optimizer adamw --lr 5e-4 --cosine-t-max 36 --grad-clip 0.5 --enable-fourier --model-layers 4 --model-hidden-dim 512 --model-heads 8 --epochs 999 --batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200 --ema-decay 0.9995 --ema-mode fixed --no-compile-model --save-checkpoint`
 
-### 2026-04-24 21:30 — PR #3302: DrivAerML: metric-aware MSE+raw-rel-L2 loss — NEW BEST (CURRENT)
+### 2026-04-25 02:45 — PR #3298: DrivAerML: T_max=36 MSE-only — NEW BEST (CURRENT)
+
+- **val_primary/surface_rel_l2_pct:** 3.622% (-5.5% vs 3.833% T_max=30) at epoch 874
+- **test_primary/surface_rel_l2_pct:** 4.631% batch-limited (-1.2% vs 4.685%)
+- **Full-eval TEST:** PENDING
+- **W&B run:** 8ru1nt55 (chrome/dm-tmax36)
+- **Config:** 4L/512d/8H, AdamW lr=5e-4, **T_max=36**, EMA=0.9995, gc=0.5, Fourier, MSE-only (no metric-aware loss)
+- **Key insight:** T_max=36 outperforms both T_max=30 MSE-only (3.833%) and metric-aware w=0.05 at T_max=30 (3.700%). Still descending at ep874 — timeout is the limit, not convergence. The gentler cosine cycle allows deeper late-epoch convergence. **CRITICAL FOLLOW-UP:** T_max=36 + metric-aware loss should compound.
+- **Reproduce:** `cd target/icml2026 && SENPAI_TIMEOUT_MINUTES=600 python train.py --dataset drivaerml --optimizer adamw --lr 5e-4 --cosine-t-max 36 --grad-clip 0.5 --enable-fourier --model-layers 4 --model-hidden-dim 512 --model-heads 8 --epochs 999 --batch-size 1 --drivaerml-train-surface-points 50000 --drivaerml-eval-surface-points 50000 --max-train-batches 394 --max-eval-batches 200 --ema-decay 0.9995 --ema-mode fixed --no-compile-model --save-checkpoint`
+
+### 2026-04-24 21:30 — PR #3302: DrivAerML: metric-aware MSE+raw-rel-L2 loss — PREVIOUS BEST
 
 - **val_primary/surface_rel_l2_pct (Trial B, w=0.05):** 3.700% (-3.5% vs 3.833%) at epoch 780
 - **val_primary/surface_rel_l2_pct (Trial A, w=0.02):** 3.935% at epoch 785
