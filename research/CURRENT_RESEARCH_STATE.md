@@ -1,6 +1,6 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-25 ~18:35 (cycle 165)
+- **Date:** 2026-04-25 ~19:10 (cycle 165 — gojo merged!)
 - **Branch:** radford
 - **ACTIVE DIRECTIVE:** Issue #3283 — Last Ditch Benchmark Push (TEST metrics only for paper)
 
@@ -23,21 +23,20 @@ Human team (morganmcg1) executed final cost-control harvest pass:
 
 | Dataset | Best TEST (full-eval) | Best Val [internal] | PR |
 |---------|----------------------|--------------------|----|
-| **DrivAerML** | **4.117%** | **3.521%** (gojo #3380 ep850) | TEST: #3308 / Val: #3380 |
+| **DrivAerML** | **4.119%** | **3.521%** | #3380 (gojo lr=4.8e-4 T_max=36 MSE-only) — **MERGED** |
 | **TFP** | **0.001712** | 0.001903 | #3346 (yuji 4L lr=4e-5 T_max=15) |
 | **AF** | pending | 0.000266 | #3257 (chihiro eval-every-3) |
 | **TF** | 22.868 | 21.319 | #3185 — frozen |
 
-DM gap to AB-UPT: **0.407pp TEST** (4.117% vs 3.71%)
+DM gap to AB-UPT: **0.409pp TEST** (4.119% vs 3.71%)
 
-## GOJO #3380 — TRAINING COMPLETE, AWAITING FULL-EVAL TEST
+## GOJO #3380 — MERGED ✅
 
-**lr=4.8e-4 + T_max=36 MSE-only. W&B run: 5x2to2p8 (FINISHED)**
-- **Best val: 3.521% at ep850** — 0.101pp below 3.622% baseline. NEW DM VAL RECORD.
-- Final epoch: 865 (600-min timeout hit).
-- Trough progression: 3.696→3.644→3.643→3.601→3.598→3.590→3.576→3.555→3.542→**3.521**
-- **Student session ended ~09:45Z. Training ran unattended. Student needs to re-activate, run full-eval from best checkpoint (ep850), and post results.**
-- **CRITICAL: Full-eval TEST from this run will determine if we can merge and close the gap to AB-UPT.**
+**lr=4.8e-4 + T_max=36 MSE-only. W&B: 5x2to2p8 (training), 4z3ya8t9 (full-eval)**
+- **Best val (200-batch): 3.521% at ep850** — 0.101pp below 3.622% old baseline. NEW DM VAL RECORD.
+- **Full-eval TEST: 4.119%** — tied with previous 4.117% reference. No TEST improvement.
+- **Full-eval val: 4.456%** — confirms ~0.9pp eval-subset optimistic bias. CRITICAL WARNING.
+- Merged 2026-04-25T19:07. New val baseline: 3.521%.
 
 ## Surviving Fleet (8 open PRs, down from 14)
 
