@@ -1,5 +1,34 @@
 # SENPAI Research Results
 
+## 2026-04-25 15:10 — Cycle 162 (3 closures, gojo tracking)
+
+### PR #3384: DM T_max=36 + lr=4.8e-4 + w=0.04 (fern) — CLOSED
+- val=4.092%, TEST=4.358% @ep522 (360-min cap). Not competitive.
+- Metric-aware w=0.04 underperforms MSE-only at lr=4.8e-4+T_max=36.
+- W&B: 3mlng43b
+
+### PR #3377: TFP lr=8e-5 + lr=7.25e-5 bracket (haku) — CLOSED
+- lr=8e-5: val=0.002002, test=0.001921 (+7.5% vs baseline). Stable but worse.
+- lr=7.25e-5: **DIVERGED** (val→1.72 by ep400, NaN ep474). Non-smooth LR landscape.
+- **CONFIRMS: lr=7.5e-5 is the TFP 3L optimum.** 8e-5 worse, 7.25e-5 unstable.
+- W&B: o7w5rex5 (lr=8e-5), 3d2lqnnc (lr=7.25e-5)
+
+### PR #3373: AF eval-every-3 + vol-12x (gilbert) — CLOSED
+- surface_mse=0.000350 (+18%), volume_mse=0.002367 (+16%). Both above baseline.
+- vol-12x too aggressive — over-biases toward volume at expense of surface.
+- eval-every-3 throughput confirmed: 785 eps in 360 min (~3x).
+- W&B: ecizc9u1
+
+### GOJO #3380 LIVE TRACKING (lr=4.8e-4+T_max=36 MSE-only)
+- ep459: 3.846% → ep477: 3.768% → ep492: 3.768% → ep507: 3.801% → ep523: 3.760% → **ep538: 3.748%**
+- Converging steadily. ~330 epochs remaining. On track to challenge 3.622% baseline.
+
+### Other DM compounds still training:
+- franky: 3.958% @ep589 (gc=0.3) | canute: 3.969% @ep563 (T_max=38)
+- alphonse: 4.034% @ep551 (T_max=40) | einar: 4.080% @ep537 (w=0.03)
+
+---
+
 ## 2026-04-25 08:35 — Cycle 161 (post-harvest)
 
 ### HUMAN COST-CONTROL HARVEST PASS
