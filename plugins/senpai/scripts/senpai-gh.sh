@@ -80,6 +80,74 @@ close_pr_with_comment() {
     gh_retry gh pr close "$num" --delete-branch
 }
 
+# Create an assignment PR through the one path that verifies student routing.
+#
+# Assignment pickup is label-based: student pods only see work when the PR has
+# the advisor branch label, student:<name>, and status:wip. Raw gh pr create
+# calls can leave behind an unroutable PR if any of that metadata is omitted.
+#
+# On success, this prints the created PR URL after confirming the PR is a draft,
+# targets the requested base/head, and has every required routing label.
+# On failure, it prints the specific missing or mismatched invariant to stderr
+# and returns nonzero so the advisor can fix the assignment before students idle.
+#   create_assignment_pr_from_file <student> <head-branch> <title> <body-file> [base-branch]
+create_assignment_pr_from_file() {
+    local student="$1" head_branch="$2" title="$3" body_file="$4" base_branch="${5:-${ADVISOR_BRANCH:-}}"
+    local pr_url num details
+
+    if [ -z "$student" ] || [ -z "$head_branch" ] || [ -z "$title" ] || [ -z "$body_file" ] || [ -z "$base_branch" ]; then
+        echo "create_assignment_pr_from_file: usage: <student> <head-branch> <title> <body-file> [base-branch]" >&2
+        return 2
+    fi
+    if [ ! -f "$body_file" ]; then
+        echo "create_assignment_pr_from_file: body file not found: $body_file" >&2
+        return 2
+    fi
+
+    pr_url=$(gh_retry gh pr create --draft \
+        --title "$title" \
+        --body-file "$body_file" \
+        --label "$base_branch" \
+        --label "student:$student" \
+        --label "status:wip" \
+        --base "$base_branch" \
+        --head "$head_branch")
+
+    num=$(printf '%s' "$pr_url" | sed -n 's#.*/pull/\([0-9][0-9]*\).*#\1#p')
+    if [ -z "$num" ]; then
+        echo "create_assignment_pr_from_file: could not parse PR number from: $pr_url" >&2
+        return 1
+    fi
+
+    details=$(gh_retry gh pr view "$num" --json number,baseRefName,headRefName,labels,isDraft)
+    python3 - "$student" "$base_branch" "$head_branch" "$details" <<'PY' || return
+import json
+import sys
+
+student, base_branch, head_branch, payload = sys.argv[1:5]
+pr = json.loads(payload)
+labels = {label.get("name", "") for label in pr.get("labels", [])}
+
+errors = []
+if pr.get("baseRefName") != base_branch:
+    errors.append(f"expected base {base_branch}, got {pr.get('baseRefName')}")
+if pr.get("headRefName") != head_branch:
+    errors.append(f"expected head {head_branch}, got {pr.get('headRefName')}")
+if not pr.get("isDraft"):
+    errors.append("expected draft PR")
+for label in (base_branch, f"student:{student}", "status:wip"):
+    if label not in labels:
+        errors.append(f"missing label {label}")
+
+if errors:
+    for error in errors:
+        print(f"create_assignment_pr_from_file: PR #{pr.get('number')} {error}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+
+    printf '%s\n' "$pr_url"
+}
+
 # ---------------------------------------------------------------------------
 # Compound actions — student
 # ---------------------------------------------------------------------------

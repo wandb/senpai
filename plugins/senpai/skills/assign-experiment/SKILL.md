@@ -43,12 +43,11 @@ BRANCH="$0/$1"
 create_assignment_branch "$0" "$1"
 ```
 
-3. **Create the draft PR** with the template below. Replace the placeholders with your actual hypothesis, instructions, and baseline data:
+3. **Write the PR body to a temp file**. Replace the placeholders with your actual hypothesis, instructions, and baseline data:
 
 ```bash
-gh pr create --draft \
-    --title "<Hypothesis title — clear, specific, under 70 chars>" \
-    --body "$(cat <<'PREOF'
+BODY_FILE=$(mktemp)
+cat > "$BODY_FILE" <<'PREOF'
 ## Hypothesis
 <What we think will improve metrics and why. For non-trivial changes,
 include links to papers or code that support the hypothesis.>
@@ -64,12 +63,18 @@ include links to papers or code that support the hypothesis.>
 - Baseline W&B run: <run-id> (<wandb-link>)
 - Reproduce command: `cd "$2" && python train.py ...`>
 PREOF
-)" \
-    --label "$ADVISOR_BRANCH" \
-    --label "student:$0" \
-    --label "status:wip" \
-    --base "$ADVISOR_BRANCH" \
-    --head "$BRANCH"
+```
+
+4. **Create and verify the draft PR**:
+
+```bash
+create_assignment_pr_from_file \
+    "$0" \
+    "$BRANCH" \
+    "<Hypothesis title — clear, specific, under 70 chars>" \
+    "$BODY_FILE" \
+    "$ADVISOR_BRANCH"
+rm -f "$BODY_FILE"
 ```
 
 ## Important details
@@ -80,4 +85,5 @@ PREOF
 - **Be specific in instructions.** The student implements exactly what you write. Vague instructions waste GPU time.
 - **Use `--wandb_group`** in instructions when a hypothesis needs multiple iterations (e.g. "try surface weight 5, 10, 20") so related runs are grouped in W&B.
 - **One hypothesis per PR.** Bundling multiple changes makes it impossible to attribute what worked.
-- If the PR body is too long for `gh pr create`, put the core info in the body and add supplementary details as a follow-up comment.
+- **Use `create_assignment_pr_from_file`.** It fails if the PR is not draft, targets the wrong base or head, or is missing `$ADVISOR_BRANCH`, `student:$0`, or `status:wip`.
+- If the PR body is too long, keep the core info in the body file and add supplementary details as a follow-up comment.

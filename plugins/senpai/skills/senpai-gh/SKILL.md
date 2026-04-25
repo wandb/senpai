@@ -45,6 +45,7 @@ GitHub's `gh pr edit --remove-label X --add-label Y` silently strips **all other
 |---|---|
 | `send_pr_back_to_student_with_comment <pr#> <comment>` | Send a PR back to the student with feedback. Comment on the PR, convert back to draft, swap `status:review` → `status:wip`. |
 | `close_pr_with_comment <pr#> <reason>` | Close a dead-end PR with a comment explaining why. Comment with reason, close the PR, delete the remote branch. |
+| `create_assignment_pr_from_file <student> <head-branch> <title> <body-file> [base-branch]` | Create a draft assignment PR, then fail if the required base/head, draft, or routing labels are missing. |
 
 ### Student actions
 
