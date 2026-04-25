@@ -1,15 +1,15 @@
 # SENPAI Research State
 
-- **Date:** 2026-04-25 02:45 (advisor cycle 129)
+- **Date:** 2026-04-25 03:15 (advisor cycle 130)
 - **Branch:** radford
 - **ACTIVE DIRECTIVE: Issue #3283 — Last Ditch Benchmark Push (final hours)**
 - **TFP NEW BEST: val=0.002180, test=0.001931** (PR #3307 MERGED, haku lr=7e-5, -7%/-13% vs previous)
 - **DM NEW VAL BEST: 3.622%** (chrome #3298 T_max=36 MSE-only, MERGED). **BREAKS AB-UPT SOTA by 0.088pp!** Still improving at ep874 timeout.
 - **DM authoritative TEST: 4.218%** (canute full-eval run n2t1nzsb, metric-aware w=0.05 T_max=30). T_max=36 full-eval PENDING (#3362 jet).
-- **CRITICAL COMPOUND: T_max=36 + metric-aware loss** — 3 students assigned (#3359-#3361). If orthogonal, val could drop below 3.5%.
+- **CRITICAL COMPOUND: T_max=36 + metric-aware loss** — 5 students assigned: chrome #3359 (w=0.05), hinata #3360 (w=0.05 seed=0), himmel #3361 (w=0.04), nami #3363 (w=0.03), robin #3364 (w=0.06)
 - **Fleet:** 59 students active. All assigned. Zero idle GPUs.
 - **Harness patches (#3284): MERGED.** All DM runs use --no-compile-model, --save-checkpoint, --ema-mode fixed
-- **Cycle 129:** DM T_max=36 MERGED (val=3.622% NEW BEST). T_max=36 + metric-aware compound is highest priority. TFP lr=7e-5 MERGED earlier (val=0.002180, test=0.001931).
+- **Cycle 130:** Closed nami #3297 (T_max=24, val=4.093%) and robin #3294 (gc=0.25, val=3.872%). Both reassigned to T_max=36 + metric-aware compounds.
 - **AF BREAKTHROUGH:** eval-every-3 + vol-weight=12x yields programme-best surface (0.000228). 8-student sweep launched to find vol-weight where both metrics beat baseline simultaneously.
 
 ## BINDING DIRECTIVE — Issue #3283 (2026-04-24)
@@ -66,8 +66,16 @@ Re-run haku/tfp-t20-gc05-lr1e4 for 2-8 seeds (best_val=0.002466, best_test=0.002
 ### DM Champion Recovery Seeds
 - `#3293` norman (seed=0, TEST=4.250% batch-ltd, full-eval pending), `#3285` jet, `#3305` faye, `#3310` zenitsu, `#3311` franky, `#3312` griffith, `#3321` wolfwood
 
+### DM T_max=36 + Metric-Aware Compound (HIGHEST PRIORITY)
+- `#3359` chrome: w=0.05 + T_max=36 (primary compound)
+- `#3360` hinata: w=0.05 + T_max=36 + seed=0 (robustness)
+- `#3361` himmel: w=0.04 + T_max=36 (lower weight)
+- `#3362` jet: T_max=36 MSE-only + full-eval TEST (paper-facing)
+- `#3363` nami: w=0.03 + T_max=36 (low weight)
+- `#3364` robin: w=0.06 + T_max=36 (high weight)
+
 ### DM Continuing Experiments
-- `#3289` himmel, `#3290` askeladd, `#3294` robin, `#3297` nami, `#3298` chrome, `#3235` kakashi, `#3152` eren, `#3146` taki, `#3121` levi
+- `#3290` askeladd, `#3152` eren, `#3121` levi
 
 ### AirfRANS — eval-every-3 Sweep (NEW BREAKTHROUGH DIRECTION)
 **Key insight:** eval-every-3 gives ~3x more training epochs. Combined with vol-weight tuning, may simultaneously beat both surface and volume baselines.

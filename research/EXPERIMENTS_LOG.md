@@ -1,5 +1,25 @@
 # SENPAI Research Results
 
+## 2026-04-25 03:15 — Cycle 130 (2 PRs)
+
+### PR #3297: DM T_max=24 narrow schedule (nami) — CLOSED
+- nami/dm-tmax24
+- val=4.093% @best — worse than T_max=30 (3.833%), T_max=36 (3.622%), and metric-aware (3.700%)
+- T_max=24 sits in an unfavorable part of the schedule landscape. The optimum is firmly at T_max=36.
+- Schedule sweep complete: T_max=15→4.406%, T_max=20→4.943%, T_max=24→4.093%, T_max=30→3.833%, T_max=36→3.622%, T_max=45→4.638%, T_max=50→diverge
+
+### PR #3294: DM grad-clip=0.25 (robin) — CLOSED
+- robin/dm-gc025
+- val=3.872% — worse than gc=0.5 baseline (3.833%) and all current baselines
+- Tighter clipping slightly degrades optimization; gc=0.5 remains the sweet spot for DM
+
+### Cycle 130 New Assignments (2 — T_max=36 metric-aware compound sweep)
+- #3363 nami: **metric-aware w=0.03 + T_max=36** (low-weight compound)
+- #3364 robin: **metric-aware w=0.06 + T_max=36** (high-weight compound)
+- Fills out the compound weight spectrum: w=0.03 (nami), w=0.04 (himmel #3361), w=0.05 (chrome #3359), w=0.06 (robin)
+
+---
+
 ## 2026-04-25 02:45 — Cycle 129 (4 PRs)
 
 ### PR #3298: DM T_max=36 narrow schedule sweep (chrome) — MERGED (NEW DM BASELINE)
