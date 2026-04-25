@@ -1292,6 +1292,7 @@ def train_one_epoch(
     if anp_head is not None:
         anp_head.train()
     running = {"loss": 0.0}
+    grad_norms_list: list[float] = []
     steps = 0
     micro_batches_total = 0
     batches = loader if max_batches <= 0 else itertools.islice(loader, max_batches)
@@ -1358,6 +1359,8 @@ def train_one_epoch(
         grad_norm_val = float(grad_norm)
         running.setdefault("grad_norm_mean", 0.0)
         running["grad_norm_mean"] += grad_norm_val
+        if math.isfinite(grad_norm_val):
+            grad_norms_list.append(grad_norm_val)
         if grad_clip > 0 and grad_norm_val > grad_clip:
             running.setdefault("grad_clip_events", 0.0)
             running["grad_clip_events"] += 1.0
@@ -1389,6 +1392,11 @@ def train_one_epoch(
     running["loss"] /= max(steps, 1)
     if "grad_norm_mean" in running:
         running["grad_norm_mean"] /= max(steps, 1)
+    if grad_norms_list:
+        grad_norms_sorted = sorted(grad_norms_list)
+        running["grad_norm_max"] = grad_norms_sorted[-1]
+        p99_idx = min(int(len(grad_norms_sorted) * 0.99), len(grad_norms_sorted) - 1)
+        running["grad_norm_p99"] = grad_norms_sorted[p99_idx]
     running["train_steps"] = float(steps)
     running["micro_batches"] = float(micro_batches_total)
     if scheduler is not None:
