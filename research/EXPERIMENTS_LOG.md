@@ -1,5 +1,25 @@
 # SENPAI Research Results
 
+## 2026-04-25 04:20 — Cycle 142 (2 PRs)
+
+### PR #3329: DM metric-aware w=0.03 + lr=4e-4 (sanji) — CLOSED
+- sanji/dm-metric-aware-w003-lr4e4
+- val=3.967% @ep724 — worse than w=0.05 baseline (3.700%) and T_max=36 (3.622%)
+- W&B: 7hrayanv
+- Lower LR converges slower without deeper basin. T_max=30 metric-aware optimum confirmed at w=0.05 lr=5e-4.
+
+### PR #3327: DM metric-aware w=0.07 (jin) — CLOSED
+- jin/dm-metric-aware-w007
+- val=4.063% @ep710 — 9.8% worse than w=0.05 (3.700%). Stable but plateaued.
+- W&B: gy3felfu
+- w=0.07 too much rel-L2 weight, pulls optimization from MSE minimum. Confirms optimum at/below w=0.05.
+
+### Cycle 142 New Assignments
+- #3369 sanji: **DM metric-aware w=0.05 + T_max=36 + seed=42** (compound seed robustness)
+- #3370 jin: **DM metric-aware w=0.05 + T_max=36 + WD=1e-3** (weight decay at compound)
+
+---
+
 ## 2026-04-25 04:10 — Cycle 141 (1 PR)
 
 ### PR #3343: AF vol-12x + eval-every-3 + seed=42 (tanjiro) — CLOSED
