@@ -1,5 +1,21 @@
 # SENPAI Research Results
 
+## 2026-04-25 03:40 — Cycle 134 (1 PR)
+
+### PR #3355: AF vol-10x + eval-every-3 + seed=42 (piccolo) — CLOSED
+- piccolo/af-vol10x-eval3-seed42
+- **Wrong config:** Lion 4L/256d instead of AdamW 2L/256d champion
+- Surface 0.00193 (6.5x worse than 0.000296 baseline), vol 0.009 (4.4x worse than 0.002)
+- Catastrophic divergence at ep137 (grad norms 25→295), terminal at ep150
+- W&B: zcbgfzlb
+- Also used `--volume-loss-weight` (possibly wrong flag name, should be `--vol-loss-weight`)
+- Lion + 4L is consistently uncompetitive on AF; stick with AdamW 2L champion
+
+### Cycle 134 New Assignment
+- #3365 piccolo: **DM metric-aware w=0.05 + T_max=36 + lr=4.5e-4** (LR probe at longer schedule)
+
+---
+
 ## 2026-04-25 03:15 — Cycle 130 (2 PRs)
 
 ### PR #3297: DM T_max=24 narrow schedule (nami) — CLOSED
