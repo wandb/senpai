@@ -586,13 +586,25 @@
 ## TandemFoil Paper
 
 - **Primary metric:** `val_primary/field_mse` (lower is better)
-- **Current best:** 0.002180 (val) at epoch 512 — test 0.001931 — **-7.0% val / -13.1% test vs previous**
-- **Best PR:** #3307 (haku — Lion lr=7e-5, T_max=10, gc=0.5, EMA=0.999, 3L/192d, Fourier+physics)
+- **Current best:** 0.001857 (val) at epoch 490 — test 0.001789 — **-14.8% val / -7.4% test vs previous**
+- **Best PR:** #3352 (haku — Lion lr=7.5e-5, T_max=10, gc=0.5, EMA=0.999, 3L/192d, Fourier+physics, seed=0)
 - **External target:** Paper MGN ~1.79 (crushed by >99% — internal frontier is the only meaningful target)
-- **Key insight:** LR optimum continues downward: 1.25e-4 → 1e-4 → 7e-5. The gap from 1e-4 to 7e-5 is large (-7% val, -13% test). 9e-5 and 8e-5 slightly worse than 1e-4; 7e-5 finds a distinctly different basin. T_max=20 at any LR is catastrophically worse.
-- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil_paper --optimizer lion --lr 7e-5 --cosine-t-max 10 --grad-clip 0.5 --weight-decay 1e-2 --enable-fourier --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999 --ema-decay 0.999`
+- **Key insight:** LR optimum continues: 7e-5 → 7.5e-5. Massive -14.8% val improvement. LR curve is non-monotonic with a sharp optimum near 7-8e-5. Next: probe lr=8e-5 to map upper bracket.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil_paper --optimizer lion --lr 7.5e-5 --cosine-t-max 10 --grad-clip 0.5 --weight-decay 1e-2 --enable-fourier --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999 --ema-decay 0.999 --seed 0`
 
-### 2026-04-25 01:00 — PR #3307: TandemFoil Paper: lr=7e-5 LR lower sweep — NEW BEST (CURRENT)
+### 2026-04-25 05:15 — PR #3352: TandemFoil Paper: LR bracket 6e-5/7.5e-5 — NEW BEST (CURRENT)
+
+- **val_primary/field_mse:** 0.001857 (-14.8% vs 0.002180) at epoch 490
+- **test_primary/field_mse:** 0.001789 (-7.4% vs 0.001931)
+- **val/surface_mse:** 0.001291 | **test/surface_mse:** 0.001212
+- **val/volume_mse:** 0.001866 | **test/volume_mse:** 0.001798
+- **W&B run:** miuluckt (haku/tfp-lr75e5-bracket) — Trial 2 winner
+- **Also tested:** lr=6e-5: val=0.002079 (-4.6% better) but test=0.002008 (+4% worse) — val-only improvement, not a winner
+- **Config:** Lion lr=**7.5e-5**, T_max=10, gc=0.5, WD=1e-2, EMA=0.999, 3L/192d, Fourier+physics, seed=0
+- **Key insight:** LR optimum is at 7.5e-5 — significantly better than both 7e-5 (baseline) and 6e-5. The improvement is large (-14.8% val) and consistent across surface and volume metrics. Next: probe lr=8e-5 to confirm 7.5e-5 is the peak.
+- **Reproduce:** `cd target/icml2026 && python train.py --dataset tandemfoil_paper --optimizer lion --lr 7.5e-5 --cosine-t-max 10 --grad-clip 0.5 --weight-decay 1e-2 --enable-fourier --model-layers 3 --model-hidden-dim 192 --model-heads 3 --enable-te-coord-frame --enable-cp-panel --enable-cp-panel-tandem-only --asinh-pressure --residual-prediction --enable-pressure-prior-addition --epochs 999 --ema-decay 0.999 --seed 0`
+
+### 2026-04-25 01:00 — PR #3307: TandemFoil Paper: lr=7e-5 LR lower sweep — PREVIOUS BEST
 
 - **val_primary/field_mse:** 0.002180 (-7.0% vs 0.002344) at epoch 512
 - **test_primary/field_mse:** 0.001931 (-13.1% vs 0.002221)
