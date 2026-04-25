@@ -1,5 +1,18 @@
 # SENPAI Research Results
 
+## 2026-04-25 05:15 — Cycle 146b: TFP WINNER (1 PR MERGED)
+
+### PR #3352: TFP LR bracket 6e-5/7.5e-5 (haku) — **MERGED (NEW TFP BASELINE)**
+- haku/tfp-lr-bracket-6e5-75e5
+- **Trial 2 (lr=7.5e-5): val=0.001857 (-14.8%), test=0.001789 (-7.4%) — NEW PROGRAMME BEST**
+- Trial 1 (lr=6e-5): val=0.002079 (-4.6% better val but test=0.002008 +4% worse — not a winner)
+- W&B: miuluckt (Trial 2 winner), 17d7r8uk (Trial 1)
+- Surface mse: val=0.001291, test=0.001212; Volume mse: val=0.001866, test=0.001798
+- LR optimum shifts upward again: 7e-5 → 7.5e-5. Need to probe lr=8e-5 next.
+- **BASELINE.md updated.** New haku assignment: #3377 lr=8e-5 + lr=7.25e-5 bracket
+
+---
+
 ## 2026-04-25 05:05 — Cycle 146 (1 PR)
 
 ### PR #3320: DM lr=3e-4 champion stack (brook) — CLOSED
